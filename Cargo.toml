@@ -1,19 +1,11 @@
-[package]
-name = "ext4-win"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "crates/ext4-core",
+    "crates/ext4-driver",
+]
+resolver = "3"
 
-[build-dependencies]
-wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", branch = "main" }
-
-[dependencies]
-wdk       = { git = "https://github.com/microsoft/windows-drivers-rs", branch = "main" }
-wdk-sys   = { git = "https://github.com/microsoft/windows-drivers-rs", branch = "main" }
-wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", branch = "main" }
-wdk-panic = { git = "https://github.com/microsoft/windows-drivers-rs", branch = "main" }
-fs-ext4 = "0.3"
-
-[lints.rust]
+[workspace.lints.rust]
 warnings = "deny"
 missing_docs = "deny"
 missing_debug_implementations = "deny"
@@ -23,7 +15,7 @@ unfulfilled_lint_expectations = "deny"
 unknown_lints = "deny"
 unsafe_op_in_unsafe_fn = "forbid"
 
-[lints.rustdoc]
+[workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
 bare_urls = "deny"
 missing_crate_level_docs = "deny"
@@ -34,7 +26,7 @@ private_doc_tests = "deny"
 unescaped_backticks = "deny"
 redundant_explicit_links = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 panic = "deny"
 panic_in_result_fn = "deny"
 unwrap_used = "deny"
