@@ -28,13 +28,13 @@ pub mod volume;
 
 mod endian;
 
-pub use block::{BlockAddress, BlockDevice, BlockSize, ByteOffset, SliceBlockDevice};
+pub use block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset, SliceBlockDevice};
 pub use dir::{DirectoryEntry, DirectoryEntryKind};
 pub use error::{Error, Result};
-pub use inode::{Inode, InodeId, InodeKind};
+pub use inode::{Ext4Timestamp, Inode, InodeId, InodeKind};
 pub use name::{Ext4Name, WindowsName};
-pub use superblock::{CleanSuperblock, FeatureSet};
-pub use volume::MountedVolume;
+pub use superblock::{FeatureSet, Superblock};
+pub use volume::{ReadOnly, ReadWrite, Volume, WriteTransaction};
 
 #[cfg(test)]
 mod tests;

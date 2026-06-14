@@ -79,8 +79,8 @@ impl BlockSize {
     }
 }
 
-/// Minimal random-access block-device interface used by ext4-core.
-pub trait BlockDevice {
+/// Minimal random-access block reader used by ext4-core.
+pub trait BlockReader {
     /// Total readable length in bytes.
     fn len(&self) -> u64;
 
@@ -110,7 +110,7 @@ impl<'a> SliceBlockDevice<'a> {
     }
 }
 
-impl BlockDevice for SliceBlockDevice<'_> {
+impl BlockReader for SliceBlockDevice<'_> {
     fn len(&self) -> u64 {
         u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
     }

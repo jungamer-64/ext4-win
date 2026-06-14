@@ -1,6 +1,6 @@
 //! Superblock parsing and mount-policy validation.
 
-use crate::block::{BlockDevice, BlockSize, ByteOffset};
+use crate::block::{BlockReader, BlockSize, ByteOffset};
 use crate::endian::{le_u16, le_u32};
 use crate::error::{Error, Result};
 
@@ -74,9 +74,9 @@ impl FeatureSet {
     }
 }
 
-/// Superblock whose structural fields and v1 feature policy are validated.
+/// Superblock whose structural fields and mount policy are validated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CleanSuperblock {
+pub struct Superblock {
     block_size: BlockSize,
     inode_count: u32,
     block_count: u32,
@@ -88,13 +88,13 @@ pub struct CleanSuperblock {
     features: FeatureSet,
 }
 
-impl CleanSuperblock {
+impl Superblock {
     /// Reads and validates the primary ext4 superblock from a block device.
     ///
     /// # Errors
     /// Returns an error when the primary superblock cannot be read or does not
     /// satisfy the clean v1 mount policy.
-    pub fn read_from(device: &impl BlockDevice) -> Result<Self> {
+    pub fn read_from(device: &impl BlockReader) -> Result<Self> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
         device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
         Self::parse(&raw)

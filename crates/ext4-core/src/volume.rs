@@ -2,39 +2,44 @@
 
 use alloc::{vec, vec::Vec};
 
-use crate::block::{BlockAddress, BlockDevice, ByteOffset};
+use crate::block::{BlockAddress, BlockReader, ByteOffset};
 use crate::dir::DirectoryEntry;
 use crate::endian::le_u32;
 use crate::error::{Error, Result};
-use crate::extent::ExtentRoot;
+use crate::extent::ExtentTree;
 use crate::inode::{Inode, InodeId, InodeKind};
 use crate::name::WindowsName;
-use crate::superblock::CleanSuperblock;
+use crate::superblock::Superblock;
 
 const BLOCK_GROUP_DESCRIPTOR_SIZE: u64 = 32;
 const MAX_EAGER_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Mounted read-only ext4 volume.
 #[derive(Debug)]
-pub struct MountedVolume<D> {
+pub struct Volume<D, State> {
     device: D,
-    superblock: CleanSuperblock,
+    superblock: Superblock,
+    state: State,
 }
 
-impl<D: BlockDevice> MountedVolume<D> {
+impl<D: BlockReader> Volume<D, ReadOnly> {
     /// Validates a clean ext4 volume and constructs mounted read-only state.
     ///
     /// # Errors
     /// Returns an error when the device does not contain a clean v1-supported
     /// ext4 superblock.
     pub fn mount(device: D) -> Result<Self> {
-        let superblock = CleanSuperblock::read_from(&device)?;
-        Ok(Self { device, superblock })
+        let superblock = Superblock::read_from(&device)?;
+        Ok(Self {
+            device,
+            superblock,
+            state: ReadOnly,
+        })
     }
 
     /// Validated superblock.
     #[must_use]
-    pub const fn superblock(&self) -> CleanSuperblock {
+    pub const fn superblock(&self) -> Superblock {
         self.superblock
     }
 
@@ -194,7 +199,7 @@ impl<D: BlockDevice> MountedVolume<D> {
                 .ok_or(Error::ArithmeticOverflow)?,
         );
         let block_size = u64::from(self.superblock.block_size().bytes());
-        let extent_root = ExtentRoot::parse_inode_root(inode.block())?;
+        let extent_root = ExtentTree::parse_inode_root(inode.block())?;
         let mut completed = 0_usize;
 
         while u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)? < readable {
