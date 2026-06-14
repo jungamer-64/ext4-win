@@ -26,9 +26,15 @@ pub mod name;
 pub mod superblock;
 pub mod volume;
 
+mod checksum;
 mod endian;
+mod group;
+mod journal;
 
-pub use block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset, SliceBlockDevice};
+pub use block::{
+    BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset, SliceBlockDevice,
+    SliceBlockDeviceMut,
+};
 pub use dir::{DirectoryEntry, DirectoryEntryKind};
 pub use error::{Error, Result};
 pub use inode::{Ext4Timestamp, Inode, InodeId, InodeKind};

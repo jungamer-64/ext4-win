@@ -44,6 +44,20 @@ pub enum Error {
     InvalidName,
     /// A Windows case-insensitive lookup matched multiple ext4 names.
     AmbiguousWindowsName,
+    /// The superblock advertises a feature that read-write mode rejects.
+    UnsupportedWriteFeature,
+    /// The internal journal is absent or outside the supported JBD2 profile.
+    UnsupportedJournal,
+    /// The journal contains malformed or inconsistent records.
+    JournalCorrupt,
+    /// A metadata checksum did not match the on-disk structure.
+    ChecksumMismatch,
+    /// No free block exists for a required allocation.
+    NoSpace,
+    /// The staged mutation cannot fit in one supported journal transaction.
+    TransactionTooLarge,
+    /// A write operation was outside the file range accepted by that operation.
+    InvalidWriteRange,
 }
 
 impl fmt::Display for Error {
@@ -67,6 +81,13 @@ impl fmt::Display for Error {
             Self::DirectoryTooLarge => "directory is too large for v1 enumeration",
             Self::InvalidName => "invalid name at domain boundary",
             Self::AmbiguousWindowsName => "windows lookup matched multiple ext4 names",
+            Self::UnsupportedWriteFeature => "unsupported ext4 feature for read-write mount",
+            Self::UnsupportedJournal => "unsupported ext4 journal",
+            Self::JournalCorrupt => "ext4 journal is corrupt",
+            Self::ChecksumMismatch => "ext4 metadata checksum mismatch",
+            Self::NoSpace => "ext4 volume has no free blocks",
+            Self::TransactionTooLarge => "ext4 transaction exceeds journal capacity",
+            Self::InvalidWriteRange => "invalid ext4 write range",
         })
     }
 }

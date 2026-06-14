@@ -96,6 +96,41 @@ pub trait BlockReader {
     }
 }
 
+/// Random-access block writer used by journaled ext4 mutations.
+pub trait BlockWriter: BlockReader {
+    /// Writes exactly `bytes.len()` bytes at `offset`.
+    ///
+    /// # Errors
+    /// Returns an error when the requested range cannot be written in full.
+    fn write_exact_at(&mut self, offset: ByteOffset, bytes: &[u8]) -> Result<()>;
+
+    /// Persists all previous writes according to the backing device contract.
+    ///
+    /// # Errors
+    /// Returns an error when the backing device cannot guarantee persistence.
+    fn flush(&mut self) -> Result<()>;
+}
+
+impl<T: BlockReader + ?Sized> BlockReader for &mut T {
+    fn len(&self) -> u64 {
+        (**self).len()
+    }
+
+    fn read_exact_at(&self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
+        (**self).read_exact_at(offset, out)
+    }
+}
+
+impl<T: BlockWriter + ?Sized> BlockWriter for &mut T {
+    fn write_exact_at(&mut self, offset: ByteOffset, bytes: &[u8]) -> Result<()> {
+        (**self).write_exact_at(offset, bytes)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        (**self).flush()
+    }
+}
+
 /// In-memory block device used by host tests and parser fixtures.
 #[derive(Clone, Copy, Debug)]
 pub struct SliceBlockDevice<'a> {
@@ -120,6 +155,48 @@ impl BlockReader for SliceBlockDevice<'_> {
         let end = start.checked_add(out.len()).ok_or(Error::DeviceRange)?;
         let source = self.bytes.get(start..end).ok_or(Error::DeviceRange)?;
         out.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+/// Mutable in-memory block device used by write transaction tests.
+#[derive(Debug)]
+pub struct SliceBlockDeviceMut<'a> {
+    bytes: &'a mut [u8],
+}
+
+impl<'a> SliceBlockDeviceMut<'a> {
+    /// Creates a mutable read-write in-memory device.
+    #[must_use]
+    pub const fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes }
+    }
+}
+
+impl BlockReader for SliceBlockDeviceMut<'_> {
+    fn len(&self) -> u64 {
+        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    }
+
+    fn read_exact_at(&self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(out.len()).ok_or(Error::DeviceRange)?;
+        let source = self.bytes.get(start..end).ok_or(Error::DeviceRange)?;
+        out.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+impl BlockWriter for SliceBlockDeviceMut<'_> {
+    fn write_exact_at(&mut self, offset: ByteOffset, bytes: &[u8]) -> Result<()> {
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(bytes.len()).ok_or(Error::DeviceRange)?;
+        let target = self.bytes.get_mut(start..end).ok_or(Error::DeviceRange)?;
+        target.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }

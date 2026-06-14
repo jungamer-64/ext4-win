@@ -9,6 +9,26 @@ const MODE_REGULAR: u16 = 0x8000;
 const MODE_SYMLINK: u16 = 0xA000;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 
+/// Ext4 inode timestamp supplied by the caller at a mutation boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ext4Timestamp {
+    seconds: u32,
+}
+
+impl Ext4Timestamp {
+    /// Creates an ext4 timestamp from low 32-bit Unix seconds.
+    #[must_use]
+    pub const fn from_unix_seconds(seconds: u32) -> Self {
+        Self { seconds }
+    }
+
+    /// Returns the low 32-bit Unix seconds stored in this timestamp.
+    #[must_use]
+    pub const fn seconds(self) -> u32 {
+        self.seconds
+    }
+}
+
 /// Stable ext4 inode identifier.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct InodeId(u32);
@@ -30,7 +50,7 @@ impl InodeId {
     }
 }
 
-/// Inode node kind accepted by the read-only domain.
+/// Inode node kind accepted by the ext4 core domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InodeKind {
     /// Regular file.
