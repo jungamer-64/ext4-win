@@ -2,14 +2,17 @@
 
 use alloc::vec::Vec;
 
-use crate::block::BlockAddress;
-use crate::endian::{le_u16, le_u32};
+use crate::block::{BlockAddress, BlockReader, BlockSize};
+use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
 
 const EXTENT_MAGIC: u16 = 0xF30A;
 const EXTENT_HEADER_SIZE: usize = 12;
 const EXTENT_ENTRY_SIZE: usize = 12;
 const EXTENT_LEN_UNINITIALIZED: u16 = 0x8000;
+const INODE_ROOT_BYTES: usize = 60;
+const INODE_ROOT_EXTENT_CAPACITY: usize = 4;
+const MAX_EXTENT_DEPTH: u16 = 5;
 
 /// A leaf extent mapping a logical block run to a physical block run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +23,14 @@ pub struct Extent {
 }
 
 impl Extent {
+    pub(crate) const fn new(logical_start: u32, len: u16, physical_start: BlockAddress) -> Self {
+        Self {
+            logical_start,
+            len,
+            physical_start,
+        }
+    }
+
     /// Logical first file block covered by this extent.
     #[must_use]
     pub const fn logical_start(self) -> u32 {
@@ -44,6 +55,12 @@ impl Extent {
         self.physical_start
     }
 
+    pub(crate) fn end_logical(self) -> Result<u32> {
+        self.logical_start
+            .checked_add(u32::from(self.len))
+            .ok_or(Error::ArithmeticOverflow)
+    }
+
     /// Maps a logical block if it falls inside this extent.
     pub fn map_logical(self, logical_block: u64) -> Option<BlockAddress> {
         let start = u64::from(self.logical_start);
@@ -65,60 +82,32 @@ pub struct ExtentTree {
 }
 
 impl ExtentTree {
-    /// Parses a v1-supported depth-0 extent root.
+    /// Parses a depth-0 inode extent root.
     ///
     /// # Errors
     /// Returns an error when the extent header is malformed, contains a deeper
-    /// tree than v1 supports, or has invalid entry bounds.
+    /// tree, or has invalid entry bounds.
     pub fn parse_inode_root(raw: &[u8; 60]) -> Result<Self> {
-        if le_u16(raw, 0)? != EXTENT_MAGIC {
-            return Err(Error::InvalidExtentTree);
-        }
-        let entries = usize::from(le_u16(raw, 2)?);
-        let max_entries = usize::from(le_u16(raw, 4)?);
-        let depth = le_u16(raw, 6)?;
-        if depth != 0 {
+        let entries = header_entries(raw)?;
+        let mut extents = Vec::with_capacity(entries);
+        if parse_node(raw, None, &mut extents)? != 0 {
             return Err(Error::UnsupportedExtentDepth);
         }
-        if entries > max_entries {
-            return Err(Error::InvalidExtentTree);
-        }
+        Ok(Self { extents })
+    }
 
-        let mut extents = Vec::with_capacity(entries);
-        for entry_index in 0..entries {
-            let offset = EXTENT_HEADER_SIZE
-                .checked_add(
-                    entry_index
-                        .checked_mul(EXTENT_ENTRY_SIZE)
-                        .ok_or(Error::ArithmeticOverflow)?,
-                )
-                .ok_or(Error::ArithmeticOverflow)?;
-            let end = offset
-                .checked_add(EXTENT_ENTRY_SIZE)
-                .ok_or(Error::ArithmeticOverflow)?;
-            if end > raw.len() {
-                return Err(Error::InvalidExtentTree);
-            }
-
-            let logical_start = le_u32(raw, offset)?;
-            let raw_len = le_u16(raw, offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?)?;
-            let len = raw_len & !EXTENT_LEN_UNINITIALIZED;
-            let start_hi = u64::from(le_u16(
-                raw,
-                offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
-            )?);
-            let start_lo = u64::from(le_u32(
-                raw,
-                offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
-            )?);
-            let physical_start = BlockAddress::new((start_hi << 32) | start_lo);
-            extents.push(Extent {
-                logical_start,
-                len,
-                physical_start,
-            });
-        }
-
+    /// Loads an extent tree, following external index blocks up to the ext4 depth limit.
+    ///
+    /// # Errors
+    /// Returns an error when the tree is malformed, too deep, or an index block
+    /// cannot be read.
+    pub fn load_inode_tree(
+        raw: &[u8; 60],
+        block_size: BlockSize,
+        reader: &impl BlockReader,
+    ) -> Result<Self> {
+        let mut extents = Vec::new();
+        parse_node_recursive(raw, block_size, reader, &mut extents)?;
         Ok(Self { extents })
     }
 
@@ -137,4 +126,175 @@ impl ExtentTree {
     pub fn extents(&self) -> &[Extent] {
         &self.extents
     }
+}
+
+pub(crate) fn serialize_inode_root(extents: &[Extent]) -> Result<[u8; INODE_ROOT_BYTES]> {
+    if extents.len() > INODE_ROOT_EXTENT_CAPACITY {
+        return Err(Error::UnsupportedExtentDepth);
+    }
+    let mut raw = [0_u8; INODE_ROOT_BYTES];
+    put_le_u16(&mut raw, 0, EXTENT_MAGIC)?;
+    put_le_u16(
+        &mut raw,
+        2,
+        u16::try_from(extents.len()).map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
+    put_le_u16(
+        &mut raw,
+        4,
+        u16::try_from(INODE_ROOT_EXTENT_CAPACITY).map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
+    put_le_u16(&mut raw, 6, 0)?;
+    put_le_u32(&mut raw, 8, 0)?;
+    for (entry_index, extent) in extents.iter().enumerate() {
+        let offset = EXTENT_HEADER_SIZE
+            .checked_add(
+                entry_index
+                    .checked_mul(EXTENT_ENTRY_SIZE)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::ArithmeticOverflow)?;
+        put_le_u32(&mut raw, offset, extent.logical_start())?;
+        put_le_u16(
+            &mut raw,
+            offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+            extent.len(),
+        )?;
+        put_le_u16(
+            &mut raw,
+            offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
+            u16::try_from(extent.physical_start().get() >> 32)
+                .map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        put_le_u32(
+            &mut raw,
+            offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+            u32::try_from(extent.physical_start().get() & u64::from(u32::MAX))
+                .map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+    }
+    Ok(raw)
+}
+
+fn parse_node_recursive(
+    raw: &[u8],
+    block_size: BlockSize,
+    reader: &impl BlockReader,
+    extents: &mut Vec<Extent>,
+) -> Result<()> {
+    let depth = parse_node(raw, None, extents)?;
+    if depth == 0 {
+        return Ok(());
+    }
+    parse_index_node(raw, depth, block_size, reader, extents)
+}
+
+fn parse_index_node(
+    raw: &[u8],
+    depth: u16,
+    block_size: BlockSize,
+    reader: &impl BlockReader,
+    extents: &mut Vec<Extent>,
+) -> Result<()> {
+    let entries = header_entries(raw)?;
+    for entry_index in 0..entries {
+        let offset = entry_offset(entry_index)?;
+        let end = offset
+            .checked_add(EXTENT_ENTRY_SIZE)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if end > raw.len() {
+            return Err(Error::InvalidExtentTree);
+        }
+        let leaf_lo = u64::from(le_u32(
+            raw,
+            offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+        )?);
+        let leaf_hi = u64::from(le_u16(
+            raw,
+            offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+        )?);
+        let leaf = BlockAddress::new((leaf_hi << 32) | leaf_lo);
+        let mut child = alloc::vec![0_u8; usize::try_from(block_size.bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?];
+        reader.read_exact_at(block_size.offset_of(leaf)?, &mut child)?;
+        let child_depth = parse_node(
+            &child,
+            Some(depth.checked_sub(1).ok_or(Error::InvalidExtentTree)?),
+            extents,
+        )?;
+        if child_depth > 0 {
+            parse_index_node(&child, child_depth, block_size, reader, extents)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>) -> Result<u16> {
+    if le_u16(raw, 0)? != EXTENT_MAGIC {
+        return Err(Error::InvalidExtentTree);
+    }
+    let entries = header_entries(raw)?;
+    let max_entries = usize::from(le_u16(raw, 4)?);
+    let depth = le_u16(raw, 6)?;
+    if depth > MAX_EXTENT_DEPTH {
+        return Err(Error::UnsupportedExtentDepth);
+    }
+    if let Some(expected) = expected_depth
+        && depth != expected
+    {
+        return Err(Error::InvalidExtentTree);
+    }
+    if entries > max_entries {
+        return Err(Error::InvalidExtentTree);
+    }
+    if depth != 0 {
+        return Ok(depth);
+    }
+    for entry_index in 0..entries {
+        let offset = entry_offset(entry_index)?;
+        let end = offset
+            .checked_add(EXTENT_ENTRY_SIZE)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if end > raw.len() {
+            return Err(Error::InvalidExtentTree);
+        }
+        extents.push(parse_extent(raw, offset)?);
+    }
+    Ok(depth)
+}
+
+fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
+    let logical_start = le_u32(raw, offset)?;
+    let raw_len = le_u16(raw, offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?)?;
+    let len = raw_len & !EXTENT_LEN_UNINITIALIZED;
+    let start_hi = u64::from(le_u16(
+        raw,
+        offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
+    )?);
+    let start_lo = u64::from(le_u32(
+        raw,
+        offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+    )?);
+    Ok(Extent::new(
+        logical_start,
+        len,
+        BlockAddress::new((start_hi << 32) | start_lo),
+    ))
+}
+
+fn header_entries(raw: &[u8]) -> Result<usize> {
+    if raw.len() < EXTENT_HEADER_SIZE {
+        return Err(Error::InvalidExtentTree);
+    }
+    Ok(usize::from(le_u16(raw, 2)?))
+}
+
+fn entry_offset(entry_index: usize) -> Result<usize> {
+    EXTENT_HEADER_SIZE
+        .checked_add(
+            entry_index
+                .checked_mul(EXTENT_ENTRY_SIZE)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )
+        .ok_or(Error::ArithmeticOverflow)
 }
