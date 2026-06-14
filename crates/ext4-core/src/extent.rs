@@ -58,13 +58,13 @@ impl Extent {
     }
 }
 
-/// Parsed extent root from an inode's `i_block`.
+/// Parsed extent tree from an inode's `i_block` and external extent blocks.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExtentRoot {
+pub struct ExtentTree {
     extents: Vec<Extent>,
 }
 
-impl ExtentRoot {
+impl ExtentTree {
     /// Parses a v1-supported depth-0 extent root.
     ///
     /// # Errors
