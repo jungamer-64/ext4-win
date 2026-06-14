@@ -1,7 +1,5 @@
-use alloc::vec;
-
 use crate::block::{BlockReader, BlockSize, BlockWriter};
-use crate::endian::{be_u32, put_be_u32};
+use crate::endian::be_u32;
 use crate::error::{Error, Result};
 use crate::extent::ExtentTree;
 use crate::inode::Inode;
@@ -58,36 +56,23 @@ impl Journal {
         }
     }
 
-    pub(crate) fn write_descriptor_marker(
+    pub(crate) fn replay_and_checkpoint(
         self,
-        writer: &mut impl BlockWriter,
-        block_size: BlockSize,
-        sequence: u32,
+        _filesystem: &mut impl BlockWriter,
+        _journal: &mut impl BlockWriter,
+        _block_size: BlockSize,
     ) -> Result<()> {
-        let mut block =
-            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
-        Jbd2Header::descriptor(sequence).encode(&mut block)?;
-        let parsed = Jbd2Header::parse(&block)?;
-        if parsed.block_type() != JBD2_DESCRIPTOR_BLOCK || parsed.sequence() != sequence {
-            return Err(Error::JournalCorrupt);
-        }
-        writer.write_exact_at(block_size.offset_of(self.descriptor_block)?, &block)
+        replay_journal(self)
     }
 
-    pub(crate) fn write_commit_marker(
+    pub(crate) fn commit_metadata_transaction(
         self,
-        writer: &mut impl BlockWriter,
-        block_size: BlockSize,
-        sequence: u32,
+        _filesystem: &mut impl BlockWriter,
+        _journal: &mut impl BlockWriter,
+        _block_size: BlockSize,
+        _metadata_blocks: &[crate::volume::MetadataBlock],
     ) -> Result<()> {
-        let mut block =
-            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
-        Jbd2Header::commit(sequence).encode(&mut block)?;
-        let parsed = Jbd2Header::parse(&block)?;
-        if parsed.block_type() != JBD2_COMMIT_BLOCK || parsed.sequence() != sequence {
-            return Err(Error::JournalCorrupt);
-        }
-        writer.write_exact_at(block_size.offset_of(self.commit_block)?, &block)
+        commit_journal_transaction(self)
     }
 }
 
@@ -111,29 +96,6 @@ impl Jbd2Header {
         })
     }
 
-    pub(crate) fn descriptor(sequence: u32) -> Self {
-        Self {
-            block_type: JBD2_DESCRIPTOR_BLOCK,
-            sequence,
-        }
-    }
-
-    pub(crate) fn commit(sequence: u32) -> Self {
-        Self {
-            block_type: JBD2_COMMIT_BLOCK,
-            sequence,
-        }
-    }
-
-    pub(crate) fn encode(self, bytes: &mut [u8]) -> Result<()> {
-        if bytes.len() < 12 {
-            return Err(Error::TruncatedStructure);
-        }
-        put_be_u32(bytes, 0, JBD2_MAGIC)?;
-        put_be_u32(bytes, 4, self.block_type)?;
-        put_be_u32(bytes, 8, self.sequence)
-    }
-
     pub(crate) const fn block_type(self) -> u32 {
         self.block_type
     }
@@ -141,4 +103,12 @@ impl Jbd2Header {
     pub(crate) const fn sequence(self) -> u32 {
         self.sequence
     }
+}
+
+fn replay_journal(_journal: Journal) -> Result<()> {
+    Err(Error::UnsupportedJournal)
+}
+
+fn commit_journal_transaction(_journal: Journal) -> Result<()> {
+    Err(Error::UnsupportedJournal)
 }

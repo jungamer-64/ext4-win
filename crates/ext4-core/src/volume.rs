@@ -563,10 +563,15 @@ impl<D: BlockWriter> WriteTransaction<'_, D> {
         }
         self.volume.device.flush()?;
 
-        self.volume.state.journal.write_descriptor_marker(
+        let metadata_blocks = metadata_writes
+            .iter()
+            .map(|write| write.as_metadata_block(self.volume.superblock.block_size()))
+            .collect::<Result<Vec<_>>>()?;
+        self.volume.state.journal.commit_metadata_transaction(
+            &mut self.volume.device,
             &mut self.volume.device,
             self.volume.superblock.block_size(),
-            1,
+            &metadata_blocks,
         )?;
         self.volume.device.flush()?;
 
@@ -575,13 +580,6 @@ impl<D: BlockWriter> WriteTransaction<'_, D> {
                 .device
                 .write_exact_at(write.offset, write.bytes.as_slice())?;
         }
-        self.volume.device.flush()?;
-
-        self.volume.state.journal.write_commit_marker(
-            &mut self.volume.device,
-            self.volume.superblock.block_size(),
-            1,
-        )?;
         self.volume.device.flush()
     }
 
@@ -945,6 +943,31 @@ struct GroupDelta {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RangeWrite {
     offset: ByteOffset,
+    bytes: Vec<u8>,
+}
+
+impl RangeWrite {
+    fn as_metadata_block(&self, block_size: crate::block::BlockSize) -> Result<MetadataBlock> {
+        if self.bytes.len()
+            != usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?
+        {
+            return Err(Error::InvalidWriteRange);
+        }
+        let block = self
+            .offset
+            .get()
+            .checked_div(u64::from(block_size.bytes()))
+            .ok_or(Error::InvalidSuperblock)?;
+        Ok(MetadataBlock {
+            block: BlockAddress::new(block),
+            bytes: self.bytes.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MetadataBlock {
+    block: BlockAddress,
     bytes: Vec<u8>,
 }
 
