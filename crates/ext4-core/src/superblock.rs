@@ -1,8 +1,8 @@
 //! Superblock parsing and mount-policy validation.
 
-use crate::block::{BlockReader, BlockSize, ByteOffset};
-use crate::checksum::verify_crc32c;
-use crate::endian::{le_u16, le_u32};
+use crate::block::{BlockReader, BlockSize, BlockWriter, ByteOffset};
+use crate::checksum::{crc32c, verify_crc32c};
+use crate::endian::{le_u16, le_u32, put_le_u32};
 use crate::error::{Error, Result};
 
 const SUPERBLOCK_OFFSET: u64 = 1024;
@@ -35,6 +35,8 @@ const SUPPORTED_READ_INCOMPAT: u32 =
     INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG;
 const REQUIRED_WRITE_INCOMPAT: u32 =
     INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG;
+const SUPPORTED_WRITE_INCOMPAT: u32 =
+    REQUIRED_WRITE_INCOMPAT | INCOMPAT_RECOVER | INCOMPAT_JOURNAL_DEV;
 
 const RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
 const RO_COMPAT_LARGE_FILE: u32 = 0x0002;
@@ -60,8 +62,7 @@ const REQUIRED_WRITE_COMPAT: u32 =
     COMPAT_HAS_JOURNAL | COMPAT_EXT_ATTR | COMPAT_RESIZE_INODE | COMPAT_DIR_INDEX;
 const SUPPORTED_WRITE_COMPAT: u32 = REQUIRED_WRITE_COMPAT;
 const REJECTED_WRITE_COMPAT: u32 = COMPAT_FAST_COMMIT | COMPAT_ORPHAN_FILE;
-const REJECTED_WRITE_INCOMPAT: u32 = INCOMPAT_JOURNAL_DEV
-    | INCOMPAT_META_BG
+const REJECTED_WRITE_INCOMPAT: u32 = INCOMPAT_META_BG
     | INCOMPAT_MMP
     | INCOMPAT_EA_INODE
     | INCOMPAT_CSUM_SEED
@@ -132,7 +133,7 @@ impl FeatureSet {
         if incompat & REQUIRED_WRITE_INCOMPAT != REQUIRED_WRITE_INCOMPAT {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if incompat & !REQUIRED_WRITE_INCOMPAT != 0 {
+        if incompat & !SUPPORTED_WRITE_INCOMPAT != 0 {
             return Err(Error::UnsupportedWriteFeature);
         }
         if incompat & REJECTED_WRITE_INCOMPAT != 0 {
@@ -184,6 +185,12 @@ impl FeatureSet {
         self.compat & COMPAT_HAS_JOURNAL != 0
     }
 
+    /// Returns true when the filesystem uses an external journal device.
+    #[must_use]
+    pub const fn has_external_journal(self) -> bool {
+        self.incompat & INCOMPAT_JOURNAL_DEV != 0
+    }
+
     /// Returns true when metadata checksums are enabled.
     #[must_use]
     pub const fn has_metadata_csum(self) -> bool {
@@ -205,6 +212,8 @@ pub struct Superblock {
     first_inode: u32,
     descriptor_size: u16,
     journal_inode: u32,
+    uuid: [u8; 16],
+    journal_uuid: [u8; 16],
     checksum_seed: u32,
     features: FeatureSet,
 }
@@ -298,6 +307,10 @@ impl Superblock {
             verify_crc32c(0, raw, 1020)?;
         }
         let journal_inode = le_u32(raw, 224)?;
+        let mut uuid = [0_u8; 16];
+        uuid.copy_from_slice(raw.get(104..120).ok_or(Error::TruncatedStructure)?);
+        let mut journal_uuid = [0_u8; 16];
+        journal_uuid.copy_from_slice(raw.get(208..224).ok_or(Error::TruncatedStructure)?);
         let checksum_seed = if features.incompat & INCOMPAT_CSUM_SEED != 0 {
             le_u32(raw, 624)?
         } else {
@@ -328,6 +341,8 @@ impl Superblock {
             first_inode,
             descriptor_size,
             journal_inode,
+            uuid,
+            journal_uuid,
             checksum_seed,
             features,
         })
@@ -399,6 +414,18 @@ impl Superblock {
         self.journal_inode
     }
 
+    /// Filesystem UUID.
+    #[must_use]
+    pub const fn uuid(self) -> [u8; 16] {
+        self.uuid
+    }
+
+    /// External journal UUID recorded by the filesystem superblock.
+    #[must_use]
+    pub const fn journal_uuid(self) -> [u8; 16] {
+        self.journal_uuid
+    }
+
     /// Metadata checksum seed.
     #[must_use]
     pub const fn checksum_seed(self) -> u32 {
@@ -409,6 +436,36 @@ impl Superblock {
     #[must_use]
     pub const fn features(self) -> FeatureSet {
         self.features
+    }
+
+    /// Returns true when the filesystem advertises pending journal recovery.
+    #[must_use]
+    pub const fn needs_recovery(self) -> bool {
+        self.features.incompat & INCOMPAT_RECOVER != 0
+    }
+
+    /// Clears the recovery-required incompat bit in the primary superblock.
+    ///
+    /// # Errors
+    /// Returns an error when the primary superblock cannot be read or written.
+    pub fn clear_recover_on_device(device: &mut impl BlockWriter) -> Result<()> {
+        let mut raw = [0_u8; SUPERBLOCK_SIZE];
+        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
+        let incompat = le_u32(&raw, 96)? & !INCOMPAT_RECOVER;
+        put_le_u32(&mut raw, 96, incompat)?;
+        Self::refresh_checksum(&mut raw)?;
+        device.write_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &raw)?;
+        device.flush()
+    }
+
+    /// Recomputes the primary superblock checksum when the on-disk checksum is present.
+    pub(crate) fn refresh_checksum(raw: &mut [u8]) -> Result<()> {
+        if le_u32(raw, 1020)? == 0 {
+            return Ok(());
+        }
+        put_le_u32(raw, 1020, 0)?;
+        let checksum = crc32c(0, raw);
+        put_le_u32(raw, 1020, checksum)
     }
 
     /// Number of block groups implied by the superblock.

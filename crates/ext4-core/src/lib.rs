@@ -40,7 +40,7 @@ pub use error::{Error, Result};
 pub use inode::{Ext4Timestamp, Inode, InodeId, InodeKind};
 pub use name::{Ext4Name, WindowsName};
 pub use superblock::{FeatureSet, Superblock};
-pub use volume::{ReadOnly, ReadWrite, Volume, WriteTransaction};
+pub use volume::{ExternalJournal, InternalJournal, ReadOnly, ReadWrite, Volume, WriteTransaction};
 
 #[cfg(test)]
 mod tests;
