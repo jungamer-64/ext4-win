@@ -15,6 +15,16 @@ pub fn be_u32(bytes: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_be_bytes(raw))
 }
 
+pub fn be_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    let raw = fixed::<2>(bytes, offset)?;
+    Ok(u16::from_be_bytes(raw))
+}
+
+pub fn be_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    let raw = fixed::<8>(bytes, offset)?;
+    Ok(u64::from_be_bytes(raw))
+}
+
 pub fn put_le_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<()> {
     put_fixed(bytes, offset, &value.to_le_bytes())
 }
@@ -24,6 +34,10 @@ pub fn put_le_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<()> {
 }
 
 pub fn put_be_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<()> {
+    put_fixed(bytes, offset, &value.to_be_bytes())
+}
+
+pub fn put_be_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<()> {
     put_fixed(bytes, offset, &value.to_be_bytes())
 }
 

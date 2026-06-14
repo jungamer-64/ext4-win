@@ -29,10 +29,23 @@ const SUPERBLOCK_OFFSET: u64 = 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadOnly;
 
-/// Journaled read-write mounted volume state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReadWrite {
+/// Internal journal stored as a hidden ext4 inode on the filesystem device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InternalJournal {
     journal: Journal,
+}
+
+/// External journal stored on a separate journal device.
+#[derive(Debug)]
+pub struct ExternalJournal<J> {
+    device: J,
+    journal: Journal,
+}
+
+/// Journaled read-write mounted volume state.
+#[derive(Debug)]
+pub struct ReadWrite<J = InternalJournal> {
+    journal: J,
 }
 
 /// Mounted ext4 volume with typestate-selected mutation capability.
@@ -58,26 +71,37 @@ impl<D: BlockReader> Volume<D, ReadOnly> {
     }
 }
 
-impl<D: BlockWriter> Volume<D, ReadWrite> {
+impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
     /// Replays the internal journal boundary and constructs journaled read-write state.
     ///
     /// # Errors
     /// Returns an error when the device is not a supported journaled ext4 volume.
-    pub fn mount_read_write(device: D) -> Result<Self> {
-        let superblock = Superblock::read_write_from(&device)?;
-        if !superblock.features().has_journal() || superblock.journal_inode() == 0 {
+    pub fn mount_read_write(mut device: D) -> Result<Self> {
+        let mut superblock = Superblock::read_write_from(&device)?;
+        if !superblock.features().has_journal()
+            || superblock.features().has_external_journal()
+            || superblock.journal_inode() == 0
+        {
             return Err(Error::UnsupportedJournal);
         }
-        let read_only = Volume::<D, ReadOnly> {
-            device,
+        let read_only = Volume::<&mut D, ReadOnly> {
+            device: &mut device,
             superblock,
             state: ReadOnly,
         };
         let journal_inode = read_only.read_inode(InodeId::new(superblock.journal_inode()))?;
         let journal =
             Journal::from_inode(&journal_inode, superblock.block_size(), &read_only.device)?;
+        let mut journal = InternalJournal { journal };
+        journal
+            .journal
+            .replay_and_checkpoint_internal(&mut device, superblock.block_size())?;
+        if superblock.needs_recovery() {
+            Superblock::clear_recover_on_device(&mut device)?;
+            superblock = Superblock::read_write_from(&device)?;
+        }
         Ok(Self {
-            device: read_only.device,
+            device,
             superblock,
             state: ReadWrite { journal },
         })
@@ -86,6 +110,65 @@ impl<D: BlockWriter> Volume<D, ReadWrite> {
     /// Starts a write transaction with caller-supplied inode timestamps.
     #[must_use]
     pub fn begin_transaction(&mut self, now: Ext4Timestamp) -> WriteTransaction<'_, D> {
+        WriteTransaction {
+            volume: self,
+            now,
+            inode_updates: Vec::new(),
+            bitmap_updates: Vec::new(),
+            group_deltas: Vec::new(),
+            data_writes: Vec::new(),
+            free_blocks_delta: 0,
+        }
+    }
+}
+
+impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
+    /// Replays an external journal and constructs journaled read-write state.
+    ///
+    /// # Errors
+    /// Returns an error when either device cannot support the external journal contract.
+    pub fn mount_read_write_with_external_journal(
+        mut device: D,
+        journal_device: J,
+    ) -> Result<Self> {
+        let mut superblock = Superblock::read_write_from(&device)?;
+        if !superblock.features().has_journal()
+            || !superblock.features().has_external_journal()
+            || superblock.journal_inode() != 0
+        {
+            return Err(Error::UnsupportedJournal);
+        }
+        let journal = Journal::from_external_device(
+            &journal_device,
+            superblock.block_size(),
+            superblock.journal_uuid(),
+        )?;
+        let mut journal = ExternalJournal {
+            device: journal_device,
+            journal,
+        };
+        journal.journal.replay_and_checkpoint_external(
+            &mut device,
+            &mut journal.device,
+            superblock.block_size(),
+        )?;
+        if superblock.needs_recovery() {
+            Superblock::clear_recover_on_device(&mut device)?;
+            superblock = Superblock::read_write_from(&device)?;
+        }
+        Ok(Self {
+            device,
+            superblock,
+            state: ReadWrite { journal },
+        })
+    }
+
+    /// Starts a write transaction with caller-supplied inode timestamps.
+    #[must_use]
+    pub fn begin_transaction(
+        &mut self,
+        now: Ext4Timestamp,
+    ) -> WriteTransaction<'_, D, ExternalJournal<J>> {
         WriteTransaction {
             volume: self,
             now,
@@ -317,8 +400,8 @@ impl<D: BlockReader, State> Volume<D, State> {
 
 /// In-progress ext4 write transaction.
 #[derive(Debug)]
-pub struct WriteTransaction<'a, D: BlockWriter> {
-    volume: &'a mut Volume<D, ReadWrite>,
+pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
+    volume: &'a mut Volume<D, ReadWrite<J>>,
     now: Ext4Timestamp,
     inode_updates: Vec<RawInode>,
     bitmap_updates: Vec<BlockImage>,
@@ -327,7 +410,7 @@ pub struct WriteTransaction<'a, D: BlockWriter> {
     free_blocks_delta: i64,
 }
 
-impl<D: BlockWriter> WriteTransaction<'_, D> {
+impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     /// Overwrites bytes inside an existing regular file range.
     ///
     /// # Errors
@@ -543,45 +626,6 @@ impl<D: BlockWriter> WriteTransaction<'_, D> {
 
     /// Aborts the transaction without writing staged data or metadata.
     pub fn abort(self) {}
-
-    /// Commits staged data and metadata using the volume journal ordering boundary.
-    ///
-    /// # Errors
-    /// Returns an error when the transaction exceeds journal capacity or any
-    /// backing device write/flush fails.
-    pub fn commit(mut self) -> Result<()> {
-        let mut metadata_writes = self.metadata_writes()?;
-        self.volume
-            .state
-            .journal
-            .ensure_transaction_capacity(metadata_writes.len())?;
-
-        for write in self.data_writes {
-            self.volume
-                .device
-                .write_exact_at(write.offset, write.bytes.as_slice())?;
-        }
-        self.volume.device.flush()?;
-
-        let metadata_blocks = metadata_writes
-            .iter()
-            .map(|write| write.as_metadata_block(self.volume.superblock.block_size()))
-            .collect::<Result<Vec<_>>>()?;
-        self.volume.state.journal.commit_metadata_transaction(
-            &mut self.volume.device,
-            &mut self.volume.device,
-            self.volume.superblock.block_size(),
-            &metadata_blocks,
-        )?;
-        self.volume.device.flush()?;
-
-        for write in metadata_writes.drain(..) {
-            self.volume
-                .device
-                .write_exact_at(write.offset, write.bytes.as_slice())?;
-        }
-        self.volume.device.flush()
-    }
 
     fn ensure_inode_update(&mut self, inode_id: InodeId) -> Result<usize> {
         if let Some(index) = self
@@ -831,6 +875,73 @@ impl<D: BlockWriter> WriteTransaction<'_, D> {
         Ok(writes)
     }
 
+    fn metadata_blocks(&mut self) -> Result<Vec<MetadataBlock>> {
+        let block_size = self.volume.superblock.block_size();
+        let block_bytes =
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let block_bytes_u64 = u64::from(block_size.bytes());
+        let mut blocks = Vec::new();
+
+        for write in self.metadata_writes()? {
+            let block = BlockAddress::new(
+                write
+                    .offset
+                    .get()
+                    .checked_div(block_bytes_u64)
+                    .ok_or(Error::InvalidSuperblock)?,
+            );
+            let in_block = usize::try_from(
+                write
+                    .offset
+                    .get()
+                    .checked_rem(block_bytes_u64)
+                    .ok_or(Error::InvalidSuperblock)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let end = in_block
+                .checked_add(write.bytes.len())
+                .ok_or(Error::ArithmeticOverflow)?;
+            if end > block_bytes {
+                return Err(Error::InvalidWriteRange);
+            }
+
+            let index = if let Some(index) = blocks
+                .iter()
+                .position(|metadata: &MetadataBlock| metadata.block == block)
+            {
+                index
+            } else {
+                let mut bytes = vec![0_u8; block_bytes];
+                self.volume
+                    .device
+                    .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
+                blocks.push(MetadataBlock { block, bytes });
+                blocks
+                    .len()
+                    .checked_sub(1)
+                    .ok_or(Error::ArithmeticOverflow)?
+            };
+            blocks
+                .get_mut(index)
+                .ok_or(Error::InvalidSuperblock)?
+                .bytes
+                .get_mut(in_block..end)
+                .ok_or(Error::DeviceRange)?
+                .copy_from_slice(&write.bytes);
+        }
+
+        Ok(blocks)
+    }
+
+    fn write_ordered_data(&mut self) -> Result<()> {
+        for write in &self.data_writes {
+            self.volume
+                .device
+                .write_exact_at(write.offset, write.bytes.as_slice())?;
+        }
+        self.volume.device.flush()
+    }
+
     fn updated_superblock_bytes(&self) -> Result<Vec<u8>> {
         let mut bytes = vec![0_u8; 1024];
         self.volume
@@ -860,7 +971,60 @@ impl<D: BlockWriter> WriteTransaction<'_, D> {
                 u32::try_from(updated >> 32).map_err(|_| Error::ArithmeticOverflow)?,
             )?;
         }
+        Superblock::refresh_checksum(&mut bytes)?;
         Ok(bytes)
+    }
+}
+
+impl<D: BlockWriter> WriteTransaction<'_, D, InternalJournal> {
+    /// Commits staged data and metadata through the internal journal.
+    ///
+    /// # Errors
+    /// Returns an error when the transaction exceeds journal capacity or any
+    /// backing device write/flush fails.
+    pub fn commit(mut self) -> Result<()> {
+        let block_size = self.volume.superblock.block_size();
+        let metadata_blocks = self.metadata_blocks()?;
+        self.volume
+            .state
+            .journal
+            .journal
+            .ensure_transaction_capacity(metadata_blocks.len())?;
+        self.write_ordered_data()?;
+
+        let volume = self.volume;
+        volume.state.journal.journal.commit_internal(
+            &mut volume.device,
+            block_size,
+            &metadata_blocks,
+        )
+    }
+}
+
+impl<D: BlockWriter, J: BlockWriter> WriteTransaction<'_, D, ExternalJournal<J>> {
+    /// Commits staged data and metadata through the external journal device.
+    ///
+    /// # Errors
+    /// Returns an error when the transaction exceeds journal capacity or any
+    /// backing device write/flush fails.
+    pub fn commit(mut self) -> Result<()> {
+        let block_size = self.volume.superblock.block_size();
+        let metadata_blocks = self.metadata_blocks()?;
+        self.volume
+            .state
+            .journal
+            .journal
+            .ensure_transaction_capacity(metadata_blocks.len())?;
+        self.write_ordered_data()?;
+
+        let volume = self.volume;
+        let journal = &mut volume.state.journal;
+        journal.journal.commit_external(
+            &mut volume.device,
+            &mut journal.device,
+            block_size,
+            &metadata_blocks,
+        )
     }
 }
 
@@ -946,29 +1110,20 @@ struct RangeWrite {
     bytes: Vec<u8>,
 }
 
-impl RangeWrite {
-    fn as_metadata_block(&self, block_size: crate::block::BlockSize) -> Result<MetadataBlock> {
-        if self.bytes.len()
-            != usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?
-        {
-            return Err(Error::InvalidWriteRange);
-        }
-        let block = self
-            .offset
-            .get()
-            .checked_div(u64::from(block_size.bytes()))
-            .ok_or(Error::InvalidSuperblock)?;
-        Ok(MetadataBlock {
-            block: BlockAddress::new(block),
-            bytes: self.bytes.clone(),
-        })
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MetadataBlock {
     block: BlockAddress,
     bytes: Vec<u8>,
+}
+
+impl MetadataBlock {
+    pub(crate) const fn block(&self) -> BlockAddress {
+        self.block
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 fn map_extents(extents: &[Extent], logical_block: u64) -> Option<BlockAddress> {

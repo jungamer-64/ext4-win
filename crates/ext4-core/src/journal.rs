@@ -1,19 +1,47 @@
-use crate::block::{BlockReader, BlockSize, BlockWriter};
-use crate::endian::be_u32;
+use alloc::{vec, vec::Vec};
+
+use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
+use crate::checksum::crc32c;
+use crate::endian::{be_u16, be_u32, be_u64, put_be_u16, put_be_u32};
 use crate::error::{Error, Result};
 use crate::extent::ExtentTree;
 use crate::inode::Inode;
+use crate::volume::MetadataBlock;
 
 const JBD2_MAGIC: u32 = 0xC03B_3998;
 const JBD2_DESCRIPTOR_BLOCK: u32 = 1;
 const JBD2_COMMIT_BLOCK: u32 = 2;
+const JBD2_SUPERBLOCK_V1: u32 = 3;
+const JBD2_SUPERBLOCK_V2: u32 = 4;
+const JBD2_REVOKE_BLOCK: u32 = 5;
+
+const JBD2_FEATURE_INCOMPAT_REVOKE: u32 = 0x0001;
+const JBD2_FEATURE_INCOMPAT_64BIT: u32 = 0x0002;
+const JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT: u32 = 0x0004;
+const JBD2_FEATURE_INCOMPAT_CSUM_V2: u32 = 0x0008;
+const JBD2_FEATURE_INCOMPAT_CSUM_V3: u32 = 0x0010;
+const JBD2_FEATURE_INCOMPAT_FAST_COMMIT: u32 = 0x0020;
+const JBD2_SUPPORTED_INCOMPAT: u32 = JBD2_FEATURE_INCOMPAT_REVOKE
+    | JBD2_FEATURE_INCOMPAT_64BIT
+    | JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT
+    | JBD2_FEATURE_INCOMPAT_CSUM_V2
+    | JBD2_FEATURE_INCOMPAT_CSUM_V3;
+
+const JBD2_TAG_FLAG_ESCAPE: u32 = 0x0001;
+const JBD2_TAG_FLAG_SAME_UUID: u32 = 0x0002;
+const JBD2_TAG_FLAG_DELETED: u32 = 0x0004;
+const JBD2_TAG_FLAG_LAST_TAG: u32 = 0x0008;
+
+const JBD2_CHECKSUM_CRC32C: u8 = 4;
+const JOURNAL_HEADER_BYTES: usize = 12;
+const JOURNAL_SUPERBLOCK_BYTES: usize = 1024;
+const JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET: u64 = 2048;
 const JOURNAL_OVERHEAD_BLOCKS: u32 = 2;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Journal {
-    capacity_blocks: u32,
-    descriptor_block: crate::block::BlockAddress,
-    commit_block: crate::block::BlockAddress,
+    location: JournalLocation,
+    superblock: JournalSuperblock,
 }
 
 impl Journal {
@@ -34,45 +62,839 @@ impl Journal {
         if capacity_blocks <= JOURNAL_OVERHEAD_BLOCKS {
             return Err(Error::UnsupportedJournal);
         }
+
         let tree = ExtentTree::load_inode_tree(inode.block(), block_size, reader)?;
-        let descriptor_block = tree.map_logical(1).ok_or(Error::UnsupportedJournal)?;
-        let commit_block = tree.map_logical(2).ok_or(Error::UnsupportedJournal)?;
+        let mut blocks = Vec::with_capacity(
+            usize::try_from(capacity_blocks).map_err(|_| Error::ArithmeticOverflow)?,
+        );
+        for logical in 0..capacity_blocks {
+            blocks.push(
+                tree.map_logical(u64::from(logical))
+                    .ok_or(Error::UnsupportedJournal)?,
+            );
+        }
+
+        let location = JournalLocation::Internal { blocks };
+        let mut raw =
+            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        read_journal_block(reader, &location, block_size, 0, &mut raw)?;
+        let superblock = JournalSuperblock::parse(&raw)?;
+        superblock.validate_for_mount(block_size, capacity_blocks)?;
+
         Ok(Self {
-            capacity_blocks,
-            descriptor_block,
-            commit_block,
+            location,
+            superblock,
         })
     }
 
-    pub(crate) fn ensure_transaction_capacity(self, metadata_blocks: usize) -> Result<()> {
+    pub(crate) fn from_external_device(
+        journal: &impl BlockReader,
+        block_size: BlockSize,
+        expected_uuid: [u8; 16],
+    ) -> Result<Self> {
+        let mut raw =
+            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        journal.read_exact_at(
+            ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET),
+            &mut raw,
+        )?;
+        let superblock = JournalSuperblock::parse(&raw)?;
+        if *superblock.uuid() != expected_uuid {
+            return Err(Error::UnsupportedJournal);
+        }
+        superblock.validate_for_mount(block_size, superblock.maxlen())?;
+        Ok(Self {
+            location: JournalLocation::External {
+                base: ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET),
+            },
+            superblock,
+        })
+    }
+
+    pub(crate) fn ensure_transaction_capacity(&self, metadata_blocks: usize) -> Result<()> {
         let required = u32::try_from(metadata_blocks)
             .map_err(|_| Error::TransactionTooLarge)?
             .checked_add(JOURNAL_OVERHEAD_BLOCKS)
             .ok_or(Error::TransactionTooLarge)?;
-        if required > self.capacity_blocks {
+        if required > self.usable_log_blocks()? {
             Err(Error::TransactionTooLarge)
         } else {
             Ok(())
         }
     }
 
-    pub(crate) fn replay_and_checkpoint(
-        self,
-        _filesystem: &mut impl BlockWriter,
-        _journal: &mut impl BlockWriter,
-        _block_size: BlockSize,
+    pub(crate) fn replay_and_checkpoint_internal(
+        &mut self,
+        filesystem: &mut impl BlockWriter,
+        block_size: BlockSize,
     ) -> Result<()> {
-        replay_journal(self)
+        let mut io = InternalJournalIo { device: filesystem };
+        self.replay_and_checkpoint(&mut io, block_size)
     }
 
-    pub(crate) fn commit_metadata_transaction(
-        self,
-        _filesystem: &mut impl BlockWriter,
-        _journal: &mut impl BlockWriter,
-        _block_size: BlockSize,
-        _metadata_blocks: &[crate::volume::MetadataBlock],
+    pub(crate) fn replay_and_checkpoint_external(
+        &mut self,
+        filesystem: &mut impl BlockWriter,
+        journal: &mut impl BlockWriter,
+        block_size: BlockSize,
     ) -> Result<()> {
-        commit_journal_transaction(self)
+        let mut io = ExternalJournalIo {
+            filesystem,
+            journal,
+        };
+        self.replay_and_checkpoint(&mut io, block_size)
+    }
+
+    pub(crate) fn commit_internal(
+        &mut self,
+        filesystem: &mut impl BlockWriter,
+        block_size: BlockSize,
+        metadata_blocks: &[MetadataBlock],
+    ) -> Result<()> {
+        let mut io = InternalJournalIo { device: filesystem };
+        self.commit_metadata_transaction(&mut io, block_size, metadata_blocks)
+    }
+
+    pub(crate) fn commit_external(
+        &mut self,
+        filesystem: &mut impl BlockWriter,
+        journal: &mut impl BlockWriter,
+        block_size: BlockSize,
+        metadata_blocks: &[MetadataBlock],
+    ) -> Result<()> {
+        let mut io = ExternalJournalIo {
+            filesystem,
+            journal,
+        };
+        self.commit_metadata_transaction(&mut io, block_size, metadata_blocks)
+    }
+
+    fn replay_and_checkpoint(
+        &mut self,
+        io: &mut impl JournalIo,
+        block_size: BlockSize,
+    ) -> Result<()> {
+        let transactions = self.committed_transactions(io, block_size)?;
+        if transactions.is_empty() {
+            if self.superblock.start() != 0 {
+                self.mark_clean(io, block_size, self.superblock.sequence())?;
+            }
+            return Ok(());
+        }
+
+        let mut revokes = Vec::new();
+        for transaction in &transactions {
+            for block in &transaction.revokes {
+                revokes.push(RevokedBlock {
+                    sequence: transaction.sequence,
+                    block: *block,
+                });
+            }
+        }
+
+        let mut next_sequence = self.superblock.sequence();
+        for transaction in &transactions {
+            next_sequence = transaction
+                .sequence
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?;
+            for entry in &transaction.entries {
+                if is_revoked_after(&revokes, entry.home, transaction.sequence) {
+                    continue;
+                }
+                io.write_home_block(block_size, entry.home, &entry.bytes)?;
+            }
+        }
+        io.flush_all()?;
+        self.mark_clean(io, block_size, next_sequence)
+    }
+
+    fn commit_metadata_transaction(
+        &mut self,
+        io: &mut impl JournalIo,
+        block_size: BlockSize,
+        metadata_blocks: &[MetadataBlock],
+    ) -> Result<()> {
+        self.ensure_transaction_capacity(metadata_blocks.len())?;
+        let sequence = self.superblock.sequence();
+        let descriptor = if self.superblock.start() == 0 {
+            self.superblock.first()
+        } else {
+            self.superblock.start()
+        };
+        let mut cursor = descriptor;
+        self.superblock.set_dirty(descriptor, sequence);
+        let dirty_superblock = self.superblock.encode(block_size)?;
+        io.write_journal_block(self, block_size, 0, &dirty_superblock)?;
+
+        let descriptor_block =
+            self.encode_descriptor_block(sequence, metadata_blocks, block_size)?;
+        io.write_journal_block(self, block_size, cursor, &descriptor_block)?;
+        cursor = self.next_logical(cursor)?;
+
+        for metadata in metadata_blocks {
+            io.write_journal_block(self, block_size, cursor, metadata.bytes())?;
+            cursor = self.next_logical(cursor)?;
+        }
+        io.flush_all()?;
+
+        let commit_block = self.encode_commit_block(sequence, block_size)?;
+        io.write_journal_block(self, block_size, cursor, &commit_block)?;
+        io.flush_all()?;
+
+        for metadata in metadata_blocks {
+            io.write_home_block(block_size, metadata.block(), metadata.bytes())?;
+        }
+        io.flush_all()?;
+
+        self.mark_clean(
+            io,
+            block_size,
+            sequence.checked_add(1).ok_or(Error::ArithmeticOverflow)?,
+        )
+    }
+
+    fn committed_transactions(
+        &self,
+        io: &mut impl JournalIo,
+        block_size: BlockSize,
+    ) -> Result<Vec<JournalTransaction>> {
+        if self.superblock.start() == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut transactions = Vec::new();
+        let mut cursor = self.superblock.start();
+        let mut sequence = self.superblock.sequence();
+        let mut visited = 0_u32;
+        while visited < self.usable_log_blocks()? {
+            let Some((transaction, next_cursor)) =
+                self.parse_transaction(io, block_size, cursor, sequence)?
+            else {
+                break;
+            };
+            transactions.push(transaction);
+            cursor = next_cursor;
+            sequence = sequence.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            visited = visited.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        }
+        Ok(transactions)
+    }
+
+    fn parse_transaction(
+        &self,
+        io: &mut impl JournalIo,
+        block_size: BlockSize,
+        start: u32,
+        sequence: u32,
+    ) -> Result<Option<(JournalTransaction, u32)>> {
+        let mut transaction = JournalTransaction {
+            sequence,
+            entries: Vec::new(),
+            revokes: Vec::new(),
+        };
+        let mut cursor = start;
+        let mut consumed = 0_u32;
+
+        while consumed < self.usable_log_blocks()? {
+            let block = self.read_journal_block(io, block_size, cursor)?;
+            let Ok(header) = Jbd2Header::parse(&block) else {
+                return Ok(None);
+            };
+            if header.sequence() != sequence {
+                return Ok(None);
+            }
+
+            match header.block_type() {
+                JBD2_DESCRIPTOR_BLOCK => {
+                    let descriptor = match self.parse_descriptor_block(&block) {
+                        Ok(value) => value,
+                        Err(Error::ChecksumMismatch) => return Ok(None),
+                        Err(error) => return Err(error),
+                    };
+                    cursor = self.next_logical(cursor)?;
+                    consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                    for tag in descriptor.tags {
+                        let mut data = self.read_journal_block(io, block_size, cursor)?;
+                        if tag.flags & JBD2_TAG_FLAG_ESCAPE != 0 {
+                            put_be_u32(&mut data, 0, JBD2_MAGIC)?;
+                        }
+                        if tag.flags & JBD2_TAG_FLAG_DELETED == 0 {
+                            if let Err(Error::ChecksumMismatch) =
+                                self.verify_tag_checksum(sequence, &tag, &data)
+                            {
+                                return Ok(None);
+                            }
+                            transaction.revokes.retain(|block| *block != tag.block);
+                            transaction.entries.push(JournalEntry {
+                                home: tag.block,
+                                bytes: data,
+                            });
+                        }
+                        cursor = self.next_logical(cursor)?;
+                        consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                    }
+                }
+                JBD2_REVOKE_BLOCK => {
+                    let revoke = match self.parse_revoke_block(&block) {
+                        Ok(value) => value,
+                        Err(Error::ChecksumMismatch) => return Ok(None),
+                        Err(error) => return Err(error),
+                    };
+                    for block in revoke.blocks {
+                        if !transaction.entries.iter().any(|entry| entry.home == block) {
+                            transaction.revokes.push(block);
+                        }
+                    }
+                    cursor = self.next_logical(cursor)?;
+                    consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                }
+                JBD2_COMMIT_BLOCK => {
+                    if self.parse_commit_block(&block).is_err() {
+                        return Ok(None);
+                    }
+                    return Ok(Some((transaction, self.next_logical(cursor)?)));
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn read_journal_block(
+        &self,
+        io: &mut impl JournalIo,
+        block_size: BlockSize,
+        logical: u32,
+    ) -> Result<Vec<u8>> {
+        let mut block =
+            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        io.read_journal_block(self, block_size, logical, &mut block)?;
+        Ok(block)
+    }
+
+    fn parse_descriptor_block(&self, block: &[u8]) -> Result<JournalDescriptor> {
+        self.verify_block_tail_checksum(block)?;
+        let mut offset = JOURNAL_HEADER_BYTES;
+        let limit = if self.superblock.has_metadata_checksums() {
+            block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)?
+        } else {
+            block.len()
+        };
+        let mut tags = Vec::new();
+        while offset < limit {
+            let Some((tag, next_offset)) = self.parse_tag(block, offset, limit)? else {
+                break;
+            };
+            let last = tag.flags & JBD2_TAG_FLAG_LAST_TAG != 0;
+            tags.push(tag);
+            offset = next_offset;
+            if last {
+                break;
+            }
+        }
+        Ok(JournalDescriptor { tags })
+    }
+
+    fn parse_tag(
+        &self,
+        block: &[u8],
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<(JournalTag, usize)>> {
+        if self.superblock.has_csum_v3() {
+            let base_size = 16_usize;
+            if offset
+                .checked_add(base_size)
+                .ok_or(Error::ArithmeticOverflow)?
+                > limit
+            {
+                return Ok(None);
+            }
+            let block_low = u64::from(be_u32(block, offset)?);
+            let flags = be_u32(
+                block,
+                offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+            )?;
+            let block_high = u64::from(be_u32(
+                block,
+                offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+            )?);
+            let checksum = be_u32(
+                block,
+                offset.checked_add(12).ok_or(Error::ArithmeticOverflow)?,
+            )?;
+            if block_low == 0 && block_high == 0 && flags == 0 && checksum == 0 {
+                return Ok(None);
+            }
+            let uuid_size = if flags & JBD2_TAG_FLAG_SAME_UUID == 0 {
+                16
+            } else {
+                0
+            };
+            let next = offset
+                .checked_add(base_size)
+                .and_then(|value| value.checked_add(uuid_size))
+                .ok_or(Error::ArithmeticOverflow)?;
+            if next > limit {
+                return Err(Error::JournalCorrupt);
+            }
+            return Ok(Some((
+                JournalTag {
+                    block: BlockAddress::new((block_high << 32) | block_low),
+                    flags,
+                    checksum,
+                },
+                next,
+            )));
+        }
+
+        let base_size = 8_usize;
+        if offset
+            .checked_add(base_size)
+            .ok_or(Error::ArithmeticOverflow)?
+            > limit
+        {
+            return Ok(None);
+        }
+        let block_low = u64::from(be_u32(block, offset)?);
+        let checksum = u32::from(be_u16(
+            block,
+            offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+        )?);
+        let flags = u32::from(be_u16(
+            block,
+            offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
+        )?);
+        if block_low == 0 && flags == 0 && checksum == 0 {
+            return Ok(None);
+        }
+        let high_size = if self.superblock.has_64bit() { 4 } else { 0 };
+        let block_high = if high_size == 4 {
+            u64::from(be_u32(
+                block,
+                offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+            )?)
+        } else {
+            0
+        };
+        let uuid_size = if flags & JBD2_TAG_FLAG_SAME_UUID == 0 {
+            16
+        } else {
+            0
+        };
+        let next = offset
+            .checked_add(base_size)
+            .and_then(|value| value.checked_add(high_size))
+            .and_then(|value| value.checked_add(uuid_size))
+            .ok_or(Error::ArithmeticOverflow)?;
+        if next > limit {
+            return Err(Error::JournalCorrupt);
+        }
+        Ok(Some((
+            JournalTag {
+                block: BlockAddress::new((block_high << 32) | block_low),
+                flags,
+                checksum,
+            },
+            next,
+        )))
+    }
+
+    fn parse_revoke_block(&self, block: &[u8]) -> Result<JournalRevoke> {
+        self.verify_block_tail_checksum(block)?;
+        let used = usize::try_from(be_u32(block, JOURNAL_HEADER_BYTES)?)
+            .map_err(|_| Error::JournalCorrupt)?;
+        if used < 16 || used > block.len() {
+            return Err(Error::JournalCorrupt);
+        }
+        let tail = if self.superblock.has_metadata_checksums() {
+            4
+        } else {
+            0
+        };
+        let limit = used.checked_sub(tail).ok_or(Error::JournalCorrupt)?;
+        let entry_size = if self.superblock.has_64bit() { 8 } else { 4 };
+        let mut offset = 16_usize;
+        let mut blocks = Vec::new();
+        while offset
+            .checked_add(entry_size)
+            .ok_or(Error::ArithmeticOverflow)?
+            <= limit
+        {
+            let block = if entry_size == 8 {
+                be_u64(block, offset)?
+            } else {
+                u64::from(be_u32(block, offset)?)
+            };
+            blocks.push(BlockAddress::new(block));
+            offset = offset
+                .checked_add(entry_size)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        Ok(JournalRevoke { blocks })
+    }
+
+    fn parse_commit_block(&self, block: &[u8]) -> Result<JournalCommit> {
+        let header = Jbd2Header::parse(block)?;
+        if header.block_type() != JBD2_COMMIT_BLOCK {
+            return Err(Error::JournalCorrupt);
+        }
+        if self.superblock.has_metadata_checksums() && be_u32(block, 0x10)? != 0 {
+            self.verify_commit_checksum(block)?;
+        }
+        Ok(JournalCommit {
+            sequence: header.sequence(),
+        })
+    }
+
+    fn encode_descriptor_block(
+        &self,
+        sequence: u32,
+        metadata_blocks: &[MetadataBlock],
+        block_size: BlockSize,
+    ) -> Result<Vec<u8>> {
+        let mut block =
+            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        Jbd2Header::descriptor(sequence).encode(&mut block)?;
+        let mut offset = JOURNAL_HEADER_BYTES;
+        for (index, metadata) in metadata_blocks.iter().enumerate() {
+            let last =
+                index.checked_add(1).ok_or(Error::ArithmeticOverflow)? == metadata_blocks.len();
+            let flags = JBD2_TAG_FLAG_SAME_UUID
+                | if last { JBD2_TAG_FLAG_LAST_TAG } else { 0 }
+                | if starts_with_jbd2_magic(metadata.bytes()) {
+                    JBD2_TAG_FLAG_ESCAPE
+                } else {
+                    0
+                };
+            offset = self.encode_tag(&mut block, offset, sequence, metadata, flags)?;
+        }
+        self.write_block_tail_checksum(&mut block)?;
+        Ok(block)
+    }
+
+    fn encode_tag(
+        &self,
+        block: &mut [u8],
+        offset: usize,
+        sequence: u32,
+        metadata: &MetadataBlock,
+        flags: u32,
+    ) -> Result<usize> {
+        let checksum = self.tag_checksum(sequence, metadata.bytes())?;
+        if self.superblock.has_csum_v3() {
+            let next = offset.checked_add(16).ok_or(Error::ArithmeticOverflow)?;
+            if next > block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)? {
+                return Err(Error::TransactionTooLarge);
+            }
+            put_be_u32(
+                block,
+                offset,
+                u32::try_from(metadata.block().get() & u64::from(u32::MAX))
+                    .map_err(|_| Error::ArithmeticOverflow)?,
+            )?;
+            put_be_u32(
+                block,
+                offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+                flags,
+            )?;
+            put_be_u32(
+                block,
+                offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+                u32::try_from(metadata.block().get() >> 32)
+                    .map_err(|_| Error::ArithmeticOverflow)?,
+            )?;
+            put_be_u32(
+                block,
+                offset.checked_add(12).ok_or(Error::ArithmeticOverflow)?,
+                checksum,
+            )?;
+            return Ok(next);
+        }
+
+        let high_size = if self.superblock.has_64bit() { 4 } else { 0 };
+        let next = offset
+            .checked_add(8)
+            .and_then(|value| value.checked_add(high_size))
+            .ok_or(Error::ArithmeticOverflow)?;
+        if next > block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)? {
+            return Err(Error::TransactionTooLarge);
+        }
+        put_be_u32(
+            block,
+            offset,
+            u32::try_from(metadata.block().get() & u64::from(u32::MAX))
+                .map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        put_be_u16(
+            block,
+            offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+            u16::try_from(checksum & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        put_be_u16(
+            block,
+            offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
+            u16::try_from(flags).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        if high_size == 4 {
+            put_be_u32(
+                block,
+                offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+                u32::try_from(metadata.block().get() >> 32)
+                    .map_err(|_| Error::ArithmeticOverflow)?,
+            )?;
+        }
+        Ok(next)
+    }
+
+    fn encode_commit_block(&self, sequence: u32, block_size: BlockSize) -> Result<Vec<u8>> {
+        let mut block =
+            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        Jbd2Header::commit(sequence).encode(&mut block)?;
+        if self.superblock.has_metadata_checksums() {
+            *block.get_mut(0x0C).ok_or(Error::TruncatedStructure)? = JBD2_CHECKSUM_CRC32C;
+            *block.get_mut(0x0D).ok_or(Error::TruncatedStructure)? = 4;
+            let checksum = self.block_checksum_with_zeroed(&block, 0x10)?;
+            put_be_u32(&mut block, 0x10, checksum)?;
+        }
+        Ok(block)
+    }
+
+    fn mark_clean(
+        &mut self,
+        io: &mut impl JournalIo,
+        block_size: BlockSize,
+        next_sequence: u32,
+    ) -> Result<()> {
+        self.superblock.set_clean(next_sequence);
+        let block = self.superblock.encode(block_size)?;
+        io.write_journal_block(self, block_size, 0, &block)?;
+        io.flush_all()
+    }
+
+    fn usable_log_blocks(&self) -> Result<u32> {
+        self.superblock
+            .maxlen()
+            .checked_sub(self.superblock.first())
+            .ok_or(Error::UnsupportedJournal)
+    }
+
+    fn next_logical(&self, logical: u32) -> Result<u32> {
+        let next = logical.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        if next >= self.superblock.maxlen() {
+            Ok(self.superblock.first())
+        } else {
+            Ok(next)
+        }
+    }
+
+    fn verify_tag_checksum(&self, sequence: u32, tag: &JournalTag, data: &[u8]) -> Result<()> {
+        if tag.checksum == 0 {
+            return Ok(());
+        }
+        let actual = self.tag_checksum(sequence, data)?;
+        let expected = if self.superblock.has_csum_v3() {
+            tag.checksum
+        } else {
+            tag.checksum & u32::from(u16::MAX)
+        };
+        let actual = if self.superblock.has_csum_v3() {
+            actual
+        } else {
+            actual & u32::from(u16::MAX)
+        };
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(Error::ChecksumMismatch)
+        }
+    }
+
+    fn tag_checksum(&self, sequence: u32, data: &[u8]) -> Result<u32> {
+        let mut sequence_bytes = [0_u8; 4];
+        put_be_u32(&mut sequence_bytes, 0, sequence)?;
+        let seed = crc32c(0, self.superblock.uuid());
+        let seed = crc32c(seed, &sequence_bytes);
+        Ok(crc32c(seed, data))
+    }
+
+    fn verify_block_tail_checksum(&self, block: &[u8]) -> Result<()> {
+        if !self.superblock.has_metadata_checksums() {
+            return Ok(());
+        }
+        let offset = block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)?;
+        let expected = be_u32(block, offset)?;
+        if expected == 0 {
+            return Ok(());
+        }
+        let actual = self.block_checksum_with_zeroed(block, offset)?;
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(Error::ChecksumMismatch)
+        }
+    }
+
+    fn write_block_tail_checksum(&self, block: &mut [u8]) -> Result<()> {
+        if !self.superblock.has_metadata_checksums() {
+            return Ok(());
+        }
+        let offset = block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)?;
+        let checksum = self.block_checksum_with_zeroed(block, offset)?;
+        put_be_u32(block, offset, checksum)
+    }
+
+    fn verify_commit_checksum(&self, block: &[u8]) -> Result<()> {
+        let expected = be_u32(block, 0x10)?;
+        let actual = self.block_checksum_with_zeroed(block, 0x10)?;
+        if expected == actual {
+            Ok(())
+        } else {
+            Err(Error::ChecksumMismatch)
+        }
+    }
+
+    fn block_checksum_with_zeroed(&self, block: &[u8], checksum_offset: usize) -> Result<u32> {
+        let end = checksum_offset
+            .checked_add(4)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let mut checked = block.to_vec();
+        checked
+            .get_mut(checksum_offset..end)
+            .ok_or(Error::TruncatedStructure)?
+            .fill(0);
+        Ok(crc32c(crc32c(0, self.superblock.uuid()), &checked))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum JournalLocation {
+    Internal { blocks: Vec<BlockAddress> },
+    External { base: ByteOffset },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JournalSuperblock {
+    block_size: u32,
+    maxlen: u32,
+    first: u32,
+    sequence: u32,
+    start: u32,
+    compat: u32,
+    incompat: u32,
+    uuid: [u8; 16],
+    checksum_type: u8,
+}
+
+impl JournalSuperblock {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < JOURNAL_SUPERBLOCK_BYTES {
+            return Err(Error::TruncatedStructure);
+        }
+        let header = Jbd2Header::parse(bytes)?;
+        if !matches!(header.block_type(), JBD2_SUPERBLOCK_V1 | JBD2_SUPERBLOCK_V2) {
+            return Err(Error::UnsupportedJournal);
+        }
+        let mut uuid = [0_u8; 16];
+        uuid.copy_from_slice(bytes.get(0x30..0x40).ok_or(Error::TruncatedStructure)?);
+        Ok(Self {
+            block_size: be_u32(bytes, 0x0C)?,
+            maxlen: be_u32(bytes, 0x10)?,
+            first: be_u32(bytes, 0x14)?,
+            sequence: be_u32(bytes, 0x18)?,
+            start: be_u32(bytes, 0x1C)?,
+            compat: be_u32(bytes, 0x24)?,
+            incompat: be_u32(bytes, 0x28)?,
+            uuid,
+            checksum_type: *bytes.get(0x50).ok_or(Error::TruncatedStructure)?,
+        })
+    }
+
+    fn validate_for_mount(self, block_size: BlockSize, capacity_blocks: u32) -> Result<()> {
+        if self.block_size != block_size.bytes()
+            || self.maxlen == 0
+            || self.maxlen > capacity_blocks
+            || self.first == 0
+            || self.first >= self.maxlen
+            || (self.start != 0 && (self.start < self.first || self.start >= self.maxlen))
+        {
+            return Err(Error::UnsupportedJournal);
+        }
+        if self.incompat & JBD2_FEATURE_INCOMPAT_FAST_COMMIT != 0 {
+            return Err(Error::UnsupportedJournal);
+        }
+        if self.incompat & !JBD2_SUPPORTED_INCOMPAT != 0 {
+            return Err(Error::UnsupportedJournal);
+        }
+        if self.has_metadata_checksums() && self.checksum_type != JBD2_CHECKSUM_CRC32C {
+            return Err(Error::UnsupportedJournal);
+        }
+        Ok(())
+    }
+
+    fn encode(self, block_size: BlockSize) -> Result<Vec<u8>> {
+        let mut block =
+            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        Jbd2Header::superblock_v2(0).encode(&mut block)?;
+        put_be_u32(&mut block, 0x0C, self.block_size)?;
+        put_be_u32(&mut block, 0x10, self.maxlen)?;
+        put_be_u32(&mut block, 0x14, self.first)?;
+        put_be_u32(&mut block, 0x18, self.sequence)?;
+        put_be_u32(&mut block, 0x1C, self.start)?;
+        put_be_u32(&mut block, 0x24, self.compat)?;
+        put_be_u32(&mut block, 0x28, self.incompat)?;
+        block
+            .get_mut(0x30..0x40)
+            .ok_or(Error::TruncatedStructure)?
+            .copy_from_slice(&self.uuid);
+        if self.has_metadata_checksums() {
+            *block.get_mut(0x50).ok_or(Error::TruncatedStructure)? = self.checksum_type;
+        }
+        Ok(block)
+    }
+
+    fn set_clean(&mut self, sequence: u32) {
+        self.sequence = sequence;
+        self.start = 0;
+    }
+
+    fn set_dirty(&mut self, start: u32, sequence: u32) {
+        self.start = start;
+        self.sequence = sequence;
+    }
+
+    pub(crate) const fn maxlen(self) -> u32 {
+        self.maxlen
+    }
+
+    pub(crate) const fn first(self) -> u32 {
+        self.first
+    }
+
+    pub(crate) const fn sequence(self) -> u32 {
+        self.sequence
+    }
+
+    pub(crate) const fn start(self) -> u32 {
+        self.start
+    }
+
+    pub(crate) const fn uuid(&self) -> &[u8; 16] {
+        &self.uuid
+    }
+
+    pub(crate) const fn has_64bit(self) -> bool {
+        self.incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0
+    }
+
+    fn has_csum_v3(self) -> bool {
+        self.incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0
+    }
+
+    fn has_metadata_checksums(self) -> bool {
+        self.incompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0
     }
 }
 
@@ -84,7 +906,7 @@ pub(crate) struct Jbd2Header {
 
 impl Jbd2Header {
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 12 {
+        if bytes.len() < JOURNAL_HEADER_BYTES {
             return Err(Error::TruncatedStructure);
         }
         if be_u32(bytes, 0)? != JBD2_MAGIC {
@@ -96,6 +918,36 @@ impl Jbd2Header {
         })
     }
 
+    pub(crate) fn descriptor(sequence: u32) -> Self {
+        Self {
+            block_type: JBD2_DESCRIPTOR_BLOCK,
+            sequence,
+        }
+    }
+
+    pub(crate) fn commit(sequence: u32) -> Self {
+        Self {
+            block_type: JBD2_COMMIT_BLOCK,
+            sequence,
+        }
+    }
+
+    pub(crate) fn superblock_v2(sequence: u32) -> Self {
+        Self {
+            block_type: JBD2_SUPERBLOCK_V2,
+            sequence,
+        }
+    }
+
+    pub(crate) fn encode(self, bytes: &mut [u8]) -> Result<()> {
+        if bytes.len() < JOURNAL_HEADER_BYTES {
+            return Err(Error::TruncatedStructure);
+        }
+        put_be_u32(bytes, 0, JBD2_MAGIC)?;
+        put_be_u32(bytes, 4, self.block_type)?;
+        put_be_u32(bytes, 8, self.sequence)
+    }
+
     pub(crate) const fn block_type(self) -> u32 {
         self.block_type
     }
@@ -105,10 +957,214 @@ impl Jbd2Header {
     }
 }
 
-fn replay_journal(_journal: Journal) -> Result<()> {
-    Err(Error::UnsupportedJournal)
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JournalTransaction {
+    sequence: u32,
+    entries: Vec<JournalEntry>,
+    revokes: Vec<BlockAddress>,
 }
 
-fn commit_journal_transaction(_journal: Journal) -> Result<()> {
-    Err(Error::UnsupportedJournal)
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JournalEntry {
+    home: BlockAddress,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JournalDescriptor {
+    tags: Vec<JournalTag>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JournalTag {
+    block: BlockAddress,
+    flags: u32,
+    checksum: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JournalRevoke {
+    blocks: Vec<BlockAddress>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JournalCommit {
+    sequence: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RevokedBlock {
+    sequence: u32,
+    block: BlockAddress,
+}
+
+trait JournalIo {
+    fn read_journal_block(
+        &mut self,
+        journal: &Journal,
+        block_size: BlockSize,
+        logical: u32,
+        out: &mut [u8],
+    ) -> Result<()>;
+
+    fn write_journal_block(
+        &mut self,
+        journal: &Journal,
+        block_size: BlockSize,
+        logical: u32,
+        bytes: &[u8],
+    ) -> Result<()>;
+
+    fn write_home_block(
+        &mut self,
+        block_size: BlockSize,
+        block: BlockAddress,
+        bytes: &[u8],
+    ) -> Result<()>;
+
+    fn flush_all(&mut self) -> Result<()>;
+}
+
+struct InternalJournalIo<'a, D> {
+    device: &'a mut D,
+}
+
+impl<D: BlockWriter> JournalIo for InternalJournalIo<'_, D> {
+    fn read_journal_block(
+        &mut self,
+        journal: &Journal,
+        block_size: BlockSize,
+        logical: u32,
+        out: &mut [u8],
+    ) -> Result<()> {
+        self.device
+            .read_exact_at(journal.offset_of(logical, block_size)?, out)
+    }
+
+    fn write_journal_block(
+        &mut self,
+        journal: &Journal,
+        block_size: BlockSize,
+        logical: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.device
+            .write_exact_at(journal.offset_of(logical, block_size)?, bytes)
+    }
+
+    fn write_home_block(
+        &mut self,
+        block_size: BlockSize,
+        block: BlockAddress,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.device
+            .write_exact_at(block_size.offset_of(block)?, bytes)
+    }
+
+    fn flush_all(&mut self) -> Result<()> {
+        self.device.flush()
+    }
+}
+
+struct ExternalJournalIo<'a, F, J> {
+    filesystem: &'a mut F,
+    journal: &'a mut J,
+}
+
+impl<F: BlockWriter, J: BlockWriter> JournalIo for ExternalJournalIo<'_, F, J> {
+    fn read_journal_block(
+        &mut self,
+        journal: &Journal,
+        block_size: BlockSize,
+        logical: u32,
+        out: &mut [u8],
+    ) -> Result<()> {
+        self.journal
+            .read_exact_at(journal.offset_of(logical, block_size)?, out)
+    }
+
+    fn write_journal_block(
+        &mut self,
+        journal: &Journal,
+        block_size: BlockSize,
+        logical: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.journal
+            .write_exact_at(journal.offset_of(logical, block_size)?, bytes)
+    }
+
+    fn write_home_block(
+        &mut self,
+        block_size: BlockSize,
+        block: BlockAddress,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.filesystem
+            .write_exact_at(block_size.offset_of(block)?, bytes)
+    }
+
+    fn flush_all(&mut self) -> Result<()> {
+        self.journal.flush()?;
+        self.filesystem.flush()
+    }
+}
+
+impl Journal {
+    fn offset_of(&self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
+        match &self.location {
+            JournalLocation::Internal { blocks } => {
+                let index = usize::try_from(logical).map_err(|_| Error::ArithmeticOverflow)?;
+                let block = *blocks.get(index).ok_or(Error::UnsupportedJournal)?;
+                block_size.offset_of(block)
+            }
+            JournalLocation::External { base } => Ok(ByteOffset::new(
+                base.get()
+                    .checked_add(
+                        u64::from(logical)
+                            .checked_mul(u64::from(block_size.bytes()))
+                            .ok_or(Error::ArithmeticOverflow)?,
+                    )
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )),
+        }
+    }
+}
+
+fn read_journal_block(
+    reader: &impl BlockReader,
+    location: &JournalLocation,
+    block_size: BlockSize,
+    logical: u32,
+    out: &mut [u8],
+) -> Result<()> {
+    let offset = match location {
+        JournalLocation::Internal { blocks } => {
+            let index = usize::try_from(logical).map_err(|_| Error::ArithmeticOverflow)?;
+            block_size.offset_of(*blocks.get(index).ok_or(Error::UnsupportedJournal)?)?
+        }
+        JournalLocation::External { base } => ByteOffset::new(
+            base.get()
+                .checked_add(
+                    u64::from(logical)
+                        .checked_mul(u64::from(block_size.bytes()))
+                        .ok_or(Error::ArithmeticOverflow)?,
+                )
+                .ok_or(Error::ArithmeticOverflow)?,
+        ),
+    };
+    reader.read_exact_at(offset, out)
+}
+
+fn starts_with_jbd2_magic(bytes: &[u8]) -> bool {
+    bytes
+        .get(0..4)
+        .is_some_and(|prefix| prefix == JBD2_MAGIC.to_be_bytes())
+}
+
+fn is_revoked_after(revokes: &[RevokedBlock], block: BlockAddress, sequence: u32) -> bool {
+    revokes
+        .iter()
+        .any(|revoked| revoked.block == block && revoked.sequence > sequence)
 }
