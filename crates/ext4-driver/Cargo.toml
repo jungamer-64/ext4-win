@@ -1,0 +1,27 @@
+[package]
+name = "ext4win"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[build-dependencies]
+wdk-build.workspace = true
+
+[dependencies]
+ext4-core = { path = "../ext4-core" }
+wdk-alloc.workspace = true
+wdk-panic.workspace = true
+wdk-sys.workspace = true
+
+[features]
+default = []
+nightly = ["wdk-sys/nightly"]
+
+[lints]
+workspace = true

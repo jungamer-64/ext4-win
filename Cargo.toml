@@ -5,6 +5,19 @@ members = [
 ]
 resolver = "3"
 
+[workspace.dependencies]
+wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "df5fa67be68c0ea443267fe38e4c83ea177d7f40" }
+wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "df5fa67be68c0ea443267fe38e4c83ea177d7f40" }
+wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "df5fa67be68c0ea443267fe38e4c83ea177d7f40" }
+wdk-panic = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "df5fa67be68c0ea443267fe38e4c83ea177d7f40" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+lto = true
+panic = "abort"
+
 [workspace.lints.rust]
 warnings = "deny"
 missing_docs = "deny"

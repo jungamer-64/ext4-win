@@ -1,0 +1,51 @@
+;
+; ext4win.inf
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Provider    = %ProviderName%
+DriverVer   =
+CatalogFile = ext4win.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+Ext4Win.DriverFiles = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+ext4win.sys = 1
+
+[DefaultInstall.NT$ARCH$]
+OptionDesc = %ServiceDesc%
+CopyFiles  = Ext4Win.DriverFiles
+
+[DefaultInstall.NT$ARCH$.Services]
+AddService = %ServiceName%,,Ext4Win.Service
+
+[DefaultUninstall.NT$ARCH$]
+DelFiles = Ext4Win.DriverFiles
+
+[DefaultUninstall.NT$ARCH$.Services]
+DelService = %ServiceName%,0x200
+
+[Ext4Win.DriverFiles]
+ext4win.sys
+
+[Ext4Win.Service]
+DisplayName    = %ServiceDesc%
+Description    = %ServiceDesc%
+ServiceBinary  = %13%\ext4win.sys
+ServiceType    = 2
+StartType      = 3
+ErrorControl   = 1
+LoadOrderGroup = "File System"
+
+[Strings]
+ProviderName = "ext4-win"
+DiskName     = "ext4win installation media"
+ServiceName  = "ext4win"
+ServiceDesc  = "Native read-only ext4 file system driver"
