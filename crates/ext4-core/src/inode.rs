@@ -584,7 +584,7 @@ impl Inode {
     }
 }
 
-/// Internal parse_uid operation used by this module's domain boundary.
+/// Combines the low and optional high inode UID fields.
 fn parse_uid(raw: &[u8]) -> Result<u32> {
     let low = u32::from(le_u16(raw, INODE_UID_LO_OFFSET)?);
     let high_offset_end = INODE_UID_HI_OFFSET
@@ -598,7 +598,7 @@ fn parse_uid(raw: &[u8]) -> Result<u32> {
     Ok(low | high)
 }
 
-/// Internal parse_gid operation used by this module's domain boundary.
+/// Combines the low and optional high inode GID fields.
 fn parse_gid(raw: &[u8]) -> Result<u32> {
     let low = u32::from(le_u16(raw, INODE_GID_LO_OFFSET)?);
     let high_offset_end = INODE_GID_HI_OFFSET

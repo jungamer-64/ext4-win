@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::inode::InodeId;
 use crate::name::Ext4Name;
 
-/// Internal constant DIRENT_HEADER_SIZE used by on-disk layout and policy checks.
+/// Bytes occupied by the fixed header of an ext4 directory record.
 const DIRENT_HEADER_SIZE: usize = 8;
 /// Directory records are padded to four-byte boundaries on disk.
 const DIRENT_ALIGNMENT: usize = 4;
@@ -485,7 +485,7 @@ impl DirectoryBlock {
     }
 }
 
-/// Internal write_entry operation used by this module's domain boundary.
+/// Writes one ext4 directory record into a checked block slice.
 fn write_entry(
     bytes: &mut [u8],
     offset: usize,
@@ -546,7 +546,7 @@ fn write_entry(
     Ok(())
 }
 
-/// Internal required_name_rec_len operation used by this module's domain boundary.
+/// Returns the aligned record length required for a name payload.
 fn required_name_rec_len(name_len: usize) -> Result<usize> {
     checked_rec_len(
         DIRENT_HEADER_SIZE
