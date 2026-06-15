@@ -2,5 +2,6 @@
 
 pub(crate) use wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM;
 pub(crate) use wdk_sys::ntddk::{
-    IoCreateDevice, IoDeleteDevice, IoRegisterFileSystem, IoUnregisterFileSystem,
+    IoBuildSynchronousFsdRequest, IoCreateDevice, IoDeleteDevice, IoRegisterFileSystem,
+    IoUnregisterFileSystem, IofCallDriver, KeInitializeEvent, KeWaitForSingleObject,
 };

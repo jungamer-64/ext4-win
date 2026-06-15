@@ -3,10 +3,10 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::InodeId;
+use ext4_core::{DeviceLength, InodeId};
 use wdk_sys::{PDEVICE_OBJECT, PDRIVER_OBJECT};
 
-use crate::ffi;
+use crate::{block_device::KernelBlockDevice, ffi};
 
 /// Non-null kernel device object pointer at the WDK boundary.
 #[derive(Clone, Copy, Debug)]
@@ -66,6 +66,8 @@ pub(crate) struct RegisteredDriver {
 pub(crate) struct MountCandidate {
     /// Device object that will back the mounted ext4 volume.
     target_device: KernelDevice,
+    /// Valid byte length reported by the storage stack.
+    length: DeviceLength,
 }
 
 #[expect(
@@ -86,8 +88,8 @@ pub(crate) enum MountMode {
 #[derive(Clone, Copy, Debug)]
 /// Volume control block stored in a mounted volume device extension.
 pub(crate) struct VolumeControlBlock {
-    /// Device object that stores the ext4 block device.
-    target_device: KernelDevice,
+    /// Storage target connected to ext4-core block I/O.
+    block_device: KernelBlockDevice,
     /// Root directory inode of the mounted volume.
     root_inode: InodeId,
     /// Mounted volume capability.
@@ -100,17 +102,17 @@ pub(crate) struct VolumeControlBlock {
 )]
 impl VolumeControlBlock {
     /// Creates a journaled read-write VCB.
-    pub(crate) const fn read_write(target_device: KernelDevice) -> Self {
+    pub(crate) const fn read_write(target_device: KernelDevice, length: DeviceLength) -> Self {
         Self {
-            target_device,
+            block_device: KernelBlockDevice::new(target_device, length),
             root_inode: InodeId::ROOT,
             mode: MountMode::ReadWrite,
         }
     }
 
-    /// Returns the target block device object.
-    pub(crate) const fn target_device(self) -> KernelDevice {
-        self.target_device
+    /// Returns the mounted block-device boundary.
+    pub(crate) const fn block_device(self) -> KernelBlockDevice {
+        self.block_device
     }
 
     /// Returns the mounted root inode.
