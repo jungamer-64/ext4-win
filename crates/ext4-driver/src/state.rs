@@ -21,6 +21,13 @@ impl KernelDevice {
         NonNull::new(device.cast()).map(|device| Self { device })
     }
 
+    /// Creates a kernel device from a non-null WDK device pointer.
+    pub(crate) fn from_non_null(device: NonNull<wdk_sys::DEVICE_OBJECT>) -> Self {
+        Self {
+            device: device.cast(),
+        }
+    }
+
     /// Returns the raw WDK device pointer for FFI calls.
     pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
         self.device.as_ptr().cast()

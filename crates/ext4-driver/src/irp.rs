@@ -2,7 +2,7 @@
 
 use core::ptr::NonNull;
 
-use wdk_sys::{PDEVICE_OBJECT, PIRP};
+use wdk_sys::{PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP};
 
 use crate::status::DriverError;
 
@@ -36,6 +36,111 @@ impl DispatchTarget {
     pub(crate) const fn irp(self) -> NonNull<wdk_sys::IRP> {
         self.irp
     }
+
+    /// Returns the current stack location selected by the I/O Manager.
+    pub(crate) fn current_stack(self) -> Result<CurrentIrpStackLocation, DriverError> {
+        let irp = unsafe {
+            // SAFETY: DispatchTarget owns a non-null IRP pointer decoded from
+            // the WDK dispatch boundary for the duration of this callback.
+            self.irp.as_ref()
+        };
+        let tail_overlay = unsafe {
+            // SAFETY: CurrentStackLocation is stored through the IRP tail
+            // overlay for active IRPs delivered to driver dispatch routines.
+            irp.Tail.Overlay
+        };
+        let current_stack = unsafe {
+            // SAFETY: The list overlay contains the current stack pointer in
+            // active dispatch IRPs.
+            tail_overlay
+                .__bindgen_anon_2
+                .__bindgen_anon_1
+                .CurrentStackLocation
+        };
+        CurrentIrpStackLocation::from_raw(current_stack)
+    }
+}
+
+/// Non-null current IRP stack location.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CurrentIrpStackLocation {
+    /// Current stack location selected by the I/O Manager.
+    stack: NonNull<wdk_sys::IO_STACK_LOCATION>,
+}
+
+impl CurrentIrpStackLocation {
+    /// Decodes a raw stack location pointer.
+    fn from_raw(stack: PIO_STACK_LOCATION) -> Result<Self, DriverError> {
+        let Some(stack) = NonNull::new(stack) else {
+            return Err(DriverError::InvalidParameter);
+        };
+        Ok(Self { stack })
+    }
+
+    /// Returns the IRP minor function.
+    pub(crate) fn minor_function(self) -> wdk_sys::UCHAR {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        stack.MinorFunction
+    }
+
+    /// Decodes mount-volume parameters from the current stack location.
+    pub(crate) fn mount_volume(self) -> Result<MountVolumeStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let mount = unsafe {
+            // SAFETY: The caller has selected this accessor only for
+            // IRP_MN_MOUNT_VOLUME, where the MountVolume union arm is active.
+            stack.Parameters.MountVolume
+        };
+
+        let Some(vpb) = NonNull::new(mount.Vpb) else {
+            return Err(DriverError::InvalidParameter);
+        };
+        let Some(target_device) = NonNull::new(mount.DeviceObject) else {
+            return Err(DriverError::InvalidParameter);
+        };
+
+        Ok(MountVolumeStack {
+            vpb,
+            target_device,
+            output_buffer_length: mount.OutputBufferLength,
+        })
+    }
+}
+
+/// Decoded mount-volume stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MountVolumeStack {
+    /// VPB supplied by the I/O Manager for the target volume.
+    vpb: NonNull<wdk_sys::VPB>,
+    /// Lower storage device object to mount.
+    target_device: NonNull<wdk_sys::DEVICE_OBJECT>,
+    /// Output buffer length supplied with the mount request.
+    output_buffer_length: wdk_sys::ULONG,
+}
+
+impl MountVolumeStack {
+    /// Returns the VPB supplied for the mount.
+    pub(crate) const fn vpb(self) -> NonNull<wdk_sys::VPB> {
+        self.vpb
+    }
+
+    /// Returns the lower storage device object.
+    pub(crate) const fn target_device(self) -> NonNull<wdk_sys::DEVICE_OBJECT> {
+        self.target_device
+    }
+
+    /// Returns the mount request output buffer length.
+    pub(crate) const fn output_buffer_length(self) -> wdk_sys::ULONG {
+        self.output_buffer_length
+    }
 }
 
 #[cfg(test)]
@@ -44,7 +149,10 @@ mod tests {
 
     use wdk_sys::STATUS_INVALID_PARAMETER;
 
-    use super::DispatchTarget;
+    use super::{CurrentIrpStackLocation, DispatchTarget};
+
+    /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
+    const MOUNT_VOLUME_MINOR: wdk_sys::UCHAR = 1;
 
     /// Returns a non-null opaque pointer for decode-only dispatch tests.
     fn opaque<T>() -> *mut T {
@@ -78,6 +186,42 @@ mod tests {
         if let Ok(target) = decoded {
             assert_eq!(target.device().as_ptr(), device);
             assert_eq!(target.irp().as_ptr(), irp);
+        }
+    }
+
+    #[test]
+    fn current_stack_location_rejects_null_pointer() {
+        assert_eq!(
+            CurrentIrpStackLocation::from_raw(core::ptr::null_mut())
+                .err()
+                .map(crate::status::DriverError::ntstatus),
+            Some(STATUS_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn mount_volume_stack_preserves_vpb_and_target() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let vpb = NonNull::<wdk_sys::VPB>::dangling();
+        let target = NonNull::<wdk_sys::DEVICE_OBJECT>::dangling();
+        stack.MinorFunction = MOUNT_VOLUME_MINOR;
+        stack.Parameters.MountVolume = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_20 {
+            Vpb: vpb.as_ptr(),
+            DeviceObject: target.as_ptr(),
+            OutputBufferLength: 16,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            assert_eq!(current.minor_function(), MOUNT_VOLUME_MINOR);
+            let mount = current.mount_volume();
+            assert!(mount.is_ok());
+            if let Ok(mount) = mount {
+                assert_eq!(mount.vpb(), vpb);
+                assert_eq!(mount.target_device(), target);
+                assert_eq!(mount.output_buffer_length(), 16);
+            }
         }
     }
 }
