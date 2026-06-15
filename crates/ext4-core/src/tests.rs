@@ -16,8 +16,8 @@ use alloc::{vec, vec::Vec};
 use crate::{
     BlockAddress, BlockGroupId, BlockMapping, BlockReader, BlockSize, BlockWriter, ByteOffset,
     DeviceLength, DirectoryEntry, DirectoryEntryKind, DirectoryNode, Error, Ext4Gid, Ext4Name,
-    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Timestamp, Ext4Uid, Extent, ExtentLength,
-    ExtentTree, ExtentTreeContext, ExternalJournal, FileNode, FileOffset, FileSize,
+    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, Extent,
+    ExtentLength, ExtentTree, ExtentTreeContext, ExternalJournal, FileNode, FileOffset, FileSize,
     InodeExtentRoot, InodeId, JournalMode, LogicalBlock, LookupResult, MutableExtentTree,
     NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, Node, ReadOnly, ReadWrite,
     SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget,
@@ -896,6 +896,32 @@ fn set_posix_security_updates_owner_and_permissions() {
     assert_eq!(get_u16(&image, inode_offset + 24), 3);
     assert_eq!(get_u16(&image, inode_offset + 120), 2);
     assert_eq!(get_u16(&image, inode_offset + 122), 4);
+}
+
+#[test]
+fn set_times_updates_inode_timestamp_fields() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let times = Ext4Times::new(
+        Ext4Timestamp::from_unix_seconds(11),
+        Ext4Timestamp::from_unix_seconds(22),
+        Ext4Timestamp::from_unix_seconds(33),
+        Ext4Timestamp::from_unix_seconds(44),
+    );
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        let node = transaction_node(&transaction, inode(3));
+        must(transaction.set_times(node, times));
+        must(transaction.commit());
+    }
+
+    let inode_offset = modern_inode_offset(3);
+    assert_eq!(get_u32(&image, inode_offset + 8), 11);
+    assert_eq!(get_u32(&image, inode_offset + 16), 22);
+    assert_eq!(get_u32(&image, inode_offset + 12), 33);
+    assert_eq!(get_u32(&image, inode_offset + 144), 44);
 }
 
 #[test]

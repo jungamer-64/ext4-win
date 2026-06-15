@@ -22,6 +22,7 @@ use crate::name::WindowsName;
 use crate::superblock::{
     BlockGroupId, FreeBlockDelta, JournalMode, MetadataChecksum, RecoveryState, Superblock,
 };
+use crate::windows::Ext4Times;
 
 // Volume mutation offsets are kept together so inode/superblock rewrites use one
 // source of truth for on-disk byte layout.
@@ -1055,6 +1056,30 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .inode_updates
             .get_mut(child_index)
             .ok_or(Error::InvalidInode)? = child_raw;
+        Ok(())
+    }
+
+    /// Updates ext4 inode timestamps from a complete timestamp domain value.
+    ///
+    /// # Errors
+    /// Returns an error when the inode leaves the mutable write domain or the
+    /// inode record cannot be rewritten.
+    pub fn set_times(&mut self, node: TransactionNode, times: Ext4Times) -> Result<()> {
+        let inode_index = self.ensure_inode_update(node.inode_id())?;
+        let mut raw_inode = self
+            .inode_updates
+            .get(inode_index)
+            .ok_or(Error::InvalidInode)?
+            .clone();
+        let inode = raw_inode.parse()?;
+        if !inode.supports_basic_mutation() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        raw_inode.set_ext4_times(times)?;
+        *self
+            .inode_updates
+            .get_mut(inode_index)
+            .ok_or(Error::InvalidInode)? = raw_inode;
         Ok(())
     }
 
@@ -2599,6 +2624,31 @@ impl RawInode {
             .ok_or(Error::TruncatedStructure)?
             .copy_from_slice(root);
         Ok(())
+    }
+
+    /// Writes explicit ext4 inode timestamps.
+    fn set_ext4_times(&mut self, times: Ext4Times) -> Result<()> {
+        put_le_u32(
+            &mut self.bytes,
+            INODE_ATIME_OFFSET,
+            times.accessed().seconds(),
+        )?;
+        put_le_u32(
+            &mut self.bytes,
+            INODE_CTIME_OFFSET,
+            times.changed().seconds(),
+        )?;
+        put_le_u32(
+            &mut self.bytes,
+            INODE_MTIME_OFFSET,
+            times.modified().seconds(),
+        )?;
+        if self.bytes.len() > INODE_ATIME_EXTRA_OFFSET {
+            put_le_u32(&mut self.bytes, INODE_ATIME_EXTRA_OFFSET, 0)?;
+            put_le_u32(&mut self.bytes, INODE_CTIME_EXTRA_OFFSET, 0)?;
+            put_le_u32(&mut self.bytes, INODE_MTIME_EXTRA_OFFSET, 0)?;
+        }
+        self.set_creation_time(times.created())
     }
 
     /// Writes an inline symbolic link target into `i_block`.
