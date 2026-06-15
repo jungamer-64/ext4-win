@@ -627,11 +627,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 });
             } else {
                 let physical = self.allocate_block()?;
-                insert_or_extend_extent(
-                    &mut extents,
-                    logical_block,
-                    physical,
-                )?;
+                insert_or_extend_extent(&mut extents, logical_block, physical)?;
                 let mut block = vec![0_u8; block_size];
                 let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
                 let block_end = start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
@@ -784,7 +780,9 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 .get()
                 .checked_add(
                     u64::from(group.as_u32())
-                        .checked_mul(u64::from(self.volume.superblock.blocks_per_group().as_u32()))
+                        .checked_mul(u64::from(
+                            self.volume.superblock.blocks_per_group().as_u32(),
+                        ))
                         .ok_or(Error::ArithmeticOverflow)?,
                 )
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -929,7 +927,9 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .get()
             .checked_add(
                 u64::from(group.as_u32())
-                    .checked_mul(u64::from(self.volume.superblock.blocks_per_group().as_u32()))
+                    .checked_mul(u64::from(
+                        self.volume.superblock.blocks_per_group().as_u32(),
+                    ))
                     .ok_or(Error::ArithmeticOverflow)?,
             )
             .ok_or(Error::ArithmeticOverflow)?;
@@ -977,10 +977,8 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 &self.volume.superblock,
                 delta.group,
             )?;
-            descriptor.apply_free_blocks_delta(
-                delta.delta,
-                self.volume.superblock.descriptor_layout(),
-            )?;
+            descriptor
+                .apply_free_blocks_delta(delta.delta, self.volume.superblock.descriptor_layout())?;
             writes.push(RangeWrite {
                 offset: descriptor.offset(),
                 bytes: descriptor.bytes().to_vec(),
@@ -1081,9 +1079,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 .ok_or(Error::InvalidSuperblock)?
         } else {
             current
-                .checked_add(
-                    u64::try_from(raw_delta).map_err(|_| Error::ArithmeticOverflow)?,
-                )
+                .checked_add(u64::try_from(raw_delta).map_err(|_| Error::ArithmeticOverflow)?)
                 .ok_or(Error::ArithmeticOverflow)?
         };
         put_le_u32(
@@ -1091,12 +1087,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             SUPERBLOCK_FREE_BLOCKS_LO_OFFSET,
             u32::try_from(updated & u64::from(u32::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        if self
-            .volume
-            .superblock
-            .descriptor_layout()
-            .has_high_fields()
-        {
+        if self.volume.superblock.descriptor_layout().has_high_fields() {
             put_le_u32(
                 &mut bytes,
                 SUPERBLOCK_FREE_BLOCKS_HI_OFFSET,
