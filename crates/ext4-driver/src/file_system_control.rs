@@ -3,8 +3,10 @@
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_NOT_SUPPORTED, STATUS_UNRECOGNIZED_VOLUME};
 
 use crate::{
+    block_device::query_device_length,
     irp::{DispatchTarget, MountVolumeStack},
-    state::KernelDevice,
+    state::{KernelDevice, MountCandidate},
+    status::DriverError,
 };
 
 /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
@@ -109,9 +111,15 @@ impl MountVolumeRequest {
 
 /// Handles a decoded mount request.
 fn mount_volume(request: MountVolumeRequest) -> NTSTATUS {
+    let length = match query_device_length(request.target_device()) {
+        Ok(length) => length,
+        Err(error) => return DriverError::from(error).ntstatus(),
+    };
+    let candidate = MountCandidate::new(request.target_device(), length);
     let _mount_boundary = (
         request.vpb(),
-        request.target_device(),
+        candidate.target_device(),
+        candidate.length(),
         request.output_buffer_length(),
     );
     STATUS_UNRECOGNIZED_VOLUME
