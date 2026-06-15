@@ -102,8 +102,19 @@ impl ExtentLength {
 pub enum BlockMapping {
     /// The logical block is backed by this physical block.
     Physical(BlockAddress),
+    /// The logical block is backed by an uninitialized extent and reads as zero.
+    Uninitialized,
     /// The logical block is a sparse hole.
     Hole,
+}
+
+/// Initialization state encoded in an ext4 leaf extent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtentInitialization {
+    /// Extent payload contains initialized file data.
+    Initialized,
+    /// Extent payload is allocated but must read as zero until initialized.
+    Uninitialized,
 }
 
 /// A leaf extent mapping a logical block run to a physical block run.
@@ -115,11 +126,13 @@ pub struct Extent {
     len: ExtentLength,
     /// First physical filesystem block backing this run.
     physical_start: BlockAddress,
+    /// Initialization state encoded in `ee_len`.
+    initialization: ExtentInitialization,
 }
 
 impl Extent {
-    /// Creates a typed extent after callers have validated on-disk fields.
-    pub(crate) fn new(
+    /// Creates an initialized extent after callers have validated fields.
+    pub(crate) fn initialized(
         logical_start: LogicalBlock,
         len: ExtentLength,
         physical_start: BlockAddress,
@@ -128,6 +141,21 @@ impl Extent {
             logical_start,
             len,
             physical_start,
+            initialization: ExtentInitialization::Initialized,
+        }
+    }
+
+    /// Creates an uninitialized extent after callers have validated fields.
+    pub(crate) fn uninitialized(
+        logical_start: LogicalBlock,
+        len: ExtentLength,
+        physical_start: BlockAddress,
+    ) -> Self {
+        Self {
+            logical_start,
+            len,
+            physical_start,
+            initialization: ExtentInitialization::Uninitialized,
         }
     }
 
@@ -147,6 +175,12 @@ impl Extent {
     #[must_use]
     pub const fn physical_start(self) -> BlockAddress {
         self.physical_start
+    }
+
+    /// Initialization state of this extent.
+    #[must_use]
+    pub const fn initialization(self) -> ExtentInitialization {
+        self.initialization
     }
 
     /// Returns the exclusive logical end of this extent.
@@ -173,7 +207,10 @@ impl Extent {
         let Some(physical) = self.physical_start.get().checked_add(logical_offset) else {
             return BlockMapping::Hole;
         };
-        BlockMapping::Physical(BlockAddress::new(physical))
+        match self.initialization {
+            ExtentInitialization::Initialized => BlockMapping::Physical(BlockAddress::new(physical)),
+            ExtentInitialization::Uninitialized => BlockMapping::Uninitialized,
+        }
     }
 }
 
@@ -231,55 +268,6 @@ impl ExtentTree {
     pub fn extents(&self) -> &[Extent] {
         &self.extents
     }
-}
-
-/// Serializes a depth-0 extent root back into the inode `i_block` field.
-pub(crate) fn serialize_inode_root(extents: &[Extent]) -> Result<[u8; INODE_ROOT_BYTES]> {
-    if extents.len() > INODE_ROOT_EXTENT_CAPACITY {
-        return Err(Error::UnsupportedExtentDepth);
-    }
-    let mut raw = [0_u8; INODE_ROOT_BYTES];
-    put_le_u16(&mut raw, 0, EXTENT_MAGIC)?;
-    put_le_u16(
-        &mut raw,
-        2,
-        u16::try_from(extents.len()).map_err(|_| Error::ArithmeticOverflow)?,
-    )?;
-    put_le_u16(
-        &mut raw,
-        4,
-        u16::try_from(INODE_ROOT_EXTENT_CAPACITY).map_err(|_| Error::ArithmeticOverflow)?,
-    )?;
-    put_le_u16(&mut raw, 6, 0)?;
-    put_le_u32(&mut raw, 8, 0)?;
-    for (entry_index, extent) in extents.iter().enumerate() {
-        let offset = EXTENT_HEADER_SIZE
-            .checked_add(
-                entry_index
-                    .checked_mul(EXTENT_ENTRY_SIZE)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .ok_or(Error::ArithmeticOverflow)?;
-        put_le_u32(&mut raw, offset, extent.logical_start().as_u32())?;
-        put_le_u16(
-            &mut raw,
-            offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
-            extent.len().as_u16(),
-        )?;
-        put_le_u16(
-            &mut raw,
-            offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
-            u16::try_from(extent.physical_start().get() >> 32)
-                .map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-        put_le_u32(
-            &mut raw,
-            offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
-            u32::try_from(extent.physical_start().get() & u64::from(u32::MAX))
-                .map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-    }
-    Ok(raw)
 }
 
 /// Internal parse_node_recursive operation used by this module's domain boundary.
@@ -381,6 +369,11 @@ fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
     let logical_start = LogicalBlock::from_u32(le_u32(raw, offset)?);
     let raw_len = le_u16(raw, offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?)?;
     let len = ExtentLength::new(raw_len & !EXTENT_LEN_UNINITIALIZED)?;
+    let initialization = if raw_len & EXTENT_LEN_UNINITIALIZED == 0 {
+        ExtentInitialization::Initialized
+    } else {
+        ExtentInitialization::Uninitialized
+    };
     let start_hi = u64::from(le_u16(
         raw,
         offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
@@ -389,11 +382,13 @@ fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
         raw,
         offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
     )?);
-    Ok(Extent::new(
-        logical_start,
-        len,
-        BlockAddress::new((start_hi << 32) | start_lo),
-    ))
+    let physical_start = BlockAddress::new((start_hi << 32) | start_lo);
+    Ok(match initialization {
+        ExtentInitialization::Initialized => Extent::initialized(logical_start, len, physical_start),
+        ExtentInitialization::Uninitialized => {
+            Extent::uninitialized(logical_start, len, physical_start)
+        }
+    })
 }
 
 /// Reads the extent-header entry count after validating header size.
