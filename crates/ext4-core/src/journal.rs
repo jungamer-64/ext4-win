@@ -235,22 +235,27 @@ impl Journal {
 
         let mut revokes = Vec::new();
         for transaction in &scan.transactions {
-            for block in &transaction.revokes {
-                revokes.push(RevokedBlock {
-                    sequence: transaction.sequence,
-                    block: *block,
-                });
+            for (order, event) in transaction.events.iter().enumerate() {
+                if let JournalTransactionEvent::Revoke(block) = event {
+                    revokes.push(RevokedBlock {
+                        sequence: transaction.sequence,
+                        order,
+                        block: *block,
+                    });
+                }
             }
         }
 
         let mut next_sequence = self.superblock.sequence();
         for transaction in &scan.transactions {
             next_sequence = transaction.sequence.next();
-            for entry in &transaction.entries {
-                if is_revoked_after(&revokes, entry.home, transaction.sequence) {
-                    continue;
+            for (order, event) in transaction.events.iter().enumerate() {
+                if let JournalTransactionEvent::Entry(entry) = event {
+                    if is_revoked_after(&revokes, entry.home, transaction.sequence, order) {
+                        continue;
+                    }
+                    io.write_home_block(block_size, entry.home, &entry.bytes)?;
                 }
-                io.write_home_block(block_size, entry.home, &entry.bytes)?;
             }
         }
         io.flush_all()?;
@@ -399,11 +404,11 @@ impl Journal {
     ) -> Result<JournalTransactionScan> {
         let mut transaction = JournalTransaction {
             sequence,
-            entries: Vec::new(),
-            revokes: Vec::new(),
+            events: Vec::new(),
         };
         let mut cursor = start;
         let mut consumed = 0_u32;
+        let mut descriptor_seen = false;
 
         while consumed < self.usable_log_blocks()? {
             let block = self.read_journal_block(io, block_size, cursor)?;
@@ -416,6 +421,10 @@ impl Journal {
 
             match header.block_type() {
                 JBD2_DESCRIPTOR_BLOCK => {
+                    if descriptor_seen {
+                        return Err(Error::UnsupportedJournal);
+                    }
+                    descriptor_seen = true;
                     let descriptor = self.parse_descriptor_block(&block)?;
                     cursor = self.next_logical(cursor)?;
                     consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
@@ -430,11 +439,15 @@ impl Journal {
                                 put_be_u32(&mut data, 0, JBD2_MAGIC)?;
                             }
                             self.validate_replay_target(tag.block)?;
-                            transaction.revokes.retain(|block| *block != tag.block);
-                            transaction.entries.push(JournalEntry {
+                            if transaction.events.iter().any(|event| {
+                                matches!(event, JournalTransactionEvent::Entry(entry) if entry.home == tag.block)
+                            }) {
+                                return Err(Error::JournalCorrupt);
+                            }
+                            transaction.events.push(JournalTransactionEvent::Entry(JournalEntry {
                                 home: tag.block,
                                 bytes: data,
-                            });
+                            }));
                         }
                         cursor = self.next_logical(cursor)?;
                         consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
@@ -443,15 +456,16 @@ impl Journal {
                 JBD2_REVOKE_BLOCK => {
                     let revoke = self.parse_revoke_block(&block)?;
                     for block in revoke.blocks {
-                        if !transaction.entries.iter().any(|entry| entry.home == block) {
-                            transaction.revokes.push(block);
-                        }
+                        transaction.events.push(JournalTransactionEvent::Revoke(block));
                     }
                     cursor = self.next_logical(cursor)?;
                     consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
                 }
                 JBD2_COMMIT_BLOCK => {
-                    self.parse_commit_block(&block)?;
+                    if transaction.events.is_empty() {
+                        return Err(Error::JournalCorrupt);
+                    }
+                    self.parse_commit_block(&block, sequence)?;
                     return Ok(JournalTransactionScan::Committed {
                         transaction,
                         next_cursor: self.next_logical(cursor)?,
@@ -498,16 +512,21 @@ impl Journal {
             block.len()
         };
         let mut tags = Vec::new();
+        let mut saw_last = false;
         while offset < limit {
             let Some((tag, next_offset)) = self.parse_tag(block, offset, limit)? else {
-                break;
+                return Err(Error::JournalCorrupt);
             };
             let last = tag.flags & JBD2_TAG_FLAG_LAST_TAG != 0;
             tags.push(tag);
             offset = next_offset;
             if last {
+                saw_last = true;
                 break;
             }
+        }
+        if tags.is_empty() || !saw_last {
+            return Err(Error::JournalCorrupt);
         }
         Ok(JournalDescriptor { tags })
     }
@@ -543,6 +562,7 @@ impl Journal {
             if block_low == 0 && block_high == 0 && flags == 0 && checksum == 0 {
                 return Ok(None);
             }
+            validate_tag_flags(flags)?;
             let uuid_size = if flags & JBD2_TAG_FLAG_SAME_UUID == 0 {
                 16
             } else {
@@ -554,6 +574,14 @@ impl Journal {
                 .ok_or(Error::ArithmeticOverflow)?;
             if next > limit {
                 return Err(Error::JournalCorrupt);
+            }
+            if uuid_size == 16 {
+                let uuid = block
+                    .get(offset.checked_add(base_size).ok_or(Error::ArithmeticOverflow)?..next)
+                    .ok_or(Error::TruncatedStructure)?;
+                if uuid != self.superblock.uuid() {
+                    return Err(Error::JournalCorrupt);
+                }
             }
             return Ok(Some((
                 JournalTag {
@@ -585,6 +613,7 @@ impl Journal {
         if block_low == 0 && flags == 0 && checksum == 0 {
             return Ok(None);
         }
+        validate_tag_flags(flags)?;
         let high_size = if self.superblock.has_64bit() { 4 } else { 0 };
         let block_high = if high_size == 4 {
             u64::from(be_u32(
@@ -606,6 +635,16 @@ impl Journal {
             .ok_or(Error::ArithmeticOverflow)?;
         if next > limit {
             return Err(Error::JournalCorrupt);
+        }
+        if uuid_size == 16 {
+            let uuid_start = offset
+                .checked_add(base_size)
+                .and_then(|value| value.checked_add(high_size))
+                .ok_or(Error::ArithmeticOverflow)?;
+            let uuid = block.get(uuid_start..next).ok_or(Error::TruncatedStructure)?;
+            if uuid != self.superblock.uuid() {
+                return Err(Error::JournalCorrupt);
+            }
         }
         Ok(Some((
             JournalTag {
@@ -654,14 +693,19 @@ impl Journal {
         Ok(JournalRevoke { blocks })
     }
 
-    fn parse_commit_block(&self, block: &[u8]) -> Result<JournalCommit> {
+    fn parse_commit_block(&self, block: &[u8], expected_sequence: JournalSequence) -> Result<JournalCommit> {
         let header = Jbd2Header::parse(block)?;
         if header.block_type() != JBD2_COMMIT_BLOCK {
+            return Err(Error::JournalCorrupt);
+        }
+        if header.sequence() != expected_sequence.get() {
             return Err(Error::JournalCorrupt);
         }
         if self.superblock.has_metadata_checksums() {
             if *block.get(0x0C).ok_or(Error::TruncatedStructure)? != JBD2_CHECKSUM_CRC32C
                 || *block.get(0x0D).ok_or(Error::TruncatedStructure)? != 4
+                || *block.get(0x0E).ok_or(Error::TruncatedStructure)? != 0
+                || *block.get(0x0F).ok_or(Error::TruncatedStructure)? != 0
             {
                 return Err(Error::JournalCorrupt);
             }
@@ -1154,8 +1198,7 @@ impl Jbd2Header {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct JournalTransaction {
     sequence: JournalSequence,
-    entries: Vec<JournalEntry>,
-    revokes: Vec<BlockAddress>,
+    events: Vec<JournalTransactionEvent>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1199,6 +1242,12 @@ struct JournalEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum JournalTransactionEvent {
+    Entry(JournalEntry),
+    Revoke(BlockAddress),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct JournalDescriptor {
     tags: Vec<JournalTag>,
 }
@@ -1223,6 +1272,7 @@ struct JournalCommit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RevokedBlock {
     sequence: JournalSequence,
+    order: usize,
     block: BlockAddress,
 }
 
@@ -1391,6 +1441,18 @@ fn starts_with_jbd2_magic(bytes: &[u8]) -> bool {
         .is_some_and(|prefix| prefix == JBD2_MAGIC.to_be_bytes())
 }
 
+fn validate_tag_flags(flags: u32) -> Result<()> {
+    const SUPPORTED_TAG_FLAGS: u32 = JBD2_TAG_FLAG_ESCAPE
+        | JBD2_TAG_FLAG_SAME_UUID
+        | JBD2_TAG_FLAG_DELETED
+        | JBD2_TAG_FLAG_LAST_TAG;
+    if flags & !SUPPORTED_TAG_FLAGS == 0 {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedJournal)
+    }
+}
+
 fn transaction_tail(consumed: u32) -> JournalTransactionScan {
     if consumed == 0 {
         JournalTransactionScan::EndOfLog
@@ -1431,8 +1493,11 @@ fn is_revoked_after(
     revokes: &[RevokedBlock],
     block: BlockAddress,
     sequence: JournalSequence,
+    order: usize,
 ) -> bool {
-    revokes
-        .iter()
-        .any(|revoked| revoked.block == block && revoked.sequence.is_after(sequence))
+    revokes.iter().any(|revoked| {
+        revoked.block == block
+            && (revoked.sequence.is_after(sequence)
+                || (revoked.sequence == sequence && revoked.order > order))
+    })
 }
