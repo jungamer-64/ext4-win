@@ -14,7 +14,7 @@ use crate::extent::{
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Timestamp, FileOffset, FileSize, Inode, InodeId,
-    InodeKind, NewDirectoryMetadata, NewFileMetadata, ReadBytes,
+    InodeKind, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 use crate::journal::{Journal, LoadedJournal};
 use crate::name::Ext4Name;
@@ -31,6 +31,8 @@ const MAX_EAGER_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
 const MODE_DIRECTORY: u16 = 0x4000;
 /// `i_mode` type bits for regular files.
 const MODE_REGULAR: u16 = 0x8000;
+/// `i_mode` type bits for symbolic links.
+const MODE_SYMLINK: u16 = 0xA000;
 /// `i_mode` mask that preserves inode type bits.
 const MODE_KIND_MASK: u16 = 0xF000;
 /// `i_flags` bit indicating extent-based block mapping.
@@ -633,6 +635,21 @@ impl TransactionDirectory {
     }
 }
 
+/// Symbolic link selected for mutation inside a write transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionSymlink {
+    /// Mutable symbolic-link inode selected for this transaction.
+    inode_id: InodeId,
+}
+
+impl TransactionSymlink {
+    /// Inode identifier backing this transaction symlink.
+    #[must_use]
+    pub const fn inode_id(self) -> InodeId {
+        self.inode_id
+    }
+}
+
 /// Inode selected for POSIX metadata mutation inside a write transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionNode {
@@ -714,6 +731,22 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             return Err(Error::UnsupportedInodeMutation);
         }
         Ok(TransactionDirectory { inode_id })
+    }
+
+    /// Selects a symbolic link for mutation.
+    ///
+    /// # Errors
+    /// Returns an error when the inode is not a symbolic link or carries
+    /// mutation semantics outside the write domain.
+    pub fn symlink(&self, inode_id: InodeId) -> Result<TransactionSymlink> {
+        let inode = self.volume.read_inode_record(inode_id)?;
+        if inode.kind() != InodeKind::Symlink {
+            return Err(Error::WrongInodeKind);
+        }
+        if !inode.supports_basic_mutation() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        Ok(TransactionSymlink { inode_id })
     }
 
     /// Updates POSIX owner and permission state representable by ext4 inode fields.
@@ -843,6 +876,59 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(TransactionDirectory { inode_id })
     }
 
+    /// Creates a symbolic link under a directory.
+    ///
+    /// # Errors
+    /// Returns an error when the parent is not mutable, the name exists, no
+    /// inode or data block is free, or the target cannot be represented.
+    pub fn create_symlink(
+        &mut self,
+        parent: TransactionDirectory,
+        name: &Ext4Name,
+        target: &SymlinkTarget,
+        metadata: NewSymlinkMetadata,
+    ) -> Result<TransactionSymlink> {
+        self.ensure_child_absent(parent.inode_id(), name)?;
+        let mut raw_inode = self.allocate_inode()?;
+        let inode_id = raw_inode.id;
+        if target.is_inline() {
+            raw_inode.initialize_inline_symlink(metadata, self.now, target)?;
+        } else {
+            let block_size = self.volume.superblock.block_size();
+            raw_inode.initialize_extent_symlink(metadata, self.now, block_size, target)?;
+            let block_bytes =
+                usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+            let mut tree = MutableExtentTree::from_extents(Vec::new())?;
+            for (logical, chunk) in target.bytes().chunks(block_bytes).enumerate() {
+                let block = self.allocate_block()?;
+                let mut bytes = vec![0_u8; block_bytes];
+                bytes
+                    .get_mut(..chunk.len())
+                    .ok_or(Error::DeviceRange)?
+                    .copy_from_slice(chunk);
+                self.data_writes.push(RangeWrite {
+                    offset: block_size.offset_of(block)?,
+                    bytes,
+                });
+                tree.insert_or_extend_initialized(
+                    LogicalBlock::try_from(
+                        u64::try_from(logical).map_err(|_| Error::ArithmeticOverflow)?,
+                    )?,
+                    block,
+                )?;
+            }
+            self.stage_extent_tree(&mut raw_inode, tree)?;
+        }
+        self.add_directory_entry(
+            parent.inode_id(),
+            name,
+            inode_id,
+            DirectoryEntryKind::Symlink,
+        )?;
+        self.inode_updates.push(raw_inode);
+        Ok(TransactionSymlink { inode_id })
+    }
+
     /// Removes an empty child directory.
     ///
     /// # Errors
@@ -969,6 +1055,43 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .inode_updates
             .get_mut(child_index)
             .ok_or(Error::InvalidInode)? = child_raw;
+        Ok(())
+    }
+
+    /// Removes a symbolic link directory entry and releases its inode.
+    ///
+    /// # Errors
+    /// Returns an error when the entry is absent, not a symbolic link, or
+    /// metadata cannot be updated.
+    pub fn remove_symlink(&mut self, parent: TransactionDirectory, name: &Ext4Name) -> Result<()> {
+        let removed = self.remove_directory_entry(parent.inode_id(), name)?;
+        let inode_index = self.ensure_inode_update(removed.inode())?;
+        let mut raw_inode = self
+            .inode_updates
+            .get(inode_index)
+            .ok_or(Error::InvalidInode)?
+            .clone();
+        let inode = raw_inode.parse()?;
+        if inode.kind() != InodeKind::Symlink {
+            return Err(Error::WrongInodeKind);
+        }
+        if !inode.supports_basic_mutation() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        if let Ok(tree) = self.mutable_extent_tree(&inode) {
+            for extent in tree.extents().iter().copied() {
+                self.free_extent(extent, 0)?;
+            }
+            for block in tree.metadata_blocks().iter().copied() {
+                self.free_block(block)?;
+            }
+        }
+        self.free_inode(raw_inode.id)?;
+        raw_inode.clear_deleted(self.now, self.volume.superblock.block_size())?;
+        *self
+            .inode_updates
+            .get_mut(inode_index)
+            .ok_or(Error::InvalidInode)? = raw_inode;
         Ok(())
     }
 
@@ -2287,6 +2410,59 @@ impl RawInode {
         self.set_allocated_blocks(1, u64::from(block_size.bytes()))
     }
 
+    /// Initializes a zeroed inode record as an inline symbolic link.
+    fn initialize_inline_symlink(
+        &mut self,
+        metadata: NewSymlinkMetadata,
+        now: Ext4Timestamp,
+        target: &SymlinkTarget,
+    ) -> Result<()> {
+        if !target.is_inline() {
+            return Err(Error::InvalidWriteRange);
+        }
+        self.bytes.fill(0);
+        self.set_mode(MODE_SYMLINK, metadata.permissions())?;
+        self.set_owner(metadata.owner())?;
+        self.set_size(FileSize::from_bytes(
+            u64::try_from(target.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
+        ))?;
+        self.set_links_count(1)?;
+        self.set_timestamps(now)?;
+        self.set_creation_time(now)?;
+        self.set_deletion_time(0)?;
+        self.set_flags(0)?;
+        self.set_inline_target(target.bytes())?;
+        self.set_allocated_blocks(0, 1024)
+    }
+
+    /// Initializes a zeroed inode record as an extent-backed symbolic link.
+    fn initialize_extent_symlink(
+        &mut self,
+        metadata: NewSymlinkMetadata,
+        now: Ext4Timestamp,
+        block_size: BlockSize,
+        target: &SymlinkTarget,
+    ) -> Result<()> {
+        if target.is_inline() {
+            return Err(Error::InvalidWriteRange);
+        }
+        self.bytes.fill(0);
+        self.set_mode(MODE_SYMLINK, metadata.permissions())?;
+        self.set_owner(metadata.owner())?;
+        self.set_size(FileSize::from_bytes(
+            u64::try_from(target.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
+        ))?;
+        self.set_links_count(1)?;
+        self.set_timestamps(now)?;
+        self.set_creation_time(now)?;
+        self.set_deletion_time(0)?;
+        self.set_flags(EXT4_EXTENTS_FL)?;
+        let tree = MutableExtentTree::from_extents(Vec::new())?;
+        let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
+        self.set_extent_root_bytes(serialized.inode_root())?;
+        self.set_allocated_blocks(0, 1024)
+    }
+
     /// Writes inode type and permission bits into `i_mode`.
     fn set_mode(&mut self, file_type: u16, permissions: Ext4Permissions) -> Result<()> {
         put_le_u16(
@@ -2422,6 +2598,26 @@ impl RawInode {
             .get_mut(INODE_BLOCK_OFFSET..end)
             .ok_or(Error::TruncatedStructure)?
             .copy_from_slice(root);
+        Ok(())
+    }
+
+    /// Writes an inline symbolic link target into `i_block`.
+    fn set_inline_target(&mut self, target: &[u8]) -> Result<()> {
+        if target.len() > SymlinkTarget::INLINE_CAPACITY {
+            return Err(Error::InvalidWriteRange);
+        }
+        let end = INODE_BLOCK_OFFSET
+            .checked_add(SymlinkTarget::INLINE_CAPACITY)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let block = self
+            .bytes
+            .get_mut(INODE_BLOCK_OFFSET..end)
+            .ok_or(Error::TruncatedStructure)?;
+        block.fill(0);
+        block
+            .get_mut(..target.len())
+            .ok_or(Error::DeviceRange)?
+            .copy_from_slice(target);
         Ok(())
     }
 
