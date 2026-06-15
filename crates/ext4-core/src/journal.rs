@@ -174,16 +174,18 @@ impl Journal {
         io: &mut impl JournalIo,
         block_size: BlockSize,
     ) -> Result<()> {
-        let transactions = self.committed_transactions(io, block_size)?;
-        if transactions.is_empty() {
-            if self.superblock.start() != 0 {
-                self.mark_clean(io, block_size, self.superblock.sequence())?;
-            }
+        let scan = self.committed_transactions(io, block_size)?;
+        match scan.tail {
+            JournalScanTail::CleanSuperblock
+            | JournalScanTail::EndOfLog
+            | JournalScanTail::IncompleteTail => {}
+        }
+        if scan.transactions.is_empty() {
             return Ok(());
         }
 
         let mut revokes = Vec::new();
-        for transaction in &transactions {
+        for transaction in &scan.transactions {
             for block in &transaction.revokes {
                 revokes.push(RevokedBlock {
                     sequence: transaction.sequence,
@@ -193,7 +195,7 @@ impl Journal {
         }
 
         let mut next_sequence = self.superblock.sequence();
-        for transaction in &transactions {
+        for transaction in &scan.transactions {
             next_sequence = transaction
                 .sequence
                 .checked_add(1)
@@ -258,27 +260,50 @@ impl Journal {
         &self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
-    ) -> Result<Vec<JournalTransaction>> {
+    ) -> Result<JournalReplayScan> {
         if self.superblock.start() == 0 {
-            return Ok(Vec::new());
+            return Ok(JournalReplayScan {
+                transactions: Vec::new(),
+                tail: JournalScanTail::CleanSuperblock,
+            });
         }
 
         let mut transactions = Vec::new();
         let mut cursor = self.superblock.start();
         let mut sequence = self.superblock.sequence();
-        let mut visited = 0_u32;
-        while visited < self.usable_log_blocks()? {
-            let Some((transaction, next_cursor)) =
-                self.parse_transaction(io, block_size, cursor, sequence)?
-            else {
-                break;
-            };
-            transactions.push(transaction);
-            cursor = next_cursor;
-            sequence = sequence.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
-            visited = visited.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        let mut consumed = 0_u32;
+        while consumed < self.usable_log_blocks()? {
+            match self.parse_transaction(io, block_size, cursor, sequence)? {
+                JournalTransactionScan::Committed {
+                    transaction,
+                    next_cursor,
+                    consumed: transaction_blocks,
+                } => {
+                    transactions.push(transaction);
+                    cursor = next_cursor;
+                    sequence = sequence.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                    consumed = consumed
+                        .checked_add(transaction_blocks)
+                        .ok_or(Error::ArithmeticOverflow)?;
+                }
+                JournalTransactionScan::IncompleteTail => {
+                    return Ok(JournalReplayScan {
+                        transactions,
+                        tail: JournalScanTail::IncompleteTail,
+                    });
+                }
+                JournalTransactionScan::EndOfLog => {
+                    return Ok(JournalReplayScan {
+                        transactions,
+                        tail: JournalScanTail::EndOfLog,
+                    });
+                }
+            }
         }
-        Ok(transactions)
+        Ok(JournalReplayScan {
+            transactions,
+            tail: JournalScanTail::EndOfLog,
+        })
     }
 
     fn parse_transaction(
@@ -287,7 +312,7 @@ impl Journal {
         block_size: BlockSize,
         start: u32,
         sequence: u32,
-    ) -> Result<Option<(JournalTransaction, u32)>> {
+    ) -> Result<JournalTransactionScan> {
         let mut transaction = JournalTransaction {
             sequence,
             entries: Vec::new(),
@@ -299,17 +324,16 @@ impl Journal {
         while consumed < self.usable_log_blocks()? {
             let block = self.read_journal_block(io, block_size, cursor)?;
             let Ok(header) = Jbd2Header::parse(&block) else {
-                return Ok(None);
+                return Ok(transaction_tail(consumed));
             };
             if header.sequence() != sequence {
-                return Ok(None);
+                return Ok(transaction_tail(consumed));
             }
 
             match header.block_type() {
                 JBD2_DESCRIPTOR_BLOCK => {
                     let descriptor = match self.parse_descriptor_block(&block) {
                         Ok(value) => value,
-                        Err(Error::ChecksumMismatch) => return Ok(None),
                         Err(error) => return Err(error),
                     };
                     cursor = self.next_logical(cursor)?;
@@ -320,11 +344,7 @@ impl Journal {
                             put_be_u32(&mut data, 0, JBD2_MAGIC)?;
                         }
                         if tag.flags & JBD2_TAG_FLAG_DELETED == 0 {
-                            if let Err(Error::ChecksumMismatch) =
-                                self.verify_tag_checksum(sequence, &tag, &data)
-                            {
-                                return Ok(None);
-                            }
+                            self.verify_tag_checksum(sequence, &tag, &data)?;
                             transaction.revokes.retain(|block| *block != tag.block);
                             transaction.entries.push(JournalEntry {
                                 home: tag.block,
@@ -338,7 +358,6 @@ impl Journal {
                 JBD2_REVOKE_BLOCK => {
                     let revoke = match self.parse_revoke_block(&block) {
                         Ok(value) => value,
-                        Err(Error::ChecksumMismatch) => return Ok(None),
                         Err(error) => return Err(error),
                     };
                     for block in revoke.blocks {
@@ -350,16 +369,18 @@ impl Journal {
                     consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
                 }
                 JBD2_COMMIT_BLOCK => {
-                    if self.parse_commit_block(&block).is_err() {
-                        return Ok(None);
-                    }
-                    return Ok(Some((transaction, self.next_logical(cursor)?)));
+                    self.parse_commit_block(&block)?;
+                    return Ok(JournalTransactionScan::Committed {
+                        transaction,
+                        next_cursor: self.next_logical(cursor)?,
+                        consumed: consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?,
+                    });
                 }
-                _ => return Ok(None),
+                _ => return Ok(transaction_tail(consumed)),
             }
         }
 
-        Ok(None)
+        Ok(JournalTransactionScan::IncompleteTail)
     }
 
     fn read_journal_block(
@@ -965,6 +986,30 @@ struct JournalTransaction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct JournalReplayScan {
+    transactions: Vec<JournalTransaction>,
+    tail: JournalScanTail,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalScanTail {
+    CleanSuperblock,
+    EndOfLog,
+    IncompleteTail,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum JournalTransactionScan {
+    Committed {
+        transaction: JournalTransaction,
+        next_cursor: u32,
+        consumed: u32,
+    },
+    IncompleteTail,
+    EndOfLog,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct JournalEntry {
     home: BlockAddress,
     bytes: Vec<u8>,
@@ -1161,6 +1206,14 @@ fn starts_with_jbd2_magic(bytes: &[u8]) -> bool {
     bytes
         .get(0..4)
         .is_some_and(|prefix| prefix == JBD2_MAGIC.to_be_bytes())
+}
+
+fn transaction_tail(consumed: u32) -> JournalTransactionScan {
+    if consumed == 0 {
+        JournalTransactionScan::EndOfLog
+    } else {
+        JournalTransactionScan::IncompleteTail
+    }
 }
 
 fn is_revoked_after(revokes: &[RevokedBlock], block: BlockAddress, sequence: u32) -> bool {
