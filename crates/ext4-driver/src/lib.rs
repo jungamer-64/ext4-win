@@ -5,6 +5,7 @@
 mod dispatch;
 mod ffi;
 mod state;
+mod status;
 
 #[cfg(not(test))]
 extern crate wdk_panic;
