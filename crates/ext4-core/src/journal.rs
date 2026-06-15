@@ -1,3 +1,11 @@
+//! JBD2 journal loading, replay, checkpointing, and commit construction.
+//!
+//! The journal code is modeled as typestates: loaded journals must be replayed
+//! into a clean state before write transactions can commit, dirty transactions
+//! must become durable before checkpoint, and checkpointed transactions can then
+//! advance the superblock tail. This keeps crash-ordering rules out of ad hoc
+//! booleans in the volume layer.
+
 use alloc::{vec, vec::Vec};
 use core::marker::PhantomData;
 
@@ -10,72 +18,114 @@ use crate::inode::Inode;
 use crate::superblock::RecoveryState;
 use crate::volume::MetadataBlock;
 
+// Common JBD2 block header fields. JBD2 stores its control structures big-endian.
+/// Internal constant JBD2_MAGIC used by on-disk layout and policy checks.
 const JBD2_MAGIC: u32 = 0xC03B_3998;
+/// Internal constant JBD2_DESCRIPTOR_BLOCK used by on-disk layout and policy checks.
 const JBD2_DESCRIPTOR_BLOCK: u32 = 1;
+/// Internal constant JBD2_COMMIT_BLOCK used by on-disk layout and policy checks.
 const JBD2_COMMIT_BLOCK: u32 = 2;
+/// Internal constant JBD2_SUPERBLOCK_V1 used by on-disk layout and policy checks.
 const JBD2_SUPERBLOCK_V1: u32 = 3;
+/// Internal constant JBD2_SUPERBLOCK_V2 used by on-disk layout and policy checks.
 const JBD2_SUPERBLOCK_V2: u32 = 4;
+/// Internal constant JBD2_REVOKE_BLOCK used by on-disk layout and policy checks.
 const JBD2_REVOKE_BLOCK: u32 = 5;
 
+// Incompatible feature bits are validated before replay because unsupported
+// features can change transaction interpretation.
+/// Internal constant JBD2_FEATURE_INCOMPAT_REVOKE used by on-disk layout and policy checks.
 const JBD2_FEATURE_INCOMPAT_REVOKE: u32 = 0x0001;
+/// Internal constant JBD2_FEATURE_INCOMPAT_64BIT used by on-disk layout and policy checks.
 const JBD2_FEATURE_INCOMPAT_64BIT: u32 = 0x0002;
+/// Internal constant JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT used by on-disk layout and policy checks.
 const JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT: u32 = 0x0004;
+/// Internal constant JBD2_FEATURE_INCOMPAT_CSUM_V2 used by on-disk layout and policy checks.
 const JBD2_FEATURE_INCOMPAT_CSUM_V2: u32 = 0x0008;
+/// Internal constant JBD2_FEATURE_INCOMPAT_CSUM_V3 used by on-disk layout and policy checks.
 const JBD2_FEATURE_INCOMPAT_CSUM_V3: u32 = 0x0010;
+/// Internal constant JBD2_FEATURE_INCOMPAT_FAST_COMMIT used by on-disk layout and policy checks.
 const JBD2_FEATURE_INCOMPAT_FAST_COMMIT: u32 = 0x0020;
+/// Internal constant JBD2_SUPPORTED_INCOMPAT used by on-disk layout and policy checks.
 const JBD2_SUPPORTED_INCOMPAT: u32 = JBD2_FEATURE_INCOMPAT_REVOKE
     | JBD2_FEATURE_INCOMPAT_64BIT
     | JBD2_FEATURE_INCOMPAT_CSUM_V2
     | JBD2_FEATURE_INCOMPAT_CSUM_V3;
 
+// Descriptor tag flags define how following payload blocks are decoded.
+/// Internal constant JBD2_TAG_FLAG_ESCAPE used by on-disk layout and policy checks.
 const JBD2_TAG_FLAG_ESCAPE: u32 = 0x0001;
+/// Internal constant JBD2_TAG_FLAG_SAME_UUID used by on-disk layout and policy checks.
 const JBD2_TAG_FLAG_SAME_UUID: u32 = 0x0002;
+/// Internal constant JBD2_TAG_FLAG_DELETED used by on-disk layout and policy checks.
 const JBD2_TAG_FLAG_DELETED: u32 = 0x0004;
+/// Internal constant JBD2_TAG_FLAG_LAST_TAG used by on-disk layout and policy checks.
 const JBD2_TAG_FLAG_LAST_TAG: u32 = 0x0008;
 
+// JBD2 checksum and layout constants used by both replay and new commits.
+/// Internal constant JBD2_CHECKSUM_CRC32C used by on-disk layout and policy checks.
 const JBD2_CHECKSUM_CRC32C: u8 = 4;
+/// Internal constant JOURNAL_HEADER_BYTES used by on-disk layout and policy checks.
 const JOURNAL_HEADER_BYTES: usize = 12;
+/// Internal constant JOURNAL_SUPERBLOCK_BYTES used by on-disk layout and policy checks.
 const JOURNAL_SUPERBLOCK_BYTES: usize = 1024;
+/// Internal constant JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET used by on-disk layout and policy checks.
 const JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET: u64 = 2048;
+/// Internal constant JOURNAL_OVERHEAD_BLOCKS used by on-disk layout and policy checks.
 const JOURNAL_OVERHEAD_BLOCKS: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal Journal state used to keep module invariants explicit.
 pub(crate) struct Journal<State = CleanJournal> {
+    /// Physical location of the journal blocks.
     location: JournalLocation,
+    /// Parsed journal superblock kept as the mutable journal metadata source.
     superblock: JournalSuperblock,
+    /// Validated circular log range inside the journal device.
     ring: JournalRing,
+    /// Filesystem block count used to reject journal entries outside the volume.
     filesystem_blocks: u64,
+    /// Typestate marker for loaded, clean, dirty, or checkpointed journal state.
     state: PhantomData<State>,
 }
 
+/// Journal loaded from disk but not yet replayed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LoadedJournal;
 
+/// Journal whose committed transactions have been checkpointed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CleanJournal;
 
+/// Journal after descriptor/data/commit blocks have been durably written.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DirtyJournal;
 
+/// Journal after transaction home blocks have been checkpointed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CheckpointedJournal;
 
+/// Wrapping JBD2 transaction sequence number.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JournalSequence(u32);
 
 impl JournalSequence {
+    /// Creates a sequence number from an on-disk or freshly allocated value.
     const fn new(value: u32) -> Self {
         Self(value)
     }
 
+    /// Returns the raw sequence number for block encoding.
     const fn get(self) -> u32 {
         self.0
     }
 
+    /// Returns the next sequence with JBD2 wrapping semantics.
     const fn next(self) -> Self {
         Self(self.0.wrapping_add(1))
     }
 
+    /// Compares two wrapping sequence numbers using half-range ordering.
     const fn is_after(self, other: Self) -> bool {
         let distance = self.0.wrapping_sub(other.0);
         distance != 0 && distance < 0x8000_0000
@@ -83,6 +133,7 @@ impl JournalSequence {
 }
 
 impl<State> Journal<State> {
+    /// Rebuilds the same journal data with a different typestate marker.
     fn clone_without_state<Next>(&self) -> Journal<Next> {
         Journal {
             location: self.location.clone(),
@@ -93,6 +144,7 @@ impl<State> Journal<State> {
         }
     }
 
+    /// Loads an internal journal stored in the filesystem journal inode.
     pub(crate) fn from_inode(
         inode: &Inode,
         block_size: BlockSize,
@@ -132,6 +184,7 @@ impl<State> Journal<State> {
         })
     }
 
+    /// Loads an external journal device and validates its filesystem UUID.
     pub(crate) fn from_external_device(
         journal: &impl BlockReader,
         block_size: BlockSize,
@@ -160,6 +213,7 @@ impl<State> Journal<State> {
         })
     }
 
+    /// Verifies that one metadata transaction can fit in the usable log window.
     pub(crate) fn ensure_transaction_capacity(&self, metadata_blocks: usize) -> Result<()> {
         if metadata_blocks > self.descriptor_tag_capacity()? {
             return Err(Error::TransactionTooLarge);
@@ -175,6 +229,7 @@ impl<State> Journal<State> {
         }
     }
 
+    /// Replays and checkpoints an internal journal through the filesystem device.
     pub(crate) fn replay_and_checkpoint_internal(
         mut self,
         filesystem: &mut impl BlockWriter,
@@ -185,6 +240,7 @@ impl<State> Journal<State> {
         self.replay_and_checkpoint(&mut io, block_size, recovery_state)
     }
 
+    /// Replays and checkpoints an external journal through separate I/O targets.
     pub(crate) fn replay_and_checkpoint_external(
         mut self,
         filesystem: &mut impl BlockWriter,
@@ -199,6 +255,7 @@ impl<State> Journal<State> {
         self.replay_and_checkpoint(&mut io, block_size, recovery_state)
     }
 
+    /// Commits metadata blocks through an internal journal.
     pub(crate) fn commit_internal(
         &mut self,
         filesystem: &mut impl BlockWriter,
@@ -209,6 +266,7 @@ impl<State> Journal<State> {
         self.commit_metadata_transaction(&mut io, block_size, metadata_blocks)
     }
 
+    /// Commits metadata blocks through an external journal.
     pub(crate) fn commit_external(
         &mut self,
         filesystem: &mut impl BlockWriter,
@@ -223,6 +281,7 @@ impl<State> Journal<State> {
         self.commit_metadata_transaction(&mut io, block_size, metadata_blocks)
     }
 
+    /// Internal replay_and_checkpoint operation used by this module's domain boundary.
     fn replay_and_checkpoint(
         &mut self,
         io: &mut impl JournalIo,
@@ -271,6 +330,7 @@ impl<State> Journal<State> {
         Ok(self.clone_without_state())
     }
 
+    /// Internal commit_metadata_transaction operation used by this module's domain boundary.
     fn commit_metadata_transaction(
         &mut self,
         io: &mut impl JournalIo,
@@ -287,6 +347,7 @@ impl<State> Journal<State> {
         self.clean_checkpointed_transaction(io, block_size, checkpointed)
     }
 
+    /// Internal write_prepared_transaction operation used by this module's domain boundary.
     fn write_prepared_transaction(
         &mut self,
         io: &mut impl JournalIo,
@@ -319,6 +380,7 @@ impl<State> Journal<State> {
         })
     }
 
+    /// Internal checkpoint_durable_transaction operation used by this module's domain boundary.
     fn checkpoint_durable_transaction(
         &mut self,
         io: &mut impl JournalIo,
@@ -336,6 +398,7 @@ impl<State> Journal<State> {
         })
     }
 
+    /// Internal clean_checkpointed_transaction operation used by this module's domain boundary.
     fn clean_checkpointed_transaction(
         &mut self,
         io: &mut impl JournalIo,
@@ -346,6 +409,7 @@ impl<State> Journal<State> {
         Ok(())
     }
 
+    /// Internal prepare_metadata_transaction operation used by this module's domain boundary.
     fn prepare_metadata_transaction(
         &self,
         block_size: BlockSize,
@@ -383,6 +447,7 @@ impl<State> Journal<State> {
         })
     }
 
+    /// Internal committed_transactions operation used by this module's domain boundary.
     fn committed_transactions(
         &self,
         io: &mut impl JournalIo,
@@ -436,6 +501,7 @@ impl<State> Journal<State> {
         })
     }
 
+    /// Internal parse_transaction operation used by this module's domain boundary.
     fn parse_transaction(
         &self,
         io: &mut impl JournalIo,
@@ -532,6 +598,7 @@ impl<State> Journal<State> {
         Ok(JournalTransactionScan::IncompleteTail)
     }
 
+    /// Internal read_journal_block operation used by this module's domain boundary.
     fn read_journal_block(
         &self,
         io: &mut impl JournalIo,
@@ -544,6 +611,7 @@ impl<State> Journal<State> {
         Ok(block)
     }
 
+    /// Internal validate_replay_target operation used by this module's domain boundary.
     fn validate_replay_target(&self, block: BlockAddress) -> Result<()> {
         if block.get() >= self.filesystem_blocks {
             return Err(Error::JournalCorrupt);
@@ -554,6 +622,7 @@ impl<State> Journal<State> {
         Ok(())
     }
 
+    /// Internal parse_descriptor_block operation used by this module's domain boundary.
     fn parse_descriptor_block(&self, block: &[u8]) -> Result<JournalDescriptor> {
         self.verify_block_tail_checksum(block)?;
         let mut offset = JOURNAL_HEADER_BYTES;
@@ -582,6 +651,7 @@ impl<State> Journal<State> {
         Ok(JournalDescriptor { tags })
     }
 
+    /// Internal parse_tag operation used by this module's domain boundary.
     fn parse_tag(
         &self,
         block: &[u8],
@@ -713,6 +783,7 @@ impl<State> Journal<State> {
         )))
     }
 
+    /// Internal parse_revoke_block operation used by this module's domain boundary.
     fn parse_revoke_block(&self, block: &[u8]) -> Result<JournalRevoke> {
         self.verify_block_tail_checksum(block)?;
         let used = usize::try_from(be_u32(block, JOURNAL_HEADER_BYTES)?)
@@ -750,6 +821,7 @@ impl<State> Journal<State> {
         Ok(JournalRevoke { blocks })
     }
 
+    /// Internal parse_commit_block operation used by this module's domain boundary.
     fn parse_commit_block(
         &self,
         block: &[u8],
@@ -777,6 +849,7 @@ impl<State> Journal<State> {
         })
     }
 
+    /// Internal encode_descriptor_block operation used by this module's domain boundary.
     fn encode_descriptor_block(
         &self,
         sequence: JournalSequence,
@@ -805,6 +878,7 @@ impl<State> Journal<State> {
         Ok(block)
     }
 
+    /// Internal encode_tag operation used by this module's domain boundary.
     fn encode_tag(
         &self,
         block: &mut [u8],
@@ -880,6 +954,7 @@ impl<State> Journal<State> {
         Ok(next)
     }
 
+    /// Internal encode_commit_block operation used by this module's domain boundary.
     fn encode_commit_block(
         &self,
         sequence: JournalSequence,
@@ -897,6 +972,7 @@ impl<State> Journal<State> {
         Ok(block)
     }
 
+    /// Internal mark_clean operation used by this module's domain boundary.
     fn mark_clean(
         &mut self,
         io: &mut impl JournalIo,
@@ -910,10 +986,12 @@ impl<State> Journal<State> {
         Ok(())
     }
 
+    /// Internal usable_log_blocks operation used by this module's domain boundary.
     fn usable_log_blocks(&self) -> Result<u32> {
         self.ring.usable_blocks()
     }
 
+    /// Internal descriptor_tag_capacity operation used by this module's domain boundary.
     fn descriptor_tag_capacity(&self) -> Result<usize> {
         let block_bytes =
             usize::try_from(self.superblock.block_size()).map_err(|_| Error::ArithmeticOverflow)?;
@@ -931,6 +1009,7 @@ impl<State> Journal<State> {
             .ok_or(Error::TransactionTooLarge)
     }
 
+    /// Internal descriptor_tag_size operation used by this module's domain boundary.
     fn descriptor_tag_size(&self) -> usize {
         if self.superblock.has_csum_v3() {
             16
@@ -941,6 +1020,7 @@ impl<State> Journal<State> {
         }
     }
 
+    /// Internal descriptor_payload_limit operation used by this module's domain boundary.
     fn descriptor_payload_limit(&self, block_len: usize) -> Result<usize> {
         if self.superblock.has_metadata_checksums() {
             block_len.checked_sub(4).ok_or(Error::InvalidSuperblock)
@@ -949,10 +1029,12 @@ impl<State> Journal<State> {
         }
     }
 
+    /// Internal next_logical operation used by this module's domain boundary.
     fn next_logical(&self, logical: u32) -> Result<u32> {
         self.ring.next(logical)
     }
 
+    /// Internal verify_tag_checksum operation used by this module's domain boundary.
     fn verify_tag_checksum(
         &self,
         sequence: JournalSequence,
@@ -980,6 +1062,7 @@ impl<State> Journal<State> {
         }
     }
 
+    /// Internal tag_checksum operation used by this module's domain boundary.
     fn tag_checksum(&self, sequence: JournalSequence, data: &[u8]) -> Result<u32> {
         let mut sequence_bytes = [0_u8; 4];
         put_be_u32(&mut sequence_bytes, 0, sequence.get())?;
@@ -988,6 +1071,7 @@ impl<State> Journal<State> {
         Ok(crc32c(seed, data))
     }
 
+    /// Internal verify_block_tail_checksum operation used by this module's domain boundary.
     fn verify_block_tail_checksum(&self, block: &[u8]) -> Result<()> {
         if !self.superblock.has_metadata_checksums() {
             return Ok(());
@@ -1002,6 +1086,7 @@ impl<State> Journal<State> {
         }
     }
 
+    /// Internal write_block_tail_checksum operation used by this module's domain boundary.
     fn write_block_tail_checksum(&self, block: &mut [u8]) -> Result<()> {
         if !self.superblock.has_metadata_checksums() {
             return Ok(());
@@ -1011,6 +1096,7 @@ impl<State> Journal<State> {
         put_be_u32(block, offset, checksum)
     }
 
+    /// Internal verify_commit_checksum operation used by this module's domain boundary.
     fn verify_commit_checksum(&self, block: &[u8]) -> Result<()> {
         let expected = be_u32(block, 0x10)?;
         let actual = self.block_checksum_with_zeroed(block, 0x10)?;
@@ -1021,6 +1107,7 @@ impl<State> Journal<State> {
         }
     }
 
+    /// Internal block_checksum_with_zeroed operation used by this module's domain boundary.
     fn block_checksum_with_zeroed(&self, block: &[u8], checksum_offset: usize) -> Result<u32> {
         let end = checksum_offset
             .checked_add(4)
@@ -1035,12 +1122,16 @@ impl<State> Journal<State> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal JournalRing state used to keep module invariants explicit.
 struct JournalRing {
+    /// Internal first state carried by this domain type.
     first: u32,
+    /// Internal maxlen state carried by this domain type.
     maxlen: u32,
 }
 
 impl JournalRing {
+    /// Internal new operation used by this module's domain boundary.
     fn new(superblock: &JournalSuperblock, capacity_blocks: u32) -> Result<Self> {
         let first = superblock.first();
         let maxlen = superblock.maxlen();
@@ -1056,12 +1147,14 @@ impl JournalRing {
         Ok(Self { first, maxlen })
     }
 
+    /// Internal usable_blocks operation used by this module's domain boundary.
     fn usable_blocks(self) -> Result<u32> {
         self.maxlen
             .checked_sub(self.first)
             .ok_or(Error::UnsupportedJournal)
     }
 
+    /// Internal next operation used by this module's domain boundary.
     fn next(self, logical: u32) -> Result<u32> {
         if logical < self.first || logical >= self.maxlen {
             return Err(Error::JournalCorrupt);
@@ -1076,12 +1169,16 @@ impl JournalRing {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal JournalLocation states used to make module control flow explicit.
 enum JournalLocation {
+    /// Internal Internal variant for this domain state.
     Internal(InternalJournalLayout),
+    /// Internal External variant for this domain state.
     External(ExternalJournalLayout),
 }
 
 impl JournalLocation {
+    /// Internal offset_of operation used by this module's domain boundary.
     fn offset_of(&self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
         match self {
             Self::Internal(layout) => block_size.offset_of(layout.map_logical(logical)?),
@@ -1089,6 +1186,7 @@ impl JournalLocation {
         }
     }
 
+    /// Internal validate_ring operation used by this module's domain boundary.
     fn validate_ring(&self, ring: &JournalRing) -> Result<()> {
         match self {
             Self::Internal(layout) => layout.validate_ring(ring),
@@ -1096,6 +1194,7 @@ impl JournalLocation {
         }
     }
 
+    /// Internal contains_home_block operation used by this module's domain boundary.
     fn contains_home_block(&self, block: BlockAddress) -> Result<bool> {
         match self {
             Self::Internal(layout) => layout.contains_physical(block),
@@ -1103,6 +1202,7 @@ impl JournalLocation {
         }
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     const fn capacity_blocks(&self) -> u32 {
         match self {
             Self::Internal(layout) => layout.capacity_blocks(),
@@ -1112,12 +1212,16 @@ impl JournalLocation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal InternalJournalLayout state used to keep module invariants explicit.
 struct InternalJournalLayout {
+    /// Internal extents state carried by this domain type.
     extents: Vec<JournalExtent>,
+    /// Internal capacity_blocks state carried by this domain type.
     capacity_blocks: u32,
 }
 
 impl InternalJournalLayout {
+    /// Internal new operation used by this module's domain boundary.
     fn new(extents: &[crate::extent::Extent], capacity_blocks: u32) -> Result<Self> {
         let mut mapped = Vec::with_capacity(extents.len());
         for extent in extents {
@@ -1143,6 +1247,7 @@ impl InternalJournalLayout {
         })
     }
 
+    /// Internal validate_ring operation used by this module's domain boundary.
     fn validate_ring(&self, ring: &JournalRing) -> Result<()> {
         let mut expected = 0_u32;
         for extent in &self.extents {
@@ -1157,6 +1262,7 @@ impl InternalJournalLayout {
         Err(Error::UnsupportedJournal)
     }
 
+    /// Internal map_logical operation used by this module's domain boundary.
     fn map_logical(&self, logical: u32) -> Result<BlockAddress> {
         for extent in &self.extents {
             if let Some(block) = extent.map_logical(logical)? {
@@ -1166,6 +1272,7 @@ impl InternalJournalLayout {
         Err(Error::UnsupportedJournal)
     }
 
+    /// Internal contains_physical operation used by this module's domain boundary.
     fn contains_physical(&self, block: BlockAddress) -> Result<bool> {
         for extent in &self.extents {
             if extent.contains_physical(block) {
@@ -1175,20 +1282,27 @@ impl InternalJournalLayout {
         Ok(false)
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     const fn capacity_blocks(&self) -> u32 {
         self.capacity_blocks
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal JournalExtent state used to keep module invariants explicit.
 struct JournalExtent {
+    /// Internal logical_start state carried by this domain type.
     logical_start: u32,
+    /// Internal logical_end state carried by this domain type.
     logical_end: u32,
+    /// Internal physical_start state carried by this domain type.
     physical_start: BlockAddress,
+    /// Internal physical_end state carried by this domain type.
     physical_end: u64,
 }
 
 impl JournalExtent {
+    /// Internal new operation used by this module's domain boundary.
     fn new(
         logical_start: u32,
         logical_end: u32,
@@ -1207,6 +1321,7 @@ impl JournalExtent {
         })
     }
 
+    /// Internal map_logical operation used by this module's domain boundary.
     fn map_logical(self, logical: u32) -> Result<Option<BlockAddress>> {
         if logical < self.logical_start || logical >= self.logical_end {
             return Ok(None);
@@ -1222,18 +1337,23 @@ impl JournalExtent {
         )))
     }
 
+    /// Internal contains_physical operation used by this module's domain boundary.
     fn contains_physical(self, block: BlockAddress) -> bool {
         block.get() >= self.physical_start.get() && block.get() < self.physical_end
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal ExternalJournalLayout state used to keep module invariants explicit.
 struct ExternalJournalLayout {
+    /// Internal base state carried by this domain type.
     base: ByteOffset,
+    /// Internal capacity_blocks state carried by this domain type.
     capacity_blocks: u32,
 }
 
 impl ExternalJournalLayout {
+    /// Internal new operation used by this module's domain boundary.
     fn new(journal: &impl BlockReader, block_size: BlockSize) -> Result<Self> {
         let base = ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET);
         let remaining = journal
@@ -1255,6 +1375,7 @@ impl ExternalJournalLayout {
         })
     }
 
+    /// Internal validate_ring operation used by this module's domain boundary.
     fn validate_ring(self, ring: &JournalRing) -> Result<()> {
         if ring.maxlen <= self.capacity_blocks {
             Ok(())
@@ -1263,6 +1384,7 @@ impl ExternalJournalLayout {
         }
     }
 
+    /// Internal offset_of operation used by this module's domain boundary.
     fn offset_of(self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
         if logical >= self.capacity_blocks {
             return Err(Error::UnsupportedJournal);
@@ -1279,27 +1401,41 @@ impl ExternalJournalLayout {
         ))
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     const fn capacity_blocks(self) -> u32 {
         self.capacity_blocks
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal JournalSuperblock state used to keep module invariants explicit.
 pub(crate) struct JournalSuperblock {
+    /// Internal raw state carried by this domain type.
     raw: Vec<u8>,
+    /// Internal block_size state carried by this domain type.
     block_size: u32,
+    /// Internal maxlen state carried by this domain type.
     maxlen: u32,
+    /// Internal first state carried by this domain type.
     first: u32,
+    /// Internal sequence state carried by this domain type.
     sequence: JournalSequence,
+    /// Internal start state carried by this domain type.
     start: u32,
+    /// Internal compat state carried by this domain type.
     compat: u32,
+    /// Internal incompat state carried by this domain type.
     incompat: u32,
+    /// Internal ro_compat state carried by this domain type.
     ro_compat: u32,
+    /// Internal uuid state carried by this domain type.
     uuid: [u8; 16],
+    /// Internal checksum_type state carried by this domain type.
     checksum_type: u8,
 }
 
 impl JournalSuperblock {
+    /// Internal parse operation used by this module's domain boundary.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < JOURNAL_SUPERBLOCK_BYTES {
             return Err(Error::TruncatedStructure);
@@ -1328,6 +1464,7 @@ impl JournalSuperblock {
         })
     }
 
+    /// Internal validate_for_mount operation used by this module's domain boundary.
     fn validate_for_mount(
         &self,
         block_size: BlockSize,
@@ -1356,6 +1493,7 @@ impl JournalSuperblock {
         JournalRing::new(self, capacity_blocks)
     }
 
+    /// Internal encode_with_state operation used by this module's domain boundary.
     fn encode_with_state(
         &self,
         block_size: BlockSize,
@@ -1376,10 +1514,12 @@ impl JournalSuperblock {
         Ok(block)
     }
 
+    /// Internal encode_clean operation used by this module's domain boundary.
     fn encode_clean(&self, block_size: BlockSize, sequence: JournalSequence) -> Result<Vec<u8>> {
         self.encode_with_state(block_size, sequence, 0)
     }
 
+    /// Internal encode_dirty operation used by this module's domain boundary.
     fn encode_dirty(
         &self,
         block_size: BlockSize,
@@ -1389,66 +1529,82 @@ impl JournalSuperblock {
         self.encode_with_state(block_size, sequence, start)
     }
 
+    /// Internal apply_clean operation used by this module's domain boundary.
     fn apply_clean(&mut self, sequence: JournalSequence, raw: Vec<u8>) {
         self.sequence = sequence;
         self.start = 0;
         self.raw = raw;
     }
 
+    /// Internal apply_dirty operation used by this module's domain boundary.
     fn apply_dirty(&mut self, start: u32, sequence: JournalSequence, raw: Vec<u8>) {
         self.start = start;
         self.sequence = sequence;
         self.raw = raw;
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     pub(crate) const fn block_size(&self) -> u32 {
         self.block_size
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     pub(crate) const fn maxlen(&self) -> u32 {
         self.maxlen
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     pub(crate) const fn first(&self) -> u32 {
         self.first
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     pub(crate) const fn sequence(&self) -> JournalSequence {
         self.sequence
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     pub(crate) const fn start(&self) -> u32 {
         self.start
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     pub(crate) const fn uuid(&self) -> &[u8; 16] {
         &self.uuid
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     pub(crate) const fn has_64bit(&self) -> bool {
         self.incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0
     }
 
+    /// Internal has_csum_v3 operation used by this module's domain boundary.
     fn has_csum_v3(&self) -> bool {
         self.incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0
     }
 
+    /// Internal has_metadata_checksums operation used by this module's domain boundary.
     fn has_metadata_checksums(&self) -> bool {
         self.incompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0
     }
 
+    /// Internal has_superblock_checksum operation used by this module's domain boundary.
     fn has_superblock_checksum(&self) -> Result<bool> {
         Ok(be_u32(&self.raw, 0xFC)? != 0)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal Jbd2Header state used to keep module invariants explicit.
 pub(crate) struct Jbd2Header {
+    /// Internal block_type state carried by this domain type.
     block_type: u32,
+    /// Internal sequence state carried by this domain type.
     sequence: u32,
 }
 
 impl Jbd2Header {
+    /// Internal parse operation used by this module's domain boundary.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < JOURNAL_HEADER_BYTES {
             return Err(Error::TruncatedStructure);
@@ -1462,6 +1618,7 @@ impl Jbd2Header {
         })
     }
 
+    /// Internal descriptor operation used by this module's domain boundary.
     pub(crate) fn descriptor(sequence: u32) -> Self {
         Self {
             block_type: JBD2_DESCRIPTOR_BLOCK,
@@ -1469,6 +1626,7 @@ impl Jbd2Header {
         }
     }
 
+    /// Internal commit operation used by this module's domain boundary.
     pub(crate) fn commit(sequence: u32) -> Self {
         Self {
             block_type: JBD2_COMMIT_BLOCK,
@@ -1476,6 +1634,7 @@ impl Jbd2Header {
         }
     }
 
+    /// Internal encode operation used by this module's domain boundary.
     pub(crate) fn encode(self, bytes: &mut [u8]) -> Result<()> {
         if bytes.len() < JOURNAL_HEADER_BYTES {
             return Err(Error::TruncatedStructure);
@@ -1485,109 +1644,163 @@ impl Jbd2Header {
         put_be_u32(bytes, 8, self.sequence)
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     pub(crate) const fn block_type(self) -> u32 {
         self.block_type
     }
 
+    /// Internal fn operation used by this module's domain boundary.
     pub(crate) const fn sequence(self) -> u32 {
         self.sequence
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal JournalTransaction state used to keep module invariants explicit.
 struct JournalTransaction {
+    /// Internal sequence state carried by this domain type.
     sequence: JournalSequence,
+    /// Internal events state carried by this domain type.
     events: Vec<JournalTransactionEvent>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal JournalReplayScan state used to keep module invariants explicit.
 struct JournalReplayScan {
+    /// Internal transactions state carried by this domain type.
     transactions: Vec<JournalTransaction>,
+    /// Internal tail state carried by this domain type.
     tail: JournalScanTail,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal PreparedJournalTransaction state used to keep module invariants explicit.
 struct PreparedJournalTransaction {
+    /// Internal sequence state carried by this domain type.
     sequence: JournalSequence,
+    /// Internal next_sequence state carried by this domain type.
     next_sequence: JournalSequence,
+    /// Internal descriptor state carried by this domain type.
     descriptor: u32,
+    /// Internal descriptor_block state carried by this domain type.
     descriptor_block: Vec<u8>,
+    /// Internal data_blocks state carried by this domain type.
     data_blocks: Vec<Vec<u8>>,
+    /// Internal commit_block state carried by this domain type.
     commit_block: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal JournalDurableTransaction state used to keep module invariants explicit.
 struct JournalDurableTransaction {
+    /// Internal next_sequence state carried by this domain type.
     next_sequence: JournalSequence,
+    /// Internal state state carried by this domain type.
     state: PhantomData<DirtyJournal>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal CheckpointedJournalTransaction state used to keep module invariants explicit.
 struct CheckpointedJournalTransaction {
+    /// Internal next_sequence state carried by this domain type.
     next_sequence: JournalSequence,
+    /// Internal state state carried by this domain type.
     state: PhantomData<CheckpointedJournal>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal JournalScanTail states used to make module control flow explicit.
 enum JournalScanTail {
+    /// Internal CleanSuperblock variant for this domain state.
     CleanSuperblock,
+    /// Internal EndOfLog variant for this domain state.
     EndOfLog,
+    /// Internal IncompleteTail variant for this domain state.
     IncompleteTail,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal JournalTransactionScan states used to make module control flow explicit.
 enum JournalTransactionScan {
+    /// Internal Committed variant for this domain state.
     Committed {
+        /// Internal transaction state carried by this domain type.
         transaction: JournalTransaction,
+        /// Internal next_cursor state carried by this domain type.
         next_cursor: u32,
+        /// Internal consumed state carried by this domain type.
         consumed: u32,
     },
+    /// Internal IncompleteTail variant for this domain state.
     IncompleteTail,
+    /// Internal EndOfLog variant for this domain state.
     EndOfLog,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal JournalEntry state used to keep module invariants explicit.
 struct JournalEntry {
+    /// Internal home state carried by this domain type.
     home: BlockAddress,
+    /// Internal bytes state carried by this domain type.
     bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal JournalTransactionEvent states used to make module control flow explicit.
 enum JournalTransactionEvent {
+    /// Internal Entry variant for this domain state.
     Entry(JournalEntry),
+    /// Internal Revoke variant for this domain state.
     Revoke(BlockAddress),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal JournalDescriptor state used to keep module invariants explicit.
 struct JournalDescriptor {
+    /// Internal tags state carried by this domain type.
     tags: Vec<JournalTag>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal JournalTag state used to keep module invariants explicit.
 struct JournalTag {
+    /// Internal block state carried by this domain type.
     block: BlockAddress,
+    /// Internal flags state carried by this domain type.
     flags: u32,
+    /// Internal checksum state carried by this domain type.
     checksum: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Internal JournalRevoke state used to keep module invariants explicit.
 struct JournalRevoke {
+    /// Internal blocks state carried by this domain type.
     blocks: Vec<BlockAddress>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal JournalCommit state used to keep module invariants explicit.
 struct JournalCommit {
+    /// Internal sequence state carried by this domain type.
     sequence: JournalSequence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal RevokedBlock state used to keep module invariants explicit.
 struct RevokedBlock {
+    /// Internal sequence state carried by this domain type.
     sequence: JournalSequence,
+    /// Internal order state carried by this domain type.
     order: usize,
+    /// Internal block state carried by this domain type.
     block: BlockAddress,
 }
 
+/// Internal JournalIo boundary used by this module.
 trait JournalIo {
+    /// Internal read_journal_block operation used by this module's domain boundary.
     fn read_journal_block<S>(
         &mut self,
         journal: &Journal<S>,
@@ -1596,6 +1809,7 @@ trait JournalIo {
         out: &mut [u8],
     ) -> Result<()>;
 
+    /// Internal write_journal_block operation used by this module's domain boundary.
     fn write_journal_block<S>(
         &mut self,
         journal: &Journal<S>,
@@ -1604,6 +1818,7 @@ trait JournalIo {
         bytes: &[u8],
     ) -> Result<()>;
 
+    /// Internal write_home_block operation used by this module's domain boundary.
     fn write_home_block(
         &mut self,
         block_size: BlockSize,
@@ -1611,10 +1826,13 @@ trait JournalIo {
         bytes: &[u8],
     ) -> Result<()>;
 
+    /// Internal flush_all operation used by this module's domain boundary.
     fn flush_all(&mut self) -> Result<()>;
 }
 
+/// Internal InternalJournalIo state used to keep module invariants explicit.
 struct InternalJournalIo<'a, D> {
+    /// Internal device state carried by this domain type.
     device: &'a mut D,
 }
 
@@ -1656,8 +1874,11 @@ impl<D: BlockWriter> JournalIo for InternalJournalIo<'_, D> {
     }
 }
 
+/// Internal ExternalJournalIo state used to keep module invariants explicit.
 struct ExternalJournalIo<'a, F, J> {
+    /// Internal filesystem state carried by this domain type.
     filesystem: &'a mut F,
+    /// Internal journal state carried by this domain type.
     journal: &'a mut J,
 }
 
@@ -1701,11 +1922,13 @@ impl<F: BlockWriter, J: BlockWriter> JournalIo for ExternalJournalIo<'_, F, J> {
 }
 
 impl<State> Journal<State> {
+    /// Internal offset_of operation used by this module's domain boundary.
     fn offset_of(&self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
         self.location.offset_of(logical, block_size)
     }
 }
 
+/// Internal read_journal_block operation used by this module's domain boundary.
 fn read_journal_block(
     reader: &impl BlockReader,
     location: &JournalLocation,
@@ -1717,12 +1940,14 @@ fn read_journal_block(
     reader.read_exact_at(offset, out)
 }
 
+/// Internal starts_with_jbd2_magic operation used by this module's domain boundary.
 fn starts_with_jbd2_magic(bytes: &[u8]) -> bool {
     bytes
         .get(0..4)
         .is_some_and(|prefix| prefix == JBD2_MAGIC.to_be_bytes())
 }
 
+/// Internal validate_tag_flags operation used by this module's domain boundary.
 fn validate_tag_flags(flags: u32) -> Result<()> {
     const SUPPORTED_TAG_FLAGS: u32 = JBD2_TAG_FLAG_ESCAPE
         | JBD2_TAG_FLAG_SAME_UUID
@@ -1735,6 +1960,7 @@ fn validate_tag_flags(flags: u32) -> Result<()> {
     }
 }
 
+/// Internal transaction_tail operation used by this module's domain boundary.
 fn transaction_tail(consumed: u32) -> JournalTransactionScan {
     if consumed == 0 {
         JournalTransactionScan::EndOfLog
@@ -1743,6 +1969,7 @@ fn transaction_tail(consumed: u32) -> JournalTransactionScan {
     }
 }
 
+/// Internal verify_journal_superblock_checksum operation used by this module's domain boundary.
 fn verify_journal_superblock_checksum(block: &[u8]) -> Result<()> {
     let expected = be_u32(block, 0xFC)?;
     let actual = journal_superblock_checksum(block)?;
@@ -1753,12 +1980,14 @@ fn verify_journal_superblock_checksum(block: &[u8]) -> Result<()> {
     }
 }
 
+/// Internal refresh_journal_superblock_checksum operation used by this module's domain boundary.
 fn refresh_journal_superblock_checksum(block: &mut [u8]) -> Result<()> {
     put_be_u32(block, 0xFC, 0)?;
     let checksum = journal_superblock_checksum(block)?;
     put_be_u32(block, 0xFC, checksum)
 }
 
+/// Internal journal_superblock_checksum operation used by this module's domain boundary.
 fn journal_superblock_checksum(block: &[u8]) -> Result<u32> {
     let mut checked = block
         .get(..JOURNAL_SUPERBLOCK_BYTES)
@@ -1771,6 +2000,7 @@ fn journal_superblock_checksum(block: &[u8]) -> Result<u32> {
     Ok(crc32c(0, &checked))
 }
 
+/// Internal is_revoked_after operation used by this module's domain boundary.
 fn is_revoked_after(
     revokes: &[RevokedBlock],
     block: BlockAddress,

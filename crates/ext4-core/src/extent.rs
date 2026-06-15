@@ -7,12 +7,19 @@ use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
 use crate::inode::InodeExtentRoot;
 
+/// Magic value stored at the start of every ext4 extent header.
 const EXTENT_MAGIC: u16 = 0xF30A;
+/// Size of an extent or index header in bytes.
 const EXTENT_HEADER_SIZE: usize = 12;
+/// Size of one extent leaf or index entry in bytes.
 const EXTENT_ENTRY_SIZE: usize = 12;
+/// High bit of `ee_len` marking uninitialized extents.
 const EXTENT_LEN_UNINITIALIZED: u16 = 0x8000;
+/// Bytes available in an inode `i_block` extent root.
 const INODE_ROOT_BYTES: usize = 60;
+/// Maximum leaf extents that fit in an inode root without external blocks.
 const INODE_ROOT_EXTENT_CAPACITY: usize = 4;
+/// ext4 extent trees are bounded; deeper trees are rejected before recursion.
 const MAX_EXTENT_DEPTH: u16 = 5;
 
 /// Logical block address inside a file.
@@ -84,6 +91,7 @@ impl ExtentLength {
         u64::from(self.0)
     }
 
+    /// Returns this length plus one while preserving the non-zero invariant.
     pub(crate) fn checked_add_one(self) -> Result<Self> {
         Self::new(self.0.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
     }
@@ -101,12 +109,16 @@ pub enum BlockMapping {
 /// A leaf extent mapping a logical block run to a physical block run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Extent {
+    /// First logical file block covered by this run.
     logical_start: LogicalBlock,
+    /// Non-zero number of logical blocks in this run.
     len: ExtentLength,
+    /// First physical filesystem block backing this run.
     physical_start: BlockAddress,
 }
 
 impl Extent {
+    /// Creates a typed extent after callers have validated on-disk fields.
     pub(crate) fn new(
         logical_start: LogicalBlock,
         len: ExtentLength,
@@ -137,6 +149,7 @@ impl Extent {
         self.physical_start
     }
 
+    /// Returns the exclusive logical end of this extent.
     pub(crate) fn end_logical(self) -> Result<u32> {
         self.logical_start
             .as_u32()
@@ -167,6 +180,7 @@ impl Extent {
 /// Parsed extent tree from an inode's `i_block` and external extent blocks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtentTree {
+    /// Leaf extents collected in on-disk traversal order.
     extents: Vec<Extent>,
 }
 
@@ -219,6 +233,7 @@ impl ExtentTree {
     }
 }
 
+/// Serializes a depth-0 extent root back into the inode `i_block` field.
 pub(crate) fn serialize_inode_root(extents: &[Extent]) -> Result<[u8; INODE_ROOT_BYTES]> {
     if extents.len() > INODE_ROOT_EXTENT_CAPACITY {
         return Err(Error::UnsupportedExtentDepth);
@@ -267,12 +282,15 @@ pub(crate) fn serialize_inode_root(extents: &[Extent]) -> Result<[u8; INODE_ROOT
     Ok(raw)
 }
 
+/// Internal parse_node_recursive operation used by this module's domain boundary.
 fn parse_node_recursive(
     raw: &[u8],
     block_size: BlockSize,
     reader: &impl BlockReader,
     extents: &mut Vec<Extent>,
 ) -> Result<()> {
+    // The inode root and external extent blocks share the same header format;
+    // recursion only begins after the root confirms a non-zero depth.
     let depth = parse_node(raw, None, extents)?;
     if depth == 0 {
         return Ok(());
@@ -280,6 +298,7 @@ fn parse_node_recursive(
     parse_index_node(raw, depth, block_size, reader, extents)
 }
 
+/// Internal parse_index_node operation used by this module's domain boundary.
 fn parse_index_node(
     raw: &[u8],
     depth: u16,
@@ -287,6 +306,8 @@ fn parse_index_node(
     reader: &impl BlockReader,
     extents: &mut Vec<Extent>,
 ) -> Result<()> {
+    // Index entries point at child extent blocks; each child depth must be one
+    // less than the parent to prevent malformed cycles from masquerading as a tree.
     let entries = header_entries(raw)?;
     for entry_index in 0..entries {
         let offset = entry_offset(entry_index)?;
@@ -320,6 +341,7 @@ fn parse_index_node(
     Ok(())
 }
 
+/// Internal parse_node operation used by this module's domain boundary.
 fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>) -> Result<u16> {
     if le_u16(raw, 0)? != EXTENT_MAGIC {
         return Err(Error::InvalidExtentTree);
@@ -354,6 +376,7 @@ fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>
     Ok(depth)
 }
 
+/// Parses one leaf extent entry from `raw`.
 fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
     let logical_start = LogicalBlock::from_u32(le_u32(raw, offset)?);
     let raw_len = le_u16(raw, offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?)?;
@@ -373,6 +396,7 @@ fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
     ))
 }
 
+/// Reads the extent-header entry count after validating header size.
 fn header_entries(raw: &[u8]) -> Result<usize> {
     if raw.len() < EXTENT_HEADER_SIZE {
         return Err(Error::InvalidExtentTree);
@@ -380,6 +404,7 @@ fn header_entries(raw: &[u8]) -> Result<usize> {
     Ok(usize::from(le_u16(raw, 2)?))
 }
 
+/// Computes the byte offset of one extent or index entry.
 fn entry_offset(entry_index: usize) -> Result<usize> {
     EXTENT_HEADER_SIZE
         .checked_add(

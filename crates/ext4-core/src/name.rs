@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 /// Raw ext4 directory entry name.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ext4Name {
+    /// Internal bytes state carried by this domain type.
     bytes: Vec<u8>,
 }
 
@@ -39,6 +40,7 @@ impl Ext4Name {
 /// Name that can be losslessly exposed through the Windows UTF-16 namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowsName {
+    /// Internal utf16 state carried by this domain type.
     utf16: Vec<u16>,
 }
 
@@ -117,6 +119,7 @@ impl WindowsName {
     }
 }
 
+/// Internal fold_ascii_u16 operation used by this module's domain boundary.
 fn fold_ascii_u16(value: u16) -> u16 {
     match value {
         0x0041..=0x005A => value | 0x0020,

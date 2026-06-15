@@ -4,13 +4,7 @@
 //! not expose Windows types, NTSTATUS values, IRPs, or driver lifetime state.
 
 #![no_std]
-#![cfg_attr(
-    not(test),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "private parser offsets and backing fields repeat documented ext4 domain concepts"
-    )
-)]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 

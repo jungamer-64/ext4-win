@@ -158,6 +158,7 @@ impl<T: BlockWriter + ?Sized> BlockWriter for &mut T {
 /// In-memory block device used by host tests and parser fixtures.
 #[derive(Clone, Copy, Debug)]
 pub struct SliceBlockDevice<'a> {
+    /// Whole device image exposed through checked random-access reads.
     bytes: &'a [u8],
 }
 
@@ -186,6 +187,7 @@ impl BlockReader for SliceBlockDevice<'_> {
 /// Mutable in-memory block device used by write transaction tests.
 #[derive(Debug)]
 pub struct SliceBlockDeviceMut<'a> {
+    /// Whole mutable device image exposed through checked random-access I/O.
     bytes: &'a mut [u8],
 }
 
