@@ -90,13 +90,18 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
             state: ReadOnly,
         };
         let journal_inode = read_only.read_inode(InodeId::new(superblock.journal_inode()))?;
-        let journal =
-            Journal::from_inode(&journal_inode, superblock.block_size(), &read_only.device)?;
+        let journal = Journal::from_inode(
+            &journal_inode,
+            superblock.block_size(),
+            superblock.block_count(),
+            &read_only.device,
+        )?;
         let mut journal = InternalJournal { journal };
+        let needs_recovery = superblock.needs_recovery();
         journal
             .journal
-            .replay_and_checkpoint_internal(&mut device, superblock.block_size())?;
-        if superblock.needs_recovery() {
+            .replay_and_checkpoint_internal(&mut device, superblock.block_size(), needs_recovery)?;
+        if needs_recovery {
             Superblock::clear_recover_on_device(&mut device)?;
             superblock = Superblock::read_write_from(&device)?;
         }
@@ -142,17 +147,20 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
             &journal_device,
             superblock.block_size(),
             superblock.journal_uuid(),
+            superblock.block_count(),
         )?;
         let mut journal = ExternalJournal {
             device: journal_device,
             journal,
         };
+        let needs_recovery = superblock.needs_recovery();
         journal.journal.replay_and_checkpoint_external(
             &mut device,
             &mut journal.device,
             superblock.block_size(),
+            needs_recovery,
         )?;
-        if superblock.needs_recovery() {
+        if needs_recovery {
             Superblock::clear_recover_on_device(&mut device)?;
             superblock = Superblock::read_write_from(&device)?;
         }

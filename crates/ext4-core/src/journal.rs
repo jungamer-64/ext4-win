@@ -23,7 +23,6 @@ const JBD2_FEATURE_INCOMPAT_CSUM_V3: u32 = 0x0010;
 const JBD2_FEATURE_INCOMPAT_FAST_COMMIT: u32 = 0x0020;
 const JBD2_SUPPORTED_INCOMPAT: u32 = JBD2_FEATURE_INCOMPAT_REVOKE
     | JBD2_FEATURE_INCOMPAT_64BIT
-    | JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT
     | JBD2_FEATURE_INCOMPAT_CSUM_V2
     | JBD2_FEATURE_INCOMPAT_CSUM_V3;
 
@@ -42,12 +41,44 @@ const JOURNAL_OVERHEAD_BLOCKS: u32 = 2;
 pub(crate) struct Journal {
     location: JournalLocation,
     superblock: JournalSuperblock,
+    filesystem_blocks: u64,
+    state: JournalState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalState {
+    Loaded,
+    Clean,
+    Dirty,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JournalSequence(u32);
+
+impl JournalSequence {
+    const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    const fn get(self) -> u32 {
+        self.0
+    }
+
+    const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+
+    const fn is_after(self, other: Self) -> bool {
+        let distance = self.0.wrapping_sub(other.0);
+        distance != 0 && distance < 0x8000_0000
+    }
 }
 
 impl Journal {
     pub(crate) fn from_inode(
         inode: &Inode,
         block_size: BlockSize,
+        filesystem_blocks: u64,
         reader: &impl BlockReader,
     ) -> Result<Self> {
         if inode.size() == 0 || block_size.bytes() == 0 {
@@ -84,6 +115,8 @@ impl Journal {
         Ok(Self {
             location,
             superblock,
+            filesystem_blocks,
+            state: JournalState::Loaded,
         })
     }
 
@@ -91,6 +124,7 @@ impl Journal {
         journal: &impl BlockReader,
         block_size: BlockSize,
         expected_uuid: [u8; 16],
+        filesystem_blocks: u64,
     ) -> Result<Self> {
         let mut raw =
             vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
@@ -108,6 +142,8 @@ impl Journal {
                 base: ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET),
             },
             superblock,
+            filesystem_blocks,
+            state: JournalState::Loaded,
         })
     }
 
@@ -127,9 +163,10 @@ impl Journal {
         &mut self,
         filesystem: &mut impl BlockWriter,
         block_size: BlockSize,
+        recovery_required: bool,
     ) -> Result<()> {
         let mut io = InternalJournalIo { device: filesystem };
-        self.replay_and_checkpoint(&mut io, block_size)
+        self.replay_and_checkpoint(&mut io, block_size, recovery_required)
     }
 
     pub(crate) fn replay_and_checkpoint_external(
@@ -137,12 +174,13 @@ impl Journal {
         filesystem: &mut impl BlockWriter,
         journal: &mut impl BlockWriter,
         block_size: BlockSize,
+        recovery_required: bool,
     ) -> Result<()> {
         let mut io = ExternalJournalIo {
             filesystem,
             journal,
         };
-        self.replay_and_checkpoint(&mut io, block_size)
+        self.replay_and_checkpoint(&mut io, block_size, recovery_required)
     }
 
     pub(crate) fn commit_internal(
@@ -173,14 +211,22 @@ impl Journal {
         &mut self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
+        recovery_required: bool,
     ) -> Result<()> {
+        if self.state == JournalState::Dirty {
+            return Err(Error::JournalCorrupt);
+        }
+        if recovery_required && self.superblock.start() == 0 {
+            return Err(Error::JournalCorrupt);
+        }
         let scan = self.committed_transactions(io, block_size)?;
-        match scan.tail {
-            JournalScanTail::CleanSuperblock
-            | JournalScanTail::EndOfLog
-            | JournalScanTail::IncompleteTail => {}
+        if scan.tail == JournalScanTail::CleanSuperblock {
+            self.state = JournalState::Clean;
+            return Ok(());
         }
         if scan.transactions.is_empty() {
+            self.mark_clean(io, block_size, self.superblock.sequence())?;
+            self.state = JournalState::Clean;
             return Ok(());
         }
 
@@ -196,10 +242,7 @@ impl Journal {
 
         let mut next_sequence = self.superblock.sequence();
         for transaction in &scan.transactions {
-            next_sequence = transaction
-                .sequence
-                .checked_add(1)
-                .ok_or(Error::ArithmeticOverflow)?;
+            next_sequence = transaction.sequence.next();
             for entry in &transaction.entries {
                 if is_revoked_after(&revokes, entry.home, transaction.sequence) {
                     continue;
@@ -208,7 +251,9 @@ impl Journal {
             }
         }
         io.flush_all()?;
-        self.mark_clean(io, block_size, next_sequence)
+        self.mark_clean(io, block_size, next_sequence)?;
+        self.state = JournalState::Clean;
+        Ok(())
     }
 
     fn commit_metadata_transaction(
@@ -252,7 +297,7 @@ impl Journal {
         self.mark_clean(
             io,
             block_size,
-            sequence.checked_add(1).ok_or(Error::ArithmeticOverflow)?,
+            sequence.next(),
         )
     }
 
@@ -281,7 +326,7 @@ impl Journal {
                 } => {
                     transactions.push(transaction);
                     cursor = next_cursor;
-                    sequence = sequence.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                    sequence = sequence.next();
                     consumed = consumed
                         .checked_add(transaction_blocks)
                         .ok_or(Error::ArithmeticOverflow)?;
@@ -293,6 +338,9 @@ impl Journal {
                     });
                 }
                 JournalTransactionScan::EndOfLog => {
+                    if transactions.is_empty() {
+                        return Err(Error::JournalCorrupt);
+                    }
                     return Ok(JournalReplayScan {
                         transactions,
                         tail: JournalScanTail::EndOfLog,
@@ -311,7 +359,7 @@ impl Journal {
         io: &mut impl JournalIo,
         block_size: BlockSize,
         start: u32,
-        sequence: u32,
+        sequence: JournalSequence,
     ) -> Result<JournalTransactionScan> {
         let mut transaction = JournalTransaction {
             sequence,
@@ -326,7 +374,7 @@ impl Journal {
             let Ok(header) = Jbd2Header::parse(&block) else {
                 return Ok(transaction_tail(consumed));
             };
-            if header.sequence() != sequence {
+            if header.sequence() != sequence.get() {
                 return Ok(transaction_tail(consumed));
             }
 
@@ -340,11 +388,15 @@ impl Journal {
                     consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
                     for tag in descriptor.tags {
                         let mut data = self.read_journal_block(io, block_size, cursor)?;
-                        if tag.flags & JBD2_TAG_FLAG_ESCAPE != 0 {
-                            put_be_u32(&mut data, 0, JBD2_MAGIC)?;
-                        }
                         if tag.flags & JBD2_TAG_FLAG_DELETED == 0 {
                             self.verify_tag_checksum(sequence, &tag, &data)?;
+                            if tag.flags & JBD2_TAG_FLAG_ESCAPE != 0 {
+                                if be_u32(&data, 0)? != 0 {
+                                    return Err(Error::JournalCorrupt);
+                                }
+                                put_be_u32(&mut data, 0, JBD2_MAGIC)?;
+                            }
+                            self.validate_replay_target(tag.block)?;
                             transaction.revokes.retain(|block| *block != tag.block);
                             transaction.entries.push(JournalEntry {
                                 home: tag.block,
@@ -393,6 +445,18 @@ impl Journal {
             vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
         io.read_journal_block(self, block_size, logical, &mut block)?;
         Ok(block)
+    }
+
+    fn validate_replay_target(&self, block: BlockAddress) -> Result<()> {
+        if block.get() >= self.filesystem_blocks {
+            return Err(Error::JournalCorrupt);
+        }
+        if let JournalLocation::Internal { blocks } = &self.location {
+            if blocks.contains(&block) {
+                return Err(Error::JournalCorrupt);
+            }
+        }
+        Ok(())
     }
 
     fn parse_descriptor_block(&self, block: &[u8]) -> Result<JournalDescriptor> {
@@ -554,6 +618,9 @@ impl Journal {
                 .checked_add(entry_size)
                 .ok_or(Error::ArithmeticOverflow)?;
         }
+        if offset != limit {
+            return Err(Error::JournalCorrupt);
+        }
         Ok(JournalRevoke { blocks })
     }
 
@@ -562,23 +629,28 @@ impl Journal {
         if header.block_type() != JBD2_COMMIT_BLOCK {
             return Err(Error::JournalCorrupt);
         }
-        if self.superblock.has_metadata_checksums() && be_u32(block, 0x10)? != 0 {
+        if self.superblock.has_metadata_checksums() {
+            if *block.get(0x0C).ok_or(Error::TruncatedStructure)? != JBD2_CHECKSUM_CRC32C
+                || *block.get(0x0D).ok_or(Error::TruncatedStructure)? != 4
+            {
+                return Err(Error::JournalCorrupt);
+            }
             self.verify_commit_checksum(block)?;
         }
         Ok(JournalCommit {
-            sequence: header.sequence(),
+            sequence: JournalSequence::new(header.sequence()),
         })
     }
 
     fn encode_descriptor_block(
         &self,
-        sequence: u32,
+        sequence: JournalSequence,
         metadata_blocks: &[MetadataBlock],
         block_size: BlockSize,
     ) -> Result<Vec<u8>> {
         let mut block =
             vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
-        Jbd2Header::descriptor(sequence).encode(&mut block)?;
+        Jbd2Header::descriptor(sequence.get()).encode(&mut block)?;
         let mut offset = JOURNAL_HEADER_BYTES;
         for (index, metadata) in metadata_blocks.iter().enumerate() {
             let last =
@@ -600,7 +672,7 @@ impl Journal {
         &self,
         block: &mut [u8],
         offset: usize,
-        sequence: u32,
+        sequence: JournalSequence,
         metadata: &MetadataBlock,
         flags: u32,
     ) -> Result<usize> {
@@ -670,10 +742,14 @@ impl Journal {
         Ok(next)
     }
 
-    fn encode_commit_block(&self, sequence: u32, block_size: BlockSize) -> Result<Vec<u8>> {
+    fn encode_commit_block(
+        &self,
+        sequence: JournalSequence,
+        block_size: BlockSize,
+    ) -> Result<Vec<u8>> {
         let mut block =
             vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
-        Jbd2Header::commit(sequence).encode(&mut block)?;
+        Jbd2Header::commit(sequence.get()).encode(&mut block)?;
         if self.superblock.has_metadata_checksums() {
             *block.get_mut(0x0C).ok_or(Error::TruncatedStructure)? = JBD2_CHECKSUM_CRC32C;
             *block.get_mut(0x0D).ok_or(Error::TruncatedStructure)? = 4;
@@ -687,7 +763,7 @@ impl Journal {
         &mut self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
-        next_sequence: u32,
+        next_sequence: JournalSequence,
     ) -> Result<()> {
         self.superblock.set_clean(next_sequence);
         let block = self.superblock.encode(block_size)?;
@@ -711,8 +787,13 @@ impl Journal {
         }
     }
 
-    fn verify_tag_checksum(&self, sequence: u32, tag: &JournalTag, data: &[u8]) -> Result<()> {
-        if tag.checksum == 0 {
+    fn verify_tag_checksum(
+        &self,
+        sequence: JournalSequence,
+        tag: &JournalTag,
+        data: &[u8],
+    ) -> Result<()> {
+        if !self.superblock.has_metadata_checksums() {
             return Ok(());
         }
         let actual = self.tag_checksum(sequence, data)?;
@@ -733,9 +814,9 @@ impl Journal {
         }
     }
 
-    fn tag_checksum(&self, sequence: u32, data: &[u8]) -> Result<u32> {
+    fn tag_checksum(&self, sequence: JournalSequence, data: &[u8]) -> Result<u32> {
         let mut sequence_bytes = [0_u8; 4];
-        put_be_u32(&mut sequence_bytes, 0, sequence)?;
+        put_be_u32(&mut sequence_bytes, 0, sequence.get())?;
         let seed = crc32c(0, self.superblock.uuid());
         let seed = crc32c(seed, &sequence_bytes);
         Ok(crc32c(seed, data))
@@ -747,9 +828,6 @@ impl Journal {
         }
         let offset = block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)?;
         let expected = be_u32(block, offset)?;
-        if expected == 0 {
-            return Ok(());
-        }
         let actual = self.block_checksum_with_zeroed(block, offset)?;
         if actual == expected {
             Ok(())
@@ -801,10 +879,11 @@ pub(crate) struct JournalSuperblock {
     block_size: u32,
     maxlen: u32,
     first: u32,
-    sequence: u32,
+    sequence: JournalSequence,
     start: u32,
     compat: u32,
     incompat: u32,
+    ro_compat: u32,
     uuid: [u8; 16],
     checksum_type: u8,
 }
@@ -824,10 +903,11 @@ impl JournalSuperblock {
             block_size: be_u32(bytes, 0x0C)?,
             maxlen: be_u32(bytes, 0x10)?,
             first: be_u32(bytes, 0x14)?,
-            sequence: be_u32(bytes, 0x18)?,
+            sequence: JournalSequence::new(be_u32(bytes, 0x18)?),
             start: be_u32(bytes, 0x1C)?,
             compat: be_u32(bytes, 0x24)?,
             incompat: be_u32(bytes, 0x28)?,
+            ro_compat: be_u32(bytes, 0x2C)?,
             uuid,
             checksum_type: *bytes.get(0x50).ok_or(Error::TruncatedStructure)?,
         })
@@ -843,10 +923,15 @@ impl JournalSuperblock {
         {
             return Err(Error::UnsupportedJournal);
         }
-        if self.incompat & JBD2_FEATURE_INCOMPAT_FAST_COMMIT != 0 {
+        if self.incompat & (JBD2_FEATURE_INCOMPAT_FAST_COMMIT | JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT)
+            != 0
+        {
             return Err(Error::UnsupportedJournal);
         }
         if self.incompat & !JBD2_SUPPORTED_INCOMPAT != 0 {
+            return Err(Error::UnsupportedJournal);
+        }
+        if self.ro_compat != 0 {
             return Err(Error::UnsupportedJournal);
         }
         if self.has_metadata_checksums() && self.checksum_type != JBD2_CHECKSUM_CRC32C {
@@ -862,10 +947,11 @@ impl JournalSuperblock {
         put_be_u32(&mut block, 0x0C, self.block_size)?;
         put_be_u32(&mut block, 0x10, self.maxlen)?;
         put_be_u32(&mut block, 0x14, self.first)?;
-        put_be_u32(&mut block, 0x18, self.sequence)?;
+        put_be_u32(&mut block, 0x18, self.sequence.get())?;
         put_be_u32(&mut block, 0x1C, self.start)?;
         put_be_u32(&mut block, 0x24, self.compat)?;
         put_be_u32(&mut block, 0x28, self.incompat)?;
+        put_be_u32(&mut block, 0x2C, self.ro_compat)?;
         block
             .get_mut(0x30..0x40)
             .ok_or(Error::TruncatedStructure)?
@@ -876,12 +962,12 @@ impl JournalSuperblock {
         Ok(block)
     }
 
-    fn set_clean(&mut self, sequence: u32) {
+    fn set_clean(&mut self, sequence: JournalSequence) {
         self.sequence = sequence;
         self.start = 0;
     }
 
-    fn set_dirty(&mut self, start: u32, sequence: u32) {
+    fn set_dirty(&mut self, start: u32, sequence: JournalSequence) {
         self.start = start;
         self.sequence = sequence;
     }
@@ -894,7 +980,7 @@ impl JournalSuperblock {
         self.first
     }
 
-    pub(crate) const fn sequence(self) -> u32 {
+    pub(crate) const fn sequence(self) -> JournalSequence {
         self.sequence
     }
 
@@ -980,7 +1066,7 @@ impl Jbd2Header {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct JournalTransaction {
-    sequence: u32,
+    sequence: JournalSequence,
     entries: Vec<JournalEntry>,
     revokes: Vec<BlockAddress>,
 }
@@ -1034,12 +1120,12 @@ struct JournalRevoke {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct JournalCommit {
-    sequence: u32,
+    sequence: JournalSequence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RevokedBlock {
-    sequence: u32,
+    sequence: JournalSequence,
     block: BlockAddress,
 }
 
@@ -1216,8 +1302,12 @@ fn transaction_tail(consumed: u32) -> JournalTransactionScan {
     }
 }
 
-fn is_revoked_after(revokes: &[RevokedBlock], block: BlockAddress, sequence: u32) -> bool {
+fn is_revoked_after(
+    revokes: &[RevokedBlock],
+    block: BlockAddress,
+    sequence: JournalSequence,
+) -> bool {
     revokes
         .iter()
-        .any(|revoked| revoked.block == block && revoked.sequence > sequence)
+        .any(|revoked| revoked.block == block && revoked.sequence.is_after(sequence))
 }
