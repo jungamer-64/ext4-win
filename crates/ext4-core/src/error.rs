@@ -42,6 +42,10 @@ pub enum Error {
     DirectoryTooLarge,
     /// An ext4 or Windows path component failed validation.
     InvalidName,
+    /// An extended attribute name, value, or set failed validation.
+    InvalidXattr,
+    /// A POSIX ACL payload failed validation.
+    InvalidAcl,
     /// A Windows case-insensitive lookup matched multiple ext4 names.
     AmbiguousWindowsName,
     /// The superblock advertises a feature that read-write mode rejects.
@@ -94,6 +98,8 @@ impl fmt::Display for Error {
             Self::InvalidDirectoryEntry => "invalid directory entry",
             Self::DirectoryTooLarge => "directory is too large for v1 enumeration",
             Self::InvalidName => "invalid name at domain boundary",
+            Self::InvalidXattr => "invalid ext4 extended attribute",
+            Self::InvalidAcl => "invalid POSIX ACL",
             Self::AmbiguousWindowsName => "windows lookup matched multiple ext4 names",
             Self::UnsupportedWriteFeature => "unsupported ext4 feature for read-write mount",
             Self::UnsupportedJournal => "unsupported ext4 journal",

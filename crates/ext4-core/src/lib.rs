@@ -20,12 +20,16 @@ pub mod inode;
 pub mod name;
 pub mod superblock;
 pub mod volume;
+pub mod windows;
+pub mod xattr;
 
+mod acl;
 mod checksum;
 mod endian;
 mod group;
 mod journal;
 
+pub use acl::{PosixAcl, PosixAclEntry};
 pub use block::{
     BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset, DeviceLength, SliceBlockDevice,
     SliceBlockDeviceMut,
@@ -53,6 +57,8 @@ pub use volume::{
     ReadWrite, SymlinkNode, TransactionDirectory, TransactionFile, TransactionNode,
     TransactionSymlink, Volume, WriteTransaction,
 };
+pub use windows::{Ext4Times, Ext4WindowsAttributes, WindowsOverlay};
+pub use xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 
 #[cfg(test)]
 mod tests;

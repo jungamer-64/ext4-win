@@ -639,9 +639,7 @@ fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
             overwrite_file(
                 &mut transaction,
                 3,
-                logical
-                    .checked_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX))
-                    .unwrap_or(u64::MAX),
+                logical.saturating_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX)),
                 b"x",
             );
         }
@@ -676,9 +674,7 @@ fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
         read_file(
             &volume,
             3,
-            8_u64
-                .checked_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX))
-                .unwrap_or(u64::MAX),
+            8_u64.saturating_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX)),
             &mut output
         ),
         1
@@ -692,7 +688,7 @@ fn mutable_extent_tree_serializes_depth_two_indexes() {
     let mut extents = Vec::new();
     for index in 0..337_u32 {
         extents.push(Extent::initialized(
-            LogicalBlock::from_u32(index.checked_mul(2).unwrap_or(u32::MAX)),
+            LogicalBlock::from_u32(index.saturating_mul(2)),
             must(ExtentLength::new(1)),
             BlockAddress::new(1_000 + u64::from(index)),
         ));
@@ -738,9 +734,7 @@ fn external_extent_block_checksum_mismatch_is_rejected() {
             overwrite_file(
                 &mut transaction,
                 3,
-                logical
-                    .checked_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX))
-                    .unwrap_or(u64::MAX),
+                logical.saturating_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX)),
                 b"x",
             );
         }
@@ -1142,9 +1136,11 @@ fn rename_directory_across_parents_updates_dotdot() {
         let moved_entries = read_directory(&volume, inode(11));
         let dotdot = moved_entries
             .iter()
-            .find(|entry| entry.name().bytes() == b"..")
-            .expect("moved directory must retain dotdot");
-        assert_eq!(dotdot.inode(), inode(12));
+            .find(|entry| entry.name().bytes() == b"..");
+        assert!(dotdot.is_some());
+        if let Some(dotdot) = dotdot {
+            assert_eq!(dotdot.inode(), inode(12));
+        }
     }
 
     assert_eq!(get_u32(&image, 1024 + 16), 4);
