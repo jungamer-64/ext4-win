@@ -7,7 +7,9 @@ use crate::error::{Error, Result};
 use crate::inode::InodeId;
 use crate::name::Ext4Name;
 
+/// Internal constant DIRENT_HEADER_SIZE used by on-disk layout and policy checks.
 const DIRENT_HEADER_SIZE: usize = 8;
+/// Directory records are padded to four-byte boundaries on disk.
 const DIRENT_ALIGNMENT: usize = 4;
 
 /// File type recorded in an ext4 directory entry.
@@ -32,6 +34,7 @@ pub enum DirectoryEntryKind {
 }
 
 impl DirectoryEntryKind {
+    /// Decodes the ext4 dirent file-type byte.
     fn from_raw(value: u8) -> Self {
         match value {
             1 => Self::File,
@@ -45,6 +48,7 @@ impl DirectoryEntryKind {
         }
     }
 
+    /// Encodes the ext4 dirent file-type byte.
     pub(crate) const fn to_raw(self) -> u8 {
         match self {
             Self::Unknown => 0,
@@ -62,8 +66,11 @@ impl DirectoryEntryKind {
 /// Valid directory entry exposed by the ext4 domain.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectoryEntry {
+    /// Non-zero inode referenced by the entry.
     inode: InodeId,
+    /// Validated ext4 name bytes.
     name: Ext4Name,
+    /// File type recorded in the directory entry.
     kind: DirectoryEntryKind,
 }
 
@@ -158,24 +165,29 @@ impl DirectoryEntry {
 /// Mutable ext4 directory block with checked dirent surgery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DirectoryBlock {
+    /// Raw directory block bytes; all mutations update this single buffer.
     bytes: Vec<u8>,
 }
 
 impl DirectoryBlock {
+    /// Wraps an existing directory block for checked mutation.
     pub(crate) fn new(bytes: Vec<u8>) -> Self {
         Self { bytes }
     }
 
+    /// Creates a zero-filled directory block with the filesystem block size.
     pub(crate) fn empty(block_size: usize) -> Self {
         Self {
             bytes: alloc::vec![0_u8; block_size],
         }
     }
 
+    /// Returns the mutated directory block bytes.
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
 
+    /// Initializes `.` and `..`, leaving the second entry to own remaining space.
     pub(crate) fn initialize_dot_entries(
         &mut self,
         self_inode: InodeId,
@@ -212,16 +224,19 @@ impl DirectoryBlock {
         )
     }
 
+    /// Initializes the block as one free dirent slot.
     pub(crate) fn initialize_free_space(&mut self) -> Result<()> {
         let rec_len = checked_u16(self.bytes.len())?;
         self.bytes.fill(0);
         put_le_u16(&mut self.bytes, 4, rec_len)
     }
 
+    /// Parses live entries from the current block image.
     pub(crate) fn entries(&self) -> Result<Vec<DirectoryEntry>> {
         DirectoryEntry::parse_all(&self.bytes)
     }
 
+    /// Checks whether a live entry already owns `name`.
     pub(crate) fn contains_name(&self, name: &Ext4Name) -> Result<bool> {
         for entry in self.entries()? {
             if entry.name() == name {
@@ -231,6 +246,7 @@ impl DirectoryBlock {
         Ok(false)
     }
 
+    /// Returns whether only `.` and `..` live entries remain.
     pub(crate) fn is_empty_directory_payload(&self) -> Result<bool> {
         for entry in self.entries()? {
             let bytes = entry.name().bytes();
@@ -241,6 +257,7 @@ impl DirectoryBlock {
         Ok(true)
     }
 
+    /// Inserts a live entry by reusing free space or splitting an oversized record.
     pub(crate) fn insert(
         &mut self,
         inode: InodeId,
@@ -319,6 +336,7 @@ impl DirectoryBlock {
         Ok(false)
     }
 
+    /// Removes a live entry by clearing its inode while preserving record length.
     pub(crate) fn remove(&mut self, name: &Ext4Name) -> Result<Option<DirectoryEntry>> {
         let mut offset = 0_usize;
         while offset < self.bytes.len() {
@@ -376,6 +394,7 @@ impl DirectoryBlock {
     }
 }
 
+/// Internal write_entry operation used by this module's domain boundary.
 fn write_entry(
     bytes: &mut [u8],
     offset: usize,
@@ -384,6 +403,8 @@ fn write_entry(
     name: &[u8],
     kind: DirectoryEntryKind,
 ) -> Result<()> {
+    // The record length is owned by the caller so existing free-space shape can
+    // be preserved when inserting into a hole or splitting a live entry.
     let rec_len_usize = usize::from(rec_len);
     if rec_len_usize < required_name_rec_len(name.len())?
         || offset
@@ -434,6 +455,7 @@ fn write_entry(
     Ok(())
 }
 
+/// Internal required_name_rec_len operation used by this module's domain boundary.
 fn required_name_rec_len(name_len: usize) -> Result<usize> {
     checked_rec_len(
         DIRENT_HEADER_SIZE
@@ -442,6 +464,7 @@ fn required_name_rec_len(name_len: usize) -> Result<usize> {
     )
 }
 
+/// Rounds a directory record length up to the ext4 alignment and `u16` range.
 fn checked_rec_len(value: usize) -> Result<usize> {
     let adjusted = value
         .checked_add(
@@ -461,6 +484,7 @@ fn checked_rec_len(value: usize) -> Result<usize> {
     Ok(aligned)
 }
 
+/// Converts a checked record length into the on-disk `rec_len` field.
 fn checked_u16(value: usize) -> Result<u16> {
     u16::try_from(value).map_err(|_| Error::InvalidDirectoryEntry)
 }

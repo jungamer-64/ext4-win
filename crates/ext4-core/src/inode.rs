@@ -3,17 +3,29 @@
 use crate::endian::{le_u16, le_u32};
 use crate::error::{Error, Result};
 
+/// Mask selecting file-type bits from `i_mode`.
 const MODE_KIND_MASK: u16 = 0xF000;
+/// ext4 directory file-type bits in `i_mode`.
 const MODE_DIRECTORY: u16 = 0x4000;
+/// ext4 regular-file file-type bits in `i_mode`.
 const MODE_REGULAR: u16 = 0x8000;
+/// ext4 symlink file-type bits in `i_mode`.
 const MODE_SYMLINK: u16 = 0xA000;
+/// Inode flag selecting extent-based data mapping.
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+/// Inode flag selecting indexed directory data.
 const EXT4_INDEX_FL: u32 = 0x0000_1000;
+/// Inode flag rejecting write-domain mutation.
 const EXT4_IMMUTABLE_FL: u32 = 0x0000_0010;
+/// Inode flag rejecting non-append mutation.
 const EXT4_APPEND_FL: u32 = 0x0000_0020;
+/// Inode flag rejected because encrypted payload interpretation is unsupported.
 const EXT4_ENCRYPT_FL: u32 = 0x0000_0800;
+/// Inode flag rejected for write-domain mutation of inline-data files.
 const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
+/// Inode flag rejected because casefolded lookup semantics are unsupported.
 const EXT4_CASEFOLD_FL: u32 = 0x4000_0000;
+/// Permission and special-mode bits allowed apart from the inode file type.
 const PERMISSION_BITS: u16 = 0o7777;
 
 /// Byte offset inside a regular file or symlink payload.
@@ -106,6 +118,7 @@ impl ReadBytes {
 /// Ext4 inode timestamp supplied by the caller at a mutation boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ext4Timestamp {
+    /// Low 32-bit Unix seconds stored by ext4 timestamp fields.
     seconds: u32,
 }
 
@@ -162,7 +175,9 @@ impl Ext4Gid {
 /// Ext4 inode owner supplied at a creation boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ext4Owner {
+    /// Low 32-bit user id.
     uid: Ext4Uid,
+    /// Low 32-bit group id.
     gid: Ext4Gid,
 }
 
@@ -213,7 +228,9 @@ impl Ext4Permissions {
 /// Metadata required to create a regular file inode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NewFileMetadata {
+    /// Owner encoded into the new inode.
     owner: Ext4Owner,
+    /// Permission bits encoded with the regular-file mode.
     permissions: Ext4Permissions,
 }
 
@@ -240,7 +257,9 @@ impl NewFileMetadata {
 /// Metadata required to create a directory inode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NewDirectoryMetadata {
+    /// Owner encoded into the new inode.
     owner: Ext4Owner,
+    /// Permission bits encoded with the directory mode.
     permissions: Ext4Permissions,
 }
 
@@ -316,6 +335,7 @@ pub enum InodeStorage {
 /// Raw extent root bytes isolated behind an inode-storage type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InodeExtentRoot {
+    /// Exact `i_block` bytes when the inode has the extents flag.
     bytes: [u8; 60],
 }
 
@@ -336,6 +356,7 @@ impl InodeExtentRoot {
 /// Inline bytes isolated behind an inode-storage type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InodeInlineBytes {
+    /// Exact `i_block` bytes when a symlink payload is stored inline.
     bytes: [u8; 60],
 }
 
@@ -360,12 +381,19 @@ impl InodeInlineBytes {
 /// Parsed ext4 inode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Inode {
+    /// Stable inode number used by directory entries and checksum seeds.
     id: InodeId,
+    /// Supported inode kind selected from `i_mode`.
     kind: InodeKind,
+    /// Combined low/high inode size.
     size: FileSize,
+    /// Raw link count used by directory removal checks.
     links_count: u16,
+    /// Raw inode flags kept for capability predicates.
     flags: u32,
+    /// Inode generation used by metadata checksums.
     generation: u32,
+    /// Typed interpretation of the 60-byte `i_block` field.
     storage: InodeStorage,
 }
 
