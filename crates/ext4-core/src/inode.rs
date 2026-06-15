@@ -37,16 +37,22 @@ impl InodeId {
     /// Root directory inode.
     pub const ROOT: Self = Self(2);
 
-    /// Creates an inode identifier.
+    /// Returns the raw inode number for on-disk encoding boundaries.
     #[must_use]
-    pub const fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw inode number.
-    #[must_use]
-    pub const fn get(self) -> u32 {
+    pub const fn as_u32(self) -> u32 {
         self.0
+    }
+}
+
+impl TryFrom<u32> for InodeId {
+    type Error = Error;
+
+    fn try_from(value: u32) -> Result<Self> {
+        if value == 0 {
+            Err(Error::InvalidInode)
+        } else {
+            Ok(Self(value))
+        }
     }
 }
 
