@@ -271,6 +271,18 @@ impl Journal {
             return Err(Error::JournalCorrupt);
         }
         let prepared = self.prepare_metadata_transaction(block_size, metadata_blocks)?;
+        let durable = self.write_prepared_transaction(io, block_size, prepared)?;
+        let checkpointed =
+            self.checkpoint_durable_transaction(io, block_size, metadata_blocks, durable)?;
+        self.clean_checkpointed_transaction(io, block_size, checkpointed)
+    }
+
+    fn write_prepared_transaction(
+        &mut self,
+        io: &mut impl JournalIo,
+        block_size: BlockSize,
+        prepared: PreparedJournalTransaction,
+    ) -> Result<JournalDurableTransaction> {
         let mut cursor = prepared.descriptor;
         let dirty_superblock =
             self.superblock
@@ -292,12 +304,34 @@ impl Journal {
         io.write_journal_block(self, block_size, cursor, &prepared.commit_block)?;
         io.flush_all()?;
 
+        Ok(JournalDurableTransaction {
+            next_sequence: prepared.next_sequence,
+        })
+    }
+
+    fn checkpoint_durable_transaction(
+        &mut self,
+        io: &mut impl JournalIo,
+        block_size: BlockSize,
+        metadata_blocks: &[MetadataBlock],
+        durable: JournalDurableTransaction,
+    ) -> Result<CheckpointedJournalTransaction> {
         for metadata in metadata_blocks {
             io.write_home_block(block_size, metadata.block(), metadata.bytes())?;
         }
         io.flush_all()?;
+        Ok(CheckpointedJournalTransaction {
+            next_sequence: durable.next_sequence,
+        })
+    }
 
-        self.mark_clean(io, block_size, prepared.next_sequence)?;
+    fn clean_checkpointed_transaction(
+        &mut self,
+        io: &mut impl JournalIo,
+        block_size: BlockSize,
+        checkpointed: CheckpointedJournalTransaction,
+    ) -> Result<()> {
+        self.mark_clean(io, block_size, checkpointed.next_sequence)?;
         self.state = JournalState::Clean;
         Ok(())
     }
@@ -1443,6 +1477,16 @@ struct PreparedJournalTransaction {
     descriptor_block: Vec<u8>,
     data_blocks: Vec<Vec<u8>>,
     commit_block: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JournalDurableTransaction {
+    next_sequence: JournalSequence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckpointedJournalTransaction {
+    next_sequence: JournalSequence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
