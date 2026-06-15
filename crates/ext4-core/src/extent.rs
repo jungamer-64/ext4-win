@@ -666,7 +666,7 @@ fn parse_index_node(
             offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
         )?);
         let leaf = BlockAddress::new((leaf_hi << 32) | leaf_lo);
-        if metadata_blocks.iter().any(|block| *block == leaf) {
+        if metadata_blocks.contains(&leaf) {
             return Err(Error::InvalidExtentTree);
         }
         metadata_blocks.push(leaf);
