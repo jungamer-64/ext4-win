@@ -217,10 +217,14 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
             volume: self,
             now,
             inode_updates: Vec::new(),
-            bitmap_updates: Vec::new(),
+            block_bitmap_updates: Vec::new(),
+            inode_bitmap_updates: Vec::new(),
+            directory_updates: Vec::new(),
             group_deltas: Vec::new(),
             data_writes: Vec::new(),
             free_blocks_delta: FreeBlockDelta::ZERO,
+            free_inodes_delta: 0,
+            used_dirs_delta: 0,
         }
     }
 }
@@ -277,10 +281,14 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
             volume: self,
             now,
             inode_updates: Vec::new(),
-            bitmap_updates: Vec::new(),
+            block_bitmap_updates: Vec::new(),
+            inode_bitmap_updates: Vec::new(),
+            directory_updates: Vec::new(),
             group_deltas: Vec::new(),
             data_writes: Vec::new(),
             free_blocks_delta: FreeBlockDelta::ZERO,
+            free_inodes_delta: 0,
+            used_dirs_delta: 0,
         }
     }
 }
@@ -525,10 +533,14 @@ pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
     volume: &'a mut Volume<D, ReadWrite<J>>,
     now: Ext4Timestamp,
     inode_updates: Vec<RawInode>,
-    bitmap_updates: Vec<BlockImage>,
+    block_bitmap_updates: Vec<BlockImage>,
+    inode_bitmap_updates: Vec<BlockImage>,
+    directory_updates: Vec<BlockImage>,
     group_deltas: Vec<GroupDelta>,
     data_writes: Vec<RangeWrite>,
     free_blocks_delta: FreeBlockDelta,
+    free_inodes_delta: i64,
+    used_dirs_delta: i64,
 }
 
 impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
