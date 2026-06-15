@@ -1,4 +1,4 @@
-//! Native Windows kernel entry point for the read-only ext4 file system driver.
+//! Native Windows kernel entry point for the ext4 file system driver.
 
 #![no_std]
 

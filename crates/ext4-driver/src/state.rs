@@ -70,30 +70,162 @@ pub(crate) struct MountCandidate {
 
 #[expect(
     dead_code,
-    reason = "volume state is introduced before VCB allocation is wired"
+    reason = "mount capability is defined before mount FSCTL constructs VCB state"
 )]
-#[derive(Clone, Copy, Debug)]
-/// Mounted ext4 volume state owned by a volume control block.
-pub(crate) struct MountedVolume {
-    /// Root directory inode of the mounted volume.
-    root_inode: InodeId,
-    /// Device object that stores the ext4 block device.
-    target_device: KernelDevice,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Mounted volume capability selected by the core mount mode.
+pub(crate) enum MountMode {
+    /// Journaled read-write volume.
+    ReadWrite,
 }
 
 #[expect(
     dead_code,
-    reason = "open node state is introduced before CREATE allocates CCBs"
+    reason = "VCB state is defined before mount FSCTL allocates device extensions"
 )]
 #[derive(Clone, Copy, Debug)]
-/// Open ext4 node represented by per-handle context.
-pub(crate) enum OpenNode {
+/// Volume control block stored in a mounted volume device extension.
+pub(crate) struct VolumeControlBlock {
+    /// Device object that stores the ext4 block device.
+    target_device: KernelDevice,
+    /// Root directory inode of the mounted volume.
+    root_inode: InodeId,
+    /// Mounted volume capability.
+    mode: MountMode,
+}
+
+#[expect(
+    dead_code,
+    reason = "VCB accessors are defined before IRP dispatch stores VCB pointers"
+)]
+impl VolumeControlBlock {
+    /// Creates a journaled read-write VCB.
+    pub(crate) const fn read_write(target_device: KernelDevice) -> Self {
+        Self {
+            target_device,
+            root_inode: InodeId::ROOT,
+            mode: MountMode::ReadWrite,
+        }
+    }
+
+    /// Returns the target block device object.
+    pub(crate) const fn target_device(self) -> KernelDevice {
+        self.target_device
+    }
+
+    /// Returns the mounted root inode.
+    pub(crate) const fn root_inode(self) -> InodeId {
+        self.root_inode
+    }
+
+    /// Returns the mounted capability.
+    pub(crate) const fn mode(self) -> MountMode {
+        self.mode
+    }
+}
+
+#[expect(
+    dead_code,
+    reason = "FCB node variants are defined before CREATE constructs FCB state"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Ext4 node represented by an FCB.
+pub(crate) enum FileSystemNode {
     /// Regular file inode.
     File(InodeId),
     /// Directory inode.
     Directory(InodeId),
     /// Symbolic link inode.
     Symlink(InodeId),
+}
+
+#[expect(
+    dead_code,
+    reason = "FCB node accessors are defined before CREATE constructs FCB state"
+)]
+impl FileSystemNode {
+    /// Returns the inode represented by this node.
+    pub(crate) const fn inode(self) -> InodeId {
+        match self {
+            Self::File(inode) | Self::Directory(inode) | Self::Symlink(inode) => inode,
+        }
+    }
+}
+
+#[expect(
+    dead_code,
+    reason = "FCB state is defined before CREATE allocates file objects"
+)]
+#[derive(Clone, Copy, Debug)]
+/// File control block stored in `FILE_OBJECT::FsContext`.
+pub(crate) struct FileControlBlock {
+    /// Mounted volume that owns this file.
+    volume: NonNull<c_void>,
+    /// Ext4 node opened by this FCB.
+    node: FileSystemNode,
+}
+
+#[expect(
+    dead_code,
+    reason = "FCB constructors are defined before CREATE stores FsContext"
+)]
+impl FileControlBlock {
+    /// Creates an FCB boundary value for a mounted node.
+    pub(crate) const fn new(volume: NonNull<c_void>, node: FileSystemNode) -> Self {
+        Self { volume, node }
+    }
+
+    /// Returns the opaque VCB pointer.
+    pub(crate) const fn volume(self) -> NonNull<c_void> {
+        self.volume
+    }
+
+    /// Returns the ext4 node.
+    pub(crate) const fn node(self) -> FileSystemNode {
+        self.node
+    }
+}
+
+#[expect(
+    dead_code,
+    reason = "directory CCB cursor is defined before DIRECTORY_CONTROL stores FsContext2"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Per-handle directory enumeration state.
+pub(crate) struct DirectoryCursor {
+    /// Next directory entry index to emit.
+    next_entry: u32,
+}
+
+#[expect(
+    dead_code,
+    reason = "directory cursor accessors are defined before DIRECTORY_CONTROL uses CCB state"
+)]
+impl DirectoryCursor {
+    /// Creates a cursor at the first directory entry.
+    pub(crate) const fn start() -> Self {
+        Self { next_entry: 0 }
+    }
+
+    /// Returns the next directory entry index.
+    pub(crate) const fn next_entry(self) -> u32 {
+        self.next_entry
+    }
+}
+
+#[expect(
+    dead_code,
+    reason = "CCB variants are defined before CREATE stores FsContext2"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Per-handle state stored in `FILE_OBJECT::FsContext2`.
+pub(crate) enum ContextControlBlock {
+    /// Regular file handle.
+    File,
+    /// Directory handle with enumeration cursor.
+    Directory(DirectoryCursor),
+    /// Symlink handle.
+    Symlink,
 }
 
 /// Driver unload callback registered in the driver object.

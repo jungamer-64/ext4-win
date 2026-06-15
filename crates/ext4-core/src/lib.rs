@@ -1,7 +1,8 @@
-//! `no_std` ext4 read domain for the Windows kernel driver.
+//! `no_std` ext4 domain for the Windows kernel driver.
 //!
-//! This crate owns ext4 on-disk validation and read-only traversal. It does
-//! not expose Windows types, NTSTATUS values, IRPs, or driver lifetime state.
+//! This crate owns ext4 on-disk validation, traversal, and journaled mutation.
+//! It does not expose Windows types, NTSTATUS values, IRPs, or driver lifetime
+//! state.
 
 #![no_std]
 #![forbid(unsafe_code)]
