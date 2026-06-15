@@ -33,7 +33,7 @@ const INCOMPAT_INLINE_DATA: u32 = 0x8000;
 const INCOMPAT_ENCRYPT: u32 = 0x0001_0000;
 const INCOMPAT_CASEFOLD: u32 = 0x0002_0000;
 const SUPPORTED_READ_INCOMPAT: u32 =
-    INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG;
+    INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG | INCOMPAT_CSUM_SEED;
 const REQUIRED_WRITE_INCOMPAT: u32 =
     INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG;
 const SUPPORTED_WRITE_INCOMPAT: u32 =
@@ -45,6 +45,7 @@ const RO_COMPAT_HUGE_FILE: u32 = 0x0008;
 const RO_COMPAT_GDT_CSUM: u32 = 0x0010;
 const RO_COMPAT_DIR_NLINK: u32 = 0x0020;
 const RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
+const RO_COMPAT_QUOTA: u32 = 0x0100;
 const RO_COMPAT_BIGALLOC: u32 = 0x0200;
 const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 const RO_COMPAT_READONLY: u32 = 0x1000;
@@ -54,8 +55,10 @@ const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
 const SUPPORTED_READ_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_LARGE_FILE
     | RO_COMPAT_HUGE_FILE
+    | RO_COMPAT_GDT_CSUM
     | RO_COMPAT_DIR_NLINK
     | RO_COMPAT_EXTRA_ISIZE
+    | RO_COMPAT_QUOTA
     | RO_COMPAT_METADATA_CSUM
     | RO_COMPAT_READONLY
     | RO_COMPAT_PROJECT;
@@ -415,6 +418,13 @@ impl BlockGroupDescriptorLayout {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlockGroupDescriptorChecksum {
+    None,
+    GdtCrc16,
+    MetadataCrc32c,
+}
+
 /// Validated ext4 feature flags accepted by a mount policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FeatureSet {
@@ -435,6 +445,9 @@ impl FeatureSet {
         }
         if read_only_compat & !SUPPORTED_READ_RO_COMPAT != 0 {
             return Err(Error::UnsupportedReadOnlyFeature);
+        }
+        if incompat & INCOMPAT_CSUM_SEED != 0 && read_only_compat & RO_COMPAT_METADATA_CSUM == 0 {
+            return Err(Error::UnsupportedIncompatFeature);
         }
         if incompat & INCOMPAT_EXTENTS == 0 {
             return Err(Error::UnsupportedIncompatFeature);
@@ -500,6 +513,14 @@ impl FeatureSet {
 
     pub(crate) const fn has_metadata_csum(self) -> bool {
         self.read_only_compat & RO_COMPAT_METADATA_CSUM != 0
+    }
+
+    pub(crate) const fn has_gdt_csum(self) -> bool {
+        self.read_only_compat & RO_COMPAT_GDT_CSUM != 0
+    }
+
+    pub(crate) const fn has_checksum_seed(self) -> bool {
+        self.incompat & INCOMPAT_CSUM_SEED != 0
     }
 }
 
@@ -633,11 +654,14 @@ impl Superblock {
         } else {
             JournalMode::None
         };
-        let checksum_seed = if features.incompat & INCOMPAT_CSUM_SEED != 0 {
+        let checksum_seed = if features.has_checksum_seed() {
             ChecksumSeed::from_u32(le_u32(raw, 624)?)
+        } else if features.has_metadata_csum() {
+            ChecksumSeed::from_u32(crc32c(u32::MAX, &uuid))
         } else {
             ChecksumSeed::from_u32(0)
         };
+        let uuid = FilesystemUuid::from_bytes(uuid);
 
         Ok(Self {
             block_size,
@@ -651,7 +675,7 @@ impl Superblock {
             first_inode,
             descriptor_size,
             journal_mode,
-            uuid: FilesystemUuid::from_bytes(uuid),
+            uuid,
             checksum_seed,
             features,
         })
@@ -750,6 +774,16 @@ impl Superblock {
             BlockGroupDescriptorLayout::SixtyFourBit
         } else {
             BlockGroupDescriptorLayout::Standard32
+        }
+    }
+
+    pub(crate) const fn descriptor_checksum(self) -> BlockGroupDescriptorChecksum {
+        if self.features.has_metadata_csum() {
+            BlockGroupDescriptorChecksum::MetadataCrc32c
+        } else if self.features.has_gdt_csum() {
+            BlockGroupDescriptorChecksum::GdtCrc16
+        } else {
+            BlockGroupDescriptorChecksum::None
         }
     }
 

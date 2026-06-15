@@ -2,6 +2,7 @@ use crate::endian::le_u32;
 use crate::error::{Error, Result};
 
 const CRC32C_POLY_REVERSED: u32 = 0x82F6_3B78;
+const CRC16_POLY_REVERSED: u16 = 0xA001;
 
 pub(crate) fn crc32c(seed: u32, bytes: &[u8]) -> u32 {
     let mut crc = !seed;
@@ -13,6 +14,18 @@ pub(crate) fn crc32c(seed: u32, bytes: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+pub(crate) fn crc16(seed: u16, bytes: &[u8]) -> u16 {
+    let mut crc = seed;
+    for byte in bytes {
+        crc ^= u16::from(*byte);
+        for _bit in 0..8 {
+            let mask = 0_u16.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (CRC16_POLY_REVERSED & mask);
+        }
+    }
+    crc
 }
 
 pub(crate) fn verify_crc32c(seed: u32, bytes: &[u8], checksum_offset: usize) -> Result<()> {

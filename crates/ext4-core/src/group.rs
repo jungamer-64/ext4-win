@@ -1,15 +1,19 @@
 use alloc::vec::Vec;
 
 use crate::block::{BlockAddress, BlockReader, BlockSize, ByteOffset};
+use crate::checksum::{crc16, crc32c};
 use crate::endian::{le_u16, le_u32, put_le_u16};
 use crate::error::{Error, Result};
 use crate::superblock::{
-    BlockGroupDescriptorLayout, BlockGroupDescriptorSize, BlockGroupId, FreeBlockDelta, Superblock,
+    BlockGroupDescriptorChecksum, BlockGroupDescriptorLayout, BlockGroupDescriptorSize,
+    BlockGroupId, FreeBlockDelta, Superblock,
 };
 
 const BG_BLOCK_BITMAP_LO_OFFSET: usize = 0;
 const BG_INODE_TABLE_LO_OFFSET: usize = 8;
 const BG_FREE_BLOCKS_LO_OFFSET: usize = 12;
+const BG_CHECKSUM_OFFSET: usize = 30;
+const BG_CHECKSUM_SIZE: usize = 2;
 const BG_BLOCK_BITMAP_HI_OFFSET: usize = 32;
 const BG_INODE_TABLE_HI_OFFSET: usize = 40;
 const BG_FREE_BLOCKS_HI_OFFSET: usize = 44;
@@ -36,6 +40,7 @@ impl BlockGroupDescriptor {
             descriptor_offset(superblock.block_size(), superblock.descriptor_size(), group)?;
         let mut bytes = alloc::vec![0_u8; usize::from(superblock.descriptor_size().as_u16())];
         reader.read_exact_at(offset, &mut bytes)?;
+        verify_block_group_descriptor_checksum(superblock, group, &bytes)?;
         let block_bitmap = descriptor_block_address(
             &bytes,
             BG_BLOCK_BITMAP_LO_OFFSET,
@@ -86,7 +91,8 @@ impl BlockGroupDescriptor {
     pub(crate) fn apply_free_blocks_delta(
         &mut self,
         delta: FreeBlockDelta,
-        layout: BlockGroupDescriptorLayout,
+        superblock: &Superblock,
+        group: BlockGroupId,
     ) -> Result<()> {
         let raw_delta = i32::try_from(delta.as_i64()).map_err(|_| Error::ArithmeticOverflow)?;
         let updated = if raw_delta.is_negative() {
@@ -103,7 +109,7 @@ impl BlockGroupDescriptor {
             BG_FREE_BLOCKS_LO_OFFSET,
             u16::try_from(updated & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        if layout.has_high_fields() {
+        if superblock.descriptor_layout().has_high_fields() {
             put_le_u16(
                 &mut self.bytes,
                 BG_FREE_BLOCKS_HI_OFFSET,
@@ -111,8 +117,95 @@ impl BlockGroupDescriptor {
             )?;
         }
         self.free_blocks_count = updated;
+        write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)?;
         Ok(())
     }
+}
+
+pub(crate) fn write_block_group_descriptor_checksum(
+    superblock: &Superblock,
+    group: BlockGroupId,
+    bytes: &mut [u8],
+) -> Result<()> {
+    if superblock.descriptor_checksum() == BlockGroupDescriptorChecksum::None {
+        return Ok(());
+    }
+    let checksum = block_group_descriptor_checksum(superblock, group, bytes)?;
+    put_le_u16(bytes, BG_CHECKSUM_OFFSET, checksum)
+}
+
+fn verify_block_group_descriptor_checksum(
+    superblock: &Superblock,
+    group: BlockGroupId,
+    bytes: &[u8],
+) -> Result<()> {
+    if superblock.descriptor_checksum() == BlockGroupDescriptorChecksum::None {
+        return Ok(());
+    }
+    let expected = le_u16(bytes, BG_CHECKSUM_OFFSET)?;
+    if block_group_descriptor_checksum(superblock, group, bytes)? == expected {
+        Ok(())
+    } else {
+        Err(Error::ChecksumMismatch)
+    }
+}
+
+fn block_group_descriptor_checksum(
+    superblock: &Superblock,
+    group: BlockGroupId,
+    bytes: &[u8],
+) -> Result<u16> {
+    match superblock.descriptor_checksum() {
+        BlockGroupDescriptorChecksum::None => Ok(0),
+        BlockGroupDescriptorChecksum::GdtCrc16 => gdt_checksum(superblock, group, bytes),
+        BlockGroupDescriptorChecksum::MetadataCrc32c => metadata_checksum(superblock, group, bytes),
+    }
+}
+
+fn gdt_checksum(superblock: &Superblock, group: BlockGroupId, bytes: &[u8]) -> Result<u16> {
+    let checksum_end = BG_CHECKSUM_OFFSET
+        .checked_add(BG_CHECKSUM_SIZE)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let uuid = superblock.uuid().bytes();
+    let group_bytes = group.as_u32().to_le_bytes();
+    let mut checksum = crc16(u16::MAX, &uuid);
+    checksum = crc16(checksum, &group_bytes);
+    checksum = crc16(
+        checksum,
+        bytes
+            .get(..BG_CHECKSUM_OFFSET)
+            .ok_or(Error::TruncatedStructure)?,
+    );
+    if checksum_end < bytes.len() {
+        checksum = crc16(
+            checksum,
+            bytes.get(checksum_end..).ok_or(Error::TruncatedStructure)?,
+        );
+    }
+    Ok(checksum)
+}
+
+fn metadata_checksum(superblock: &Superblock, group: BlockGroupId, bytes: &[u8]) -> Result<u16> {
+    let checksum_end = BG_CHECKSUM_OFFSET
+        .checked_add(BG_CHECKSUM_SIZE)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let group_bytes = group.as_u32().to_le_bytes();
+    let zero_checksum = [0_u8; BG_CHECKSUM_SIZE];
+    let mut checksum = crc32c(superblock.checksum_seed().as_u32(), &group_bytes);
+    checksum = crc32c(
+        checksum,
+        bytes
+            .get(..BG_CHECKSUM_OFFSET)
+            .ok_or(Error::TruncatedStructure)?,
+    );
+    checksum = crc32c(checksum, &zero_checksum);
+    if checksum_end < bytes.len() {
+        checksum = crc32c(
+            checksum,
+            bytes.get(checksum_end..).ok_or(Error::TruncatedStructure)?,
+        );
+    }
+    u16::try_from(checksum & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)
 }
 
 fn descriptor_offset(
