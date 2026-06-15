@@ -11,6 +11,14 @@ const MODE_DIRECTORY: u16 = 0x4000;
 const MODE_REGULAR: u16 = 0x8000;
 /// ext4 symlink file-type bits in `i_mode`.
 const MODE_SYMLINK: u16 = 0xA000;
+/// Low UID field offset inside an inode record.
+const INODE_UID_LO_OFFSET: usize = 2;
+/// Low GID field offset inside an inode record.
+const INODE_GID_LO_OFFSET: usize = 24;
+/// High UID field offset inside a large inode record.
+const INODE_UID_HI_OFFSET: usize = 120;
+/// High GID field offset inside a large inode record.
+const INODE_GID_HI_OFFSET: usize = 122;
 /// Inode flag selecting extent-based data mapping.
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 /// Inode flag selecting indexed directory data.
@@ -225,6 +233,35 @@ impl Ext4Permissions {
     }
 }
 
+/// POSIX security state representable in ext4 inode owner and mode fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ext4Security {
+    /// Owner encoded in uid/gid fields.
+    owner: Ext4Owner,
+    /// Permission and special mode bits without file type bits.
+    permissions: Ext4Permissions,
+}
+
+impl Ext4Security {
+    /// Creates representable ext4 security state.
+    #[must_use]
+    pub const fn new(owner: Ext4Owner, permissions: Ext4Permissions) -> Self {
+        Self { owner, permissions }
+    }
+
+    /// Owner component.
+    #[must_use]
+    pub const fn owner(self) -> Ext4Owner {
+        self.owner
+    }
+
+    /// Permission component.
+    #[must_use]
+    pub const fn permissions(self) -> Ext4Permissions {
+        self.permissions
+    }
+}
+
 /// Metadata required to create a regular file inode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NewFileMetadata {
@@ -387,6 +424,8 @@ pub struct Inode {
     kind: InodeKind,
     /// Combined low/high inode size.
     size: FileSize,
+    /// POSIX security state parsed from owner and mode fields.
+    security: Ext4Security,
     /// Raw link count used by directory removal checks.
     links_count: u16,
     /// Raw inode flags kept for capability predicates.
@@ -408,6 +447,11 @@ impl Inode {
             return Err(Error::TruncatedStructure);
         }
         let mode = le_u16(raw, 0)?;
+        let permissions = Ext4Permissions::new(mode & PERMISSION_BITS)?;
+        let owner = Ext4Owner::new(
+            Ext4Uid::from_u32(parse_uid(raw)?),
+            Ext4Gid::from_u32(parse_gid(raw)?),
+        );
         let kind = match mode & MODE_KIND_MASK {
             MODE_REGULAR => InodeKind::File,
             MODE_DIRECTORY => InodeKind::Directory,
@@ -433,6 +477,7 @@ impl Inode {
             id,
             kind,
             size,
+            security: Ext4Security::new(owner, permissions),
             links_count,
             flags,
             generation,
@@ -456,6 +501,24 @@ impl Inode {
     #[must_use]
     pub const fn size(&self) -> FileSize {
         self.size
+    }
+
+    /// POSIX security state parsed from owner and mode fields.
+    #[must_use]
+    pub const fn security(&self) -> Ext4Security {
+        self.security
+    }
+
+    /// POSIX owner parsed from uid/gid fields.
+    #[must_use]
+    pub const fn owner(&self) -> Ext4Owner {
+        self.security.owner()
+    }
+
+    /// Permission bits parsed from `i_mode` without file-type bits.
+    #[must_use]
+    pub const fn permissions(&self) -> Ext4Permissions {
+        self.security.permissions()
     }
 
     /// Raw link count.
@@ -519,4 +582,32 @@ impl Inode {
             }
         }
     }
+}
+
+/// Internal parse_uid operation used by this module's domain boundary.
+fn parse_uid(raw: &[u8]) -> Result<u32> {
+    let low = u32::from(le_u16(raw, INODE_UID_LO_OFFSET)?);
+    let high_offset_end = INODE_UID_HI_OFFSET
+        .checked_add(2)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let high = if raw.len() >= high_offset_end {
+        u32::from(le_u16(raw, INODE_UID_HI_OFFSET)?) << 16
+    } else {
+        0
+    };
+    Ok(low | high)
+}
+
+/// Internal parse_gid operation used by this module's domain boundary.
+fn parse_gid(raw: &[u8]) -> Result<u32> {
+    let low = u32::from(le_u16(raw, INODE_GID_LO_OFFSET)?);
+    let high_offset_end = INODE_GID_HI_OFFSET
+        .checked_add(2)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let high = if raw.len() >= high_offset_end {
+        u32::from(le_u16(raw, INODE_GID_HI_OFFSET)?) << 16
+    } else {
+        0
+    };
+    Ok(low | high)
 }

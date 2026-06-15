@@ -37,9 +37,9 @@ pub use extent::{
     LogicalBlock, MutableExtentTree, SerializedExtentBlock, SerializedExtentTree,
 };
 pub use inode::{
-    Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Timestamp, Ext4Uid, FileOffset, FileSize, Inode,
-    InodeExtentRoot, InodeId, InodeInlineBytes, InodeKind, InodeStorage, NewDirectoryMetadata,
-    NewFileMetadata, ReadBytes,
+    Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Timestamp, Ext4Uid, FileOffset,
+    FileSize, Inode, InodeExtentRoot, InodeId, InodeInlineBytes, InodeKind, InodeStorage,
+    NewDirectoryMetadata, NewFileMetadata, ReadBytes,
 };
 pub use name::{Ext4Name, WindowsName};
 pub use superblock::{
@@ -50,7 +50,8 @@ pub use superblock::{
 };
 pub use volume::{
     DirectoryNode, ExternalJournal, FileNode, InternalJournal, LookupResult, Node, ReadOnly,
-    ReadWrite, SymlinkNode, TransactionDirectory, TransactionFile, Volume, WriteTransaction,
+    ReadWrite, SymlinkNode, TransactionDirectory, TransactionFile, TransactionNode, Volume,
+    WriteTransaction,
 };
 
 #[cfg(test)]
