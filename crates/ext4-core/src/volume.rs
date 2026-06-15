@@ -977,8 +977,11 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 &self.volume.superblock,
                 delta.group,
             )?;
-            descriptor
-                .apply_free_blocks_delta(delta.delta, self.volume.superblock.descriptor_layout())?;
+            descriptor.apply_free_blocks_delta(
+                delta.delta,
+                &self.volume.superblock,
+                delta.group,
+            )?;
             writes.push(RangeWrite {
                 offset: descriptor.offset(),
                 bytes: descriptor.bytes().to_vec(),

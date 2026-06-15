@@ -14,7 +14,7 @@
 use alloc::{vec, vec::Vec};
 
 use crate::{
-    BlockMapping, BlockReader, BlockWriter, ByteOffset, DeviceLength, DirectoryEntry,
+    BlockGroupId, BlockMapping, BlockReader, BlockWriter, ByteOffset, DeviceLength, DirectoryEntry,
     DirectoryEntryKind, DirectoryNode, Error, Ext4Name, Ext4Timestamp, ExtentTree, ExternalJournal,
     FileNode, FileOffset, FileSize, InodeId, JournalMode, LogicalBlock, LookupResult, Node,
     ReadOnly, ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode,
@@ -54,8 +54,20 @@ const JBD2_TAG_FLAG_ESCAPE: u32 = 0x0001;
 const JBD2_TAG_FLAG_SAME_UUID: u32 = 0x0002;
 const JBD2_TAG_FLAG_LAST_TAG: u32 = 0x0008;
 const JBD2_CHECKSUM_CRC32C: u8 = 4;
+const COMPAT_ORPHAN_FILE: u32 = 0x1000;
 const INCOMPAT_RECOVER: u32 = 0x0004;
 const INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
+const INCOMPAT_META_BG: u32 = 0x0010;
+const INCOMPAT_CSUM_SEED: u32 = 0x2000;
+const INCOMPAT_LARGEDIR: u32 = 0x4000;
+const INCOMPAT_INLINE_DATA: u32 = 0x8000;
+const INCOMPAT_ENCRYPT: u32 = 0x0001_0000;
+const INCOMPAT_CASEFOLD: u32 = 0x0002_0000;
+const RO_COMPAT_GDT_CSUM: u32 = 0x0010;
+const RO_COMPAT_QUOTA: u32 = 0x0100;
+const RO_COMPAT_BIGALLOC: u32 = 0x0200;
+const RO_COMPAT_VERITY: u32 = 0x8000;
+const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
 const EXTERNAL_JOURNAL_SUPERBLOCK_OFFSET: usize = 2048;
 
 fn inode(value: u32) -> InodeId {
@@ -346,6 +358,25 @@ fn metadata_checksum_mismatch_is_rejected() {
 }
 
 #[test]
+fn larger_block_sizes_mount_and_read_file() {
+    for block_size in [8192_usize, 16_384, 65_536] {
+        let image = variable_block_fixture_image(block_size);
+        let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+            SliceBlockDevice::new(&image),
+        ));
+        let mut output = [0_u8; 5];
+        let read = read_file(&volume, 3, 0, &mut output);
+
+        assert_eq!(
+            volume.superblock().block_size().bytes(),
+            u32::try_from(block_size).unwrap_or(u32::MAX)
+        );
+        assert_eq!(read, 5);
+        assert_eq!(&output, b"hello");
+    }
+}
+
+#[test]
 fn block_count_uses_64bit_superblock_high_field() {
     let mut image = modern_fixture_image();
     put_u32(&mut image, 1024 + 4, 1);
@@ -353,6 +384,118 @@ fn block_count_uses_64bit_superblock_high_field() {
     let superblock = must(Superblock::parse(&image[1024..2048]));
 
     assert_eq!(superblock.block_count().as_u64(), 0x1_0000_0001);
+}
+
+#[test]
+fn metadata_csum_seed_is_accepted_with_metadata_csum() {
+    let mut image = modern_fixture_image();
+    put_u32(&mut image, 1024 + 96, INCOMPAT_MODERN | INCOMPAT_CSUM_SEED);
+    put_u32(&mut image, 1024 + 624, 0x1234_5678);
+    refresh_primary_block_group_descriptor_checksum(&mut image);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+
+    assert_eq!(volume.superblock().checksum_seed().as_u32(), 0x1234_5678);
+    assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 3);
+}
+
+#[test]
+fn metadata_csum_seed_without_metadata_csum_is_rejected() {
+    let mut image = fixture_image();
+    put_u32(&mut image, 1024 + 96, 0x0002 | 0x0040 | INCOMPAT_CSUM_SEED);
+    let result = Superblock::parse(&image[1024..2048]);
+
+    assert!(matches!(result, Err(Error::UnsupportedIncompatFeature)));
+}
+
+#[test]
+fn metadata_descriptor_checksum_is_verified() {
+    let image = modern_fixture_image();
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+
+    assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 3);
+}
+
+#[test]
+fn bad_metadata_descriptor_checksum_is_rejected() {
+    let mut image = modern_fixture_image();
+    corrupt_primary_block_group_descriptor_checksum(&mut image);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+    let result = volume.read_node(InodeId::ROOT);
+
+    assert!(matches!(result, Err(Error::ChecksumMismatch)));
+}
+
+#[test]
+fn gdt_descriptor_checksum_is_verified() {
+    let mut image = fixture_image();
+    put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | RO_COMPAT_GDT_CSUM);
+    refresh_primary_block_group_descriptor_checksum(&mut image);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+
+    assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 4);
+}
+
+#[test]
+fn bad_gdt_descriptor_checksum_is_rejected() {
+    let mut image = fixture_image();
+    put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | RO_COMPAT_GDT_CSUM);
+    refresh_primary_block_group_descriptor_checksum(&mut image);
+    corrupt_primary_block_group_descriptor_checksum(&mut image);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+    let result = volume.read_node(InodeId::ROOT);
+
+    assert!(matches!(result, Err(Error::ChecksumMismatch)));
+}
+
+#[test]
+fn read_only_mount_accepts_quota_and_clean_orphan_file() {
+    let mut image = fixture_image();
+    put_u32(&mut image, 1024 + 92, COMPAT_ORPHAN_FILE);
+    put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | RO_COMPAT_QUOTA);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+
+    assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 4);
+}
+
+#[test]
+fn read_only_mount_rejects_layout_changing_features() {
+    for incompat in [
+        INCOMPAT_META_BG,
+        INCOMPAT_LARGEDIR,
+        INCOMPAT_INLINE_DATA,
+        INCOMPAT_ENCRYPT,
+        INCOMPAT_CASEFOLD,
+    ] {
+        let mut image = fixture_image();
+        put_u32(&mut image, 1024 + 96, 0x0002 | 0x0040 | incompat);
+        let result = Superblock::parse(&image[1024..2048]);
+
+        assert!(matches!(result, Err(Error::UnsupportedIncompatFeature)));
+    }
+
+    for read_only_compat in [
+        RO_COMPAT_BIGALLOC,
+        RO_COMPAT_VERITY,
+        RO_COMPAT_ORPHAN_PRESENT,
+    ] {
+        let mut image = fixture_image();
+        put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | read_only_compat);
+        let result = Superblock::parse(&image[1024..2048]);
+
+        assert!(matches!(result, Err(Error::UnsupportedReadOnlyFeature)));
+    }
 }
 
 #[test]
@@ -1290,11 +1433,82 @@ fn modern_fixture_image_with_journal_blocks(journal_blocks: u16) -> Vec<u8> {
     let free_blocks = write_modern_block_bitmap(&mut image, journal_blocks);
     write_modern_superblock(&mut image, free_blocks, journal_blocks);
     write_modern_block_group_descriptor(&mut image, free_blocks);
+    refresh_primary_block_group_descriptor_checksum(&mut image);
     write_modern_root_inode(&mut image);
     write_modern_file_inode(&mut image);
     write_modern_journal_inode(&mut image, journal_blocks);
     write_modern_root_directory(&mut image);
     let file_data_offset = block_offset(MODERN_FILE_DATA_BLOCK);
+    image[file_data_offset..file_data_offset + 5].copy_from_slice(b"hello");
+    image
+}
+
+fn variable_block_fixture_image(block_size: usize) -> Vec<u8> {
+    let image_blocks = 8_usize;
+    let inode_table_block = 3_u32;
+    let root_dir_block = 5_u32;
+    let file_data_block = 6_u32;
+    let mut image = vec![0_u8; block_size * image_blocks];
+    let base = 1024;
+    let log_block_size = block_size.trailing_zeros() - 10;
+
+    put_u32(&mut image, base, 16);
+    put_u32(
+        &mut image,
+        base + 4,
+        u32::try_from(image_blocks).unwrap_or(u32::MAX),
+    );
+    put_u32(&mut image, base + 20, 0);
+    put_u32(&mut image, base + 24, log_block_size);
+    put_u32(
+        &mut image,
+        base + 32,
+        u32::try_from(block_size * 8).unwrap_or(u32::MAX),
+    );
+    put_u32(&mut image, base + 40, 16);
+    put_u16(&mut image, base + 56, 0xEF53);
+    put_u16(&mut image, base + 58, 1);
+    put_u32(&mut image, base + 76, 1);
+    put_u32(&mut image, base + 84, 11);
+    put_u16(&mut image, base + 88, 128);
+    put_u32(&mut image, base + 96, 0x0002 | 0x0040);
+    put_u32(&mut image, base + 100, 0x0001 | 0x0002);
+
+    put_u32(
+        &mut image,
+        variable_block_offset(1, block_size) + 8,
+        inode_table_block,
+    );
+
+    let root_inode = variable_inode_offset(inode_table_block, 2, block_size);
+    put_u16(&mut image, root_inode, 0x4000 | 0o755);
+    put_u32(
+        &mut image,
+        root_inode + 4,
+        u32::try_from(block_size).unwrap_or(u32::MAX),
+    );
+    put_u32(&mut image, root_inode + 32, EXT4_EXTENTS_FL);
+    write_extent_root(&mut image, root_inode + 40, 0, 1, root_dir_block);
+
+    let file_inode = variable_inode_offset(inode_table_block, 3, block_size);
+    put_u16(&mut image, file_inode, 0x8000 | 0o444);
+    put_u32(&mut image, file_inode + 4, 5);
+    put_u32(&mut image, file_inode + 32, EXT4_EXTENTS_FL);
+    write_extent_root(&mut image, file_inode + 40, 0, 1, file_data_block);
+
+    let root_dir = variable_block_offset(root_dir_block, block_size);
+    write_dirent(&mut image, root_dir, 2, 12, b".", 2);
+    write_dirent(&mut image, root_dir + 12, 2, 12, b"..", 2);
+    write_dirent(
+        &mut image,
+        root_dir + 24,
+        3,
+        u16::try_from(block_size - 24).unwrap_or(u16::MAX),
+        b"file",
+        1,
+    );
+
+    let file_data_offset = variable_block_offset(file_data_block, block_size);
     image[file_data_offset..file_data_offset + 5].copy_from_slice(b"hello");
     image
 }
@@ -1876,8 +2090,48 @@ fn modern_inode_offset(inode: u32) -> usize {
         + usize::try_from(inode - 1).unwrap_or(usize::MAX) * MODERN_INODE_SIZE
 }
 
+fn variable_inode_offset(inode_table_block: u32, inode: u32, block_size: usize) -> usize {
+    variable_block_offset(inode_table_block, block_size)
+        + usize::try_from(inode - 1).unwrap_or(usize::MAX) * 128
+}
+
 fn block_offset(block: u32) -> usize {
     usize::try_from(block).unwrap_or(usize::MAX) * BLOCK_SIZE
+}
+
+fn variable_block_offset(block: u32, block_size: usize) -> usize {
+    usize::try_from(block).unwrap_or(usize::MAX) * block_size
+}
+
+fn primary_block_group_descriptor_offset(image: &[u8]) -> usize {
+    let superblock = must(Superblock::parse(&image[1024..2048]));
+    let block_size = usize::try_from(superblock.block_size().bytes()).unwrap_or(usize::MAX);
+    if block_size == 1024 {
+        variable_block_offset(2, block_size)
+    } else {
+        variable_block_offset(1, block_size)
+    }
+}
+
+fn refresh_primary_block_group_descriptor_checksum(image: &mut [u8]) {
+    let superblock = must(Superblock::parse(&image[1024..2048]));
+    let descriptor_size = usize::from(superblock.descriptor_size().as_u16());
+    let base = primary_block_group_descriptor_offset(image);
+    must(crate::group::write_block_group_descriptor_checksum(
+        &superblock,
+        BlockGroupId::from_u32(0),
+        &mut image[base..base + descriptor_size],
+    ));
+}
+
+fn corrupt_primary_block_group_descriptor_checksum(image: &mut [u8]) {
+    let base = primary_block_group_descriptor_offset(image);
+    let checksum_offset = base + 30;
+    put_u16(
+        image,
+        checksum_offset,
+        get_u16(image, checksum_offset) ^ u16::MAX,
+    );
 }
 
 fn set_modern_block_used(image: &mut [u8], block: u32, used: bool) {
@@ -1906,6 +2160,10 @@ fn put_be_u32(image: &mut [u8], offset: usize, value: u32) {
 
 fn put_be_u16(image: &mut [u8], offset: usize, value: u16) {
     image[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+}
+
+fn get_u16(image: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([image[offset], image[offset + 1]])
 }
 
 fn get_u32(image: &[u8], offset: usize) -> u32 {

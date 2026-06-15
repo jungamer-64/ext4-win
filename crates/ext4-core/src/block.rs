@@ -67,13 +67,13 @@ impl BlockAddress {
 pub struct BlockSize(u32);
 
 impl BlockSize {
-    /// Creates a v1-supported ext4 block size from `s_log_block_size`.
+    /// Creates a supported ext4 block size from `s_log_block_size`.
     ///
     /// # Errors
-    /// Returns an error when the encoded block size is outside the v1 range or
+    /// Returns an error when the encoded block size is outside the supported range or
     /// cannot be computed without overflow.
     pub fn from_superblock_log(log_block_size: u32) -> Result<Self> {
-        if log_block_size > 2 {
+        if log_block_size > 6 {
             return Err(Error::UnsupportedBlockSize);
         }
 
