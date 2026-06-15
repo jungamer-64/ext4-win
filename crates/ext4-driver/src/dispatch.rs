@@ -1,46 +1,118 @@
 //! IRP major-function dispatch table for the read-only FSD boundary.
 
 use wdk_sys::{
-    DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_ACCESS_DENIED,
+    DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP, STATUS_ACCESS_DENIED,
     STATUS_INVALID_DEVICE_REQUEST, STATUS_MEDIA_WRITE_PROTECTED, STATUS_NOT_IMPLEMENTED,
     STATUS_SUCCESS,
 };
 
-const IRP_MJ_CREATE: usize = 0x00;
-const IRP_MJ_CLOSE: usize = 0x02;
-const IRP_MJ_READ: usize = 0x03;
-const IRP_MJ_WRITE: usize = 0x04;
-const IRP_MJ_QUERY_INFORMATION: usize = 0x05;
-const IRP_MJ_SET_INFORMATION: usize = 0x06;
-const IRP_MJ_QUERY_VOLUME_INFORMATION: usize = 0x0A;
-const IRP_MJ_SET_VOLUME_INFORMATION: usize = 0x0B;
-const IRP_MJ_DIRECTORY_CONTROL: usize = 0x0C;
-const IRP_MJ_FILE_SYSTEM_CONTROL: usize = 0x0D;
-const IRP_MJ_DEVICE_CONTROL: usize = 0x0E;
-const IRP_MJ_SHUTDOWN: usize = 0x10;
-const IRP_MJ_CLEANUP: usize = 0x12;
-const IRP_MJ_QUERY_SECURITY: usize = 0x14;
-const IRP_MJ_SET_SECURITY: usize = 0x15;
+type DispatchRoutine = unsafe extern "system" fn(PDEVICE_OBJECT, PIRP) -> NTSTATUS;
+type UnloadRoutine = unsafe extern "system" fn(PDRIVER_OBJECT);
+
+/// Valid IRP major-function slot understood by this driver.
+#[derive(Clone, Copy, Debug)]
+struct MajorFunction {
+    index: usize,
+}
+
+impl MajorFunction {
+    /// Create/open request.
+    const CREATE: Self = Self { index: 0x00 };
+    /// Close request.
+    const CLOSE: Self = Self { index: 0x02 };
+    /// Read request.
+    const READ: Self = Self { index: 0x03 };
+    /// Write request.
+    const WRITE: Self = Self { index: 0x04 };
+    /// File information query.
+    const QUERY_INFORMATION: Self = Self { index: 0x05 };
+    /// File information mutation.
+    const SET_INFORMATION: Self = Self { index: 0x06 };
+    /// Volume information query.
+    const QUERY_VOLUME_INFORMATION: Self = Self { index: 0x0A };
+    /// Volume information mutation.
+    const SET_VOLUME_INFORMATION: Self = Self { index: 0x0B };
+    /// Directory enumeration request.
+    const DIRECTORY_CONTROL: Self = Self { index: 0x0C };
+    /// File-system control request.
+    const FILE_SYSTEM_CONTROL: Self = Self { index: 0x0D };
+    /// Device control request.
+    const DEVICE_CONTROL: Self = Self { index: 0x0E };
+    /// Shutdown notification.
+    const SHUTDOWN: Self = Self { index: 0x10 };
+    /// Cleanup request.
+    const CLEANUP: Self = Self { index: 0x12 };
+    /// Security descriptor query.
+    const QUERY_SECURITY: Self = Self { index: 0x14 };
+    /// Security descriptor mutation.
+    const SET_SECURITY: Self = Self { index: 0x15 };
+
+    /// Returns the WDK dispatch table index.
+    const fn index(self) -> usize {
+        self.index
+    }
+}
+
+/// Dispatch table installation failed because the WDK table cannot hold a slot.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DispatchInstallError;
+
+/// Typed writer for the WDK major-function dispatch table.
+struct DispatchTable<'driver> {
+    driver: &'driver mut DRIVER_OBJECT,
+}
+
+impl<'driver> DispatchTable<'driver> {
+    /// Creates a dispatch-table writer for a driver object.
+    fn new(driver: &'driver mut DRIVER_OBJECT) -> Self {
+        Self { driver }
+    }
+
+    /// Installs the driver unload routine.
+    fn unload(&mut self, routine: UnloadRoutine) {
+        self.driver.DriverUnload = Some(routine);
+    }
+
+    /// Installs one major-function dispatch routine.
+    fn set(
+        &mut self,
+        major_function: MajorFunction,
+        routine: DispatchRoutine,
+    ) -> Result<(), DispatchInstallError> {
+        let Some(slot) = self.driver.MajorFunction.get_mut(major_function.index()) else {
+            return Err(DispatchInstallError);
+        };
+
+        *slot = Some(routine);
+        Ok(())
+    }
+}
 
 /// Installs the v1 read-only dispatch table.
-pub(crate) fn install(driver: &mut DRIVER_OBJECT) {
-    driver.DriverUnload = Some(super::state::driver_unload);
-    driver.MajorFunction[IRP_MJ_CREATE] = Some(create);
-    driver.MajorFunction[IRP_MJ_CLOSE] = Some(success);
-    driver.MajorFunction[IRP_MJ_CLEANUP] = Some(success);
-    driver.MajorFunction[IRP_MJ_READ] = Some(read);
-    driver.MajorFunction[IRP_MJ_QUERY_INFORMATION] = Some(query_information);
-    driver.MajorFunction[IRP_MJ_QUERY_VOLUME_INFORMATION] = Some(query_volume_information);
-    driver.MajorFunction[IRP_MJ_DIRECTORY_CONTROL] = Some(directory_control);
-    driver.MajorFunction[IRP_MJ_FILE_SYSTEM_CONTROL] = Some(file_system_control);
-    driver.MajorFunction[IRP_MJ_DEVICE_CONTROL] = Some(device_control);
-    driver.MajorFunction[IRP_MJ_SHUTDOWN] = Some(success);
-    driver.MajorFunction[IRP_MJ_QUERY_SECURITY] = Some(query_security);
+pub(crate) fn install(driver: &mut DRIVER_OBJECT) -> Result<(), DispatchInstallError> {
+    let mut table = DispatchTable::new(driver);
+    table.unload(super::state::driver_unload);
+    table.set(MajorFunction::CREATE, create)?;
+    table.set(MajorFunction::CLOSE, success)?;
+    table.set(MajorFunction::CLEANUP, success)?;
+    table.set(MajorFunction::READ, read)?;
+    table.set(MajorFunction::QUERY_INFORMATION, query_information)?;
+    table.set(
+        MajorFunction::QUERY_VOLUME_INFORMATION,
+        query_volume_information,
+    )?;
+    table.set(MajorFunction::DIRECTORY_CONTROL, directory_control)?;
+    table.set(MajorFunction::FILE_SYSTEM_CONTROL, file_system_control)?;
+    table.set(MajorFunction::DEVICE_CONTROL, device_control)?;
+    table.set(MajorFunction::SHUTDOWN, success)?;
+    table.set(MajorFunction::QUERY_SECURITY, query_security)?;
 
-    driver.MajorFunction[IRP_MJ_WRITE] = Some(read_only);
-    driver.MajorFunction[IRP_MJ_SET_INFORMATION] = Some(read_only);
-    driver.MajorFunction[IRP_MJ_SET_VOLUME_INFORMATION] = Some(read_only);
-    driver.MajorFunction[IRP_MJ_SET_SECURITY] = Some(read_only);
+    table.set(MajorFunction::WRITE, read_only)?;
+    table.set(MajorFunction::SET_INFORMATION, read_only)?;
+    table.set(MajorFunction::SET_VOLUME_INFORMATION, read_only)?;
+    table.set(MajorFunction::SET_SECURITY, read_only)?;
+
+    Ok(())
 }
 
 unsafe extern "system" fn create(_device: PDEVICE_OBJECT, _irp: PIRP) -> NTSTATUS {

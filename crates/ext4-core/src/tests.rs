@@ -15,10 +15,10 @@ use alloc::{vec, vec::Vec};
 
 use crate::{
     BlockMapping, BlockReader, BlockWriter, ByteOffset, DeviceLength, DirectoryEntry,
-    DirectoryEntryKind, DirectoryNode, Error, Ext4Name, Ext4Timestamp, ExtentTree,
-    ExternalJournal, FileNode, FileOffset, FileSize, InodeId, JournalMode, LogicalBlock,
-    LookupResult, Node, ReadOnly, ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock,
-    SymlinkNode, TransactionFile, Volume, WindowsName,
+    DirectoryEntryKind, DirectoryNode, Error, Ext4Name, Ext4Timestamp, ExtentTree, ExternalJournal,
+    FileNode, FileOffset, FileSize, InodeId, JournalMode, LogicalBlock, LookupResult, Node,
+    ReadOnly, ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode,
+    TransactionFile, Volume, WindowsName,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -300,7 +300,14 @@ fn lookup_reports_not_found_without_option() {
 #[test]
 fn windows_lookup_rejects_ambiguous_case_fold() {
     let mut image = fixture_image();
-    write_dirent(&mut image, block_offset(ROOT_DIR_BLOCK) + 40, 4, 984, b"FILE", 1);
+    write_dirent(
+        &mut image,
+        block_offset(ROOT_DIR_BLOCK) + 40,
+        4,
+        984,
+        b"FILE",
+        1,
+    );
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
     ));

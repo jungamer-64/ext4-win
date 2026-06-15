@@ -11,13 +11,15 @@ extern crate wdk_panic;
 
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
-use wdk_sys::{NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_SUCCESS};
+use wdk_sys::{
+    NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
+};
 
 #[cfg(not(test))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
-static mut CONTROL_DEVICE: state::ControlDevice = state::ControlDevice::none();
+static mut CONTROL_DEVICE: Option<state::ControlDevice> = None;
 
 /// Driver entry point called by the Windows kernel loader.
 ///
@@ -36,7 +38,9 @@ pub unsafe extern "system" fn driver_entry(
         return wdk_sys::STATUS_INVALID_PARAMETER;
     };
 
-    dispatch::install(driver_object);
+    if dispatch::install(driver_object).is_err() {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     let mut device = core::ptr::null_mut();
     let status = unsafe {
@@ -56,10 +60,21 @@ pub unsafe extern "system" fn driver_entry(
         return status;
     }
 
+    let Some(control_device) = state::ControlDevice::registered(device) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+
     unsafe {
-        // SAFETY: `device` was initialized by a successful IoCreateDevice call.
-        ffi::IoRegisterFileSystem(device);
-        CONTROL_DEVICE = state::ControlDevice::registered(device);
+        // SAFETY: `control_device` was initialized by a successful IoCreateDevice call.
+        ffi::IoRegisterFileSystem(control_device.as_ptr());
+    }
+    unsafe {
+        // SAFETY: DriverEntry initializes this global before the unload callback
+        // can observe it. Raw pointer write avoids borrowing the mutable static.
+        core::ptr::write(
+            core::ptr::addr_of_mut!(CONTROL_DEVICE),
+            Some(control_device),
+        );
     }
 
     STATUS_SUCCESS

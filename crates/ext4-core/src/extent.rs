@@ -34,8 +34,8 @@ impl LogicalBlock {
 
     /// Returns the logical block value widened for arithmetic.
     #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0 as u64
+    pub fn as_u64(self) -> u64 {
+        u64::from(self.0)
     }
 }
 
@@ -74,14 +74,14 @@ impl ExtentLength {
 
     /// Returns the length widened for arithmetic.
     #[must_use]
-    pub const fn as_u32(self) -> u32 {
-        self.0 as u32
+    pub fn as_u32(self) -> u32 {
+        u32::from(self.0)
     }
 
     /// Returns the length widened for arithmetic.
     #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0 as u64
+    pub fn as_u64(self) -> u64 {
+        u64::from(self.0)
     }
 
     pub(crate) fn checked_add_one(self) -> Result<Self> {
