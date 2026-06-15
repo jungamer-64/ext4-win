@@ -15,10 +15,11 @@ use alloc::{vec, vec::Vec};
 
 use crate::{
     BlockGroupId, BlockMapping, BlockReader, BlockWriter, ByteOffset, DeviceLength, DirectoryEntry,
-    DirectoryEntryKind, DirectoryNode, Error, Ext4Name, Ext4Timestamp, ExtentTree, ExternalJournal,
-    FileNode, FileOffset, FileSize, InodeId, JournalMode, LogicalBlock, LookupResult, Node,
-    ReadOnly, ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode,
-    TransactionFile, Volume, WindowsName,
+    DirectoryEntryKind, DirectoryNode, Error, Ext4Gid, Ext4Name, Ext4Owner, Ext4Permissions,
+    Ext4Timestamp, Ext4Uid, ExtentTree, ExternalJournal, FileNode, FileOffset, FileSize, InodeId,
+    JournalMode, LogicalBlock, LookupResult, NewDirectoryMetadata, NewFileMetadata, Node, ReadOnly,
+    ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode,
+    TransactionDirectory, TransactionFile, Volume, WindowsName,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -146,6 +147,25 @@ fn transaction_file<D: BlockWriter, J>(
     inode_id: u32,
 ) -> TransactionFile {
     must(transaction.file(inode(inode_id)))
+}
+
+fn transaction_directory<D: BlockWriter, J>(
+    transaction: &crate::WriteTransaction<'_, D, J>,
+    inode_id: InodeId,
+) -> TransactionDirectory {
+    must(transaction.directory(inode_id))
+}
+
+fn test_owner() -> Ext4Owner {
+    Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(1000))
+}
+
+fn test_file_metadata() -> NewFileMetadata {
+    NewFileMetadata::new(test_owner(), must(Ext4Permissions::new(0o644)))
+}
+
+fn test_directory_metadata() -> NewDirectoryMetadata {
+    NewDirectoryMetadata::new(test_owner(), must(Ext4Permissions::new(0o755)))
 }
 
 fn overwrite_file<D: BlockWriter, J>(
@@ -350,7 +370,7 @@ fn crc32c_known_vector_matches_castagnoli() {
 
 #[test]
 fn metadata_checksum_mismatch_is_rejected() {
-    let mut image = modern_fixture_image();
+    let mut image = modern_fixture_image_with_journal_blocks(16);
     put_u32(&mut image, 1024 + 1020, 1);
     let result = Superblock::parse(&image[1024..2048]);
 
@@ -378,7 +398,7 @@ fn larger_block_sizes_mount_and_read_file() {
 
 #[test]
 fn block_count_uses_64bit_superblock_high_field() {
-    let mut image = modern_fixture_image();
+    let mut image = modern_fixture_image_with_journal_blocks(16);
     put_u32(&mut image, 1024 + 4, 1);
     put_u32(&mut image, 1024 + 336, 1);
     let superblock = must(Superblock::parse(&image[1024..2048]));
@@ -388,7 +408,7 @@ fn block_count_uses_64bit_superblock_high_field() {
 
 #[test]
 fn metadata_csum_seed_is_accepted_with_metadata_csum() {
-    let mut image = modern_fixture_image();
+    let mut image = modern_fixture_image_with_journal_blocks(16);
     put_u32(&mut image, 1024 + 96, INCOMPAT_MODERN | INCOMPAT_CSUM_SEED);
     put_u32(&mut image, 1024 + 624, 0x1234_5678);
     refresh_primary_block_group_descriptor_checksum(&mut image);
@@ -421,7 +441,7 @@ fn metadata_descriptor_checksum_is_verified() {
 
 #[test]
 fn bad_metadata_descriptor_checksum_is_rejected() {
-    let mut image = modern_fixture_image();
+    let mut image = modern_fixture_image_with_journal_blocks(16);
     corrupt_primary_block_group_descriptor_checksum(&mut image);
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
@@ -608,6 +628,157 @@ fn transaction_too_large_is_rejected_before_writes() {
     let result = transaction.commit();
 
     assert!(matches!(result, Err(Error::TransactionTooLarge)));
+}
+
+#[test]
+fn create_file_adds_directory_entry_and_inode() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let name = must(Ext4Name::new(b"new"));
+        let file = must(transaction.create_file(root, &name, test_file_metadata()));
+        assert_eq!(file.inode_id(), inode(11));
+        must(transaction.commit());
+
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"new"),
+            LookupResult::Found(inode(11))
+        );
+        let file = file_node(&volume, 11);
+        assert_eq!(file.size().bytes(), 0);
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 16), 5);
+}
+
+#[test]
+fn create_file_rejects_duplicate_name() {
+    let mut image = modern_fixture_image();
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut transaction = volume.begin_transaction(NOW);
+    let root = transaction_directory(&transaction, InodeId::ROOT);
+    let name = must(Ext4Name::new(b"file"));
+    let result = transaction.create_file(root, &name, test_file_metadata());
+
+    assert_eq!(result, Err(Error::NameAlreadyExists));
+}
+
+#[test]
+fn unlink_file_removes_directory_entry_and_frees_inode() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let name = must(Ext4Name::new(b"new"));
+
+        let mut create = volume.begin_transaction(NOW);
+        let root = transaction_directory(&create, InodeId::ROOT);
+        let _file = must(create.create_file(root, &name, test_file_metadata()));
+        must(create.commit());
+
+        let mut unlink = volume.begin_transaction(NOW);
+        let root = transaction_directory(&unlink, InodeId::ROOT);
+        must(unlink.unlink_file(root, &name));
+        must(unlink.commit());
+
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"new"),
+            LookupResult::NotFound
+        );
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 16), 6);
+}
+
+#[test]
+fn unlink_file_reports_missing_entry() {
+    let mut image = modern_fixture_image();
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut transaction = volume.begin_transaction(NOW);
+    let root = transaction_directory(&transaction, InodeId::ROOT);
+    let name = must(Ext4Name::new(b"missing"));
+    let result = transaction.unlink_file(root, &name);
+
+    assert_eq!(result, Err(Error::DirectoryEntryNotFound));
+}
+
+#[test]
+fn create_and_remove_empty_directory_updates_namespace() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let name = must(Ext4Name::new(b"dir"));
+
+        let mut create = volume.begin_transaction(NOW);
+        let root = transaction_directory(&create, InodeId::ROOT);
+        let directory = must(create.create_directory(root, &name, test_directory_metadata()));
+        assert_eq!(directory.inode_id(), inode(11));
+        must(create.commit());
+
+        let entries = read_directory(&volume, inode(11));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name().bytes(), b".");
+        assert_eq!(entries[1].name().bytes(), b"..");
+
+        let mut remove = volume.begin_transaction(NOW);
+        let root = transaction_directory(&remove, InodeId::ROOT);
+        must(remove.remove_empty_directory(root, &name));
+        must(remove.commit());
+
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"dir"),
+            LookupResult::NotFound
+        );
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 16), 6);
+}
+
+#[test]
+fn remove_directory_rejects_non_empty_child() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let dir_name = must(Ext4Name::new(b"dir"));
+    let file_name = must(Ext4Name::new(b"child"));
+
+    let mut create_dir = volume.begin_transaction(NOW);
+    let root = transaction_directory(&create_dir, InodeId::ROOT);
+    let directory = must(create_dir.create_directory(root, &dir_name, test_directory_metadata()));
+    must(create_dir.commit());
+
+    let mut create_file = volume.begin_transaction(NOW);
+    let child_parent = transaction_directory(&create_file, directory.inode_id());
+    let _file = must(create_file.create_file(child_parent, &file_name, test_file_metadata()));
+    must(create_file.commit());
+
+    let mut remove = volume.begin_transaction(NOW);
+    let root = transaction_directory(&remove, InodeId::ROOT);
+    let result = remove.remove_empty_directory(root, &dir_name);
+
+    assert_eq!(result, Err(Error::DirectoryNotEmpty));
+}
+
+#[test]
+fn remove_directory_rejects_root_entry() {
+    let mut image = modern_fixture_image();
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut transaction = volume.begin_transaction(NOW);
+    let root = transaction_directory(&transaction, InodeId::ROOT);
+    let dot = must(Ext4Name::new(b"."));
+    let result = transaction.remove_empty_directory(root, &dot);
+
+    assert_eq!(result, Err(Error::CannotRemoveRoot));
 }
 
 #[test]
@@ -1431,8 +1602,9 @@ fn modern_fixture_image() -> Vec<u8> {
 fn modern_fixture_image_with_journal_blocks(journal_blocks: u16) -> Vec<u8> {
     let mut image = vec![0_u8; BLOCK_SIZE * MODERN_IMAGE_BLOCKS];
     let free_blocks = write_modern_block_bitmap(&mut image, journal_blocks);
-    write_modern_superblock(&mut image, free_blocks, journal_blocks);
-    write_modern_block_group_descriptor(&mut image, free_blocks);
+    let free_inodes = write_modern_inode_bitmap(&mut image);
+    write_modern_superblock(&mut image, free_blocks, free_inodes, journal_blocks);
+    write_modern_block_group_descriptor(&mut image, free_blocks, free_inodes);
     refresh_primary_block_group_descriptor_checksum(&mut image);
     write_modern_root_inode(&mut image);
     write_modern_file_inode(&mut image);
@@ -1534,7 +1706,12 @@ fn write_superblock(image: &mut [u8]) {
     put_u32(image, base + 100, 0x0001 | 0x0002);
 }
 
-fn write_modern_superblock(image: &mut [u8], free_blocks: u32, journal_blocks: u16) {
+fn write_modern_superblock(
+    image: &mut [u8],
+    free_blocks: u32,
+    free_inodes: u32,
+    journal_blocks: u16,
+) {
     let base = 1024;
     put_u32(image, base, 16);
     put_u32(
@@ -1543,6 +1720,7 @@ fn write_modern_superblock(image: &mut [u8], free_blocks: u32, journal_blocks: u
         u32::try_from(MODERN_IMAGE_BLOCKS).unwrap_or(u32::MAX),
     );
     put_u32(image, base + 12, free_blocks);
+    put_u32(image, base + 16, free_inodes);
     put_u32(image, base + 20, 1);
     put_u32(image, base + 24, 0);
     put_u32(image, base + 32, 8192);
@@ -1570,7 +1748,7 @@ fn write_block_group_descriptor(image: &mut [u8]) {
     put_u32(image, block_offset(2) + 8, INODE_TABLE_BLOCK);
 }
 
-fn write_modern_block_group_descriptor(image: &mut [u8], free_blocks: u32) {
+fn write_modern_block_group_descriptor(image: &mut [u8], free_blocks: u32, free_inodes: u32) {
     let base = block_offset(2);
     put_u32(image, base, MODERN_BLOCK_BITMAP_BLOCK);
     put_u32(image, base + 4, MODERN_INODE_BITMAP_BLOCK);
@@ -1584,6 +1762,17 @@ fn write_modern_block_group_descriptor(image: &mut [u8], free_blocks: u32) {
         image,
         base + 44,
         u16::try_from(free_blocks >> 16).unwrap_or(u16::MAX),
+    );
+    put_u16(
+        image,
+        base + 14,
+        u16::try_from(free_inodes & u32::from(u16::MAX)).unwrap_or(u16::MAX),
+    );
+    put_u16(image, base + 16, 1);
+    put_u16(
+        image,
+        base + 46,
+        u16::try_from(free_inodes >> 16).unwrap_or(u16::MAX),
     );
 }
 
@@ -1608,6 +1797,13 @@ fn write_modern_block_bitmap(image: &mut [u8], journal_blocks: u16) -> u32 {
     }
     let used = u32::try_from(used_blocks.len()).unwrap_or(u32::MAX) + u32::from(journal_blocks);
     u32::try_from(MODERN_IMAGE_BLOCKS - 1).unwrap_or(u32::MAX) - used
+}
+
+fn write_modern_inode_bitmap(image: &mut [u8]) -> u32 {
+    for inode in 1..=10 {
+        set_modern_inode_used(image, inode, true);
+    }
+    6
 }
 
 fn write_root_inode(image: &mut [u8]) {
@@ -2138,6 +2334,18 @@ fn set_modern_block_used(image: &mut [u8], block: u32, used: bool) {
     let bit = block - 1;
     let byte =
         block_offset(MODERN_BLOCK_BITMAP_BLOCK) + usize::try_from(bit / 8).unwrap_or(usize::MAX);
+    let mask = 1_u8 << (bit % 8);
+    if used {
+        image[byte] |= mask;
+    } else {
+        image[byte] &= !mask;
+    }
+}
+
+fn set_modern_inode_used(image: &mut [u8], inode: u32, used: bool) {
+    let bit = inode - 1;
+    let byte =
+        block_offset(MODERN_INODE_BITMAP_BLOCK) + usize::try_from(bit / 8).unwrap_or(usize::MAX);
     let mask = 1_u8 << (bit % 8);
     if used {
         image[byte] |= mask;

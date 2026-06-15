@@ -58,6 +58,20 @@ pub enum Error {
     TransactionTooLarge,
     /// A write operation was outside the file range accepted by that operation.
     InvalidWriteRange,
+    /// A directory already contains the requested child name.
+    NameAlreadyExists,
+    /// A directory does not contain the requested child name.
+    DirectoryEntryNotFound,
+    /// A directory removal target still contains children.
+    DirectoryNotEmpty,
+    /// No free inode exists for a required allocation.
+    NoFreeInode,
+    /// A hashed directory uses a hash profile outside the write domain.
+    UnsupportedDirectoryHash,
+    /// An inode carries mutation semantics outside the write domain.
+    UnsupportedInodeMutation,
+    /// The root directory cannot be removed.
+    CannotRemoveRoot,
 }
 
 impl fmt::Display for Error {
@@ -88,6 +102,13 @@ impl fmt::Display for Error {
             Self::NoSpace => "ext4 volume has no free blocks",
             Self::TransactionTooLarge => "ext4 transaction exceeds journal capacity",
             Self::InvalidWriteRange => "invalid ext4 write range",
+            Self::NameAlreadyExists => "directory child name already exists",
+            Self::DirectoryEntryNotFound => "directory child name was not found",
+            Self::DirectoryNotEmpty => "directory is not empty",
+            Self::NoFreeInode => "ext4 volume has no free inodes",
+            Self::UnsupportedDirectoryHash => "unsupported ext4 directory hash",
+            Self::UnsupportedInodeMutation => "unsupported ext4 inode mutation",
+            Self::CannotRemoveRoot => "cannot remove the ext4 root directory",
         })
     }
 }

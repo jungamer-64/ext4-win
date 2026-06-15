@@ -154,6 +154,24 @@ impl FreeBlockCount {
     }
 }
 
+/// Number of free inodes recorded by a validated superblock.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FreeInodeCount(u32);
+
+impl FreeInodeCount {
+    /// Creates a free-inode count.
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the count for on-disk accounting.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
 /// Blocks per ext4 block group.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BlocksPerGroup(u32);
@@ -295,6 +313,43 @@ impl FreeBlockDelta {
     pub const ZERO: Self = Self(0);
 
     /// Creates a free-block delta from a signed count.
+    #[must_use]
+    pub const fn from_i64(value: i64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the delta for checked arithmetic at metadata encoding boundaries.
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
+        self.0
+    }
+
+    /// Returns true when the delta has no effect.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Adds another delta.
+    ///
+    /// # Errors
+    /// Returns an error when the signed delta would overflow.
+    pub fn checked_add(self, delta: i64) -> Result<Self> {
+        Ok(Self(
+            self.0.checked_add(delta).ok_or(Error::ArithmeticOverflow)?,
+        ))
+    }
+}
+
+/// Signed free-inode count delta.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FreeInodeDelta(i64);
+
+impl FreeInodeDelta {
+    /// Zero free-inode delta.
+    pub const ZERO: Self = Self(0);
+
+    /// Creates a free-inode delta from a signed count.
     #[must_use]
     pub const fn from_i64(value: i64) -> Self {
         Self(value)
@@ -531,6 +586,7 @@ pub struct Superblock {
     inode_count: InodeCount,
     block_count: BlockCount,
     free_blocks_count: FreeBlockCount,
+    free_inodes_count: FreeInodeCount,
     first_data_block: BlockAddress,
     blocks_per_group: BlocksPerGroup,
     inodes_per_group: InodesPerGroup,
@@ -599,6 +655,7 @@ impl Superblock {
         let inode_count = InodeCount::new(le_u32(raw, 0)?)?;
         let block_count_lo = le_u32(raw, 4)?;
         let free_blocks_count_lo = le_u32(raw, 12)?;
+        let free_inodes_count = FreeInodeCount::new(le_u32(raw, 16)?);
         let first_data_block = BlockAddress::new(u64::from(le_u32(raw, 20)?));
         let block_size = BlockSize::from_superblock_log(le_u32(raw, 24)?)?;
         let blocks_per_group = BlocksPerGroup::new(le_u32(raw, 32)?)?;
@@ -668,6 +725,7 @@ impl Superblock {
             inode_count,
             block_count,
             free_blocks_count,
+            free_inodes_count,
             first_data_block,
             blocks_per_group,
             inodes_per_group,
@@ -703,6 +761,12 @@ impl Superblock {
     #[must_use]
     pub const fn free_blocks_count(self) -> FreeBlockCount {
         self.free_blocks_count
+    }
+
+    /// Total free inode count.
+    #[must_use]
+    pub const fn free_inodes_count(self) -> FreeInodeCount {
+        self.free_inodes_count
     }
 
     /// First data block.
