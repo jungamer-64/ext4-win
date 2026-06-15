@@ -148,6 +148,9 @@ impl Journal {
     }
 
     pub(crate) fn ensure_transaction_capacity(&self, metadata_blocks: usize) -> Result<()> {
+        if metadata_blocks > self.descriptor_tag_capacity()? {
+            return Err(Error::TransactionTooLarge);
+        }
         let required = u32::try_from(metadata_blocks)
             .map_err(|_| Error::TransactionTooLarge)?
             .checked_add(JOURNAL_OVERHEAD_BLOCKS)
@@ -262,31 +265,29 @@ impl Journal {
         block_size: BlockSize,
         metadata_blocks: &[MetadataBlock],
     ) -> Result<()> {
-        self.ensure_transaction_capacity(metadata_blocks.len())?;
-        let sequence = self.superblock.sequence();
-        let descriptor = if self.superblock.start() == 0 {
-            self.superblock.first()
-        } else {
-            self.superblock.start()
-        };
-        let mut cursor = descriptor;
-        self.superblock.set_dirty(descriptor, sequence);
-        let dirty_superblock = self.superblock.encode(block_size)?;
+        if self.state != JournalState::Clean || self.superblock.start() != 0 {
+            return Err(Error::JournalCorrupt);
+        }
+        let prepared = self.prepare_metadata_transaction(block_size, metadata_blocks)?;
+        let mut cursor = prepared.descriptor;
+        let dirty_superblock =
+            self.superblock
+                .encode_dirty(block_size, prepared.descriptor, prepared.sequence)?;
         io.write_journal_block(self, block_size, 0, &dirty_superblock)?;
+        self.superblock
+            .apply_dirty(prepared.descriptor, prepared.sequence, dirty_superblock);
+        self.state = JournalState::Dirty;
 
-        let descriptor_block =
-            self.encode_descriptor_block(sequence, metadata_blocks, block_size)?;
-        io.write_journal_block(self, block_size, cursor, &descriptor_block)?;
+        io.write_journal_block(self, block_size, cursor, &prepared.descriptor_block)?;
         cursor = self.next_logical(cursor)?;
 
-        for metadata in metadata_blocks {
-            io.write_journal_block(self, block_size, cursor, metadata.bytes())?;
+        for data in &prepared.data_blocks {
+            io.write_journal_block(self, block_size, cursor, data)?;
             cursor = self.next_logical(cursor)?;
         }
         io.flush_all()?;
 
-        let commit_block = self.encode_commit_block(sequence, block_size)?;
-        io.write_journal_block(self, block_size, cursor, &commit_block)?;
+        io.write_journal_block(self, block_size, cursor, &prepared.commit_block)?;
         io.flush_all()?;
 
         for metadata in metadata_blocks {
@@ -294,11 +295,46 @@ impl Journal {
         }
         io.flush_all()?;
 
-        self.mark_clean(
-            io,
-            block_size,
-            sequence.next(),
-        )
+        self.mark_clean(io, block_size, prepared.next_sequence)?;
+        self.state = JournalState::Clean;
+        Ok(())
+    }
+
+    fn prepare_metadata_transaction(
+        &self,
+        block_size: BlockSize,
+        metadata_blocks: &[MetadataBlock],
+    ) -> Result<PreparedJournalTransaction> {
+        self.ensure_transaction_capacity(metadata_blocks.len())?;
+        let block_bytes =
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let mut data_blocks = Vec::with_capacity(metadata_blocks.len());
+        for metadata in metadata_blocks {
+            if metadata.bytes().len() != block_bytes {
+                return Err(Error::InvalidWriteRange);
+            }
+            let mut data = metadata.bytes().to_vec();
+            if starts_with_jbd2_magic(&data) {
+                put_be_u32(&mut data, 0, 0)?;
+            }
+            data_blocks.push(data);
+        }
+
+        let sequence = self.superblock.sequence();
+        let descriptor = self.superblock.first();
+        Ok(PreparedJournalTransaction {
+            sequence,
+            next_sequence: sequence.next(),
+            descriptor,
+            descriptor_block: self.encode_descriptor_block(
+                sequence,
+                metadata_blocks,
+                &data_blocks,
+                block_size,
+            )?,
+            data_blocks,
+            commit_block: self.encode_commit_block(sequence, block_size)?,
+        })
     }
 
     fn committed_transactions(
@@ -646,6 +682,7 @@ impl Journal {
         &self,
         sequence: JournalSequence,
         metadata_blocks: &[MetadataBlock],
+        data_blocks: &[Vec<u8>],
         block_size: BlockSize,
     ) -> Result<Vec<u8>> {
         let mut block =
@@ -655,6 +692,7 @@ impl Journal {
         for (index, metadata) in metadata_blocks.iter().enumerate() {
             let last =
                 index.checked_add(1).ok_or(Error::ArithmeticOverflow)? == metadata_blocks.len();
+            let data = data_blocks.get(index).ok_or(Error::InvalidWriteRange)?;
             let flags = JBD2_TAG_FLAG_SAME_UUID
                 | if last { JBD2_TAG_FLAG_LAST_TAG } else { 0 }
                 | if starts_with_jbd2_magic(metadata.bytes()) {
@@ -662,7 +700,7 @@ impl Journal {
                 } else {
                     0
                 };
-            offset = self.encode_tag(&mut block, offset, sequence, metadata, flags)?;
+            offset = self.encode_tag(&mut block, offset, sequence, metadata, data, flags)?;
         }
         self.write_block_tail_checksum(&mut block)?;
         Ok(block)
@@ -674,12 +712,13 @@ impl Journal {
         offset: usize,
         sequence: JournalSequence,
         metadata: &MetadataBlock,
+        data: &[u8],
         flags: u32,
     ) -> Result<usize> {
-        let checksum = self.tag_checksum(sequence, metadata.bytes())?;
+        let checksum = self.tag_checksum(sequence, data)?;
         if self.superblock.has_csum_v3() {
             let next = offset.checked_add(16).ok_or(Error::ArithmeticOverflow)?;
-            if next > block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)? {
+            if next > self.descriptor_payload_limit(block.len())? {
                 return Err(Error::TransactionTooLarge);
             }
             put_be_u32(
@@ -712,7 +751,7 @@ impl Journal {
             .checked_add(8)
             .and_then(|value| value.checked_add(high_size))
             .ok_or(Error::ArithmeticOverflow)?;
-        if next > block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)? {
+        if next > self.descriptor_payload_limit(block.len())? {
             return Err(Error::TransactionTooLarge);
         }
         put_be_u32(
@@ -765,10 +804,11 @@ impl Journal {
         block_size: BlockSize,
         next_sequence: JournalSequence,
     ) -> Result<()> {
-        self.superblock.set_clean(next_sequence);
-        let block = self.superblock.encode(block_size)?;
+        let block = self.superblock.encode_clean(block_size, next_sequence)?;
         io.write_journal_block(self, block_size, 0, &block)?;
-        io.flush_all()
+        io.flush_all()?;
+        self.superblock.apply_clean(next_sequence, block);
+        Ok(())
     }
 
     fn usable_log_blocks(&self) -> Result<u32> {
@@ -776,6 +816,39 @@ impl Journal {
             .maxlen()
             .checked_sub(self.superblock.first())
             .ok_or(Error::UnsupportedJournal)
+    }
+
+    fn descriptor_tag_capacity(&self) -> Result<usize> {
+        let block_bytes =
+            usize::try_from(self.superblock.block_size()).map_err(|_| Error::ArithmeticOverflow)?;
+        let tail_bytes = if self.superblock.has_metadata_checksums() {
+            4
+        } else {
+            0
+        };
+        let usable = block_bytes
+            .checked_sub(JOURNAL_HEADER_BYTES)
+            .and_then(|value| value.checked_sub(tail_bytes))
+            .ok_or(Error::TransactionTooLarge)?;
+        Ok(usable / self.descriptor_tag_size())
+    }
+
+    fn descriptor_tag_size(&self) -> usize {
+        if self.superblock.has_csum_v3() {
+            16
+        } else if self.superblock.has_64bit() {
+            12
+        } else {
+            8
+        }
+    }
+
+    fn descriptor_payload_limit(&self, block_len: usize) -> Result<usize> {
+        if self.superblock.has_metadata_checksums() {
+            block_len.checked_sub(4).ok_or(Error::InvalidSuperblock)
+        } else {
+            Ok(block_len)
+        }
     }
 
     fn next_logical(&self, logical: u32) -> Result<u32> {
@@ -874,8 +947,9 @@ enum JournalLocation {
     External { base: ByteOffset },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct JournalSuperblock {
+    raw: Vec<u8>,
     block_size: u32,
     maxlen: u32,
     first: u32,
@@ -899,7 +973,11 @@ impl JournalSuperblock {
         }
         let mut uuid = [0_u8; 16];
         uuid.copy_from_slice(bytes.get(0x30..0x40).ok_or(Error::TruncatedStructure)?);
+        if be_u32(bytes, 0xFC)? != 0 {
+            verify_journal_superblock_checksum(bytes)?;
+        }
         Ok(Self {
+            raw: bytes.to_vec(),
             block_size: be_u32(bytes, 0x0C)?,
             maxlen: be_u32(bytes, 0x10)?,
             first: be_u32(bytes, 0x14)?,
@@ -913,7 +991,7 @@ impl JournalSuperblock {
         })
     }
 
-    fn validate_for_mount(self, block_size: BlockSize, capacity_blocks: u32) -> Result<()> {
+    fn validate_for_mount(&self, block_size: BlockSize, capacity_blocks: u32) -> Result<()> {
         if self.block_size != block_size.bytes()
             || self.maxlen == 0
             || self.maxlen > capacity_blocks
@@ -940,51 +1018,67 @@ impl JournalSuperblock {
         Ok(())
     }
 
-    fn encode(self, block_size: BlockSize) -> Result<Vec<u8>> {
-        let mut block =
-            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
-        Jbd2Header::superblock_v2(0).encode(&mut block)?;
-        put_be_u32(&mut block, 0x0C, self.block_size)?;
-        put_be_u32(&mut block, 0x10, self.maxlen)?;
-        put_be_u32(&mut block, 0x14, self.first)?;
-        put_be_u32(&mut block, 0x18, self.sequence.get())?;
-        put_be_u32(&mut block, 0x1C, self.start)?;
-        put_be_u32(&mut block, 0x24, self.compat)?;
-        put_be_u32(&mut block, 0x28, self.incompat)?;
-        put_be_u32(&mut block, 0x2C, self.ro_compat)?;
-        block
-            .get_mut(0x30..0x40)
-            .ok_or(Error::TruncatedStructure)?
-            .copy_from_slice(&self.uuid);
-        if self.has_metadata_checksums() {
-            *block.get_mut(0x50).ok_or(Error::TruncatedStructure)? = self.checksum_type;
+    fn encode_with_state(
+        &self,
+        block_size: BlockSize,
+        sequence: JournalSequence,
+        start: u32,
+    ) -> Result<Vec<u8>> {
+        let block_len = usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        if self.raw.len() != block_len {
+            return Err(Error::JournalCorrupt);
+        }
+        let mut block = self.raw.clone();
+        put_be_u32(&mut block, 0x18, sequence.get())?;
+        put_be_u32(&mut block, 0x1C, start)?;
+        if self.has_superblock_checksum()? {
+            refresh_journal_superblock_checksum(&mut block)?;
         }
         Ok(block)
     }
 
-    fn set_clean(&mut self, sequence: JournalSequence) {
+    fn encode_clean(&self, block_size: BlockSize, sequence: JournalSequence) -> Result<Vec<u8>> {
+        self.encode_with_state(block_size, sequence, 0)
+    }
+
+    fn encode_dirty(
+        &self,
+        block_size: BlockSize,
+        start: u32,
+        sequence: JournalSequence,
+    ) -> Result<Vec<u8>> {
+        self.encode_with_state(block_size, sequence, start)
+    }
+
+    fn apply_clean(&mut self, sequence: JournalSequence, raw: Vec<u8>) {
         self.sequence = sequence;
         self.start = 0;
+        self.raw = raw;
     }
 
-    fn set_dirty(&mut self, start: u32, sequence: JournalSequence) {
+    fn apply_dirty(&mut self, start: u32, sequence: JournalSequence, raw: Vec<u8>) {
         self.start = start;
         self.sequence = sequence;
+        self.raw = raw;
     }
 
-    pub(crate) const fn maxlen(self) -> u32 {
+    pub(crate) const fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    pub(crate) const fn maxlen(&self) -> u32 {
         self.maxlen
     }
 
-    pub(crate) const fn first(self) -> u32 {
+    pub(crate) const fn first(&self) -> u32 {
         self.first
     }
 
-    pub(crate) const fn sequence(self) -> JournalSequence {
+    pub(crate) const fn sequence(&self) -> JournalSequence {
         self.sequence
     }
 
-    pub(crate) const fn start(self) -> u32 {
+    pub(crate) const fn start(&self) -> u32 {
         self.start
     }
 
@@ -992,16 +1086,20 @@ impl JournalSuperblock {
         &self.uuid
     }
 
-    pub(crate) const fn has_64bit(self) -> bool {
+    pub(crate) const fn has_64bit(&self) -> bool {
         self.incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0
     }
 
-    fn has_csum_v3(self) -> bool {
+    fn has_csum_v3(&self) -> bool {
         self.incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0
     }
 
-    fn has_metadata_checksums(self) -> bool {
+    fn has_metadata_checksums(&self) -> bool {
         self.incompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0
+    }
+
+    fn has_superblock_checksum(&self) -> Result<bool> {
+        Ok(be_u32(&self.raw, 0xFC)? != 0)
     }
 }
 
@@ -1039,13 +1137,6 @@ impl Jbd2Header {
         }
     }
 
-    pub(crate) fn superblock_v2(sequence: u32) -> Self {
-        Self {
-            block_type: JBD2_SUPERBLOCK_V2,
-            sequence,
-        }
-    }
-
     pub(crate) fn encode(self, bytes: &mut [u8]) -> Result<()> {
         if bytes.len() < JOURNAL_HEADER_BYTES {
             return Err(Error::TruncatedStructure);
@@ -1075,6 +1166,16 @@ struct JournalTransaction {
 struct JournalReplayScan {
     transactions: Vec<JournalTransaction>,
     tail: JournalScanTail,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedJournalTransaction {
+    sequence: JournalSequence,
+    next_sequence: JournalSequence,
+    descriptor: u32,
+    descriptor_block: Vec<u8>,
+    data_blocks: Vec<Vec<u8>>,
+    commit_block: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1300,6 +1401,34 @@ fn transaction_tail(consumed: u32) -> JournalTransactionScan {
     } else {
         JournalTransactionScan::IncompleteTail
     }
+}
+
+fn verify_journal_superblock_checksum(block: &[u8]) -> Result<()> {
+    let expected = be_u32(block, 0xFC)?;
+    let actual = journal_superblock_checksum(block)?;
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(Error::ChecksumMismatch)
+    }
+}
+
+fn refresh_journal_superblock_checksum(block: &mut [u8]) -> Result<()> {
+    put_be_u32(block, 0xFC, 0)?;
+    let checksum = journal_superblock_checksum(block)?;
+    put_be_u32(block, 0xFC, checksum)
+}
+
+fn journal_superblock_checksum(block: &[u8]) -> Result<u32> {
+    let mut checked = block
+        .get(..JOURNAL_SUPERBLOCK_BYTES)
+        .ok_or(Error::TruncatedStructure)?
+        .to_vec();
+    checked
+        .get_mut(0xFC..0x100)
+        .ok_or(Error::TruncatedStructure)?
+        .fill(0);
+    Ok(crc32c(0, &checked))
 }
 
 fn is_revoked_after(
