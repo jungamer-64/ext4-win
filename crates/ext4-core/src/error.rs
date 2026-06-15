@@ -10,6 +10,8 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub enum Error {
     /// A block read fell outside the backing device.
     DeviceRange,
+    /// The backing device failed an in-range I/O request.
+    DeviceIo,
     /// The requested byte range overflowed integer arithmetic.
     ArithmeticOverflow,
     /// A fixed-size on-disk structure was truncated.
@@ -82,6 +84,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::DeviceRange => "block read is outside the backing device",
+            Self::DeviceIo => "backing device I/O request failed",
             Self::ArithmeticOverflow => "arithmetic overflow while mapping ext4 data",
             Self::TruncatedStructure => "on-disk structure is truncated",
             Self::InvalidMagic => "invalid ext4 superblock magic",

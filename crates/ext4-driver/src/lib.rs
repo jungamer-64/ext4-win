@@ -2,6 +2,7 @@
 
 #![no_std]
 
+mod block_device;
 mod dispatch;
 mod ffi;
 mod file_info;
