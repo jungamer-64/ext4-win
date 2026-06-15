@@ -1,11 +1,12 @@
-//! Extent tree parsing for read-only file data mapping.
+//! Extent tree parsing, mapping, and mutation serialization.
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 use crate::block::{BlockAddress, BlockReader, BlockSize};
+use crate::checksum::crc32c;
 use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
-use crate::inode::InodeExtentRoot;
+use crate::inode::{InodeExtentRoot, InodeId};
 
 /// Magic value stored at the start of every ext4 extent header.
 const EXTENT_MAGIC: u16 = 0xF30A;
@@ -17,8 +18,10 @@ const EXTENT_ENTRY_SIZE: usize = 12;
 const EXTENT_LEN_UNINITIALIZED: u16 = 0x8000;
 /// Bytes available in an inode `i_block` extent root.
 const INODE_ROOT_BYTES: usize = 60;
-/// Maximum leaf extents that fit in an inode root without external blocks.
-const INODE_ROOT_EXTENT_CAPACITY: usize = 4;
+/// Maximum entries that fit in the inode root.
+const INODE_ROOT_ENTRY_CAPACITY: usize = 4;
+/// Checksum tail bytes reserved at the end of external extent blocks.
+const EXTENT_TAIL_SIZE: usize = 4;
 /// ext4 extent trees are bounded; deeper trees are rejected before recursion.
 const MAX_EXTENT_DEPTH: u16 = 5;
 
@@ -90,11 +93,6 @@ impl ExtentLength {
     pub fn as_u64(self) -> u64 {
         u64::from(self.0)
     }
-
-    /// Returns this length plus one while preserving the non-zero invariant.
-    pub(crate) fn checked_add_one(self) -> Result<Self> {
-        Self::new(self.0.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
-    }
 }
 
 /// Result of mapping a logical file block through an extent tree.
@@ -117,6 +115,44 @@ pub enum ExtentInitialization {
     Uninitialized,
 }
 
+/// Checksum context required for external extent blocks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtentTreeContext {
+    /// Metadata checksum fields when the volume advertises metadata checksums.
+    checksum: Option<ExtentBlockChecksum>,
+}
+
+impl ExtentTreeContext {
+    /// Creates a context for a filesystem without external extent checksums.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self { checksum: None }
+    }
+
+    /// Creates a metadata-checksum context for one inode extent tree.
+    #[must_use]
+    pub const fn metadata_csum(seed: u32, inode_id: InodeId, generation: u32) -> Self {
+        Self {
+            checksum: Some(ExtentBlockChecksum {
+                seed,
+                inode_id,
+                generation,
+            }),
+        }
+    }
+}
+
+/// Metadata checksum fields for one inode extent tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExtentBlockChecksum {
+    /// Filesystem checksum seed.
+    seed: u32,
+    /// Inode number owning the extent tree.
+    inode_id: InodeId,
+    /// Inode generation owning the extent tree.
+    generation: u32,
+}
+
 /// A leaf extent mapping a logical block run to a physical block run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Extent {
@@ -137,12 +173,12 @@ impl Extent {
         len: ExtentLength,
         physical_start: BlockAddress,
     ) -> Self {
-        Self {
+        Self::from_parts(
             logical_start,
             len,
             physical_start,
-            initialization: ExtentInitialization::Initialized,
-        }
+            ExtentInitialization::Initialized,
+        )
     }
 
     /// Creates an uninitialized extent after callers have validated fields.
@@ -151,11 +187,26 @@ impl Extent {
         len: ExtentLength,
         physical_start: BlockAddress,
     ) -> Self {
+        Self::from_parts(
+            logical_start,
+            len,
+            physical_start,
+            ExtentInitialization::Uninitialized,
+        )
+    }
+
+    /// Creates a typed extent from fully validated parts.
+    const fn from_parts(
+        logical_start: LogicalBlock,
+        len: ExtentLength,
+        physical_start: BlockAddress,
+        initialization: ExtentInitialization,
+    ) -> Self {
         Self {
             logical_start,
             len,
             physical_start,
-            initialization: ExtentInitialization::Uninitialized,
+            initialization,
         }
     }
 
@@ -192,6 +243,7 @@ impl Extent {
     }
 
     /// Maps a logical block if it falls inside this extent.
+    #[must_use]
     pub fn map_logical(self, logical_block: LogicalBlock) -> BlockMapping {
         let start = self.logical_start.as_u64();
         let end = match start.checked_add(self.len.as_u64()) {
@@ -208,7 +260,9 @@ impl Extent {
             return BlockMapping::Hole;
         };
         match self.initialization {
-            ExtentInitialization::Initialized => BlockMapping::Physical(BlockAddress::new(physical)),
+            ExtentInitialization::Initialized => {
+                BlockMapping::Physical(BlockAddress::new(physical))
+            }
             ExtentInitialization::Uninitialized => BlockMapping::Uninitialized,
         }
     }
@@ -219,6 +273,8 @@ impl Extent {
 pub struct ExtentTree {
     /// Leaf extents collected in on-disk traversal order.
     extents: Vec<Extent>,
+    /// External extent metadata blocks visited while loading the tree.
+    metadata_blocks: Vec<BlockAddress>,
 }
 
 impl ExtentTree {
@@ -234,40 +290,328 @@ impl ExtentTree {
         if parse_node(raw, None, &mut extents)? != 0 {
             return Err(Error::UnsupportedExtentDepth);
         }
-        Ok(Self { extents })
+        normalize_extents(&mut extents)?;
+        Ok(Self {
+            extents,
+            metadata_blocks: Vec::new(),
+        })
     }
 
     /// Loads an extent tree, following external index blocks up to the ext4 depth limit.
     ///
     /// # Errors
-    /// Returns an error when the tree is malformed, too deep, or an index block
-    /// cannot be read.
+    /// Returns an error when the tree is malformed, too deep, has a bad
+    /// metadata checksum, or an index block cannot be read.
     pub fn load_inode_tree(
         root: &InodeExtentRoot,
         block_size: BlockSize,
         reader: &impl BlockReader,
+        context: ExtentTreeContext,
     ) -> Result<Self> {
         let mut extents = Vec::new();
-        parse_node_recursive(root.bytes(), block_size, reader, &mut extents)?;
-        Ok(Self { extents })
+        let mut metadata_blocks = Vec::new();
+        parse_node_recursive(
+            root.bytes(),
+            block_size,
+            reader,
+            context,
+            &mut extents,
+            &mut metadata_blocks,
+        )?;
+        normalize_extents(&mut extents)?;
+        Ok(Self {
+            extents,
+            metadata_blocks,
+        })
     }
 
-    /// Maps a logical file block to a physical block or sparse hole.
+    /// Maps a logical file block to a physical block, uninitialized extent, or sparse hole.
     #[must_use]
     pub fn map_logical(&self, logical_block: LogicalBlock) -> BlockMapping {
-        for extent in &self.extents {
-            if let BlockMapping::Physical(block) = extent.map_logical(logical_block) {
-                return BlockMapping::Physical(block);
-            }
-        }
-        BlockMapping::Hole
+        map_extents(self.extents.as_slice(), logical_block)
     }
 
-    /// Leaf extents in on-disk order.
+    /// Leaf extents in normalized logical order.
     #[must_use]
     pub fn extents(&self) -> &[Extent] {
         &self.extents
     }
+
+    /// External extent metadata blocks visited while loading this tree.
+    #[must_use]
+    pub fn metadata_blocks(&self) -> &[BlockAddress] {
+        &self.metadata_blocks
+    }
+}
+
+/// Mutable extent tree used by write transactions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutableExtentTree {
+    /// Normalized leaf extents.
+    extents: Vec<Extent>,
+    /// External extent metadata blocks reserved for serialization.
+    metadata_blocks: Vec<BlockAddress>,
+}
+
+impl MutableExtentTree {
+    /// Creates a mutable tree from normalized extents.
+    ///
+    /// # Errors
+    /// Returns an error when the extents overlap or cannot be merged safely.
+    pub fn from_extents(mut extents: Vec<Extent>) -> Result<Self> {
+        normalize_extents(&mut extents)?;
+        Ok(Self {
+            extents,
+            metadata_blocks: Vec::new(),
+        })
+    }
+
+    /// Loads a mutable extent tree from an inode root.
+    ///
+    /// # Errors
+    /// Returns an error when loading the backing immutable tree fails.
+    pub fn load_inode_tree(
+        root: &InodeExtentRoot,
+        block_size: BlockSize,
+        reader: &impl BlockReader,
+        context: ExtentTreeContext,
+    ) -> Result<Self> {
+        let tree = ExtentTree::load_inode_tree(root, block_size, reader, context)?;
+        Ok(Self {
+            extents: tree.extents,
+            metadata_blocks: tree.metadata_blocks,
+        })
+    }
+
+    /// Maps a logical file block to a physical block, uninitialized extent, or sparse hole.
+    #[must_use]
+    pub fn map_logical(&self, logical_block: LogicalBlock) -> BlockMapping {
+        map_extents(self.extents.as_slice(), logical_block)
+    }
+
+    /// Normalized leaf extents.
+    #[must_use]
+    pub fn extents(&self) -> &[Extent] {
+        self.extents.as_slice()
+    }
+
+    /// Replaces the leaf extents and restores normalized order.
+    ///
+    /// # Errors
+    /// Returns an error when the replacement extents overlap.
+    pub(crate) fn replace_extents(&mut self, mut extents: Vec<Extent>) -> Result<()> {
+        normalize_extents(&mut extents)?;
+        self.extents = extents;
+        Ok(())
+    }
+
+    /// Returns true when any leaf extent is uninitialized.
+    #[must_use]
+    pub fn contains_uninitialized(&self) -> bool {
+        self.extents
+            .iter()
+            .any(|extent| extent.initialization() == ExtentInitialization::Uninitialized)
+    }
+
+    /// Inserts one initialized logical block mapping, extending adjacent extents when possible.
+    ///
+    /// # Errors
+    /// Returns an error when the insertion overlaps an existing mapping.
+    pub fn insert_or_extend_initialized(
+        &mut self,
+        logical_block: LogicalBlock,
+        physical_block: BlockAddress,
+    ) -> Result<()> {
+        self.extents.push(Extent::initialized(
+            logical_block,
+            ExtentLength::new(1)?,
+            physical_block,
+        ));
+        normalize_extents(&mut self.extents)
+    }
+
+    /// Number of allocated data blocks represented by leaf extents.
+    #[must_use]
+    pub fn allocated_data_blocks(&self) -> u64 {
+        self.extents
+            .iter()
+            .map(|extent| extent.len().as_u64())
+            .sum()
+    }
+
+    /// External extent metadata blocks currently reserved for this tree.
+    #[must_use]
+    pub fn metadata_blocks(&self) -> &[BlockAddress] {
+        self.metadata_blocks.as_slice()
+    }
+
+    /// Replaces external extent metadata block reservations.
+    pub fn set_metadata_blocks(&mut self, metadata_blocks: Vec<BlockAddress>) {
+        self.metadata_blocks = metadata_blocks;
+    }
+
+    /// Computes the number of external extent metadata blocks required to serialize this tree.
+    ///
+    /// # Errors
+    /// Returns an error when the tree would exceed the ext4 maximum depth.
+    pub fn required_metadata_blocks(&self, block_size: BlockSize) -> Result<usize> {
+        required_metadata_blocks(self.extents.len(), block_size)
+    }
+
+    /// Serializes this tree into an inode root plus external extent metadata blocks.
+    ///
+    /// # Errors
+    /// Returns an error when the reserved metadata block count does not match
+    /// the required tree shape or the tree exceeds the supported ext4 depth.
+    pub fn serialize(
+        &self,
+        block_size: BlockSize,
+        context: ExtentTreeContext,
+    ) -> Result<SerializedExtentTree> {
+        let required = self.required_metadata_blocks(block_size)?;
+        if self.metadata_blocks.len() != required {
+            return Err(Error::InvalidExtentTree);
+        }
+        if self.extents.len() <= INODE_ROOT_ENTRY_CAPACITY {
+            return Ok(SerializedExtentTree {
+                inode_root: serialize_extent_root(self.extents.as_slice())?,
+                external_blocks: Vec::new(),
+            });
+        }
+
+        let capacity = external_entry_capacity(block_size)?;
+        let mut block_index = 0_usize;
+        let mut external_blocks = Vec::new();
+        let mut nodes = Vec::new();
+
+        for chunk in self.extents.chunks(capacity) {
+            let block = *self
+                .metadata_blocks
+                .get(block_index)
+                .ok_or(Error::InvalidExtentTree)?;
+            block_index = block_index
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let bytes = serialize_external_extent_node(block_size, 0, chunk, context)?;
+            external_blocks.push(SerializedExtentBlock {
+                block,
+                bytes: bytes.clone(),
+            });
+            nodes.push(SerializedNode {
+                first_logical: chunk
+                    .first()
+                    .ok_or(Error::InvalidExtentTree)?
+                    .logical_start(),
+                depth: 0,
+                block,
+                bytes,
+            });
+        }
+
+        while nodes.len() > INODE_ROOT_ENTRY_CAPACITY {
+            let child_depth = nodes.first().ok_or(Error::InvalidExtentTree)?.depth;
+            let parent_depth = child_depth
+                .checked_add(1)
+                .ok_or(Error::UnsupportedExtentDepth)?;
+            if parent_depth >= MAX_EXTENT_DEPTH {
+                return Err(Error::UnsupportedExtentDepth);
+            }
+            let mut parents = Vec::new();
+            for chunk in nodes.chunks(capacity) {
+                let block = *self
+                    .metadata_blocks
+                    .get(block_index)
+                    .ok_or(Error::InvalidExtentTree)?;
+                block_index = block_index
+                    .checked_add(1)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                let bytes =
+                    serialize_external_index_node(block_size, parent_depth, chunk, context)?;
+                external_blocks.push(SerializedExtentBlock {
+                    block,
+                    bytes: bytes.clone(),
+                });
+                parents.push(SerializedNode {
+                    first_logical: chunk.first().ok_or(Error::InvalidExtentTree)?.first_logical,
+                    depth: parent_depth,
+                    block,
+                    bytes,
+                });
+            }
+            nodes = parents;
+        }
+
+        let child_depth = nodes.first().ok_or(Error::InvalidExtentTree)?.depth;
+        let root_depth = child_depth
+            .checked_add(1)
+            .ok_or(Error::UnsupportedExtentDepth)?;
+        if root_depth > MAX_EXTENT_DEPTH {
+            return Err(Error::UnsupportedExtentDepth);
+        }
+        Ok(SerializedExtentTree {
+            inode_root: serialize_index_root(root_depth, nodes.as_slice())?,
+            external_blocks,
+        })
+    }
+}
+
+/// Serialized extent tree ready to stage in a transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SerializedExtentTree {
+    /// Inode `i_block` extent root bytes.
+    inode_root: [u8; INODE_ROOT_BYTES],
+    /// External extent metadata block images.
+    external_blocks: Vec<SerializedExtentBlock>,
+}
+
+impl SerializedExtentTree {
+    /// Inode `i_block` extent root bytes.
+    #[must_use]
+    pub const fn inode_root(&self) -> &[u8; INODE_ROOT_BYTES] {
+        &self.inode_root
+    }
+
+    /// External extent metadata block images.
+    #[must_use]
+    pub fn external_blocks(&self) -> &[SerializedExtentBlock] {
+        self.external_blocks.as_slice()
+    }
+}
+
+/// Serialized external extent metadata block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SerializedExtentBlock {
+    /// Physical block that stores this extent metadata node.
+    block: BlockAddress,
+    /// Full block image.
+    bytes: Vec<u8>,
+}
+
+impl SerializedExtentBlock {
+    /// Physical block that stores this extent metadata node.
+    #[must_use]
+    pub const fn block(&self) -> BlockAddress {
+        self.block
+    }
+
+    /// Full block image.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+
+/// Serialized external node used while building parent indexes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SerializedNode {
+    /// First logical block covered by this child node.
+    first_logical: LogicalBlock,
+    /// Node depth, where leaf nodes are zero.
+    depth: u16,
+    /// Physical block containing this node.
+    block: BlockAddress,
+    /// Full block image.
+    bytes: Vec<u8>,
 }
 
 /// Internal parse_node_recursive operation used by this module's domain boundary.
@@ -275,15 +619,23 @@ fn parse_node_recursive(
     raw: &[u8],
     block_size: BlockSize,
     reader: &impl BlockReader,
+    context: ExtentTreeContext,
     extents: &mut Vec<Extent>,
+    metadata_blocks: &mut Vec<BlockAddress>,
 ) -> Result<()> {
-    // The inode root and external extent blocks share the same header format;
-    // recursion only begins after the root confirms a non-zero depth.
     let depth = parse_node(raw, None, extents)?;
     if depth == 0 {
         return Ok(());
     }
-    parse_index_node(raw, depth, block_size, reader, extents)
+    parse_index_node(
+        raw,
+        depth,
+        block_size,
+        reader,
+        context,
+        extents,
+        metadata_blocks,
+    )
 }
 
 /// Internal parse_index_node operation used by this module's domain boundary.
@@ -292,10 +644,10 @@ fn parse_index_node(
     depth: u16,
     block_size: BlockSize,
     reader: &impl BlockReader,
+    context: ExtentTreeContext,
     extents: &mut Vec<Extent>,
+    metadata_blocks: &mut Vec<BlockAddress>,
 ) -> Result<()> {
-    // Index entries point at child extent blocks; each child depth must be one
-    // less than the parent to prevent malformed cycles from masquerading as a tree.
     let entries = header_entries(raw)?;
     for entry_index in 0..entries {
         let offset = entry_offset(entry_index)?;
@@ -314,16 +666,30 @@ fn parse_index_node(
             offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
         )?);
         let leaf = BlockAddress::new((leaf_hi << 32) | leaf_lo);
-        let mut child = alloc::vec![0_u8; usize::try_from(block_size.bytes())
-            .map_err(|_| Error::ArithmeticOverflow)?];
+        if metadata_blocks.iter().any(|block| *block == leaf) {
+            return Err(Error::InvalidExtentTree);
+        }
+        metadata_blocks.push(leaf);
+
+        let mut child =
+            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
         reader.read_exact_at(block_size.offset_of(leaf)?, &mut child)?;
+        verify_external_extent_block_checksum(context, child.as_slice())?;
         let child_depth = parse_node(
-            &child,
+            child.as_slice(),
             Some(depth.checked_sub(1).ok_or(Error::InvalidExtentTree)?),
             extents,
         )?;
         if child_depth > 0 {
-            parse_index_node(&child, child_depth, block_size, reader, extents)?;
+            parse_index_node(
+                child.as_slice(),
+                child_depth,
+                block_size,
+                reader,
+                context,
+                extents,
+                metadata_blocks,
+            )?;
         }
     }
     Ok(())
@@ -384,7 +750,9 @@ fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
     )?);
     let physical_start = BlockAddress::new((start_hi << 32) | start_lo);
     Ok(match initialization {
-        ExtentInitialization::Initialized => Extent::initialized(logical_start, len, physical_start),
+        ExtentInitialization::Initialized => {
+            Extent::initialized(logical_start, len, physical_start)
+        }
         ExtentInitialization::Uninitialized => {
             Extent::uninitialized(logical_start, len, physical_start)
         }
@@ -408,4 +776,308 @@ fn entry_offset(entry_index: usize) -> Result<usize> {
                 .ok_or(Error::ArithmeticOverflow)?,
         )
         .ok_or(Error::ArithmeticOverflow)
+}
+
+/// Maps a logical block through a normalized extent list.
+fn map_extents(extents: &[Extent], logical_block: LogicalBlock) -> BlockMapping {
+    for extent in extents {
+        match extent.map_logical(logical_block) {
+            BlockMapping::Physical(block) => return BlockMapping::Physical(block),
+            BlockMapping::Uninitialized => return BlockMapping::Uninitialized,
+            BlockMapping::Hole => {}
+        }
+    }
+    BlockMapping::Hole
+}
+
+/// Restores logical order, merges adjacent compatible extents, and rejects overlaps.
+fn normalize_extents(extents: &mut Vec<Extent>) -> Result<()> {
+    extents.sort_by_key(|extent| extent.logical_start());
+    let mut normalized: Vec<Extent> = Vec::new();
+    for extent in extents.iter().copied() {
+        if let Some(last) = normalized.last_mut() {
+            let last_end = last.end_logical()?;
+            if extent.logical_start().as_u32() < last_end {
+                return Err(Error::InvalidExtentTree);
+            }
+            if extent.logical_start().as_u32() == last_end
+                && extent.initialization() == last.initialization()
+                && last
+                    .physical_start()
+                    .get()
+                    .checked_add(last.len().as_u64())
+                    .ok_or(Error::ArithmeticOverflow)?
+                    == extent.physical_start().get()
+            {
+                let combined = last
+                    .len()
+                    .as_u32()
+                    .checked_add(extent.len().as_u32())
+                    .ok_or(Error::ArithmeticOverflow)?;
+                let len = ExtentLength::new(
+                    u16::try_from(combined).map_err(|_| Error::ArithmeticOverflow)?,
+                )?;
+                *last = Extent::from_parts(
+                    last.logical_start(),
+                    len,
+                    last.physical_start(),
+                    last.initialization(),
+                );
+                continue;
+            }
+        }
+        normalized.push(extent);
+    }
+    *extents = normalized;
+    Ok(())
+}
+
+/// Computes external extent metadata block count for a normalized leaf count.
+fn required_metadata_blocks(extent_count: usize, block_size: BlockSize) -> Result<usize> {
+    if extent_count <= INODE_ROOT_ENTRY_CAPACITY {
+        return Ok(0);
+    }
+    let capacity = external_entry_capacity(block_size)?;
+    let mut level_nodes = round_up_div_usize(extent_count, capacity)?;
+    let mut total = level_nodes;
+    let mut root_depth = 1_u16;
+    while level_nodes > INODE_ROOT_ENTRY_CAPACITY {
+        level_nodes = round_up_div_usize(level_nodes, capacity)?;
+        total = total
+            .checked_add(level_nodes)
+            .ok_or(Error::ArithmeticOverflow)?;
+        root_depth = root_depth
+            .checked_add(1)
+            .ok_or(Error::UnsupportedExtentDepth)?;
+        if root_depth > MAX_EXTENT_DEPTH {
+            return Err(Error::UnsupportedExtentDepth);
+        }
+    }
+    Ok(total)
+}
+
+/// Number of extent/index entries that fit in one external extent block.
+fn external_entry_capacity(block_size: BlockSize) -> Result<usize> {
+    let bytes = usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+    let payload = bytes
+        .checked_sub(EXTENT_HEADER_SIZE)
+        .and_then(|value| value.checked_sub(EXTENT_TAIL_SIZE))
+        .ok_or(Error::InvalidExtentTree)?;
+    let capacity = payload
+        .checked_div(EXTENT_ENTRY_SIZE)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if capacity == 0 {
+        Err(Error::InvalidExtentTree)
+    } else {
+        Ok(capacity)
+    }
+}
+
+/// Integer ceiling division for tree packing.
+fn round_up_div_usize(value: usize, divisor: usize) -> Result<usize> {
+    if divisor == 0 {
+        return Err(Error::ArithmeticOverflow);
+    }
+    let adjusted = value
+        .checked_add(divisor.checked_sub(1).ok_or(Error::ArithmeticOverflow)?)
+        .ok_or(Error::ArithmeticOverflow)?;
+    adjusted
+        .checked_div(divisor)
+        .ok_or(Error::ArithmeticOverflow)
+}
+
+/// Serializes a root containing leaf extent entries.
+fn serialize_extent_root(extents: &[Extent]) -> Result<[u8; INODE_ROOT_BYTES]> {
+    let mut raw = [0_u8; INODE_ROOT_BYTES];
+    write_header(&mut raw, extents.len(), INODE_ROOT_ENTRY_CAPACITY, 0)?;
+    for (entry_index, extent) in extents.iter().copied().enumerate() {
+        write_extent_entry(&mut raw, entry_offset(entry_index)?, extent)?;
+    }
+    Ok(raw)
+}
+
+/// Serializes a root containing index entries.
+fn serialize_index_root(depth: u16, nodes: &[SerializedNode]) -> Result<[u8; INODE_ROOT_BYTES]> {
+    let mut raw = [0_u8; INODE_ROOT_BYTES];
+    write_header(&mut raw, nodes.len(), INODE_ROOT_ENTRY_CAPACITY, depth)?;
+    for (entry_index, node) in nodes.iter().enumerate() {
+        write_index_entry(&mut raw, entry_offset(entry_index)?, node)?;
+    }
+    Ok(raw)
+}
+
+/// Serializes an external leaf extent node.
+fn serialize_external_extent_node(
+    block_size: BlockSize,
+    depth: u16,
+    extents: &[Extent],
+    context: ExtentTreeContext,
+) -> Result<Vec<u8>> {
+    let capacity = external_entry_capacity(block_size)?;
+    let mut raw =
+        vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+    write_header(raw.as_mut_slice(), extents.len(), capacity, depth)?;
+    for (entry_index, extent) in extents.iter().copied().enumerate() {
+        write_extent_entry(raw.as_mut_slice(), entry_offset(entry_index)?, extent)?;
+    }
+    refresh_external_extent_block_checksum(context, raw.as_mut_slice())?;
+    Ok(raw)
+}
+
+/// Serializes an external index node.
+fn serialize_external_index_node(
+    block_size: BlockSize,
+    depth: u16,
+    nodes: &[SerializedNode],
+    context: ExtentTreeContext,
+) -> Result<Vec<u8>> {
+    let capacity = external_entry_capacity(block_size)?;
+    let mut raw =
+        vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+    write_header(raw.as_mut_slice(), nodes.len(), capacity, depth)?;
+    for (entry_index, node) in nodes.iter().enumerate() {
+        write_index_entry(raw.as_mut_slice(), entry_offset(entry_index)?, node)?;
+    }
+    refresh_external_extent_block_checksum(context, raw.as_mut_slice())?;
+    Ok(raw)
+}
+
+/// Writes a common extent header.
+fn write_header(raw: &mut [u8], entries: usize, max_entries: usize, depth: u16) -> Result<()> {
+    if entries > max_entries {
+        return Err(Error::InvalidExtentTree);
+    }
+    put_le_u16(raw, 0, EXTENT_MAGIC)?;
+    put_le_u16(
+        raw,
+        2,
+        u16::try_from(entries).map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
+    put_le_u16(
+        raw,
+        4,
+        u16::try_from(max_entries).map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
+    put_le_u16(raw, 6, depth)?;
+    put_le_u32(raw, 8, 0)
+}
+
+/// Writes one leaf extent entry.
+fn write_extent_entry(raw: &mut [u8], offset: usize, extent: Extent) -> Result<()> {
+    let end = offset
+        .checked_add(EXTENT_ENTRY_SIZE)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if end > raw.len() {
+        return Err(Error::InvalidExtentTree);
+    }
+    let len = match extent.initialization() {
+        ExtentInitialization::Initialized => extent.len().as_u16(),
+        ExtentInitialization::Uninitialized => extent.len().as_u16() | EXTENT_LEN_UNINITIALIZED,
+    };
+    put_le_u32(raw, offset, extent.logical_start().as_u32())?;
+    put_le_u16(
+        raw,
+        offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+        len,
+    )?;
+    put_le_u16(
+        raw,
+        offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
+        u16::try_from(extent.physical_start().get() >> 32)
+            .map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
+    put_le_u32(
+        raw,
+        offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+        u32::try_from(extent.physical_start().get() & u64::from(u32::MAX))
+            .map_err(|_| Error::ArithmeticOverflow)?,
+    )
+}
+
+/// Writes one index entry.
+fn write_index_entry(raw: &mut [u8], offset: usize, node: &SerializedNode) -> Result<()> {
+    let end = offset
+        .checked_add(EXTENT_ENTRY_SIZE)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if end > raw.len() {
+        return Err(Error::InvalidExtentTree);
+    }
+    put_le_u32(raw, offset, node.first_logical.as_u32())?;
+    put_le_u32(
+        raw,
+        offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+        u32::try_from(node.block.get() & u64::from(u32::MAX))
+            .map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
+    put_le_u16(
+        raw,
+        offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+        u16::try_from(node.block.get() >> 32).map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
+    put_le_u16(
+        raw,
+        offset.checked_add(10).ok_or(Error::ArithmeticOverflow)?,
+        0,
+    )
+}
+
+/// Verifies an external extent block checksum when metadata checksums are enabled.
+fn verify_external_extent_block_checksum(context: ExtentTreeContext, raw: &[u8]) -> Result<()> {
+    let Some(checksum) = context.checksum else {
+        return Ok(());
+    };
+    let offset = raw
+        .len()
+        .checked_sub(EXTENT_TAIL_SIZE)
+        .ok_or(Error::InvalidExtentTree)?;
+    let expected = le_u32(raw, offset)?;
+    if extent_block_checksum(checksum, raw, offset)? == expected {
+        Ok(())
+    } else {
+        Err(Error::ChecksumMismatch)
+    }
+}
+
+/// Refreshes an external extent block checksum when metadata checksums are enabled.
+fn refresh_external_extent_block_checksum(
+    context: ExtentTreeContext,
+    raw: &mut [u8],
+) -> Result<()> {
+    let Some(checksum) = context.checksum else {
+        return Ok(());
+    };
+    let offset = raw
+        .len()
+        .checked_sub(EXTENT_TAIL_SIZE)
+        .ok_or(Error::InvalidExtentTree)?;
+    put_le_u32(raw, offset, 0)?;
+    let checksum = extent_block_checksum(checksum, raw, offset)?;
+    put_le_u32(raw, offset, checksum)
+}
+
+/// Computes the crc32c checksum for one external extent block.
+fn extent_block_checksum(
+    checksum: ExtentBlockChecksum,
+    raw: &[u8],
+    checksum_offset: usize,
+) -> Result<u32> {
+    let zero_checksum = [0_u8; EXTENT_TAIL_SIZE];
+    let mut seed = crc32c(checksum.seed, &checksum.inode_id.as_u32().to_le_bytes());
+    seed = crc32c(seed, &checksum.generation.to_le_bytes());
+    let mut value = crc32c(
+        seed,
+        raw.get(..checksum_offset)
+            .ok_or(Error::TruncatedStructure)?,
+    );
+    value = crc32c(value, &zero_checksum);
+    let checksum_end = checksum_offset
+        .checked_add(EXTENT_TAIL_SIZE)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if checksum_end < raw.len() {
+        value = crc32c(
+            value,
+            raw.get(checksum_end..).ok_or(Error::TruncatedStructure)?,
+        );
+    }
+    Ok(value)
 }

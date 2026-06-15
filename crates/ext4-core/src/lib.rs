@@ -31,7 +31,10 @@ pub use block::{
 };
 pub use dir::{DirectoryEntry, DirectoryEntryKind};
 pub use error::{Error, Result};
-pub use extent::{BlockMapping, Extent, ExtentLength, ExtentTree, LogicalBlock};
+pub use extent::{
+    BlockMapping, Extent, ExtentInitialization, ExtentLength, ExtentTree, ExtentTreeContext,
+    LogicalBlock, MutableExtentTree, SerializedExtentBlock, SerializedExtentTree,
+};
 pub use inode::{
     Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Timestamp, Ext4Uid, FileOffset, FileSize, Inode,
     InodeExtentRoot, InodeId, InodeInlineBytes, InodeKind, InodeStorage, NewDirectoryMetadata,

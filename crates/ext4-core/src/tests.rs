@@ -276,6 +276,20 @@ fn symlink_inline_target_is_read_without_extents() {
 }
 
 #[test]
+fn uninitialized_extent_reads_as_zeroes() {
+    let mut image = fixture_image();
+    put_u16(&mut image, inode_offset(3) + 56, 0x8001);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+    let mut output = [0xAA; 5];
+    let read = read_file(&volume, 3, 1024, &mut output);
+
+    assert_eq!(read, 5);
+    assert_eq!(output, [0, 0, 0, 0, 0]);
+}
+
+#[test]
 fn exact_ext4_lookup_uses_raw_bytes() {
     let image = fixture_image();
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
@@ -419,6 +433,18 @@ fn metadata_csum_seed_is_accepted_with_metadata_csum() {
 
     assert_eq!(volume.superblock().checksum_seed().as_u32(), 0x1234_5678);
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 3);
+}
+
+#[test]
+fn write_mount_accepts_metadata_csum_seed() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    put_u32(&mut image, 1024 + 96, INCOMPAT_MODERN | INCOMPAT_CSUM_SEED);
+    put_u32(&mut image, 1024 + 624, 0x1234_5678);
+    refresh_primary_block_group_descriptor_checksum(&mut image);
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+
+    assert_eq!(volume.superblock().checksum_seed().as_u32(), 0x1234_5678);
 }
 
 #[test]
@@ -581,6 +607,83 @@ fn sparse_hole_write_allocates_block() {
     let read = read_file(&volume, 3, 1024, &mut output);
     assert_eq!(read, 4);
     assert_eq!(&output, b"hole");
+}
+
+#[test]
+fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        extend_file(
+            &mut transaction,
+            3,
+            u64::try_from(BLOCK_SIZE * 10).unwrap_or(u64::MAX),
+        );
+        for logical in [0_u64, 2, 4, 6, 8] {
+            overwrite_file(
+                &mut transaction,
+                3,
+                logical
+                    .checked_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX))
+                    .unwrap_or(u64::MAX),
+                b"x",
+            );
+        }
+        must(transaction.commit());
+
+        let mut output = [0_u8; 1];
+        assert_eq!(read_file(&volume, 3, 0, &mut output), 1);
+        assert_eq!(output, [b'x']);
+        assert_eq!(
+            read_file(
+                &volume,
+                3,
+                u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX),
+                &mut output
+            ),
+            1
+        );
+        assert_eq!(output, [0]);
+    }
+
+    let inode_base = modern_inode_offset(3);
+    assert_eq!(get_u16(&image, inode_base + 46), 1);
+    let extent_block = get_u32(&image, inode_base + 56);
+    assert_ne!(extent_block, 0);
+    assert_eq!(get_u16(&image, block_offset(extent_block)), 0xF30A);
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+    let mut output = [0_u8; 1];
+    assert_eq!(
+        read_file(
+            &volume,
+            3,
+            8_u64
+                .checked_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX))
+                .unwrap_or(u64::MAX),
+            &mut output
+        ),
+        1
+    );
+    assert_eq!(output, [b'x']);
+}
+
+#[test]
+fn uninitialized_extent_write_is_rejected() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    put_u16(&mut image, modern_inode_offset(3) + 56, 0x8001);
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut transaction = volume.begin_transaction(NOW);
+    let file = transaction_file(&transaction, 3);
+    let result = transaction.overwrite_file_range(file, FileOffset::ZERO, b"x");
+
+    assert_eq!(result, Err(Error::UnsupportedInodeMutation));
 }
 
 #[test]
@@ -1897,6 +2000,7 @@ fn write_indexed_file_inode(image: &mut [u8]) {
     put_u16(image, leaf + 16, 1);
     put_u16(image, leaf + 18, 0);
     put_u32(image, leaf + 20, MODERN_FILE_DATA_BLOCK);
+    refresh_extent_block_checksum(image, 3, MODERN_EXTENT_INDEX_BLOCK);
 }
 
 fn write_modern_journal_inode(image: &mut [u8], journal_blocks: u16) {
@@ -2391,6 +2495,19 @@ fn refresh_primary_block_group_descriptor_checksum(image: &mut [u8]) {
         BlockGroupId::from_u32(0),
         &mut image[base..base + descriptor_size],
     ));
+}
+
+fn refresh_extent_block_checksum(image: &mut [u8], inode: u32, block: u32) {
+    let superblock = must(Superblock::parse(&image[1024..2048]));
+    let base = block_offset(block);
+    put_u32(image, base + BLOCK_SIZE - 4, 0);
+    let inode_offset = modern_inode_offset(inode);
+    let generation = get_u32(image, inode_offset + 100);
+    let mut checksum =
+        crate::checksum::crc32c(superblock.checksum_seed().as_u32(), &inode.to_le_bytes());
+    checksum = crate::checksum::crc32c(checksum, &generation.to_le_bytes());
+    checksum = crate::checksum::crc32c(checksum, &image[base..base + BLOCK_SIZE]);
+    put_u32(image, base + BLOCK_SIZE - 4, checksum);
 }
 
 fn corrupt_primary_block_group_descriptor_checksum(image: &mut [u8]) {

@@ -2,13 +2,14 @@
 
 use alloc::{vec, vec::Vec};
 
-use crate::block::{BlockAddress, BlockReader, BlockWriter, ByteOffset};
+use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
 use crate::checksum::crc32c;
 use crate::dir::{DirectoryBlock, DirectoryEntry, DirectoryEntryKind};
 use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
 use crate::extent::{
-    BlockMapping, Extent, ExtentLength, ExtentTree, LogicalBlock, serialize_inode_root,
+    BlockMapping, Extent, ExtentLength, ExtentTree, ExtentTreeContext, LogicalBlock,
+    MutableExtentTree, SerializedExtentTree,
 };
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
@@ -299,6 +300,7 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
             block_bitmap_updates: Vec::new(),
             inode_bitmap_updates: Vec::new(),
             directory_updates: Vec::new(),
+            extent_updates: Vec::new(),
             group_deltas: Vec::new(),
             data_writes: Vec::new(),
             free_blocks_delta: FreeBlockDelta::ZERO,
@@ -362,6 +364,7 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
             block_bitmap_updates: Vec::new(),
             inode_bitmap_updates: Vec::new(),
             directory_updates: Vec::new(),
+            extent_updates: Vec::new(),
             group_deltas: Vec::new(),
             data_writes: Vec::new(),
             free_blocks_delta: FreeBlockDelta::ZERO,
@@ -491,6 +494,7 @@ impl<D: BlockReader, State> Volume<D, State> {
             inode.extent_root()?,
             self.superblock.block_size(),
             &self.device,
+            self.extent_tree_context(inode),
         )?;
         let mut completed = 0_usize;
 
@@ -531,7 +535,7 @@ impl<D: BlockReader, State> Volume<D, State> {
                         out.get_mut(completed..end).ok_or(Error::DeviceRange)?,
                     )?;
                 }
-                BlockMapping::Hole => {
+                BlockMapping::Uninitialized | BlockMapping::Hole => {
                     out.get_mut(completed..end)
                         .ok_or(Error::DeviceRange)?
                         .fill(0);
@@ -563,6 +567,19 @@ impl<D: BlockReader, State> Volume<D, State> {
     /// Internal read_inode_record operation used by this module's domain boundary.
     fn read_inode_record(&self, inode_id: InodeId) -> Result<Inode> {
         self.read_raw_inode(inode_id)?.parse()
+    }
+
+    /// Internal extent_tree_context operation used by this module's domain boundary.
+    fn extent_tree_context(&self, inode: &Inode) -> ExtentTreeContext {
+        if self.superblock.metadata_checksum() == MetadataChecksum::Crc32c {
+            ExtentTreeContext::metadata_csum(
+                self.superblock.checksum_seed().as_u32(),
+                inode.id(),
+                inode.generation(),
+            )
+        } else {
+            ExtentTreeContext::none()
+        }
     }
 }
 
@@ -611,6 +628,8 @@ pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
     inode_bitmap_updates: Vec<BlockImage>,
     /// Internal directory_updates state carried by this domain type.
     directory_updates: Vec<BlockImage>,
+    /// Internal extent_updates state carried by this domain type.
+    extent_updates: Vec<BlockImage>,
     /// Internal group_deltas state carried by this domain type.
     group_deltas: Vec<GroupDelta>,
     /// Internal data_writes state carried by this domain type.
@@ -662,7 +681,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     ) -> Result<TransactionFile> {
         self.ensure_child_absent(parent.inode_id(), name)?;
         let mut raw_inode = self.allocate_inode()?;
-        raw_inode.initialize_file(metadata, self.now)?;
+        raw_inode.initialize_file(metadata, self.now, self.volume.superblock.block_size())?;
         let inode_id = raw_inode.id;
         self.add_directory_entry(parent.inode_id(), name, inode_id, DirectoryEntryKind::File)?;
         self.inode_updates.push(raw_inode);
@@ -691,14 +710,15 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             return Err(Error::UnsupportedInodeMutation);
         }
         if raw_inode.decrement_links_count()? == 0 {
-            let extents = ExtentTree::parse_inode_root(inode.extent_root()?)?
-                .extents()
-                .to_vec();
-            for extent in extents {
+            let tree = self.mutable_extent_tree(&inode)?;
+            for extent in tree.extents().iter().copied() {
                 self.free_extent(extent, 0)?;
             }
+            for block in tree.metadata_blocks().iter().copied() {
+                self.free_block(block)?;
+            }
             self.free_inode(raw_inode.id)?;
-            raw_inode.clear_deleted(self.now)?;
+            raw_inode.clear_deleted(self.now, self.volume.superblock.block_size())?;
         }
         raw_inode.set_timestamps(self.now)?;
         *self
@@ -724,7 +744,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         let mut raw_inode = self.allocate_inode()?;
         let inode_id = raw_inode.id;
         let block_size = self.volume.superblock.block_size();
-        raw_inode.initialize_directory(metadata, self.now, u64::from(block_size.bytes()), block)?;
+        raw_inode.initialize_directory(metadata, self.now, block_size, block)?;
 
         let mut directory = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
@@ -779,14 +799,15 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             return Err(Error::DirectoryNotEmpty);
         }
         let _removed = self.remove_directory_entry(parent.inode_id(), name)?;
-        let extents = ExtentTree::parse_inode_root(inode.extent_root()?)?
-            .extents()
-            .to_vec();
-        for extent in extents {
+        let tree = self.mutable_extent_tree(&inode)?;
+        for extent in tree.extents().iter().copied() {
             self.free_extent(extent, 0)?;
         }
+        for block in tree.metadata_blocks().iter().copied() {
+            self.free_block(block)?;
+        }
         self.free_inode(raw_inode.id)?;
-        raw_inode.clear_deleted(self.now)?;
+        raw_inode.clear_deleted(self.now, self.volume.superblock.block_size())?;
         *self
             .inode_updates
             .get_mut(inode_index)
@@ -828,9 +849,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
 
         let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
         let block_size = usize::try_from(block_size_u64).map_err(|_| Error::ArithmeticOverflow)?;
-        let mut extents = ExtentTree::parse_inode_root(inode.extent_root()?)?
-            .extents()
-            .to_vec();
+        let mut tree = self.mutable_extent_tree(&inode)?;
+        if tree.contains_uninitialized() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
         let mut completed = 0_usize;
 
         while completed < bytes.len() {
@@ -861,44 +883,47 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 .ok_or(Error::ArithmeticOverflow)?;
 
             let logical_block = LogicalBlock::try_from(logical_block)?;
-            if let BlockMapping::Physical(physical) = map_extents(&extents, logical_block) {
-                let write_offset = self
-                    .volume
-                    .superblock
-                    .block_size()
-                    .offset_of(physical)?
-                    .get()
-                    .checked_add(in_block)
-                    .ok_or(Error::ArithmeticOverflow)?;
-                self.data_writes.push(RangeWrite {
-                    offset: ByteOffset::new(write_offset),
-                    bytes: bytes
-                        .get(completed..end)
+            match tree.map_logical(logical_block) {
+                BlockMapping::Physical(physical) => {
+                    let write_offset = self
+                        .volume
+                        .superblock
+                        .block_size()
+                        .offset_of(physical)?
+                        .get()
+                        .checked_add(in_block)
+                        .ok_or(Error::ArithmeticOverflow)?;
+                    self.data_writes.push(RangeWrite {
+                        offset: ByteOffset::new(write_offset),
+                        bytes: bytes
+                            .get(completed..end)
+                            .ok_or(Error::DeviceRange)?
+                            .to_vec(),
+                    });
+                }
+                BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
+                BlockMapping::Hole => {
+                    let physical = self.allocate_block()?;
+                    tree.insert_or_extend_initialized(logical_block, physical)?;
+                    let mut block = vec![0_u8; block_size];
+                    let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
+                    let block_end = start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
+                    block
+                        .get_mut(start..block_end)
                         .ok_or(Error::DeviceRange)?
-                        .to_vec(),
-                });
-            } else {
-                let physical = self.allocate_block()?;
-                insert_or_extend_extent(&mut extents, logical_block, physical)?;
-                let mut block = vec![0_u8; block_size];
-                let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
-                let block_end = start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
-                block
-                    .get_mut(start..block_end)
-                    .ok_or(Error::DeviceRange)?
-                    .copy_from_slice(bytes.get(completed..end).ok_or(Error::DeviceRange)?);
-                self.data_writes.push(RangeWrite {
-                    offset: self.volume.superblock.block_size().offset_of(physical)?,
-                    bytes: block,
-                });
+                        .copy_from_slice(bytes.get(completed..end).ok_or(Error::DeviceRange)?);
+                    self.data_writes.push(RangeWrite {
+                        offset: self.volume.superblock.block_size().offset_of(physical)?,
+                        bytes: block,
+                    });
+                }
             }
 
             completed = end;
         }
 
         raw_inode.set_timestamps(self.now)?;
-        raw_inode.set_extent_root(&extents)?;
-        raw_inode.set_allocated_blocks(extents_allocated_blocks(&extents), block_size_u64)?;
+        self.stage_extent_tree(&mut raw_inode, tree)?;
         *self
             .inode_updates
             .get_mut(inode_index)
@@ -947,9 +972,11 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             return Err(Error::InvalidWriteRange);
         }
         let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
-        let extents = ExtentTree::parse_inode_root(inode.extent_root()?)?
-            .extents()
-            .to_vec();
+        let mut tree = self.mutable_extent_tree(&inode)?;
+        if tree.contains_uninitialized() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        let extents = tree.extents().to_vec();
         let keep_blocks = round_up_div(new_size.bytes(), block_size_u64)?;
         let mut updated = Vec::new();
         for extent in extents {
@@ -965,7 +992,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 )
                 .map_err(|_| Error::ArithmeticOverflow)?;
                 self.free_extent(extent, keep_len)?;
-                updated.push(Extent::new(
+                updated.push(Extent::initialized(
                     extent.logical_start(),
                     ExtentLength::new(keep_len)?,
                     extent.physical_start(),
@@ -980,12 +1007,12 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::InvalidSuperblock)?
             != 0
         {
-            self.zero_truncated_tail(&updated, new_size, block_size_u64)?;
+            self.zero_truncated_tail(updated.as_slice(), new_size, block_size_u64)?;
         }
+        tree.replace_extents(updated)?;
         raw_inode.set_size(new_size)?;
         raw_inode.set_timestamps(self.now)?;
-        raw_inode.set_extent_root(&updated)?;
-        raw_inode.set_allocated_blocks(extents_allocated_blocks(&updated), block_size_u64)?;
+        self.stage_extent_tree(&mut raw_inode, tree)?;
         *self
             .inode_updates
             .get_mut(inode_index)
@@ -1064,12 +1091,13 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         let block_size = self.volume.superblock.block_size();
         let block_size_u64 = u64::from(block_size.bytes());
         let new_physical = self.allocate_block()?;
-        let mut extents = ExtentTree::parse_inode_root(parent_inode.extent_root()?)?
-            .extents()
-            .to_vec();
+        let mut tree = self.mutable_extent_tree(&parent_inode)?;
+        if tree.contains_uninitialized() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
         let logical_block =
             LogicalBlock::try_from(round_up_div(parent_inode.size().bytes(), block_size_u64)?)?;
-        insert_or_extend_extent(&mut extents, logical_block, new_physical)?;
+        tree.insert_or_extend_initialized(logical_block, new_physical)?;
 
         let mut block = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
@@ -1091,8 +1119,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 .ok_or(Error::ArithmeticOverflow)?,
         ))?;
         raw_parent.set_timestamps(self.now)?;
-        raw_parent.set_extent_root(&extents)?;
-        raw_parent.set_allocated_blocks(extents_allocated_blocks(&extents), block_size_u64)?;
+        self.stage_extent_tree(&mut raw_parent, tree)?;
         *self
             .inode_updates
             .get_mut(inode_index)
@@ -1158,13 +1185,20 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
         let block_count = round_up_div(inode.size().bytes(), u64::from(block_size.bytes()))?;
-        let tree =
-            ExtentTree::load_inode_tree(inode.extent_root()?, block_size, &self.volume.device)?;
+        let tree = MutableExtentTree::load_inode_tree(
+            inode.extent_root()?,
+            block_size,
+            &self.volume.device,
+            self.volume.extent_tree_context(inode),
+        )?;
         let mut blocks = Vec::new();
         for logical in 0..block_count {
             let logical = LogicalBlock::try_from(logical)?;
-            let BlockMapping::Physical(physical) = tree.map_logical(logical) else {
-                return Err(Error::InvalidDirectoryEntry);
+            let physical = match tree.map_logical(logical) {
+                BlockMapping::Physical(physical) => physical,
+                BlockMapping::Uninitialized | BlockMapping::Hole => {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
             };
             let mut bytes = vec![0_u8; block_bytes];
             self.volume
@@ -1173,6 +1207,56 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             blocks.push((logical, physical, DirectoryBlock::new(bytes)));
         }
         Ok(blocks)
+    }
+
+    /// Internal mutable_extent_tree operation used by this module's domain boundary.
+    fn mutable_extent_tree(&self, inode: &Inode) -> Result<MutableExtentTree> {
+        MutableExtentTree::load_inode_tree(
+            inode.extent_root()?,
+            self.volume.superblock.block_size(),
+            &self.volume.device,
+            self.volume.extent_tree_context(inode),
+        )
+    }
+
+    /// Internal stage_extent_tree operation used by this module's domain boundary.
+    fn stage_extent_tree(
+        &mut self,
+        raw_inode: &mut RawInode,
+        mut tree: MutableExtentTree,
+    ) -> Result<()> {
+        let block_size = self.volume.superblock.block_size();
+        let required = tree.required_metadata_blocks(block_size)?;
+        let mut metadata_blocks = tree.metadata_blocks().to_vec();
+        while metadata_blocks.len() < required {
+            metadata_blocks.push(self.allocate_block()?);
+        }
+        while metadata_blocks.len() > required {
+            let block = metadata_blocks.pop().ok_or(Error::InvalidExtentTree)?;
+            self.free_block(block)?;
+        }
+        tree.set_metadata_blocks(metadata_blocks);
+
+        let inode = raw_inode.parse()?;
+        let serialized = tree.serialize(block_size, self.volume.extent_tree_context(&inode))?;
+        self.stage_serialized_extent_tree(raw_inode, &serialized)?;
+        raw_inode.set_allocated_blocks(tree.allocated_data_blocks(), u64::from(block_size.bytes()))
+    }
+
+    /// Internal stage_serialized_extent_tree operation used by this module's domain boundary.
+    fn stage_serialized_extent_tree(
+        &mut self,
+        raw_inode: &mut RawInode,
+        serialized: &SerializedExtentTree,
+    ) -> Result<()> {
+        raw_inode.set_extent_root_bytes(serialized.inode_root())?;
+        for block in serialized.external_blocks() {
+            self.extent_updates.push(BlockImage {
+                block: block.block(),
+                bytes: block.bytes().to_vec(),
+            });
+        }
+        Ok(())
     }
 
     /// Internal increment_directory_links operation used by this module's domain boundary.
@@ -1626,6 +1710,16 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 bytes: directory.bytes.clone(),
             });
         }
+        for extent in &self.extent_updates {
+            writes.push(RangeWrite {
+                offset: self
+                    .volume
+                    .superblock
+                    .block_size()
+                    .offset_of(extent.block)?,
+                bytes: extent.bytes.clone(),
+            });
+        }
         for delta in &self.group_deltas {
             let mut descriptor = BlockGroupDescriptor::read_from(
                 &self.volume.device,
@@ -1893,7 +1987,12 @@ impl RawInode {
     }
 
     /// Internal initialize_file operation used by this module's domain boundary.
-    fn initialize_file(&mut self, metadata: NewFileMetadata, now: Ext4Timestamp) -> Result<()> {
+    fn initialize_file(
+        &mut self,
+        metadata: NewFileMetadata,
+        now: Ext4Timestamp,
+        block_size: BlockSize,
+    ) -> Result<()> {
         self.bytes.fill(0);
         self.set_mode(MODE_REGULAR, metadata.permissions())?;
         self.set_owner(metadata.owner())?;
@@ -1903,7 +2002,9 @@ impl RawInode {
         self.set_creation_time(now)?;
         self.set_deletion_time(0)?;
         self.set_flags(EXT4_EXTENTS_FL)?;
-        self.set_extent_root(&[])?;
+        let tree = MutableExtentTree::from_extents(Vec::new())?;
+        let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
+        self.set_extent_root_bytes(serialized.inode_root())?;
         self.set_allocated_blocks(0, 1024)
     }
 
@@ -1912,24 +2013,26 @@ impl RawInode {
         &mut self,
         metadata: NewDirectoryMetadata,
         now: Ext4Timestamp,
-        block_size: u64,
+        block_size: BlockSize,
         first_block: BlockAddress,
     ) -> Result<()> {
         self.bytes.fill(0);
         self.set_mode(MODE_DIRECTORY, metadata.permissions())?;
         self.set_owner(metadata.owner())?;
-        self.set_size(FileSize::from_bytes(block_size))?;
+        self.set_size(FileSize::from_bytes(u64::from(block_size.bytes())))?;
         self.set_links_count(2)?;
         self.set_timestamps(now)?;
         self.set_creation_time(now)?;
         self.set_deletion_time(0)?;
         self.set_flags(EXT4_EXTENTS_FL)?;
-        self.set_extent_root(&[Extent::new(
+        let tree = MutableExtentTree::from_extents(vec![Extent::initialized(
             LogicalBlock::from_u32(0),
             ExtentLength::new(1)?,
             first_block,
         )])?;
-        self.set_allocated_blocks(1, block_size)
+        let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
+        self.set_extent_root_bytes(serialized.inode_root())?;
+        self.set_allocated_blocks(1, u64::from(block_size.bytes()))
     }
 
     /// Internal set_mode operation used by this module's domain boundary.
@@ -2038,24 +2141,25 @@ impl RawInode {
     }
 
     /// Internal clear_deleted operation used by this module's domain boundary.
-    fn clear_deleted(&mut self, now: Ext4Timestamp) -> Result<()> {
+    fn clear_deleted(&mut self, now: Ext4Timestamp, block_size: BlockSize) -> Result<()> {
         self.set_deletion_time(now.seconds())?;
         self.set_links_count(0)?;
         self.set_size(FileSize::from_bytes(0))?;
         self.set_allocated_blocks(0, 1024)?;
-        self.set_extent_root(&[])
+        let tree = MutableExtentTree::from_extents(Vec::new())?;
+        let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
+        self.set_extent_root_bytes(serialized.inode_root())
     }
 
-    /// Internal set_extent_root operation used by this module's domain boundary.
-    fn set_extent_root(&mut self, extents: &[Extent]) -> Result<()> {
-        let root = serialize_inode_root(extents)?;
+    /// Internal set_extent_root_bytes operation used by this module's domain boundary.
+    fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> {
         let end = INODE_BLOCK_OFFSET
             .checked_add(root.len())
             .ok_or(Error::ArithmeticOverflow)?;
         self.bytes
             .get_mut(INODE_BLOCK_OFFSET..end)
             .ok_or(Error::TruncatedStructure)?
-            .copy_from_slice(&root);
+            .copy_from_slice(root);
         Ok(())
     }
 
@@ -2200,44 +2304,13 @@ impl MetadataBlock {
 /// Internal map_extents operation used by this module's domain boundary.
 fn map_extents(extents: &[Extent], logical_block: LogicalBlock) -> BlockMapping {
     for extent in extents {
-        if let BlockMapping::Physical(block) = extent.map_logical(logical_block) {
-            return BlockMapping::Physical(block);
+        match extent.map_logical(logical_block) {
+            BlockMapping::Physical(block) => return BlockMapping::Physical(block),
+            BlockMapping::Uninitialized => return BlockMapping::Uninitialized,
+            BlockMapping::Hole => {}
         }
     }
     BlockMapping::Hole
-}
-
-/// Internal insert_or_extend_extent operation used by this module's domain boundary.
-fn insert_or_extend_extent(
-    extents: &mut Vec<Extent>,
-    logical_block: LogicalBlock,
-    physical_block: BlockAddress,
-) -> Result<()> {
-    if let Some(last) = extents.last_mut()
-        && last.end_logical()? == logical_block.as_u32()
-        && last
-            .physical_start()
-            .get()
-            .checked_add(last.len().as_u64())
-            .ok_or(Error::ArithmeticOverflow)?
-            == physical_block.get()
-    {
-        let len = last.len().checked_add_one()?;
-        *last = Extent::new(last.logical_start(), len, last.physical_start());
-        return Ok(());
-    }
-    extents.push(Extent::new(
-        logical_block,
-        ExtentLength::new(1)?,
-        physical_block,
-    ));
-    extents.sort_by_key(|extent| extent.logical_start());
-    Ok(())
-}
-
-/// Internal extents_allocated_blocks operation used by this module's domain boundary.
-fn extents_allocated_blocks(extents: &[Extent]) -> u64 {
-    extents.iter().map(|extent| extent.len().as_u64()).sum()
 }
 
 /// Internal round_up_div operation used by this module's domain boundary.
