@@ -416,10 +416,7 @@ impl Journal {
 
             match header.block_type() {
                 JBD2_DESCRIPTOR_BLOCK => {
-                    let descriptor = match self.parse_descriptor_block(&block) {
-                        Ok(value) => value,
-                        Err(error) => return Err(error),
-                    };
+                    let descriptor = self.parse_descriptor_block(&block)?;
                     cursor = self.next_logical(cursor)?;
                     consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
                     for tag in descriptor.tags {
@@ -444,10 +441,7 @@ impl Journal {
                     }
                 }
                 JBD2_REVOKE_BLOCK => {
-                    let revoke = match self.parse_revoke_block(&block) {
-                        Ok(value) => value,
-                        Err(error) => return Err(error),
-                    };
+                    let revoke = self.parse_revoke_block(&block)?;
                     for block in revoke.blocks {
                         if !transaction.entries.iter().any(|entry| entry.home == block) {
                             transaction.revokes.push(block);
@@ -487,10 +481,10 @@ impl Journal {
         if block.get() >= self.filesystem_blocks {
             return Err(Error::JournalCorrupt);
         }
-        if let JournalLocation::Internal { blocks } = &self.location {
-            if blocks.contains(&block) {
-                return Err(Error::JournalCorrupt);
-            }
+        if let JournalLocation::Internal { blocks } = &self.location
+            && blocks.contains(&block)
+        {
+            return Err(Error::JournalCorrupt);
         }
         Ok(())
     }
@@ -830,7 +824,9 @@ impl Journal {
             .checked_sub(JOURNAL_HEADER_BYTES)
             .and_then(|value| value.checked_sub(tail_bytes))
             .ok_or(Error::TransactionTooLarge)?;
-        Ok(usable / self.descriptor_tag_size())
+        usable
+            .checked_div(self.descriptor_tag_size())
+            .ok_or(Error::TransactionTooLarge)
     }
 
     fn descriptor_tag_size(&self) -> usize {

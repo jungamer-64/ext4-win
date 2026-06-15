@@ -301,8 +301,8 @@ fn committed_dirty_journal_transaction_is_replayed() {
     let mut image = modern_fixture_image();
     mark_filesystem_needs_recovery(&mut image);
     write_dirty_journal_superblock(&mut image, 7, 1);
-    write_jbd2_descriptor(&mut image, 1, 7, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_data(&mut image, 2, b"REPLAY");
+    write_jbd2_descriptor(&mut image, 1, 7, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_commit(&mut image, 3, 7);
 
     {
@@ -323,8 +323,8 @@ fn descriptor_without_commit_is_ignored() {
     let mut image = modern_fixture_image();
     mark_filesystem_needs_recovery(&mut image);
     write_dirty_journal_superblock(&mut image, 8, 1);
-    write_jbd2_descriptor(&mut image, 1, 8, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_data(&mut image, 2, b"IGNORE");
+    write_jbd2_descriptor(&mut image, 1, 8, MODERN_FILE_DATA_BLOCK, 0);
 
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
@@ -336,21 +336,20 @@ fn descriptor_without_commit_is_ignored() {
 }
 
 #[test]
-fn bad_tag_checksum_transaction_is_ignored() {
+fn bad_tag_checksum_transaction_is_rejected() {
     let mut image = modern_fixture_image();
     mark_filesystem_needs_recovery(&mut image);
     write_dirty_journal_superblock(&mut image, 9, 1);
-    write_jbd2_descriptor_with_checksum(&mut image, 1, 9, MODERN_FILE_DATA_BLOCK, 0xDEAD_BEEF);
     write_jbd2_data(&mut image, 2, b"BAD!!");
+    write_jbd2_descriptor_with_checksum(&mut image, 1, 9, MODERN_FILE_DATA_BLOCK, 0xDEAD_BEEF);
     write_jbd2_commit(&mut image, 3, 9);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
-    let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let result = Volume::<_, ReadWrite>::mount_read_write(device);
 
-    assert_eq!(read, 5);
-    assert_eq!(&output, b"hello");
+    assert!(matches!(result, Err(Error::ChecksumMismatch)));
+    assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x1C), 1);
+    assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
 }
 
 #[test]
@@ -358,8 +357,8 @@ fn later_revoke_prevents_stale_metadata_replay() {
     let mut image = modern_fixture_image();
     mark_filesystem_needs_recovery(&mut image);
     write_dirty_journal_superblock(&mut image, 10, 1);
-    write_jbd2_descriptor(&mut image, 1, 10, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_data(&mut image, 2, b"STALE");
+    write_jbd2_descriptor(&mut image, 1, 10, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_commit(&mut image, 3, 10);
     write_jbd2_revoke(&mut image, 4, 11, MODERN_FILE_DATA_BLOCK);
     write_jbd2_commit(&mut image, 5, 11);
@@ -378,8 +377,8 @@ fn circular_journal_wraparound_is_replayed() {
     let mut image = modern_fixture_image();
     mark_filesystem_needs_recovery(&mut image);
     write_dirty_journal_superblock(&mut image, 12, 6);
-    write_jbd2_descriptor(&mut image, 6, 12, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_data(&mut image, 7, b"WRAP!");
+    write_jbd2_descriptor(&mut image, 6, 12, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_commit(&mut image, 1, 12);
 
     let device = SliceBlockDeviceMut::new(&mut image);
@@ -396,6 +395,7 @@ fn escaped_journal_data_block_is_unescaped_on_replay() {
     let mut image = modern_fixture_image();
     mark_filesystem_needs_recovery(&mut image);
     write_dirty_journal_superblock(&mut image, 13, 1);
+    write_jbd2_data(&mut image, 2, &[0, 0, 0, 0, b'E']);
     write_jbd2_descriptor(
         &mut image,
         1,
@@ -403,7 +403,6 @@ fn escaped_journal_data_block_is_unescaped_on_replay() {
         MODERN_FILE_DATA_BLOCK,
         JBD2_TAG_FLAG_ESCAPE,
     );
-    write_jbd2_data(&mut image, 2, &[0, 0, 0, 0, b'E']);
     write_jbd2_commit(&mut image, 3, 13);
 
     let device = SliceBlockDeviceMut::new(&mut image);
@@ -423,8 +422,8 @@ fn checkpointed_dirty_journal_replay_is_idempotent() {
     image[home..home + 5].copy_from_slice(b"DONE!");
     mark_filesystem_needs_recovery(&mut image);
     write_dirty_journal_superblock(&mut image, 14, 1);
-    write_jbd2_descriptor(&mut image, 1, 14, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_data(&mut image, 2, b"DONE!");
+    write_jbd2_descriptor(&mut image, 1, 14, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_commit(&mut image, 3, 14);
 
     let device = SliceBlockDeviceMut::new(&mut image);
@@ -566,6 +565,197 @@ fn csum_v2_descriptor_tail_and_commit_checksum_are_verified() {
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"V2OK!");
+}
+
+#[test]
+fn zero_tag_checksum_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 17, 1);
+    write_jbd2_data(&mut image, 2, b"ZERO!");
+    write_jbd2_descriptor_with_checksum(&mut image, 1, 17, MODERN_FILE_DATA_BLOCK, 0);
+    write_jbd2_commit(&mut image, 3, 17);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::ChecksumMismatch)));
+}
+
+#[test]
+fn zero_descriptor_tail_checksum_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 18, 1);
+    write_jbd2_data(&mut image, 2, b"TAIL!");
+    write_jbd2_descriptor(&mut image, 1, 18, MODERN_FILE_DATA_BLOCK, 0);
+    put_be_u32(&mut image, journal_log_offset(1) + BLOCK_SIZE - 4, 0);
+    write_jbd2_commit(&mut image, 3, 18);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::ChecksumMismatch)));
+}
+
+#[test]
+fn invalid_commit_checksum_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 19, 1);
+    write_jbd2_data(&mut image, 2, b"COMIT");
+    write_jbd2_descriptor(&mut image, 1, 19, MODERN_FILE_DATA_BLOCK, 0);
+    write_jbd2_commit(&mut image, 3, 19);
+    put_be_u32(&mut image, journal_log_offset(3) + 0x10, 0xDEAD_BEEF);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::ChecksumMismatch)));
+}
+
+#[test]
+fn invalid_revoke_tail_checksum_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 20, 1);
+    write_jbd2_revoke(&mut image, 1, 20, MODERN_FILE_DATA_BLOCK);
+    put_be_u32(&mut image, journal_log_offset(1) + BLOCK_SIZE - 4, 0xDEAD_BEEF);
+    write_jbd2_commit(&mut image, 2, 20);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::ChecksumMismatch)));
+}
+
+#[test]
+fn journal_superblock_fields_and_checksum_are_preserved_when_cleaned() {
+    let mut image = modern_fixture_image();
+    let base = journal_log_offset(0);
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 21, 1);
+    put_be_u32(&mut image, base + 0x58, 0x1122_3344);
+    refresh_jbd2_superblock_checksum(&mut image, base);
+    write_jbd2_data(&mut image, 2, b"KEEP!");
+    write_jbd2_descriptor(&mut image, 1, 21, MODERN_FILE_DATA_BLOCK, 0);
+    write_jbd2_commit(&mut image, 3, 21);
+
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let _volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+
+    assert_eq!(get_be_u32(&image, base + 0x18), 22);
+    assert_eq!(get_be_u32(&image, base + 0x1C), 0);
+    assert_eq!(get_be_u32(&image, base + 0x58), 0x1122_3344);
+    assert_eq!(
+        get_be_u32(&image, base + 0xFC),
+        jbd2_superblock_checksum(&image, base)
+    );
+}
+
+#[test]
+fn journal_sequence_wraps_after_max_transaction() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, u32::MAX, 1);
+    write_jbd2_data(&mut image, 2, b"WRAP0");
+    write_jbd2_descriptor(&mut image, 1, u32::MAX, MODERN_FILE_DATA_BLOCK, 0);
+    write_jbd2_commit(&mut image, 3, u32::MAX);
+
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let _volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+
+    assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x18), 0);
+    assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x1C), 0);
+}
+
+#[test]
+fn nonzero_journal_ro_compat_is_rejected() {
+    let mut image = modern_fixture_image();
+    put_be_u32(&mut image, journal_log_offset(0) + 0x2C, 1);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::UnsupportedJournal)));
+}
+
+#[test]
+fn recovery_required_with_zero_journal_start_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::JournalCorrupt)));
+    assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
+}
+
+#[test]
+fn replay_target_outside_filesystem_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 22, 1);
+    write_jbd2_data(&mut image, 2, b"OUT!!");
+    write_jbd2_descriptor(
+        &mut image,
+        1,
+        22,
+        u32::try_from(MODERN_IMAGE_BLOCKS).unwrap_or(u32::MAX),
+        0,
+    );
+    write_jbd2_commit(&mut image, 3, 22);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::JournalCorrupt)));
+}
+
+#[test]
+fn replay_target_inside_internal_journal_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 23, 1);
+    write_jbd2_data(&mut image, 2, b"SELF!");
+    write_jbd2_descriptor(&mut image, 1, 23, MODERN_JOURNAL_BLOCK, 0);
+    write_jbd2_commit(&mut image, 3, 23);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::JournalCorrupt)));
+}
+
+#[test]
+fn emitted_journal_data_escapes_jbd2_magic_prefix() {
+    let mut image = modern_fixture_image();
+    put_be_u32(
+        &mut image,
+        block_offset(MODERN_INODE_TABLE_BLOCK),
+        JBD2_MAGIC,
+    );
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        must(transaction.overwrite_file_range(InodeId::new(3), 0, b"MAGIC"));
+        must(transaction.commit());
+    }
+
+    let descriptor = journal_log_offset(1);
+    let mut tag = descriptor + 12;
+    let mut data_logical = 2;
+    let mut found = false;
+    while tag < descriptor + BLOCK_SIZE - 4 {
+        let block = get_be_u32(&image, tag);
+        let flags = get_be_u32(&image, tag + 4);
+        if block == MODERN_INODE_TABLE_BLOCK {
+            found = true;
+            assert_ne!(flags & JBD2_TAG_FLAG_ESCAPE, 0);
+            assert_eq!(get_be_u32(&image, journal_log_offset(data_logical)), 0);
+            break;
+        }
+        if flags & JBD2_TAG_FLAG_LAST_TAG != 0 {
+            break;
+        }
+        tag += 16;
+        data_logical += 1;
+    }
+    assert!(found);
 }
 
 #[test]
@@ -852,13 +1042,17 @@ fn write_jbd2_descriptor(
     home_block: u32,
     extra_flags: u32,
 ) {
-    write_jbd2_descriptor_with_checksum(image, logical, sequence, home_block, 0);
+    let data = image[journal_log_offset(logical + 1)..journal_log_offset(logical + 1) + BLOCK_SIZE]
+        .to_vec();
+    let checksum = jbd2_tag_checksum(sequence, &data, [0; 16]);
+    write_jbd2_descriptor_with_checksum(image, logical, sequence, home_block, checksum);
     let flags_offset = journal_log_offset(logical) + 16;
     put_be_u32(
         image,
         flags_offset,
         JBD2_TAG_FLAG_SAME_UUID | JBD2_TAG_FLAG_LAST_TAG | extra_flags,
     );
+    write_jbd2_block_tail_checksum(image, logical, [0; 16]);
 }
 
 fn write_jbd2_descriptor_with_checksum(
@@ -879,6 +1073,7 @@ fn write_jbd2_descriptor_with_checksum(
     );
     put_be_u32(image, base + 20, 0);
     put_be_u32(image, base + 24, checksum);
+    write_jbd2_block_tail_checksum(image, logical, [0; 16]);
 }
 
 fn write_jbd2_descriptor_32bit(image: &mut [u8], logical: u32, sequence: u32, home_block: u32) {
@@ -927,14 +1122,13 @@ fn write_jbd2_data(image: &mut [u8], logical: u32, prefix: &[u8]) {
 }
 
 fn write_jbd2_commit(image: &mut [u8], logical: u32, sequence: u32) {
-    let base = journal_log_offset(logical);
-    image[base..base + BLOCK_SIZE].fill(0);
-    write_jbd2_header(image, base, JBD2_COMMIT_BLOCK, sequence);
+    write_jbd2_commit_with_checksum(image, logical, sequence, [0; 16]);
 }
 
 fn write_jbd2_commit_with_checksum(image: &mut [u8], logical: u32, sequence: u32, uuid: [u8; 16]) {
-    write_jbd2_commit(image, logical, sequence);
     let base = journal_log_offset(logical);
+    image[base..base + BLOCK_SIZE].fill(0);
+    write_jbd2_header(image, base, JBD2_COMMIT_BLOCK, sequence);
     image[base + 0x0C] = JBD2_CHECKSUM_CRC32C;
     image[base + 0x0D] = 4;
     let checksum = jbd2_block_checksum(image, logical, 0x10, uuid);
@@ -948,6 +1142,7 @@ fn write_jbd2_revoke(image: &mut [u8], logical: u32, sequence: u32, block: u32) 
     put_be_u32(image, base + 12, 28);
     put_be_u32(image, base + 16, 0);
     put_be_u32(image, base + 20, block);
+    write_jbd2_block_tail_checksum(image, logical, [0; 16]);
 }
 
 fn write_jbd2_header(image: &mut [u8], base: usize, block_type: u32, sequence: u32) {
@@ -961,6 +1156,18 @@ fn write_jbd2_block_tail_checksum(image: &mut [u8], logical: u32, uuid: [u8; 16]
     put_be_u32(image, tail, 0);
     let checksum = jbd2_block_checksum(image, logical, BLOCK_SIZE - 4, uuid);
     put_be_u32(image, tail, checksum);
+}
+
+fn refresh_jbd2_superblock_checksum(image: &mut [u8], base: usize) {
+    put_be_u32(image, base + 0xFC, 0);
+    let checksum = jbd2_superblock_checksum(image, base);
+    put_be_u32(image, base + 0xFC, checksum);
+}
+
+fn jbd2_superblock_checksum(image: &[u8], base: usize) -> u32 {
+    let mut block = image[base..base + 1024].to_vec();
+    block[0xFC..0x100].fill(0);
+    crate::checksum::crc32c(0, &block)
 }
 
 fn jbd2_block_checksum(image: &[u8], logical: u32, checksum_offset: usize, uuid: [u8; 16]) -> u32 {
