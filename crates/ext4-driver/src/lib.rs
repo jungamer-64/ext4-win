@@ -17,8 +17,10 @@ use wdk_sys::{
 
 #[cfg(not(test))]
 #[global_allocator]
+/// Kernel allocator used by WDK-backed driver builds.
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
+/// Registered control device observed by the unload callback.
 static mut CONTROL_DEVICE: Option<state::ControlDevice> = None;
 
 /// Driver entry point called by the Windows kernel loader.
@@ -68,14 +70,12 @@ pub unsafe extern "system" fn driver_entry(
         // SAFETY: `control_device` was initialized by a successful IoCreateDevice call.
         ffi::IoRegisterFileSystem(control_device.as_ptr());
     }
+    let control_device_slot = core::ptr::addr_of_mut!(CONTROL_DEVICE);
     unsafe {
-        // SAFETY: DriverEntry initializes this global before the unload callback
-        // can observe it. Raw pointer write avoids borrowing the mutable static.
-        core::ptr::write(
-            core::ptr::addr_of_mut!(CONTROL_DEVICE),
-            Some(control_device),
-        );
-    }
+        // SAFETY: `control_device_slot` points to the driver-owned global state.
+        // Raw pointer write avoids borrowing the mutable static.
+        core::ptr::write(control_device_slot, Some(control_device));
+    };
 
     STATUS_SUCCESS
 }

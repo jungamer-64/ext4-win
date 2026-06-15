@@ -691,7 +691,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "wdk-alloc"
 version = "0.4.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=df5fa67be68c0ea443267fe38e4c83ea177d7f40#df5fa67be68c0ea443267fe38e4c83ea177d7f40"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=dc6fbf3c3f8696e00a399ac03e1968aaff1c5bb3#dc6fbf3c3f8696e00a399ac03e1968aaff1c5bb3"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -702,7 +702,7 @@ dependencies = [
 [[package]]
 name = "wdk-build"
 version = "0.5.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=df5fa67be68c0ea443267fe38e4c83ea177d7f40#df5fa67be68c0ea443267fe38e4c83ea177d7f40"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=dc6fbf3c3f8696e00a399ac03e1968aaff1c5bb3#dc6fbf3c3f8696e00a399ac03e1968aaff1c5bb3"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -725,7 +725,7 @@ dependencies = [
 [[package]]
 name = "wdk-macros"
 version = "0.5.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=df5fa67be68c0ea443267fe38e4c83ea177d7f40#df5fa67be68c0ea443267fe38e4c83ea177d7f40"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=dc6fbf3c3f8696e00a399ac03e1968aaff1c5bb3#dc6fbf3c3f8696e00a399ac03e1968aaff1c5bb3"
 dependencies = [
  "cfg-if",
  "fs4",
@@ -741,12 +741,12 @@ dependencies = [
 [[package]]
 name = "wdk-panic"
 version = "0.4.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=df5fa67be68c0ea443267fe38e4c83ea177d7f40#df5fa67be68c0ea443267fe38e4c83ea177d7f40"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=dc6fbf3c3f8696e00a399ac03e1968aaff1c5bb3#dc6fbf3c3f8696e00a399ac03e1968aaff1c5bb3"
 
 [[package]]
 name = "wdk-sys"
 version = "0.5.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=df5fa67be68c0ea443267fe38e4c83ea177d7f40#df5fa67be68c0ea443267fe38e4c83ea177d7f40"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=dc6fbf3c3f8696e00a399ac03e1968aaff1c5bb3#dc6fbf3c3f8696e00a399ac03e1968aaff1c5bb3"
 dependencies = [
  "anyhow",
  "bindgen",

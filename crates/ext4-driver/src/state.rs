@@ -11,6 +11,7 @@ use crate::ffi;
 /// Non-null kernel device object pointer at the WDK boundary.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct KernelDevice {
+    /// Non-null opaque WDK device pointer.
     device: NonNull<c_void>,
 }
 
@@ -29,6 +30,7 @@ impl KernelDevice {
 /// Registered file system control device owned by the driver.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ControlDevice {
+    /// File-system control device registered with the I/O Manager.
     device: KernelDevice,
 }
 
@@ -49,7 +51,9 @@ impl ControlDevice {
     reason = "mount state is introduced before FSCTL mount IRP handling"
 )]
 #[derive(Clone, Copy, Debug)]
+/// Driver state after the control device has been registered.
 pub(crate) struct RegisteredDriver {
+    /// Registered control device owned by the driver.
     control_device: KernelDevice,
 }
 
@@ -58,7 +62,9 @@ pub(crate) struct RegisteredDriver {
     reason = "mount state is introduced before FSCTL mount IRP handling"
 )]
 #[derive(Clone, Copy, Debug)]
+/// Target device selected by mount FSCTL validation before VCB creation.
 pub(crate) struct MountCandidate {
+    /// Device object that will back the mounted ext4 volume.
     target_device: KernelDevice,
 }
 
@@ -67,8 +73,11 @@ pub(crate) struct MountCandidate {
     reason = "volume state is introduced before VCB allocation is wired"
 )]
 #[derive(Clone, Copy, Debug)]
+/// Mounted ext4 volume state owned by a volume control block.
 pub(crate) struct MountedVolume {
+    /// Root directory inode of the mounted volume.
     root_inode: InodeId,
+    /// Device object that stores the ext4 block device.
     target_device: KernelDevice,
 }
 
@@ -77,19 +86,23 @@ pub(crate) struct MountedVolume {
     reason = "open node state is introduced before CREATE allocates CCBs"
 )]
 #[derive(Clone, Copy, Debug)]
+/// Open ext4 node represented by per-handle context.
 pub(crate) enum OpenNode {
+    /// Regular file inode.
     File(InodeId),
+    /// Directory inode.
     Directory(InodeId),
+    /// Symbolic link inode.
     Symlink(InodeId),
 }
 
 /// Driver unload callback registered in the driver object.
-pub(crate) unsafe extern "system" fn driver_unload(_driver: PDRIVER_OBJECT) {
+pub(crate) unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {
+    let control_device = core::ptr::addr_of_mut!(crate::CONTROL_DEVICE);
     let device = unsafe {
-        // SAFETY: Driver unload is serialized by the I/O Manager for this
-        // driver object. Use raw pointer replacement to avoid borrowing the
-        // mutable static.
-        core::ptr::replace(core::ptr::addr_of_mut!(crate::CONTROL_DEVICE), None)
+        // SAFETY: `control_device` points to the driver-owned global state.
+        // Replacement takes ownership of the registered device for teardown.
+        core::ptr::replace(control_device, None)
     };
     if let Some(device) = device {
         let device = device.as_ptr();
