@@ -28,6 +28,7 @@ const INODE_TABLE_BLOCK: u32 = 5;
 const ROOT_DIR_BLOCK: u32 = 8;
 const FILE_DATA_BLOCK: u32 = 9;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+const EXT4_INDEX_FL: u32 = 0x0000_1000;
 const MODERN_IMAGE_BLOCKS: usize = 64;
 const MODERN_INODE_SIZE: usize = 256;
 const MODERN_BLOCK_BITMAP_BLOCK: u32 = 3;
@@ -779,6 +780,32 @@ fn remove_directory_rejects_root_entry() {
     let result = transaction.remove_empty_directory(root, &dot);
 
     assert_eq!(result, Err(Error::CannotRemoveRoot));
+}
+
+#[test]
+fn indexed_directory_create_updates_leaf_block() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    make_indexed_root_directory(&mut image);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let name = must(Ext4Name::new(b"idx"));
+        let file = must(transaction.create_file(root, &name, test_file_metadata()));
+        assert_eq!(file.inode_id(), inode(11));
+        must(transaction.commit());
+
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"idx"),
+            LookupResult::Found(inode(11))
+        );
+    }
+
+    let root_block = block_offset(MODERN_ROOT_DIR_BLOCK);
+    assert_eq!(get_u32(&image, root_block), 2);
+    assert_eq!(get_u32(&image, block_offset(MODERN_EXTENT_INDEX_BLOCK)), 3);
 }
 
 #[test]
@@ -2214,6 +2241,52 @@ fn write_modern_root_directory(image: &mut [u8]) {
     write_dirent(image, base, 2, 12, b".", 2);
     write_dirent(image, base + 12, 2, 12, b"..", 2);
     write_dirent(image, base + 24, 3, 1000, b"file", 1);
+}
+
+fn make_indexed_root_directory(image: &mut [u8]) {
+    set_modern_block_used(image, MODERN_EXTENT_INDEX_BLOCK, true);
+    let free_blocks = get_u32(image, 1024 + 12) - 1;
+    put_u32(image, 1024 + 12, free_blocks);
+    let descriptor = block_offset(2);
+    put_u16(
+        image,
+        descriptor + 12,
+        u16::try_from(free_blocks & u32::from(u16::MAX)).unwrap_or(u16::MAX),
+    );
+    put_u16(
+        image,
+        descriptor + 44,
+        u16::try_from(free_blocks >> 16).unwrap_or(u16::MAX),
+    );
+
+    let root_inode = modern_inode_offset(2);
+    put_u32(
+        image,
+        root_inode + 4,
+        u32::try_from(BLOCK_SIZE * 2).unwrap_or(u32::MAX),
+    );
+    put_u32(image, root_inode + 28, 4);
+    put_u32(image, root_inode + 32, EXT4_EXTENTS_FL | EXT4_INDEX_FL);
+    write_two_extent_root(
+        image,
+        root_inode + 40,
+        0,
+        1,
+        MODERN_ROOT_DIR_BLOCK,
+        1,
+        1,
+        MODERN_EXTENT_INDEX_BLOCK,
+    );
+
+    let root = block_offset(MODERN_ROOT_DIR_BLOCK);
+    image[root..root + BLOCK_SIZE].fill(0);
+    write_dirent(image, root, 2, 12, b".", 2);
+    write_dirent(image, root + 12, 2, 1012, b"..", 2);
+
+    let leaf = block_offset(MODERN_EXTENT_INDEX_BLOCK);
+    image[leaf..leaf + BLOCK_SIZE].fill(0);
+    write_dirent(image, leaf, 3, 1024, b"file", 1);
+    refresh_primary_block_group_descriptor_checksum(image);
 }
 
 fn write_extent_root(
