@@ -5,7 +5,7 @@ use core::ffi::c_void;
 use ext4_core::{BlockReader, BlockWriter, ByteOffset, DeviceLength, Error, Result};
 use wdk_sys::{
     BOOLEAN, IO_STATUS_BLOCK, IRP_MJ_FLUSH_BUFFERS, IRP_MJ_READ, IRP_MJ_WRITE, KEVENT,
-    KPROCESSOR_MODE, LARGE_INTEGER, NTSTATUS, PVOID, STATUS_PENDING, STATUS_SUCCESS,
+    KPROCESSOR_MODE, LARGE_INTEGER, NTSTATUS, PIRP, PVOID, STATUS_PENDING, STATUS_SUCCESS,
 };
 
 use crate::{ffi, state::KernelDevice};
@@ -14,6 +14,55 @@ use crate::{ffi, state::KernelDevice};
 const BOOLEAN_FALSE: BOOLEAN = 0;
 /// Kernel wait mode for synchronous lower-device requests.
 const KERNEL_MODE: KPROCESSOR_MODE = 0;
+/// `IOCTL_DISK_GET_LENGTH_INFO` from `winioctl.h`.
+const IOCTL_DISK_GET_LENGTH_INFO: wdk_sys::ULONG = 475_228;
+
+/// Output buffer returned by `IOCTL_DISK_GET_LENGTH_INFO`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiskLengthInformation {
+    /// Device length in bytes.
+    length: i64,
+}
+
+/// Queries the byte length of a lower storage device.
+pub(crate) fn query_device_length(device: KernelDevice) -> Result<DeviceLength> {
+    let mut event = KEVENT::default();
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let mut length = DiskLengthInformation::default();
+    initialize_notification_event(&mut event);
+
+    let output_length =
+        <wdk_sys::ULONG as TryFrom<usize>>::try_from(core::mem::size_of::<DiskLengthInformation>())
+            .map_err(|_| Error::DeviceRange)?;
+    let irp = unsafe {
+        // SAFETY: The target device is non-null. The output buffer, event, and
+        // IOSB are stack locals that outlive the synchronous request.
+        ffi::IoBuildDeviceIoControlRequest(
+            IOCTL_DISK_GET_LENGTH_INFO,
+            device.as_ptr(),
+            core::ptr::null_mut(),
+            0,
+            core::ptr::from_mut(&mut length).cast::<c_void>(),
+            output_length,
+            BOOLEAN_FALSE,
+            core::ptr::from_mut(&mut event),
+            core::ptr::from_mut(&mut io_status),
+        )
+    };
+    let information = submit_synchronous_irp(device, irp, &mut event, &io_status)?;
+    ensure_expected_information(information, output_length)?;
+    device_length_from_information(length)
+}
+
+/// Converts disk length query output into the core device-length domain.
+fn device_length_from_information(length: DiskLengthInformation) -> Result<DeviceLength> {
+    let bytes = u64::try_from(length.length).map_err(|_| Error::DeviceRange)?;
+    if bytes == 0 {
+        return Err(Error::DeviceRange);
+    }
+    Ok(DeviceLength::from_bytes(bytes))
+}
 
 /// Lower storage device exposed to ext4-core as a checked random-access device.
 #[derive(Clone, Copy, Debug)]
@@ -91,15 +140,7 @@ impl KernelBlockDevice {
     ) -> Result<()> {
         let mut event = KEVENT::default();
         let mut io_status = IO_STATUS_BLOCK::default();
-        unsafe {
-            // SAFETY: `event` is writable stack storage and the event type/state
-            // values are the WDK-defined NotificationEvent/FALSE constants.
-            ffi::KeInitializeEvent(
-                core::ptr::addr_of_mut!(event),
-                wdk_sys::_EVENT_TYPE::NotificationEvent,
-                BOOLEAN_FALSE,
-            );
-        }
+        initialize_notification_event(&mut event);
 
         let irp = unsafe {
             // SAFETY: The target device is a non-null kernel device object. The
@@ -111,45 +152,13 @@ impl KernelBlockDevice {
                 buffer,
                 request_length,
                 starting_offset,
-                core::ptr::addr_of_mut!(event),
-                core::ptr::addr_of_mut!(io_status),
+                core::ptr::from_mut(&mut event),
+                core::ptr::from_mut(&mut io_status),
             )
         };
-        if irp.is_null() {
-            return Err(Error::DeviceIo);
-        }
-
-        let call_status = unsafe {
-            // SAFETY: `irp` was allocated by IoBuildSynchronousFsdRequest for
-            // this non-null lower device object and ownership is transferred to
-            // the I/O Manager by IofCallDriver.
-            ffi::IofCallDriver(self.device.as_ptr(), irp)
-        };
-
-        if call_status == STATUS_PENDING {
-            let wait_status = unsafe {
-                // SAFETY: `event` remains alive until the synchronous request
-                // completes, timeout is null for an indefinite kernel wait.
-                ffi::KeWaitForSingleObject(
-                    core::ptr::addr_of_mut!(event).cast::<c_void>(),
-                    wdk_sys::_KWAIT_REASON::Executive,
-                    KERNEL_MODE,
-                    BOOLEAN_FALSE,
-                    core::ptr::null_mut(),
-                )
-            };
-            ensure_nt_success(wait_status)?;
-        } else {
-            ensure_nt_success(call_status)?;
-        }
-
-        let final_status = io_status_status(&io_status);
-        ensure_nt_success(final_status)?;
-        if io_status.Information
-            != <wdk_sys::ULONG_PTR as From<wdk_sys::ULONG>>::from(request_length)
-            && request_length != 0
-        {
-            return Err(Error::DeviceIo);
+        let information = submit_synchronous_irp(self.device, irp, &mut event, &io_status)?;
+        if request_length != 0 {
+            ensure_expected_information(information, request_length)?;
         }
 
         Ok(())
@@ -186,6 +195,69 @@ impl BlockWriter for KernelBlockDevice {
     }
 }
 
+/// Initializes a stack event used for one synchronous lower-device request.
+fn initialize_notification_event(event: &mut KEVENT) {
+    unsafe {
+        // SAFETY: `event` is writable stack storage and the event type/state
+        // values are the WDK-defined NotificationEvent/FALSE constants.
+        ffi::KeInitializeEvent(
+            core::ptr::from_mut(event),
+            wdk_sys::_EVENT_TYPE::NotificationEvent,
+            BOOLEAN_FALSE,
+        );
+    }
+}
+
+/// Submits an already-built synchronous IRP and waits for completion.
+fn submit_synchronous_irp(
+    device: KernelDevice,
+    irp: PIRP,
+    event: &mut KEVENT,
+    io_status: &IO_STATUS_BLOCK,
+) -> Result<wdk_sys::ULONG_PTR> {
+    if irp.is_null() {
+        return Err(Error::DeviceIo);
+    }
+
+    let call_status = unsafe {
+        // SAFETY: `irp` was allocated for this non-null lower device object and
+        // ownership is transferred to the I/O Manager by IofCallDriver.
+        ffi::IofCallDriver(device.as_ptr(), irp)
+    };
+
+    if call_status == STATUS_PENDING {
+        let wait_status = unsafe {
+            // SAFETY: `event` remains alive until the synchronous request
+            // completes, timeout is null for an indefinite kernel wait.
+            ffi::KeWaitForSingleObject(
+                core::ptr::from_mut(event).cast::<c_void>(),
+                wdk_sys::_KWAIT_REASON::Executive,
+                KERNEL_MODE,
+                BOOLEAN_FALSE,
+                core::ptr::null_mut(),
+            )
+        };
+        ensure_nt_success(wait_status)?;
+    } else {
+        ensure_nt_success(call_status)?;
+    }
+
+    let final_status = io_status_status(io_status);
+    ensure_nt_success(final_status)?;
+    Ok(io_status.Information)
+}
+
+/// Requires a lower-device request to report the expected transfer size.
+fn ensure_expected_information(
+    information: wdk_sys::ULONG_PTR,
+    expected: wdk_sys::ULONG,
+) -> Result<()> {
+    if information != <wdk_sys::ULONG_PTR as From<wdk_sys::ULONG>>::from(expected) {
+        return Err(Error::DeviceIo);
+    }
+    Ok(())
+}
+
 /// Rejects failing NTSTATUS values.
 fn ensure_nt_success(status: NTSTATUS) -> Result<()> {
     if status < STATUS_SUCCESS {
@@ -210,7 +282,7 @@ mod tests {
 
     use ext4_core::{BlockReader, ByteOffset};
 
-    use super::KernelBlockDevice;
+    use super::{DiskLengthInformation, KernelBlockDevice, device_length_from_information};
     use crate::state::KernelDevice;
 
     #[test]
@@ -243,5 +315,26 @@ mod tests {
             block_device.read_exact_at(ByteOffset::new(3), &mut output),
             Err(ext4_core::Error::DeviceRange)
         );
+    }
+
+    #[test]
+    fn disk_length_information_rejects_non_positive_lengths() {
+        assert_eq!(
+            device_length_from_information(DiskLengthInformation { length: 0 }),
+            Err(ext4_core::Error::DeviceRange)
+        );
+        assert_eq!(
+            device_length_from_information(DiskLengthInformation { length: -1 }),
+            Err(ext4_core::Error::DeviceRange)
+        );
+    }
+
+    #[test]
+    fn disk_length_information_preserves_positive_length() {
+        let length = device_length_from_information(DiskLengthInformation { length: 4096 });
+        assert!(length.is_ok());
+        if let Ok(length) = length {
+            assert_eq!(length.bytes(), 4096);
+        }
     }
 }

@@ -64,10 +64,6 @@ pub(crate) struct RegisteredDriver {
     control_device: KernelDevice,
 }
 
-#[expect(
-    dead_code,
-    reason = "mount state is introduced before FSCTL mount IRP handling"
-)]
 #[derive(Clone, Copy, Debug)]
 /// Target device selected by mount FSCTL validation before VCB creation.
 pub(crate) struct MountCandidate {
@@ -75,6 +71,26 @@ pub(crate) struct MountCandidate {
     target_device: KernelDevice,
     /// Valid byte length reported by the storage stack.
     length: DeviceLength,
+}
+
+impl MountCandidate {
+    /// Creates a mount candidate after storage length validation.
+    pub(crate) const fn new(target_device: KernelDevice, length: DeviceLength) -> Self {
+        Self {
+            target_device,
+            length,
+        }
+    }
+
+    /// Returns the target storage device.
+    pub(crate) const fn target_device(self) -> KernelDevice {
+        self.target_device
+    }
+
+    /// Returns the validated storage length.
+    pub(crate) const fn length(self) -> DeviceLength {
+        self.length
+    }
 }
 
 #[expect(
