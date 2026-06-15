@@ -1,33 +1,46 @@
 //! Driver-local lifecycle and open-object state.
 
+use core::ffi::c_void;
+use core::ptr::NonNull;
+
 use ext4_core::InodeId;
 use wdk_sys::{PDEVICE_OBJECT, PDRIVER_OBJECT};
 
 use crate::ffi;
 
+/// Non-null kernel device object pointer at the WDK boundary.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KernelDevice {
+    device: NonNull<c_void>,
+}
+
+impl KernelDevice {
+    /// Converts a raw WDK device pointer into the non-null boundary type.
+    pub(crate) fn from_raw(device: PDEVICE_OBJECT) -> Option<Self> {
+        NonNull::new(device.cast()).map(|device| Self { device })
+    }
+
+    /// Returns the raw WDK device pointer for FFI calls.
+    pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
+        self.device.as_ptr().cast()
+    }
+}
+
 /// Registered file system control device owned by the driver.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ControlDevice {
-    device: PDEVICE_OBJECT,
+    device: KernelDevice,
 }
 
 impl ControlDevice {
-    /// Creates an empty unregistered control-device state.
-    pub(crate) const fn none() -> Self {
-        Self {
-            device: core::ptr::null_mut(),
-        }
-    }
-
     /// Creates registered control-device state.
-    pub(crate) const fn registered(device: PDEVICE_OBJECT) -> Self {
-        Self { device }
+    pub(crate) fn registered(device: PDEVICE_OBJECT) -> Option<Self> {
+        KernelDevice::from_raw(device).map(|device| Self { device })
     }
 
-    fn take(&mut self) -> PDEVICE_OBJECT {
-        let device = self.device;
-        self.device = core::ptr::null_mut();
-        device
+    /// Returns the raw WDK device pointer for FFI calls.
+    pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
+        self.device.as_ptr()
     }
 }
 
@@ -37,7 +50,7 @@ impl ControlDevice {
 )]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RegisteredDriver {
-    control_device: PDEVICE_OBJECT,
+    control_device: KernelDevice,
 }
 
 #[expect(
@@ -46,7 +59,7 @@ pub(crate) struct RegisteredDriver {
 )]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MountCandidate {
-    target_device: PDEVICE_OBJECT,
+    target_device: KernelDevice,
 }
 
 #[expect(
@@ -56,7 +69,7 @@ pub(crate) struct MountCandidate {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MountedVolume {
     root_inode: InodeId,
-    target_device: PDEVICE_OBJECT,
+    target_device: KernelDevice,
 }
 
 #[expect(
@@ -74,13 +87,18 @@ pub(crate) enum OpenNode {
 pub(crate) unsafe extern "system" fn driver_unload(_driver: PDRIVER_OBJECT) {
     let device = unsafe {
         // SAFETY: Driver unload is serialized by the I/O Manager for this
-        // driver object. The mutable static is only touched during load/unload.
-        crate::CONTROL_DEVICE.take()
+        // driver object. Use raw pointer replacement to avoid borrowing the
+        // mutable static.
+        core::ptr::replace(core::ptr::addr_of_mut!(crate::CONTROL_DEVICE), None)
     };
-    if !device.is_null() {
+    if let Some(device) = device {
+        let device = device.as_ptr();
         unsafe {
             // SAFETY: The device was created and registered by DriverEntry.
             ffi::IoUnregisterFileSystem(device);
+        }
+        unsafe {
+            // SAFETY: The device is no longer registered and is owned by this driver.
             ffi::IoDeleteDevice(device);
         }
     }
