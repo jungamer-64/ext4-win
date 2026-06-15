@@ -32,15 +32,26 @@ mod group;
 mod journal;
 
 pub use block::{
-    BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset, SliceBlockDevice,
+    BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset, DeviceLength, SliceBlockDevice,
     SliceBlockDeviceMut,
 };
 pub use dir::{DirectoryEntry, DirectoryEntryKind};
 pub use error::{Error, Result};
-pub use inode::{Ext4Timestamp, Inode, InodeId, InodeKind};
+pub use extent::{BlockMapping, Extent, ExtentLength, ExtentTree, LogicalBlock};
+pub use inode::{
+    Ext4Timestamp, FileOffset, FileSize, Inode, InodeExtentRoot, InodeId, InodeInlineBytes,
+    InodeKind, InodeStorage, ReadBytes,
+};
 pub use name::{Ext4Name, WindowsName};
-pub use superblock::{FeatureSet, Superblock};
-pub use volume::{ExternalJournal, InternalJournal, ReadOnly, ReadWrite, Volume, WriteTransaction};
+pub use superblock::{
+    BlockCount, BlockGroupCount, BlockGroupDescriptorSize, BlockGroupId, BlocksPerGroup,
+    ChecksumSeed, FilesystemUuid, FreeBlockCount, FreeBlockDelta, InodeCount, InodeRecordSize,
+    InodesPerGroup, JournalMode, JournalUuid, MetadataChecksum, RecoveryState, Superblock,
+};
+pub use volume::{
+    DirectoryNode, ExternalJournal, FileNode, InternalJournal, LookupResult, Node, ReadOnly,
+    ReadWrite, SymlinkNode, TransactionFile, Volume, WriteTransaction,
+};
 
 #[cfg(test)]
 mod tests;

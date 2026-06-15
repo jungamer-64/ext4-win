@@ -2,6 +2,30 @@
 
 use crate::error::{Error, Result};
 
+/// Total byte length of a backing block device.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DeviceLength(u64);
+
+impl DeviceLength {
+    /// Creates a device length from bytes reported by an external device boundary.
+    #[must_use]
+    pub const fn from_bytes(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the device length in bytes for range arithmetic at I/O boundaries.
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        self.0
+    }
+
+    /// Returns true when the device has no bytes.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// Absolute byte offset on a backing block device.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ByteOffset(u64);
@@ -82,7 +106,7 @@ impl BlockSize {
 /// Minimal random-access block reader used by ext4-core.
 pub trait BlockReader {
     /// Total readable length in bytes.
-    fn len(&self) -> u64;
+    fn len(&self) -> DeviceLength;
 
     /// Reads exactly `out.len()` bytes at `offset`.
     ///
@@ -92,7 +116,7 @@ pub trait BlockReader {
 
     /// Returns true when the device has no bytes.
     fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len().is_empty()
     }
 }
 
@@ -112,7 +136,7 @@ pub trait BlockWriter: BlockReader {
 }
 
 impl<T: BlockReader + ?Sized> BlockReader for &mut T {
-    fn len(&self) -> u64 {
+    fn len(&self) -> DeviceLength {
         (**self).len()
     }
 
@@ -146,8 +170,8 @@ impl<'a> SliceBlockDevice<'a> {
 }
 
 impl BlockReader for SliceBlockDevice<'_> {
-    fn len(&self) -> u64 {
-        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    fn len(&self) -> DeviceLength {
+        DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
     }
 
     fn read_exact_at(&self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
@@ -174,8 +198,8 @@ impl<'a> SliceBlockDeviceMut<'a> {
 }
 
 impl BlockReader for SliceBlockDeviceMut<'_> {
-    fn len(&self) -> u64 {
-        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    fn len(&self) -> DeviceLength {
+        DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
     }
 
     fn read_exact_at(&self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {

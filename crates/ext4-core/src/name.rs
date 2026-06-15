@@ -43,6 +43,36 @@ pub struct WindowsName {
 }
 
 impl WindowsName {
+    /// Validates and stores a Windows UTF-16 lookup component.
+    ///
+    /// # Errors
+    /// Returns an error when the requested component is empty or contains a
+    /// separator or wildcard character that is not a file-name component.
+    pub fn from_utf16(utf16: &[u16]) -> Result<Self> {
+        if utf16.is_empty()
+            || utf16.iter().any(|unit| {
+                matches!(
+                    *unit,
+                    0x0000
+                        | 0x0022
+                        | 0x002A
+                        | 0x002F
+                        | 0x003A
+                        | 0x003C
+                        | 0x003E
+                        | 0x003F
+                        | 0x005C
+                        | 0x007C
+                )
+            })
+        {
+            return Err(Error::InvalidName);
+        }
+        Ok(Self {
+            utf16: utf16.to_vec(),
+        })
+    }
+
     /// Converts a raw ext4 name if Windows can represent it without escaping.
     ///
     /// # Errors
@@ -69,20 +99,20 @@ impl WindowsName {
         &self.utf16
     }
 
-    /// Returns true when the name exactly equals a requested UTF-16 name.
+    /// Returns true when the name exactly equals another Windows name.
     #[must_use]
-    pub fn equals_utf16(&self, requested: &[u16]) -> bool {
-        self.utf16 == requested
+    pub fn equals(&self, requested: &Self) -> bool {
+        self.utf16 == requested.utf16
     }
 
     /// Returns true for the v1 ASCII-only case-insensitive comparison.
     #[must_use]
-    pub fn equals_ascii_case_insensitive(&self, requested: &[u16]) -> bool {
-        self.utf16.len() == requested.len()
+    pub fn equals_ascii_case_insensitive(&self, requested: &Self) -> bool {
+        self.utf16.len() == requested.utf16.len()
             && self
                 .utf16
                 .iter()
-                .zip(requested)
+                .zip(&requested.utf16)
                 .all(|(left, right)| fold_ascii_u16(*left) == fold_ascii_u16(*right))
     }
 }

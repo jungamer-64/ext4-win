@@ -1,4 +1,5 @@
 use alloc::{vec, vec::Vec};
+use core::marker::PhantomData;
 
 use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
 use crate::checksum::crc32c;
@@ -6,6 +7,7 @@ use crate::endian::{be_u16, be_u32, be_u64, put_be_u16, put_be_u32};
 use crate::error::{Error, Result};
 use crate::extent::ExtentTree;
 use crate::inode::Inode;
+use crate::superblock::RecoveryState;
 use crate::volume::MetadataBlock;
 
 const JBD2_MAGIC: u32 = 0xC03B_3998;
@@ -38,20 +40,25 @@ const JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET: u64 = 2048;
 const JOURNAL_OVERHEAD_BLOCKS: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Journal {
+pub(crate) struct Journal<State = CleanJournal> {
     location: JournalLocation,
     superblock: JournalSuperblock,
     ring: JournalRing,
     filesystem_blocks: u64,
-    state: JournalState,
+    state: PhantomData<State>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum JournalState {
-    Loaded,
-    Clean,
-    Dirty,
-}
+pub(crate) struct LoadedJournal;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CleanJournal;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DirtyJournal;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CheckpointedJournal;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JournalSequence(u32);
@@ -75,18 +82,29 @@ impl JournalSequence {
     }
 }
 
-impl Journal {
+impl<State> Journal<State> {
+    fn clone_without_state<Next>(&self) -> Journal<Next> {
+        Journal {
+            location: self.location.clone(),
+            superblock: self.superblock.clone(),
+            ring: self.ring,
+            filesystem_blocks: self.filesystem_blocks,
+            state: PhantomData,
+        }
+    }
+
     pub(crate) fn from_inode(
         inode: &Inode,
         block_size: BlockSize,
         filesystem_blocks: u64,
         reader: &impl BlockReader,
-    ) -> Result<Self> {
-        if inode.size() == 0 || block_size.bytes() == 0 {
+    ) -> Result<Journal<LoadedJournal>> {
+        if inode.size().bytes() == 0 || block_size.bytes() == 0 {
             return Err(Error::UnsupportedJournal);
         }
         let capacity_blocks = inode
             .size()
+            .bytes()
             .checked_div(u64::from(block_size.bytes()))
             .ok_or(Error::ArithmeticOverflow)?;
         let capacity_blocks =
@@ -95,7 +113,7 @@ impl Journal {
             return Err(Error::UnsupportedJournal);
         }
 
-        let tree = ExtentTree::load_inode_tree(inode.block(), block_size, reader)?;
+        let tree = ExtentTree::load_inode_tree(inode.extent_root()?, block_size, reader)?;
         let location =
             JournalLocation::Internal(InternalJournalLayout::new(tree.extents(), capacity_blocks)?);
         let mut raw =
@@ -105,12 +123,12 @@ impl Journal {
         let ring = superblock.validate_for_mount(block_size, capacity_blocks)?;
         location.validate_ring(&ring)?;
 
-        Ok(Self {
+        Ok(Journal {
             location,
             superblock,
             ring,
             filesystem_blocks,
-            state: JournalState::Loaded,
+            state: PhantomData,
         })
     }
 
@@ -119,7 +137,7 @@ impl Journal {
         block_size: BlockSize,
         expected_uuid: [u8; 16],
         filesystem_blocks: u64,
-    ) -> Result<Self> {
+    ) -> Result<Journal<LoadedJournal>> {
         let mut raw =
             vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
         journal.read_exact_at(
@@ -133,12 +151,12 @@ impl Journal {
         let location = JournalLocation::External(ExternalJournalLayout::new(journal, block_size)?);
         let ring = superblock.validate_for_mount(block_size, location.capacity_blocks())?;
         location.validate_ring(&ring)?;
-        Ok(Self {
+        Ok(Journal {
             location,
             superblock,
             ring,
             filesystem_blocks,
-            state: JournalState::Loaded,
+            state: PhantomData,
         })
     }
 
@@ -158,27 +176,27 @@ impl Journal {
     }
 
     pub(crate) fn replay_and_checkpoint_internal(
-        &mut self,
+        mut self,
         filesystem: &mut impl BlockWriter,
         block_size: BlockSize,
-        recovery_required: bool,
-    ) -> Result<()> {
+        recovery_state: RecoveryState,
+    ) -> Result<Journal<CleanJournal>> {
         let mut io = InternalJournalIo { device: filesystem };
-        self.replay_and_checkpoint(&mut io, block_size, recovery_required)
+        self.replay_and_checkpoint(&mut io, block_size, recovery_state)
     }
 
     pub(crate) fn replay_and_checkpoint_external(
-        &mut self,
+        mut self,
         filesystem: &mut impl BlockWriter,
         journal: &mut impl BlockWriter,
         block_size: BlockSize,
-        recovery_required: bool,
-    ) -> Result<()> {
+        recovery_state: RecoveryState,
+    ) -> Result<Journal<CleanJournal>> {
         let mut io = ExternalJournalIo {
             filesystem,
             journal,
         };
-        self.replay_and_checkpoint(&mut io, block_size, recovery_required)
+        self.replay_and_checkpoint(&mut io, block_size, recovery_state)
     }
 
     pub(crate) fn commit_internal(
@@ -209,23 +227,18 @@ impl Journal {
         &mut self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
-        recovery_required: bool,
-    ) -> Result<()> {
-        if self.state == JournalState::Dirty {
-            return Err(Error::JournalCorrupt);
-        }
-        if recovery_required && self.superblock.start() == 0 {
+        recovery_state: RecoveryState,
+    ) -> Result<Journal<CleanJournal>> {
+        if recovery_state == RecoveryState::NeedsRecovery && self.superblock.start() == 0 {
             return Err(Error::JournalCorrupt);
         }
         let scan = self.committed_transactions(io, block_size)?;
         if scan.tail == JournalScanTail::CleanSuperblock {
-            self.state = JournalState::Clean;
-            return Ok(());
+            return Ok(self.clone_without_state());
         }
         if scan.transactions.is_empty() {
             self.mark_clean(io, block_size, self.superblock.sequence())?;
-            self.state = JournalState::Clean;
-            return Ok(());
+            return Ok(self.clone_without_state());
         }
 
         let mut revokes = Vec::new();
@@ -255,8 +268,7 @@ impl Journal {
         }
         io.flush_all()?;
         self.mark_clean(io, block_size, next_sequence)?;
-        self.state = JournalState::Clean;
-        Ok(())
+        Ok(self.clone_without_state())
     }
 
     fn commit_metadata_transaction(
@@ -265,7 +277,7 @@ impl Journal {
         block_size: BlockSize,
         metadata_blocks: &[MetadataBlock],
     ) -> Result<()> {
-        if self.state != JournalState::Clean || self.superblock.start() != 0 {
+        if self.superblock.start() != 0 {
             return Err(Error::JournalCorrupt);
         }
         let prepared = self.prepare_metadata_transaction(block_size, metadata_blocks)?;
@@ -288,7 +300,6 @@ impl Journal {
         io.write_journal_block(self, block_size, 0, &dirty_superblock)?;
         self.superblock
             .apply_dirty(prepared.descriptor, prepared.sequence, dirty_superblock);
-        self.state = JournalState::Dirty;
 
         io.write_journal_block(self, block_size, cursor, &prepared.descriptor_block)?;
         cursor = self.next_logical(cursor)?;
@@ -304,6 +315,7 @@ impl Journal {
 
         Ok(JournalDurableTransaction {
             next_sequence: prepared.next_sequence,
+            state: PhantomData,
         })
     }
 
@@ -320,6 +332,7 @@ impl Journal {
         io.flush_all()?;
         Ok(CheckpointedJournalTransaction {
             next_sequence: durable.next_sequence,
+            state: PhantomData,
         })
     }
 
@@ -330,7 +343,6 @@ impl Journal {
         checkpointed: CheckpointedJournalTransaction,
     ) -> Result<()> {
         self.mark_clean(io, block_size, checkpointed.next_sequence)?;
-        self.state = JournalState::Clean;
         Ok(())
     }
 
@@ -1109,11 +1121,8 @@ impl InternalJournalLayout {
     fn new(extents: &[crate::extent::Extent], capacity_blocks: u32) -> Result<Self> {
         let mut mapped = Vec::with_capacity(extents.len());
         for extent in extents {
-            let len = u32::from(extent.len());
-            if len == 0 {
-                return Err(Error::UnsupportedJournal);
-            }
-            let logical_start = extent.logical_start();
+            let len = extent.len().as_u32();
+            let logical_start = extent.logical_start().as_u32();
             let logical_end = logical_start
                 .checked_add(len)
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -1229,6 +1238,7 @@ impl ExternalJournalLayout {
         let base = ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET);
         let remaining = journal
             .len()
+            .bytes()
             .checked_sub(base.get())
             .ok_or(Error::UnsupportedJournal)?;
         let capacity_blocks = remaining
@@ -1509,11 +1519,13 @@ struct PreparedJournalTransaction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct JournalDurableTransaction {
     next_sequence: JournalSequence,
+    state: PhantomData<DirtyJournal>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CheckpointedJournalTransaction {
     next_sequence: JournalSequence,
+    state: PhantomData<CheckpointedJournal>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1576,17 +1588,17 @@ struct RevokedBlock {
 }
 
 trait JournalIo {
-    fn read_journal_block(
+    fn read_journal_block<S>(
         &mut self,
-        journal: &Journal,
+        journal: &Journal<S>,
         block_size: BlockSize,
         logical: u32,
         out: &mut [u8],
     ) -> Result<()>;
 
-    fn write_journal_block(
+    fn write_journal_block<S>(
         &mut self,
-        journal: &Journal,
+        journal: &Journal<S>,
         block_size: BlockSize,
         logical: u32,
         bytes: &[u8],
@@ -1607,9 +1619,9 @@ struct InternalJournalIo<'a, D> {
 }
 
 impl<D: BlockWriter> JournalIo for InternalJournalIo<'_, D> {
-    fn read_journal_block(
+    fn read_journal_block<S>(
         &mut self,
-        journal: &Journal,
+        journal: &Journal<S>,
         block_size: BlockSize,
         logical: u32,
         out: &mut [u8],
@@ -1618,9 +1630,9 @@ impl<D: BlockWriter> JournalIo for InternalJournalIo<'_, D> {
             .read_exact_at(journal.offset_of(logical, block_size)?, out)
     }
 
-    fn write_journal_block(
+    fn write_journal_block<S>(
         &mut self,
-        journal: &Journal,
+        journal: &Journal<S>,
         block_size: BlockSize,
         logical: u32,
         bytes: &[u8],
@@ -1650,9 +1662,9 @@ struct ExternalJournalIo<'a, F, J> {
 }
 
 impl<F: BlockWriter, J: BlockWriter> JournalIo for ExternalJournalIo<'_, F, J> {
-    fn read_journal_block(
+    fn read_journal_block<S>(
         &mut self,
-        journal: &Journal,
+        journal: &Journal<S>,
         block_size: BlockSize,
         logical: u32,
         out: &mut [u8],
@@ -1661,9 +1673,9 @@ impl<F: BlockWriter, J: BlockWriter> JournalIo for ExternalJournalIo<'_, F, J> {
             .read_exact_at(journal.offset_of(logical, block_size)?, out)
     }
 
-    fn write_journal_block(
+    fn write_journal_block<S>(
         &mut self,
-        journal: &Journal,
+        journal: &Journal<S>,
         block_size: BlockSize,
         logical: u32,
         bytes: &[u8],
@@ -1688,7 +1700,7 @@ impl<F: BlockWriter, J: BlockWriter> JournalIo for ExternalJournalIo<'_, F, J> {
     }
 }
 
-impl Journal {
+impl<State> Journal<State> {
     fn offset_of(&self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
         self.location.offset_of(logical, block_size)
     }

@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use crate::block::{BlockAddress, BlockReader, BlockSize};
 use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
+use crate::inode::InodeExtentRoot;
 
 const EXTENT_MAGIC: u16 = 0xF30A;
 const EXTENT_HEADER_SIZE: usize = 12;
@@ -14,16 +15,103 @@ const INODE_ROOT_BYTES: usize = 60;
 const INODE_ROOT_EXTENT_CAPACITY: usize = 4;
 const MAX_EXTENT_DEPTH: u16 = 5;
 
+/// Logical block address inside a file.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct LogicalBlock(u32);
+
+impl LogicalBlock {
+    /// Creates a logical block address from an on-disk extent field.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the logical block value for on-disk encoding.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    /// Returns the logical block value widened for arithmetic.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0 as u64
+    }
+}
+
+impl TryFrom<u64> for LogicalBlock {
+    type Error = Error;
+
+    fn try_from(value: u64) -> Result<Self> {
+        Ok(Self(
+            u32::try_from(value).map_err(|_| Error::ArithmeticOverflow)?,
+        ))
+    }
+}
+
+/// Non-zero length of an extent in blocks.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ExtentLength(u16);
+
+impl ExtentLength {
+    /// Creates an extent length.
+    ///
+    /// # Errors
+    /// Returns an error when the extent length is zero.
+    pub fn new(value: u16) -> Result<Self> {
+        if value == 0 {
+            Err(Error::InvalidExtentTree)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the length in blocks.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+
+    /// Returns the length widened for arithmetic.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0 as u32
+    }
+
+    /// Returns the length widened for arithmetic.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0 as u64
+    }
+
+    pub(crate) fn checked_add_one(self) -> Result<Self> {
+        Self::new(self.0.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
+    }
+}
+
+/// Result of mapping a logical file block through an extent tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockMapping {
+    /// The logical block is backed by this physical block.
+    Physical(BlockAddress),
+    /// The logical block is a sparse hole.
+    Hole,
+}
+
 /// A leaf extent mapping a logical block run to a physical block run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Extent {
-    logical_start: u32,
-    len: u16,
+    logical_start: LogicalBlock,
+    len: ExtentLength,
     physical_start: BlockAddress,
 }
 
 impl Extent {
-    pub(crate) const fn new(logical_start: u32, len: u16, physical_start: BlockAddress) -> Self {
+    pub(crate) fn new(
+        logical_start: LogicalBlock,
+        len: ExtentLength,
+        physical_start: BlockAddress,
+    ) -> Self {
         Self {
             logical_start,
             len,
@@ -33,20 +121,14 @@ impl Extent {
 
     /// Logical first file block covered by this extent.
     #[must_use]
-    pub const fn logical_start(self) -> u32 {
+    pub const fn logical_start(self) -> LogicalBlock {
         self.logical_start
     }
 
     /// Number of blocks covered by this extent.
     #[must_use]
-    pub const fn len(self) -> u16 {
+    pub const fn len(self) -> ExtentLength {
         self.len
-    }
-
-    /// Returns true when the extent has no blocks.
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.len == 0
     }
 
     /// First physical block covered by this extent.
@@ -57,21 +139,28 @@ impl Extent {
 
     pub(crate) fn end_logical(self) -> Result<u32> {
         self.logical_start
-            .checked_add(u32::from(self.len))
+            .as_u32()
+            .checked_add(self.len.as_u32())
             .ok_or(Error::ArithmeticOverflow)
     }
 
     /// Maps a logical block if it falls inside this extent.
-    pub fn map_logical(self, logical_block: u64) -> Option<BlockAddress> {
-        let start = u64::from(self.logical_start);
-        let end = start.checked_add(u64::from(self.len))?;
-        if logical_block < start || logical_block >= end {
-            return None;
+    pub fn map_logical(self, logical_block: LogicalBlock) -> BlockMapping {
+        let start = self.logical_start.as_u64();
+        let end = match start.checked_add(self.len.as_u64()) {
+            Some(end) => end,
+            None => return BlockMapping::Hole,
+        };
+        if logical_block.as_u64() < start || logical_block.as_u64() >= end {
+            return BlockMapping::Hole;
         }
-        let logical_offset = logical_block.checked_sub(start)?;
-        Some(BlockAddress::new(
-            self.physical_start.get().checked_add(logical_offset)?,
-        ))
+        let Some(logical_offset) = logical_block.as_u64().checked_sub(start) else {
+            return BlockMapping::Hole;
+        };
+        let Some(physical) = self.physical_start.get().checked_add(logical_offset) else {
+            return BlockMapping::Hole;
+        };
+        BlockMapping::Physical(BlockAddress::new(physical))
     }
 }
 
@@ -87,7 +176,8 @@ impl ExtentTree {
     /// # Errors
     /// Returns an error when the extent header is malformed, contains a deeper
     /// tree, or has invalid entry bounds.
-    pub fn parse_inode_root(raw: &[u8; 60]) -> Result<Self> {
+    pub fn parse_inode_root(root: &InodeExtentRoot) -> Result<Self> {
+        let raw = root.bytes();
         let entries = header_entries(raw)?;
         let mut extents = Vec::with_capacity(entries);
         if parse_node(raw, None, &mut extents)? != 0 {
@@ -102,23 +192,24 @@ impl ExtentTree {
     /// Returns an error when the tree is malformed, too deep, or an index block
     /// cannot be read.
     pub fn load_inode_tree(
-        raw: &[u8; 60],
+        root: &InodeExtentRoot,
         block_size: BlockSize,
         reader: &impl BlockReader,
     ) -> Result<Self> {
         let mut extents = Vec::new();
-        parse_node_recursive(raw, block_size, reader, &mut extents)?;
+        parse_node_recursive(root.bytes(), block_size, reader, &mut extents)?;
         Ok(Self { extents })
     }
 
-    /// Maps a logical file block to a physical block, or `None` for a sparse hole.
-    pub fn map_logical(&self, logical_block: u64) -> Option<BlockAddress> {
+    /// Maps a logical file block to a physical block or sparse hole.
+    #[must_use]
+    pub fn map_logical(&self, logical_block: LogicalBlock) -> BlockMapping {
         for extent in &self.extents {
-            if let Some(block) = extent.map_logical(logical_block) {
-                return Some(block);
+            if let BlockMapping::Physical(block) = extent.map_logical(logical_block) {
+                return BlockMapping::Physical(block);
             }
         }
-        None
+        BlockMapping::Hole
     }
 
     /// Leaf extents in on-disk order.
@@ -154,11 +245,11 @@ pub(crate) fn serialize_inode_root(extents: &[Extent]) -> Result<[u8; INODE_ROOT
                     .ok_or(Error::ArithmeticOverflow)?,
             )
             .ok_or(Error::ArithmeticOverflow)?;
-        put_le_u32(&mut raw, offset, extent.logical_start())?;
+        put_le_u32(&mut raw, offset, extent.logical_start().as_u32())?;
         put_le_u16(
             &mut raw,
             offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
-            extent.len(),
+            extent.len().as_u16(),
         )?;
         put_le_u16(
             &mut raw,
@@ -264,9 +355,9 @@ fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>
 }
 
 fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
-    let logical_start = le_u32(raw, offset)?;
+    let logical_start = LogicalBlock::from_u32(le_u32(raw, offset)?);
     let raw_len = le_u16(raw, offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?)?;
-    let len = raw_len & !EXTENT_LEN_UNINITIALIZED;
+    let len = ExtentLength::new(raw_len & !EXTENT_LEN_UNINITIALIZED)?;
     let start_hi = u64::from(le_u16(
         raw,
         offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
