@@ -14,8 +14,9 @@
 use alloc::{vec, vec::Vec};
 
 use crate::{
-    DirectoryEntryKind, Error, Ext4Timestamp, ExternalJournal, InodeId, ReadOnly, ReadWrite,
-    SliceBlockDevice, SliceBlockDeviceMut, Superblock, Volume, WindowsName,
+    BlockReader, BlockWriter, ByteOffset, DirectoryEntryKind, Error, Ext4Timestamp,
+    ExternalJournal, InodeId, ReadOnly, ReadWrite, SliceBlockDevice, SliceBlockDeviceMut,
+    Superblock, Volume, WindowsName,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -617,7 +618,11 @@ fn invalid_revoke_tail_checksum_is_rejected() {
     mark_filesystem_needs_recovery(&mut image);
     write_dirty_journal_superblock(&mut image, 20, 1);
     write_jbd2_revoke(&mut image, 1, 20, MODERN_FILE_DATA_BLOCK);
-    put_be_u32(&mut image, journal_log_offset(1) + BLOCK_SIZE - 4, 0xDEAD_BEEF);
+    put_be_u32(
+        &mut image,
+        journal_log_offset(1) + BLOCK_SIZE - 4,
+        0xDEAD_BEEF,
+    );
     write_jbd2_commit(&mut image, 2, 20);
 
     let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
@@ -756,6 +761,327 @@ fn emitted_journal_data_escapes_jbd2_magic_prefix() {
         data_logical += 1;
     }
     assert!(found);
+}
+
+#[test]
+fn descriptor_tag_uuid_mismatch_is_rejected() {
+    let mut image = modern_fixture_image();
+    let journal_uuid = [7; 16];
+    mark_filesystem_needs_recovery(&mut image);
+    write_jbd2_superblock_at(
+        &mut image,
+        journal_log_offset(0),
+        8,
+        journal_uuid,
+        24,
+        1,
+        default_journal_incompat(),
+    );
+    write_jbd2_data(&mut image, 2, b"UUID!");
+    write_jbd2_descriptor_with_uuid(
+        &mut image,
+        1,
+        24,
+        MODERN_FILE_DATA_BLOCK,
+        [8; 16],
+        journal_uuid,
+    );
+    write_jbd2_commit_with_checksum(&mut image, 3, 24, journal_uuid);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::JournalCorrupt)));
+}
+
+#[test]
+fn descriptor_tag_uuid_match_is_replayed() {
+    let mut image = modern_fixture_image();
+    let journal_uuid = [9; 16];
+    mark_filesystem_needs_recovery(&mut image);
+    write_jbd2_superblock_at(
+        &mut image,
+        journal_log_offset(0),
+        8,
+        journal_uuid,
+        25,
+        1,
+        default_journal_incompat(),
+    );
+    write_jbd2_data(&mut image, 2, b"UUID?");
+    write_jbd2_descriptor_with_uuid(
+        &mut image,
+        1,
+        25,
+        MODERN_FILE_DATA_BLOCK,
+        journal_uuid,
+        journal_uuid,
+    );
+    write_jbd2_commit_with_checksum(&mut image, 3, 25, journal_uuid);
+
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut output = [0_u8; 5];
+    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+
+    assert_eq!(read, 5);
+    assert_eq!(&output, b"UUID?");
+}
+
+#[test]
+fn descriptor_without_last_tag_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 26, 1);
+    write_jbd2_data(&mut image, 2, b"NLAST");
+    write_jbd2_descriptor(&mut image, 1, 26, MODERN_FILE_DATA_BLOCK, 0);
+    put_be_u32(
+        &mut image,
+        journal_log_offset(1) + 16,
+        JBD2_TAG_FLAG_SAME_UUID,
+    );
+    write_jbd2_block_tail_checksum(&mut image, 1, [0; 16]);
+    write_jbd2_commit(&mut image, 3, 26);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::JournalCorrupt)));
+}
+
+#[test]
+fn empty_descriptor_commit_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 27, 1);
+    let descriptor = journal_log_offset(1);
+    image[descriptor..descriptor + BLOCK_SIZE].fill(0);
+    write_jbd2_header(&mut image, descriptor, JBD2_DESCRIPTOR_BLOCK, 27);
+    write_jbd2_block_tail_checksum(&mut image, 1, [0; 16]);
+    write_jbd2_commit(&mut image, 2, 27);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::JournalCorrupt)));
+}
+
+#[test]
+fn duplicate_home_block_in_transaction_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 28, 1);
+    write_jbd2_data(&mut image, 2, b"DUPA!");
+    write_jbd2_data(&mut image, 3, b"DUPB!");
+    write_jbd2_two_tag_descriptor(
+        &mut image,
+        1,
+        28,
+        MODERN_FILE_DATA_BLOCK,
+        MODERN_FILE_DATA_BLOCK,
+        [0; 16],
+    );
+    write_jbd2_commit(&mut image, 4, 28);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::JournalCorrupt)));
+}
+
+#[test]
+fn second_descriptor_block_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 29, 1);
+    write_jbd2_data(&mut image, 2, b"ONE!!");
+    write_jbd2_descriptor(&mut image, 1, 29, MODERN_FILE_DATA_BLOCK, 0);
+    write_jbd2_data(&mut image, 4, b"TWO!!");
+    write_jbd2_descriptor(&mut image, 3, 29, MODERN_ROOT_DIR_BLOCK, 0);
+    write_jbd2_commit(&mut image, 5, 29);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::UnsupportedJournal)));
+}
+
+#[test]
+fn commit_sequence_mismatch_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 30, 1);
+    write_jbd2_data(&mut image, 2, b"CSEQ!");
+    write_jbd2_descriptor(&mut image, 1, 30, MODERN_FILE_DATA_BLOCK, 0);
+    write_jbd2_commit(&mut image, 3, 31);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::JournalCorrupt)));
+    assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
+}
+
+#[test]
+fn same_transaction_later_revoke_prevents_replay() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 31, 1);
+    write_jbd2_data(&mut image, 2, b"NOPE!");
+    write_jbd2_descriptor(&mut image, 1, 31, MODERN_FILE_DATA_BLOCK, 0);
+    write_jbd2_revoke(&mut image, 3, 31, MODERN_FILE_DATA_BLOCK);
+    write_jbd2_commit(&mut image, 4, 31);
+
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut output = [0_u8; 5];
+    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+
+    assert_eq!(read, 5);
+    assert_eq!(&output, b"hello");
+}
+
+#[test]
+fn malformed_revoke_remainder_is_rejected() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 32, 1);
+    write_jbd2_revoke(&mut image, 1, 32, MODERN_FILE_DATA_BLOCK);
+    put_be_u32(&mut image, journal_log_offset(1) + 12, 29);
+    write_jbd2_block_tail_checksum(&mut image, 1, [0; 16]);
+    write_jbd2_commit(&mut image, 2, 32);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::JournalCorrupt)));
+}
+
+#[test]
+fn wrapped_later_revoke_prevents_old_sequence_replay() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, u32::MAX, 1);
+    write_jbd2_data(&mut image, 2, b"OLD!!");
+    write_jbd2_descriptor(&mut image, 1, u32::MAX, MODERN_FILE_DATA_BLOCK, 0);
+    write_jbd2_commit(&mut image, 3, u32::MAX);
+    write_jbd2_revoke(&mut image, 4, 0, MODERN_FILE_DATA_BLOCK);
+    write_jbd2_commit(&mut image, 5, 0);
+
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut output = [0_u8; 5];
+    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+
+    assert_eq!(read, 5);
+    assert_eq!(&output, b"hello");
+}
+
+#[test]
+fn nonzero_journal_compat_is_rejected() {
+    let mut image = modern_fixture_image();
+    put_be_u32(&mut image, journal_log_offset(0) + 0x24, 1);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::UnsupportedJournal)));
+}
+
+#[test]
+fn journal_first_block_must_be_one() {
+    let mut image = modern_fixture_image();
+    put_be_u32(&mut image, journal_log_offset(0) + 0x14, 2);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::UnsupportedJournal)));
+}
+
+#[test]
+fn journal_maxlen_beyond_inode_capacity_is_rejected() {
+    let mut image = modern_fixture_image();
+    put_be_u32(&mut image, journal_log_offset(0) + 0x10, 9);
+
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+
+    assert!(matches!(result, Err(Error::UnsupportedJournal)));
+}
+
+#[test]
+fn external_journal_short_device_is_rejected() {
+    let mut image = modern_fixture_image();
+    let uuid = [4; 16];
+    make_external_journal_filesystem(&mut image, uuid);
+    let mut journal = vec![0_u8; EXTERNAL_JOURNAL_SUPERBLOCK_OFFSET + BLOCK_SIZE * 4];
+    write_jbd2_superblock_at(
+        &mut journal,
+        EXTERNAL_JOURNAL_SUPERBLOCK_OFFSET,
+        8,
+        uuid,
+        1,
+        0,
+        default_journal_incompat(),
+    );
+
+    let result: crate::Result<Volume<_, ReadWrite<ExternalJournal<_>>>> =
+        Volume::mount_read_write_with_external_journal(
+            SliceBlockDeviceMut::new(&mut image),
+            SliceBlockDeviceMut::new(&mut journal),
+        );
+
+    assert!(matches!(result, Err(Error::UnsupportedJournal)));
+}
+
+#[test]
+fn fragmented_internal_journal_is_mapped_on_demand() {
+    let mut image = modern_fixture_image();
+    write_fragmented_journal_inode(&mut image);
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 33, 4);
+    write_jbd2_data(&mut image, 5, b"FRAG!");
+    write_jbd2_descriptor(&mut image, 4, 33, MODERN_FILE_DATA_BLOCK, 0);
+    write_jbd2_commit(&mut image, 6, 33);
+    move_journal_block(&mut image, 4, 28);
+    move_journal_block(&mut image, 5, 29);
+    move_journal_block(&mut image, 6, 30);
+
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut output = [0_u8; 5];
+    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+
+    assert_eq!(read, 5);
+    assert_eq!(&output, b"FRAG!");
+
+    let mut transaction = volume.begin_transaction(NOW);
+    must(transaction.overwrite_file_range(InodeId::new(3), 1024, b"hole"));
+    must(transaction.commit());
+    let mut committed = [0_u8; 4];
+    let read = must(volume.read_file(InodeId::new(3), 1024, &mut committed));
+
+    assert_eq!(read, 4);
+    assert_eq!(&committed, b"hole");
+}
+
+#[test]
+fn checkpoint_failure_leaves_replayable_dirty_journal() {
+    let mut image = modern_fixture_image();
+    mark_filesystem_needs_recovery(&mut image);
+    write_dirty_journal_superblock(&mut image, 34, 1);
+    write_jbd2_data(&mut image, 2, b"AGAIN");
+    write_jbd2_descriptor(&mut image, 1, 34, MODERN_FILE_DATA_BLOCK, 0);
+    write_jbd2_commit(&mut image, 3, 34);
+    {
+        let fail_offset = ByteOffset::new(
+            u64::try_from(block_offset(MODERN_FILE_DATA_BLOCK)).unwrap_or(u64::MAX),
+        );
+        let device = FailOneWriteAt::new(&mut image, fail_offset);
+        let result = Volume::<_, ReadWrite>::mount_read_write(device);
+        assert!(matches!(result, Err(Error::DeviceRange)));
+    }
+    assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x1C), 1);
+    assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
+
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut output = [0_u8; 5];
+    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+
+    assert_eq!(read, 5);
+    assert_eq!(&output, b"AGAIN");
 }
 
 #[test]
@@ -1076,6 +1402,71 @@ fn write_jbd2_descriptor_with_checksum(
     write_jbd2_block_tail_checksum(image, logical, [0; 16]);
 }
 
+fn write_jbd2_descriptor_with_uuid(
+    image: &mut [u8],
+    logical: u32,
+    sequence: u32,
+    home_block: u32,
+    tag_uuid: [u8; 16],
+    journal_uuid: [u8; 16],
+) {
+    let data = image[journal_log_offset(logical + 1)..journal_log_offset(logical + 1) + BLOCK_SIZE]
+        .to_vec();
+    let checksum = jbd2_tag_checksum(sequence, &data, journal_uuid);
+    let base = journal_log_offset(logical);
+    image[base..base + BLOCK_SIZE].fill(0);
+    write_jbd2_header(image, base, JBD2_DESCRIPTOR_BLOCK, sequence);
+    put_be_u32(image, base + 12, home_block);
+    put_be_u32(image, base + 16, JBD2_TAG_FLAG_LAST_TAG);
+    put_be_u32(image, base + 20, 0);
+    put_be_u32(image, base + 24, checksum);
+    image[base + 28..base + 44].copy_from_slice(&tag_uuid);
+    write_jbd2_block_tail_checksum(image, logical, journal_uuid);
+}
+
+fn write_jbd2_two_tag_descriptor(
+    image: &mut [u8],
+    logical: u32,
+    sequence: u32,
+    first_home_block: u32,
+    second_home_block: u32,
+    uuid: [u8; 16],
+) {
+    let first_data = image
+        [journal_log_offset(logical + 1)..journal_log_offset(logical + 1) + BLOCK_SIZE]
+        .to_vec();
+    let second_data = image
+        [journal_log_offset(logical + 2)..journal_log_offset(logical + 2) + BLOCK_SIZE]
+        .to_vec();
+    let base = journal_log_offset(logical);
+    image[base..base + BLOCK_SIZE].fill(0);
+    write_jbd2_header(image, base, JBD2_DESCRIPTOR_BLOCK, sequence);
+
+    put_be_u32(image, base + 12, first_home_block);
+    put_be_u32(image, base + 16, JBD2_TAG_FLAG_SAME_UUID);
+    put_be_u32(image, base + 20, 0);
+    put_be_u32(
+        image,
+        base + 24,
+        jbd2_tag_checksum(sequence, &first_data, uuid),
+    );
+
+    put_be_u32(image, base + 28, second_home_block);
+    put_be_u32(
+        image,
+        base + 32,
+        JBD2_TAG_FLAG_SAME_UUID | JBD2_TAG_FLAG_LAST_TAG,
+    );
+    put_be_u32(image, base + 36, 0);
+    put_be_u32(
+        image,
+        base + 40,
+        jbd2_tag_checksum(sequence, &second_data, uuid),
+    );
+
+    write_jbd2_block_tail_checksum(image, logical, uuid);
+}
+
 fn write_jbd2_descriptor_32bit(image: &mut [u8], logical: u32, sequence: u32, home_block: u32) {
     let base = journal_log_offset(logical);
     image[base..base + BLOCK_SIZE].fill(0);
@@ -1197,6 +1588,32 @@ fn make_external_journal_filesystem(image: &mut [u8], uuid: [u8; 16]) {
     put_u32(image, 1024 + 224, 0);
 }
 
+fn write_fragmented_journal_inode(image: &mut [u8]) {
+    let offset = modern_inode_offset(8);
+    put_u16(image, offset, 0x8000 | 0o600);
+    put_u32(
+        image,
+        offset + 4,
+        8 * u32::try_from(BLOCK_SIZE).unwrap_or(u32::MAX),
+    );
+    put_u32(image, offset + 28, 16);
+    put_u32(image, offset + 32, EXT4_EXTENTS_FL);
+    write_two_extent_root(image, offset + 40, 0, 4, MODERN_JOURNAL_BLOCK, 4, 4, 28);
+    for block in 24..28 {
+        set_modern_block_used(image, block, false);
+    }
+    for block in 28..32 {
+        set_modern_block_used(image, block, true);
+    }
+}
+
+fn move_journal_block(image: &mut [u8], logical: u32, physical_block: u32) {
+    let source = journal_log_offset(logical);
+    let target = block_offset(physical_block);
+    let block = image[source..source + BLOCK_SIZE].to_vec();
+    image[target..target + BLOCK_SIZE].copy_from_slice(&block);
+}
+
 fn write_symlink_inode(image: &mut [u8]) {
     let offset = inode_offset(4);
     put_u16(image, offset, 0xA000 | 0o777);
@@ -1234,6 +1651,35 @@ fn write_extent_root(
     put_u16(image, offset + 16, len);
     put_u16(image, offset + 18, 0);
     put_u32(image, offset + 20, physical_start);
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ext4 extent entries are fixed on-disk fields"
+)]
+fn write_two_extent_root(
+    image: &mut [u8],
+    offset: usize,
+    first_logical_start: u32,
+    first_len: u16,
+    first_physical_start: u32,
+    second_logical_start: u32,
+    second_len: u16,
+    second_physical_start: u32,
+) {
+    image[offset..offset + 60].fill(0);
+    put_u16(image, offset, 0xF30A);
+    put_u16(image, offset + 2, 2);
+    put_u16(image, offset + 4, 4);
+    put_u16(image, offset + 6, 0);
+    put_u32(image, offset + 12, first_logical_start);
+    put_u16(image, offset + 16, first_len);
+    put_u16(image, offset + 18, 0);
+    put_u32(image, offset + 20, first_physical_start);
+    put_u32(image, offset + 24, second_logical_start);
+    put_u16(image, offset + 28, second_len);
+    put_u16(image, offset + 30, 0);
+    put_u32(image, offset + 32, second_physical_start);
 }
 
 fn write_dirent(
@@ -1308,6 +1754,55 @@ fn get_be_u32(image: &[u8], offset: usize) -> u32 {
         image[offset + 2],
         image[offset + 3],
     ])
+}
+
+#[derive(Debug)]
+struct FailOneWriteAt<'a> {
+    bytes: &'a mut [u8],
+    fail_offset: ByteOffset,
+    failed: bool,
+}
+
+impl<'a> FailOneWriteAt<'a> {
+    fn new(bytes: &'a mut [u8], fail_offset: ByteOffset) -> Self {
+        Self {
+            bytes,
+            fail_offset,
+            failed: false,
+        }
+    }
+}
+
+impl BlockReader for FailOneWriteAt<'_> {
+    fn len(&self) -> u64 {
+        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    }
+
+    fn read_exact_at(&self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(out.len()).ok_or(Error::DeviceRange)?;
+        let source = self.bytes.get(start..end).ok_or(Error::DeviceRange)?;
+        out.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+impl BlockWriter for FailOneWriteAt<'_> {
+    fn write_exact_at(&mut self, offset: ByteOffset, bytes: &[u8]) -> crate::Result<()> {
+        if offset == self.fail_offset && !self.failed {
+            self.failed = true;
+            return Err(Error::DeviceRange);
+        }
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(bytes.len()).ok_or(Error::DeviceRange)?;
+        let target = self.bytes.get_mut(start..end).ok_or(Error::DeviceRange)?;
+        target.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 fn must<T>(result: crate::Result<T>) -> T {

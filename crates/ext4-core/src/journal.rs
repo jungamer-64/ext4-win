@@ -96,10 +96,8 @@ impl Journal {
         }
 
         let tree = ExtentTree::load_inode_tree(inode.block(), block_size, reader)?;
-        let location = JournalLocation::Internal(InternalJournalLayout::new(
-            tree.extents(),
-            capacity_blocks,
-        )?);
+        let location =
+            JournalLocation::Internal(InternalJournalLayout::new(tree.extents(), capacity_blocks)?);
         let mut raw =
             vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
         read_journal_block(reader, &location, block_size, 0, &mut raw)?;
@@ -447,7 +445,10 @@ impl Journal {
                 return Ok(transaction_tail(consumed));
             };
             if header.sequence() != sequence.get() {
-                return Ok(transaction_tail(consumed));
+                if consumed == 0 {
+                    return Ok(JournalTransactionScan::EndOfLog);
+                }
+                return Err(Error::JournalCorrupt);
             }
 
             match header.block_type() {
@@ -475,10 +476,12 @@ impl Journal {
                             }) {
                                 return Err(Error::JournalCorrupt);
                             }
-                            transaction.events.push(JournalTransactionEvent::Entry(JournalEntry {
-                                home: tag.block,
-                                bytes: data,
-                            }));
+                            transaction
+                                .events
+                                .push(JournalTransactionEvent::Entry(JournalEntry {
+                                    home: tag.block,
+                                    bytes: data,
+                                }));
                         }
                         cursor = self.next_logical(cursor)?;
                         consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
@@ -487,7 +490,9 @@ impl Journal {
                 JBD2_REVOKE_BLOCK => {
                     let revoke = self.parse_revoke_block(&block)?;
                     for block in revoke.blocks {
-                        transaction.events.push(JournalTransactionEvent::Revoke(block));
+                        transaction
+                            .events
+                            .push(JournalTransactionEvent::Revoke(block));
                     }
                     cursor = self.next_logical(cursor)?;
                     consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
@@ -503,7 +508,12 @@ impl Journal {
                         consumed: consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?,
                     });
                 }
-                _ => return Ok(transaction_tail(consumed)),
+                _ => {
+                    if consumed == 0 {
+                        return Ok(JournalTransactionScan::EndOfLog);
+                    }
+                    return Err(Error::UnsupportedJournal);
+                }
             }
         }
 
@@ -606,7 +616,11 @@ impl Journal {
             }
             if uuid_size == 16 {
                 let uuid = block
-                    .get(offset.checked_add(base_size).ok_or(Error::ArithmeticOverflow)?..next)
+                    .get(
+                        offset
+                            .checked_add(base_size)
+                            .ok_or(Error::ArithmeticOverflow)?..next,
+                    )
                     .ok_or(Error::TruncatedStructure)?;
                 if uuid != self.superblock.uuid() {
                     return Err(Error::JournalCorrupt);
@@ -670,7 +684,9 @@ impl Journal {
                 .checked_add(base_size)
                 .and_then(|value| value.checked_add(high_size))
                 .ok_or(Error::ArithmeticOverflow)?;
-            let uuid = block.get(uuid_start..next).ok_or(Error::TruncatedStructure)?;
+            let uuid = block
+                .get(uuid_start..next)
+                .ok_or(Error::TruncatedStructure)?;
             if uuid != self.superblock.uuid() {
                 return Err(Error::JournalCorrupt);
             }
@@ -722,7 +738,11 @@ impl Journal {
         Ok(JournalRevoke { blocks })
     }
 
-    fn parse_commit_block(&self, block: &[u8], expected_sequence: JournalSequence) -> Result<JournalCommit> {
+    fn parse_commit_block(
+        &self,
+        block: &[u8],
+        expected_sequence: JournalSequence,
+    ) -> Result<JournalCommit> {
         let header = Jbd2Header::parse(block)?;
         if header.block_type() != JBD2_COMMIT_BLOCK {
             return Err(Error::JournalCorrupt);
@@ -1025,7 +1045,9 @@ impl JournalRing {
     }
 
     fn usable_blocks(self) -> Result<u32> {
-        self.maxlen.checked_sub(self.first).ok_or(Error::UnsupportedJournal)
+        self.maxlen
+            .checked_sub(self.first)
+            .ok_or(Error::UnsupportedJournal)
     }
 
     fn next(self, logical: u32) -> Result<u32> {
@@ -1296,7 +1318,11 @@ impl JournalSuperblock {
         })
     }
 
-    fn validate_for_mount(&self, block_size: BlockSize, capacity_blocks: u32) -> Result<JournalRing> {
+    fn validate_for_mount(
+        &self,
+        block_size: BlockSize,
+        capacity_blocks: u32,
+    ) -> Result<JournalRing> {
         if self.block_size != block_size.bytes() {
             return Err(Error::UnsupportedJournal);
         }
@@ -1326,7 +1352,8 @@ impl JournalSuperblock {
         sequence: JournalSequence,
         start: u32,
     ) -> Result<Vec<u8>> {
-        let block_len = usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let block_len =
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
         if self.raw.len() != block_len {
             return Err(Error::JournalCorrupt);
         }
