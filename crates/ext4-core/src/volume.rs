@@ -750,10 +750,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
         );
         directory.initialize_dot_entries(inode_id, parent.inode_id())?;
-        self.directory_updates.push(BlockImage {
-            block,
-            bytes: directory.into_bytes(),
-        });
+        self.stage_directory_block(block, directory.into_bytes());
 
         self.add_directory_entry(
             parent.inode_id(),
@@ -815,6 +812,86 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         self.decrement_directory_links(parent.inode_id())?;
         let (group, _) = inode_group_bit(&self.volume.superblock, removed.inode())?;
         self.record_group_used_dirs_delta(group, -1)
+    }
+
+    /// Renames or moves a child entry without replacing an existing target.
+    ///
+    /// # Errors
+    /// Returns an error when the source entry is absent, the target name exists,
+    /// either parent is outside the mutable directory domain, or a moved
+    /// directory cannot have its parent link updated.
+    pub fn rename_child(
+        &mut self,
+        source_parent: TransactionDirectory,
+        source_name: &Ext4Name,
+        target_parent: TransactionDirectory,
+        target_name: &Ext4Name,
+    ) -> Result<()> {
+        reject_reserved_directory_name(source_name)?;
+        reject_reserved_directory_name(target_name)?;
+
+        let source_parent = source_parent.inode_id();
+        let target_parent = target_parent.inode_id();
+        let source = self.find_child_entry(source_parent, source_name)?;
+        if source_parent == target_parent && source_name == target_name {
+            return Ok(());
+        }
+        self.ensure_child_absent(target_parent, target_name)?;
+
+        let child_index = self.ensure_inode_update(source.inode())?;
+        let mut child_raw = self
+            .inode_updates
+            .get(child_index)
+            .ok_or(Error::InvalidInode)?
+            .clone();
+        let child_inode = child_raw.parse()?;
+        if !child_inode.supports_basic_mutation() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        if child_inode.kind() == InodeKind::Directory && source.inode() == InodeId::ROOT {
+            return Err(Error::CannotRemoveRoot);
+        }
+        let kind = directory_entry_kind(child_inode.kind());
+
+        if source_parent == target_parent {
+            let renamed = self.rename_directory_entry(
+                source_parent,
+                source_name,
+                target_name,
+                source.inode(),
+                kind,
+            )?;
+            if renamed.inode() != source.inode() {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+        } else {
+            self.add_directory_entry(target_parent, target_name, source.inode(), kind)?;
+            let removed = self.remove_directory_entry(source_parent, source_name)?;
+            if removed.inode() != source.inode() {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            if child_inode.kind() == InodeKind::Directory {
+                let dotdot = Ext4Name::new(b"..")?;
+                let replaced = self.replace_directory_entry(
+                    source.inode(),
+                    &dotdot,
+                    target_parent,
+                    DirectoryEntryKind::Directory,
+                )?;
+                if replaced.inode() != source_parent {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
+                self.decrement_directory_links(source_parent)?;
+                self.increment_directory_links(target_parent)?;
+            }
+        }
+
+        child_raw.set_timestamps(self.now)?;
+        *self
+            .inode_updates
+            .get_mut(child_index)
+            .ok_or(Error::InvalidInode)? = child_raw;
+        Ok(())
     }
 
     /// Overwrites bytes inside an existing regular file range.
@@ -1072,10 +1149,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 continue;
             }
             if block.insert(child, name, kind)? {
-                self.directory_updates.push(BlockImage {
-                    block: physical,
-                    bytes: block.into_bytes(),
-                });
+                self.stage_directory_block(physical, block.into_bytes());
                 raw_parent.set_timestamps(self.now)?;
                 *self
                     .inode_updates
@@ -1107,10 +1181,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if !inserted {
             return Err(Error::InvalidDirectoryEntry);
         }
-        self.directory_updates.push(BlockImage {
-            block: new_physical,
-            bytes: block.into_bytes(),
-        });
+        self.stage_directory_block(new_physical, block.into_bytes());
         raw_parent.set_size(FileSize::from_bytes(
             parent_inode
                 .size()
@@ -1151,10 +1222,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 continue;
             }
             if let Some(removed) = block.remove(name)? {
-                self.directory_updates.push(BlockImage {
-                    block: physical,
-                    bytes: block.into_bytes(),
-                });
+                self.stage_directory_block(physical, block.into_bytes());
                 raw_parent.set_timestamps(self.now)?;
                 *self
                     .inode_updates
@@ -1164,6 +1232,100 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             }
         }
         Err(Error::DirectoryEntryNotFound)
+    }
+
+    /// Internal rename_directory_entry operation used by this module's domain boundary.
+    fn rename_directory_entry(
+        &mut self,
+        parent: InodeId,
+        old_name: &Ext4Name,
+        new_name: &Ext4Name,
+        child: InodeId,
+        kind: DirectoryEntryKind,
+    ) -> Result<DirectoryEntry> {
+        let inode_index = self.ensure_inode_update(parent)?;
+        let mut raw_parent = self
+            .inode_updates
+            .get(inode_index)
+            .ok_or(Error::InvalidInode)?
+            .clone();
+        let parent_inode = raw_parent.parse()?;
+        if parent_inode.kind() != InodeKind::Directory {
+            return Err(Error::WrongInodeKind);
+        }
+        if !parent_inode.supports_basic_mutation() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        for (logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
+            if parent_inode.is_indexed_directory() && logical.as_u32() == 0 {
+                continue;
+            }
+            if let Some(renamed) = block.rename(old_name, new_name)? {
+                if renamed.inode() != child {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
+                let replacement = block.replace(new_name, child, kind)?;
+                if replacement.is_none() {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
+                self.stage_directory_block(physical, block.into_bytes());
+                raw_parent.set_timestamps(self.now)?;
+                *self
+                    .inode_updates
+                    .get_mut(inode_index)
+                    .ok_or(Error::InvalidInode)? = raw_parent;
+                return Ok(renamed);
+            }
+        }
+        Err(Error::DirectoryEntryNotFound)
+    }
+
+    /// Internal replace_directory_entry operation used by this module's domain boundary.
+    fn replace_directory_entry(
+        &mut self,
+        parent: InodeId,
+        name: &Ext4Name,
+        child: InodeId,
+        kind: DirectoryEntryKind,
+    ) -> Result<DirectoryEntry> {
+        let inode_index = self.ensure_inode_update(parent)?;
+        let mut raw_parent = self
+            .inode_updates
+            .get(inode_index)
+            .ok_or(Error::InvalidInode)?
+            .clone();
+        let parent_inode = raw_parent.parse()?;
+        if parent_inode.kind() != InodeKind::Directory {
+            return Err(Error::WrongInodeKind);
+        }
+        if !parent_inode.supports_basic_mutation() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
+            if let Some(replaced) = block.replace(name, child, kind)? {
+                self.stage_directory_block(physical, block.into_bytes());
+                raw_parent.set_timestamps(self.now)?;
+                *self
+                    .inode_updates
+                    .get_mut(inode_index)
+                    .ok_or(Error::InvalidInode)? = raw_parent;
+                return Ok(replaced);
+            }
+        }
+        Err(Error::DirectoryEntryNotFound)
+    }
+
+    /// Internal stage_directory_block operation used by this module's domain boundary.
+    fn stage_directory_block(&mut self, block: BlockAddress, bytes: Vec<u8>) {
+        if let Some(image) = self
+            .directory_updates
+            .iter_mut()
+            .find(|image| image.block == block)
+        {
+            image.bytes = bytes;
+        } else {
+            self.directory_updates.push(BlockImage { block, bytes });
+        }
     }
 
     /// Internal directory_is_empty operation used by this module's domain boundary.
@@ -1200,10 +1362,22 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                     return Err(Error::InvalidDirectoryEntry);
                 }
             };
-            let mut bytes = vec![0_u8; block_bytes];
-            self.volume
-                .device
-                .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
+            let bytes = if let Some(staged) = self
+                .directory_updates
+                .iter()
+                .find(|image| image.block == physical)
+            {
+                if staged.bytes.len() != block_bytes {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
+                staged.bytes.clone()
+            } else {
+                let mut bytes = vec![0_u8; block_bytes];
+                self.volume
+                    .device
+                    .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
+                bytes
+            };
             blocks.push((logical, physical, DirectoryBlock::new(bytes)));
         }
         Ok(blocks)
@@ -2311,6 +2485,24 @@ fn map_extents(extents: &[Extent], logical_block: LogicalBlock) -> BlockMapping 
         }
     }
     BlockMapping::Hole
+}
+
+/// Internal directory_entry_kind operation used by this module's domain boundary.
+const fn directory_entry_kind(kind: InodeKind) -> DirectoryEntryKind {
+    match kind {
+        InodeKind::File => DirectoryEntryKind::File,
+        InodeKind::Directory => DirectoryEntryKind::Directory,
+        InodeKind::Symlink => DirectoryEntryKind::Symlink,
+    }
+}
+
+/// Internal reject_reserved_directory_name operation used by this module's domain boundary.
+fn reject_reserved_directory_name(name: &Ext4Name) -> Result<()> {
+    if matches!(name.bytes(), b"." | b"..") {
+        Err(Error::InvalidName)
+    } else {
+        Ok(())
+    }
 }
 
 /// Internal round_up_div operation used by this module's domain boundary.

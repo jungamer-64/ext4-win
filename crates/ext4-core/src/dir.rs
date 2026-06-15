@@ -392,6 +392,97 @@ impl DirectoryBlock {
         }
         Ok(None)
     }
+
+    /// Renames a live entry inside this directory block.
+    pub(crate) fn rename(
+        &mut self,
+        old_name: &Ext4Name,
+        new_name: &Ext4Name,
+    ) -> Result<Option<DirectoryEntry>> {
+        if self.contains_name(new_name)? {
+            return Err(Error::NameAlreadyExists);
+        }
+
+        let original = self.bytes.clone();
+        let Some(entry) = self.remove(old_name)? else {
+            return Ok(None);
+        };
+        let renamed = self.insert(entry.inode(), new_name, entry.kind())?;
+        if renamed {
+            Ok(Some(entry))
+        } else {
+            self.bytes = original;
+            Err(Error::NoSpace)
+        }
+    }
+
+    /// Replaces the inode and kind of an existing entry without changing its name.
+    pub(crate) fn replace(
+        &mut self,
+        name: &Ext4Name,
+        inode: InodeId,
+        kind: DirectoryEntryKind,
+    ) -> Result<Option<DirectoryEntry>> {
+        let mut offset = 0_usize;
+        while offset < self.bytes.len() {
+            let rec_len = usize::from(le_u16(
+                &self.bytes,
+                offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+            )?);
+            if rec_len < DIRENT_HEADER_SIZE
+                || offset
+                    .checked_add(rec_len)
+                    .ok_or(Error::ArithmeticOverflow)?
+                    > self.bytes.len()
+            {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            let live_inode = le_u32(&self.bytes, offset)?;
+            let name_len = usize::from(
+                *self
+                    .bytes
+                    .get(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
+                    .ok_or(Error::InvalidDirectoryEntry)?,
+            );
+            let name_start = offset
+                .checked_add(DIRENT_HEADER_SIZE)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let name_end = name_start
+                .checked_add(name_len)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if live_inode != 0
+                && self
+                    .bytes
+                    .get(name_start..name_end)
+                    .ok_or(Error::InvalidDirectoryEntry)?
+                    == name.bytes()
+            {
+                let previous = DirectoryEntry {
+                    inode: InodeId::try_from(live_inode)?,
+                    name: Ext4Name::new(name.bytes())?,
+                    kind: DirectoryEntryKind::from_raw(
+                        *self
+                            .bytes
+                            .get(offset.checked_add(7).ok_or(Error::ArithmeticOverflow)?)
+                            .ok_or(Error::InvalidDirectoryEntry)?,
+                    ),
+                };
+                write_entry(
+                    &mut self.bytes,
+                    offset,
+                    inode,
+                    checked_u16(rec_len)?,
+                    name.bytes(),
+                    kind,
+                )?;
+                return Ok(Some(previous));
+            }
+            offset = offset
+                .checked_add(rec_len)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        Ok(None)
+    }
 }
 
 /// Internal write_entry operation used by this module's domain boundary.
