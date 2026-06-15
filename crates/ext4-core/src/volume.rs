@@ -13,8 +13,8 @@ use crate::extent::{
 };
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
-    Ext4Owner, Ext4Permissions, Ext4Timestamp, FileOffset, FileSize, Inode, InodeId, InodeKind,
-    NewDirectoryMetadata, NewFileMetadata, ReadBytes,
+    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Timestamp, FileOffset, FileSize, Inode, InodeId,
+    InodeKind, NewDirectoryMetadata, NewFileMetadata, ReadBytes,
 };
 use crate::journal::{Journal, LoadedJournal};
 use crate::name::Ext4Name;
@@ -31,6 +31,8 @@ const MAX_EAGER_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
 const MODE_DIRECTORY: u16 = 0x4000;
 /// Internal constant MODE_REGULAR used by on-disk layout and policy checks.
 const MODE_REGULAR: u16 = 0x8000;
+/// Internal constant MODE_KIND_MASK used by on-disk layout and policy checks.
+const MODE_KIND_MASK: u16 = 0xF000;
 /// Internal constant EXT4_EXTENTS_FL used by on-disk layout and policy checks.
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 /// Internal constant INODE_MODE_OFFSET used by on-disk layout and policy checks.
@@ -174,6 +176,12 @@ impl FileNode {
         self.inode.size()
     }
 
+    /// POSIX security state parsed from the file inode.
+    #[must_use]
+    pub const fn security(&self) -> Ext4Security {
+        self.inode.security()
+    }
+
     /// Returns the backing inode for volume-internal operations.
     fn inode(&self) -> &Inode {
         &self.inode
@@ -192,6 +200,12 @@ impl DirectoryNode {
     #[must_use]
     pub const fn id(&self) -> InodeId {
         self.inode.id()
+    }
+
+    /// POSIX security state parsed from the directory inode.
+    #[must_use]
+    pub const fn security(&self) -> Ext4Security {
+        self.inode.security()
     }
 
     /// Returns the backing inode for volume-internal operations.
@@ -218,6 +232,12 @@ impl SymlinkNode {
     #[must_use]
     pub const fn size(&self) -> FileSize {
         self.inode.size()
+    }
+
+    /// POSIX security state parsed from the symlink inode.
+    #[must_use]
+    pub const fn security(&self) -> Ext4Security {
+        self.inode.security()
     }
 
     /// Returns the backing inode for volume-internal operations.
@@ -613,6 +633,21 @@ impl TransactionDirectory {
     }
 }
 
+/// Inode selected for POSIX metadata mutation inside a write transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionNode {
+    /// Internal inode_id state carried by this domain type.
+    inode_id: InodeId,
+}
+
+impl TransactionNode {
+    /// Inode identifier backing this transaction node.
+    #[must_use]
+    pub const fn inode_id(self) -> InodeId {
+        self.inode_id
+    }
+}
+
 /// In-progress ext4 write transaction.
 #[derive(Debug)]
 pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
@@ -641,6 +676,19 @@ pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
 }
 
 impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
+    /// Selects any supported inode for POSIX metadata mutation.
+    ///
+    /// # Errors
+    /// Returns an error when the inode cannot be read or carries mutation
+    /// semantics outside the write domain.
+    pub fn node(&self, inode_id: InodeId) -> Result<TransactionNode> {
+        let inode = self.volume.read_inode_record(inode_id)?;
+        if !inode.supports_basic_mutation() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        Ok(TransactionNode { inode_id })
+    }
+
     /// Selects a regular file for mutation.
     ///
     /// # Errors
@@ -666,6 +714,36 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             return Err(Error::UnsupportedInodeMutation);
         }
         Ok(TransactionDirectory { inode_id })
+    }
+
+    /// Updates POSIX owner and permission state representable by ext4 inode fields.
+    ///
+    /// # Errors
+    /// Returns an error when the inode leaves the mutable write domain or the
+    /// inode record cannot be rewritten.
+    pub fn set_posix_security(
+        &mut self,
+        node: TransactionNode,
+        security: Ext4Security,
+    ) -> Result<()> {
+        let inode_index = self.ensure_inode_update(node.inode_id())?;
+        let mut raw_inode = self
+            .inode_updates
+            .get(inode_index)
+            .ok_or(Error::InvalidInode)?
+            .clone();
+        let inode = raw_inode.parse()?;
+        if !inode.supports_basic_mutation() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        raw_inode.set_owner(security.owner())?;
+        raw_inode.set_permissions(security.permissions())?;
+        raw_inode.set_timestamps(self.now)?;
+        *self
+            .inode_updates
+            .get_mut(inode_index)
+            .ok_or(Error::InvalidInode)? = raw_inode;
+        Ok(())
     }
 
     /// Creates an empty regular file under a directory.
@@ -2215,6 +2293,16 @@ impl RawInode {
             &mut self.bytes,
             INODE_MODE_OFFSET,
             file_type | permissions.as_u16(),
+        )
+    }
+
+    /// Internal set_permissions operation used by this module's domain boundary.
+    fn set_permissions(&mut self, permissions: Ext4Permissions) -> Result<()> {
+        let mode = le_u16(&self.bytes, INODE_MODE_OFFSET)?;
+        put_le_u16(
+            &mut self.bytes,
+            INODE_MODE_OFFSET,
+            (mode & MODE_KIND_MASK) | permissions.as_u16(),
         )
     }
 

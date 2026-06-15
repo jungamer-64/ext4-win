@@ -16,10 +16,10 @@ use alloc::{vec, vec::Vec};
 use crate::{
     BlockGroupId, BlockMapping, BlockReader, BlockWriter, ByteOffset, DeviceLength, DirectoryEntry,
     DirectoryEntryKind, DirectoryNode, Error, Ext4Gid, Ext4Name, Ext4Owner, Ext4Permissions,
-    Ext4Timestamp, Ext4Uid, ExtentTree, ExternalJournal, FileNode, FileOffset, FileSize, InodeId,
-    JournalMode, LogicalBlock, LookupResult, NewDirectoryMetadata, NewFileMetadata, Node, ReadOnly,
-    ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode,
-    TransactionDirectory, TransactionFile, Volume, WindowsName,
+    Ext4Security, Ext4Timestamp, Ext4Uid, ExtentTree, ExternalJournal, FileNode, FileOffset,
+    FileSize, InodeId, JournalMode, LogicalBlock, LookupResult, NewDirectoryMetadata,
+    NewFileMetadata, Node, ReadOnly, ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock,
+    SymlinkNode, TransactionDirectory, TransactionFile, Volume, WindowsName,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -155,6 +155,13 @@ fn transaction_directory<D: BlockWriter, J>(
     inode_id: InodeId,
 ) -> TransactionDirectory {
     must(transaction.directory(inode_id))
+}
+
+fn transaction_node<D: BlockWriter, J>(
+    transaction: &crate::WriteTransaction<'_, D, J>,
+    inode_id: InodeId,
+) -> crate::TransactionNode {
+    must(transaction.node(inode_id))
 }
 
 fn test_owner() -> Ext4Owner {
@@ -770,6 +777,50 @@ fn create_file_rejects_duplicate_name() {
     let result = transaction.create_file(root, &name, test_file_metadata());
 
     assert_eq!(result, Err(Error::NameAlreadyExists));
+}
+
+#[test]
+fn inode_security_is_parsed_from_owner_and_mode() {
+    let image = modern_fixture_image();
+    let device = SliceBlockDevice::new(&image);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
+
+    let file = file_node(&volume, 3);
+    assert_eq!(file.security().owner().uid().as_u32(), 0);
+    assert_eq!(file.security().owner().gid().as_u32(), 0);
+    assert_eq!(file.security().permissions().as_u16(), 0o444);
+}
+
+#[test]
+fn set_posix_security_updates_owner_and_permissions() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let security = Ext4Security::new(
+            Ext4Owner::new(
+                Ext4Uid::from_u32(0x0002_0001),
+                Ext4Gid::from_u32(0x0004_0003),
+            ),
+            must(Ext4Permissions::new(0o6750)),
+        );
+
+        let mut transaction = volume.begin_transaction(NOW);
+        let node = transaction_node(&transaction, inode(3));
+        must(transaction.set_posix_security(node, security));
+        must(transaction.commit());
+
+        let file = file_node(&volume, 3);
+        assert_eq!(file.security(), security);
+    }
+
+    let inode_offset = modern_inode_offset(3);
+    assert_eq!(get_u16(&image, inode_offset) & 0o7777, 0o6750);
+    assert_eq!(get_u16(&image, inode_offset + 2), 1);
+    assert_eq!(get_u16(&image, inode_offset + 24), 3);
+    assert_eq!(get_u16(&image, inode_offset + 120), 2);
+    assert_eq!(get_u16(&image, inode_offset + 122), 4);
 }
 
 #[test]
