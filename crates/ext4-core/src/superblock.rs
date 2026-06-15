@@ -315,9 +315,7 @@ impl FreeBlockDelta {
     /// Returns an error when the signed delta would overflow.
     pub fn checked_add(self, delta: i64) -> Result<Self> {
         Ok(Self(
-            self.0
-                .checked_add(delta)
-                .ok_or(Error::ArithmeticOverflow)?,
+            self.0.checked_add(delta).ok_or(Error::ArithmeticOverflow)?,
         ))
     }
 }

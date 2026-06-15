@@ -14,9 +14,11 @@
 use alloc::{vec, vec::Vec};
 
 use crate::{
-    BlockReader, BlockWriter, ByteOffset, DirectoryEntryKind, Error, Ext4Timestamp,
-    ExternalJournal, InodeId, ReadOnly, ReadWrite, SliceBlockDevice, SliceBlockDeviceMut,
-    Superblock, Volume, WindowsName,
+    BlockMapping, BlockReader, BlockWriter, ByteOffset, DeviceLength, DirectoryEntry,
+    DirectoryEntryKind, DirectoryNode, Error, Ext4Name, Ext4Timestamp, ExtentTree,
+    ExternalJournal, FileNode, FileOffset, FileSize, InodeId, JournalMode, LogicalBlock,
+    LookupResult, Node, ReadOnly, ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock,
+    SymlinkNode, TransactionFile, Volume, WindowsName,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -56,6 +58,112 @@ const INCOMPAT_RECOVER: u32 = 0x0004;
 const INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
 const EXTERNAL_JOURNAL_SUPERBLOCK_OFFSET: usize = 2048;
 
+fn inode(value: u32) -> InodeId {
+    must(InodeId::try_from(value))
+}
+
+fn file_node<D: BlockReader, State>(volume: &Volume<D, State>, inode_id: u32) -> FileNode {
+    match must(volume.read_node(inode(inode_id))) {
+        Node::File(file) => file,
+        Node::Directory(_) | Node::Symlink(_) => panic!("expected file node"),
+    }
+}
+
+fn directory_node<D: BlockReader, State>(
+    volume: &Volume<D, State>,
+    inode_id: InodeId,
+) -> DirectoryNode {
+    match must(volume.read_node(inode_id)) {
+        Node::Directory(directory) => directory,
+        Node::File(_) | Node::Symlink(_) => panic!("expected directory node"),
+    }
+}
+
+fn symlink_node<D: BlockReader, State>(volume: &Volume<D, State>, inode_id: u32) -> SymlinkNode {
+    match must(volume.read_node(inode(inode_id))) {
+        Node::Symlink(symlink) => symlink,
+        Node::File(_) | Node::Directory(_) => panic!("expected symlink node"),
+    }
+}
+
+fn read_file<D: BlockReader, State>(
+    volume: &Volume<D, State>,
+    inode_id: u32,
+    offset: u64,
+    out: &mut [u8],
+) -> usize {
+    let file = file_node(volume, inode_id);
+    must(volume.read_file(&file, FileOffset::from_bytes(offset), out)).as_usize()
+}
+
+fn read_directory<D: BlockReader, State>(
+    volume: &Volume<D, State>,
+    inode_id: InodeId,
+) -> Vec<DirectoryEntry> {
+    let directory = directory_node(volume, inode_id);
+    must(volume.read_directory(&directory))
+}
+
+fn read_symlink<D: BlockReader, State>(volume: &Volume<D, State>, inode_id: u32) -> Vec<u8> {
+    let symlink = symlink_node(volume, inode_id);
+    must(volume.read_symlink(&symlink))
+}
+
+fn lookup_ext4<D: BlockReader, State>(
+    volume: &Volume<D, State>,
+    parent: InodeId,
+    name: &[u8],
+) -> LookupResult {
+    let directory = directory_node(volume, parent);
+    let name = must(Ext4Name::new(name));
+    must(volume.lookup_child(&directory, &name))
+}
+
+fn lookup_windows<D: BlockReader, State>(
+    volume: &Volume<D, State>,
+    parent: InodeId,
+    name: &[u16],
+) -> LookupResult {
+    let directory = directory_node(volume, parent);
+    let name = must(WindowsName::from_utf16(name));
+    must(volume.lookup_windows_child(&directory, &name))
+}
+
+fn transaction_file<D: BlockWriter, J>(
+    transaction: &crate::WriteTransaction<'_, D, J>,
+    inode_id: u32,
+) -> TransactionFile {
+    must(transaction.file(inode(inode_id)))
+}
+
+fn overwrite_file<D: BlockWriter, J>(
+    transaction: &mut crate::WriteTransaction<'_, D, J>,
+    inode_id: u32,
+    offset: u64,
+    bytes: &[u8],
+) {
+    let file = transaction_file(transaction, inode_id);
+    must(transaction.overwrite_file_range(file, FileOffset::from_bytes(offset), bytes));
+}
+
+fn extend_file<D: BlockWriter, J>(
+    transaction: &mut crate::WriteTransaction<'_, D, J>,
+    inode_id: u32,
+    new_size: u64,
+) {
+    let file = transaction_file(transaction, inode_id);
+    must(transaction.extend_file(file, FileSize::from_bytes(new_size)));
+}
+
+fn truncate_file<D: BlockWriter, J>(
+    transaction: &mut crate::WriteTransaction<'_, D, J>,
+    inode_id: u32,
+    new_size: u64,
+) {
+    let file = transaction_file(transaction, inode_id);
+    must(transaction.truncate_file(file, FileSize::from_bytes(new_size)));
+}
+
 #[test]
 fn clean_superblock_mounts() {
     let image = fixture_image();
@@ -63,7 +171,7 @@ fn clean_superblock_mounts() {
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
 
     assert_eq!(volume.superblock().block_size().bytes(), 1024);
-    assert_eq!(volume.superblock().inode_count(), 16);
+    assert_eq!(volume.superblock().inode_count().as_u32(), 16);
 }
 
 #[test]
@@ -99,7 +207,7 @@ fn directory_entries_are_parsed_from_root_inode() {
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
     ));
-    let entries = must(volume.read_directory(InodeId::ROOT));
+    let entries = read_directory(&volume, InodeId::ROOT);
 
     assert_eq!(entries.len(), 4);
     assert_eq!(entries[2].name().bytes(), b"file");
@@ -115,7 +223,7 @@ fn sparse_file_reads_zeroes_for_holes() {
         SliceBlockDevice::new(&image),
     ));
     let mut output = vec![0xAA; 1030];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 1030);
     assert!(output[..1024].iter().all(|byte| *byte == 0));
@@ -129,7 +237,7 @@ fn symlink_inline_target_is_read_without_extents() {
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
     ));
-    let target = must(volume.read_symlink(InodeId::new(4)));
+    let target = read_symlink(&volume, 4);
 
     assert_eq!(target, b"file");
 }
@@ -140,9 +248,9 @@ fn exact_ext4_lookup_uses_raw_bytes() {
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
     ));
-    let child = must(volume.lookup_child(InodeId::ROOT, b"file"));
+    let child = lookup_ext4(&volume, InodeId::ROOT, b"file");
 
-    assert_eq!(child, Some(InodeId::new(3)));
+    assert_eq!(child, LookupResult::Found(inode(3)));
 }
 
 #[test]
@@ -159,9 +267,61 @@ fn windows_lookup_accepts_unique_ascii_case_fold() {
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
     ));
-    let child = must(volume.lookup_windows_child(InodeId::ROOT, &[0x0046, 0x0049, 0x004C, 0x0045]));
+    let child = lookup_windows(&volume, InodeId::ROOT, &[0x0046, 0x0049, 0x004C, 0x0045]);
 
-    assert_eq!(child, Some(InodeId::new(3)));
+    assert_eq!(child, LookupResult::Found(inode(3)));
+}
+
+#[test]
+fn inode_zero_is_not_constructible() {
+    assert_eq!(InodeId::try_from(0), Err(Error::InvalidInode));
+}
+
+#[test]
+fn file_offset_addition_rejects_overflow() {
+    let result = FileOffset::from_bytes(u64::MAX).checked_add_len(1);
+
+    assert_eq!(result, Err(Error::ArithmeticOverflow));
+}
+
+#[test]
+fn lookup_reports_not_found_without_option() {
+    let image = fixture_image();
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+
+    assert_eq!(
+        lookup_ext4(&volume, InodeId::ROOT, b"missing"),
+        LookupResult::NotFound
+    );
+}
+
+#[test]
+fn windows_lookup_rejects_ambiguous_case_fold() {
+    let mut image = fixture_image();
+    write_dirent(&mut image, block_offset(ROOT_DIR_BLOCK) + 40, 4, 984, b"FILE", 1);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+    let root = directory_node(&volume, InodeId::ROOT);
+    let requested = must(WindowsName::from_utf16(&[0x0046, 0x0069, 0x004C, 0x0065]));
+    let result = volume.lookup_windows_child(&root, &requested);
+
+    assert_eq!(result, Err(Error::AmbiguousWindowsName));
+}
+
+#[test]
+fn extent_hole_mapping_is_explicit() {
+    let mut raw = [0_u8; 60];
+    write_extent_root(&mut raw, 0, 1, 1, FILE_DATA_BLOCK);
+    let root = crate::inode::InodeExtentRoot::from_bytes(raw);
+    let tree = must(ExtentTree::parse_inode_root(&root));
+
+    assert_eq!(
+        tree.map_logical(LogicalBlock::from_u32(0)),
+        BlockMapping::Hole
+    );
 }
 
 #[test]
@@ -185,7 +345,7 @@ fn block_count_uses_64bit_superblock_high_field() {
     put_u32(&mut image, 1024 + 336, 1);
     let superblock = must(Superblock::parse(&image[1024..2048]));
 
-    assert_eq!(superblock.block_count(), 0x1_0000_0001);
+    assert_eq!(superblock.block_count().as_u64(), 0x1_0000_0001);
 }
 
 #[test]
@@ -204,7 +364,10 @@ fn write_mount_accepts_modern_baseline() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
 
-    assert_eq!(volume.superblock().journal_inode(), 8);
+    assert_eq!(
+        volume.superblock().journal_mode(),
+        JournalMode::Internal(inode(8))
+    );
 }
 
 #[test]
@@ -224,11 +387,11 @@ fn overwrite_existing_file_range_commits() {
     let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
 
     let mut transaction = volume.begin_transaction(NOW);
-    must(transaction.overwrite_file_range(InodeId::new(3), 0, b"HELLO"));
+    overwrite_file(&mut transaction, 3, 0, b"HELLO");
     must(transaction.commit());
 
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
     assert_eq!(read, 5);
     assert_eq!(&output, b"HELLO");
 }
@@ -240,11 +403,11 @@ fn sparse_hole_write_allocates_block() {
     let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
 
     let mut transaction = volume.begin_transaction(NOW);
-    must(transaction.overwrite_file_range(InodeId::new(3), 1024, b"hole"));
+    overwrite_file(&mut transaction, 3, 1024, b"hole");
     must(transaction.commit());
 
     let mut output = [0_u8; 4];
-    let read = must(volume.read_file(InodeId::new(3), 1024, &mut output));
+    let read = read_file(&volume, 3, 1024, &mut output);
     assert_eq!(read, 4);
     assert_eq!(&output, b"hole");
 }
@@ -256,13 +419,13 @@ fn extend_file_creates_sparse_range() {
     let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
 
     let mut transaction = volume.begin_transaction(NOW);
-    must(transaction.extend_file(InodeId::new(3), 3072));
+    extend_file(&mut transaction, 3, 3072);
     must(transaction.commit());
 
-    let inode = must(volume.read_inode(InodeId::new(3)));
+    let file = file_node(&volume, 3);
     let mut output = [0xAA; 4];
-    let read = must(volume.read_file(InodeId::new(3), 2048, &mut output));
-    assert_eq!(inode.size(), 3072);
+    let read = read_file(&volume, 3, 2048, &mut output);
+    assert_eq!(file.size().bytes(), 3072);
     assert_eq!(read, 4);
     assert_eq!(output, [0, 0, 0, 0]);
 }
@@ -274,14 +437,14 @@ fn truncate_file_releases_blocks() {
     let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
 
     let mut write = volume.begin_transaction(NOW);
-    must(write.overwrite_file_range(InodeId::new(3), 1024, b"hole"));
+    overwrite_file(&mut write, 3, 1024, b"hole");
     must(write.commit());
     let mut truncate = volume.begin_transaction(NOW);
-    must(truncate.truncate_file(InodeId::new(3), 0));
+    truncate_file(&mut truncate, 3, 0);
     must(truncate.commit());
 
-    let inode = must(volume.read_inode(InodeId::new(3)));
-    assert_eq!(inode.size(), 0);
+    let file = file_node(&volume, 3);
+    assert_eq!(file.size().bytes(), 0);
 }
 
 #[test]
@@ -291,7 +454,7 @@ fn transaction_too_large_is_rejected_before_writes() {
     let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut transaction = volume.begin_transaction(NOW);
 
-    must(transaction.overwrite_file_range(InodeId::new(3), 1024, b"hole"));
+    overwrite_file(&mut transaction, 3, 1024, b"hole");
     let result = transaction.commit();
 
     assert!(matches!(result, Err(Error::TransactionTooLarge)));
@@ -310,7 +473,7 @@ fn committed_dirty_journal_transaction_is_replayed() {
         let device = SliceBlockDeviceMut::new(&mut image);
         let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
         let mut output = [0_u8; 6];
-        let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+        let read = read_file(&volume, 3, 0, &mut output);
         assert_eq!(read, 6);
         assert_eq!(&output, b"REPLAY");
     }
@@ -330,7 +493,7 @@ fn descriptor_without_commit_is_ignored() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"hello");
@@ -367,7 +530,7 @@ fn later_revoke_prevents_stale_metadata_replay() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"hello");
@@ -385,7 +548,7 @@ fn circular_journal_wraparound_is_replayed() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"WRAP!");
@@ -409,7 +572,7 @@ fn escaped_journal_data_block_is_unescaped_on_replay() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output[..4], &JBD2_MAGIC.to_be_bytes());
@@ -430,7 +593,7 @@ fn checkpointed_dirty_journal_replay_is_idempotent() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"DONE!");
@@ -485,7 +648,7 @@ fn write_transaction_emits_descriptor_data_and_commit_records() {
         let device = SliceBlockDeviceMut::new(&mut image);
         let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
         let mut transaction = volume.begin_transaction(NOW);
-        must(transaction.overwrite_file_range(InodeId::new(3), 0, b"HELLO"));
+        overwrite_file(&mut transaction, 3, 0, b"HELLO");
         must(transaction.commit());
     }
 
@@ -508,7 +671,7 @@ fn emitted_committed_records_are_replayable_after_checkpoint_loss() {
         let device = SliceBlockDeviceMut::new(&mut image);
         let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
         let mut transaction = volume.begin_transaction(NOW);
-        must(transaction.extend_file(InodeId::new(3), 3072));
+        extend_file(&mut transaction, 3, 3072);
         must(transaction.commit());
     }
 
@@ -518,9 +681,9 @@ fn emitted_committed_records_are_replayable_after_checkpoint_loss() {
 
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
-    let inode = must(volume.read_inode(InodeId::new(3)));
+    let file = file_node(&volume, 3);
 
-    assert_eq!(inode.size(), 3072);
+    assert_eq!(file.size().bytes(), 3072);
 }
 
 #[test]
@@ -535,7 +698,7 @@ fn legacy_32bit_descriptor_tag_is_replayed() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"32BIT");
@@ -562,7 +725,7 @@ fn csum_v2_descriptor_tail_and_commit_checksum_are_verified() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"V2OK!");
@@ -737,7 +900,7 @@ fn emitted_journal_data_escapes_jbd2_magic_prefix() {
         let device = SliceBlockDeviceMut::new(&mut image);
         let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
         let mut transaction = volume.begin_transaction(NOW);
-        must(transaction.overwrite_file_range(InodeId::new(3), 0, b"MAGIC"));
+        overwrite_file(&mut transaction, 3, 0, b"MAGIC");
         must(transaction.commit());
     }
 
@@ -821,7 +984,7 @@ fn descriptor_tag_uuid_match_is_replayed() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"UUID?");
@@ -929,7 +1092,7 @@ fn same_transaction_later_revoke_prevents_replay() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"hello");
@@ -964,7 +1127,7 @@ fn wrapped_later_revoke_prevents_old_sequence_replay() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"hello");
@@ -1041,16 +1204,16 @@ fn fragmented_internal_journal_is_mapped_on_demand() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"FRAG!");
 
     let mut transaction = volume.begin_transaction(NOW);
-    must(transaction.overwrite_file_range(InodeId::new(3), 1024, b"hole"));
+    overwrite_file(&mut transaction, 3, 1024, b"hole");
     must(transaction.commit());
     let mut committed = [0_u8; 4];
-    let read = must(volume.read_file(InodeId::new(3), 1024, &mut committed));
+    let read = read_file(&volume, 3, 1024, &mut committed);
 
     assert_eq!(read, 4);
     assert_eq!(&committed, b"hole");
@@ -1078,7 +1241,7 @@ fn checkpoint_failure_leaves_replayable_dirty_journal() {
     let device = SliceBlockDeviceMut::new(&mut image);
     let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"AGAIN");
@@ -1092,7 +1255,7 @@ fn extent_depth_traversal_reads_index_block() {
         SliceBlockDevice::new(&image),
     ));
     let mut output = [0_u8; 5];
-    let read = must(volume.read_file(InodeId::new(3), 0, &mut output));
+    let read = read_file(&volume, 3, 0, &mut output);
 
     assert_eq!(read, 5);
     assert_eq!(&output, b"hello");
@@ -1774,8 +1937,8 @@ impl<'a> FailOneWriteAt<'a> {
 }
 
 impl BlockReader for FailOneWriteAt<'_> {
-    fn len(&self) -> u64 {
-        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    fn len(&self) -> DeviceLength {
+        DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
     }
 
     fn read_exact_at(&self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
