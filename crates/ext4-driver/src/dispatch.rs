@@ -219,7 +219,10 @@ unsafe extern "C" fn lock_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS
 }
 
 /// Decodes the current dispatch boundary enough to reject null kernel inputs.
-fn decode_dispatch_target(device: PDEVICE_OBJECT, irp: PIRP) -> Result<(), crate::status::DriverError> {
+fn decode_dispatch_target(
+    device: PDEVICE_OBJECT,
+    irp: PIRP,
+) -> Result<(), crate::status::DriverError> {
     if device.is_null() || irp.is_null() {
         Err(crate::status::DriverError::InvalidParameter)
     } else {

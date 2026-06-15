@@ -6,6 +6,7 @@ mod dispatch;
 mod ffi;
 mod file_info;
 mod file_system_control;
+mod irp;
 mod state;
 mod status;
 mod volume_info;
