@@ -3,7 +3,7 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::{DeviceLength, InodeId};
+use ext4_core::{DeviceLength, InodeId, InternalJournal, ReadWrite, Result, Volume};
 use wdk_sys::{PDEVICE_OBJECT, PDRIVER_OBJECT};
 
 use crate::{block_device::KernelBlockDevice, ffi};
@@ -79,28 +79,15 @@ pub(crate) struct MountCandidate {
 
 #[expect(
     dead_code,
-    reason = "mount capability is defined before mount FSCTL constructs VCB state"
-)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Mounted volume capability selected by the core mount mode.
-pub(crate) enum MountMode {
-    /// Journaled read-write volume.
-    ReadWrite,
-}
-
-#[expect(
-    dead_code,
     reason = "VCB state is defined before mount FSCTL allocates device extensions"
 )]
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 /// Volume control block stored in a mounted volume device extension.
 pub(crate) struct VolumeControlBlock {
-    /// Storage target connected to ext4-core block I/O.
-    block_device: KernelBlockDevice,
+    /// Mounted journaled read-write ext4 volume.
+    volume: Volume<KernelBlockDevice, ReadWrite<InternalJournal>>,
     /// Root directory inode of the mounted volume.
     root_inode: InodeId,
-    /// Mounted volume capability.
-    mode: MountMode,
 }
 
 #[expect(
@@ -108,28 +95,34 @@ pub(crate) struct VolumeControlBlock {
     reason = "VCB accessors are defined before IRP dispatch stores VCB pointers"
 )]
 impl VolumeControlBlock {
-    /// Creates a journaled read-write VCB.
-    pub(crate) const fn read_write(target_device: KernelDevice, length: DeviceLength) -> Self {
-        Self {
-            block_device: KernelBlockDevice::new(target_device, length),
+    /// Mounts a journaled read-write ext4 VCB.
+    pub(crate) fn mount_read_write(
+        target_device: KernelDevice,
+        length: DeviceLength,
+    ) -> Result<Self> {
+        let block_device = KernelBlockDevice::new(target_device, length);
+        let volume = Volume::<_, ReadWrite<InternalJournal>>::mount_read_write(block_device)?;
+        Ok(Self {
+            volume,
             root_inode: InodeId::ROOT,
-            mode: MountMode::ReadWrite,
-        }
+        })
     }
 
-    /// Returns the mounted block-device boundary.
-    pub(crate) const fn block_device(self) -> KernelBlockDevice {
-        self.block_device
+    /// Returns the mounted ext4 volume.
+    pub(crate) const fn volume(&self) -> &Volume<KernelBlockDevice, ReadWrite<InternalJournal>> {
+        &self.volume
+    }
+
+    /// Returns the mounted ext4 volume for mutation.
+    pub(crate) const fn volume_mut(
+        &mut self,
+    ) -> &mut Volume<KernelBlockDevice, ReadWrite<InternalJournal>> {
+        &mut self.volume
     }
 
     /// Returns the mounted root inode.
-    pub(crate) const fn root_inode(self) -> InodeId {
+    pub(crate) const fn root_inode(&self) -> InodeId {
         self.root_inode
-    }
-
-    /// Returns the mounted capability.
-    pub(crate) const fn mode(self) -> MountMode {
-        self.mode
     }
 }
 
