@@ -1,9 +1,10 @@
 //! Superblock parsing and mount-policy validation.
 
-use crate::block::{BlockReader, BlockSize, BlockWriter, ByteOffset};
+use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
 use crate::checksum::{crc32c, verify_crc32c};
 use crate::endian::{le_u16, le_u32, put_le_u32};
 use crate::error::{Error, Result};
+use crate::inode::InodeId;
 
 const SUPERBLOCK_OFFSET: u64 = 1024;
 const SUPERBLOCK_SIZE: usize = 1024;
@@ -84,9 +85,341 @@ const REJECTED_WRITE_RO_COMPAT: u32 = RO_COMPAT_GDT_CSUM
     | RO_COMPAT_ORPHAN_PRESENT;
 const DEFAULT_64BIT_DESCRIPTOR_SIZE: u16 = 64;
 
+/// Total number of inodes recorded by a validated superblock.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct InodeCount(u32);
+
+impl InodeCount {
+    /// Creates an inode count.
+    ///
+    /// # Errors
+    /// Returns an error when the count is zero.
+    pub fn new(value: u32) -> Result<Self> {
+        if value == 0 {
+            Err(Error::InvalidSuperblock)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the count for on-disk geometry arithmetic.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Total number of blocks recorded by a validated superblock.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BlockCount(u64);
+
+impl BlockCount {
+    /// Creates a block count.
+    ///
+    /// # Errors
+    /// Returns an error when the count is zero.
+    pub fn new(value: u64) -> Result<Self> {
+        if value == 0 {
+            Err(Error::InvalidSuperblock)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the count for on-disk geometry arithmetic.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Number of free blocks recorded by a validated superblock.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FreeBlockCount(u64);
+
+impl FreeBlockCount {
+    /// Creates a free-block count.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the count for on-disk geometry arithmetic.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Blocks per ext4 block group.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BlocksPerGroup(u32);
+
+impl BlocksPerGroup {
+    /// Creates a blocks-per-group value.
+    ///
+    /// # Errors
+    /// Returns an error when the value is zero.
+    pub fn new(value: u32) -> Result<Self> {
+        if value == 0 {
+            Err(Error::InvalidSuperblock)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the value for on-disk geometry arithmetic.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Inodes per ext4 block group.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct InodesPerGroup(u32);
+
+impl InodesPerGroup {
+    /// Creates an inodes-per-group value.
+    ///
+    /// # Errors
+    /// Returns an error when the value is zero.
+    pub fn new(value: u32) -> Result<Self> {
+        if value == 0 {
+            Err(Error::InvalidSuperblock)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the value for on-disk geometry arithmetic.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Size of one inode record in bytes.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct InodeRecordSize(u16);
+
+impl InodeRecordSize {
+    /// Creates an inode record size.
+    ///
+    /// # Errors
+    /// Returns an error when the value cannot contain a v1-supported inode.
+    pub fn new(value: u16, block_size: BlockSize) -> Result<Self> {
+        if value < 128 || u32::from(value) > block_size.bytes() {
+            Err(Error::InvalidSuperblock)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the size for on-disk geometry arithmetic.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+}
+
+/// Size of one block group descriptor in bytes.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BlockGroupDescriptorSize(u16);
+
+impl BlockGroupDescriptorSize {
+    /// Creates a descriptor size.
+    ///
+    /// # Errors
+    /// Returns an error when the descriptor cannot fit in one block.
+    pub fn new(value: u16, block_size: BlockSize) -> Result<Self> {
+        if value < 32 || u32::from(value) > block_size.bytes() {
+            Err(Error::InvalidSuperblock)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the size for on-disk geometry arithmetic.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+}
+
+/// Ext4 block group identifier.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BlockGroupId(u32);
+
+impl BlockGroupId {
+    /// Creates a block group identifier from validated geometry iteration.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the identifier for descriptor-table arithmetic.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Number of ext4 block groups.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BlockGroupCount(u32);
+
+impl BlockGroupCount {
+    /// Creates a block group count.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the count for group iteration.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Signed free-block count delta.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FreeBlockDelta(i64);
+
+impl FreeBlockDelta {
+    /// Zero free-block delta.
+    pub const ZERO: Self = Self(0);
+
+    /// Creates a free-block delta from a signed count.
+    #[must_use]
+    pub const fn from_i64(value: i64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the delta for checked arithmetic at metadata encoding boundaries.
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
+        self.0
+    }
+
+    /// Returns true when the delta has no effect.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Adds another delta.
+    ///
+    /// # Errors
+    /// Returns an error when the signed delta would overflow.
+    pub fn checked_add(self, delta: i64) -> Result<Self> {
+        Ok(Self(
+            self.0
+                .checked_add(delta)
+                .ok_or(Error::ArithmeticOverflow)?,
+        ))
+    }
+}
+
+/// Filesystem UUID recorded by the superblock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilesystemUuid([u8; 16]);
+
+impl FilesystemUuid {
+    /// Creates a filesystem UUID from the superblock bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns UUID bytes for checksum and external-boundary comparison.
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+/// External journal UUID recorded by the superblock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalUuid([u8; 16]);
+
+impl JournalUuid {
+    /// Creates a journal UUID from the superblock bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns UUID bytes for external journal validation.
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+/// Metadata checksum seed recorded by the superblock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChecksumSeed(u32);
+
+impl ChecksumSeed {
+    /// Creates a checksum seed from the superblock field.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the seed for checksum calculation.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Journal placement mode selected by validated superblock features.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalMode {
+    /// The filesystem has no journal.
+    None,
+    /// The journal is stored in this filesystem inode.
+    Internal(InodeId),
+    /// The journal is stored on an external device with this UUID.
+    External(JournalUuid),
+}
+
+/// Recovery state advertised by the superblock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryState {
+    /// No journal recovery is pending.
+    Clean,
+    /// Journal recovery is required before mounting cleanly.
+    NeedsRecovery,
+}
+
+/// Metadata checksum mode selected by validated features.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetadataChecksum {
+    /// Metadata checksums are absent.
+    None,
+    /// CRC32C metadata checksums are present.
+    Crc32c,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlockGroupDescriptorLayout {
+    Standard32,
+    SixtyFourBit,
+}
+
+impl BlockGroupDescriptorLayout {
+    pub(crate) const fn has_high_fields(self) -> bool {
+        matches!(self, Self::SixtyFourBit)
+    }
+}
+
 /// Validated ext4 feature flags accepted by a mount policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FeatureSet {
+pub(crate) struct FeatureSet {
     compat: u32,
     incompat: u32,
     read_only_compat: u32,
@@ -98,7 +431,7 @@ impl FeatureSet {
     /// # Errors
     /// Returns an error when the advertised feature set is outside the
     /// read-only mount policy.
-    pub fn read_only(compat: u32, incompat: u32, read_only_compat: u32) -> Result<Self> {
+    pub(crate) fn read_only(compat: u32, incompat: u32, read_only_compat: u32) -> Result<Self> {
         if incompat & !SUPPORTED_READ_INCOMPAT != 0 {
             return Err(Error::UnsupportedIncompatFeature);
         }
@@ -120,7 +453,7 @@ impl FeatureSet {
     /// # Errors
     /// Returns an error when required write features are absent or any
     /// unsupported write feature is present.
-    pub fn read_write(compat: u32, incompat: u32, read_only_compat: u32) -> Result<Self> {
+    pub(crate) fn read_write(compat: u32, incompat: u32, read_only_compat: u32) -> Result<Self> {
         if compat & REQUIRED_WRITE_COMPAT != REQUIRED_WRITE_COMPAT {
             return Err(Error::UnsupportedWriteFeature);
         }
@@ -155,45 +488,19 @@ impl FeatureSet {
         })
     }
 
-    /// Raw compatible feature flags.
-    #[must_use]
-    pub const fn compat(self) -> u32 {
-        self.compat
-    }
-
-    /// Raw incompatible feature flags.
-    #[must_use]
-    pub const fn incompat(self) -> u32 {
-        self.incompat
-    }
-
-    /// Raw read-only-compatible feature flags.
-    #[must_use]
-    pub const fn read_only_compat(self) -> u32 {
-        self.read_only_compat
-    }
-
-    /// Returns true when the filesystem uses 64-bit block fields.
-    #[must_use]
-    pub const fn has_64bit(self) -> bool {
+    pub(crate) const fn has_64bit(self) -> bool {
         self.incompat & INCOMPAT_64BIT != 0
     }
 
-    /// Returns true when the filesystem has an internal journal.
-    #[must_use]
-    pub const fn has_journal(self) -> bool {
+    pub(crate) const fn has_journal(self) -> bool {
         self.compat & COMPAT_HAS_JOURNAL != 0
     }
 
-    /// Returns true when the filesystem uses an external journal device.
-    #[must_use]
-    pub const fn has_external_journal(self) -> bool {
+    pub(crate) const fn has_external_journal(self) -> bool {
         self.incompat & INCOMPAT_JOURNAL_DEV != 0
     }
 
-    /// Returns true when metadata checksums are enabled.
-    #[must_use]
-    pub const fn has_metadata_csum(self) -> bool {
+    pub(crate) const fn has_metadata_csum(self) -> bool {
         self.read_only_compat & RO_COMPAT_METADATA_CSUM != 0
     }
 }
@@ -202,19 +509,18 @@ impl FeatureSet {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Superblock {
     block_size: BlockSize,
-    inode_count: u32,
-    block_count: u64,
-    free_blocks_count: u64,
-    first_data_block: u32,
-    blocks_per_group: u32,
-    inodes_per_group: u32,
-    inode_size: u16,
-    first_inode: u32,
-    descriptor_size: u16,
-    journal_inode: u32,
-    uuid: [u8; 16],
-    journal_uuid: [u8; 16],
-    checksum_seed: u32,
+    inode_count: InodeCount,
+    block_count: BlockCount,
+    free_blocks_count: FreeBlockCount,
+    first_data_block: BlockAddress,
+    blocks_per_group: BlocksPerGroup,
+    inodes_per_group: InodesPerGroup,
+    inode_size: InodeRecordSize,
+    first_inode: InodeId,
+    descriptor_size: BlockGroupDescriptorSize,
+    journal_mode: JournalMode,
+    uuid: FilesystemUuid,
+    checksum_seed: ChecksumSeed,
     features: FeatureSet,
 }
 
@@ -271,17 +577,17 @@ impl Superblock {
             return Err(Error::DirtyVolume);
         }
 
-        let inode_count = le_u32(raw, 0)?;
+        let inode_count = InodeCount::new(le_u32(raw, 0)?)?;
         let block_count_lo = le_u32(raw, 4)?;
         let free_blocks_count_lo = le_u32(raw, 12)?;
-        let first_data_block = le_u32(raw, 20)?;
+        let first_data_block = BlockAddress::new(u64::from(le_u32(raw, 20)?));
         let block_size = BlockSize::from_superblock_log(le_u32(raw, 24)?)?;
-        let blocks_per_group = le_u32(raw, 32)?;
-        let inodes_per_group = le_u32(raw, 40)?;
-        let first_inode = le_u32(raw, 84)?;
-        let inode_size = le_u16(raw, 88)?;
+        let blocks_per_group = BlocksPerGroup::new(le_u32(raw, 32)?)?;
+        let inodes_per_group = InodesPerGroup::new(le_u32(raw, 40)?)?;
+        let first_inode = InodeId::try_from(le_u32(raw, 84)?)?;
+        let inode_size = InodeRecordSize::new(le_u16(raw, 88)?, block_size)?;
         let features = validate_features(le_u32(raw, 92)?, le_u32(raw, 96)?, le_u32(raw, 100)?)?;
-        let descriptor_size = if features.has_64bit() {
+        let raw_descriptor_size = if features.has_64bit() {
             let raw_size = le_u16(raw, 254)?;
             if raw_size == 0 {
                 DEFAULT_64BIT_DESCRIPTOR_SIZE
@@ -291,18 +597,23 @@ impl Superblock {
         } else {
             32
         };
-        let block_count = u64::from(block_count_lo)
-            | if features.has_64bit() {
-                u64::from(le_u32(raw, 336)?) << 32
-            } else {
-                0
-            };
-        let free_blocks_count = u64::from(free_blocks_count_lo)
-            | if features.has_64bit() {
-                u64::from(le_u32(raw, 344)?) << 32
-            } else {
-                0
-            };
+        let descriptor_size = BlockGroupDescriptorSize::new(raw_descriptor_size, block_size)?;
+        let block_count = BlockCount::new(
+            u64::from(block_count_lo)
+                | if features.has_64bit() {
+                    u64::from(le_u32(raw, 336)?) << 32
+                } else {
+                    0
+                },
+        )?;
+        let free_blocks_count = FreeBlockCount::new(
+            u64::from(free_blocks_count_lo)
+                | if features.has_64bit() {
+                    u64::from(le_u32(raw, 344)?) << 32
+                } else {
+                    0
+                },
+        );
         if features.has_metadata_csum() && le_u32(raw, 1020)? != 0 {
             verify_crc32c(0, raw, 1020)?;
         }
@@ -311,23 +622,24 @@ impl Superblock {
         uuid.copy_from_slice(raw.get(104..120).ok_or(Error::TruncatedStructure)?);
         let mut journal_uuid = [0_u8; 16];
         journal_uuid.copy_from_slice(raw.get(208..224).ok_or(Error::TruncatedStructure)?);
-        let checksum_seed = if features.incompat & INCOMPAT_CSUM_SEED != 0 {
-            le_u32(raw, 624)?
+        let journal_uuid = JournalUuid::from_bytes(journal_uuid);
+        let journal_mode = if features.has_journal() {
+            if features.has_external_journal() {
+                if journal_inode != 0 {
+                    return Err(Error::InvalidSuperblock);
+                }
+                JournalMode::External(journal_uuid)
+            } else {
+                JournalMode::Internal(InodeId::try_from(journal_inode)?)
+            }
         } else {
-            0
+            JournalMode::None
         };
-
-        if inode_count == 0
-            || block_count == 0
-            || blocks_per_group == 0
-            || inodes_per_group == 0
-            || inode_size < 128
-            || u32::from(inode_size) > block_size.bytes()
-            || descriptor_size < 32
-            || u32::from(descriptor_size) > block_size.bytes()
-        {
-            return Err(Error::InvalidSuperblock);
-        }
+        let checksum_seed = if features.incompat & INCOMPAT_CSUM_SEED != 0 {
+            ChecksumSeed::from_u32(le_u32(raw, 624)?)
+        } else {
+            ChecksumSeed::from_u32(0)
+        };
 
         Ok(Self {
             block_size,
@@ -340,9 +652,8 @@ impl Superblock {
             inode_size,
             first_inode,
             descriptor_size,
-            journal_inode,
-            uuid,
-            journal_uuid,
+            journal_mode,
+            uuid: FilesystemUuid::from_bytes(uuid),
             checksum_seed,
             features,
         })
@@ -356,92 +667,102 @@ impl Superblock {
 
     /// Total inodes recorded by the superblock.
     #[must_use]
-    pub const fn inode_count(self) -> u32 {
+    pub const fn inode_count(self) -> InodeCount {
         self.inode_count
     }
 
-    /// Total low 32-bit block count.
+    /// Total block count.
     #[must_use]
-    pub const fn block_count(self) -> u64 {
+    pub const fn block_count(self) -> BlockCount {
         self.block_count
     }
 
     /// Total free block count.
     #[must_use]
-    pub const fn free_blocks_count(self) -> u64 {
+    pub const fn free_blocks_count(self) -> FreeBlockCount {
         self.free_blocks_count
     }
 
     /// First data block.
     #[must_use]
-    pub const fn first_data_block(self) -> u32 {
+    pub const fn first_data_block(self) -> BlockAddress {
         self.first_data_block
     }
 
     /// Blocks per block group.
     #[must_use]
-    pub const fn blocks_per_group(self) -> u32 {
+    pub const fn blocks_per_group(self) -> BlocksPerGroup {
         self.blocks_per_group
     }
 
     /// Inodes per block group.
     #[must_use]
-    pub const fn inodes_per_group(self) -> u32 {
+    pub const fn inodes_per_group(self) -> InodesPerGroup {
         self.inodes_per_group
     }
 
     /// Inode record size in bytes.
     #[must_use]
-    pub const fn inode_size(self) -> u16 {
+    pub const fn inode_size(self) -> InodeRecordSize {
         self.inode_size
     }
 
     /// First non-reserved inode.
     #[must_use]
-    pub const fn first_inode(self) -> u32 {
+    pub const fn first_inode(self) -> InodeId {
         self.first_inode
     }
 
     /// Block group descriptor size in bytes.
     #[must_use]
-    pub const fn descriptor_size(self) -> u16 {
+    pub const fn descriptor_size(self) -> BlockGroupDescriptorSize {
         self.descriptor_size
     }
 
-    /// Internal journal inode number.
+    /// Journal placement mode.
     #[must_use]
-    pub const fn journal_inode(self) -> u32 {
-        self.journal_inode
+    pub const fn journal_mode(self) -> JournalMode {
+        self.journal_mode
     }
 
     /// Filesystem UUID.
     #[must_use]
-    pub const fn uuid(self) -> [u8; 16] {
+    pub const fn uuid(self) -> FilesystemUuid {
         self.uuid
-    }
-
-    /// External journal UUID recorded by the filesystem superblock.
-    #[must_use]
-    pub const fn journal_uuid(self) -> [u8; 16] {
-        self.journal_uuid
     }
 
     /// Metadata checksum seed.
     #[must_use]
-    pub const fn checksum_seed(self) -> u32 {
+    pub const fn checksum_seed(self) -> ChecksumSeed {
         self.checksum_seed
     }
 
-    /// Validated feature set.
+    /// Metadata checksum mode.
     #[must_use]
-    pub const fn features(self) -> FeatureSet {
-        self.features
+    pub const fn metadata_checksum(self) -> MetadataChecksum {
+        if self.features.has_metadata_csum() {
+            MetadataChecksum::Crc32c
+        } else {
+            MetadataChecksum::None
+        }
     }
 
-    /// Returns true when the filesystem advertises pending journal recovery.
+    pub(crate) const fn descriptor_layout(self) -> BlockGroupDescriptorLayout {
+        if self.features.has_64bit() {
+            BlockGroupDescriptorLayout::SixtyFourBit
+        } else {
+            BlockGroupDescriptorLayout::Standard32
+        }
+    }
+
+    /// Returns the journal recovery state.
     #[must_use]
-    pub const fn needs_recovery(self) -> bool {
-        self.features.incompat & INCOMPAT_RECOVER != 0
+    pub const fn recovery_state(self) -> RecoveryState {
+        if self.features.incompat & INCOMPAT_RECOVER != 0 {
+            RecoveryState::NeedsRecovery
+        } else {
+            RecoveryState::Clean
+        }
     }
 
     /// Clears the recovery-required incompat bit in the primary superblock.
@@ -473,21 +794,24 @@ impl Superblock {
     /// # Errors
     /// Returns an error when validated geometry cannot be combined without
     /// overflow.
-    pub fn block_group_count(self) -> Result<u32> {
+    pub fn block_group_count(self) -> Result<BlockGroupCount> {
         let data_blocks = self
             .block_count
-            .checked_sub(u64::from(self.first_data_block))
+            .as_u64()
+            .checked_sub(self.first_data_block.get())
             .ok_or(Error::InvalidSuperblock)?;
         let numerator = data_blocks
             .checked_add(
-                u64::from(self.blocks_per_group)
+                u64::from(self.blocks_per_group.as_u32())
                     .checked_sub(1)
                     .ok_or(Error::InvalidSuperblock)?,
             )
             .ok_or(Error::ArithmeticOverflow)?;
         let groups = numerator
-            .checked_div(u64::from(self.blocks_per_group))
+            .checked_div(u64::from(self.blocks_per_group.as_u32()))
             .ok_or(Error::InvalidSuperblock)?;
-        u32::try_from(groups).map_err(|_| Error::ArithmeticOverflow)
+        Ok(BlockGroupCount::from_u32(
+            u32::try_from(groups).map_err(|_| Error::ArithmeticOverflow)?,
+        ))
     }
 }

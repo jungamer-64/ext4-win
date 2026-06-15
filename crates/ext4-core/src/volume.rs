@@ -6,12 +6,15 @@ use crate::block::{BlockAddress, BlockReader, BlockWriter, ByteOffset};
 use crate::dir::DirectoryEntry;
 use crate::endian::put_le_u32;
 use crate::error::{Error, Result};
-use crate::extent::{Extent, ExtentTree, serialize_inode_root};
+use crate::extent::{
+    BlockMapping, Extent, ExtentLength, ExtentTree, LogicalBlock, serialize_inode_root,
+};
 use crate::group::BlockGroupDescriptor;
-use crate::inode::{Ext4Timestamp, Inode, InodeId, InodeKind};
-use crate::journal::Journal;
+use crate::inode::{Ext4Timestamp, FileOffset, FileSize, Inode, InodeId, InodeKind, ReadBytes};
+use crate::journal::{Journal, LoadedJournal};
+use crate::name::Ext4Name;
 use crate::name::WindowsName;
-use crate::superblock::Superblock;
+use crate::superblock::{BlockGroupId, FreeBlockDelta, JournalMode, RecoveryState, Superblock};
 
 const MAX_EAGER_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
 const INODE_SIZE_LO_OFFSET: usize = 4;
@@ -56,6 +59,102 @@ pub struct Volume<D, State> {
     state: State,
 }
 
+/// Typed node loaded from an inode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Node {
+    /// Regular file node.
+    File(FileNode),
+    /// Directory node.
+    Directory(DirectoryNode),
+    /// Symbolic link node.
+    Symlink(SymlinkNode),
+}
+
+impl Node {
+    fn from_inode(inode: Inode) -> Self {
+        match inode.kind() {
+            InodeKind::File => Self::File(FileNode { inode }),
+            InodeKind::Directory => Self::Directory(DirectoryNode { inode }),
+            InodeKind::Symlink => Self::Symlink(SymlinkNode { inode }),
+        }
+    }
+}
+
+/// Typed regular file node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileNode {
+    inode: Inode,
+}
+
+impl FileNode {
+    /// Inode identifier backing this file node.
+    #[must_use]
+    pub const fn id(&self) -> InodeId {
+        self.inode.id()
+    }
+
+    /// File size in bytes.
+    #[must_use]
+    pub const fn size(&self) -> FileSize {
+        self.inode.size()
+    }
+
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+}
+
+/// Typed directory node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryNode {
+    inode: Inode,
+}
+
+impl DirectoryNode {
+    /// Inode identifier backing this directory node.
+    #[must_use]
+    pub const fn id(&self) -> InodeId {
+        self.inode.id()
+    }
+
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+}
+
+/// Typed symbolic link node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymlinkNode {
+    inode: Inode,
+}
+
+impl SymlinkNode {
+    /// Inode identifier backing this symbolic link node.
+    #[must_use]
+    pub const fn id(&self) -> InodeId {
+        self.inode.id()
+    }
+
+    /// Symlink payload size in bytes.
+    #[must_use]
+    pub const fn size(&self) -> FileSize {
+        self.inode.size()
+    }
+
+    fn inode(&self) -> &Inode {
+        &self.inode
+    }
+}
+
+/// Result of a directory lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LookupResult {
+    /// The child name was found.
+    Found(InodeId),
+    /// No child matched the requested name.
+    NotFound,
+}
+
 impl<D: BlockReader> Volume<D, ReadOnly> {
     /// Validates an ext4 volume and constructs read-only mounted state.
     ///
@@ -78,30 +177,29 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
     /// Returns an error when the device is not a supported journaled ext4 volume.
     pub fn mount_read_write(mut device: D) -> Result<Self> {
         let mut superblock = Superblock::read_write_from(&device)?;
-        if !superblock.features().has_journal()
-            || superblock.features().has_external_journal()
-            || superblock.journal_inode() == 0
-        {
+        let JournalMode::Internal(journal_inode_id) = superblock.journal_mode() else {
             return Err(Error::UnsupportedJournal);
-        }
+        };
         let read_only = Volume::<&mut D, ReadOnly> {
             device: &mut device,
             superblock,
             state: ReadOnly,
         };
-        let journal_inode = read_only.read_inode(InodeId::new(superblock.journal_inode()))?;
-        let journal = Journal::from_inode(
+        let journal_inode = read_only.read_inode_record(journal_inode_id)?;
+        let journal = Journal::<LoadedJournal>::from_inode(
             &journal_inode,
             superblock.block_size(),
-            superblock.block_count(),
+            superblock.block_count().as_u64(),
             &read_only.device,
         )?;
-        let mut journal = InternalJournal { journal };
-        let needs_recovery = superblock.needs_recovery();
-        journal
-            .journal
-            .replay_and_checkpoint_internal(&mut device, superblock.block_size(), needs_recovery)?;
-        if needs_recovery {
+        let recovery_state = superblock.recovery_state();
+        let journal = journal.replay_and_checkpoint_internal(
+            &mut device,
+            superblock.block_size(),
+            recovery_state,
+        )?;
+        let journal = InternalJournal { journal };
+        if recovery_state == RecoveryState::NeedsRecovery {
             Superblock::clear_recover_on_device(&mut device)?;
             superblock = Superblock::read_write_from(&device)?;
         }
@@ -122,7 +220,7 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
             bitmap_updates: Vec::new(),
             group_deltas: Vec::new(),
             data_writes: Vec::new(),
-            free_blocks_delta: 0,
+            free_blocks_delta: FreeBlockDelta::ZERO,
         }
     }
 }
@@ -137,30 +235,28 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
         journal_device: J,
     ) -> Result<Self> {
         let mut superblock = Superblock::read_write_from(&device)?;
-        if !superblock.features().has_journal()
-            || !superblock.features().has_external_journal()
-            || superblock.journal_inode() != 0
-        {
+        let JournalMode::External(journal_uuid) = superblock.journal_mode() else {
             return Err(Error::UnsupportedJournal);
-        }
-        let journal = Journal::from_external_device(
+        };
+        let journal = Journal::<LoadedJournal>::from_external_device(
             &journal_device,
             superblock.block_size(),
-            superblock.journal_uuid(),
-            superblock.block_count(),
+            journal_uuid.bytes(),
+            superblock.block_count().as_u64(),
         )?;
-        let mut journal = ExternalJournal {
+        let recovery_state = superblock.recovery_state();
+        let mut journal_device = journal_device;
+        let journal = journal.replay_and_checkpoint_external(
+            &mut device,
+            &mut journal_device,
+            superblock.block_size(),
+            recovery_state,
+        )?;
+        let journal = ExternalJournal {
             device: journal_device,
             journal,
         };
-        let needs_recovery = superblock.needs_recovery();
-        journal.journal.replay_and_checkpoint_external(
-            &mut device,
-            &mut journal.device,
-            superblock.block_size(),
-            needs_recovery,
-        )?;
-        if needs_recovery {
+        if recovery_state == RecoveryState::NeedsRecovery {
             Superblock::clear_recover_on_device(&mut device)?;
             superblock = Superblock::read_write_from(&device)?;
         }
@@ -184,7 +280,7 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
             bitmap_updates: Vec::new(),
             group_deltas: Vec::new(),
             data_writes: Vec::new(),
-            free_blocks_delta: 0,
+            free_blocks_delta: FreeBlockDelta::ZERO,
         }
     }
 }
@@ -196,80 +292,68 @@ impl<D: BlockReader, State> Volume<D, State> {
         self.superblock
     }
 
-    /// Reads and parses one inode.
+    /// Reads and classifies one inode as a typed node.
     ///
     /// # Errors
     /// Returns an error when the inode number is outside the volume or the inode
     /// table cannot be read and parsed.
-    pub fn read_inode(&self, inode_id: InodeId) -> Result<Inode> {
-        self.read_raw_inode(inode_id)?.parse()
+    pub fn read_node(&self, inode_id: InodeId) -> Result<Node> {
+        Ok(Node::from_inode(self.read_inode_record(inode_id)?))
     }
 
-    /// Reads file bytes from a regular file or symlink inode.
+    /// Reads file bytes from a typed regular file node.
     ///
     /// # Errors
-    /// Returns an error when the inode is not file-like or its extent mapping
-    /// cannot be traversed.
-    pub fn read_file(&self, inode_id: InodeId, offset: u64, out: &mut [u8]) -> Result<usize> {
-        let inode = self.read_inode(inode_id)?;
-        if !matches!(inode.kind(), InodeKind::File | InodeKind::Symlink) {
-            return Err(Error::WrongInodeKind);
-        }
-        self.read_inode_data(&inode, offset, out)
+    /// Returns an error when the file extent mapping cannot be traversed.
+    pub fn read_file(
+        &self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes> {
+        self.read_inode_data(file.inode(), offset, out)
     }
 
-    /// Reads a symlink target as bytes.
+    /// Reads a typed symlink target as bytes.
     ///
     /// # Errors
-    /// Returns an error when the inode is not a symlink or its target cannot be read.
-    pub fn read_symlink(&self, inode_id: InodeId) -> Result<Vec<u8>> {
-        let inode = self.read_inode(inode_id)?;
-        if inode.kind() != InodeKind::Symlink {
-            return Err(Error::WrongInodeKind);
-        }
-        let len = usize::try_from(inode.size()).map_err(|_| Error::ArithmeticOverflow)?;
-        if len <= inode.block().len() && !inode.has_extents() {
-            return Ok(inode
-                .block()
-                .get(..len)
-                .ok_or(Error::TruncatedStructure)?
-                .to_vec());
+    /// Returns an error when the symlink target cannot be read.
+    pub fn read_symlink(&self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
+        let len = symlink.size().to_usize()?;
+        if let Ok(inline) = symlink.inode().inline_bytes() {
+            return Ok(inline.prefix(symlink.size())?.to_vec());
         }
         let mut target = vec![0_u8; len];
-        let _bytes_read = self.read_inode_data(&inode, 0, &mut target)?;
+        let _bytes_read = self.read_inode_data(symlink.inode(), FileOffset::ZERO, &mut target)?;
         Ok(target)
     }
 
-    /// Enumerates directory entries from a directory inode.
+    /// Enumerates directory entries from a typed directory node.
     ///
     /// # Errors
-    /// Returns an error when the inode is not a directory, is too large for eager
+    /// Returns an error when the directory is too large for eager
     /// enumeration, or contains malformed entries.
-    pub fn read_directory(&self, inode_id: InodeId) -> Result<Vec<DirectoryEntry>> {
-        let inode = self.read_inode(inode_id)?;
-        if inode.kind() != InodeKind::Directory {
-            return Err(Error::WrongInodeKind);
-        }
-        if inode.size() > MAX_EAGER_DIRECTORY_BYTES {
+    pub fn read_directory(&self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
+        if directory.inode().size().bytes() > MAX_EAGER_DIRECTORY_BYTES {
             return Err(Error::DirectoryTooLarge);
         }
-        let len = usize::try_from(inode.size()).map_err(|_| Error::ArithmeticOverflow)?;
+        let len = directory.inode().size().to_usize()?;
         let mut bytes = vec![0_u8; len];
-        let _bytes_read = self.read_inode_data(&inode, 0, &mut bytes)?;
+        let _bytes_read = self.read_inode_data(directory.inode(), FileOffset::ZERO, &mut bytes)?;
         DirectoryEntry::parse_all(&bytes)
     }
 
     /// Looks up an exact ext4 child name under a directory.
     ///
     /// # Errors
-    /// Returns an error when the parent cannot be enumerated as a directory.
-    pub fn lookup_child(&self, parent: InodeId, name: &[u8]) -> Result<Option<InodeId>> {
+    /// Returns an error when the parent cannot be enumerated.
+    pub fn lookup_child(&self, parent: &DirectoryNode, name: &Ext4Name) -> Result<LookupResult> {
         for entry in self.read_directory(parent)? {
-            if entry.name().bytes() == name {
-                return Ok(Some(entry.inode()));
+            if entry.name() == name {
+                return Ok(LookupResult::Found(entry.inode()));
             }
         }
-        Ok(None)
+        Ok(LookupResult::NotFound)
     }
 
     /// Looks up a Windows-visible child name, accepting case-insensitive matches only when unique.
@@ -279,53 +363,54 @@ impl<D: BlockReader, State> Volume<D, State> {
     /// case-insensitive Windows projection is ambiguous.
     pub fn lookup_windows_child(
         &self,
-        parent: InodeId,
-        requested_utf16: &[u16],
-    ) -> Result<Option<InodeId>> {
-        let mut exact = None;
-        let mut folded = None;
+        parent: &DirectoryNode,
+        requested: &WindowsName,
+    ) -> Result<LookupResult> {
+        let mut folded = LookupResult::NotFound;
 
         for entry in self.read_directory(parent)? {
             let Ok(name) = WindowsName::from_ext4(entry.name()) else {
                 continue;
             };
-            if name.equals_utf16(requested_utf16) {
-                exact = Some(entry.inode());
-                break;
+            if name.equals(requested) {
+                return Ok(LookupResult::Found(entry.inode()));
             }
-            if name.equals_ascii_case_insensitive(requested_utf16) {
-                if folded.is_some() {
+            if name.equals_ascii_case_insensitive(requested) {
+                if matches!(folded, LookupResult::Found(_)) {
                     return Err(Error::AmbiguousWindowsName);
                 }
-                folded = Some(entry.inode());
+                folded = LookupResult::Found(entry.inode());
             }
         }
 
-        Ok(exact.or(folded))
+        Ok(folded)
     }
 
-    fn read_inode_data(&self, inode: &Inode, offset: u64, out: &mut [u8]) -> Result<usize> {
-        if out.is_empty() || offset >= inode.size() {
-            return Ok(0);
-        }
-        if !inode.has_extents() {
-            return Err(Error::UnsupportedBlockMap);
+    fn read_inode_data(
+        &self,
+        inode: &Inode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes> {
+        if out.is_empty() || offset.bytes() >= inode.size().bytes() {
+            return Ok(ReadBytes::from_usize(0));
         }
 
         let readable = core::cmp::min(
             u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?,
-            inode
-                .size()
-                .checked_sub(offset)
-                .ok_or(Error::ArithmeticOverflow)?,
+            inode.size().remaining_from(offset)?,
         );
         let block_size = u64::from(self.superblock.block_size().bytes());
-        let extent_tree =
-            ExtentTree::load_inode_tree(inode.block(), self.superblock.block_size(), &self.device)?;
+        let extent_tree = ExtentTree::load_inode_tree(
+            inode.extent_root()?,
+            self.superblock.block_size(),
+            &self.device,
+        )?;
         let mut completed = 0_usize;
 
         while u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)? < readable {
             let position = offset
+                .bytes()
                 .checked_add(u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)?)
                 .ok_or(Error::ArithmeticOverflow)?;
             let logical_block = position
@@ -346,43 +431,53 @@ impl<D: BlockReader, State> Volume<D, State> {
                 .checked_add(chunk)
                 .ok_or(Error::ArithmeticOverflow)?;
 
-            if let Some(physical_block) = extent_tree.map_logical(logical_block) {
-                let device_offset = self
-                    .superblock
-                    .block_size()
-                    .offset_of(physical_block)?
-                    .get()
-                    .checked_add(in_block)
-                    .ok_or(Error::ArithmeticOverflow)?;
-                self.device.read_exact_at(
-                    ByteOffset::new(device_offset),
-                    out.get_mut(completed..end).ok_or(Error::DeviceRange)?,
-                )?;
-            } else {
-                out.get_mut(completed..end)
-                    .ok_or(Error::DeviceRange)?
-                    .fill(0);
+            match extent_tree.map_logical(LogicalBlock::try_from(logical_block)?) {
+                BlockMapping::Physical(physical_block) => {
+                    let device_offset = self
+                        .superblock
+                        .block_size()
+                        .offset_of(physical_block)?
+                        .get()
+                        .checked_add(in_block)
+                        .ok_or(Error::ArithmeticOverflow)?;
+                    self.device.read_exact_at(
+                        ByteOffset::new(device_offset),
+                        out.get_mut(completed..end).ok_or(Error::DeviceRange)?,
+                    )?;
+                }
+                BlockMapping::Hole => {
+                    out.get_mut(completed..end)
+                        .ok_or(Error::DeviceRange)?
+                        .fill(0);
+                }
             }
             completed = end;
         }
 
-        Ok(completed)
+        Ok(ReadBytes::from_usize(completed))
     }
 
     fn read_raw_inode(&self, inode_id: InodeId) -> Result<RawInode> {
-        if inode_id.get() == 0 || inode_id.get() > self.superblock.inode_count() {
+        if inode_id.as_u32() > self.superblock.inode_count().as_u32() {
             return Err(Error::InvalidInode);
         }
 
-        let zero_based = inode_id.get().checked_sub(1).ok_or(Error::InvalidInode)?;
+        let zero_based = inode_id
+            .as_u32()
+            .checked_sub(1)
+            .ok_or(Error::InvalidInode)?;
         let group = zero_based
-            .checked_div(self.superblock.inodes_per_group())
+            .checked_div(self.superblock.inodes_per_group().as_u32())
             .ok_or(Error::InvalidSuperblock)?;
         let index = zero_based
-            .checked_rem(self.superblock.inodes_per_group())
+            .checked_rem(self.superblock.inodes_per_group().as_u32())
             .ok_or(Error::InvalidSuperblock)?;
-        let descriptor = BlockGroupDescriptor::read_from(&self.device, &self.superblock, group)?;
-        let inode_size = u64::from(self.superblock.inode_size());
+        let descriptor = BlockGroupDescriptor::read_from(
+            &self.device,
+            &self.superblock,
+            BlockGroupId::from_u32(group),
+        )?;
+        let inode_size = u64::from(self.superblock.inode_size().as_u16());
         let inode_offset = self
             .superblock
             .block_size()
@@ -395,7 +490,7 @@ impl<D: BlockReader, State> Volume<D, State> {
             )
             .ok_or(Error::ArithmeticOverflow)?;
 
-        let mut bytes = vec![0_u8; usize::from(self.superblock.inode_size())];
+        let mut bytes = vec![0_u8; usize::from(self.superblock.inode_size().as_u16())];
         self.device
             .read_exact_at(ByteOffset::new(inode_offset), &mut bytes)?;
         Ok(RawInode {
@@ -403,6 +498,24 @@ impl<D: BlockReader, State> Volume<D, State> {
             offset: ByteOffset::new(inode_offset),
             bytes,
         })
+    }
+
+    fn read_inode_record(&self, inode_id: InodeId) -> Result<Inode> {
+        self.read_raw_inode(inode_id)?.parse()
+    }
+}
+
+/// Regular file selected for mutation inside a write transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionFile {
+    inode_id: InodeId,
+}
+
+impl TransactionFile {
+    /// Inode identifier backing this transaction file.
+    #[must_use]
+    pub const fn inode_id(self) -> InodeId {
+        self.inode_id
     }
 }
 
@@ -415,10 +528,22 @@ pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
     bitmap_updates: Vec<BlockImage>,
     group_deltas: Vec<GroupDelta>,
     data_writes: Vec<RangeWrite>,
-    free_blocks_delta: i64,
+    free_blocks_delta: FreeBlockDelta,
 }
 
 impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
+    /// Selects a regular file for mutation.
+    ///
+    /// # Errors
+    /// Returns an error when the inode is not a regular file or cannot be read.
+    pub fn file(&self, inode_id: InodeId) -> Result<TransactionFile> {
+        let inode = self.volume.read_inode_record(inode_id)?;
+        if inode.kind() != InodeKind::File {
+            return Err(Error::WrongInodeKind);
+        }
+        Ok(TransactionFile { inode_id })
+    }
+
     /// Overwrites bytes inside an existing regular file range.
     ///
     /// # Errors
@@ -427,14 +552,14 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     /// in the inode.
     pub fn overwrite_file_range(
         &mut self,
-        inode_id: InodeId,
-        offset: u64,
+        file: TransactionFile,
+        offset: FileOffset,
         bytes: &[u8],
     ) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
-        let inode_index = self.ensure_inode_update(inode_id)?;
+        let inode_index = self.ensure_inode_update(file.inode_id())?;
         let mut raw_inode = self
             .inode_updates
             .get(inode_index)
@@ -444,25 +569,21 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
-        let end_offset = offset
-            .checked_add(u64::try_from(bytes.len()).map_err(|_| Error::ArithmeticOverflow)?)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if end_offset > inode.size() {
+        let end_offset = offset.checked_add_len(bytes.len())?;
+        if end_offset.bytes() > inode.size().bytes() {
             return Err(Error::InvalidWriteRange);
-        }
-        if !inode.has_extents() {
-            return Err(Error::UnsupportedBlockMap);
         }
 
         let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
         let block_size = usize::try_from(block_size_u64).map_err(|_| Error::ArithmeticOverflow)?;
-        let mut extents = ExtentTree::parse_inode_root(inode.block())?
+        let mut extents = ExtentTree::parse_inode_root(inode.extent_root()?)?
             .extents()
             .to_vec();
         let mut completed = 0_usize;
 
         while completed < bytes.len() {
             let position = offset
+                .bytes()
                 .checked_add(u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)?)
                 .ok_or(Error::ArithmeticOverflow)?;
             let logical_block = position
@@ -487,7 +608,8 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 .checked_add(chunk)
                 .ok_or(Error::ArithmeticOverflow)?;
 
-            if let Some(physical) = map_extents(&extents, logical_block) {
+            let logical_block = LogicalBlock::try_from(logical_block)?;
+            if let BlockMapping::Physical(physical) = map_extents(&extents, logical_block) {
                 let write_offset = self
                     .volume
                     .superblock
@@ -507,7 +629,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 let physical = self.allocate_block()?;
                 insert_or_extend_extent(
                     &mut extents,
-                    u32::try_from(logical_block).map_err(|_| Error::ArithmeticOverflow)?,
+                    logical_block,
                     physical,
                 )?;
                 let mut block = vec![0_u8; block_size];
@@ -539,19 +661,15 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     /// Extends a regular file as a sparse range.
     ///
     /// # Errors
-    /// Returns an error when the inode is not a regular file or `new_size`
-    /// would shrink the file.
-    pub fn extend_file(&mut self, inode_id: InodeId, new_size: u64) -> Result<()> {
-        let inode_index = self.ensure_inode_update(inode_id)?;
+    /// Returns an error when `new_size` would shrink the file.
+    pub fn extend_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
+        let inode_index = self.ensure_inode_update(file.inode_id())?;
         let mut raw_inode = self
             .inode_updates
             .get(inode_index)
             .ok_or(Error::InvalidInode)?
             .clone();
         let inode = raw_inode.parse()?;
-        if inode.kind() != InodeKind::File {
-            return Err(Error::WrongInodeKind);
-        }
         if new_size < inode.size() {
             return Err(Error::InvalidWriteRange);
         }
@@ -567,33 +685,27 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     /// Truncates a regular file and releases whole blocks beyond the new EOF.
     ///
     /// # Errors
-    /// Returns an error when the inode is not a regular file, `new_size`
-    /// would extend the file, or root extent updates cannot fit in the inode.
-    pub fn truncate_file(&mut self, inode_id: InodeId, new_size: u64) -> Result<()> {
-        let inode_index = self.ensure_inode_update(inode_id)?;
+    /// Returns an error when `new_size` would extend the file or root extent
+    /// updates cannot fit in the inode.
+    pub fn truncate_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
+        let inode_index = self.ensure_inode_update(file.inode_id())?;
         let mut raw_inode = self
             .inode_updates
             .get(inode_index)
             .ok_or(Error::InvalidInode)?
             .clone();
         let inode = raw_inode.parse()?;
-        if inode.kind() != InodeKind::File {
-            return Err(Error::WrongInodeKind);
-        }
         if new_size > inode.size() {
             return Err(Error::InvalidWriteRange);
         }
-        if !inode.has_extents() {
-            return Err(Error::UnsupportedBlockMap);
-        }
         let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
-        let extents = ExtentTree::parse_inode_root(inode.block())?
+        let extents = ExtentTree::parse_inode_root(inode.extent_root()?)?
             .extents()
             .to_vec();
-        let keep_blocks = round_up_div(new_size, block_size_u64)?;
+        let keep_blocks = round_up_div(new_size.bytes(), block_size_u64)?;
         let mut updated = Vec::new();
         for extent in extents {
-            let start = u64::from(extent.logical_start());
+            let start = extent.logical_start().as_u64();
             let end = u64::from(extent.end_logical()?);
             if start >= keep_blocks {
                 self.free_extent(extent, 0)?;
@@ -607,7 +719,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 self.free_extent(extent, keep_len)?;
                 updated.push(Extent::new(
                     extent.logical_start(),
-                    keep_len,
+                    ExtentLength::new(keep_len)?,
                     extent.physical_start(),
                 ));
             } else {
@@ -615,6 +727,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             }
         }
         if new_size
+            .bytes()
             .checked_rem(block_size_u64)
             .ok_or(Error::InvalidSuperblock)?
             != 0
@@ -653,7 +766,8 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
 
     fn allocate_block(&mut self) -> Result<BlockAddress> {
         let groups = self.volume.superblock.block_group_count()?;
-        for group in 0..groups {
+        for group in 0..groups.as_u32() {
+            let group = BlockGroupId::from_u32(group);
             let descriptor = BlockGroupDescriptor::read_from(
                 &self.volume.device,
                 &self.volume.superblock,
@@ -663,10 +777,14 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 continue;
             }
             let bitmap_index = self.ensure_bitmap_update(descriptor.block_bitmap())?;
-            let group_start = u64::from(self.volume.superblock.first_data_block())
+            let group_start = self
+                .volume
+                .superblock
+                .first_data_block()
+                .get()
                 .checked_add(
-                    u64::from(group)
-                        .checked_mul(u64::from(self.volume.superblock.blocks_per_group()))
+                    u64::from(group.as_u32())
+                        .checked_mul(u64::from(self.volume.superblock.blocks_per_group().as_u32()))
                         .ok_or(Error::ArithmeticOverflow)?,
                 )
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -675,7 +793,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 let absolute_block = group_start
                     .checked_add(u64::from(bit))
                     .ok_or(Error::ArithmeticOverflow)?;
-                if absolute_block >= self.volume.superblock.block_count() {
+                if absolute_block >= self.volume.superblock.block_count().as_u64() {
                     break;
                 }
                 let bitmap = self
@@ -684,11 +802,8 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                     .ok_or(Error::InvalidSuperblock)?;
                 if !bitmap_bit(bitmap.bytes.as_slice(), bit)? {
                     set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, true)?;
-                    self.record_group_delta(group, -1)?;
-                    self.free_blocks_delta = self
-                        .free_blocks_delta
-                        .checked_sub(1)
-                        .ok_or(Error::ArithmeticOverflow)?;
+                    self.record_group_delta(group, FreeBlockDelta::from_i64(-1))?;
+                    self.free_blocks_delta = self.free_blocks_delta.checked_add(-1)?;
                     return Ok(BlockAddress::new(absolute_block));
                 }
             }
@@ -698,7 +813,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
 
     fn free_extent(&mut self, extent: Extent, keep_len: u16) -> Result<()> {
         let start = u64::from(keep_len);
-        let len = u64::from(extent.len());
+        let len = extent.len().as_u64();
         let physical_start = extent
             .physical_start()
             .get()
@@ -733,11 +848,8 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         let bit = block_bit_in_group(&self.volume.superblock, block, group)?;
         if bitmap_bit(bitmap.bytes.as_slice(), bit)? {
             set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, false)?;
-            self.record_group_delta(group, 1)?;
-            self.free_blocks_delta = self
-                .free_blocks_delta
-                .checked_add(1)
-                .ok_or(Error::ArithmeticOverflow)?;
+            self.record_group_delta(group, FreeBlockDelta::from_i64(1))?;
+            self.free_blocks_delta = self.free_blocks_delta.checked_add(1)?;
         }
         Ok(())
     }
@@ -745,16 +857,20 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     fn zero_truncated_tail(
         &mut self,
         extents: &[Extent],
-        new_size: u64,
+        new_size: FileSize,
         block_size: u64,
     ) -> Result<()> {
         let logical_block = new_size
+            .bytes()
             .checked_div(block_size)
             .ok_or(Error::InvalidSuperblock)?;
         let in_block = new_size
+            .bytes()
             .checked_rem(block_size)
             .ok_or(Error::InvalidSuperblock)?;
-        let Some(physical) = map_extents(extents, logical_block) else {
+        let BlockMapping::Physical(physical) =
+            map_extents(extents, LogicalBlock::try_from(logical_block)?)
+        else {
             return Ok(());
         };
         let zero_len = block_size
@@ -805,11 +921,15 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::ArithmeticOverflow)
     }
 
-    fn blocks_in_group(&self, group: u32) -> Result<u32> {
-        let group_start = u64::from(self.volume.superblock.first_data_block())
+    fn blocks_in_group(&self, group: BlockGroupId) -> Result<u32> {
+        let group_start = self
+            .volume
+            .superblock
+            .first_data_block()
+            .get()
             .checked_add(
-                u64::from(group)
-                    .checked_mul(u64::from(self.volume.superblock.blocks_per_group()))
+                u64::from(group.as_u32())
+                    .checked_mul(u64::from(self.volume.superblock.blocks_per_group().as_u32()))
                     .ok_or(Error::ArithmeticOverflow)?,
             )
             .ok_or(Error::ArithmeticOverflow)?;
@@ -817,24 +937,22 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .volume
             .superblock
             .block_count()
+            .as_u64()
             .checked_sub(group_start)
             .ok_or(Error::InvalidSuperblock)?;
         Ok(core::cmp::min(
-            self.volume.superblock.blocks_per_group(),
+            self.volume.superblock.blocks_per_group().as_u32(),
             u32::try_from(remaining).unwrap_or(u32::MAX),
         ))
     }
 
-    fn record_group_delta(&mut self, group: u32, delta: i32) -> Result<()> {
+    fn record_group_delta(&mut self, group: BlockGroupId, delta: FreeBlockDelta) -> Result<()> {
         if let Some(existing) = self
             .group_deltas
             .iter_mut()
             .find(|entry| entry.group == group)
         {
-            existing.delta = existing
-                .delta
-                .checked_add(delta)
-                .ok_or(Error::ArithmeticOverflow)?;
+            existing.delta = existing.delta.checked_add(delta.as_i64())?;
             return Ok(());
         }
         self.group_deltas.push(GroupDelta { group, delta });
@@ -861,14 +979,14 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             )?;
             descriptor.apply_free_blocks_delta(
                 delta.delta,
-                self.volume.superblock.features().has_64bit(),
+                self.volume.superblock.descriptor_layout(),
             )?;
             writes.push(RangeWrite {
                 offset: descriptor.offset(),
                 bytes: descriptor.bytes().to_vec(),
             });
         }
-        if self.free_blocks_delta != 0 {
+        if !self.free_blocks_delta.is_zero() {
             writes.push(RangeWrite {
                 offset: ByteOffset::new(SUPERBLOCK_OFFSET),
                 bytes: self.updated_superblock_bytes()?,
@@ -955,15 +1073,16 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         self.volume
             .device
             .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut bytes)?;
-        let current = self.volume.superblock.free_blocks_count();
-        let updated = if self.free_blocks_delta.is_negative() {
+        let current = self.volume.superblock.free_blocks_count().as_u64();
+        let raw_delta = self.free_blocks_delta.as_i64();
+        let updated = if raw_delta.is_negative() {
             current
-                .checked_sub(self.free_blocks_delta.unsigned_abs())
+                .checked_sub(raw_delta.unsigned_abs())
                 .ok_or(Error::InvalidSuperblock)?
         } else {
             current
                 .checked_add(
-                    u64::try_from(self.free_blocks_delta).map_err(|_| Error::ArithmeticOverflow)?,
+                    u64::try_from(raw_delta).map_err(|_| Error::ArithmeticOverflow)?,
                 )
                 .ok_or(Error::ArithmeticOverflow)?
         };
@@ -972,7 +1091,12 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             SUPERBLOCK_FREE_BLOCKS_LO_OFFSET,
             u32::try_from(updated & u64::from(u32::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        if self.volume.superblock.features().has_64bit() {
+        if self
+            .volume
+            .superblock
+            .descriptor_layout()
+            .has_high_fields()
+        {
             put_le_u32(
                 &mut bytes,
                 SUPERBLOCK_FREE_BLOCKS_HI_OFFSET,
@@ -1048,7 +1172,8 @@ impl RawInode {
         Inode::parse(self.id, &self.bytes)
     }
 
-    fn set_size(&mut self, size: u64) -> Result<()> {
+    fn set_size(&mut self, size: FileSize) -> Result<()> {
+        let size = size.bytes();
         put_le_u32(
             &mut self.bytes,
             INODE_SIZE_LO_OFFSET,
@@ -1108,8 +1233,8 @@ struct BlockImage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GroupDelta {
-    group: u32,
-    delta: i32,
+    group: BlockGroupId,
+    delta: FreeBlockDelta,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1134,40 +1259,44 @@ impl MetadataBlock {
     }
 }
 
-fn map_extents(extents: &[Extent], logical_block: u64) -> Option<BlockAddress> {
+fn map_extents(extents: &[Extent], logical_block: LogicalBlock) -> BlockMapping {
     for extent in extents {
-        if let Some(block) = extent.map_logical(logical_block) {
-            return Some(block);
+        if let BlockMapping::Physical(block) = extent.map_logical(logical_block) {
+            return BlockMapping::Physical(block);
         }
     }
-    None
+    BlockMapping::Hole
 }
 
 fn insert_or_extend_extent(
     extents: &mut Vec<Extent>,
-    logical_block: u32,
+    logical_block: LogicalBlock,
     physical_block: BlockAddress,
 ) -> Result<()> {
     if let Some(last) = extents.last_mut()
-        && last.end_logical()? == logical_block
+        && last.end_logical()? == logical_block.as_u32()
         && last
             .physical_start()
             .get()
-            .checked_add(u64::from(last.len()))
+            .checked_add(last.len().as_u64())
             .ok_or(Error::ArithmeticOverflow)?
             == physical_block.get()
     {
-        let len = last.len().checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        let len = last.len().checked_add_one()?;
         *last = Extent::new(last.logical_start(), len, last.physical_start());
         return Ok(());
     }
-    extents.push(Extent::new(logical_block, 1, physical_block));
+    extents.push(Extent::new(
+        logical_block,
+        ExtentLength::new(1)?,
+        physical_block,
+    ));
     extents.sort_by_key(|extent| extent.logical_start());
     Ok(())
 }
 
 fn extents_allocated_blocks(extents: &[Extent]) -> u64 {
-    extents.iter().map(|extent| u64::from(extent.len())).sum()
+    extents.iter().map(|extent| extent.len().as_u64()).sum()
 }
 
 fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
@@ -1203,24 +1332,30 @@ fn set_bitmap_bit(bytes: &mut [u8], bit: u32, value: bool) -> Result<()> {
     Ok(())
 }
 
-fn block_group_of(superblock: &Superblock, block: BlockAddress) -> Result<u32> {
+fn block_group_of(superblock: &Superblock, block: BlockAddress) -> Result<BlockGroupId> {
     let relative = block
         .get()
-        .checked_sub(u64::from(superblock.first_data_block()))
+        .checked_sub(superblock.first_data_block().get())
         .ok_or(Error::InvalidSuperblock)?;
-    u32::try_from(
-        relative
-            .checked_div(u64::from(superblock.blocks_per_group()))
-            .ok_or(Error::InvalidSuperblock)?,
-    )
-    .map_err(|_| Error::ArithmeticOverflow)
+    let group = relative
+        .checked_div(u64::from(superblock.blocks_per_group().as_u32()))
+        .ok_or(Error::InvalidSuperblock)?;
+    Ok(BlockGroupId::from_u32(
+        u32::try_from(group).map_err(|_| Error::ArithmeticOverflow)?,
+    ))
 }
 
-fn block_bit_in_group(superblock: &Superblock, block: BlockAddress, group: u32) -> Result<u32> {
-    let group_start = u64::from(superblock.first_data_block())
+fn block_bit_in_group(
+    superblock: &Superblock,
+    block: BlockAddress,
+    group: BlockGroupId,
+) -> Result<u32> {
+    let group_start = superblock
+        .first_data_block()
+        .get()
         .checked_add(
-            u64::from(group)
-                .checked_mul(u64::from(superblock.blocks_per_group()))
+            u64::from(group.as_u32())
+                .checked_mul(u64::from(superblock.blocks_per_group().as_u32()))
                 .ok_or(Error::ArithmeticOverflow)?,
         )
         .ok_or(Error::ArithmeticOverflow)?;

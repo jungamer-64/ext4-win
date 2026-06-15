@@ -104,7 +104,7 @@ impl DirectoryEntry {
                     .checked_add(name_len)
                     .ok_or(Error::ArithmeticOverflow)?;
                 entries.push(Self {
-                    inode: InodeId::new(inode),
+                    inode: InodeId::try_from(inode)?,
                     name: Ext4Name::new(
                         bytes
                             .get(name_start..name_end)
