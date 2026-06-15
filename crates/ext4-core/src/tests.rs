@@ -14,12 +14,14 @@
 use alloc::{vec, vec::Vec};
 
 use crate::{
-    BlockGroupId, BlockMapping, BlockReader, BlockWriter, ByteOffset, DeviceLength, DirectoryEntry,
-    DirectoryEntryKind, DirectoryNode, Error, Ext4Gid, Ext4Name, Ext4Owner, Ext4Permissions,
-    Ext4Security, Ext4Timestamp, Ext4Uid, ExtentTree, ExternalJournal, FileNode, FileOffset,
-    FileSize, InodeId, JournalMode, LogicalBlock, LookupResult, NewDirectoryMetadata,
-    NewFileMetadata, Node, ReadOnly, ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock,
-    SymlinkNode, TransactionDirectory, TransactionFile, Volume, WindowsName,
+    BlockAddress, BlockGroupId, BlockMapping, BlockReader, BlockSize, BlockWriter, ByteOffset,
+    DeviceLength, DirectoryEntry, DirectoryEntryKind, DirectoryNode, Error, Ext4Gid, Ext4Name,
+    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Timestamp, Ext4Uid, Extent, ExtentLength,
+    ExtentTree, ExtentTreeContext, ExternalJournal, FileNode, FileOffset, FileSize,
+    InodeExtentRoot, InodeId, JournalMode, LogicalBlock, LookupResult, MutableExtentTree,
+    NewDirectoryMetadata, NewFileMetadata, Node, ReadOnly, ReadWrite, SliceBlockDevice,
+    SliceBlockDeviceMut, Superblock, SymlinkNode, TransactionDirectory, TransactionFile, Volume,
+    WindowsName,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -678,6 +680,81 @@ fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
         1
     );
     assert_eq!(output, [b'x']);
+}
+
+#[test]
+fn mutable_extent_tree_serializes_depth_two_indexes() {
+    let block_size = must(BlockSize::from_superblock_log(0));
+    let mut extents = Vec::new();
+    for index in 0..337_u32 {
+        extents.push(Extent::initialized(
+            LogicalBlock::from_u32(index.checked_mul(2).unwrap_or(u32::MAX)),
+            must(ExtentLength::new(1)),
+            BlockAddress::new(1_000 + u64::from(index)),
+        ));
+    }
+    let mut tree = must(MutableExtentTree::from_extents(extents));
+    let metadata_blocks = (1..=6).map(BlockAddress::new).collect::<Vec<_>>();
+    tree.set_metadata_blocks(metadata_blocks);
+    let serialized = must(tree.serialize(block_size, ExtentTreeContext::none()));
+
+    let mut image = vec![0_u8; BLOCK_SIZE * 8];
+    for block in serialized.external_blocks() {
+        let offset = block_offset(u32::try_from(block.block().get()).unwrap_or(u32::MAX));
+        image[offset..offset + BLOCK_SIZE].copy_from_slice(block.bytes());
+    }
+    let loaded = must(MutableExtentTree::load_inode_tree(
+        &InodeExtentRoot::from_bytes(*serialized.inode_root()),
+        block_size,
+        &SliceBlockDevice::new(&image),
+        ExtentTreeContext::none(),
+    ));
+
+    assert_eq!(loaded.extents().len(), 337);
+    assert_eq!(
+        loaded.map_logical(LogicalBlock::from_u32(672)),
+        BlockMapping::Physical(BlockAddress::new(1_336))
+    );
+}
+
+#[test]
+fn external_extent_block_checksum_mismatch_is_rejected() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        extend_file(
+            &mut transaction,
+            3,
+            u64::try_from(BLOCK_SIZE * 10).unwrap_or(u64::MAX),
+        );
+        for logical in [0_u64, 2, 4, 6, 8] {
+            overwrite_file(
+                &mut transaction,
+                3,
+                logical
+                    .checked_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX))
+                    .unwrap_or(u64::MAX),
+                b"x",
+            );
+        }
+        must(transaction.commit());
+    }
+
+    let extent_block = get_u32(&image, modern_inode_offset(3) + 56);
+    let checksum_offset = block_offset(extent_block) + BLOCK_SIZE - 4;
+    image[checksum_offset] ^= 0x80;
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+    let file = file_node(&volume, 3);
+    let mut output = [0_u8; 1];
+    let result = volume.read_file(&file, FileOffset::ZERO, &mut output);
+
+    assert_eq!(result, Err(Error::ChecksumMismatch));
 }
 
 #[test]
