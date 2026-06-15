@@ -10,21 +10,37 @@ use crate::superblock::{
 };
 
 const BG_BLOCK_BITMAP_LO_OFFSET: usize = 0;
+const BG_INODE_BITMAP_LO_OFFSET: usize = 4;
 const BG_INODE_TABLE_LO_OFFSET: usize = 8;
 const BG_FREE_BLOCKS_LO_OFFSET: usize = 12;
+const BG_FREE_INODES_LO_OFFSET: usize = 14;
+const BG_USED_DIRS_LO_OFFSET: usize = 16;
+const BG_BLOCK_BITMAP_CSUM_LO_OFFSET: usize = 24;
+const BG_INODE_BITMAP_CSUM_LO_OFFSET: usize = 26;
+const BG_ITABLE_UNUSED_LO_OFFSET: usize = 28;
 const BG_CHECKSUM_OFFSET: usize = 30;
 const BG_CHECKSUM_SIZE: usize = 2;
 const BG_BLOCK_BITMAP_HI_OFFSET: usize = 32;
+const BG_INODE_BITMAP_HI_OFFSET: usize = 36;
 const BG_INODE_TABLE_HI_OFFSET: usize = 40;
 const BG_FREE_BLOCKS_HI_OFFSET: usize = 44;
+const BG_FREE_INODES_HI_OFFSET: usize = 46;
+const BG_USED_DIRS_HI_OFFSET: usize = 48;
+const BG_ITABLE_UNUSED_HI_OFFSET: usize = 50;
+const BG_BLOCK_BITMAP_CSUM_HI_OFFSET: usize = 56;
+const BG_INODE_BITMAP_CSUM_HI_OFFSET: usize = 58;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BlockGroupDescriptor {
     offset: ByteOffset,
     bytes: Vec<u8>,
     block_bitmap: BlockAddress,
+    inode_bitmap: BlockAddress,
     inode_table: BlockAddress,
     free_blocks_count: u32,
+    free_inodes_count: u32,
+    used_dirs_count: u32,
+    itable_unused_count: u32,
 }
 
 impl BlockGroupDescriptor {
@@ -47,6 +63,12 @@ impl BlockGroupDescriptor {
             BG_BLOCK_BITMAP_HI_OFFSET,
             superblock.descriptor_layout(),
         )?;
+        let inode_bitmap = descriptor_block_address(
+            &bytes,
+            BG_INODE_BITMAP_LO_OFFSET,
+            BG_INODE_BITMAP_HI_OFFSET,
+            superblock.descriptor_layout(),
+        )?;
         let inode_table = descriptor_block_address(
             &bytes,
             BG_INODE_TABLE_LO_OFFSET,
@@ -59,12 +81,34 @@ impl BlockGroupDescriptor {
             BG_FREE_BLOCKS_HI_OFFSET,
             superblock.descriptor_layout(),
         )?;
+        let free_inodes_count = descriptor_count(
+            &bytes,
+            BG_FREE_INODES_LO_OFFSET,
+            BG_FREE_INODES_HI_OFFSET,
+            superblock.descriptor_layout(),
+        )?;
+        let used_dirs_count = descriptor_count(
+            &bytes,
+            BG_USED_DIRS_LO_OFFSET,
+            BG_USED_DIRS_HI_OFFSET,
+            superblock.descriptor_layout(),
+        )?;
+        let itable_unused_count = descriptor_count(
+            &bytes,
+            BG_ITABLE_UNUSED_LO_OFFSET,
+            BG_ITABLE_UNUSED_HI_OFFSET,
+            superblock.descriptor_layout(),
+        )?;
         Ok(Self {
             offset,
             bytes,
             block_bitmap,
+            inode_bitmap,
             inode_table,
             free_blocks_count,
+            free_inodes_count,
+            used_dirs_count,
+            itable_unused_count,
         })
     }
 
@@ -80,12 +124,20 @@ impl BlockGroupDescriptor {
         self.block_bitmap
     }
 
+    pub(crate) const fn inode_bitmap(&self) -> BlockAddress {
+        self.inode_bitmap
+    }
+
     pub(crate) const fn inode_table(&self) -> BlockAddress {
         self.inode_table
     }
 
     pub(crate) const fn free_blocks_count(&self) -> u32 {
         self.free_blocks_count
+    }
+
+    pub(crate) const fn free_inodes_count(&self) -> u32 {
+        self.free_inodes_count
     }
 
     pub(crate) fn apply_free_blocks_delta(
@@ -119,6 +171,97 @@ impl BlockGroupDescriptor {
         self.free_blocks_count = updated;
         write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)?;
         Ok(())
+    }
+
+    pub(crate) fn apply_free_inodes_delta(
+        &mut self,
+        delta: i64,
+        superblock: &Superblock,
+        group: BlockGroupId,
+    ) -> Result<()> {
+        self.free_inodes_count = apply_u32_delta(self.free_inodes_count, delta)?;
+        write_descriptor_count(
+            &mut self.bytes,
+            BG_FREE_INODES_LO_OFFSET,
+            BG_FREE_INODES_HI_OFFSET,
+            self.free_inodes_count,
+            superblock.descriptor_layout(),
+        )?;
+        write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)
+    }
+
+    pub(crate) fn apply_used_dirs_delta(
+        &mut self,
+        delta: i64,
+        superblock: &Superblock,
+        group: BlockGroupId,
+    ) -> Result<()> {
+        self.used_dirs_count = apply_u32_delta(self.used_dirs_count, delta)?;
+        write_descriptor_count(
+            &mut self.bytes,
+            BG_USED_DIRS_LO_OFFSET,
+            BG_USED_DIRS_HI_OFFSET,
+            self.used_dirs_count,
+            superblock.descriptor_layout(),
+        )?;
+        write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)
+    }
+
+    pub(crate) fn refresh_block_bitmap_checksum(
+        &mut self,
+        superblock: &Superblock,
+        group: BlockGroupId,
+        bitmap: &[u8],
+    ) -> Result<()> {
+        self.refresh_bitmap_checksum(
+            superblock,
+            group,
+            bitmap,
+            BG_BLOCK_BITMAP_CSUM_LO_OFFSET,
+            BG_BLOCK_BITMAP_CSUM_HI_OFFSET,
+        )
+    }
+
+    pub(crate) fn refresh_inode_bitmap_checksum(
+        &mut self,
+        superblock: &Superblock,
+        group: BlockGroupId,
+        bitmap: &[u8],
+    ) -> Result<()> {
+        self.refresh_bitmap_checksum(
+            superblock,
+            group,
+            bitmap,
+            BG_INODE_BITMAP_CSUM_LO_OFFSET,
+            BG_INODE_BITMAP_CSUM_HI_OFFSET,
+        )
+    }
+
+    fn refresh_bitmap_checksum(
+        &mut self,
+        superblock: &Superblock,
+        group: BlockGroupId,
+        bitmap: &[u8],
+        lo_offset: usize,
+        hi_offset: usize,
+    ) -> Result<()> {
+        if superblock.descriptor_checksum() != BlockGroupDescriptorChecksum::MetadataCrc32c {
+            return Ok(());
+        }
+        let checksum = bitmap_checksum(superblock, group, bitmap);
+        put_le_u16(
+            &mut self.bytes,
+            lo_offset,
+            u16::try_from(checksum & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        if superblock.descriptor_layout().has_high_fields() {
+            put_le_u16(
+                &mut self.bytes,
+                hi_offset,
+                u16::try_from(checksum >> 16).map_err(|_| Error::ArithmeticOverflow)?,
+            )?;
+        }
+        write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)
     }
 }
 
@@ -259,4 +402,46 @@ fn descriptor_count(
         0
     };
     Ok((high << 16) | low)
+}
+
+fn write_descriptor_count(
+    bytes: &mut [u8],
+    lo_offset: usize,
+    hi_offset: usize,
+    value: u32,
+    layout: BlockGroupDescriptorLayout,
+) -> Result<()> {
+    put_le_u16(
+        bytes,
+        lo_offset,
+        u16::try_from(value & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
+    if layout.has_high_fields() {
+        put_le_u16(
+            bytes,
+            hi_offset,
+            u16::try_from(value >> 16).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_u32_delta(current: u32, delta: i64) -> Result<u32> {
+    if delta.is_negative() {
+        current
+            .checked_sub(
+                u32::try_from(delta.unsigned_abs()).map_err(|_| Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::InvalidSuperblock)
+    } else {
+        current
+            .checked_add(u32::try_from(delta).map_err(|_| Error::ArithmeticOverflow)?)
+            .ok_or(Error::ArithmeticOverflow)
+    }
+}
+
+fn bitmap_checksum(superblock: &Superblock, group: BlockGroupId, bitmap: &[u8]) -> u32 {
+    let group_bytes = group.as_u32().to_le_bytes();
+    let checksum = crc32c(superblock.checksum_seed().as_u32(), &group_bytes);
+    crc32c(checksum, bitmap)
 }

@@ -39,18 +39,20 @@ pub use dir::{DirectoryEntry, DirectoryEntryKind};
 pub use error::{Error, Result};
 pub use extent::{BlockMapping, Extent, ExtentLength, ExtentTree, LogicalBlock};
 pub use inode::{
-    Ext4Timestamp, FileOffset, FileSize, Inode, InodeExtentRoot, InodeId, InodeInlineBytes,
-    InodeKind, InodeStorage, ReadBytes,
+    Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Timestamp, Ext4Uid, FileOffset, FileSize, Inode,
+    InodeExtentRoot, InodeId, InodeInlineBytes, InodeKind, InodeStorage, NewDirectoryMetadata,
+    NewFileMetadata, ReadBytes,
 };
 pub use name::{Ext4Name, WindowsName};
 pub use superblock::{
     BlockCount, BlockGroupCount, BlockGroupDescriptorSize, BlockGroupId, BlocksPerGroup,
-    ChecksumSeed, FilesystemUuid, FreeBlockCount, FreeBlockDelta, InodeCount, InodeRecordSize,
-    InodesPerGroup, JournalMode, JournalUuid, MetadataChecksum, RecoveryState, Superblock,
+    ChecksumSeed, FilesystemUuid, FreeBlockCount, FreeBlockDelta, FreeInodeCount, FreeInodeDelta,
+    InodeCount, InodeRecordSize, InodesPerGroup, JournalMode, JournalUuid, MetadataChecksum,
+    RecoveryState, Superblock,
 };
 pub use volume::{
     DirectoryNode, ExternalJournal, FileNode, InternalJournal, LookupResult, Node, ReadOnly,
-    ReadWrite, SymlinkNode, TransactionFile, Volume, WriteTransaction,
+    ReadWrite, SymlinkNode, TransactionDirectory, TransactionFile, Volume, WriteTransaction,
 };
 
 #[cfg(test)]
