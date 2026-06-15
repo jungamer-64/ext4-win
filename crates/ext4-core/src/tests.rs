@@ -19,9 +19,9 @@ use crate::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Timestamp, Ext4Uid, Extent, ExtentLength,
     ExtentTree, ExtentTreeContext, ExternalJournal, FileNode, FileOffset, FileSize,
     InodeExtentRoot, InodeId, JournalMode, LogicalBlock, LookupResult, MutableExtentTree,
-    NewDirectoryMetadata, NewFileMetadata, Node, ReadOnly, ReadWrite, SliceBlockDevice,
-    SliceBlockDeviceMut, Superblock, SymlinkNode, TransactionDirectory, TransactionFile, Volume,
-    WindowsName,
+    NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, Node, ReadOnly, ReadWrite,
+    SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget,
+    TransactionDirectory, TransactionFile, Volume, WindowsName,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -176,6 +176,10 @@ fn test_file_metadata() -> NewFileMetadata {
 
 fn test_directory_metadata() -> NewDirectoryMetadata {
     NewDirectoryMetadata::new(test_owner(), must(Ext4Permissions::new(0o755)))
+}
+
+fn test_symlink_metadata() -> NewSymlinkMetadata {
+    NewSymlinkMetadata::new(test_owner(), must(Ext4Permissions::new(0o777)))
 }
 
 fn overwrite_file<D: BlockWriter, J>(
@@ -1017,6 +1021,80 @@ fn create_and_remove_empty_directory_updates_namespace() {
     }
 
     assert_eq!(get_u32(&image, 1024 + 16), 6);
+}
+
+#[test]
+fn create_inline_symlink_adds_directory_entry_and_inode() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let name = must(Ext4Name::new(b"inline-link"));
+        let target = must(SymlinkTarget::new(b"file"));
+        let symlink =
+            must(transaction.create_symlink(root, &name, &target, test_symlink_metadata()));
+        assert_eq!(symlink.inode_id(), inode(11));
+        must(transaction.commit());
+
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"inline-link"),
+            LookupResult::Found(inode(11))
+        );
+        let symlink = symlink_node(&volume, 11);
+        assert_eq!(must(volume.read_symlink(&symlink)), b"file");
+    }
+}
+
+#[test]
+fn create_extent_symlink_writes_target_blocks() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let target_bytes = [b't'; 96];
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let name = must(Ext4Name::new(b"extent-link"));
+        let target = must(SymlinkTarget::new(&target_bytes));
+        let symlink =
+            must(transaction.create_symlink(root, &name, &target, test_symlink_metadata()));
+        assert_eq!(symlink.inode_id(), inode(11));
+        must(transaction.commit());
+
+        let symlink = symlink_node(&volume, 11);
+        assert_eq!(must(volume.read_symlink(&symlink)), target_bytes);
+    }
+}
+
+#[test]
+fn remove_symlink_removes_directory_entry_and_frees_inode() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let name = must(Ext4Name::new(b"delete-link"));
+        let target = must(SymlinkTarget::new(b"file"));
+
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        must(transaction.create_symlink(root, &name, &target, test_symlink_metadata()));
+        must(transaction.commit());
+
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        must(transaction.remove_symlink(root, &name));
+        must(transaction.commit());
+
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"delete-link"),
+            LookupResult::NotFound
+        );
+    }
 }
 
 #[test]

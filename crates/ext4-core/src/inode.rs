@@ -1,5 +1,7 @@
 //! Inode parsing and domain typing.
 
+use alloc::vec::Vec;
+
 use crate::endian::{le_u16, le_u32};
 use crate::error::{Error, Result};
 
@@ -317,6 +319,73 @@ impl NewDirectoryMetadata {
     #[must_use]
     pub const fn permissions(self) -> Ext4Permissions {
         self.permissions
+    }
+}
+
+/// Metadata required to create a symbolic link inode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NewSymlinkMetadata {
+    /// Owner encoded into the new inode.
+    owner: Ext4Owner,
+    /// Permission bits encoded with the symlink mode.
+    permissions: Ext4Permissions,
+}
+
+impl NewSymlinkMetadata {
+    /// Creates symbolic link metadata.
+    #[must_use]
+    pub const fn new(owner: Ext4Owner, permissions: Ext4Permissions) -> Self {
+        Self { owner, permissions }
+    }
+
+    /// Owner for the new inode.
+    #[must_use]
+    pub const fn owner(self) -> Ext4Owner {
+        self.owner
+    }
+
+    /// Permission bits for the new inode.
+    #[must_use]
+    pub const fn permissions(self) -> Ext4Permissions {
+        self.permissions
+    }
+}
+
+/// Symbolic link target accepted by the ext4 domain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymlinkTarget {
+    /// Non-empty target path bytes.
+    bytes: Vec<u8>,
+}
+
+impl SymlinkTarget {
+    /// Maximum target size stored inline inside the inode `i_block` field.
+    pub const INLINE_CAPACITY: usize = 60;
+
+    /// Validates and stores a symbolic link target.
+    ///
+    /// # Errors
+    /// Returns an error when the target is empty, contains a NUL byte, or is
+    /// too large for ext4's 32-bit low size field used by this domain.
+    pub fn new(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() || bytes.contains(&0) || u32::try_from(bytes.len()).is_err() {
+            return Err(Error::InvalidName);
+        }
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    /// Returns the raw target bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns whether the target fits in the inode body.
+    #[must_use]
+    pub fn is_inline(&self) -> bool {
+        self.bytes.len() <= Self::INLINE_CAPACITY
     }
 }
 
