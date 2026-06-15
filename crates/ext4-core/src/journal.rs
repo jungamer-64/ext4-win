@@ -13,7 +13,7 @@ use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset
 use crate::checksum::crc32c;
 use crate::endian::{be_u16, be_u32, be_u64, put_be_u16, put_be_u32};
 use crate::error::{Error, Result};
-use crate::extent::ExtentTree;
+use crate::extent::{ExtentTree, ExtentTreeContext};
 use crate::inode::Inode;
 use crate::superblock::RecoveryState;
 use crate::volume::MetadataBlock;
@@ -165,7 +165,12 @@ impl<State> Journal<State> {
             return Err(Error::UnsupportedJournal);
         }
 
-        let tree = ExtentTree::load_inode_tree(inode.extent_root()?, block_size, reader)?;
+        let tree = ExtentTree::load_inode_tree(
+            inode.extent_root()?,
+            block_size,
+            reader,
+            ExtentTreeContext::none(),
+        )?;
         let location =
             JournalLocation::Internal(InternalJournalLayout::new(tree.extents(), capacity_blocks)?);
         let mut raw =
