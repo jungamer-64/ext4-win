@@ -41,6 +41,7 @@ const JOURNAL_OVERHEAD_BLOCKS: u32 = 2;
 pub(crate) struct Journal {
     location: JournalLocation,
     superblock: JournalSuperblock,
+    ring: JournalRing,
     filesystem_blocks: u64,
     state: JournalState,
 }
@@ -95,26 +96,21 @@ impl Journal {
         }
 
         let tree = ExtentTree::load_inode_tree(inode.block(), block_size, reader)?;
-        let mut blocks = Vec::with_capacity(
-            usize::try_from(capacity_blocks).map_err(|_| Error::ArithmeticOverflow)?,
-        );
-        for logical in 0..capacity_blocks {
-            blocks.push(
-                tree.map_logical(u64::from(logical))
-                    .ok_or(Error::UnsupportedJournal)?,
-            );
-        }
-
-        let location = JournalLocation::Internal { blocks };
+        let location = JournalLocation::Internal(InternalJournalLayout::new(
+            tree.extents(),
+            capacity_blocks,
+        )?);
         let mut raw =
             vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
         read_journal_block(reader, &location, block_size, 0, &mut raw)?;
         let superblock = JournalSuperblock::parse(&raw)?;
-        superblock.validate_for_mount(block_size, capacity_blocks)?;
+        let ring = superblock.validate_for_mount(block_size, capacity_blocks)?;
+        location.validate_ring(&ring)?;
 
         Ok(Self {
             location,
             superblock,
+            ring,
             filesystem_blocks,
             state: JournalState::Loaded,
         })
@@ -136,12 +132,13 @@ impl Journal {
         if *superblock.uuid() != expected_uuid {
             return Err(Error::UnsupportedJournal);
         }
-        superblock.validate_for_mount(block_size, superblock.maxlen())?;
+        let location = JournalLocation::External(ExternalJournalLayout::new(journal, block_size)?);
+        let ring = superblock.validate_for_mount(block_size, location.capacity_blocks())?;
+        location.validate_ring(&ring)?;
         Ok(Self {
-            location: JournalLocation::External {
-                base: ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET),
-            },
+            location,
             superblock,
+            ring,
             filesystem_blocks,
             state: JournalState::Loaded,
         })
@@ -495,9 +492,7 @@ impl Journal {
         if block.get() >= self.filesystem_blocks {
             return Err(Error::JournalCorrupt);
         }
-        if let JournalLocation::Internal { blocks } = &self.location
-            && blocks.contains(&block)
-        {
+        if self.location.contains_home_block(block)? {
             return Err(Error::JournalCorrupt);
         }
         Ok(())
@@ -850,10 +845,7 @@ impl Journal {
     }
 
     fn usable_log_blocks(&self) -> Result<u32> {
-        self.superblock
-            .maxlen()
-            .checked_sub(self.superblock.first())
-            .ok_or(Error::UnsupportedJournal)
+        self.ring.usable_blocks()
     }
 
     fn descriptor_tag_capacity(&self) -> Result<usize> {
@@ -892,12 +884,7 @@ impl Journal {
     }
 
     fn next_logical(&self, logical: u32) -> Result<u32> {
-        let next = logical.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
-        if next >= self.superblock.maxlen() {
-            Ok(self.superblock.first())
-        } else {
-            Ok(next)
-        }
+        self.ring.next(logical)
     }
 
     fn verify_tag_checksum(
@@ -981,10 +968,254 @@ impl Journal {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JournalRing {
+    first: u32,
+    maxlen: u32,
+}
+
+impl JournalRing {
+    fn new(superblock: &JournalSuperblock, capacity_blocks: u32) -> Result<Self> {
+        let first = superblock.first();
+        let maxlen = superblock.maxlen();
+        if maxlen == 0
+            || maxlen > capacity_blocks
+            || first != 1
+            || first >= maxlen
+            || (superblock.start() != 0
+                && (superblock.start() < first || superblock.start() >= maxlen))
+        {
+            return Err(Error::UnsupportedJournal);
+        }
+        Ok(Self { first, maxlen })
+    }
+
+    fn usable_blocks(self) -> Result<u32> {
+        self.maxlen.checked_sub(self.first).ok_or(Error::UnsupportedJournal)
+    }
+
+    fn next(self, logical: u32) -> Result<u32> {
+        if logical < self.first || logical >= self.maxlen {
+            return Err(Error::JournalCorrupt);
+        }
+        let next = logical.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        if next >= self.maxlen {
+            Ok(self.first)
+        } else {
+            Ok(next)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum JournalLocation {
-    Internal { blocks: Vec<BlockAddress> },
-    External { base: ByteOffset },
+    Internal(InternalJournalLayout),
+    External(ExternalJournalLayout),
+}
+
+impl JournalLocation {
+    fn offset_of(&self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
+        match self {
+            Self::Internal(layout) => block_size.offset_of(layout.map_logical(logical)?),
+            Self::External(layout) => layout.offset_of(logical, block_size),
+        }
+    }
+
+    fn validate_ring(&self, ring: &JournalRing) -> Result<()> {
+        match self {
+            Self::Internal(layout) => layout.validate_ring(ring),
+            Self::External(layout) => layout.validate_ring(ring),
+        }
+    }
+
+    fn contains_home_block(&self, block: BlockAddress) -> Result<bool> {
+        match self {
+            Self::Internal(layout) => layout.contains_physical(block),
+            Self::External(_) => Ok(false),
+        }
+    }
+
+    const fn capacity_blocks(&self) -> u32 {
+        match self {
+            Self::Internal(layout) => layout.capacity_blocks(),
+            Self::External(layout) => layout.capacity_blocks(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InternalJournalLayout {
+    extents: Vec<JournalExtent>,
+    capacity_blocks: u32,
+}
+
+impl InternalJournalLayout {
+    fn new(extents: &[crate::extent::Extent], capacity_blocks: u32) -> Result<Self> {
+        let mut mapped = Vec::with_capacity(extents.len());
+        for extent in extents {
+            let len = u32::from(extent.len());
+            if len == 0 {
+                return Err(Error::UnsupportedJournal);
+            }
+            let logical_start = extent.logical_start();
+            let logical_end = logical_start
+                .checked_add(len)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if logical_end > capacity_blocks {
+                return Err(Error::UnsupportedJournal);
+            }
+            mapped.push(JournalExtent::new(
+                logical_start,
+                logical_end,
+                extent.physical_start(),
+                len,
+            )?);
+        }
+        mapped.sort_by_key(|extent| extent.logical_start);
+        Ok(Self {
+            extents: mapped,
+            capacity_blocks,
+        })
+    }
+
+    fn validate_ring(&self, ring: &JournalRing) -> Result<()> {
+        let mut expected = 0_u32;
+        for extent in &self.extents {
+            if extent.logical_start != expected {
+                return Err(Error::UnsupportedJournal);
+            }
+            expected = extent.logical_end;
+            if expected >= ring.maxlen {
+                return Ok(());
+            }
+        }
+        Err(Error::UnsupportedJournal)
+    }
+
+    fn map_logical(&self, logical: u32) -> Result<BlockAddress> {
+        for extent in &self.extents {
+            if let Some(block) = extent.map_logical(logical)? {
+                return Ok(block);
+            }
+        }
+        Err(Error::UnsupportedJournal)
+    }
+
+    fn contains_physical(&self, block: BlockAddress) -> Result<bool> {
+        for extent in &self.extents {
+            if extent.contains_physical(block) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    const fn capacity_blocks(&self) -> u32 {
+        self.capacity_blocks
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JournalExtent {
+    logical_start: u32,
+    logical_end: u32,
+    physical_start: BlockAddress,
+    physical_end: u64,
+}
+
+impl JournalExtent {
+    fn new(
+        logical_start: u32,
+        logical_end: u32,
+        physical_start: BlockAddress,
+        len: u32,
+    ) -> Result<Self> {
+        let physical_end = physical_start
+            .get()
+            .checked_add(u64::from(len))
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(Self {
+            logical_start,
+            logical_end,
+            physical_start,
+            physical_end,
+        })
+    }
+
+    fn map_logical(self, logical: u32) -> Result<Option<BlockAddress>> {
+        if logical < self.logical_start || logical >= self.logical_end {
+            return Ok(None);
+        }
+        let offset = logical
+            .checked_sub(self.logical_start)
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(Some(BlockAddress::new(
+            self.physical_start
+                .get()
+                .checked_add(u64::from(offset))
+                .ok_or(Error::ArithmeticOverflow)?,
+        )))
+    }
+
+    fn contains_physical(self, block: BlockAddress) -> bool {
+        block.get() >= self.physical_start.get() && block.get() < self.physical_end
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExternalJournalLayout {
+    base: ByteOffset,
+    capacity_blocks: u32,
+}
+
+impl ExternalJournalLayout {
+    fn new(journal: &impl BlockReader, block_size: BlockSize) -> Result<Self> {
+        let base = ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET);
+        let remaining = journal
+            .len()
+            .checked_sub(base.get())
+            .ok_or(Error::UnsupportedJournal)?;
+        let capacity_blocks = remaining
+            .checked_div(u64::from(block_size.bytes()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let capacity_blocks =
+            u32::try_from(capacity_blocks).map_err(|_| Error::UnsupportedJournal)?;
+        if capacity_blocks <= JOURNAL_OVERHEAD_BLOCKS {
+            return Err(Error::UnsupportedJournal);
+        }
+        Ok(Self {
+            base,
+            capacity_blocks,
+        })
+    }
+
+    fn validate_ring(self, ring: &JournalRing) -> Result<()> {
+        if ring.maxlen <= self.capacity_blocks {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedJournal)
+        }
+    }
+
+    fn offset_of(self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
+        if logical >= self.capacity_blocks {
+            return Err(Error::UnsupportedJournal);
+        }
+        Ok(ByteOffset::new(
+            self.base
+                .get()
+                .checked_add(
+                    u64::from(logical)
+                        .checked_mul(u64::from(block_size.bytes()))
+                        .ok_or(Error::ArithmeticOverflow)?,
+                )
+                .ok_or(Error::ArithmeticOverflow)?,
+        ))
+    }
+
+    const fn capacity_blocks(self) -> u32 {
+        self.capacity_blocks
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1031,14 +1262,11 @@ impl JournalSuperblock {
         })
     }
 
-    fn validate_for_mount(&self, block_size: BlockSize, capacity_blocks: u32) -> Result<()> {
-        if self.block_size != block_size.bytes()
-            || self.maxlen == 0
-            || self.maxlen > capacity_blocks
-            || self.first == 0
-            || self.first >= self.maxlen
-            || (self.start != 0 && (self.start < self.first || self.start >= self.maxlen))
-        {
+    fn validate_for_mount(&self, block_size: BlockSize, capacity_blocks: u32) -> Result<JournalRing> {
+        if self.block_size != block_size.bytes() {
+            return Err(Error::UnsupportedJournal);
+        }
+        if self.compat != 0 {
             return Err(Error::UnsupportedJournal);
         }
         if self.incompat & (JBD2_FEATURE_INCOMPAT_FAST_COMMIT | JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT)
@@ -1055,7 +1283,7 @@ impl JournalSuperblock {
         if self.has_metadata_checksums() && self.checksum_type != JBD2_CHECKSUM_CRC32C {
             return Err(Error::UnsupportedJournal);
         }
-        Ok(())
+        JournalRing::new(self, capacity_blocks)
     }
 
     fn encode_with_state(
@@ -1391,22 +1619,7 @@ impl<F: BlockWriter, J: BlockWriter> JournalIo for ExternalJournalIo<'_, F, J> {
 
 impl Journal {
     fn offset_of(&self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
-        match &self.location {
-            JournalLocation::Internal { blocks } => {
-                let index = usize::try_from(logical).map_err(|_| Error::ArithmeticOverflow)?;
-                let block = *blocks.get(index).ok_or(Error::UnsupportedJournal)?;
-                block_size.offset_of(block)
-            }
-            JournalLocation::External { base } => Ok(ByteOffset::new(
-                base.get()
-                    .checked_add(
-                        u64::from(logical)
-                            .checked_mul(u64::from(block_size.bytes()))
-                            .ok_or(Error::ArithmeticOverflow)?,
-                    )
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )),
-        }
+        self.location.offset_of(logical, block_size)
     }
 }
 
@@ -1417,21 +1630,7 @@ fn read_journal_block(
     logical: u32,
     out: &mut [u8],
 ) -> Result<()> {
-    let offset = match location {
-        JournalLocation::Internal { blocks } => {
-            let index = usize::try_from(logical).map_err(|_| Error::ArithmeticOverflow)?;
-            block_size.offset_of(*blocks.get(index).ok_or(Error::UnsupportedJournal)?)?
-        }
-        JournalLocation::External { base } => ByteOffset::new(
-            base.get()
-                .checked_add(
-                    u64::from(logical)
-                        .checked_mul(u64::from(block_size.bytes()))
-                        .ok_or(Error::ArithmeticOverflow)?,
-                )
-                .ok_or(Error::ArithmeticOverflow)?,
-        ),
-    };
+    let offset = location.offset_of(logical, block_size)?;
     reader.read_exact_at(offset, out)
 }
 
