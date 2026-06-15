@@ -814,6 +814,50 @@ fn unlink_file_reports_missing_entry() {
 }
 
 #[test]
+fn rename_file_updates_staged_directory_entry() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let old_name = must(Ext4Name::new(b"old"));
+        let new_name = must(Ext4Name::new(b"new"));
+        let file = must(transaction.create_file(root, &old_name, test_file_metadata()));
+        must(transaction.rename_child(root, &old_name, root, &new_name));
+        assert_eq!(file.inode_id(), inode(11));
+        must(transaction.commit());
+
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"old"),
+            LookupResult::NotFound
+        );
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"new"),
+            LookupResult::Found(inode(11))
+        );
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 16), 5);
+}
+
+#[test]
+fn rename_rejects_existing_target() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut transaction = volume.begin_transaction(NOW);
+    let root = transaction_directory(&transaction, InodeId::ROOT);
+    let source = must(Ext4Name::new(b"file"));
+    let target = must(Ext4Name::new(b"target"));
+    let _target_file = must(transaction.create_file(root, &target, test_file_metadata()));
+    let result = transaction.rename_child(root, &source, root, &target);
+
+    assert_eq!(result, Err(Error::NameAlreadyExists));
+}
+
+#[test]
 fn create_and_remove_empty_directory_updates_namespace() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
@@ -845,6 +889,59 @@ fn create_and_remove_empty_directory_updates_namespace() {
     }
 
     assert_eq!(get_u32(&image, 1024 + 16), 6);
+}
+
+#[test]
+fn rename_directory_across_parents_updates_dotdot() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let source_name = must(Ext4Name::new(b"a"));
+        let target_parent_name = must(Ext4Name::new(b"b"));
+        let moved_name = must(Ext4Name::new(b"moved"));
+
+        let mut create_source = volume.begin_transaction(NOW);
+        let root = transaction_directory(&create_source, InodeId::ROOT);
+        let source =
+            must(create_source.create_directory(root, &source_name, test_directory_metadata()));
+        assert_eq!(source.inode_id(), inode(11));
+        must(create_source.commit());
+
+        let mut create_target = volume.begin_transaction(NOW);
+        let root = transaction_directory(&create_target, InodeId::ROOT);
+        let target_parent = must(create_target.create_directory(
+            root,
+            &target_parent_name,
+            test_directory_metadata(),
+        ));
+        assert_eq!(target_parent.inode_id(), inode(12));
+        must(create_target.commit());
+
+        let mut rename = volume.begin_transaction(NOW);
+        let root = transaction_directory(&rename, InodeId::ROOT);
+        let target_parent = transaction_directory(&rename, inode(12));
+        must(rename.rename_child(root, &source_name, target_parent, &moved_name));
+        must(rename.commit());
+
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"a"),
+            LookupResult::NotFound
+        );
+        assert_eq!(
+            lookup_ext4(&volume, inode(12), b"moved"),
+            LookupResult::Found(inode(11))
+        );
+        let moved_entries = read_directory(&volume, inode(11));
+        let dotdot = moved_entries
+            .iter()
+            .find(|entry| entry.name().bytes() == b"..")
+            .expect("moved directory must retain dotdot");
+        assert_eq!(dotdot.inode(), inode(12));
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 16), 4);
 }
 
 #[test]
