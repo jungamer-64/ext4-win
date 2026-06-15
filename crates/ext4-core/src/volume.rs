@@ -25,82 +25,82 @@ use crate::superblock::{
 
 // Volume mutation offsets are kept together so inode/superblock rewrites use one
 // source of truth for on-disk byte layout.
-/// Internal constant MAX_EAGER_DIRECTORY_BYTES used by on-disk layout and policy checks.
+/// Maximum directory size read eagerly for lookup and enumeration.
 const MAX_EAGER_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
-/// Internal constant MODE_DIRECTORY used by on-disk layout and policy checks.
+/// `i_mode` type bits for ext4 directories.
 const MODE_DIRECTORY: u16 = 0x4000;
-/// Internal constant MODE_REGULAR used by on-disk layout and policy checks.
+/// `i_mode` type bits for regular files.
 const MODE_REGULAR: u16 = 0x8000;
-/// Internal constant MODE_KIND_MASK used by on-disk layout and policy checks.
+/// `i_mode` mask that preserves inode type bits.
 const MODE_KIND_MASK: u16 = 0xF000;
-/// Internal constant EXT4_EXTENTS_FL used by on-disk layout and policy checks.
+/// `i_flags` bit indicating extent-based block mapping.
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
-/// Internal constant INODE_MODE_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_mode` in an inode record.
 const INODE_MODE_OFFSET: usize = 0;
-/// Internal constant INODE_UID_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_uid_lo` in an inode record.
 const INODE_UID_LO_OFFSET: usize = 2;
-/// Internal constant INODE_SIZE_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_size_lo` in an inode record.
 const INODE_SIZE_LO_OFFSET: usize = 4;
-/// Internal constant INODE_ATIME_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_atime` in an inode record.
 const INODE_ATIME_OFFSET: usize = 8;
-/// Internal constant INODE_CTIME_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_ctime` in an inode record.
 const INODE_CTIME_OFFSET: usize = 12;
-/// Internal constant INODE_MTIME_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_mtime` in an inode record.
 const INODE_MTIME_OFFSET: usize = 16;
-/// Internal constant INODE_DTIME_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_dtime` in an inode record.
 const INODE_DTIME_OFFSET: usize = 20;
-/// Internal constant INODE_GID_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_gid_lo` in an inode record.
 const INODE_GID_LO_OFFSET: usize = 24;
-/// Internal constant INODE_LINKS_COUNT_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_links_count` in an inode record.
 const INODE_LINKS_COUNT_OFFSET: usize = 26;
-/// Internal constant INODE_BLOCKS_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_blocks_lo` in an inode record.
 const INODE_BLOCKS_LO_OFFSET: usize = 28;
-/// Internal constant INODE_FLAGS_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_flags` in an inode record.
 const INODE_FLAGS_OFFSET: usize = 32;
-/// Internal constant INODE_BLOCK_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_block` in an inode record.
 const INODE_BLOCK_OFFSET: usize = 40;
-/// Internal constant INODE_GENERATION_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_generation` in an inode record.
 const INODE_GENERATION_OFFSET: usize = 100;
-/// Internal constant INODE_SIZE_HIGH_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_size_high` in an inode record.
 const INODE_SIZE_HIGH_OFFSET: usize = 108;
-/// Internal constant INODE_BLOCKS_HIGH_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_blocks_high` in an inode record.
 const INODE_BLOCKS_HIGH_OFFSET: usize = 116;
-/// Internal constant INODE_CHECKSUM_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_checksum_lo` in an inode record.
 const INODE_CHECKSUM_LO_OFFSET: usize = 124;
-/// Internal constant INODE_EXTRA_ISIZE_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_extra_isize` in an inode record.
 const INODE_EXTRA_ISIZE_OFFSET: usize = 128;
-/// Internal constant INODE_CTIME_EXTRA_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_ctime_extra` in an inode record.
 const INODE_CTIME_EXTRA_OFFSET: usize = 132;
-/// Internal constant INODE_MTIME_EXTRA_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_mtime_extra` in an inode record.
 const INODE_MTIME_EXTRA_OFFSET: usize = 136;
-/// Internal constant INODE_ATIME_EXTRA_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_atime_extra` in an inode record.
 const INODE_ATIME_EXTRA_OFFSET: usize = 140;
-/// Internal constant INODE_CRTIME_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_crtime` in an inode record.
 const INODE_CRTIME_OFFSET: usize = 144;
-/// Internal constant INODE_CRTIME_EXTRA_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_crtime_extra` in an inode record.
 const INODE_CRTIME_EXTRA_OFFSET: usize = 148;
-/// Internal constant INODE_UID_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_uid_high` in an inode record.
 const INODE_UID_HI_OFFSET: usize = 120;
-/// Internal constant INODE_GID_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_gid_high` in an inode record.
 const INODE_GID_HI_OFFSET: usize = 122;
-/// Internal constant INODE_CHECKSUM_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of `i_checksum_hi` in an inode record.
 const INODE_CHECKSUM_HI_OFFSET: usize = 130;
-/// Internal constant EXT4_INODE_MIN_EXTRA_ISIZE used by on-disk layout and policy checks.
+/// Minimum ext4 extra inode size required for checksum and creation-time fields.
 const EXT4_INODE_MIN_EXTRA_ISIZE: u16 = 32;
-/// Internal constant SUPERBLOCK_FREE_BLOCKS_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `s_free_blocks_count_lo` in the superblock.
 const SUPERBLOCK_FREE_BLOCKS_LO_OFFSET: usize = 12;
-/// Internal constant SUPERBLOCK_FREE_INODES_OFFSET used by on-disk layout and policy checks.
+/// Offset of `s_free_inodes_count` in the superblock.
 const SUPERBLOCK_FREE_INODES_OFFSET: usize = 16;
-/// Internal constant SUPERBLOCK_FREE_BLOCKS_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of `s_free_blocks_count_hi` in the superblock.
 const SUPERBLOCK_FREE_BLOCKS_HI_OFFSET: usize = 344;
-/// Internal constant SUPERBLOCK_OFFSET used by on-disk layout and policy checks.
+/// Byte offset of the primary ext4 superblock.
 const SUPERBLOCK_OFFSET: u64 = 1024;
 
 /// Read-only mounted volume state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadOnly;
 
-/// Internal journal stored as a hidden ext4 inode on the filesystem device.
+/// Journal stored as a hidden ext4 inode on the filesystem device.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InternalJournal {
     /// Clean journal state ready to accept write transactions.
@@ -494,7 +494,7 @@ impl<D: BlockReader, State> Volume<D, State> {
         Ok(folded)
     }
 
-    /// Internal read_inode_data operation used by this module's domain boundary.
+    /// Reads file data through the inode extent tree, zero-filling sparse ranges.
     fn read_inode_data(
         &self,
         inode: &Inode,
@@ -567,7 +567,7 @@ impl<D: BlockReader, State> Volume<D, State> {
         Ok(ReadBytes::from_usize(completed))
     }
 
-    /// Internal read_raw_inode operation used by this module's domain boundary.
+    /// Reads an inode record together with its on-device offset.
     fn read_raw_inode(&self, inode_id: InodeId) -> Result<RawInode> {
         if inode_id.as_u32() > self.superblock.inode_count().as_u32() {
             return Err(Error::InvalidInode);
@@ -584,12 +584,12 @@ impl<D: BlockReader, State> Volume<D, State> {
         })
     }
 
-    /// Internal read_inode_record operation used by this module's domain boundary.
+    /// Reads and parses a typed inode record.
     fn read_inode_record(&self, inode_id: InodeId) -> Result<Inode> {
         self.read_raw_inode(inode_id)?.parse()
     }
 
-    /// Internal extent_tree_context operation used by this module's domain boundary.
+    /// Builds the checksum context required for this inode's extent tree.
     fn extent_tree_context(&self, inode: &Inode) -> ExtentTreeContext {
         if self.superblock.metadata_checksum() == MetadataChecksum::Crc32c {
             ExtentTreeContext::metadata_csum(
@@ -606,7 +606,7 @@ impl<D: BlockReader, State> Volume<D, State> {
 /// Regular file selected for mutation inside a write transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionFile {
-    /// Internal inode_id state carried by this domain type.
+    /// Mutable regular-file inode selected for this transaction.
     inode_id: InodeId,
 }
 
@@ -621,7 +621,7 @@ impl TransactionFile {
 /// Directory selected for mutation inside a write transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionDirectory {
-    /// Internal inode_id state carried by this domain type.
+    /// Mutable directory inode selected for this transaction.
     inode_id: InodeId,
 }
 
@@ -636,7 +636,7 @@ impl TransactionDirectory {
 /// Inode selected for POSIX metadata mutation inside a write transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionNode {
-    /// Internal inode_id state carried by this domain type.
+    /// Mutable inode selected for metadata updates.
     inode_id: InodeId,
 }
 
@@ -651,27 +651,27 @@ impl TransactionNode {
 /// In-progress ext4 write transaction.
 #[derive(Debug)]
 pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
-    /// Internal volume state carried by this domain type.
+    /// Mounted read-write volume being mutated.
     volume: &'a mut Volume<D, ReadWrite<J>>,
-    /// Internal now state carried by this domain type.
+    /// Timestamp applied consistently to staged inode updates.
     now: Ext4Timestamp,
-    /// Internal inode_updates state carried by this domain type.
+    /// Inode records staged for rewrite at commit.
     inode_updates: Vec<RawInode>,
-    /// Internal block_bitmap_updates state carried by this domain type.
+    /// Block bitmap images staged for allocation changes.
     block_bitmap_updates: Vec<BlockImage>,
-    /// Internal inode_bitmap_updates state carried by this domain type.
+    /// Inode bitmap images staged for allocation changes.
     inode_bitmap_updates: Vec<BlockImage>,
-    /// Internal directory_updates state carried by this domain type.
+    /// Directory block images staged after dirent mutation.
     directory_updates: Vec<BlockImage>,
-    /// Internal extent_updates state carried by this domain type.
+    /// External extent tree blocks staged after extent mutation.
     extent_updates: Vec<BlockImage>,
-    /// Internal group_deltas state carried by this domain type.
+    /// Per-group allocation count deltas to fold into descriptors.
     group_deltas: Vec<GroupDelta>,
-    /// Internal data_writes state carried by this domain type.
+    /// Ordered file data writes that must reach disk before metadata commit.
     data_writes: Vec<RangeWrite>,
-    /// Internal free_blocks_delta state carried by this domain type.
+    /// Superblock free-block delta accumulated by this transaction.
     free_blocks_delta: FreeBlockDelta,
-    /// Internal free_inodes_delta state carried by this domain type.
+    /// Superblock free-inode delta accumulated by this transaction.
     free_inodes_delta: i64,
 }
 
@@ -1175,7 +1175,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(())
     }
 
-    /// Internal ensure_child_absent operation used by this module's domain boundary.
+    /// Verifies that a directory does not already contain `name`.
     fn ensure_child_absent(&self, parent: InodeId, name: &Ext4Name) -> Result<()> {
         match self.find_child_entry(parent, name) {
             Ok(_) => Err(Error::NameAlreadyExists),
@@ -1184,7 +1184,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         }
     }
 
-    /// Internal find_child_entry operation used by this module's domain boundary.
+    /// Finds a live directory entry by exact ext4 name.
     fn find_child_entry(&self, parent: InodeId, name: &Ext4Name) -> Result<DirectoryEntry> {
         let inode = self.volume.read_inode_record(parent)?;
         if inode.kind() != InodeKind::Directory {
@@ -1200,7 +1200,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Err(Error::DirectoryEntryNotFound)
     }
 
-    /// Internal add_directory_entry operation used by this module's domain boundary.
+    /// Adds a child entry to a mutable directory, extending it when supported.
     fn add_directory_entry(
         &mut self,
         parent: InodeId,
@@ -1276,7 +1276,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(())
     }
 
-    /// Internal remove_directory_entry operation used by this module's domain boundary.
+    /// Removes a child entry from a mutable directory.
     fn remove_directory_entry(
         &mut self,
         parent: InodeId,
@@ -1312,7 +1312,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Err(Error::DirectoryEntryNotFound)
     }
 
-    /// Internal rename_directory_entry operation used by this module's domain boundary.
+    /// Renames a child entry while preserving the expected child inode and kind.
     fn rename_directory_entry(
         &mut self,
         parent: InodeId,
@@ -1358,7 +1358,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Err(Error::DirectoryEntryNotFound)
     }
 
-    /// Internal replace_directory_entry operation used by this module's domain boundary.
+    /// Replaces the inode and kind stored for an existing directory name.
     fn replace_directory_entry(
         &mut self,
         parent: InodeId,
@@ -1393,7 +1393,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Err(Error::DirectoryEntryNotFound)
     }
 
-    /// Internal stage_directory_block operation used by this module's domain boundary.
+    /// Stages the latest image for a mutated directory block.
     fn stage_directory_block(&mut self, block: BlockAddress, bytes: Vec<u8>) {
         if let Some(image) = self
             .directory_updates
@@ -1406,7 +1406,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         }
     }
 
-    /// Internal directory_is_empty operation used by this module's domain boundary.
+    /// Returns whether a directory contains only `.` and `..`.
     fn directory_is_empty(&self, inode: &Inode) -> Result<bool> {
         for (_logical, _physical, block) in self.directory_blocks(inode)? {
             if !block.is_empty_directory_payload()? {
@@ -1416,7 +1416,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(true)
     }
 
-    /// Internal directory_blocks operation used by this module's domain boundary.
+    /// Loads directory blocks, preferring staged images over device bytes.
     fn directory_blocks(
         &self,
         inode: &Inode,
@@ -1461,7 +1461,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(blocks)
     }
 
-    /// Internal mutable_extent_tree operation used by this module's domain boundary.
+    /// Loads a mutable extent tree for an inode selected by this transaction.
     fn mutable_extent_tree(&self, inode: &Inode) -> Result<MutableExtentTree> {
         MutableExtentTree::load_inode_tree(
             inode.extent_root()?,
@@ -1471,7 +1471,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         )
     }
 
-    /// Internal stage_extent_tree operation used by this module's domain boundary.
+    /// Stages an updated extent tree and adjusts its metadata block ownership.
     fn stage_extent_tree(
         &mut self,
         raw_inode: &mut RawInode,
@@ -1495,7 +1495,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         raw_inode.set_allocated_blocks(tree.allocated_data_blocks(), u64::from(block_size.bytes()))
     }
 
-    /// Internal stage_serialized_extent_tree operation used by this module's domain boundary.
+    /// Copies a serialized extent tree into the inode and metadata block staging areas.
     fn stage_serialized_extent_tree(
         &mut self,
         raw_inode: &mut RawInode,
@@ -1511,7 +1511,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(())
     }
 
-    /// Internal increment_directory_links operation used by this module's domain boundary.
+    /// Increments a directory inode link count and updates timestamps.
     fn increment_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
         let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self
@@ -1528,7 +1528,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(())
     }
 
-    /// Internal decrement_directory_links operation used by this module's domain boundary.
+    /// Decrements a directory inode link count and updates timestamps.
     fn decrement_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
         let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self
@@ -1548,7 +1548,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     /// Aborts the transaction without writing staged data or metadata.
     pub fn abort(self) {}
 
-    /// Internal ensure_inode_update operation used by this module's domain boundary.
+    /// Returns the staged inode record index, loading it once when needed.
     fn ensure_inode_update(&mut self, inode_id: InodeId) -> Result<usize> {
         if let Some(index) = self
             .inode_updates
@@ -1565,7 +1565,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::ArithmeticOverflow)
     }
 
-    /// Internal allocate_block operation used by this module's domain boundary.
+    /// Allocates the first free block visible in block group bitmaps.
     fn allocate_block(&mut self) -> Result<BlockAddress> {
         let groups = self.volume.superblock.block_group_count()?;
         for group in 0..groups.as_u32() {
@@ -1615,7 +1615,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Err(Error::NoSpace)
     }
 
-    /// Internal free_extent operation used by this module's domain boundary.
+    /// Frees the suffix of an extent after `keep_len` blocks.
     fn free_extent(&mut self, extent: Extent, keep_len: u16) -> Result<()> {
         let start = u64::from(keep_len);
         let len = extent.len().as_u64();
@@ -1641,7 +1641,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         }
     }
 
-    /// Internal free_block operation used by this module's domain boundary.
+    /// Marks a block free and records the affected group and superblock deltas.
     fn free_block(&mut self, block: BlockAddress) -> Result<()> {
         let group = block_group_of(&self.volume.superblock, block)?;
         let descriptor =
@@ -1660,7 +1660,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(())
     }
 
-    /// Internal allocate_inode operation used by this module's domain boundary.
+    /// Allocates the first non-reserved inode visible in inode bitmaps.
     fn allocate_inode(&mut self) -> Result<RawInode> {
         let groups = self.volume.superblock.block_group_count()?;
         for group in 0..groups.as_u32() {
@@ -1694,7 +1694,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Err(Error::NoFreeInode)
     }
 
-    /// Internal free_inode operation used by this module's domain boundary.
+    /// Marks an inode free and records its group allocation delta.
     fn free_inode(&mut self, inode_id: InodeId) -> Result<()> {
         if inode_id == InodeId::ROOT {
             return Err(Error::CannotRemoveRoot);
@@ -1714,7 +1714,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(())
     }
 
-    /// Internal zero_truncated_tail operation used by this module's domain boundary.
+    /// Stages zeroes for the remainder of a partially truncated data block.
     fn zero_truncated_tail(
         &mut self,
         extents: &[Extent],
@@ -1752,7 +1752,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(())
     }
 
-    /// Internal ensure_block_bitmap_update operation used by this module's domain boundary.
+    /// Returns the staged block bitmap index, loading it once when needed.
     fn ensure_block_bitmap_update(&mut self, bitmap_block: BlockAddress) -> Result<usize> {
         if let Some(index) = self
             .block_bitmap_updates
@@ -1783,7 +1783,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::ArithmeticOverflow)
     }
 
-    /// Internal ensure_inode_bitmap_update operation used by this module's domain boundary.
+    /// Returns the staged inode bitmap index, loading it once when needed.
     fn ensure_inode_bitmap_update(&mut self, bitmap_block: BlockAddress) -> Result<usize> {
         if let Some(index) = self
             .inode_bitmap_updates
@@ -1814,7 +1814,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::ArithmeticOverflow)
     }
 
-    /// Internal blocks_in_group operation used by this module's domain boundary.
+    /// Returns the block count actually present in a possibly partial group.
     fn blocks_in_group(&self, group: BlockGroupId) -> Result<u32> {
         let group_start = self
             .volume
@@ -1842,7 +1842,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         ))
     }
 
-    /// Internal inodes_in_group operation used by this module's domain boundary.
+    /// Returns the inode count actually present in a possibly partial group.
     fn inodes_in_group(&self, group: BlockGroupId) -> Result<u32> {
         let group_start = u64::from(group.as_u32())
             .checked_mul(u64::from(
@@ -1858,7 +1858,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         ))
     }
 
-    /// Internal inode_id_in_group operation used by this module's domain boundary.
+    /// Converts a group-local inode bitmap bit into an inode number.
     fn inode_id_in_group(&self, group: BlockGroupId, bit: u32) -> Result<InodeId> {
         let zero_based = group
             .as_u32()
@@ -1869,7 +1869,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         InodeId::try_from(zero_based.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
     }
 
-    /// Internal empty_raw_inode operation used by this module's domain boundary.
+    /// Creates a zeroed inode record at the allocated inode's device offset.
     fn empty_raw_inode(&self, inode_id: InodeId) -> Result<RawInode> {
         Ok(RawInode {
             id: inode_id,
@@ -1878,7 +1878,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         })
     }
 
-    /// Internal group_delta_mut operation used by this module's domain boundary.
+    /// Returns the mutable delta accumulator for a block group.
     fn group_delta_mut(&mut self, group: BlockGroupId) -> Result<&mut GroupDelta> {
         if let Some(index) = self
             .group_deltas
@@ -1894,7 +1894,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         self.group_deltas.last_mut().ok_or(Error::InvalidSuperblock)
     }
 
-    /// Internal record_group_free_blocks_delta operation used by this module's domain boundary.
+    /// Records a free-block count delta for one block group.
     fn record_group_free_blocks_delta(
         &mut self,
         group: BlockGroupId,
@@ -1905,7 +1905,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(())
     }
 
-    /// Internal record_group_free_inodes_delta operation used by this module's domain boundary.
+    /// Records a free-inode count delta for one block group and the superblock.
     fn record_group_free_inodes_delta(&mut self, group: BlockGroupId, delta: i64) -> Result<()> {
         let entry = self.group_delta_mut(group)?;
         entry.free_inodes_delta = entry
@@ -1919,7 +1919,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(())
     }
 
-    /// Internal record_group_used_dirs_delta operation used by this module's domain boundary.
+    /// Records a used-directory count delta for one block group.
     fn record_group_used_dirs_delta(&mut self, group: BlockGroupId, delta: i64) -> Result<()> {
         let entry = self.group_delta_mut(group)?;
         entry.used_dirs_delta = entry
@@ -1929,7 +1929,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(())
     }
 
-    /// Internal metadata_writes operation used by this module's domain boundary.
+    /// Serializes all staged metadata mutations into byte-range writes.
     fn metadata_writes(&mut self) -> Result<Vec<RangeWrite>> {
         let mut writes = Vec::new();
         for bitmap in &self.block_bitmap_updates {
@@ -2043,7 +2043,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(writes)
     }
 
-    /// Internal metadata_blocks operation used by this module's domain boundary.
+    /// Coalesces metadata byte ranges into full blocks for journaling.
     fn metadata_blocks(&mut self) -> Result<Vec<MetadataBlock>> {
         let block_size = self.volume.superblock.block_size();
         let block_bytes =
@@ -2102,7 +2102,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(blocks)
     }
 
-    /// Internal write_ordered_data operation used by this module's domain boundary.
+    /// Writes ordered file data before the metadata transaction is committed.
     fn write_ordered_data(&mut self) -> Result<()> {
         for write in &self.data_writes {
             self.volume
@@ -2112,7 +2112,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         self.volume.device.flush()
     }
 
-    /// Internal updated_superblock_bytes operation used by this module's domain boundary.
+    /// Applies accumulated free-count deltas to a superblock image.
     fn updated_superblock_bytes(&self) -> Result<Vec<u8>> {
         let mut bytes = vec![0_u8; 1024];
         self.volume
@@ -2222,23 +2222,23 @@ impl<D: BlockWriter, J: BlockWriter> WriteTransaction<'_, D, ExternalJournal<J>>
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Internal RawInode state used to keep module invariants explicit.
+/// Writable raw inode record paired with its inode number and device offset.
 struct RawInode {
-    /// Internal id state carried by this domain type.
+    /// Inode number represented by this raw record.
     id: InodeId,
-    /// Internal offset state carried by this domain type.
+    /// Absolute device offset of the inode record.
     offset: ByteOffset,
-    /// Internal bytes state carried by this domain type.
+    /// Writable inode record bytes.
     bytes: Vec<u8>,
 }
 
 impl RawInode {
-    /// Internal parse operation used by this module's domain boundary.
+    /// Parses the raw bytes as a validated inode.
     fn parse(&self) -> Result<Inode> {
         Inode::parse(self.id, &self.bytes)
     }
 
-    /// Internal initialize_file operation used by this module's domain boundary.
+    /// Initializes a zeroed inode record as an empty extent-backed file.
     fn initialize_file(
         &mut self,
         metadata: NewFileMetadata,
@@ -2260,7 +2260,7 @@ impl RawInode {
         self.set_allocated_blocks(0, 1024)
     }
 
-    /// Internal initialize_directory operation used by this module's domain boundary.
+    /// Initializes a zeroed inode record as a directory owning its first block.
     fn initialize_directory(
         &mut self,
         metadata: NewDirectoryMetadata,
@@ -2287,7 +2287,7 @@ impl RawInode {
         self.set_allocated_blocks(1, u64::from(block_size.bytes()))
     }
 
-    /// Internal set_mode operation used by this module's domain boundary.
+    /// Writes inode type and permission bits into `i_mode`.
     fn set_mode(&mut self, file_type: u16, permissions: Ext4Permissions) -> Result<()> {
         put_le_u16(
             &mut self.bytes,
@@ -2296,7 +2296,7 @@ impl RawInode {
         )
     }
 
-    /// Internal set_permissions operation used by this module's domain boundary.
+    /// Updates inode permission bits without changing the inode type.
     fn set_permissions(&mut self, permissions: Ext4Permissions) -> Result<()> {
         let mode = le_u16(&self.bytes, INODE_MODE_OFFSET)?;
         put_le_u16(
@@ -2306,7 +2306,7 @@ impl RawInode {
         )
     }
 
-    /// Internal set_owner operation used by this module's domain boundary.
+    /// Writes low and high UID/GID fields when the inode record can hold them.
     fn set_owner(&mut self, owner: Ext4Owner) -> Result<()> {
         let uid = owner.uid().as_u32();
         let gid = owner.gid().as_u32();
@@ -2335,18 +2335,18 @@ impl RawInode {
         Ok(())
     }
 
-    /// Internal set_links_count operation used by this module's domain boundary.
+    /// Writes the inode link count.
     fn set_links_count(&mut self, links: u16) -> Result<()> {
         put_le_u16(&mut self.bytes, INODE_LINKS_COUNT_OFFSET, links)
     }
 
-    /// Internal increment_links_count operation used by this module's domain boundary.
+    /// Increments the inode link count with overflow checking.
     fn increment_links_count(&mut self) -> Result<()> {
         let links = self.parse()?.links_count();
         self.set_links_count(links.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
     }
 
-    /// Internal decrement_links_count operation used by this module's domain boundary.
+    /// Decrements the inode link count with underflow checking.
     fn decrement_links_count(&mut self) -> Result<u16> {
         let links = self.parse()?.links_count();
         let updated = links.checked_sub(1).ok_or(Error::InvalidInode)?;
@@ -2354,12 +2354,12 @@ impl RawInode {
         Ok(updated)
     }
 
-    /// Internal set_flags operation used by this module's domain boundary.
+    /// Writes the inode flags field.
     fn set_flags(&mut self, flags: u32) -> Result<()> {
         put_le_u32(&mut self.bytes, INODE_FLAGS_OFFSET, flags)
     }
 
-    /// Internal set_size operation used by this module's domain boundary.
+    /// Splits a file size across low and high inode size fields.
     fn set_size(&mut self, size: FileSize) -> Result<()> {
         let size = size.bytes();
         put_le_u32(
@@ -2374,7 +2374,7 @@ impl RawInode {
         )
     }
 
-    /// Internal set_timestamps operation used by this module's domain boundary.
+    /// Updates access, change, and modification timestamps.
     fn set_timestamps(&mut self, now: Ext4Timestamp) -> Result<()> {
         put_le_u32(&mut self.bytes, INODE_ATIME_OFFSET, now.seconds())?;
         put_le_u32(&mut self.bytes, INODE_CTIME_OFFSET, now.seconds())?;
@@ -2387,7 +2387,7 @@ impl RawInode {
         Ok(())
     }
 
-    /// Internal set_creation_time operation used by this module's domain boundary.
+    /// Writes creation time when the inode record has extra timestamp fields.
     fn set_creation_time(&mut self, now: Ext4Timestamp) -> Result<()> {
         if self.bytes.len() > INODE_CRTIME_EXTRA_OFFSET {
             self.ensure_extra_isize()?;
@@ -2397,12 +2397,12 @@ impl RawInode {
         Ok(())
     }
 
-    /// Internal set_deletion_time operation used by this module's domain boundary.
+    /// Writes the inode deletion time field.
     fn set_deletion_time(&mut self, seconds: u32) -> Result<()> {
         put_le_u32(&mut self.bytes, INODE_DTIME_OFFSET, seconds)
     }
 
-    /// Internal clear_deleted operation used by this module's domain boundary.
+    /// Clears live inode state before releasing an unlinked inode.
     fn clear_deleted(&mut self, now: Ext4Timestamp, block_size: BlockSize) -> Result<()> {
         self.set_deletion_time(now.seconds())?;
         self.set_links_count(0)?;
@@ -2413,7 +2413,7 @@ impl RawInode {
         self.set_extent_root_bytes(serialized.inode_root())
     }
 
-    /// Internal set_extent_root_bytes operation used by this module's domain boundary.
+    /// Writes the serialized extent root into `i_block`.
     fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> {
         let end = INODE_BLOCK_OFFSET
             .checked_add(root.len())
@@ -2425,7 +2425,7 @@ impl RawInode {
         Ok(())
     }
 
-    /// Internal set_allocated_blocks operation used by this module's domain boundary.
+    /// Writes allocated 512-byte sector counts from allocated data blocks.
     fn set_allocated_blocks(&mut self, blocks: u64, block_size: u64) -> Result<()> {
         let sectors = blocks
             .checked_mul(block_size)
@@ -2447,7 +2447,7 @@ impl RawInode {
         Ok(())
     }
 
-    /// Internal refresh_checksum operation used by this module's domain boundary.
+    /// Recomputes inode checksum fields when metadata checksums are enabled.
     fn refresh_checksum(&mut self, superblock: &Superblock) -> Result<()> {
         if superblock.metadata_checksum() != MetadataChecksum::Crc32c {
             return Ok(());
@@ -2484,7 +2484,7 @@ impl RawInode {
         Ok(())
     }
 
-    /// Internal ensure_extra_isize operation used by this module's domain boundary.
+    /// Ensures the inode advertises enough extra space for extended fields.
     fn ensure_extra_isize(&mut self) -> Result<()> {
         if self.bytes.len() > INODE_EXTRA_ISIZE_OFFSET
             && le_u16(&self.bytes, INODE_EXTRA_ISIZE_OFFSET)? == 0
@@ -2500,29 +2500,29 @@ impl RawInode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Internal BlockImage state used to keep module invariants explicit.
+/// Full block image staged for metadata rewrite.
 struct BlockImage {
-    /// Internal block state carried by this domain type.
+    /// Metadata block address.
     block: BlockAddress,
-    /// Internal bytes state carried by this domain type.
+    /// Complete block bytes to journal and write.
     bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Internal GroupDelta state used to keep module invariants explicit.
+/// Accumulated block group accounting changes.
 struct GroupDelta {
-    /// Internal group state carried by this domain type.
+    /// Block group receiving the accounting changes.
     group: BlockGroupId,
-    /// Internal free_blocks_delta state carried by this domain type.
+    /// Free-block count delta for the descriptor.
     free_blocks_delta: FreeBlockDelta,
-    /// Internal free_inodes_delta state carried by this domain type.
+    /// Free-inode count delta for the descriptor.
     free_inodes_delta: i64,
-    /// Internal used_dirs_delta state carried by this domain type.
+    /// Used-directory count delta for the descriptor.
     used_dirs_delta: i64,
 }
 
 impl GroupDelta {
-    /// Internal new operation used by this module's domain boundary.
+    /// Starts an empty accounting delta for one block group.
     fn new(group: BlockGroupId) -> Self {
         Self {
             group,
@@ -2534,36 +2534,36 @@ impl GroupDelta {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Internal RangeWrite state used to keep module invariants explicit.
+/// Byte range write staged for ordered data or metadata persistence.
 struct RangeWrite {
-    /// Internal offset state carried by this domain type.
+    /// Absolute device byte offset.
     offset: ByteOffset,
-    /// Internal bytes state carried by this domain type.
+    /// Bytes to write at the offset.
     bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Internal MetadataBlock state used to keep module invariants explicit.
+/// Full metadata block supplied to the journal commit path.
 pub(crate) struct MetadataBlock {
-    /// Internal block state carried by this domain type.
+    /// Filesystem block address.
     block: BlockAddress,
-    /// Internal bytes state carried by this domain type.
+    /// Complete metadata block bytes.
     bytes: Vec<u8>,
 }
 
 impl MetadataBlock {
-    /// Internal fn operation used by this module's domain boundary.
+    /// Returns the filesystem block address.
     pub(crate) const fn block(&self) -> BlockAddress {
         self.block
     }
 
-    /// Internal bytes operation used by this module's domain boundary.
+    /// Returns the full metadata block bytes.
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 }
 
-/// Internal map_extents operation used by this module's domain boundary.
+/// Maps a logical block through an ordered extent list.
 fn map_extents(extents: &[Extent], logical_block: LogicalBlock) -> BlockMapping {
     for extent in extents {
         match extent.map_logical(logical_block) {
@@ -2575,7 +2575,7 @@ fn map_extents(extents: &[Extent], logical_block: LogicalBlock) -> BlockMapping 
     BlockMapping::Hole
 }
 
-/// Internal directory_entry_kind operation used by this module's domain boundary.
+/// Converts an inode kind into the directory entry file-type byte domain.
 const fn directory_entry_kind(kind: InodeKind) -> DirectoryEntryKind {
     match kind {
         InodeKind::File => DirectoryEntryKind::File,
@@ -2584,7 +2584,7 @@ const fn directory_entry_kind(kind: InodeKind) -> DirectoryEntryKind {
     }
 }
 
-/// Internal reject_reserved_directory_name operation used by this module's domain boundary.
+/// Rejects `.` and `..` as caller-supplied child names.
 fn reject_reserved_directory_name(name: &Ext4Name) -> Result<()> {
     if matches!(name.bytes(), b"." | b"..") {
         Err(Error::InvalidName)
@@ -2593,7 +2593,7 @@ fn reject_reserved_directory_name(name: &Ext4Name) -> Result<()> {
     }
 }
 
-/// Internal round_up_div operation used by this module's domain boundary.
+/// Divides with upward rounding and overflow checking.
 fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
     if divisor == 0 {
         return Err(Error::ArithmeticOverflow);
@@ -2606,7 +2606,7 @@ fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
         .ok_or(Error::ArithmeticOverflow)
 }
 
-/// Internal bitmap_bit operation used by this module's domain boundary.
+/// Reads one allocation bitmap bit.
 fn bitmap_bit(bytes: &[u8], bit: u32) -> Result<bool> {
     let byte_index = usize::try_from(bit.checked_div(8).ok_or(Error::ArithmeticOverflow)?)
         .map_err(|_| Error::ArithmeticOverflow)?;
@@ -2615,7 +2615,7 @@ fn bitmap_bit(bytes: &[u8], bit: u32) -> Result<bool> {
     Ok(byte & (1_u8 << bit_index) != 0)
 }
 
-/// Internal set_bitmap_bit operation used by this module's domain boundary.
+/// Writes one allocation bitmap bit.
 fn set_bitmap_bit(bytes: &mut [u8], bit: u32, value: bool) -> Result<()> {
     let byte_index = usize::try_from(bit.checked_div(8).ok_or(Error::ArithmeticOverflow)?)
         .map_err(|_| Error::ArithmeticOverflow)?;
@@ -2629,7 +2629,7 @@ fn set_bitmap_bit(bytes: &mut [u8], bit: u32, value: bool) -> Result<()> {
     Ok(())
 }
 
-/// Internal block_group_of operation used by this module's domain boundary.
+/// Computes the block group that owns a filesystem block.
 fn block_group_of(superblock: &Superblock, block: BlockAddress) -> Result<BlockGroupId> {
     let relative = block
         .get()
@@ -2643,7 +2643,7 @@ fn block_group_of(superblock: &Superblock, block: BlockAddress) -> Result<BlockG
     ))
 }
 
-/// Internal inode_group_bit operation used by this module's domain boundary.
+/// Computes the inode bitmap group and bit for an inode number.
 fn inode_group_bit(superblock: &Superblock, inode_id: InodeId) -> Result<(BlockGroupId, u32)> {
     if inode_id.as_u32() > superblock.inode_count().as_u32() {
         return Err(Error::InvalidInode);
@@ -2661,7 +2661,7 @@ fn inode_group_bit(superblock: &Superblock, inode_id: InodeId) -> Result<(BlockG
     Ok((BlockGroupId::from_u32(group), bit))
 }
 
-/// Internal inode_offset_on_device operation used by this module's domain boundary.
+/// Computes the absolute device offset of an inode record.
 fn inode_offset_on_device(
     reader: &impl BlockReader,
     superblock: &Superblock,
@@ -2683,7 +2683,7 @@ fn inode_offset_on_device(
     Ok(ByteOffset::new(offset))
 }
 
-/// Internal block_bit_in_group operation used by this module's domain boundary.
+/// Computes the block bitmap bit for a block inside its group.
 fn block_bit_in_group(
     superblock: &Superblock,
     block: BlockAddress,

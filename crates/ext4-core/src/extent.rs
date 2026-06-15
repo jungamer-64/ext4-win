@@ -614,7 +614,7 @@ struct SerializedNode {
     bytes: Vec<u8>,
 }
 
-/// Internal parse_node_recursive operation used by this module's domain boundary.
+/// Walks an extent node and all index children, collecting leaf extents.
 fn parse_node_recursive(
     raw: &[u8],
     block_size: BlockSize,
@@ -638,7 +638,7 @@ fn parse_node_recursive(
     )
 }
 
-/// Internal parse_index_node operation used by this module's domain boundary.
+/// Parses an extent index node and validates each referenced child block.
 fn parse_index_node(
     raw: &[u8],
     depth: u16,
@@ -695,7 +695,7 @@ fn parse_index_node(
     Ok(())
 }
 
-/// Internal parse_node operation used by this module's domain boundary.
+/// Parses one extent tree node and appends leaf extents when the node is a leaf.
 fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>) -> Result<u16> {
     if le_u16(raw, 0)? != EXTENT_MAGIC {
         return Err(Error::InvalidExtentTree);

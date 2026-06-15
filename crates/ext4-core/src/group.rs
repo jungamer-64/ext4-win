@@ -16,50 +16,50 @@ use crate::superblock::{
 };
 
 // Low 32-bit descriptor fields are present in both 32-byte and 64-byte layouts.
-/// Internal constant BG_BLOCK_BITMAP_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_block_bitmap_lo` in a block group descriptor.
 const BG_BLOCK_BITMAP_LO_OFFSET: usize = 0;
-/// Internal constant BG_INODE_BITMAP_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_inode_bitmap_lo` in a block group descriptor.
 const BG_INODE_BITMAP_LO_OFFSET: usize = 4;
-/// Internal constant BG_INODE_TABLE_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_inode_table_lo` in a block group descriptor.
 const BG_INODE_TABLE_LO_OFFSET: usize = 8;
-/// Internal constant BG_FREE_BLOCKS_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_free_blocks_count_lo` in a block group descriptor.
 const BG_FREE_BLOCKS_LO_OFFSET: usize = 12;
-/// Internal constant BG_FREE_INODES_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_free_inodes_count_lo` in a block group descriptor.
 const BG_FREE_INODES_LO_OFFSET: usize = 14;
-/// Internal constant BG_USED_DIRS_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_used_dirs_count_lo` in a block group descriptor.
 const BG_USED_DIRS_LO_OFFSET: usize = 16;
-/// Internal constant BG_BLOCK_BITMAP_CSUM_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of the low block bitmap checksum field.
 const BG_BLOCK_BITMAP_CSUM_LO_OFFSET: usize = 24;
-/// Internal constant BG_INODE_BITMAP_CSUM_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of the low inode bitmap checksum field.
 const BG_INODE_BITMAP_CSUM_LO_OFFSET: usize = 26;
-/// Internal constant BG_ITABLE_UNUSED_LO_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_itable_unused_lo` in a block group descriptor.
 const BG_ITABLE_UNUSED_LO_OFFSET: usize = 28;
-/// Internal constant BG_CHECKSUM_OFFSET used by on-disk layout and policy checks.
+/// Offset of the descriptor checksum field.
 const BG_CHECKSUM_OFFSET: usize = 30;
-/// Internal constant BG_CHECKSUM_SIZE used by on-disk layout and policy checks.
+/// Width of the descriptor checksum field.
 const BG_CHECKSUM_SIZE: usize = 2;
 // High 32-bit fields exist only when the validated descriptor layout is 64-bit.
-/// Internal constant BG_BLOCK_BITMAP_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_block_bitmap_hi` in a 64-bit block group descriptor.
 const BG_BLOCK_BITMAP_HI_OFFSET: usize = 32;
-/// Internal constant BG_INODE_BITMAP_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_inode_bitmap_hi` in a 64-bit block group descriptor.
 const BG_INODE_BITMAP_HI_OFFSET: usize = 36;
-/// Internal constant BG_INODE_TABLE_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_inode_table_hi` in a 64-bit block group descriptor.
 const BG_INODE_TABLE_HI_OFFSET: usize = 40;
-/// Internal constant BG_FREE_BLOCKS_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_free_blocks_count_hi` in a 64-bit block group descriptor.
 const BG_FREE_BLOCKS_HI_OFFSET: usize = 44;
-/// Internal constant BG_FREE_INODES_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_free_inodes_count_hi` in a 64-bit block group descriptor.
 const BG_FREE_INODES_HI_OFFSET: usize = 46;
-/// Internal constant BG_USED_DIRS_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_used_dirs_count_hi` in a 64-bit block group descriptor.
 const BG_USED_DIRS_HI_OFFSET: usize = 48;
-/// Internal constant BG_ITABLE_UNUSED_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of `bg_itable_unused_hi` in a 64-bit block group descriptor.
 const BG_ITABLE_UNUSED_HI_OFFSET: usize = 50;
-/// Internal constant BG_BLOCK_BITMAP_CSUM_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of the high block bitmap checksum field.
 const BG_BLOCK_BITMAP_CSUM_HI_OFFSET: usize = 56;
-/// Internal constant BG_INODE_BITMAP_CSUM_HI_OFFSET used by on-disk layout and policy checks.
+/// Offset of the high inode bitmap checksum field.
 const BG_INODE_BITMAP_CSUM_HI_OFFSET: usize = 58;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Internal BlockGroupDescriptor state used to keep module invariants explicit.
+/// Decoded block group descriptor backed by its writable raw bytes.
 pub(crate) struct BlockGroupDescriptor {
     /// Absolute byte offset of this descriptor in the descriptor table.
     offset: ByteOffset,
@@ -272,7 +272,7 @@ impl BlockGroupDescriptor {
         )
     }
 
-    /// Internal refresh_inode_bitmap_checksum operation used by this module's domain boundary.
+    /// Recomputes the inode bitmap checksum fields for this group.
     pub(crate) fn refresh_inode_bitmap_checksum(
         &mut self,
         superblock: &Superblock,
@@ -288,7 +288,7 @@ impl BlockGroupDescriptor {
         )
     }
 
-    /// Internal refresh_bitmap_checksum operation used by this module's domain boundary.
+    /// Writes a metadata CRC32C bitmap checksum and refreshes the descriptor checksum.
     fn refresh_bitmap_checksum(
         &mut self,
         superblock: &Superblock,
@@ -317,7 +317,7 @@ impl BlockGroupDescriptor {
     }
 }
 
-/// Internal write_block_group_descriptor_checksum operation used by this module's domain boundary.
+/// Writes the active block group descriptor checksum into the raw descriptor.
 pub(crate) fn write_block_group_descriptor_checksum(
     superblock: &Superblock,
     group: BlockGroupId,
@@ -330,7 +330,7 @@ pub(crate) fn write_block_group_descriptor_checksum(
     put_le_u16(bytes, BG_CHECKSUM_OFFSET, checksum)
 }
 
-/// Internal verify_block_group_descriptor_checksum operation used by this module's domain boundary.
+/// Verifies the block group descriptor checksum selected by the superblock.
 fn verify_block_group_descriptor_checksum(
     superblock: &Superblock,
     group: BlockGroupId,
@@ -347,7 +347,7 @@ fn verify_block_group_descriptor_checksum(
     }
 }
 
-/// Internal block_group_descriptor_checksum operation used by this module's domain boundary.
+/// Computes the descriptor checksum using the validated checksum mode.
 fn block_group_descriptor_checksum(
     superblock: &Superblock,
     group: BlockGroupId,
@@ -360,7 +360,7 @@ fn block_group_descriptor_checksum(
     }
 }
 
-/// Internal gdt_checksum operation used by this module's domain boundary.
+/// Computes the legacy GDT CRC16 descriptor checksum.
 fn gdt_checksum(superblock: &Superblock, group: BlockGroupId, bytes: &[u8]) -> Result<u16> {
     let checksum_end = BG_CHECKSUM_OFFSET
         .checked_add(BG_CHECKSUM_SIZE)
@@ -384,7 +384,7 @@ fn gdt_checksum(superblock: &Superblock, group: BlockGroupId, bytes: &[u8]) -> R
     Ok(checksum)
 }
 
-/// Internal metadata_checksum operation used by this module's domain boundary.
+/// Computes the metadata_csum CRC32C descriptor checksum.
 fn metadata_checksum(superblock: &Superblock, group: BlockGroupId, bytes: &[u8]) -> Result<u16> {
     let checksum_end = BG_CHECKSUM_OFFSET
         .checked_add(BG_CHECKSUM_SIZE)
@@ -408,7 +408,7 @@ fn metadata_checksum(superblock: &Superblock, group: BlockGroupId, bytes: &[u8])
     u16::try_from(checksum & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)
 }
 
-/// Internal descriptor_offset operation used by this module's domain boundary.
+/// Computes the absolute byte offset of one descriptor table entry.
 fn descriptor_offset(
     block_size: BlockSize,
     descriptor_size: BlockGroupDescriptorSize,
@@ -432,7 +432,7 @@ fn descriptor_offset(
     ))
 }
 
-/// Internal descriptor_block_address operation used by this module's domain boundary.
+/// Combines low and optional high descriptor fields into a block address.
 fn descriptor_block_address(
     bytes: &[u8],
     lo_offset: usize,
@@ -448,7 +448,7 @@ fn descriptor_block_address(
     Ok(BlockAddress::new((high << 32) | low))
 }
 
-/// Internal descriptor_count operation used by this module's domain boundary.
+/// Combines low and optional high descriptor fields into a 32-bit count.
 fn descriptor_count(
     bytes: &[u8],
     lo_offset: usize,
@@ -464,7 +464,7 @@ fn descriptor_count(
     Ok((high << 16) | low)
 }
 
-/// Internal write_descriptor_count operation used by this module's domain boundary.
+/// Splits a 32-bit count across the low and optional high descriptor fields.
 fn write_descriptor_count(
     bytes: &mut [u8],
     lo_offset: usize,
@@ -487,7 +487,7 @@ fn write_descriptor_count(
     Ok(())
 }
 
-/// Internal apply_u32_delta operation used by this module's domain boundary.
+/// Applies a signed accounting delta without underflowing the descriptor count.
 fn apply_u32_delta(current: u32, delta: i64) -> Result<u32> {
     if delta.is_negative() {
         current
@@ -502,7 +502,7 @@ fn apply_u32_delta(current: u32, delta: i64) -> Result<u32> {
     }
 }
 
-/// Internal bitmap_checksum operation used by this module's domain boundary.
+/// Computes the metadata_csum checksum for a group bitmap payload.
 fn bitmap_checksum(superblock: &Superblock, group: BlockGroupId, bitmap: &[u8]) -> u32 {
     let group_bytes = group.as_u32().to_le_bytes();
     let checksum = crc32c(superblock.checksum_seed().as_u32(), &group_bytes);

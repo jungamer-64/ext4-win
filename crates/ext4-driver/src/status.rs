@@ -43,7 +43,7 @@ impl From<Error> for DriverError {
     }
 }
 
-/// Internal core_error_status operation used by the driver status boundary.
+/// Maps ext4-core domain errors to the closest NTSTATUS value.
 const fn core_error_status(error: Error) -> NTSTATUS {
     match error {
         Error::DirectoryEntryNotFound => STATUS_OBJECT_NAME_NOT_FOUND,

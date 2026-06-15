@@ -8,99 +8,99 @@ use crate::inode::InodeId;
 
 // ext4 superblock and feature-policy constants. Feature masks stay here so the
 // mount boundary is the only place where unsupported on-disk formats enter.
-/// Internal constant SUPERBLOCK_OFFSET used by on-disk layout and policy checks.
+/// Byte offset of the primary ext4 superblock from the start of the device.
 const SUPERBLOCK_OFFSET: u64 = 1024;
-/// Internal constant SUPERBLOCK_SIZE used by on-disk layout and policy checks.
+/// Fixed byte length of an ext4 superblock.
 const SUPERBLOCK_SIZE: usize = 1024;
-/// Internal constant EXT4_SUPER_MAGIC used by on-disk layout and policy checks.
+/// Magic value stored in `s_magic`.
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
-/// Internal constant EXT4_VALID_FS used by on-disk layout and policy checks.
+/// Clean filesystem bit stored in `s_state`.
 const EXT4_VALID_FS: u16 = 0x0001;
 
 // Compatible feature bits can usually be ignored for reads, but the write domain
 // requires an explicit supported set because mutation changes their invariants.
-/// Internal constant COMPAT_HAS_JOURNAL used by on-disk layout and policy checks.
+/// Compatible feature bit for a filesystem journal.
 const COMPAT_HAS_JOURNAL: u32 = 0x0004;
-/// Internal constant COMPAT_EXT_ATTR used by on-disk layout and policy checks.
+/// Compatible feature bit for extended attributes.
 const COMPAT_EXT_ATTR: u32 = 0x0008;
-/// Internal constant COMPAT_RESIZE_INODE used by on-disk layout and policy checks.
+/// Compatible feature bit for reserved resize inode support.
 const COMPAT_RESIZE_INODE: u32 = 0x0010;
-/// Internal constant COMPAT_DIR_INDEX used by on-disk layout and policy checks.
+/// Compatible feature bit for hashed directory indexes.
 const COMPAT_DIR_INDEX: u32 = 0x0020;
-/// Internal constant COMPAT_FAST_COMMIT used by on-disk layout and policy checks.
+/// Compatible feature bit for fast commit journal areas.
 const COMPAT_FAST_COMMIT: u32 = 0x0400;
-/// Internal constant COMPAT_ORPHAN_FILE used by on-disk layout and policy checks.
+/// Compatible feature bit for orphan file tracking.
 const COMPAT_ORPHAN_FILE: u32 = 0x1000;
 
 // Incompatible feature bits affect core interpretation and must be accepted or
 // rejected before constructing a mounted volume.
-/// Internal constant INCOMPAT_FILETYPE used by on-disk layout and policy checks.
+/// Incompatible feature bit for directory entry file types.
 const INCOMPAT_FILETYPE: u32 = 0x0002;
-/// Internal constant INCOMPAT_RECOVER used by on-disk layout and policy checks.
+/// Incompatible feature bit indicating pending journal recovery.
 const INCOMPAT_RECOVER: u32 = 0x0004;
-/// Internal constant INCOMPAT_JOURNAL_DEV used by on-disk layout and policy checks.
+/// Incompatible feature bit for external journal devices.
 const INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
-/// Internal constant INCOMPAT_META_BG used by on-disk layout and policy checks.
+/// Incompatible feature bit for meta block groups.
 const INCOMPAT_META_BG: u32 = 0x0010;
-/// Internal constant INCOMPAT_EXTENTS used by on-disk layout and policy checks.
+/// Incompatible feature bit for extent-based file mapping.
 const INCOMPAT_EXTENTS: u32 = 0x0040;
-/// Internal constant INCOMPAT_64BIT used by on-disk layout and policy checks.
+/// Incompatible feature bit for 64-bit block group descriptors.
 const INCOMPAT_64BIT: u32 = 0x0080;
-/// Internal constant INCOMPAT_MMP used by on-disk layout and policy checks.
+/// Incompatible feature bit for multiple-mount protection.
 const INCOMPAT_MMP: u32 = 0x0100;
-/// Internal constant INCOMPAT_FLEX_BG used by on-disk layout and policy checks.
+/// Incompatible feature bit for flexible block groups.
 const INCOMPAT_FLEX_BG: u32 = 0x0200;
-/// Internal constant INCOMPAT_EA_INODE used by on-disk layout and policy checks.
+/// Incompatible feature bit for extended-attribute inodes.
 const INCOMPAT_EA_INODE: u32 = 0x0400;
-/// Internal constant INCOMPAT_CSUM_SEED used by on-disk layout and policy checks.
+/// Incompatible feature bit for an explicit metadata checksum seed.
 const INCOMPAT_CSUM_SEED: u32 = 0x2000;
-/// Internal constant INCOMPAT_LARGEDIR used by on-disk layout and policy checks.
+/// Incompatible feature bit for large directory formats.
 const INCOMPAT_LARGEDIR: u32 = 0x4000;
-/// Internal constant INCOMPAT_INLINE_DATA used by on-disk layout and policy checks.
+/// Incompatible feature bit for inline file data.
 const INCOMPAT_INLINE_DATA: u32 = 0x8000;
-/// Internal constant INCOMPAT_ENCRYPT used by on-disk layout and policy checks.
+/// Incompatible feature bit for encrypted filenames or file data.
 const INCOMPAT_ENCRYPT: u32 = 0x0001_0000;
-/// Internal constant INCOMPAT_CASEFOLD used by on-disk layout and policy checks.
+/// Incompatible feature bit for casefolded directory lookup.
 const INCOMPAT_CASEFOLD: u32 = 0x0002_0000;
-/// Internal constant SUPPORTED_READ_INCOMPAT used by on-disk layout and policy checks.
+/// Incompatible feature mask accepted for read-only traversal.
 const SUPPORTED_READ_INCOMPAT: u32 =
     INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG | INCOMPAT_CSUM_SEED;
-/// Internal constant REQUIRED_WRITE_INCOMPAT used by on-disk layout and policy checks.
+/// Incompatible feature bits required before journaled writes are allowed.
 const REQUIRED_WRITE_INCOMPAT: u32 =
     INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG;
-/// Internal constant SUPPORTED_WRITE_INCOMPAT used by on-disk layout and policy checks.
+/// Incompatible feature mask accepted by the write mount policy.
 const SUPPORTED_WRITE_INCOMPAT: u32 =
     REQUIRED_WRITE_INCOMPAT | INCOMPAT_RECOVER | INCOMPAT_JOURNAL_DEV | INCOMPAT_CSUM_SEED;
 
 // Read-only compatible feature bits are safe for read traversal but still need
 // write-domain screening before metadata can be changed.
-/// Internal constant RO_COMPAT_SPARSE_SUPER used by on-disk layout and policy checks.
+/// Read-only compatible feature bit for sparse superblock backups.
 const RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
-/// Internal constant RO_COMPAT_LARGE_FILE used by on-disk layout and policy checks.
+/// Read-only compatible feature bit for files larger than 2 GiB.
 const RO_COMPAT_LARGE_FILE: u32 = 0x0002;
-/// Internal constant RO_COMPAT_HUGE_FILE used by on-disk layout and policy checks.
+/// Read-only compatible feature bit for huge file block counts.
 const RO_COMPAT_HUGE_FILE: u32 = 0x0008;
-/// Internal constant RO_COMPAT_GDT_CSUM used by on-disk layout and policy checks.
+/// Read-only compatible feature bit for legacy GDT checksums.
 const RO_COMPAT_GDT_CSUM: u32 = 0x0010;
-/// Internal constant RO_COMPAT_DIR_NLINK used by on-disk layout and policy checks.
+/// Read-only compatible feature bit for directory link counts beyond 65000.
 const RO_COMPAT_DIR_NLINK: u32 = 0x0020;
-/// Internal constant RO_COMPAT_EXTRA_ISIZE used by on-disk layout and policy checks.
+/// Read-only compatible feature bit for extended inode extra size.
 const RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
-/// Internal constant RO_COMPAT_QUOTA used by on-disk layout and policy checks.
+/// Read-only compatible feature bit for quota inodes.
 const RO_COMPAT_QUOTA: u32 = 0x0100;
-/// Internal constant RO_COMPAT_BIGALLOC used by on-disk layout and policy checks.
+/// Read-only compatible feature bit for cluster-based allocation.
 const RO_COMPAT_BIGALLOC: u32 = 0x0200;
-/// Internal constant RO_COMPAT_METADATA_CSUM used by on-disk layout and policy checks.
+/// Read-only compatible feature bit for metadata CRC32C checksums.
 const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
-/// Internal constant RO_COMPAT_READONLY used by on-disk layout and policy checks.
+/// Read-only compatible feature bit that forces read-only mounts.
 const RO_COMPAT_READONLY: u32 = 0x1000;
-/// Internal constant RO_COMPAT_PROJECT used by on-disk layout and policy checks.
+/// Read-only compatible feature bit for project quotas.
 const RO_COMPAT_PROJECT: u32 = 0x2000;
-/// Internal constant RO_COMPAT_VERITY used by on-disk layout and policy checks.
+/// Read-only compatible feature bit for fs-verity protected files.
 const RO_COMPAT_VERITY: u32 = 0x8000;
-/// Internal constant RO_COMPAT_ORPHAN_PRESENT used by on-disk layout and policy checks.
+/// Read-only compatible feature bit indicating orphan cleanup is required.
 const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
-/// Internal constant SUPPORTED_READ_RO_COMPAT used by on-disk layout and policy checks.
+/// Read-only compatible feature mask accepted for read-only traversal.
 const SUPPORTED_READ_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_LARGE_FILE
     | RO_COMPAT_HUGE_FILE
@@ -111,14 +111,14 @@ const SUPPORTED_READ_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_METADATA_CSUM
     | RO_COMPAT_READONLY
     | RO_COMPAT_PROJECT;
-/// Internal constant REQUIRED_WRITE_COMPAT used by on-disk layout and policy checks.
+/// Compatible feature bits required before journaled writes are allowed.
 const REQUIRED_WRITE_COMPAT: u32 =
     COMPAT_HAS_JOURNAL | COMPAT_EXT_ATTR | COMPAT_RESIZE_INODE | COMPAT_DIR_INDEX;
-/// Internal constant SUPPORTED_WRITE_COMPAT used by on-disk layout and policy checks.
+/// Compatible feature mask accepted by the write mount policy.
 const SUPPORTED_WRITE_COMPAT: u32 = REQUIRED_WRITE_COMPAT;
-/// Internal constant REJECTED_WRITE_COMPAT used by on-disk layout and policy checks.
+/// Compatible feature bits rejected by the write mount policy.
 const REJECTED_WRITE_COMPAT: u32 = COMPAT_FAST_COMMIT | COMPAT_ORPHAN_FILE;
-/// Internal constant REJECTED_WRITE_INCOMPAT used by on-disk layout and policy checks.
+/// Incompatible feature bits rejected by the write mount policy.
 const REJECTED_WRITE_INCOMPAT: u32 = INCOMPAT_META_BG
     | INCOMPAT_MMP
     | INCOMPAT_EA_INODE
@@ -126,16 +126,16 @@ const REJECTED_WRITE_INCOMPAT: u32 = INCOMPAT_META_BG
     | INCOMPAT_INLINE_DATA
     | INCOMPAT_ENCRYPT
     | INCOMPAT_CASEFOLD;
-/// Internal constant REQUIRED_WRITE_RO_COMPAT used by on-disk layout and policy checks.
+/// Read-only compatible feature bits required before journaled writes are allowed.
 const REQUIRED_WRITE_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_LARGE_FILE
     | RO_COMPAT_HUGE_FILE
     | RO_COMPAT_DIR_NLINK
     | RO_COMPAT_EXTRA_ISIZE
     | RO_COMPAT_METADATA_CSUM;
-/// Internal constant SUPPORTED_WRITE_RO_COMPAT used by on-disk layout and policy checks.
+/// Read-only compatible feature mask accepted by the write mount policy.
 const SUPPORTED_WRITE_RO_COMPAT: u32 = REQUIRED_WRITE_RO_COMPAT;
-/// Internal constant REJECTED_WRITE_RO_COMPAT used by on-disk layout and policy checks.
+/// Read-only compatible feature bits rejected by the write mount policy.
 const REJECTED_WRITE_RO_COMPAT: u32 = RO_COMPAT_GDT_CSUM
     | RO_COMPAT_BIGALLOC
     | RO_COMPAT_READONLY
@@ -518,40 +518,40 @@ pub enum MetadataChecksum {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Internal BlockGroupDescriptorLayout states used to make module control flow explicit.
+/// Block group descriptor field layout selected by the 64-bit feature bit.
 pub(crate) enum BlockGroupDescriptorLayout {
-    /// Internal Standard32 variant for this domain state.
+    /// Descriptor contains only the standard 32-byte field set.
     Standard32,
-    /// Internal SixtyFourBit variant for this domain state.
+    /// Descriptor contains the high 64-bit extension fields.
     SixtyFourBit,
 }
 
 impl BlockGroupDescriptorLayout {
-    /// Internal fn operation used by this module's domain boundary.
+    /// Returns whether descriptor fields have high 32-bit companions.
     pub(crate) const fn has_high_fields(self) -> bool {
         matches!(self, Self::SixtyFourBit)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Internal BlockGroupDescriptorChecksum states used to make module control flow explicit.
+/// Checksum algorithm used for block group descriptors.
 pub(crate) enum BlockGroupDescriptorChecksum {
-    /// Internal None variant for this domain state.
+    /// Descriptor checksums are not present.
     None,
-    /// Internal GdtCrc16 variant for this domain state.
+    /// Legacy GDT CRC16 descriptor checksum.
     GdtCrc16,
-    /// Internal MetadataCrc32c variant for this domain state.
+    /// Metadata CRC32C descriptor checksum.
     MetadataCrc32c,
 }
 
 /// Validated ext4 feature flags accepted by a mount policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FeatureSet {
-    /// Internal compat state carried by this domain type.
+    /// Compatible feature bits from `s_feature_compat`.
     compat: u32,
-    /// Internal incompat state carried by this domain type.
+    /// Incompatible feature bits from `s_feature_incompat`.
     incompat: u32,
-    /// Internal read_only_compat state carried by this domain type.
+    /// Read-only compatible feature bits from `s_feature_ro_compat`.
     read_only_compat: u32,
 }
 
@@ -621,32 +621,32 @@ impl FeatureSet {
         })
     }
 
-    /// Internal fn operation used by this module's domain boundary.
+    /// Returns whether the 64-bit descriptor feature is present.
     pub(crate) const fn has_64bit(self) -> bool {
         self.incompat & INCOMPAT_64BIT != 0
     }
 
-    /// Internal fn operation used by this module's domain boundary.
+    /// Returns whether the filesystem advertises a journal.
     pub(crate) const fn has_journal(self) -> bool {
         self.compat & COMPAT_HAS_JOURNAL != 0
     }
 
-    /// Internal fn operation used by this module's domain boundary.
+    /// Returns whether the journal lives on a separate journal device.
     pub(crate) const fn has_external_journal(self) -> bool {
         self.incompat & INCOMPAT_JOURNAL_DEV != 0
     }
 
-    /// Internal fn operation used by this module's domain boundary.
+    /// Returns whether metadata CRC32C checksums are enabled.
     pub(crate) const fn has_metadata_csum(self) -> bool {
         self.read_only_compat & RO_COMPAT_METADATA_CSUM != 0
     }
 
-    /// Internal fn operation used by this module's domain boundary.
+    /// Returns whether legacy GDT checksums are enabled.
     pub(crate) const fn has_gdt_csum(self) -> bool {
         self.read_only_compat & RO_COMPAT_GDT_CSUM != 0
     }
 
-    /// Internal fn operation used by this module's domain boundary.
+    /// Returns whether the checksum seed is stored explicitly in the superblock.
     pub(crate) const fn has_checksum_seed(self) -> bool {
         self.incompat & INCOMPAT_CSUM_SEED != 0
     }
@@ -655,35 +655,35 @@ impl FeatureSet {
 /// Superblock whose structural fields and mount policy are validated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Superblock {
-    /// Internal block_size state carried by this domain type.
+    /// Validated filesystem block size.
     block_size: BlockSize,
-    /// Internal inode_count state carried by this domain type.
+    /// Total inode count.
     inode_count: InodeCount,
-    /// Internal block_count state carried by this domain type.
+    /// Total block count.
     block_count: BlockCount,
-    /// Internal free_blocks_count state carried by this domain type.
+    /// Total free block count advertised by the superblock.
     free_blocks_count: FreeBlockCount,
-    /// Internal free_inodes_count state carried by this domain type.
+    /// Total free inode count advertised by the superblock.
     free_inodes_count: FreeInodeCount,
-    /// Internal first_data_block state carried by this domain type.
+    /// First block that can contain filesystem data.
     first_data_block: BlockAddress,
-    /// Internal blocks_per_group state carried by this domain type.
+    /// Blocks assigned to each block group.
     blocks_per_group: BlocksPerGroup,
-    /// Internal inodes_per_group state carried by this domain type.
+    /// Inodes assigned to each block group.
     inodes_per_group: InodesPerGroup,
-    /// Internal inode_size state carried by this domain type.
+    /// Validated inode record size.
     inode_size: InodeRecordSize,
-    /// Internal first_inode state carried by this domain type.
+    /// First non-reserved inode number.
     first_inode: InodeId,
-    /// Internal descriptor_size state carried by this domain type.
+    /// Validated block group descriptor size.
     descriptor_size: BlockGroupDescriptorSize,
-    /// Internal journal_mode state carried by this domain type.
+    /// Journal placement selected from superblock feature fields.
     journal_mode: JournalMode,
-    /// Internal uuid state carried by this domain type.
+    /// Filesystem UUID used for checksums and journal matching.
     uuid: FilesystemUuid,
-    /// Internal checksum_seed state carried by this domain type.
+    /// Seed used for metadata CRC32C calculations.
     checksum_seed: ChecksumSeed,
-    /// Internal features state carried by this domain type.
+    /// Feature bits validated for this mount policy.
     features: FeatureSet,
 }
 
@@ -726,7 +726,7 @@ impl Superblock {
         Self::parse_with_policy(raw, FeatureSet::read_write)
     }
 
-    /// Internal parse_with_policy operation used by this module's domain boundary.
+    /// Parses a raw superblock with the supplied feature validation policy.
     fn parse_with_policy(
         raw: &[u8],
         validate_features: fn(u32, u32, u32) -> Result<FeatureSet>,
@@ -922,7 +922,7 @@ impl Superblock {
         }
     }
 
-    /// Internal fn operation used by this module's domain boundary.
+    /// Returns the descriptor layout implied by validated feature bits.
     pub(crate) const fn descriptor_layout(self) -> BlockGroupDescriptorLayout {
         if self.features.has_64bit() {
             BlockGroupDescriptorLayout::SixtyFourBit
@@ -931,7 +931,7 @@ impl Superblock {
         }
     }
 
-    /// Internal fn operation used by this module's domain boundary.
+    /// Returns the active block group descriptor checksum mode.
     pub(crate) const fn descriptor_checksum(self) -> BlockGroupDescriptorChecksum {
         if self.features.has_metadata_csum() {
             BlockGroupDescriptorChecksum::MetadataCrc32c

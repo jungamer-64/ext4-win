@@ -40,7 +40,7 @@ pub enum Error {
     InvalidDirectoryEntry,
     /// A directory is too large for v1 eager enumeration.
     DirectoryTooLarge,
-    /// An ext4 name is not valid for its domain boundary.
+    /// An ext4 or Windows path component failed validation.
     InvalidName,
     /// A Windows case-insensitive lookup matched multiple ext4 names.
     AmbiguousWindowsName,
