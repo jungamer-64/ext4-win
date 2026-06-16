@@ -9,7 +9,8 @@ use ext4_core::{
     DeviceLength, Ext4Name, InodeId, InternalJournal, ReadWrite, Result as Ext4Result, Volume,
 };
 use wdk_sys::{
-    DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT, VPB_MOUNTED,
+    ACCESS_MASK, DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT,
+    PDRIVER_OBJECT, SHARE_ACCESS, VPB_MOUNTED,
 };
 
 use crate::status::DriverError;
@@ -427,6 +428,8 @@ pub(crate) struct FileControlBlock {
     volume: NonNull<VolumeControlBlock>,
     /// Ext4 node opened by this FCB.
     node: FileSystemNode,
+    /// I/O manager share-access accounting for this inode identity.
+    share_access: SHARE_ACCESS,
     /// Number of open FILE_OBJECTs currently referencing this FCB.
     open_count: u32,
 }
@@ -437,6 +440,15 @@ impl FileControlBlock {
         Self {
             volume,
             node,
+            share_access: SHARE_ACCESS {
+                OpenCount: 0,
+                Readers: 0,
+                Writers: 0,
+                Deleters: 0,
+                SharedRead: 0,
+                SharedWrite: 0,
+                SharedDelete: 0,
+            },
             open_count: 0,
         }
     }
@@ -454,6 +466,38 @@ impl FileControlBlock {
     /// Replaces the ext4 node identity after an in-place namespace conversion.
     pub(crate) fn replace_node(&mut self, node: FileSystemNode) {
         self.node = node;
+    }
+
+    /// Checks and records one FILE_OBJECT's share-access claim.
+    pub(crate) fn check_share_access(
+        &mut self,
+        file_object: NonNull<FILE_OBJECT>,
+        desired_access: ACCESS_MASK,
+        share_access: wdk_sys::ULONG,
+    ) -> NTSTATUS {
+        unsafe {
+            // SAFETY: The FCB owns this SHARE_ACCESS record for the opened
+            // inode identity, and FILE_OBJECT is the active create target.
+            ffi::IoCheckShareAccess(
+                desired_access,
+                share_access,
+                file_object.as_ptr(),
+                core::ptr::addr_of_mut!(self.share_access),
+                1,
+            )
+        }
+    }
+
+    /// Removes one FILE_OBJECT's recorded share-access claim.
+    pub(crate) fn remove_share_access(&mut self, file_object: NonNull<FILE_OBJECT>) {
+        unsafe {
+            // SAFETY: Successful create recorded this FILE_OBJECT against this
+            // FCB-owned SHARE_ACCESS, and close is the unique removal point.
+            ffi::IoRemoveShareAccess(
+                file_object.as_ptr(),
+                core::ptr::addr_of_mut!(self.share_access),
+            );
+        }
     }
 
     /// Increments the number of open FILE_OBJECT references.
@@ -696,5 +740,19 @@ mod tests {
             Some(FileControlBlockOpenState::LastReference)
         );
         assert_eq!(fcb.decrement_open(), None);
+    }
+
+    #[test]
+    fn file_control_block_starts_with_empty_share_access() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let fcb = FileControlBlock::new(volume, FileSystemNode::Directory(InodeId::ROOT));
+
+        assert_eq!(fcb.share_access.OpenCount, 0);
+        assert_eq!(fcb.share_access.Readers, 0);
+        assert_eq!(fcb.share_access.Writers, 0);
+        assert_eq!(fcb.share_access.Deleters, 0);
+        assert_eq!(fcb.share_access.SharedRead, 0);
+        assert_eq!(fcb.share_access.SharedWrite, 0);
+        assert_eq!(fcb.share_access.SharedDelete, 0);
     }
 }

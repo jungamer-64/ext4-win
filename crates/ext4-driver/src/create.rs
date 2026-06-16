@@ -16,8 +16,8 @@ use crate::{
     irp::{CreateStack, DispatchTarget},
     metadata,
     state::{
-        ContextControlBlock, FileSystemNode, KernelDevice, MountedVolumeDevice, OpenedPath,
-        VolumeControlBlock,
+        ContextControlBlock, FileControlBlock, FileSystemNode, KernelDevice, MountedVolumeDevice,
+        OpenedPath, VolumeControlBlock, release_file_control_block,
     },
 };
 
@@ -81,7 +81,6 @@ impl CreateRequest {
 
 /// Opens or creates a root-relative ext4 object.
 fn open_or_create(request: CreateRequest) -> NTSTATUS {
-    let _share_access = request.stack.share_access();
     if request.stack.ea_length() != 0 {
         return STATUS_NOT_SUPPORTED;
     }
@@ -190,7 +189,14 @@ fn open_existing_node(
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             match validate_existing_node_options(node, request.stack.options()) {
-                Ok(()) => initialize_file_object(request.file_object(), vcb, node, path),
+                Ok(()) => initialize_file_object(
+                    request.file_object(),
+                    vcb,
+                    node,
+                    path,
+                    request.stack.desired_access(),
+                    wdk_sys::ULONG::from(request.stack.share_access()),
+                ),
                 Err(status) => status,
             }
         }
@@ -198,10 +204,46 @@ fn open_existing_node(
         CreateDisposition::Overwrite
         | CreateDisposition::OverwriteIf
         | CreateDisposition::Supersede => {
-            match truncate_existing_file(vcb, node, request.stack.options()) {
-                Ok(()) => initialize_file_object(request.file_object(), vcb, node, path),
-                Err(status) => status,
+            let inode = match overwrite_file_inode(node, request.stack.options()) {
+                Ok(inode) => inode,
+                Err(status) => return status,
+            };
+            let fcb = match open_shared_file_control_block(
+                request.file_object(),
+                vcb,
+                node,
+                request.stack.desired_access(),
+                wdk_sys::ULONG::from(request.stack.share_access()),
+            ) {
+                Ok(fcb) => fcb,
+                Err(status) => return status,
+            };
+            match truncate_existing_file(vcb, inode) {
+                Ok(()) => attach_file_object(request.file_object(), fcb, node, path),
+                Err(status) => {
+                    abandon_file_control_block(request.file_object(), fcb);
+                    status
+                }
             }
+        }
+    }
+}
+
+/// Resolves an existing regular file inode for overwrite-style dispositions.
+fn overwrite_file_inode(
+    node: FileSystemNode,
+    options: wdk_sys::ULONG,
+) -> Result<InodeId, NTSTATUS> {
+    if options & FILE_DIRECTORY_FILE_OPTION != 0 {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    if options & FILE_NON_DIRECTORY_FILE_OPTION != 0 {
+        validate_existing_node_options(node, options)?;
+    }
+    match node {
+        FileSystemNode::File(inode) => Ok(inode),
+        FileSystemNode::Directory(_) | FileSystemNode::Symlink(_) => {
+            Err(STATUS_OBJECT_TYPE_MISMATCH)
         }
     }
 }
@@ -238,6 +280,8 @@ fn create_missing_node(
             parent,
             name: name.clone(),
         },
+        request.stack.desired_access(),
+        wdk_sys::ULONG::from(request.stack.share_access()),
     )
 }
 
@@ -259,18 +303,8 @@ fn validate_existing_node_options(
 /// Truncates an existing regular file for overwrite-style create dispositions.
 fn truncate_existing_file(
     mut vcb: NonNull<crate::state::VolumeControlBlock>,
-    node: FileSystemNode,
-    options: wdk_sys::ULONG,
+    inode: InodeId,
 ) -> Result<(), NTSTATUS> {
-    if options & FILE_DIRECTORY_FILE_OPTION != 0 {
-        return Err(STATUS_NOT_SUPPORTED);
-    }
-    if options & FILE_NON_DIRECTORY_FILE_OPTION != 0 {
-        validate_existing_node_options(node, options)?;
-    }
-    let FileSystemNode::File(inode) = node else {
-        return Err(STATUS_OBJECT_TYPE_MISMATCH);
-    };
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
         // in the mounted device extension. The mutable borrow is the
@@ -449,8 +483,57 @@ fn path_components(file_object: &FILE_OBJECT) -> Result<Vec<WindowsName>, NTSTAT
 
 /// Stores FCB/CCB context pointers in the FILE_OBJECT.
 fn initialize_file_object(
-    mut file_object: NonNull<FILE_OBJECT>,
+    file_object: NonNull<FILE_OBJECT>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
+    node: FileSystemNode,
+    path: OpenedPath,
+    desired_access: wdk_sys::ACCESS_MASK,
+    share_access: wdk_sys::ULONG,
+) -> NTSTATUS {
+    match open_shared_file_control_block(file_object, vcb, node, desired_access, share_access) {
+        Ok(fcb) => attach_file_object(file_object, fcb, node, path),
+        Err(status) => status,
+    }
+}
+
+/// Opens the shared FCB for a node and records the create share-access claim.
+fn open_shared_file_control_block(
+    file_object: NonNull<FILE_OBJECT>,
+    vcb: NonNull<crate::state::VolumeControlBlock>,
+    node: FileSystemNode,
+    desired_access: wdk_sys::ACCESS_MASK,
+    share_access: wdk_sys::ULONG,
+) -> Result<NonNull<FileControlBlock>, NTSTATUS> {
+    let file_object_ref = unsafe {
+        // SAFETY: `file_object` comes from the active create stack and is read
+        // only for filesystem-owned context pointers before initialization.
+        file_object.as_ref()
+    };
+    if !file_object_ref.FsContext.is_null() || !file_object_ref.FsContext2.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    let Some(mut fcb) = VolumeControlBlock::open_file_control_block(vcb, node) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let fcb_ref = unsafe {
+        // SAFETY: The VCB returned a live owned FCB pointer with an open
+        // reference for this create request.
+        fcb.as_mut()
+    };
+    let status = fcb_ref.check_share_access(file_object, desired_access, share_access);
+    if status < STATUS_SUCCESS {
+        release_file_control_block(fcb);
+        return Err(status);
+    }
+
+    Ok(fcb)
+}
+
+/// Stores already-opened FCB and new CCB context pointers in the FILE_OBJECT.
+fn attach_file_object(
+    mut file_object: NonNull<FILE_OBJECT>,
+    fcb: NonNull<FileControlBlock>,
     node: FileSystemNode,
     path: OpenedPath,
 ) -> NTSTATUS {
@@ -459,17 +542,24 @@ fn initialize_file_object(
         // writable during successful create processing.
         file_object.as_mut()
     };
-    if !file_object.FsContext.is_null() || !file_object.FsContext2.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    let Some(fcb) = VolumeControlBlock::open_file_control_block(vcb, node) else {
-        return STATUS_INVALID_PARAMETER;
-    };
     let ccb = Box::new(ContextControlBlock::new(node, path));
     file_object.FsContext = fcb.as_ptr().cast::<c_void>();
     file_object.FsContext2 = Box::into_raw(ccb).cast::<c_void>();
     STATUS_SUCCESS
+}
+
+/// Rolls back an FCB open whose FILE_OBJECT was not attached.
+fn abandon_file_control_block(
+    file_object: NonNull<FILE_OBJECT>,
+    mut fcb: NonNull<FileControlBlock>,
+) {
+    let fcb_ref = unsafe {
+        // SAFETY: The FCB was opened for this create request and has not been
+        // published into FILE_OBJECT::FsContext.
+        fcb.as_mut()
+    };
+    fcb_ref.remove_share_access(file_object);
+    release_file_control_block(fcb);
 }
 
 #[cfg(test)]
