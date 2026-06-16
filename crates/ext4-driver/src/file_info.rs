@@ -16,14 +16,21 @@ use wdk_sys::{
 
 use crate::irp::{DispatchTarget, QueryDirectoryStack, QueryFileStack, SetFileStack};
 use crate::state::{
-    ContextControlBlock, DirectoryCursor, FileControlBlock, FileSystemNode, VolumeControlBlock,
+    CloseDisposition, ContextControlBlock, DirectoryCursor, FileControlBlock, FileSystemNode,
+    OpenedPath, VolumeControlBlock,
 };
 use crate::status::DriverError;
 
 /// Handles cleanup IRPs.
 pub(crate) fn cleanup(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(_target) => STATUS_SUCCESS,
+    match DispatchTarget::decode(device, irp).and_then(|target| target.current_stack()) {
+        Ok(stack) => match stack.file_object() {
+            Ok(file_object) => match cleanup_file_object(file_object) {
+                Ok(()) => STATUS_SUCCESS,
+                Err(status) => status,
+            },
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
@@ -264,6 +271,10 @@ fn apply_file_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
         wdk_sys::_FILE_INFORMATION_CLASS::FileAllocationInformation => {
             set_allocation_information(request)
         }
+        wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformation => {
+            set_disposition_information(request)
+        }
+        wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformationEx => Err(STATUS_NOT_SUPPORTED),
         _ => Err(STATUS_INVALID_INFO_CLASS),
     }
 }
@@ -345,6 +356,28 @@ fn set_allocation_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
         return Ok(());
     }
     set_regular_file_size(request.stack.file_object(), requested)
+}
+
+/// Applies FILE_DISPOSITION_INFORMATION to the handle-local close disposition.
+fn set_disposition_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
+    let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION>(
+        request.target,
+        request.stack.length(),
+    )?;
+    let mut ccb =
+        context_control_block(request.stack.file_object()).map_err(DriverError::ntstatus)?;
+    let ccb = unsafe {
+        // SAFETY: Successful create stores Box<ContextControlBlock> in
+        // FsContext2 until close releases it, and this mutation runs while the
+        // FILE_OBJECT is active.
+        ccb.as_mut()
+    };
+    if info.DeleteFile == 0 {
+        ccb.keep_on_close();
+    } else {
+        ccb.mark_delete_on_close();
+    }
+    Ok(())
 }
 
 /// Sets a regular file size by extending sparse or truncating allocated ranges.
@@ -449,7 +482,7 @@ fn pack_directory_information(
         // FILE_OBJECT is active.
         ccb.as_mut()
     };
-    let ContextControlBlock::Directory(cursor) = ccb else {
+    let Some(cursor) = ccb.directory_cursor_mut() else {
         return Err(STATUS_INVALID_PARAMETER);
     };
     initialize_directory_cursor(cursor, request.stack);
@@ -914,6 +947,60 @@ fn context_control_block(
     };
     NonNull::new(file_object.FsContext2.cast::<ContextControlBlock>())
         .ok_or(DriverError::InvalidParameter)
+}
+
+/// Applies cleanup-time namespace mutations requested by this handle.
+fn cleanup_file_object(file_object: NonNull<wdk_sys::FILE_OBJECT>) -> Result<(), NTSTATUS> {
+    let fcb = file_control_block(file_object).map_err(DriverError::ntstatus)?;
+    let fcb = unsafe {
+        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
+        // until close releases it, and cleanup runs while the FILE_OBJECT is
+        // active.
+        fcb.as_ref()
+    };
+    let mut ccb = context_control_block(file_object).map_err(DriverError::ntstatus)?;
+    let ccb = unsafe {
+        // SAFETY: Successful create stores Box<ContextControlBlock> in
+        // FsContext2 until close releases it, and cleanup runs while the
+        // FILE_OBJECT is active.
+        ccb.as_mut()
+    };
+    if ccb.close_disposition() == CloseDisposition::Keep {
+        return Ok(());
+    }
+    let OpenedPath::Child { parent, name } = ccb.path().clone() else {
+        return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot).ntstatus());
+    };
+
+    let mut vcb = fcb.volume();
+    let vcb = unsafe {
+        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
+        // remain valid while file objects are open. The mutable borrow is the
+        // transaction boundary for this cleanup namespace mutation.
+        vcb.as_mut()
+    };
+    let mut transaction = vcb
+        .volume_mut()
+        .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
+    let parent = transaction
+        .directory(parent)
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    match fcb.node() {
+        FileSystemNode::File(_) => transaction
+            .unlink_file(parent, &name)
+            .map_err(|error| DriverError::from(error).ntstatus())?,
+        FileSystemNode::Directory(_) => transaction
+            .remove_empty_directory(parent, &name)
+            .map_err(|error| DriverError::from(error).ntstatus())?,
+        FileSystemNode::Symlink(_) => transaction
+            .remove_symlink(parent, &name)
+            .map_err(|error| DriverError::from(error).ntstatus())?,
+    }
+    transaction
+        .commit()
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    ccb.keep_on_close();
+    Ok(())
 }
 
 /// Open file state needed for journaled metadata mutations.

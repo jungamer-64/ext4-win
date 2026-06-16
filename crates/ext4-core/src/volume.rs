@@ -580,20 +580,36 @@ impl<D: BlockReader, State> Volume<D, State> {
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> Result<LookupResult> {
-        let mut folded = LookupResult::NotFound;
+        match self.lookup_windows_child_entry(parent, requested)? {
+            Some(entry) => Ok(LookupResult::Found(entry.inode())),
+            None => Ok(LookupResult::NotFound),
+        }
+    }
+
+    /// Looks up a Windows-visible child name and returns the matched directory entry.
+    ///
+    /// # Errors
+    /// Returns an error when the parent cannot be enumerated or the
+    /// case-insensitive Windows projection is ambiguous.
+    pub fn lookup_windows_child_entry(
+        &self,
+        parent: &DirectoryNode,
+        requested: &WindowsName,
+    ) -> Result<Option<DirectoryEntry>> {
+        let mut folded = None;
 
         for entry in self.read_directory(parent)? {
             let Ok(name) = WindowsName::from_ext4(entry.name()) else {
                 continue;
             };
             if name.equals(requested) {
-                return Ok(LookupResult::Found(entry.inode()));
+                return Ok(Some(entry));
             }
             if name.equals_ascii_case_insensitive(requested) {
-                if matches!(folded, LookupResult::Found(_)) {
+                if folded.is_some() {
                     return Err(Error::AmbiguousWindowsName);
                 }
-                folded = LookupResult::Found(entry.inode());
+                folded = Some(entry);
             }
         }
 
