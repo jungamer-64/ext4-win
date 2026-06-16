@@ -339,6 +339,11 @@ impl FileControlBlock {
     pub(crate) const fn node(&self) -> FileSystemNode {
         self.node
     }
+
+    /// Replaces the ext4 node identity after an in-place namespace conversion.
+    pub(crate) fn replace_node(&mut self, node: FileSystemNode) {
+        self.node = node;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -390,6 +395,17 @@ pub(crate) enum OpenedHandleState {
     Symlink,
 }
 
+impl OpenedHandleState {
+    /// Builds handle-local state from an opened node identity.
+    const fn from_node(node: FileSystemNode) -> Self {
+        match node {
+            FileSystemNode::File(_) => Self::File,
+            FileSystemNode::Directory(_) => Self::Directory(DirectoryCursor::start()),
+            FileSystemNode::Symlink(_) => Self::Symlink,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Action requested when the last handle cleanup occurs.
 pub(crate) enum CloseDisposition {
@@ -413,13 +429,8 @@ pub(crate) struct ContextControlBlock {
 impl ContextControlBlock {
     /// Creates per-handle state for an opened node.
     pub(crate) fn new(node: FileSystemNode, path: OpenedPath) -> Self {
-        let handle = match node {
-            FileSystemNode::File(_) => OpenedHandleState::File,
-            FileSystemNode::Directory(_) => OpenedHandleState::Directory(DirectoryCursor::start()),
-            FileSystemNode::Symlink(_) => OpenedHandleState::Symlink,
-        };
         Self {
-            handle,
+            handle: OpenedHandleState::from_node(node),
             path,
             close_disposition: CloseDisposition::Keep,
         }
@@ -456,6 +467,11 @@ impl ContextControlBlock {
     /// Replaces the opened path after a successful rename.
     pub(crate) fn replace_path(&mut self, path: OpenedPath) {
         self.path = path;
+    }
+
+    /// Replaces handle-local node state after an in-place namespace conversion.
+    pub(crate) fn replace_node(&mut self, node: FileSystemNode) {
+        self.handle = OpenedHandleState::from_node(node);
     }
 }
 

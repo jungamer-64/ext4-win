@@ -11,6 +11,7 @@ mod ffi;
 mod file_info;
 mod file_system_control;
 mod irp;
+mod metadata;
 mod reparse;
 mod state;
 mod status;

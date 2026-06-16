@@ -229,9 +229,10 @@ fn user_fs_control(request: UserFsControlRequest) -> NTSTATUS {
         reparse::FSCTL_GET_REPARSE_POINT => {
             reparse::get_reparse_point(request.target(), request.stack())
         }
-        reparse::FSCTL_SET_REPARSE_POINT | reparse::FSCTL_DELETE_REPARSE_POINT => {
-            STATUS_NOT_SUPPORTED
+        reparse::FSCTL_SET_REPARSE_POINT => {
+            reparse::set_reparse_point(request.target(), request.stack())
         }
+        reparse::FSCTL_DELETE_REPARSE_POINT => STATUS_NOT_SUPPORTED,
         _ => STATUS_NOT_SUPPORTED,
     }
 }

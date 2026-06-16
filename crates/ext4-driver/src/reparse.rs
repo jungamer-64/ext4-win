@@ -1,15 +1,20 @@
 //! Reparse-point FSCTL packing for ext4 symbolic links.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
-use ext4_core::{InodeId, Node};
+use ext4_core::{InodeId, Node, SymlinkTarget};
 use wdk_sys::{
     NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
     STATUS_SUCCESS,
 };
 
 use crate::irp::{DispatchTarget, FileSystemControlStack};
-use crate::state::{FileControlBlock, FileSystemNode, VolumeControlBlock, file_control_block};
+use crate::metadata;
+use crate::state::{
+    FileControlBlock, FileSystemNode, OpenedPath, VolumeControlBlock, context_control_block,
+    file_control_block,
+};
 use crate::status::DriverError;
 
 /// `FSCTL_GET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
@@ -23,6 +28,8 @@ pub(crate) const FSCTL_DELETE_REPARSE_POINT: wdk_sys::ULONG = 589_996;
 
 /// The opened node is not a reparse point.
 const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = ntstatus(0xC000_0275);
+/// The caller supplied a reparse tag owned by another handler.
+const STATUS_IO_REPARSE_TAG_NOT_HANDLED: NTSTATUS = ntstatus(0xC000_0279);
 
 /// Reparse buffer header before the tag-specific payload.
 const REPARSE_DATA_BUFFER_HEADER_SIZE: usize = 8;
@@ -48,6 +55,19 @@ pub(crate) fn get_reparse_point(target: DispatchTarget, stack: FileSystemControl
         Ok(())
     }) {
         Ok(()) => STATUS_SUCCESS,
+        Err(status) => status,
+    }
+}
+
+/// Handles `FSCTL_SET_REPARSE_POINT` by replacing the opened node with an ext4 symlink.
+pub(crate) fn set_reparse_point(target: DispatchTarget, stack: FileSystemControlStack) -> NTSTATUS {
+    match parse_symlink_reparse_target(target, stack)
+        .and_then(|symlink_target| replace_opened_path_with_symlink(stack, &symlink_target))
+    {
+        Ok(()) => {
+            target.set_information(0);
+            STATUS_SUCCESS
+        }
         Err(status) => status,
     }
 }
@@ -80,6 +100,84 @@ fn read_core_symlink(vcb: &VolumeControlBlock, inode: InodeId) -> Result<Vec<u8>
     vcb.volume()
         .read_symlink(&symlink)
         .map_err(|error| DriverError::from(error).ntstatus())
+}
+
+/// Parses a Windows symbolic-link reparse input buffer into an ext4 symlink target.
+fn parse_symlink_reparse_target(
+    target: DispatchTarget,
+    stack: FileSystemControlStack,
+) -> Result<SymlinkTarget, NTSTATUS> {
+    let length =
+        usize::try_from(stack.input_buffer_length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let input = target
+        .data_buffer(length)
+        .map_err(|error| error.ntstatus())?;
+    parse_symlink_reparse_buffer(input.as_slice())
+}
+
+/// Replaces the opened child entry with a newly-created symlink inode.
+fn replace_opened_path_with_symlink(
+    stack: FileSystemControlStack,
+    target: &SymlinkTarget,
+) -> Result<(), NTSTATUS> {
+    let mut fcb = file_control_block(stack.file_object()).map_err(DriverError::ntstatus)?;
+    let fcb = unsafe {
+        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
+        // until close releases it, and this FSCTL runs while the FILE_OBJECT
+        // is active.
+        fcb.as_mut()
+    };
+    let mut ccb = context_control_block(stack.file_object()).map_err(DriverError::ntstatus)?;
+    let ccb = unsafe {
+        // SAFETY: Successful create stores Box<ContextControlBlock> in
+        // FsContext2 until close releases it, and this FSCTL runs while the
+        // FILE_OBJECT is active.
+        ccb.as_mut()
+    };
+    let OpenedPath::Child { parent, name } = ccb.path().clone() else {
+        return Err(STATUS_NOT_SUPPORTED);
+    };
+
+    let mut vcb = fcb.volume();
+    let vcb = unsafe {
+        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
+        // remain valid while file objects are open. The mutable borrow is the
+        // transaction boundary for this namespace conversion.
+        vcb.as_mut()
+    };
+    let mut transaction = vcb
+        .volume_mut()
+        .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
+    let parent_directory = transaction
+        .directory(parent)
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    match fcb.node() {
+        FileSystemNode::File(_) => transaction
+            .unlink_file(parent_directory, &name)
+            .map_err(|error| DriverError::from(error).ntstatus())?,
+        FileSystemNode::Directory(_) => transaction
+            .remove_empty_directory(parent_directory, &name)
+            .map_err(|error| DriverError::from(error).ntstatus())?,
+        FileSystemNode::Symlink(_) => transaction
+            .remove_symlink(parent_directory, &name)
+            .map_err(|error| DriverError::from(error).ntstatus())?,
+    }
+    let symlink = transaction
+        .create_symlink(
+            parent_directory,
+            &name,
+            target,
+            metadata::default_symlink_metadata()
+                .map_err(|error| DriverError::from(error).ntstatus())?,
+        )
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    transaction
+        .commit()
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    let node = FileSystemNode::Symlink(symlink.inode_id());
+    fcb.replace_node(node);
+    ccb.replace_node(node);
+    Ok(())
 }
 
 /// Returns the mounted VCB referenced by an FCB.
@@ -133,6 +231,96 @@ fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> Result<usize
         path.as_slice(),
     )?;
     Ok(total_length)
+}
+
+/// Parses a Windows symbolic-link reparse buffer.
+fn parse_symlink_reparse_buffer(input: &[u8]) -> Result<SymlinkTarget, NTSTATUS> {
+    let tag = read_u32(input, 0)?;
+    if tag != wdk_sys::IO_REPARSE_TAG_SYMLINK {
+        return Err(STATUS_IO_REPARSE_TAG_NOT_HANDLED);
+    }
+    let reparse_data_length = usize::from(read_u16(input, 4)?);
+    let total_length = REPARSE_DATA_BUFFER_HEADER_SIZE
+        .checked_add(reparse_data_length)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    if input.len() < total_length {
+        return Err(STATUS_BUFFER_TOO_SMALL);
+    }
+    if reparse_data_length < SYMLINK_REPARSE_BUFFER_HEADER_SIZE {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    let substitute_name_offset = usize::from(read_u16(input, 8)?);
+    let substitute_name_length = usize::from(read_u16(input, 10)?);
+    let flags = read_u32(input, 16)?;
+    if flags & !wdk_sys::SYMLINK_FLAG_RELATIVE != 0 {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+
+    let path_buffer_length = reparse_data_length
+        .checked_sub(SYMLINK_REPARSE_BUFFER_HEADER_SIZE)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let units = reparse_path_units(
+        input,
+        path_buffer_length,
+        substitute_name_offset,
+        substitute_name_length,
+    )?;
+    let target = String::from_utf16(units.as_slice()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    SymlinkTarget::new(target.as_bytes()).map_err(|error| DriverError::from(error).ntstatus())
+}
+
+/// Reads a UTF-16 path slice from a symbolic-link reparse path buffer.
+fn reparse_path_units(
+    input: &[u8],
+    path_buffer_length: usize,
+    offset: usize,
+    length: usize,
+) -> Result<Vec<u16>, NTSTATUS> {
+    if !offset.is_multiple_of(2) || !length.is_multiple_of(2) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let path_buffer_end = SYMLINK_PATH_BUFFER_OFFSET
+        .checked_add(path_buffer_length)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let start = SYMLINK_PATH_BUFFER_OFFSET
+        .checked_add(offset)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let end = start.checked_add(length).ok_or(STATUS_INVALID_PARAMETER)?;
+    if end > path_buffer_end {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let bytes = input.get(start..end).ok_or(STATUS_BUFFER_TOO_SMALL)?;
+    let mut chunks = bytes.chunks_exact(core::mem::size_of::<u16>());
+    let mut units = Vec::new();
+    for chunk in &mut chunks {
+        let unit: [u8; 2] = chunk.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
+        units.push(u16::from_le_bytes(unit));
+    }
+    if !chunks.remainder().is_empty() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(units)
+}
+
+/// Reads a little-endian `u16` from an unaligned input buffer.
+fn read_u16(input: &[u8], offset: usize) -> Result<u16, NTSTATUS> {
+    let end = offset
+        .checked_add(core::mem::size_of::<u16>())
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let bytes = input.get(offset..end).ok_or(STATUS_BUFFER_TOO_SMALL)?;
+    let bytes: [u8; 2] = bytes.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+/// Reads a little-endian `u32` from an unaligned input buffer.
+fn read_u32(input: &[u8], offset: usize) -> Result<u32, NTSTATUS> {
+    let end = offset
+        .checked_add(core::mem::size_of::<u32>())
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let bytes = input.get(offset..end).ok_or(STATUS_BUFFER_TOO_SMALL)?;
+    let bytes: [u8; 4] = bytes.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 /// Returns the byte count for UTF-16 code units.
@@ -198,8 +386,12 @@ fn write_utf16(output: &mut [u8], offset: usize, units: &[u16]) -> Result<(), NT
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use alloc::vec::Vec;
 
-    use super::{SYMLINK_PATH_BUFFER_OFFSET, pack_symlink_reparse_buffer};
+    use super::{
+        STATUS_IO_REPARSE_TAG_NOT_HANDLED, SYMLINK_PATH_BUFFER_OFFSET, pack_symlink_reparse_buffer,
+        parse_symlink_reparse_buffer, write_u32,
+    };
 
     fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
         let end = offset.checked_add(core::mem::size_of::<u16>())?;
@@ -264,6 +456,51 @@ mod tests {
         assert_eq!(
             pack_symlink_reparse_buffer(b"target", output.as_mut_slice()),
             Err(wdk_sys::STATUS_BUFFER_TOO_SMALL)
+        );
+    }
+
+    #[test]
+    fn parses_symlink_reparse_buffer_target() {
+        let mut input = vec![0; 128];
+        let expected = Vec::from(&b"dir/file"[..]);
+        assert_eq!(
+            pack_symlink_reparse_buffer(expected.as_slice(), input.as_mut_slice()),
+            Ok(52)
+        );
+
+        assert_eq!(
+            parse_symlink_reparse_buffer(input.as_slice()).map(|target| target.bytes().to_vec()),
+            Ok(expected)
+        );
+    }
+
+    #[test]
+    fn rejects_unhandled_reparse_tag_on_set() {
+        let mut input = vec![0; 128];
+        assert_eq!(
+            pack_symlink_reparse_buffer(b"target", input.as_mut_slice()),
+            Ok(44)
+        );
+        assert_eq!(write_u32(input.as_mut_slice(), 0, 0), Ok(()));
+
+        assert_eq!(
+            parse_symlink_reparse_buffer(input.as_slice()),
+            Err(STATUS_IO_REPARSE_TAG_NOT_HANDLED)
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_symlink_reparse_flags() {
+        let mut input = vec![0; 128];
+        assert_eq!(
+            pack_symlink_reparse_buffer(b"target", input.as_mut_slice()),
+            Ok(44)
+        );
+        assert_eq!(write_u32(input.as_mut_slice(), 16, 2), Ok(()));
+
+        assert_eq!(
+            parse_symlink_reparse_buffer(input.as_slice()),
+            Err(wdk_sys::STATUS_NOT_SUPPORTED)
         );
     }
 }
