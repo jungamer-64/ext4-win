@@ -5,5 +5,5 @@ pub(crate) use wdk_sys::ntddk::{
     IoBuildDeviceIoControlRequest, IoBuildSynchronousFsdRequest, IoCreateDevice, IoDeleteDevice,
     IoRegisterFileSystem, IoUnregisterFileSystem, IofCallDriver, KeInitializeEvent,
     KeQuerySystemTimePrecise, KeWaitForSingleObject, MmMapLockedPagesSpecifyCache,
-    RtlTimeToSecondsSince1970,
+    RtlSecondsSince1970ToTime, RtlTimeToSecondsSince1970,
 };

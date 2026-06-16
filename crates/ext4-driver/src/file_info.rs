@@ -3,10 +3,15 @@
 use alloc::boxed::Box;
 use core::ptr::NonNull;
 
-use ext4_core::{Ext4Timestamp, FileOffset, Node};
-use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_NOT_SUPPORTED, STATUS_SUCCESS};
+use core::ffi::c_void;
 
-use crate::irp::DispatchTarget;
+use ext4_core::{Ext4Security, Ext4Times, Ext4Timestamp, FileOffset, FileSize, InodeId, Node};
+use wdk_sys::{
+    LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_BUFFER_TOO_SMALL,
+    STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
+};
+
+use crate::irp::{DispatchTarget, QueryFileStack};
 use crate::state::{ContextControlBlock, FileControlBlock, FileSystemNode, VolumeControlBlock};
 use crate::status::DriverError;
 
@@ -58,7 +63,10 @@ pub(crate) fn flush(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 
 /// Handles file information queries.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    decoded_not_supported(device, irp)
+    match DispatchTarget::decode(device, irp).and_then(QueryFileRequest::decode) {
+        Ok(request) => query_file_information(request),
+        Err(error) => error.ntstatus(),
+    }
 }
 
 /// Handles file information mutations.
@@ -113,6 +121,337 @@ fn decoded_not_supported(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
         }
         Err(error) => error.ntstatus(),
     }
+}
+
+/// Decoded query-file-information request.
+#[derive(Clone, Copy, Debug)]
+struct QueryFileRequest {
+    /// Dispatch target receiving the query.
+    target: DispatchTarget,
+    /// Decoded query stack.
+    stack: QueryFileStack,
+}
+
+impl QueryFileRequest {
+    /// Decodes a query-file-information request.
+    fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
+        Ok(Self {
+            target,
+            stack: target.current_stack()?.query_file()?,
+        })
+    }
+}
+
+/// Handles fixed-size file information queries.
+fn query_file_information(request: QueryFileRequest) -> NTSTATUS {
+    match pack_file_information(request) {
+        Ok(information) => {
+            request.target.set_information(information);
+            STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+/// Packs one supported file information class.
+fn pack_file_information(request: QueryFileRequest) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+    let metadata = load_file_metadata(request.stack.file_object())?;
+    let buffer = request
+        .target
+        .system_buffer()
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let length = usize::try_from(request.stack.length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    match request.stack.information_class() {
+        wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => {
+            pack_basic_information(buffer, length, metadata)
+        }
+        wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation => {
+            pack_standard_information(buffer, length, metadata)
+        }
+        wdk_sys::_FILE_INFORMATION_CLASS::FileInternalInformation => {
+            pack_internal_information(buffer, length, metadata)
+        }
+        wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => {
+            pack_position_information(buffer, length, request.stack.file_object())
+        }
+        wdk_sys::_FILE_INFORMATION_CLASS::FileNetworkOpenInformation => {
+            pack_network_open_information(buffer, length, metadata)
+        }
+        _ => Err(STATUS_INVALID_INFO_CLASS),
+    }
+}
+
+/// File metadata needed by fixed-size Windows information classes.
+#[derive(Clone, Copy, Debug)]
+struct FileMetadata {
+    /// Stable ext4 inode id.
+    inode: InodeId,
+    /// Open node kind.
+    kind: FileMetadataKind,
+    /// Payload size in bytes.
+    size: FileSize,
+    /// POSIX security metadata.
+    security: Ext4Security,
+    /// ext4 inode timestamps.
+    times: Ext4Times,
+    /// ext4 inode link count.
+    links_count: u16,
+    /// Windows-specific overlay attributes.
+    overlay_attributes: u32,
+    /// Mounted volume block size.
+    block_size: ext4_core::BlockSize,
+}
+
+/// Node kind projected to Windows information flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileMetadataKind {
+    /// Regular file.
+    File,
+    /// Directory.
+    Directory,
+    /// Symbolic link.
+    Symlink,
+}
+
+/// Loads metadata for the file object currently being queried.
+fn load_file_metadata(
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+) -> Result<FileMetadata, NTSTATUS> {
+    let fcb = file_control_block(file_object).map_err(DriverError::ntstatus)?;
+    let fcb = unsafe {
+        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
+        // until close releases it, and this query runs while the FILE_OBJECT is
+        // active.
+        fcb.as_ref()
+    };
+    let vcb = volume_control_block(fcb);
+    let inode = fcb.node().inode();
+    let overlay_attributes = vcb
+        .volume()
+        .read_windows_overlay(inode)
+        .map_err(|error| DriverError::from(error).ntstatus())?
+        .map(|overlay| overlay.attributes().bits())
+        .unwrap_or(0);
+
+    let block_size = vcb.volume().superblock().block_size();
+    match (
+        fcb.node(),
+        vcb.volume()
+            .read_node(inode)
+            .map_err(|error| DriverError::from(error).ntstatus())?,
+    ) {
+        (FileSystemNode::File(_), Node::File(file)) => Ok(FileMetadata {
+            inode,
+            kind: FileMetadataKind::File,
+            size: file.size(),
+            security: file.security(),
+            times: file.times(),
+            links_count: file.links_count(),
+            overlay_attributes,
+            block_size,
+        }),
+        (FileSystemNode::Directory(_), Node::Directory(directory)) => Ok(FileMetadata {
+            inode,
+            kind: FileMetadataKind::Directory,
+            size: directory.size(),
+            security: directory.security(),
+            times: directory.times(),
+            links_count: directory.links_count(),
+            overlay_attributes,
+            block_size,
+        }),
+        (FileSystemNode::Symlink(_), Node::Symlink(symlink)) => Ok(FileMetadata {
+            inode,
+            kind: FileMetadataKind::Symlink,
+            size: symlink.size(),
+            security: symlink.security(),
+            times: symlink.times(),
+            links_count: symlink.links_count(),
+            overlay_attributes,
+            block_size,
+        }),
+        _ => Err(DriverError::Core(ext4_core::Error::WrongInodeKind).ntstatus()),
+    }
+}
+
+/// Packs FILE_BASIC_INFORMATION.
+fn pack_basic_information(
+    buffer: NonNull<c_void>,
+    length: usize,
+    metadata: FileMetadata,
+) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+    write_fixed(
+        buffer,
+        length,
+        wdk_sys::FILE_BASIC_INFORMATION {
+            CreationTime: windows_time(metadata.times.created()),
+            LastAccessTime: windows_time(metadata.times.accessed()),
+            LastWriteTime: windows_time(metadata.times.modified()),
+            ChangeTime: windows_time(metadata.times.changed()),
+            FileAttributes: file_attributes(metadata),
+        },
+    )
+}
+
+/// Packs FILE_STANDARD_INFORMATION.
+fn pack_standard_information(
+    buffer: NonNull<c_void>,
+    length: usize,
+    metadata: FileMetadata,
+) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+    write_fixed(
+        buffer,
+        length,
+        wdk_sys::FILE_STANDARD_INFORMATION {
+            AllocationSize: large_integer_from_u64(allocation_size(metadata)?)?,
+            EndOfFile: large_integer_from_u64(metadata.size.bytes())?,
+            NumberOfLinks: wdk_sys::ULONG::from(metadata.links_count),
+            DeletePending: boolean(false),
+            Directory: boolean(metadata.kind == FileMetadataKind::Directory),
+        },
+    )
+}
+
+/// Packs FILE_INTERNAL_INFORMATION.
+fn pack_internal_information(
+    buffer: NonNull<c_void>,
+    length: usize,
+    metadata: FileMetadata,
+) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+    write_fixed(
+        buffer,
+        length,
+        wdk_sys::FILE_INTERNAL_INFORMATION {
+            IndexNumber: LARGE_INTEGER {
+                QuadPart: i64::from(metadata.inode.as_u32()),
+            },
+        },
+    )
+}
+
+/// Packs FILE_POSITION_INFORMATION.
+fn pack_position_information(
+    buffer: NonNull<c_void>,
+    length: usize,
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+    let file_object = unsafe {
+        // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
+        // is read only for the current byte offset field.
+        file_object.as_ref()
+    };
+    let current = unsafe {
+        // SAFETY: CurrentByteOffset is read through its QuadPart arm.
+        file_object.CurrentByteOffset.QuadPart
+    };
+    write_fixed(
+        buffer,
+        length,
+        wdk_sys::FILE_POSITION_INFORMATION {
+            CurrentByteOffset: LARGE_INTEGER { QuadPart: current },
+        },
+    )
+}
+
+/// Packs FILE_NETWORK_OPEN_INFORMATION.
+fn pack_network_open_information(
+    buffer: NonNull<c_void>,
+    length: usize,
+    metadata: FileMetadata,
+) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+    write_fixed(
+        buffer,
+        length,
+        wdk_sys::FILE_NETWORK_OPEN_INFORMATION {
+            CreationTime: windows_time(metadata.times.created()),
+            LastAccessTime: windows_time(metadata.times.accessed()),
+            LastWriteTime: windows_time(metadata.times.modified()),
+            ChangeTime: windows_time(metadata.times.changed()),
+            AllocationSize: large_integer_from_u64(allocation_size(metadata)?)?,
+            EndOfFile: large_integer_from_u64(metadata.size.bytes())?,
+            FileAttributes: file_attributes(metadata),
+        },
+    )
+}
+
+/// Writes one fixed-size information structure into the caller's buffer.
+fn write_fixed<T>(
+    buffer: NonNull<c_void>,
+    length: usize,
+    value: T,
+) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+    let size = core::mem::size_of::<T>();
+    if length < size {
+        return Err(STATUS_BUFFER_TOO_SMALL);
+    }
+    let target = buffer.cast::<T>().as_ptr();
+    unsafe {
+        // SAFETY: The caller supplied a system buffer of at least `size`
+        // bytes, and `target` is aligned according to the WDK buffer contract
+        // for fixed-size query information outputs.
+        target.write(value);
+    }
+    wdk_sys::ULONG_PTR::try_from(size).map_err(|_| STATUS_INVALID_PARAMETER)
+}
+
+/// Converts an ext4 timestamp to a Windows system-time LARGE_INTEGER.
+fn windows_time(timestamp: Ext4Timestamp) -> LARGE_INTEGER {
+    let mut time = LARGE_INTEGER { QuadPart: 0 };
+    unsafe {
+        // SAFETY: `time` points to writable stack storage for the conversion
+        // result.
+        crate::ffi::RtlSecondsSince1970ToTime(timestamp.seconds(), core::ptr::addr_of_mut!(time));
+    }
+    time
+}
+
+/// Returns Windows file attribute bits for an ext4 node.
+fn file_attributes(metadata: FileMetadata) -> wdk_sys::ULONG {
+    let mut attributes = metadata.overlay_attributes;
+    if metadata.security.permissions().as_u16() & 0o222 == 0 {
+        attributes |= wdk_sys::FILE_ATTRIBUTE_READONLY;
+    }
+    match metadata.kind {
+        FileMetadataKind::File => {}
+        FileMetadataKind::Directory => attributes |= wdk_sys::FILE_ATTRIBUTE_DIRECTORY,
+        FileMetadataKind::Symlink => attributes |= wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT,
+    }
+    if attributes == 0 {
+        wdk_sys::FILE_ATTRIBUTE_NORMAL
+    } else {
+        attributes
+    }
+}
+
+/// Returns allocation size rounded to a volume allocation unit.
+fn allocation_size(metadata: FileMetadata) -> Result<u64, NTSTATUS> {
+    let size = metadata.size.bytes();
+    if size == 0 {
+        return Ok(0);
+    }
+    let block_size = u64::from(metadata.block_size.bytes());
+    let adjustment = block_size.checked_sub(1).ok_or(STATUS_INVALID_PARAMETER)?;
+    let adjusted = size
+        .checked_add(adjustment)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let blocks = adjusted
+        .checked_div(block_size)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    blocks
+        .checked_mul(block_size)
+        .ok_or(STATUS_INVALID_PARAMETER)
+}
+
+/// Creates a signed LARGE_INTEGER from an unsigned byte count.
+fn large_integer_from_u64(value: u64) -> Result<LARGE_INTEGER, NTSTATUS> {
+    Ok(LARGE_INTEGER {
+        QuadPart: i64::try_from(value).map_err(|_| STATUS_INVALID_PARAMETER)?,
+    })
+}
+
+/// Converts a Rust boolean to WDK BOOLEAN.
+fn boolean(value: bool) -> wdk_sys::BOOLEAN {
+    u8::from(value)
 }
 
 /// Reads a regular file through ext4-core into the IRP output buffer.

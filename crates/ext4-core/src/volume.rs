@@ -14,8 +14,9 @@ use crate::extent::{
 };
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
-    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Timestamp, FileOffset, FileSize, Inode, InodeId,
-    InodeKind, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
+    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset, FileSize,
+    Inode, InodeId, InodeKind, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
+    ReadBytes, SymlinkTarget,
 };
 use crate::journal::{Journal, LoadedJournal};
 use crate::name::Ext4Name;
@@ -24,7 +25,7 @@ use crate::superblock::{
     BlockGroupId, Ext4VolumeLabel, FreeBlockDelta, JournalMode, MetadataChecksum, RecoveryState,
     Superblock,
 };
-use crate::windows::{Ext4Times, WindowsOverlay};
+use crate::windows::WindowsOverlay;
 use crate::xattr::{self as xattr_storage, XattrName, XattrSet, XattrValue};
 
 // Volume mutation offsets are kept together so inode/superblock rewrites use one
@@ -192,6 +193,18 @@ impl FileNode {
         self.inode.security()
     }
 
+    /// ext4 timestamps parsed from the file inode.
+    #[must_use]
+    pub const fn times(&self) -> Ext4Times {
+        self.inode.times()
+    }
+
+    /// Link count parsed from the file inode.
+    #[must_use]
+    pub const fn links_count(&self) -> u16 {
+        self.inode.links_count()
+    }
+
     /// Returns the backing inode for volume-internal operations.
     fn inode(&self) -> &Inode {
         &self.inode
@@ -216,6 +229,24 @@ impl DirectoryNode {
     #[must_use]
     pub const fn security(&self) -> Ext4Security {
         self.inode.security()
+    }
+
+    /// Directory payload size in bytes.
+    #[must_use]
+    pub const fn size(&self) -> FileSize {
+        self.inode.size()
+    }
+
+    /// ext4 timestamps parsed from the directory inode.
+    #[must_use]
+    pub const fn times(&self) -> Ext4Times {
+        self.inode.times()
+    }
+
+    /// Link count parsed from the directory inode.
+    #[must_use]
+    pub const fn links_count(&self) -> u16 {
+        self.inode.links_count()
     }
 
     /// Returns the backing inode for volume-internal operations.
@@ -248,6 +279,18 @@ impl SymlinkNode {
     #[must_use]
     pub const fn security(&self) -> Ext4Security {
         self.inode.security()
+    }
+
+    /// ext4 timestamps parsed from the symlink inode.
+    #[must_use]
+    pub const fn times(&self) -> Ext4Times {
+        self.inode.times()
+    }
+
+    /// Link count parsed from the symlink inode.
+    #[must_use]
+    pub const fn links_count(&self) -> u16 {
+        self.inode.links_count()
     }
 
     /// Returns the backing inode for volume-internal operations.

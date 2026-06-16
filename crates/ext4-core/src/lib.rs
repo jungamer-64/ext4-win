@@ -41,9 +41,10 @@ pub use extent::{
     LogicalBlock, MutableExtentTree, SerializedExtentBlock, SerializedExtentTree,
 };
 pub use inode::{
-    Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Timestamp, Ext4Uid, FileOffset,
-    FileSize, Inode, InodeExtentRoot, InodeId, InodeInlineBytes, InodeKind, InodeStorage,
-    NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
+    Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid,
+    FileOffset, FileSize, Inode, InodeExtentRoot, InodeId, InodeInlineBytes, InodeKind,
+    InodeStorage, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, ReadBytes,
+    SymlinkTarget,
 };
 pub use name::{Ext4Name, WindowsName};
 pub use superblock::{
@@ -57,7 +58,7 @@ pub use volume::{
     ReadWrite, SymlinkNode, TransactionDirectory, TransactionFile, TransactionNode,
     TransactionSymlink, Volume, WriteTransaction,
 };
-pub use windows::{Ext4Times, Ext4WindowsAttributes, WindowsOverlay};
+pub use windows::{Ext4WindowsAttributes, WindowsOverlay};
 pub use xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 
 #[cfg(test)]

@@ -21,6 +21,14 @@ const INODE_GID_LO_OFFSET: usize = 24;
 const INODE_UID_HI_OFFSET: usize = 120;
 /// High GID field offset inside a large inode record.
 const INODE_GID_HI_OFFSET: usize = 122;
+/// Access time field offset inside an inode record.
+const INODE_ATIME_OFFSET: usize = 8;
+/// Change time field offset inside an inode record.
+const INODE_CTIME_OFFSET: usize = 12;
+/// Modification time field offset inside an inode record.
+const INODE_MTIME_OFFSET: usize = 16;
+/// Creation time field offset inside a large inode record.
+const INODE_CRTIME_OFFSET: usize = 144;
 /// Inode flag selecting extent-based data mapping.
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 /// Inode flag selecting indexed directory data.
@@ -143,6 +151,61 @@ impl Ext4Timestamp {
     #[must_use]
     pub const fn seconds(self) -> u32 {
         self.seconds
+    }
+}
+
+/// ext4 inode timestamps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ext4Times {
+    /// Last access time.
+    accessed: Ext4Timestamp,
+    /// Last modification time.
+    modified: Ext4Timestamp,
+    /// Last metadata change time.
+    changed: Ext4Timestamp,
+    /// Creation time.
+    created: Ext4Timestamp,
+}
+
+impl Ext4Times {
+    /// Creates a full timestamp set.
+    #[must_use]
+    pub const fn new(
+        accessed: Ext4Timestamp,
+        modified: Ext4Timestamp,
+        changed: Ext4Timestamp,
+        created: Ext4Timestamp,
+    ) -> Self {
+        Self {
+            accessed,
+            modified,
+            changed,
+            created,
+        }
+    }
+
+    /// Last access time.
+    #[must_use]
+    pub const fn accessed(self) -> Ext4Timestamp {
+        self.accessed
+    }
+
+    /// Last modification time.
+    #[must_use]
+    pub const fn modified(self) -> Ext4Timestamp {
+        self.modified
+    }
+
+    /// Last metadata change time.
+    #[must_use]
+    pub const fn changed(self) -> Ext4Timestamp {
+        self.changed
+    }
+
+    /// Creation time.
+    #[must_use]
+    pub const fn created(self) -> Ext4Timestamp {
+        self.created
     }
 }
 
@@ -495,6 +558,8 @@ pub struct Inode {
     size: FileSize,
     /// POSIX security state parsed from owner and mode fields.
     security: Ext4Security,
+    /// Timestamps parsed from ext4 inode time fields.
+    times: Ext4Times,
     /// Raw link count used by directory removal checks.
     links_count: u16,
     /// Raw inode flags kept for capability predicates.
@@ -529,6 +594,7 @@ impl Inode {
         };
         let size =
             FileSize::from_bytes(u64::from(le_u32(raw, 4)?) | (u64::from(le_u32(raw, 108)?) << 32));
+        let times = parse_times(raw)?;
         let links_count = le_u16(raw, 26)?;
         let flags = le_u32(raw, 32)?;
         let generation = le_u32(raw, 100)?;
@@ -547,6 +613,7 @@ impl Inode {
             kind,
             size,
             security: Ext4Security::new(owner, permissions),
+            times,
             links_count,
             flags,
             generation,
@@ -576,6 +643,12 @@ impl Inode {
     #[must_use]
     pub const fn security(&self) -> Ext4Security {
         self.security
+    }
+
+    /// ext4 inode timestamps.
+    #[must_use]
+    pub const fn times(&self) -> Ext4Times {
+        self.times
     }
 
     /// POSIX owner parsed from uid/gid fields.
@@ -679,4 +752,25 @@ fn parse_gid(raw: &[u8]) -> Result<u32> {
         0
     };
     Ok(low | high)
+}
+
+/// Parses ext4 inode timestamps.
+fn parse_times(raw: &[u8]) -> Result<Ext4Times> {
+    let accessed = Ext4Timestamp::from_unix_seconds(le_u32(raw, INODE_ATIME_OFFSET)?);
+    let changed = Ext4Timestamp::from_unix_seconds(le_u32(raw, INODE_CTIME_OFFSET)?);
+    let modified = Ext4Timestamp::from_unix_seconds(le_u32(raw, INODE_MTIME_OFFSET)?);
+    let created = if raw
+        .get(
+            INODE_CRTIME_OFFSET
+                ..INODE_CRTIME_OFFSET
+                    .checked_add(core::mem::size_of::<u32>())
+                    .ok_or(Error::ArithmeticOverflow)?,
+        )
+        .is_some()
+    {
+        Ext4Timestamp::from_unix_seconds(le_u32(raw, INODE_CRTIME_OFFSET)?)
+    } else {
+        changed
+    };
+    Ok(Ext4Times::new(accessed, modified, changed, created))
 }
