@@ -290,6 +290,46 @@ impl CurrentIrpStackLocation {
         })
     }
 
+    /// Decodes query-EA parameters.
+    pub(crate) fn query_ea(self) -> Result<QueryEaStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let query = unsafe {
+            // SAFETY: The caller selects this accessor only for IRP_MJ_QUERY_EA,
+            // where QueryEa is active.
+            stack.Parameters.QueryEa
+        };
+        Ok(QueryEaStack {
+            file_object: self.file_object()?,
+            flags: stack.Flags,
+            length: query.Length,
+            ea_list: NonNull::new(query.EaList.cast::<u8>()),
+            ea_list_length: query.EaListLength,
+            ea_index: query.EaIndex,
+        })
+    }
+
+    /// Decodes set-EA parameters.
+    pub(crate) fn set_ea(self) -> Result<SetEaStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let set = unsafe {
+            // SAFETY: The caller selects this accessor only for IRP_MJ_SET_EA,
+            // where SetEa is active.
+            stack.Parameters.SetEa
+        };
+        Ok(SetEaStack {
+            file_object: self.file_object()?,
+            length: set.Length,
+        })
+    }
+
     /// Decodes read parameters from the current stack location.
     pub(crate) fn read(self) -> Result<ReadStack, DriverError> {
         let stack = unsafe {
@@ -574,6 +614,32 @@ pub(crate) struct QueryDirectoryStack {
     file_index: wdk_sys::ULONG,
 }
 
+/// Decoded query-EA stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueryEaStack {
+    /// FILE_OBJECT carrying the FCB/CCB.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Query-EA SL_* flags.
+    flags: wdk_sys::UCHAR,
+    /// Output buffer length.
+    length: wdk_sys::ULONG,
+    /// Optional FILE_GET_EA_INFORMATION list.
+    ea_list: Option<NonNull<u8>>,
+    /// Optional EA list byte length.
+    ea_list_length: wdk_sys::ULONG,
+    /// Caller-supplied EA index when SL_INDEX_SPECIFIED is set.
+    ea_index: wdk_sys::ULONG,
+}
+
+/// Decoded set-EA stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SetEaStack {
+    /// FILE_OBJECT carrying the FCB/CCB.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Input FILE_FULL_EA_INFORMATION byte length.
+    length: wdk_sys::ULONG,
+}
+
 /// Decoded read stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadStack {
@@ -708,6 +774,50 @@ impl QueryDirectoryStack {
     }
 }
 
+impl QueryEaStack {
+    /// Returns the FILE_OBJECT carrying this query.
+    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object
+    }
+
+    /// Returns query-EA SL_* flags.
+    pub(crate) const fn flags(self) -> wdk_sys::UCHAR {
+        self.flags
+    }
+
+    /// Returns the output buffer length.
+    pub(crate) const fn length(self) -> wdk_sys::ULONG {
+        self.length
+    }
+
+    /// Returns the optional input EA name list.
+    pub(crate) const fn ea_list(self) -> Option<NonNull<u8>> {
+        self.ea_list
+    }
+
+    /// Returns the optional EA name list byte length.
+    pub(crate) const fn ea_list_length(self) -> wdk_sys::ULONG {
+        self.ea_list_length
+    }
+
+    /// Returns the caller-supplied EA index.
+    pub(crate) const fn ea_index(self) -> wdk_sys::ULONG {
+        self.ea_index
+    }
+}
+
+impl SetEaStack {
+    /// Returns the FILE_OBJECT carrying this mutation.
+    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object
+    }
+
+    /// Returns the input FILE_FULL_EA_INFORMATION byte length.
+    pub(crate) const fn length(self) -> wdk_sys::ULONG {
+        self.length
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::ffi::c_void;
@@ -815,6 +925,57 @@ mod tests {
                 assert_eq!(control.input_buffer_length(), 32);
                 assert_eq!(control.output_buffer_length(), 128);
                 assert_eq!(control.fs_control_code(), 589_992);
+            }
+        }
+    }
+
+    #[test]
+    fn query_ea_stack_preserves_file_object_flags_lengths_list_and_index() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let ea_list = NonNull::<u8>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Flags = u8::try_from(wdk_sys::SL_RETURN_SINGLE_ENTRY).unwrap_or(u8::MAX);
+        stack.Parameters.QueryEa = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_11 {
+            Length: 128,
+            EaList: ea_list.as_ptr().cast(),
+            EaListLength: 24,
+            __bindgen_padding_0: 0,
+            EaIndex: 2,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let query = current.query_ea();
+            assert!(query.is_ok());
+            if let Ok(query) = query {
+                assert_eq!(query.file_object(), file_object);
+                assert_eq!(query.flags(), stack.Flags);
+                assert_eq!(query.length(), 128);
+                assert_eq!(query.ea_list(), Some(ea_list));
+                assert_eq!(query.ea_list_length(), 24);
+                assert_eq!(query.ea_index(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn set_ea_stack_preserves_file_object_and_length() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Parameters.SetEa =
+            wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_12 { Length: 64 };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let set = current.set_ea();
+            assert!(set.is_ok());
+            if let Ok(set) = set {
+                assert_eq!(set.file_object(), file_object);
+                assert_eq!(set.length(), 64);
             }
         }
     }
