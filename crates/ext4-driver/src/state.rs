@@ -301,10 +301,6 @@ pub(crate) enum FileSystemNode {
     Symlink(InodeId),
 }
 
-#[expect(
-    dead_code,
-    reason = "FCB node accessors are defined before CREATE constructs FCB state"
-)]
 impl FileSystemNode {
     /// Returns the inode represented by this node.
     pub(crate) const fn inode(self) -> InodeId {

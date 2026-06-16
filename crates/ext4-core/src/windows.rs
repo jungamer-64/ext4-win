@@ -1,7 +1,6 @@
 //! Windows metadata projected onto ext4 domain types.
 
 use crate::error::{Error, Result};
-use crate::inode::Ext4Timestamp;
 use crate::xattr::{XattrName, XattrNamespace, XattrValue};
 
 /// File attributes that cannot be represented by POSIX mode bits.
@@ -112,61 +111,6 @@ impl WindowsOverlay {
         Ok(Self {
             attributes: Ext4WindowsAttributes::new(attributes)?,
         })
-    }
-}
-
-/// ext4 inode timestamps projected to Windows file information classes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Ext4Times {
-    /// Last access time.
-    accessed: Ext4Timestamp,
-    /// Last modification time.
-    modified: Ext4Timestamp,
-    /// Last metadata change time.
-    changed: Ext4Timestamp,
-    /// Creation time.
-    created: Ext4Timestamp,
-}
-
-impl Ext4Times {
-    /// Creates a full timestamp set.
-    #[must_use]
-    pub const fn new(
-        accessed: Ext4Timestamp,
-        modified: Ext4Timestamp,
-        changed: Ext4Timestamp,
-        created: Ext4Timestamp,
-    ) -> Self {
-        Self {
-            accessed,
-            modified,
-            changed,
-            created,
-        }
-    }
-
-    /// Last access time.
-    #[must_use]
-    pub const fn accessed(self) -> Ext4Timestamp {
-        self.accessed
-    }
-
-    /// Last modification time.
-    #[must_use]
-    pub const fn modified(self) -> Ext4Timestamp {
-        self.modified
-    }
-
-    /// Last metadata change time.
-    #[must_use]
-    pub const fn changed(self) -> Ext4Timestamp {
-        self.changed
-    }
-
-    /// Creation time.
-    #[must_use]
-    pub const fn created(self) -> Ext4Timestamp {
-        self.created
     }
 }
 

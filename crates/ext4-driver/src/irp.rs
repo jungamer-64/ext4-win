@@ -210,6 +210,25 @@ impl CurrentIrpStackLocation {
         })
     }
 
+    /// Decodes query-file-information parameters.
+    pub(crate) fn query_file(self) -> Result<QueryFileStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let query = unsafe {
+            // SAFETY: The caller selects this accessor only for
+            // IRP_MJ_QUERY_INFORMATION, where QueryFile is active.
+            stack.Parameters.QueryFile
+        };
+        Ok(QueryFileStack {
+            file_object: self.file_object()?,
+            length: query.Length,
+            information_class: query.FileInformationClass,
+        })
+    }
+
     /// Decodes read parameters from the current stack location.
     pub(crate) fn read(self) -> Result<ReadStack, DriverError> {
         let stack = unsafe {
@@ -420,6 +439,17 @@ pub(crate) struct QueryVolumeStack {
     information_class: wdk_sys::FS_INFORMATION_CLASS,
 }
 
+/// Decoded query-file-information stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueryFileStack {
+    /// FILE_OBJECT carrying the FCB/CCB.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Output buffer length.
+    length: wdk_sys::ULONG,
+    /// Requested file information class.
+    information_class: wdk_sys::FILE_INFORMATION_CLASS,
+}
+
 /// Decoded read stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadStack {
@@ -484,6 +514,23 @@ impl QueryVolumeStack {
 
     /// Returns the requested filesystem information class.
     pub(crate) const fn information_class(self) -> wdk_sys::FS_INFORMATION_CLASS {
+        self.information_class
+    }
+}
+
+impl QueryFileStack {
+    /// Returns the FILE_OBJECT carrying this query.
+    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object
+    }
+
+    /// Returns the output buffer length.
+    pub(crate) const fn length(self) -> wdk_sys::ULONG {
+        self.length
+    }
+
+    /// Returns the requested file information class.
+    pub(crate) const fn information_class(self) -> wdk_sys::FILE_INFORMATION_CLASS {
         self.information_class
     }
 }
@@ -618,6 +665,33 @@ mod tests {
                 assert_eq!(write.file_object(), file_object);
                 assert_eq!(write.length(), 2048);
                 assert_eq!(write.byte_offset(), 4096);
+            }
+        }
+    }
+
+    #[test]
+    fn query_file_stack_preserves_file_object_length_and_class() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
+            Length: 64,
+            __bindgen_padding_0: 0,
+            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let query = current.query_file();
+            assert!(query.is_ok());
+            if let Ok(query) = query {
+                assert_eq!(query.file_object(), file_object);
+                assert_eq!(query.length(), 64);
+                assert_eq!(
+                    query.information_class(),
+                    wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation
+                );
             }
         }
     }

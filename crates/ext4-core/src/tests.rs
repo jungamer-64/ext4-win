@@ -868,6 +868,30 @@ fn inode_security_is_parsed_from_owner_and_mode() {
 }
 
 #[test]
+fn inode_times_are_parsed_from_inode_fields() {
+    let mut image = modern_fixture_image();
+    let offset = modern_inode_offset(3);
+    put_u32(&mut image, offset + 8, 11);
+    put_u32(&mut image, offset + 12, 22);
+    put_u32(&mut image, offset + 16, 33);
+    put_u32(&mut image, offset + 144, 44);
+
+    let device = SliceBlockDevice::new(&image);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
+    let file = file_node(&volume, 3);
+
+    assert_eq!(
+        file.times(),
+        Ext4Times::new(
+            Ext4Timestamp::from_unix_seconds(11),
+            Ext4Timestamp::from_unix_seconds(33),
+            Ext4Timestamp::from_unix_seconds(22),
+            Ext4Timestamp::from_unix_seconds(44),
+        )
+    );
+}
+
+#[test]
 fn set_posix_security_updates_owner_and_permissions() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
