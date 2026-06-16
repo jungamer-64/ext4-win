@@ -1,17 +1,19 @@
 //! File object IRP handlers and file information packing boundary.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    DirectoryEntry, Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileOffset,
-    FileSize, InodeId, Node, WindowsName, WindowsOverlay,
+    DirectoryEntry, Ext4Name, Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes,
+    FileOffset, FileSize, InodeId, Node, WindowsName, WindowsOverlay,
 };
 use wdk_sys::{
     LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
     STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
-    STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
+    STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_NOT_SUPPORTED, STATUS_OBJECT_PATH_NOT_FOUND,
+    STATUS_SUCCESS,
 };
 
 use crate::irp::{DispatchTarget, QueryDirectoryStack, QueryFileStack, SetFileStack};
@@ -275,6 +277,8 @@ fn apply_file_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
             set_disposition_information(request)
         }
         wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformationEx => Err(STATUS_NOT_SUPPORTED),
+        wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation => set_rename_information(request),
+        wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformationEx => Err(STATUS_NOT_SUPPORTED),
         _ => Err(STATUS_INVALID_INFO_CLASS),
     }
 }
@@ -377,6 +381,66 @@ fn set_disposition_information(request: SetFileRequest) -> Result<(), NTSTATUS> 
     } else {
         ccb.mark_delete_on_close();
     }
+    Ok(())
+}
+
+/// Applies FILE_RENAME_INFORMATION to the opened path.
+fn set_rename_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
+    let rename = RenameInformation::parse(request.target, request.stack.length())?;
+    if rename.replace_if_exists {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+
+    let fcb = file_control_block(request.stack.file_object()).map_err(DriverError::ntstatus)?;
+    let fcb = unsafe {
+        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
+        // until close releases it, and this mutation runs while the
+        // FILE_OBJECT is active.
+        fcb.as_ref()
+    };
+    let mut ccb =
+        context_control_block(request.stack.file_object()).map_err(DriverError::ntstatus)?;
+    let ccb = unsafe {
+        // SAFETY: Successful create stores Box<ContextControlBlock> in
+        // FsContext2 until close releases it, and this mutation runs while the
+        // FILE_OBJECT is active.
+        ccb.as_mut()
+    };
+    let OpenedPath::Child {
+        parent: source_parent,
+        name: source_name,
+    } = ccb.path().clone()
+    else {
+        return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot).ntstatus());
+    };
+
+    let mut vcb = fcb.volume();
+    let vcb = unsafe {
+        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
+        // remain valid while file objects are open. The mutable borrow is the
+        // transaction boundary for this rename request.
+        vcb.as_mut()
+    };
+    let (target_parent, target_name) = resolve_rename_target(vcb, &rename.name)?;
+    let mut transaction = vcb
+        .volume_mut()
+        .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
+    let source_parent = transaction
+        .directory(source_parent)
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    let target_parent = transaction
+        .directory(target_parent)
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    transaction
+        .rename_child(source_parent, &source_name, target_parent, &target_name)
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    transaction
+        .commit()
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    ccb.replace_path(OpenedPath::Child {
+        parent: target_parent.inode_id(),
+        name: target_name,
+    });
     Ok(())
 }
 
@@ -1034,8 +1098,8 @@ fn read_file_information_input<T: Copy>(
     target: DispatchTarget,
     length: wdk_sys::ULONG,
 ) -> Result<T, NTSTATUS> {
-    let buffer = target.system_buffer().ok_or(STATUS_INVALID_PARAMETER)?;
     let length = usize::try_from(length).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let buffer = system_buffer_input(target, length)?;
     let size = core::mem::size_of::<T>();
     if length < size {
         return Err(STATUS_BUFFER_TOO_SMALL);
@@ -1044,8 +1108,182 @@ fn read_file_information_input<T: Copy>(
         // SAFETY: The set-information system buffer is at least `size` bytes
         // and is copied out immediately. Unaligned read avoids imposing a
         // stronger alignment contract on the I/O Manager buffer.
-        buffer.cast::<T>().as_ptr().read_unaligned()
+        buffer.address.cast::<T>().as_ptr().read_unaligned()
     })
+}
+
+/// Immutable system buffer view for set-information parsing.
+#[derive(Clone, Copy, Debug)]
+struct SystemBufferInput {
+    /// First byte of the system buffer.
+    address: NonNull<u8>,
+    /// Byte length supplied by the IRP stack.
+    length: usize,
+}
+
+impl SystemBufferInput {
+    /// Returns the system buffer as bytes.
+    fn as_slice(&self) -> &[u8] {
+        unsafe {
+            // SAFETY: SystemBufferInput is constructed only after the active
+            // IRP exposes a kernel-addressable system buffer for `length`
+            // bytes. The returned slice is consumed within this dispatch path.
+            core::slice::from_raw_parts(self.address.as_ptr(), self.length)
+        }
+    }
+}
+
+/// Returns a checked immutable view of the set-information system buffer.
+fn system_buffer_input(
+    target: DispatchTarget,
+    length: usize,
+) -> Result<SystemBufferInput, NTSTATUS> {
+    let address = target
+        .system_buffer()
+        .ok_or(STATUS_INVALID_PARAMETER)?
+        .cast::<u8>();
+    let max_slice_len = usize::try_from(isize::MAX).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    if length > max_slice_len {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(SystemBufferInput { address, length })
+}
+
+/// Decoded FILE_RENAME_INFORMATION payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RenameInformation {
+    /// Whether replacement of an existing target was requested.
+    replace_if_exists: bool,
+    /// Root-relative target path components.
+    name: Vec<WindowsName>,
+}
+
+impl RenameInformation {
+    /// Decodes a FILE_RENAME_INFORMATION variable-length input buffer.
+    fn parse(target: DispatchTarget, length: wdk_sys::ULONG) -> Result<Self, NTSTATUS> {
+        let length = usize::try_from(length).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let input = system_buffer_input(target, length)?;
+        let bytes = input.as_slice();
+        let replace_if_exists = *bytes
+            .get(FILE_RENAME_REPLACE_IF_EXISTS_OFFSET)
+            .ok_or(STATUS_BUFFER_TOO_SMALL)?
+            != 0;
+        if root_directory_is_present(bytes)? {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        let name_length = usize::try_from(read_u32_le(bytes, FILE_RENAME_NAME_LENGTH_OFFSET)?)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        if name_length == 0 || name_length & 1 != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let name_bytes = input_range(bytes, FILE_RENAME_NAME_OFFSET, name_length)?;
+        let units = utf16_units_from_le_bytes(name_bytes)?;
+        Ok(Self {
+            replace_if_exists,
+            name: windows_path_components(&units)?,
+        })
+    }
+}
+
+/// Offset of FILE_RENAME_INFORMATION ReplaceIfExists.
+const FILE_RENAME_REPLACE_IF_EXISTS_OFFSET: usize = 0;
+/// Offset of FILE_RENAME_INFORMATION RootDirectory.
+const FILE_RENAME_ROOT_DIRECTORY_OFFSET: usize = 8;
+/// Offset of FILE_RENAME_INFORMATION FileNameLength.
+const FILE_RENAME_NAME_LENGTH_OFFSET: usize = 16;
+/// Offset of FILE_RENAME_INFORMATION FileName.
+const FILE_RENAME_NAME_OFFSET: usize = 20;
+/// UTF-16 backslash separator.
+const UTF16_BACKSLASH: u16 = 0x005C;
+
+/// Returns true when FILE_RENAME_INFORMATION carries an unsupported root handle.
+fn root_directory_is_present(bytes: &[u8]) -> Result<bool, NTSTATUS> {
+    Ok(input_range(
+        bytes,
+        FILE_RENAME_ROOT_DIRECTORY_OFFSET,
+        core::mem::size_of::<wdk_sys::HANDLE>(),
+    )?
+    .iter()
+    .any(|byte| *byte != 0))
+}
+
+/// Decodes little-endian UTF-16 units from a byte buffer.
+fn utf16_units_from_le_bytes(bytes: &[u8]) -> Result<Vec<u16>, NTSTATUS> {
+    if bytes.len() & 1 != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut units = Vec::new();
+    for chunk in bytes.chunks_exact(core::mem::size_of::<u16>()) {
+        let unit = u16::from_le_bytes(chunk.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?);
+        units.push(unit);
+    }
+    Ok(units)
+}
+
+/// Splits a root-relative UTF-16 path into validated Windows components.
+fn windows_path_components(units: &[u16]) -> Result<Vec<WindowsName>, NTSTATUS> {
+    let mut trimmed = units;
+    while let Some(rest) = trimmed.strip_prefix(&[UTF16_BACKSLASH]) {
+        trimmed = rest;
+    }
+    if trimmed.is_empty() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut components = Vec::new();
+    for component in trimmed.split(|unit| *unit == UTF16_BACKSLASH) {
+        components.push(
+            WindowsName::from_utf16(component)
+                .map_err(|error| DriverError::from(error).ntstatus())?,
+        );
+    }
+    Ok(components)
+}
+
+/// Resolves the target parent directory and final ext4 name for a rename.
+fn resolve_rename_target(
+    vcb: &VolumeControlBlock,
+    components: &[WindowsName],
+) -> Result<(InodeId, Ext4Name), NTSTATUS> {
+    let (target_name, parents) = components.split_last().ok_or(STATUS_INVALID_PARAMETER)?;
+    let mut parent_inode = InodeId::ROOT;
+    for component in parents {
+        let parent = match vcb
+            .volume()
+            .read_node(parent_inode)
+            .map_err(|error| DriverError::from(error).ntstatus())?
+        {
+            Node::Directory(directory) => directory,
+            Node::File(_) | Node::Symlink(_) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
+        };
+        let Some(entry) = vcb
+            .volume()
+            .lookup_windows_child_entry(&parent, component)
+            .map_err(|error| DriverError::from(error).ntstatus())?
+        else {
+            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+        };
+        parent_inode = entry.inode();
+    }
+    Ok((
+        parent_inode,
+        target_name
+            .to_ext4()
+            .map_err(|error| DriverError::from(error).ntstatus())?,
+    ))
+}
+
+/// Reads a little-endian u32 from a checked input range.
+fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, NTSTATUS> {
+    let bytes = input_range(bytes, offset, core::mem::size_of::<u32>())?;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?,
+    ))
+}
+
+/// Returns an immutable checked input byte range.
+fn input_range(bytes: &[u8], offset: usize, length: usize) -> Result<&[u8], NTSTATUS> {
+    let end = offset.checked_add(length).ok_or(STATUS_INVALID_PARAMETER)?;
+    bytes.get(offset..end).ok_or(STATUS_BUFFER_TOO_SMALL)
 }
 
 /// Builds a complete ext4 timestamp set from FILE_BASIC_INFORMATION.
