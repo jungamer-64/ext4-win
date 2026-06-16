@@ -16,6 +16,10 @@ const SUPERBLOCK_SIZE: usize = 1024;
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 /// Clean filesystem bit stored in `s_state`.
 const EXT4_VALID_FS: u16 = 0x0001;
+/// Byte offset of `s_volume_name` inside the superblock.
+const VOLUME_LABEL_OFFSET: usize = 120;
+/// Fixed byte width of `s_volume_name`.
+const VOLUME_LABEL_BYTES: usize = 16;
 
 // Compatible feature bits can usually be ignored for reads, but the write domain
 // requires an explicit supported set because mutation changes their invariants.
@@ -470,6 +474,71 @@ impl JournalUuid {
     }
 }
 
+/// Ext4 volume label stored in `s_volume_name`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ext4VolumeLabel {
+    /// Label bytes without trailing NUL padding.
+    bytes: [u8; VOLUME_LABEL_BYTES],
+    /// Length of the live label prefix.
+    len: u8,
+}
+
+impl Ext4VolumeLabel {
+    /// Maximum byte length accepted by ext4 `s_volume_name`.
+    pub const MAX_BYTES: usize = VOLUME_LABEL_BYTES;
+
+    /// Creates a volume label from non-NUL bytes.
+    ///
+    /// # Errors
+    /// Returns an error when the label is longer than the on-disk field or
+    /// contains NUL, which is reserved for fixed-field padding.
+    pub fn new(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > VOLUME_LABEL_BYTES || bytes.contains(&0) {
+            return Err(Error::InvalidName);
+        }
+        let mut label = [0_u8; VOLUME_LABEL_BYTES];
+        let len = u8::try_from(bytes.len()).map_err(|_| Error::ArithmeticOverflow)?;
+        label
+            .get_mut(..bytes.len())
+            .ok_or(Error::ArithmeticOverflow)?
+            .copy_from_slice(bytes);
+        Ok(Self { bytes: label, len })
+    }
+
+    /// Parses the fixed superblock label field.
+    pub(crate) fn parse(raw: &[u8]) -> Result<Self> {
+        let field = raw
+            .get(VOLUME_LABEL_OFFSET..VOLUME_LABEL_OFFSET + VOLUME_LABEL_BYTES)
+            .ok_or(Error::TruncatedStructure)?;
+        let len = field
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(field.len());
+        Self::new(field.get(..len).ok_or(Error::TruncatedStructure)?)
+    }
+
+    /// Writes this label to the fixed superblock label field.
+    pub(crate) fn write_to(self, raw: &mut [u8]) -> Result<()> {
+        let field = raw
+            .get_mut(VOLUME_LABEL_OFFSET..VOLUME_LABEL_OFFSET + VOLUME_LABEL_BYTES)
+            .ok_or(Error::TruncatedStructure)?;
+        field.fill(0);
+        let len = usize::from(self.len);
+        let source = self.bytes.get(..len).ok_or(Error::InvalidName)?;
+        field
+            .get_mut(..len)
+            .ok_or(Error::TruncatedStructure)?
+            .copy_from_slice(source);
+        Ok(())
+    }
+
+    /// Returns the non-padding bytes of this label.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.get(..usize::from(self.len)).unwrap_or(&[])
+    }
+}
+
 /// Metadata checksum seed recorded by the superblock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChecksumSeed(u32);
@@ -681,6 +750,8 @@ pub struct Superblock {
     journal_mode: JournalMode,
     /// Filesystem UUID used for checksums and journal matching.
     uuid: FilesystemUuid,
+    /// Filesystem volume label stored in the superblock.
+    volume_label: Ext4VolumeLabel,
     /// Seed used for metadata CRC32C calculations.
     checksum_seed: ChecksumSeed,
     /// Feature bits validated for this mount policy.
@@ -785,6 +856,7 @@ impl Superblock {
         let journal_inode = le_u32(raw, 224)?;
         let mut uuid = [0_u8; 16];
         uuid.copy_from_slice(raw.get(104..120).ok_or(Error::TruncatedStructure)?);
+        let volume_label = Ext4VolumeLabel::parse(raw)?;
         let mut journal_uuid = [0_u8; 16];
         journal_uuid.copy_from_slice(raw.get(208..224).ok_or(Error::TruncatedStructure)?);
         let journal_uuid = JournalUuid::from_bytes(journal_uuid);
@@ -823,6 +895,7 @@ impl Superblock {
             descriptor_size,
             journal_mode,
             uuid,
+            volume_label,
             checksum_seed,
             features,
         })
@@ -904,6 +977,12 @@ impl Superblock {
     #[must_use]
     pub const fn uuid(self) -> FilesystemUuid {
         self.uuid
+    }
+
+    /// Filesystem volume label.
+    #[must_use]
+    pub const fn volume_label(self) -> Ext4VolumeLabel {
+        self.volume_label
     }
 
     /// Metadata checksum seed.

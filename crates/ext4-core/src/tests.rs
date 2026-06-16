@@ -16,9 +16,9 @@ use alloc::{vec, vec::Vec};
 use crate::{
     BlockAddress, BlockGroupId, BlockMapping, BlockReader, BlockSize, BlockWriter, ByteOffset,
     DeviceLength, DirectoryEntry, DirectoryEntryKind, DirectoryNode, Error, Ext4Gid, Ext4Name,
-    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, Extent,
-    ExtentLength, ExtentTree, ExtentTreeContext, ExternalJournal, FileNode, FileOffset, FileSize,
-    InodeExtentRoot, InodeId, JournalMode, LogicalBlock, LookupResult, MutableExtentTree,
+    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, Ext4VolumeLabel,
+    Extent, ExtentLength, ExtentTree, ExtentTreeContext, ExternalJournal, FileNode, FileOffset,
+    FileSize, InodeExtentRoot, InodeId, JournalMode, LogicalBlock, LookupResult, MutableExtentTree,
     NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, Node, ReadOnly, ReadWrite,
     SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget,
     TransactionDirectory, TransactionFile, Volume, WindowsName,
@@ -922,6 +922,38 @@ fn set_times_updates_inode_timestamp_fields() {
     assert_eq!(get_u32(&image, inode_offset + 16), 22);
     assert_eq!(get_u32(&image, inode_offset + 12), 33);
     assert_eq!(get_u32(&image, inode_offset + 144), 44);
+}
+
+#[test]
+fn volume_label_round_trips_through_superblock() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let label = must(Ext4VolumeLabel::new(b"EXT4WIN"));
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        transaction.set_volume_label(label);
+        must(transaction.commit());
+    }
+
+    assert_eq!(&image[1024 + 120..1024 + 127], b"EXT4WIN");
+    assert_eq!(&image[1024 + 127..1024 + 136], &[0_u8; 9]);
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+    assert_eq!(volume.volume_label(), label);
+    assert_eq!(volume.volume_label().bytes(), b"EXT4WIN");
+}
+
+#[test]
+fn volume_label_rejects_unrepresentable_bytes() {
+    assert_eq!(
+        Ext4VolumeLabel::new(b"12345678901234567"),
+        Err(Error::InvalidName)
+    );
+    assert_eq!(Ext4VolumeLabel::new(b"bad\0label"), Err(Error::InvalidName));
 }
 
 #[test]
