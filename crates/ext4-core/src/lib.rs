@@ -29,7 +29,7 @@ mod endian;
 mod group;
 mod journal;
 
-pub use acl::{PosixAcl, PosixAclEntry};
+pub use acl::{PosixAcl, PosixAclEntry, PosixAclKind};
 pub use block::{
     BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset, DeviceLength, SliceBlockDevice,
     SliceBlockDeviceMut,
