@@ -70,6 +70,19 @@ impl DispatchTarget {
         mdl_data_buffer(mdl, length)
     }
 
+    /// Returns the IRP user buffer as kernel-addressable memory.
+    pub(crate) fn user_buffer(self, length: usize) -> Result<IrpDataBuffer, DriverError> {
+        let irp = unsafe {
+            // SAFETY: DispatchTarget owns a non-null IRP pointer decoded from
+            // the WDK dispatch boundary for the duration of this callback.
+            self.irp.as_ref()
+        };
+        let Some(buffer) = NonNull::new(irp.UserBuffer) else {
+            return Err(DriverError::InvalidParameter);
+        };
+        IrpDataBuffer::new(buffer.cast(), length)
+    }
+
     /// Stores the byte count returned by this IRP.
     pub(crate) fn set_information(self, information: wdk_sys::ULONG_PTR) {
         let irp = unsafe {
@@ -327,6 +340,48 @@ impl CurrentIrpStackLocation {
         Ok(SetEaStack {
             file_object: self.file_object()?,
             length: set.Length,
+        })
+    }
+
+    /// Decodes query-security parameters.
+    pub(crate) fn query_security(self) -> Result<QuerySecurityStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let query = unsafe {
+            // SAFETY: The caller selects this accessor only for
+            // IRP_MJ_QUERY_SECURITY, where QuerySecurity is active.
+            stack.Parameters.QuerySecurity
+        };
+        Ok(QuerySecurityStack {
+            file_object: self.file_object()?,
+            security_information: query.SecurityInformation,
+            length: query.Length,
+        })
+    }
+
+    /// Decodes set-security parameters.
+    pub(crate) fn set_security(self) -> Result<SetSecurityStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let set = unsafe {
+            // SAFETY: The caller selects this accessor only for
+            // IRP_MJ_SET_SECURITY, where SetSecurity is active.
+            stack.Parameters.SetSecurity
+        };
+        let Some(security_descriptor) = NonNull::new(set.SecurityDescriptor.cast::<c_void>())
+        else {
+            return Err(DriverError::InvalidParameter);
+        };
+        Ok(SetSecurityStack {
+            file_object: self.file_object()?,
+            security_information: set.SecurityInformation,
+            security_descriptor,
         })
     }
 
@@ -640,6 +695,28 @@ pub(crate) struct SetEaStack {
     length: wdk_sys::ULONG,
 }
 
+/// Decoded query-security stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuerySecurityStack {
+    /// FILE_OBJECT carrying the FCB/CCB.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Requested SECURITY_INFORMATION bitmask.
+    security_information: wdk_sys::SECURITY_INFORMATION,
+    /// Output buffer length.
+    length: wdk_sys::ULONG,
+}
+
+/// Decoded set-security stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SetSecurityStack {
+    /// FILE_OBJECT carrying the FCB/CCB.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// SECURITY_INFORMATION bitmask selected for mutation.
+    security_information: wdk_sys::SECURITY_INFORMATION,
+    /// Caller-supplied security descriptor.
+    security_descriptor: NonNull<c_void>,
+}
+
 /// Decoded read stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadStack {
@@ -818,6 +895,40 @@ impl SetEaStack {
     }
 }
 
+impl QuerySecurityStack {
+    /// Returns the FILE_OBJECT carrying this query.
+    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object
+    }
+
+    /// Returns the requested SECURITY_INFORMATION bitmask.
+    pub(crate) const fn security_information(self) -> wdk_sys::SECURITY_INFORMATION {
+        self.security_information
+    }
+
+    /// Returns the output buffer length.
+    pub(crate) const fn length(self) -> wdk_sys::ULONG {
+        self.length
+    }
+}
+
+impl SetSecurityStack {
+    /// Returns the FILE_OBJECT carrying this mutation.
+    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object
+    }
+
+    /// Returns the SECURITY_INFORMATION mutation bitmask.
+    pub(crate) const fn security_information(self) -> wdk_sys::SECURITY_INFORMATION {
+        self.security_information
+    }
+
+    /// Returns the caller-supplied security descriptor.
+    pub(crate) const fn security_descriptor(self) -> NonNull<c_void> {
+        self.security_descriptor
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::ffi::c_void;
@@ -976,6 +1087,34 @@ mod tests {
             if let Ok(set) = set {
                 assert_eq!(set.file_object(), file_object);
                 assert_eq!(set.length(), 64);
+            }
+        }
+    }
+
+    #[test]
+    fn query_security_stack_preserves_file_object_information_and_length() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Parameters.QuerySecurity = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_18 {
+            SecurityInformation: wdk_sys::OWNER_SECURITY_INFORMATION
+                | wdk_sys::DACL_SECURITY_INFORMATION,
+            __bindgen_padding_0: 0,
+            Length: 256,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let query = current.query_security();
+            assert!(query.is_ok());
+            if let Ok(query) = query {
+                assert_eq!(query.file_object(), file_object);
+                assert_eq!(
+                    query.security_information(),
+                    wdk_sys::OWNER_SECURITY_INFORMATION | wdk_sys::DACL_SECURITY_INFORMATION
+                );
+                assert_eq!(query.length(), 256);
             }
         }
     }

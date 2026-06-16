@@ -14,6 +14,7 @@ mod file_system_control;
 mod irp;
 mod metadata;
 mod reparse;
+mod security;
 mod state;
 mod status;
 mod time;

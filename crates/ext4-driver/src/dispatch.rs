@@ -192,12 +192,12 @@ unsafe extern "C" fn device_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTAT
 
 /// Handles security descriptor queries.
 unsafe extern "C" fn query_security(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::query_security(device, irp)
+    crate::security::query(device, irp)
 }
 
 /// Handles security descriptor mutations.
 unsafe extern "C" fn set_security(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::set_security(device, irp)
+    crate::security::set(device, irp)
 }
 
 /// Completes IRPs whose current minimal behavior is successful no-op.
