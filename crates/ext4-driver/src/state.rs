@@ -1,6 +1,7 @@
 //! Driver-local lifecycle and open-object state.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
@@ -130,6 +131,8 @@ pub(crate) struct VolumeControlBlock {
     volume: Volume<KernelBlockDevice, ReadWrite<InternalJournal>>,
     /// Root directory inode of the mounted volume.
     root_inode: InodeId,
+    /// VCB-owned FCBs keyed by ext4 node identity.
+    file_control_blocks: Vec<NonNull<FileControlBlock>>,
 }
 
 impl VolumeControlBlock {
@@ -143,6 +146,7 @@ impl VolumeControlBlock {
         Ok(Self {
             volume,
             root_inode: InodeId::ROOT,
+            file_control_blocks: Vec::new(),
         })
     }
 
@@ -168,6 +172,92 @@ impl VolumeControlBlock {
     /// Returns the mounted ext4 volume label.
     pub(crate) fn volume_label(&self) -> ext4_core::Ext4VolumeLabel {
         self.volume.volume_label()
+    }
+
+    /// Opens or reuses the VCB-owned FCB for a node.
+    pub(crate) fn open_file_control_block(
+        mut volume: NonNull<Self>,
+        node: FileSystemNode,
+    ) -> Option<NonNull<FileControlBlock>> {
+        let vcb = unsafe {
+            // SAFETY: The caller passes a live mounted VCB pointer from the
+            // mounted device extension while processing create/open.
+            volume.as_mut()
+        };
+        if let Some(mut fcb) = vcb.find_file_control_block(node) {
+            let fcb_ref = unsafe {
+                // SAFETY: FCB pointers in the table are Box allocations owned
+                // by this VCB and remain valid until their open count reaches
+                // zero in `close_file_control_block`.
+                fcb.as_mut()
+            };
+            fcb_ref.increment_open()?;
+            return Some(fcb);
+        }
+
+        let fcb = Box::new(FileControlBlock::new(volume, node));
+        let mut fcb = NonNull::new(Box::into_raw(fcb))?;
+        let fcb_ref = unsafe {
+            // SAFETY: `fcb` was just allocated and is not aliased mutably.
+            fcb.as_mut()
+        };
+        fcb_ref.increment_open()?;
+        vcb.file_control_blocks.push(fcb);
+        Some(fcb)
+    }
+
+    /// Releases one open reference to a VCB-owned FCB.
+    fn close_file_control_block(&mut self, fcb: NonNull<FileControlBlock>) {
+        let Some(index) = self
+            .file_control_blocks
+            .iter()
+            .position(|candidate| *candidate == fcb)
+        else {
+            return;
+        };
+        let mut fcb = fcb;
+        let fcb_ref = unsafe {
+            // SAFETY: The FCB was found in this VCB's ownership table.
+            fcb.as_mut()
+        };
+        match fcb_ref.decrement_open() {
+            Some(FileControlBlockOpenState::StillOpen) => {}
+            Some(FileControlBlockOpenState::LastReference) | None => {
+                let removed = self.file_control_blocks.swap_remove(index);
+                unsafe {
+                    // SAFETY: The pointer was removed from the ownership table
+                    // exactly once and no open FILE_OBJECT should reference it
+                    // after the last close.
+                    drop(Box::from_raw(removed.as_ptr()));
+                }
+            }
+        }
+    }
+
+    /// Finds a VCB-owned FCB by node identity.
+    fn find_file_control_block(
+        &mut self,
+        node: FileSystemNode,
+    ) -> Option<NonNull<FileControlBlock>> {
+        self.file_control_blocks.iter().copied().find(|fcb| {
+            let fcb = unsafe {
+                // SAFETY: FCB pointers in this table are owned by the VCB.
+                fcb.as_ref()
+            };
+            fcb.node() == node
+        })
+    }
+}
+
+impl Drop for VolumeControlBlock {
+    fn drop(&mut self) {
+        for fcb in self.file_control_blocks.drain(..) {
+            unsafe {
+                // SAFETY: Remaining FCB pointers are still owned by this VCB
+                // during volume teardown.
+                drop(Box::from_raw(fcb.as_ptr()));
+            }
+        }
     }
 }
 
@@ -330,19 +420,25 @@ impl FileSystemNode {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 /// File control block stored in `FILE_OBJECT::FsContext`.
 pub(crate) struct FileControlBlock {
     /// Mounted volume that owns this file.
     volume: NonNull<VolumeControlBlock>,
     /// Ext4 node opened by this FCB.
     node: FileSystemNode,
+    /// Number of open FILE_OBJECTs currently referencing this FCB.
+    open_count: u32,
 }
 
 impl FileControlBlock {
     /// Creates an FCB boundary value for a mounted node.
     pub(crate) const fn new(volume: NonNull<VolumeControlBlock>, node: FileSystemNode) -> Self {
-        Self { volume, node }
+        Self {
+            volume,
+            node,
+            open_count: 0,
+        }
     }
 
     /// Returns the mounted VCB pointer that owns this open node.
@@ -359,6 +455,31 @@ impl FileControlBlock {
     pub(crate) fn replace_node(&mut self, node: FileSystemNode) {
         self.node = node;
     }
+
+    /// Increments the number of open FILE_OBJECT references.
+    fn increment_open(&mut self) -> Option<()> {
+        self.open_count = self.open_count.checked_add(1)?;
+        Some(())
+    }
+
+    /// Decrements the open reference count.
+    fn decrement_open(&mut self) -> Option<FileControlBlockOpenState> {
+        self.open_count = self.open_count.checked_sub(1)?;
+        if self.open_count == 0 {
+            Some(FileControlBlockOpenState::LastReference)
+        } else {
+            Some(FileControlBlockOpenState::StillOpen)
+        }
+    }
+}
+
+/// FCB lifetime state after releasing one open reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileControlBlockOpenState {
+    /// Other FILE_OBJECTs still reference this FCB.
+    StillOpen,
+    /// The released reference was the final open reference.
+    LastReference,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,6 +624,19 @@ pub(crate) fn file_control_block(
         .ok_or(DriverError::InvalidParameter)
 }
 
+/// Releases one FILE_OBJECT reference to a VCB-owned FCB.
+pub(crate) fn release_file_control_block(fcb: NonNull<FileControlBlock>) {
+    let mut volume = unsafe {
+        // SAFETY: FCBs are owned by the VCB recorded in the FCB itself.
+        fcb.as_ref().volume()
+    };
+    let vcb = unsafe {
+        // SAFETY: The VCB outlives all FCBs it owns.
+        volume.as_mut()
+    };
+    vcb.close_file_control_block(fcb);
+}
+
 /// Returns the CCB stored on a successfully opened FILE_OBJECT.
 pub(crate) fn context_control_block(
     file_object: NonNull<FILE_OBJECT>,
@@ -534,5 +668,33 @@ pub(crate) unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {
             // SAFETY: The device is no longer registered and is owned by this driver.
             ffi::IoDeleteDevice(device);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ptr::NonNull;
+
+    use ext4_core::InodeId;
+
+    use super::{FileControlBlock, FileControlBlockOpenState, FileSystemNode, VolumeControlBlock};
+
+    #[test]
+    fn file_control_block_open_count_tracks_last_reference() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, FileSystemNode::Directory(InodeId::ROOT));
+
+        assert_eq!(fcb.decrement_open(), None);
+        assert_eq!(fcb.increment_open(), Some(()));
+        assert_eq!(fcb.increment_open(), Some(()));
+        assert_eq!(
+            fcb.decrement_open(),
+            Some(FileControlBlockOpenState::StillOpen)
+        );
+        assert_eq!(
+            fcb.decrement_open(),
+            Some(FileControlBlockOpenState::LastReference)
+        );
+        assert_eq!(fcb.decrement_open(), None);
     }
 }

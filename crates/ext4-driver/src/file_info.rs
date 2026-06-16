@@ -20,6 +20,7 @@ use crate::irp::{DispatchTarget, QueryDirectoryStack, QueryFileStack, SetFileSta
 use crate::state::{
     CloseDisposition, ContextControlBlock, DirectoryCursor, FileControlBlock, FileSystemNode,
     OpenedPath, VolumeControlBlock, context_control_block, file_control_block,
+    release_file_control_block,
 };
 use crate::status::DriverError;
 
@@ -1762,12 +1763,8 @@ fn release_file_contexts(mut file_object: core::ptr::NonNull<wdk_sys::FILE_OBJEC
         file_object.as_mut()
     };
     let fcb = core::mem::replace(&mut file_object.FsContext, core::ptr::null_mut());
-    if !fcb.is_null() {
-        unsafe {
-            // SAFETY: Successful create stores Box<FileControlBlock> in
-            // FsContext, and close is the unique release point.
-            drop(Box::from_raw(fcb.cast::<FileControlBlock>()));
-        }
+    if let Some(fcb) = NonNull::new(fcb.cast::<FileControlBlock>()) {
+        release_file_control_block(fcb);
     }
     let ccb = core::mem::replace(&mut file_object.FsContext2, core::ptr::null_mut());
     if !ccb.is_null() {
