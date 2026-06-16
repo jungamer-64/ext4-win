@@ -292,7 +292,7 @@ fn set_basic_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
     };
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(current_time().map_err(DriverError::ntstatus)?);
+        .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
     let node = transaction
         .node(context.node.inode())
         .map_err(|error| DriverError::from(error).ntstatus())?;
@@ -370,7 +370,7 @@ fn set_regular_file_size(
 
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(current_time().map_err(DriverError::ntstatus)?);
+        .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
     let file = transaction
         .file(inode)
         .map_err(|error| DriverError::from(error).ntstatus())?;
@@ -1448,7 +1448,9 @@ fn write_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
         return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
     };
 
-    let mut transaction = vcb.volume_mut().begin_transaction(current_time()?);
+    let mut transaction = vcb
+        .volume_mut()
+        .begin_transaction(crate::time::current_ext4_timestamp()?);
     let file = transaction.file(inode)?;
     transaction.overwrite_file_range(file, FileOffset::from_bytes(offset), input.as_slice())?;
     transaction.commit()?;
@@ -1456,29 +1458,6 @@ fn write_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
         wdk_sys::ULONG_PTR::try_from(length).map_err(|_| DriverError::InvalidParameter)?,
     );
     Ok(())
-}
-
-/// Returns the current system time as an ext4 inode timestamp.
-fn current_time() -> Result<Ext4Timestamp, DriverError> {
-    let mut time = wdk_sys::LARGE_INTEGER { QuadPart: 0 };
-    unsafe {
-        // SAFETY: `time` points to writable stack storage for the kernel to
-        // receive the current system time.
-        crate::ffi::KeQuerySystemTimePrecise(core::ptr::addr_of_mut!(time));
-    }
-    let mut seconds: wdk_sys::ULONG = 0;
-    let converted = unsafe {
-        // SAFETY: Both pointers reference writable stack storage valid for the
-        // duration of the conversion call.
-        crate::ffi::RtlTimeToSecondsSince1970(
-            core::ptr::addr_of_mut!(time),
-            core::ptr::addr_of_mut!(seconds),
-        )
-    };
-    if converted == 0 {
-        return Err(DriverError::InvalidParameter);
-    }
-    Ok(Ext4Timestamp::from_unix_seconds(seconds))
 }
 
 /// Returns the FCB stored on a successfully opened FILE_OBJECT.
