@@ -113,6 +113,39 @@ impl CurrentIrpStackLocation {
             output_buffer_length: mount.OutputBufferLength,
         })
     }
+
+    /// Decodes create/open parameters from the current stack location.
+    pub(crate) fn create(self) -> Result<CreateStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let create = unsafe {
+            // SAFETY: The caller selects this accessor only for IRP_MJ_CREATE,
+            // where the Create union arm is active.
+            stack.Parameters.Create
+        };
+        let Some(file_object) = NonNull::new(stack.FileObject) else {
+            return Err(DriverError::InvalidParameter);
+        };
+        Ok(CreateStack {
+            file_object,
+            options: create.Options,
+            share_access: create.ShareAccess,
+            ea_length: create.EaLength,
+        })
+    }
+
+    /// Decodes the FILE_OBJECT carried by the current stack location.
+    pub(crate) fn file_object(self) -> Result<NonNull<wdk_sys::FILE_OBJECT>, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        NonNull::new(stack.FileObject).ok_or(DriverError::InvalidParameter)
+    }
 }
 
 /// Decoded mount-volume stack parameters.
@@ -140,6 +173,41 @@ impl MountVolumeStack {
     /// Returns the mount request output buffer length.
     pub(crate) const fn output_buffer_length(self) -> wdk_sys::ULONG {
         self.output_buffer_length
+    }
+}
+
+/// Decoded create/open stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CreateStack {
+    /// FILE_OBJECT receiving FsContext/FsContext2 on successful create.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Packed create disposition/options field.
+    options: wdk_sys::ULONG,
+    /// Share-access bits requested by the opener.
+    share_access: wdk_sys::USHORT,
+    /// Extended-attribute input length supplied with create.
+    ea_length: wdk_sys::ULONG,
+}
+
+impl CreateStack {
+    /// Returns the FILE_OBJECT receiving this create request.
+    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object
+    }
+
+    /// Returns the packed create disposition/options field.
+    pub(crate) const fn options(self) -> wdk_sys::ULONG {
+        self.options
+    }
+
+    /// Returns the requested share access.
+    pub(crate) const fn share_access(self) -> wdk_sys::USHORT {
+        self.share_access
+    }
+
+    /// Returns the input EA length.
+    pub(crate) const fn ea_length(self) -> wdk_sys::ULONG {
+        self.ea_length
     }
 }
 

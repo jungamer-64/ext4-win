@@ -201,6 +201,25 @@ impl MountedVolumeDevice {
         self.device.as_ptr()
     }
 
+    /// Returns the mounted VCB pointer stored in a mounted device extension.
+    pub(crate) fn vcb(device: KernelDevice) -> Option<NonNull<VolumeControlBlock>> {
+        let device_object = unsafe {
+            // SAFETY: `device` is a non-null DEVICE_OBJECT decoded at the
+            // dispatch boundary and is read for its extension pointer only.
+            device.as_ptr().as_ref()
+        }?;
+        let extension = unsafe {
+            // SAFETY: Mounted volume devices created by this driver store a
+            // MountedVolumeDeviceExtension in DeviceExtension. Null or foreign
+            // extensions are rejected by the following pointer checks.
+            device_object
+                .DeviceExtension
+                .cast::<MountedVolumeDeviceExtension>()
+                .as_ref()
+        }?;
+        NonNull::new(extension.vcb)
+    }
+
     /// Initializes DEVICE_OBJECT and VPB fields after a successful core mount.
     fn initialize_device_object(
         device: KernelDevice,
@@ -300,31 +319,13 @@ pub(crate) struct FileControlBlock {
     node: FileSystemNode,
 }
 
-#[expect(
-    dead_code,
-    reason = "FCB constructors are defined before CREATE stores FsContext"
-)]
 impl FileControlBlock {
     /// Creates an FCB boundary value for a mounted node.
     pub(crate) const fn new(volume: NonNull<c_void>, node: FileSystemNode) -> Self {
         Self { volume, node }
     }
-
-    /// Returns the opaque VCB pointer.
-    pub(crate) const fn volume(self) -> NonNull<c_void> {
-        self.volume
-    }
-
-    /// Returns the ext4 node.
-    pub(crate) const fn node(self) -> FileSystemNode {
-        self.node
-    }
 }
 
-#[expect(
-    dead_code,
-    reason = "directory CCB cursor is defined before DIRECTORY_CONTROL stores FsContext2"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Per-handle directory enumeration state.
 pub(crate) struct DirectoryCursor {
@@ -332,19 +333,10 @@ pub(crate) struct DirectoryCursor {
     next_entry: u32,
 }
 
-#[expect(
-    dead_code,
-    reason = "directory cursor accessors are defined before DIRECTORY_CONTROL uses CCB state"
-)]
 impl DirectoryCursor {
     /// Creates a cursor at the first directory entry.
     pub(crate) const fn start() -> Self {
         Self { next_entry: 0 }
-    }
-
-    /// Returns the next directory entry index.
-    pub(crate) const fn next_entry(self) -> u32 {
-        self.next_entry
     }
 }
 

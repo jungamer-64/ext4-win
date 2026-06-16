@@ -21,11 +21,6 @@ use crate::{
 /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
 const MOUNT_VOLUME_MINOR: wdk_sys::UCHAR = 1;
 
-/// Handles create/open requests.
-pub(crate) fn create(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    decoded_not_supported(device, irp)
-}
-
 /// Handles file-system control requests, including mount and reparse controls.
 pub(crate) fn dispatch(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(FileSystemControlRequest::decode) {
@@ -42,18 +37,6 @@ pub(crate) fn device_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
             let _device = target.device();
             let _irp = target.irp();
             crate::status::DriverError::InvalidDeviceRequest.ntstatus()
-        }
-        Err(error) => error.ntstatus(),
-    }
-}
-
-/// Rejects a decoded FSCTL until a dedicated control path owns it.
-fn decoded_not_supported(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => {
-            let _device = target.device();
-            let _irp = target.irp();
-            STATUS_NOT_SUPPORTED
         }
         Err(error) => error.ntstatus(),
     }

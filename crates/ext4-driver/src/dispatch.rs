@@ -101,8 +101,8 @@ pub(crate) fn install(driver: &mut DRIVER_OBJECT) -> Result<(), DispatchInstallE
     let mut table = DispatchTable::new(driver);
     table.unload(super::state::driver_unload);
     table.set(MajorFunction::CREATE, create)?;
-    table.set(MajorFunction::CLOSE, success)?;
-    table.set(MajorFunction::CLEANUP, success)?;
+    table.set(MajorFunction::CLOSE, close)?;
+    table.set(MajorFunction::CLEANUP, cleanup)?;
     table.set(MajorFunction::READ, read)?;
     table.set(MajorFunction::FLUSH_BUFFERS, flush_buffers)?;
     table.set(MajorFunction::QUERY_INFORMATION, query_information)?;
@@ -132,7 +132,17 @@ pub(crate) fn install(driver: &mut DRIVER_OBJECT) -> Result<(), DispatchInstallE
 
 /// Handles create/open IRPs.
 unsafe extern "C" fn create(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_system_control::create(device, irp)
+    crate::create::dispatch(device, irp)
+}
+
+/// Handles close IRPs.
+unsafe extern "C" fn close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
+    crate::file_info::close(device, irp)
+}
+
+/// Handles cleanup IRPs.
+unsafe extern "C" fn cleanup(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
+    crate::file_info::cleanup(device, irp)
 }
 
 /// Handles read IRPs.
