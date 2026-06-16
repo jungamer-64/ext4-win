@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use core::ptr::NonNull;
 
-use ext4_core::{FileOffset, Node};
+use ext4_core::{Ext4Timestamp, FileOffset, Node};
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_NOT_SUPPORTED, STATUS_SUCCESS};
 
 use crate::irp::DispatchTarget;
@@ -42,7 +42,10 @@ pub(crate) fn read(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 
 /// Handles regular file data writes.
 pub(crate) fn write(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    decoded_not_supported(device, irp)
+    match DispatchTarget::decode(device, irp).and_then(write_regular_file) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(error) => error.ntstatus(),
+    }
 }
 
 /// Flushes cached or ordered file data.
@@ -121,7 +124,7 @@ fn read_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
         return Ok(());
     }
     let offset = u64::try_from(stack.byte_offset()).map_err(|_| DriverError::InvalidParameter)?;
-    let mut output = target.output_buffer(length)?;
+    let mut output = target.data_buffer(length)?;
     let fcb = file_control_block(stack.file_object())?;
     let fcb = unsafe {
         // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
@@ -146,6 +149,67 @@ fn read_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
             .map_err(|_| DriverError::InvalidParameter)?,
     );
     Ok(())
+}
+
+/// Writes a regular file range through an ext4 journal transaction.
+fn write_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
+    let stack = target.current_stack()?.write()?;
+    let length = usize::try_from(stack.length()).map_err(|_| DriverError::InvalidParameter)?;
+    if length == 0 {
+        target.set_information(0);
+        return Ok(());
+    }
+    let offset = u64::try_from(stack.byte_offset()).map_err(|_| DriverError::InvalidParameter)?;
+    let input = target.data_buffer(length)?;
+    let fcb = file_control_block(stack.file_object())?;
+    let fcb = unsafe {
+        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
+        // until close releases it, and this write runs while the FILE_OBJECT is
+        // active.
+        fcb.as_ref()
+    };
+    let mut vcb = fcb.volume();
+    let vcb = unsafe {
+        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
+        // remain valid while file objects are open. The mutable borrow is the
+        // transaction boundary for this synchronous write path.
+        vcb.as_mut()
+    };
+    let FileSystemNode::File(inode) = fcb.node() else {
+        return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
+    };
+
+    let mut transaction = vcb.volume_mut().begin_transaction(current_time()?);
+    let file = transaction.file(inode)?;
+    transaction.overwrite_file_range(file, FileOffset::from_bytes(offset), input.as_slice())?;
+    transaction.commit()?;
+    target.set_information(
+        wdk_sys::ULONG_PTR::try_from(length).map_err(|_| DriverError::InvalidParameter)?,
+    );
+    Ok(())
+}
+
+/// Returns the current system time as an ext4 inode timestamp.
+fn current_time() -> Result<Ext4Timestamp, DriverError> {
+    let mut time = wdk_sys::LARGE_INTEGER { QuadPart: 0 };
+    unsafe {
+        // SAFETY: `time` points to writable stack storage for the kernel to
+        // receive the current system time.
+        crate::ffi::KeQuerySystemTimePrecise(core::ptr::addr_of_mut!(time));
+    }
+    let mut seconds: wdk_sys::ULONG = 0;
+    let converted = unsafe {
+        // SAFETY: Both pointers reference writable stack storage valid for the
+        // duration of the conversion call.
+        crate::ffi::RtlTimeToSecondsSince1970(
+            core::ptr::addr_of_mut!(time),
+            core::ptr::addr_of_mut!(seconds),
+        )
+    };
+    if converted == 0 {
+        return Err(DriverError::InvalidParameter);
+    }
+    Ok(Ext4Timestamp::from_unix_seconds(seconds))
 }
 
 /// Returns the FCB stored on a successfully opened FILE_OBJECT.

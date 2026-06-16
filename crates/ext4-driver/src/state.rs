@@ -153,6 +153,13 @@ impl VolumeControlBlock {
         &self.volume
     }
 
+    /// Returns the mounted ext4 volume for journaled mutation.
+    pub(crate) const fn volume_mut(
+        &mut self,
+    ) -> &mut Volume<KernelBlockDevice, ReadWrite<InternalJournal>> {
+        &mut self.volume
+    }
+
     /// Returns the mounted ext4 volume label.
     pub(crate) fn volume_label(&self) -> ext4_core::Ext4VolumeLabel {
         self.volume.volume_label()
