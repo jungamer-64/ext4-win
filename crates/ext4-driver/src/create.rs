@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::{Ext4Name, InodeId, Node, WindowsName};
+use ext4_core::{Ext4Name, FileSize, InodeId, Node, WindowsName};
 use wdk_sys::{
     FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
     STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
@@ -112,8 +112,12 @@ enum CreateDisposition {
     Create,
     /// Open existing or create absent.
     OpenIf,
-    /// Existing data replacement requested by the caller.
-    ReplaceExisting,
+    /// Truncate an existing regular file.
+    Overwrite,
+    /// Truncate an existing regular file or create an absent object.
+    OverwriteIf,
+    /// Replace an existing regular file's data or create an absent object.
+    Supersede,
 }
 
 impl CreateDisposition {
@@ -123,9 +127,9 @@ impl CreateDisposition {
             FILE_OPEN_DISPOSITION => Ok(Self::Open),
             FILE_CREATE_DISPOSITION => Ok(Self::Create),
             FILE_OPEN_IF_DISPOSITION => Ok(Self::OpenIf),
-            FILE_SUPERSEDE_DISPOSITION
-            | FILE_OVERWRITE_DISPOSITION
-            | FILE_OVERWRITE_IF_DISPOSITION => Ok(Self::ReplaceExisting),
+            FILE_SUPERSEDE_DISPOSITION => Ok(Self::Supersede),
+            FILE_OVERWRITE_DISPOSITION => Ok(Self::Overwrite),
+            FILE_OVERWRITE_IF_DISPOSITION => Ok(Self::OverwriteIf),
             _ => Err(STATUS_INVALID_PARAMETER),
         }
     }
@@ -191,7 +195,14 @@ fn open_existing_node(
             }
         }
         CreateDisposition::Create => STATUS_OBJECT_NAME_COLLISION,
-        CreateDisposition::ReplaceExisting => STATUS_NOT_SUPPORTED,
+        CreateDisposition::Overwrite
+        | CreateDisposition::OverwriteIf
+        | CreateDisposition::Supersede => {
+            match truncate_existing_file(vcb, node, request.stack.options()) {
+                Ok(()) => initialize_file_object(request.file_object(), vcb, node, path),
+                Err(status) => status,
+            }
+        }
     }
 }
 
@@ -204,9 +215,12 @@ fn create_missing_node(
     name: &Ext4Name,
 ) -> NTSTATUS {
     match disposition {
-        CreateDisposition::Create | CreateDisposition::OpenIf => {}
+        CreateDisposition::Create
+        | CreateDisposition::OpenIf
+        | CreateDisposition::OverwriteIf
+        | CreateDisposition::Supersede => {}
         CreateDisposition::Open => return STATUS_OBJECT_NAME_NOT_FOUND,
-        CreateDisposition::ReplaceExisting => return STATUS_NOT_SUPPORTED,
+        CreateDisposition::Overwrite => return STATUS_OBJECT_NAME_NOT_FOUND,
     }
     let kind = match CreateNodeKind::from_options(request.stack.options()) {
         Ok(kind) => kind,
@@ -240,6 +254,41 @@ fn validate_existing_node_options(
         return Err(STATUS_OBJECT_TYPE_MISMATCH);
     }
     Ok(())
+}
+
+/// Truncates an existing regular file for overwrite-style create dispositions.
+fn truncate_existing_file(
+    mut vcb: NonNull<crate::state::VolumeControlBlock>,
+    node: FileSystemNode,
+    options: wdk_sys::ULONG,
+) -> Result<(), NTSTATUS> {
+    if options & FILE_DIRECTORY_FILE_OPTION != 0 {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    if options & FILE_NON_DIRECTORY_FILE_OPTION != 0 {
+        validate_existing_node_options(node, options)?;
+    }
+    let FileSystemNode::File(inode) = node else {
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+    };
+    let vcb = unsafe {
+        // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
+        // in the mounted device extension. The mutable borrow is the
+        // transaction boundary for this overwrite request.
+        vcb.as_mut()
+    };
+    let mut transaction = vcb.volume_mut().begin_transaction(
+        crate::time::current_ext4_timestamp().map_err(crate::status::DriverError::ntstatus)?,
+    );
+    let file = transaction
+        .file(inode)
+        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
+    transaction
+        .truncate_file(file, FileSize::from_bytes(0))
+        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
+    transaction
+        .commit()
+        .map_err(|error| crate::status::DriverError::from(error).ntstatus())
 }
 
 /// Resolves a root-relative Windows path to an existing node or missing leaf.
@@ -419,4 +468,39 @@ fn initialize_file_object(
     file_object.FsContext = Box::into_raw(fcb).cast::<c_void>();
     file_object.FsContext2 = Box::into_raw(ccb).cast::<c_void>();
     STATUS_SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CREATE_DISPOSITION_SHIFT, CreateDisposition, FILE_CREATE_DISPOSITION,
+        FILE_OPEN_IF_DISPOSITION, FILE_OVERWRITE_DISPOSITION, FILE_OVERWRITE_IF_DISPOSITION,
+        FILE_SUPERSEDE_DISPOSITION,
+    };
+
+    #[test]
+    fn create_disposition_keeps_overwrite_and_supersede_distinct() {
+        assert_eq!(
+            CreateDisposition::from_options(FILE_CREATE_DISPOSITION << CREATE_DISPOSITION_SHIFT),
+            Ok(CreateDisposition::Create)
+        );
+        assert_eq!(
+            CreateDisposition::from_options(FILE_OPEN_IF_DISPOSITION << CREATE_DISPOSITION_SHIFT),
+            Ok(CreateDisposition::OpenIf)
+        );
+        assert_eq!(
+            CreateDisposition::from_options(FILE_OVERWRITE_DISPOSITION << CREATE_DISPOSITION_SHIFT),
+            Ok(CreateDisposition::Overwrite)
+        );
+        assert_eq!(
+            CreateDisposition::from_options(
+                FILE_OVERWRITE_IF_DISPOSITION << CREATE_DISPOSITION_SHIFT
+            ),
+            Ok(CreateDisposition::OverwriteIf)
+        );
+        assert_eq!(
+            CreateDisposition::from_options(FILE_SUPERSEDE_DISPOSITION << CREATE_DISPOSITION_SHIFT),
+            Ok(CreateDisposition::Supersede)
+        );
+    }
 }
