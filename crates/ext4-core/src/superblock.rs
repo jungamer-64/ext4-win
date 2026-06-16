@@ -196,24 +196,6 @@ impl BlockCount {
     }
 }
 
-/// Number of free blocks recorded by a validated superblock.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct FreeBlockCount(u64);
-
-impl FreeBlockCount {
-    /// Creates a free-block count.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the count for on-disk geometry arithmetic.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
 /// Number of free inodes recorded by a validated superblock.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FreeInodeCount(u32);
@@ -361,43 +343,6 @@ impl BlockGroupCount {
     #[must_use]
     pub const fn as_u32(self) -> u32 {
         self.0
-    }
-}
-
-/// Signed free-block count delta.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FreeBlockDelta(i64);
-
-impl FreeBlockDelta {
-    /// Zero free-block delta.
-    pub const ZERO: Self = Self(0);
-
-    /// Creates a free-block delta from a signed count.
-    #[must_use]
-    pub const fn from_i64(value: i64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the delta for checked arithmetic at metadata encoding boundaries.
-    #[must_use]
-    pub const fn as_i64(self) -> i64 {
-        self.0
-    }
-
-    /// Returns true when the delta has no effect.
-    #[must_use]
-    pub const fn is_zero(self) -> bool {
-        self.0 == 0
-    }
-
-    /// Adds another delta.
-    ///
-    /// # Errors
-    /// Returns an error when the signed delta would overflow.
-    pub fn checked_add(self, delta: i64) -> Result<Self> {
-        Ok(Self(
-            self.0.checked_add(delta).ok_or(Error::ArithmeticOverflow)?,
-        ))
     }
 }
 
