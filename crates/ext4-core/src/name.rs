@@ -1,7 +1,7 @@
 //! Ext4 names and the conservative Windows namespace projection.
 
 use alloc::vec::Vec;
-use core::str;
+use core::{char, str};
 
 use crate::error::{Error, Result};
 
@@ -95,6 +95,22 @@ impl WindowsName {
         })
     }
 
+    /// Converts this Windows name to the ext4 UTF-8 name stored on disk.
+    ///
+    /// # Errors
+    /// Returns an error when the Windows UTF-16 contains an unpaired surrogate
+    /// or the encoded ext4 name violates ext4 component limits.
+    pub fn to_ext4(&self) -> Result<Ext4Name> {
+        let mut bytes = Vec::new();
+        for item in char::decode_utf16(self.utf16.iter().copied()) {
+            let ch = item.map_err(|_| Error::InvalidName)?;
+            let mut encoded = [0_u8; 4];
+            let text = ch.encode_utf8(&mut encoded);
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        Ext4Name::new(&bytes)
+    }
+
     /// Returns the UTF-16 Windows name.
     #[must_use]
     pub fn utf16(&self) -> &[u16] {
@@ -124,5 +140,32 @@ fn fold_ascii_u16(value: u16) -> u16 {
     match value {
         0x0041..=0x005A => value | 0x0020,
         _ => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WindowsName;
+
+    #[test]
+    fn windows_name_converts_to_ext4_utf8_name() {
+        let name = WindowsName::from_utf16(&[0x0063, 0x0061, 0x0066, 0x00E9]);
+        assert!(name.is_ok());
+        if let Ok(name) = name {
+            let ext4 = name.to_ext4();
+            assert!(ext4.is_ok());
+            if let Ok(ext4) = ext4 {
+                assert_eq!(ext4.bytes(), b"caf\xC3\xA9");
+            }
+        }
+    }
+
+    #[test]
+    fn windows_name_rejects_unpaired_surrogate_for_ext4_creation() {
+        let name = WindowsName::from_utf16(&[0xD800]);
+        assert!(name.is_ok());
+        if let Ok(name) = name {
+            assert!(name.to_ext4().is_err());
+        }
     }
 }

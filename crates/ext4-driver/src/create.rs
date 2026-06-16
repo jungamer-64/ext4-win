@@ -5,10 +5,14 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::{InodeId, LookupResult, Node, WindowsName};
+use ext4_core::{
+    Ext4Gid, Ext4Name, Ext4Owner, Ext4Permissions, Ext4Uid, InodeId, LookupResult,
+    NewDirectoryMetadata, NewFileMetadata, Node, WindowsName,
+};
 use wdk_sys::{
     FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS,
+    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+    STATUS_OBJECT_TYPE_MISMATCH, STATUS_SUCCESS,
 };
 
 use crate::{
@@ -19,19 +23,31 @@ use crate::{
     },
 };
 
+/// `FILE_SUPERSEDE` create disposition.
+const FILE_SUPERSEDE_DISPOSITION: wdk_sys::ULONG = 0;
 /// `FILE_OPEN` create disposition.
 const FILE_OPEN_DISPOSITION: wdk_sys::ULONG = 1;
+/// `FILE_CREATE` create disposition.
+const FILE_CREATE_DISPOSITION: wdk_sys::ULONG = 2;
 /// `FILE_OPEN_IF` create disposition.
 const FILE_OPEN_IF_DISPOSITION: wdk_sys::ULONG = 3;
+/// `FILE_OVERWRITE` create disposition.
+const FILE_OVERWRITE_DISPOSITION: wdk_sys::ULONG = 4;
+/// `FILE_OVERWRITE_IF` create disposition.
+const FILE_OVERWRITE_IF_DISPOSITION: wdk_sys::ULONG = 5;
 /// Shift for the create disposition stored in `Options`.
 const CREATE_DISPOSITION_SHIFT: u32 = 24;
+/// `FILE_DIRECTORY_FILE` create option.
+const FILE_DIRECTORY_FILE_OPTION: wdk_sys::ULONG = 0x0000_0001;
+/// `FILE_NON_DIRECTORY_FILE` create option.
+const FILE_NON_DIRECTORY_FILE_OPTION: wdk_sys::ULONG = 0x0000_0040;
 /// UTF-16 backslash separator.
 const UTF16_BACKSLASH: u16 = 0x005C;
 
 /// Handles create/open IRPs.
 pub(crate) fn dispatch(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(CreateRequest::decode) {
-        Ok(request) => open_root_directory(request),
+        Ok(request) => open_or_create(request),
         Err(error) => error.ntstatus(),
     }
 }
@@ -65,34 +81,158 @@ impl CreateRequest {
     }
 }
 
-/// Opens the mounted volume root directory.
-fn open_root_directory(request: CreateRequest) -> NTSTATUS {
-    if !supports_existing_open_disposition(request.stack.options()) {
+/// Opens or creates a root-relative ext4 object.
+fn open_or_create(request: CreateRequest) -> NTSTATUS {
+    let _share_access = request.stack.share_access();
+    if request.stack.ea_length() != 0 {
         return STATUS_NOT_SUPPORTED;
     }
-    let _share_access = request.stack.share_access();
-    let _ea_length = request.stack.ea_length();
     let Some(vcb) = MountedVolumeDevice::vcb(request.device()) else {
         return crate::status::DriverError::InvalidDeviceRequest.ntstatus();
     };
-    let node = match resolve_existing_path(request.file_object(), vcb) {
+    let disposition = match CreateDisposition::from_options(request.stack.options()) {
+        Ok(disposition) => disposition,
+        Err(status) => return status,
+    };
+    match resolve_path(request.file_object(), vcb) {
+        Ok(PathLookup::Existing(node)) => open_existing_node(request, vcb, disposition, node),
+        Ok(PathLookup::Missing { parent, name }) => {
+            create_missing_node(request, vcb, disposition, parent, &name)
+        }
+        Err(status) => status,
+    }
+}
+
+/// Requested create disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreateDisposition {
+    /// Open only if the path exists.
+    Open,
+    /// Create only if the path is absent.
+    Create,
+    /// Open existing or create absent.
+    OpenIf,
+    /// Existing data replacement requested by the caller.
+    ReplaceExisting,
+}
+
+impl CreateDisposition {
+    /// Decodes the disposition stored in Create.Options.
+    fn from_options(options: wdk_sys::ULONG) -> Result<Self, NTSTATUS> {
+        match options >> CREATE_DISPOSITION_SHIFT {
+            FILE_OPEN_DISPOSITION => Ok(Self::Open),
+            FILE_CREATE_DISPOSITION => Ok(Self::Create),
+            FILE_OPEN_IF_DISPOSITION => Ok(Self::OpenIf),
+            FILE_SUPERSEDE_DISPOSITION
+            | FILE_OVERWRITE_DISPOSITION
+            | FILE_OVERWRITE_IF_DISPOSITION => Ok(Self::ReplaceExisting),
+            _ => Err(STATUS_INVALID_PARAMETER),
+        }
+    }
+}
+
+/// Node kind requested for a missing create target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreateNodeKind {
+    /// Regular file.
+    File,
+    /// Directory.
+    Directory,
+}
+
+impl CreateNodeKind {
+    /// Decodes create options that select file-vs-directory creation.
+    fn from_options(options: wdk_sys::ULONG) -> Result<Self, NTSTATUS> {
+        let directory = options & FILE_DIRECTORY_FILE_OPTION != 0;
+        let non_directory = options & FILE_NON_DIRECTORY_FILE_OPTION != 0;
+        if directory && non_directory {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if directory {
+            Ok(Self::Directory)
+        } else {
+            Ok(Self::File)
+        }
+    }
+}
+
+/// Result of resolving a Windows path against the mounted volume.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PathLookup {
+    /// The requested path already exists.
+    Existing(FileSystemNode),
+    /// The final path component is absent under an existing parent directory.
+    Missing {
+        /// Parent directory inode.
+        parent: InodeId,
+        /// New ext4 child name.
+        name: Ext4Name,
+    },
+}
+
+/// Opens an existing path according to the requested disposition and options.
+fn open_existing_node(
+    request: CreateRequest,
+    vcb: NonNull<crate::state::VolumeControlBlock>,
+    disposition: CreateDisposition,
+    node: FileSystemNode,
+) -> NTSTATUS {
+    match disposition {
+        CreateDisposition::Open | CreateDisposition::OpenIf => {
+            match validate_existing_node_options(node, request.stack.options()) {
+                Ok(()) => initialize_file_object(request.file_object(), vcb, node),
+                Err(status) => status,
+            }
+        }
+        CreateDisposition::Create => STATUS_OBJECT_NAME_COLLISION,
+        CreateDisposition::ReplaceExisting => STATUS_NOT_SUPPORTED,
+    }
+}
+
+/// Creates a missing final path component.
+fn create_missing_node(
+    request: CreateRequest,
+    vcb: NonNull<crate::state::VolumeControlBlock>,
+    disposition: CreateDisposition,
+    parent: InodeId,
+    name: &Ext4Name,
+) -> NTSTATUS {
+    match disposition {
+        CreateDisposition::Create | CreateDisposition::OpenIf => {}
+        CreateDisposition::Open => return STATUS_OBJECT_NAME_NOT_FOUND,
+        CreateDisposition::ReplaceExisting => return STATUS_NOT_SUPPORTED,
+    }
+    let kind = match CreateNodeKind::from_options(request.stack.options()) {
+        Ok(kind) => kind,
+        Err(status) => return status,
+    };
+    let node = match create_child(vcb, parent, name, kind) {
         Ok(node) => node,
         Err(status) => return status,
     };
     initialize_file_object(request.file_object(), vcb, node)
 }
 
-/// Returns whether this create disposition can open an existing object.
-const fn supports_existing_open_disposition(options: wdk_sys::ULONG) -> bool {
-    let disposition = options >> CREATE_DISPOSITION_SHIFT;
-    disposition == FILE_OPEN_DISPOSITION || disposition == FILE_OPEN_IF_DISPOSITION
+/// Validates file-vs-directory options for an existing node.
+fn validate_existing_node_options(
+    node: FileSystemNode,
+    options: wdk_sys::ULONG,
+) -> Result<(), NTSTATUS> {
+    if options & FILE_DIRECTORY_FILE_OPTION != 0 && !matches!(node, FileSystemNode::Directory(_)) {
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    if options & FILE_NON_DIRECTORY_FILE_OPTION != 0 && matches!(node, FileSystemNode::Directory(_))
+    {
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    Ok(())
 }
 
-/// Resolves a root-relative Windows path to an existing ext4 node.
-fn resolve_existing_path(
+/// Resolves a root-relative Windows path to an existing node or missing leaf.
+fn resolve_path(
     file_object: NonNull<FILE_OBJECT>,
-    mut vcb: NonNull<crate::state::VolumeControlBlock>,
-) -> Result<FileSystemNode, NTSTATUS> {
+    vcb: NonNull<crate::state::VolumeControlBlock>,
+) -> Result<PathLookup, NTSTATUS> {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is read
         // only for immutable path fields.
@@ -103,29 +243,102 @@ fn resolve_existing_path(
     }
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
-        // in the mounted device extension.
-        vcb.as_mut()
+        // in the mounted device extension and is read only for path lookup.
+        vcb.as_ref()
     };
     let mut inode = InodeId::ROOT;
-    for component in path_components(file_object)? {
+    let components = path_components(file_object)?;
+    let mut components = components.iter().peekable();
+    while let Some(component) = components.next() {
+        let is_final = components.peek().is_none();
         let parent = match vcb.volume().read_node(inode) {
             Ok(Node::Directory(directory)) => directory,
             Ok(_) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
             Err(error) => return Err(crate::status::DriverError::from(error).ntstatus()),
         };
-        inode = match vcb.volume().lookup_windows_child(&parent, &component) {
+        inode = match vcb.volume().lookup_windows_child(&parent, component) {
             Ok(LookupResult::Found(child)) => child,
-            Ok(LookupResult::NotFound) => return Err(STATUS_OBJECT_NAME_NOT_FOUND),
+            Ok(LookupResult::NotFound) if is_final => {
+                return Ok(PathLookup::Missing {
+                    parent: inode,
+                    name: component
+                        .to_ext4()
+                        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
+                });
+            }
+            Ok(LookupResult::NotFound) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
             Err(error) => return Err(crate::status::DriverError::from(error).ntstatus()),
         };
     }
 
     match vcb.volume().read_node(inode) {
-        Ok(Node::File(_)) => Ok(FileSystemNode::File(inode)),
-        Ok(Node::Directory(_)) => Ok(FileSystemNode::Directory(inode)),
-        Ok(Node::Symlink(_)) => Ok(FileSystemNode::Symlink(inode)),
+        Ok(Node::File(_)) => Ok(PathLookup::Existing(FileSystemNode::File(inode))),
+        Ok(Node::Directory(_)) => Ok(PathLookup::Existing(FileSystemNode::Directory(inode))),
+        Ok(Node::Symlink(_)) => Ok(PathLookup::Existing(FileSystemNode::Symlink(inode))),
         Err(error) => Err(crate::status::DriverError::from(error).ntstatus()),
     }
+}
+
+/// Creates a file or directory under an existing parent directory.
+fn create_child(
+    mut vcb: NonNull<crate::state::VolumeControlBlock>,
+    parent: InodeId,
+    name: &Ext4Name,
+    kind: CreateNodeKind,
+) -> Result<FileSystemNode, NTSTATUS> {
+    let vcb = unsafe {
+        // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
+        // in the mounted device extension. The mutable borrow is the
+        // transaction boundary for this create request.
+        vcb.as_mut()
+    };
+    let mut transaction = vcb.volume_mut().begin_transaction(
+        crate::time::current_ext4_timestamp().map_err(crate::status::DriverError::ntstatus)?,
+    );
+    let parent = transaction
+        .directory(parent)
+        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
+    let node = match kind {
+        CreateNodeKind::File => {
+            let file = transaction
+                .create_file(parent, name, default_file_metadata()?)
+                .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
+            FileSystemNode::File(file.inode_id())
+        }
+        CreateNodeKind::Directory => {
+            let directory = transaction
+                .create_directory(parent, name, default_directory_metadata()?)
+                .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
+            FileSystemNode::Directory(directory.inode_id())
+        }
+    };
+    transaction
+        .commit()
+        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
+    Ok(node)
+}
+
+/// Default POSIX owner for Windows-created inodes before security mapping lands.
+fn default_owner() -> Ext4Owner {
+    Ext4Owner::new(Ext4Uid::from_u32(0), Ext4Gid::from_u32(0))
+}
+
+/// Default metadata for Windows-created regular files.
+fn default_file_metadata() -> Result<NewFileMetadata, NTSTATUS> {
+    Ok(NewFileMetadata::new(
+        default_owner(),
+        Ext4Permissions::new(0o644)
+            .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
+    ))
+}
+
+/// Default metadata for Windows-created directories.
+fn default_directory_metadata() -> Result<NewDirectoryMetadata, NTSTATUS> {
+    Ok(NewDirectoryMetadata::new(
+        default_owner(),
+        Ext4Permissions::new(0o755)
+            .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
+    ))
 }
 
 /// Splits the FILE_OBJECT name into validated root-relative Windows components.

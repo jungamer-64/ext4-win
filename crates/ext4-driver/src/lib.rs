@@ -13,6 +13,7 @@ mod file_system_control;
 mod irp;
 mod state;
 mod status;
+mod time;
 mod volume_info;
 
 #[cfg(not(test))]
