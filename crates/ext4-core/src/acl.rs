@@ -28,6 +28,15 @@ const ACL_OTHER: u16 = 0x0020;
 /// Undefined identifier used by non-named ACL entries.
 const ACL_UNDEFINED_ID: u32 = u32::MAX;
 
+/// POSIX ACL xattr slot associated with one inode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PosixAclKind {
+    /// `system.posix_acl_access`.
+    Access,
+    /// `system.posix_acl_default`.
+    Default,
+}
+
 /// POSIX ACL associated with one inode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PosixAcl {
@@ -50,6 +59,17 @@ impl PosixAcl {
     /// Returns an error only if the fixed domain name is invalid.
     pub fn default_xattr_name() -> Result<XattrName> {
         XattrName::new(XattrNamespace::System, b"posix_acl_default")
+    }
+
+    /// Returns the xattr name for the requested POSIX ACL slot.
+    ///
+    /// # Errors
+    /// Returns an error only if the fixed domain name is invalid.
+    pub fn xattr_name(kind: PosixAclKind) -> Result<XattrName> {
+        match kind {
+            PosixAclKind::Access => Self::access_xattr_name(),
+            PosixAclKind::Default => Self::default_xattr_name(),
+        }
     }
 
     /// Creates a canonical POSIX ACL.

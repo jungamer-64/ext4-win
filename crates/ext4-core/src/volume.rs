@@ -2,6 +2,7 @@
 
 use alloc::{vec, vec::Vec};
 
+use crate::acl::{PosixAcl, PosixAclKind};
 use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
 use crate::checksum::crc32c;
 use crate::dir::{DirectoryBlock, DirectoryEntry, DirectoryEntryKind};
@@ -23,7 +24,8 @@ use crate::superblock::{
     BlockGroupId, Ext4VolumeLabel, FreeBlockDelta, JournalMode, MetadataChecksum, RecoveryState,
     Superblock,
 };
-use crate::windows::Ext4Times;
+use crate::windows::{Ext4Times, WindowsOverlay};
+use crate::xattr::{self as xattr_storage, XattrName, XattrSet, XattrValue};
 
 // Volume mutation offsets are kept together so inode/superblock rewrites use one
 // source of truth for on-disk byte layout.
@@ -65,10 +67,14 @@ const INODE_FLAGS_OFFSET: usize = 32;
 const INODE_BLOCK_OFFSET: usize = 40;
 /// Offset of `i_generation` in an inode record.
 const INODE_GENERATION_OFFSET: usize = 100;
+/// Offset of `i_file_acl_lo` in an inode record.
+const INODE_FILE_ACL_LO_OFFSET: usize = 104;
 /// Offset of `i_size_high` in an inode record.
 const INODE_SIZE_HIGH_OFFSET: usize = 108;
 /// Offset of `i_blocks_high` in an inode record.
 const INODE_BLOCKS_HIGH_OFFSET: usize = 116;
+/// Offset of `i_file_acl_high` in an inode record.
+const INODE_FILE_ACL_HI_OFFSET: usize = 118;
 /// Offset of `i_checksum_lo` in an inode record.
 const INODE_CHECKSUM_LO_OFFSET: usize = 124;
 /// Offset of `i_extra_isize` in an inode record.
@@ -325,6 +331,7 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
             inode_bitmap_updates: Vec::new(),
             directory_updates: Vec::new(),
             extent_updates: Vec::new(),
+            xattr_updates: Vec::new(),
             group_deltas: Vec::new(),
             data_writes: Vec::new(),
             free_blocks_delta: FreeBlockDelta::ZERO,
@@ -390,6 +397,7 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
             inode_bitmap_updates: Vec::new(),
             directory_updates: Vec::new(),
             extent_updates: Vec::new(),
+            xattr_updates: Vec::new(),
             group_deltas: Vec::new(),
             data_writes: Vec::new(),
             free_blocks_delta: FreeBlockDelta::ZERO,
@@ -410,6 +418,49 @@ impl<D: BlockReader, State> Volume<D, State> {
     #[must_use]
     pub const fn volume_label(&self) -> Ext4VolumeLabel {
         self.superblock.volume_label()
+    }
+
+    /// Reads all extended attributes attached to an inode.
+    ///
+    /// # Errors
+    /// Returns an error when the inode or its external xattr block is malformed.
+    pub fn read_xattrs(&self, inode_id: InodeId) -> Result<XattrSet> {
+        self.read_xattr_set_from_raw(&self.read_raw_inode(inode_id)?)
+    }
+
+    /// Reads one extended attribute value by name.
+    ///
+    /// # Errors
+    /// Returns an error when the inode or its external xattr block is malformed.
+    pub fn read_xattr(&self, inode_id: InodeId, name: &XattrName) -> Result<Option<XattrValue>> {
+        Ok(self.read_xattrs(inode_id)?.get(name).cloned())
+    }
+
+    /// Reads a POSIX ACL from its ext4 xattr slot.
+    ///
+    /// # Errors
+    /// Returns an error when the backing xattr or ACL payload is malformed.
+    pub fn read_posix_acl(
+        &self,
+        inode_id: InodeId,
+        kind: PosixAclKind,
+    ) -> Result<Option<PosixAcl>> {
+        let Some(value) = self.read_xattr(inode_id, &PosixAcl::xattr_name(kind)?)? else {
+            return Ok(None);
+        };
+        Ok(Some(PosixAcl::parse(&value)?))
+    }
+
+    /// Reads Windows overlay metadata isolated in `user.ext4win.*` xattrs.
+    ///
+    /// # Errors
+    /// Returns an error when the overlay xattr payload is malformed.
+    pub fn read_windows_overlay(&self, inode_id: InodeId) -> Result<Option<WindowsOverlay>> {
+        let Some(value) = self.read_xattr(inode_id, &WindowsOverlay::attributes_xattr_name()?)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(WindowsOverlay::parse(&value)?))
     }
 
     /// Reads and classifies one inode as a typed node.
@@ -601,6 +652,23 @@ impl<D: BlockReader, State> Volume<D, State> {
         self.read_raw_inode(inode_id)?.parse()
     }
 
+    /// Reads all xattr storage locations referenced by a raw inode.
+    fn read_xattr_set_from_raw(&self, raw_inode: &RawInode) -> Result<XattrSet> {
+        let inline = xattr_storage::parse_inline_xattrs(raw_inode.inline_xattr_region()?)?;
+        let Some(block) = raw_inode.xattr_block()? else {
+            return Ok(inline);
+        };
+        let mut bytes = vec![
+            0_u8;
+            usize::try_from(self.superblock.block_size().bytes())
+                .map_err(|_| Error::ArithmeticOverflow)?
+        ];
+        self.device
+            .read_exact_at(self.superblock.block_size().offset_of(block)?, &mut bytes)?;
+        let external = xattr_storage::parse_external_xattr_block(&bytes, block, &self.superblock)?;
+        xattr_storage::merge_xattr_sets(inline, external)
+    }
+
     /// Builds the checksum context required for this inode's extent tree.
     fn extent_tree_context(&self, inode: &Inode) -> ExtentTreeContext {
         if self.superblock.metadata_checksum() == MetadataChecksum::Crc32c {
@@ -692,6 +760,8 @@ pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
     directory_updates: Vec<BlockImage>,
     /// External extent tree blocks staged after extent mutation.
     extent_updates: Vec<BlockImage>,
+    /// External xattr blocks staged after xattr mutation.
+    xattr_updates: Vec<BlockImage>,
     /// Per-group allocation count deltas to fold into descriptors.
     group_deltas: Vec<GroupDelta>,
     /// Ordered file data writes that must reach disk before metadata commit.
@@ -1092,6 +1162,69 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .get_mut(inode_index)
             .ok_or(Error::InvalidInode)? = raw_inode;
         Ok(())
+    }
+
+    /// Sets or replaces one ext4 extended attribute.
+    ///
+    /// # Errors
+    /// Returns an error when the inode is not mutable or the xattr set cannot
+    /// fit in supported in-inode or single-block external storage.
+    pub fn set_xattr(
+        &mut self,
+        node: TransactionNode,
+        name: XattrName,
+        value: XattrValue,
+    ) -> Result<()> {
+        self.update_xattrs(node, |set| {
+            set.insert(name, value);
+            Ok(())
+        })
+    }
+
+    /// Removes one ext4 extended attribute.
+    ///
+    /// # Errors
+    /// Returns an error when the inode or current xattr storage is malformed.
+    pub fn remove_xattr(
+        &mut self,
+        node: TransactionNode,
+        name: &XattrName,
+    ) -> Result<Option<XattrValue>> {
+        let mut removed = None;
+        self.update_xattrs(node, |set| {
+            removed = set.remove(name);
+            Ok(())
+        })?;
+        Ok(removed)
+    }
+
+    /// Sets a POSIX ACL in the requested ACL xattr slot.
+    ///
+    /// # Errors
+    /// Returns an error when the ACL cannot be serialized or stored.
+    pub fn set_posix_acl(
+        &mut self,
+        node: TransactionNode,
+        kind: PosixAclKind,
+        acl: PosixAcl,
+    ) -> Result<()> {
+        self.set_xattr(node, PosixAcl::xattr_name(kind)?, acl.to_xattr_value()?)
+    }
+
+    /// Sets Windows overlay metadata in `user.ext4win.*` xattrs.
+    ///
+    /// # Errors
+    /// Returns an error when the overlay cannot be serialized or stored.
+    pub fn set_windows_overlay(
+        &mut self,
+        node: TransactionNode,
+        overlay: WindowsOverlay,
+    ) -> Result<()> {
+        self.set_xattr(
+            node,
+            WindowsOverlay::attributes_xattr_name()?,
+            overlay.to_xattr_value()?,
+        )
     }
 
     /// Replaces the ext4 volume label stored in the primary superblock.
@@ -1568,6 +1701,172 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         } else {
             self.directory_updates.push(BlockImage { block, bytes });
         }
+    }
+
+    /// Stages the latest image for a mutated external xattr block.
+    fn stage_xattr_block(&mut self, block: BlockAddress, bytes: Vec<u8>) {
+        if let Some(image) = self
+            .xattr_updates
+            .iter_mut()
+            .find(|image| image.block == block)
+        {
+            image.bytes = bytes;
+        } else {
+            self.xattr_updates.push(BlockImage { block, bytes });
+        }
+    }
+
+    /// Reads an external xattr block, preferring this transaction's staged image.
+    fn xattr_block_bytes(&self, block: BlockAddress) -> Result<Vec<u8>> {
+        if let Some(staged) = self
+            .xattr_updates
+            .iter()
+            .rev()
+            .find(|image| image.block == block)
+        {
+            return Ok(staged.bytes.clone());
+        }
+        let block_size = self.volume.superblock.block_size();
+        let mut bytes =
+            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        self.volume
+            .device
+            .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Reads all xattrs referenced by a staged raw inode.
+    fn xattr_set_for_raw_inode(&self, raw_inode: &RawInode) -> Result<XattrSet> {
+        let inline = xattr_storage::parse_inline_xattrs(raw_inode.inline_xattr_region()?)?;
+        let Some(block) = raw_inode.xattr_block()? else {
+            return Ok(inline);
+        };
+        let bytes = self.xattr_block_bytes(block)?;
+        let external =
+            xattr_storage::parse_external_xattr_block(&bytes, block, &self.volume.superblock)?;
+        xattr_storage::merge_xattr_sets(inline, external)
+    }
+
+    /// Applies a mutation to an inode's complete xattr set.
+    fn update_xattrs(
+        &mut self,
+        node: TransactionNode,
+        update: impl FnOnce(&mut XattrSet) -> Result<()>,
+    ) -> Result<()> {
+        let inode_index = self.ensure_inode_update(node.inode_id())?;
+        let mut raw_inode = self
+            .inode_updates
+            .get(inode_index)
+            .ok_or(Error::InvalidInode)?
+            .clone();
+        let inode = raw_inode.parse()?;
+        if !inode.supports_basic_mutation() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+
+        let mut set = self.xattr_set_for_raw_inode(&raw_inode)?;
+        update(&mut set)?;
+        self.store_xattr_set(&mut raw_inode, &set)?;
+        raw_inode.set_timestamps(self.now)?;
+        *self
+            .inode_updates
+            .get_mut(inode_index)
+            .ok_or(Error::InvalidInode)? = raw_inode;
+        Ok(())
+    }
+
+    /// Stores a complete xattr set using inline storage when possible and one
+    /// external xattr block otherwise.
+    fn store_xattr_set(&mut self, raw_inode: &mut RawInode, set: &XattrSet) -> Result<()> {
+        let old_block = raw_inode.xattr_block()?;
+        if set.is_empty() {
+            raw_inode.clear_inline_xattr_region()?;
+            if let Some(block) = old_block {
+                self.release_xattr_block_ref(block)?;
+            }
+            raw_inode.set_xattr_block(None)?;
+            return Ok(());
+        }
+
+        let inline_capacity = raw_inode.writable_inline_xattr_region()?.len();
+        match xattr_storage::serialize_inline_xattrs(set, inline_capacity) {
+            Ok(bytes) => {
+                raw_inode
+                    .writable_inline_xattr_region()?
+                    .copy_from_slice(&bytes);
+                if let Some(block) = old_block {
+                    self.release_xattr_block_ref(block)?;
+                }
+                raw_inode.set_xattr_block(None)
+            }
+            Err(Error::NoSpace) => self.store_external_xattr_set(raw_inode, set, old_block),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Stores a complete xattr set in a single external block.
+    fn store_external_xattr_set(
+        &mut self,
+        raw_inode: &mut RawInode,
+        set: &XattrSet,
+        old_block: Option<BlockAddress>,
+    ) -> Result<()> {
+        let block_size = self.volume.superblock.block_size();
+        let block_bytes =
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        xattr_storage::ensure_external_xattrs_fit(set, block_bytes)?;
+
+        let block = if let Some(block) = old_block {
+            let bytes = self.xattr_block_bytes(block)?;
+            let refcount = xattr_storage::external_xattr_refcount(&bytes)?;
+            if refcount == 1 {
+                block
+            } else {
+                let new_block = self.allocate_block()?;
+                self.decrement_xattr_block_ref(block, bytes, refcount)?;
+                new_block
+            }
+        } else {
+            self.allocate_block()?
+        };
+        let bytes = xattr_storage::serialize_external_xattr_block(
+            set,
+            block_bytes,
+            block,
+            &self.volume.superblock,
+        )?;
+        self.stage_xattr_block(block, bytes);
+        raw_inode.clear_inline_xattr_region()?;
+        raw_inode.set_xattr_block(Some(block))
+    }
+
+    /// Releases one inode reference to an external xattr block.
+    fn release_xattr_block_ref(&mut self, block: BlockAddress) -> Result<()> {
+        let bytes = self.xattr_block_bytes(block)?;
+        let refcount = xattr_storage::external_xattr_refcount(&bytes)?;
+        if refcount == 1 {
+            self.free_block(block)
+        } else {
+            self.decrement_xattr_block_ref(block, bytes, refcount)
+        }
+    }
+
+    /// Decrements a shared external xattr block refcount.
+    fn decrement_xattr_block_ref(
+        &mut self,
+        block: BlockAddress,
+        mut bytes: Vec<u8>,
+        refcount: u32,
+    ) -> Result<()> {
+        let updated = refcount.checked_sub(1).ok_or(Error::InvalidXattr)?;
+        xattr_storage::set_external_xattr_refcount(
+            &mut bytes,
+            block,
+            &self.volume.superblock,
+            updated,
+        )?;
+        self.stage_xattr_block(block, bytes);
+        Ok(())
     }
 
     /// Returns whether a directory contains only `.` and `..`.
@@ -2136,6 +2435,12 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 bytes: extent.bytes.clone(),
             });
         }
+        for xattr in &self.xattr_updates {
+            writes.push(RangeWrite {
+                offset: self.volume.superblock.block_size().offset_of(xattr.block)?,
+                bytes: xattr.bytes.clone(),
+            });
+        }
         for delta in &self.group_deltas {
             let mut descriptor = BlockGroupDescriptor::read_from(
                 &self.volume.device,
@@ -2673,6 +2978,80 @@ impl RawInode {
         self.set_creation_time(times.created())
     }
 
+    /// Returns the external xattr block referenced by `i_file_acl`.
+    fn xattr_block(&self) -> Result<Option<BlockAddress>> {
+        if self.bytes.len() <= INODE_FILE_ACL_LO_OFFSET {
+            return Ok(None);
+        }
+        let low = u64::from(le_u32(&self.bytes, INODE_FILE_ACL_LO_OFFSET)?);
+        let high = if self.bytes.len() > INODE_FILE_ACL_HI_OFFSET {
+            u64::from(le_u16(&self.bytes, INODE_FILE_ACL_HI_OFFSET)?)
+        } else {
+            0
+        };
+        let block = low | (high << 32);
+        if block == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(BlockAddress::new(block)))
+        }
+    }
+
+    /// Writes the external xattr block reference into `i_file_acl`.
+    fn set_xattr_block(&mut self, block: Option<BlockAddress>) -> Result<()> {
+        let raw = block.map_or(0, BlockAddress::get);
+        put_le_u32(
+            &mut self.bytes,
+            INODE_FILE_ACL_LO_OFFSET,
+            u32::try_from(raw & u64::from(u32::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        let high = raw >> 32;
+        if self.bytes.len() > INODE_FILE_ACL_HI_OFFSET {
+            put_le_u16(
+                &mut self.bytes,
+                INODE_FILE_ACL_HI_OFFSET,
+                u16::try_from(high).map_err(|_| Error::ArithmeticOverflow)?,
+            )?;
+        } else if high != 0 {
+            return Err(Error::InvalidWriteRange);
+        }
+        Ok(())
+    }
+
+    /// Returns the in-inode xattr body region.
+    fn inline_xattr_region(&self) -> Result<&[u8]> {
+        let offset = self.inline_xattr_offset()?;
+        self.bytes.get(offset..).ok_or(Error::InvalidXattr)
+    }
+
+    /// Returns the mutable in-inode xattr body region, initializing extra inode
+    /// size before new xattrs are written.
+    fn writable_inline_xattr_region(&mut self) -> Result<&mut [u8]> {
+        self.ensure_extra_isize()?;
+        let offset = self.inline_xattr_offset()?;
+        self.bytes.get_mut(offset..).ok_or(Error::InvalidXattr)
+    }
+
+    /// Clears the in-inode xattr body region.
+    fn clear_inline_xattr_region(&mut self) -> Result<()> {
+        self.writable_inline_xattr_region()?.fill(0);
+        Ok(())
+    }
+
+    /// Computes the in-inode xattr body offset from `i_extra_isize`.
+    fn inline_xattr_offset(&self) -> Result<usize> {
+        if self.bytes.len() <= INODE_EXTRA_ISIZE_OFFSET {
+            return Ok(self.bytes.len());
+        }
+        let offset = 128_usize
+            .checked_add(usize::from(le_u16(&self.bytes, INODE_EXTRA_ISIZE_OFFSET)?))
+            .ok_or(Error::ArithmeticOverflow)?;
+        if offset > self.bytes.len() {
+            return Err(Error::InvalidXattr);
+        }
+        Ok(offset)
+    }
+
     /// Writes an inline symbolic link target into `i_block`.
     fn set_inline_target(&mut self, target: &[u8]) -> Result<()> {
         if target.len() > SymlinkTarget::INLINE_CAPACITY {
@@ -2706,10 +3085,11 @@ impl RawInode {
             u32::try_from(sectors & u64::from(u32::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
         if self.bytes.len() > INODE_BLOCKS_HIGH_OFFSET {
-            put_le_u32(
+            put_le_u16(
                 &mut self.bytes,
                 INODE_BLOCKS_HIGH_OFFSET,
-                u32::try_from(sectors >> 32).map_err(|_| Error::ArithmeticOverflow)?,
+                u16::try_from((sectors >> 32) & u64::from(u16::MAX))
+                    .map_err(|_| Error::ArithmeticOverflow)?,
             )?;
         }
         Ok(())
