@@ -3,13 +3,13 @@
 use alloc::{vec, vec::Vec};
 use core::ptr::NonNull;
 
-use ext4_core::{Ext4Security, Node};
+use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, Node};
 use wdk_sys::{
     NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER,
     STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
 };
 
-use crate::irp::{DispatchTarget, QuerySecurityStack};
+use crate::irp::{DispatchTarget, QuerySecurityStack, SetSecurityStack};
 use crate::state::{FileControlBlock, FileSystemNode, VolumeControlBlock, file_control_block};
 use crate::status::DriverError;
 
@@ -21,10 +21,26 @@ const ACL_HEADER_BYTES: usize = 8;
 const ACCESS_ALLOWED_ACE_PREFIX_BYTES: usize = 8;
 /// SID bytes before the first sub-authority.
 const SID_PREFIX_BYTES: usize = 8;
+/// SECURITY_DESCRIPTOR_RELATIVE owner SID offset.
+const SECURITY_DESCRIPTOR_OWNER_OFFSET: usize = 4;
+/// SECURITY_DESCRIPTOR_RELATIVE group SID offset.
+const SECURITY_DESCRIPTOR_GROUP_OFFSET: usize = 8;
+/// SECURITY_DESCRIPTOR_RELATIVE DACL offset.
+const SECURITY_DESCRIPTOR_DACL_OFFSET: usize = 16;
+/// ACL size field offset.
+const ACL_SIZE_OFFSET: usize = 2;
+/// ACL ACE count field offset.
+const ACL_ACE_COUNT_OFFSET: usize = 4;
+/// ACCESS_ALLOWED_ACE mask field offset.
+const ACE_MASK_OFFSET: usize = 4;
+/// ACCESS_ALLOWED_ACE SID payload offset.
+const ACE_SID_OFFSET: usize = 8;
 /// SID authority used by Linux-style UID/GID SIDs (`S-1-22-*`).
 const SECURITY_NT_NON_UNIQUE_AUTHORITY: u64 = 22;
 /// World authority used by Everyone (`S-1-1-0`).
 const SECURITY_WORLD_AUTHORITY: u64 = 1;
+/// POSIX permission bits stored in ext4 mode.
+const POSIX_RWX_BITS: u16 = 0o777;
 
 /// Handles IRP_MJ_QUERY_SECURITY.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
@@ -36,16 +52,8 @@ pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 
 /// Handles IRP_MJ_SET_SECURITY.
 pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(|target| target.current_stack()) {
-        Ok(stack) => match stack.set_security() {
-            Ok(stack) => {
-                let _file_object = stack.file_object();
-                let _security_information = stack.security_information();
-                let _security_descriptor = stack.security_descriptor();
-                STATUS_NOT_SUPPORTED
-            }
-            Err(error) => error.ntstatus(),
-        },
+    match DispatchTarget::decode(device, irp).and_then(SetSecurityRequest::decode) {
+        Ok(request) => set_security(request),
         Err(error) => error.ntstatus(),
     }
 }
@@ -69,6 +77,22 @@ impl QuerySecurityRequest {
     }
 }
 
+/// Decoded set-security request.
+#[derive(Clone, Copy, Debug)]
+struct SetSecurityRequest {
+    /// Decoded set-security stack.
+    stack: SetSecurityStack,
+}
+
+impl SetSecurityRequest {
+    /// Decodes a set-security request.
+    fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
+        Ok(Self {
+            stack: target.current_stack()?.set_security()?,
+        })
+    }
+}
+
 /// Binary SID used while building a self-relative descriptor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BinarySid {
@@ -83,6 +107,65 @@ struct AllowAce {
     mask: u32,
     /// Trustee SID.
     sid: BinarySid,
+}
+
+/// Open security state needed for journaled security mutations.
+#[derive(Clone, Copy, Debug)]
+struct OpenedSecurityContext {
+    /// Mounted VCB owning the open file.
+    volume: NonNull<VolumeControlBlock>,
+    /// ext4 node opened by this FILE_OBJECT.
+    node: FileSystemNode,
+    /// Current POSIX security metadata.
+    security: Ext4Security,
+}
+
+/// Parsed self-relative Windows security descriptor.
+#[derive(Clone, Copy, Debug)]
+struct ParsedSecurityDescriptor<'a> {
+    /// Original descriptor image.
+    bytes: &'a [u8],
+    /// Descriptor control flags.
+    control: u16,
+    /// Owner SID offset.
+    owner_offset: u32,
+    /// Group SID offset.
+    group_offset: u32,
+    /// DACL offset.
+    dacl_offset: u32,
+}
+
+/// SID identity accepted by the ext4 Windows security boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidIdentity {
+    /// Linux UID SID, `S-1-22-1-uid`.
+    LinuxUid(u32),
+    /// Linux GID SID, `S-1-22-2-gid`.
+    LinuxGid(u32),
+    /// Everyone SID, `S-1-1-0`.
+    Everyone,
+}
+
+/// POSIX permission class addressed by one allow ACE.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PermissionClass {
+    /// Owner rwx class.
+    Owner,
+    /// Group rwx class.
+    Group,
+    /// Other rwx class.
+    Other,
+}
+
+/// DACL permissions while parsing allow ACEs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ParsedDaclPermissions {
+    /// Owner class permission bits.
+    owner: Option<u16>,
+    /// Group class permission bits.
+    group: Option<u16>,
+    /// Other class permission bits.
+    other: Option<u16>,
 }
 
 /// Performs a security descriptor query.
@@ -114,10 +197,59 @@ fn query_security(request: QuerySecurityRequest) -> NTSTATUS {
     }
 }
 
+/// Performs a POSIX security mutation from a Windows security descriptor.
+fn set_security(request: SetSecurityRequest) -> NTSTATUS {
+    match load_ext4_security_context(request.stack.file_object()).and_then(|context| {
+        let descriptor = security_descriptor_bytes(
+            request.stack.security_descriptor(),
+            request.stack.security_information(),
+        )?;
+        let security = security_from_descriptor(
+            descriptor.as_slice(),
+            request.stack.security_information(),
+            context.security,
+        )?;
+        if security == context.security {
+            return Ok(());
+        }
+
+        let mut vcb = context.volume;
+        let vcb = unsafe {
+            // SAFETY: FCBs are constructed only from live mounted VCB pointers
+            // and remain valid while file objects are open. The mutable borrow
+            // is the transaction boundary for this synchronous security
+            // mutation.
+            vcb.as_mut()
+        };
+        let mut transaction = vcb.volume_mut().begin_transaction(
+            crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?,
+        );
+        let node = transaction
+            .node(context.node.inode())
+            .map_err(|error| DriverError::from(error).ntstatus())?;
+        transaction
+            .set_posix_security(node, security)
+            .map_err(|error| DriverError::from(error).ntstatus())?;
+        transaction
+            .commit()
+            .map_err(|error| DriverError::from(error).ntstatus())
+    }) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(status) => status,
+    }
+}
+
 /// Loads ext4 security metadata for an opened node.
 fn load_ext4_security(
     file_object: NonNull<wdk_sys::FILE_OBJECT>,
 ) -> Result<Ext4Security, NTSTATUS> {
+    load_ext4_security_context(file_object).map(|context| context.security)
+}
+
+/// Loads ext4 security context for an opened node.
+fn load_ext4_security_context(
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+) -> Result<OpenedSecurityContext, NTSTATUS> {
     let fcb = file_control_block(file_object).map_err(DriverError::ntstatus)?;
     let fcb = unsafe {
         // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
@@ -130,7 +262,11 @@ fn load_ext4_security(
         .volume()
         .read_node(fcb.node().inode())
         .map_err(|error| DriverError::from(error).ntstatus())?;
-    security_from_node(fcb.node(), node)
+    Ok(OpenedSecurityContext {
+        volume: fcb.volume(),
+        node: fcb.node(),
+        security: security_from_node(fcb.node(), node)?,
+    })
 }
 
 /// Extracts security metadata after validating FCB kind against core metadata.
@@ -190,6 +326,384 @@ fn security_descriptor(
         u16::try_from(control).map_err(|_| STATUS_INVALID_PARAMETER)?,
     )?;
     Ok(descriptor)
+}
+
+/// Copies the raw SetSecurity descriptor into a bounded byte image.
+fn security_descriptor_bytes(
+    security_descriptor: NonNull<core::ffi::c_void>,
+    information: wdk_sys::SECURITY_INFORMATION,
+) -> Result<Vec<u8>, NTSTATUS> {
+    let pointer = security_descriptor.cast::<u8>();
+    let mut length = SECURITY_DESCRIPTOR_RELATIVE_BYTES;
+    let header = unsafe {
+        // SAFETY: The I/O Manager supplies a non-null security descriptor
+        // pointer for IRP_MJ_SET_SECURITY. Only the fixed header is read here;
+        // component reads below are selected by validated offsets.
+        core::slice::from_raw_parts(pointer.as_ptr(), SECURITY_DESCRIPTOR_RELATIVE_BYTES)
+    };
+    let descriptor = ParsedSecurityDescriptor::parse(header)?;
+
+    if information & wdk_sys::OWNER_SECURITY_INFORMATION != 0 {
+        length = length.max(raw_sid_end(pointer, descriptor.owner_offset)?);
+    }
+    if information & wdk_sys::GROUP_SECURITY_INFORMATION != 0 {
+        length = length.max(raw_sid_end(pointer, descriptor.group_offset)?);
+    }
+    if information & wdk_sys::DACL_SECURITY_INFORMATION != 0 {
+        length = length.max(raw_acl_end(pointer, descriptor.dacl_offset)?);
+    }
+
+    let bytes = unsafe {
+        // SAFETY: Length was derived from the self-relative descriptor's SID
+        // and ACL size fields. Windows owns the descriptor for this dispatch.
+        core::slice::from_raw_parts(pointer.as_ptr(), length)
+    };
+    Ok(bytes.to_vec())
+}
+
+/// Builds new ext4 security metadata from a Windows security descriptor.
+fn security_from_descriptor(
+    descriptor: &[u8],
+    information: wdk_sys::SECURITY_INFORMATION,
+    current: Ext4Security,
+) -> Result<Ext4Security, NTSTATUS> {
+    let supported = wdk_sys::OWNER_SECURITY_INFORMATION
+        | wdk_sys::GROUP_SECURITY_INFORMATION
+        | wdk_sys::DACL_SECURITY_INFORMATION;
+    if information & wdk_sys::SACL_SECURITY_INFORMATION != 0 {
+        return Err(DriverError::AccessDenied.ntstatus());
+    }
+    if information & !supported != 0 {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+
+    let descriptor = ParsedSecurityDescriptor::parse(descriptor)?;
+    let mut owner = current.owner();
+    if information & wdk_sys::OWNER_SECURITY_INFORMATION != 0 {
+        let uid = descriptor.owner_uid()?;
+        owner = Ext4Owner::new(Ext4Uid::from_u32(uid), owner.gid());
+    }
+    if information & wdk_sys::GROUP_SECURITY_INFORMATION != 0 {
+        let gid = descriptor.group_gid()?;
+        owner = Ext4Owner::new(owner.uid(), Ext4Gid::from_u32(gid));
+    }
+
+    let mut permissions = current.permissions().as_u16();
+    if information & wdk_sys::DACL_SECURITY_INFORMATION != 0 {
+        let low_bits = descriptor.dacl_permissions(owner)?;
+        permissions = (permissions & !POSIX_RWX_BITS) | low_bits;
+    }
+
+    Ok(Ext4Security::new(
+        owner,
+        Ext4Permissions::new(permissions).map_err(|error| DriverError::from(error).ntstatus())?,
+    ))
+}
+
+impl<'a> ParsedSecurityDescriptor<'a> {
+    /// Parses a self-relative Windows security descriptor.
+    fn parse(bytes: &'a [u8]) -> Result<Self, NTSTATUS> {
+        if bytes.len() < SECURITY_DESCRIPTOR_RELATIVE_BYTES {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let revision = read_u8(bytes, 0)?;
+        if u32::from(revision) != wdk_sys::SECURITY_DESCRIPTOR_REVISION {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let control = read_u16(bytes, 2)?;
+        let self_relative =
+            u16::try_from(wdk_sys::SE_SELF_RELATIVE).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        if control & self_relative == 0 {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        let sacl_present =
+            u16::try_from(wdk_sys::SE_SACL_PRESENT).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        if control & sacl_present != 0 {
+            return Err(DriverError::AccessDenied.ntstatus());
+        }
+
+        Ok(Self {
+            bytes,
+            control,
+            owner_offset: read_u32(bytes, SECURITY_DESCRIPTOR_OWNER_OFFSET)?,
+            group_offset: read_u32(bytes, SECURITY_DESCRIPTOR_GROUP_OFFSET)?,
+            dacl_offset: read_u32(bytes, SECURITY_DESCRIPTOR_DACL_OFFSET)?,
+        })
+    }
+
+    /// Returns the owner UID represented by the owner SID.
+    fn owner_uid(self) -> Result<u32, NTSTATUS> {
+        match sid_identity(self.sid_at(self.owner_offset)?)? {
+            SidIdentity::LinuxUid(uid) => Ok(uid),
+            SidIdentity::LinuxGid(_) | SidIdentity::Everyone => Err(STATUS_NOT_SUPPORTED),
+        }
+    }
+
+    /// Returns the group GID represented by the group SID.
+    fn group_gid(self) -> Result<u32, NTSTATUS> {
+        match sid_identity(self.sid_at(self.group_offset)?)? {
+            SidIdentity::LinuxGid(gid) => Ok(gid),
+            SidIdentity::LinuxUid(_) | SidIdentity::Everyone => Err(STATUS_NOT_SUPPORTED),
+        }
+    }
+
+    /// Returns low POSIX rwx bits represented by the descriptor DACL.
+    fn dacl_permissions(self, owner: Ext4Owner) -> Result<u16, NTSTATUS> {
+        let dacl_present =
+            u16::try_from(wdk_sys::SE_DACL_PRESENT).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        if self.control & dacl_present == 0 || self.dacl_offset == 0 {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        let acl = self.acl_at(self.dacl_offset)?;
+        parse_dacl_permissions(acl, owner)
+    }
+
+    /// Returns a SID component at a self-relative descriptor offset.
+    fn sid_at(self, offset: u32) -> Result<&'a [u8], NTSTATUS> {
+        if offset == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let header_end = start
+            .checked_add(SID_PREFIX_BYTES)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let header = self
+            .bytes
+            .get(start..header_end)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let count = usize::from(read_u8(header, 1)?);
+        let sid_len = sid_length_from_sub_authorities(count)?;
+        let end = start.checked_add(sid_len).ok_or(STATUS_INVALID_PARAMETER)?;
+        self.bytes.get(start..end).ok_or(STATUS_INVALID_PARAMETER)
+    }
+
+    /// Returns an ACL component at a self-relative descriptor offset.
+    fn acl_at(self, offset: u32) -> Result<&'a [u8], NTSTATUS> {
+        let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let header_end = start
+            .checked_add(ACL_HEADER_BYTES)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let header = self
+            .bytes
+            .get(start..header_end)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let acl_len = usize::from(read_u16(header, ACL_SIZE_OFFSET)?);
+        let end = start.checked_add(acl_len).ok_or(STATUS_INVALID_PARAMETER)?;
+        self.bytes.get(start..end).ok_or(STATUS_INVALID_PARAMETER)
+    }
+}
+
+impl ParsedDaclPermissions {
+    /// Stores one parsed permission class.
+    fn set(&mut self, class: PermissionClass, bits: u16) -> Result<(), NTSTATUS> {
+        let target = match class {
+            PermissionClass::Owner => &mut self.owner,
+            PermissionClass::Group => &mut self.group,
+            PermissionClass::Other => &mut self.other,
+        };
+        if target.replace(bits).is_some() {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        Ok(())
+    }
+
+    /// Converts parsed classes into POSIX rwx mode bits.
+    fn mode_bits(self) -> u16 {
+        (self.owner.unwrap_or(0) << 6) | (self.group.unwrap_or(0) << 3) | self.other.unwrap_or(0)
+    }
+}
+
+/// Returns the byte end of a raw SID component.
+fn raw_sid_end(pointer: NonNull<u8>, offset: u32) -> Result<usize, NTSTATUS> {
+    if offset == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let count_offset = start.checked_add(1).ok_or(STATUS_INVALID_PARAMETER)?;
+    let count_pointer = unsafe {
+        // SAFETY: The offset is selected from a self-relative security
+        // descriptor supplied by the I/O Manager.
+        pointer.as_ptr().add(count_offset)
+    };
+    let count = unsafe {
+        // SAFETY: `count_pointer` addresses the SID sub-authority count byte
+        // selected above.
+        *count_pointer
+    };
+    let sid_len = sid_length_from_sub_authorities(usize::from(count))?;
+    start.checked_add(sid_len).ok_or(STATUS_INVALID_PARAMETER)
+}
+
+/// Returns the byte end of a raw ACL component.
+fn raw_acl_end(pointer: NonNull<u8>, offset: u32) -> Result<usize, NTSTATUS> {
+    if offset == 0 {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let acl_size_offset = start
+        .checked_add(ACL_SIZE_OFFSET)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let acl_size_pointer = unsafe {
+        // SAFETY: The offset is selected from a self-relative security
+        // descriptor supplied by the I/O Manager.
+        pointer.as_ptr().add(acl_size_offset)
+    };
+    let size_bytes = unsafe {
+        // SAFETY: `acl_size_pointer` addresses the two-byte ACL size field
+        // used to bound the subsequent copy.
+        core::slice::from_raw_parts(acl_size_pointer, 2)
+    };
+    let acl_len = usize::from(read_u16(size_bytes, 0)?);
+    start.checked_add(acl_len).ok_or(STATUS_INVALID_PARAMETER)
+}
+
+/// Returns the serialized SID length for a sub-authority count.
+fn sid_length_from_sub_authorities(count: usize) -> Result<usize, NTSTATUS> {
+    SID_PREFIX_BYTES
+        .checked_add(
+            count
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(STATUS_INVALID_PARAMETER)?,
+        )
+        .ok_or(STATUS_INVALID_PARAMETER)
+}
+
+/// Parses a DACL into POSIX rwx permission bits.
+fn parse_dacl_permissions(acl: &[u8], owner: Ext4Owner) -> Result<u16, NTSTATUS> {
+    if acl.len() < ACL_HEADER_BYTES {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let revision = read_u8(acl, 0)?;
+    if u32::from(revision) != wdk_sys::ACL_REVISION {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    let acl_len = usize::from(read_u16(acl, ACL_SIZE_OFFSET)?);
+    if acl_len != acl.len() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let ace_count = usize::from(read_u16(acl, ACL_ACE_COUNT_OFFSET)?);
+    let mut cursor = ACL_HEADER_BYTES;
+    let mut parsed = ParsedDaclPermissions::default();
+    for _ in 0..ace_count {
+        let ace_header = acl
+            .get(cursor..)
+            .and_then(|remaining| remaining.get(..4))
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let ace_type = read_u8(ace_header, 0)?;
+        let ace_flags = read_u8(ace_header, 1)?;
+        let ace_size = usize::from(read_u16(ace_header, 2)?);
+        if ace_size < ACCESS_ALLOWED_ACE_PREFIX_BYTES {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let ace_end = cursor
+            .checked_add(ace_size)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let ace = acl.get(cursor..ace_end).ok_or(STATUS_INVALID_PARAMETER)?;
+        parse_allow_ace(ace_type, ace_flags, ace, owner, &mut parsed)?;
+        cursor = ace_end;
+    }
+    if cursor != acl.len() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(parsed.mode_bits())
+}
+
+/// Parses one allow ACE into a POSIX permission class.
+fn parse_allow_ace(
+    ace_type: u8,
+    ace_flags: u8,
+    ace: &[u8],
+    owner: Ext4Owner,
+    parsed: &mut ParsedDaclPermissions,
+) -> Result<(), NTSTATUS> {
+    if u32::from(ace_type) != wdk_sys::ACCESS_ALLOWED_ACE_TYPE {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    if ace_flags != 0 {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    let mask = read_u32(ace, ACE_MASK_OFFSET)?;
+    let bits = permission_bits_from_mask(mask)?;
+    let sid = ace.get(ACE_SID_OFFSET..).ok_or(STATUS_INVALID_PARAMETER)?;
+    let class = permission_class_from_sid(sid_identity(sid)?, owner)?;
+    parsed.set(class, bits)
+}
+
+/// Maps one accepted Windows access mask back to POSIX rwx bits.
+fn permission_bits_from_mask(mask: u32) -> Result<u16, NTSTATUS> {
+    for bits in 0..=0o7 {
+        if permission_class_mask(bits) == mask {
+            return Ok(bits);
+        }
+    }
+    Err(STATUS_NOT_SUPPORTED)
+}
+
+/// Classifies a SID for DACL permission projection.
+fn permission_class_from_sid(
+    sid: SidIdentity,
+    owner: Ext4Owner,
+) -> Result<PermissionClass, NTSTATUS> {
+    match sid {
+        SidIdentity::LinuxUid(uid) if uid == owner.uid().as_u32() => Ok(PermissionClass::Owner),
+        SidIdentity::LinuxGid(gid) if gid == owner.gid().as_u32() => Ok(PermissionClass::Group),
+        SidIdentity::Everyone => Ok(PermissionClass::Other),
+        SidIdentity::LinuxUid(_) | SidIdentity::LinuxGid(_) => Err(STATUS_NOT_SUPPORTED),
+    }
+}
+
+/// Parses a SID into the identities accepted by this driver.
+fn sid_identity(bytes: &[u8]) -> Result<SidIdentity, NTSTATUS> {
+    if bytes.len() < SID_PREFIX_BYTES {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let revision = read_u8(bytes, 0)?;
+    if u32::from(revision) != wdk_sys::SID_REVISION {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let count = usize::from(read_u8(bytes, 1)?);
+    if bytes.len() != sid_length_from_sub_authorities(count)? {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let authority = sid_authority(bytes)?;
+    if authority == SECURITY_WORLD_AUTHORITY && count == 1 && sid_sub_authority(bytes, 0)? == 0 {
+        return Ok(SidIdentity::Everyone);
+    }
+    if authority == SECURITY_NT_NON_UNIQUE_AUTHORITY && count == 2 {
+        return match sid_sub_authority(bytes, 0)? {
+            1 => Ok(SidIdentity::LinuxUid(sid_sub_authority(bytes, 1)?)),
+            2 => Ok(SidIdentity::LinuxGid(sid_sub_authority(bytes, 1)?)),
+            _ => Err(STATUS_NOT_SUPPORTED),
+        };
+    }
+    Err(STATUS_NOT_SUPPORTED)
+}
+
+/// Reads the big-endian SID authority.
+fn sid_authority(bytes: &[u8]) -> Result<u64, NTSTATUS> {
+    let authority = bytes.get(2..8).ok_or(STATUS_INVALID_PARAMETER)?;
+    Ok(u64::from_be_bytes([
+        0,
+        0,
+        *authority.first().ok_or(STATUS_INVALID_PARAMETER)?,
+        *authority.get(1).ok_or(STATUS_INVALID_PARAMETER)?,
+        *authority.get(2).ok_or(STATUS_INVALID_PARAMETER)?,
+        *authority.get(3).ok_or(STATUS_INVALID_PARAMETER)?,
+        *authority.get(4).ok_or(STATUS_INVALID_PARAMETER)?,
+        *authority.get(5).ok_or(STATUS_INVALID_PARAMETER)?,
+    ]))
+}
+
+/// Reads a little-endian SID sub-authority by index.
+fn sid_sub_authority(bytes: &[u8], index: usize) -> Result<u32, NTSTATUS> {
+    let start = SID_PREFIX_BYTES
+        .checked_add(
+            index
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(STATUS_INVALID_PARAMETER)?,
+        )
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    read_u32(bytes, start)
 }
 
 /// Builds a DACL with owner, group, and everyone allow ACEs from POSIX mode bits.
@@ -345,6 +859,31 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
     }
 }
 
+/// Reads one byte from a byte buffer.
+fn read_u8(input: &[u8], offset: usize) -> Result<u8, NTSTATUS> {
+    input.get(offset).copied().ok_or(STATUS_INVALID_PARAMETER)
+}
+
+/// Reads a little-endian `u16`.
+fn read_u16(input: &[u8], offset: usize) -> Result<u16, NTSTATUS> {
+    let end = offset
+        .checked_add(core::mem::size_of::<u16>())
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let bytes = input.get(offset..end).ok_or(STATUS_INVALID_PARAMETER)?;
+    let array: [u8; 2] = bytes.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
+    Ok(u16::from_le_bytes(array))
+}
+
+/// Reads a little-endian `u32`.
+fn read_u32(input: &[u8], offset: usize) -> Result<u32, NTSTATUS> {
+    let end = offset
+        .checked_add(core::mem::size_of::<u32>())
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let bytes = input.get(offset..end).ok_or(STATUS_INVALID_PARAMETER)?;
+    let array: [u8; 4] = bytes.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
+    Ok(u32::from_le_bytes(array))
+}
+
 /// Writes one byte into a byte buffer.
 fn write_u8(output: &mut [u8], offset: usize, value: u8) -> Result<(), NTSTATUS> {
     let Some(target) = output.get_mut(offset) else {
@@ -397,7 +936,9 @@ mod tests {
     use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid};
 
     use super::{
-        dacl_from_permissions, gid_sid, permission_class_mask, security_descriptor, uid_sid,
+        SidIdentity, dacl_from_permissions, gid_sid, permission_bits_from_mask,
+        permission_class_mask, security_descriptor, security_from_descriptor, sid_identity,
+        uid_sid,
     };
 
     #[test]
@@ -464,6 +1005,154 @@ mod tests {
                 assert_eq!(read_test_u32(descriptor.as_slice(), 16), Some(52));
             }
         }
+    }
+
+    #[test]
+    fn security_descriptor_set_round_trips_posix_owner_group_and_dacl() {
+        let current_permissions = Ext4Permissions::new(0o600);
+        let target_permissions = Ext4Permissions::new(0o754);
+        assert!(current_permissions.is_ok());
+        assert!(target_permissions.is_ok());
+        if let (Ok(current_permissions), Ok(target_permissions)) =
+            (current_permissions, target_permissions)
+        {
+            let current = Ext4Security::new(
+                Ext4Owner::new(Ext4Uid::from_u32(1), Ext4Gid::from_u32(2)),
+                current_permissions,
+            );
+            let target = Ext4Security::new(
+                Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(100)),
+                target_permissions,
+            );
+            let descriptor = security_descriptor(
+                target,
+                wdk_sys::OWNER_SECURITY_INFORMATION
+                    | wdk_sys::GROUP_SECURITY_INFORMATION
+                    | wdk_sys::DACL_SECURITY_INFORMATION,
+            );
+            assert!(descriptor.is_ok());
+            if let Ok(descriptor) = descriptor {
+                assert_eq!(
+                    security_from_descriptor(
+                        descriptor.as_slice(),
+                        wdk_sys::OWNER_SECURITY_INFORMATION
+                            | wdk_sys::GROUP_SECURITY_INFORMATION
+                            | wdk_sys::DACL_SECURITY_INFORMATION,
+                        current,
+                    ),
+                    Ok(target)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_dacl_rejects_owner_sid_that_does_not_match_inode_owner() {
+        let current_permissions = Ext4Permissions::new(0o600);
+        let descriptor_permissions = Ext4Permissions::new(0o700);
+        assert!(current_permissions.is_ok());
+        assert!(descriptor_permissions.is_ok());
+        if let (Ok(current_permissions), Ok(descriptor_permissions)) =
+            (current_permissions, descriptor_permissions)
+        {
+            let current = Ext4Security::new(
+                Ext4Owner::new(Ext4Uid::from_u32(1), Ext4Gid::from_u32(2)),
+                current_permissions,
+            );
+            let descriptor_security = Ext4Security::new(
+                Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(2)),
+                descriptor_permissions,
+            );
+            let descriptor =
+                security_descriptor(descriptor_security, wdk_sys::DACL_SECURITY_INFORMATION);
+            assert!(descriptor.is_ok());
+            if let Ok(descriptor) = descriptor {
+                assert_eq!(
+                    security_from_descriptor(
+                        descriptor.as_slice(),
+                        wdk_sys::DACL_SECURITY_INFORMATION,
+                        current,
+                    ),
+                    Err(wdk_sys::STATUS_NOT_SUPPORTED)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_dacl_rejects_deny_aces() {
+        let permissions = Ext4Permissions::new(0o700);
+        assert!(permissions.is_ok());
+        if let Ok(permissions) = permissions {
+            let security = Ext4Security::new(
+                Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(100)),
+                permissions,
+            );
+            let descriptor = security_descriptor(security, wdk_sys::DACL_SECURITY_INFORMATION);
+            assert!(descriptor.is_ok());
+            if let Ok(mut descriptor) = descriptor {
+                let dacl_offset = read_test_u32(
+                    descriptor.as_slice(),
+                    super::SECURITY_DESCRIPTOR_DACL_OFFSET,
+                );
+                assert!(dacl_offset.is_some());
+                if let Some(dacl_offset) = dacl_offset {
+                    let ace_type_offset = usize::try_from(dacl_offset)
+                        .ok()
+                        .and_then(|offset| offset.checked_add(super::ACL_HEADER_BYTES));
+                    assert!(ace_type_offset.is_some());
+                    if let Some(ace_type_offset) = ace_type_offset {
+                        let deny_type = u8::try_from(wdk_sys::ACCESS_DENIED_ACE_TYPE);
+                        assert!(deny_type.is_ok());
+                        if let (Some(byte), Ok(deny_type)) =
+                            (descriptor.get_mut(ace_type_offset), deny_type)
+                        {
+                            *byte = deny_type;
+                        }
+                        assert_eq!(
+                            security_from_descriptor(
+                                descriptor.as_slice(),
+                                wdk_sys::DACL_SECURITY_INFORMATION,
+                                security,
+                            ),
+                            Err(wdk_sys::STATUS_NOT_SUPPORTED)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_sid_identities_are_strictly_classified() {
+        assert_eq!(
+            uid_sid(42).and_then(|sid| sid_identity(sid.bytes.as_slice())),
+            Ok(SidIdentity::LinuxUid(42))
+        );
+        assert_eq!(
+            super::everyone_sid().and_then(|sid| sid_identity(sid.bytes.as_slice())),
+            Ok(SidIdentity::Everyone)
+        );
+        assert_eq!(
+            sid_identity(&[1, 1, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0]),
+            Err(wdk_sys::STATUS_NOT_SUPPORTED)
+        );
+    }
+
+    #[test]
+    fn file_generic_masks_are_the_only_accepted_permission_masks() {
+        assert_eq!(
+            permission_bits_from_mask(
+                wdk_sys::FILE_GENERIC_READ
+                    | wdk_sys::FILE_GENERIC_WRITE
+                    | wdk_sys::FILE_GENERIC_EXECUTE
+            ),
+            Ok(0o7)
+        );
+        assert_eq!(
+            permission_bits_from_mask(wdk_sys::FILE_GENERIC_READ | wdk_sys::DELETE),
+            Err(wdk_sys::STATUS_NOT_SUPPORTED)
+        );
     }
 
     fn read_test_u16(bytes: &[u8], offset: usize) -> Option<u16> {
