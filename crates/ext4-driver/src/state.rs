@@ -447,6 +447,11 @@ impl ContextControlBlock {
     pub(crate) const fn path(&self) -> &OpenedPath {
         &self.path
     }
+
+    /// Replaces the opened path after a successful rename.
+    pub(crate) fn replace_path(&mut self, path: OpenedPath) {
+        self.path = path;
+    }
 }
 
 /// Driver unload callback registered in the driver object.
