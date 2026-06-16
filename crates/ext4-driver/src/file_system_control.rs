@@ -1,11 +1,20 @@
 //! File-system control, mount, reparse, and device-control dispatch boundary.
 
-use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_NOT_SUPPORTED, STATUS_UNRECOGNIZED_VOLUME};
+use alloc::boxed::Box;
+
+use wdk_sys::{
+    NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
+    STATUS_UNRECOGNIZED_VOLUME,
+};
 
 use crate::{
     block_device::query_device_length,
+    ffi,
     irp::{DispatchTarget, MountVolumeStack},
-    state::{KernelDevice, MountCandidate},
+    state::{
+        KernelDevice, MountCandidate, MountedVolumeDevice, MountedVolumeDeviceExtension,
+        VolumeControlBlock,
+    },
     status::DriverError,
 };
 
@@ -67,6 +76,7 @@ impl FileSystemControlRequest {
             return Ok(Self::Unsupported);
         }
         Ok(Self::MountVolume(MountVolumeRequest::from_stack(
+            target.device(),
             stack.mount_volume()?,
         )))
     }
@@ -75,6 +85,8 @@ impl FileSystemControlRequest {
 /// Mount request after raw IRP stack decoding.
 #[derive(Clone, Copy, Debug)]
 struct MountVolumeRequest {
+    /// File-system control device receiving the mount IRP.
+    file_system_device: KernelDevice,
     /// VPB supplied by the I/O Manager for this mount.
     vpb: core::ptr::NonNull<wdk_sys::VPB>,
     /// Lower storage device selected by the I/O Manager.
@@ -85,12 +97,21 @@ struct MountVolumeRequest {
 
 impl MountVolumeRequest {
     /// Converts decoded stack parameters into the mount domain boundary.
-    fn from_stack(stack: MountVolumeStack) -> Self {
+    fn from_stack(
+        file_system_device: core::ptr::NonNull<wdk_sys::DEVICE_OBJECT>,
+        stack: MountVolumeStack,
+    ) -> Self {
         Self {
+            file_system_device: KernelDevice::from_non_null(file_system_device),
             vpb: stack.vpb(),
             target_device: KernelDevice::from_non_null(stack.target_device()),
             output_buffer_length: stack.output_buffer_length(),
         }
+    }
+
+    /// Returns the file-system control device receiving this mount request.
+    const fn file_system_device(self) -> KernelDevice {
+        self.file_system_device
     }
 
     /// Returns the VPB supplied by the I/O Manager.
@@ -116,11 +137,64 @@ fn mount_volume(request: MountVolumeRequest) -> NTSTATUS {
         Err(error) => return DriverError::from(error).ntstatus(),
     };
     let candidate = MountCandidate::new(request.target_device(), length);
-    let _mount_boundary = (
+    let vcb =
+        match VolumeControlBlock::mount_read_write(candidate.target_device(), candidate.length()) {
+            Ok(vcb) => vcb,
+            Err(ext4_core::Error::InvalidMagic | ext4_core::Error::InvalidSuperblock) => {
+                return STATUS_UNRECOGNIZED_VOLUME;
+            }
+            Err(error) => return DriverError::from(error).ntstatus(),
+        };
+    let _output_buffer_length = request.output_buffer_length();
+    let Some(driver_object) = request.file_system_device().driver_object() else {
+        return STATUS_INVALID_PARAMETER;
+    };
+
+    let mut device = core::ptr::null_mut();
+    let extension_size =
+        match wdk_sys::ULONG::try_from(core::mem::size_of::<MountedVolumeDeviceExtension>()) {
+            Ok(size) => size,
+            Err(_) => return STATUS_INVALID_PARAMETER,
+        };
+    let status = unsafe {
+        // SAFETY: `driver_object` belongs to the control device receiving the
+        // mount IRP. `device` points to writable storage for the created object.
+        ffi::IoCreateDevice(
+            driver_object,
+            extension_size,
+            core::ptr::null_mut(),
+            ffi::FILE_DEVICE_DISK_FILE_SYSTEM,
+            0,
+            0,
+            core::ptr::addr_of_mut!(device),
+        )
+    };
+    if status < STATUS_SUCCESS {
+        return status;
+    }
+
+    if MountedVolumeDevice::initialize_vpb_identity(request.vpb(), &vcb).is_none() {
+        unsafe {
+            // SAFETY: `device` was returned by a successful IoCreateDevice call
+            // and has not been published as a mounted volume.
+            ffi::IoDeleteDevice(device);
+        }
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let Some(mounted_device) = MountedVolumeDevice::initialize(
+        device,
+        Box::new(vcb),
         request.vpb(),
         candidate.target_device(),
-        candidate.length(),
-        request.output_buffer_length(),
-    );
-    STATUS_UNRECOGNIZED_VOLUME
+    ) else {
+        unsafe {
+            // SAFETY: `device` was returned by a successful IoCreateDevice call
+            // and no initialized extension owns heap state on this path.
+            ffi::IoDeleteDevice(device);
+        }
+        return STATUS_INVALID_PARAMETER;
+    };
+    let _mounted_device = mounted_device.as_ptr();
+    STATUS_SUCCESS
 }

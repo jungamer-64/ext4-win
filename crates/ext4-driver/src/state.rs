@@ -1,10 +1,11 @@
 //! Driver-local lifecycle and open-object state.
 
+use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::{DeviceLength, InodeId, InternalJournal, ReadWrite, Result, Volume};
-use wdk_sys::{PDEVICE_OBJECT, PDRIVER_OBJECT};
+use wdk_sys::{DO_DEVICE_INITIALIZING, DO_DIRECT_IO, PDEVICE_OBJECT, PDRIVER_OBJECT, VPB_MOUNTED};
 
 use crate::{block_device::KernelBlockDevice, ffi};
 
@@ -31,6 +32,26 @@ impl KernelDevice {
     /// Returns the raw WDK device pointer for FFI calls.
     pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
         self.device.as_ptr().cast()
+    }
+
+    /// Returns the owning driver object for creating sibling device objects.
+    pub(crate) fn driver_object(self) -> Option<PDRIVER_OBJECT> {
+        let device = unsafe {
+            // SAFETY: `self` is a non-null DEVICE_OBJECT pointer decoded at the
+            // driver boundary and is only read for its stable DriverObject field.
+            self.as_ptr().as_ref()
+        }?;
+        NonNull::new(device.DriverObject).map(NonNull::as_ptr)
+    }
+
+    /// Returns the lower-device stack size advertised by the I/O Manager.
+    pub(crate) fn stack_size(self) -> Option<i8> {
+        let device = unsafe {
+            // SAFETY: `self` is a non-null DEVICE_OBJECT pointer decoded at the
+            // driver boundary and is only read for StackSize propagation.
+            self.as_ptr().as_ref()
+        }?;
+        Some(device.StackSize)
     }
 }
 
@@ -106,10 +127,6 @@ pub(crate) struct VolumeControlBlock {
     root_inode: InodeId,
 }
 
-#[expect(
-    dead_code,
-    reason = "VCB accessors are defined before IRP dispatch stores VCB pointers"
-)]
 impl VolumeControlBlock {
     /// Mounts a journaled read-write ext4 VCB.
     pub(crate) fn mount_read_write(
@@ -124,22 +141,122 @@ impl VolumeControlBlock {
         })
     }
 
-    /// Returns the mounted ext4 volume.
-    pub(crate) const fn volume(&self) -> &Volume<KernelBlockDevice, ReadWrite<InternalJournal>> {
-        &self.volume
+    /// Returns a stable serial number derived from the ext4 filesystem UUID.
+    pub(crate) fn serial_number(&self) -> Option<u32> {
+        let uuid = self.volume.superblock().uuid().bytes();
+        let bytes: [u8; 4] = uuid.get(0..4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(bytes))
     }
 
-    /// Returns the mounted ext4 volume for mutation.
-    pub(crate) const fn volume_mut(
-        &mut self,
-    ) -> &mut Volume<KernelBlockDevice, ReadWrite<InternalJournal>> {
-        &mut self.volume
+    /// Returns the mounted ext4 volume label.
+    pub(crate) fn volume_label(&self) -> ext4_core::Ext4VolumeLabel {
+        self.volume.volume_label()
+    }
+}
+
+/// Device extension stored in mounted volume device objects.
+#[repr(C)]
+pub(crate) struct MountedVolumeDeviceExtension {
+    /// Heap-owned VCB for this mounted volume device.
+    vcb: *mut VolumeControlBlock,
+}
+
+/// Mounted volume device object produced by a successful mount FSCTL.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MountedVolumeDevice {
+    /// Mounted volume device object.
+    device: KernelDevice,
+}
+
+impl MountedVolumeDevice {
+    /// Initializes an IoCreateDevice-created mounted device and takes ownership
+    /// of the VCB.
+    pub(crate) fn initialize(
+        device: PDEVICE_OBJECT,
+        vcb: Box<VolumeControlBlock>,
+        vpb: NonNull<wdk_sys::VPB>,
+        real_device: KernelDevice,
+    ) -> Option<Self> {
+        let device = KernelDevice::from_raw(device)?;
+        let device_object = unsafe {
+            // SAFETY: The device was just created by this driver and remains
+            // valid during mount initialization.
+            device.as_ptr().as_mut()
+        }?;
+        let extension = unsafe {
+            // SAFETY: The device was created with a DeviceExtension sized for
+            // MountedVolumeDeviceExtension by this driver.
+            device_object
+                .DeviceExtension
+                .cast::<MountedVolumeDeviceExtension>()
+                .as_mut()
+        }?;
+        Self::initialize_device_object(device, vpb, real_device)?;
+        extension.vcb = Box::into_raw(vcb);
+        Some(Self { device })
     }
 
-    /// Returns the mounted root inode.
-    pub(crate) const fn root_inode(&self) -> InodeId {
-        self.root_inode
+    /// Returns the mounted volume device object pointer.
+    pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
+        self.device.as_ptr()
     }
+
+    /// Initializes DEVICE_OBJECT and VPB fields after a successful core mount.
+    fn initialize_device_object(
+        device: KernelDevice,
+        mut vpb: NonNull<wdk_sys::VPB>,
+        real_device: KernelDevice,
+    ) -> Option<()> {
+        let device_object = unsafe {
+            // SAFETY: The mounted device object was created by this driver and
+            // remains valid during mount initialization.
+            device.as_ptr().as_mut()
+        }?;
+        device_object.Vpb = vpb.as_ptr();
+        device_object.Flags |= DO_DIRECT_IO;
+        device_object.Flags &= !DO_DEVICE_INITIALIZING;
+        device_object.StackSize = real_device.stack_size()?.checked_add(1)?;
+
+        let vpb = unsafe {
+            // SAFETY: The VPB was supplied by the I/O Manager for this mount
+            // request and is writable during successful mount completion.
+            vpb.as_mut()
+        };
+        vpb.DeviceObject = device.as_ptr();
+        vpb.RealDevice = real_device.as_ptr();
+        vpb.Flags |= u16::try_from(VPB_MOUNTED).ok()?;
+        Some(())
+    }
+
+    /// Copies VCB-derived identity fields into the VPB.
+    pub(crate) fn initialize_vpb_identity(
+        vpb: NonNull<wdk_sys::VPB>,
+        vcb: &VolumeControlBlock,
+    ) -> Option<()> {
+        let vpb = unsafe {
+            // SAFETY: The VPB belongs to the active mount request and remains
+            // writable until the mount IRP is completed.
+            vpb.as_ptr().as_mut()
+        }?;
+        vpb.SerialNumber = vcb.serial_number()?;
+        write_vpb_label(vpb, vcb.volume_label())
+    }
+}
+
+/// Writes an ext4 label into the UTF-16 VPB label field using one code unit per
+/// ext4 label byte.
+fn write_vpb_label(vpb: &mut wdk_sys::VPB, label: ext4_core::Ext4VolumeLabel) -> Option<()> {
+    vpb.VolumeLabel.fill(0);
+    let bytes = label.bytes();
+    if bytes.len() > vpb.VolumeLabel.len() {
+        return None;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        *vpb.VolumeLabel.get_mut(index)? = u16::from(*byte);
+    }
+    let wchar_bytes = bytes.len().checked_mul(core::mem::size_of::<u16>())?;
+    vpb.VolumeLabelLength = u16::try_from(wchar_bytes).ok()?;
+    Some(())
 }
 
 #[expect(
