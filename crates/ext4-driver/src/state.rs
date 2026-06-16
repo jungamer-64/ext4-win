@@ -277,6 +277,21 @@ impl MountedVolumeDevice {
         vpb.SerialNumber = vcb.serial_number()?;
         write_vpb_label(vpb, vcb.volume_label())
     }
+
+    /// Refreshes the VPB volume label after a successful label mutation.
+    pub(crate) fn refresh_vpb_label(device: KernelDevice, vcb: &VolumeControlBlock) -> Option<()> {
+        let device_object = unsafe {
+            // SAFETY: `device` is a mounted volume device owned by this driver
+            // and is read only for its current VPB pointer.
+            device.as_ptr().as_ref()
+        }?;
+        let vpb = unsafe {
+            // SAFETY: The VPB pointer belongs to the mounted device and stays
+            // valid while the volume remains mounted.
+            device_object.Vpb.as_mut()
+        }?;
+        write_vpb_label(vpb, vcb.volume_label())
+    }
 }
 
 /// Writes an ext4 label into the UTF-16 VPB label field using one code unit per

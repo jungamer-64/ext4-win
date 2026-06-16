@@ -243,6 +243,24 @@ impl CurrentIrpStackLocation {
         })
     }
 
+    /// Decodes set-volume-information parameters.
+    pub(crate) fn set_volume(self) -> Result<SetVolumeStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let set = unsafe {
+            // SAFETY: The caller selects this accessor only for
+            // IRP_MJ_SET_VOLUME_INFORMATION, where SetVolume is active.
+            stack.Parameters.SetVolume
+        };
+        Ok(SetVolumeStack {
+            length: set.Length,
+            information_class: set.FsInformationClass,
+        })
+    }
+
     /// Decodes query-file-information parameters.
     pub(crate) fn query_file(self) -> Result<QueryFileStack, DriverError> {
         let stack = unsafe {
@@ -630,6 +648,15 @@ pub(crate) struct QueryVolumeStack {
     information_class: wdk_sys::FS_INFORMATION_CLASS,
 }
 
+/// Decoded set-volume-information stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SetVolumeStack {
+    /// Input buffer length.
+    length: wdk_sys::ULONG,
+    /// Requested filesystem information class.
+    information_class: wdk_sys::FS_INFORMATION_CLASS,
+}
+
 /// Decoded query-file-information stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryFileStack {
@@ -775,6 +802,18 @@ impl WriteStack {
 
 impl QueryVolumeStack {
     /// Returns the output buffer length.
+    pub(crate) const fn length(self) -> wdk_sys::ULONG {
+        self.length
+    }
+
+    /// Returns the requested filesystem information class.
+    pub(crate) const fn information_class(self) -> wdk_sys::FS_INFORMATION_CLASS {
+        self.information_class
+    }
+}
+
+impl SetVolumeStack {
+    /// Returns the input buffer length.
     pub(crate) const fn length(self) -> wdk_sys::ULONG {
         self.length
     }
@@ -1115,6 +1154,30 @@ mod tests {
                     wdk_sys::OWNER_SECURITY_INFORMATION | wdk_sys::DACL_SECURITY_INFORMATION
                 );
                 assert_eq!(query.length(), 256);
+            }
+        }
+    }
+
+    #[test]
+    fn set_volume_stack_preserves_length_and_class() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        stack.Parameters.SetVolume = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_14 {
+            Length: 24,
+            __bindgen_padding_0: 0,
+            FsInformationClass: wdk_sys::_FSINFOCLASS::FileFsLabelInformation,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let set = current.set_volume();
+            assert!(set.is_ok());
+            if let Ok(set) = set {
+                assert_eq!(set.length(), 24);
+                assert_eq!(
+                    set.information_class(),
+                    wdk_sys::_FSINFOCLASS::FileFsLabelInformation
+                );
             }
         }
     }
