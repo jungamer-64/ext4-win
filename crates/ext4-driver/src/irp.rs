@@ -46,17 +46,17 @@ impl DispatchTarget {
             self.irp.as_ref()
         };
         let system_buffer = unsafe {
-            // SAFETY: SystemBuffer is the active AssociatedIrp arm for buffered
-            // query/set information requests delivered to this driver.
+            // SAFETY: SystemBuffer is the active AssociatedIrp arm for
+            // buffered requests delivered to this driver.
             irp.AssociatedIrp.SystemBuffer
         };
         NonNull::new(system_buffer)
     }
 
-    /// Returns the read/write IRP output buffer as writable kernel memory.
-    pub(crate) fn output_buffer(self, length: usize) -> Result<IrpOutputBuffer, DriverError> {
+    /// Returns the read/write IRP data buffer as kernel memory.
+    pub(crate) fn data_buffer(self, length: usize) -> Result<IrpDataBuffer, DriverError> {
         if let Some(system_buffer) = self.system_buffer() {
-            return IrpOutputBuffer::new(system_buffer.cast(), length);
+            return IrpDataBuffer::new(system_buffer.cast(), length);
         }
 
         let irp = unsafe {
@@ -67,7 +67,7 @@ impl DispatchTarget {
         let Some(mdl) = NonNull::new(irp.MdlAddress) else {
             return Err(DriverError::InvalidParameter);
         };
-        mdl_output_buffer(mdl, length)
+        mdl_data_buffer(mdl, length)
     }
 
     /// Stores the byte count returned by this IRP.
@@ -233,19 +233,43 @@ impl CurrentIrpStackLocation {
             byte_offset,
         })
     }
+
+    /// Decodes write parameters from the current stack location.
+    pub(crate) fn write(self) -> Result<WriteStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let write = unsafe {
+            // SAFETY: The caller selects this accessor only for IRP_MJ_WRITE,
+            // where Write is active.
+            stack.Parameters.Write
+        };
+        let byte_offset = unsafe {
+            // SAFETY: ByteOffset is represented by the QuadPart arm for IRP
+            // read/write stack locations.
+            write.ByteOffset.QuadPart
+        };
+        Ok(WriteStack {
+            file_object: self.file_object()?,
+            length: write.Length,
+            byte_offset,
+        })
+    }
 }
 
-/// Writable kernel buffer decoded from an IRP output boundary.
+/// Kernel-addressable buffer decoded from a read/write IRP boundary.
 #[derive(Debug)]
-pub(crate) struct IrpOutputBuffer {
-    /// First writable byte.
+pub(crate) struct IrpDataBuffer {
+    /// First buffer byte.
     address: NonNull<u8>,
-    /// Writable byte count.
+    /// Buffer byte count.
     length: usize,
 }
 
-impl IrpOutputBuffer {
-    /// Creates a writable output buffer after length validation.
+impl IrpDataBuffer {
+    /// Creates a data buffer after length validation.
     fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
         let max_slice_len =
             usize::try_from(isize::MAX).map_err(|_| DriverError::InvalidParameter)?;
@@ -255,21 +279,30 @@ impl IrpOutputBuffer {
         Ok(Self { address, length })
     }
 
+    /// Returns the buffer as a byte slice.
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        unsafe {
+            // SAFETY: IrpDataBuffer is constructed only after the active IRP
+            // exposes a kernel-addressable buffer for `length` bytes.
+            core::slice::from_raw_parts(self.address.as_ptr(), self.length)
+        }
+    }
+
     /// Returns the buffer as a mutable byte slice.
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe {
-            // SAFETY: IrpOutputBuffer is constructed only after the active IRP
-            // exposes a kernel-addressable output buffer for `length` bytes.
+            // SAFETY: IrpDataBuffer is constructed only after the active IRP
+            // exposes a kernel-addressable buffer for `length` bytes.
             core::slice::from_raw_parts_mut(self.address.as_ptr(), self.length)
         }
     }
 }
 
-/// Returns an IRP MDL output buffer as writable kernel memory.
-fn mdl_output_buffer(
+/// Returns an IRP MDL data buffer as kernel memory.
+fn mdl_data_buffer(
     mdl: NonNull<wdk_sys::MDL>,
     length: usize,
-) -> Result<IrpOutputBuffer, DriverError> {
+) -> Result<IrpDataBuffer, DriverError> {
     let mdl_ref = unsafe {
         // SAFETY: The IRP's MdlAddress is non-null and owned by the I/O
         // Manager for the lifetime of this dispatch callback.
@@ -281,7 +314,7 @@ fn mdl_output_buffer(
     }
 
     let address = mapped_mdl_address(mdl, mdl_ref)?;
-    IrpOutputBuffer::new(address.cast(), length)
+    IrpDataBuffer::new(address.cast(), length)
 }
 
 /// Implements the address-selection behavior of `MmGetSystemAddressForMdlSafe`.
@@ -415,6 +448,34 @@ impl ReadStack {
     }
 }
 
+/// Decoded write stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WriteStack {
+    /// FILE_OBJECT carrying the FCB/CCB.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Requested byte count.
+    length: wdk_sys::ULONG,
+    /// Requested byte offset.
+    byte_offset: wdk_sys::LONGLONG,
+}
+
+impl WriteStack {
+    /// Returns the FILE_OBJECT carrying this write.
+    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object
+    }
+
+    /// Returns the requested byte count.
+    pub(crate) const fn length(self) -> wdk_sys::ULONG {
+        self.length
+    }
+
+    /// Returns the requested byte offset.
+    pub(crate) const fn byte_offset(self) -> wdk_sys::LONGLONG {
+        self.byte_offset
+    }
+}
+
 impl QueryVolumeStack {
     /// Returns the output buffer length.
     pub(crate) const fn length(self) -> wdk_sys::ULONG {
@@ -531,6 +592,32 @@ mod tests {
                 assert_eq!(read.file_object(), file_object);
                 assert_eq!(read.length(), 4096);
                 assert_eq!(read.byte_offset(), 8192);
+            }
+        }
+    }
+
+    #[test]
+    fn write_stack_preserves_file_object_length_and_offset() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
+            Length: 2048,
+            __bindgen_padding_0: 0,
+            Key: 0,
+            Flags: 0,
+            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 4096 },
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let write = current.write();
+            assert!(write.is_ok());
+            if let Ok(write) = write {
+                assert_eq!(write.file_object(), file_object);
+                assert_eq!(write.length(), 2048);
+                assert_eq!(write.byte_offset(), 4096);
             }
         }
     }
