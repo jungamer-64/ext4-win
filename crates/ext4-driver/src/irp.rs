@@ -207,8 +207,17 @@ impl CurrentIrpStackLocation {
         let Some(file_object) = NonNull::new(stack.FileObject) else {
             return Err(DriverError::InvalidParameter);
         };
+        let Some(security_context) = NonNull::new(create.SecurityContext) else {
+            return Err(DriverError::InvalidParameter);
+        };
+        let security_context = unsafe {
+            // SAFETY: The I/O manager supplies a live security context for
+            // IRP_MJ_CREATE while this stack location is active.
+            security_context.as_ref()
+        };
         Ok(CreateStack {
             file_object,
+            desired_access: security_context.DesiredAccess,
             options: create.Options,
             share_access: create.ShareAccess,
             ea_length: create.EaLength,
@@ -609,6 +618,8 @@ impl FileSystemControlStack {
 pub(crate) struct CreateStack {
     /// FILE_OBJECT receiving FsContext/FsContext2 on successful create.
     file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Desired access mask requested by the opener.
+    desired_access: wdk_sys::ACCESS_MASK,
     /// Packed create disposition/options field.
     options: wdk_sys::ULONG,
     /// Share-access bits requested by the opener.
@@ -621,6 +632,11 @@ impl CreateStack {
     /// Returns the FILE_OBJECT receiving this create request.
     pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
         self.file_object
+    }
+
+    /// Returns the requested desired access mask.
+    pub(crate) const fn desired_access(self) -> wdk_sys::ACCESS_MASK {
+        self.desired_access
     }
 
     /// Returns the packed create disposition/options field.
@@ -1075,6 +1091,44 @@ mod tests {
                 assert_eq!(control.input_buffer_length(), 32);
                 assert_eq!(control.output_buffer_length(), 128);
                 assert_eq!(control.fs_control_code(), 589_992);
+            }
+        }
+    }
+
+    #[test]
+    fn create_stack_preserves_access_share_options_and_ea_length() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let desired_access = wdk_sys::FILE_READ_DATA | wdk_sys::FILE_WRITE_DATA;
+        security_context.DesiredAccess = desired_access;
+        stack.FileObject = file_object.as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: 0x0300_0040,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0x20,
+            ShareAccess: u16::try_from(wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE)
+                .unwrap_or(u16::MAX),
+            __bindgen_padding_1: 0,
+            EaLength: 48,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let create = current.create();
+            assert!(create.is_ok());
+            if let Ok(create) = create {
+                assert_eq!(create.file_object(), file_object);
+                assert_eq!(create.desired_access(), desired_access);
+                assert_eq!(create.options(), 0x0300_0040);
+                assert_eq!(
+                    create.share_access(),
+                    u16::try_from(wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE)
+                        .unwrap_or(u16::MAX)
+                );
+                assert_eq!(create.ea_length(), 48);
             }
         }
     }

@@ -1757,13 +1757,20 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
 
 /// Releases heap-owned FCB and CCB pointers stored on a FILE_OBJECT.
 fn release_file_contexts(mut file_object: core::ptr::NonNull<wdk_sys::FILE_OBJECT>) {
+    let file_object_ptr = file_object;
     let file_object = unsafe {
         // SAFETY: Close receives the final FILE_OBJECT and may clear its
         // filesystem-owned context pointers.
         file_object.as_mut()
     };
     let fcb = core::mem::replace(&mut file_object.FsContext, core::ptr::null_mut());
-    if let Some(fcb) = NonNull::new(fcb.cast::<FileControlBlock>()) {
+    if let Some(mut fcb) = NonNull::new(fcb.cast::<FileControlBlock>()) {
+        let fcb_ref = unsafe {
+            // SAFETY: Successful create stores a live VCB-owned FCB in
+            // FsContext until this close path removes the handle reference.
+            fcb.as_mut()
+        };
+        fcb_ref.remove_share_access(file_object_ptr);
         release_file_control_block(fcb);
     }
     let ccb = core::mem::replace(&mut file_object.FsContext2, core::ptr::null_mut());
