@@ -1,8 +1,33 @@
 //! File object IRP handlers and file information packing boundary.
 
+use alloc::boxed::Box;
+
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_NOT_SUPPORTED, STATUS_SUCCESS};
 
 use crate::irp::DispatchTarget;
+use crate::state::{ContextControlBlock, FileControlBlock};
+
+/// Handles cleanup IRPs.
+pub(crate) fn cleanup(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
+    match DispatchTarget::decode(device, irp) {
+        Ok(_target) => STATUS_SUCCESS,
+        Err(error) => error.ntstatus(),
+    }
+}
+
+/// Handles close IRPs and releases FILE_OBJECT contexts.
+pub(crate) fn close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
+    match DispatchTarget::decode(device, irp).and_then(|target| target.current_stack()) {
+        Ok(stack) => match stack.file_object() {
+            Ok(file_object) => {
+                release_file_contexts(file_object);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
+        Err(error) => error.ntstatus(),
+    }
+}
 
 /// Handles regular file data reads.
 pub(crate) fn read(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
@@ -78,5 +103,30 @@ fn decoded_not_supported(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
             STATUS_NOT_SUPPORTED
         }
         Err(error) => error.ntstatus(),
+    }
+}
+
+/// Releases heap-owned FCB and CCB pointers stored on a FILE_OBJECT.
+fn release_file_contexts(mut file_object: core::ptr::NonNull<wdk_sys::FILE_OBJECT>) {
+    let file_object = unsafe {
+        // SAFETY: Close receives the final FILE_OBJECT and may clear its
+        // filesystem-owned context pointers.
+        file_object.as_mut()
+    };
+    let fcb = core::mem::replace(&mut file_object.FsContext, core::ptr::null_mut());
+    if !fcb.is_null() {
+        unsafe {
+            // SAFETY: Successful create stores Box<FileControlBlock> in
+            // FsContext, and close is the unique release point.
+            drop(Box::from_raw(fcb.cast::<FileControlBlock>()));
+        }
+    }
+    let ccb = core::mem::replace(&mut file_object.FsContext2, core::ptr::null_mut());
+    if !ccb.is_null() {
+        unsafe {
+            // SAFETY: Successful create stores Box<ContextControlBlock> in
+            // FsContext2, and close is the unique release point.
+            drop(Box::from_raw(ccb.cast::<ContextControlBlock>()));
+        }
     }
 }
