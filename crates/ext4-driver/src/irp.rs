@@ -1120,6 +1120,34 @@ mod tests {
     }
 
     #[test]
+    fn set_security_stack_preserves_file_object_information_and_descriptor() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let descriptor = NonNull::<c_void>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Parameters.SetSecurity = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_19 {
+            SecurityInformation: wdk_sys::OWNER_SECURITY_INFORMATION
+                | wdk_sys::GROUP_SECURITY_INFORMATION,
+            SecurityDescriptor: descriptor.as_ptr(),
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let set = current.set_security();
+            assert!(set.is_ok());
+            if let Ok(set) = set {
+                assert_eq!(set.file_object(), file_object);
+                assert_eq!(
+                    set.security_information(),
+                    wdk_sys::OWNER_SECURITY_INFORMATION | wdk_sys::GROUP_SECURITY_INFORMATION
+                );
+                assert_eq!(set.security_descriptor(), descriptor);
+            }
+        }
+    }
+
+    #[test]
     fn read_stack_preserves_file_object_length_and_offset() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
