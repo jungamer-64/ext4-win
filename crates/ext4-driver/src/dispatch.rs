@@ -215,12 +215,12 @@ unsafe extern "C" fn flush_buffers(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATU
 
 /// Handles extended-attribute queries.
 unsafe extern "C" fn query_ea(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::query_ea(device, irp)
+    crate::ea::query(device, irp)
 }
 
 /// Handles extended-attribute mutations.
 unsafe extern "C" fn set_ea(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::set_ea(device, irp)
+    crate::ea::set(device, irp)
 }
 
 /// Handles byte-range lock requests.

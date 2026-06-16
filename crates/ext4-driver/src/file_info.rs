@@ -129,16 +129,6 @@ pub(crate) fn set_security(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     decoded_not_supported(device, irp)
 }
 
-/// Handles extended-attribute queries.
-pub(crate) fn query_ea(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    decoded_not_supported(device, irp)
-}
-
-/// Handles extended-attribute mutations.
-pub(crate) fn set_ea(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    decoded_not_supported(device, irp)
-}
-
 /// Handles byte-range lock requests.
 pub(crate) fn lock_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     decoded_not_supported(device, irp)

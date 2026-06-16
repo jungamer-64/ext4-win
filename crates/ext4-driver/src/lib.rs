@@ -7,6 +7,7 @@ extern crate alloc;
 mod block_device;
 mod create;
 mod dispatch;
+mod ea;
 mod ffi;
 mod file_info;
 mod file_system_control;
