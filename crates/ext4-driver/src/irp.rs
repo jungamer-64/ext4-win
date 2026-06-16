@@ -173,6 +173,7 @@ impl CurrentIrpStackLocation {
         };
         Ok(FileSystemControlStack {
             file_object: self.file_object()?,
+            input_buffer_length: control.InputBufferLength,
             output_buffer_length: control.OutputBufferLength,
             fs_control_code: control.FsControlCode,
         })
@@ -443,6 +444,8 @@ pub(crate) struct MountVolumeStack {
 pub(crate) struct FileSystemControlStack {
     /// FILE_OBJECT carrying the FCB/CCB for path-scoped controls.
     file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Input system-buffer length.
+    input_buffer_length: wdk_sys::ULONG,
     /// Output system-buffer length.
     output_buffer_length: wdk_sys::ULONG,
     /// Requested FSCTL code.
@@ -470,6 +473,11 @@ impl FileSystemControlStack {
     /// Returns the FILE_OBJECT carrying this FSCTL.
     pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
         self.file_object
+    }
+
+    /// Returns the input system-buffer length.
+    pub(crate) const fn input_buffer_length(self) -> wdk_sys::ULONG {
+        self.input_buffer_length
     }
 
     /// Returns the output system-buffer length.
@@ -804,6 +812,7 @@ mod tests {
             assert!(control.is_ok());
             if let Ok(control) = control {
                 assert_eq!(control.file_object(), file_object);
+                assert_eq!(control.input_buffer_length(), 32);
                 assert_eq!(control.output_buffer_length(), 128);
                 assert_eq!(control.fs_control_code(), 589_992);
             }

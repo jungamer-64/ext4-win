@@ -5,10 +5,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::{
-    Ext4Gid, Ext4Name, Ext4Owner, Ext4Permissions, Ext4Uid, InodeId, NewDirectoryMetadata,
-    NewFileMetadata, Node, WindowsName,
-};
+use ext4_core::{Ext4Name, InodeId, Node, WindowsName};
 use wdk_sys::{
     FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
     STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
@@ -17,6 +14,7 @@ use wdk_sys::{
 
 use crate::{
     irp::{CreateStack, DispatchTarget},
+    metadata,
     state::{
         ContextControlBlock, FileControlBlock, FileSystemNode, KernelDevice, MountedVolumeDevice,
         OpenedPath,
@@ -342,13 +340,23 @@ fn create_child(
     let node = match kind {
         CreateNodeKind::File => {
             let file = transaction
-                .create_file(parent, name, default_file_metadata()?)
+                .create_file(
+                    parent,
+                    name,
+                    metadata::default_file_metadata()
+                        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
+                )
                 .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
             FileSystemNode::File(file.inode_id())
         }
         CreateNodeKind::Directory => {
             let directory = transaction
-                .create_directory(parent, name, default_directory_metadata()?)
+                .create_directory(
+                    parent,
+                    name,
+                    metadata::default_directory_metadata()
+                        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
+                )
                 .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
             FileSystemNode::Directory(directory.inode_id())
         }
@@ -357,29 +365,6 @@ fn create_child(
         .commit()
         .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
     Ok(node)
-}
-
-/// Default POSIX owner for Windows-created inodes before security mapping lands.
-fn default_owner() -> Ext4Owner {
-    Ext4Owner::new(Ext4Uid::from_u32(0), Ext4Gid::from_u32(0))
-}
-
-/// Default metadata for Windows-created regular files.
-fn default_file_metadata() -> Result<NewFileMetadata, NTSTATUS> {
-    Ok(NewFileMetadata::new(
-        default_owner(),
-        Ext4Permissions::new(0o644)
-            .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
-    ))
-}
-
-/// Default metadata for Windows-created directories.
-fn default_directory_metadata() -> Result<NewDirectoryMetadata, NTSTATUS> {
-    Ok(NewDirectoryMetadata::new(
-        default_owner(),
-        Ext4Permissions::new(0o755)
-            .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
-    ))
 }
 
 /// Splits the FILE_OBJECT name into validated root-relative Windows components.
