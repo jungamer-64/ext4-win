@@ -16,8 +16,8 @@ use crate::{
     irp::{CreateStack, DispatchTarget},
     metadata,
     state::{
-        ContextControlBlock, FileControlBlock, FileSystemNode, KernelDevice, MountedVolumeDevice,
-        OpenedPath,
+        ContextControlBlock, FileSystemNode, KernelDevice, MountedVolumeDevice, OpenedPath,
+        VolumeControlBlock,
     },
 };
 
@@ -463,9 +463,11 @@ fn initialize_file_object(
         return STATUS_INVALID_PARAMETER;
     }
 
-    let fcb = Box::new(FileControlBlock::new(vcb, node));
+    let Some(fcb) = VolumeControlBlock::open_file_control_block(vcb, node) else {
+        return STATUS_INVALID_PARAMETER;
+    };
     let ccb = Box::new(ContextControlBlock::new(node, path));
-    file_object.FsContext = Box::into_raw(fcb).cast::<c_void>();
+    file_object.FsContext = fcb.as_ptr().cast::<c_void>();
     file_object.FsContext2 = Box::into_raw(ccb).cast::<c_void>();
     STATUS_SUCCESS
 }
