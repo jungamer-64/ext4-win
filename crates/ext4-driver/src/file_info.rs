@@ -19,7 +19,7 @@ use wdk_sys::{
 use crate::irp::{DispatchTarget, QueryDirectoryStack, QueryFileStack, SetFileStack};
 use crate::state::{
     CloseDisposition, ContextControlBlock, DirectoryCursor, FileControlBlock, FileSystemNode,
-    OpenedPath, VolumeControlBlock,
+    OpenedPath, VolumeControlBlock, context_control_block, file_control_block,
 };
 use crate::status::DriverError;
 
@@ -1000,19 +1000,6 @@ fn windows_time_quad(timestamp: Ext4Timestamp) -> i64 {
     }
 }
 
-/// Returns the CCB stored on a successfully opened FILE_OBJECT.
-fn context_control_block(
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
-) -> Result<NonNull<ContextControlBlock>, DriverError> {
-    let file_object = unsafe {
-        // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
-        // is read only for filesystem-owned context pointers.
-        file_object.as_ref()
-    };
-    NonNull::new(file_object.FsContext2.cast::<ContextControlBlock>())
-        .ok_or(DriverError::InvalidParameter)
-}
-
 /// Applies cleanup-time namespace mutations requested by this handle.
 fn cleanup_file_object(file_object: NonNull<wdk_sys::FILE_OBJECT>) -> Result<(), NTSTATUS> {
     let fcb = file_control_block(file_object).map_err(DriverError::ntstatus)?;
@@ -1783,19 +1770,6 @@ fn write_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
         wdk_sys::ULONG_PTR::try_from(length).map_err(|_| DriverError::InvalidParameter)?,
     );
     Ok(())
-}
-
-/// Returns the FCB stored on a successfully opened FILE_OBJECT.
-fn file_control_block(
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
-) -> Result<NonNull<FileControlBlock>, DriverError> {
-    let file_object = unsafe {
-        // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
-        // is read only for filesystem-owned context pointers.
-        file_object.as_ref()
-    };
-    NonNull::new(file_object.FsContext.cast::<FileControlBlock>())
-        .ok_or(DriverError::InvalidParameter)
 }
 
 /// Returns the mounted VCB referenced by an FCB.

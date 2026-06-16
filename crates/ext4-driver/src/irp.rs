@@ -159,6 +159,25 @@ impl CurrentIrpStackLocation {
         })
     }
 
+    /// Decodes user file-system-control parameters from the current stack location.
+    pub(crate) fn file_system_control(self) -> Result<FileSystemControlStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let control = unsafe {
+            // SAFETY: The caller selects this accessor only for
+            // IRP_MN_USER_FS_REQUEST, where FileSystemControl is active.
+            stack.Parameters.FileSystemControl
+        };
+        Ok(FileSystemControlStack {
+            file_object: self.file_object()?,
+            output_buffer_length: control.OutputBufferLength,
+            fs_control_code: control.FsControlCode,
+        })
+    }
+
     /// Decodes create/open parameters from the current stack location.
     pub(crate) fn create(self) -> Result<CreateStack, DriverError> {
         let stack = unsafe {
@@ -419,6 +438,17 @@ pub(crate) struct MountVolumeStack {
     output_buffer_length: wdk_sys::ULONG,
 }
 
+/// Decoded user file-system-control stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FileSystemControlStack {
+    /// FILE_OBJECT carrying the FCB/CCB for path-scoped controls.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Output system-buffer length.
+    output_buffer_length: wdk_sys::ULONG,
+    /// Requested FSCTL code.
+    fs_control_code: wdk_sys::ULONG,
+}
+
 impl MountVolumeStack {
     /// Returns the VPB supplied for the mount.
     pub(crate) const fn vpb(self) -> NonNull<wdk_sys::VPB> {
@@ -433,6 +463,23 @@ impl MountVolumeStack {
     /// Returns the mount request output buffer length.
     pub(crate) const fn output_buffer_length(self) -> wdk_sys::ULONG {
         self.output_buffer_length
+    }
+}
+
+impl FileSystemControlStack {
+    /// Returns the FILE_OBJECT carrying this FSCTL.
+    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object
+    }
+
+    /// Returns the output system-buffer length.
+    pub(crate) const fn output_buffer_length(self) -> wdk_sys::ULONG {
+        self.output_buffer_length
+    }
+
+    /// Returns the FSCTL code.
+    pub(crate) const fn fs_control_code(self) -> wdk_sys::ULONG {
+        self.fs_control_code
     }
 }
 
@@ -731,6 +778,34 @@ mod tests {
                 assert_eq!(mount.vpb(), vpb);
                 assert_eq!(mount.target_device(), target);
                 assert_eq!(mount.output_buffer_length(), 16);
+            }
+        }
+    }
+
+    #[test]
+    fn file_system_control_stack_preserves_file_object_output_and_code() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Parameters.FileSystemControl =
+            wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_15 {
+                OutputBufferLength: 128,
+                __bindgen_padding_0: 0,
+                InputBufferLength: 32,
+                __bindgen_padding_1: 0,
+                FsControlCode: 589_992,
+                Type3InputBuffer: core::ptr::null_mut(),
+            };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let control = current.file_system_control();
+            assert!(control.is_ok());
+            if let Ok(control) = control {
+                assert_eq!(control.file_object(), file_object);
+                assert_eq!(control.output_buffer_length(), 128);
+                assert_eq!(control.fs_control_code(), 589_992);
             }
         }
     }

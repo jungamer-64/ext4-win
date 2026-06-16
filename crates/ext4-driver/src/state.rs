@@ -4,9 +4,14 @@ use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::{DeviceLength, Ext4Name, InodeId, InternalJournal, ReadWrite, Result, Volume};
-use wdk_sys::{DO_DEVICE_INITIALIZING, DO_DIRECT_IO, PDEVICE_OBJECT, PDRIVER_OBJECT, VPB_MOUNTED};
+use ext4_core::{
+    DeviceLength, Ext4Name, InodeId, InternalJournal, ReadWrite, Result as Ext4Result, Volume,
+};
+use wdk_sys::{
+    DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT, VPB_MOUNTED,
+};
 
+use crate::status::DriverError;
 use crate::{block_device::KernelBlockDevice, ffi};
 
 /// Non-null kernel device object pointer at the WDK boundary.
@@ -132,7 +137,7 @@ impl VolumeControlBlock {
     pub(crate) fn mount_read_write(
         target_device: KernelDevice,
         length: DeviceLength,
-    ) -> Result<Self> {
+    ) -> Ext4Result<Self> {
         let block_device = KernelBlockDevice::new(target_device, length);
         let volume = Volume::<_, ReadWrite<InternalJournal>>::mount_read_write(block_device)?;
         Ok(Self {
@@ -452,6 +457,32 @@ impl ContextControlBlock {
     pub(crate) fn replace_path(&mut self, path: OpenedPath) {
         self.path = path;
     }
+}
+
+/// Returns the FCB stored on a successfully opened FILE_OBJECT.
+pub(crate) fn file_control_block(
+    file_object: NonNull<FILE_OBJECT>,
+) -> Result<NonNull<FileControlBlock>, DriverError> {
+    let file_object = unsafe {
+        // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
+        // is read only for filesystem-owned context pointers.
+        file_object.as_ref()
+    };
+    NonNull::new(file_object.FsContext.cast::<FileControlBlock>())
+        .ok_or(DriverError::InvalidParameter)
+}
+
+/// Returns the CCB stored on a successfully opened FILE_OBJECT.
+pub(crate) fn context_control_block(
+    file_object: NonNull<FILE_OBJECT>,
+) -> Result<NonNull<ContextControlBlock>, DriverError> {
+    let file_object = unsafe {
+        // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
+        // is read only for filesystem-owned context pointers.
+        file_object.as_ref()
+    };
+    NonNull::new(file_object.FsContext2.cast::<ContextControlBlock>())
+        .ok_or(DriverError::InvalidParameter)
 }
 
 /// Driver unload callback registered in the driver object.
