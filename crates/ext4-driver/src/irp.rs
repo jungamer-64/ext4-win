@@ -37,6 +37,33 @@ impl DispatchTarget {
         self.irp
     }
 
+    /// Returns the buffered I/O system buffer for this IRP.
+    pub(crate) fn system_buffer(self) -> Option<NonNull<core::ffi::c_void>> {
+        let irp = unsafe {
+            // SAFETY: DispatchTarget owns a non-null IRP pointer decoded from
+            // the WDK dispatch boundary for the duration of this callback.
+            self.irp.as_ref()
+        };
+        let system_buffer = unsafe {
+            // SAFETY: SystemBuffer is the active AssociatedIrp arm for buffered
+            // query/set information requests delivered to this driver.
+            irp.AssociatedIrp.SystemBuffer
+        };
+        NonNull::new(system_buffer)
+    }
+
+    /// Stores the byte count returned by this IRP.
+    pub(crate) fn set_information(self, information: wdk_sys::ULONG_PTR) {
+        let irp = unsafe {
+            // SAFETY: DispatchTarget owns a non-null IRP pointer decoded from
+            // the WDK dispatch boundary for the duration of this callback.
+            self.irp.as_ptr().as_mut()
+        };
+        if let Some(irp) = irp {
+            irp.IoStatus.Information = information;
+        }
+    }
+
     /// Returns the current stack location selected by the I/O Manager.
     pub(crate) fn current_stack(self) -> Result<CurrentIrpStackLocation, DriverError> {
         let irp = unsafe {
@@ -146,6 +173,24 @@ impl CurrentIrpStackLocation {
         };
         NonNull::new(stack.FileObject).ok_or(DriverError::InvalidParameter)
     }
+
+    /// Decodes query-volume-information parameters.
+    pub(crate) fn query_volume(self) -> Result<QueryVolumeStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let query = unsafe {
+            // SAFETY: The caller selects this accessor only for
+            // IRP_MJ_QUERY_VOLUME_INFORMATION, where QueryVolume is active.
+            stack.Parameters.QueryVolume
+        };
+        Ok(QueryVolumeStack {
+            length: query.Length,
+            information_class: query.FsInformationClass,
+        })
+    }
 }
 
 /// Decoded mount-volume stack parameters.
@@ -208,6 +253,27 @@ impl CreateStack {
     /// Returns the input EA length.
     pub(crate) const fn ea_length(self) -> wdk_sys::ULONG {
         self.ea_length
+    }
+}
+
+/// Decoded query-volume-information stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueryVolumeStack {
+    /// Output buffer length.
+    length: wdk_sys::ULONG,
+    /// Requested filesystem information class.
+    information_class: wdk_sys::FS_INFORMATION_CLASS,
+}
+
+impl QueryVolumeStack {
+    /// Returns the output buffer length.
+    pub(crate) const fn length(self) -> wdk_sys::ULONG {
+        self.length
+    }
+
+    /// Returns the requested filesystem information class.
+    pub(crate) const fn information_class(self) -> wdk_sys::FS_INFORMATION_CLASS {
+        self.information_class
     }
 }
 
