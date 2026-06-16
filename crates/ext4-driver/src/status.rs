@@ -3,10 +3,10 @@
 use ext4_core::Error;
 use wdk_sys::{
     NTSTATUS, STATUS_ACCESS_DENIED, STATUS_CANNOT_DELETE, STATUS_DIRECTORY_NOT_EMPTY,
-    STATUS_DISK_FULL, STATUS_FILE_CORRUPT_ERROR, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_NOT_SUPPORTED,
-    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_TYPE_MISMATCH,
-    STATUS_VOLUME_DIRTY,
+    STATUS_DISK_FULL, STATUS_FILE_CORRUPT_ERROR, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR,
+    STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_TYPE_MISMATCH, STATUS_VOLUME_DIRTY,
 };
 
 /// Driver failure after IRP decoding and ext4-core execution.
@@ -16,6 +16,8 @@ pub(crate) enum DriverError {
     InvalidDeviceRequest,
     /// Caller supplied parameters outside the accepted FSD boundary.
     InvalidParameter,
+    /// Kernel memory could not be mapped for the current IRP.
+    InsufficientResources,
     /// Access is denied by the current FSD policy.
     AccessDenied,
     /// ext4-core rejected the requested filesystem operation.
@@ -28,6 +30,7 @@ impl DriverError {
         match self {
             Self::InvalidDeviceRequest => STATUS_INVALID_DEVICE_REQUEST,
             Self::InvalidParameter => STATUS_INVALID_PARAMETER,
+            Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,
             Self::Core(error) => core_error_status(error),
         }

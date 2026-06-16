@@ -1,5 +1,6 @@
 //! Typed IRP boundary shared by FSD dispatch modules.
 
+use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use wdk_sys::{PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP};
@@ -50,6 +51,23 @@ impl DispatchTarget {
             irp.AssociatedIrp.SystemBuffer
         };
         NonNull::new(system_buffer)
+    }
+
+    /// Returns the read/write IRP output buffer as writable kernel memory.
+    pub(crate) fn output_buffer(self, length: usize) -> Result<IrpOutputBuffer, DriverError> {
+        if let Some(system_buffer) = self.system_buffer() {
+            return IrpOutputBuffer::new(system_buffer.cast(), length);
+        }
+
+        let irp = unsafe {
+            // SAFETY: DispatchTarget owns a non-null IRP pointer decoded from
+            // the WDK dispatch boundary for the duration of this callback.
+            self.irp.as_ref()
+        };
+        let Some(mdl) = NonNull::new(irp.MdlAddress) else {
+            return Err(DriverError::InvalidParameter);
+        };
+        mdl_output_buffer(mdl, length)
     }
 
     /// Stores the byte count returned by this IRP.
@@ -191,6 +209,110 @@ impl CurrentIrpStackLocation {
             information_class: query.FsInformationClass,
         })
     }
+
+    /// Decodes read parameters from the current stack location.
+    pub(crate) fn read(self) -> Result<ReadStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let read = unsafe {
+            // SAFETY: The caller selects this accessor only for IRP_MJ_READ,
+            // where Read is active.
+            stack.Parameters.Read
+        };
+        let byte_offset = unsafe {
+            // SAFETY: ByteOffset is represented by the QuadPart arm for IRP
+            // read/write stack locations.
+            read.ByteOffset.QuadPart
+        };
+        Ok(ReadStack {
+            file_object: self.file_object()?,
+            length: read.Length,
+            byte_offset,
+        })
+    }
+}
+
+/// Writable kernel buffer decoded from an IRP output boundary.
+#[derive(Debug)]
+pub(crate) struct IrpOutputBuffer {
+    /// First writable byte.
+    address: NonNull<u8>,
+    /// Writable byte count.
+    length: usize,
+}
+
+impl IrpOutputBuffer {
+    /// Creates a writable output buffer after length validation.
+    fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
+        let max_slice_len =
+            usize::try_from(isize::MAX).map_err(|_| DriverError::InvalidParameter)?;
+        if length > max_slice_len {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(Self { address, length })
+    }
+
+    /// Returns the buffer as a mutable byte slice.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe {
+            // SAFETY: IrpOutputBuffer is constructed only after the active IRP
+            // exposes a kernel-addressable output buffer for `length` bytes.
+            core::slice::from_raw_parts_mut(self.address.as_ptr(), self.length)
+        }
+    }
+}
+
+/// Returns an IRP MDL output buffer as writable kernel memory.
+fn mdl_output_buffer(
+    mdl: NonNull<wdk_sys::MDL>,
+    length: usize,
+) -> Result<IrpOutputBuffer, DriverError> {
+    let mdl_ref = unsafe {
+        // SAFETY: The IRP's MdlAddress is non-null and owned by the I/O
+        // Manager for the lifetime of this dispatch callback.
+        mdl.as_ref()
+    };
+    let mdl_len = usize::try_from(mdl_ref.ByteCount).map_err(|_| DriverError::InvalidParameter)?;
+    if length > mdl_len {
+        return Err(DriverError::InvalidParameter);
+    }
+
+    let address = mapped_mdl_address(mdl, mdl_ref)?;
+    IrpOutputBuffer::new(address.cast(), length)
+}
+
+/// Implements the address-selection behavior of `MmGetSystemAddressForMdlSafe`.
+fn mapped_mdl_address(
+    mdl: NonNull<wdk_sys::MDL>,
+    mdl_ref: &wdk_sys::MDL,
+) -> Result<NonNull<c_void>, DriverError> {
+    let flags = u32::from(u16::from_ne_bytes(mdl_ref.MdlFlags.to_ne_bytes()));
+    let mapped_flags = wdk_sys::MDL_MAPPED_TO_SYSTEM_VA | wdk_sys::MDL_SOURCE_IS_NONPAGED_POOL;
+    if flags & mapped_flags != 0 {
+        return NonNull::new(mdl_ref.MappedSystemVa).ok_or(DriverError::InvalidParameter);
+    }
+
+    let kernel_mode = wdk_sys::KPROCESSOR_MODE::try_from(wdk_sys::_MODE::KernelMode)
+        .map_err(|_| DriverError::InvalidParameter)?;
+    let priority = u32::try_from(wdk_sys::_MM_PAGE_PRIORITY::NormalPagePriority)
+        .map_err(|_| DriverError::InvalidParameter)?
+        | wdk_sys::MdlMappingNoExecute;
+    let address = unsafe {
+        // SAFETY: The MDL belongs to the active IRP and describes locked pages
+        // supplied by the I/O Manager for direct I/O.
+        crate::ffi::MmMapLockedPagesSpecifyCache(
+            mdl.as_ptr(),
+            kernel_mode,
+            wdk_sys::_MEMORY_CACHING_TYPE::MmCached,
+            core::ptr::null_mut(),
+            0,
+            priority,
+        )
+    };
+    NonNull::new(address).ok_or(DriverError::InsufficientResources)
 }
 
 /// Decoded mount-volume stack parameters.
@@ -263,6 +385,34 @@ pub(crate) struct QueryVolumeStack {
     length: wdk_sys::ULONG,
     /// Requested filesystem information class.
     information_class: wdk_sys::FS_INFORMATION_CLASS,
+}
+
+/// Decoded read stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadStack {
+    /// FILE_OBJECT carrying the FCB/CCB.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Requested byte count.
+    length: wdk_sys::ULONG,
+    /// Requested byte offset.
+    byte_offset: wdk_sys::LONGLONG,
+}
+
+impl ReadStack {
+    /// Returns the FILE_OBJECT carrying this read.
+    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object
+    }
+
+    /// Returns the requested byte count.
+    pub(crate) const fn length(self) -> wdk_sys::ULONG {
+        self.length
+    }
+
+    /// Returns the requested byte offset.
+    pub(crate) const fn byte_offset(self) -> wdk_sys::LONGLONG {
+        self.byte_offset
+    }
 }
 
 impl QueryVolumeStack {
@@ -355,6 +505,32 @@ mod tests {
                 assert_eq!(mount.vpb(), vpb);
                 assert_eq!(mount.target_device(), target);
                 assert_eq!(mount.output_buffer_length(), 16);
+            }
+        }
+    }
+
+    #[test]
+    fn read_stack_preserves_file_object_length_and_offset() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
+            Length: 4096,
+            __bindgen_padding_0: 0,
+            Key: 0,
+            Flags: 0,
+            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 8192 },
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let read = current.read();
+            assert!(read.is_ok());
+            if let Ok(read) = read {
+                assert_eq!(read.file_object(), file_object);
+                assert_eq!(read.length(), 4096);
+                assert_eq!(read.byte_offset(), 8192);
             }
         }
     }
