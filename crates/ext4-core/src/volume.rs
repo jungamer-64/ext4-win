@@ -20,7 +20,8 @@ use crate::journal::{Journal, LoadedJournal};
 use crate::name::Ext4Name;
 use crate::name::WindowsName;
 use crate::superblock::{
-    BlockGroupId, FreeBlockDelta, JournalMode, MetadataChecksum, RecoveryState, Superblock,
+    BlockGroupId, Ext4VolumeLabel, FreeBlockDelta, JournalMode, MetadataChecksum, RecoveryState,
+    Superblock,
 };
 use crate::windows::Ext4Times;
 
@@ -328,6 +329,7 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
             data_writes: Vec::new(),
             free_blocks_delta: FreeBlockDelta::ZERO,
             free_inodes_delta: 0,
+            volume_label_update: None,
         }
     }
 }
@@ -392,6 +394,7 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
             data_writes: Vec::new(),
             free_blocks_delta: FreeBlockDelta::ZERO,
             free_inodes_delta: 0,
+            volume_label_update: None,
         }
     }
 }
@@ -401,6 +404,12 @@ impl<D: BlockReader, State> Volume<D, State> {
     #[must_use]
     pub const fn superblock(&self) -> Superblock {
         self.superblock
+    }
+
+    /// Filesystem volume label parsed from the mounted superblock.
+    #[must_use]
+    pub const fn volume_label(&self) -> Ext4VolumeLabel {
+        self.superblock.volume_label()
     }
 
     /// Reads and classifies one inode as a typed node.
@@ -691,6 +700,8 @@ pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
     free_blocks_delta: FreeBlockDelta,
     /// Superblock free-inode delta accumulated by this transaction.
     free_inodes_delta: i64,
+    /// Superblock volume label replacement staged by this transaction.
+    volume_label_update: Option<Ext4VolumeLabel>,
 }
 
 impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
@@ -1081,6 +1092,11 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .get_mut(inode_index)
             .ok_or(Error::InvalidInode)? = raw_inode;
         Ok(())
+    }
+
+    /// Replaces the ext4 volume label stored in the primary superblock.
+    pub fn set_volume_label(&mut self, label: Ext4VolumeLabel) {
+        self.volume_label_update = Some(label);
     }
 
     /// Removes a symbolic link directory entry and releases its inode.
@@ -2174,7 +2190,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 bytes: descriptor.bytes().to_vec(),
             });
         }
-        if !self.free_blocks_delta.is_zero() || self.free_inodes_delta != 0 {
+        if !self.free_blocks_delta.is_zero()
+            || self.free_inodes_delta != 0
+            || self.volume_label_update.is_some()
+        {
             writes.push(RangeWrite {
                 offset: ByteOffset::new(SUPERBLOCK_OFFSET),
                 bytes: self.updated_superblock_bytes()?,
@@ -2311,6 +2330,9 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 SUPERBLOCK_FREE_INODES_OFFSET,
                 u32::try_from(updated).map_err(|_| Error::ArithmeticOverflow)?,
             )?;
+        }
+        if let Some(label) = self.volume_label_update {
+            label.write_to(&mut bytes)?;
         }
         Superblock::refresh_checksum(&mut bytes)?;
         Ok(bytes)
