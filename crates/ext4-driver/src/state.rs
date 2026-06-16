@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::{DeviceLength, InodeId, InternalJournal, ReadWrite, Result, Volume};
+use ext4_core::{DeviceLength, Ext4Name, InodeId, InternalJournal, ReadWrite, Result, Volume};
 use wdk_sys::{DO_DEVICE_INITIALIZING, DO_DIRECT_IO, PDEVICE_OBJECT, PDRIVER_OBJECT, VPB_MOUNTED};
 
 use crate::{block_device::KernelBlockDevice, ffi};
@@ -360,15 +360,93 @@ impl DirectoryCursor {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Opened path identity stored with a handle.
+pub(crate) enum OpenedPath {
+    /// Mounted volume root.
+    Root,
+    /// Child entry under a parent directory.
+    Child {
+        /// Parent directory inode.
+        parent: InodeId,
+        /// Exact ext4 directory entry name.
+        name: Ext4Name,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Per-handle state stored in `FILE_OBJECT::FsContext2`.
-pub(crate) enum ContextControlBlock {
+/// Handle-local node state.
+pub(crate) enum OpenedHandleState {
     /// Regular file handle.
     File,
     /// Directory handle with enumeration cursor.
     Directory(DirectoryCursor),
     /// Symlink handle.
     Symlink,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Action requested when the last handle cleanup occurs.
+pub(crate) enum CloseDisposition {
+    /// Keep the opened object.
+    Keep,
+    /// Delete the opened object during cleanup.
+    Delete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Per-handle state stored in `FILE_OBJECT::FsContext2`.
+pub(crate) struct ContextControlBlock {
+    /// Handle-local node state.
+    handle: OpenedHandleState,
+    /// Path used for namespace mutations on cleanup.
+    path: OpenedPath,
+    /// Requested close disposition.
+    close_disposition: CloseDisposition,
+}
+
+impl ContextControlBlock {
+    /// Creates per-handle state for an opened node.
+    pub(crate) fn new(node: FileSystemNode, path: OpenedPath) -> Self {
+        let handle = match node {
+            FileSystemNode::File(_) => OpenedHandleState::File,
+            FileSystemNode::Directory(_) => OpenedHandleState::Directory(DirectoryCursor::start()),
+            FileSystemNode::Symlink(_) => OpenedHandleState::Symlink,
+        };
+        Self {
+            handle,
+            path,
+            close_disposition: CloseDisposition::Keep,
+        }
+    }
+
+    /// Returns the mutable directory cursor when this handle opened a directory.
+    pub(crate) fn directory_cursor_mut(&mut self) -> Option<&mut DirectoryCursor> {
+        match &mut self.handle {
+            OpenedHandleState::Directory(cursor) => Some(cursor),
+            OpenedHandleState::File | OpenedHandleState::Symlink => None,
+        }
+    }
+
+    /// Marks the handle for delete-on-close cleanup.
+    pub(crate) const fn mark_delete_on_close(&mut self) {
+        self.close_disposition = CloseDisposition::Delete;
+    }
+
+    /// Clears a delete-on-close request for this handle.
+    pub(crate) const fn keep_on_close(&mut self) {
+        self.close_disposition = CloseDisposition::Keep;
+    }
+
+    /// Returns the requested close disposition.
+    pub(crate) const fn close_disposition(&self) -> CloseDisposition {
+        self.close_disposition
+    }
+
+    /// Returns the opened path identity.
+    pub(crate) const fn path(&self) -> &OpenedPath {
+        &self.path
+    }
 }
 
 /// Driver unload callback registered in the driver object.

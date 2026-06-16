@@ -6,8 +6,8 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    Ext4Gid, Ext4Name, Ext4Owner, Ext4Permissions, Ext4Uid, InodeId, LookupResult,
-    NewDirectoryMetadata, NewFileMetadata, Node, WindowsName,
+    Ext4Gid, Ext4Name, Ext4Owner, Ext4Permissions, Ext4Uid, InodeId, NewDirectoryMetadata,
+    NewFileMetadata, Node, WindowsName,
 };
 use wdk_sys::{
     FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
@@ -18,8 +18,8 @@ use wdk_sys::{
 use crate::{
     irp::{CreateStack, DispatchTarget},
     state::{
-        ContextControlBlock, DirectoryCursor, FileControlBlock, FileSystemNode, KernelDevice,
-        MountedVolumeDevice,
+        ContextControlBlock, FileControlBlock, FileSystemNode, KernelDevice, MountedVolumeDevice,
+        OpenedPath,
     },
 };
 
@@ -95,7 +95,9 @@ fn open_or_create(request: CreateRequest) -> NTSTATUS {
         Err(status) => return status,
     };
     match resolve_path(request.file_object(), vcb) {
-        Ok(PathLookup::Existing(node)) => open_existing_node(request, vcb, disposition, node),
+        Ok(PathLookup::Existing { node, path }) => {
+            open_existing_node(request, vcb, disposition, node, path)
+        }
         Ok(PathLookup::Missing { parent, name }) => {
             create_missing_node(request, vcb, disposition, parent, &name)
         }
@@ -160,7 +162,12 @@ impl CreateNodeKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PathLookup {
     /// The requested path already exists.
-    Existing(FileSystemNode),
+    Existing {
+        /// Opened ext4 node.
+        node: FileSystemNode,
+        /// Exact path identity.
+        path: OpenedPath,
+    },
     /// The final path component is absent under an existing parent directory.
     Missing {
         /// Parent directory inode.
@@ -176,11 +183,12 @@ fn open_existing_node(
     vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
     node: FileSystemNode,
+    path: OpenedPath,
 ) -> NTSTATUS {
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             match validate_existing_node_options(node, request.stack.options()) {
-                Ok(()) => initialize_file_object(request.file_object(), vcb, node),
+                Ok(()) => initialize_file_object(request.file_object(), vcb, node, path),
                 Err(status) => status,
             }
         }
@@ -210,7 +218,15 @@ fn create_missing_node(
         Ok(node) => node,
         Err(status) => return status,
     };
-    initialize_file_object(request.file_object(), vcb, node)
+    initialize_file_object(
+        request.file_object(),
+        vcb,
+        node,
+        OpenedPath::Child {
+            parent,
+            name: name.clone(),
+        },
+    )
 }
 
 /// Validates file-vs-directory options for an existing node.
@@ -256,9 +272,9 @@ fn resolve_path(
             Ok(_) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
             Err(error) => return Err(crate::status::DriverError::from(error).ntstatus()),
         };
-        inode = match vcb.volume().lookup_windows_child(&parent, component) {
-            Ok(LookupResult::Found(child)) => child,
-            Ok(LookupResult::NotFound) if is_final => {
+        let entry = match vcb.volume().lookup_windows_child_entry(&parent, component) {
+            Ok(Some(entry)) => entry,
+            Ok(None) if is_final => {
                 return Ok(PathLookup::Missing {
                     parent: inode,
                     name: component
@@ -266,15 +282,40 @@ fn resolve_path(
                         .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
                 });
             }
-            Ok(LookupResult::NotFound) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
+            Ok(None) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
             Err(error) => return Err(crate::status::DriverError::from(error).ntstatus()),
         };
+        if is_final {
+            let node = match vcb.volume().read_node(entry.inode()) {
+                Ok(Node::File(_)) => FileSystemNode::File(entry.inode()),
+                Ok(Node::Directory(_)) => FileSystemNode::Directory(entry.inode()),
+                Ok(Node::Symlink(_)) => FileSystemNode::Symlink(entry.inode()),
+                Err(error) => return Err(crate::status::DriverError::from(error).ntstatus()),
+            };
+            return Ok(PathLookup::Existing {
+                node,
+                path: OpenedPath::Child {
+                    parent: inode,
+                    name: entry.name().clone(),
+                },
+            });
+        }
+        inode = entry.inode();
     }
 
     match vcb.volume().read_node(inode) {
-        Ok(Node::File(_)) => Ok(PathLookup::Existing(FileSystemNode::File(inode))),
-        Ok(Node::Directory(_)) => Ok(PathLookup::Existing(FileSystemNode::Directory(inode))),
-        Ok(Node::Symlink(_)) => Ok(PathLookup::Existing(FileSystemNode::Symlink(inode))),
+        Ok(Node::File(_)) => Ok(PathLookup::Existing {
+            node: FileSystemNode::File(inode),
+            path: OpenedPath::Root,
+        }),
+        Ok(Node::Directory(_)) => Ok(PathLookup::Existing {
+            node: FileSystemNode::Directory(inode),
+            path: OpenedPath::Root,
+        }),
+        Ok(Node::Symlink(_)) => Ok(PathLookup::Existing {
+            node: FileSystemNode::Symlink(inode),
+            path: OpenedPath::Root,
+        }),
         Err(error) => Err(crate::status::DriverError::from(error).ntstatus()),
     }
 }
@@ -377,6 +418,7 @@ fn initialize_file_object(
     mut file_object: NonNull<FILE_OBJECT>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: FileSystemNode,
+    path: OpenedPath,
 ) -> NTSTATUS {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is
@@ -388,11 +430,7 @@ fn initialize_file_object(
     }
 
     let fcb = Box::new(FileControlBlock::new(vcb, node));
-    let ccb = Box::new(match node {
-        FileSystemNode::File(_) => ContextControlBlock::File,
-        FileSystemNode::Directory(_) => ContextControlBlock::Directory(DirectoryCursor::start()),
-        FileSystemNode::Symlink(_) => ContextControlBlock::Symlink,
-    });
+    let ccb = Box::new(ContextControlBlock::new(node, path));
     file_object.FsContext = Box::into_raw(fcb).cast::<c_void>();
     file_object.FsContext2 = Box::into_raw(ccb).cast::<c_void>();
     STATUS_SUCCESS
