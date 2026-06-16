@@ -348,6 +348,16 @@ impl DirectoryCursor {
     pub(crate) const fn start() -> Self {
         Self { next_entry: 0 }
     }
+
+    /// Returns the next directory entry index to emit.
+    pub(crate) const fn next_entry(self) -> u32 {
+        self.next_entry
+    }
+
+    /// Moves the cursor to a specific directory entry index.
+    pub(crate) const fn seek(&mut self, next_entry: u32) {
+        self.next_entry = next_entry;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

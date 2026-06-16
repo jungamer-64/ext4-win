@@ -229,6 +229,28 @@ impl CurrentIrpStackLocation {
         })
     }
 
+    /// Decodes query-directory parameters.
+    pub(crate) fn query_directory(self) -> Result<QueryDirectoryStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let query = unsafe {
+            // SAFETY: The caller selects this accessor only for
+            // IRP_MN_QUERY_DIRECTORY, where QueryDirectory is active.
+            stack.Parameters.QueryDirectory
+        };
+        Ok(QueryDirectoryStack {
+            file_object: self.file_object()?,
+            flags: stack.Flags,
+            length: query.Length,
+            file_name: NonNull::new(query.FileName),
+            information_class: query.FileInformationClass,
+            file_index: query.FileIndex,
+        })
+    }
+
     /// Decodes read parameters from the current stack location.
     pub(crate) fn read(self) -> Result<ReadStack, DriverError> {
         let stack = unsafe {
@@ -450,6 +472,23 @@ pub(crate) struct QueryFileStack {
     information_class: wdk_sys::FILE_INFORMATION_CLASS,
 }
 
+/// Decoded query-directory stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueryDirectoryStack {
+    /// FILE_OBJECT carrying the directory CCB.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Query-directory SL_* flags.
+    flags: wdk_sys::UCHAR,
+    /// Output buffer length.
+    length: wdk_sys::ULONG,
+    /// Optional filename pattern supplied by the caller.
+    file_name: Option<NonNull<wdk_sys::UNICODE_STRING>>,
+    /// Requested directory information class.
+    information_class: wdk_sys::FILE_INFORMATION_CLASS,
+    /// Caller-supplied file index when SL_INDEX_SPECIFIED is set.
+    file_index: wdk_sys::ULONG,
+}
+
 /// Decoded read stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadStack {
@@ -532,6 +571,38 @@ impl QueryFileStack {
     /// Returns the requested file information class.
     pub(crate) const fn information_class(self) -> wdk_sys::FILE_INFORMATION_CLASS {
         self.information_class
+    }
+}
+
+impl QueryDirectoryStack {
+    /// Returns the FILE_OBJECT carrying this query.
+    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object
+    }
+
+    /// Returns query-directory SL_* flags.
+    pub(crate) const fn flags(self) -> wdk_sys::UCHAR {
+        self.flags
+    }
+
+    /// Returns the output buffer length.
+    pub(crate) const fn length(self) -> wdk_sys::ULONG {
+        self.length
+    }
+
+    /// Returns the optional filename pattern.
+    pub(crate) const fn file_name(self) -> Option<NonNull<wdk_sys::UNICODE_STRING>> {
+        self.file_name
+    }
+
+    /// Returns the requested directory information class.
+    pub(crate) const fn information_class(self) -> wdk_sys::FILE_INFORMATION_CLASS {
+        self.information_class
+    }
+
+    /// Returns the caller-supplied file index.
+    pub(crate) const fn file_index(self) -> wdk_sys::ULONG {
+        self.file_index
     }
 }
 
@@ -692,6 +763,40 @@ mod tests {
                     query.information_class(),
                     wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn query_directory_stack_preserves_file_object_flags_length_name_class_and_index() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let file_name = NonNull::<wdk_sys::UNICODE_STRING>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Flags = u8::try_from(wdk_sys::SL_RESTART_SCAN).unwrap_or(u8::MAX);
+        stack.Parameters.QueryDirectory = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_6 {
+            Length: 128,
+            FileName: file_name.as_ptr(),
+            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileDirectoryInformation,
+            __bindgen_padding_0: 0,
+            FileIndex: 3,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let query = current.query_directory();
+            assert!(query.is_ok());
+            if let Ok(query) = query {
+                assert_eq!(query.file_object(), file_object);
+                assert_eq!(query.flags(), stack.Flags);
+                assert_eq!(query.length(), 128);
+                assert_eq!(query.file_name(), Some(file_name));
+                assert_eq!(
+                    query.information_class(),
+                    wdk_sys::_FILE_INFORMATION_CLASS::FileDirectoryInformation
+                );
+                assert_eq!(query.file_index(), 3);
             }
         }
     }
