@@ -2,6 +2,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 mod block_device;
 mod dispatch;
 mod ffi;
