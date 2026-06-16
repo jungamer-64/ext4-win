@@ -229,6 +229,25 @@ impl CurrentIrpStackLocation {
         })
     }
 
+    /// Decodes set-file-information parameters.
+    pub(crate) fn set_file(self) -> Result<SetFileStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let set = unsafe {
+            // SAFETY: The caller selects this accessor only for
+            // IRP_MJ_SET_INFORMATION, where SetFile is active.
+            stack.Parameters.SetFile
+        };
+        Ok(SetFileStack {
+            file_object: self.file_object()?,
+            length: set.Length,
+            information_class: set.FileInformationClass,
+        })
+    }
+
     /// Decodes query-directory parameters.
     pub(crate) fn query_directory(self) -> Result<QueryDirectoryStack, DriverError> {
         let stack = unsafe {
@@ -472,6 +491,17 @@ pub(crate) struct QueryFileStack {
     information_class: wdk_sys::FILE_INFORMATION_CLASS,
 }
 
+/// Decoded set-file-information stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SetFileStack {
+    /// FILE_OBJECT carrying the FCB/CCB.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    /// Input buffer length.
+    length: wdk_sys::ULONG,
+    /// Requested file information class.
+    information_class: wdk_sys::FILE_INFORMATION_CLASS,
+}
+
 /// Decoded query-directory stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryDirectoryStack {
@@ -564,6 +594,23 @@ impl QueryFileStack {
     }
 
     /// Returns the output buffer length.
+    pub(crate) const fn length(self) -> wdk_sys::ULONG {
+        self.length
+    }
+
+    /// Returns the requested file information class.
+    pub(crate) const fn information_class(self) -> wdk_sys::FILE_INFORMATION_CLASS {
+        self.information_class
+    }
+}
+
+impl SetFileStack {
+    /// Returns the FILE_OBJECT carrying this mutation.
+    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object
+    }
+
+    /// Returns the input buffer length.
     pub(crate) const fn length(self) -> wdk_sys::ULONG {
         self.length
     }
@@ -762,6 +809,36 @@ mod tests {
                 assert_eq!(
                     query.information_class(),
                     wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_file_stack_preserves_file_object_length_and_class() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
+            Length: 40,
+            __bindgen_padding_0: 0,
+            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation,
+            FileObject: core::ptr::null_mut(),
+            __bindgen_anon_1:
+                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let set = current.set_file();
+            assert!(set.is_ok());
+            if let Ok(set) = set {
+                assert_eq!(set.file_object(), file_object);
+                assert_eq!(set.length(), 40);
+                assert_eq!(
+                    set.information_class(),
+                    wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation
                 );
             }
         }

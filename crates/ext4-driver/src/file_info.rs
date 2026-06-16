@@ -5,8 +5,8 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    DirectoryEntry, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset, FileSize, InodeId, Node,
-    WindowsName,
+    DirectoryEntry, Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileOffset,
+    FileSize, InodeId, Node, WindowsName, WindowsOverlay,
 };
 use wdk_sys::{
     LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
@@ -14,7 +14,7 @@ use wdk_sys::{
     STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
 };
 
-use crate::irp::{DispatchTarget, QueryDirectoryStack, QueryFileStack};
+use crate::irp::{DispatchTarget, QueryDirectoryStack, QueryFileStack, SetFileStack};
 use crate::state::{
     ContextControlBlock, DirectoryCursor, FileControlBlock, FileSystemNode, VolumeControlBlock,
 };
@@ -76,7 +76,10 @@ pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 
 /// Handles file information mutations.
 pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    decoded_not_supported(device, irp)
+    match DispatchTarget::decode(device, irp).and_then(SetFileRequest::decode) {
+        Ok(request) => set_file_information(request),
+        Err(error) => error.ntstatus(),
+    }
 }
 
 /// Handles directory enumeration and notification.
@@ -163,6 +166,25 @@ impl QueryFileRequest {
     }
 }
 
+/// Decoded set-file-information request.
+#[derive(Clone, Copy, Debug)]
+struct SetFileRequest {
+    /// Dispatch target receiving the mutation.
+    target: DispatchTarget,
+    /// Decoded set stack.
+    stack: SetFileStack,
+}
+
+impl SetFileRequest {
+    /// Decodes a set-file-information request.
+    fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
+        Ok(Self {
+            target,
+            stack: target.current_stack()?.set_file()?,
+        })
+    }
+}
+
 /// Decoded query-directory request.
 #[derive(Clone, Copy, Debug)]
 struct QueryDirectoryRequest {
@@ -219,6 +241,151 @@ fn pack_file_information(request: QueryFileRequest) -> Result<wdk_sys::ULONG_PTR
         }
         _ => Err(STATUS_INVALID_INFO_CLASS),
     }
+}
+
+/// Handles supported file information mutations.
+fn set_file_information(request: SetFileRequest) -> NTSTATUS {
+    match apply_file_information(request) {
+        Ok(()) => {
+            request.target.set_information(0);
+            STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+/// Applies one supported set-file-information class.
+fn apply_file_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
+    match request.stack.information_class() {
+        wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => set_basic_information(request),
+        wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation => {
+            set_end_of_file_information(request)
+        }
+        wdk_sys::_FILE_INFORMATION_CLASS::FileAllocationInformation => {
+            set_allocation_information(request)
+        }
+        _ => Err(STATUS_INVALID_INFO_CLASS),
+    }
+}
+
+/// Applies FILE_BASIC_INFORMATION timestamps and overlay attributes.
+fn set_basic_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
+    let info = read_file_information_input::<wdk_sys::FILE_BASIC_INFORMATION>(
+        request.target,
+        request.stack.length(),
+    )?;
+    let metadata = load_file_metadata(request.stack.file_object())?;
+    let times = set_basic_times(metadata.times, info)?;
+    let overlay = set_basic_overlay(metadata, info.FileAttributes)?;
+    if times == metadata.times && overlay.is_none() {
+        return Ok(());
+    }
+
+    let context =
+        opened_file_context(request.stack.file_object()).map_err(DriverError::ntstatus)?;
+    let mut vcb = context.volume;
+    let vcb = unsafe {
+        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
+        // remain valid while file objects are open. The mutable borrow is the
+        // transaction boundary for this synchronous metadata mutation.
+        vcb.as_mut()
+    };
+    let mut transaction = vcb
+        .volume_mut()
+        .begin_transaction(current_time().map_err(DriverError::ntstatus)?);
+    let node = transaction
+        .node(context.node.inode())
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    if times != metadata.times {
+        transaction
+            .set_times(node, times)
+            .map_err(|error| DriverError::from(error).ntstatus())?;
+    }
+    if let Some(overlay) = overlay {
+        transaction
+            .set_windows_overlay(node, overlay)
+            .map_err(|error| DriverError::from(error).ntstatus())?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| DriverError::from(error).ntstatus())
+}
+
+/// Applies FILE_END_OF_FILE_INFORMATION to a regular file.
+fn set_end_of_file_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
+    let info = read_file_information_input::<wdk_sys::FILE_END_OF_FILE_INFORMATION>(
+        request.target,
+        request.stack.length(),
+    )?;
+    set_regular_file_size(
+        request.stack.file_object(),
+        file_size_from_large_integer(info.EndOfFile)?,
+    )
+}
+
+/// Applies FILE_ALLOCATION_INFORMATION within the ext4 sparse-file model.
+fn set_allocation_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
+    let info = read_file_information_input::<wdk_sys::FILE_ALLOCATION_INFORMATION>(
+        request.target,
+        request.stack.length(),
+    )?;
+    let requested = file_size_from_large_integer(info.AllocationSize)?;
+    let context =
+        opened_file_context(request.stack.file_object()).map_err(DriverError::ntstatus)?;
+    let FileSystemNode::File(inode) = context.node else {
+        return Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus());
+    };
+    let vcb = unsafe {
+        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
+        // remain valid while file objects are open.
+        context.volume.as_ref()
+    };
+    let current = regular_file_size(vcb, inode)?;
+    if requested >= current {
+        return Ok(());
+    }
+    set_regular_file_size(request.stack.file_object(), requested)
+}
+
+/// Sets a regular file size by extending sparse or truncating allocated ranges.
+fn set_regular_file_size(
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    new_size: FileSize,
+) -> Result<(), NTSTATUS> {
+    let context = opened_file_context(file_object).map_err(DriverError::ntstatus)?;
+    let FileSystemNode::File(inode) = context.node else {
+        return Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus());
+    };
+    let mut vcb = context.volume;
+    let vcb = unsafe {
+        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
+        // remain valid while file objects are open. The mutable borrow is the
+        // transaction boundary for this synchronous size mutation.
+        vcb.as_mut()
+    };
+    let current = regular_file_size(vcb, inode)?;
+    if new_size == current {
+        return Ok(());
+    }
+
+    let mut transaction = vcb
+        .volume_mut()
+        .begin_transaction(current_time().map_err(DriverError::ntstatus)?);
+    let file = transaction
+        .file(inode)
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    if new_size > current {
+        transaction
+            .extend_file(file, new_size)
+            .map_err(|error| DriverError::from(error).ntstatus())?;
+    } else {
+        transaction
+            .truncate_file(file, new_size)
+            .map_err(|error| DriverError::from(error).ntstatus())?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| DriverError::from(error).ntstatus())
 }
 
 /// Handles directory enumeration queries.
@@ -747,6 +914,179 @@ fn context_control_block(
     };
     NonNull::new(file_object.FsContext2.cast::<ContextControlBlock>())
         .ok_or(DriverError::InvalidParameter)
+}
+
+/// Open file state needed for journaled metadata mutations.
+#[derive(Clone, Copy, Debug)]
+struct OpenedFileContext {
+    /// Mounted VCB owning the open file.
+    volume: NonNull<VolumeControlBlock>,
+    /// ext4 node opened by this FILE_OBJECT.
+    node: FileSystemNode,
+}
+
+/// Returns the opened FCB identity and VCB pointer.
+fn opened_file_context(
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+) -> Result<OpenedFileContext, DriverError> {
+    let fcb = file_control_block(file_object)?;
+    let fcb = unsafe {
+        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
+        // until close releases it, and this access runs while the FILE_OBJECT
+        // is active.
+        fcb.as_ref()
+    };
+    Ok(OpenedFileContext {
+        volume: fcb.volume(),
+        node: fcb.node(),
+    })
+}
+
+/// Reads a fixed-size set-information input structure.
+fn read_file_information_input<T: Copy>(
+    target: DispatchTarget,
+    length: wdk_sys::ULONG,
+) -> Result<T, NTSTATUS> {
+    let buffer = target.system_buffer().ok_or(STATUS_INVALID_PARAMETER)?;
+    let length = usize::try_from(length).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let size = core::mem::size_of::<T>();
+    if length < size {
+        return Err(STATUS_BUFFER_TOO_SMALL);
+    }
+    Ok(unsafe {
+        // SAFETY: The set-information system buffer is at least `size` bytes
+        // and is copied out immediately. Unaligned read avoids imposing a
+        // stronger alignment contract on the I/O Manager buffer.
+        buffer.cast::<T>().as_ptr().read_unaligned()
+    })
+}
+
+/// Builds a complete ext4 timestamp set from FILE_BASIC_INFORMATION.
+fn set_basic_times(
+    current: Ext4Times,
+    info: wdk_sys::FILE_BASIC_INFORMATION,
+) -> Result<Ext4Times, NTSTATUS> {
+    Ok(Ext4Times::new(
+        windows_time_field(info.LastAccessTime, current.accessed())?,
+        windows_time_field(info.LastWriteTime, current.modified())?,
+        windows_time_field(info.ChangeTime, current.changed())?,
+        windows_time_field(info.CreationTime, current.created())?,
+    ))
+}
+
+/// Selects one timestamp field, preserving the current value for sentinel inputs.
+fn windows_time_field(
+    value: LARGE_INTEGER,
+    current: Ext4Timestamp,
+) -> Result<Ext4Timestamp, NTSTATUS> {
+    let quad = large_integer_quad(value);
+    if quad == WINDOWS_TIME_UNCHANGED || quad == WINDOWS_TIME_PRESERVE {
+        return Ok(current);
+    }
+    if quad < 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut time = value;
+    let mut seconds: wdk_sys::ULONG = 0;
+    let converted = unsafe {
+        // SAFETY: Both pointers reference writable stack storage valid for the
+        // duration of the conversion call.
+        crate::ffi::RtlTimeToSecondsSince1970(
+            core::ptr::addr_of_mut!(time),
+            core::ptr::addr_of_mut!(seconds),
+        )
+    };
+    if converted == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(Ext4Timestamp::from_unix_seconds(seconds))
+}
+
+/// Windows FILE_BASIC_INFORMATION sentinel for preserving a timestamp.
+const WINDOWS_TIME_UNCHANGED: i64 = 0;
+/// Additional Windows sentinel used by callers to preserve timestamp state.
+const WINDOWS_TIME_PRESERVE: i64 = -1;
+
+/// Builds overlay metadata from FILE_BASIC_INFORMATION attributes.
+fn set_basic_overlay(
+    metadata: FileMetadata,
+    attributes: wdk_sys::ULONG,
+) -> Result<Option<WindowsOverlay>, NTSTATUS> {
+    if attributes == 0 {
+        return Ok(None);
+    }
+    validate_kind_attribute(metadata.kind, attributes)?;
+    let current_readonly = metadata.security.permissions().as_u16() & 0o222 == 0;
+    let requested_readonly = attributes & wdk_sys::FILE_ATTRIBUTE_READONLY != 0;
+    if requested_readonly != current_readonly {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+
+    let accepted = Ext4WindowsAttributes::SUPPORTED_MASK
+        | wdk_sys::FILE_ATTRIBUTE_READONLY
+        | wdk_sys::FILE_ATTRIBUTE_NORMAL
+        | wdk_sys::FILE_ATTRIBUTE_DIRECTORY
+        | wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT;
+    if attributes & !accepted != 0 {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+
+    let overlay_bits = attributes & Ext4WindowsAttributes::SUPPORTED_MASK;
+    if overlay_bits == metadata.overlay_attributes {
+        return Ok(None);
+    }
+    let attributes = Ext4WindowsAttributes::new(overlay_bits)
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    Ok(Some(WindowsOverlay::new(attributes)))
+}
+
+/// Rejects node-kind attributes that contradict the opened ext4 node.
+fn validate_kind_attribute(
+    kind: FileMetadataKind,
+    attributes: wdk_sys::ULONG,
+) -> Result<(), NTSTATUS> {
+    if attributes & wdk_sys::FILE_ATTRIBUTE_DIRECTORY != 0 && kind != FileMetadataKind::Directory {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if attributes & wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT != 0 && kind != FileMetadataKind::Symlink
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(())
+}
+
+/// Returns a non-negative file size from a Windows LARGE_INTEGER.
+fn file_size_from_large_integer(value: LARGE_INTEGER) -> Result<FileSize, NTSTATUS> {
+    let value = large_integer_quad(value);
+    if value < 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(FileSize::from_bytes(
+        u64::try_from(value).map_err(|_| STATUS_INVALID_PARAMETER)?,
+    ))
+}
+
+/// Returns the current size of a regular file inode.
+fn regular_file_size(vcb: &VolumeControlBlock, inode: InodeId) -> Result<FileSize, NTSTATUS> {
+    match vcb
+        .volume()
+        .read_node(inode)
+        .map_err(|error| DriverError::from(error).ntstatus())?
+    {
+        Node::File(file) => Ok(file.size()),
+        Node::Directory(_) | Node::Symlink(_) => {
+            Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus())
+        }
+    }
+}
+
+/// Returns the signed payload of a LARGE_INTEGER.
+fn large_integer_quad(value: LARGE_INTEGER) -> i64 {
+    unsafe {
+        // SAFETY: `QuadPart` is the LARGE_INTEGER representation used by this
+        // driver for Windows time and file-size values.
+        value.QuadPart
+    }
 }
 
 /// File metadata needed by fixed-size Windows information classes.
