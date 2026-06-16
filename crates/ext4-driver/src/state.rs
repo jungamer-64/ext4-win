@@ -148,6 +148,11 @@ impl VolumeControlBlock {
         Some(u32::from_le_bytes(bytes))
     }
 
+    /// Returns the mounted ext4 volume.
+    pub(crate) const fn volume(&self) -> &Volume<KernelBlockDevice, ReadWrite<InternalJournal>> {
+        &self.volume
+    }
+
     /// Returns the mounted ext4 volume label.
     pub(crate) fn volume_label(&self) -> ext4_core::Ext4VolumeLabel {
         self.volume.volume_label()
@@ -278,10 +283,6 @@ fn write_vpb_label(vpb: &mut wdk_sys::VPB, label: ext4_core::Ext4VolumeLabel) ->
     Some(())
 }
 
-#[expect(
-    dead_code,
-    reason = "FCB node variants are defined before CREATE constructs FCB state"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Ext4 node represented by an FCB.
 pub(crate) enum FileSystemNode {
@@ -340,10 +341,6 @@ impl DirectoryCursor {
     }
 }
 
-#[expect(
-    dead_code,
-    reason = "CCB variants are defined before CREATE stores FsContext2"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Per-handle state stored in `FILE_OBJECT::FsContext2`.
 pub(crate) enum ContextControlBlock {
