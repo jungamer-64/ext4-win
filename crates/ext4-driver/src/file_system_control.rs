@@ -10,7 +10,8 @@ use wdk_sys::{
 use crate::{
     block_device::query_device_length,
     ffi,
-    irp::{DispatchTarget, MountVolumeStack},
+    irp::{DispatchTarget, FileSystemControlStack, MountVolumeStack},
+    reparse,
     state::{
         KernelDevice, MountCandidate, MountedVolumeDevice, MountedVolumeDeviceExtension,
         VolumeControlBlock,
@@ -25,6 +26,7 @@ const MOUNT_VOLUME_MINOR: wdk_sys::UCHAR = 1;
 pub(crate) fn dispatch(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(FileSystemControlRequest::decode) {
         Ok(FileSystemControlRequest::MountVolume(request)) => mount_volume(request),
+        Ok(FileSystemControlRequest::UserFsControl(request)) => user_fs_control(request),
         Ok(FileSystemControlRequest::Unsupported) => STATUS_NOT_SUPPORTED,
         Err(error) => error.ntstatus(),
     }
@@ -47,6 +49,8 @@ pub(crate) fn device_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 enum FileSystemControlRequest {
     /// Mount request issued by the I/O Manager.
     MountVolume(MountVolumeRequest),
+    /// User FSCTL request addressed to an opened file object.
+    UserFsControl(UserFsControlRequest),
     /// Other FSCTL minor functions not owned by this FSD path yet.
     Unsupported,
 }
@@ -55,13 +59,50 @@ impl FileSystemControlRequest {
     /// Decodes the current FSCTL stack location.
     fn decode(target: DispatchTarget) -> Result<Self, crate::status::DriverError> {
         let stack = target.current_stack()?;
-        if stack.minor_function() != MOUNT_VOLUME_MINOR {
-            return Ok(Self::Unsupported);
+        if stack.minor_function() == MOUNT_VOLUME_MINOR {
+            return Ok(Self::MountVolume(MountVolumeRequest::from_stack(
+                target.device(),
+                stack.mount_volume()?,
+            )));
         }
-        Ok(Self::MountVolume(MountVolumeRequest::from_stack(
-            target.device(),
-            stack.mount_volume()?,
-        )))
+        if u32::from(stack.minor_function()) == wdk_sys::IRP_MN_USER_FS_REQUEST {
+            return Ok(Self::UserFsControl(UserFsControlRequest::from_stack(
+                target,
+                stack.file_system_control()?,
+            )));
+        }
+        Ok(Self::Unsupported)
+    }
+}
+
+/// User FSCTL request after raw IRP stack decoding.
+#[derive(Clone, Copy, Debug)]
+struct UserFsControlRequest {
+    /// Dispatch target that owns output buffer completion.
+    target: DispatchTarget,
+    /// Decoded file-system-control stack parameters.
+    stack: FileSystemControlStack,
+}
+
+impl UserFsControlRequest {
+    /// Converts decoded stack parameters into the user-FSCTL domain boundary.
+    const fn from_stack(target: DispatchTarget, stack: FileSystemControlStack) -> Self {
+        Self { target, stack }
+    }
+
+    /// Returns the dispatch target.
+    const fn target(self) -> DispatchTarget {
+        self.target
+    }
+
+    /// Returns the decoded FSCTL stack.
+    const fn stack(self) -> FileSystemControlStack {
+        self.stack
+    }
+
+    /// Returns the requested FSCTL code.
+    const fn fs_control_code(self) -> wdk_sys::ULONG {
+        self.stack.fs_control_code()
     }
 }
 
@@ -180,4 +221,17 @@ fn mount_volume(request: MountVolumeRequest) -> NTSTATUS {
     };
     let _mounted_device = mounted_device.as_ptr();
     STATUS_SUCCESS
+}
+
+/// Handles path-scoped user FSCTL requests.
+fn user_fs_control(request: UserFsControlRequest) -> NTSTATUS {
+    match request.fs_control_code() {
+        reparse::FSCTL_GET_REPARSE_POINT => {
+            reparse::get_reparse_point(request.target(), request.stack())
+        }
+        reparse::FSCTL_SET_REPARSE_POINT | reparse::FSCTL_DELETE_REPARSE_POINT => {
+            STATUS_NOT_SUPPORTED
+        }
+        _ => STATUS_NOT_SUPPORTED,
+    }
 }
