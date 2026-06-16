@@ -6,10 +6,11 @@ use core::ffi::c_void;
 use ext4_core::{BlockSize, Ext4VolumeLabel};
 use wdk_sys::{
     FILE_CASE_PRESERVED_NAMES, FILE_CASE_SENSITIVE_SEARCH, FILE_FS_ATTRIBUTE_INFORMATION,
-    FILE_FS_LABEL_INFORMATION, FILE_FS_SIZE_INFORMATION, FILE_FS_VOLUME_INFORMATION,
-    FILE_SUPPORTS_EXTENDED_ATTRIBUTES, FILE_SUPPORTS_REPARSE_POINTS, FILE_UNICODE_ON_DISK,
-    LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_BUFFER_TOO_SMALL,
-    STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
+    FILE_FS_DEVICE_INFORMATION, FILE_FS_FULL_SIZE_INFORMATION, FILE_FS_LABEL_INFORMATION,
+    FILE_FS_SIZE_INFORMATION, FILE_FS_VOLUME_INFORMATION, FILE_SUPPORTS_EXTENDED_ATTRIBUTES,
+    FILE_SUPPORTS_REPARSE_POINTS, FILE_UNICODE_ON_DISK, LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT,
+    PIRP, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
+    STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
 };
 
 use crate::{
@@ -28,8 +29,12 @@ const FILE_FS_VOLUME_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 1;
 const FILE_FS_LABEL_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 2;
 /// `FileFsSizeInformation`.
 const FILE_FS_SIZE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 3;
+/// `FileFsDeviceInformation`.
+const FILE_FS_DEVICE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 4;
 /// `FileFsAttributeInformation`.
 const FILE_FS_ATTRIBUTE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 5;
+/// `FileFsFullSizeInformation`.
+const FILE_FS_FULL_SIZE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 7;
 
 /// Handles volume information queries.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
@@ -132,7 +137,9 @@ fn query_volume(request: QueryVolumeRequest) -> NTSTATUS {
     let written = match request.stack.information_class() {
         FILE_FS_VOLUME_INFORMATION_CLASS => pack_volume_information(vcb, buffer, length),
         FILE_FS_SIZE_INFORMATION_CLASS => pack_size_information(vcb, buffer, length),
+        FILE_FS_DEVICE_INFORMATION_CLASS => pack_device_information(buffer, length),
         FILE_FS_ATTRIBUTE_INFORMATION_CLASS => pack_attribute_information(buffer, length),
+        FILE_FS_FULL_SIZE_INFORMATION_CLASS => pack_full_size_information(vcb, buffer, length),
         _ => return STATUS_INVALID_INFO_CLASS,
     };
     match written {
@@ -286,6 +293,62 @@ fn pack_size_information(
     information_length(core::mem::size_of::<FILE_FS_SIZE_INFORMATION>())
 }
 
+/// Packs `FILE_FS_DEVICE_INFORMATION`.
+fn pack_device_information(
+    buffer: core::ptr::NonNull<c_void>,
+    length: usize,
+) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+    if length < core::mem::size_of::<FILE_FS_DEVICE_INFORMATION>() {
+        return Err(STATUS_BUFFER_TOO_SMALL);
+    }
+    let info = unsafe {
+        // SAFETY: The caller supplied at least FILE_FS_DEVICE_INFORMATION
+        // bytes.
+        buffer
+            .as_ptr()
+            .cast::<FILE_FS_DEVICE_INFORMATION>()
+            .as_mut()
+    }
+    .ok_or(STATUS_INVALID_PARAMETER)?;
+    info.DeviceType = wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM;
+    info.Characteristics = 0;
+    information_length(core::mem::size_of::<FILE_FS_DEVICE_INFORMATION>())
+}
+
+/// Packs `FILE_FS_FULL_SIZE_INFORMATION`.
+fn pack_full_size_information(
+    vcb: &VolumeControlBlock,
+    buffer: core::ptr::NonNull<c_void>,
+    length: usize,
+) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+    if length < core::mem::size_of::<FILE_FS_FULL_SIZE_INFORMATION>() {
+        return Err(STATUS_BUFFER_TOO_SMALL);
+    }
+    let superblock = vcb.volume().superblock();
+    let available = LARGE_INTEGER {
+        QuadPart: i64::try_from(superblock.free_blocks_count().as_u64())
+            .map_err(|_| STATUS_INVALID_PARAMETER)?,
+    };
+    let info = unsafe {
+        // SAFETY: The caller supplied at least FILE_FS_FULL_SIZE_INFORMATION
+        // bytes.
+        buffer
+            .as_ptr()
+            .cast::<FILE_FS_FULL_SIZE_INFORMATION>()
+            .as_mut()
+    }
+    .ok_or(STATUS_INVALID_PARAMETER)?;
+    info.TotalAllocationUnits = LARGE_INTEGER {
+        QuadPart: i64::try_from(superblock.block_count().as_u64())
+            .map_err(|_| STATUS_INVALID_PARAMETER)?,
+    };
+    info.CallerAvailableAllocationUnits = available;
+    info.ActualAvailableAllocationUnits = available;
+    info.SectorsPerAllocationUnit = sectors_per_allocation_unit(superblock.block_size())?;
+    info.BytesPerSector = BYTES_PER_SECTOR;
+    information_length(core::mem::size_of::<FILE_FS_FULL_SIZE_INFORMATION>())
+}
+
 /// Packs `FILE_FS_ATTRIBUTE_INFORMATION`.
 fn pack_attribute_information(
     buffer: core::ptr::NonNull<c_void>,
@@ -378,8 +441,9 @@ fn information_length(value: usize) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
 #[cfg(test)]
 mod tests {
     use alloc::{vec, vec::Vec};
+    use core::ptr::NonNull;
 
-    use super::volume_label_from_file_fs_label;
+    use super::{pack_device_information, volume_label_from_file_fs_label};
 
     #[test]
     fn file_fs_label_information_decodes_byte_representable_utf16() {
@@ -418,6 +482,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn device_information_reports_disk_file_system_without_device_flags() {
+        let mut buffer = vec![0; core::mem::size_of::<wdk_sys::FILE_FS_DEVICE_INFORMATION>()];
+        let pointer = NonNull::new(buffer.as_mut_ptr().cast::<core::ffi::c_void>());
+        assert!(pointer.is_some());
+        if let Some(pointer) = pointer {
+            let written = pack_device_information(pointer, buffer.len());
+            assert!(written.is_ok());
+            if let Ok(written) = written {
+                let expected = wdk_sys::ULONG_PTR::try_from(buffer.len());
+                assert!(expected.is_ok());
+                if let Ok(expected) = expected {
+                    assert_eq!(written, expected);
+                }
+                assert_eq!(
+                    read_test_u32(buffer.as_slice(), 0),
+                    Some(wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM)
+                );
+                assert_eq!(read_test_u32(buffer.as_slice(), 4), Some(0));
+            }
+        }
+    }
+
     /// Builds a FILE_FS_LABEL_INFORMATION byte image from label bytes.
     fn label_information_bytes(label: &[u8]) -> alloc::vec::Vec<u8> {
         let label_bytes = label.len().checked_mul(2);
@@ -435,5 +522,13 @@ mod tests {
             }
         }
         input
+    }
+
+    /// Reads a little-endian u32 from test bytes.
+    fn read_test_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+        let end = offset.checked_add(core::mem::size_of::<u32>())?;
+        let slice = bytes.get(offset..end)?;
+        let array: [u8; 4] = slice.try_into().ok()?;
+        Some(u32::from_le_bytes(array))
     }
 }
