@@ -1,11 +1,14 @@
 //! File object IRP handlers and file information packing boundary.
 
 use alloc::boxed::Box;
+use core::ptr::NonNull;
 
+use ext4_core::{FileOffset, Node};
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_NOT_SUPPORTED, STATUS_SUCCESS};
 
 use crate::irp::DispatchTarget;
-use crate::state::{ContextControlBlock, FileControlBlock};
+use crate::state::{ContextControlBlock, FileControlBlock, FileSystemNode, VolumeControlBlock};
+use crate::status::DriverError;
 
 /// Handles cleanup IRPs.
 pub(crate) fn cleanup(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
@@ -31,7 +34,10 @@ pub(crate) fn close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 
 /// Handles regular file data reads.
 pub(crate) fn read(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    decoded_not_supported(device, irp)
+    match DispatchTarget::decode(device, irp).and_then(read_regular_file) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(error) => error.ntstatus(),
+    }
 }
 
 /// Handles regular file data writes.
@@ -103,6 +109,64 @@ fn decoded_not_supported(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
             STATUS_NOT_SUPPORTED
         }
         Err(error) => error.ntstatus(),
+    }
+}
+
+/// Reads a regular file through ext4-core into the IRP output buffer.
+fn read_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
+    let stack = target.current_stack()?.read()?;
+    let length = usize::try_from(stack.length()).map_err(|_| DriverError::InvalidParameter)?;
+    if length == 0 {
+        target.set_information(0);
+        return Ok(());
+    }
+    let offset = u64::try_from(stack.byte_offset()).map_err(|_| DriverError::InvalidParameter)?;
+    let mut output = target.output_buffer(length)?;
+    let fcb = file_control_block(stack.file_object())?;
+    let fcb = unsafe {
+        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
+        // until close releases it, and this read runs while the FILE_OBJECT is
+        // active.
+        fcb.as_ref()
+    };
+    let vcb = volume_control_block(fcb);
+    let FileSystemNode::File(inode) = fcb.node() else {
+        return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
+    };
+
+    let node = vcb.volume().read_node(inode)?;
+    let Node::File(file) = node else {
+        return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
+    };
+    let bytes_read =
+        vcb.volume()
+            .read_file(&file, FileOffset::from_bytes(offset), output.as_mut_slice())?;
+    target.set_information(
+        wdk_sys::ULONG_PTR::try_from(bytes_read.as_usize())
+            .map_err(|_| DriverError::InvalidParameter)?,
+    );
+    Ok(())
+}
+
+/// Returns the FCB stored on a successfully opened FILE_OBJECT.
+fn file_control_block(
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+) -> Result<NonNull<FileControlBlock>, DriverError> {
+    let file_object = unsafe {
+        // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
+        // is read only for filesystem-owned context pointers.
+        file_object.as_ref()
+    };
+    NonNull::new(file_object.FsContext.cast::<FileControlBlock>())
+        .ok_or(DriverError::InvalidParameter)
+}
+
+/// Returns the mounted VCB referenced by an FCB.
+fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
+    unsafe {
+        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
+        // remain valid while file objects are open.
+        fcb.volume().as_ref()
     }
 }
 

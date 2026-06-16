@@ -174,7 +174,7 @@ fn initialize_file_object(
         return STATUS_INVALID_PARAMETER;
     }
 
-    let fcb = Box::new(FileControlBlock::new(vcb.cast::<c_void>(), node));
+    let fcb = Box::new(FileControlBlock::new(vcb, node));
     let ccb = Box::new(match node {
         FileSystemNode::File(_) => ContextControlBlock::File,
         FileSystemNode::Directory(_) => ContextControlBlock::Directory(DirectoryCursor::start()),

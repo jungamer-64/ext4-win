@@ -307,23 +307,29 @@ impl FileSystemNode {
     }
 }
 
-#[expect(
-    dead_code,
-    reason = "FCB state is defined before CREATE allocates file objects"
-)]
 #[derive(Clone, Copy, Debug)]
 /// File control block stored in `FILE_OBJECT::FsContext`.
 pub(crate) struct FileControlBlock {
     /// Mounted volume that owns this file.
-    volume: NonNull<c_void>,
+    volume: NonNull<VolumeControlBlock>,
     /// Ext4 node opened by this FCB.
     node: FileSystemNode,
 }
 
 impl FileControlBlock {
     /// Creates an FCB boundary value for a mounted node.
-    pub(crate) const fn new(volume: NonNull<c_void>, node: FileSystemNode) -> Self {
+    pub(crate) const fn new(volume: NonNull<VolumeControlBlock>, node: FileSystemNode) -> Self {
         Self { volume, node }
+    }
+
+    /// Returns the mounted VCB pointer that owns this open node.
+    pub(crate) const fn volume(&self) -> NonNull<VolumeControlBlock> {
+        self.volume
+    }
+
+    /// Returns the ext4 node identity opened by this FCB.
+    pub(crate) const fn node(&self) -> FileSystemNode {
+        self.node
     }
 }
 
