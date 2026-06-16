@@ -112,23 +112,6 @@ pub(crate) fn directory_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     }
 }
 
-/// Handles security descriptor queries.
-pub(crate) fn query_security(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => {
-            let _device = target.device();
-            let _irp = target.irp();
-            crate::status::DriverError::AccessDenied.ntstatus()
-        }
-        Err(error) => error.ntstatus(),
-    }
-}
-
-/// Handles security descriptor mutations.
-pub(crate) fn set_security(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    decoded_not_supported(device, irp)
-}
-
 /// Handles byte-range lock requests.
 pub(crate) fn lock_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     decoded_not_supported(device, irp)
