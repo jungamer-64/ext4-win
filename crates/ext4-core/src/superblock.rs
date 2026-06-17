@@ -73,14 +73,21 @@ const INCOMPAT_ENCRYPT: u32 = 0x0001_0000;
 /// Incompatible feature bit for casefolded directory lookup.
 const INCOMPAT_CASEFOLD: u32 = 0x0002_0000;
 /// Incompatible feature mask accepted for read-only traversal.
-const SUPPORTED_READ_INCOMPAT: u32 =
-    INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG | INCOMPAT_CSUM_SEED;
+const SUPPORTED_READ_INCOMPAT: u32 = INCOMPAT_FILETYPE
+    | INCOMPAT_EXTENTS
+    | INCOMPAT_64BIT
+    | INCOMPAT_FLEX_BG
+    | INCOMPAT_CSUM_SEED
+    | INCOMPAT_ENCRYPT;
 /// Incompatible feature bits required before journaled writes are allowed.
 const REQUIRED_WRITE_INCOMPAT: u32 =
     INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG;
 /// Incompatible feature mask accepted by the write mount policy.
-const SUPPORTED_WRITE_INCOMPAT: u32 =
-    REQUIRED_WRITE_INCOMPAT | INCOMPAT_RECOVER | INCOMPAT_JOURNAL_DEV | INCOMPAT_CSUM_SEED;
+const SUPPORTED_WRITE_INCOMPAT: u32 = REQUIRED_WRITE_INCOMPAT
+    | INCOMPAT_RECOVER
+    | INCOMPAT_JOURNAL_DEV
+    | INCOMPAT_CSUM_SEED
+    | INCOMPAT_ENCRYPT;
 
 // Read-only compatible feature bits are safe for read traversal but still need
 // write-domain screening before metadata can be changed.
@@ -121,7 +128,8 @@ const SUPPORTED_READ_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_BIGALLOC
     | RO_COMPAT_METADATA_CSUM
     | RO_COMPAT_READONLY
-    | RO_COMPAT_PROJECT;
+    | RO_COMPAT_PROJECT
+    | RO_COMPAT_VERITY;
 /// Compatible feature bits required before journaled writes are allowed.
 const REQUIRED_WRITE_COMPAT: u32 =
     COMPAT_HAS_JOURNAL | COMPAT_EXT_ATTR | COMPAT_RESIZE_INODE | COMPAT_DIR_INDEX;
@@ -135,7 +143,6 @@ const REJECTED_WRITE_INCOMPAT: u32 = INCOMPAT_META_BG
     | INCOMPAT_EA_INODE
     | INCOMPAT_LARGEDIR
     | INCOMPAT_INLINE_DATA
-    | INCOMPAT_ENCRYPT
     | INCOMPAT_CASEFOLD;
 /// Read-only compatible feature bits required before journaled writes are allowed.
 const REQUIRED_WRITE_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
@@ -145,10 +152,11 @@ const REQUIRED_WRITE_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_EXTRA_ISIZE
     | RO_COMPAT_METADATA_CSUM;
 /// Read-only compatible feature mask accepted by the write mount policy.
-const SUPPORTED_WRITE_RO_COMPAT: u32 = REQUIRED_WRITE_RO_COMPAT | RO_COMPAT_BIGALLOC;
+const SUPPORTED_WRITE_RO_COMPAT: u32 =
+    REQUIRED_WRITE_RO_COMPAT | RO_COMPAT_BIGALLOC | RO_COMPAT_VERITY;
 /// Read-only compatible feature bits rejected by the write mount policy.
 const REJECTED_WRITE_RO_COMPAT: u32 =
-    RO_COMPAT_GDT_CSUM | RO_COMPAT_READONLY | RO_COMPAT_VERITY | RO_COMPAT_ORPHAN_PRESENT;
+    RO_COMPAT_GDT_CSUM | RO_COMPAT_READONLY | RO_COMPAT_ORPHAN_PRESENT;
 /// Descriptor size implied by ext4 64-bit group descriptors when not explicit.
 const DEFAULT_64BIT_DESCRIPTOR_SIZE: u16 = 64;
 

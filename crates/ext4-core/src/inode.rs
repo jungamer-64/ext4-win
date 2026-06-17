@@ -681,18 +681,6 @@ impl Inode {
         self.kind == InodeKind::Directory && self.flags & EXT4_INDEX_FL != 0
     }
 
-    /// Returns true when the inode can be changed by the write domain.
-    #[must_use]
-    pub const fn supports_basic_mutation(&self) -> bool {
-        self.flags
-            & (EXT4_IMMUTABLE_FL
-                | EXT4_APPEND_FL
-                | EXT4_ENCRYPT_FL
-                | EXT4_INLINE_DATA_FL
-                | EXT4_CASEFOLD_FL)
-            == 0
-    }
-
     /// Data storage selected by inode flags and node kind.
     #[must_use]
     pub const fn storage(&self) -> &InodeStorage {
