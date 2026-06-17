@@ -1919,11 +1919,11 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if !parent_inode.supports_basic_mutation() {
             return Err(Error::UnsupportedInodeMutation);
         }
+        if parent_inode.is_indexed_directory() {
+            return Err(Error::UnsupportedDirectoryHash);
+        }
 
-        for (logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
-            if parent_inode.is_indexed_directory() && logical.as_u32() == 0 {
-                continue;
-            }
+        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if block.insert(child, name, kind)? {
                 self.stage_directory_block(physical, block.into_bytes());
                 raw_parent.set_timestamps(self.now)?;
@@ -1933,9 +1933,6 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                     .ok_or(Error::InvalidInode)? = raw_parent;
                 return Ok(());
             }
-        }
-        if parent_inode.is_indexed_directory() {
-            return Err(Error::NoSpace);
         }
 
         let block_size = self.volume.superblock.block_size();
@@ -1993,10 +1990,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if !parent_inode.supports_basic_mutation() {
             return Err(Error::UnsupportedInodeMutation);
         }
-        for (logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
-            if parent_inode.is_indexed_directory() && logical.as_u32() == 0 {
-                continue;
-            }
+        if parent_inode.is_indexed_directory() {
+            return Err(Error::UnsupportedDirectoryHash);
+        }
+        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(removed) = block.remove(name)? {
                 self.stage_directory_block(physical, block.into_bytes());
                 raw_parent.set_timestamps(self.now)?;
@@ -2032,10 +2029,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if !parent_inode.supports_basic_mutation() {
             return Err(Error::UnsupportedInodeMutation);
         }
-        for (logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
-            if parent_inode.is_indexed_directory() && logical.as_u32() == 0 {
-                continue;
-            }
+        if parent_inode.is_indexed_directory() {
+            return Err(Error::UnsupportedDirectoryHash);
+        }
+        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(renamed) = block.rename(old_name, new_name)? {
                 if renamed.inode() != child {
                     return Err(Error::InvalidDirectoryEntry);
@@ -2076,6 +2073,9 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         }
         if !parent_inode.supports_basic_mutation() {
             return Err(Error::UnsupportedInodeMutation);
+        }
+        if parent_inode.is_indexed_directory() {
+            return Err(Error::UnsupportedDirectoryHash);
         }
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(replaced) = block.replace(name, child, kind)? {
