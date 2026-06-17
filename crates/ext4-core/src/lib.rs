@@ -51,8 +51,8 @@ pub use fscrypt::{
 pub use inode::{
     Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid,
     FileOffset, FileSize, Inode, InodeExtentRoot, InodeId, InodeInlineBytes, InodeKind,
-    InodeMutation, InodeStorage, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
-    ReadBytes, SymlinkTarget,
+    InodeMutation, InodeProtection, InodeStorage, NewDirectoryMetadata, NewFileMetadata,
+    NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 pub use name::{Ext4Name, WindowsName};
 pub use superblock::{

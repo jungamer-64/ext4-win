@@ -507,6 +507,33 @@ pub enum InodeMutation {
     Delete,
 }
 
+/// Contents protection attached to an inode by ext4 flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InodeProtection {
+    /// No fscrypt or fs-verity semantics are attached.
+    Plain,
+    /// File or directory is protected by fscrypt.
+    Encrypted,
+    /// Regular file data is protected by fs-verity.
+    Verity,
+    /// File data is encrypted and protected by fs-verity.
+    EncryptedVerity,
+}
+
+impl InodeProtection {
+    /// Returns whether fscrypt semantics apply to this inode.
+    #[must_use]
+    pub const fn is_encrypted(self) -> bool {
+        matches!(self, Self::Encrypted | Self::EncryptedVerity)
+    }
+
+    /// Returns whether fs-verity semantics apply to this inode.
+    #[must_use]
+    pub const fn is_verity(self) -> bool {
+        matches!(self, Self::Verity | Self::EncryptedVerity)
+    }
+}
+
 /// Typed representation of an inode's data pointer area.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InodeStorage {
@@ -698,6 +725,20 @@ impl Inode {
         self.kind == InodeKind::Directory && self.flags & EXT4_INDEX_FL != 0
     }
 
+    /// Contents protection selected by inode flags.
+    #[must_use]
+    pub const fn protection(&self) -> InodeProtection {
+        match (
+            self.flags & EXT4_ENCRYPT_FL != 0,
+            self.flags & EXT4_VERITY_FL != 0,
+        ) {
+            (false, false) => InodeProtection::Plain,
+            (true, false) => InodeProtection::Encrypted,
+            (false, true) => InodeProtection::Verity,
+            (true, true) => InodeProtection::EncryptedVerity,
+        }
+    }
+
     /// Validates one write-domain operation against this inode's flags.
     ///
     /// # Errors
@@ -713,14 +754,16 @@ impl Inode {
         match mutation {
             InodeMutation::Metadata | InodeMutation::Delete => {}
             InodeMutation::DirectoryEntry => {
-                if self.flags & (EXT4_APPEND_FL | EXT4_ENCRYPT_FL | EXT4_CASEFOLD_FL) != 0 {
+                if self.flags & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0
+                    || self.protection().is_encrypted()
+                {
                     return Err(Error::UnsupportedInodeMutation);
                 }
             }
             InodeMutation::FileData | InodeMutation::FileSize => {
-                if self.flags
-                    & (EXT4_APPEND_FL | EXT4_ENCRYPT_FL | EXT4_CASEFOLD_FL | EXT4_VERITY_FL)
-                    != 0
+                if self.flags & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0
+                    || self.protection().is_encrypted()
+                    || self.protection().is_verity()
                 {
                     return Err(Error::UnsupportedInodeMutation);
                 }

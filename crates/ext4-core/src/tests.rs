@@ -18,10 +18,10 @@ use crate::{
     DeviceLength, DirectoryEntry, DirectoryEntryKind, DirectoryNode, Error, Ext4Gid, Ext4Name,
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, Ext4VolumeLabel,
     Ext4WindowsAttributes, Extent, ExtentLength, ExtentTree, ExtentTreeContext, ExternalJournal,
-    FileNode, FileOffset, FileSize, InodeExtentRoot, InodeId, JournalMode, LogicalBlock,
-    LookupResult, MountContext, MutableExtentTree, NewDirectoryMetadata, NewFileMetadata,
-    NewSymlinkMetadata, Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite,
-    SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget,
+    FileNode, FileOffset, FileSize, InodeExtentRoot, InodeId, InodeProtection, JournalMode,
+    LogicalBlock, LookupResult, MountContext, MutableExtentTree, NewDirectoryMetadata,
+    NewFileMetadata, NewSymlinkMetadata, Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly,
+    ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget,
     TransactionDirectory, TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName,
     XattrNamespace, XattrValue,
 };
@@ -33,6 +33,8 @@ const ROOT_DIR_BLOCK: u32 = 8;
 const FILE_DATA_BLOCK: u32 = 9;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const EXT4_INDEX_FL: u32 = 0x0000_1000;
+const EXT4_ENCRYPT_FL: u32 = 0x0000_0800;
+const EXT4_VERITY_FL: u32 = 0x0010_0000;
 const MODERN_IMAGE_BLOCKS: usize = 64;
 const MODERN_INODE_SIZE: usize = 256;
 const MODERN_BLOCK_BITMAP_BLOCK: u32 = 3;
@@ -1220,6 +1222,30 @@ fn uninitialized_extent_write_is_rejected() {
         device,
         test_mount_context(),
     ));
+    let mut transaction = volume.begin_transaction(NOW);
+    let file = transaction_file(&transaction, 3);
+    let result = transaction.overwrite_file_range(file, FileOffset::ZERO, b"x");
+
+    assert_eq!(result, Err(Error::UnsupportedInodeMutation));
+}
+
+#[test]
+fn inode_protection_flags_are_typed_before_mutation_policy() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    put_u32(
+        &mut image,
+        modern_inode_offset(3) + 32,
+        EXT4_EXTENTS_FL | EXT4_ENCRYPT_FL | EXT4_VERITY_FL,
+    );
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+        device,
+        test_mount_context(),
+    ));
+
+    let file = file_node(&volume, 3);
+    assert_eq!(file.protection(), InodeProtection::EncryptedVerity);
+
     let mut transaction = volume.begin_transaction(NOW);
     let file = transaction_file(&transaction, 3);
     let result = transaction.overwrite_file_range(file, FileOffset::ZERO, b"x");
