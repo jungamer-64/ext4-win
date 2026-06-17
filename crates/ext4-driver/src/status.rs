@@ -69,6 +69,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::InvalidName
         | Error::InvalidXattr
         | Error::InvalidAcl
+        | Error::InvalidEncryptionContext
         | Error::InvalidWriteRange
         | Error::TransactionTooLarge => STATUS_INVALID_PARAMETER,
         Error::TruncatedStructure

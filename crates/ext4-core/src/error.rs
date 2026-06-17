@@ -82,6 +82,8 @@ pub enum Error {
     UnsupportedInodeMutation,
     /// The root directory cannot be removed.
     CannotRemoveRoot,
+    /// An fscrypt context, key, or policy is malformed or unsupported.
+    InvalidEncryptionContext,
 }
 
 impl fmt::Display for Error {
@@ -126,6 +128,7 @@ impl fmt::Display for Error {
             Self::UnsupportedDirectoryHash => "unsupported ext4 directory hash",
             Self::UnsupportedInodeMutation => "unsupported ext4 inode mutation",
             Self::CannotRemoveRoot => "cannot remove the ext4 root directory",
+            Self::InvalidEncryptionContext => "invalid ext4 encryption context",
         })
     }
 }

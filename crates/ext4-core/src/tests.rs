@@ -20,7 +20,7 @@ use crate::{
     Ext4WindowsAttributes, Extent, ExtentLength, ExtentTree, ExtentTreeContext, ExternalJournal,
     FileNode, FileOffset, FileSize, InodeExtentRoot, InodeId, JournalMode, LogicalBlock,
     LookupResult, MutableExtentTree, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
-    Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite, SliceBlockDevice,
+    MountContext, Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite, SliceBlockDevice,
     SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget, TransactionDirectory,
     TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName, XattrNamespace, XattrValue,
 };
@@ -185,6 +185,10 @@ fn test_symlink_metadata() -> NewSymlinkMetadata {
     NewSymlinkMetadata::new(test_owner(), must(Ext4Permissions::new(0o777)))
 }
 
+fn test_mount_context() -> MountContext {
+    MountContext::without_encryption_keys()
+}
+
 fn overwrite_file<D: BlockWriter, J>(
     transaction: &mut crate::WriteTransaction<'_, D, J>,
     inode_id: u32,
@@ -217,7 +221,7 @@ fn truncate_file<D: BlockWriter, J>(
 fn clean_superblock_mounts() {
     let image = fixture_image();
     let device = SliceBlockDevice::new(&image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device, test_mount_context()));
 
     assert_eq!(volume.superblock().block_size().bytes(), 1024);
     assert_eq!(volume.superblock().inode_count().as_u32(), 16);
@@ -236,7 +240,7 @@ fn invalid_magic_is_rejected() {
 fn dirty_volume_is_rejected() {
     let mut image = fixture_image();
     put_u16(&mut image, 1024 + 58, 0);
-    let result = Volume::<_, ReadOnly>::mount_read_only(SliceBlockDevice::new(&image));
+    let result = Volume::<_, ReadOnly>::mount_read_only(SliceBlockDevice::new(&image), test_mount_context());
 
     assert!(matches!(result, Err(Error::DirtyVolume)));
 }
@@ -245,7 +249,7 @@ fn dirty_volume_is_rejected() {
 fn unsupported_incompat_feature_is_rejected() {
     let mut image = fixture_image();
     put_u32(&mut image, 1024 + 96, 0x0010 | 0x0040);
-    let result = Volume::<_, ReadOnly>::mount_read_only(SliceBlockDevice::new(&image));
+    let result = Volume::<_, ReadOnly>::mount_read_only(SliceBlockDevice::new(&image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedIncompatFeature)));
 }
@@ -255,7 +259,7 @@ fn directory_entries_are_parsed_from_root_inode() {
     let image = fixture_image();
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let entries = read_directory(&volume, InodeId::ROOT);
 
     assert_eq!(entries.len(), 4);
@@ -270,7 +274,7 @@ fn sparse_file_reads_zeroes_for_holes() {
     let image = fixture_image();
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let mut output = vec![0xAA; 1030];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -285,7 +289,7 @@ fn symlink_inline_target_is_read_without_extents() {
     let image = fixture_image();
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let target = read_symlink(&volume, 4);
 
     assert_eq!(target, b"file");
@@ -297,7 +301,7 @@ fn uninitialized_extent_reads_as_zeroes() {
     put_u16(&mut image, inode_offset(3) + 56, 0x8001);
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let mut output = [0xAA; 5];
     let read = read_file(&volume, 3, 1024, &mut output);
 
@@ -310,7 +314,7 @@ fn exact_ext4_lookup_uses_raw_bytes() {
     let image = fixture_image();
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let child = lookup_ext4(&volume, InodeId::ROOT, b"file");
 
     assert_eq!(child, LookupResult::Found(inode(3)));
@@ -329,7 +333,7 @@ fn windows_lookup_accepts_unique_ascii_case_fold() {
     let image = fixture_image();
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let child = lookup_windows(&volume, InodeId::ROOT, &[0x0046, 0x0049, 0x004C, 0x0045]);
 
     assert_eq!(child, LookupResult::Found(inode(3)));
@@ -352,7 +356,7 @@ fn lookup_reports_not_found_without_option() {
     let image = fixture_image();
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
 
     assert_eq!(
         lookup_ext4(&volume, InodeId::ROOT, b"missing"),
@@ -373,7 +377,7 @@ fn windows_lookup_rejects_ambiguous_case_fold() {
     );
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let root = directory_node(&volume, InodeId::ROOT);
     let requested = must(WindowsName::from_utf16(&[0x0046, 0x0069, 0x004C, 0x0065]));
     let result = volume.lookup_windows_child(&root, &requested);
@@ -414,7 +418,7 @@ fn larger_block_sizes_mount_and_read_file() {
         let image = variable_block_fixture_image(block_size);
         let volume = must(Volume::<_, ReadOnly>::mount_read_only(
             SliceBlockDevice::new(&image),
-        ));
+         test_mount_context()));
         let mut output = [0_u8; 5];
         let read = read_file(&volume, 3, 0, &mut output);
 
@@ -445,7 +449,7 @@ fn metadata_csum_seed_is_accepted_with_metadata_csum() {
     refresh_primary_block_group_descriptor_checksum(&mut image);
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
 
     assert_eq!(volume.superblock().checksum_seed().as_u32(), 0x1234_5678);
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 3);
@@ -458,7 +462,7 @@ fn write_mount_accepts_metadata_csum_seed() {
     put_u32(&mut image, 1024 + 624, 0x1234_5678);
     refresh_primary_block_group_descriptor_checksum(&mut image);
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
 
     assert_eq!(volume.superblock().checksum_seed().as_u32(), 0x1234_5678);
 }
@@ -477,7 +481,7 @@ fn metadata_descriptor_checksum_is_verified() {
     let image = modern_fixture_image();
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
 
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 3);
 }
@@ -488,7 +492,7 @@ fn bad_metadata_descriptor_checksum_is_rejected() {
     corrupt_primary_block_group_descriptor_checksum(&mut image);
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let result = volume.read_node(InodeId::ROOT);
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
@@ -501,7 +505,7 @@ fn gdt_descriptor_checksum_is_verified() {
     refresh_primary_block_group_descriptor_checksum(&mut image);
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
 
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 4);
 }
@@ -514,7 +518,7 @@ fn bad_gdt_descriptor_checksum_is_rejected() {
     corrupt_primary_block_group_descriptor_checksum(&mut image);
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let result = volume.read_node(InodeId::ROOT);
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
@@ -527,7 +531,7 @@ fn read_only_mount_accepts_quota_and_clean_orphan_file() {
     put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | RO_COMPAT_QUOTA);
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
 
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 4);
 }
@@ -539,7 +543,7 @@ fn read_only_mount_accepts_encryption_and_verity_feature_bits() {
     put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | RO_COMPAT_VERITY);
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
 
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 4);
 }
@@ -582,7 +586,7 @@ fn jbd2_header_is_big_endian() {
 fn write_mount_accepts_modern_baseline() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
 
     assert_eq!(
         volume.superblock().journal_mode(),
@@ -594,7 +598,7 @@ fn write_mount_accepts_modern_baseline() {
 fn write_mount_accepts_bigalloc() {
     let mut image = bigalloc_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
 
     assert_eq!(volume.superblock().cluster_size().bytes(), 4096);
     assert_eq!(volume.superblock().blocks_per_cluster().as_u32(), 4);
@@ -638,7 +642,7 @@ fn bigalloc_geometry_rejections_are_targeted() {
 fn overwrite_existing_file_range_commits() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
 
     let mut transaction = volume.begin_transaction(NOW);
     overwrite_file(&mut transaction, 3, 0, b"HELLO");
@@ -654,7 +658,7 @@ fn overwrite_existing_file_range_commits() {
 fn sparse_hole_write_allocates_block() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
 
     let mut transaction = volume.begin_transaction(NOW);
     overwrite_file(&mut transaction, 3, 1024, b"hole");
@@ -674,7 +678,7 @@ fn bigalloc_hole_write_reuses_logical_cluster() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         overwrite_file(&mut transaction, 3, 1024, b"hole");
         must(transaction.commit());
@@ -704,7 +708,7 @@ fn bigalloc_sparse_extension_allocates_one_cluster() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
@@ -751,7 +755,7 @@ fn bigalloc_partial_truncate_preserves_referenced_cluster() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         truncate_file(
             &mut transaction,
@@ -778,7 +782,7 @@ fn bigalloc_full_truncate_frees_last_cluster_reference() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         truncate_file(&mut transaction, 3, 0);
         must(transaction.commit());
@@ -802,7 +806,7 @@ fn bigalloc_unlink_file_frees_last_cluster_reference() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, InodeId::ROOT);
         must(transaction.unlink_file(root, &must(Ext4Name::new(b"file"))));
@@ -842,7 +846,7 @@ fn bigalloc_two_extents_in_same_physical_cluster_are_indexed() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         truncate_file(
             &mut transaction,
@@ -880,7 +884,7 @@ fn bigalloc_duplicate_physical_block_reference_is_rejected() {
         MODERN_FILE_DATA_BLOCK,
     );
     let device = SliceBlockDeviceMut::new(&mut image);
-    let result = Volume::<_, ReadWrite>::mount_read_write(device);
+    let result = Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context());
 
     assert_eq!(result.map(|_| ()), Err(Error::ClusterReferenceConflict));
 }
@@ -894,7 +898,7 @@ fn bigalloc_mount_rejects_references_into_free_clusters() {
         false,
     );
     let device = SliceBlockDeviceMut::new(&mut image);
-    let result = Volume::<_, ReadWrite>::mount_read_write(device);
+    let result = Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context());
 
     assert_eq!(result.map(|_| ()), Err(Error::ClusterReferenceConflict));
 }
@@ -912,7 +916,7 @@ fn bigalloc_allocated_unreferenced_cluster_remains_unavailable() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
@@ -940,7 +944,7 @@ fn bigalloc_directory_create_remove_returns_cluster_count() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, InodeId::ROOT);
         let child = must(transaction.create_directory(
@@ -967,7 +971,7 @@ fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
@@ -1007,7 +1011,7 @@ fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
 
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let mut output = [0_u8; 1];
     assert_eq!(
         read_file(
@@ -1028,7 +1032,7 @@ fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
@@ -1103,7 +1107,7 @@ fn external_extent_block_checksum_mismatch_is_rejected() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
@@ -1127,7 +1131,7 @@ fn external_extent_block_checksum_mismatch_is_rejected() {
 
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let file = file_node(&volume, 3);
     let mut output = [0_u8; 1];
     let result = volume.read_file(&file, FileOffset::ZERO, &mut output);
@@ -1140,7 +1144,7 @@ fn uninitialized_extent_write_is_rejected() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     put_u16(&mut image, modern_inode_offset(3) + 56, 0x8001);
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
     let file = transaction_file(&transaction, 3);
     let result = transaction.overwrite_file_range(file, FileOffset::ZERO, b"x");
@@ -1152,7 +1156,7 @@ fn uninitialized_extent_write_is_rejected() {
 fn extend_file_creates_sparse_range() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
 
     let mut transaction = volume.begin_transaction(NOW);
     extend_file(&mut transaction, 3, 3072);
@@ -1170,7 +1174,7 @@ fn extend_file_creates_sparse_range() {
 fn truncate_file_releases_blocks() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
 
     let mut write = volume.begin_transaction(NOW);
     overwrite_file(&mut write, 3, 1024, b"hole");
@@ -1187,7 +1191,7 @@ fn truncate_file_releases_blocks() {
 fn transaction_too_large_is_rejected_before_writes() {
     let mut image = modern_fixture_image_with_journal_blocks(3);
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
 
     overwrite_file(&mut transaction, 3, 1024, b"hole");
@@ -1202,7 +1206,7 @@ fn create_file_adds_directory_entry_and_inode() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, InodeId::ROOT);
         let name = must(Ext4Name::new(b"new"));
@@ -1225,7 +1229,7 @@ fn create_file_adds_directory_entry_and_inode() {
 fn create_file_rejects_duplicate_name() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
     let root = transaction_directory(&transaction, InodeId::ROOT);
     let name = must(Ext4Name::new(b"file"));
@@ -1238,7 +1242,7 @@ fn create_file_rejects_duplicate_name() {
 fn inode_security_is_parsed_from_owner_and_mode() {
     let image = modern_fixture_image();
     let device = SliceBlockDevice::new(&image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device, test_mount_context()));
 
     let file = file_node(&volume, 3);
     assert_eq!(file.security().owner().uid().as_u32(), 0);
@@ -1256,7 +1260,7 @@ fn inode_times_are_parsed_from_inode_fields() {
     put_u32(&mut image, offset + 144, 44);
 
     let device = SliceBlockDevice::new(&image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device, test_mount_context()));
     let file = file_node(&volume, 3);
 
     assert_eq!(
@@ -1276,7 +1280,7 @@ fn set_posix_security_updates_owner_and_permissions() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let security = Ext4Security::new(
             Ext4Owner::new(
                 Ext4Uid::from_u32(0x0002_0001),
@@ -1314,7 +1318,7 @@ fn set_times_updates_inode_timestamp_fields() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, inode(3));
         must(transaction.set_times(node, times));
@@ -1335,7 +1339,7 @@ fn volume_label_round_trips_through_superblock() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         transaction.set_volume_label(label);
         must(transaction.commit());
@@ -1346,7 +1350,7 @@ fn volume_label_round_trips_through_superblock() {
 
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     assert_eq!(volume.volume_label(), label);
     assert_eq!(volume.volume_label().bytes(), b"EXT4WIN");
 }
@@ -1368,7 +1372,7 @@ fn in_inode_xattr_round_trips_through_inode_body() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, inode(3));
         must(transaction.set_xattr(node, name.clone(), value.clone()));
@@ -1381,7 +1385,7 @@ fn in_inode_xattr_round_trips_through_inode_body() {
 
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     assert_eq!(must(volume.read_xattr(inode(3), &name)), Some(value));
     assert_eq!(must(volume.read_xattrs(inode(3))).entries().len(), 1);
 }
@@ -1395,7 +1399,7 @@ fn external_xattr_block_is_allocated_and_removed() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, inode(3));
         must(transaction.set_xattr(node, name.clone(), value.clone()));
@@ -1413,12 +1417,12 @@ fn external_xattr_block_is_allocated_and_removed() {
 
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     assert_eq!(must(volume.read_xattr(inode(3), &name)), Some(value));
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, inode(3));
         assert_eq!(
@@ -1431,7 +1435,7 @@ fn external_xattr_block_is_allocated_and_removed() {
     assert_eq!(get_u32(&image, inode_offset + 104), 0);
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     assert_eq!(must(volume.read_xattr(inode(3), &name)), None);
 }
 
@@ -1445,7 +1449,7 @@ fn bigalloc_external_xattr_allocation_uses_cluster_accounting() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, inode(3));
         must(transaction.set_xattr(node, name.clone(), value.clone()));
@@ -1465,7 +1469,7 @@ fn bigalloc_external_xattr_allocation_uses_cluster_accounting() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, inode(3));
         assert_eq!(must(transaction.remove_xattr(node, &name)), Some(value));
@@ -1496,7 +1500,7 @@ fn posix_acl_uses_typed_acl_boundary() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, inode(3));
         must(transaction.set_posix_acl(node, PosixAclKind::Access, acl.clone()));
@@ -1505,7 +1509,7 @@ fn posix_acl_uses_typed_acl_boundary() {
 
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     assert_eq!(
         must(volume.read_posix_acl(inode(3), PosixAclKind::Access)),
         Some(acl)
@@ -1525,7 +1529,7 @@ fn windows_overlay_is_stored_in_user_ext4win_xattr() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, inode(3));
         must(transaction.set_windows_overlay(node, overlay));
@@ -1534,7 +1538,7 @@ fn windows_overlay_is_stored_in_user_ext4win_xattr() {
 
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     assert_eq!(must(volume.read_windows_overlay(inode(3))), Some(overlay));
     assert_eq!(
         must(volume.read_xattr(inode(3), &must(WindowsOverlay::attributes_xattr_name()))),
@@ -1548,7 +1552,7 @@ fn unlink_file_removes_directory_entry_and_frees_inode() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let name = must(Ext4Name::new(b"new"));
 
         let mut create = volume.begin_transaction(NOW);
@@ -1574,7 +1578,7 @@ fn unlink_file_removes_directory_entry_and_frees_inode() {
 fn unlink_file_reports_missing_entry() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
     let root = transaction_directory(&transaction, InodeId::ROOT);
     let name = must(Ext4Name::new(b"missing"));
@@ -1589,7 +1593,7 @@ fn rename_file_updates_staged_directory_entry() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, InodeId::ROOT);
         let old_name = must(Ext4Name::new(b"old"));
@@ -1616,7 +1620,7 @@ fn rename_file_updates_staged_directory_entry() {
 fn rename_rejects_existing_target() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
     let root = transaction_directory(&transaction, InodeId::ROOT);
     let source = must(Ext4Name::new(b"file"));
@@ -1633,7 +1637,7 @@ fn create_and_remove_empty_directory_updates_namespace() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let name = must(Ext4Name::new(b"dir"));
 
         let mut create = volume.begin_transaction(NOW);
@@ -1667,7 +1671,7 @@ fn create_inline_symlink_adds_directory_entry_and_inode() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, InodeId::ROOT);
         let name = must(Ext4Name::new(b"inline-link"));
@@ -1693,7 +1697,7 @@ fn create_extent_symlink_writes_target_blocks() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, InodeId::ROOT);
         let name = must(Ext4Name::new(b"extent-link"));
@@ -1714,7 +1718,7 @@ fn remove_symlink_removes_directory_entry_and_frees_inode() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let name = must(Ext4Name::new(b"delete-link"));
         let target = must(SymlinkTarget::new(b"file"));
 
@@ -1741,7 +1745,7 @@ fn rename_directory_across_parents_updates_dotdot() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let source_name = must(Ext4Name::new(b"a"));
         let target_parent_name = must(Ext4Name::new(b"b"));
         let moved_name = must(Ext4Name::new(b"moved"));
@@ -1794,7 +1798,7 @@ fn rename_directory_across_parents_updates_dotdot() {
 fn remove_directory_rejects_non_empty_child() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let dir_name = must(Ext4Name::new(b"dir"));
     let file_name = must(Ext4Name::new(b"child"));
 
@@ -1819,7 +1823,7 @@ fn remove_directory_rejects_non_empty_child() {
 fn remove_directory_rejects_root_entry() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
     let root = transaction_directory(&transaction, InodeId::ROOT);
     let dot = must(Ext4Name::new(b"."));
@@ -1835,7 +1839,7 @@ fn indexed_directory_create_rebuilds_real_htree() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, InodeId::ROOT);
         let name = must(Ext4Name::new(b"idx"));
@@ -1863,7 +1867,7 @@ fn htree_directory_read_lookup_and_windows_lookup_use_real_index() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     make_indexed_root_directory(&mut image);
     let device = SliceBlockDevice::new(&image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device, test_mount_context()));
 
     let entries = read_directory(&volume, InodeId::ROOT);
 
@@ -1895,7 +1899,7 @@ fn htree_dx_tail_checksum_mismatch_is_rejected() {
     make_indexed_root_directory(&mut image);
     image[block_offset(MODERN_ROOT_DIR_BLOCK) + 36] ^= 1;
     let device = SliceBlockDevice::new(&image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device, test_mount_context()));
     let root = directory_node(&volume, InodeId::ROOT);
 
     assert_eq!(volume.read_directory(&root), Err(Error::ChecksumMismatch));
@@ -1907,7 +1911,7 @@ fn htree_leaf_tail_checksum_mismatch_is_rejected() {
     make_indexed_root_directory(&mut image);
     image[block_offset(MODERN_EXTENT_INDEX_BLOCK) + 8] ^= 1;
     let device = SliceBlockDevice::new(&image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device, test_mount_context()));
     let root = directory_node(&volume, InodeId::ROOT);
 
     assert_eq!(volume.read_directory(&root), Err(Error::ChecksumMismatch));
@@ -1919,7 +1923,7 @@ fn linear_directory_converts_to_htree_when_full() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         for index in 0..4_u8 {
             let mut bytes = vec![b'a' + index; 240];
             bytes.push(b'0' + index);
@@ -1951,7 +1955,7 @@ fn indexed_directory_rename_and_unlink_rebuild_htree_consistently() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let old_name = must(Ext4Name::new(b"temp"));
         let renamed_name = must(Ext4Name::new(b"renamed"));
 
@@ -1997,7 +2001,7 @@ fn committed_dirty_journal_transaction_is_replayed() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut output = [0_u8; 6];
         let read = read_file(&volume, 3, 0, &mut output);
         assert_eq!(read, 6);
@@ -2017,7 +2021,7 @@ fn descriptor_without_commit_is_ignored() {
     write_jbd2_descriptor(&mut image, 1, 8, MODERN_FILE_DATA_BLOCK, 0);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2035,7 +2039,7 @@ fn bad_tag_checksum_transaction_is_rejected() {
     write_jbd2_commit(&mut image, 3, 9);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let result = Volume::<_, ReadWrite>::mount_read_write(device);
+    let result = Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context());
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
     assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x1C), 1);
@@ -2054,7 +2058,7 @@ fn later_revoke_prevents_stale_metadata_replay() {
     write_jbd2_commit(&mut image, 5, 11);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2072,7 +2076,7 @@ fn circular_journal_wraparound_is_replayed() {
     write_jbd2_commit(&mut image, 1, 12);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2096,7 +2100,7 @@ fn escaped_journal_data_block_is_unescaped_on_replay() {
     write_jbd2_commit(&mut image, 3, 13);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2117,7 +2121,7 @@ fn checkpointed_dirty_journal_replay_is_idempotent() {
     write_jbd2_commit(&mut image, 3, 14);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2144,7 +2148,7 @@ fn external_journal_uuid_mismatch_is_rejected() {
         Volume::mount_read_write_with_external_journal(
             SliceBlockDeviceMut::new(&mut image),
             SliceBlockDeviceMut::new(&mut journal),
-        );
+         test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -2162,7 +2166,7 @@ fn fast_commit_journal_feature_is_rejected() {
         default_journal_incompat() | JBD2_FEATURE_INCOMPAT_FAST_COMMIT,
     );
     let device = SliceBlockDeviceMut::new(&mut image);
-    let result = Volume::<_, ReadWrite>::mount_read_write(device);
+    let result = Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -2172,7 +2176,7 @@ fn write_transaction_emits_descriptor_data_and_commit_records() {
     let mut image = modern_fixture_image();
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         overwrite_file(&mut transaction, 3, 0, b"HELLO");
         must(transaction.commit());
@@ -2195,7 +2199,7 @@ fn emitted_committed_records_are_replayable_after_checkpoint_loss() {
     let mut image = modern_fixture_image();
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(&mut transaction, 3, 3072);
         must(transaction.commit());
@@ -2206,7 +2210,7 @@ fn emitted_committed_records_are_replayable_after_checkpoint_loss() {
     write_dirty_journal_superblock(&mut image, 1, 1);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let file = file_node(&volume, 3);
 
     assert_eq!(file.size().bytes(), 3072);
@@ -2222,7 +2226,7 @@ fn legacy_32bit_descriptor_tag_is_replayed() {
     write_jbd2_commit(&mut image, 3, 15);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2249,7 +2253,7 @@ fn csum_v2_descriptor_tail_and_commit_checksum_are_verified() {
     write_jbd2_commit_with_checksum(&mut image, 3, 16, uuid);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2266,7 +2270,7 @@ fn zero_tag_checksum_is_rejected() {
     write_jbd2_descriptor_with_checksum(&mut image, 1, 17, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_commit(&mut image, 3, 17);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -2281,7 +2285,7 @@ fn zero_descriptor_tail_checksum_is_rejected() {
     put_be_u32(&mut image, journal_log_offset(1) + BLOCK_SIZE - 4, 0);
     write_jbd2_commit(&mut image, 3, 18);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -2296,7 +2300,7 @@ fn invalid_commit_checksum_is_rejected() {
     write_jbd2_commit(&mut image, 3, 19);
     put_be_u32(&mut image, journal_log_offset(3) + 0x10, 0xDEAD_BEEF);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -2314,7 +2318,7 @@ fn invalid_revoke_tail_checksum_is_rejected() {
     );
     write_jbd2_commit(&mut image, 2, 20);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -2332,7 +2336,7 @@ fn journal_superblock_fields_and_checksum_are_preserved_when_cleaned() {
     write_jbd2_commit(&mut image, 3, 21);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let _volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let _volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
 
     assert_eq!(get_be_u32(&image, base + 0x18), 22);
     assert_eq!(get_be_u32(&image, base + 0x1C), 0);
@@ -2353,7 +2357,7 @@ fn journal_sequence_wraps_after_max_transaction() {
     write_jbd2_commit(&mut image, 3, u32::MAX);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let _volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let _volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
 
     assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x18), 0);
     assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x1C), 0);
@@ -2364,7 +2368,7 @@ fn nonzero_journal_ro_compat_is_rejected() {
     let mut image = modern_fixture_image();
     put_be_u32(&mut image, journal_log_offset(0) + 0x2C, 1);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -2374,7 +2378,7 @@ fn recovery_required_with_zero_journal_start_is_rejected() {
     let mut image = modern_fixture_image();
     mark_filesystem_needs_recovery(&mut image);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
     assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
@@ -2395,7 +2399,7 @@ fn replay_target_outside_filesystem_is_rejected() {
     );
     write_jbd2_commit(&mut image, 3, 22);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -2409,7 +2413,7 @@ fn replay_target_inside_internal_journal_is_rejected() {
     write_jbd2_descriptor(&mut image, 1, 23, MODERN_JOURNAL_BLOCK, 0);
     write_jbd2_commit(&mut image, 3, 23);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -2424,7 +2428,7 @@ fn emitted_journal_data_escapes_jbd2_magic_prefix() {
     );
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         overwrite_file(&mut transaction, 3, 0, b"MAGIC");
         must(transaction.commit());
@@ -2477,7 +2481,7 @@ fn descriptor_tag_uuid_mismatch_is_rejected() {
     );
     write_jbd2_commit_with_checksum(&mut image, 3, 24, journal_uuid);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -2508,7 +2512,7 @@ fn descriptor_tag_uuid_match_is_replayed() {
     write_jbd2_commit_with_checksum(&mut image, 3, 25, journal_uuid);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2531,7 +2535,7 @@ fn descriptor_without_last_tag_is_rejected() {
     write_jbd2_block_tail_checksum(&mut image, 1, [0; 16]);
     write_jbd2_commit(&mut image, 3, 26);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -2547,7 +2551,7 @@ fn empty_descriptor_commit_is_rejected() {
     write_jbd2_block_tail_checksum(&mut image, 1, [0; 16]);
     write_jbd2_commit(&mut image, 2, 27);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -2569,7 +2573,7 @@ fn duplicate_home_block_in_transaction_is_rejected() {
     );
     write_jbd2_commit(&mut image, 4, 28);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -2585,7 +2589,7 @@ fn second_descriptor_block_is_rejected() {
     write_jbd2_descriptor(&mut image, 3, 29, MODERN_ROOT_DIR_BLOCK, 0);
     write_jbd2_commit(&mut image, 5, 29);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -2599,7 +2603,7 @@ fn commit_sequence_mismatch_is_rejected() {
     write_jbd2_descriptor(&mut image, 1, 30, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_commit(&mut image, 3, 31);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
     assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
@@ -2616,7 +2620,7 @@ fn same_transaction_later_revoke_prevents_replay() {
     write_jbd2_commit(&mut image, 4, 31);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2634,7 +2638,7 @@ fn malformed_revoke_remainder_is_rejected() {
     write_jbd2_block_tail_checksum(&mut image, 1, [0; 16]);
     write_jbd2_commit(&mut image, 2, 32);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -2651,7 +2655,7 @@ fn wrapped_later_revoke_prevents_old_sequence_replay() {
     write_jbd2_commit(&mut image, 5, 0);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2664,7 +2668,7 @@ fn nonzero_journal_compat_is_rejected() {
     let mut image = modern_fixture_image();
     put_be_u32(&mut image, journal_log_offset(0) + 0x24, 1);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -2674,7 +2678,7 @@ fn journal_first_block_must_be_one() {
     let mut image = modern_fixture_image();
     put_be_u32(&mut image, journal_log_offset(0) + 0x14, 2);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -2684,7 +2688,7 @@ fn journal_maxlen_beyond_inode_capacity_is_rejected() {
     let mut image = modern_fixture_image();
     put_be_u32(&mut image, journal_log_offset(0) + 0x10, 9);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image));
+    let result = Volume::<_, ReadWrite>::mount_read_write(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -2709,7 +2713,7 @@ fn external_journal_short_device_is_rejected() {
         Volume::mount_read_write_with_external_journal(
             SliceBlockDeviceMut::new(&mut image),
             SliceBlockDeviceMut::new(&mut journal),
-        );
+         test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -2728,7 +2732,7 @@ fn fragmented_internal_journal_is_mapped_on_demand() {
     move_journal_block(&mut image, 6, 30);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2758,14 +2762,14 @@ fn checkpoint_failure_leaves_replayable_dirty_journal() {
             u64::try_from(block_offset(MODERN_FILE_DATA_BLOCK)).unwrap_or(u64::MAX),
         );
         let device = FailOneWriteAt::new(&mut image, fail_offset);
-        let result = Volume::<_, ReadWrite>::mount_read_write(device);
+        let result = Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context());
         assert!(matches!(result, Err(Error::DeviceRange)));
     }
     assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x1C), 1);
     assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -2779,7 +2783,7 @@ fn extent_depth_traversal_reads_index_block() {
     write_indexed_file_inode(&mut image);
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
-    ));
+     test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 

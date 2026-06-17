@@ -15,6 +15,7 @@ use crate::extent::{
     BlockMapping, Extent, ExtentLength, ExtentTree, ExtentTreeContext, LogicalBlock,
     MutableExtentTree, SerializedExtentTree,
 };
+use crate::fscrypt::FscryptMasterKey;
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset, FileSize,
@@ -115,6 +116,35 @@ const SUPERBLOCK_OFFSET: u64 = 1024;
 /// Read-only mounted volume state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadOnly;
+
+/// Mount-time context that keeps external unlock material out of superblock parsing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountContext {
+    /// fscrypt master keys available for this mount.
+    fscrypt_keys: Vec<FscryptMasterKey>,
+}
+
+impl MountContext {
+    /// Creates a mount context without any fscrypt unlock keys.
+    #[must_use]
+    pub const fn without_encryption_keys() -> Self {
+        Self {
+            fscrypt_keys: Vec::new(),
+        }
+    }
+
+    /// Creates a mount context with explicit fscrypt unlock keys.
+    #[must_use]
+    pub fn with_fscrypt_keys(fscrypt_keys: Vec<FscryptMasterKey>) -> Self {
+        Self { fscrypt_keys }
+    }
+
+    /// fscrypt master keys available to this mount.
+    #[must_use]
+    pub fn fscrypt_keys(&self) -> &[FscryptMasterKey] {
+        &self.fscrypt_keys
+    }
+}
 
 /// Journal stored as a hidden ext4 inode on the filesystem device.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -398,6 +428,8 @@ pub struct Volume<D, State> {
     device: D,
     /// Validated superblock and mount policy.
     superblock: Superblock,
+    /// External mount context such as fscrypt unlock keys.
+    mount_context: MountContext,
     /// Typestate carrying read-only or journaled read-write capability.
     state: State,
 }
@@ -570,11 +602,12 @@ impl<D: BlockReader> Volume<D, ReadOnly> {
     ///
     /// # Errors
     /// Returns an error when the device does not contain a supported ext4 superblock.
-    pub fn mount_read_only(device: D) -> Result<Self> {
+    pub fn mount_read_only(device: D, mount_context: MountContext) -> Result<Self> {
         let superblock = Superblock::read_from(&device)?;
         Ok(Self {
             device,
             superblock,
+            mount_context,
             state: ReadOnly,
         })
     }
@@ -585,7 +618,7 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
     ///
     /// # Errors
     /// Returns an error when the device is not a supported journaled ext4 volume.
-    pub fn mount_read_write(mut device: D) -> Result<Self> {
+    pub fn mount_read_write(mut device: D, mount_context: MountContext) -> Result<Self> {
         let mut superblock = Superblock::read_write_from(&device)?;
         let JournalMode::Internal(journal_inode_id) = superblock.journal_mode() else {
             return Err(Error::UnsupportedJournal);
@@ -593,6 +626,7 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
         let read_only = Volume::<&mut D, ReadOnly> {
             device: &mut device,
             superblock,
+            mount_context: mount_context.clone(),
             state: ReadOnly,
         };
         let journal_inode = read_only.read_inode_record(journal_inode_id)?;
@@ -617,6 +651,7 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
             let recovered = Volume::<&mut D, ReadOnly> {
                 device: &mut device,
                 superblock,
+                mount_context: mount_context.clone(),
                 state: ReadOnly,
             };
             ClusterReferenceIndex::load(&recovered)?
@@ -624,6 +659,7 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
         Ok(Self {
             device,
             superblock,
+            mount_context,
             state: ReadWrite { journal, clusters },
         })
     }
@@ -658,6 +694,7 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
     pub fn mount_read_write_with_external_journal(
         mut device: D,
         journal_device: J,
+        mount_context: MountContext,
     ) -> Result<Self> {
         let mut superblock = Superblock::read_write_from(&device)?;
         let JournalMode::External(journal_uuid) = superblock.journal_mode() else {
@@ -689,6 +726,7 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
             let recovered = Volume::<&mut D, ReadOnly> {
                 device: &mut device,
                 superblock,
+                mount_context: mount_context.clone(),
                 state: ReadOnly,
             };
             ClusterReferenceIndex::load(&recovered)?
@@ -696,6 +734,7 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
         Ok(Self {
             device,
             superblock,
+            mount_context,
             state: ReadWrite { journal, clusters },
         })
     }
@@ -730,6 +769,12 @@ impl<D: BlockReader, State> Volume<D, State> {
     #[must_use]
     pub const fn superblock(&self) -> Superblock {
         self.superblock
+    }
+
+    /// Mount context used by this volume.
+    #[must_use]
+    pub const fn mount_context(&self) -> &MountContext {
+        &self.mount_context
     }
 
     /// Filesystem volume label parsed from the mounted superblock.
