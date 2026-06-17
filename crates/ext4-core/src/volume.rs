@@ -5,7 +5,10 @@ use alloc::{vec, vec::Vec};
 use crate::acl::{PosixAcl, PosixAclKind};
 use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
 use crate::checksum::crc32c;
-use crate::dir::{DirectoryBlock, DirectoryEntry, DirectoryEntryKind};
+use crate::dir::{
+    DirectoryBlock, DirectoryBlockData, DirectoryChecksum, DirectoryEntry, DirectoryEntryKind,
+    DirectoryLayout, build_htree_directory,
+};
 use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
 use crate::extent::{
@@ -42,6 +45,8 @@ const MODE_SYMLINK: u16 = 0xA000;
 const MODE_KIND_MASK: u16 = 0xF000;
 /// `i_flags` bit indicating extent-based block mapping.
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+/// `i_flags` bit indicating an HTree-indexed directory.
+const EXT4_INDEX_FL: u32 = 0x0000_1000;
 /// Offset of `i_mode` in an inode record.
 const INODE_MODE_OFFSET: usize = 0;
 /// Offset of `i_uid_lo` in an inode record.
@@ -818,13 +823,7 @@ impl<D: BlockReader, State> Volume<D, State> {
     /// Returns an error when the directory is too large for eager
     /// enumeration, or contains malformed entries.
     pub fn read_directory(&self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
-        if directory.inode().size().bytes() > MAX_EAGER_DIRECTORY_BYTES {
-            return Err(Error::DirectoryTooLarge);
-        }
-        let len = directory.inode().size().to_usize()?;
-        let mut bytes = vec![0_u8; len];
-        let _bytes_read = self.read_inode_data(directory.inode(), FileOffset::ZERO, &mut bytes)?;
-        DirectoryEntry::parse_all(&bytes)
+        Ok(self.read_directory_layout(directory.inode())?.entries())
     }
 
     /// Looks up an exact ext4 child name under a directory.
@@ -832,10 +831,8 @@ impl<D: BlockReader, State> Volume<D, State> {
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
     pub fn lookup_child(&self, parent: &DirectoryNode, name: &Ext4Name) -> Result<LookupResult> {
-        for entry in self.read_directory(parent)? {
-            if entry.name() == name {
-                return Ok(LookupResult::Found(entry.inode()));
-            }
+        if let Some(entry) = self.read_directory_layout(parent.inode())?.find(name) {
+            return Ok(LookupResult::Found(entry.inode()));
         }
         Ok(LookupResult::NotFound)
     }
@@ -884,6 +881,52 @@ impl<D: BlockReader, State> Volume<D, State> {
         }
 
         Ok(folded)
+    }
+
+    /// Loads and validates the directory layout selected by an inode.
+    fn read_directory_layout(&self, inode: &Inode) -> Result<DirectoryLayout> {
+        if inode.size().bytes() > MAX_EAGER_DIRECTORY_BYTES {
+            return Err(Error::DirectoryTooLarge);
+        }
+        if inode.is_indexed_directory() && !self.superblock.has_dir_index() {
+            return Err(Error::UnsupportedDirectoryHash);
+        }
+        DirectoryLayout::parse(
+            inode.is_indexed_directory(),
+            self.read_directory_block_data(inode)?,
+            self.superblock.directory_hash_seed(),
+            self.superblock.default_directory_hash_version(),
+            self.directory_checksum(inode),
+        )
+    }
+
+    /// Reads directory file blocks through the inode extent tree.
+    fn read_directory_block_data(&self, inode: &Inode) -> Result<Vec<DirectoryBlockData>> {
+        let block_size = self.superblock.block_size();
+        let block_bytes =
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let block_count = round_up_div(inode.size().bytes(), u64::from(block_size.bytes()))?;
+        let tree = MutableExtentTree::load_inode_tree(
+            inode.extent_root()?,
+            block_size,
+            &self.device,
+            self.extent_tree_context(inode),
+        )?;
+        let mut blocks = Vec::new();
+        for logical in 0..block_count {
+            let logical_block = LogicalBlock::try_from(logical)?;
+            let physical = match tree.map_logical(logical_block) {
+                BlockMapping::Physical(physical) => physical,
+                BlockMapping::Uninitialized | BlockMapping::Hole => {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
+            };
+            let mut bytes = vec![0_u8; block_bytes];
+            self.device
+                .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
+            blocks.push(DirectoryBlockData::new(logical_block.as_u32(), bytes));
+        }
+        Ok(blocks)
     }
 
     /// Reads file data through the inode extent tree, zero-filling sparse ranges.
@@ -1008,6 +1051,19 @@ impl<D: BlockReader, State> Volume<D, State> {
             )
         } else {
             ExtentTreeContext::none()
+        }
+    }
+
+    /// Builds the checksum context required for directory metadata.
+    fn directory_checksum(&self, inode: &Inode) -> DirectoryChecksum {
+        if self.superblock.metadata_checksum() == MetadataChecksum::Crc32c {
+            DirectoryChecksum::metadata_csum(
+                self.superblock.checksum_seed(),
+                inode.id(),
+                inode.generation(),
+            )
+        } else {
+            DirectoryChecksum::None
         }
     }
 }
@@ -1888,12 +1944,8 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        for (_logical, _physical, block) in self.directory_blocks(&inode)? {
-            for entry in block.entries()? {
-                if entry.name() == name {
-                    return Ok(entry);
-                }
-            }
+        if let Some(entry) = self.directory_layout(&inode)?.find(name) {
+            return Ok(entry);
         }
         Err(Error::DirectoryEntryNotFound)
     }
@@ -1919,8 +1971,14 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if !parent_inode.supports_basic_mutation() {
             return Err(Error::UnsupportedInodeMutation);
         }
+        if self.directory_layout(&parent_inode)?.find(name).is_some() {
+            return Err(Error::NameAlreadyExists);
+        }
         if parent_inode.is_indexed_directory() {
-            return Err(Error::UnsupportedDirectoryHash);
+            let mut entries = self.directory_layout(&parent_inode)?.entries();
+            entries.push(DirectoryEntry::new(child, name, kind));
+            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
+            return Ok(());
         }
 
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
@@ -1933,6 +1991,13 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                     .ok_or(Error::InvalidInode)? = raw_parent;
                 return Ok(());
             }
+        }
+
+        if self.volume.superblock.has_dir_index() {
+            let mut entries = self.directory_layout(&parent_inode)?.entries();
+            entries.push(DirectoryEntry::new(child, name, kind));
+            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
+            return Ok(());
         }
 
         let block_size = self.volume.superblock.block_size();
@@ -1991,7 +2056,13 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             return Err(Error::UnsupportedInodeMutation);
         }
         if parent_inode.is_indexed_directory() {
-            return Err(Error::UnsupportedDirectoryHash);
+            let mut entries = self.directory_layout(&parent_inode)?.entries();
+            let Some(position) = entries.iter().position(|entry| entry.name() == name) else {
+                return Err(Error::DirectoryEntryNotFound);
+            };
+            let removed = entries.remove(position);
+            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
+            return Ok(removed);
         }
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(removed) = block.remove(name)? {
@@ -2030,7 +2101,25 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             return Err(Error::UnsupportedInodeMutation);
         }
         if parent_inode.is_indexed_directory() {
-            return Err(Error::UnsupportedDirectoryHash);
+            let mut entries = self.directory_layout(&parent_inode)?.entries();
+            if entries.iter().any(|entry| entry.name() == new_name) {
+                return Err(Error::NameAlreadyExists);
+            }
+            let Some(position) = entries.iter().position(|entry| entry.name() == old_name) else {
+                return Err(Error::DirectoryEntryNotFound);
+            };
+            let renamed = entries
+                .get(position)
+                .ok_or(Error::InvalidDirectoryEntry)?
+                .clone();
+            if renamed.inode() != child {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            *entries
+                .get_mut(position)
+                .ok_or(Error::InvalidDirectoryEntry)? = DirectoryEntry::new(child, new_name, kind);
+            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
+            return Ok(renamed);
         }
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(renamed) = block.rename(old_name, new_name)? {
@@ -2075,7 +2164,19 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             return Err(Error::UnsupportedInodeMutation);
         }
         if parent_inode.is_indexed_directory() {
-            return Err(Error::UnsupportedDirectoryHash);
+            let mut entries = self.directory_layout(&parent_inode)?.entries();
+            let Some(position) = entries.iter().position(|entry| entry.name() == name) else {
+                return Err(Error::DirectoryEntryNotFound);
+            };
+            let replaced = entries
+                .get(position)
+                .ok_or(Error::InvalidDirectoryEntry)?
+                .clone();
+            *entries
+                .get_mut(position)
+                .ok_or(Error::InvalidDirectoryEntry)? = DirectoryEntry::new(child, name, kind);
+            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
+            return Ok(replaced);
         }
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(replaced) = block.replace(name, child, kind)? {
@@ -2089,6 +2190,80 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             }
         }
         Err(Error::DirectoryEntryNotFound)
+    }
+
+    /// Rebuilds and stages one directory as a canonical HTree image.
+    fn stage_rebuilt_htree_directory(
+        &mut self,
+        inode_index: usize,
+        mut raw_parent: RawInode,
+        parent_inode: &Inode,
+        entries: &[DirectoryEntry],
+    ) -> Result<()> {
+        let dot = entries
+            .iter()
+            .find(|entry| entry.name().bytes() == b".")
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        if dot.inode() != parent_inode.id() {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let dotdot = entries
+            .iter()
+            .find(|entry| entry.name().bytes() == b"..")
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        let block_size = self.volume.superblock.block_size();
+        let block_bytes =
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let checksum = self.volume.directory_checksum(parent_inode);
+        let image = build_htree_directory(
+            parent_inode.id(),
+            dotdot.inode(),
+            entries,
+            block_bytes,
+            self.volume.superblock.directory_hash_seed(),
+            self.volume.superblock.default_directory_hash_version(),
+            checksum,
+        )?;
+        let existing_blocks =
+            round_up_div(parent_inode.size().bytes(), u64::from(block_size.bytes()))?;
+        let image_blocks =
+            u64::try_from(image.block_count()).map_err(|_| Error::ArithmeticOverflow)?;
+        let target_blocks = existing_blocks.max(image_blocks);
+        let mut tree = self.mutable_extent_tree(parent_inode)?;
+        if tree.contains_uninitialized() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        for logical in 0..image_blocks {
+            let logical_block = LogicalBlock::try_from(logical)?;
+            let physical = match tree.map_logical(logical_block) {
+                BlockMapping::Physical(physical) => physical,
+                BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
+                BlockMapping::Hole => {
+                    let physical = self.allocate_cluster()?;
+                    tree.insert_or_extend_initialized(logical_block, physical)?;
+                    physical
+                }
+            };
+            let image_block = image
+                .blocks()
+                .get(usize::try_from(logical).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::InvalidDirectoryEntry)?
+                .clone();
+            self.stage_directory_block(physical, image_block);
+        }
+        raw_parent.set_indexed_directory()?;
+        raw_parent.set_size(FileSize::from_bytes(
+            target_blocks
+                .checked_mul(u64::from(block_size.bytes()))
+                .ok_or(Error::ArithmeticOverflow)?,
+        ))?;
+        raw_parent.set_timestamps(self.now)?;
+        self.stage_extent_tree(&mut raw_parent, tree)?;
+        *self
+            .inode_updates
+            .get_mut(inode_index)
+            .ok_or(Error::InvalidInode)? = raw_parent;
+        Ok(())
     }
 
     /// Stages the latest image for a mutated directory block.
@@ -2274,12 +2449,34 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
 
     /// Returns whether a directory contains only `.` and `..`.
     fn directory_is_empty(&self, inode: &Inode) -> Result<bool> {
-        for (_logical, _physical, block) in self.directory_blocks(inode)? {
-            if !block.is_empty_directory_payload()? {
+        for entry in self.directory_layout(inode)?.entries() {
+            let name = entry.name().bytes();
+            if name != b"." && name != b".." {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Loads the staged-aware directory layout for mutation-time lookups.
+    fn directory_layout(&self, inode: &Inode) -> Result<DirectoryLayout> {
+        if inode.is_indexed_directory() && !self.volume.superblock.has_dir_index() {
+            return Err(Error::UnsupportedDirectoryHash);
+        }
+        let mut blocks = Vec::new();
+        for (logical, _physical, block) in self.directory_blocks(inode)? {
+            blocks.push(DirectoryBlockData::new(
+                logical.as_u32(),
+                block.into_bytes(),
+            ));
+        }
+        DirectoryLayout::parse(
+            inode.is_indexed_directory(),
+            blocks,
+            self.volume.superblock.directory_hash_seed(),
+            self.volume.superblock.default_directory_hash_version(),
+            self.volume.directory_checksum(inode),
+        )
     }
 
     /// Loads directory blocks, preferring staged images over device bytes.
@@ -3215,6 +3412,12 @@ impl RawInode {
     /// Returns whether the raw inode advertises an extent tree.
     fn has_extent_tree(&self) -> Result<bool> {
         Ok(le_u32(&self.bytes, INODE_FLAGS_OFFSET)? & EXT4_EXTENTS_FL != 0)
+    }
+
+    /// Marks a directory inode as HTree indexed.
+    fn set_indexed_directory(&mut self) -> Result<()> {
+        let flags = le_u32(&self.bytes, INODE_FLAGS_OFFSET)?;
+        self.set_flags(flags | EXT4_INDEX_FL)
     }
 
     /// Parses the raw bytes as a validated inode.

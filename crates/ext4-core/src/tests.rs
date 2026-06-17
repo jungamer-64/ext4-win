@@ -1818,7 +1818,7 @@ fn remove_directory_rejects_root_entry() {
 }
 
 #[test]
-fn indexed_directory_create_updates_leaf_block() {
+fn indexed_directory_create_rebuilds_real_htree() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     make_indexed_root_directory(&mut image);
 
@@ -1840,7 +1840,139 @@ fn indexed_directory_create_updates_leaf_block() {
 
     let root_block = block_offset(MODERN_ROOT_DIR_BLOCK);
     assert_eq!(get_u32(&image, root_block), 2);
+    assert_eq!(image[root_block + 29], 8);
+    assert_eq!(image[root_block + 30], 0);
+    assert_eq!(get_u16(&image, root_block + 34), 1);
+    assert_eq!(get_u32(&image, root_block + 36), 1);
     assert_eq!(get_u32(&image, block_offset(MODERN_EXTENT_INDEX_BLOCK)), 3);
+}
+
+#[test]
+fn htree_directory_read_lookup_and_windows_lookup_use_real_index() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    make_indexed_root_directory(&mut image);
+    let device = SliceBlockDevice::new(&image);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
+
+    let entries = read_directory(&volume, InodeId::ROOT);
+
+    assert!(entries.iter().any(|entry| entry.name().bytes() == b"."));
+    assert!(entries.iter().any(|entry| entry.name().bytes() == b".."));
+    assert!(entries.iter().any(|entry| entry.name().bytes() == b"file"));
+    assert_eq!(
+        lookup_ext4(&volume, InodeId::ROOT, b"file"),
+        LookupResult::Found(inode(3))
+    );
+    assert_eq!(
+        lookup_windows(
+            &volume,
+            InodeId::ROOT,
+            &[
+                u16::from(b'F'),
+                u16::from(b'I'),
+                u16::from(b'L'),
+                u16::from(b'E'),
+            ],
+        ),
+        LookupResult::Found(inode(3))
+    );
+}
+
+#[test]
+fn htree_dx_tail_checksum_mismatch_is_rejected() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    make_indexed_root_directory(&mut image);
+    image[block_offset(MODERN_ROOT_DIR_BLOCK) + 36] ^= 1;
+    let device = SliceBlockDevice::new(&image);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
+    let root = directory_node(&volume, InodeId::ROOT);
+
+    assert_eq!(volume.read_directory(&root), Err(Error::ChecksumMismatch));
+}
+
+#[test]
+fn htree_leaf_tail_checksum_mismatch_is_rejected() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    make_indexed_root_directory(&mut image);
+    image[block_offset(MODERN_EXTENT_INDEX_BLOCK) + 8] ^= 1;
+    let device = SliceBlockDevice::new(&image);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(device));
+    let root = directory_node(&volume, InodeId::ROOT);
+
+    assert_eq!(volume.read_directory(&root), Err(Error::ChecksumMismatch));
+}
+
+#[test]
+fn linear_directory_converts_to_htree_when_full() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        for index in 0..4_u8 {
+            let mut bytes = vec![b'a' + index; 240];
+            bytes.push(b'0' + index);
+            let name = must(Ext4Name::new(&bytes));
+            let mut transaction = volume.begin_transaction(NOW);
+            let root = transaction_directory(&transaction, InodeId::ROOT);
+            let _file = must(transaction.create_file(root, &name, test_file_metadata()));
+            must(transaction.commit());
+        }
+
+        let root = directory_node(&volume, InodeId::ROOT);
+        let entries = must(volume.read_directory(&root));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name().bytes().len() == 241)
+        );
+    }
+
+    let root_inode = modern_inode_offset(2);
+    assert_ne!(get_u32(&image, root_inode + 32) & EXT4_INDEX_FL, 0);
+    assert!(get_u32(&image, root_inode + 4) >= u32::try_from(BLOCK_SIZE * 2).unwrap_or(u32::MAX));
+}
+
+#[test]
+fn indexed_directory_rename_and_unlink_rebuild_htree_consistently() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    make_indexed_root_directory(&mut image);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let old_name = must(Ext4Name::new(b"temp"));
+        let renamed_name = must(Ext4Name::new(b"renamed"));
+
+        let mut create = volume.begin_transaction(NOW);
+        let root = transaction_directory(&create, InodeId::ROOT);
+        let file = must(create.create_file(root, &old_name, test_file_metadata()));
+        must(create.commit());
+
+        let mut rename = volume.begin_transaction(NOW);
+        let root = transaction_directory(&rename, InodeId::ROOT);
+        must(rename.rename_child(root, &old_name, root, &renamed_name));
+        must(rename.commit());
+
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"temp"),
+            LookupResult::NotFound
+        );
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"renamed"),
+            LookupResult::Found(file.inode_id())
+        );
+
+        let mut unlink = volume.begin_transaction(NOW);
+        let root = transaction_directory(&unlink, InodeId::ROOT);
+        must(unlink.unlink_file(root, &renamed_name));
+        must(unlink.commit());
+
+        assert_eq!(
+            lookup_ext4(&volume, InodeId::ROOT, b"renamed"),
+            LookupResult::NotFound
+        );
+    }
 }
 
 #[test]
@@ -3408,15 +3540,32 @@ fn make_indexed_root_directory(image: &mut [u8]) {
         1,
         MODERN_EXTENT_INDEX_BLOCK,
     );
-
-    let root = block_offset(MODERN_ROOT_DIR_BLOCK);
-    image[root..root + BLOCK_SIZE].fill(0);
-    write_dirent(image, root, 2, 12, b".", 2);
-    write_dirent(image, root + 12, 2, 1012, b"..", 2);
-
-    let leaf = block_offset(MODERN_EXTENT_INDEX_BLOCK);
-    image[leaf..leaf + BLOCK_SIZE].fill(0);
-    write_dirent(image, leaf, 3, 1024, b"file", 1);
+    let superblock = must(Superblock::parse(&image[1024..2048]));
+    let checksum = crate::dir::DirectoryChecksum::metadata_csum(
+        superblock.checksum_seed(),
+        inode(2),
+        get_u32(image, root_inode + 100),
+    );
+    let file_name = must(Ext4Name::new(b"file"));
+    let entries = vec![DirectoryEntry::new(
+        inode(3),
+        &file_name,
+        DirectoryEntryKind::File,
+    )];
+    let htree = must(crate::dir::build_htree_directory(
+        inode(2),
+        inode(2),
+        &entries,
+        BLOCK_SIZE,
+        superblock.directory_hash_seed(),
+        superblock.default_directory_hash_version(),
+        checksum,
+    ));
+    image[block_offset(MODERN_ROOT_DIR_BLOCK)..block_offset(MODERN_ROOT_DIR_BLOCK) + BLOCK_SIZE]
+        .copy_from_slice(&htree.blocks()[0]);
+    image[block_offset(MODERN_EXTENT_INDEX_BLOCK)
+        ..block_offset(MODERN_EXTENT_INDEX_BLOCK) + BLOCK_SIZE]
+        .copy_from_slice(&htree.blocks()[1]);
     refresh_primary_block_group_descriptor_checksum(image);
 }
 
