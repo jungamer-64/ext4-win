@@ -20,6 +20,12 @@ const EXT4_VALID_FS: u16 = 0x0001;
 const VOLUME_LABEL_OFFSET: usize = 120;
 /// Fixed byte width of `s_volume_name`.
 const VOLUME_LABEL_BYTES: usize = 16;
+/// Byte offset of `s_hash_seed[0]` inside the superblock.
+const DIRECTORY_HASH_SEED_OFFSET: usize = 236;
+/// Number of 32-bit words in `s_hash_seed`.
+const DIRECTORY_HASH_SEED_WORDS: usize = 4;
+/// Byte offset of `s_def_hash_version` inside the superblock.
+const DEFAULT_DIRECTORY_HASH_VERSION_OFFSET: usize = 252;
 
 // Compatible feature bits can usually be ignored for reads, but the write domain
 // requires an explicit supported set because mutation changes their invariants.
@@ -669,6 +675,75 @@ impl ChecksumSeed {
     }
 }
 
+/// Directory hash seed stored in `s_hash_seed`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DirectoryHashSeed([u32; DIRECTORY_HASH_SEED_WORDS]);
+
+impl DirectoryHashSeed {
+    /// Creates a directory hash seed from the four raw superblock words.
+    #[must_use]
+    pub(crate) const fn from_words(words: [u32; DIRECTORY_HASH_SEED_WORDS]) -> Self {
+        Self(words)
+    }
+
+    /// Returns the words in on-disk order.
+    #[must_use]
+    pub(crate) const fn words(self) -> [u32; DIRECTORY_HASH_SEED_WORDS] {
+        self.0
+    }
+}
+
+/// Supported ext4 directory hash algorithm versions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryHashVersion {
+    /// Legacy ext2 hash with signed byte interpretation.
+    Legacy,
+    /// Half-MD4 hash with signed byte interpretation.
+    HalfMd4,
+    /// TEA hash with signed byte interpretation.
+    Tea,
+    /// Legacy ext2 hash with unsigned byte interpretation.
+    LegacyUnsigned,
+    /// Half-MD4 hash with unsigned byte interpretation.
+    HalfMd4Unsigned,
+    /// TEA hash with unsigned byte interpretation.
+    TeaUnsigned,
+}
+
+impl DirectoryHashVersion {
+    /// Converts the on-disk version byte to a supported hash version.
+    pub(crate) fn from_raw(raw: u8) -> Result<Self> {
+        match raw {
+            0 => Ok(Self::Legacy),
+            1 => Ok(Self::HalfMd4),
+            2 => Ok(Self::Tea),
+            3 => Ok(Self::LegacyUnsigned),
+            4 => Ok(Self::HalfMd4Unsigned),
+            5 => Ok(Self::TeaUnsigned),
+            _ => Err(Error::UnsupportedDirectoryHash),
+        }
+    }
+
+    /// Returns whether this version interprets name bytes as signed values.
+    #[must_use]
+    pub(crate) const fn uses_signed_bytes(self) -> bool {
+        matches!(self, Self::Legacy | Self::HalfMd4 | Self::Tea)
+    }
+
+    /// Encodes this version for `dx_root_info.hash_version`.
+    #[must_use]
+    pub(crate) const fn to_raw(self) -> u8 {
+        match self {
+            Self::Legacy => 0,
+            Self::HalfMd4 => 1,
+            Self::Tea => 2,
+            Self::LegacyUnsigned => 3,
+            Self::HalfMd4Unsigned => 4,
+            Self::TeaUnsigned => 5,
+        }
+    }
+}
+
 /// Journal placement mode selected by validated superblock features.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JournalMode {
@@ -910,6 +985,11 @@ impl FeatureSet {
         self.compat & COMPAT_HAS_JOURNAL != 0
     }
 
+    /// Returns whether hashed directory indexes are enabled.
+    pub(crate) const fn has_dir_index(self) -> bool {
+        self.compat & COMPAT_DIR_INDEX != 0
+    }
+
     /// Returns whether the journal lives on a separate journal device.
     pub(crate) const fn has_external_journal(self) -> bool {
         self.incompat & INCOMPAT_JOURNAL_DEV != 0
@@ -977,6 +1057,10 @@ pub struct Superblock {
     volume_label: Ext4VolumeLabel,
     /// Seed used for metadata CRC32C calculations.
     checksum_seed: ChecksumSeed,
+    /// Seed used by indexed directory hashing.
+    directory_hash_seed: DirectoryHashSeed,
+    /// Default hash version used when an HTree root does not override it.
+    default_directory_hash_version: DirectoryHashVersion,
     /// Feature bits validated for this mount policy.
     features: FeatureSet,
 }
@@ -1118,6 +1202,16 @@ impl Superblock {
         } else {
             ChecksumSeed::from_u32(0)
         };
+        let directory_hash_seed = DirectoryHashSeed::from_words([
+            le_u32(raw, DIRECTORY_HASH_SEED_OFFSET)?,
+            le_u32(raw, DIRECTORY_HASH_SEED_OFFSET + 4)?,
+            le_u32(raw, DIRECTORY_HASH_SEED_OFFSET + 8)?,
+            le_u32(raw, DIRECTORY_HASH_SEED_OFFSET + 12)?,
+        ]);
+        let default_directory_hash_version = DirectoryHashVersion::from_raw(
+            *raw.get(DEFAULT_DIRECTORY_HASH_VERSION_OFFSET)
+                .ok_or(Error::TruncatedStructure)?,
+        )?;
         let uuid = FilesystemUuid::from_bytes(uuid);
 
         Ok(Self {
@@ -1140,6 +1234,8 @@ impl Superblock {
             uuid,
             volume_label,
             checksum_seed,
+            directory_hash_seed,
+            default_directory_hash_version,
             features,
         })
     }
@@ -1256,6 +1352,24 @@ impl Superblock {
     #[must_use]
     pub const fn checksum_seed(self) -> ChecksumSeed {
         self.checksum_seed
+    }
+
+    /// Directory hash seed used by indexed directories.
+    #[must_use]
+    pub(crate) const fn directory_hash_seed(self) -> DirectoryHashSeed {
+        self.directory_hash_seed
+    }
+
+    /// Default directory hash algorithm recorded by the superblock.
+    #[must_use]
+    pub(crate) const fn default_directory_hash_version(self) -> DirectoryHashVersion {
+        self.default_directory_hash_version
+    }
+
+    /// Returns whether hashed directory indexes are available.
+    #[must_use]
+    pub(crate) const fn has_dir_index(self) -> bool {
+        self.features.has_dir_index()
     }
 
     /// Metadata checksum mode.
