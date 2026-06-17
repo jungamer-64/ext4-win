@@ -16,6 +16,7 @@ pub mod block;
 pub mod dir;
 pub mod error;
 pub mod extent;
+pub mod fscrypt;
 pub mod inode;
 pub mod name;
 pub mod superblock;
@@ -40,6 +41,7 @@ pub use extent::{
     BlockMapping, Extent, ExtentInitialization, ExtentLength, ExtentTree, ExtentTreeContext,
     LogicalBlock, MutableExtentTree, SerializedExtentBlock, SerializedExtentTree,
 };
+pub use fscrypt::{FscryptKeyIdentifier, FscryptMasterKey};
 pub use inode::{
     Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid,
     FileOffset, FileSize, Inode, InodeExtentRoot, InodeId, InodeInlineBytes, InodeKind,
@@ -56,8 +58,8 @@ pub use superblock::{
     Superblock,
 };
 pub use volume::{
-    DirectoryNode, ExternalJournal, FileNode, InternalJournal, LookupResult, Node, ReadOnly,
-    ReadWrite, SymlinkNode, TransactionDirectory, TransactionFile, TransactionNode,
+    DirectoryNode, ExternalJournal, FileNode, InternalJournal, LookupResult, MountContext, Node,
+    ReadOnly, ReadWrite, SymlinkNode, TransactionDirectory, TransactionFile, TransactionNode,
     TransactionSymlink, Volume, WriteTransaction,
 };
 pub use windows::{Ext4WindowsAttributes, WindowsOverlay};
