@@ -533,12 +533,23 @@ fn read_only_mount_accepts_quota_and_clean_orphan_file() {
 }
 
 #[test]
+fn read_only_mount_accepts_encryption_and_verity_feature_bits() {
+    let mut image = fixture_image();
+    put_u32(&mut image, 1024 + 96, 0x0002 | 0x0040 | INCOMPAT_ENCRYPT);
+    put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | RO_COMPAT_VERITY);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+    ));
+
+    assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 4);
+}
+
+#[test]
 fn read_only_mount_rejects_layout_changing_features() {
     for incompat in [
         INCOMPAT_META_BG,
         INCOMPAT_LARGEDIR,
         INCOMPAT_INLINE_DATA,
-        INCOMPAT_ENCRYPT,
         INCOMPAT_CASEFOLD,
     ] {
         let mut image = fixture_image();
@@ -548,7 +559,7 @@ fn read_only_mount_rejects_layout_changing_features() {
         assert!(matches!(result, Err(Error::UnsupportedIncompatFeature)));
     }
 
-    for read_only_compat in [RO_COMPAT_VERITY, RO_COMPAT_ORPHAN_PRESENT] {
+    for read_only_compat in [RO_COMPAT_ORPHAN_PRESENT] {
         let mut image = fixture_image();
         put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | read_only_compat);
         let result = Superblock::parse(&image[1024..2048]);

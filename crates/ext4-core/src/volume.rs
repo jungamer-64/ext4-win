@@ -18,7 +18,7 @@ use crate::extent::{
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset, FileSize,
-    Inode, InodeId, InodeKind, InodeStorage, NewDirectoryMetadata, NewFileMetadata,
+    Inode, InodeId, InodeKind, InodeMutation, InodeStorage, NewDirectoryMetadata, NewFileMetadata,
     NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 use crate::journal::{Journal, LoadedJournal};
@@ -1169,9 +1169,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     /// semantics outside the write domain.
     pub fn node(&self, inode_id: InodeId) -> Result<TransactionNode> {
         let inode = self.volume.read_inode_record(inode_id)?;
-        if !inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        inode.require_mutation(InodeMutation::Metadata)?;
         Ok(TransactionNode { inode_id })
     }
 
@@ -1196,9 +1194,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        if !inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        inode.require_mutation(InodeMutation::DirectoryEntry)?;
         Ok(TransactionDirectory { inode_id })
     }
 
@@ -1212,9 +1208,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::Symlink {
             return Err(Error::WrongInodeKind);
         }
-        if !inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        inode.require_mutation(InodeMutation::FileData)?;
         Ok(TransactionSymlink { inode_id })
     }
 
@@ -1235,9 +1229,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::InvalidInode)?
             .clone();
         let inode = raw_inode.parse()?;
-        if !inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        inode.require_mutation(InodeMutation::Metadata)?;
         raw_inode.set_owner(security.owner())?;
         raw_inode.set_permissions(security.permissions())?;
         raw_inode.set_timestamps(self.now)?;
@@ -1286,9 +1278,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
-        if !inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        inode.require_mutation(InodeMutation::Delete)?;
         if raw_inode.decrement_links_count()? == 0 {
             let tree = self.mutable_extent_tree(&inode)?;
             for extent in tree.extents().iter().copied() {
@@ -1427,9 +1417,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        if !inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        inode.require_mutation(InodeMutation::Delete)?;
         if !self.directory_is_empty(&inode)? {
             return Err(Error::DirectoryNotEmpty);
         }
@@ -1483,9 +1471,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::InvalidInode)?
             .clone();
         let child_inode = child_raw.parse()?;
-        if !child_inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        child_inode.require_mutation(InodeMutation::Metadata)?;
         if child_inode.kind() == InodeKind::Directory && source.inode() == InodeId::ROOT {
             return Err(Error::CannotRemoveRoot);
         }
@@ -1545,9 +1531,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::InvalidInode)?
             .clone();
         let inode = raw_inode.parse()?;
-        if !inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        inode.require_mutation(InodeMutation::Metadata)?;
         raw_inode.set_ext4_times(times)?;
         *self
             .inode_updates
@@ -1650,9 +1634,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::Symlink {
             return Err(Error::WrongInodeKind);
         }
-        if !inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        inode.require_mutation(InodeMutation::Delete)?;
         if let Ok(tree) = self.mutable_extent_tree(&inode) {
             for extent in tree.extents().iter().copied() {
                 self.free_extent(extent, 0)?;
@@ -1695,6 +1677,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
+        inode.require_mutation(InodeMutation::FileData)?;
         let end_offset = offset.checked_add_len(bytes.len())?;
         if end_offset.bytes() > inode.size().bytes() {
             return Err(Error::InvalidWriteRange);
@@ -1852,6 +1835,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::InvalidInode)?
             .clone();
         let inode = raw_inode.parse()?;
+        inode.require_mutation(InodeMutation::FileSize)?;
         if new_size < inode.size() {
             return Err(Error::InvalidWriteRange);
         }
@@ -1877,6 +1861,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::InvalidInode)?
             .clone();
         let inode = raw_inode.parse()?;
+        inode.require_mutation(InodeMutation::FileSize)?;
         if new_size > inode.size() {
             return Err(Error::InvalidWriteRange);
         }
@@ -1968,9 +1953,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        if !parent_inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        parent_inode.require_mutation(InodeMutation::DirectoryEntry)?;
         if self.directory_layout(&parent_inode)?.find(name).is_some() {
             return Err(Error::NameAlreadyExists);
         }
@@ -2052,9 +2035,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        if !parent_inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        parent_inode.require_mutation(InodeMutation::DirectoryEntry)?;
         if parent_inode.is_indexed_directory() {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
             let Some(position) = entries.iter().position(|entry| entry.name() == name) else {
@@ -2097,9 +2078,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        if !parent_inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        parent_inode.require_mutation(InodeMutation::DirectoryEntry)?;
         if parent_inode.is_indexed_directory() {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
             if entries.iter().any(|entry| entry.name() == new_name) {
@@ -2160,9 +2139,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        if !parent_inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        parent_inode.require_mutation(InodeMutation::DirectoryEntry)?;
         if parent_inode.is_indexed_directory() {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
             let Some(position) = entries.iter().position(|entry| entry.name() == name) else {
@@ -2336,9 +2313,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::InvalidInode)?
             .clone();
         let inode = raw_inode.parse()?;
-        if !inode.supports_basic_mutation() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        inode.require_mutation(InodeMutation::Metadata)?;
 
         let mut set = self.xattr_set_for_raw_inode(&raw_inode)?;
         update(&mut set)?;
