@@ -15,15 +15,15 @@ use crate::extent::{
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset, FileSize,
-    Inode, InodeId, InodeKind, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
-    ReadBytes, SymlinkTarget,
+    Inode, InodeId, InodeKind, InodeStorage, NewDirectoryMetadata, NewFileMetadata,
+    NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 use crate::journal::{Journal, LoadedJournal};
 use crate::name::Ext4Name;
 use crate::name::WindowsName;
 use crate::superblock::{
-    BlockGroupId, Ext4VolumeLabel, FreeBlockDelta, JournalMode, MetadataChecksum, RecoveryState,
-    Superblock,
+    BlockGroupId, ClusterAddress, Ext4VolumeLabel, FreeClusterDelta, JournalMode, MetadataChecksum,
+    RecoveryState, Superblock,
 };
 use crate::windows::WindowsOverlay;
 use crate::xattr::{self as xattr_storage, XattrName, XattrSet, XattrValue};
@@ -132,6 +132,258 @@ pub struct ExternalJournal<J> {
 pub struct ReadWrite<J = InternalJournal> {
     /// Journal backend selected at mount.
     journal: J,
+    /// Mounted cluster reference counts constructed before any mutation.
+    clusters: ClusterReferenceIndex,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Mounted allocation-cluster ownership index used by write transactions.
+struct ClusterReferenceIndex {
+    /// Reference count per allocation cluster with at least one known owner.
+    refs: Vec<ClusterReference>,
+    /// Physical blocks that must have exclusive ownership.
+    exclusive_blocks: Vec<BlockAddress>,
+    /// External xattr blocks that may be shared by ext4 xattr refcount.
+    xattr_blocks: Vec<BlockAddress>,
+}
+
+impl ClusterReferenceIndex {
+    /// Builds the mounted reference index from static metadata and live inodes.
+    fn load<D: BlockReader, State>(volume: &Volume<D, State>) -> Result<Self> {
+        let mut index = Self {
+            refs: Vec::new(),
+            exclusive_blocks: Vec::new(),
+            xattr_blocks: Vec::new(),
+        };
+        index.add_static_metadata(volume)?;
+        index.add_live_inodes(volume)?;
+        Ok(index)
+    }
+
+    /// Returns the known mounted reference count for one cluster.
+    fn count(&self, cluster: ClusterAddress) -> u32 {
+        self.refs
+            .iter()
+            .find(|reference| reference.cluster == cluster)
+            .map_or(0, |reference| reference.count)
+    }
+
+    /// Applies committed staged reference deltas.
+    fn apply_deltas(&mut self, deltas: &[ClusterReferenceDelta]) -> Result<()> {
+        for delta in deltas {
+            let updated = self.apply_delta(delta.cluster, delta.delta)?;
+            if updated < 0 {
+                return Err(Error::ClusterReferenceConflict);
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds one exclusive mounted reference after validating bitmap allocation.
+    fn add_exclusive_reference<D: BlockReader, State>(
+        &mut self,
+        volume: &Volume<D, State>,
+        block: BlockAddress,
+    ) -> Result<()> {
+        if self.exclusive_blocks.contains(&block) || self.xattr_blocks.contains(&block) {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        self.exclusive_blocks.push(block);
+        self.add_cluster_reference(volume, block)
+    }
+
+    /// Adds one external-xattr mounted reference after validating bitmap allocation.
+    fn add_xattr_reference<D: BlockReader, State>(
+        &mut self,
+        volume: &Volume<D, State>,
+        block: BlockAddress,
+    ) -> Result<()> {
+        if self.exclusive_blocks.contains(&block) {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        if !self.xattr_blocks.contains(&block) {
+            self.xattr_blocks.push(block);
+        }
+        self.add_cluster_reference(volume, block)
+    }
+
+    /// Adds one mounted cluster reference after validating bitmap allocation.
+    fn add_cluster_reference<D: BlockReader, State>(
+        &mut self,
+        volume: &Volume<D, State>,
+        block: BlockAddress,
+    ) -> Result<()> {
+        let cluster = volume.superblock.cluster_of_block(block)?;
+        if !cluster_bitmap_bit(&volume.device, &volume.superblock, cluster)? {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        self.apply_delta(cluster, 1)?;
+        Ok(())
+    }
+
+    /// Adds all static metadata ranges that must keep their clusters allocated.
+    fn add_static_metadata<D: BlockReader, State>(
+        &mut self,
+        volume: &Volume<D, State>,
+    ) -> Result<()> {
+        let groups = volume.superblock.block_group_count()?;
+        let descriptor_blocks = descriptor_table_blocks(&volume.superblock)?;
+        for group in 0..groups.as_u32() {
+            let group = BlockGroupId::from_u32(group);
+            if group_has_superblock(volume, group) {
+                let superblock_block = group_start_block(&volume.superblock, group)?;
+                self.add_exclusive_reference(volume, superblock_block)?;
+                for offset in 0..descriptor_blocks {
+                    self.add_exclusive_reference(
+                        volume,
+                        BlockAddress::new(
+                            superblock_block
+                                .get()
+                                .checked_add(1)
+                                .and_then(|value| value.checked_add(offset))
+                                .ok_or(Error::ArithmeticOverflow)?,
+                        ),
+                    )?;
+                }
+            }
+
+            let descriptor =
+                BlockGroupDescriptor::read_from(&volume.device, &volume.superblock, group)?;
+            self.add_exclusive_reference(volume, descriptor.block_bitmap())?;
+            self.add_exclusive_reference(volume, descriptor.inode_bitmap())?;
+            let inode_table_blocks = inode_table_blocks(&volume.superblock, group)?;
+            for offset in 0..inode_table_blocks {
+                self.add_exclusive_reference(
+                    volume,
+                    BlockAddress::new(
+                        descriptor
+                            .inode_table()
+                            .get()
+                            .checked_add(offset)
+                            .ok_or(Error::ArithmeticOverflow)?,
+                    ),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds data and dynamic metadata references from allocated inode records.
+    fn add_live_inodes<D: BlockReader, State>(&mut self, volume: &Volume<D, State>) -> Result<()> {
+        for inode_number in 1..=volume.superblock.inode_count().as_u32() {
+            let inode_id = InodeId::try_from(inode_number)?;
+            if !inode_bitmap_bit(&volume.device, &volume.superblock, inode_id)? {
+                continue;
+            }
+            let raw_inode = volume.read_raw_inode(inode_id)?;
+            if raw_inode.mode()? == 0 {
+                continue;
+            }
+            if let Some(block) = raw_inode.xattr_block()? {
+                self.add_xattr_reference(volume, block)?;
+            }
+            let Ok(inode) = raw_inode.parse() else {
+                if raw_inode.has_extent_tree()? {
+                    return Err(Error::UnsupportedBlockMap);
+                }
+                continue;
+            };
+            let root = match inode.storage() {
+                InodeStorage::Extents(root) => root,
+                InodeStorage::InlineBytes(_) => continue,
+                InodeStorage::UnsupportedBlockMap => return Err(Error::UnsupportedBlockMap),
+            };
+            let tree = ExtentTree::load_inode_tree(
+                root,
+                volume.superblock.block_size(),
+                &volume.device,
+                volume.extent_tree_context(&inode),
+            )?;
+            for extent in tree.extents().iter().copied() {
+                self.add_extent_references(volume, extent)?;
+            }
+            for block in tree.metadata_blocks().iter().copied() {
+                self.add_exclusive_reference(volume, block)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds references for every physical block represented by an extent.
+    fn add_extent_references<D: BlockReader, State>(
+        &mut self,
+        volume: &Volume<D, State>,
+        extent: Extent,
+    ) -> Result<()> {
+        for offset in 0..extent.len().as_u64() {
+            self.add_exclusive_reference(
+                volume,
+                BlockAddress::new(
+                    extent
+                        .physical_start()
+                        .get()
+                        .checked_add(offset)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Applies one signed delta and returns the resulting signed count.
+    fn apply_delta(&mut self, cluster: ClusterAddress, delta: i32) -> Result<i32> {
+        if let Some(index) = self
+            .refs
+            .iter()
+            .position(|reference| reference.cluster == cluster)
+        {
+            let current = i32::try_from(
+                self.refs
+                    .get(index)
+                    .ok_or(Error::ClusterReferenceConflict)?
+                    .count,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let updated = current
+                .checked_add(delta)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if updated <= 0 {
+                self.refs.remove(index);
+            } else {
+                self.refs
+                    .get_mut(index)
+                    .ok_or(Error::ClusterReferenceConflict)?
+                    .count = u32::try_from(updated).map_err(|_| Error::ArithmeticOverflow)?;
+            }
+            Ok(updated)
+        } else if delta > 0 {
+            self.refs.push(ClusterReference {
+                cluster,
+                count: u32::try_from(delta).map_err(|_| Error::ArithmeticOverflow)?,
+            });
+            Ok(delta)
+        } else {
+            Ok(delta)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Mounted reference count for one allocation cluster.
+struct ClusterReference {
+    /// Allocation cluster.
+    cluster: ClusterAddress,
+    /// Number of known owners in the mounted image.
+    count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Staged reference-count delta for one allocation cluster.
+struct ClusterReferenceDelta {
+    /// Allocation cluster receiving the delta.
+    cluster: ClusterAddress,
+    /// Signed reference delta.
+    delta: i32,
 }
 
 /// Mounted ext4 volume with typestate-selected mutation capability.
@@ -356,10 +608,18 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
             Superblock::clear_recover_on_device(&mut device)?;
             superblock = Superblock::read_write_from(&device)?;
         }
+        let clusters = {
+            let recovered = Volume::<&mut D, ReadOnly> {
+                device: &mut device,
+                superblock,
+                state: ReadOnly,
+            };
+            ClusterReferenceIndex::load(&recovered)?
+        };
         Ok(Self {
             device,
             superblock,
-            state: ReadWrite { journal },
+            state: ReadWrite { journal, clusters },
         })
     }
 
@@ -377,7 +637,8 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
             xattr_updates: Vec::new(),
             group_deltas: Vec::new(),
             data_writes: Vec::new(),
-            free_blocks_delta: FreeBlockDelta::ZERO,
+            cluster_deltas: Vec::new(),
+            free_clusters_delta: FreeClusterDelta::ZERO,
             free_inodes_delta: 0,
             volume_label_update: None,
         }
@@ -419,10 +680,18 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
             Superblock::clear_recover_on_device(&mut device)?;
             superblock = Superblock::read_write_from(&device)?;
         }
+        let clusters = {
+            let recovered = Volume::<&mut D, ReadOnly> {
+                device: &mut device,
+                superblock,
+                state: ReadOnly,
+            };
+            ClusterReferenceIndex::load(&recovered)?
+        };
         Ok(Self {
             device,
             superblock,
-            state: ReadWrite { journal },
+            state: ReadWrite { journal, clusters },
         })
     }
 
@@ -443,7 +712,8 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
             xattr_updates: Vec::new(),
             group_deltas: Vec::new(),
             data_writes: Vec::new(),
-            free_blocks_delta: FreeBlockDelta::ZERO,
+            cluster_deltas: Vec::new(),
+            free_clusters_delta: FreeClusterDelta::ZERO,
             free_inodes_delta: 0,
             volume_label_update: None,
         }
@@ -825,8 +1095,10 @@ pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
     group_deltas: Vec<GroupDelta>,
     /// Ordered file data writes that must reach disk before metadata commit.
     data_writes: Vec<RangeWrite>,
-    /// Superblock free-block delta accumulated by this transaction.
-    free_blocks_delta: FreeBlockDelta,
+    /// Staged cluster-reference changes to apply after journal commit.
+    cluster_deltas: Vec<ClusterReferenceDelta>,
+    /// Superblock free-cluster delta accumulated by this transaction.
+    free_clusters_delta: FreeClusterDelta,
     /// Superblock free-inode delta accumulated by this transaction.
     free_inodes_delta: i64,
     /// Superblock volume label replacement staged by this transaction.
@@ -967,7 +1239,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 self.free_extent(extent, 0)?;
             }
             for block in tree.metadata_blocks().iter().copied() {
-                self.free_block(block)?;
+                self.release_cluster_reference(block)?;
             }
             self.free_inode(raw_inode.id)?;
             raw_inode.clear_deleted(self.now, self.volume.superblock.block_size())?;
@@ -992,11 +1264,16 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         metadata: NewDirectoryMetadata,
     ) -> Result<TransactionDirectory> {
         self.ensure_child_absent(parent.inode_id(), name)?;
-        let block = self.allocate_block()?;
+        let block = self.allocate_cluster()?;
         let mut raw_inode = self.allocate_inode()?;
         let inode_id = raw_inode.id;
         let block_size = self.volume.superblock.block_size();
-        raw_inode.initialize_directory(metadata, self.now, block_size, block)?;
+        let allocated_blocks = u64::from(
+            self.volume
+                .superblock
+                .blocks_in_cluster(self.volume.superblock.cluster_of_block(block)?)?,
+        );
+        raw_inode.initialize_directory(metadata, self.now, block_size, block, allocated_blocks)?;
 
         let mut directory = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
@@ -1041,7 +1318,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
             let mut tree = MutableExtentTree::from_extents(Vec::new())?;
             for (logical, chunk) in target.bytes().chunks(block_bytes).enumerate() {
-                let block = self.allocate_block()?;
+                let block = self.allocate_cluster()?;
                 let mut bytes = vec![0_u8; block_bytes];
                 bytes
                     .get_mut(..chunk.len())
@@ -1106,7 +1383,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             self.free_extent(extent, 0)?;
         }
         for block in tree.metadata_blocks().iter().copied() {
-            self.free_block(block)?;
+            self.release_cluster_reference(block)?;
         }
         self.free_inode(raw_inode.id)?;
         raw_inode.clear_deleted(self.now, self.volume.superblock.block_size())?;
@@ -1291,6 +1568,15 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         self.volume_label_update = Some(label);
     }
 
+    /// Computes mounted cluster state after a successful commit.
+    fn committed_cluster_state(&self) -> Result<(ClusterReferenceIndex, Superblock)> {
+        let mut clusters = self.volume.state.clusters.clone();
+        clusters.apply_deltas(self.cluster_deltas.as_slice())?;
+        let mut superblock = self.volume.superblock;
+        superblock.apply_free_cluster_delta(self.free_clusters_delta)?;
+        Ok((clusters, superblock))
+    }
+
     /// Removes a symbolic link directory entry and releases its inode.
     ///
     /// # Errors
@@ -1316,7 +1602,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 self.free_extent(extent, 0)?;
             }
             for block in tree.metadata_blocks().iter().copied() {
-                self.free_block(block)?;
+                self.release_cluster_reference(block)?;
             }
         }
         self.free_inode(raw_inode.id)?;
@@ -1414,7 +1700,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 }
                 BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
                 BlockMapping::Hole => {
-                    let physical = self.allocate_block()?;
+                    let physical = self.physical_block_for_hole(&tree, logical_block)?;
                     tree.insert_or_extend_initialized(logical_block, physical)?;
                     let mut block = vec![0_u8; block_size];
                     let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
@@ -1440,6 +1726,62 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .get_mut(inode_index)
             .ok_or(Error::InvalidInode)? = raw_inode;
         Ok(())
+    }
+
+    /// Selects a physical block for a sparse logical block using logical-cluster placement.
+    fn physical_block_for_hole(
+        &mut self,
+        tree: &MutableExtentTree,
+        logical_block: LogicalBlock,
+    ) -> Result<BlockAddress> {
+        let blocks_per_cluster = u64::from(self.volume.superblock.blocks_per_cluster().as_u32());
+        let logical = logical_block.as_u64();
+        let cluster_offset = logical
+            .checked_rem(blocks_per_cluster)
+            .ok_or(Error::InvalidClusterGeometry)?;
+        let logical_cluster_start = logical
+            .checked_sub(cluster_offset)
+            .ok_or(Error::ArithmeticOverflow)?;
+
+        for offset in 0..blocks_per_cluster {
+            let probe = logical_cluster_start
+                .checked_add(offset)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if probe > u64::from(u32::MAX) {
+                break;
+            }
+            let BlockMapping::Physical(physical) = tree.map_logical(LogicalBlock::try_from(probe)?)
+            else {
+                continue;
+            };
+            let cluster = self.volume.superblock.cluster_of_block(physical)?;
+            let physical = self.physical_block_in_cluster(cluster, cluster_offset)?;
+            self.record_cluster_reference_delta(cluster, 1)?;
+            return Ok(physical);
+        }
+
+        let first_block = self.allocate_cluster()?;
+        let cluster = self.volume.superblock.cluster_of_block(first_block)?;
+        self.physical_block_in_cluster(cluster, cluster_offset)
+    }
+
+    /// Returns a block at `cluster_offset` inside a fully present physical cluster.
+    fn physical_block_in_cluster(
+        &self,
+        cluster: ClusterAddress,
+        cluster_offset: u64,
+    ) -> Result<BlockAddress> {
+        if cluster_offset >= u64::from(self.volume.superblock.blocks_in_cluster(cluster)?) {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        Ok(BlockAddress::new(
+            self.volume
+                .superblock
+                .first_block_of_cluster(cluster)?
+                .get()
+                .checked_add(cluster_offset)
+                .ok_or(Error::ArithmeticOverflow)?,
+        ))
     }
 
     /// Extends a regular file as a sparse range.
@@ -1598,7 +1940,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
 
         let block_size = self.volume.superblock.block_size();
         let block_size_u64 = u64::from(block_size.bytes());
-        let new_physical = self.allocate_block()?;
+        let new_physical = self.allocate_cluster()?;
         let mut tree = self.mutable_extent_tree(&parent_inode)?;
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
@@ -1881,12 +2223,13 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             if refcount == 1 {
                 block
             } else {
-                let new_block = self.allocate_block()?;
+                let new_block = self.allocate_cluster()?;
+                self.release_cluster_reference(block)?;
                 self.decrement_xattr_block_ref(block, bytes, refcount)?;
                 new_block
             }
         } else {
-            self.allocate_block()?
+            self.allocate_cluster()?
         };
         let bytes = xattr_storage::serialize_external_xattr_block(
             set,
@@ -1903,10 +2246,11 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     fn release_xattr_block_ref(&mut self, block: BlockAddress) -> Result<()> {
         let bytes = self.xattr_block_bytes(block)?;
         let refcount = xattr_storage::external_xattr_refcount(&bytes)?;
-        if refcount == 1 {
-            self.free_block(block)
-        } else {
+        self.release_cluster_reference(block)?;
+        if refcount > 1 {
             self.decrement_xattr_block_ref(block, bytes, refcount)
+        } else {
+            Ok(())
         }
     }
 
@@ -2003,18 +2347,49 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         let required = tree.required_metadata_blocks(block_size)?;
         let mut metadata_blocks = tree.metadata_blocks().to_vec();
         while metadata_blocks.len() < required {
-            metadata_blocks.push(self.allocate_block()?);
+            metadata_blocks.push(self.allocate_cluster()?);
         }
         while metadata_blocks.len() > required {
             let block = metadata_blocks.pop().ok_or(Error::InvalidExtentTree)?;
-            self.free_block(block)?;
+            self.release_cluster_reference(block)?;
         }
         tree.set_metadata_blocks(metadata_blocks);
 
         let inode = raw_inode.parse()?;
         let serialized = tree.serialize(block_size, self.volume.extent_tree_context(&inode))?;
         self.stage_serialized_extent_tree(raw_inode, &serialized)?;
-        raw_inode.set_allocated_blocks(tree.allocated_data_blocks(), u64::from(block_size.bytes()))
+        raw_inode.set_allocated_blocks(
+            self.allocated_data_blocks(&tree)?,
+            u64::from(block_size.bytes()),
+        )
+    }
+
+    /// Counts physical blocks charged to an inode through allocation clusters.
+    fn allocated_data_blocks(&self, tree: &MutableExtentTree) -> Result<u64> {
+        let mut clusters = Vec::new();
+        for extent in tree.extents().iter().copied() {
+            for offset in 0..extent.len().as_u64() {
+                let cluster = self.volume.superblock.cluster_of_block(BlockAddress::new(
+                    extent
+                        .physical_start()
+                        .get()
+                        .checked_add(offset)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                ))?;
+                if !clusters.contains(&cluster) {
+                    clusters.push(cluster);
+                }
+            }
+        }
+        let mut blocks = 0_u64;
+        for cluster in clusters {
+            blocks = blocks
+                .checked_add(u64::from(
+                    self.volume.superblock.blocks_in_cluster(cluster)?,
+                ))
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        Ok(blocks)
     }
 
     /// Copies a serialized extent tree into the inode and metadata block staging areas.
@@ -2087,8 +2462,8 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::ArithmeticOverflow)
     }
 
-    /// Allocates the first free block visible in block group bitmaps.
-    fn allocate_block(&mut self) -> Result<BlockAddress> {
+    /// Allocates the first free allocation cluster visible in group bitmaps.
+    fn allocate_cluster(&mut self) -> Result<BlockAddress> {
         let groups = self.volume.superblock.block_group_count()?;
         for group in 0..groups.as_u32() {
             let group = BlockGroupId::from_u32(group);
@@ -2097,44 +2472,148 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 &self.volume.superblock,
                 group,
             )?;
-            if descriptor.free_blocks_count() == 0 {
-                continue;
-            }
             let bitmap_index = self.ensure_block_bitmap_update(descriptor.block_bitmap())?;
-            let group_start = self
-                .volume
-                .superblock
-                .first_data_block()
-                .get()
-                .checked_add(
+            let clusters_in_group = self.volume.superblock.clusters_in_group(group)?;
+            for bit in 0..clusters_in_group {
+                let cluster = ClusterAddress::new(
                     u64::from(group.as_u32())
                         .checked_mul(u64::from(
-                            self.volume.superblock.blocks_per_group().as_u32(),
+                            self.volume.superblock.clusters_per_group().as_u32(),
                         ))
+                        .and_then(|start| start.checked_add(u64::from(bit)))
                         .ok_or(Error::ArithmeticOverflow)?,
-                )
-                .ok_or(Error::ArithmeticOverflow)?;
-            let blocks_in_group = self.blocks_in_group(group)?;
-            for bit in 0..blocks_in_group {
-                let absolute_block = group_start
-                    .checked_add(u64::from(bit))
-                    .ok_or(Error::ArithmeticOverflow)?;
-                if absolute_block >= self.volume.superblock.block_count().as_u64() {
+                );
+                let first_block = self.volume.superblock.first_block_of_cluster(cluster)?;
+                if first_block.get() >= self.volume.superblock.block_count().as_u64() {
                     break;
+                }
+                if self.volume.superblock.blocks_in_cluster(cluster)?
+                    != self.volume.superblock.blocks_per_cluster().as_u32()
+                {
+                    continue;
+                }
+                let occupied = {
+                    let bitmap = self
+                        .block_bitmap_updates
+                        .get(bitmap_index)
+                        .ok_or(Error::InvalidSuperblock)?;
+                    bitmap_bit(bitmap.bytes.as_slice(), bit)?
+                };
+                if occupied {
+                    continue;
+                }
+                if self.staged_cluster_reference_count(cluster)? != 0 {
+                    return Err(Error::ClusterReferenceConflict);
                 }
                 let bitmap = self
                     .block_bitmap_updates
                     .get_mut(bitmap_index)
                     .ok_or(Error::InvalidSuperblock)?;
-                if !bitmap_bit(bitmap.bytes.as_slice(), bit)? {
-                    set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, true)?;
-                    self.record_group_free_blocks_delta(group, FreeBlockDelta::from_i64(-1))?;
-                    self.free_blocks_delta = self.free_blocks_delta.checked_add(-1)?;
-                    return Ok(BlockAddress::new(absolute_block));
-                }
+                set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, true)?;
+                self.record_group_free_clusters_delta(group, FreeClusterDelta::from_i64(-1))?;
+                self.free_clusters_delta = self.free_clusters_delta.checked_add(-1)?;
+                self.record_cluster_reference_delta(cluster, 1)?;
+                self.stage_cluster_zeroes(cluster)?;
+                return Ok(first_block);
             }
         }
         Err(Error::NoSpace)
+    }
+
+    /// Stages zeroes for every block covered by a newly allocated cluster.
+    fn stage_cluster_zeroes(&mut self, cluster: ClusterAddress) -> Result<()> {
+        let first_block = self.volume.superblock.first_block_of_cluster(cluster)?;
+        let blocks = self.volume.superblock.blocks_in_cluster(cluster)?;
+        let bytes = usize::try_from(
+            u64::from(blocks)
+                .checked_mul(u64::from(self.volume.superblock.block_size().bytes()))
+                .ok_or(Error::ArithmeticOverflow)?,
+        )
+        .map_err(|_| Error::ArithmeticOverflow)?;
+        self.data_writes.push(RangeWrite {
+            offset: self.volume.superblock.block_size().offset_of(first_block)?,
+            bytes: vec![0_u8; bytes],
+        });
+        Ok(())
+    }
+
+    /// Records one staged cluster-reference delta after checking underflow.
+    fn record_cluster_reference_delta(
+        &mut self,
+        cluster: ClusterAddress,
+        delta: i32,
+    ) -> Result<()> {
+        let updated = self
+            .staged_cluster_reference_count(cluster)?
+            .checked_add(delta)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if updated < 0 {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        if let Some(entry) = self
+            .cluster_deltas
+            .iter_mut()
+            .find(|entry| entry.cluster == cluster)
+        {
+            entry.delta = entry
+                .delta
+                .checked_add(delta)
+                .ok_or(Error::ArithmeticOverflow)?;
+        } else {
+            self.cluster_deltas
+                .push(ClusterReferenceDelta { cluster, delta });
+        }
+        Ok(())
+    }
+
+    /// Returns mounted plus staged references for one cluster.
+    fn staged_cluster_reference_count(&self, cluster: ClusterAddress) -> Result<i32> {
+        let mut count = i32::try_from(self.volume.state.clusters.count(cluster))
+            .map_err(|_| Error::ArithmeticOverflow)?;
+        for delta in self
+            .cluster_deltas
+            .iter()
+            .filter(|delta| delta.cluster == cluster)
+        {
+            count = count
+                .checked_add(delta.delta)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        Ok(count)
+    }
+
+    /// Releases a block-owned cluster reference and frees the cluster if no references remain.
+    fn release_cluster_reference(&mut self, block: BlockAddress) -> Result<()> {
+        let cluster = self.volume.superblock.cluster_of_block(block)?;
+        self.record_cluster_reference_delta(cluster, -1)?;
+        if self.staged_cluster_reference_count(cluster)? == 0 {
+            self.free_cluster(cluster)?;
+        }
+        Ok(())
+    }
+
+    /// Clears one cluster bitmap bit and records the affected accounting deltas.
+    fn free_cluster(&mut self, cluster: ClusterAddress) -> Result<()> {
+        let group = self.volume.superblock.cluster_group_of(cluster)?;
+        let descriptor =
+            BlockGroupDescriptor::read_from(&self.volume.device, &self.volume.superblock, group)?;
+        let bitmap_index = self.ensure_block_bitmap_update(descriptor.block_bitmap())?;
+        let bitmap = self
+            .block_bitmap_updates
+            .get_mut(bitmap_index)
+            .ok_or(Error::InvalidSuperblock)?;
+        let bit = self
+            .volume
+            .superblock
+            .cluster_bit_in_group(cluster, group)?;
+        if bitmap_bit(bitmap.bytes.as_slice(), bit)? {
+            set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, false)?;
+            self.record_group_free_clusters_delta(group, FreeClusterDelta::from_i64(1))?;
+            self.free_clusters_delta = self.free_clusters_delta.checked_add(1)?;
+            Ok(())
+        } else {
+            Err(Error::ClusterReferenceConflict)
+        }
     }
 
     /// Frees the suffix of an extent after `keep_len` blocks.
@@ -2154,32 +2633,13 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                     .checked_add(offset)
                     .ok_or(Error::ArithmeticOverflow)?,
             );
-            self.free_block(block)?;
+            self.release_cluster_reference(block)?;
         }
         if physical_start > extent.physical_start().get() || keep_len == 0 {
             Ok(())
         } else {
             Err(Error::ArithmeticOverflow)
         }
-    }
-
-    /// Marks a block free and records the affected group and superblock deltas.
-    fn free_block(&mut self, block: BlockAddress) -> Result<()> {
-        let group = block_group_of(&self.volume.superblock, block)?;
-        let descriptor =
-            BlockGroupDescriptor::read_from(&self.volume.device, &self.volume.superblock, group)?;
-        let bitmap_index = self.ensure_block_bitmap_update(descriptor.block_bitmap())?;
-        let bitmap = self
-            .block_bitmap_updates
-            .get_mut(bitmap_index)
-            .ok_or(Error::InvalidSuperblock)?;
-        let bit = block_bit_in_group(&self.volume.superblock, block, group)?;
-        if bitmap_bit(bitmap.bytes.as_slice(), bit)? {
-            set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, false)?;
-            self.record_group_free_blocks_delta(group, FreeBlockDelta::from_i64(1))?;
-            self.free_blocks_delta = self.free_blocks_delta.checked_add(1)?;
-        }
-        Ok(())
     }
 
     /// Allocates the first non-reserved inode visible in inode bitmaps.
@@ -2336,34 +2796,6 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::ArithmeticOverflow)
     }
 
-    /// Returns the block count actually present in a possibly partial group.
-    fn blocks_in_group(&self, group: BlockGroupId) -> Result<u32> {
-        let group_start = self
-            .volume
-            .superblock
-            .first_data_block()
-            .get()
-            .checked_add(
-                u64::from(group.as_u32())
-                    .checked_mul(u64::from(
-                        self.volume.superblock.blocks_per_group().as_u32(),
-                    ))
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .ok_or(Error::ArithmeticOverflow)?;
-        let remaining = self
-            .volume
-            .superblock
-            .block_count()
-            .as_u64()
-            .checked_sub(group_start)
-            .ok_or(Error::InvalidSuperblock)?;
-        Ok(core::cmp::min(
-            self.volume.superblock.blocks_per_group().as_u32(),
-            u32::try_from(remaining).unwrap_or(u32::MAX),
-        ))
-    }
-
     /// Returns the inode count actually present in a possibly partial group.
     fn inodes_in_group(&self, group: BlockGroupId) -> Result<u32> {
         let group_start = u64::from(group.as_u32())
@@ -2416,14 +2848,14 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         self.group_deltas.last_mut().ok_or(Error::InvalidSuperblock)
     }
 
-    /// Records a free-block count delta for one block group.
-    fn record_group_free_blocks_delta(
+    /// Records a free-cluster count delta for one block group.
+    fn record_group_free_clusters_delta(
         &mut self,
         group: BlockGroupId,
-        delta: FreeBlockDelta,
+        delta: FreeClusterDelta,
     ) -> Result<()> {
         let entry = self.group_delta_mut(group)?;
-        entry.free_blocks_delta = entry.free_blocks_delta.checked_add(delta.as_i64())?;
+        entry.free_clusters_delta = entry.free_clusters_delta.checked_add(delta.as_i64())?;
         Ok(())
     }
 
@@ -2506,9 +2938,9 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 &self.volume.superblock,
                 delta.group,
             )?;
-            if !delta.free_blocks_delta.is_zero() {
-                descriptor.apply_free_blocks_delta(
-                    delta.free_blocks_delta,
+            if !delta.free_clusters_delta.is_zero() {
+                descriptor.apply_free_clusters_delta(
+                    delta.free_clusters_delta,
                     &self.volume.superblock,
                     delta.group,
                 )?;
@@ -2554,7 +2986,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 bytes: descriptor.bytes().to_vec(),
             });
         }
-        if !self.free_blocks_delta.is_zero()
+        if !self.free_clusters_delta.is_zero()
             || self.free_inodes_delta != 0
             || self.volume_label_update.is_some()
         {
@@ -2655,7 +3087,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             } else {
                 0
             };
-        let raw_delta = self.free_blocks_delta.as_i64();
+        let raw_delta = self.free_clusters_delta.as_i64();
         let updated = if raw_delta.is_negative() {
             current
                 .checked_sub(raw_delta.unsigned_abs())
@@ -2712,6 +3144,7 @@ impl<D: BlockWriter> WriteTransaction<'_, D, InternalJournal> {
     pub fn commit(mut self) -> Result<()> {
         let block_size = self.volume.superblock.block_size();
         let metadata_blocks = self.metadata_blocks()?;
+        let (clusters, superblock) = self.committed_cluster_state()?;
         self.volume
             .state
             .journal
@@ -2724,7 +3157,10 @@ impl<D: BlockWriter> WriteTransaction<'_, D, InternalJournal> {
             &mut volume.device,
             block_size,
             &metadata_blocks,
-        )
+        )?;
+        volume.state.clusters = clusters;
+        volume.superblock = superblock;
+        Ok(())
     }
 }
 
@@ -2737,6 +3173,7 @@ impl<D: BlockWriter, J: BlockWriter> WriteTransaction<'_, D, ExternalJournal<J>>
     pub fn commit(mut self) -> Result<()> {
         let block_size = self.volume.superblock.block_size();
         let metadata_blocks = self.metadata_blocks()?;
+        let (clusters, superblock) = self.committed_cluster_state()?;
         self.volume
             .state
             .journal
@@ -2751,7 +3188,10 @@ impl<D: BlockWriter, J: BlockWriter> WriteTransaction<'_, D, ExternalJournal<J>>
             &mut journal.device,
             block_size,
             &metadata_blocks,
-        )
+        )?;
+        volume.state.clusters = clusters;
+        volume.superblock = superblock;
+        Ok(())
     }
 }
 
@@ -2767,6 +3207,16 @@ struct RawInode {
 }
 
 impl RawInode {
+    /// Returns the raw inode mode field without imposing a supported kind.
+    fn mode(&self) -> Result<u16> {
+        le_u16(&self.bytes, INODE_MODE_OFFSET)
+    }
+
+    /// Returns whether the raw inode advertises an extent tree.
+    fn has_extent_tree(&self) -> Result<bool> {
+        Ok(le_u32(&self.bytes, INODE_FLAGS_OFFSET)? & EXT4_EXTENTS_FL != 0)
+    }
+
     /// Parses the raw bytes as a validated inode.
     fn parse(&self) -> Result<Inode> {
         Inode::parse(self.id, &self.bytes)
@@ -2801,6 +3251,7 @@ impl RawInode {
         now: Ext4Timestamp,
         block_size: BlockSize,
         first_block: BlockAddress,
+        allocated_blocks: u64,
     ) -> Result<()> {
         self.bytes.fill(0);
         self.set_mode(MODE_DIRECTORY, metadata.permissions())?;
@@ -2818,7 +3269,7 @@ impl RawInode {
         )])?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
-        self.set_allocated_blocks(1, u64::from(block_size.bytes()))
+        self.set_allocated_blocks(allocated_blocks, u64::from(block_size.bytes()))
     }
 
     /// Initializes a zeroed inode record as an inline symbolic link.
@@ -3220,8 +3671,8 @@ struct BlockImage {
 struct GroupDelta {
     /// Block group receiving the accounting changes.
     group: BlockGroupId,
-    /// Free-block count delta for the descriptor.
-    free_blocks_delta: FreeBlockDelta,
+    /// Free-cluster count delta for the descriptor.
+    free_clusters_delta: FreeClusterDelta,
     /// Free-inode count delta for the descriptor.
     free_inodes_delta: i64,
     /// Used-directory count delta for the descriptor.
@@ -3233,7 +3684,7 @@ impl GroupDelta {
     fn new(group: BlockGroupId) -> Self {
         Self {
             group,
-            free_blocks_delta: FreeBlockDelta::ZERO,
+            free_clusters_delta: FreeClusterDelta::ZERO,
             free_inodes_delta: 0,
             used_dirs_delta: 0,
         }
@@ -3336,18 +3787,118 @@ fn set_bitmap_bit(bytes: &mut [u8], bit: u32, value: bool) -> Result<()> {
     Ok(())
 }
 
-/// Computes the block group that owns a filesystem block.
-fn block_group_of(superblock: &Superblock, block: BlockAddress) -> Result<BlockGroupId> {
-    let relative = block
-        .get()
-        .checked_sub(superblock.first_data_block().get())
-        .ok_or(Error::InvalidSuperblock)?;
-    let group = relative
-        .checked_div(u64::from(superblock.blocks_per_group().as_u32()))
-        .ok_or(Error::InvalidSuperblock)?;
-    Ok(BlockGroupId::from_u32(
-        u32::try_from(group).map_err(|_| Error::ArithmeticOverflow)?,
+/// Reads the allocation bitmap bit for one cluster.
+fn cluster_bitmap_bit(
+    reader: &impl BlockReader,
+    superblock: &Superblock,
+    cluster: ClusterAddress,
+) -> Result<bool> {
+    let group = superblock.cluster_group_of(cluster)?;
+    let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
+    let mut bytes = vec![
+        0_u8;
+        usize::try_from(superblock.block_size().bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?
+    ];
+    reader.read_exact_at(
+        superblock
+            .block_size()
+            .offset_of(descriptor.block_bitmap())?,
+        &mut bytes,
+    )?;
+    bitmap_bit(
+        bytes.as_slice(),
+        superblock.cluster_bit_in_group(cluster, group)?,
+    )
+}
+
+/// Reads the inode bitmap bit for one inode.
+fn inode_bitmap_bit(
+    reader: &impl BlockReader,
+    superblock: &Superblock,
+    inode_id: InodeId,
+) -> Result<bool> {
+    let (group, bit) = inode_group_bit(superblock, inode_id)?;
+    let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
+    let mut bytes = vec![
+        0_u8;
+        usize::try_from(superblock.block_size().bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?
+    ];
+    reader.read_exact_at(
+        superblock
+            .block_size()
+            .offset_of(descriptor.inode_bitmap())?,
+        &mut bytes,
+    )?;
+    bitmap_bit(bytes.as_slice(), bit)
+}
+
+/// Returns the first physical block in a block group.
+fn group_start_block(superblock: &Superblock, group: BlockGroupId) -> Result<BlockAddress> {
+    Ok(BlockAddress::new(
+        superblock
+            .first_data_block()
+            .get()
+            .checked_add(
+                u64::from(group.as_u32())
+                    .checked_mul(u64::from(superblock.blocks_per_group().as_u32()))
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::ArithmeticOverflow)?,
     ))
+}
+
+/// Returns whether a group carries a superblock and descriptor-table copy.
+fn group_has_superblock<D, State>(volume: &Volume<D, State>, group: BlockGroupId) -> bool {
+    let value = group.as_u32();
+    !volume.superblock.has_sparse_super()
+        || value == 0
+        || value == 1
+        || is_power_of(value, 3)
+        || is_power_of(value, 5)
+        || is_power_of(value, 7)
+}
+
+/// Returns true when `value` is an exact positive power of `base`.
+fn is_power_of(mut value: u32, base: u32) -> bool {
+    if value < base {
+        return false;
+    }
+    while value.checked_rem(base) == Some(0) {
+        value = value.checked_div(base).unwrap_or(0);
+    }
+    value == 1
+}
+
+/// Returns the number of blocks occupied by one descriptor-table copy.
+fn descriptor_table_blocks(superblock: &Superblock) -> Result<u64> {
+    let descriptor_bytes = u64::from(superblock.block_group_count()?.as_u32())
+        .checked_mul(u64::from(superblock.descriptor_size().as_u16()))
+        .ok_or(Error::ArithmeticOverflow)?;
+    round_up_div(descriptor_bytes, u64::from(superblock.block_size().bytes()))
+}
+
+/// Returns the inode count actually present in a possibly partial group.
+fn inode_count_in_group(superblock: &Superblock, group: BlockGroupId) -> Result<u32> {
+    let group_start = u64::from(group.as_u32())
+        .checked_mul(u64::from(superblock.inodes_per_group().as_u32()))
+        .ok_or(Error::ArithmeticOverflow)?;
+    let remaining = u64::from(superblock.inode_count().as_u32())
+        .checked_sub(group_start)
+        .ok_or(Error::InvalidSuperblock)?;
+    Ok(core::cmp::min(
+        superblock.inodes_per_group().as_u32(),
+        u32::try_from(remaining).unwrap_or(u32::MAX),
+    ))
+}
+
+/// Returns the number of blocks occupied by a group's inode table.
+fn inode_table_blocks(superblock: &Superblock, group: BlockGroupId) -> Result<u64> {
+    let inode_bytes = u64::from(inode_count_in_group(superblock, group)?)
+        .checked_mul(u64::from(superblock.inode_size().as_u16()))
+        .ok_or(Error::ArithmeticOverflow)?;
+    round_up_div(inode_bytes, u64::from(superblock.block_size().bytes()))
 }
 
 /// Computes the inode bitmap group and bit for an inode number.
@@ -3388,28 +3939,4 @@ fn inode_offset_on_device(
         )
         .ok_or(Error::ArithmeticOverflow)?;
     Ok(ByteOffset::new(offset))
-}
-
-/// Computes the block bitmap bit for a block inside its group.
-fn block_bit_in_group(
-    superblock: &Superblock,
-    block: BlockAddress,
-    group: BlockGroupId,
-) -> Result<u32> {
-    let group_start = superblock
-        .first_data_block()
-        .get()
-        .checked_add(
-            u64::from(group.as_u32())
-                .checked_mul(u64::from(superblock.blocks_per_group().as_u32()))
-                .ok_or(Error::ArithmeticOverflow)?,
-        )
-        .ok_or(Error::ArithmeticOverflow)?;
-    u32::try_from(
-        block
-            .get()
-            .checked_sub(group_start)
-            .ok_or(Error::InvalidSuperblock)?,
-    )
-    .map_err(|_| Error::ArithmeticOverflow)
 }

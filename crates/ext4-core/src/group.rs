@@ -12,7 +12,7 @@ use crate::endian::{le_u16, le_u32, put_le_u16};
 use crate::error::{Error, Result};
 use crate::superblock::{
     BlockGroupDescriptorChecksum, BlockGroupDescriptorLayout, BlockGroupDescriptorSize,
-    BlockGroupId, FreeBlockDelta, Superblock,
+    BlockGroupId, FreeClusterDelta, Superblock,
 };
 
 // Low 32-bit descriptor fields are present in both 32-byte and 64-byte layouts.
@@ -71,8 +71,8 @@ pub(crate) struct BlockGroupDescriptor {
     inode_bitmap: BlockAddress,
     /// First inode-table block decoded from the descriptor layout.
     inode_table: BlockAddress,
-    /// Free block count materialized from low/high descriptor fields.
-    free_blocks_count: u32,
+    /// Free cluster count materialized from low/high descriptor fields.
+    free_clusters_count: u32,
     /// Free inode count materialized from low/high descriptor fields.
     free_inodes_count: u32,
     /// Directory inode count used by allocation policy.
@@ -114,7 +114,7 @@ impl BlockGroupDescriptor {
             BG_INODE_TABLE_HI_OFFSET,
             superblock.descriptor_layout(),
         )?;
-        let free_blocks_count = descriptor_count(
+        let free_clusters_count = descriptor_count(
             &bytes,
             BG_FREE_BLOCKS_LO_OFFSET,
             BG_FREE_BLOCKS_HI_OFFSET,
@@ -144,7 +144,7 @@ impl BlockGroupDescriptor {
             block_bitmap,
             inode_bitmap,
             inode_table,
-            free_blocks_count,
+            free_clusters_count,
             free_inodes_count,
             used_dirs_count,
             itable_unused_count,
@@ -176,30 +176,25 @@ impl BlockGroupDescriptor {
         self.inode_table
     }
 
-    /// Returns the decoded free block count.
-    pub(crate) const fn free_blocks_count(&self) -> u32 {
-        self.free_blocks_count
-    }
-
     /// Returns the decoded free inode count.
     pub(crate) const fn free_inodes_count(&self) -> u32 {
         self.free_inodes_count
     }
 
-    /// Applies a free-block accounting delta and refreshes the descriptor checksum.
-    pub(crate) fn apply_free_blocks_delta(
+    /// Applies a free-cluster accounting delta and refreshes the descriptor checksum.
+    pub(crate) fn apply_free_clusters_delta(
         &mut self,
-        delta: FreeBlockDelta,
+        delta: FreeClusterDelta,
         superblock: &Superblock,
         group: BlockGroupId,
     ) -> Result<()> {
         let raw_delta = i32::try_from(delta.as_i64()).map_err(|_| Error::ArithmeticOverflow)?;
         let updated = if raw_delta.is_negative() {
-            self.free_blocks_count
+            self.free_clusters_count
                 .checked_sub(raw_delta.unsigned_abs())
                 .ok_or(Error::InvalidSuperblock)?
         } else {
-            self.free_blocks_count
+            self.free_clusters_count
                 .checked_add(u32::try_from(raw_delta).map_err(|_| Error::ArithmeticOverflow)?)
                 .ok_or(Error::ArithmeticOverflow)?
         };
@@ -215,7 +210,7 @@ impl BlockGroupDescriptor {
                 u16::try_from(updated >> 16).map_err(|_| Error::ArithmeticOverflow)?,
             )?;
         }
-        self.free_blocks_count = updated;
+        self.free_clusters_count = updated;
         write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)?;
         Ok(())
     }

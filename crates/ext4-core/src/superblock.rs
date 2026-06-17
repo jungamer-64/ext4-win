@@ -112,6 +112,7 @@ const SUPPORTED_READ_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_DIR_NLINK
     | RO_COMPAT_EXTRA_ISIZE
     | RO_COMPAT_QUOTA
+    | RO_COMPAT_BIGALLOC
     | RO_COMPAT_METADATA_CSUM
     | RO_COMPAT_READONLY
     | RO_COMPAT_PROJECT;
@@ -138,13 +139,10 @@ const REQUIRED_WRITE_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_EXTRA_ISIZE
     | RO_COMPAT_METADATA_CSUM;
 /// Read-only compatible feature mask accepted by the write mount policy.
-const SUPPORTED_WRITE_RO_COMPAT: u32 = REQUIRED_WRITE_RO_COMPAT;
+const SUPPORTED_WRITE_RO_COMPAT: u32 = REQUIRED_WRITE_RO_COMPAT | RO_COMPAT_BIGALLOC;
 /// Read-only compatible feature bits rejected by the write mount policy.
-const REJECTED_WRITE_RO_COMPAT: u32 = RO_COMPAT_GDT_CSUM
-    | RO_COMPAT_BIGALLOC
-    | RO_COMPAT_READONLY
-    | RO_COMPAT_VERITY
-    | RO_COMPAT_ORPHAN_PRESENT;
+const REJECTED_WRITE_RO_COMPAT: u32 =
+    RO_COMPAT_GDT_CSUM | RO_COMPAT_READONLY | RO_COMPAT_VERITY | RO_COMPAT_ORPHAN_PRESENT;
 /// Descriptor size implied by ext4 64-bit group descriptors when not explicit.
 const DEFAULT_64BIT_DESCRIPTOR_SIZE: u16 = 64;
 
@@ -193,6 +191,175 @@ impl BlockCount {
     #[must_use]
     pub const fn as_u64(self) -> u64 {
         self.0
+    }
+}
+
+/// Absolute ext4 allocation cluster address.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ClusterAddress(u64);
+
+impl ClusterAddress {
+    /// Creates an absolute allocation cluster address.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw cluster address.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Total number of allocation clusters recorded by validated geometry.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ClusterCount(u64);
+
+impl ClusterCount {
+    /// Creates a cluster count.
+    ///
+    /// # Errors
+    /// Returns an error when the count is zero.
+    pub fn new(value: u64) -> Result<Self> {
+        if value == 0 {
+            Err(Error::InvalidClusterGeometry)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the count for allocation geometry arithmetic.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Validated ext4 allocation cluster size in bytes.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ClusterSize(u32);
+
+impl ClusterSize {
+    /// Creates a cluster size from validated superblock geometry.
+    ///
+    /// # Errors
+    /// Returns an error when the size is zero.
+    pub fn new(value: u32) -> Result<Self> {
+        if value == 0 {
+            Err(Error::InvalidClusterGeometry)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the allocation cluster size in bytes.
+    #[must_use]
+    pub const fn bytes(self) -> u32 {
+        self.0
+    }
+}
+
+/// Number of filesystem blocks in one allocation cluster.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BlocksPerCluster(u32);
+
+impl BlocksPerCluster {
+    /// Creates a blocks-per-cluster value.
+    ///
+    /// # Errors
+    /// Returns an error when the value is zero.
+    pub fn new(value: u32) -> Result<Self> {
+        if value == 0 {
+            Err(Error::InvalidClusterGeometry)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the allocation ratio for block-to-cluster conversion.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Allocation clusters per ext4 block group.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ClustersPerGroup(u32);
+
+impl ClustersPerGroup {
+    /// Creates a clusters-per-group value.
+    ///
+    /// # Errors
+    /// Returns an error when the value is zero.
+    pub fn new(value: u32) -> Result<Self> {
+        if value == 0 {
+            Err(Error::InvalidClusterGeometry)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the value for allocation geometry arithmetic.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Number of free allocation clusters recorded by a validated superblock.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FreeClusterCount(u64);
+
+impl FreeClusterCount {
+    /// Creates a free-cluster count.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the count for on-disk accounting.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Signed free-cluster count delta.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FreeClusterDelta(i64);
+
+impl FreeClusterDelta {
+    /// Zero free-cluster delta.
+    pub(crate) const ZERO: Self = Self(0);
+
+    /// Creates a free-cluster delta from a signed count.
+    #[must_use]
+    pub(crate) const fn from_i64(value: i64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the delta for checked arithmetic at metadata encoding boundaries.
+    #[must_use]
+    pub(crate) const fn as_i64(self) -> i64 {
+        self.0
+    }
+
+    /// Returns true when the delta has no effect.
+    #[must_use]
+    pub(crate) const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Adds another delta.
+    ///
+    /// # Errors
+    /// Returns an error when the signed delta would overflow.
+    pub(crate) fn checked_add(self, delta: i64) -> Result<Self> {
+        Ok(Self(
+            self.0.checked_add(delta).ok_or(Error::ArithmeticOverflow)?,
+        ))
     }
 }
 
@@ -558,6 +725,99 @@ pub(crate) enum BlockGroupDescriptorChecksum {
     MetadataCrc32c,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Validated allocation geometry derived from block and cluster superblock fields.
+struct ClusterGeometry {
+    /// Allocation cluster size.
+    cluster_size: ClusterSize,
+    /// Block-to-cluster ratio.
+    blocks_per_cluster: BlocksPerCluster,
+    /// Clusters represented by one group bitmap.
+    clusters_per_group: ClustersPerGroup,
+    /// Total allocation clusters addressable by the filesystem.
+    cluster_count: ClusterCount,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Raw superblock fields needed to validate allocation-cluster geometry.
+struct RawClusterGeometry {
+    /// Total block count.
+    block_count: BlockCount,
+    /// First data block.
+    first_data_block: BlockAddress,
+    /// Block size selected by `s_log_block_size`.
+    block_size: BlockSize,
+    /// Raw `s_log_block_size`.
+    log_block_size: u32,
+    /// Raw `s_log_cluster_size`.
+    log_cluster_size: u32,
+    /// Blocks per group.
+    blocks_per_group: BlocksPerGroup,
+    /// Raw `s_clusters_per_group`.
+    clusters_per_group: u32,
+    /// Whether `RO_COMPAT_BIGALLOC` is enabled.
+    bigalloc: bool,
+}
+
+impl ClusterGeometry {
+    /// Validates cluster fields against feature flags and block geometry.
+    fn new(raw: RawClusterGeometry) -> Result<Self> {
+        if !raw.bigalloc
+            && (raw.log_cluster_size != raw.log_block_size
+                || raw.clusters_per_group != raw.blocks_per_group.as_u32())
+        {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        if raw.log_cluster_size < raw.log_block_size || raw.log_cluster_size > 31 {
+            return Err(Error::InvalidClusterGeometry);
+        }
+
+        let ratio_shift = raw
+            .log_cluster_size
+            .checked_sub(raw.log_block_size)
+            .ok_or(Error::InvalidClusterGeometry)?;
+        let blocks_per_cluster = BlocksPerCluster::new(
+            1_u32
+                .checked_shl(ratio_shift)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )?;
+        if raw.bigalloc && blocks_per_cluster.as_u32() == 1 {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        let cluster_size = ClusterSize::new(
+            raw.block_size
+                .bytes()
+                .checked_mul(blocks_per_cluster.as_u32())
+                .ok_or(Error::ArithmeticOverflow)?,
+        )?;
+        let clusters_per_group = ClustersPerGroup::new(raw.clusters_per_group)?;
+        if clusters_per_group
+            .as_u32()
+            .checked_mul(blocks_per_cluster.as_u32())
+            .ok_or(Error::ArithmeticOverflow)?
+            != raw.blocks_per_group.as_u32()
+        {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        let data_blocks = raw
+            .block_count
+            .as_u64()
+            .checked_sub(raw.first_data_block.get())
+            .ok_or(Error::InvalidClusterGeometry)?;
+        let cluster_count = ClusterCount::new(round_up_div(
+            data_blocks,
+            u64::from(blocks_per_cluster.as_u32()),
+        )?)?;
+
+        Ok(Self {
+            cluster_size,
+            blocks_per_cluster,
+            clusters_per_group,
+            cluster_count,
+        })
+    }
+}
+
 /// Validated ext4 feature flags accepted by a mount policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FeatureSet {
@@ -640,6 +900,11 @@ impl FeatureSet {
         self.incompat & INCOMPAT_64BIT != 0
     }
 
+    /// Returns whether sparse superblock backups are enabled.
+    pub(crate) const fn has_sparse_super(self) -> bool {
+        self.read_only_compat & RO_COMPAT_SPARSE_SUPER != 0
+    }
+
     /// Returns whether the filesystem advertises a journal.
     pub(crate) const fn has_journal(self) -> bool {
         self.compat & COMPAT_HAS_JOURNAL != 0
@@ -660,6 +925,11 @@ impl FeatureSet {
         self.read_only_compat & RO_COMPAT_GDT_CSUM != 0
     }
 
+    /// Returns whether block bitmaps address clusters instead of blocks.
+    pub(crate) const fn has_bigalloc(self) -> bool {
+        self.read_only_compat & RO_COMPAT_BIGALLOC != 0
+    }
+
     /// Returns whether the checksum seed is stored explicitly in the superblock.
     pub(crate) const fn has_checksum_seed(self) -> bool {
         self.incompat & INCOMPAT_CSUM_SEED != 0
@@ -675,14 +945,22 @@ pub struct Superblock {
     inode_count: InodeCount,
     /// Total block count.
     block_count: BlockCount,
-    /// Total free block count advertised by the superblock.
-    free_blocks_count: FreeBlockCount,
+    /// Allocation cluster size.
+    cluster_size: ClusterSize,
+    /// Blocks covered by one allocation cluster.
+    blocks_per_cluster: BlocksPerCluster,
+    /// Total allocation cluster count.
+    cluster_count: ClusterCount,
+    /// Total free cluster count advertised by the superblock.
+    free_clusters_count: FreeClusterCount,
     /// Total free inode count advertised by the superblock.
     free_inodes_count: FreeInodeCount,
     /// First block that can contain filesystem data.
     first_data_block: BlockAddress,
     /// Blocks assigned to each block group.
     blocks_per_group: BlocksPerGroup,
+    /// Allocation clusters assigned to each block group.
+    clusters_per_group: ClustersPerGroup,
     /// Inodes assigned to each block group.
     inodes_per_group: InodesPerGroup,
     /// Validated inode record size.
@@ -762,8 +1040,11 @@ impl Superblock {
         let free_blocks_count_lo = le_u32(raw, 12)?;
         let free_inodes_count = FreeInodeCount::new(le_u32(raw, 16)?);
         let first_data_block = BlockAddress::new(u64::from(le_u32(raw, 20)?));
-        let block_size = BlockSize::from_superblock_log(le_u32(raw, 24)?)?;
+        let log_block_size = le_u32(raw, 24)?;
+        let log_cluster_size = le_u32(raw, 28)?;
+        let block_size = BlockSize::from_superblock_log(log_block_size)?;
         let blocks_per_group = BlocksPerGroup::new(le_u32(raw, 32)?)?;
+        let raw_clusters_per_group = le_u32(raw, 36)?;
         let inodes_per_group = InodesPerGroup::new(le_u32(raw, 40)?)?;
         let first_inode = InodeId::try_from(le_u32(raw, 84)?)?;
         let inode_size = InodeRecordSize::new(le_u16(raw, 88)?, block_size)?;
@@ -787,7 +1068,7 @@ impl Superblock {
                     0
                 },
         )?;
-        let free_blocks_count = FreeBlockCount::new(
+        let free_clusters_count = FreeClusterCount::new(
             u64::from(free_blocks_count_lo)
                 | if features.has_64bit() {
                     u64::from(le_u32(raw, 344)?) << 32
@@ -795,6 +1076,19 @@ impl Superblock {
                     0
                 },
         );
+        let geometry = ClusterGeometry::new(RawClusterGeometry {
+            block_count,
+            first_data_block,
+            block_size,
+            log_block_size,
+            log_cluster_size,
+            blocks_per_group,
+            clusters_per_group: raw_clusters_per_group,
+            bigalloc: features.has_bigalloc(),
+        })?;
+        if free_clusters_count.as_u64() > geometry.cluster_count.as_u64() {
+            return Err(Error::InvalidClusterGeometry);
+        }
         if features.has_metadata_csum() && le_u32(raw, 1020)? != 0 {
             verify_crc32c(0, raw, 1020)?;
         }
@@ -830,10 +1124,14 @@ impl Superblock {
             block_size,
             inode_count,
             block_count,
-            free_blocks_count,
+            cluster_size: geometry.cluster_size,
+            blocks_per_cluster: geometry.blocks_per_cluster,
+            cluster_count: geometry.cluster_count,
+            free_clusters_count,
             free_inodes_count,
             first_data_block,
             blocks_per_group,
+            clusters_per_group: geometry.clusters_per_group,
             inodes_per_group,
             inode_size,
             first_inode,
@@ -864,10 +1162,28 @@ impl Superblock {
         self.block_count
     }
 
-    /// Total free block count.
+    /// Allocation cluster size.
     #[must_use]
-    pub const fn free_blocks_count(self) -> FreeBlockCount {
-        self.free_blocks_count
+    pub const fn cluster_size(self) -> ClusterSize {
+        self.cluster_size
+    }
+
+    /// Blocks covered by one allocation cluster.
+    #[must_use]
+    pub const fn blocks_per_cluster(self) -> BlocksPerCluster {
+        self.blocks_per_cluster
+    }
+
+    /// Total allocation cluster count.
+    #[must_use]
+    pub const fn cluster_count(self) -> ClusterCount {
+        self.cluster_count
+    }
+
+    /// Total free allocation cluster count.
+    #[must_use]
+    pub const fn free_cluster_count(self) -> FreeClusterCount {
+        self.free_clusters_count
     }
 
     /// Total free inode count.
@@ -886,6 +1202,12 @@ impl Superblock {
     #[must_use]
     pub const fn blocks_per_group(self) -> BlocksPerGroup {
         self.blocks_per_group
+    }
+
+    /// Allocation clusters per block group.
+    #[must_use]
+    pub const fn clusters_per_group(self) -> ClustersPerGroup {
+        self.clusters_per_group
     }
 
     /// Inodes per block group.
@@ -966,6 +1288,11 @@ impl Superblock {
         }
     }
 
+    /// Returns whether sparse superblock backups are enabled.
+    pub(crate) const fn has_sparse_super(self) -> bool {
+        self.features.has_sparse_super()
+    }
+
     /// Returns the journal recovery state.
     #[must_use]
     pub const fn recovery_state(self) -> RecoveryState {
@@ -1006,23 +1333,149 @@ impl Superblock {
     /// Returns an error when validated geometry cannot be combined without
     /// overflow.
     pub fn block_group_count(self) -> Result<BlockGroupCount> {
-        let data_blocks = self
-            .block_count
-            .as_u64()
-            .checked_sub(self.first_data_block.get())
-            .ok_or(Error::InvalidSuperblock)?;
-        let numerator = data_blocks
-            .checked_add(
-                u64::from(self.blocks_per_group.as_u32())
-                    .checked_sub(1)
-                    .ok_or(Error::InvalidSuperblock)?,
-            )
-            .ok_or(Error::ArithmeticOverflow)?;
-        let groups = numerator
-            .checked_div(u64::from(self.blocks_per_group.as_u32()))
-            .ok_or(Error::InvalidSuperblock)?;
+        let groups = round_up_div(
+            self.cluster_count.as_u64(),
+            u64::from(self.clusters_per_group.as_u32()),
+        )?;
         Ok(BlockGroupCount::from_u32(
             u32::try_from(groups).map_err(|_| Error::ArithmeticOverflow)?,
         ))
     }
+
+    /// Returns the allocation cluster containing a physical block.
+    pub(crate) fn cluster_of_block(self, block: BlockAddress) -> Result<ClusterAddress> {
+        if block.get() >= self.block_count.as_u64() {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        let relative = block
+            .get()
+            .checked_sub(self.first_data_block.get())
+            .ok_or(Error::InvalidClusterGeometry)?;
+        let cluster = relative
+            .checked_div(u64::from(self.blocks_per_cluster.as_u32()))
+            .ok_or(Error::InvalidClusterGeometry)?;
+        if cluster >= self.cluster_count.as_u64() {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        Ok(ClusterAddress::new(cluster))
+    }
+
+    /// Returns the first block covered by an allocation cluster.
+    pub(crate) fn first_block_of_cluster(self, cluster: ClusterAddress) -> Result<BlockAddress> {
+        if cluster.get() >= self.cluster_count.as_u64() {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        Ok(BlockAddress::new(
+            self.first_data_block
+                .get()
+                .checked_add(
+                    cluster
+                        .get()
+                        .checked_mul(u64::from(self.blocks_per_cluster.as_u32()))
+                        .ok_or(Error::ArithmeticOverflow)?,
+                )
+                .ok_or(Error::ArithmeticOverflow)?,
+        ))
+    }
+
+    /// Returns the number of physical blocks present in a cluster.
+    pub(crate) fn blocks_in_cluster(self, cluster: ClusterAddress) -> Result<u32> {
+        let start = self.first_block_of_cluster(cluster)?.get();
+        let remaining = self
+            .block_count
+            .as_u64()
+            .checked_sub(start)
+            .ok_or(Error::InvalidClusterGeometry)?;
+        Ok(core::cmp::min(
+            self.blocks_per_cluster.as_u32(),
+            u32::try_from(remaining).unwrap_or(u32::MAX),
+        ))
+    }
+
+    /// Returns the block group containing an allocation cluster.
+    pub(crate) fn cluster_group_of(self, cluster: ClusterAddress) -> Result<BlockGroupId> {
+        if cluster.get() >= self.cluster_count.as_u64() {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        let group = cluster
+            .get()
+            .checked_div(u64::from(self.clusters_per_group.as_u32()))
+            .ok_or(Error::InvalidClusterGeometry)?;
+        Ok(BlockGroupId::from_u32(
+            u32::try_from(group).map_err(|_| Error::ArithmeticOverflow)?,
+        ))
+    }
+
+    /// Returns the group-local bitmap bit for an allocation cluster.
+    pub(crate) fn cluster_bit_in_group(
+        self,
+        cluster: ClusterAddress,
+        group: BlockGroupId,
+    ) -> Result<u32> {
+        let group_start = u64::from(group.as_u32())
+            .checked_mul(u64::from(self.clusters_per_group.as_u32()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let bit = cluster
+            .get()
+            .checked_sub(group_start)
+            .ok_or(Error::InvalidClusterGeometry)?;
+        if bit >= u64::from(self.clusters_per_group.as_u32()) {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        u32::try_from(bit).map_err(|_| Error::ArithmeticOverflow)
+    }
+
+    /// Returns the allocation cluster count present in a possibly partial group.
+    pub(crate) fn clusters_in_group(self, group: BlockGroupId) -> Result<u32> {
+        let group_start = u64::from(group.as_u32())
+            .checked_mul(u64::from(self.clusters_per_group.as_u32()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let remaining = self
+            .cluster_count
+            .as_u64()
+            .checked_sub(group_start)
+            .ok_or(Error::InvalidClusterGeometry)?;
+        Ok(core::cmp::min(
+            self.clusters_per_group.as_u32(),
+            u32::try_from(remaining).unwrap_or(u32::MAX),
+        ))
+    }
+
+    /// Applies a committed free-cluster delta to the mounted superblock image.
+    pub(crate) fn apply_free_cluster_delta(&mut self, delta: FreeClusterDelta) -> Result<()> {
+        let raw_delta = delta.as_i64();
+        let updated = if raw_delta.is_negative() {
+            self.free_clusters_count
+                .as_u64()
+                .checked_sub(raw_delta.unsigned_abs())
+                .ok_or(Error::InvalidClusterGeometry)?
+        } else {
+            self.free_clusters_count
+                .as_u64()
+                .checked_add(u64::try_from(raw_delta).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?
+        };
+        if updated > self.cluster_count.as_u64() {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        self.free_clusters_count = FreeClusterCount::new(updated);
+        Ok(())
+    }
+}
+
+/// Divides with upward rounding and overflow checking.
+fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
+    if divisor == 0 {
+        return Err(Error::InvalidClusterGeometry);
+    }
+    let adjusted = value
+        .checked_add(
+            divisor
+                .checked_sub(1)
+                .ok_or(Error::InvalidClusterGeometry)?,
+        )
+        .ok_or(Error::ArithmeticOverflow)?;
+    adjusted
+        .checked_div(divisor)
+        .ok_or(Error::InvalidClusterGeometry)
 }

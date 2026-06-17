@@ -48,8 +48,9 @@ pub use inode::{
 };
 pub use name::{Ext4Name, WindowsName};
 pub use superblock::{
-    BlockCount, BlockGroupCount, BlockGroupDescriptorSize, BlockGroupId, BlocksPerGroup,
-    ChecksumSeed, Ext4VolumeLabel, FilesystemUuid, FreeInodeCount, FreeInodeDelta, InodeCount,
+    BlockCount, BlockGroupCount, BlockGroupDescriptorSize, BlockGroupId, BlocksPerCluster,
+    BlocksPerGroup, ChecksumSeed, ClusterAddress, ClusterCount, ClusterSize, ClustersPerGroup,
+    Ext4VolumeLabel, FilesystemUuid, FreeClusterCount, FreeInodeCount, FreeInodeDelta, InodeCount,
     InodeRecordSize, InodesPerGroup, JournalMode, JournalUuid, MetadataChecksum, RecoveryState,
     Superblock,
 };

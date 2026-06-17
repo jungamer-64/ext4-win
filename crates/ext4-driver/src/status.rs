@@ -74,9 +74,11 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::TruncatedStructure
         | Error::InvalidMagic
         | Error::InvalidSuperblock
+        | Error::InvalidClusterGeometry
         | Error::InvalidInode
         | Error::InvalidExtentTree
         | Error::InvalidDirectoryEntry
+        | Error::ClusterReferenceConflict
         | Error::JournalCorrupt
         | Error::ChecksumMismatch => STATUS_FILE_CORRUPT_ERROR,
     }
