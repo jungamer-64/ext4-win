@@ -11,6 +11,7 @@ mod ea;
 mod ffi;
 mod file_info;
 mod file_system_control;
+mod fsctl;
 mod irp;
 mod metadata;
 mod reparse;

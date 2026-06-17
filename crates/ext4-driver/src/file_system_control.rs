@@ -9,7 +9,7 @@ use wdk_sys::{
 
 use crate::{
     block_device::query_device_length,
-    ffi,
+    ffi, fsctl,
     irp::{DispatchTarget, FileSystemControlStack, MountVolumeStack},
     reparse,
     state::{
@@ -233,6 +233,18 @@ fn user_fs_control(request: UserFsControlRequest) -> NTSTATUS {
             reparse::set_reparse_point(request.target(), request.stack())
         }
         reparse::FSCTL_DELETE_REPARSE_POINT => STATUS_NOT_SUPPORTED,
+        fsctl::FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY => {
+            fsctl::add_encryption_key(request.target(), request.stack())
+        }
+        fsctl::FSCTL_EXT4WIN_REMOVE_ENCRYPTION_KEY => {
+            fsctl::remove_encryption_key(request.target(), request.stack())
+        }
+        fsctl::FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS => {
+            fsctl::get_encryption_key_status(request.target(), request.stack())
+        }
+        fsctl::FSCTL_EXT4WIN_ENABLE_VERITY => {
+            fsctl::enable_verity(request.target(), request.stack())
+        }
         _ => STATUS_NOT_SUPPORTED,
     }
 }
