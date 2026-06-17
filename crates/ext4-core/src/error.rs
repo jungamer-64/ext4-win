@@ -84,6 +84,10 @@ pub enum Error {
     CannotRemoveRoot,
     /// An fscrypt context, key, or policy is malformed or unsupported.
     InvalidEncryptionContext,
+    /// fs-verity metadata, descriptor, or enable parameters are malformed.
+    InvalidVerityMetadata,
+    /// fs-verity data verification failed.
+    VerityMismatch,
 }
 
 impl fmt::Display for Error {
@@ -129,6 +133,8 @@ impl fmt::Display for Error {
             Self::UnsupportedInodeMutation => "unsupported ext4 inode mutation",
             Self::CannotRemoveRoot => "cannot remove the ext4 root directory",
             Self::InvalidEncryptionContext => "invalid ext4 encryption context",
+            Self::InvalidVerityMetadata => "invalid ext4 verity metadata",
+            Self::VerityMismatch => "ext4 verity verification failed",
         })
     }
 }

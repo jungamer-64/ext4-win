@@ -20,6 +20,7 @@ pub mod fscrypt;
 pub mod inode;
 pub mod name;
 pub mod superblock;
+pub mod verity;
 pub mod volume;
 pub mod windows;
 pub mod xattr;
@@ -60,6 +61,11 @@ pub use superblock::{
     Ext4VolumeLabel, FilesystemUuid, FreeClusterCount, FreeInodeCount, FreeInodeDelta, InodeCount,
     InodeRecordSize, InodesPerGroup, JournalMode, JournalUuid, MetadataChecksum, RecoveryState,
     Superblock,
+};
+pub use verity::{
+    FSVERITY_DESCRIPTOR_BYTES, FSVERITY_MAX_BLOCK_BYTES, FSVERITY_MIN_BLOCK_BYTES,
+    FsverityBlockSize, FsverityDescriptor, FsverityDigest, FsverityHashAlgorithm,
+    FsverityMerkleTree, FsverityRootHash, FsveritySalt,
 };
 pub use volume::{
     DirectoryNode, ExternalJournal, FileNode, InternalJournal, LookupResult, MountContext, Node,
