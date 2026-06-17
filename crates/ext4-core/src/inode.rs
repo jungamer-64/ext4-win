@@ -43,6 +43,8 @@ const EXT4_ENCRYPT_FL: u32 = 0x0000_0800;
 const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
 /// Inode flag rejected because casefolded lookup semantics are unsupported.
 const EXT4_CASEFOLD_FL: u32 = 0x4000_0000;
+/// Inode flag selecting fs-verity authenticated file contents.
+const EXT4_VERITY_FL: u32 = 0x0010_0000;
 /// Permission and special-mode bits allowed apart from the inode file type.
 const PERMISSION_BITS: u16 = 0o7777;
 
@@ -490,6 +492,21 @@ pub enum InodeKind {
     Symlink,
 }
 
+/// Write-domain operation requested against an inode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InodeMutation {
+    /// POSIX metadata, timestamps, or xattrs that do not reinterpret file data.
+    Metadata,
+    /// Directory entry insertion, removal, rename, or replacement.
+    DirectoryEntry,
+    /// Regular-file or symlink payload bytes.
+    FileData,
+    /// File length or allocated extent shape.
+    FileSize,
+    /// Namespace removal and final inode release.
+    Delete,
+}
+
 /// Typed representation of an inode's data pointer area.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InodeStorage {
@@ -679,6 +696,37 @@ impl Inode {
     #[must_use]
     pub fn is_indexed_directory(&self) -> bool {
         self.kind == InodeKind::Directory && self.flags & EXT4_INDEX_FL != 0
+    }
+
+    /// Validates one write-domain operation against this inode's flags.
+    ///
+    /// # Errors
+    /// Returns an error when the requested operation is incompatible with the
+    /// inode's on-disk semantics.
+    pub fn require_mutation(&self, mutation: InodeMutation) -> Result<()> {
+        if self.flags & EXT4_IMMUTABLE_FL != 0 {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        if self.flags & EXT4_INLINE_DATA_FL != 0 {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        match mutation {
+            InodeMutation::Metadata | InodeMutation::Delete => {}
+            InodeMutation::DirectoryEntry => {
+                if self.flags & (EXT4_APPEND_FL | EXT4_ENCRYPT_FL | EXT4_CASEFOLD_FL) != 0 {
+                    return Err(Error::UnsupportedInodeMutation);
+                }
+            }
+            InodeMutation::FileData | InodeMutation::FileSize => {
+                if self.flags
+                    & (EXT4_APPEND_FL | EXT4_ENCRYPT_FL | EXT4_CASEFOLD_FL | EXT4_VERITY_FL)
+                    != 0
+                {
+                    return Err(Error::UnsupportedInodeMutation);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Data storage selected by inode flags and node kind.
