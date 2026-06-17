@@ -31,10 +31,14 @@ const EXT4_XATTR_INDEX_TRUSTED: u8 = 4;
 const EXT4_XATTR_INDEX_SECURITY: u8 = 6;
 /// Serialized index for generic `system.*`.
 const EXT4_XATTR_INDEX_SYSTEM: u8 = 7;
+/// Serialized index for ext4's private fscrypt context xattr.
+const EXT4_XATTR_INDEX_ENCRYPTION: u8 = 9;
 /// Local name exposed for access ACLs at the public xattr boundary.
 const POSIX_ACL_ACCESS_NAME: &[u8] = b"posix_acl_access";
 /// Local name exposed for default ACLs at the public xattr boundary.
 const POSIX_ACL_DEFAULT_NAME: &[u8] = b"posix_acl_default";
+/// On-disk local name for ext4's private fscrypt context xattr.
+const ENCRYPTION_CONTEXT_NAME: &[u8] = b"c";
 
 /// External ext4 xattr namespace selected by the name prefix.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -241,6 +245,64 @@ impl XattrSet {
     }
 }
 
+/// Complete ext4 xattr set for one inode, including private filesystem slots.
+///
+/// Public xattr APIs expose only `public`; filesystem-private slots are kept in
+/// the same set so public xattr mutation cannot silently discard them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InodeXattrSet {
+    /// User-visible xattrs.
+    public: XattrSet,
+    /// ext4 private fscrypt context stored at index 9, name "c".
+    encryption_context: Option<XattrValue>,
+}
+
+impl InodeXattrSet {
+    /// Creates an empty inode xattr set.
+    #[must_use]
+    pub(crate) fn empty() -> Self {
+        Self {
+            public: XattrSet::empty(),
+            encryption_context: None,
+        }
+    }
+
+    /// Creates a complete inode xattr set from separated domains.
+    #[must_use]
+    pub(crate) const fn from_parts(
+        public: XattrSet,
+        encryption_context: Option<XattrValue>,
+    ) -> Self {
+        Self {
+            public,
+            encryption_context,
+        }
+    }
+
+    /// Public xattrs attached to the inode.
+    #[must_use]
+    pub(crate) const fn public(&self) -> &XattrSet {
+        &self.public
+    }
+
+    /// Mutable public xattrs attached to the inode.
+    pub(crate) const fn public_mut(&mut self) -> &mut XattrSet {
+        &mut self.public
+    }
+
+    /// Raw fscrypt context xattr value, when the inode is encrypted.
+    #[must_use]
+    pub(crate) fn encryption_context(&self) -> Option<&XattrValue> {
+        self.encryption_context.as_ref()
+    }
+
+    /// Returns true when no public or private xattrs are present.
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.public.is_empty() && self.encryption_context.is_none()
+    }
+}
+
 /// One xattr entry stored by `XattrSet`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct XattrEntry {
@@ -251,9 +313,9 @@ struct XattrEntry {
 }
 
 /// Parses in-inode xattrs from the inode body region after `i_extra_isize`.
-pub(crate) fn parse_inline_xattrs(region: &[u8]) -> Result<XattrSet> {
+pub(crate) fn parse_inline_xattrs(region: &[u8]) -> Result<InodeXattrSet> {
     if region.len() < EXT4_XATTR_INODE_HEADER_BYTES || region.iter().all(|byte| *byte == 0) {
-        return Ok(XattrSet::empty());
+        return Ok(InodeXattrSet::empty());
     }
     if le_u32(region, 0)? != EXT4_XATTR_MAGIC {
         return Err(Error::InvalidXattr);
@@ -267,7 +329,7 @@ pub(crate) fn parse_inline_xattrs(region: &[u8]) -> Result<XattrSet> {
 }
 
 /// Serializes a complete xattr set into an in-inode xattr region.
-pub(crate) fn serialize_inline_xattrs(set: &XattrSet, capacity: usize) -> Result<Vec<u8>> {
+pub(crate) fn serialize_inline_xattrs(set: &InodeXattrSet, capacity: usize) -> Result<Vec<u8>> {
     let mut bytes = vec![0_u8; capacity];
     if set.is_empty() {
         return Ok(bytes);
@@ -292,7 +354,7 @@ pub(crate) fn parse_external_xattr_block(
     bytes: &[u8],
     block: BlockAddress,
     superblock: &Superblock,
-) -> Result<XattrSet> {
+) -> Result<InodeXattrSet> {
     validate_external_xattr_block(bytes, block, superblock)?;
     parse_xattr_entries(
         bytes,
@@ -304,7 +366,7 @@ pub(crate) fn parse_external_xattr_block(
 
 /// Serializes a complete xattr set into one external xattr block.
 pub(crate) fn serialize_external_xattr_block(
-    set: &XattrSet,
+    set: &InodeXattrSet,
     block_size: usize,
     block: BlockAddress,
     superblock: &Superblock,
@@ -328,7 +390,7 @@ pub(crate) fn serialize_external_xattr_block(
 }
 
 /// Verifies that a set fits in one external xattr block.
-pub(crate) fn ensure_external_xattrs_fit(set: &XattrSet, block_size: usize) -> Result<()> {
+pub(crate) fn ensure_external_xattrs_fit(set: &InodeXattrSet, block_size: usize) -> Result<()> {
     let mut bytes = vec![0_u8; block_size];
     serialize_xattr_entries(
         set,
@@ -368,12 +430,18 @@ pub(crate) fn set_external_xattr_refcount(
     refresh_external_xattr_checksum(bytes, block, superblock)
 }
 
-/// Merges inline and external xattr sets while rejecting duplicate logical
-/// names.
-pub(crate) fn merge_xattr_sets(left: XattrSet, right: XattrSet) -> Result<XattrSet> {
-    let mut entries = left.into_entries();
-    entries.extend(right.into_entries());
-    XattrSet::from_entries(entries)
+/// Merges inline and external xattr sets while rejecting duplicate logical and
+/// private slots.
+pub(crate) fn merge_xattr_sets(left: InodeXattrSet, right: InodeXattrSet) -> Result<InodeXattrSet> {
+    let mut entries = left.public.into_entries();
+    entries.extend(right.public.into_entries());
+    let public = XattrSet::from_entries(entries)?;
+    let encryption_context = match (left.encryption_context, right.encryption_context) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(_), Some(_)) => return Err(Error::InvalidXattr),
+    };
+    Ok(InodeXattrSet::from_parts(public, encryption_context))
 }
 
 /// Placement rules for serialized xattr values.
@@ -388,12 +456,21 @@ enum XattrValuePlacement {
 /// Parsed entry before the value region has been proven non-overlapping.
 #[derive(Debug)]
 struct ParsedDiskXattr {
-    /// Logical public xattr name.
-    name: XattrName,
+    /// Logical xattr slot selected by the on-disk key.
+    slot: ParsedDiskXattrSlot,
     /// Value offset as encoded on disk.
     value_offset: usize,
     /// Value byte length.
     value_size: usize,
+}
+
+/// Parsed xattr slot before values have been copied into owned sets.
+#[derive(Debug)]
+enum ParsedDiskXattrSlot {
+    /// User-visible xattr.
+    Public(XattrName),
+    /// ext4 private fscrypt context.
+    EncryptionContext,
 }
 
 /// Serialized entry paired with its disk-order key.
@@ -430,7 +507,7 @@ fn parse_xattr_entries(
     entry_offset: usize,
     value_base: usize,
     placement: XattrValuePlacement,
-) -> Result<XattrSet> {
+) -> Result<InodeXattrSet> {
     let mut cursor = entry_offset;
     let mut parsed = Vec::new();
     let mut previous_key: Option<DiskXattrKey> = None;
@@ -503,14 +580,15 @@ fn parse_xattr_entries(
         previous_key = Some(key);
 
         parsed.push(ParsedDiskXattr {
-            name: logical_name(index, local)?,
+            slot: logical_slot(index, local)?,
             value_offset,
             value_size,
         });
         cursor = align_up(name_end)?;
     }
 
-    let mut entries = Vec::new();
+    let mut public_entries = Vec::new();
+    let mut encryption_context = None;
     for entry in parsed {
         let value = if entry.value_size == 0 {
             XattrValue::new(&[])?
@@ -530,24 +608,43 @@ fn parse_xattr_entries(
                     .ok_or(Error::InvalidXattr)?,
             )?
         };
-        entries.push((entry.name, value));
+        match entry.slot {
+            ParsedDiskXattrSlot::Public(name) => public_entries.push((name, value)),
+            ParsedDiskXattrSlot::EncryptionContext => {
+                if encryption_context.replace(value).is_some() {
+                    return Err(Error::InvalidXattr);
+                }
+            }
+        }
     }
-    XattrSet::from_entries(entries)
+    Ok(InodeXattrSet::from_parts(
+        XattrSet::from_entries(public_entries)?,
+        encryption_context,
+    ))
 }
 
 /// Serializes xattr entries into a pre-zeroed storage image.
 fn serialize_xattr_entries(
-    set: &XattrSet,
+    set: &InodeXattrSet,
     storage: &mut [u8],
     entry_offset: usize,
     value_base: usize,
     placement: XattrValuePlacement,
 ) -> Result<()> {
     let mut entries = Vec::new();
-    for entry in &set.entries {
+    for entry in &set.public.entries {
         entries.push(SerializedDiskXattr {
             key: disk_key(&entry.name)?,
             value: entry.value.clone(),
+        });
+    }
+    if let Some(value) = &set.encryption_context {
+        entries.push(SerializedDiskXattr {
+            key: DiskXattrKey {
+                index: EXT4_XATTR_INDEX_ENCRYPTION,
+                local: ENCRYPTION_CONTEXT_NAME.to_vec(),
+            },
+            value: value.clone(),
         });
     }
     entries.sort_by(|left, right| left.key.cmp_disk(&right.key));
@@ -675,18 +772,33 @@ fn disk_key(name: &XattrName) -> Result<DiskXattrKey> {
     })
 }
 
-/// Converts an on-disk xattr key to the public logical xattr name.
-fn logical_name(index: u8, local: &[u8]) -> Result<XattrName> {
+/// Converts an on-disk xattr key to the logical inode xattr slot.
+fn logical_slot(index: u8, local: &[u8]) -> Result<ParsedDiskXattrSlot> {
     match index {
-        EXT4_XATTR_INDEX_USER => XattrName::new(XattrNamespace::User, local),
-        EXT4_XATTR_INDEX_TRUSTED => XattrName::new(XattrNamespace::Trusted, local),
-        EXT4_XATTR_INDEX_SECURITY => XattrName::new(XattrNamespace::Security, local),
-        EXT4_XATTR_INDEX_SYSTEM => XattrName::new(XattrNamespace::System, local),
-        EXT4_XATTR_INDEX_POSIX_ACL_ACCESS if local.is_empty() => {
-            XattrName::new(XattrNamespace::System, POSIX_ACL_ACCESS_NAME)
-        }
-        EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT if local.is_empty() => {
-            XattrName::new(XattrNamespace::System, POSIX_ACL_DEFAULT_NAME)
+        EXT4_XATTR_INDEX_USER => Ok(ParsedDiskXattrSlot::Public(XattrName::new(
+            XattrNamespace::User,
+            local,
+        )?)),
+        EXT4_XATTR_INDEX_TRUSTED => Ok(ParsedDiskXattrSlot::Public(XattrName::new(
+            XattrNamespace::Trusted,
+            local,
+        )?)),
+        EXT4_XATTR_INDEX_SECURITY => Ok(ParsedDiskXattrSlot::Public(XattrName::new(
+            XattrNamespace::Security,
+            local,
+        )?)),
+        EXT4_XATTR_INDEX_SYSTEM => Ok(ParsedDiskXattrSlot::Public(XattrName::new(
+            XattrNamespace::System,
+            local,
+        )?)),
+        EXT4_XATTR_INDEX_POSIX_ACL_ACCESS if local.is_empty() => Ok(ParsedDiskXattrSlot::Public(
+            XattrName::new(XattrNamespace::System, POSIX_ACL_ACCESS_NAME)?,
+        )),
+        EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT if local.is_empty() => Ok(ParsedDiskXattrSlot::Public(
+            XattrName::new(XattrNamespace::System, POSIX_ACL_DEFAULT_NAME)?,
+        )),
+        EXT4_XATTR_INDEX_ENCRYPTION if local == ENCRYPTION_CONTEXT_NAME => {
+            Ok(ParsedDiskXattrSlot::EncryptionContext)
         }
         _ => Err(Error::InvalidXattr),
     }
@@ -755,7 +867,10 @@ const fn align_down(value: usize) -> usize {
 mod tests {
     use alloc::vec;
 
-    use super::{XattrName, XattrNamespace, XattrSet, XattrValue};
+    use super::{
+        InodeXattrSet, XattrName, XattrNamespace, XattrSet, XattrValue, merge_xattr_sets,
+        parse_inline_xattrs, serialize_inline_xattrs,
+    };
 
     #[test]
     fn xattr_name_is_split_from_namespace() {
@@ -776,5 +891,30 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn fscrypt_context_is_private_inode_xattr() {
+        let name = XattrName::new(XattrNamespace::User, b"visible").unwrap();
+        let value = XattrValue::new(b"public").unwrap();
+        let public = XattrSet::from_entries(vec![(name, value)]).unwrap();
+        let context = XattrValue::new(&[0xA5; 40]).unwrap();
+        let set = InodeXattrSet::from_parts(public.clone(), Some(context.clone()));
+
+        let image = serialize_inline_xattrs(&set, 256).unwrap();
+        let parsed = parse_inline_xattrs(&image).unwrap();
+
+        assert_eq!(parsed.public(), &public);
+        assert_eq!(parsed.encryption_context(), Some(&context));
+    }
+
+    #[test]
+    fn duplicate_private_fscrypt_context_is_rejected() {
+        let left =
+            InodeXattrSet::from_parts(XattrSet::empty(), Some(XattrValue::new(b"a").unwrap()));
+        let right =
+            InodeXattrSet::from_parts(XattrSet::empty(), Some(XattrValue::new(b"b").unwrap()));
+
+        assert!(merge_xattr_sets(left, right).is_err());
     }
 }

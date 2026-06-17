@@ -13,17 +13,18 @@
 
 use alloc::{vec, vec::Vec};
 
+use crate::xattr::{self as xattr_storage, InodeXattrSet};
 use crate::{
     BlockAddress, BlockGroupId, BlockMapping, BlockReader, BlockSize, BlockWriter, ByteOffset,
     DeviceLength, DirectoryEntry, DirectoryEntryKind, DirectoryNode, Error, Ext4Gid, Ext4Name,
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, Ext4VolumeLabel,
     Ext4WindowsAttributes, Extent, ExtentLength, ExtentTree, ExtentTreeContext, ExternalJournal,
-    FileNode, FileOffset, FileSize, InodeExtentRoot, InodeId, InodeProtection, JournalMode,
-    LogicalBlock, LookupResult, MountContext, MutableExtentTree, NewDirectoryMetadata,
+    FileNode, FileOffset, FileSize, FscryptContextV2, InodeExtentRoot, InodeId, InodeProtection,
+    JournalMode, LogicalBlock, LookupResult, MountContext, MutableExtentTree, NewDirectoryMetadata,
     NewFileMetadata, NewSymlinkMetadata, Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly,
     ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget,
     TransactionDirectory, TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName,
-    XattrNamespace, XattrValue,
+    XattrNamespace, XattrSet, XattrValue,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -190,6 +191,39 @@ fn test_symlink_metadata() -> NewSymlinkMetadata {
 
 fn test_mount_context() -> MountContext {
     MountContext::without_encryption_keys()
+}
+
+fn fscrypt_v2_context_bytes() -> [u8; 40] {
+    let mut bytes = [0_u8; 40];
+    bytes[0] = 2;
+    bytes[1] = 1;
+    bytes[2] = 4;
+    bytes[8..24].fill(0x11);
+    bytes[24..40].fill(0x22);
+    bytes
+}
+
+fn install_inline_fscrypt_context(image: &mut [u8], inode_value: u32, context: &[u8]) {
+    let inode_offset = modern_inode_offset(inode_value);
+    put_u32(
+        image,
+        1024 + 96,
+        get_u32(image, 1024 + 96) | INCOMPAT_ENCRYPT,
+    );
+    put_u32(
+        image,
+        inode_offset + 32,
+        get_u32(image, inode_offset + 32) | EXT4_ENCRYPT_FL,
+    );
+    put_u16(image, inode_offset + 128, 32);
+    let xattrs = InodeXattrSet::from_parts(XattrSet::empty(), Some(must(XattrValue::new(context))));
+    let body_offset = inode_offset + 160;
+    let body_capacity = MODERN_INODE_SIZE - 160;
+    let bytes = must(xattr_storage::serialize_inline_xattrs(
+        &xattrs,
+        body_capacity,
+    ));
+    image[body_offset..body_offset + bytes.len()].copy_from_slice(&bytes);
 }
 
 fn overwrite_file<D: BlockWriter, J>(
@@ -1522,6 +1556,56 @@ fn in_inode_xattr_round_trips_through_inode_body() {
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
+    assert_eq!(must(volume.read_xattr(inode(3), &name)), Some(value));
+    assert_eq!(must(volume.read_xattrs(inode(3))).entries().len(), 1);
+}
+
+#[test]
+fn private_fscrypt_context_is_not_public_xattr() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let context_bytes = fscrypt_v2_context_bytes();
+    install_inline_fscrypt_context(&mut image, 3, &context_bytes);
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context(),
+    ));
+
+    assert_eq!(
+        must(volume.read_fscrypt_context(inode(3))),
+        Some(must(FscryptContextV2::parse(&context_bytes)))
+    );
+    assert_eq!(must(volume.read_xattrs(inode(3))).entries().len(), 0);
+}
+
+#[test]
+fn public_xattr_update_preserves_private_fscrypt_context() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let context_bytes = fscrypt_v2_context_bytes();
+    install_inline_fscrypt_context(&mut image, 3, &context_bytes);
+
+    let name = must(XattrName::new(XattrNamespace::User, b"visible"));
+    let value = must(XattrValue::new(b"value"));
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+            device,
+            test_mount_context(),
+        ));
+        let mut transaction = volume.begin_transaction(NOW);
+        let node = transaction_node(&transaction, inode(3));
+        must(transaction.set_xattr(node, name.clone(), value.clone()));
+        must(transaction.commit());
+    }
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context(),
+    ));
+    assert_eq!(
+        must(volume.read_fscrypt_context(inode(3))),
+        Some(must(FscryptContextV2::parse(&context_bytes)))
+    );
     assert_eq!(must(volume.read_xattr(inode(3), &name)), Some(value));
     assert_eq!(must(volume.read_xattrs(inode(3))).entries().len(), 1);
 }
