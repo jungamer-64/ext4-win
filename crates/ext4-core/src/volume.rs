@@ -15,7 +15,7 @@ use crate::extent::{
     BlockMapping, Extent, ExtentLength, ExtentTree, ExtentTreeContext, LogicalBlock,
     MutableExtentTree, SerializedExtentTree,
 };
-use crate::fscrypt::FscryptKeySet;
+use crate::fscrypt::{FscryptContextV2, FscryptKeySet};
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset, FileSize,
@@ -30,7 +30,7 @@ use crate::superblock::{
     RecoveryState, Superblock,
 };
 use crate::windows::WindowsOverlay;
-use crate::xattr::{self as xattr_storage, XattrName, XattrSet, XattrValue};
+use crate::xattr::{self as xattr_storage, InodeXattrSet, XattrName, XattrSet, XattrValue};
 
 // Volume mutation offsets are kept together so inode/superblock rewrites use one
 // source of truth for on-disk byte layout.
@@ -806,7 +806,10 @@ impl<D: BlockReader, State> Volume<D, State> {
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
     pub fn read_xattrs(&self, inode_id: InodeId) -> Result<XattrSet> {
-        self.read_xattr_set_from_raw(&self.read_raw_inode(inode_id)?)
+        Ok(self
+            .read_inode_xattrs_from_raw(&self.read_raw_inode(inode_id)?)?
+            .public()
+            .clone())
     }
 
     /// Reads one extended attribute value by name.
@@ -842,6 +845,19 @@ impl<D: BlockReader, State> Volume<D, State> {
             return Ok(None);
         };
         Ok(Some(WindowsOverlay::parse(&value)?))
+    }
+
+    /// Reads the fscrypt v2 context stored in ext4's private inode xattr slot.
+    ///
+    /// # Errors
+    /// Returns an error when the inode's xattr storage is malformed or the
+    /// stored fscrypt context is not in the supported v2 AES profile.
+    pub fn read_fscrypt_context(&self, inode_id: InodeId) -> Result<Option<FscryptContextV2>> {
+        let xattrs = self.read_inode_xattrs_from_raw(&self.read_raw_inode(inode_id)?)?;
+        let Some(value) = xattrs.encryption_context() else {
+            return Ok(None);
+        };
+        Ok(Some(FscryptContextV2::parse(value.bytes())?))
     }
 
     /// Reads and classifies one inode as a typed node.
@@ -1088,7 +1104,7 @@ impl<D: BlockReader, State> Volume<D, State> {
     }
 
     /// Reads all xattr storage locations referenced by a raw inode.
-    fn read_xattr_set_from_raw(&self, raw_inode: &RawInode) -> Result<XattrSet> {
+    fn read_inode_xattrs_from_raw(&self, raw_inode: &RawInode) -> Result<InodeXattrSet> {
         let inline = xattr_storage::parse_inline_xattrs(raw_inode.inline_xattr_region()?)?;
         let Some(block) = raw_inode.xattr_block()? else {
             return Ok(inline);
@@ -2352,7 +2368,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     }
 
     /// Reads all xattrs referenced by a staged raw inode.
-    fn xattr_set_for_raw_inode(&self, raw_inode: &RawInode) -> Result<XattrSet> {
+    fn xattr_set_for_raw_inode(&self, raw_inode: &RawInode) -> Result<InodeXattrSet> {
         let inline = xattr_storage::parse_inline_xattrs(raw_inode.inline_xattr_region()?)?;
         let Some(block) = raw_inode.xattr_block()? else {
             return Ok(inline);
@@ -2379,7 +2395,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         inode.require_mutation(InodeMutation::Metadata)?;
 
         let mut set = self.xattr_set_for_raw_inode(&raw_inode)?;
-        update(&mut set)?;
+        update(set.public_mut())?;
         self.store_xattr_set(&mut raw_inode, &set)?;
         raw_inode.set_timestamps(self.now)?;
         *self
@@ -2391,7 +2407,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
 
     /// Stores a complete xattr set using inline storage when possible and one
     /// external xattr block otherwise.
-    fn store_xattr_set(&mut self, raw_inode: &mut RawInode, set: &XattrSet) -> Result<()> {
+    fn store_xattr_set(&mut self, raw_inode: &mut RawInode, set: &InodeXattrSet) -> Result<()> {
         let old_block = raw_inode.xattr_block()?;
         if set.is_empty() {
             raw_inode.clear_inline_xattr_region()?;
@@ -2422,7 +2438,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     fn store_external_xattr_set(
         &mut self,
         raw_inode: &mut RawInode,
-        set: &XattrSet,
+        set: &InodeXattrSet,
         old_block: Option<BlockAddress>,
     ) -> Result<()> {
         let block_size = self.volume.superblock.block_size();
