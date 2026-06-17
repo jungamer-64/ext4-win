@@ -15,7 +15,7 @@ use crate::extent::{
     BlockMapping, Extent, ExtentLength, ExtentTree, ExtentTreeContext, LogicalBlock,
     MutableExtentTree, SerializedExtentTree,
 };
-use crate::fscrypt::FscryptMasterKey;
+use crate::fscrypt::FscryptKeySet;
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset, FileSize,
@@ -121,7 +121,7 @@ pub struct ReadOnly;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MountContext {
     /// fscrypt master keys available for this mount.
-    fscrypt_keys: Vec<FscryptMasterKey>,
+    fscrypt_keys: FscryptKeySet,
 }
 
 impl MountContext {
@@ -129,19 +129,19 @@ impl MountContext {
     #[must_use]
     pub const fn without_encryption_keys() -> Self {
         Self {
-            fscrypt_keys: Vec::new(),
+            fscrypt_keys: FscryptKeySet::empty(),
         }
     }
 
     /// Creates a mount context with explicit fscrypt unlock keys.
     #[must_use]
-    pub fn with_fscrypt_keys(fscrypt_keys: Vec<FscryptMasterKey>) -> Self {
+    pub const fn with_fscrypt_keys(fscrypt_keys: FscryptKeySet) -> Self {
         Self { fscrypt_keys }
     }
 
     /// fscrypt master keys available to this mount.
     #[must_use]
-    pub fn fscrypt_keys(&self) -> &[FscryptMasterKey] {
+    pub const fn fscrypt_keys(&self) -> &FscryptKeySet {
         &self.fscrypt_keys
     }
 }

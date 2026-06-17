@@ -41,13 +41,17 @@ pub use extent::{
     BlockMapping, Extent, ExtentInitialization, ExtentLength, ExtentTree, ExtentTreeContext,
     LogicalBlock, MutableExtentTree, SerializedExtentBlock, SerializedExtentTree,
 };
-pub use fscrypt::{FscryptKeyIdentifier, FscryptMasterKey};
+pub use fscrypt::{
+    FSCRYPT_CONTEXT_V2_BYTES, FSCRYPT_POLICY_V2_BYTES, FscryptContentsKey, FscryptContentsMode,
+    FscryptContextV2, FscryptDataUnitSize, FscryptFileNonce, FscryptFilenamePadding,
+    FscryptFilenamesKey, FscryptFilenamesMode, FscryptKeyIdentifier, FscryptKeySet,
+    FscryptMasterKey, FscryptPolicyV2,
+};
 pub use inode::{
     Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid,
     FileOffset, FileSize, Inode, InodeExtentRoot, InodeId, InodeInlineBytes, InodeKind,
-    InodeMutation,
-    InodeStorage, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, ReadBytes,
-    SymlinkTarget,
+    InodeMutation, InodeStorage, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
+    ReadBytes, SymlinkTarget,
 };
 pub use name::{Ext4Name, WindowsName};
 pub use superblock::{

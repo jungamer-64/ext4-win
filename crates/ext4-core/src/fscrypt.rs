@@ -1,45 +1,339 @@
-//! fscrypt mount-key domain.
+//! fscrypt v2 policy, context, and mount-key domain.
 
 use alloc::vec::Vec;
+use core::fmt;
+
+use hkdf::Hkdf;
+use sha2::Sha512;
+use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
 
-/// Filesystem-wide fscrypt master-key identifier.
+/// Serialized fscrypt v2 policy size.
+pub const FSCRYPT_POLICY_V2_BYTES: usize = 24;
+/// Serialized fscrypt v2 context size.
+pub const FSCRYPT_CONTEXT_V2_BYTES: usize = 40;
+
+/// fscrypt v2 policy version byte.
+const FSCRYPT_POLICY_V2: u8 = 2;
+/// fscrypt v2 context version byte.
+const FSCRYPT_CONTEXT_V2: u8 = 2;
+/// fscrypt AES-256-XTS mode number.
+const FSCRYPT_MODE_AES_256_XTS: u8 = 1;
+/// fscrypt AES-256-CBC-CTS filename mode number.
+const FSCRYPT_MODE_AES_256_CTS: u8 = 4;
+/// Mask selecting the fscrypt filename padding policy.
+const FSCRYPT_POLICY_FLAGS_PAD_MASK: u8 = 0x03;
+/// All fscrypt policy flags accepted by the first v2 AES domain.
+const FSCRYPT_SUPPORTED_POLICY_FLAGS: u8 = FSCRYPT_POLICY_FLAGS_PAD_MASK;
+/// Minimum raw key length for AES-256 fscrypt policies.
+const FSCRYPT_AES_256_MIN_MASTER_KEY_BYTES: usize = 32;
+/// Maximum raw key length accepted by fscrypt for software keys.
+const FSCRYPT_MAX_RAW_KEY_BYTES: usize = 64;
+/// Length of fscrypt v2 key identifiers.
+const FSCRYPT_KEY_IDENTIFIER_BYTES: usize = 16;
+/// Length of per-file fscrypt nonces.
+const FSCRYPT_FILE_NONCE_BYTES: usize = 16;
+/// AES-256-XTS key bytes derived for file contents.
+const FSCRYPT_AES_256_XTS_KEY_BYTES: usize = 64;
+/// AES-256-CBC-CTS key bytes derived for filenames.
+const FSCRYPT_AES_256_CBC_CTS_KEY_BYTES: usize = 32;
+/// Prefix used by Linux fscrypt before the HKDF context byte.
+const FSCRYPT_HKDF_INFO_PREFIX: &[u8; 8] = b"fscrypt\0";
+/// Offset of the version field in a v2 policy or context.
+const FSCRYPT_VERSION_OFFSET: usize = 0;
+/// Offset of the contents-mode field in a v2 policy or context.
+const FSCRYPT_CONTENTS_MODE_OFFSET: usize = 1;
+/// Offset of the filenames-mode field in a v2 policy or context.
+const FSCRYPT_FILENAMES_MODE_OFFSET: usize = 2;
+/// Offset of the flags field in a v2 policy or context.
+const FSCRYPT_FLAGS_OFFSET: usize = 3;
+/// Offset of the log2 data-unit-size field in a v2 policy or context.
+const FSCRYPT_LOG2_DATA_UNIT_SIZE_OFFSET: usize = 4;
+/// Offset of the reserved field in a v2 policy or context.
+const FSCRYPT_RESERVED_OFFSET: usize = 5;
+/// Offset of the master-key identifier in a v2 policy or context.
+const FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET: usize = 8;
+/// Offset of the per-file nonce in a v2 context.
+const FSCRYPT_NONCE_OFFSET: usize = 24;
+
+/// Filesystem-wide fscrypt v2 raw-key identifier.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct FscryptKeyIdentifier([u8; 16]);
+pub struct FscryptKeyIdentifier([u8; FSCRYPT_KEY_IDENTIFIER_BYTES]);
 
 impl FscryptKeyIdentifier {
     /// Creates a key identifier from the 16-byte fscrypt v2 key id.
     #[must_use]
-    pub const fn new(bytes: [u8; 16]) -> Self {
+    pub const fn new(bytes: [u8; FSCRYPT_KEY_IDENTIFIER_BYTES]) -> Self {
         Self(bytes)
+    }
+
+    /// Derives the fscrypt v2 identifier for a raw software master key.
+    ///
+    /// # Errors
+    /// Returns an error when the raw key length is outside the supported
+    /// AES-256 fscrypt v2 range.
+    pub fn for_raw_master_key(bytes: &[u8]) -> Result<Self> {
+        validate_raw_master_key(bytes)?;
+        let mut identifier = [0_u8; FSCRYPT_KEY_IDENTIFIER_BYTES];
+        fscrypt_hkdf_expand(
+            bytes,
+            FscryptHkdfContext::KeyIdentifierForRawKey,
+            &[],
+            &mut identifier,
+        )?;
+        Ok(Self(identifier))
     }
 
     /// Returns the raw key identifier bytes.
     #[must_use]
-    pub const fn bytes(self) -> [u8; 16] {
+    pub const fn bytes(self) -> [u8; FSCRYPT_KEY_IDENTIFIER_BYTES] {
         self.0
     }
 }
 
+/// Per-file fscrypt nonce stored in the encryption context xattr.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FscryptFileNonce([u8; FSCRYPT_FILE_NONCE_BYTES]);
+
+impl FscryptFileNonce {
+    /// Creates a per-file nonce from the 16-byte on-disk value.
+    #[must_use]
+    pub const fn new(bytes: [u8; FSCRYPT_FILE_NONCE_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the raw nonce bytes.
+    #[must_use]
+    pub const fn bytes(self) -> [u8; FSCRYPT_FILE_NONCE_BYTES] {
+        self.0
+    }
+}
+
+/// fscrypt contents encryption mode accepted by this driver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FscryptContentsMode {
+    /// AES-256-XTS for regular file contents.
+    Aes256Xts,
+}
+
+impl FscryptContentsMode {
+    /// Parses a serialized fscrypt contents-mode byte.
+    fn parse(value: u8) -> Result<Self> {
+        match value {
+            FSCRYPT_MODE_AES_256_XTS => Ok(Self::Aes256Xts),
+            _ => Err(Error::InvalidEncryptionContext),
+        }
+    }
+
+    /// Returns the Linux fscrypt mode number.
+    #[must_use]
+    pub const fn mode_number(self) -> u8 {
+        match self {
+            Self::Aes256Xts => FSCRYPT_MODE_AES_256_XTS,
+        }
+    }
+}
+
+/// fscrypt filenames encryption mode accepted by this driver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FscryptFilenamesMode {
+    /// AES-256-CBC-CTS for directory entry names.
+    Aes256CbcCts,
+}
+
+impl FscryptFilenamesMode {
+    /// Parses a serialized fscrypt filenames-mode byte.
+    fn parse(value: u8) -> Result<Self> {
+        match value {
+            FSCRYPT_MODE_AES_256_CTS => Ok(Self::Aes256CbcCts),
+            _ => Err(Error::InvalidEncryptionContext),
+        }
+    }
+
+    /// Returns the Linux fscrypt mode number.
+    #[must_use]
+    pub const fn mode_number(self) -> u8 {
+        match self {
+            Self::Aes256CbcCts => FSCRYPT_MODE_AES_256_CTS,
+        }
+    }
+}
+
+/// fscrypt filename padding encoded in policy flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FscryptFilenamePadding {
+    /// Pad encrypted names to a 4-byte boundary.
+    Pad4,
+    /// Pad encrypted names to an 8-byte boundary.
+    Pad8,
+    /// Pad encrypted names to a 16-byte boundary.
+    Pad16,
+    /// Pad encrypted names to a 32-byte boundary.
+    Pad32,
+}
+
+impl FscryptFilenamePadding {
+    /// Parses a supported v2 policy flags byte.
+    fn parse(flags: u8) -> Result<Self> {
+        if flags & !FSCRYPT_SUPPORTED_POLICY_FLAGS != 0 {
+            return Err(Error::InvalidEncryptionContext);
+        }
+        match flags & FSCRYPT_POLICY_FLAGS_PAD_MASK {
+            0x00 => Ok(Self::Pad4),
+            0x01 => Ok(Self::Pad8),
+            0x02 => Ok(Self::Pad16),
+            0x03 => Ok(Self::Pad32),
+            _ => Err(Error::InvalidEncryptionContext),
+        }
+    }
+
+    /// Returns the serialized flags bits for this padding policy.
+    #[must_use]
+    pub const fn flags(self) -> u8 {
+        match self {
+            Self::Pad4 => 0x00,
+            Self::Pad8 => 0x01,
+            Self::Pad16 => 0x02,
+            Self::Pad32 => 0x03,
+        }
+    }
+}
+
+/// fscrypt contents data-unit size accepted by this driver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FscryptDataUnitSize {
+    /// Use the ext4 filesystem block size.
+    FilesystemBlock,
+}
+
+impl FscryptDataUnitSize {
+    /// Parses the v2 policy data-unit-size byte.
+    fn parse(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::FilesystemBlock),
+            _ => Err(Error::InvalidEncryptionContext),
+        }
+    }
+
+    /// Returns the serialized log2 data-unit-size byte.
+    #[must_use]
+    pub const fn log2_value(self) -> u8 {
+        match self {
+            Self::FilesystemBlock => 0,
+        }
+    }
+}
+
+/// Validated fscrypt v2 policy in the supported AES configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FscryptPolicyV2 {
+    /// Contents encryption mode.
+    contents_mode: FscryptContentsMode,
+    /// Filenames encryption mode.
+    filenames_mode: FscryptFilenamesMode,
+    /// Filename padding policy.
+    filename_padding: FscryptFilenamePadding,
+    /// Contents data-unit size.
+    data_unit_size: FscryptDataUnitSize,
+    /// Master-key identifier.
+    master_key_identifier: FscryptKeyIdentifier,
+}
+
+impl FscryptPolicyV2 {
+    /// Parses a Linux `struct fscrypt_policy_v2` byte image.
+    ///
+    /// # Errors
+    /// Returns an error when the image is not exactly v2 AES-256-XTS plus
+    /// AES-256-CBC-CTS with only supported flags.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        require_exact_len(bytes, FSCRYPT_POLICY_V2_BYTES)?;
+        parse_policy_fields(bytes, FSCRYPT_POLICY_V2)
+    }
+
+    /// Contents encryption mode.
+    #[must_use]
+    pub const fn contents_mode(self) -> FscryptContentsMode {
+        self.contents_mode
+    }
+
+    /// Filenames encryption mode.
+    #[must_use]
+    pub const fn filenames_mode(self) -> FscryptFilenamesMode {
+        self.filenames_mode
+    }
+
+    /// Filename padding policy.
+    #[must_use]
+    pub const fn filename_padding(self) -> FscryptFilenamePadding {
+        self.filename_padding
+    }
+
+    /// Contents data-unit size.
+    #[must_use]
+    pub const fn data_unit_size(self) -> FscryptDataUnitSize {
+        self.data_unit_size
+    }
+
+    /// Master-key identifier selected by this policy.
+    #[must_use]
+    pub const fn master_key_identifier(self) -> FscryptKeyIdentifier {
+        self.master_key_identifier
+    }
+}
+
+/// Validated on-disk fscrypt v2 context in the supported AES configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FscryptContextV2 {
+    /// Policy fields inherited by this inode.
+    policy: FscryptPolicyV2,
+    /// Per-file nonce.
+    nonce: FscryptFileNonce,
+}
+
+impl FscryptContextV2 {
+    /// Parses a Linux `struct fscrypt_context_v2` byte image.
+    ///
+    /// # Errors
+    /// Returns an error when the image is not exactly a supported fscrypt v2
+    /// context.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        require_exact_len(bytes, FSCRYPT_CONTEXT_V2_BYTES)?;
+        let policy = parse_policy_fields(bytes, FSCRYPT_CONTEXT_V2)?;
+        let nonce = FscryptFileNonce::new(fixed(bytes, FSCRYPT_NONCE_OFFSET)?);
+        Ok(Self { policy, nonce })
+    }
+
+    /// Policy fields from this context.
+    #[must_use]
+    pub const fn policy(self) -> FscryptPolicyV2 {
+        self.policy
+    }
+
+    /// Per-file nonce from this context.
+    #[must_use]
+    pub const fn nonce(self) -> FscryptFileNonce {
+        self.nonce
+    }
+}
+
 /// Raw fscrypt master key material supplied at the mount boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct FscryptMasterKey {
-    /// Stable fscrypt v2 identifier.
+    /// Stable fscrypt v2 identifier derived from the raw key.
     identifier: FscryptKeyIdentifier,
     /// Raw key bytes before per-file derivation.
     bytes: Vec<u8>,
 }
 
 impl FscryptMasterKey {
-    /// Creates a mount-scoped fscrypt master key.
+    /// Creates a mount-scoped fscrypt master key from raw software key bytes.
     ///
     /// # Errors
-    /// Returns an error when the key material is empty.
-    pub fn new(identifier: FscryptKeyIdentifier, bytes: &[u8]) -> Result<Self> {
-        if bytes.is_empty() {
-            return Err(Error::InvalidEncryptionContext);
-        }
+    /// Returns an error when the key material is outside the AES-256 fscrypt
+    /// range.
+    pub fn from_raw(bytes: &[u8]) -> Result<Self> {
+        let identifier = FscryptKeyIdentifier::for_raw_master_key(bytes)?;
         Ok(Self {
             identifier,
             bytes: bytes.to_vec(),
@@ -52,9 +346,493 @@ impl FscryptMasterKey {
         self.identifier
     }
 
-    /// Raw key material.
+    /// Derives the AES-256-XTS per-file contents key for a regular file.
+    ///
+    /// # Errors
+    /// Returns an error when HKDF expansion fails.
+    pub fn derive_contents_key(&self, nonce: FscryptFileNonce) -> Result<FscryptContentsKey> {
+        let mut bytes = [0_u8; FSCRYPT_AES_256_XTS_KEY_BYTES];
+        fscrypt_hkdf_expand(
+            &self.bytes,
+            FscryptHkdfContext::PerFileEncryptionKey,
+            &nonce.bytes(),
+            &mut bytes,
+        )?;
+        Ok(FscryptContentsKey { bytes })
+    }
+
+    /// Derives the AES-256-CBC-CTS per-file filename key for a directory.
+    ///
+    /// # Errors
+    /// Returns an error when HKDF expansion fails.
+    pub fn derive_filenames_key(&self, nonce: FscryptFileNonce) -> Result<FscryptFilenamesKey> {
+        let mut bytes = [0_u8; FSCRYPT_AES_256_CBC_CTS_KEY_BYTES];
+        fscrypt_hkdf_expand(
+            &self.bytes,
+            FscryptHkdfContext::PerFileEncryptionKey,
+            &nonce.bytes(),
+            &mut bytes,
+        )?;
+        Ok(FscryptFilenamesKey { bytes })
+    }
+}
+
+impl Drop for FscryptMasterKey {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+impl fmt::Debug for FscryptMasterKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FscryptMasterKey")
+            .field("identifier", &self.identifier)
+            .field("key_bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// Sorted unique mount-scoped fscrypt master-key set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FscryptKeySet {
+    /// Keys sorted by fscrypt v2 identifier.
+    keys: Vec<FscryptMasterKey>,
+}
+
+impl FscryptKeySet {
+    /// Creates an empty fscrypt key set.
     #[must_use]
-    pub fn bytes(&self) -> &[u8] {
+    pub const fn empty() -> Self {
+        Self { keys: Vec::new() }
+    }
+
+    /// Creates a sorted key set from mount-supplied keys.
+    ///
+    /// # Errors
+    /// Returns an error when two keys have the same v2 identifier.
+    pub fn from_keys(mut keys: Vec<FscryptMasterKey>) -> Result<Self> {
+        keys.sort_by_key(FscryptMasterKey::identifier);
+        if keys
+            .windows(2)
+            .any(|pair| matches!(pair, [left, right] if left.identifier() == right.identifier()))
+        {
+            return Err(Error::InvalidEncryptionContext);
+        }
+        Ok(Self { keys })
+    }
+
+    /// Returns true when no fscrypt keys are available.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Returns keys in stable identifier order.
+    #[must_use]
+    pub fn keys(&self) -> &[FscryptMasterKey] {
+        &self.keys
+    }
+
+    /// Looks up a key by v2 identifier.
+    #[must_use]
+    pub fn get(&self, identifier: FscryptKeyIdentifier) -> Option<&FscryptMasterKey> {
+        self.keys
+            .binary_search_by_key(&identifier, FscryptMasterKey::identifier)
+            .ok()
+            .and_then(|index| self.keys.get(index))
+    }
+}
+
+/// Derived AES-256-XTS key bytes for fscrypt contents encryption.
+#[derive(Eq, PartialEq)]
+pub struct FscryptContentsKey {
+    /// Raw AES-256-XTS key bytes.
+    bytes: [u8; FSCRYPT_AES_256_XTS_KEY_BYTES],
+}
+
+impl FscryptContentsKey {
+    /// Returns raw AES-256-XTS key bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8; FSCRYPT_AES_256_XTS_KEY_BYTES] {
         &self.bytes
+    }
+}
+
+impl Drop for FscryptContentsKey {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+impl fmt::Debug for FscryptContentsKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FscryptContentsKey")
+            .field("key_bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// Derived AES-256-CBC-CTS key bytes for fscrypt filename encryption.
+#[derive(Eq, PartialEq)]
+pub struct FscryptFilenamesKey {
+    /// Raw AES-256-CBC-CTS key bytes.
+    bytes: [u8; FSCRYPT_AES_256_CBC_CTS_KEY_BYTES],
+}
+
+impl FscryptFilenamesKey {
+    /// Returns raw AES-256-CBC-CTS key bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8; FSCRYPT_AES_256_CBC_CTS_KEY_BYTES] {
+        &self.bytes
+    }
+}
+
+impl Drop for FscryptFilenamesKey {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+impl fmt::Debug for FscryptFilenamesKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FscryptFilenamesKey")
+            .field("key_bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// HKDF output namespaces used by fscrypt v2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FscryptHkdfContext {
+    /// `HKDF_CONTEXT_KEY_IDENTIFIER_FOR_RAW_KEY`.
+    KeyIdentifierForRawKey,
+    /// `HKDF_CONTEXT_PER_FILE_ENC_KEY`.
+    PerFileEncryptionKey,
+}
+
+impl FscryptHkdfContext {
+    /// Returns the Linux fscrypt HKDF context byte.
+    const fn value(self) -> u8 {
+        match self {
+            Self::KeyIdentifierForRawKey => 1,
+            Self::PerFileEncryptionKey => 2,
+        }
+    }
+}
+
+/// Validates the supported raw master-key size range.
+fn validate_raw_master_key(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < FSCRYPT_AES_256_MIN_MASTER_KEY_BYTES || bytes.len() > FSCRYPT_MAX_RAW_KEY_BYTES
+    {
+        return Err(Error::InvalidEncryptionContext);
+    }
+    Ok(())
+}
+
+/// Parses policy fields shared by v2 policies and contexts.
+fn parse_policy_fields(bytes: &[u8], version: u8) -> Result<FscryptPolicyV2> {
+    if byte(bytes, FSCRYPT_VERSION_OFFSET)? != version {
+        return Err(Error::InvalidEncryptionContext);
+    }
+    let contents_mode = FscryptContentsMode::parse(byte(bytes, FSCRYPT_CONTENTS_MODE_OFFSET)?)?;
+    let filenames_mode = FscryptFilenamesMode::parse(byte(bytes, FSCRYPT_FILENAMES_MODE_OFFSET)?)?;
+    let filename_padding = FscryptFilenamePadding::parse(byte(bytes, FSCRYPT_FLAGS_OFFSET)?)?;
+    let data_unit_size =
+        FscryptDataUnitSize::parse(byte(bytes, FSCRYPT_LOG2_DATA_UNIT_SIZE_OFFSET)?)?;
+    let reserved: [u8; 3] = fixed(bytes, FSCRYPT_RESERVED_OFFSET)?;
+    if reserved != [0_u8; 3] {
+        return Err(Error::InvalidEncryptionContext);
+    }
+    let master_key_identifier =
+        FscryptKeyIdentifier::new(fixed(bytes, FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET)?);
+    Ok(FscryptPolicyV2 {
+        contents_mode,
+        filenames_mode,
+        filename_padding,
+        data_unit_size,
+        master_key_identifier,
+    })
+}
+
+/// Expands an fscrypt v2 HKDF output for one namespace and info value.
+fn fscrypt_hkdf_expand(
+    master_key: &[u8],
+    context: FscryptHkdfContext,
+    info: &[u8],
+    output: &mut [u8],
+) -> Result<()> {
+    let mut prefixed_info = Vec::with_capacity(
+        FSCRYPT_HKDF_INFO_PREFIX
+            .len()
+            .checked_add(1)
+            .and_then(|len| len.checked_add(info.len()))
+            .ok_or(Error::ArithmeticOverflow)?,
+    );
+    prefixed_info.extend_from_slice(FSCRYPT_HKDF_INFO_PREFIX);
+    prefixed_info.push(context.value());
+    prefixed_info.extend_from_slice(info);
+
+    Hkdf::<Sha512>::new(None, master_key)
+        .expand(&prefixed_info, output)
+        .map_err(|_| Error::InvalidEncryptionContext)
+}
+
+/// Requires an exact serialized structure length.
+fn require_exact_len(bytes: &[u8], expected: usize) -> Result<()> {
+    match bytes.len().cmp(&expected) {
+        core::cmp::Ordering::Less => Err(Error::TruncatedStructure),
+        core::cmp::Ordering::Equal => Ok(()),
+        core::cmp::Ordering::Greater => Err(Error::InvalidEncryptionContext),
+    }
+}
+
+/// Reads one byte from a checked offset.
+fn byte(bytes: &[u8], offset: usize) -> Result<u8> {
+    bytes.get(offset).copied().ok_or(Error::TruncatedStructure)
+}
+
+/// Copies a fixed byte array from a checked offset.
+fn fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
+    let end = offset.checked_add(N).ok_or(Error::ArithmeticOverflow)?;
+    let slice = bytes.get(offset..end).ok_or(Error::TruncatedStructure)?;
+    let mut output = [0_u8; N];
+    output.copy_from_slice(slice);
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    /// Master key used by fscrypt HKDF vector tests.
+    const VECTOR_MASTER_KEY: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ];
+    /// Per-file nonce used by fscrypt HKDF vector tests.
+    const VECTOR_NONCE: [u8; 16] = [
+        0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae,
+        0xaf,
+    ];
+    /// Expected v2 identifier for `VECTOR_MASTER_KEY`.
+    const VECTOR_IDENTIFIER: [u8; 16] = [
+        0x37, 0xd7, 0xd7, 0x6a, 0x59, 0x40, 0x00, 0x83, 0x28, 0x9c, 0x18, 0x55, 0x26, 0x73, 0x0d,
+        0x34,
+    ];
+    /// Expected AES-256-XTS per-file key.
+    const VECTOR_CONTENTS_KEY: [u8; 64] = [
+        0xe0, 0x80, 0x03, 0x95, 0x2a, 0x49, 0xa8, 0xfe, 0x90, 0x56, 0x87, 0x3d, 0x11, 0xe4, 0xcb,
+        0x82, 0xe0, 0xa5, 0x21, 0x90, 0x20, 0x96, 0x0c, 0x35, 0x38, 0x71, 0x30, 0xa2, 0xa1, 0x93,
+        0x82, 0x3e, 0xda, 0x7f, 0xd6, 0x41, 0xa7, 0xeb, 0x36, 0x5a, 0x44, 0xa3, 0x90, 0xc1, 0x8e,
+        0x3c, 0x69, 0xf4, 0xa7, 0x73, 0x9a, 0xe4, 0x13, 0xdc, 0xc2, 0x0a, 0x2d, 0x42, 0x66, 0xe2,
+        0xd2, 0x4c, 0x7f, 0x2a,
+    ];
+    /// Expected AES-256-CBC-CTS filename key.
+    const VECTOR_FILENAMES_KEY: [u8; 32] = [
+        0xe0, 0x80, 0x03, 0x95, 0x2a, 0x49, 0xa8, 0xfe, 0x90, 0x56, 0x87, 0x3d, 0x11, 0xe4, 0xcb,
+        0x82, 0xe0, 0xa5, 0x21, 0x90, 0x20, 0x96, 0x0c, 0x35, 0x38, 0x71, 0x30, 0xa2, 0xa1, 0x93,
+        0x82, 0x3e,
+    ];
+
+    #[test]
+    fn fscrypt_v2_policy_parses_supported_aes_profile() {
+        let policy = valid_policy_bytes();
+
+        let parsed = FscryptPolicyV2::parse(&policy);
+
+        assert_eq!(
+            parsed,
+            Ok(FscryptPolicyV2 {
+                contents_mode: FscryptContentsMode::Aes256Xts,
+                filenames_mode: FscryptFilenamesMode::Aes256CbcCts,
+                filename_padding: FscryptFilenamePadding::Pad32,
+                data_unit_size: FscryptDataUnitSize::FilesystemBlock,
+                master_key_identifier: FscryptKeyIdentifier::new([0x42; 16]),
+            })
+        );
+    }
+
+    #[test]
+    fn fscrypt_v2_context_parses_nonce_and_policy() {
+        let mut context = [0_u8; FSCRYPT_CONTEXT_V2_BYTES];
+        context
+            .get_mut(..FSCRYPT_POLICY_V2_BYTES)
+            .expect("policy region")
+            .copy_from_slice(&valid_policy_bytes());
+        context
+            .get_mut(FSCRYPT_NONCE_OFFSET..FSCRYPT_CONTEXT_V2_BYTES)
+            .expect("nonce region")
+            .copy_from_slice(&VECTOR_NONCE);
+
+        let parsed = FscryptContextV2::parse(&context).expect("valid context");
+
+        assert_eq!(parsed.nonce(), FscryptFileNonce::new(VECTOR_NONCE));
+        assert_eq!(
+            parsed.policy().master_key_identifier(),
+            FscryptKeyIdentifier::new([0x42; 16])
+        );
+    }
+
+    #[test]
+    fn fscrypt_v2_context_rejects_unsupported_features() {
+        let mut unsupported_contents = valid_context_bytes();
+        *unsupported_contents
+            .get_mut(FSCRYPT_CONTENTS_MODE_OFFSET)
+            .expect("contents mode") = 9;
+        assert_eq!(
+            FscryptContextV2::parse(&unsupported_contents),
+            Err(Error::InvalidEncryptionContext)
+        );
+
+        let mut unsupported_names = valid_context_bytes();
+        *unsupported_names
+            .get_mut(FSCRYPT_FILENAMES_MODE_OFFSET)
+            .expect("filenames mode") = 10;
+        assert_eq!(
+            FscryptContextV2::parse(&unsupported_names),
+            Err(Error::InvalidEncryptionContext)
+        );
+
+        let mut direct_key = valid_context_bytes();
+        *direct_key.get_mut(FSCRYPT_FLAGS_OFFSET).expect("flags") = 0x04;
+        assert_eq!(
+            FscryptContextV2::parse(&direct_key),
+            Err(Error::InvalidEncryptionContext)
+        );
+
+        let mut custom_data_unit = valid_context_bytes();
+        *custom_data_unit
+            .get_mut(FSCRYPT_LOG2_DATA_UNIT_SIZE_OFFSET)
+            .expect("data unit size") = 12;
+        assert_eq!(
+            FscryptContextV2::parse(&custom_data_unit),
+            Err(Error::InvalidEncryptionContext)
+        );
+    }
+
+    #[test]
+    fn fscrypt_v2_context_rejects_wrong_size_and_reserved_bytes() {
+        let context = valid_context_bytes();
+        assert_eq!(
+            FscryptContextV2::parse(context.get(..39).expect("short context")),
+            Err(Error::TruncatedStructure)
+        );
+
+        let mut long_context = context.to_vec();
+        long_context.push(0);
+        assert_eq!(
+            FscryptContextV2::parse(&long_context),
+            Err(Error::InvalidEncryptionContext)
+        );
+
+        let mut reserved = valid_context_bytes();
+        *reserved
+            .get_mut(FSCRYPT_RESERVED_OFFSET)
+            .expect("reserved byte") = 1;
+        assert_eq!(
+            FscryptContextV2::parse(&reserved),
+            Err(Error::InvalidEncryptionContext)
+        );
+    }
+
+    #[test]
+    fn fscrypt_master_key_derives_identifier_and_per_file_keys() {
+        let master_key = FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY).expect("master key");
+        let nonce = FscryptFileNonce::new(VECTOR_NONCE);
+
+        assert_eq!(master_key.identifier().bytes(), VECTOR_IDENTIFIER);
+        assert_eq!(
+            master_key
+                .derive_contents_key(nonce)
+                .expect("contents key")
+                .bytes(),
+            &VECTOR_CONTENTS_KEY
+        );
+        assert_eq!(
+            master_key
+                .derive_filenames_key(nonce)
+                .expect("filenames key")
+                .bytes(),
+            &VECTOR_FILENAMES_KEY
+        );
+    }
+
+    #[test]
+    fn fscrypt_master_key_rejects_invalid_raw_key_sizes() {
+        assert_eq!(
+            FscryptMasterKey::from_raw(&[0_u8; 31]),
+            Err(Error::InvalidEncryptionContext)
+        );
+        assert_eq!(
+            FscryptMasterKey::from_raw(&[0_u8; 65]),
+            Err(Error::InvalidEncryptionContext)
+        );
+    }
+
+    #[test]
+    fn fscrypt_key_set_is_sorted_unique_by_identifier() {
+        let first = FscryptMasterKey::from_raw(&[1_u8; 32]).expect("first key");
+        let second = FscryptMasterKey::from_raw(&[2_u8; 32]).expect("second key");
+        let second_identifier = second.identifier();
+
+        let set = FscryptKeySet::from_keys(vec![second, first]).expect("key set");
+
+        assert!(set.get(second_identifier).is_some());
+        assert_eq!(set.keys().len(), 2);
+        assert!(
+            set.keys().windows(2).all(
+                |pair| matches!(pair, [left, right] if left.identifier() < right.identifier())
+            )
+        );
+    }
+
+    #[test]
+    fn fscrypt_key_set_rejects_duplicate_identifiers() {
+        let first = FscryptMasterKey::from_raw(&[1_u8; 32]).expect("first key");
+        let duplicate = FscryptMasterKey::from_raw(&[1_u8; 32]).expect("duplicate key");
+
+        assert_eq!(
+            FscryptKeySet::from_keys(vec![first, duplicate]),
+            Err(Error::InvalidEncryptionContext)
+        );
+    }
+
+    /// Builds a supported fscrypt v2 policy byte image.
+    fn valid_policy_bytes() -> [u8; FSCRYPT_POLICY_V2_BYTES] {
+        let mut bytes = [0_u8; FSCRYPT_POLICY_V2_BYTES];
+        *bytes.get_mut(FSCRYPT_VERSION_OFFSET).expect("version") = FSCRYPT_POLICY_V2;
+        *bytes
+            .get_mut(FSCRYPT_CONTENTS_MODE_OFFSET)
+            .expect("contents mode") = FSCRYPT_MODE_AES_256_XTS;
+        *bytes
+            .get_mut(FSCRYPT_FILENAMES_MODE_OFFSET)
+            .expect("filenames mode") = FSCRYPT_MODE_AES_256_CTS;
+        *bytes.get_mut(FSCRYPT_FLAGS_OFFSET).expect("flags") =
+            FscryptFilenamePadding::Pad32.flags();
+        bytes
+            .get_mut(
+                FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET
+                    ..FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET + FSCRYPT_KEY_IDENTIFIER_BYTES,
+            )
+            .expect("key identifier")
+            .copy_from_slice(&[0x42; 16]);
+        bytes
+    }
+
+    /// Builds a supported fscrypt v2 context byte image.
+    fn valid_context_bytes() -> [u8; FSCRYPT_CONTEXT_V2_BYTES] {
+        let mut bytes = [0_u8; FSCRYPT_CONTEXT_V2_BYTES];
+        bytes
+            .get_mut(..FSCRYPT_POLICY_V2_BYTES)
+            .expect("policy region")
+            .copy_from_slice(&valid_policy_bytes());
+        bytes
+            .get_mut(FSCRYPT_NONCE_OFFSET..FSCRYPT_CONTEXT_V2_BYTES)
+            .expect("nonce region")
+            .copy_from_slice(&VECTOR_NONCE);
+        bytes
     }
 }
