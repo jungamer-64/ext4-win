@@ -54,6 +54,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::CannotRemoveRoot => STATUS_CANNOT_DELETE,
         Error::DirtyVolume => STATUS_VOLUME_DIRTY,
         Error::DeviceIo => STATUS_IO_DEVICE_ERROR,
+        Error::VerityMismatch => STATUS_IO_DEVICE_ERROR,
         Error::UnsupportedBlockSize
         | Error::UnsupportedIncompatFeature
         | Error::UnsupportedReadOnlyFeature
@@ -70,6 +71,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::InvalidXattr
         | Error::InvalidAcl
         | Error::InvalidEncryptionContext
+        | Error::InvalidVerityMetadata
         | Error::InvalidWriteRange
         | Error::TransactionTooLarge => STATUS_INVALID_PARAMETER,
         Error::TruncatedStructure
