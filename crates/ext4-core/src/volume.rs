@@ -19,8 +19,8 @@ use crate::fscrypt::FscryptKeySet;
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset, FileSize,
-    Inode, InodeId, InodeKind, InodeMutation, InodeStorage, NewDirectoryMetadata, NewFileMetadata,
-    NewSymlinkMetadata, ReadBytes, SymlinkTarget,
+    Inode, InodeId, InodeKind, InodeMutation, InodeProtection, InodeStorage, NewDirectoryMetadata,
+    NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 use crate::journal::{Journal, LoadedJournal};
 use crate::name::Ext4Name;
@@ -494,6 +494,12 @@ impl FileNode {
         self.inode.links_count()
     }
 
+    /// Contents protection selected by file inode flags.
+    #[must_use]
+    pub const fn protection(&self) -> InodeProtection {
+        self.inode.protection()
+    }
+
     /// Returns the backing inode for volume-internal operations.
     fn inode(&self) -> &Inode {
         &self.inode
@@ -538,6 +544,12 @@ impl DirectoryNode {
         self.inode.links_count()
     }
 
+    /// Contents protection selected by directory inode flags.
+    #[must_use]
+    pub const fn protection(&self) -> InodeProtection {
+        self.inode.protection()
+    }
+
     /// Returns the backing inode for volume-internal operations.
     fn inode(&self) -> &Inode {
         &self.inode
@@ -580,6 +592,12 @@ impl SymlinkNode {
     #[must_use]
     pub const fn links_count(&self) -> u16 {
         self.inode.links_count()
+    }
+
+    /// Contents protection selected by symlink inode flags.
+    #[must_use]
+    pub const fn protection(&self) -> InodeProtection {
+        self.inode.protection()
     }
 
     /// Returns the backing inode for volume-internal operations.
