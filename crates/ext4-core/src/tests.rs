@@ -41,6 +41,8 @@ const MODERN_ROOT_DIR_BLOCK: u32 = 12;
 const MODERN_FILE_DATA_BLOCK: u32 = 13;
 const MODERN_EXTENT_INDEX_BLOCK: u32 = 14;
 const MODERN_JOURNAL_BLOCK: u32 = 20;
+const BIGALLOC_BLOCKS_PER_CLUSTER: u32 = 4;
+const BIGALLOC_LOG_CLUSTER_SIZE: u32 = 2;
 const COMPAT_MODERN: u32 = 0x0004 | 0x0008 | 0x0010 | 0x0020;
 const INCOMPAT_MODERN: u32 = 0x0002 | 0x0040 | 0x0080 | 0x0200;
 const RO_COMPAT_MODERN: u32 = 0x0001 | 0x0002 | 0x0008 | 0x0020 | 0x0040 | 0x0400;
@@ -546,11 +548,7 @@ fn read_only_mount_rejects_layout_changing_features() {
         assert!(matches!(result, Err(Error::UnsupportedIncompatFeature)));
     }
 
-    for read_only_compat in [
-        RO_COMPAT_BIGALLOC,
-        RO_COMPAT_VERITY,
-        RO_COMPAT_ORPHAN_PRESENT,
-    ] {
+    for read_only_compat in [RO_COMPAT_VERITY, RO_COMPAT_ORPHAN_PRESENT] {
         let mut image = fixture_image();
         put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | read_only_compat);
         let result = Superblock::parse(&image[1024..2048]);
@@ -582,13 +580,47 @@ fn write_mount_accepts_modern_baseline() {
 }
 
 #[test]
-fn write_mount_rejects_bigalloc() {
-    let mut image = modern_fixture_image();
-    put_u32(&mut image, 1024 + 100, RO_COMPAT_MODERN | 0x0200);
+fn write_mount_accepts_bigalloc() {
+    let mut image = bigalloc_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let result = Volume::<_, ReadWrite>::mount_read_write(device);
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
 
-    assert!(matches!(result, Err(Error::UnsupportedWriteFeature)));
+    assert_eq!(volume.superblock().cluster_size().bytes(), 4096);
+    assert_eq!(volume.superblock().blocks_per_cluster().as_u32(), 4);
+    assert_eq!(volume.superblock().clusters_per_group().as_u32(), 2048);
+    assert_eq!(volume.superblock().cluster_count().as_u64(), 16);
+    assert_eq!(volume.superblock().free_cluster_count().as_u64(), 9);
+}
+
+#[test]
+fn bigalloc_geometry_rejections_are_targeted() {
+    let mut image = bigalloc_fixture_image();
+    put_u32(&mut image, 1024 + 28, 0);
+    assert_eq!(
+        Superblock::parse_read_write(&image[1024..2048]),
+        Err(Error::InvalidClusterGeometry)
+    );
+
+    let mut image = bigalloc_fixture_image();
+    put_u32(&mut image, 1024 + 36, 8192);
+    assert_eq!(
+        Superblock::parse_read_write(&image[1024..2048]),
+        Err(Error::InvalidClusterGeometry)
+    );
+
+    let mut image = bigalloc_fixture_image();
+    put_u32(&mut image, 1024 + 96, INCOMPAT_MODERN & !0x0040);
+    assert_eq!(
+        Superblock::parse_read_write(&image[1024..2048]),
+        Err(Error::UnsupportedWriteFeature)
+    );
+
+    let mut image = variable_block_fixture_image(4096);
+    put_u32(&mut image, 1024 + 28, 0);
+    assert_eq!(
+        Superblock::parse(&image[1024..2048]),
+        Err(Error::InvalidClusterGeometry)
+    );
 }
 
 #[test]
@@ -621,6 +653,301 @@ fn sparse_hole_write_allocates_block() {
     let read = read_file(&volume, 3, 1024, &mut output);
     assert_eq!(read, 4);
     assert_eq!(&output, b"hole");
+}
+
+#[test]
+fn bigalloc_hole_write_reuses_logical_cluster() {
+    let mut image = bigalloc_fixture_image();
+    let initial_free = get_u32(&image, 1024 + 12);
+    let file_cluster = bigalloc_cluster_for_block(MODERN_FILE_DATA_BLOCK);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        overwrite_file(&mut transaction, 3, 1024, b"hole");
+        must(transaction.commit());
+
+        assert_eq!(
+            volume.superblock().free_cluster_count().as_u64(),
+            u64::from(initial_free)
+        );
+        let mut output = [0_u8; 4];
+        assert_eq!(read_file(&volume, 3, 1024, &mut output), 4);
+        assert_eq!(&output, b"hole");
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 12), initial_free);
+    assert!(bigalloc_cluster_is_used(&image, file_cluster));
+    assert_eq!(
+        &image[block_offset(MODERN_FILE_DATA_BLOCK + 1)
+            ..block_offset(MODERN_FILE_DATA_BLOCK + 1) + 4],
+        b"hole"
+    );
+}
+
+#[test]
+fn bigalloc_sparse_extension_allocates_one_cluster() {
+    let mut image = bigalloc_fixture_image();
+    let initial_free = get_u32(&image, 1024 + 12);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        extend_file(
+            &mut transaction,
+            3,
+            u64::try_from(BLOCK_SIZE * 5).unwrap_or(u64::MAX),
+        );
+        overwrite_file(
+            &mut transaction,
+            3,
+            u64::try_from(BLOCK_SIZE * 4).unwrap_or(u64::MAX),
+            b"next",
+        );
+        must(transaction.commit());
+
+        assert_eq!(
+            volume.superblock().free_cluster_count().as_u64(),
+            u64::from(initial_free - 1)
+        );
+        let mut output = [0_u8; 4];
+        assert_eq!(
+            read_file(
+                &volume,
+                3,
+                u64::try_from(BLOCK_SIZE * 4).unwrap_or(u64::MAX),
+                &mut output,
+            ),
+            4
+        );
+        assert_eq!(&output, b"next");
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 12), initial_free - 1);
+}
+
+#[test]
+fn bigalloc_partial_truncate_preserves_referenced_cluster() {
+    let mut image = bigalloc_fixture_image();
+    let inode_base = modern_inode_offset(3);
+    write_extent_root(&mut image, inode_base + 40, 0, 2, MODERN_FILE_DATA_BLOCK);
+    image[block_offset(MODERN_FILE_DATA_BLOCK + 1)..block_offset(MODERN_FILE_DATA_BLOCK + 1) + 4]
+        .copy_from_slice(b"tail");
+    let initial_free = get_u32(&image, 1024 + 12);
+    let file_cluster = bigalloc_cluster_for_block(MODERN_FILE_DATA_BLOCK);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        truncate_file(
+            &mut transaction,
+            3,
+            u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX),
+        );
+        must(transaction.commit());
+
+        assert_eq!(
+            volume.superblock().free_cluster_count().as_u64(),
+            u64::from(initial_free)
+        );
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 12), initial_free);
+    assert!(bigalloc_cluster_is_used(&image, file_cluster));
+}
+
+#[test]
+fn bigalloc_full_truncate_frees_last_cluster_reference() {
+    let mut image = bigalloc_fixture_image();
+    let initial_free = get_u32(&image, 1024 + 12);
+    let file_cluster = bigalloc_cluster_for_block(MODERN_FILE_DATA_BLOCK);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        truncate_file(&mut transaction, 3, 0);
+        must(transaction.commit());
+
+        assert_eq!(
+            volume.superblock().free_cluster_count().as_u64(),
+            u64::from(initial_free + 1)
+        );
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 12), initial_free + 1);
+    assert!(!bigalloc_cluster_is_used(&image, file_cluster));
+}
+
+#[test]
+fn bigalloc_unlink_file_frees_last_cluster_reference() {
+    let mut image = bigalloc_fixture_image_with_journal_blocks(16);
+    put_u16(&mut image, modern_inode_offset(3) + 26, 1);
+    let initial_free = get_u32(&image, 1024 + 12);
+    let file_cluster = bigalloc_cluster_for_block(MODERN_FILE_DATA_BLOCK);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        must(transaction.unlink_file(root, &must(Ext4Name::new(b"file"))));
+        must(transaction.commit());
+
+        assert_eq!(
+            volume.superblock().free_cluster_count().as_u64(),
+            u64::from(initial_free + 1)
+        );
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 12), initial_free + 1);
+    assert!(!bigalloc_cluster_is_used(&image, file_cluster));
+}
+
+#[test]
+fn bigalloc_two_extents_in_same_physical_cluster_are_indexed() {
+    let mut image = bigalloc_fixture_image();
+    let inode_base = modern_inode_offset(3);
+    put_u32(
+        &mut image,
+        inode_base + 4,
+        u32::try_from(BLOCK_SIZE * 3).unwrap_or(u32::MAX),
+    );
+    write_two_extent_root(
+        &mut image,
+        inode_base + 40,
+        0,
+        1,
+        MODERN_FILE_DATA_BLOCK,
+        2,
+        1,
+        MODERN_FILE_DATA_BLOCK + 2,
+    );
+    let initial_free = get_u32(&image, 1024 + 12);
+    let file_cluster = bigalloc_cluster_for_block(MODERN_FILE_DATA_BLOCK);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        truncate_file(
+            &mut transaction,
+            3,
+            u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX),
+        );
+        must(transaction.commit());
+
+        assert_eq!(
+            volume.superblock().free_cluster_count().as_u64(),
+            u64::from(initial_free)
+        );
+    }
+
+    assert!(bigalloc_cluster_is_used(&image, file_cluster));
+}
+
+#[test]
+fn bigalloc_duplicate_physical_block_reference_is_rejected() {
+    let mut image = bigalloc_fixture_image();
+    let inode_base = modern_inode_offset(3);
+    put_u32(
+        &mut image,
+        inode_base + 4,
+        u32::try_from(BLOCK_SIZE * 2).unwrap_or(u32::MAX),
+    );
+    write_two_extent_root(
+        &mut image,
+        inode_base + 40,
+        0,
+        1,
+        MODERN_FILE_DATA_BLOCK,
+        1,
+        1,
+        MODERN_FILE_DATA_BLOCK,
+    );
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let result = Volume::<_, ReadWrite>::mount_read_write(device);
+
+    assert_eq!(result.map(|_| ()), Err(Error::ClusterReferenceConflict));
+}
+
+#[test]
+fn bigalloc_mount_rejects_references_into_free_clusters() {
+    let mut image = bigalloc_fixture_image();
+    set_bigalloc_cluster_used(
+        &mut image,
+        bigalloc_cluster_for_block(MODERN_FILE_DATA_BLOCK),
+        false,
+    );
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let result = Volume::<_, ReadWrite>::mount_read_write(device);
+
+    assert_eq!(result.map(|_| ()), Err(Error::ClusterReferenceConflict));
+}
+
+#[test]
+fn bigalloc_allocated_unreferenced_cluster_remains_unavailable() {
+    let mut image = bigalloc_fixture_image();
+    let reserved_cluster = 7_u32;
+    set_bigalloc_cluster_used(&mut image, reserved_cluster, true);
+    let initial_free = get_u32(&image, 1024 + 12) - 1;
+    let free_inodes = get_u32(&image, 1024 + 16);
+    put_u32(&mut image, 1024 + 12, initial_free);
+    write_modern_block_group_descriptor(&mut image, initial_free, free_inodes);
+    refresh_primary_block_group_descriptor_checksum(&mut image);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        extend_file(
+            &mut transaction,
+            3,
+            u64::try_from(BLOCK_SIZE * 5).unwrap_or(u64::MAX),
+        );
+        overwrite_file(
+            &mut transaction,
+            3,
+            u64::try_from(BLOCK_SIZE * 4).unwrap_or(u64::MAX),
+            b"next",
+        );
+        must(transaction.commit());
+    }
+
+    assert!(bigalloc_cluster_is_used(&image, reserved_cluster));
+    assert!(bigalloc_cluster_is_used(&image, reserved_cluster + 1));
+    assert_eq!(&image[block_offset(33)..block_offset(33) + 4], b"next");
+}
+
+#[test]
+fn bigalloc_directory_create_remove_returns_cluster_count() {
+    let mut image = bigalloc_fixture_image_with_journal_blocks(16);
+    let initial_free = get_u32(&image, 1024 + 12);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let child = must(transaction.create_directory(
+            root,
+            &must(Ext4Name::new(b"child")),
+            test_directory_metadata(),
+        ));
+        must(transaction.remove_empty_directory(root, &must(Ext4Name::new(b"child"))));
+        assert_eq!(child.inode_id().as_u32(), 11);
+        must(transaction.commit());
+
+        assert_eq!(
+            volume.superblock().free_cluster_count().as_u64(),
+            u64::from(initial_free)
+        );
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 12), initial_free);
 }
 
 #[test]
@@ -681,6 +1008,47 @@ fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
         1
     );
     assert_eq!(output, [b'x']);
+}
+
+#[test]
+fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
+    let mut image = bigalloc_fixture_image_with_journal_blocks(16);
+    let initial_free = get_u32(&image, 1024 + 12);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        extend_file(
+            &mut transaction,
+            3,
+            u64::try_from(BLOCK_SIZE * 10).unwrap_or(u64::MAX),
+        );
+        for logical in [0_u64, 2, 4, 6, 8] {
+            overwrite_file(
+                &mut transaction,
+                3,
+                logical.saturating_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX)),
+                b"x",
+            );
+        }
+        must(transaction.commit());
+
+        assert_eq!(
+            volume.superblock().free_cluster_count().as_u64(),
+            u64::from(initial_free - 3)
+        );
+    }
+
+    let inode_base = modern_inode_offset(3);
+    assert_eq!(get_u16(&image, inode_base + 46), 1);
+    let extent_block = get_u32(&image, inode_base + 56);
+    assert_ne!(extent_block, 0);
+    assert!(bigalloc_cluster_is_used(
+        &image,
+        bigalloc_cluster_for_block(extent_block)
+    ));
+    assert_eq!(get_u16(&image, block_offset(extent_block)), 0xF30A);
 }
 
 #[test]
@@ -1054,6 +1422,55 @@ fn external_xattr_block_is_allocated_and_removed() {
         SliceBlockDevice::new(&image),
     ));
     assert_eq!(must(volume.read_xattr(inode(3), &name)), None);
+}
+
+#[test]
+fn bigalloc_external_xattr_allocation_uses_cluster_accounting() {
+    let mut image = bigalloc_fixture_image_with_journal_blocks(16);
+    let initial_free = get_u32(&image, 1024 + 12);
+    let name = must(XattrName::new(XattrNamespace::User, b"large"));
+    let payload = vec![0xAB; 700];
+    let value = must(XattrValue::new(&payload));
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        let node = transaction_node(&transaction, inode(3));
+        must(transaction.set_xattr(node, name.clone(), value.clone()));
+        must(transaction.commit());
+
+        assert_eq!(
+            volume.superblock().free_cluster_count().as_u64(),
+            u64::from(initial_free - 1)
+        );
+    }
+    let xattr_block = get_u32(&image, modern_inode_offset(3) + 104);
+    assert_ne!(xattr_block, 0);
+    assert!(bigalloc_cluster_is_used(
+        &image,
+        bigalloc_cluster_for_block(xattr_block)
+    ));
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(device));
+        let mut transaction = volume.begin_transaction(NOW);
+        let node = transaction_node(&transaction, inode(3));
+        assert_eq!(must(transaction.remove_xattr(node, &name)), Some(value));
+        must(transaction.commit());
+
+        assert_eq!(
+            volume.superblock().free_cluster_count().as_u64(),
+            u64::from(initial_free)
+        );
+    }
+
+    assert_eq!(get_u32(&image, 1024 + 12), initial_free);
+    assert!(!bigalloc_cluster_is_used(
+        &image,
+        bigalloc_cluster_for_block(xattr_block)
+    ));
 }
 
 #[test]
@@ -2244,12 +2661,39 @@ fn modern_fixture_image() -> Vec<u8> {
     modern_fixture_image_with_journal_blocks(8)
 }
 
+fn bigalloc_fixture_image() -> Vec<u8> {
+    bigalloc_fixture_image_with_journal_blocks(8)
+}
+
+fn bigalloc_fixture_image_with_journal_blocks(journal_blocks: u16) -> Vec<u8> {
+    let mut image = vec![0_u8; BLOCK_SIZE * MODERN_IMAGE_BLOCKS];
+    let free_clusters = write_bigalloc_block_bitmap(&mut image, journal_blocks);
+    let free_inodes = write_modern_inode_bitmap(&mut image);
+    write_modern_superblock(&mut image, free_clusters, free_inodes, journal_blocks);
+    put_u32(&mut image, 1024 + 28, BIGALLOC_LOG_CLUSTER_SIZE);
+    put_u32(&mut image, 1024 + 36, 8192 / BIGALLOC_BLOCKS_PER_CLUSTER);
+    put_u32(
+        &mut image,
+        1024 + 100,
+        RO_COMPAT_MODERN | RO_COMPAT_BIGALLOC,
+    );
+    write_modern_block_group_descriptor(&mut image, free_clusters, free_inodes);
+    refresh_primary_block_group_descriptor_checksum(&mut image);
+    write_modern_root_inode(&mut image);
+    write_modern_file_inode(&mut image);
+    write_modern_journal_inode(&mut image, journal_blocks);
+    write_modern_root_directory(&mut image);
+    let file_data_offset = block_offset(MODERN_FILE_DATA_BLOCK);
+    image[file_data_offset..file_data_offset + 5].copy_from_slice(b"hello");
+    image
+}
+
 fn modern_fixture_image_with_journal_blocks(journal_blocks: u16) -> Vec<u8> {
     let mut image = vec![0_u8; BLOCK_SIZE * MODERN_IMAGE_BLOCKS];
-    let free_blocks = write_modern_block_bitmap(&mut image, journal_blocks);
+    let free_clusters = write_modern_block_bitmap(&mut image, journal_blocks);
     let free_inodes = write_modern_inode_bitmap(&mut image);
-    write_modern_superblock(&mut image, free_blocks, free_inodes, journal_blocks);
-    write_modern_block_group_descriptor(&mut image, free_blocks, free_inodes);
+    write_modern_superblock(&mut image, free_clusters, free_inodes, journal_blocks);
+    write_modern_block_group_descriptor(&mut image, free_clusters, free_inodes);
     refresh_primary_block_group_descriptor_checksum(&mut image);
     write_modern_root_inode(&mut image);
     write_modern_file_inode(&mut image);
@@ -2277,9 +2721,15 @@ fn variable_block_fixture_image(block_size: usize) -> Vec<u8> {
     );
     put_u32(&mut image, base + 20, 0);
     put_u32(&mut image, base + 24, log_block_size);
+    put_u32(&mut image, base + 28, log_block_size);
     put_u32(
         &mut image,
         base + 32,
+        u32::try_from(block_size * 8).unwrap_or(u32::MAX),
+    );
+    put_u32(
+        &mut image,
+        base + 36,
         u32::try_from(block_size * 8).unwrap_or(u32::MAX),
     );
     put_u32(&mut image, base + 40, 16);
@@ -2340,7 +2790,9 @@ fn write_superblock(image: &mut [u8]) {
     );
     put_u32(image, base + 20, 1);
     put_u32(image, base + 24, 0);
+    put_u32(image, base + 28, 0);
     put_u32(image, base + 32, 8192);
+    put_u32(image, base + 36, 8192);
     put_u32(image, base + 40, 16);
     put_u16(image, base + 56, 0xEF53);
     put_u16(image, base + 58, 1);
@@ -2353,7 +2805,7 @@ fn write_superblock(image: &mut [u8]) {
 
 fn write_modern_superblock(
     image: &mut [u8],
-    free_blocks: u32,
+    free_clusters: u32,
     free_inodes: u32,
     journal_blocks: u16,
 ) {
@@ -2364,11 +2816,13 @@ fn write_modern_superblock(
         base + 4,
         u32::try_from(MODERN_IMAGE_BLOCKS).unwrap_or(u32::MAX),
     );
-    put_u32(image, base + 12, free_blocks);
+    put_u32(image, base + 12, free_clusters);
     put_u32(image, base + 16, free_inodes);
     put_u32(image, base + 20, 1);
     put_u32(image, base + 24, 0);
+    put_u32(image, base + 28, 0);
     put_u32(image, base + 32, 8192);
+    put_u32(image, base + 36, 8192);
     put_u32(image, base + 40, 16);
     put_u16(image, base + 56, 0xEF53);
     put_u16(image, base + 58, 1);
@@ -2393,7 +2847,7 @@ fn write_block_group_descriptor(image: &mut [u8]) {
     put_u32(image, block_offset(2) + 8, INODE_TABLE_BLOCK);
 }
 
-fn write_modern_block_group_descriptor(image: &mut [u8], free_blocks: u32, free_inodes: u32) {
+fn write_modern_block_group_descriptor(image: &mut [u8], free_clusters: u32, free_inodes: u32) {
     let base = block_offset(2);
     put_u32(image, base, MODERN_BLOCK_BITMAP_BLOCK);
     put_u32(image, base + 4, MODERN_INODE_BITMAP_BLOCK);
@@ -2401,12 +2855,12 @@ fn write_modern_block_group_descriptor(image: &mut [u8], free_blocks: u32, free_
     put_u16(
         image,
         base + 12,
-        u16::try_from(free_blocks & u32::from(u16::MAX)).unwrap_or(u16::MAX),
+        u16::try_from(free_clusters & u32::from(u16::MAX)).unwrap_or(u16::MAX),
     );
     put_u16(
         image,
         base + 44,
-        u16::try_from(free_blocks >> 16).unwrap_or(u16::MAX),
+        u16::try_from(free_clusters >> 16).unwrap_or(u16::MAX),
     );
     put_u16(
         image,
@@ -2442,6 +2896,64 @@ fn write_modern_block_bitmap(image: &mut [u8], journal_blocks: u16) -> u32 {
     }
     let used = u32::try_from(used_blocks.len()).unwrap_or(u32::MAX) + u32::from(journal_blocks);
     u32::try_from(MODERN_IMAGE_BLOCKS - 1).unwrap_or(u32::MAX) - used
+}
+
+fn write_bigalloc_block_bitmap(image: &mut [u8], journal_blocks: u16) -> u32 {
+    let bitmap = block_offset(MODERN_BLOCK_BITMAP_BLOCK);
+    image[bitmap..bitmap + BLOCK_SIZE].fill(0);
+    let mut used_clusters = [false; 16];
+    let used_blocks = [
+        1_u32,
+        2,
+        MODERN_BLOCK_BITMAP_BLOCK,
+        MODERN_INODE_BITMAP_BLOCK,
+        MODERN_INODE_TABLE_BLOCK,
+        MODERN_INODE_TABLE_BLOCK + 1,
+        MODERN_INODE_TABLE_BLOCK + 2,
+        MODERN_INODE_TABLE_BLOCK + 3,
+        MODERN_ROOT_DIR_BLOCK,
+        MODERN_FILE_DATA_BLOCK,
+    ];
+    for block in used_blocks {
+        mark_bigalloc_cluster_for_block(image, &mut used_clusters, block);
+    }
+    for offset in 0..journal_blocks {
+        mark_bigalloc_cluster_for_block(
+            image,
+            &mut used_clusters,
+            MODERN_JOURNAL_BLOCK + u32::from(offset),
+        );
+    }
+    let used = used_clusters.iter().filter(|used| **used).count();
+    u32::try_from(used_clusters.len() - used).unwrap_or(u32::MAX)
+}
+
+fn mark_bigalloc_cluster_for_block(image: &mut [u8], used_clusters: &mut [bool; 16], block: u32) {
+    let cluster = usize::try_from((block - 1) / BIGALLOC_BLOCKS_PER_CLUSTER).unwrap_or(usize::MAX);
+    used_clusters[cluster] = true;
+    set_bigalloc_cluster_used(image, u32::try_from(cluster).unwrap_or(u32::MAX), true);
+}
+
+fn set_bigalloc_cluster_used(image: &mut [u8], cluster: u32, used: bool) {
+    let byte = block_offset(MODERN_BLOCK_BITMAP_BLOCK)
+        + usize::try_from(cluster / 8).unwrap_or(usize::MAX);
+    let mask = 1_u8 << (cluster % 8);
+    if used {
+        image[byte] |= mask;
+    } else {
+        image[byte] &= !mask;
+    }
+}
+
+fn bigalloc_cluster_is_used(image: &[u8], cluster: u32) -> bool {
+    let byte = block_offset(MODERN_BLOCK_BITMAP_BLOCK)
+        + usize::try_from(cluster / 8).unwrap_or(usize::MAX);
+    let mask = 1_u8 << (cluster % 8);
+    image[byte] & mask != 0
+}
+
+fn bigalloc_cluster_for_block(block: u32) -> u32 {
+    (block - 1) / BIGALLOC_BLOCKS_PER_CLUSTER
 }
 
 fn write_modern_inode_bitmap(image: &mut [u8]) -> u32 {
@@ -2864,18 +3376,18 @@ fn write_modern_root_directory(image: &mut [u8]) {
 
 fn make_indexed_root_directory(image: &mut [u8]) {
     set_modern_block_used(image, MODERN_EXTENT_INDEX_BLOCK, true);
-    let free_blocks = get_u32(image, 1024 + 12) - 1;
-    put_u32(image, 1024 + 12, free_blocks);
+    let free_clusters = get_u32(image, 1024 + 12) - 1;
+    put_u32(image, 1024 + 12, free_clusters);
     let descriptor = block_offset(2);
     put_u16(
         image,
         descriptor + 12,
-        u16::try_from(free_blocks & u32::from(u16::MAX)).unwrap_or(u16::MAX),
+        u16::try_from(free_clusters & u32::from(u16::MAX)).unwrap_or(u16::MAX),
     );
     put_u16(
         image,
         descriptor + 44,
-        u16::try_from(free_blocks >> 16).unwrap_or(u16::MAX),
+        u16::try_from(free_clusters >> 16).unwrap_or(u16::MAX),
     );
 
     let root_inode = modern_inode_offset(2);

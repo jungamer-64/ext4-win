@@ -28,6 +28,8 @@ pub enum Error {
     UnsupportedReadOnlyFeature,
     /// The superblock contains an invalid structural value.
     InvalidSuperblock,
+    /// The superblock cluster geometry is inconsistent.
+    InvalidClusterGeometry,
     /// The inode number is outside the mounted filesystem.
     InvalidInode,
     /// An inode did not contain the requested node kind.
@@ -60,6 +62,8 @@ pub enum Error {
     ChecksumMismatch,
     /// No free block exists for a required allocation.
     NoSpace,
+    /// Cluster ownership references conflict with allocation state.
+    ClusterReferenceConflict,
     /// The staged mutation cannot fit in one supported journal transaction.
     TransactionTooLarge,
     /// A write operation was outside the file range accepted by that operation.
@@ -93,6 +97,7 @@ impl fmt::Display for Error {
             Self::UnsupportedIncompatFeature => "unsupported ext4 incompat feature",
             Self::UnsupportedReadOnlyFeature => "unsupported ext4 read-only feature",
             Self::InvalidSuperblock => "invalid ext4 superblock",
+            Self::InvalidClusterGeometry => "invalid ext4 cluster geometry",
             Self::InvalidInode => "invalid ext4 inode",
             Self::WrongInodeKind => "inode has the wrong kind",
             Self::UnsupportedBlockMap => "unsupported inode block map",
@@ -108,7 +113,10 @@ impl fmt::Display for Error {
             Self::UnsupportedJournal => "unsupported ext4 journal",
             Self::JournalCorrupt => "ext4 journal is corrupt",
             Self::ChecksumMismatch => "ext4 metadata checksum mismatch",
-            Self::NoSpace => "ext4 volume has no free blocks",
+            Self::NoSpace => "ext4 volume has no free clusters",
+            Self::ClusterReferenceConflict => {
+                "ext4 cluster references conflict with allocation state"
+            }
             Self::TransactionTooLarge => "ext4 transaction exceeds journal capacity",
             Self::InvalidWriteRange => "invalid ext4 write range",
             Self::NameAlreadyExists => "directory child name already exists",

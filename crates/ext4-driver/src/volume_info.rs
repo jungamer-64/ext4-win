@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
-use ext4_core::{BlockSize, Ext4VolumeLabel};
+use ext4_core::{ClusterSize, Ext4VolumeLabel};
 use wdk_sys::{
     FILE_CASE_PRESERVED_NAMES, FILE_CASE_SENSITIVE_SEARCH, FILE_FS_ATTRIBUTE_INFORMATION,
     FILE_FS_DEVICE_INFORMATION, FILE_FS_FULL_SIZE_INFORMATION, FILE_FS_LABEL_INFORMATION,
@@ -281,14 +281,14 @@ fn pack_size_information(
     }
     .ok_or(STATUS_INVALID_PARAMETER)?;
     info.TotalAllocationUnits = LARGE_INTEGER {
-        QuadPart: i64::try_from(superblock.block_count().as_u64())
+        QuadPart: i64::try_from(superblock.cluster_count().as_u64())
             .map_err(|_| STATUS_INVALID_PARAMETER)?,
     };
     info.AvailableAllocationUnits = LARGE_INTEGER {
-        QuadPart: i64::try_from(superblock.free_blocks_count().as_u64())
+        QuadPart: i64::try_from(superblock.free_cluster_count().as_u64())
             .map_err(|_| STATUS_INVALID_PARAMETER)?,
     };
-    info.SectorsPerAllocationUnit = sectors_per_allocation_unit(superblock.block_size())?;
+    info.SectorsPerAllocationUnit = sectors_per_allocation_unit(superblock.cluster_size())?;
     info.BytesPerSector = BYTES_PER_SECTOR;
     information_length(core::mem::size_of::<FILE_FS_SIZE_INFORMATION>())
 }
@@ -326,7 +326,7 @@ fn pack_full_size_information(
     }
     let superblock = vcb.volume().superblock();
     let available = LARGE_INTEGER {
-        QuadPart: i64::try_from(superblock.free_blocks_count().as_u64())
+        QuadPart: i64::try_from(superblock.free_cluster_count().as_u64())
             .map_err(|_| STATUS_INVALID_PARAMETER)?,
     };
     let info = unsafe {
@@ -339,12 +339,12 @@ fn pack_full_size_information(
     }
     .ok_or(STATUS_INVALID_PARAMETER)?;
     info.TotalAllocationUnits = LARGE_INTEGER {
-        QuadPart: i64::try_from(superblock.block_count().as_u64())
+        QuadPart: i64::try_from(superblock.cluster_count().as_u64())
             .map_err(|_| STATUS_INVALID_PARAMETER)?,
     };
     info.CallerAvailableAllocationUnits = available;
     info.ActualAvailableAllocationUnits = available;
-    info.SectorsPerAllocationUnit = sectors_per_allocation_unit(superblock.block_size())?;
+    info.SectorsPerAllocationUnit = sectors_per_allocation_unit(superblock.cluster_size())?;
     info.BytesPerSector = BYTES_PER_SECTOR;
     information_length(core::mem::size_of::<FILE_FS_FULL_SIZE_INFORMATION>())
 }
@@ -424,9 +424,9 @@ fn read_u32(input: &[u8], offset: usize) -> Result<u32, NTSTATUS> {
     Ok(u32::from_le_bytes(array))
 }
 
-/// Returns sectors per ext4 block for Windows allocation units.
-fn sectors_per_allocation_unit(block_size: BlockSize) -> Result<u32, NTSTATUS> {
-    block_size
+/// Returns sectors per ext4 allocation cluster for Windows allocation units.
+fn sectors_per_allocation_unit(cluster_size: ClusterSize) -> Result<u32, NTSTATUS> {
+    cluster_size
         .bytes()
         .checked_div(BYTES_PER_SECTOR)
         .filter(|sectors| *sectors != 0)
