@@ -80,6 +80,10 @@ pub enum Error {
     UnsupportedDirectoryHash,
     /// An inode carries mutation semantics outside the write domain.
     UnsupportedInodeMutation,
+    /// An encrypted inode requires a fscrypt key that is not present at mount.
+    MissingEncryptionKey,
+    /// The encrypted inode operation has no connected crypto data path yet.
+    UnsupportedEncryption,
     /// The root directory cannot be removed.
     CannotRemoveRoot,
     /// An fscrypt context, key, or policy is malformed or unsupported.
@@ -131,6 +135,8 @@ impl fmt::Display for Error {
             Self::NoFreeInode => "ext4 volume has no free inodes",
             Self::UnsupportedDirectoryHash => "unsupported ext4 directory hash",
             Self::UnsupportedInodeMutation => "unsupported ext4 inode mutation",
+            Self::MissingEncryptionKey => "missing fscrypt encryption key",
+            Self::UnsupportedEncryption => "unsupported ext4 encryption operation",
             Self::CannotRemoveRoot => "cannot remove the ext4 root directory",
             Self::InvalidEncryptionContext => "invalid ext4 encryption context",
             Self::InvalidVerityMetadata => "invalid ext4 verity metadata",

@@ -52,6 +52,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::NoSpace | Error::NoFreeInode => STATUS_DISK_FULL,
         Error::DirectoryNotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
         Error::CannotRemoveRoot => STATUS_CANNOT_DELETE,
+        Error::MissingEncryptionKey => STATUS_ACCESS_DENIED,
         Error::DirtyVolume => STATUS_VOLUME_DIRTY,
         Error::DeviceIo => STATUS_IO_DEVICE_ERROR,
         Error::VerityMismatch => STATUS_IO_DEVICE_ERROR,
@@ -64,6 +65,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::UnsupportedExtentDepth
         | Error::UnsupportedDirectoryHash
         | Error::UnsupportedInodeMutation
+        | Error::UnsupportedEncryption
         | Error::DirectoryTooLarge => STATUS_NOT_SUPPORTED,
         Error::DeviceRange
         | Error::ArithmeticOverflow

@@ -497,8 +497,14 @@ pub enum InodeKind {
 pub enum InodeMutation {
     /// POSIX metadata, timestamps, or xattrs that do not reinterpret file data.
     Metadata,
-    /// Directory entry insertion, removal, rename, or replacement.
-    DirectoryEntry,
+    /// Directory entry insertion.
+    DirectoryEntryCreate,
+    /// Directory entry removal by exact on-disk name.
+    DirectoryEntryDelete,
+    /// Directory entry rename within one directory.
+    DirectoryEntryRename,
+    /// Directory entry target replacement.
+    DirectoryEntryReplace,
     /// Regular-file or symlink payload bytes.
     FileData,
     /// File length or allocated extent shape.
@@ -753,7 +759,14 @@ impl Inode {
         }
         match mutation {
             InodeMutation::Metadata | InodeMutation::Delete => {}
-            InodeMutation::DirectoryEntry => {
+            InodeMutation::DirectoryEntryDelete => {
+                if self.flags & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0 {
+                    return Err(Error::UnsupportedInodeMutation);
+                }
+            }
+            InodeMutation::DirectoryEntryCreate
+            | InodeMutation::DirectoryEntryRename
+            | InodeMutation::DirectoryEntryReplace => {
                 if self.flags & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0
                     || self.protection().is_encrypted()
                 {
