@@ -767,9 +767,7 @@ impl Inode {
             InodeMutation::DirectoryEntryCreate
             | InodeMutation::DirectoryEntryRename
             | InodeMutation::DirectoryEntryReplace => {
-                if self.flags & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0
-                    || self.protection().is_encrypted()
-                {
+                if self.flags & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0 {
                     return Err(Error::UnsupportedInodeMutation);
                 }
             }

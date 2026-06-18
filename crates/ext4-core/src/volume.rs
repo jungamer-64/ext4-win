@@ -860,6 +860,34 @@ impl<D: BlockReader, State> Volume<D, State> {
         Ok(Some(FscryptContextV2::parse(value.bytes())?))
     }
 
+    /// Verifies that an encrypted inode has an available fscrypt master key.
+    fn require_encryption_key(&self, inode: &Inode) -> Result<()> {
+        if !inode.protection().is_encrypted() {
+            return Ok(());
+        }
+        let Some(context) = self.read_fscrypt_context(inode.id())? else {
+            return Err(Error::InvalidEncryptionContext);
+        };
+        if self
+            .mount_context
+            .fscrypt_keys()
+            .get(context.policy().master_key_identifier())
+            .is_none()
+        {
+            return Err(Error::MissingEncryptionKey);
+        }
+        Ok(())
+    }
+
+    /// Rejects encrypted plaintext data access until the crypto data path exists.
+    fn reject_unsupported_encrypted_payload_access(&self, inode: &Inode) -> Result<()> {
+        if inode.protection().is_encrypted() {
+            self.require_encryption_key(inode)?;
+            return Err(Error::UnsupportedEncryption);
+        }
+        Ok(())
+    }
+
     /// Reads and classifies one inode as a typed node.
     ///
     /// # Errors
@@ -879,6 +907,7 @@ impl<D: BlockReader, State> Volume<D, State> {
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
+        self.reject_unsupported_encrypted_payload_access(file.inode())?;
         self.read_inode_data(file.inode(), offset, out)
     }
 
@@ -887,6 +916,7 @@ impl<D: BlockReader, State> Volume<D, State> {
     /// # Errors
     /// Returns an error when the symlink target cannot be read.
     pub fn read_symlink(&self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
+        self.reject_unsupported_encrypted_payload_access(symlink.inode())?;
         let len = symlink.size().to_usize()?;
         if let Ok(inline) = symlink.inode().inline_bytes() {
             return Ok(inline.prefix(symlink.size())?.to_vec());
@@ -942,6 +972,7 @@ impl<D: BlockReader, State> Volume<D, State> {
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> Result<Option<DirectoryEntry>> {
+        self.reject_unsupported_encrypted_payload_access(parent.inode())?;
         let mut folded = None;
 
         for entry in self.read_directory(parent)? {
@@ -1273,7 +1304,6 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        inode.require_mutation(InodeMutation::DirectoryEntry)?;
         Ok(TransactionDirectory { inode_id })
     }
 
@@ -1287,7 +1317,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::Symlink {
             return Err(Error::WrongInodeKind);
         }
-        inode.require_mutation(InodeMutation::FileData)?;
+        self.require_file_data_mutation(&inode)?;
         Ok(TransactionSymlink { inode_id })
     }
 
@@ -1331,6 +1361,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         metadata: NewFileMetadata,
     ) -> Result<TransactionFile> {
         self.ensure_child_absent(parent.inode_id(), name)?;
+        self.require_directory_entry_mutation(
+            parent.inode_id(),
+            InodeMutation::DirectoryEntryCreate,
+        )?;
         let mut raw_inode = self.allocate_inode()?;
         raw_inode.initialize_file(metadata, self.now, self.volume.superblock.block_size())?;
         let inode_id = raw_inode.id;
@@ -1389,6 +1423,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         metadata: NewDirectoryMetadata,
     ) -> Result<TransactionDirectory> {
         self.ensure_child_absent(parent.inode_id(), name)?;
+        self.require_directory_entry_mutation(
+            parent.inode_id(),
+            InodeMutation::DirectoryEntryCreate,
+        )?;
         let block = self.allocate_cluster()?;
         let mut raw_inode = self.allocate_inode()?;
         let inode_id = raw_inode.id;
@@ -1432,6 +1470,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         metadata: NewSymlinkMetadata,
     ) -> Result<TransactionSymlink> {
         self.ensure_child_absent(parent.inode_id(), name)?;
+        self.require_directory_entry_mutation(
+            parent.inode_id(),
+            InodeMutation::DirectoryEntryCreate,
+        )?;
         let mut raw_inode = self.allocate_inode()?;
         let inode_id = raw_inode.id;
         if target.is_inline() {
@@ -1756,7 +1798,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
-        inode.require_mutation(InodeMutation::FileData)?;
+        self.require_file_data_mutation(&inode)?;
         let end_offset = offset.checked_add_len(bytes.len())?;
         if end_offset.bytes() > inode.size().bytes() {
             return Err(Error::InvalidWriteRange);
@@ -1914,7 +1956,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::InvalidInode)?
             .clone();
         let inode = raw_inode.parse()?;
-        inode.require_mutation(InodeMutation::FileSize)?;
+        self.require_file_size_mutation(&inode)?;
         if new_size < inode.size() {
             return Err(Error::InvalidWriteRange);
         }
@@ -1940,7 +1982,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::InvalidInode)?
             .clone();
         let inode = raw_inode.parse()?;
-        inode.require_mutation(InodeMutation::FileSize)?;
+        self.require_file_size_mutation(&inode)?;
         if new_size > inode.size() {
             return Err(Error::InvalidWriteRange);
         }
@@ -1993,6 +2035,74 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         Ok(())
     }
 
+    /// Verifies file-data mutation policy with mount-scoped fscrypt keys.
+    fn require_file_data_mutation(&self, inode: &Inode) -> Result<()> {
+        if inode.protection().is_encrypted() {
+            self.volume.require_encryption_key(inode)?;
+            return Err(Error::UnsupportedEncryption);
+        }
+        inode.require_mutation(InodeMutation::FileData)
+    }
+
+    /// Verifies file-size mutation policy with mount-scoped fscrypt keys.
+    fn require_file_size_mutation(&self, inode: &Inode) -> Result<()> {
+        if inode.protection().is_encrypted() {
+            self.volume.require_encryption_key(inode)?;
+            return Err(Error::UnsupportedEncryption);
+        }
+        inode.require_mutation(InodeMutation::FileSize)
+    }
+
+    /// Verifies directory-entry mutation policy using the latest staged inode.
+    fn require_directory_entry_mutation(
+        &self,
+        inode_id: InodeId,
+        mutation: InodeMutation,
+    ) -> Result<()> {
+        let raw_inode = self.raw_inode_for_policy(inode_id)?;
+        let inode = raw_inode.parse()?;
+        if inode.kind() != InodeKind::Directory {
+            return Err(Error::WrongInodeKind);
+        }
+        self.require_directory_entry_mutation_for_inode(&inode, mutation)
+    }
+
+    /// Verifies directory-entry mutation policy with mount-scoped fscrypt keys.
+    fn require_directory_entry_mutation_for_inode(
+        &self,
+        inode: &Inode,
+        mutation: InodeMutation,
+    ) -> Result<()> {
+        if inode.protection().is_encrypted() {
+            match mutation {
+                InodeMutation::DirectoryEntryDelete => {}
+                InodeMutation::DirectoryEntryCreate
+                | InodeMutation::DirectoryEntryRename
+                | InodeMutation::DirectoryEntryReplace => {
+                    self.volume.require_encryption_key(inode)?;
+                    return Err(Error::UnsupportedEncryption);
+                }
+                InodeMutation::Metadata
+                | InodeMutation::FileData
+                | InodeMutation::FileSize
+                | InodeMutation::Delete => {}
+            }
+        }
+        inode.require_mutation(mutation)
+    }
+
+    /// Returns the staged inode record when present, otherwise the device image.
+    fn raw_inode_for_policy(&self, inode_id: InodeId) -> Result<RawInode> {
+        if let Some(raw_inode) = self
+            .inode_updates
+            .iter()
+            .find(|raw_inode| raw_inode.id == inode_id)
+        {
+            return Ok(raw_inode.clone());
+        }
+        self.volume.read_raw_inode(inode_id)
+    }
+
     /// Verifies that a directory does not already contain `name`.
     fn ensure_child_absent(&self, parent: InodeId, name: &Ext4Name) -> Result<()> {
         match self.find_child_entry(parent, name) {
@@ -2032,7 +2142,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        parent_inode.require_mutation(InodeMutation::DirectoryEntry)?;
+        self.require_directory_entry_mutation_for_inode(
+            &parent_inode,
+            InodeMutation::DirectoryEntryCreate,
+        )?;
         if self.directory_layout(&parent_inode)?.find(name).is_some() {
             return Err(Error::NameAlreadyExists);
         }
@@ -2114,7 +2227,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        parent_inode.require_mutation(InodeMutation::DirectoryEntry)?;
+        self.require_directory_entry_mutation_for_inode(
+            &parent_inode,
+            InodeMutation::DirectoryEntryDelete,
+        )?;
         if parent_inode.is_indexed_directory() {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
             let Some(position) = entries.iter().position(|entry| entry.name() == name) else {
@@ -2157,7 +2273,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        parent_inode.require_mutation(InodeMutation::DirectoryEntry)?;
+        self.require_directory_entry_mutation_for_inode(
+            &parent_inode,
+            InodeMutation::DirectoryEntryRename,
+        )?;
         if parent_inode.is_indexed_directory() {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
             if entries.iter().any(|entry| entry.name() == new_name) {
@@ -2218,7 +2337,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        parent_inode.require_mutation(InodeMutation::DirectoryEntry)?;
+        self.require_directory_entry_mutation_for_inode(
+            &parent_inode,
+            InodeMutation::DirectoryEntryReplace,
+        )?;
         if parent_inode.is_indexed_directory() {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
             let Some(position) = entries.iter().position(|entry| entry.name() == name) else {
