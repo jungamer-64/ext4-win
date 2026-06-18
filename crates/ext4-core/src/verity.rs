@@ -4,7 +4,9 @@ use alloc::{vec, vec::Vec};
 
 use sha2::{Digest, Sha256, Sha512};
 
+use crate::block::BlockSize;
 use crate::error::{Error, Result};
+use crate::inode::FileSize;
 
 /// Serialized Linux `struct fsverity_descriptor` size without signature bytes.
 pub const FSVERITY_DESCRIPTOR_BYTES: usize = 256;
@@ -12,6 +14,8 @@ pub const FSVERITY_DESCRIPTOR_BYTES: usize = 256;
 pub const FSVERITY_MIN_BLOCK_BYTES: u32 = 1024;
 /// Maximum block size representable by the descriptor's log2 field in this domain.
 pub const FSVERITY_MAX_BLOCK_BYTES: u32 = 65_536;
+/// ext4 stores verity metadata after padding file data to a 64 KiB boundary.
+pub const EXT4_VERITY_METADATA_ALIGNMENT_BYTES: u64 = 65_536;
 
 /// Linux fs-verity descriptor version.
 const FSVERITY_DESCRIPTOR_VERSION: u8 = 1;
@@ -43,6 +47,107 @@ const DESCRIPTOR_SALT_OFFSET: usize = 80;
 const DESCRIPTOR_RESERVED_OFFSET: usize = 112;
 /// Size of descriptor trailing reserved bytes.
 const DESCRIPTOR_RESERVED_BYTES: usize = 144;
+
+/// ext4 post-EOF fs-verity metadata layout for one inode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ext4VerityMetadataLayout {
+    /// Byte offset where the Merkle tree starts in the inode payload stream.
+    merkle_tree_offset: u64,
+    /// Serialized Merkle tree byte count.
+    merkle_tree_bytes: u64,
+    /// Byte offset where the descriptor plus optional signature starts.
+    descriptor_offset: u64,
+    /// Descriptor plus optional signature byte count.
+    descriptor_bytes: u32,
+    /// Byte offset of the little-endian descriptor-size tail.
+    descriptor_size_offset: u64,
+    /// First byte after all ext4 verity metadata.
+    metadata_end: u64,
+}
+
+impl Ext4VerityMetadataLayout {
+    /// Computes the ext4 post-EOF fs-verity metadata layout.
+    ///
+    /// # Errors
+    /// Returns an error when sizes overflow or descriptor bytes cannot contain
+    /// the fixed Linux `fsverity_descriptor`.
+    pub fn new(
+        file_size: FileSize,
+        filesystem_block_size: BlockSize,
+        merkle_tree_bytes: u64,
+        descriptor_bytes: u32,
+    ) -> Result<Self> {
+        if usize::try_from(descriptor_bytes).map_err(|_| Error::ArithmeticOverflow)?
+            < FSVERITY_DESCRIPTOR_BYTES
+        {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        let merkle_tree_offset =
+            align_up_u64(file_size.bytes(), EXT4_VERITY_METADATA_ALIGNMENT_BYTES)?;
+        let tree_end = merkle_tree_offset
+            .checked_add(merkle_tree_bytes)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let descriptor_offset = align_up_u64(tree_end, u64::from(filesystem_block_size.bytes()))?;
+        let descriptor_end = descriptor_offset
+            .checked_add(u64::from(descriptor_bytes))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let descriptor_size_offset = align_up_u64(
+            descriptor_end
+                .checked_add(4)
+                .ok_or(Error::ArithmeticOverflow)?,
+            u64::from(filesystem_block_size.bytes()),
+        )?
+        .checked_sub(4)
+        .ok_or(Error::ArithmeticOverflow)?;
+        let metadata_end = descriptor_size_offset
+            .checked_add(4)
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(Self {
+            merkle_tree_offset,
+            merkle_tree_bytes,
+            descriptor_offset,
+            descriptor_bytes,
+            descriptor_size_offset,
+            metadata_end,
+        })
+    }
+
+    /// Merkle tree byte offset.
+    #[must_use]
+    pub const fn merkle_tree_offset(self) -> u64 {
+        self.merkle_tree_offset
+    }
+
+    /// Merkle tree byte count.
+    #[must_use]
+    pub const fn merkle_tree_bytes(self) -> u64 {
+        self.merkle_tree_bytes
+    }
+
+    /// Descriptor byte offset.
+    #[must_use]
+    pub const fn descriptor_offset(self) -> u64 {
+        self.descriptor_offset
+    }
+
+    /// Descriptor plus optional signature byte count.
+    #[must_use]
+    pub const fn descriptor_bytes(self) -> u32 {
+        self.descriptor_bytes
+    }
+
+    /// Descriptor-size tail byte offset.
+    #[must_use]
+    pub const fn descriptor_size_offset(self) -> u64 {
+        self.descriptor_size_offset
+    }
+
+    /// First byte after all verity metadata.
+    #[must_use]
+    pub const fn metadata_end(self) -> u64 {
+        self.metadata_end
+    }
+}
 /// fs-verity hash algorithm accepted by this driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsverityHashAlgorithm {
@@ -568,6 +673,22 @@ fn parse_salt(bytes: &[u8], salt_size: usize) -> Result<FsveritySalt> {
     FsveritySalt::new(salt)
 }
 
+/// Aligns an offset upward to a positive byte boundary.
+fn align_up_u64(value: u64, alignment: u64) -> Result<u64> {
+    if alignment == 0 {
+        return Err(Error::ArithmeticOverflow);
+    }
+    let remainder = value
+        .checked_rem(alignment)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if remainder == 0 {
+        return Ok(value);
+    }
+    value
+        .checked_add(alignment - remainder)
+        .ok_or(Error::ArithmeticOverflow)
+}
+
 /// Hashes every data block, padding the final block with zeroes.
 fn hash_data_blocks(
     data: &[u8],
@@ -730,6 +851,48 @@ mod tests {
         0x86, 0xa0, 0xf7, 0x16, 0xb5, 0x0e, 0x04, 0x49, 0xb5, 0x62, 0x05, 0x30, 0xf6, 0xdf, 0xca,
         0xa1, 0x3a, 0xc2, 0x5b,
     ];
+
+    #[test]
+    fn ext4_verity_metadata_layout_places_descriptor_size_tail() -> Result<()> {
+        let layout = Ext4VerityMetadataLayout::new(
+            FileSize::from_bytes(1),
+            BlockSize::from_superblock_log(2)?,
+            8192,
+            u32::try_from(FSVERITY_DESCRIPTOR_BYTES + 16).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+
+        assert_eq!(layout.merkle_tree_offset(), 65_536);
+        assert_eq!(layout.merkle_tree_bytes(), 8192);
+        assert_eq!(layout.descriptor_offset(), 73_728);
+        assert_eq!(layout.descriptor_bytes(), 272);
+        assert_eq!(layout.descriptor_size_offset(), 77_820);
+        assert_eq!(layout.metadata_end(), 77_824);
+        Ok(())
+    }
+
+    #[test]
+    fn ext4_verity_metadata_layout_rejects_bad_descriptor_and_overflow() -> Result<()> {
+        assert_eq!(
+            Ext4VerityMetadataLayout::new(
+                FileSize::from_bytes(0),
+                BlockSize::from_superblock_log(0)?,
+                0,
+                u32::try_from(FSVERITY_DESCRIPTOR_BYTES - 1)
+                    .map_err(|_| Error::ArithmeticOverflow)?,
+            ),
+            Err(Error::InvalidVerityMetadata)
+        );
+        assert_eq!(
+            Ext4VerityMetadataLayout::new(
+                FileSize::from_bytes(u64::MAX),
+                BlockSize::from_superblock_log(0)?,
+                0,
+                u32::try_from(FSVERITY_DESCRIPTOR_BYTES).map_err(|_| Error::ArithmeticOverflow)?,
+            ),
+            Err(Error::ArithmeticOverflow)
+        );
+        Ok(())
+    }
 
     #[test]
     fn fsverity_descriptor_round_trips_supported_layout() -> Result<()> {
