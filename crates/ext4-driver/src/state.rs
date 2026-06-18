@@ -6,8 +6,8 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    DeviceLength, Ext4Name, InodeId, InternalJournal, MountContext, ReadWrite,
-    Result as Ext4Result, Volume,
+    DeviceLength, Ext4Name, FscryptKeyIdentifier, FscryptMasterKey, InodeId, InternalJournal,
+    MountContext, ReadWrite, Result as Ext4Result, Volume,
 };
 use wdk_sys::{
     ACCESS_MASK, DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT,
@@ -177,6 +177,24 @@ impl VolumeControlBlock {
     /// Returns the mounted ext4 volume label.
     pub(crate) fn volume_label(&self) -> ext4_core::Ext4VolumeLabel {
         self.volume.volume_label()
+    }
+
+    /// Adds one fscrypt master key to the mounted volume.
+    pub(crate) fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> Ext4Result<()> {
+        self.volume.add_fscrypt_key(key)
+    }
+
+    /// Removes one fscrypt master key from the mounted volume.
+    pub(crate) fn remove_fscrypt_key(
+        &mut self,
+        identifier: FscryptKeyIdentifier,
+    ) -> Option<FscryptMasterKey> {
+        self.volume.remove_fscrypt_key(identifier)
+    }
+
+    /// Returns whether the mounted volume has a fscrypt key.
+    pub(crate) fn contains_fscrypt_key(&self, identifier: FscryptKeyIdentifier) -> bool {
+        self.volume.contains_fscrypt_key(identifier)
     }
 
     /// Opens or reuses the VCB-owned FCB for a node.

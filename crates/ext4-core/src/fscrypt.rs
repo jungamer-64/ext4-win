@@ -427,6 +427,38 @@ impl FscryptKeySet {
         self.keys.is_empty()
     }
 
+    /// Adds one mount-scoped key while preserving identifier uniqueness.
+    ///
+    /// # Errors
+    /// Returns an error when a key with the same identifier is already present.
+    pub fn insert(&mut self, key: FscryptMasterKey) -> Result<()> {
+        match self
+            .keys
+            .binary_search_by_key(&key.identifier(), FscryptMasterKey::identifier)
+        {
+            Ok(_) => Err(Error::InvalidEncryptionContext),
+            Err(index) => {
+                self.keys.insert(index, key);
+                Ok(())
+            }
+        }
+    }
+
+    /// Removes a key by identifier.
+    #[must_use]
+    pub fn remove(&mut self, identifier: FscryptKeyIdentifier) -> Option<FscryptMasterKey> {
+        self.keys
+            .binary_search_by_key(&identifier, FscryptMasterKey::identifier)
+            .ok()
+            .map(|index| self.keys.remove(index))
+    }
+
+    /// Returns whether a key with the identifier is present.
+    #[must_use]
+    pub fn contains(&self, identifier: FscryptKeyIdentifier) -> bool {
+        self.get(identifier).is_some()
+    }
+
     /// Returns keys in stable identifier order.
     #[must_use]
     pub fn keys(&self) -> &[FscryptMasterKey] {
@@ -798,6 +830,22 @@ mod tests {
             FscryptKeySet::from_keys(vec![first, duplicate]),
             Err(Error::InvalidEncryptionContext)
         );
+    }
+
+    #[test]
+    fn fscrypt_key_set_insert_and_remove_update_mount_state() {
+        let first = FscryptMasterKey::from_raw(&[1_u8; 32]).expect("first key");
+        let duplicate = FscryptMasterKey::from_raw(&[1_u8; 32]).expect("duplicate key");
+        let identifier = first.identifier();
+
+        let mut set = FscryptKeySet::empty();
+        set.insert(first).expect("insert first key");
+
+        assert!(set.contains(identifier));
+        assert_eq!(set.insert(duplicate), Err(Error::InvalidEncryptionContext));
+        assert!(set.remove(identifier).is_some());
+        assert!(!set.contains(identifier));
+        assert!(set.remove(identifier).is_none());
     }
 
     /// Builds a supported fscrypt v2 policy byte image.

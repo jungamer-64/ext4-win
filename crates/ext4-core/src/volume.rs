@@ -15,7 +15,7 @@ use crate::extent::{
     BlockMapping, Extent, ExtentLength, ExtentTree, ExtentTreeContext, LogicalBlock,
     MutableExtentTree, SerializedExtentTree,
 };
-use crate::fscrypt::{FscryptContextV2, FscryptKeySet};
+use crate::fscrypt::{FscryptContextV2, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey};
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset, FileSize,
@@ -143,6 +143,29 @@ impl MountContext {
     #[must_use]
     pub const fn fscrypt_keys(&self) -> &FscryptKeySet {
         &self.fscrypt_keys
+    }
+
+    /// Adds one fscrypt master key to this mount context.
+    ///
+    /// # Errors
+    /// Returns an error when the key identifier is already present.
+    pub fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> Result<()> {
+        self.fscrypt_keys.insert(key)
+    }
+
+    /// Removes one fscrypt master key from this mount context.
+    #[must_use]
+    pub fn remove_fscrypt_key(
+        &mut self,
+        identifier: FscryptKeyIdentifier,
+    ) -> Option<FscryptMasterKey> {
+        self.fscrypt_keys.remove(identifier)
+    }
+
+    /// Returns whether this mount context contains a key identifier.
+    #[must_use]
+    pub fn contains_fscrypt_key(&self, identifier: FscryptKeyIdentifier) -> bool {
+        self.fscrypt_keys.contains(identifier)
     }
 }
 
@@ -793,6 +816,29 @@ impl<D: BlockReader, State> Volume<D, State> {
     #[must_use]
     pub const fn mount_context(&self) -> &MountContext {
         &self.mount_context
+    }
+
+    /// Adds one fscrypt master key to this mounted volume.
+    ///
+    /// # Errors
+    /// Returns an error when the key identifier is already present.
+    pub fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> Result<()> {
+        self.mount_context.add_fscrypt_key(key)
+    }
+
+    /// Removes one fscrypt master key from this mounted volume.
+    #[must_use]
+    pub fn remove_fscrypt_key(
+        &mut self,
+        identifier: FscryptKeyIdentifier,
+    ) -> Option<FscryptMasterKey> {
+        self.mount_context.remove_fscrypt_key(identifier)
+    }
+
+    /// Returns whether this mounted volume has an fscrypt key.
+    #[must_use]
+    pub fn contains_fscrypt_key(&self, identifier: FscryptKeyIdentifier) -> bool {
+        self.mount_context.contains_fscrypt_key(identifier)
     }
 
     /// Filesystem volume label parsed from the mounted superblock.
