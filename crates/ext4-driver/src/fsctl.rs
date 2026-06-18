@@ -1,11 +1,16 @@
 //! ext4win-private FSCTL payload decoding for fscrypt and fs-verity.
 
 use alloc::vec::Vec;
+use core::ptr::NonNull;
 
 use ext4_core::{FscryptKeyIdentifier, FscryptMasterKey, FsverityBlockSize, FsverityHashAlgorithm};
-use wdk_sys::{NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
+use wdk_sys::{
+    NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
+    STATUS_SUCCESS,
+};
 
 use crate::irp::{DispatchTarget, FileSystemControlStack};
+use crate::state::{VolumeControlBlock, file_control_block};
 use crate::status::DriverError;
 
 /// Windows `FILE_DEVICE_FILE_SYSTEM`.
@@ -48,6 +53,8 @@ const FSCRYPT_ADD_KEY_FIXED_BYTES: usize = 80;
 const FSCRYPT_REMOVE_KEY_BYTES: usize = 64;
 /// Input prefix of Linux `struct fscrypt_get_key_status_arg`.
 const FSCRYPT_GET_KEY_STATUS_INPUT_BYTES: usize = 64;
+/// Linux `struct fscrypt_get_key_status_arg` size with output fields.
+const FSCRYPT_GET_KEY_STATUS_BYTES: usize = 128;
 /// Offset of fscrypt key-specifier type.
 const FSCRYPT_KEY_SPEC_TYPE_OFFSET: usize = 0;
 /// Offset of fscrypt key-specifier reserved word.
@@ -74,6 +81,20 @@ const FSCRYPT_REMOVE_KEY_RESERVED_BYTES: usize = 20;
 const FSCRYPT_GET_KEY_STATUS_RESERVED_OFFSET: usize = 40;
 /// Size of key-status input reserved words.
 const FSCRYPT_GET_KEY_STATUS_RESERVED_BYTES: usize = 24;
+/// Offset of key-status output status word.
+const FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET: usize = 64;
+/// Offset of key-status output status flags word.
+const FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET: usize = 68;
+/// Offset of key-status output user-count word.
+const FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET: usize = 72;
+/// Offset of key-status output reserved words.
+const FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET: usize = 76;
+/// Linux `FSCRYPT_KEY_STATUS_ABSENT`.
+const FSCRYPT_KEY_STATUS_ABSENT: u32 = 1;
+/// Linux `FSCRYPT_KEY_STATUS_PRESENT`.
+const FSCRYPT_KEY_STATUS_PRESENT: u32 = 2;
+/// Linux `FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF`.
+const FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF: u32 = 1;
 
 /// Linux `struct fsverity_enable_arg` size.
 const FSVERITY_ENABLE_ARG_BYTES: usize = 128;
@@ -112,12 +133,8 @@ pub(crate) fn add_encryption_key(
     target: DispatchTarget,
     stack: FileSystemControlStack,
 ) -> NTSTATUS {
-    match read_input(target, stack).and_then(|input| FscryptAddKeyPayload::parse(input.as_slice()))
-    {
-        Ok(payload) => {
-            let _identifier = payload.master_key().identifier();
-            STATUS_NOT_SUPPORTED
-        }
+    match add_encryption_key_result(target, stack) {
+        Ok(()) => STATUS_SUCCESS,
         Err(status) => status,
     }
 }
@@ -127,13 +144,8 @@ pub(crate) fn remove_encryption_key(
     target: DispatchTarget,
     stack: FileSystemControlStack,
 ) -> NTSTATUS {
-    match read_input(target, stack)
-        .and_then(|input| FscryptRemoveKeyPayload::parse(input.as_slice()))
-    {
-        Ok(payload) => {
-            let _identifier = payload.identifier();
-            STATUS_NOT_SUPPORTED
-        }
+    match remove_encryption_key_result(target, stack) {
+        Ok(()) => STATUS_SUCCESS,
         Err(status) => status,
     }
 }
@@ -143,13 +155,8 @@ pub(crate) fn get_encryption_key_status(
     target: DispatchTarget,
     stack: FileSystemControlStack,
 ) -> NTSTATUS {
-    match read_input(target, stack)
-        .and_then(|input| FscryptKeyStatusPayload::parse(input.as_slice()))
-    {
-        Ok(payload) => {
-            let _identifier = payload.identifier();
-            STATUS_NOT_SUPPORTED
-        }
+    match get_encryption_key_status_result(target, stack) {
+        Ok(()) => STATUS_SUCCESS,
         Err(status) => status,
     }
 }
@@ -167,6 +174,101 @@ pub(crate) fn enable_verity(target: DispatchTarget, stack: FileSystemControlStac
         }
         Err(status) => status,
     }
+}
+
+/// Adds an fscrypt master key to the mounted VCB.
+fn add_encryption_key_result(
+    target: DispatchTarget,
+    stack: FileSystemControlStack,
+) -> Result<(), NTSTATUS> {
+    let input = read_input(target, stack)?;
+    let payload = FscryptAddKeyPayload::parse(input.as_slice())?;
+    let mut vcb = mounted_vcb(stack)?;
+    let vcb = unsafe {
+        // SAFETY: The VCB pointer comes from an open FCB that is valid for the
+        // duration of this synchronous FSCTL dispatch.
+        vcb.as_mut()
+    };
+    vcb.add_fscrypt_key(payload.into_master_key())
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    target.set_information(0);
+    Ok(())
+}
+
+/// Removes an fscrypt master key from the mounted VCB.
+fn remove_encryption_key_result(
+    target: DispatchTarget,
+    stack: FileSystemControlStack,
+) -> Result<(), NTSTATUS> {
+    let input = read_input(target, stack)?;
+    let payload = FscryptRemoveKeyPayload::parse(input.as_slice())?;
+    let mut vcb = mounted_vcb(stack)?;
+    let vcb = unsafe {
+        // SAFETY: The VCB pointer comes from an open FCB that is valid for the
+        // duration of this synchronous FSCTL dispatch.
+        vcb.as_mut()
+    };
+    let _removed = vcb.remove_fscrypt_key(payload.identifier());
+
+    let mut output = output_buffer(target, stack, FSCRYPT_REMOVE_KEY_BYTES)?;
+    write_remove_key_output(output.as_mut_slice())?;
+    set_information(target, FSCRYPT_REMOVE_KEY_BYTES)
+}
+
+/// Writes fscrypt key presence into Linux-compatible status output fields.
+fn get_encryption_key_status_result(
+    target: DispatchTarget,
+    stack: FileSystemControlStack,
+) -> Result<(), NTSTATUS> {
+    let input = read_input(target, stack)?;
+    let payload = FscryptKeyStatusPayload::parse(input.as_slice())?;
+    let vcb = mounted_vcb(stack)?;
+    let present = unsafe {
+        // SAFETY: The VCB pointer comes from an open FCB that is valid for the
+        // duration of this synchronous FSCTL dispatch.
+        vcb.as_ref()
+    }
+    .contains_fscrypt_key(payload.identifier());
+
+    let mut output = output_buffer(target, stack, FSCRYPT_GET_KEY_STATUS_BYTES)?;
+    write_key_status_output(output.as_mut_slice(), present)?;
+    set_information(target, FSCRYPT_GET_KEY_STATUS_BYTES)
+}
+
+/// Writes Linux-compatible remove-key output fields.
+fn write_remove_key_output(output: &mut [u8]) -> Result<(), NTSTATUS> {
+    write_u32(output, FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET, 0)
+}
+
+/// Writes Linux-compatible key-status output fields.
+fn write_key_status_output(output: &mut [u8], present: bool) -> Result<(), NTSTATUS> {
+    output
+        .get_mut(FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET..FSCRYPT_GET_KEY_STATUS_BYTES)
+        .ok_or(STATUS_BUFFER_TOO_SMALL)?
+        .fill(0);
+    write_u32(
+        output,
+        FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET,
+        if present {
+            FSCRYPT_KEY_STATUS_PRESENT
+        } else {
+            FSCRYPT_KEY_STATUS_ABSENT
+        },
+    )?;
+    write_u32(
+        output,
+        FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET,
+        if present {
+            FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF
+        } else {
+            0
+        },
+    )?;
+    write_u32(
+        output,
+        FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET,
+        if present { 1 } else { 0 },
+    )
 }
 
 /// Parsed fscrypt add-key payload.
@@ -212,6 +314,11 @@ impl FscryptAddKeyPayload {
     /// Validated mount key from the payload.
     const fn master_key(&self) -> &FscryptMasterKey {
         &self.master_key
+    }
+
+    /// Consumes this payload into the validated mount key.
+    fn into_master_key(self) -> FscryptMasterKey {
+        self.master_key
     }
 }
 
@@ -403,6 +510,38 @@ fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> Result<V
     Ok(input.as_slice().to_vec())
 }
 
+/// Returns a mounted VCB from a path-scoped FSCTL stack.
+fn mounted_vcb(stack: FileSystemControlStack) -> Result<NonNull<VolumeControlBlock>, NTSTATUS> {
+    let fcb = file_control_block(stack.file_object()).map_err(DriverError::ntstatus)?;
+    let fcb = unsafe {
+        // SAFETY: The FCB pointer is read from a live FILE_OBJECT owned by this
+        // filesystem for the duration of this FSCTL dispatch.
+        fcb.as_ref()
+    };
+    Ok(fcb.volume())
+}
+
+/// Returns a METHOD_BUFFERED output buffer after stack length validation.
+fn output_buffer(
+    target: DispatchTarget,
+    stack: FileSystemControlStack,
+    len: usize,
+) -> Result<crate::irp::IrpDataBuffer, NTSTATUS> {
+    let output_len =
+        usize::try_from(stack.output_buffer_length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    if output_len < len {
+        return Err(STATUS_BUFFER_TOO_SMALL);
+    }
+    target.data_buffer(len).map_err(DriverError::ntstatus)
+}
+
+/// Stores an FSCTL output byte count.
+fn set_information(target: DispatchTarget, len: usize) -> Result<(), NTSTATUS> {
+    target
+        .set_information(wdk_sys::ULONG_PTR::try_from(len).map_err(|_| STATUS_INVALID_PARAMETER)?);
+    Ok(())
+}
+
 /// Parses a Linux fscrypt v2 key identifier specifier.
 fn parse_key_identifier(input: &[u8]) -> Result<FscryptKeyIdentifier, NTSTATUS> {
     if input.len() < FSCRYPT_KEY_SPECIFIER_BYTES {
@@ -560,6 +699,60 @@ mod tests {
                 .expect("status")
                 .identifier(),
             identifier
+        );
+    }
+
+    #[test]
+    fn fscrypt_status_outputs_linux_layout() {
+        let mut present = vec![0xFF; FSCRYPT_GET_KEY_STATUS_BYTES];
+        write_key_status_output(&mut present, true).expect("present output");
+
+        assert_eq!(
+            read_u32(&present, FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
+            Ok(FSCRYPT_KEY_STATUS_PRESENT)
+        );
+        assert_eq!(
+            read_u32(&present, FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET),
+            Ok(FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF)
+        );
+        assert_eq!(
+            read_u32(&present, FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET),
+            Ok(1)
+        );
+        assert!(
+            present
+                .get(FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET..)
+                .expect("reserved")
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+
+        let mut absent = vec![0xFF; FSCRYPT_GET_KEY_STATUS_BYTES];
+        write_key_status_output(&mut absent, false).expect("absent output");
+
+        assert_eq!(
+            read_u32(&absent, FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
+            Ok(FSCRYPT_KEY_STATUS_ABSENT)
+        );
+        assert_eq!(
+            read_u32(&absent, FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET),
+            Ok(0)
+        );
+        assert_eq!(
+            read_u32(&absent, FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn fscrypt_remove_output_clears_status_flags() {
+        let mut output = vec![0xFF; FSCRYPT_REMOVE_KEY_BYTES];
+
+        write_remove_key_output(&mut output).expect("remove output");
+
+        assert_eq!(
+            read_u32(&output, FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET),
+            Ok(0)
         );
     }
 
