@@ -30,6 +30,20 @@ impl Ext4Name {
         })
     }
 
+    /// Stores a raw on-disk dirent name.
+    ///
+    /// Encrypted ext4 directories can contain ciphertext bytes that are not
+    /// valid plaintext path components. External callers must continue to use
+    /// [`Self::new`] for user-provided names.
+    pub(crate) fn from_disk(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() || bytes.len() > 255 {
+            return Err(Error::InvalidName);
+        }
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
     /// Returns the raw ext4 name bytes.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {

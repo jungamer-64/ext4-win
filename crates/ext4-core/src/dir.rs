@@ -165,7 +165,7 @@ impl DirectoryEntry {
                     .ok_or(Error::ArithmeticOverflow)?;
                 entries.push(Self {
                     inode: InodeId::try_from(inode)?,
-                    name: Ext4Name::new(
+                    name: Ext4Name::from_disk(
                         bytes
                             .get(name_start..name_end)
                             .ok_or(Error::InvalidDirectoryEntry)?,
@@ -1640,7 +1640,7 @@ impl DirectoryBlock {
                 );
                 let removed = DirectoryEntry {
                     inode: InodeId::try_from(inode)?,
-                    name: Ext4Name::new(name.bytes())?,
+                    name: Ext4Name::from_disk(name.bytes())?,
                     kind,
                 };
                 put_le_u32(&mut self.bytes, offset, 0)?;
@@ -1719,7 +1719,7 @@ impl DirectoryBlock {
             {
                 let previous = DirectoryEntry {
                     inode: InodeId::try_from(live_inode)?,
-                    name: Ext4Name::new(name.bytes())?,
+                    name: Ext4Name::from_disk(name.bytes())?,
                     kind: DirectoryEntryKind::from_raw(
                         *self
                             .bytes
@@ -1855,7 +1855,7 @@ fn parse_live_entry_at(bytes: &[u8], offset: usize) -> Result<DirectoryEntry> {
         .ok_or(Error::ArithmeticOverflow)?;
     Ok(DirectoryEntry {
         inode: InodeId::try_from(inode)?,
-        name: Ext4Name::new(
+        name: Ext4Name::from_disk(
             bytes
                 .get(name_start..name_end)
                 .ok_or(Error::InvalidDirectoryEntry)?,

@@ -17,17 +17,17 @@ use crate::xattr::{self as xattr_storage, InodeXattrSet};
 use crate::{
     BlockAddress, BlockGroupId, BlockMapping, BlockReader, BlockSize, BlockWriter, ByteOffset,
     DeviceLength, DirectoryEntry, DirectoryEntryKind, DirectoryNode, Error, Ext4Gid, Ext4Name,
-    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, Ext4VolumeLabel,
-    Ext4VerityMetadataLayout, Ext4WindowsAttributes, Extent, ExtentLength, ExtentTree,
-    ExtentTreeContext, ExternalJournal, FileNode, FileOffset, FileSize, FscryptContextV2,
-    FscryptKeySet, FscryptMasterKey, FsverityBlockSize, FsverityDescriptor,
-    FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt, FsveritySignature,
-    InodeExtentRoot, InodeId, InodeProtection, JournalMode, LogicalBlock, LookupResult,
-    MountContext, MutableExtentTree, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
-    Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite, SliceBlockDevice,
-    SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget, TransactionDirectory,
-    TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName, XattrNamespace, XattrSet,
-    XattrValue, FSVERITY_DESCRIPTOR_BYTES,
+    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid,
+    Ext4VerityMetadataLayout, Ext4VolumeLabel, Ext4WindowsAttributes, Extent, ExtentLength,
+    ExtentTree, ExtentTreeContext, ExternalJournal, FSVERITY_DESCRIPTOR_BYTES, FileNode,
+    FileOffset, FileSize, FscryptContextV2, FscryptKeySet, FscryptMasterKey, FsverityBlockSize,
+    FsverityDescriptor, FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt,
+    FsveritySignature, InodeExtentRoot, InodeId, InodeProtection, JournalMode, LogicalBlock,
+    LookupResult, MountContext, MutableExtentTree, NewDirectoryMetadata, NewFileMetadata,
+    NewSymlinkMetadata, Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite,
+    SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget,
+    TransactionDirectory, TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName,
+    XattrNamespace, XattrSet, XattrValue,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -229,6 +229,27 @@ fn install_inline_fscrypt_context(image: &mut [u8], inode_value: u32, context: &
         body_capacity,
     ));
     image[body_offset..body_offset + bytes.len()].copy_from_slice(&bytes);
+}
+
+fn encrypt_modern_file_data_block(image: &mut [u8], master_key: &FscryptMasterKey, context: &[u8]) {
+    let context = must(FscryptContextV2::parse(context));
+    let key = must(master_key.derive_contents_key(context.nonce()));
+    let offset = block_offset(MODERN_FILE_DATA_BLOCK);
+    must(key.encrypt_block(0, &mut image[offset..offset + BLOCK_SIZE]));
+}
+
+fn encrypt_modern_root_file_name(image: &mut [u8], master_key: &FscryptMasterKey, context: &[u8]) {
+    let context = must(FscryptContextV2::parse(context));
+    let key = must(master_key.derive_filenames_key(context.nonce()));
+    let ciphertext = must(key.encrypt_filename(b"file", context.policy().filename_padding()));
+    write_dirent(
+        image,
+        block_offset(MODERN_ROOT_DIR_BLOCK) + 24,
+        3,
+        1000,
+        &ciphertext,
+        1,
+    );
 }
 
 fn overwrite_file<D: BlockWriter, J>(
@@ -1634,23 +1655,88 @@ fn encrypted_file_read_requires_mount_key() {
 }
 
 #[test]
-fn encrypted_file_read_with_key_reaches_crypto_path_boundary() {
+fn encrypted_file_read_with_key_decrypts_plaintext() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
     let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
     install_inline_fscrypt_context(&mut image, 3, &context_bytes);
+    encrypt_modern_file_data_block(&mut image, &master_key, &context_bytes);
 
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
         test_mount_context_with_key(master_key),
     ));
     let file = file_node(&volume, 3);
-    let mut output = [0_u8; 1];
+    let mut output = [0_u8; 5];
 
     assert_eq!(
-        volume.read_file(&file, FileOffset::ZERO, &mut output),
-        Err(Error::UnsupportedEncryption)
+        must(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
+        5
     );
+    assert_eq!(&output, b"hello");
+}
+
+#[test]
+fn encrypted_file_overwrite_roundtrips_ciphertext() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
+    install_inline_fscrypt_context(&mut image, 3, &context_bytes);
+    encrypt_modern_file_data_block(&mut image, &master_key, &context_bytes);
+
+    {
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+            SliceBlockDeviceMut::new(&mut image),
+            test_mount_context_with_key(master_key.clone()),
+        ));
+        let mut transaction = volume.begin_transaction(NOW);
+        overwrite_file(&mut transaction, 3, 1, b"EL");
+        must(transaction.commit());
+    }
+
+    let raw_offset = block_offset(MODERN_FILE_DATA_BLOCK);
+    assert_ne!(&image[raw_offset..raw_offset + 5], b"hELlo");
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context_with_key(master_key),
+    ));
+    let mut output = [0_u8; 5];
+    assert_eq!(read_file(&volume, 3, 0, &mut output), 5);
+    assert_eq!(&output, b"hELlo");
+}
+
+#[test]
+fn encrypted_truncate_zeroes_plaintext_tail() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
+    install_inline_fscrypt_context(&mut image, 3, &context_bytes);
+    encrypt_modern_file_data_block(&mut image, &master_key, &context_bytes);
+
+    {
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+            SliceBlockDeviceMut::new(&mut image),
+            test_mount_context_with_key(master_key.clone()),
+        ));
+        let mut truncate = volume.begin_transaction(NOW);
+        let file = transaction_file(&truncate, 3);
+        must(truncate.truncate_file(file, FileSize::from_bytes(3)));
+        must(truncate.commit());
+
+        let mut extend = volume.begin_transaction(NOW);
+        let file = transaction_file(&extend, 3);
+        must(extend.extend_file(file, FileSize::from_bytes(5)));
+        must(extend.commit());
+    }
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context_with_key(master_key),
+    ));
+    let mut output = [0_u8; 5];
+    assert_eq!(read_file(&volume, 3, 0, &mut output), 5);
+    assert_eq!(&output, b"hel\0\0");
 }
 
 #[test]
@@ -1742,6 +1828,51 @@ fn enable_verity_commits_metadata_and_remount_verifies() {
 }
 
 #[test]
+fn encrypted_enable_verity_remount_verifies_after_decrypt() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
+    let read_only_compat = get_u32(&image, 1024 + 100) | RO_COMPAT_VERITY;
+    put_u32(&mut image, 1024 + 100, read_only_compat);
+    install_inline_fscrypt_context(&mut image, 3, &context_bytes);
+    encrypt_modern_file_data_block(&mut image, &master_key, &context_bytes);
+
+    {
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+            SliceBlockDeviceMut::new(&mut image),
+            test_mount_context_with_key(master_key.clone()),
+        ));
+        let mut transaction = volume.begin_transaction(NOW);
+        let file = transaction_file(&transaction, 3);
+        let enable = FsverityEnable::new(
+            FsverityHashAlgorithm::Sha256,
+            must(FsverityBlockSize::new(
+                u32::try_from(BLOCK_SIZE).unwrap_or(u32::MAX),
+            )),
+            FsveritySalt::empty(),
+            FsveritySignature::empty(),
+        );
+
+        must(transaction.enable_verity(file, &enable));
+        must(transaction.commit());
+    }
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context_with_key(master_key),
+    ));
+    let file = file_node(&volume, 3);
+    let mut output = [0_u8; 5];
+
+    assert_eq!(file.protection(), InodeProtection::EncryptedVerity);
+    assert_eq!(
+        must(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
+        5
+    );
+    assert_eq!(&output, b"hello");
+}
+
+#[test]
 fn encrypted_directory_create_requires_mount_key() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     let context_bytes = fscrypt_v2_context_bytes();
@@ -1759,6 +1890,163 @@ fn encrypted_directory_create_requires_mount_key() {
     assert_eq!(
         transaction.create_file(root, &name, test_file_metadata()),
         Err(Error::MissingEncryptionKey)
+    );
+}
+
+#[test]
+fn encrypted_directory_read_projects_names_when_key_is_present() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
+    install_inline_fscrypt_context(&mut image, 2, &context_bytes);
+    encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
+
+    let locked = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context(),
+    ));
+    let locked_entries = read_directory(&locked, InodeId::ROOT);
+    assert!(
+        locked_entries
+            .iter()
+            .all(|entry| entry.name().bytes() != b"file")
+    );
+
+    let unlocked = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context_with_key(master_key),
+    ));
+    let entries = read_directory(&unlocked, InodeId::ROOT);
+    assert!(entries.iter().any(|entry| entry.name().bytes() == b"file"));
+}
+
+#[test]
+fn encrypted_directory_windows_lookup_encrypts_requested_name() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
+    install_inline_fscrypt_context(&mut image, 2, &context_bytes);
+    encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context_with_key(master_key),
+    ));
+
+    assert_eq!(
+        lookup_windows(
+            &volume,
+            InodeId::ROOT,
+            &[
+                u16::from(b'f'),
+                u16::from(b'i'),
+                u16::from(b'l'),
+                u16::from(b'e'),
+            ],
+        ),
+        LookupResult::Found(inode(3))
+    );
+}
+
+#[test]
+fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
+    install_inline_fscrypt_context(&mut image, 2, &context_bytes);
+    encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
+
+    {
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+            SliceBlockDeviceMut::new(&mut image),
+            test_mount_context_with_key(master_key.clone()),
+        ));
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let name = must(Ext4Name::new(b"created"));
+        let file = must(transaction.create_file(root, &name, test_file_metadata()));
+        assert_eq!(file.inode_id(), inode(11));
+        must(transaction.commit());
+    }
+
+    let directory_block = &image
+        [block_offset(MODERN_ROOT_DIR_BLOCK)..block_offset(MODERN_ROOT_DIR_BLOCK) + BLOCK_SIZE];
+    assert!(
+        !directory_block
+            .windows(b"created".len())
+            .any(|window| window == b"created")
+    );
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context_with_key(master_key),
+    ));
+    assert_eq!(
+        lookup_windows(
+            &volume,
+            InodeId::ROOT,
+            &[
+                u16::from(b'c'),
+                u16::from(b'r'),
+                u16::from(b'e'),
+                u16::from(b'a'),
+                u16::from(b't'),
+                u16::from(b'e'),
+                u16::from(b'd'),
+            ],
+        ),
+        LookupResult::Found(inode(11))
+    );
+}
+
+#[test]
+fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
+    install_inline_fscrypt_context(&mut image, 2, &context_bytes);
+    encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
+
+    {
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+            SliceBlockDeviceMut::new(&mut image),
+            test_mount_context_with_key(master_key.clone()),
+        ));
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let old_name = must(Ext4Name::new(b"file"));
+        let new_name = must(Ext4Name::new(b"renamed"));
+        must(transaction.rename_child(root, &old_name, root, &new_name));
+        must(transaction.commit());
+    }
+
+    let directory_block = &image
+        [block_offset(MODERN_ROOT_DIR_BLOCK)..block_offset(MODERN_ROOT_DIR_BLOCK) + BLOCK_SIZE];
+    assert!(
+        !directory_block
+            .windows(b"renamed".len())
+            .any(|window| window == b"renamed")
+    );
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context_with_key(master_key),
+    ));
+    assert_eq!(
+        lookup_windows(
+            &volume,
+            InodeId::ROOT,
+            &[
+                u16::from(b'r'),
+                u16::from(b'e'),
+                u16::from(b'n'),
+                u16::from(b'a'),
+                u16::from(b'm'),
+                u16::from(b'e'),
+                u16::from(b'd'),
+            ],
+        ),
+        LookupResult::Found(inode(3))
     );
 }
 
@@ -3464,9 +3752,7 @@ fn verity_fixture_image() -> Vec<u8> {
         descriptor + 44,
         u16::try_from(free_clusters >> 16).unwrap_or(u16::MAX),
     );
-    for block in VERITY_METADATA_BLOCK
-        ..VERITY_METADATA_BLOCK + u32::from(VERITY_METADATA_BLOCKS)
-    {
+    for block in VERITY_METADATA_BLOCK..VERITY_METADATA_BLOCK + u32::from(VERITY_METADATA_BLOCKS) {
         set_modern_block_used(&mut image, block, true);
     }
 
