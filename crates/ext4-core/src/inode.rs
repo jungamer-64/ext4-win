@@ -773,7 +773,6 @@ impl Inode {
             }
             InodeMutation::FileData | InodeMutation::FileSize => {
                 if self.flags & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0
-                    || self.protection().is_encrypted()
                     || self.protection().is_verity()
                 {
                     return Err(Error::UnsupportedInodeMutation);

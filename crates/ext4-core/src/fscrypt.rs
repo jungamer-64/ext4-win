@@ -1,10 +1,14 @@
 //! fscrypt v2 policy, context, and mount-key domain.
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use core::fmt;
 
+use aes::Aes256;
+use aes::cipher::{Array, KeyInit, consts::U32, consts::U64};
+use cts::{CbcCs3, Decrypt as CtsDecrypt, Encrypt as CtsEncrypt, KeyIvInit};
 use hkdf::Hkdf;
 use sha2::Sha512;
+use xts_mode::{Xts128, get_tweak_default};
 use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
@@ -196,6 +200,17 @@ impl FscryptFilenamePadding {
             Self::Pad8 => 0x01,
             Self::Pad16 => 0x02,
             Self::Pad32 => 0x03,
+        }
+    }
+
+    /// Returns the plaintext filename length-hiding alignment in bytes.
+    #[must_use]
+    pub const fn bytes(self) -> usize {
+        match self {
+            Self::Pad4 => 4,
+            Self::Pad8 => 8,
+            Self::Pad16 => 16,
+            Self::Pad32 => 32,
         }
     }
 }
@@ -488,6 +503,32 @@ impl FscryptContentsKey {
     pub const fn bytes(&self) -> &[u8; FSCRYPT_AES_256_XTS_KEY_BYTES] {
         &self.bytes
     }
+
+    /// Encrypts one fscrypt contents data unit in place.
+    ///
+    /// # Errors
+    /// Returns an error when the data unit is smaller than one AES block.
+    pub fn encrypt_block(&self, logical_block: u64, block: &mut [u8]) -> Result<()> {
+        if block.len() < 16 {
+            return Err(Error::InvalidWriteRange);
+        }
+        let xts = aes_256_xts(self.bytes);
+        xts.encrypt_sector(block, get_tweak_default(u128::from(logical_block)));
+        Ok(())
+    }
+
+    /// Decrypts one fscrypt contents data unit in place.
+    ///
+    /// # Errors
+    /// Returns an error when the data unit is smaller than one AES block.
+    pub fn decrypt_block(&self, logical_block: u64, block: &mut [u8]) -> Result<()> {
+        if block.len() < 16 {
+            return Err(Error::InvalidWriteRange);
+        }
+        let xts = aes_256_xts(self.bytes);
+        xts.decrypt_sector(block, get_tweak_default(u128::from(logical_block)));
+        Ok(())
+    }
 }
 
 impl Drop for FscryptContentsKey {
@@ -516,6 +557,52 @@ impl FscryptFilenamesKey {
     #[must_use]
     pub const fn bytes(&self) -> &[u8; FSCRYPT_AES_256_CBC_CTS_KEY_BYTES] {
         &self.bytes
+    }
+
+    /// Encrypts a plaintext filename using fscrypt AES-256-CBC-CTS.
+    ///
+    /// # Errors
+    /// Returns an error when the plaintext name is invalid or the CTS operation
+    /// fails.
+    pub fn encrypt_filename(
+        &self,
+        plaintext: &[u8],
+        padding: FscryptFilenamePadding,
+    ) -> Result<Vec<u8>> {
+        let padded_len = padded_filename_len(plaintext.len(), padding)?;
+        let mut ciphertext = vec![0_u8; padded_len];
+        ciphertext
+            .get_mut(..plaintext.len())
+            .ok_or(Error::InvalidName)?
+            .copy_from_slice(plaintext);
+        aes_256_cbc_cts(self.bytes)
+            .encrypt(&mut ciphertext)
+            .map_err(|_| Error::InvalidName)?;
+        Ok(ciphertext)
+    }
+
+    /// Decrypts a ciphertext filename using fscrypt AES-256-CBC-CTS.
+    ///
+    /// # Errors
+    /// Returns an error when the ciphertext length or recovered plaintext
+    /// padding is invalid.
+    pub fn decrypt_filename(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        if ciphertext.len() < 16 || ciphertext.len() > 255 {
+            return Err(Error::InvalidName);
+        }
+        let mut plaintext = ciphertext.to_vec();
+        aes_256_cbc_cts(self.bytes)
+            .decrypt(&mut plaintext)
+            .map_err(|_| Error::InvalidName)?;
+        let Some(last) = plaintext.iter().rposition(|byte| *byte != 0) else {
+            return Err(Error::InvalidName);
+        };
+        let len = last.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        if plaintext.get(..len).ok_or(Error::InvalidName)?.contains(&0) {
+            return Err(Error::InvalidName);
+        }
+        plaintext.truncate(len);
+        Ok(plaintext)
     }
 }
 
@@ -607,6 +694,36 @@ fn fscrypt_hkdf_expand(
     Hkdf::<Sha512>::new(None, master_key)
         .expand(&prefixed_info, output)
         .map_err(|_| Error::InvalidEncryptionContext)
+}
+
+/// Builds an AES-256-XTS context from a fscrypt contents key.
+fn aes_256_xts(key: [u8; FSCRYPT_AES_256_XTS_KEY_BYTES]) -> Xts128<Aes256> {
+    let key = Array::<u8, U64>(key);
+    let (key_1, key_2) = key.split::<U32>();
+    Xts128::<Aes256>::new(Aes256::new(&key_1), Aes256::new(&key_2))
+}
+
+/// Builds an AES-256-CBC-CTS filename cipher with fscrypt's all-zero IV.
+fn aes_256_cbc_cts(key: [u8; FSCRYPT_AES_256_CBC_CTS_KEY_BYTES]) -> CbcCs3<Aes256> {
+    CbcCs3::<Aes256>::new(&key.into(), &[0_u8; 16].into())
+}
+
+/// Returns the padded filename length accepted by fscrypt AES-CBC-CTS.
+fn padded_filename_len(len: usize, padding: FscryptFilenamePadding) -> Result<usize> {
+    if len == 0 || len > 255 {
+        return Err(Error::InvalidName);
+    }
+    let minimum = len.max(16);
+    let alignment = padding.bytes();
+    let adjusted = minimum
+        .checked_add(alignment.checked_sub(1).ok_or(Error::ArithmeticOverflow)?)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let padded = adjusted
+        .checked_div(alignment)
+        .ok_or(Error::ArithmeticOverflow)?
+        .checked_mul(alignment)
+        .ok_or(Error::ArithmeticOverflow)?;
+    Ok(padded.min(255))
 }
 
 /// Requires an exact serialized structure length.
@@ -846,6 +963,25 @@ mod tests {
         assert!(set.remove(identifier).is_some());
         assert!(!set.contains(identifier));
         assert!(set.remove(identifier).is_none());
+    }
+
+    #[test]
+    fn fscrypt_filename_key_encrypts_and_decrypts_padded_name() {
+        let master_key = FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY).expect("master key");
+        let key = master_key
+            .derive_filenames_key(FscryptFileNonce::new(VECTOR_NONCE))
+            .expect("filenames key");
+
+        let ciphertext = key
+            .encrypt_filename(b"secret.txt", FscryptFilenamePadding::Pad32)
+            .expect("encrypted name");
+
+        assert_eq!(ciphertext.len(), 32);
+        assert_ne!(&ciphertext, b"secret.txt");
+        assert_eq!(
+            key.decrypt_filename(&ciphertext).expect("decrypted name"),
+            b"secret.txt"
+        );
     }
 
     /// Builds a supported fscrypt v2 policy byte image.

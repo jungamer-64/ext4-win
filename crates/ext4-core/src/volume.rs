@@ -15,7 +15,10 @@ use crate::extent::{
     BlockMapping, Extent, ExtentLength, ExtentTree, ExtentTreeContext, LogicalBlock,
     MutableExtentTree, SerializedExtentTree,
 };
-use crate::fscrypt::{FscryptContextV2, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey};
+use crate::fscrypt::{
+    FscryptContentsKey, FscryptContextV2, FscryptFilenamePadding, FscryptFilenamesKey,
+    FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey,
+};
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset, FileSize,
@@ -30,8 +33,8 @@ use crate::superblock::{
     RecoveryState, Superblock,
 };
 use crate::verity::{
-    Ext4VerityMetadata, Ext4VerityMetadataLayout, FsverityDescriptor, FsverityEnable,
-    FsverityMerkleTree, FSVERITY_DESCRIPTOR_BYTES,
+    Ext4VerityMetadata, Ext4VerityMetadataLayout, FSVERITY_DESCRIPTOR_BYTES, FsverityDescriptor,
+    FsverityEnable, FsverityMerkleTree,
 };
 use crate::windows::WindowsOverlay;
 use crate::xattr::{self as xattr_storage, InodeXattrSet, XattrName, XattrSet, XattrValue};
@@ -917,18 +920,62 @@ impl<D: BlockReader, State> Volume<D, State> {
         if !inode.protection().is_encrypted() {
             return Ok(());
         }
+        let _key = self.fscrypt_master_key_for_inode(inode)?;
+        Ok(())
+    }
+
+    /// Returns the mount key matching an encrypted inode's fscrypt context.
+    fn fscrypt_master_key_for_inode(
+        &self,
+        inode: &Inode,
+    ) -> Result<(FscryptContextV2, &FscryptMasterKey)> {
         let Some(context) = self.read_fscrypt_context(inode.id())? else {
             return Err(Error::InvalidEncryptionContext);
         };
-        if self
+        let Some(key) = self
             .mount_context
             .fscrypt_keys()
             .get(context.policy().master_key_identifier())
-            .is_none()
-        {
+        else {
             return Err(Error::MissingEncryptionKey);
+        };
+        Ok((context, key))
+    }
+
+    /// Derives the per-file AES-XTS contents key for an encrypted inode.
+    fn fscrypt_contents_key_for_inode(&self, inode: &Inode) -> Result<FscryptContentsKey> {
+        let (context, master_key) = self.fscrypt_master_key_for_inode(inode)?;
+        master_key.derive_contents_key(context.nonce())
+    }
+
+    /// Derives the per-directory filename key and padding policy.
+    fn fscrypt_filenames_key_for_inode(
+        &self,
+        inode: &Inode,
+    ) -> Result<(FscryptFilenamesKey, FscryptFilenamePadding)> {
+        let (context, master_key) = self.fscrypt_master_key_for_inode(inode)?;
+        Ok((
+            master_key.derive_filenames_key(context.nonce())?,
+            context.policy().filename_padding(),
+        ))
+    }
+
+    /// Converts a plaintext child name to the on-disk name for a directory.
+    fn encrypt_directory_child_name(&self, parent: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
+        if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
+            return Ok(name.clone());
         }
-        Ok(())
+        let (key, padding) = self.fscrypt_filenames_key_for_inode(parent)?;
+        Ext4Name::from_disk(&key.encrypt_filename(name.bytes(), padding)?)
+    }
+
+    /// Converts an on-disk child name to plaintext for a directory.
+    fn decrypt_directory_child_name(&self, parent: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
+        if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
+            return Ok(name.clone());
+        }
+        let (key, _padding) = self.fscrypt_filenames_key_for_inode(parent)?;
+        Ext4Name::new(&key.decrypt_filename(name.bytes())?)
     }
 
     /// Rejects protected plaintext data access until crypto and verification paths exist.
@@ -962,14 +1009,10 @@ impl<D: BlockReader, State> Volume<D, State> {
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
-        if file.protection().is_encrypted() {
-            self.require_encryption_key(file.inode())?;
-            return Err(Error::UnsupportedEncryption);
-        }
         if file.protection().is_verity() {
             return self.read_verified_file(file, offset, out);
         }
-        self.read_inode_data(file.inode(), offset, out)
+        self.read_inode_plaintext_data(file.inode(), offset, out)
     }
 
     /// Reads a typed symlink target as bytes.
@@ -999,7 +1042,8 @@ impl<D: BlockReader, State> Volume<D, State> {
         }
         let metadata = self.read_verity_metadata(file)?;
         let mut plaintext = vec![0_u8; file.size().to_usize()?];
-        let read = self.read_inode_data(file.inode(), FileOffset::ZERO, &mut plaintext)?;
+        let read =
+            self.read_inode_plaintext_data(file.inode(), FileOffset::ZERO, &mut plaintext)?;
         if read.as_usize() != plaintext.len() {
             return Err(Error::InvalidVerityMetadata);
         }
@@ -1037,7 +1081,8 @@ impl<D: BlockReader, State> Volume<D, State> {
             .checked_sub(4)
             .ok_or(Error::InvalidVerityMetadata)?;
         let mut descriptor_size_tail = [0_u8; 4];
-        self.read_inode_stream_range(
+        self.read_inode_plaintext_stream_range(
+            file.inode(),
             &extent_tree,
             tail_offset,
             &mut descriptor_size_tail,
@@ -1051,7 +1096,12 @@ impl<D: BlockReader, State> Volume<D, State> {
         let descriptor_len =
             usize::try_from(descriptor_bytes).map_err(|_| Error::ArithmeticOverflow)?;
         let mut descriptor_image = vec![0_u8; descriptor_len];
-        self.read_inode_stream_range(&extent_tree, descriptor_offset, &mut descriptor_image)?;
+        self.read_inode_plaintext_stream_range(
+            file.inode(),
+            &extent_tree,
+            descriptor_offset,
+            &mut descriptor_image,
+        )?;
         let descriptor = FsverityDescriptor::parse(
             descriptor_image
                 .get(..FSVERITY_DESCRIPTOR_BYTES)
@@ -1067,7 +1117,12 @@ impl<D: BlockReader, State> Volume<D, State> {
         let merkle_tree_len =
             usize::try_from(layout.merkle_tree_bytes()).map_err(|_| Error::ArithmeticOverflow)?;
         let mut merkle_tree = vec![0_u8; merkle_tree_len];
-        self.read_inode_stream_range(&extent_tree, layout.merkle_tree_offset(), &mut merkle_tree)?;
+        self.read_inode_plaintext_stream_range(
+            file.inode(),
+            &extent_tree,
+            layout.merkle_tree_offset(),
+            &mut merkle_tree,
+        )?;
         let signature = descriptor_image
             .get(FSVERITY_DESCRIPTOR_BYTES..)
             .ok_or(Error::TruncatedStructure)?
@@ -1081,7 +1136,30 @@ impl<D: BlockReader, State> Volume<D, State> {
     /// Returns an error when the directory is too large for eager
     /// enumeration, or contains malformed entries.
     pub fn read_directory(&self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
-        Ok(self.read_directory_layout(directory.inode())?.entries())
+        let entries = self.read_directory_layout(directory.inode())?.entries();
+        if !directory.protection().is_encrypted() {
+            return Ok(entries);
+        }
+        match self.decrypt_directory_entries(directory.inode(), entries) {
+            Err(Error::MissingEncryptionKey) => {
+                Ok(self.read_directory_layout(directory.inode())?.entries())
+            }
+            result => result,
+        }
+    }
+
+    /// Decrypts directory-entry names for an unlocked encrypted directory.
+    fn decrypt_directory_entries(
+        &self,
+        directory: &Inode,
+        entries: Vec<DirectoryEntry>,
+    ) -> Result<Vec<DirectoryEntry>> {
+        let mut decrypted = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let name = self.decrypt_directory_child_name(directory, entry.name())?;
+            decrypted.push(DirectoryEntry::new(entry.inode(), &name, entry.kind()));
+        }
+        Ok(decrypted)
     }
 
     /// Looks up an exact ext4 child name under a directory.
@@ -1121,7 +1199,17 @@ impl<D: BlockReader, State> Volume<D, State> {
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> Result<Option<DirectoryEntry>> {
-        self.reject_unsupported_protected_payload_access(parent.inode())?;
+        if parent.protection().is_encrypted() {
+            let plaintext = requested.to_ext4()?;
+            let ciphertext = self.encrypt_directory_child_name(parent.inode(), &plaintext)?;
+            return Ok(self
+                .read_directory_layout(parent.inode())?
+                .find(&ciphertext)
+                .map(|entry| DirectoryEntry::new(entry.inode(), &plaintext, entry.kind())));
+        }
+        if parent.protection().is_verity() {
+            return Err(Error::UnsupportedVerity);
+        }
         let mut folded = None;
 
         for entry in self.read_directory(parent)? {
@@ -1188,6 +1276,40 @@ impl<D: BlockReader, State> Volume<D, State> {
         Ok(blocks)
     }
 
+    /// Reads plaintext file data, decrypting fscrypt contents when needed.
+    fn read_inode_plaintext_data(
+        &self,
+        inode: &Inode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes> {
+        if !inode.protection().is_encrypted() {
+            return self.read_inode_data(inode, offset, out);
+        }
+        if out.is_empty() || offset.bytes() >= inode.size().bytes() {
+            return Ok(ReadBytes::from_usize(0));
+        }
+
+        let readable = core::cmp::min(
+            u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?,
+            inode.size().remaining_from(offset)?,
+        );
+        let extent_tree = ExtentTree::load_inode_tree(
+            inode.extent_root()?,
+            self.superblock.block_size(),
+            &self.device,
+            self.extent_tree_context(inode),
+        )?;
+        let readable_len = usize::try_from(readable).map_err(|_| Error::ArithmeticOverflow)?;
+        self.read_inode_plaintext_stream_range(
+            inode,
+            &extent_tree,
+            offset.bytes(),
+            out.get_mut(..readable_len).ok_or(Error::DeviceRange)?,
+        )?;
+        Ok(ReadBytes::from_usize(readable_len))
+    }
+
     /// Reads file data through the inode extent tree, zero-filling sparse ranges.
     fn read_inode_data(
         &self,
@@ -1216,6 +1338,89 @@ impl<D: BlockReader, State> Volume<D, State> {
             out.get_mut(..readable_len).ok_or(Error::DeviceRange)?,
         )?;
         Ok(ReadBytes::from_usize(readable_len))
+    }
+
+    /// Reads plaintext bytes from an inode extent stream without applying `i_size` limits.
+    fn read_inode_plaintext_stream_range(
+        &self,
+        inode: &Inode,
+        extent_tree: &ExtentTree,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        if inode.protection().is_encrypted() {
+            let contents_key = self.fscrypt_contents_key_for_inode(inode)?;
+            self.read_encrypted_inode_stream_range(&contents_key, extent_tree, offset, out)
+        } else {
+            self.read_inode_stream_range(extent_tree, offset, out)
+        }
+    }
+
+    /// Reads and decrypts bytes from an fscrypt inode stream.
+    fn read_encrypted_inode_stream_range(
+        &self,
+        contents_key: &FscryptContentsKey,
+        extent_tree: &ExtentTree,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        let block_size = u64::from(self.superblock.block_size().bytes());
+        let block_bytes = usize::try_from(self.superblock.block_size().bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?;
+        let mut completed = 0_usize;
+
+        while completed < out.len() {
+            let position = offset
+                .checked_add(u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let logical_block = position
+                .checked_div(block_size)
+                .ok_or(Error::InvalidSuperblock)?;
+            let in_block = position
+                .checked_rem(block_size)
+                .ok_or(Error::InvalidSuperblock)?;
+            let block_remaining = block_size
+                .checked_sub(in_block)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let total_remaining = u64::try_from(
+                out.len()
+                    .checked_sub(completed)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let chunk = usize::try_from(core::cmp::min(block_remaining, total_remaining))
+                .map_err(|_| Error::ArithmeticOverflow)?;
+            let end = completed
+                .checked_add(chunk)
+                .ok_or(Error::ArithmeticOverflow)?;
+
+            match extent_tree.map_logical(LogicalBlock::try_from(logical_block)?) {
+                BlockMapping::Physical(physical_block) => {
+                    let mut block = vec![0_u8; block_bytes];
+                    self.device.read_exact_at(
+                        self.superblock.block_size().offset_of(physical_block)?,
+                        &mut block,
+                    )?;
+                    contents_key.decrypt_block(logical_block, &mut block)?;
+                    let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
+                    let block_end = start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
+                    out.get_mut(completed..end)
+                        .ok_or(Error::DeviceRange)?
+                        .copy_from_slice(block.get(start..block_end).ok_or(Error::DeviceRange)?);
+                }
+                BlockMapping::Uninitialized | BlockMapping::Hole => {
+                    out.get_mut(completed..end)
+                        .ok_or(Error::DeviceRange)?
+                        .fill(0);
+                }
+            }
+            completed = end;
+        }
+
+        Ok(())
     }
 
     /// Reads bytes from an inode extent stream without applying `i_size` limits.
@@ -1980,6 +2185,11 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
+        let encrypted_contents_key = if inode.protection().is_encrypted() {
+            Some(self.volume.fscrypt_contents_key_for_inode(&inode)?)
+        } else {
+            None
+        };
         let mut completed = 0_usize;
 
         while completed < bytes.len() {
@@ -2012,37 +2222,61 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             let logical_block = LogicalBlock::try_from(logical_block)?;
             match tree.map_logical(logical_block) {
                 BlockMapping::Physical(physical) => {
-                    let write_offset = self
-                        .volume
-                        .superblock
-                        .block_size()
-                        .offset_of(physical)?
-                        .get()
-                        .checked_add(in_block)
-                        .ok_or(Error::ArithmeticOverflow)?;
-                    self.data_writes.push(RangeWrite {
-                        offset: ByteOffset::new(write_offset),
-                        bytes: bytes
-                            .get(completed..end)
-                            .ok_or(Error::DeviceRange)?
-                            .to_vec(),
-                    });
+                    if let Some(contents_key) = &encrypted_contents_key {
+                        self.stage_encrypted_file_block_update(
+                            contents_key,
+                            logical_block,
+                            physical,
+                            in_block,
+                            bytes.get(completed..end).ok_or(Error::DeviceRange)?,
+                            false,
+                        )?;
+                    } else {
+                        let write_offset = self
+                            .volume
+                            .superblock
+                            .block_size()
+                            .offset_of(physical)?
+                            .get()
+                            .checked_add(in_block)
+                            .ok_or(Error::ArithmeticOverflow)?;
+                        self.data_writes.push(RangeWrite {
+                            offset: ByteOffset::new(write_offset),
+                            bytes: bytes
+                                .get(completed..end)
+                                .ok_or(Error::DeviceRange)?
+                                .to_vec(),
+                        });
+                    }
                 }
                 BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
                 BlockMapping::Hole => {
                     let physical = self.physical_block_for_hole(&tree, logical_block)?;
                     tree.insert_or_extend_initialized(logical_block, physical)?;
-                    let mut block = vec![0_u8; block_size];
-                    let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
-                    let block_end = start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
-                    block
-                        .get_mut(start..block_end)
-                        .ok_or(Error::DeviceRange)?
-                        .copy_from_slice(bytes.get(completed..end).ok_or(Error::DeviceRange)?);
-                    self.data_writes.push(RangeWrite {
-                        offset: self.volume.superblock.block_size().offset_of(physical)?,
-                        bytes: block,
-                    });
+                    if let Some(contents_key) = &encrypted_contents_key {
+                        self.stage_encrypted_file_block_update(
+                            contents_key,
+                            logical_block,
+                            physical,
+                            in_block,
+                            bytes.get(completed..end).ok_or(Error::DeviceRange)?,
+                            true,
+                        )?;
+                    } else {
+                        let mut block = vec![0_u8; block_size];
+                        let start =
+                            usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
+                        let block_end =
+                            start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
+                        block
+                            .get_mut(start..block_end)
+                            .ok_or(Error::DeviceRange)?
+                            .copy_from_slice(bytes.get(completed..end).ok_or(Error::DeviceRange)?);
+                        self.data_writes.push(RangeWrite {
+                            offset: self.volume.superblock.block_size().offset_of(physical)?,
+                            bytes: block,
+                        });
+                    }
                 }
             }
 
@@ -2095,6 +2329,68 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         self.physical_block_in_cluster(cluster, cluster_offset)
     }
 
+    /// Merges plaintext bytes into one encrypted file block and stages ciphertext.
+    fn stage_encrypted_file_block_update(
+        &mut self,
+        contents_key: &FscryptContentsKey,
+        logical_block: LogicalBlock,
+        physical: BlockAddress,
+        in_block: u64,
+        bytes: &[u8],
+        zero_plaintext: bool,
+    ) -> Result<()> {
+        let mut block = if zero_plaintext {
+            vec![
+                0_u8;
+                usize::try_from(self.volume.superblock.block_size().bytes())
+                    .map_err(|_| Error::ArithmeticOverflow)?
+            ]
+        } else {
+            self.plaintext_file_block_for_update(contents_key, logical_block, physical)?
+        };
+        let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or(Error::ArithmeticOverflow)?;
+        block
+            .get_mut(start..end)
+            .ok_or(Error::DeviceRange)?
+            .copy_from_slice(bytes);
+        contents_key.encrypt_block(logical_block.as_u64(), &mut block)?;
+        self.data_writes.push(RangeWrite {
+            offset: self.volume.superblock.block_size().offset_of(physical)?,
+            bytes: block,
+        });
+        Ok(())
+    }
+
+    /// Returns the latest plaintext image of one file block for encrypted updates.
+    fn plaintext_file_block_for_update(
+        &self,
+        contents_key: &FscryptContentsKey,
+        logical_block: LogicalBlock,
+        physical: BlockAddress,
+    ) -> Result<Vec<u8>> {
+        let block_size = self.volume.superblock.block_size();
+        let block_bytes =
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let block_offset = block_size.offset_of(physical)?;
+        let mut block = if let Some(staged) = self
+            .data_writes
+            .iter()
+            .rev()
+            .find(|write| write.offset == block_offset && write.bytes.len() == block_bytes)
+        {
+            staged.bytes.clone()
+        } else {
+            let mut bytes = vec![0_u8; block_bytes];
+            self.volume.device.read_exact_at(block_offset, &mut bytes)?;
+            bytes
+        };
+        contents_key.decrypt_block(logical_block.as_u64(), &mut block)?;
+        Ok(block)
+    }
+
     /// Returns a block at `cluster_offset` inside a fully present physical cluster.
     fn physical_block_in_cluster(
         &self,
@@ -2110,7 +2406,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 .first_block_of_cluster(cluster)?
                 .get()
                 .checked_add(cluster_offset)
-            .ok_or(Error::ArithmeticOverflow)?,
+                .ok_or(Error::ArithmeticOverflow)?,
         ))
     }
 
@@ -2177,6 +2473,69 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                     .ok_or(Error::DeviceRange)?
                     .to_vec(),
             });
+            completed = end;
+        }
+        Ok(())
+    }
+
+    /// Stages a plaintext write into an encrypted inode stream without EOF limits.
+    fn stage_encrypted_inode_stream_write(
+        &mut self,
+        inode: &Inode,
+        tree: &mut MutableExtentTree,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let contents_key = self.volume.fscrypt_contents_key_for_inode(inode)?;
+        let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
+        let mut completed = 0_usize;
+        while completed < bytes.len() {
+            let position = offset
+                .checked_add(u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let logical_block = position
+                .checked_div(block_size_u64)
+                .ok_or(Error::InvalidSuperblock)?;
+            let in_block = position
+                .checked_rem(block_size_u64)
+                .ok_or(Error::InvalidSuperblock)?;
+            let block_remaining = block_size_u64
+                .checked_sub(in_block)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let total_remaining = u64::try_from(
+                bytes
+                    .len()
+                    .checked_sub(completed)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let chunk = usize::try_from(core::cmp::min(block_remaining, total_remaining))
+                .map_err(|_| Error::ArithmeticOverflow)?;
+            let end = completed
+                .checked_add(chunk)
+                .ok_or(Error::ArithmeticOverflow)?;
+
+            let logical_block = LogicalBlock::try_from(logical_block)?;
+            let (physical, zero_plaintext) = match tree.map_logical(logical_block) {
+                BlockMapping::Physical(physical) => (physical, false),
+                BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
+                BlockMapping::Hole => {
+                    let physical = self.physical_block_for_hole(tree, logical_block)?;
+                    tree.insert_or_extend_initialized(logical_block, physical)?;
+                    (physical, true)
+                }
+            };
+            self.stage_encrypted_file_block_update(
+                &contents_key,
+                logical_block,
+                physical,
+                in_block,
+                bytes.get(completed..end).ok_or(Error::DeviceRange)?,
+                zero_plaintext,
+            )?;
             completed = end;
         }
         Ok(())
@@ -2260,7 +2619,16 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             .ok_or(Error::InvalidSuperblock)?
             != 0
         {
-            self.zero_truncated_tail(updated.as_slice(), new_size, block_size_u64)?;
+            if inode.protection().is_encrypted() {
+                self.zero_encrypted_truncated_tail(
+                    &inode,
+                    updated.as_slice(),
+                    new_size,
+                    block_size_u64,
+                )?;
+            } else {
+                self.zero_truncated_tail(updated.as_slice(), new_size, block_size_u64)?;
+            }
         }
         tree.replace_extents(updated)?;
         raw_inode.set_size(new_size)?;
@@ -2280,11 +2648,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     /// Returns an error when the inode is not a plain regular file, the file
     /// cannot be read into the verification domain, metadata allocation fails,
     /// or the extent tree cannot represent the post-EOF metadata.
-    pub fn enable_verity(
-        &mut self,
-        file: TransactionFile,
-        enable: &FsverityEnable,
-    ) -> Result<()> {
+    pub fn enable_verity(&mut self, file: TransactionFile, enable: &FsverityEnable) -> Result<()> {
         let inode_index = self.ensure_inode_update(file.inode_id())?;
         let mut raw_inode = self
             .inode_updates
@@ -2297,7 +2661,6 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         }
         if inode.protection().is_encrypted() {
             self.volume.require_encryption_key(&inode)?;
-            return Err(Error::UnsupportedEncryption);
         }
         if inode.protection().is_verity() {
             return Err(Error::UnsupportedInodeMutation);
@@ -2305,9 +2668,9 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         inode.require_mutation(InodeMutation::FileData)?;
 
         let mut plaintext = vec![0_u8; inode.size().to_usize()?];
-        let read = self
-            .volume
-            .read_inode_data(&inode, FileOffset::ZERO, &mut plaintext)?;
+        let read =
+            self.volume
+                .read_inode_plaintext_data(&inode, FileOffset::ZERO, &mut plaintext)?;
         if read.as_usize() != plaintext.len() {
             return Err(Error::InvalidVerityMetadata);
         }
@@ -2343,7 +2706,16 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
-        self.stage_inode_stream_write(&mut tree, layout.merkle_tree_offset(), &metadata)?;
+        if inode.protection().is_encrypted() {
+            self.stage_encrypted_inode_stream_write(
+                &inode,
+                &mut tree,
+                layout.merkle_tree_offset(),
+                &metadata,
+            )?;
+        } else {
+            self.stage_inode_stream_write(&mut tree, layout.merkle_tree_offset(), &metadata)?;
+        }
         raw_inode.set_verity()?;
         raw_inode.set_timestamps(self.now)?;
         self.stage_extent_tree(&mut raw_inode, tree)?;
@@ -2358,7 +2730,9 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     fn require_file_data_mutation(&self, inode: &Inode) -> Result<()> {
         if inode.protection().is_encrypted() {
             self.volume.require_encryption_key(inode)?;
-            return Err(Error::UnsupportedEncryption);
+            if inode.kind() != InodeKind::File || inode.protection().is_verity() {
+                return Err(Error::UnsupportedEncryption);
+            }
         }
         inode.require_mutation(InodeMutation::FileData)
     }
@@ -2367,7 +2741,9 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     fn require_file_size_mutation(&self, inode: &Inode) -> Result<()> {
         if inode.protection().is_encrypted() {
             self.volume.require_encryption_key(inode)?;
-            return Err(Error::UnsupportedEncryption);
+            if inode.kind() != InodeKind::File || inode.protection().is_verity() {
+                return Err(Error::UnsupportedEncryption);
+            }
         }
         inode.require_mutation(InodeMutation::FileSize)
     }
@@ -2399,7 +2775,6 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 | InodeMutation::DirectoryEntryRename
                 | InodeMutation::DirectoryEntryReplace => {
                     self.volume.require_encryption_key(inode)?;
-                    return Err(Error::UnsupportedEncryption);
                 }
                 InodeMutation::Metadata
                 | InodeMutation::FileData
@@ -2437,10 +2812,19 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        if let Some(entry) = self.directory_layout(&inode)?.find(name) {
+        let lookup_name = self.directory_lookup_name(&inode, name)?;
+        if let Some(entry) = self.directory_layout(&inode)?.find(&lookup_name) {
             return Ok(entry);
         }
         Err(Error::DirectoryEntryNotFound)
+    }
+
+    /// Returns the on-disk name to use for a directory lookup inside this transaction.
+    fn directory_lookup_name(&self, directory: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
+        match self.volume.encrypt_directory_child_name(directory, name) {
+            Err(Error::MissingEncryptionKey) => Ok(name.clone()),
+            result => result,
+        }
     }
 
     /// Adds a child entry to a mutable directory, extending it when supported.
@@ -2465,18 +2849,25 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             &parent_inode,
             InodeMutation::DirectoryEntryCreate,
         )?;
-        if self.directory_layout(&parent_inode)?.find(name).is_some() {
+        let disk_name = self
+            .volume
+            .encrypt_directory_child_name(&parent_inode, name)?;
+        if self
+            .directory_layout(&parent_inode)?
+            .find(&disk_name)
+            .is_some()
+        {
             return Err(Error::NameAlreadyExists);
         }
         if parent_inode.is_indexed_directory() {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
-            entries.push(DirectoryEntry::new(child, name, kind));
+            entries.push(DirectoryEntry::new(child, &disk_name, kind));
             self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
             return Ok(());
         }
 
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
-            if block.insert(child, name, kind)? {
+            if block.insert(child, &disk_name, kind)? {
                 self.stage_directory_block(physical, block.into_bytes());
                 raw_parent.set_timestamps(self.now)?;
                 *self
@@ -2489,7 +2880,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
 
         if self.volume.superblock.has_dir_index() {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
-            entries.push(DirectoryEntry::new(child, name, kind));
+            entries.push(DirectoryEntry::new(child, &disk_name, kind));
             self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
             return Ok(());
         }
@@ -2509,7 +2900,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
         );
         block.initialize_free_space()?;
-        let inserted = block.insert(child, name, kind)?;
+        let inserted = block.insert(child, &disk_name, kind)?;
         if !inserted {
             return Err(Error::InvalidDirectoryEntry);
         }
@@ -2550,9 +2941,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             &parent_inode,
             InodeMutation::DirectoryEntryDelete,
         )?;
+        let disk_name = self.directory_lookup_name(&parent_inode, name)?;
         if parent_inode.is_indexed_directory() {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
-            let Some(position) = entries.iter().position(|entry| entry.name() == name) else {
+            let Some(position) = entries.iter().position(|entry| entry.name() == &disk_name) else {
                 return Err(Error::DirectoryEntryNotFound);
             };
             let removed = entries.remove(position);
@@ -2560,7 +2952,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             return Ok(removed);
         }
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
-            if let Some(removed) = block.remove(name)? {
+            if let Some(removed) = block.remove(&disk_name)? {
                 self.stage_directory_block(physical, block.into_bytes());
                 raw_parent.set_timestamps(self.now)?;
                 *self
@@ -2596,12 +2988,21 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             &parent_inode,
             InodeMutation::DirectoryEntryRename,
         )?;
+        let old_disk_name = self
+            .volume
+            .encrypt_directory_child_name(&parent_inode, old_name)?;
+        let new_disk_name = self
+            .volume
+            .encrypt_directory_child_name(&parent_inode, new_name)?;
         if parent_inode.is_indexed_directory() {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
-            if entries.iter().any(|entry| entry.name() == new_name) {
+            if entries.iter().any(|entry| entry.name() == &new_disk_name) {
                 return Err(Error::NameAlreadyExists);
             }
-            let Some(position) = entries.iter().position(|entry| entry.name() == old_name) else {
+            let Some(position) = entries
+                .iter()
+                .position(|entry| entry.name() == &old_disk_name)
+            else {
                 return Err(Error::DirectoryEntryNotFound);
             };
             let renamed = entries
@@ -2613,16 +3014,17 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             }
             *entries
                 .get_mut(position)
-                .ok_or(Error::InvalidDirectoryEntry)? = DirectoryEntry::new(child, new_name, kind);
+                .ok_or(Error::InvalidDirectoryEntry)? =
+                DirectoryEntry::new(child, &new_disk_name, kind);
             self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
             return Ok(renamed);
         }
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
-            if let Some(renamed) = block.rename(old_name, new_name)? {
+            if let Some(renamed) = block.rename(&old_disk_name, &new_disk_name)? {
                 if renamed.inode() != child {
                     return Err(Error::InvalidDirectoryEntry);
                 }
-                let replacement = block.replace(new_name, child, kind)?;
+                let replacement = block.replace(&new_disk_name, child, kind)?;
                 if replacement.is_none() {
                     return Err(Error::InvalidDirectoryEntry);
                 }
@@ -2660,9 +3062,12 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             &parent_inode,
             InodeMutation::DirectoryEntryReplace,
         )?;
+        let disk_name = self
+            .volume
+            .encrypt_directory_child_name(&parent_inode, name)?;
         if parent_inode.is_indexed_directory() {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
-            let Some(position) = entries.iter().position(|entry| entry.name() == name) else {
+            let Some(position) = entries.iter().position(|entry| entry.name() == &disk_name) else {
                 return Err(Error::DirectoryEntryNotFound);
             };
             let replaced = entries
@@ -2671,12 +3076,13 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 .clone();
             *entries
                 .get_mut(position)
-                .ok_or(Error::InvalidDirectoryEntry)? = DirectoryEntry::new(child, name, kind);
+                .ok_or(Error::InvalidDirectoryEntry)? =
+                DirectoryEntry::new(child, &disk_name, kind);
             self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
             return Ok(replaced);
         }
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
-            if let Some(replaced) = block.replace(name, child, kind)? {
+            if let Some(replaced) = block.replace(&disk_name, child, kind)? {
                 self.stage_directory_block(physical, block.into_bytes());
                 raw_parent.set_timestamps(self.now)?;
                 *self
@@ -3424,6 +3830,45 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             bytes: vec![0_u8; usize::try_from(zero_len).map_err(|_| Error::ArithmeticOverflow)?],
         });
         Ok(())
+    }
+
+    /// Stages encrypted zeroes for the plaintext suffix of a truncated block.
+    fn zero_encrypted_truncated_tail(
+        &mut self,
+        inode: &Inode,
+        extents: &[Extent],
+        new_size: FileSize,
+        block_size: u64,
+    ) -> Result<()> {
+        let logical_block = new_size
+            .bytes()
+            .checked_div(block_size)
+            .ok_or(Error::InvalidSuperblock)?;
+        let in_block = new_size
+            .bytes()
+            .checked_rem(block_size)
+            .ok_or(Error::InvalidSuperblock)?;
+        let BlockMapping::Physical(physical) =
+            map_extents(extents, LogicalBlock::try_from(logical_block)?)
+        else {
+            return Ok(());
+        };
+        let contents_key = self.volume.fscrypt_contents_key_for_inode(inode)?;
+        let zero_len = usize::try_from(
+            block_size
+                .checked_sub(in_block)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )
+        .map_err(|_| Error::ArithmeticOverflow)?;
+        let zeroes = vec![0_u8; zero_len];
+        self.stage_encrypted_file_block_update(
+            &contents_key,
+            LogicalBlock::try_from(logical_block)?,
+            physical,
+            in_block,
+            &zeroes,
+            false,
+        )
     }
 
     /// Returns the staged block bitmap index, loading it once when needed.
