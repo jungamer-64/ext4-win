@@ -925,11 +925,14 @@ impl<D: BlockReader, State> Volume<D, State> {
         Ok(())
     }
 
-    /// Rejects encrypted plaintext data access until the crypto data path exists.
-    fn reject_unsupported_encrypted_payload_access(&self, inode: &Inode) -> Result<()> {
+    /// Rejects protected plaintext data access until crypto and verification paths exist.
+    fn reject_unsupported_protected_payload_access(&self, inode: &Inode) -> Result<()> {
         if inode.protection().is_encrypted() {
             self.require_encryption_key(inode)?;
             return Err(Error::UnsupportedEncryption);
+        }
+        if inode.protection().is_verity() {
+            return Err(Error::UnsupportedVerity);
         }
         Ok(())
     }
@@ -953,7 +956,7 @@ impl<D: BlockReader, State> Volume<D, State> {
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
-        self.reject_unsupported_encrypted_payload_access(file.inode())?;
+        self.reject_unsupported_protected_payload_access(file.inode())?;
         self.read_inode_data(file.inode(), offset, out)
     }
 
@@ -962,7 +965,7 @@ impl<D: BlockReader, State> Volume<D, State> {
     /// # Errors
     /// Returns an error when the symlink target cannot be read.
     pub fn read_symlink(&self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
-        self.reject_unsupported_encrypted_payload_access(symlink.inode())?;
+        self.reject_unsupported_protected_payload_access(symlink.inode())?;
         let len = symlink.size().to_usize()?;
         if let Ok(inline) = symlink.inode().inline_bytes() {
             return Ok(inline.prefix(symlink.size())?.to_vec());
@@ -1018,7 +1021,7 @@ impl<D: BlockReader, State> Volume<D, State> {
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> Result<Option<DirectoryEntry>> {
-        self.reject_unsupported_encrypted_payload_access(parent.inode())?;
+        self.reject_unsupported_protected_payload_access(parent.inode())?;
         let mut folded = None;
 
         for entry in self.read_directory(parent)? {

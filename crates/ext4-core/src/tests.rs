@@ -1652,6 +1652,28 @@ fn encrypted_file_read_with_key_reaches_crypto_path_boundary() {
 }
 
 #[test]
+fn verity_file_read_reaches_verification_path_boundary() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let read_only_compat = get_u32(&image, 1024 + 100) | RO_COMPAT_VERITY;
+    let file_flags = get_u32(&image, modern_inode_offset(3) + 32) | EXT4_VERITY_FL;
+    put_u32(&mut image, 1024 + 100, read_only_compat);
+    put_u32(&mut image, modern_inode_offset(3) + 32, file_flags);
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context(),
+    ));
+    let file = file_node(&volume, 3);
+    let mut output = [0_u8; 1];
+
+    assert_eq!(file.protection(), InodeProtection::Verity);
+    assert_eq!(
+        volume.read_file(&file, FileOffset::ZERO, &mut output),
+        Err(Error::UnsupportedVerity)
+    );
+}
+
+#[test]
 fn encrypted_directory_create_requires_mount_key() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     let context_bytes = fscrypt_v2_context_bytes();

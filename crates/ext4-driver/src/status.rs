@@ -66,6 +66,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::UnsupportedDirectoryHash
         | Error::UnsupportedInodeMutation
         | Error::UnsupportedEncryption
+        | Error::UnsupportedVerity
         | Error::DirectoryTooLarge => STATUS_NOT_SUPPORTED,
         Error::DeviceRange
         | Error::ArithmeticOverflow
@@ -128,6 +129,10 @@ mod tests {
         );
         assert_eq!(
             DriverError::from(Error::UnsupportedDirectoryHash).ntstatus(),
+            STATUS_NOT_SUPPORTED
+        );
+        assert_eq!(
+            DriverError::from(Error::UnsupportedVerity).ntstatus(),
             STATUS_NOT_SUPPORTED
         );
     }
