@@ -267,7 +267,7 @@ fn write_key_status_output(output: &mut [u8], present: bool) -> Result<(), NTSTA
     write_u32(
         output,
         FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET,
-        if present { 1 } else { 0 },
+        u32::from(present),
     )
 }
 
@@ -309,11 +309,6 @@ impl FscryptAddKeyPayload {
             return Err(STATUS_INVALID_PARAMETER);
         }
         Ok(Self { master_key })
-    }
-
-    /// Validated mount key from the payload.
-    const fn master_key(&self) -> &FscryptMasterKey {
-        &self.master_key
     }
 
     /// Consumes this payload into the validated mount key.
@@ -490,16 +485,6 @@ impl OptionalUserBuffer {
         }
         Ok(Self { address, length })
     }
-
-    /// Returns the raw user-mode address carried by the payload.
-    const fn address(self) -> u64 {
-        self.address
-    }
-
-    /// Returns the buffer length in bytes.
-    const fn length(self) -> u32 {
-        self.length
-    }
 }
 
 /// Reads METHOD_BUFFERED input bytes for one user FSCTL.
@@ -600,6 +585,7 @@ fn write_u32(output: &mut [u8], offset: usize, value: u32) -> Result<(), NTSTATU
 }
 
 /// Writes one little-endian `u64` into a checked offset.
+#[cfg(test)]
 fn write_u64(output: &mut [u8], offset: usize, value: u64) -> Result<(), NTSTATUS> {
     let end = offset.checked_add(8).ok_or(STATUS_INVALID_PARAMETER)?;
     output
@@ -642,7 +628,7 @@ mod tests {
         let decoded = FscryptAddKeyPayload::parse(&payload).expect("decoded add key");
 
         assert_eq!(
-            decoded.master_key().identifier(),
+            decoded.into_master_key().identifier(),
             FscryptMasterKey::from_raw(&RAW_KEY)
                 .expect("master key")
                 .identifier()
@@ -776,10 +762,10 @@ mod tests {
 
         assert_eq!(decoded.algorithm(), FsverityHashAlgorithm::Sha512);
         assert_eq!(decoded.block_size().bytes(), 4096);
-        assert_eq!(decoded.salt().address(), 0x1000);
-        assert_eq!(decoded.salt().length(), 3);
-        assert_eq!(decoded.signature().address(), 0x2000);
-        assert_eq!(decoded.signature().length(), 16);
+        assert_eq!(decoded.salt().address, 0x1000);
+        assert_eq!(decoded.salt().length, 3);
+        assert_eq!(decoded.signature().address, 0x2000);
+        assert_eq!(decoded.signature().length, 16);
     }
 
     #[test]
@@ -894,22 +880,22 @@ mod tests {
         write_u32(
             &mut payload,
             FSVERITY_ENABLE_SALT_SIZE_OFFSET,
-            salt.length(),
+            salt.length,
         )?;
         write_u64(
             &mut payload,
             FSVERITY_ENABLE_SALT_PTR_OFFSET,
-            salt.address(),
+            salt.address,
         )?;
         write_u32(
             &mut payload,
             FSVERITY_ENABLE_SIG_SIZE_OFFSET,
-            signature.length(),
+            signature.length,
         )?;
         write_u64(
             &mut payload,
             FSVERITY_ENABLE_SIG_PTR_OFFSET,
-            signature.address(),
+            signature.address,
         )?;
         Ok(payload)
     }

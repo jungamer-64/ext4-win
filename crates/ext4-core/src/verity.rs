@@ -112,6 +112,62 @@ impl Ext4VerityMetadataLayout {
         })
     }
 
+    /// Computes the descriptor offset when only the ext4 metadata end and
+    /// descriptor-size tail are known.
+    ///
+    /// # Errors
+    /// Returns an error when the descriptor cannot contain a Linux
+    /// `fsverity_descriptor` or the slot arithmetic underflows.
+    pub fn descriptor_offset_from_metadata_end(
+        filesystem_block_size: BlockSize,
+        metadata_end: u64,
+        descriptor_bytes: u32,
+    ) -> Result<u64> {
+        if usize::try_from(descriptor_bytes).map_err(|_| Error::ArithmeticOverflow)?
+            < FSVERITY_DESCRIPTOR_BYTES
+        {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        let slot_bytes = align_up_u64(
+            u64::from(descriptor_bytes)
+                .checked_add(4)
+                .ok_or(Error::ArithmeticOverflow)?,
+            u64::from(filesystem_block_size.bytes()),
+        )?;
+        metadata_end
+            .checked_sub(slot_bytes)
+            .ok_or(Error::InvalidVerityMetadata)
+    }
+
+    /// Reconstructs and validates the ext4 metadata layout after the descriptor
+    /// has been parsed.
+    ///
+    /// # Errors
+    /// Returns an error when descriptor-derived Merkle tree size does not place
+    /// the metadata end at the supplied inode payload end.
+    pub fn from_metadata_end(
+        file_size: FileSize,
+        filesystem_block_size: BlockSize,
+        metadata_end: u64,
+        descriptor_bytes: u32,
+        descriptor: &FsverityDescriptor,
+    ) -> Result<Self> {
+        if descriptor.data_size() != file_size.bytes() {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        let merkle_tree_bytes = FsverityMerkleTree::stored_tree_bytes_for_descriptor(descriptor)?;
+        let layout = Self::new(
+            file_size,
+            filesystem_block_size,
+            merkle_tree_bytes,
+            descriptor_bytes,
+        )?;
+        if layout.metadata_end != metadata_end {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        Ok(layout)
+    }
+
     /// Merkle tree byte offset.
     #[must_use]
     pub const fn merkle_tree_offset(self) -> u64 {
@@ -148,6 +204,80 @@ impl Ext4VerityMetadataLayout {
         self.metadata_end
     }
 }
+
+/// Parsed ext4 post-EOF fs-verity metadata for one inode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Ext4VerityMetadata {
+    /// Validated byte layout in the inode payload stream.
+    layout: Ext4VerityMetadataLayout,
+    /// Linux fs-verity descriptor.
+    descriptor: FsverityDescriptor,
+    /// Optional builtin signature bytes after the fixed descriptor.
+    signature: Vec<u8>,
+    /// Stored Merkle tree bytes in ext4 root-to-leaf order.
+    merkle_tree: FsverityMerkleTree,
+}
+
+impl Ext4VerityMetadata {
+    /// Creates parsed ext4 verity metadata from already-located inode payload
+    /// slices.
+    ///
+    /// # Errors
+    /// Returns an error when descriptor/signature sizes do not match the layout
+    /// or the stored Merkle tree size is inconsistent with the descriptor.
+    pub fn new(
+        layout: Ext4VerityMetadataLayout,
+        descriptor: FsverityDescriptor,
+        signature: Vec<u8>,
+        merkle_tree_bytes: Vec<u8>,
+    ) -> Result<Self> {
+        let descriptor_with_signature = u32::try_from(
+            FSVERITY_DESCRIPTOR_BYTES
+                .checked_add(signature.len())
+                .ok_or(Error::ArithmeticOverflow)?,
+        )
+        .map_err(|_| Error::ArithmeticOverflow)?;
+        if descriptor_with_signature != layout.descriptor_bytes() {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        if u64::try_from(merkle_tree_bytes.len()).map_err(|_| Error::ArithmeticOverflow)?
+            != layout.merkle_tree_bytes()
+        {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        let merkle_tree = FsverityMerkleTree::from_stored_blocks(&descriptor, merkle_tree_bytes)?;
+        Ok(Self {
+            layout,
+            descriptor,
+            signature,
+            merkle_tree,
+        })
+    }
+
+    /// ext4 byte layout.
+    #[must_use]
+    pub const fn layout(&self) -> Ext4VerityMetadataLayout {
+        self.layout
+    }
+
+    /// Linux fs-verity descriptor.
+    #[must_use]
+    pub const fn descriptor(&self) -> &FsverityDescriptor {
+        &self.descriptor
+    }
+
+    /// Optional builtin signature bytes.
+    #[must_use]
+    pub fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+
+    /// Stored Merkle tree.
+    #[must_use]
+    pub const fn merkle_tree(&self) -> &FsverityMerkleTree {
+        &self.merkle_tree
+    }
+}
 /// fs-verity hash algorithm accepted by this driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsverityHashAlgorithm {
@@ -168,6 +298,10 @@ impl FsverityHashAlgorithm {
     }
 
     /// Parses a Linux fs-verity hash algorithm id widened by an ioctl payload.
+    ///
+    /// # Errors
+    /// Returns an error when the algorithm id is not in the supported fs-verity
+    /// SHA-256/SHA-512 domain.
     pub const fn parse_u32(value: u32) -> Result<Self> {
         match value {
             1 => Ok(Self::Sha256),
@@ -601,6 +735,41 @@ impl FsverityMerkleTree {
         })
     }
 
+    /// Creates a stored Merkle tree image already read from ext4 post-EOF
+    /// metadata.
+    ///
+    /// # Errors
+    /// Returns an error when the stored tree byte count does not match the
+    /// descriptor's data size, hash algorithm, and Merkle block geometry.
+    pub fn from_stored_blocks(
+        descriptor: &FsverityDescriptor,
+        blocks: Vec<u8>,
+    ) -> Result<Self> {
+        if u64::try_from(blocks.len()).map_err(|_| Error::ArithmeticOverflow)?
+            != Self::stored_tree_bytes_for_descriptor(descriptor)?
+        {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        Ok(Self {
+            algorithm: descriptor.algorithm(),
+            block_size: descriptor.block_size(),
+            root_hash: descriptor.root_hash(),
+            blocks,
+        })
+    }
+
+    /// Returns the serialized Merkle tree byte count implied by a descriptor.
+    ///
+    /// # Errors
+    /// Returns an error when the descriptor geometry overflows arithmetic.
+    pub fn stored_tree_bytes_for_descriptor(descriptor: &FsverityDescriptor) -> Result<u64> {
+        stored_tree_bytes_for_data_size(
+            descriptor.algorithm(),
+            descriptor.block_size(),
+            descriptor.data_size(),
+        )
+    }
+
     /// Verifies plaintext file data against a descriptor and stored tree bytes.
     ///
     /// # Errors
@@ -651,6 +820,37 @@ impl FsverityMerkleTree {
     }
 }
 
+/// Computes the serialized Merkle tree byte count for one file.
+fn stored_tree_bytes_for_data_size(
+    algorithm: FsverityHashAlgorithm,
+    block_size: FsverityBlockSize,
+    data_size: u64,
+) -> Result<u64> {
+    if data_size == 0 {
+        return Ok(0);
+    }
+    let block_bytes = u64::from(block_size.bytes());
+    let digest_bytes =
+        u64::try_from(algorithm.digest_bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+    let mut hash_count = round_up_div_u64(data_size, block_bytes)?;
+    let mut tree_bytes = 0_u64;
+    while hash_count > 1 {
+        let level_input_bytes = hash_count
+            .checked_mul(digest_bytes)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let level_blocks = round_up_div_u64(level_input_bytes, block_bytes)?;
+        tree_bytes = tree_bytes
+            .checked_add(
+                level_blocks
+                    .checked_mul(block_bytes)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::ArithmeticOverflow)?;
+        hash_count = level_blocks;
+    }
+    Ok(tree_bytes)
+}
+
 /// Parses salt and requires unused descriptor salt bytes to be zero.
 fn parse_salt(bytes: &[u8], salt_size: usize) -> Result<FsveritySalt> {
     let salt_end = DESCRIPTOR_SALT_OFFSET
@@ -684,9 +884,24 @@ fn align_up_u64(value: u64, alignment: u64) -> Result<u64> {
     if remainder == 0 {
         return Ok(value);
     }
+    let delta = alignment
+        .checked_sub(remainder)
+        .ok_or(Error::ArithmeticOverflow)?;
     value
-        .checked_add(alignment - remainder)
+        .checked_add(delta)
         .ok_or(Error::ArithmeticOverflow)
+}
+
+/// Divides and rounds up without accepting a zero divisor.
+fn round_up_div_u64(value: u64, divisor: u64) -> Result<u64> {
+    if divisor == 0 {
+        return Err(Error::ArithmeticOverflow);
+    }
+    let delta = divisor.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+    let adjusted = value
+        .checked_add(delta)
+        .ok_or(Error::ArithmeticOverflow)?;
+    adjusted.checked_div(divisor).ok_or(Error::ArithmeticOverflow)
 }
 
 /// Hashes every data block, padding the final block with zeroes.

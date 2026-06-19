@@ -29,6 +29,10 @@ use crate::superblock::{
     BlockGroupId, ClusterAddress, Ext4VolumeLabel, FreeClusterDelta, JournalMode, MetadataChecksum,
     RecoveryState, Superblock,
 };
+use crate::verity::{
+    Ext4VerityMetadata, Ext4VerityMetadataLayout, FsverityDescriptor,
+    FSVERITY_DESCRIPTOR_BYTES,
+};
 use crate::windows::WindowsOverlay;
 use crate::xattr::{self as xattr_storage, InodeXattrSet, XattrName, XattrSet, XattrValue};
 
@@ -956,7 +960,13 @@ impl<D: BlockReader, State> Volume<D, State> {
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
-        self.reject_unsupported_protected_payload_access(file.inode())?;
+        if file.protection().is_encrypted() {
+            self.require_encryption_key(file.inode())?;
+            return Err(Error::UnsupportedEncryption);
+        }
+        if file.protection().is_verity() {
+            return self.read_verified_file(file, offset, out);
+        }
         self.read_inode_data(file.inode(), offset, out)
     }
 
@@ -973,6 +983,94 @@ impl<D: BlockReader, State> Volume<D, State> {
         let mut target = vec![0_u8; len];
         let _bytes_read = self.read_inode_data(symlink.inode(), FileOffset::ZERO, &mut target)?;
         Ok(target)
+    }
+
+    /// Reads a verity-protected regular file after verifying its full plaintext.
+    fn read_verified_file(
+        &self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes> {
+        if out.is_empty() || offset.bytes() >= file.size().bytes() {
+            return Ok(ReadBytes::from_usize(0));
+        }
+        let metadata = self.read_verity_metadata(file)?;
+        let mut plaintext = vec![0_u8; file.size().to_usize()?];
+        let read = self.read_inode_data(file.inode(), FileOffset::ZERO, &mut plaintext)?;
+        if read.as_usize() != plaintext.len() {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        metadata
+            .merkle_tree()
+            .verify_data(&plaintext, metadata.descriptor())?;
+
+        let readable = core::cmp::min(
+            u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?,
+            file.size().remaining_from(offset)?,
+        );
+        let start = usize::try_from(offset.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let count = usize::try_from(readable).map_err(|_| Error::ArithmeticOverflow)?;
+        let end = start.checked_add(count).ok_or(Error::ArithmeticOverflow)?;
+        out.get_mut(..count)
+            .ok_or(Error::DeviceRange)?
+            .copy_from_slice(plaintext.get(start..end).ok_or(Error::DeviceRange)?);
+        Ok(ReadBytes::from_usize(count))
+    }
+
+    /// Reads ext4 post-EOF fs-verity metadata from a regular file's extent stream.
+    fn read_verity_metadata(&self, file: &FileNode) -> Result<Ext4VerityMetadata> {
+        let block_size = self.superblock.block_size();
+        let extent_tree = ExtentTree::load_inode_tree(
+            file.inode().extent_root()?,
+            block_size,
+            &self.device,
+            self.extent_tree_context(file.inode()),
+        )?;
+        let metadata_end = extent_payload_end_bytes(&extent_tree, block_size)?;
+        if metadata_end <= file.size().bytes() {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        let tail_offset = metadata_end
+            .checked_sub(4)
+            .ok_or(Error::InvalidVerityMetadata)?;
+        let mut descriptor_size_tail = [0_u8; 4];
+        self.read_inode_stream_range(
+            &extent_tree,
+            tail_offset,
+            &mut descriptor_size_tail,
+        )?;
+        let descriptor_bytes = u32::from_le_bytes(descriptor_size_tail);
+        let descriptor_offset = Ext4VerityMetadataLayout::descriptor_offset_from_metadata_end(
+            block_size,
+            metadata_end,
+            descriptor_bytes,
+        )?;
+        let descriptor_len =
+            usize::try_from(descriptor_bytes).map_err(|_| Error::ArithmeticOverflow)?;
+        let mut descriptor_image = vec![0_u8; descriptor_len];
+        self.read_inode_stream_range(&extent_tree, descriptor_offset, &mut descriptor_image)?;
+        let descriptor = FsverityDescriptor::parse(
+            descriptor_image
+                .get(..FSVERITY_DESCRIPTOR_BYTES)
+                .ok_or(Error::TruncatedStructure)?,
+        )?;
+        let layout = Ext4VerityMetadataLayout::from_metadata_end(
+            file.size(),
+            block_size,
+            metadata_end,
+            descriptor_bytes,
+            &descriptor,
+        )?;
+        let merkle_tree_len =
+            usize::try_from(layout.merkle_tree_bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let mut merkle_tree = vec![0_u8; merkle_tree_len];
+        self.read_inode_stream_range(&extent_tree, layout.merkle_tree_offset(), &mut merkle_tree)?;
+        let signature = descriptor_image
+            .get(FSVERITY_DESCRIPTOR_BYTES..)
+            .ok_or(Error::TruncatedStructure)?
+            .to_vec();
+        Ext4VerityMetadata::new(layout, descriptor, signature, merkle_tree)
     }
 
     /// Enumerates directory entries from a typed directory node.
@@ -1103,18 +1201,36 @@ impl<D: BlockReader, State> Volume<D, State> {
             u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?,
             inode.size().remaining_from(offset)?,
         );
-        let block_size = u64::from(self.superblock.block_size().bytes());
         let extent_tree = ExtentTree::load_inode_tree(
             inode.extent_root()?,
             self.superblock.block_size(),
             &self.device,
             self.extent_tree_context(inode),
         )?;
+        let readable_len = usize::try_from(readable).map_err(|_| Error::ArithmeticOverflow)?;
+        self.read_inode_stream_range(
+            &extent_tree,
+            offset.bytes(),
+            out.get_mut(..readable_len).ok_or(Error::DeviceRange)?,
+        )?;
+        Ok(ReadBytes::from_usize(readable_len))
+    }
+
+    /// Reads bytes from an inode extent stream without applying `i_size` limits.
+    fn read_inode_stream_range(
+        &self,
+        extent_tree: &ExtentTree,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        let block_size = u64::from(self.superblock.block_size().bytes());
         let mut completed = 0_usize;
 
-        while u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)? < readable {
+        while completed < out.len() {
             let position = offset
-                .bytes()
                 .checked_add(u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)?)
                 .ok_or(Error::ArithmeticOverflow)?;
             let logical_block = position
@@ -1126,9 +1242,12 @@ impl<D: BlockReader, State> Volume<D, State> {
             let block_remaining = block_size
                 .checked_sub(in_block)
                 .ok_or(Error::ArithmeticOverflow)?;
-            let total_remaining = readable
-                .checked_sub(u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)?)
-                .ok_or(Error::ArithmeticOverflow)?;
+            let total_remaining = u64::try_from(
+                out.len()
+                    .checked_sub(completed)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
             let chunk_u64 = core::cmp::min(block_remaining, total_remaining);
             let chunk = usize::try_from(chunk_u64).map_err(|_| Error::ArithmeticOverflow)?;
             let end = completed
@@ -1158,7 +1277,7 @@ impl<D: BlockReader, State> Volume<D, State> {
             completed = end;
         }
 
-        Ok(ReadBytes::from_usize(completed))
+        Ok(())
     }
 
     /// Reads an inode record together with its on-device offset.
@@ -4159,6 +4278,17 @@ fn map_extents(extents: &[Extent], logical_block: LogicalBlock) -> BlockMapping 
         }
     }
     BlockMapping::Hole
+}
+
+/// Returns the exclusive byte end of the logical inode stream described by extents.
+fn extent_payload_end_bytes(extent_tree: &ExtentTree, block_size: BlockSize) -> Result<u64> {
+    let mut end_blocks = 0_u64;
+    for extent in extent_tree.extents().iter().copied() {
+        end_blocks = end_blocks.max(u64::from(extent.end_logical()?));
+    }
+    end_blocks
+        .checked_mul(u64::from(block_size.bytes()))
+        .ok_or(Error::ArithmeticOverflow)
 }
 
 /// Converts an inode kind into the directory entry file-type byte domain.
