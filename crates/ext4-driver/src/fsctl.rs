@@ -3,14 +3,17 @@
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 
-use ext4_core::{FscryptKeyIdentifier, FscryptMasterKey, FsverityBlockSize, FsverityHashAlgorithm};
+use ext4_core::{
+    FscryptKeyIdentifier, FscryptMasterKey, FsverityBlockSize, FsverityEnable,
+    FsverityHashAlgorithm, FsveritySalt, FsveritySignature,
+};
 use wdk_sys::{
     NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
     STATUS_SUCCESS,
 };
 
 use crate::irp::{DispatchTarget, FileSystemControlStack};
-use crate::state::{VolumeControlBlock, file_control_block};
+use crate::state::{FileSystemNode, VolumeControlBlock, file_control_block};
 use crate::status::DriverError;
 
 /// Windows `FILE_DEVICE_FILE_SYSTEM`.
@@ -163,17 +166,47 @@ pub(crate) fn get_encryption_key_status(
 
 /// Handles fs-verity enable FSCTL payloads.
 pub(crate) fn enable_verity(target: DispatchTarget, stack: FileSystemControlStack) -> NTSTATUS {
-    match read_input(target, stack).and_then(|input| FsverityEnablePayload::parse(input.as_slice()))
-    {
-        Ok(payload) => {
-            let _algorithm = payload.algorithm();
-            let _block_size = payload.block_size();
-            let _salt = payload.salt();
-            let _signature = payload.signature();
-            STATUS_NOT_SUPPORTED
-        }
+    match enable_verity_result(target, stack) {
+        Ok(()) => STATUS_SUCCESS,
         Err(status) => status,
     }
+}
+
+/// Enables fs-verity on the opened regular file.
+fn enable_verity_result(
+    target: DispatchTarget,
+    stack: FileSystemControlStack,
+) -> Result<(), NTSTATUS> {
+    let payload = read_input(target, stack)
+        .and_then(|input| FsverityEnablePayload::parse(input.as_slice()))?;
+    let enable = payload.into_core_enable()?;
+    let fcb = file_control_block(stack.file_object()).map_err(DriverError::ntstatus)?;
+    let fcb = unsafe {
+        // SAFETY: Successful create stores a live FCB in FsContext while this
+        // FSCTL is dispatched for the opened FILE_OBJECT.
+        fcb.as_ref()
+    };
+    let FileSystemNode::File(inode) = fcb.node() else {
+        return Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus());
+    };
+    let mut vcb = fcb.volume();
+    let vcb = unsafe {
+        // SAFETY: FCBs only store live mounted VCB pointers. The mutable borrow
+        // is the transaction boundary for this synchronous FSCTL.
+        vcb.as_mut()
+    };
+    let mut transaction = vcb
+        .volume_mut()
+        .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
+    let file = transaction
+        .file(inode)
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    transaction
+        .enable_verity(file, &enable)
+        .map_err(|error| DriverError::from(error).ntstatus())?;
+    transaction
+        .commit()
+        .map_err(|error| DriverError::from(error).ntstatus())
 }
 
 /// Adds an fscrypt master key to the mounted VCB.
@@ -442,6 +475,21 @@ impl FsverityEnablePayload {
             salt,
             signature,
         })
+    }
+
+    /// Converts this decoded payload into the ext4-core enable domain.
+    fn into_core_enable(self) -> Result<FsverityEnable, NTSTATUS> {
+        let salt = self.salt();
+        let signature = self.signature();
+        if salt.length != 0 || signature.length != 0 {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        Ok(FsverityEnable::new(
+            self.algorithm(),
+            self.block_size(),
+            FsveritySalt::empty(),
+            FsveritySignature::empty(),
+        ))
     }
 
     /// Hash algorithm for the Merkle tree.
@@ -766,6 +814,55 @@ mod tests {
         assert_eq!(decoded.salt().length, 3);
         assert_eq!(decoded.signature().address, 0x2000);
         assert_eq!(decoded.signature().length, 16);
+    }
+
+    #[test]
+    fn fsverity_enable_payload_maps_empty_buffers_to_core_domain() {
+        let payload = enable_verity_payload(
+            1,
+            1024,
+            OptionalUserBuffer {
+                address: 0,
+                length: 0,
+            },
+            OptionalUserBuffer {
+                address: 0,
+                length: 0,
+            },
+        )
+        .expect("payload");
+
+        let enable = FsverityEnablePayload::parse(&payload)
+            .and_then(FsverityEnablePayload::into_core_enable)
+            .expect("core enable");
+
+        assert_eq!(enable.algorithm(), FsverityHashAlgorithm::Sha256);
+        assert_eq!(enable.block_size().bytes(), 1024);
+        assert!(enable.salt().is_empty());
+        assert!(enable.signature().bytes().is_empty());
+    }
+
+    #[test]
+    fn fsverity_enable_payload_rejects_external_salt_or_signature_buffers() {
+        let payload = enable_verity_payload(
+            1,
+            1024,
+            OptionalUserBuffer {
+                address: 0x1000,
+                length: 1,
+            },
+            OptionalUserBuffer {
+                address: 0,
+                length: 0,
+            },
+        )
+        .expect("payload");
+
+        assert_eq!(
+            FsverityEnablePayload::parse(&payload)
+                .and_then(FsverityEnablePayload::into_core_enable),
+            Err(STATUS_NOT_SUPPORTED)
+        );
     }
 
     #[test]
