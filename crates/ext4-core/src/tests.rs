@@ -18,14 +18,15 @@ use crate::{
     BlockAddress, BlockGroupId, BlockMapping, BlockReader, BlockSize, BlockWriter, ByteOffset,
     DeviceLength, DirectoryEntry, DirectoryEntryKind, DirectoryNode, Error, Ext4Gid, Ext4Name,
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, Ext4VolumeLabel,
-    Ext4WindowsAttributes, Extent, ExtentLength, ExtentTree, ExtentTreeContext, ExternalJournal,
-    FileNode, FileOffset, FileSize, FscryptContextV2, FscryptKeySet, FscryptMasterKey,
-    InodeExtentRoot, InodeId, InodeProtection, JournalMode, LogicalBlock, LookupResult,
-    MountContext, MutableExtentTree, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
-    Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite, SliceBlockDevice,
-    SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget, TransactionDirectory,
-    TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName, XattrNamespace, XattrSet,
-    XattrValue,
+    Ext4VerityMetadataLayout, Ext4WindowsAttributes, Extent, ExtentLength, ExtentTree,
+    ExtentTreeContext, ExternalJournal, FileNode, FileOffset, FileSize, FscryptContextV2,
+    FscryptKeySet, FscryptMasterKey, FsverityBlockSize, FsverityDescriptor,
+    FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt, InodeExtentRoot, InodeId,
+    InodeProtection, JournalMode, LogicalBlock, LookupResult, MountContext, MutableExtentTree,
+    NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, Node, PosixAcl, PosixAclEntry,
+    PosixAclKind, ReadOnly, ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock,
+    SymlinkNode, SymlinkTarget, TransactionDirectory, TransactionFile, Volume, WindowsName,
+    WindowsOverlay, XattrName, XattrNamespace, XattrSet, XattrValue, FSVERITY_DESCRIPTOR_BYTES,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -1652,24 +1653,48 @@ fn encrypted_file_read_with_key_reaches_crypto_path_boundary() {
 }
 
 #[test]
-fn verity_file_read_reaches_verification_path_boundary() {
-    let mut image = modern_fixture_image_with_journal_blocks(16);
-    let read_only_compat = get_u32(&image, 1024 + 100) | RO_COMPAT_VERITY;
-    let file_flags = get_u32(&image, modern_inode_offset(3) + 32) | EXT4_VERITY_FL;
-    put_u32(&mut image, 1024 + 100, read_only_compat);
-    put_u32(&mut image, modern_inode_offset(3) + 32, file_flags);
-
+fn verity_file_read_verifies_post_eof_metadata() {
+    let image = verity_fixture_image();
     let volume = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
     let file = file_node(&volume, 3);
-    let mut output = [0_u8; 1];
+    let mut output = [0_u8; 5];
 
     assert_eq!(file.protection(), InodeProtection::Verity);
     assert_eq!(
+        must(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
+        5
+    );
+    assert_eq!(&output, b"hello");
+}
+
+#[test]
+fn verity_file_read_rejects_corruption() {
+    let mut corrupt_data = verity_fixture_image();
+    corrupt_data[block_offset(MODERN_FILE_DATA_BLOCK)] ^= 0x80;
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&corrupt_data),
+        test_mount_context(),
+    ));
+    let file = file_node(&volume, 3);
+    let mut output = [0_u8; 5];
+    assert_eq!(
         volume.read_file(&file, FileOffset::ZERO, &mut output),
-        Err(Error::UnsupportedVerity)
+        Err(Error::VerityMismatch)
+    );
+
+    let mut corrupt_tree = verity_fixture_image();
+    corrupt_tree[block_offset(64)] ^= 0x80;
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&corrupt_tree),
+        test_mount_context(),
+    ));
+    let file = file_node(&volume, 3);
+    assert_eq!(
+        volume.read_file(&file, FileOffset::ZERO, &mut output),
+        Err(Error::VerityMismatch)
     );
 }
 
@@ -3368,6 +3393,95 @@ fn modern_fixture_image_with_journal_blocks(journal_blocks: u16) -> Vec<u8> {
     write_modern_root_directory(&mut image);
     let file_data_offset = block_offset(MODERN_FILE_DATA_BLOCK);
     image[file_data_offset..file_data_offset + 5].copy_from_slice(b"hello");
+    image
+}
+
+fn verity_fixture_image() -> Vec<u8> {
+    const VERITY_IMAGE_BLOCKS: usize = 80;
+    const VERITY_METADATA_BLOCK: u32 = 64;
+    const VERITY_METADATA_BLOCKS: u16 = 2;
+
+    let mut image = modern_fixture_image();
+    image.resize(BLOCK_SIZE * VERITY_IMAGE_BLOCKS, 0);
+    put_u32(
+        &mut image,
+        1024 + 4,
+        u32::try_from(VERITY_IMAGE_BLOCKS).unwrap_or(u32::MAX),
+    );
+    let free_clusters = get_u32(&image, 1024 + 12) + 14;
+    put_u32(&mut image, 1024 + 12, free_clusters);
+    let descriptor = block_offset(2);
+    put_u16(
+        &mut image,
+        descriptor + 12,
+        u16::try_from(free_clusters & u32::from(u16::MAX)).unwrap_or(u16::MAX),
+    );
+    put_u16(
+        &mut image,
+        descriptor + 44,
+        u16::try_from(free_clusters >> 16).unwrap_or(u16::MAX),
+    );
+    for block in VERITY_METADATA_BLOCK
+        ..VERITY_METADATA_BLOCK + u32::from(VERITY_METADATA_BLOCKS)
+    {
+        set_modern_block_used(&mut image, block, true);
+    }
+
+    let inode_offset = modern_inode_offset(3);
+    let read_only_compat = get_u32(&image, 1024 + 100) | RO_COMPAT_VERITY;
+    let inode_flags = get_u32(&image, inode_offset + 32) | EXT4_VERITY_FL;
+    put_u32(&mut image, 1024 + 100, read_only_compat);
+    put_u32(&mut image, inode_offset + 32, inode_flags);
+    put_u32(&mut image, inode_offset + 28, 6);
+    write_two_extent_root(
+        &mut image,
+        inode_offset + 40,
+        0,
+        1,
+        MODERN_FILE_DATA_BLOCK,
+        VERITY_METADATA_BLOCK,
+        VERITY_METADATA_BLOCKS,
+        VERITY_METADATA_BLOCK,
+    );
+
+    let mut plaintext = vec![0_u8; 2048];
+    plaintext[..5].copy_from_slice(b"hello");
+    let verity_block_size = must(FsverityBlockSize::new(
+        u32::try_from(BLOCK_SIZE).unwrap_or(u32::MAX),
+    ));
+    let salt = FsveritySalt::empty();
+    let merkle_tree = must(FsverityMerkleTree::build(
+        &plaintext,
+        FsverityHashAlgorithm::Sha256,
+        verity_block_size,
+        &salt,
+    ));
+    let descriptor = must(FsverityDescriptor::new(
+        FsverityHashAlgorithm::Sha256,
+        verity_block_size,
+        u64::try_from(plaintext.len()).unwrap_or(u64::MAX),
+        merkle_tree.root_hash(),
+        salt,
+    ));
+    let descriptor_bytes = must(descriptor.to_bytes());
+    let layout = must(Ext4VerityMetadataLayout::new(
+        FileSize::from_bytes(u64::try_from(plaintext.len()).unwrap_or(u64::MAX)),
+        must(BlockSize::from_superblock_log(0)),
+        u64::try_from(merkle_tree.blocks().len()).unwrap_or(u64::MAX),
+        u32::try_from(FSVERITY_DESCRIPTOR_BYTES).unwrap_or(u32::MAX),
+    ));
+    let tree_offset = usize::try_from(layout.merkle_tree_offset()).unwrap_or(usize::MAX);
+    image[tree_offset..tree_offset + merkle_tree.blocks().len()]
+        .copy_from_slice(merkle_tree.blocks());
+    let descriptor_offset = usize::try_from(layout.descriptor_offset()).unwrap_or(usize::MAX);
+    image[descriptor_offset..descriptor_offset + descriptor_bytes.len()]
+        .copy_from_slice(&descriptor_bytes);
+    put_u32(
+        &mut image,
+        usize::try_from(layout.descriptor_size_offset()).unwrap_or(usize::MAX),
+        u32::try_from(FSVERITY_DESCRIPTOR_BYTES).unwrap_or(u32::MAX),
+    );
+    refresh_primary_block_group_descriptor_checksum(&mut image);
     image
 }
 
