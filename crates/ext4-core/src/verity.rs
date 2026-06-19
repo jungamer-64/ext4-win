@@ -27,6 +27,8 @@ const FSVERITY_HASH_ALG_SHA512: u8 = 2;
 const FSVERITY_MAX_DIGEST_BYTES: usize = 64;
 /// Maximum fs-verity salt bytes stored in descriptor fields.
 const FSVERITY_MAX_SALT_BYTES: usize = 32;
+/// Maximum builtin signature bytes accepted by Linux fs-verity UAPI.
+pub const FSVERITY_MAX_SIGNATURE_BYTES: usize = 16_128;
 /// Offset of descriptor version.
 const DESCRIPTOR_VERSION_OFFSET: usize = 0;
 /// Offset of descriptor hash algorithm.
@@ -432,6 +434,101 @@ impl FsveritySalt {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+}
+
+/// Optional builtin fs-verity signature bytes stored after the descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FsveritySignature {
+    /// Signature bytes.
+    bytes: Vec<u8>,
+}
+
+impl FsveritySignature {
+    /// Creates validated signature bytes.
+    ///
+    /// # Errors
+    /// Returns an error when the signature exceeds the Linux fs-verity limit.
+    pub fn new(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > FSVERITY_MAX_SIGNATURE_BYTES {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    /// Creates an empty signature.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    /// Signature bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes this signature into raw bytes.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Parameters for generating fs-verity metadata for a regular file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FsverityEnable {
+    /// Hash algorithm.
+    algorithm: FsverityHashAlgorithm,
+    /// Data and Merkle tree block size.
+    block_size: FsverityBlockSize,
+    /// Merkle tree salt.
+    salt: FsveritySalt,
+    /// Optional builtin signature bytes.
+    signature: FsveritySignature,
+}
+
+impl FsverityEnable {
+    /// Creates an fs-verity enable request from validated components.
+    #[must_use]
+    pub fn new(
+        algorithm: FsverityHashAlgorithm,
+        block_size: FsverityBlockSize,
+        salt: FsveritySalt,
+        signature: FsveritySignature,
+    ) -> Self {
+        Self {
+            algorithm,
+            block_size,
+            salt,
+            signature,
+        }
+    }
+
+    /// Hash algorithm.
+    #[must_use]
+    pub const fn algorithm(&self) -> FsverityHashAlgorithm {
+        self.algorithm
+    }
+
+    /// Data and Merkle tree block size.
+    #[must_use]
+    pub const fn block_size(&self) -> FsverityBlockSize {
+        self.block_size
+    }
+
+    /// Merkle tree salt.
+    #[must_use]
+    pub const fn salt(&self) -> &FsveritySalt {
+        &self.salt
+    }
+
+    /// Optional builtin signature.
+    #[must_use]
+    pub const fn signature(&self) -> &FsveritySignature {
+        &self.signature
     }
 }
 

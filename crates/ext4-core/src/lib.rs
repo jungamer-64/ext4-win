@@ -64,9 +64,10 @@ pub use superblock::{
 };
 pub use verity::{
     EXT4_VERITY_METADATA_ALIGNMENT_BYTES, Ext4VerityMetadata, Ext4VerityMetadataLayout,
-    FSVERITY_DESCRIPTOR_BYTES, FSVERITY_MAX_BLOCK_BYTES, FSVERITY_MIN_BLOCK_BYTES,
-    FsverityBlockSize, FsverityDescriptor, FsverityDigest, FsverityHashAlgorithm,
-    FsverityMerkleTree, FsverityRootHash, FsveritySalt,
+    FSVERITY_DESCRIPTOR_BYTES, FSVERITY_MAX_BLOCK_BYTES, FSVERITY_MAX_SIGNATURE_BYTES,
+    FSVERITY_MIN_BLOCK_BYTES, FsverityBlockSize, FsverityDescriptor, FsverityDigest,
+    FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsverityRootHash, FsveritySalt,
+    FsveritySignature,
 };
 pub use volume::{
     DirectoryNode, ExternalJournal, FileNode, InternalJournal, LookupResult, MountContext, Node,

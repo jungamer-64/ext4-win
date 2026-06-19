@@ -30,8 +30,8 @@ use crate::superblock::{
     RecoveryState, Superblock,
 };
 use crate::verity::{
-    Ext4VerityMetadata, Ext4VerityMetadataLayout, FsverityDescriptor,
-    FSVERITY_DESCRIPTOR_BYTES,
+    Ext4VerityMetadata, Ext4VerityMetadataLayout, FsverityDescriptor, FsverityEnable,
+    FsverityMerkleTree, FSVERITY_DESCRIPTOR_BYTES,
 };
 use crate::windows::WindowsOverlay;
 use crate::xattr::{self as xattr_storage, InodeXattrSet, XattrName, XattrSet, XattrValue};
@@ -52,6 +52,8 @@ const MODE_KIND_MASK: u16 = 0xF000;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 /// `i_flags` bit indicating an HTree-indexed directory.
 const EXT4_INDEX_FL: u32 = 0x0000_1000;
+/// `i_flags` bit indicating fs-verity protected file contents.
+const EXT4_VERITY_FL: u32 = 0x0010_0000;
 /// Offset of `i_mode` in an inode record.
 const INODE_MODE_OFFSET: usize = 0;
 /// Offset of `i_uid_lo` in an inode record.
@@ -2108,8 +2110,76 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 .first_block_of_cluster(cluster)?
                 .get()
                 .checked_add(cluster_offset)
-                .ok_or(Error::ArithmeticOverflow)?,
+            .ok_or(Error::ArithmeticOverflow)?,
         ))
+    }
+
+    /// Stages a write into an inode extent stream without applying EOF limits.
+    fn stage_inode_stream_write(
+        &mut self,
+        tree: &mut MutableExtentTree,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
+        let mut completed = 0_usize;
+        while completed < bytes.len() {
+            let position = offset
+                .checked_add(u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let logical_block = position
+                .checked_div(block_size_u64)
+                .ok_or(Error::InvalidSuperblock)?;
+            let in_block = position
+                .checked_rem(block_size_u64)
+                .ok_or(Error::InvalidSuperblock)?;
+            let block_remaining = block_size_u64
+                .checked_sub(in_block)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let total_remaining = u64::try_from(
+                bytes
+                    .len()
+                    .checked_sub(completed)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let chunk = usize::try_from(core::cmp::min(block_remaining, total_remaining))
+                .map_err(|_| Error::ArithmeticOverflow)?;
+            let end = completed
+                .checked_add(chunk)
+                .ok_or(Error::ArithmeticOverflow)?;
+
+            let logical_block = LogicalBlock::try_from(logical_block)?;
+            let physical = match tree.map_logical(logical_block) {
+                BlockMapping::Physical(physical) => physical,
+                BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
+                BlockMapping::Hole => {
+                    let physical = self.physical_block_for_hole(tree, logical_block)?;
+                    tree.insert_or_extend_initialized(logical_block, physical)?;
+                    physical
+                }
+            };
+            let write_offset = self
+                .volume
+                .superblock
+                .block_size()
+                .offset_of(physical)?
+                .get()
+                .checked_add(in_block)
+                .ok_or(Error::ArithmeticOverflow)?;
+            self.data_writes.push(RangeWrite {
+                offset: ByteOffset::new(write_offset),
+                bytes: bytes
+                    .get(completed..end)
+                    .ok_or(Error::DeviceRange)?
+                    .to_vec(),
+            });
+            completed = end;
+        }
+        Ok(())
     }
 
     /// Extends a regular file as a sparse range.
@@ -2194,6 +2264,87 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
         }
         tree.replace_extents(updated)?;
         raw_inode.set_size(new_size)?;
+        raw_inode.set_timestamps(self.now)?;
+        self.stage_extent_tree(&mut raw_inode, tree)?;
+        *self
+            .inode_updates
+            .get_mut(inode_index)
+            .ok_or(Error::InvalidInode)? = raw_inode;
+        Ok(())
+    }
+
+    /// Enables fs-verity on a plain regular file by journal-staging ext4
+    /// post-EOF metadata and setting `EXT4_VERITY_FL`.
+    ///
+    /// # Errors
+    /// Returns an error when the inode is not a plain regular file, the file
+    /// cannot be read into the verification domain, metadata allocation fails,
+    /// or the extent tree cannot represent the post-EOF metadata.
+    pub fn enable_verity(
+        &mut self,
+        file: TransactionFile,
+        enable: &FsverityEnable,
+    ) -> Result<()> {
+        let inode_index = self.ensure_inode_update(file.inode_id())?;
+        let mut raw_inode = self
+            .inode_updates
+            .get(inode_index)
+            .ok_or(Error::InvalidInode)?
+            .clone();
+        let inode = raw_inode.parse()?;
+        if inode.kind() != InodeKind::File {
+            return Err(Error::WrongInodeKind);
+        }
+        if inode.protection().is_encrypted() {
+            self.volume.require_encryption_key(&inode)?;
+            return Err(Error::UnsupportedEncryption);
+        }
+        if inode.protection().is_verity() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        inode.require_mutation(InodeMutation::FileData)?;
+
+        let mut plaintext = vec![0_u8; inode.size().to_usize()?];
+        let read = self
+            .volume
+            .read_inode_data(&inode, FileOffset::ZERO, &mut plaintext)?;
+        if read.as_usize() != plaintext.len() {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        let merkle_tree = FsverityMerkleTree::build(
+            &plaintext,
+            enable.algorithm(),
+            enable.block_size(),
+            enable.salt(),
+        )?;
+        let descriptor = FsverityDescriptor::new(
+            enable.algorithm(),
+            enable.block_size(),
+            inode.size().bytes(),
+            merkle_tree.root_hash(),
+            enable.salt().clone(),
+        )?;
+        let descriptor_fixed = descriptor.to_bytes()?;
+        let descriptor_bytes = descriptor_byte_count(enable.signature().bytes())?;
+        let layout = Ext4VerityMetadataLayout::new(
+            inode.size(),
+            self.volume.superblock.block_size(),
+            u64::try_from(merkle_tree.blocks().len()).map_err(|_| Error::ArithmeticOverflow)?,
+            descriptor_bytes,
+        )?;
+        let metadata = verity_metadata_image(
+            layout,
+            merkle_tree.blocks(),
+            &descriptor_fixed,
+            enable.signature().bytes(),
+        )?;
+
+        let mut tree = self.mutable_extent_tree(&inode)?;
+        if tree.contains_uninitialized() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        self.stage_inode_stream_write(&mut tree, layout.merkle_tree_offset(), &metadata)?;
+        raw_inode.set_verity()?;
         raw_inode.set_timestamps(self.now)?;
         self.stage_extent_tree(&mut raw_inode, tree)?;
         *self
@@ -3764,6 +3915,12 @@ impl RawInode {
         self.set_flags(flags | EXT4_INDEX_FL)
     }
 
+    /// Marks a regular file inode as fs-verity protected.
+    fn set_verity(&mut self) -> Result<()> {
+        let flags = le_u32(&self.bytes, INODE_FLAGS_OFFSET)?;
+        self.set_flags(flags | EXT4_VERITY_FL)
+    }
+
     /// Parses the raw bytes as a validated inode.
     fn parse(&self) -> Result<Inode> {
         Inode::parse(self.id, &self.bytes)
@@ -4289,6 +4446,68 @@ fn extent_payload_end_bytes(extent_tree: &ExtentTree, block_size: BlockSize) -> 
     end_blocks
         .checked_mul(u64::from(block_size.bytes()))
         .ok_or(Error::ArithmeticOverflow)
+}
+
+/// Returns descriptor plus signature byte count.
+fn descriptor_byte_count(signature: &[u8]) -> Result<u32> {
+    u32::try_from(
+        FSVERITY_DESCRIPTOR_BYTES
+            .checked_add(signature.len())
+            .ok_or(Error::ArithmeticOverflow)?,
+    )
+    .map_err(|_| Error::ArithmeticOverflow)
+}
+
+/// Builds the ext4 post-EOF verity metadata byte image.
+fn verity_metadata_image(
+    layout: Ext4VerityMetadataLayout,
+    merkle_tree: &[u8],
+    descriptor: &[u8; FSVERITY_DESCRIPTOR_BYTES],
+    signature: &[u8],
+) -> Result<Vec<u8>> {
+    let metadata_bytes = usize::try_from(
+        layout
+            .metadata_end()
+            .checked_sub(layout.merkle_tree_offset())
+            .ok_or(Error::InvalidVerityMetadata)?,
+    )
+    .map_err(|_| Error::ArithmeticOverflow)?;
+    let mut image = vec![0_u8; metadata_bytes];
+    let tree_end = merkle_tree.len();
+    image
+        .get_mut(..tree_end)
+        .ok_or(Error::InvalidVerityMetadata)?
+        .copy_from_slice(merkle_tree);
+    let descriptor_offset = usize::try_from(
+        layout
+            .descriptor_offset()
+            .checked_sub(layout.merkle_tree_offset())
+            .ok_or(Error::InvalidVerityMetadata)?,
+    )
+    .map_err(|_| Error::ArithmeticOverflow)?;
+    let descriptor_end = descriptor_offset
+        .checked_add(FSVERITY_DESCRIPTOR_BYTES)
+        .ok_or(Error::ArithmeticOverflow)?;
+    image
+        .get_mut(descriptor_offset..descriptor_end)
+        .ok_or(Error::InvalidVerityMetadata)?
+        .copy_from_slice(descriptor);
+    let signature_end = descriptor_end
+        .checked_add(signature.len())
+        .ok_or(Error::ArithmeticOverflow)?;
+    image
+        .get_mut(descriptor_end..signature_end)
+        .ok_or(Error::InvalidVerityMetadata)?
+        .copy_from_slice(signature);
+    let tail_offset = usize::try_from(
+        layout
+            .descriptor_size_offset()
+            .checked_sub(layout.merkle_tree_offset())
+            .ok_or(Error::InvalidVerityMetadata)?,
+    )
+    .map_err(|_| Error::ArithmeticOverflow)?;
+    put_le_u32(&mut image, tail_offset, descriptor_byte_count(signature)?)?;
+    Ok(image)
 }
 
 /// Converts an inode kind into the directory entry file-type byte domain.
