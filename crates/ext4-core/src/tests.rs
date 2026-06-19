@@ -21,12 +21,13 @@ use crate::{
     Ext4VerityMetadataLayout, Ext4WindowsAttributes, Extent, ExtentLength, ExtentTree,
     ExtentTreeContext, ExternalJournal, FileNode, FileOffset, FileSize, FscryptContextV2,
     FscryptKeySet, FscryptMasterKey, FsverityBlockSize, FsverityDescriptor,
-    FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt, InodeExtentRoot, InodeId,
-    InodeProtection, JournalMode, LogicalBlock, LookupResult, MountContext, MutableExtentTree,
-    NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, Node, PosixAcl, PosixAclEntry,
-    PosixAclKind, ReadOnly, ReadWrite, SliceBlockDevice, SliceBlockDeviceMut, Superblock,
-    SymlinkNode, SymlinkTarget, TransactionDirectory, TransactionFile, Volume, WindowsName,
-    WindowsOverlay, XattrName, XattrNamespace, XattrSet, XattrValue, FSVERITY_DESCRIPTOR_BYTES,
+    FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt, FsveritySignature,
+    InodeExtentRoot, InodeId, InodeProtection, JournalMode, LogicalBlock, LookupResult,
+    MountContext, MutableExtentTree, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
+    Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite, SliceBlockDevice,
+    SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget, TransactionDirectory,
+    TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName, XattrNamespace, XattrSet,
+    XattrValue, FSVERITY_DESCRIPTOR_BYTES,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -1696,6 +1697,48 @@ fn verity_file_read_rejects_corruption() {
         volume.read_file(&file, FileOffset::ZERO, &mut output),
         Err(Error::VerityMismatch)
     );
+}
+
+#[test]
+fn enable_verity_commits_metadata_and_remount_verifies() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let read_only_compat = get_u32(&image, 1024 + 100) | RO_COMPAT_VERITY;
+    put_u32(&mut image, 1024 + 100, read_only_compat);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+            device,
+            test_mount_context(),
+        ));
+        let mut transaction = volume.begin_transaction(NOW);
+        let file = transaction_file(&transaction, 3);
+        let enable = FsverityEnable::new(
+            FsverityHashAlgorithm::Sha256,
+            must(FsverityBlockSize::new(
+                u32::try_from(BLOCK_SIZE).unwrap_or(u32::MAX),
+            )),
+            FsveritySalt::empty(),
+            FsveritySignature::empty(),
+        );
+
+        must(transaction.enable_verity(file, &enable));
+        must(transaction.commit());
+    }
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context(),
+    ));
+    let file = file_node(&volume, 3);
+    let mut output = [0_u8; 5];
+
+    assert_eq!(file.protection(), InodeProtection::Verity);
+    assert_eq!(
+        must(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
+        5
+    );
+    assert_eq!(&output, b"hello");
 }
 
 #[test]
