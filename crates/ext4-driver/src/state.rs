@@ -6,8 +6,8 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    DeviceLength, Ext4Name, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey,
-    InodeId, InternalJournal, MountContext, ReadWrite, Result as Ext4Result, Volume,
+    DeviceLength, Ext4Name, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey, InodeId,
+    InternalJournal, MountContext, ReadWrite, Result as Ext4Result, Volume,
 };
 use wdk_sys::{
     ACCESS_MASK, DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT,

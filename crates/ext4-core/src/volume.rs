@@ -17,7 +17,7 @@ use crate::extent::{
 };
 use crate::fscrypt::{
     FscryptContentsKey, FscryptContextV2, FscryptFileNonce, FscryptFilenamePadding,
-    FscryptFilenamesKey, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey,
+    FscryptFilenamesKey, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey, FscryptNoKeyName,
     FscryptNoNonceGenerator, FscryptNonceGenerator,
 };
 use crate::group::BlockGroupDescriptor;
@@ -1156,10 +1156,8 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
         if !directory.protection().is_encrypted() {
             return Ok(entries);
         }
-        match self.decrypt_directory_entries(directory.inode(), entries) {
-            Err(Error::MissingEncryptionKey) => {
-                Ok(self.read_directory_layout(directory.inode())?.entries())
-            }
+        match self.decrypt_directory_entries(directory.inode(), &entries) {
+            Err(Error::MissingEncryptionKey) => Self::project_locked_directory_entries(entries),
             result => result,
         }
     }
@@ -1168,7 +1166,7 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
     fn decrypt_directory_entries(
         &self,
         directory: &Inode,
-        entries: Vec<DirectoryEntry>,
+        entries: &[DirectoryEntry],
     ) -> Result<Vec<DirectoryEntry>> {
         let mut decrypted = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -1176,6 +1174,35 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
             decrypted.push(DirectoryEntry::new(entry.inode(), &name, entry.kind()));
         }
         Ok(decrypted)
+    }
+
+    /// Projects encrypted on-disk dirent names into reversible no-key names.
+    fn project_locked_directory_entries(
+        entries: Vec<DirectoryEntry>,
+    ) -> Result<Vec<DirectoryEntry>> {
+        let mut projected = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let name = Self::project_locked_directory_name(entry.name())?;
+            projected.push(DirectoryEntry::new(entry.inode(), &name, entry.kind()));
+        }
+        Ok(projected)
+    }
+
+    /// Projects one encrypted on-disk dirent name into a no-key display name.
+    fn project_locked_directory_name(name: &Ext4Name) -> Result<Ext4Name> {
+        if matches!(name.bytes(), b"." | b"..") {
+            return Ok(name.clone());
+        }
+        let display = FscryptNoKeyName::from_ciphertext(name.bytes())?.display_bytes()?;
+        Ext4Name::new(&display)
+    }
+
+    /// Decodes a no-key display name back into its encrypted on-disk name.
+    fn locked_directory_ciphertext_name(name: &Ext4Name) -> Result<Option<Ext4Name>> {
+        let Some(no_key_name) = FscryptNoKeyName::from_display(name.bytes())? else {
+            return Ok(None);
+        };
+        Ok(Some(Ext4Name::from_disk(no_key_name.ciphertext_bytes())?))
     }
 
     /// Looks up an exact ext4 child name under a directory.
@@ -1216,12 +1243,23 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
         requested: &WindowsName,
     ) -> Result<Option<DirectoryEntry>> {
         if parent.protection().is_encrypted() {
-            let plaintext = requested.to_ext4()?;
-            let ciphertext = self.encrypt_directory_child_name(parent.inode(), &plaintext)?;
+            let visible_name = requested.to_ext4()?;
+            let ciphertext = match self.encrypt_directory_child_name(parent.inode(), &visible_name)
+            {
+                Ok(ciphertext) => ciphertext,
+                Err(Error::MissingEncryptionKey) => {
+                    let Some(ciphertext) = Self::locked_directory_ciphertext_name(&visible_name)?
+                    else {
+                        return Err(Error::MissingEncryptionKey);
+                    };
+                    ciphertext
+                }
+                Err(error) => return Err(error),
+            };
             return Ok(self
                 .read_directory_layout(parent.inode())?
                 .find(&ciphertext)
-                .map(|entry| DirectoryEntry::new(entry.inode(), &plaintext, entry.kind())));
+                .map(|entry| DirectoryEntry::new(entry.inode(), &visible_name, entry.kind())));
         }
         if parent.protection().is_verity() {
             return Err(Error::UnsupportedVerity);
@@ -2873,7 +2911,10 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     /// Returns the on-disk name to use for a directory lookup inside this transaction.
     fn directory_lookup_name(&self, directory: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
         match self.volume.encrypt_directory_child_name(directory, name) {
-            Err(Error::MissingEncryptionKey) => Ok(name.clone()),
+            Err(Error::MissingEncryptionKey) => Ok(
+                Volume::<D, ReadWrite<J>, N>::locked_directory_ciphertext_name(name)?
+                    .unwrap_or_else(|| name.clone()),
+            ),
             result => result,
         }
     }

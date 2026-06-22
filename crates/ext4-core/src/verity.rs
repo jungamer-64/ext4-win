@@ -838,10 +838,7 @@ impl FsverityMerkleTree {
     /// # Errors
     /// Returns an error when the stored tree byte count does not match the
     /// descriptor's data size, hash algorithm, and Merkle block geometry.
-    pub fn from_stored_blocks(
-        descriptor: &FsverityDescriptor,
-        blocks: Vec<u8>,
-    ) -> Result<Self> {
+    pub fn from_stored_blocks(descriptor: &FsverityDescriptor, blocks: Vec<u8>) -> Result<Self> {
         if u64::try_from(blocks.len()).map_err(|_| Error::ArithmeticOverflow)?
             != Self::stored_tree_bytes_for_descriptor(descriptor)?
         {
@@ -984,9 +981,7 @@ fn align_up_u64(value: u64, alignment: u64) -> Result<u64> {
     let delta = alignment
         .checked_sub(remainder)
         .ok_or(Error::ArithmeticOverflow)?;
-    value
-        .checked_add(delta)
-        .ok_or(Error::ArithmeticOverflow)
+    value.checked_add(delta).ok_or(Error::ArithmeticOverflow)
 }
 
 /// Divides and rounds up without accepting a zero divisor.
@@ -995,10 +990,10 @@ fn round_up_div_u64(value: u64, divisor: u64) -> Result<u64> {
         return Err(Error::ArithmeticOverflow);
     }
     let delta = divisor.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
-    let adjusted = value
-        .checked_add(delta)
-        .ok_or(Error::ArithmeticOverflow)?;
-    adjusted.checked_div(divisor).ok_or(Error::ArithmeticOverflow)
+    let adjusted = value.checked_add(delta).ok_or(Error::ArithmeticOverflow)?;
+    adjusted
+        .checked_div(divisor)
+        .ok_or(Error::ArithmeticOverflow)
 }
 
 /// Hashes every data block, padding the final block with zeroes.

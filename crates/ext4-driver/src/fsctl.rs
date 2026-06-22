@@ -974,16 +974,8 @@ mod tests {
             algorithm,
         )?;
         write_u32(&mut payload, FSVERITY_ENABLE_BLOCK_SIZE_OFFSET, block_size)?;
-        write_u32(
-            &mut payload,
-            FSVERITY_ENABLE_SALT_SIZE_OFFSET,
-            salt.length,
-        )?;
-        write_u64(
-            &mut payload,
-            FSVERITY_ENABLE_SALT_PTR_OFFSET,
-            salt.address,
-        )?;
+        write_u32(&mut payload, FSVERITY_ENABLE_SALT_SIZE_OFFSET, salt.length)?;
+        write_u64(&mut payload, FSVERITY_ENABLE_SALT_PTR_OFFSET, salt.address)?;
         write_u32(
             &mut payload,
             FSVERITY_ENABLE_SIG_SIZE_OFFSET,

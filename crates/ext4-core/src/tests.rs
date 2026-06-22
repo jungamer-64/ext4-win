@@ -134,10 +134,16 @@ fn read_directory<D: BlockReader, State, N>(
     must(volume.read_directory(&directory))
 }
 
-fn read_symlink<D: BlockReader, State, N>(
-    volume: &Volume<D, State, N>,
-    inode_id: u32,
-) -> Vec<u8> {
+fn directory_entry_name(entries: &[DirectoryEntry], inode_id: InodeId) -> Ext4Name {
+    for entry in entries {
+        if entry.inode() == inode_id {
+            return entry.name().clone();
+        }
+    }
+    panic!("expected directory entry");
+}
+
+fn read_symlink<D: BlockReader, State, N>(volume: &Volume<D, State, N>, inode_id: u32) -> Vec<u8> {
     let symlink = symlink_node(volume, inode_id);
     must(volume.read_symlink(&symlink))
 }
@@ -1949,11 +1955,14 @@ fn encrypted_directory_read_projects_names_when_key_is_present() {
         test_mount_context(),
     ));
     let locked_entries = read_directory(&locked, InodeId::ROOT);
+    let encoded = directory_entry_name(&locked_entries, inode(3));
     assert!(
         locked_entries
             .iter()
             .all(|entry| entry.name().bytes() != b"file")
     );
+    assert!(encoded.bytes().starts_with(b"_fscrypt_"));
+    assert!(WindowsName::from_ext4(&encoded).is_ok());
 
     let unlocked = must(Volume::<_, ReadOnly>::mount_read_only(
         SliceBlockDevice::new(&image),
@@ -1987,6 +1996,27 @@ fn encrypted_directory_windows_lookup_encrypts_requested_name() {
                 u16::from(b'e'),
             ],
         ),
+        LookupResult::Found(inode(3))
+    );
+}
+
+#[test]
+fn encrypted_directory_encoded_lookup_does_not_require_mount_key() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
+    install_inline_fscrypt_context(&mut image, 2, &context_bytes);
+    encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context(),
+    ));
+    let encoded = directory_entry_name(&read_directory(&volume, InodeId::ROOT), inode(3));
+    let requested: Vec<u16> = encoded.bytes().iter().copied().map(u16::from).collect();
+
+    assert_eq!(
+        lookup_windows(&volume, InodeId::ROOT, &requested),
         LookupResult::Found(inode(3))
     );
 }
@@ -2182,11 +2212,21 @@ fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
 }
 
 #[test]
-fn encrypted_directory_exact_delete_does_not_require_mount_key() {
+fn encrypted_directory_encoded_delete_does_not_require_mount_key() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
-    let context_bytes = fscrypt_v2_context_bytes();
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
     install_inline_fscrypt_context(&mut image, 2, &context_bytes);
+    encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
     put_u16(&mut image, modern_inode_offset(3) + 26, 1);
+
+    let encoded = {
+        let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+            SliceBlockDevice::new(&image),
+            test_mount_context(),
+        ));
+        directory_entry_name(&read_directory(&volume, InodeId::ROOT), inode(3))
+    };
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
@@ -2196,7 +2236,7 @@ fn encrypted_directory_exact_delete_does_not_require_mount_key() {
         ));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, InodeId::ROOT);
-        must(transaction.unlink_file(root, &must(Ext4Name::new(b"file"))));
+        must(transaction.unlink_file(root, &encoded));
         must(transaction.commit());
     }
 
@@ -2204,9 +2244,10 @@ fn encrypted_directory_exact_delete_does_not_require_mount_key() {
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    assert_eq!(
-        lookup_ext4(&volume, InodeId::ROOT, b"file"),
-        LookupResult::NotFound
+    assert!(
+        !read_directory(&volume, InodeId::ROOT)
+            .iter()
+            .any(|entry| entry.name() == &encoded)
     );
 }
 
