@@ -266,6 +266,14 @@ impl FscryptPolicyV2 {
         parse_policy_fields(bytes, FSCRYPT_POLICY_V2)
     }
 
+    /// Serializes this policy as Linux `struct fscrypt_policy_v2` bytes.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; FSCRYPT_POLICY_V2_BYTES] {
+        let mut bytes = [0_u8; FSCRYPT_POLICY_V2_BYTES];
+        write_policy_fields(&mut bytes, FSCRYPT_POLICY_V2, self);
+        bytes
+    }
+
     /// Contents encryption mode.
     #[must_use]
     pub const fn contents_mode(self) -> FscryptContentsMode {
@@ -307,6 +315,12 @@ pub struct FscryptContextV2 {
 }
 
 impl FscryptContextV2 {
+    /// Creates a per-inode v2 context from an inherited policy and new nonce.
+    #[must_use]
+    pub const fn new(policy: FscryptPolicyV2, nonce: FscryptFileNonce) -> Self {
+        Self { policy, nonce }
+    }
+
     /// Parses a Linux `struct fscrypt_context_v2` byte image.
     ///
     /// # Errors
@@ -319,6 +333,16 @@ impl FscryptContextV2 {
         Ok(Self { policy, nonce })
     }
 
+    /// Serializes this context as Linux `struct fscrypt_context_v2` bytes.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; FSCRYPT_CONTEXT_V2_BYTES] {
+        let mut bytes = [0_u8; FSCRYPT_CONTEXT_V2_BYTES];
+        write_policy_fields(&mut bytes, FSCRYPT_CONTEXT_V2, self.policy);
+        bytes[FSCRYPT_NONCE_OFFSET..FSCRYPT_NONCE_OFFSET + FSCRYPT_FILE_NONCE_BYTES]
+            .copy_from_slice(&self.nonce.bytes());
+        bytes
+    }
+
     /// Policy fields from this context.
     #[must_use]
     pub const fn policy(self) -> FscryptPolicyV2 {
@@ -329,6 +353,25 @@ impl FscryptContextV2 {
     #[must_use]
     pub const fn nonce(self) -> FscryptFileNonce {
         self.nonce
+    }
+}
+
+/// Source of fresh fscrypt per-file nonces for new encrypted inodes.
+pub trait FscryptNonceGenerator {
+    /// Returns the next nonce to store in a newly-created fscrypt context.
+    ///
+    /// # Errors
+    /// Returns an error when the mount cannot create a fresh encrypted inode.
+    fn next_file_nonce(&mut self) -> Result<FscryptFileNonce>;
+}
+
+/// Mount nonce source used when encrypted inode creation is unavailable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FscryptNoNonceGenerator;
+
+impl FscryptNonceGenerator for FscryptNoNonceGenerator {
+    fn next_file_nonce(&mut self) -> Result<FscryptFileNonce> {
+        Err(Error::UnsupportedEncryption)
     }
 }
 
@@ -673,6 +716,18 @@ fn parse_policy_fields(bytes: &[u8], version: u8) -> Result<FscryptPolicyV2> {
     })
 }
 
+/// Writes policy fields shared by v2 policies and contexts.
+fn write_policy_fields(bytes: &mut [u8], version: u8, policy: FscryptPolicyV2) {
+    bytes[FSCRYPT_VERSION_OFFSET] = version;
+    bytes[FSCRYPT_CONTENTS_MODE_OFFSET] = policy.contents_mode().mode_number();
+    bytes[FSCRYPT_FILENAMES_MODE_OFFSET] = policy.filenames_mode().mode_number();
+    bytes[FSCRYPT_FLAGS_OFFSET] = policy.filename_padding().flags();
+    bytes[FSCRYPT_LOG2_DATA_UNIT_SIZE_OFFSET] = policy.data_unit_size().log2_value();
+    bytes[FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET
+        ..FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET + FSCRYPT_KEY_IDENTIFIER_BYTES]
+        .copy_from_slice(&policy.master_key_identifier().bytes());
+}
+
 /// Expands an fscrypt v2 HKDF output for one namespace and info value.
 fn fscrypt_hkdf_expand(
     master_key: &[u8],
@@ -822,6 +877,18 @@ mod tests {
         assert_eq!(
             parsed.policy().master_key_identifier(),
             FscryptKeyIdentifier::new([0x42; 16])
+        );
+    }
+
+    #[test]
+    fn fscrypt_v2_context_serializes_linux_layout() {
+        let parsed = FscryptContextV2::parse(&valid_context_bytes()).expect("valid context");
+
+        assert_eq!(parsed.policy().to_bytes(), valid_policy_bytes());
+        assert_eq!(parsed.to_bytes(), valid_context_bytes());
+        assert_eq!(
+            FscryptContextV2::new(parsed.policy(), parsed.nonce()).to_bytes(),
+            valid_context_bytes()
         );
     }
 

@@ -296,6 +296,11 @@ impl InodeXattrSet {
         self.encryption_context.as_ref()
     }
 
+    /// Replaces the private fscrypt context stored on this inode.
+    pub(crate) fn set_encryption_context(&mut self, context: XattrValue) {
+        self.encryption_context = Some(context);
+    }
+
     /// Returns true when no public or private xattrs are present.
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
