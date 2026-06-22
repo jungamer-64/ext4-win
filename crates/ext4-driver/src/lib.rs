@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod block_device;
+mod cng;
 mod create;
 mod dispatch;
 mod ea;

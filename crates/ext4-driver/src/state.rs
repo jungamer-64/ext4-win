@@ -7,14 +7,14 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     DeviceLength, Ext4Name, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey,
-    FscryptNoNonceGenerator, InodeId, InternalJournal, MountContext, ReadWrite,
-    Result as Ext4Result, Volume,
+    InodeId, InternalJournal, MountContext, ReadWrite, Result as Ext4Result, Volume,
 };
 use wdk_sys::{
     ACCESS_MASK, DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT,
     PDRIVER_OBJECT, SHARE_ACCESS, VPB_MOUNTED,
 };
 
+use crate::cng::CngFscryptNonceGenerator;
 use crate::status::DriverError;
 use crate::{block_device::KernelBlockDevice, ffi};
 
@@ -131,7 +131,7 @@ impl MountCandidate {
 /// Volume control block stored in a mounted volume device extension.
 pub(crate) struct VolumeControlBlock {
     /// Mounted journaled read-write ext4 volume.
-    volume: Volume<KernelBlockDevice, ReadWrite<InternalJournal>>,
+    volume: Volume<KernelBlockDevice, ReadWrite<InternalJournal>, CngFscryptNonceGenerator>,
     /// Root directory inode of the mounted volume.
     root_inode: InodeId,
     /// VCB-owned FCBs keyed by ext4 node identity.
@@ -145,9 +145,9 @@ impl VolumeControlBlock {
         length: DeviceLength,
     ) -> Ext4Result<Self> {
         let block_device = KernelBlockDevice::new(target_device, length);
-        let volume = Volume::<_, ReadWrite<InternalJournal>>::mount_read_write(
+        let volume = Volume::<_, ReadWrite<InternalJournal>, _>::mount_read_write(
             block_device,
-            MountContext::new(FscryptKeySet::empty(), FscryptNoNonceGenerator),
+            MountContext::new(FscryptKeySet::empty(), CngFscryptNonceGenerator),
         )?;
         Ok(Self {
             volume,
@@ -164,14 +164,16 @@ impl VolumeControlBlock {
     }
 
     /// Returns the mounted ext4 volume.
-    pub(crate) const fn volume(&self) -> &Volume<KernelBlockDevice, ReadWrite<InternalJournal>> {
+    pub(crate) const fn volume(
+        &self,
+    ) -> &Volume<KernelBlockDevice, ReadWrite<InternalJournal>, CngFscryptNonceGenerator> {
         &self.volume
     }
 
     /// Returns the mounted ext4 volume for journaled mutation.
     pub(crate) const fn volume_mut(
         &mut self,
-    ) -> &mut Volume<KernelBlockDevice, ReadWrite<InternalJournal>> {
+    ) -> &mut Volume<KernelBlockDevice, ReadWrite<InternalJournal>, CngFscryptNonceGenerator> {
         &mut self.volume
     }
 
