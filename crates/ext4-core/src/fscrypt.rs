@@ -18,6 +18,8 @@ pub const FSCRYPT_POLICY_V2_BYTES: usize = 24;
 /// Serialized fscrypt v2 context size.
 pub const FSCRYPT_CONTEXT_V2_BYTES: usize = 40;
 
+/// Prefix used for reversible no-key filename display names.
+const FSCRYPT_NOKEY_NAME_PREFIX: &[u8] = b"_fscrypt_";
 /// fscrypt v2 policy version byte.
 const FSCRYPT_POLICY_V2: u8 = 2;
 /// fscrypt v2 context version byte.
@@ -60,6 +62,9 @@ const FSCRYPT_RESERVED_OFFSET: usize = 5;
 const FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET: usize = 8;
 /// Offset of the per-file nonce in a v2 context.
 const FSCRYPT_NONCE_OFFSET: usize = 24;
+/// URL-safe base64 alphabet used for no-key display names.
+const BASE64URL_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Filesystem-wide fscrypt v2 raw-key identifier.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -353,6 +358,58 @@ impl FscryptContextV2 {
     #[must_use]
     pub const fn nonce(self) -> FscryptFileNonce {
         self.nonce
+    }
+}
+
+/// Reversible Windows-safe projection of an encrypted dirent name without keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FscryptNoKeyName {
+    /// On-disk encrypted filename bytes.
+    ciphertext: Vec<u8>,
+}
+
+impl FscryptNoKeyName {
+    /// Builds a displayable no-key name from on-disk ciphertext bytes.
+    pub(crate) fn from_ciphertext(ciphertext: &[u8]) -> Result<Self> {
+        validate_ciphertext_filename_len(ciphertext.len())?;
+        let name = Self {
+            ciphertext: ciphertext.to_vec(),
+        };
+        let _display = name.display_bytes()?;
+        Ok(name)
+    }
+
+    /// Decodes a display name created by [`Self::display_bytes`].
+    pub(crate) fn from_display(display: &[u8]) -> Result<Option<Self>> {
+        if !display.starts_with(FSCRYPT_NOKEY_NAME_PREFIX) {
+            return Ok(None);
+        }
+        let encoded = display
+            .get(FSCRYPT_NOKEY_NAME_PREFIX.len()..)
+            .ok_or(Error::InvalidName)?;
+        let ciphertext = base64url_decode_nopad(encoded)?;
+        Ok(Some(Self::from_ciphertext(&ciphertext)?))
+    }
+
+    /// Returns the Windows-safe encoded display name.
+    pub(crate) fn display_bytes(&self) -> Result<Vec<u8>> {
+        let encoded_len = base64url_nopad_len(self.ciphertext.len())?;
+        let display_len = FSCRYPT_NOKEY_NAME_PREFIX
+            .len()
+            .checked_add(encoded_len)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if display_len > 255 {
+            return Err(Error::InvalidName);
+        }
+        let mut display = Vec::with_capacity(display_len);
+        display.extend_from_slice(FSCRYPT_NOKEY_NAME_PREFIX);
+        base64url_encode_nopad(&self.ciphertext, &mut display)?;
+        Ok(display)
+    }
+
+    /// Returns the on-disk encrypted filename bytes.
+    pub(crate) fn ciphertext_bytes(&self) -> &[u8] {
+        &self.ciphertext
     }
 }
 
@@ -691,6 +748,153 @@ fn validate_raw_master_key(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Validates the on-disk ciphertext filename length.
+fn validate_ciphertext_filename_len(len: usize) -> Result<()> {
+    if len == 0 || len > 255 {
+        return Err(Error::InvalidName);
+    }
+    Ok(())
+}
+
+/// Returns the unpadded base64url length for `len` source bytes.
+fn base64url_nopad_len(len: usize) -> Result<usize> {
+    let full_groups = len.checked_div(3).ok_or(Error::ArithmeticOverflow)?;
+    let full_chars = full_groups
+        .checked_mul(4)
+        .ok_or(Error::ArithmeticOverflow)?;
+    match len % 3 {
+        0 => Ok(full_chars),
+        1 => full_chars.checked_add(2).ok_or(Error::ArithmeticOverflow),
+        2 => full_chars.checked_add(3).ok_or(Error::ArithmeticOverflow),
+        _ => Err(Error::ArithmeticOverflow),
+    }
+}
+
+/// Encodes bytes with URL-safe base64 and no padding.
+fn base64url_encode_nopad(bytes: &[u8], output: &mut Vec<u8>) -> Result<()> {
+    let mut remaining = bytes;
+    while remaining.len() >= 3 {
+        let chunk = remaining.get(..3).ok_or(Error::InvalidName)?;
+        let b0 = *chunk.first().ok_or(Error::InvalidName)?;
+        let b1 = *chunk.get(1).ok_or(Error::InvalidName)?;
+        let b2 = *chunk.get(2).ok_or(Error::InvalidName)?;
+        push_base64url(output, b0 >> 2)?;
+        push_base64url(output, ((b0 & 0x03) << 4) | (b1 >> 4))?;
+        push_base64url(output, ((b1 & 0x0f) << 2) | (b2 >> 6))?;
+        push_base64url(output, b2 & 0x3f)?;
+        remaining = remaining.get(3..).ok_or(Error::InvalidName)?;
+    }
+
+    match remaining.len() {
+        0 => Ok(()),
+        1 => {
+            let b0 = *remaining.first().ok_or(Error::InvalidName)?;
+            push_base64url(output, b0 >> 2)?;
+            push_base64url(output, (b0 & 0x03) << 4)
+        }
+        2 => {
+            let b0 = *remaining.first().ok_or(Error::InvalidName)?;
+            let b1 = *remaining.get(1).ok_or(Error::InvalidName)?;
+            push_base64url(output, b0 >> 2)?;
+            push_base64url(output, ((b0 & 0x03) << 4) | (b1 >> 4))?;
+            push_base64url(output, (b1 & 0x0f) << 2)
+        }
+        _ => Err(Error::InvalidName),
+    }
+}
+
+/// Appends one base64url alphabet byte.
+fn push_base64url(output: &mut Vec<u8>, value: u8) -> Result<()> {
+    output.push(base64url_alphabet_byte(value)?);
+    Ok(())
+}
+
+/// Returns one base64url alphabet byte by six-bit value.
+fn base64url_alphabet_byte(value: u8) -> Result<u8> {
+    BASE64URL_ALPHABET
+        .get(usize::from(value))
+        .copied()
+        .ok_or(Error::InvalidName)
+}
+
+/// Decodes URL-safe base64 without padding.
+fn base64url_decode_nopad(encoded: &[u8]) -> Result<Vec<u8>> {
+    if encoded.is_empty() || encoded.len() % 4 == 1 {
+        return Err(Error::InvalidName);
+    }
+    let capacity = base64url_decoded_len(encoded.len())?;
+    let mut output = Vec::with_capacity(capacity);
+    let mut remaining = encoded;
+    while remaining.len() >= 4 {
+        let chunk = remaining.get(..4).ok_or(Error::InvalidName)?;
+        let c0 = base64url_value(*chunk.first().ok_or(Error::InvalidName)?)?;
+        let c1 = base64url_value(*chunk.get(1).ok_or(Error::InvalidName)?)?;
+        let c2 = base64url_value(*chunk.get(2).ok_or(Error::InvalidName)?)?;
+        let c3 = base64url_value(*chunk.get(3).ok_or(Error::InvalidName)?)?;
+        output.push((c0 << 2) | (c1 >> 4));
+        output.push((c1 << 4) | (c2 >> 2));
+        output.push((c2 << 6) | c3);
+        remaining = remaining.get(4..).ok_or(Error::InvalidName)?;
+    }
+
+    match remaining.len() {
+        0 => Ok(output),
+        2 => {
+            let c0 = base64url_value(*remaining.first().ok_or(Error::InvalidName)?)?;
+            let c1 = base64url_value(*remaining.get(1).ok_or(Error::InvalidName)?)?;
+            if c1 & 0x0f != 0 {
+                return Err(Error::InvalidName);
+            }
+            output.push((c0 << 2) | (c1 >> 4));
+            Ok(output)
+        }
+        3 => {
+            let c0 = base64url_value(*remaining.first().ok_or(Error::InvalidName)?)?;
+            let c1 = base64url_value(*remaining.get(1).ok_or(Error::InvalidName)?)?;
+            let c2 = base64url_value(*remaining.get(2).ok_or(Error::InvalidName)?)?;
+            if c2 & 0x03 != 0 {
+                return Err(Error::InvalidName);
+            }
+            output.push((c0 << 2) | (c1 >> 4));
+            output.push((c1 << 4) | (c2 >> 2));
+            Ok(output)
+        }
+        _ => Err(Error::InvalidName),
+    }
+}
+
+/// Returns decoded byte capacity for an unpadded base64url string.
+fn base64url_decoded_len(len: usize) -> Result<usize> {
+    let full_groups = len.checked_div(4).ok_or(Error::ArithmeticOverflow)?;
+    let full_bytes = full_groups
+        .checked_mul(3)
+        .ok_or(Error::ArithmeticOverflow)?;
+    match len % 4 {
+        0 => Ok(full_bytes),
+        2 => full_bytes.checked_add(1).ok_or(Error::ArithmeticOverflow),
+        3 => full_bytes.checked_add(2).ok_or(Error::ArithmeticOverflow),
+        _ => Err(Error::InvalidName),
+    }
+}
+
+/// Decodes one base64url alphabet byte.
+fn base64url_value(byte: u8) -> Result<u8> {
+    match byte {
+        b'A'..=b'Z' => byte.checked_sub(b'A').ok_or(Error::ArithmeticOverflow),
+        b'a'..=b'z' => byte
+            .checked_sub(b'a')
+            .and_then(|value| value.checked_add(26))
+            .ok_or(Error::ArithmeticOverflow),
+        b'0'..=b'9' => byte
+            .checked_sub(b'0')
+            .and_then(|value| value.checked_add(52))
+            .ok_or(Error::ArithmeticOverflow),
+        b'-' => Ok(62),
+        b'_' => Ok(63),
+        _ => Err(Error::InvalidName),
+    }
+}
+
 /// Parses policy fields shared by v2 policies and contexts.
 fn parse_policy_fields(bytes: &[u8], version: u8) -> Result<FscryptPolicyV2> {
     if byte(bytes, FSCRYPT_VERSION_OFFSET)? != version {
@@ -718,14 +922,49 @@ fn parse_policy_fields(bytes: &[u8], version: u8) -> Result<FscryptPolicyV2> {
 
 /// Writes policy fields shared by v2 policies and contexts.
 fn write_policy_fields(bytes: &mut [u8], version: u8, policy: FscryptPolicyV2) {
-    bytes[FSCRYPT_VERSION_OFFSET] = version;
-    bytes[FSCRYPT_CONTENTS_MODE_OFFSET] = policy.contents_mode().mode_number();
-    bytes[FSCRYPT_FILENAMES_MODE_OFFSET] = policy.filenames_mode().mode_number();
-    bytes[FSCRYPT_FLAGS_OFFSET] = policy.filename_padding().flags();
-    bytes[FSCRYPT_LOG2_DATA_UNIT_SIZE_OFFSET] = policy.data_unit_size().log2_value();
-    bytes[FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET
-        ..FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET + FSCRYPT_KEY_IDENTIFIER_BYTES]
-        .copy_from_slice(&policy.master_key_identifier().bytes());
+    put_byte(bytes, FSCRYPT_VERSION_OFFSET, version);
+    put_byte(
+        bytes,
+        FSCRYPT_CONTENTS_MODE_OFFSET,
+        policy.contents_mode().mode_number(),
+    );
+    put_byte(
+        bytes,
+        FSCRYPT_FILENAMES_MODE_OFFSET,
+        policy.filenames_mode().mode_number(),
+    );
+    put_byte(
+        bytes,
+        FSCRYPT_FLAGS_OFFSET,
+        policy.filename_padding().flags(),
+    );
+    put_byte(
+        bytes,
+        FSCRYPT_LOG2_DATA_UNIT_SIZE_OFFSET,
+        policy.data_unit_size().log2_value(),
+    );
+    put_bytes(
+        bytes,
+        FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET,
+        &policy.master_key_identifier().bytes(),
+    );
+}
+
+/// Writes one byte at a compile-time fscrypt structure offset.
+fn put_byte(bytes: &mut [u8], offset: usize, value: u8) {
+    if let Some(slot) = bytes.get_mut(offset) {
+        *slot = value;
+    }
+}
+
+/// Writes a byte slice at a compile-time fscrypt structure offset.
+fn put_bytes(bytes: &mut [u8], offset: usize, value: &[u8]) {
+    let Some(end) = offset.checked_add(value.len()) else {
+        return;
+    };
+    if let Some(slot) = bytes.get_mut(offset..end) {
+        slot.copy_from_slice(value);
+    }
 }
 
 /// Expands an fscrypt v2 HKDF output for one namespace and info value.
@@ -1048,6 +1287,44 @@ mod tests {
         assert_eq!(
             key.decrypt_filename(&ciphertext).expect("decrypted name"),
             b"secret.txt"
+        );
+    }
+
+    #[test]
+    fn fscrypt_nokey_name_roundtrips_ciphertext_with_windows_safe_bytes() {
+        let ciphertext = b"\x00\xff/opaque encrypted name";
+        let name = FscryptNoKeyName::from_ciphertext(ciphertext).expect("no-key name");
+        let display = name.display_bytes().expect("display bytes");
+
+        assert!(display.starts_with(FSCRYPT_NOKEY_NAME_PREFIX));
+        assert!(
+            display
+                .iter()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-') })
+        );
+        assert_eq!(
+            FscryptNoKeyName::from_display(&display)
+                .expect("decoded display")
+                .expect("encoded name")
+                .ciphertext_bytes(),
+            ciphertext
+        );
+        assert_eq!(FscryptNoKeyName::from_display(b"plain"), Ok(None));
+    }
+
+    #[test]
+    fn fscrypt_nokey_name_rejects_noncanonical_display() {
+        assert_eq!(
+            FscryptNoKeyName::from_display(b"_fscrypt_A"),
+            Err(Error::InvalidName)
+        );
+        assert_eq!(
+            FscryptNoKeyName::from_display(b"_fscrypt_A!"),
+            Err(Error::InvalidName)
+        );
+        assert_eq!(
+            FscryptNoKeyName::from_display(b"_fscrypt_AB"),
+            Err(Error::InvalidName)
         );
     }
 

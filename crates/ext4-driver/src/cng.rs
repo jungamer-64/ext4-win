@@ -66,6 +66,9 @@ mod tests {
     #[test]
     fn cng_status_mapping_preserves_success_and_io_failure() {
         assert_eq!(cng_status_to_core(STATUS_SUCCESS), Ok(()));
-        assert_eq!(cng_status_to_core(STATUS_UNSUCCESSFUL), Err(Error::DeviceIo));
+        assert_eq!(
+            cng_status_to_core(STATUS_UNSUCCESSFUL),
+            Err(Error::DeviceIo)
+        );
     }
 }
