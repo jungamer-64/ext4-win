@@ -20,14 +20,15 @@ use crate::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid,
     Ext4VerityMetadataLayout, Ext4VolumeLabel, Ext4WindowsAttributes, Extent, ExtentLength,
     ExtentTree, ExtentTreeContext, ExternalJournal, FSVERITY_DESCRIPTOR_BYTES, FileNode,
-    FileOffset, FileSize, FscryptContextV2, FscryptKeySet, FscryptMasterKey, FsverityBlockSize,
-    FsverityDescriptor, FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt,
-    FsveritySignature, InodeExtentRoot, InodeId, InodeProtection, JournalMode, LogicalBlock,
-    LookupResult, MountContext, MutableExtentTree, NewDirectoryMetadata, NewFileMetadata,
-    NewSymlinkMetadata, Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite,
-    SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget,
-    TransactionDirectory, TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName,
-    XattrNamespace, XattrSet, XattrValue,
+    FileOffset, FileSize, FscryptContextV2, FscryptFileNonce, FscryptKeySet, FscryptMasterKey,
+    FscryptNoNonceGenerator, FscryptNonceGenerator, FsverityBlockSize, FsverityDescriptor,
+    FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt, FsveritySignature,
+    InodeExtentRoot, InodeId, InodeProtection, JournalMode, LogicalBlock, LookupResult,
+    MountContext, MutableExtentTree, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
+    Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite, SliceBlockDevice,
+    SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget, TransactionDirectory,
+    TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName, XattrNamespace, XattrSet,
+    XattrValue,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -88,15 +89,15 @@ fn inode(value: u32) -> InodeId {
     must(InodeId::try_from(value))
 }
 
-fn file_node<D: BlockReader, State>(volume: &Volume<D, State>, inode_id: u32) -> FileNode {
+fn file_node<D: BlockReader, State, N>(volume: &Volume<D, State, N>, inode_id: u32) -> FileNode {
     match must(volume.read_node(inode(inode_id))) {
         Node::File(file) => file,
         Node::Directory(_) | Node::Symlink(_) => panic!("expected file node"),
     }
 }
 
-fn directory_node<D: BlockReader, State>(
-    volume: &Volume<D, State>,
+fn directory_node<D: BlockReader, State, N>(
+    volume: &Volume<D, State, N>,
     inode_id: InodeId,
 ) -> DirectoryNode {
     match must(volume.read_node(inode_id)) {
@@ -105,15 +106,18 @@ fn directory_node<D: BlockReader, State>(
     }
 }
 
-fn symlink_node<D: BlockReader, State>(volume: &Volume<D, State>, inode_id: u32) -> SymlinkNode {
+fn symlink_node<D: BlockReader, State, N>(
+    volume: &Volume<D, State, N>,
+    inode_id: u32,
+) -> SymlinkNode {
     match must(volume.read_node(inode(inode_id))) {
         Node::Symlink(symlink) => symlink,
         Node::File(_) | Node::Directory(_) => panic!("expected symlink node"),
     }
 }
 
-fn read_file<D: BlockReader, State>(
-    volume: &Volume<D, State>,
+fn read_file<D: BlockReader, State, N>(
+    volume: &Volume<D, State, N>,
     inode_id: u32,
     offset: u64,
     out: &mut [u8],
@@ -122,21 +126,24 @@ fn read_file<D: BlockReader, State>(
     must(volume.read_file(&file, FileOffset::from_bytes(offset), out)).as_usize()
 }
 
-fn read_directory<D: BlockReader, State>(
-    volume: &Volume<D, State>,
+fn read_directory<D: BlockReader, State, N>(
+    volume: &Volume<D, State, N>,
     inode_id: InodeId,
 ) -> Vec<DirectoryEntry> {
     let directory = directory_node(volume, inode_id);
     must(volume.read_directory(&directory))
 }
 
-fn read_symlink<D: BlockReader, State>(volume: &Volume<D, State>, inode_id: u32) -> Vec<u8> {
+fn read_symlink<D: BlockReader, State, N>(
+    volume: &Volume<D, State, N>,
+    inode_id: u32,
+) -> Vec<u8> {
     let symlink = symlink_node(volume, inode_id);
     must(volume.read_symlink(&symlink))
 }
 
-fn lookup_ext4<D: BlockReader, State>(
-    volume: &Volume<D, State>,
+fn lookup_ext4<D: BlockReader, State, N>(
+    volume: &Volume<D, State, N>,
     parent: InodeId,
     name: &[u8],
 ) -> LookupResult {
@@ -145,8 +152,8 @@ fn lookup_ext4<D: BlockReader, State>(
     must(volume.lookup_child(&directory, &name))
 }
 
-fn lookup_windows<D: BlockReader, State>(
-    volume: &Volume<D, State>,
+fn lookup_windows<D: BlockReader, State, N>(
+    volume: &Volume<D, State, N>,
     parent: InodeId,
     name: &[u16],
 ) -> LookupResult {
@@ -155,22 +162,22 @@ fn lookup_windows<D: BlockReader, State>(
     must(volume.lookup_windows_child(&directory, &name))
 }
 
-fn transaction_file<D: BlockWriter, J>(
-    transaction: &crate::WriteTransaction<'_, D, J>,
+fn transaction_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
+    transaction: &crate::WriteTransaction<'_, D, J, N>,
     inode_id: u32,
 ) -> TransactionFile {
     must(transaction.file(inode(inode_id)))
 }
 
-fn transaction_directory<D: BlockWriter, J>(
-    transaction: &crate::WriteTransaction<'_, D, J>,
+fn transaction_directory<D: BlockWriter, J, N: FscryptNonceGenerator>(
+    transaction: &crate::WriteTransaction<'_, D, J, N>,
     inode_id: InodeId,
 ) -> TransactionDirectory {
     must(transaction.directory(inode_id))
 }
 
-fn transaction_node<D: BlockWriter, J>(
-    transaction: &crate::WriteTransaction<'_, D, J>,
+fn transaction_node<D: BlockWriter, J, N: FscryptNonceGenerator>(
+    transaction: &crate::WriteTransaction<'_, D, J, N>,
     inode_id: InodeId,
 ) -> crate::TransactionNode {
     must(transaction.node(inode_id))
@@ -193,11 +200,47 @@ fn test_symlink_metadata() -> NewSymlinkMetadata {
 }
 
 fn test_mount_context() -> MountContext {
-    MountContext::without_encryption_keys()
+    MountContext::new(FscryptKeySet::empty(), FscryptNoNonceGenerator)
 }
 
 fn test_mount_context_with_key(master_key: FscryptMasterKey) -> MountContext {
-    MountContext::with_fscrypt_keys(must(FscryptKeySet::from_keys(vec![master_key])))
+    MountContext::new(
+        must(FscryptKeySet::from_keys(vec![master_key])),
+        FscryptNoNonceGenerator,
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestFscryptNonceGenerator {
+    next: u8,
+}
+
+impl TestFscryptNonceGenerator {
+    const FIRST_NONCE_BYTE: u8 = 0xA5;
+
+    const fn new() -> Self {
+        Self {
+            next: Self::FIRST_NONCE_BYTE,
+        }
+    }
+}
+
+impl FscryptNonceGenerator for TestFscryptNonceGenerator {
+    fn next_file_nonce(&mut self) -> crate::Result<FscryptFileNonce> {
+        let mut nonce = [0_u8; 16];
+        nonce.fill(self.next);
+        self.next = self.next.wrapping_add(1);
+        Ok(FscryptFileNonce::new(nonce))
+    }
+}
+
+fn test_mount_context_with_key_and_nonce_source(
+    master_key: FscryptMasterKey,
+) -> MountContext<TestFscryptNonceGenerator> {
+    MountContext::new(
+        must(FscryptKeySet::from_keys(vec![master_key])),
+        TestFscryptNonceGenerator::new(),
+    )
 }
 
 fn fscrypt_v2_context_bytes() -> [u8; 40] {
@@ -252,8 +295,8 @@ fn encrypt_modern_root_file_name(image: &mut [u8], master_key: &FscryptMasterKey
     );
 }
 
-fn overwrite_file<D: BlockWriter, J>(
-    transaction: &mut crate::WriteTransaction<'_, D, J>,
+fn overwrite_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
+    transaction: &mut crate::WriteTransaction<'_, D, J, N>,
     inode_id: u32,
     offset: u64,
     bytes: &[u8],
@@ -262,8 +305,8 @@ fn overwrite_file<D: BlockWriter, J>(
     must(transaction.overwrite_file_range(file, FileOffset::from_bytes(offset), bytes));
 }
 
-fn extend_file<D: BlockWriter, J>(
-    transaction: &mut crate::WriteTransaction<'_, D, J>,
+fn extend_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
+    transaction: &mut crate::WriteTransaction<'_, D, J, N>,
     inode_id: u32,
     new_size: u64,
 ) {
@@ -271,8 +314,8 @@ fn extend_file<D: BlockWriter, J>(
     must(transaction.extend_file(file, FileSize::from_bytes(new_size)));
 }
 
-fn truncate_file<D: BlockWriter, J>(
-    transaction: &mut crate::WriteTransaction<'_, D, J>,
+fn truncate_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
+    transaction: &mut crate::WriteTransaction<'_, D, J, N>,
     inode_id: u32,
     new_size: u64,
 ) {
@@ -1957,9 +2000,9 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
     {
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+        let mut volume = must(Volume::<_, ReadWrite, _>::mount_read_write(
             SliceBlockDeviceMut::new(&mut image),
-            test_mount_context_with_key(master_key.clone()),
+            test_mount_context_with_key_and_nonce_source(master_key.clone()),
         ));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, InodeId::ROOT);
@@ -1981,6 +2024,17 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
         SliceBlockDevice::new(&image),
         test_mount_context_with_key(master_key),
     ));
+    let child_context = must(volume.read_fscrypt_context(inode(11))).expect("child context");
+    let parent_context = must(FscryptContextV2::parse(&context_bytes));
+    assert_eq!(child_context.policy(), parent_context.policy());
+    assert_eq!(
+        child_context.nonce(),
+        FscryptFileNonce::new([TestFscryptNonceGenerator::FIRST_NONCE_BYTE; 16])
+    );
+    assert!(matches!(
+        must(volume.read_node(inode(11))),
+        Node::File(file) if file.protection() == InodeProtection::Encrypted
+    ));
     assert_eq!(
         lookup_windows(
             &volume,
@@ -1996,6 +2050,83 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
             ],
         ),
         LookupResult::Found(inode(11))
+    );
+}
+
+#[test]
+fn encrypted_directory_create_directory_inherits_child_context_when_key_is_present() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
+    install_inline_fscrypt_context(&mut image, 2, &context_bytes);
+    encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
+
+    {
+        let mut volume = must(Volume::<_, ReadWrite, _>::mount_read_write(
+            SliceBlockDeviceMut::new(&mut image),
+            test_mount_context_with_key_and_nonce_source(master_key.clone()),
+        ));
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let name = must(Ext4Name::new(b"childdir"));
+        let directory = must(transaction.create_directory(root, &name, test_directory_metadata()));
+        assert_eq!(directory.inode_id(), inode(11));
+        must(transaction.commit());
+    }
+
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context_with_key(master_key),
+    ));
+    let child_context = must(volume.read_fscrypt_context(inode(11))).expect("child context");
+    let parent_context = must(FscryptContextV2::parse(&context_bytes));
+    assert_eq!(child_context.policy(), parent_context.policy());
+    assert_eq!(
+        child_context.nonce(),
+        FscryptFileNonce::new([TestFscryptNonceGenerator::FIRST_NONCE_BYTE; 16])
+    );
+    assert!(matches!(
+        must(volume.read_node(inode(11))),
+        Node::Directory(directory) if directory.protection() == InodeProtection::Encrypted
+    ));
+    assert_eq!(
+        lookup_windows(
+            &volume,
+            InodeId::ROOT,
+            &[
+                u16::from(b'c'),
+                u16::from(b'h'),
+                u16::from(b'i'),
+                u16::from(b'l'),
+                u16::from(b'd'),
+                u16::from(b'd'),
+                u16::from(b'i'),
+                u16::from(b'r'),
+            ],
+        ),
+        LookupResult::Found(inode(11))
+    );
+}
+
+#[test]
+fn encrypted_directory_create_symlink_rejects_plaintext_target() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
+    install_inline_fscrypt_context(&mut image, 2, &context_bytes);
+
+    let mut volume = must(Volume::<_, ReadWrite, _>::mount_read_write(
+        SliceBlockDeviceMut::new(&mut image),
+        test_mount_context_with_key_and_nonce_source(master_key),
+    ));
+    let mut transaction = volume.begin_transaction(NOW);
+    let root = transaction_directory(&transaction, InodeId::ROOT);
+    let name = must(Ext4Name::new(b"link"));
+    let target = must(SymlinkTarget::new(b"target"));
+
+    assert_eq!(
+        transaction.create_symlink(root, &name, &target, test_symlink_metadata()),
+        Err(Error::UnsupportedEncryption)
     );
 }
 

@@ -46,7 +46,7 @@ pub use fscrypt::{
     FSCRYPT_CONTEXT_V2_BYTES, FSCRYPT_POLICY_V2_BYTES, FscryptContentsKey, FscryptContentsMode,
     FscryptContextV2, FscryptDataUnitSize, FscryptFileNonce, FscryptFilenamePadding,
     FscryptFilenamesKey, FscryptFilenamesMode, FscryptKeyIdentifier, FscryptKeySet,
-    FscryptMasterKey, FscryptPolicyV2,
+    FscryptMasterKey, FscryptNoNonceGenerator, FscryptNonceGenerator, FscryptPolicyV2,
 };
 pub use inode::{
     Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid,

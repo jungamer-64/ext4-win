@@ -16,8 +16,9 @@ use crate::extent::{
     MutableExtentTree, SerializedExtentTree,
 };
 use crate::fscrypt::{
-    FscryptContentsKey, FscryptContextV2, FscryptFilenamePadding, FscryptFilenamesKey,
-    FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey,
+    FscryptContentsKey, FscryptContextV2, FscryptFileNonce, FscryptFilenamePadding,
+    FscryptFilenamesKey, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey,
+    FscryptNoNonceGenerator, FscryptNonceGenerator,
 };
 use crate::group::BlockGroupDescriptor;
 use crate::inode::{
@@ -55,6 +56,8 @@ const MODE_KIND_MASK: u16 = 0xF000;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 /// `i_flags` bit indicating an HTree-indexed directory.
 const EXT4_INDEX_FL: u32 = 0x0000_1000;
+/// `i_flags` bit indicating fscrypt-protected file contents or dirent names.
+const EXT4_ENCRYPT_FL: u32 = 0x0000_0800;
 /// `i_flags` bit indicating fs-verity protected file contents.
 const EXT4_VERITY_FL: u32 = 0x0010_0000;
 /// Offset of `i_mode` in an inode record.
@@ -126,32 +129,37 @@ const SUPERBLOCK_OFFSET: u64 = 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadOnly;
 
-/// Mount-time context that keeps external unlock material out of superblock parsing.
+/// Mount-time context that keeps external fscrypt material out of superblock parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MountContext {
+pub struct MountContext<N = FscryptNoNonceGenerator> {
     /// fscrypt master keys available for this mount.
     fscrypt_keys: FscryptKeySet,
+    /// Source of fresh nonces for newly-created encrypted inodes.
+    fscrypt_nonce_generator: N,
 }
 
-impl MountContext {
-    /// Creates a mount context without any fscrypt unlock keys.
+impl<N> MountContext<N> {
+    /// Creates a mount context with explicit fscrypt keys and nonce source.
     #[must_use]
-    pub const fn without_encryption_keys() -> Self {
+    pub const fn new(fscrypt_keys: FscryptKeySet, fscrypt_nonce_generator: N) -> Self {
         Self {
-            fscrypt_keys: FscryptKeySet::empty(),
+            fscrypt_keys,
+            fscrypt_nonce_generator,
         }
-    }
-
-    /// Creates a mount context with explicit fscrypt unlock keys.
-    #[must_use]
-    pub const fn with_fscrypt_keys(fscrypt_keys: FscryptKeySet) -> Self {
-        Self { fscrypt_keys }
     }
 
     /// fscrypt master keys available to this mount.
     #[must_use]
     pub const fn fscrypt_keys(&self) -> &FscryptKeySet {
         &self.fscrypt_keys
+    }
+
+    /// Returns the next fscrypt nonce for a new encrypted inode.
+    fn next_fscrypt_file_nonce(&mut self) -> Result<FscryptFileNonce>
+    where
+        N: FscryptNonceGenerator,
+    {
+        self.fscrypt_nonce_generator.next_file_nonce()
     }
 
     /// Adds one fscrypt master key to this mount context.
@@ -216,7 +224,7 @@ struct ClusterReferenceIndex {
 
 impl ClusterReferenceIndex {
     /// Builds the mounted reference index from static metadata and live inodes.
-    fn load<D: BlockReader, State>(volume: &Volume<D, State>) -> Result<Self> {
+    fn load<D: BlockReader, State, N>(volume: &Volume<D, State, N>) -> Result<Self> {
         let mut index = Self {
             refs: Vec::new(),
             exclusive_blocks: Vec::new(),
@@ -247,9 +255,9 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds one exclusive mounted reference after validating bitmap allocation.
-    fn add_exclusive_reference<D: BlockReader, State>(
+    fn add_exclusive_reference<D: BlockReader, State, N>(
         &mut self,
-        volume: &Volume<D, State>,
+        volume: &Volume<D, State, N>,
         block: BlockAddress,
     ) -> Result<()> {
         if self.exclusive_blocks.contains(&block) || self.xattr_blocks.contains(&block) {
@@ -260,9 +268,9 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds one external-xattr mounted reference after validating bitmap allocation.
-    fn add_xattr_reference<D: BlockReader, State>(
+    fn add_xattr_reference<D: BlockReader, State, N>(
         &mut self,
-        volume: &Volume<D, State>,
+        volume: &Volume<D, State, N>,
         block: BlockAddress,
     ) -> Result<()> {
         if self.exclusive_blocks.contains(&block) {
@@ -275,9 +283,9 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds one mounted cluster reference after validating bitmap allocation.
-    fn add_cluster_reference<D: BlockReader, State>(
+    fn add_cluster_reference<D: BlockReader, State, N>(
         &mut self,
-        volume: &Volume<D, State>,
+        volume: &Volume<D, State, N>,
         block: BlockAddress,
     ) -> Result<()> {
         let cluster = volume.superblock.cluster_of_block(block)?;
@@ -289,9 +297,9 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds all static metadata ranges that must keep their clusters allocated.
-    fn add_static_metadata<D: BlockReader, State>(
+    fn add_static_metadata<D: BlockReader, State, N>(
         &mut self,
-        volume: &Volume<D, State>,
+        volume: &Volume<D, State, N>,
     ) -> Result<()> {
         let groups = volume.superblock.block_group_count()?;
         let descriptor_blocks = descriptor_table_blocks(&volume.superblock)?;
@@ -336,7 +344,10 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds data and dynamic metadata references from allocated inode records.
-    fn add_live_inodes<D: BlockReader, State>(&mut self, volume: &Volume<D, State>) -> Result<()> {
+    fn add_live_inodes<D: BlockReader, State, N>(
+        &mut self,
+        volume: &Volume<D, State, N>,
+    ) -> Result<()> {
         for inode_number in 1..=volume.superblock.inode_count().as_u32() {
             let inode_id = InodeId::try_from(inode_number)?;
             if !inode_bitmap_bit(&volume.device, &volume.superblock, inode_id)? {
@@ -377,9 +388,9 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds references for every physical block represented by an extent.
-    fn add_extent_references<D: BlockReader, State>(
+    fn add_extent_references<D: BlockReader, State, N>(
         &mut self,
-        volume: &Volume<D, State>,
+        volume: &Volume<D, State, N>,
         extent: Extent,
     ) -> Result<()> {
         for offset in 0..extent.len().as_u64() {
@@ -455,13 +466,13 @@ struct ClusterReferenceDelta {
 
 /// Mounted ext4 volume with typestate-selected mutation capability.
 #[derive(Debug)]
-pub struct Volume<D, State> {
+pub struct Volume<D, State, N = FscryptNoNonceGenerator> {
     /// Backing filesystem block device.
     device: D,
     /// Validated superblock and mount policy.
     superblock: Superblock,
     /// External mount context such as fscrypt unlock keys.
-    mount_context: MountContext,
+    mount_context: MountContext<N>,
     /// Typestate carrying read-only or journaled read-write capability.
     state: State,
 }
@@ -647,12 +658,12 @@ pub enum LookupResult {
     NotFound,
 }
 
-impl<D: BlockReader> Volume<D, ReadOnly> {
+impl<D: BlockReader, N> Volume<D, ReadOnly, N> {
     /// Validates an ext4 volume and constructs read-only mounted state.
     ///
     /// # Errors
     /// Returns an error when the device does not contain a supported ext4 superblock.
-    pub fn mount_read_only(device: D, mount_context: MountContext) -> Result<Self> {
+    pub fn mount_read_only(device: D, mount_context: MountContext<N>) -> Result<Self> {
         let superblock = Superblock::read_from(&device)?;
         Ok(Self {
             device,
@@ -663,17 +674,17 @@ impl<D: BlockReader> Volume<D, ReadOnly> {
     }
 }
 
-impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
+impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> Volume<D, ReadWrite<InternalJournal>, N> {
     /// Replays the internal journal boundary and constructs journaled read-write state.
     ///
     /// # Errors
     /// Returns an error when the device is not a supported journaled ext4 volume.
-    pub fn mount_read_write(mut device: D, mount_context: MountContext) -> Result<Self> {
+    pub fn mount_read_write(mut device: D, mount_context: MountContext<N>) -> Result<Self> {
         let mut superblock = Superblock::read_write_from(&device)?;
         let JournalMode::Internal(journal_inode_id) = superblock.journal_mode() else {
             return Err(Error::UnsupportedJournal);
         };
-        let read_only = Volume::<&mut D, ReadOnly> {
+        let read_only = Volume::<&mut D, ReadOnly, N> {
             device: &mut device,
             superblock,
             mount_context: mount_context.clone(),
@@ -698,7 +709,7 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
             superblock = Superblock::read_write_from(&device)?;
         }
         let clusters = {
-            let recovered = Volume::<&mut D, ReadOnly> {
+            let recovered = Volume::<&mut D, ReadOnly, N> {
                 device: &mut device,
                 superblock,
                 mount_context: mount_context.clone(),
@@ -716,7 +727,10 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
 
     /// Starts a write transaction with caller-supplied inode timestamps.
     #[must_use]
-    pub fn begin_transaction(&mut self, now: Ext4Timestamp) -> WriteTransaction<'_, D> {
+    pub fn begin_transaction(
+        &mut self,
+        now: Ext4Timestamp,
+    ) -> WriteTransaction<'_, D, InternalJournal, N> {
         WriteTransaction {
             volume: self,
             now,
@@ -736,7 +750,9 @@ impl<D: BlockWriter> Volume<D, ReadWrite<InternalJournal>> {
     }
 }
 
-impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
+impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
+    Volume<D, ReadWrite<ExternalJournal<J>>, N>
+{
     /// Replays an external journal and constructs journaled read-write state.
     ///
     /// # Errors
@@ -744,7 +760,7 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
     pub fn mount_read_write_with_external_journal(
         mut device: D,
         journal_device: J,
-        mount_context: MountContext,
+        mount_context: MountContext<N>,
     ) -> Result<Self> {
         let mut superblock = Superblock::read_write_from(&device)?;
         let JournalMode::External(journal_uuid) = superblock.journal_mode() else {
@@ -773,7 +789,7 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
             superblock = Superblock::read_write_from(&device)?;
         }
         let clusters = {
-            let recovered = Volume::<&mut D, ReadOnly> {
+            let recovered = Volume::<&mut D, ReadOnly, N> {
                 device: &mut device,
                 superblock,
                 mount_context: mount_context.clone(),
@@ -794,7 +810,7 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
     pub fn begin_transaction(
         &mut self,
         now: Ext4Timestamp,
-    ) -> WriteTransaction<'_, D, ExternalJournal<J>> {
+    ) -> WriteTransaction<'_, D, ExternalJournal<J>, N> {
         WriteTransaction {
             volume: self,
             now,
@@ -814,7 +830,7 @@ impl<D: BlockWriter, J: BlockWriter> Volume<D, ReadWrite<ExternalJournal<J>>> {
     }
 }
 
-impl<D: BlockReader, State> Volume<D, State> {
+impl<D: BlockReader, State, N> Volume<D, State, N> {
     /// Validated superblock.
     #[must_use]
     pub const fn superblock(&self) -> Superblock {
@@ -823,7 +839,7 @@ impl<D: BlockReader, State> Volume<D, State> {
 
     /// Mount context used by this volume.
     #[must_use]
-    pub const fn mount_context(&self) -> &MountContext {
+    pub const fn mount_context(&self) -> &MountContext<N> {
         &self.mount_context
     }
 
@@ -1615,9 +1631,9 @@ impl TransactionNode {
 
 /// In-progress ext4 write transaction.
 #[derive(Debug)]
-pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
+pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal, N = FscryptNoNonceGenerator> {
     /// Mounted read-write volume being mutated.
-    volume: &'a mut Volume<D, ReadWrite<J>>,
+    volume: &'a mut Volume<D, ReadWrite<J>, N>,
     /// Timestamp applied consistently to staged inode updates.
     now: Ext4Timestamp,
     /// Inode records staged for rewrite at commit.
@@ -1646,7 +1662,7 @@ pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal> {
     volume_label_update: Option<Ext4VolumeLabel>,
 }
 
-impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
+impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> {
     /// Selects any supported inode for POSIX metadata mutation.
     ///
     /// # Errors
@@ -1740,8 +1756,11 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             parent.inode_id(),
             InodeMutation::DirectoryEntryCreate,
         )?;
+        let parent_inode = self.raw_inode_for_policy(parent.inode_id())?.parse()?;
+        let inherited_context = self.inherited_fscrypt_context(&parent_inode)?;
         let mut raw_inode = self.allocate_inode()?;
         raw_inode.initialize_file(metadata, self.now, self.volume.superblock.block_size())?;
+        self.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
         let inode_id = raw_inode.id;
         self.add_directory_entry(parent.inode_id(), name, inode_id, DirectoryEntryKind::File)?;
         self.inode_updates.push(raw_inode);
@@ -1802,6 +1821,8 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             parent.inode_id(),
             InodeMutation::DirectoryEntryCreate,
         )?;
+        let parent_inode = self.raw_inode_for_policy(parent.inode_id())?.parse()?;
+        let inherited_context = self.inherited_fscrypt_context(&parent_inode)?;
         let block = self.allocate_cluster()?;
         let mut raw_inode = self.allocate_inode()?;
         let inode_id = raw_inode.id;
@@ -1812,6 +1833,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
                 .blocks_in_cluster(self.volume.superblock.cluster_of_block(block)?)?,
         );
         raw_inode.initialize_directory(metadata, self.now, block_size, block, allocated_blocks)?;
+        self.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
 
         let mut directory = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
@@ -1849,6 +1871,10 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             parent.inode_id(),
             InodeMutation::DirectoryEntryCreate,
         )?;
+        let parent_inode = self.raw_inode_for_policy(parent.inode_id())?.parse()?;
+        if parent_inode.protection().is_encrypted() {
+            return Err(Error::UnsupportedEncryption);
+        }
         let mut raw_inode = self.allocate_inode()?;
         let inode_id = raw_inode.id;
         if target.is_inline() {
@@ -2783,6 +2809,31 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
             }
         }
         inode.require_mutation(mutation)
+    }
+
+    /// Builds the fscrypt context inherited by a new child of this directory.
+    fn inherited_fscrypt_context(&mut self, parent: &Inode) -> Result<Option<FscryptContextV2>> {
+        if !parent.protection().is_encrypted() {
+            return Ok(None);
+        }
+        let (parent_context, _master_key) = self.volume.fscrypt_master_key_for_inode(parent)?;
+        let nonce = self.volume.mount_context.next_fscrypt_file_nonce()?;
+        Ok(Some(FscryptContextV2::new(parent_context.policy(), nonce)))
+    }
+
+    /// Stores an inherited fscrypt context on a newly-initialized raw inode.
+    fn apply_fscrypt_context(
+        &mut self,
+        raw_inode: &mut RawInode,
+        context: Option<FscryptContextV2>,
+    ) -> Result<()> {
+        let Some(context) = context else {
+            return Ok(());
+        };
+        raw_inode.set_encrypted()?;
+        let mut set = self.xattr_set_for_raw_inode(raw_inode)?;
+        set.set_encryption_context(XattrValue::new(&context.to_bytes())?);
+        self.store_xattr_set(raw_inode, &set)
     }
 
     /// Returns the staged inode record when present, otherwise the device image.
@@ -4272,7 +4323,7 @@ impl<D: BlockWriter, J> WriteTransaction<'_, D, J> {
     }
 }
 
-impl<D: BlockWriter> WriteTransaction<'_, D, InternalJournal> {
+impl<D: BlockWriter, N: FscryptNonceGenerator> WriteTransaction<'_, D, InternalJournal, N> {
     /// Commits staged data and metadata through the internal journal.
     ///
     /// # Errors
@@ -4301,7 +4352,9 @@ impl<D: BlockWriter> WriteTransaction<'_, D, InternalJournal> {
     }
 }
 
-impl<D: BlockWriter, J: BlockWriter> WriteTransaction<'_, D, ExternalJournal<J>> {
+impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator>
+    WriteTransaction<'_, D, ExternalJournal<J>, N>
+{
     /// Commits staged data and metadata through the external journal device.
     ///
     /// # Errors
@@ -4364,6 +4417,12 @@ impl RawInode {
     fn set_verity(&mut self) -> Result<()> {
         let flags = le_u32(&self.bytes, INODE_FLAGS_OFFSET)?;
         self.set_flags(flags | EXT4_VERITY_FL)
+    }
+
+    /// Marks an inode as fscrypt protected.
+    fn set_encrypted(&mut self) -> Result<()> {
+        let flags = le_u32(&self.bytes, INODE_FLAGS_OFFSET)?;
+        self.set_flags(flags | EXT4_ENCRYPT_FL)
     }
 
     /// Parses the raw bytes as a validated inode.
@@ -5072,7 +5131,7 @@ fn group_start_block(superblock: &Superblock, group: BlockGroupId) -> Result<Blo
 }
 
 /// Returns whether a group carries a superblock and descriptor-table copy.
-fn group_has_superblock<D, State>(volume: &Volume<D, State>, group: BlockGroupId) -> bool {
+fn group_has_superblock<D, State, N>(volume: &Volume<D, State, N>, group: BlockGroupId) -> bool {
     let value = group.as_u32();
     !volume.superblock.has_sparse_super()
         || value == 0

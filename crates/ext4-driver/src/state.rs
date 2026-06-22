@@ -6,8 +6,9 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    DeviceLength, Ext4Name, FscryptKeyIdentifier, FscryptMasterKey, InodeId, InternalJournal,
-    MountContext, ReadWrite, Result as Ext4Result, Volume,
+    DeviceLength, Ext4Name, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey,
+    FscryptNoNonceGenerator, InodeId, InternalJournal, MountContext, ReadWrite,
+    Result as Ext4Result, Volume,
 };
 use wdk_sys::{
     ACCESS_MASK, DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT,
@@ -146,7 +147,7 @@ impl VolumeControlBlock {
         let block_device = KernelBlockDevice::new(target_device, length);
         let volume = Volume::<_, ReadWrite<InternalJournal>>::mount_read_write(
             block_device,
-            MountContext::without_encryption_keys(),
+            MountContext::new(FscryptKeySet::empty(), FscryptNoNonceGenerator),
         )?;
         Ok(Self {
             volume,
