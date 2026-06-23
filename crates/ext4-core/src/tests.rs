@@ -51,9 +51,48 @@ const MODERN_EXTENT_INDEX_BLOCK: u32 = 14;
 const MODERN_JOURNAL_BLOCK: u32 = 20;
 const BIGALLOC_BLOCKS_PER_CLUSTER: u32 = 4;
 const BIGALLOC_LOG_CLUSTER_SIZE: u32 = 2;
-const COMPAT_MODERN: u32 = 0x0004 | 0x0008 | 0x0010 | 0x0020;
-const INCOMPAT_MODERN: u32 = 0x0002 | 0x0040 | 0x0080 | 0x0200;
-const RO_COMPAT_MODERN: u32 = 0x0001 | 0x0002 | 0x0008 | 0x0020 | 0x0040 | 0x0400;
+const COMPAT_HAS_JOURNAL: u32 = 0x0004;
+const COMPAT_EXT_ATTR: u32 = 0x0008;
+const COMPAT_RESIZE_INODE: u32 = 0x0010;
+const COMPAT_DIR_INDEX: u32 = 0x0020;
+const COMPAT_FAST_COMMIT: u32 = 0x0400;
+const COMPAT_MODERN: u32 =
+    COMPAT_HAS_JOURNAL | COMPAT_EXT_ATTR | COMPAT_RESIZE_INODE | COMPAT_DIR_INDEX;
+const INCOMPAT_FILETYPE: u32 = 0x0002;
+const INCOMPAT_RECOVER: u32 = 0x0004;
+const INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
+const INCOMPAT_META_BG: u32 = 0x0010;
+const INCOMPAT_EXTENTS: u32 = 0x0040;
+const INCOMPAT_64BIT: u32 = 0x0080;
+const INCOMPAT_MMP: u32 = 0x0100;
+const INCOMPAT_FLEX_BG: u32 = 0x0200;
+const INCOMPAT_EA_INODE: u32 = 0x0400;
+const INCOMPAT_CSUM_SEED: u32 = 0x2000;
+const INCOMPAT_LARGEDIR: u32 = 0x4000;
+const INCOMPAT_INLINE_DATA: u32 = 0x8000;
+const INCOMPAT_ENCRYPT: u32 = 0x0001_0000;
+const INCOMPAT_CASEFOLD: u32 = 0x0002_0000;
+const INCOMPAT_MODERN: u32 =
+    INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG;
+const RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+const RO_COMPAT_LARGE_FILE: u32 = 0x0002;
+const RO_COMPAT_HUGE_FILE: u32 = 0x0008;
+const RO_COMPAT_GDT_CSUM: u32 = 0x0010;
+const RO_COMPAT_DIR_NLINK: u32 = 0x0020;
+const RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
+const RO_COMPAT_QUOTA: u32 = 0x0100;
+const RO_COMPAT_BIGALLOC: u32 = 0x0200;
+const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
+const RO_COMPAT_READONLY: u32 = 0x1000;
+const RO_COMPAT_PROJECT: u32 = 0x2000;
+const RO_COMPAT_VERITY: u32 = 0x8000;
+const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
+const RO_COMPAT_MODERN: u32 = RO_COMPAT_SPARSE_SUPER
+    | RO_COMPAT_LARGE_FILE
+    | RO_COMPAT_HUGE_FILE
+    | RO_COMPAT_DIR_NLINK
+    | RO_COMPAT_EXTRA_ISIZE
+    | RO_COMPAT_METADATA_CSUM;
 const NOW: Ext4Timestamp = Ext4Timestamp::from_unix_seconds(1_700_000_000);
 const JBD2_MAGIC: u32 = 0xC03B_3998;
 const JBD2_DESCRIPTOR_BLOCK: u32 = 1;
@@ -70,19 +109,6 @@ const JBD2_TAG_FLAG_SAME_UUID: u32 = 0x0002;
 const JBD2_TAG_FLAG_LAST_TAG: u32 = 0x0008;
 const JBD2_CHECKSUM_CRC32C: u8 = 4;
 const COMPAT_ORPHAN_FILE: u32 = 0x1000;
-const INCOMPAT_RECOVER: u32 = 0x0004;
-const INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
-const INCOMPAT_META_BG: u32 = 0x0010;
-const INCOMPAT_CSUM_SEED: u32 = 0x2000;
-const INCOMPAT_LARGEDIR: u32 = 0x4000;
-const INCOMPAT_INLINE_DATA: u32 = 0x8000;
-const INCOMPAT_ENCRYPT: u32 = 0x0001_0000;
-const INCOMPAT_CASEFOLD: u32 = 0x0002_0000;
-const RO_COMPAT_GDT_CSUM: u32 = 0x0010;
-const RO_COMPAT_QUOTA: u32 = 0x0100;
-const RO_COMPAT_BIGALLOC: u32 = 0x0200;
-const RO_COMPAT_VERITY: u32 = 0x8000;
-const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
 const EXTERNAL_JOURNAL_SUPERBLOCK_OFFSET: usize = 2048;
 
 fn inode(value: u32) -> InodeId {
@@ -734,6 +760,53 @@ fn write_mount_accepts_modern_baseline() {
 }
 
 #[test]
+fn write_mount_accepts_minimal_journaled_profile() {
+    let mut image = minimal_write_fixture_image();
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
+        device,
+        test_mount_context(),
+    ));
+
+    assert_eq!(
+        volume.superblock().journal_mode(),
+        JournalMode::Internal(inode(8))
+    );
+    let mut output = [0_u8; 5];
+    assert_eq!(read_file(&volume, 3, 0, &mut output), 5);
+    assert_eq!(&output, b"hello");
+}
+
+#[test]
+fn gdt_csum_minimal_profile_refreshes_descriptor_checksum_after_write() {
+    let mut image = minimal_write_fixture_image_with_gdt_csum();
+    let checksum_offset = block_offset(2) + 30;
+    let before = get_u16(&image, checksum_offset);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+            device,
+            test_mount_context(),
+        ));
+        let mut transaction = volume.begin_transaction(NOW);
+        let root = transaction_directory(&transaction, InodeId::ROOT);
+        must(transaction.create_file(root, &must(Ext4Name::new(b"new")), test_file_metadata()));
+        must(transaction.commit());
+    }
+
+    assert_ne!(get_u16(&image, checksum_offset), before);
+    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        SliceBlockDevice::new(&image),
+        test_mount_context(),
+    ));
+    assert_eq!(
+        lookup_ext4(&volume, InodeId::ROOT, b"new"),
+        LookupResult::Found(inode(11))
+    );
+}
+
+#[test]
 fn write_mount_accepts_bigalloc() {
     let mut image = bigalloc_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
@@ -747,6 +820,52 @@ fn write_mount_accepts_bigalloc() {
     assert_eq!(volume.superblock().clusters_per_group().as_u32(), 2048);
     assert_eq!(volume.superblock().cluster_count().as_u64(), 16);
     assert_eq!(volume.superblock().free_cluster_count().as_u64(), 9);
+}
+
+#[test]
+fn write_mount_rejects_recovery_accounting_feature_profiles() {
+    for compat in [COMPAT_FAST_COMMIT, COMPAT_ORPHAN_FILE] {
+        let mut image = minimal_write_fixture_image();
+        put_u32(&mut image, 1024 + 92, COMPAT_HAS_JOURNAL | compat);
+        let result = Superblock::parse_read_write(&image[1024..2048]);
+
+        assert_eq!(result, Err(Error::UnsupportedWriteFeature));
+    }
+
+    for read_only_compat in [
+        RO_COMPAT_READONLY,
+        RO_COMPAT_QUOTA,
+        RO_COMPAT_PROJECT,
+        RO_COMPAT_ORPHAN_PRESENT,
+    ] {
+        let mut image = minimal_write_fixture_image();
+        put_u32(&mut image, 1024 + 100, read_only_compat);
+        let result = Superblock::parse_read_write(&image[1024..2048]);
+
+        assert_eq!(result, Err(Error::UnsupportedWriteFeature));
+    }
+}
+
+#[test]
+fn write_mount_rejects_layout_and_namespace_feature_profiles() {
+    for incompat in [
+        INCOMPAT_META_BG,
+        INCOMPAT_MMP,
+        INCOMPAT_EA_INODE,
+        INCOMPAT_LARGEDIR,
+        INCOMPAT_INLINE_DATA,
+        INCOMPAT_CASEFOLD,
+    ] {
+        let mut image = minimal_write_fixture_image();
+        put_u32(
+            &mut image,
+            1024 + 96,
+            INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | incompat,
+        );
+        let result = Superblock::parse_read_write(&image[1024..2048]);
+
+        assert_eq!(result, Err(Error::UnsupportedWriteFeature));
+    }
 }
 
 #[test]
@@ -1383,6 +1502,21 @@ fn extend_file_creates_sparse_range() {
 }
 
 #[test]
+fn minimal_profile_rejects_file_size_beyond_large_file_boundary() {
+    let mut image = minimal_write_fixture_image();
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+        device,
+        test_mount_context(),
+    ));
+    let mut transaction = volume.begin_transaction(NOW);
+    let file = transaction_file(&transaction, 3);
+    let result = transaction.extend_file(file, FileSize::from_bytes(0x8000_0000));
+
+    assert_eq!(result, Err(Error::UnsupportedInodeMutation));
+}
+
+#[test]
 fn truncate_file_releases_blocks() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
@@ -1400,6 +1534,61 @@ fn truncate_file_releases_blocks() {
 
     let file = file_node(&volume, 3);
     assert_eq!(file.size().bytes(), 0);
+}
+
+#[test]
+fn minimal_profile_supports_file_and_namespace_mutations() {
+    let mut image = minimal_write_fixture_image();
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+            device,
+            test_mount_context(),
+        ));
+
+        let mut overwrite = volume.begin_transaction(NOW);
+        overwrite_file(&mut overwrite, 3, 0, b"HELLO");
+        extend_file(&mut overwrite, 3, 3072);
+        overwrite_file(&mut overwrite, 3, 2048, b"tail");
+        truncate_file(&mut overwrite, 3, 1024);
+        must(overwrite.commit());
+
+        let mut output = [0_u8; 5];
+        assert_eq!(read_file(&volume, 3, 0, &mut output), 5);
+        assert_eq!(&output, b"HELLO");
+        assert_eq!(file_node(&volume, 3).size().bytes(), 1024);
+
+        let root = InodeId::ROOT;
+        let old_name = must(Ext4Name::new(b"old"));
+        let new_name = must(Ext4Name::new(b"renamed"));
+
+        let mut create = volume.begin_transaction(NOW);
+        let root_directory = transaction_directory(&create, root);
+        let file = must(create.create_file(root_directory, &old_name, test_file_metadata()));
+        assert_eq!(file.inode_id(), inode(11));
+        must(create.commit());
+
+        let mut rename = volume.begin_transaction(NOW);
+        let root_directory = transaction_directory(&rename, root);
+        must(rename.rename_child(root_directory, &old_name, root_directory, &new_name));
+        must(rename.commit());
+
+        let mut unlink = volume.begin_transaction(NOW);
+        let root_directory = transaction_directory(&unlink, root);
+        must(unlink.unlink_file(root_directory, &new_name));
+        must(unlink.commit());
+
+        assert_eq!(
+            lookup_ext4(&volume, root, b"renamed"),
+            LookupResult::NotFound
+        );
+    }
+
+    assert_eq!(
+        get_u32(&image, modern_inode_offset(2) + 32) & EXT4_INDEX_FL,
+        0
+    );
 }
 
 #[test]
@@ -1566,6 +1755,36 @@ fn set_times_updates_inode_timestamp_fields() {
     assert_eq!(get_u32(&image, inode_offset + 16), 22);
     assert_eq!(get_u32(&image, inode_offset + 12), 33);
     assert_eq!(get_u32(&image, inode_offset + 144), 44);
+}
+
+#[test]
+fn minimal_profile_does_not_write_extra_inode_timestamp_fields() {
+    let mut image = minimal_write_fixture_image();
+    let times = Ext4Times::new(
+        Ext4Timestamp::from_unix_seconds(11),
+        Ext4Timestamp::from_unix_seconds(22),
+        Ext4Timestamp::from_unix_seconds(33),
+        Ext4Timestamp::from_unix_seconds(44),
+    );
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+            device,
+            test_mount_context(),
+        ));
+        let mut transaction = volume.begin_transaction(NOW);
+        let node = transaction_node(&transaction, inode(3));
+        must(transaction.set_times(node, times));
+        must(transaction.commit());
+    }
+
+    let inode_offset = modern_inode_offset(3);
+    assert_eq!(get_u32(&image, inode_offset + 8), 11);
+    assert_eq!(get_u32(&image, inode_offset + 16), 22);
+    assert_eq!(get_u32(&image, inode_offset + 12), 33);
+    assert_eq!(get_u16(&image, inode_offset + 128), 0);
+    assert_eq!(get_u32(&image, inode_offset + 144), 0);
 }
 
 #[test]
@@ -2427,6 +2646,52 @@ fn windows_overlay_is_stored_in_user_ext4win_xattr() {
         must(volume.read_xattr(inode(3), &must(WindowsOverlay::attributes_xattr_name()))),
         Some(must(overlay.to_xattr_value()))
     );
+}
+
+#[test]
+fn minimal_profile_mounts_without_ext_attr_but_rejects_xattr_mutations() {
+    let mut image = minimal_write_fixture_image();
+    let overlay = WindowsOverlay::new(must(Ext4WindowsAttributes::new(
+        Ext4WindowsAttributes::HIDDEN | Ext4WindowsAttributes::ARCHIVE,
+    )));
+    let acl = must(PosixAcl::new(vec![
+        PosixAclEntry::UserObj(must(Ext4Permissions::new(0o700))),
+        PosixAclEntry::GroupObj(must(Ext4Permissions::new(0o500))),
+        PosixAclEntry::Other(must(Ext4Permissions::new(0o000))),
+    ]));
+
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
+        device,
+        test_mount_context(),
+    ));
+    assert_eq!(
+        must(volume.read_xattr(
+            inode(3),
+            &must(XattrName::new(XattrNamespace::User, b"name"))
+        )),
+        None
+    );
+    assert_eq!(must(volume.read_windows_overlay(inode(3))), None);
+
+    let mut xattr = volume.begin_transaction(NOW);
+    let node = transaction_node(&xattr, inode(3));
+    let result = xattr.set_xattr(
+        node,
+        must(XattrName::new(XattrNamespace::User, b"name")),
+        must(XattrValue::new(b"value")),
+    );
+    assert_eq!(result, Err(Error::UnsupportedWriteFeature));
+
+    let mut posix_acl = volume.begin_transaction(NOW);
+    let node = transaction_node(&posix_acl, inode(3));
+    let result = posix_acl.set_posix_acl(node, PosixAclKind::Access, acl);
+    assert_eq!(result, Err(Error::UnsupportedWriteFeature));
+
+    let mut windows = volume.begin_transaction(NOW);
+    let node = transaction_node(&windows, inode(3));
+    let result = windows.set_windows_overlay(node, overlay);
+    assert_eq!(result, Err(Error::UnsupportedWriteFeature));
 }
 
 #[test]
@@ -3854,6 +4119,26 @@ fn fixture_image() -> Vec<u8> {
 
 fn modern_fixture_image() -> Vec<u8> {
     modern_fixture_image_with_journal_blocks(8)
+}
+
+fn minimal_write_fixture_image() -> Vec<u8> {
+    minimal_write_fixture_image_with_journal_blocks(16)
+}
+
+fn minimal_write_fixture_image_with_journal_blocks(journal_blocks: u16) -> Vec<u8> {
+    let mut image = modern_fixture_image_with_journal_blocks(journal_blocks);
+    put_u32(&mut image, 1024 + 92, COMPAT_HAS_JOURNAL);
+    put_u32(&mut image, 1024 + 96, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
+    put_u32(&mut image, 1024 + 100, 0);
+    put_u16(&mut image, 1024 + 254, 0);
+    image
+}
+
+fn minimal_write_fixture_image_with_gdt_csum() -> Vec<u8> {
+    let mut image = minimal_write_fixture_image();
+    put_u32(&mut image, 1024 + 100, RO_COMPAT_GDT_CSUM);
+    refresh_primary_block_group_descriptor_checksum(&mut image);
+    image
 }
 
 fn bigalloc_fixture_image() -> Vec<u8> {
