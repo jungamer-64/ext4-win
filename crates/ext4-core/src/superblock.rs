@@ -864,15 +864,46 @@ impl ClusterGeometry {
     }
 }
 
-/// Validated ext4 feature flags accepted by a mount policy.
+/// Journal placement class selected by validated feature flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalFeature {
+    /// The filesystem has no journal.
+    None,
+    /// The journal lives in an ext4 inode on the filesystem device.
+    Internal,
+    /// The journal lives on a separate JBD2 device.
+    External,
+}
+
+/// Validated ext4 capabilities accepted by a mount policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FeatureSet {
-    /// Compatible feature bits from `s_feature_compat`.
-    compat: u32,
-    /// Incompatible feature bits from `s_feature_incompat`.
-    incompat: u32,
-    /// Read-only compatible feature bits from `s_feature_ro_compat`.
-    read_only_compat: u32,
+    /// Block group descriptor layout selected by the 64-bit feature.
+    descriptor_layout: BlockGroupDescriptorLayout,
+    /// Whether sparse superblock backups are enabled.
+    sparse_super: bool,
+    /// Journal placement class selected by feature flags.
+    journal: JournalFeature,
+    /// Journal recovery state selected by `INCOMPAT_RECOVER`.
+    recovery_state: RecoveryState,
+    /// Whether hashed directory indexes are enabled.
+    directory_index: bool,
+    /// Metadata checksum algorithm selected by read-only-compatible features.
+    metadata_checksum: MetadataChecksum,
+    /// Block group descriptor checksum algorithm.
+    descriptor_checksum: BlockGroupDescriptorChecksum,
+    /// Whether block bitmaps address allocation clusters instead of blocks.
+    bigalloc: bool,
+    /// Whether the metadata checksum seed is stored explicitly in the superblock.
+    explicit_checksum_seed: bool,
+    /// Whether public extended attributes are part of the write domain.
+    xattrs: bool,
+    /// Whether regular-file sizes may exceed the pre-large-file profile.
+    large_file: bool,
+    /// Whether inode block counts may use the huge-file representation.
+    huge_file: bool,
+    /// Whether extended inode fields such as creation time are advertised.
+    extra_inode_fields: bool,
 }
 
 impl FeatureSet {
@@ -894,96 +925,220 @@ impl FeatureSet {
         if incompat & INCOMPAT_EXTENTS == 0 {
             return Err(Error::UnsupportedIncompatFeature);
         }
-        Ok(Self {
-            compat,
-            incompat,
-            read_only_compat,
-        })
+        Ok(Self::from_raw(compat, incompat, read_only_compat))
     }
 
     /// Validates raw superblock feature flags for journaled read-write mode.
     ///
     /// # Errors
-    /// Returns an error when required write features are absent or any
-    /// unsupported write feature is present.
+    /// Returns an error when write-domain invariants cannot be maintained for
+    /// the advertised feature profile.
     pub(crate) fn read_write(compat: u32, incompat: u32, read_only_compat: u32) -> Result<Self> {
-        if compat & REQUIRED_WRITE_COMPAT != REQUIRED_WRITE_COMPAT {
+        if compat & COMPAT_HAS_JOURNAL == 0 {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if compat & !SUPPORTED_WRITE_COMPAT != 0 {
+        if compat & (COMPAT_FAST_COMMIT | COMPAT_ORPHAN_FILE) != 0 {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if compat & REJECTED_WRITE_COMPAT != 0 {
+        if compat & !(COMPAT_HAS_JOURNAL | COMPAT_EXT_ATTR | COMPAT_RESIZE_INODE | COMPAT_DIR_INDEX)
+            != 0
+        {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if incompat & REQUIRED_WRITE_INCOMPAT != REQUIRED_WRITE_INCOMPAT {
+        if incompat & (INCOMPAT_FILETYPE | INCOMPAT_EXTENTS)
+            != (INCOMPAT_FILETYPE | INCOMPAT_EXTENTS)
+        {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if incompat & !SUPPORTED_WRITE_INCOMPAT != 0 {
+        if incompat
+            & !(INCOMPAT_FILETYPE
+                | INCOMPAT_RECOVER
+                | INCOMPAT_JOURNAL_DEV
+                | INCOMPAT_EXTENTS
+                | INCOMPAT_64BIT
+                | INCOMPAT_FLEX_BG
+                | INCOMPAT_CSUM_SEED
+                | INCOMPAT_ENCRYPT
+                | INCOMPAT_META_BG
+                | INCOMPAT_MMP
+                | INCOMPAT_EA_INODE
+                | INCOMPAT_LARGEDIR
+                | INCOMPAT_INLINE_DATA
+                | INCOMPAT_CASEFOLD)
+            != 0
+        {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if incompat & REJECTED_WRITE_INCOMPAT != 0 {
+        if incompat
+            & (INCOMPAT_META_BG
+                | INCOMPAT_MMP
+                | INCOMPAT_EA_INODE
+                | INCOMPAT_LARGEDIR
+                | INCOMPAT_INLINE_DATA
+                | INCOMPAT_CASEFOLD)
+            != 0
+        {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if read_only_compat & REQUIRED_WRITE_RO_COMPAT != REQUIRED_WRITE_RO_COMPAT {
+        if incompat & INCOMPAT_CSUM_SEED != 0 && read_only_compat & RO_COMPAT_METADATA_CSUM == 0 {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if read_only_compat & !SUPPORTED_WRITE_RO_COMPAT != 0 {
+        if read_only_compat
+            & !(RO_COMPAT_SPARSE_SUPER
+                | RO_COMPAT_LARGE_FILE
+                | RO_COMPAT_HUGE_FILE
+                | RO_COMPAT_GDT_CSUM
+                | RO_COMPAT_DIR_NLINK
+                | RO_COMPAT_EXTRA_ISIZE
+                | RO_COMPAT_BIGALLOC
+                | RO_COMPAT_METADATA_CSUM
+                | RO_COMPAT_VERITY
+                | RO_COMPAT_READONLY
+                | RO_COMPAT_QUOTA
+                | RO_COMPAT_PROJECT
+                | RO_COMPAT_ORPHAN_PRESENT)
+            != 0
+        {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if read_only_compat & REJECTED_WRITE_RO_COMPAT != 0 {
+        if read_only_compat
+            & (RO_COMPAT_READONLY | RO_COMPAT_QUOTA | RO_COMPAT_PROJECT | RO_COMPAT_ORPHAN_PRESENT)
+            != 0
+        {
             return Err(Error::UnsupportedWriteFeature);
         }
-        Ok(Self {
-            compat,
-            incompat,
-            read_only_compat,
-        })
+        Ok(Self::from_raw(compat, incompat, read_only_compat))
+    }
+
+    /// Converts validated raw flags into internal write/read capabilities.
+    fn from_raw(compat: u32, incompat: u32, read_only_compat: u32) -> Self {
+        let metadata_checksum = if read_only_compat & RO_COMPAT_METADATA_CSUM != 0 {
+            MetadataChecksum::Crc32c
+        } else {
+            MetadataChecksum::None
+        };
+        let descriptor_checksum = if metadata_checksum == MetadataChecksum::Crc32c {
+            BlockGroupDescriptorChecksum::MetadataCrc32c
+        } else if read_only_compat & RO_COMPAT_GDT_CSUM != 0 {
+            BlockGroupDescriptorChecksum::GdtCrc16
+        } else {
+            BlockGroupDescriptorChecksum::None
+        };
+        let journal = if compat & COMPAT_HAS_JOURNAL == 0 {
+            JournalFeature::None
+        } else if incompat & INCOMPAT_JOURNAL_DEV != 0 {
+            JournalFeature::External
+        } else {
+            JournalFeature::Internal
+        };
+        let recovery_state = if incompat & INCOMPAT_RECOVER != 0 {
+            RecoveryState::NeedsRecovery
+        } else {
+            RecoveryState::Clean
+        };
+
+        Self {
+            descriptor_layout: if incompat & INCOMPAT_64BIT != 0 {
+                BlockGroupDescriptorLayout::SixtyFourBit
+            } else {
+                BlockGroupDescriptorLayout::Standard32
+            },
+            sparse_super: read_only_compat & RO_COMPAT_SPARSE_SUPER != 0,
+            journal,
+            recovery_state,
+            directory_index: compat & COMPAT_DIR_INDEX != 0,
+            metadata_checksum,
+            descriptor_checksum,
+            bigalloc: read_only_compat & RO_COMPAT_BIGALLOC != 0,
+            explicit_checksum_seed: incompat & INCOMPAT_CSUM_SEED != 0,
+            xattrs: compat & COMPAT_EXT_ATTR != 0,
+            large_file: read_only_compat & RO_COMPAT_LARGE_FILE != 0,
+            huge_file: read_only_compat & RO_COMPAT_HUGE_FILE != 0,
+            extra_inode_fields: read_only_compat & RO_COMPAT_EXTRA_ISIZE != 0,
+        }
     }
 
     /// Returns whether the 64-bit descriptor feature is present.
     pub(crate) const fn has_64bit(self) -> bool {
-        self.incompat & INCOMPAT_64BIT != 0
+        matches!(
+            self.descriptor_layout,
+            BlockGroupDescriptorLayout::SixtyFourBit
+        )
+    }
+
+    /// Returns the descriptor layout selected by validated feature flags.
+    pub(crate) const fn descriptor_layout(self) -> BlockGroupDescriptorLayout {
+        self.descriptor_layout
     }
 
     /// Returns whether sparse superblock backups are enabled.
     pub(crate) const fn has_sparse_super(self) -> bool {
-        self.read_only_compat & RO_COMPAT_SPARSE_SUPER != 0
+        self.sparse_super
     }
 
     /// Returns whether the filesystem advertises a journal.
     pub(crate) const fn has_journal(self) -> bool {
-        self.compat & COMPAT_HAS_JOURNAL != 0
+        !matches!(self.journal, JournalFeature::None)
     }
 
     /// Returns whether hashed directory indexes are enabled.
     pub(crate) const fn has_dir_index(self) -> bool {
-        self.compat & COMPAT_DIR_INDEX != 0
+        self.directory_index
     }
 
     /// Returns whether the journal lives on a separate journal device.
     pub(crate) const fn has_external_journal(self) -> bool {
-        self.incompat & INCOMPAT_JOURNAL_DEV != 0
+        matches!(self.journal, JournalFeature::External)
+    }
+
+    /// Returns the metadata checksum mode.
+    pub(crate) const fn metadata_checksum(self) -> MetadataChecksum {
+        self.metadata_checksum
+    }
+
+    /// Returns the block group descriptor checksum mode.
+    pub(crate) const fn descriptor_checksum(self) -> BlockGroupDescriptorChecksum {
+        self.descriptor_checksum
     }
 
     /// Returns whether metadata CRC32C checksums are enabled.
     pub(crate) const fn has_metadata_csum(self) -> bool {
-        self.read_only_compat & RO_COMPAT_METADATA_CSUM != 0
-    }
-
-    /// Returns whether legacy GDT checksums are enabled.
-    pub(crate) const fn has_gdt_csum(self) -> bool {
-        self.read_only_compat & RO_COMPAT_GDT_CSUM != 0
+        matches!(self.metadata_checksum, MetadataChecksum::Crc32c)
     }
 
     /// Returns whether block bitmaps address clusters instead of blocks.
     pub(crate) const fn has_bigalloc(self) -> bool {
-        self.read_only_compat & RO_COMPAT_BIGALLOC != 0
+        self.bigalloc
     }
 
     /// Returns whether the checksum seed is stored explicitly in the superblock.
     pub(crate) const fn has_checksum_seed(self) -> bool {
-        self.incompat & INCOMPAT_CSUM_SEED != 0
+        self.explicit_checksum_seed
+    }
+
+    /// Returns whether xattr storage is enabled for mutation.
+    pub(crate) const fn has_ext_attr(self) -> bool {
+        self.xattrs
+    }
+
+    /// Returns whether file sizes may use the high `i_size` field.
+    pub(crate) const fn has_large_file(self) -> bool {
+        self.large_file
+    }
+
+    /// Returns whether inode block counts may exceed the legacy sector count.
+    pub(crate) const fn has_huge_file(self) -> bool {
+        self.huge_file
+    }
+
+    /// Returns whether extended inode fields are advertised.
+    pub(crate) const fn has_extra_isize(self) -> bool {
+        self.extra_inode_fields
+    }
+
+    /// Returns the journal recovery state.
+    pub(crate) const fn recovery_state(self) -> RecoveryState {
+        self.recovery_state
     }
 }
 
@@ -1343,34 +1498,40 @@ impl Superblock {
         self.features.has_dir_index()
     }
 
+    /// Returns whether public extended attributes are available for mutation.
+    pub(crate) const fn has_ext_attr(self) -> bool {
+        self.features.has_ext_attr()
+    }
+
+    /// Returns whether file sizes may exceed the pre-large-file profile.
+    pub(crate) const fn has_large_file(self) -> bool {
+        self.features.has_large_file()
+    }
+
+    /// Returns whether inode block counts may exceed the legacy sector count.
+    pub(crate) const fn has_huge_file(self) -> bool {
+        self.features.has_huge_file()
+    }
+
+    /// Returns whether extended inode fields are advertised.
+    pub(crate) const fn has_extra_isize(self) -> bool {
+        self.features.has_extra_isize()
+    }
+
     /// Metadata checksum mode.
     #[must_use]
     pub const fn metadata_checksum(self) -> MetadataChecksum {
-        if self.features.has_metadata_csum() {
-            MetadataChecksum::Crc32c
-        } else {
-            MetadataChecksum::None
-        }
+        self.features.metadata_checksum()
     }
 
     /// Returns the descriptor layout implied by validated feature bits.
     pub(crate) const fn descriptor_layout(self) -> BlockGroupDescriptorLayout {
-        if self.features.has_64bit() {
-            BlockGroupDescriptorLayout::SixtyFourBit
-        } else {
-            BlockGroupDescriptorLayout::Standard32
-        }
+        self.features.descriptor_layout()
     }
 
     /// Returns the active block group descriptor checksum mode.
     pub(crate) const fn descriptor_checksum(self) -> BlockGroupDescriptorChecksum {
-        if self.features.has_metadata_csum() {
-            BlockGroupDescriptorChecksum::MetadataCrc32c
-        } else if self.features.has_gdt_csum() {
-            BlockGroupDescriptorChecksum::GdtCrc16
-        } else {
-            BlockGroupDescriptorChecksum::None
-        }
+        self.features.descriptor_checksum()
     }
 
     /// Returns whether sparse superblock backups are enabled.
@@ -1381,11 +1542,7 @@ impl Superblock {
     /// Returns the journal recovery state.
     #[must_use]
     pub const fn recovery_state(self) -> RecoveryState {
-        if self.features.incompat & INCOMPAT_RECOVER != 0 {
-            RecoveryState::NeedsRecovery
-        } else {
-            RecoveryState::Clean
-        }
+        self.features.recovery_state()
     }
 
     /// Clears the recovery-required incompat bit in the primary superblock.

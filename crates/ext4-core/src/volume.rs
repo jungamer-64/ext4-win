@@ -116,6 +116,10 @@ const INODE_GID_HI_OFFSET: usize = 122;
 const INODE_CHECKSUM_HI_OFFSET: usize = 130;
 /// Minimum ext4 extra inode size required for checksum and creation-time fields.
 const EXT4_INODE_MIN_EXTRA_ISIZE: u16 = 32;
+/// Largest regular-file size accepted when `large_file` is absent.
+const LEGACY_FILE_SIZE_LIMIT: u64 = 0x7fff_ffff;
+/// Largest 512-byte sector count accepted when `huge_file` is absent.
+const LEGACY_I_BLOCKS_LIMIT: u64 = 0xffff_ffff;
 /// Offset of `s_free_blocks_count_lo` in the superblock.
 const SUPERBLOCK_FREE_BLOCKS_LO_OFFSET: usize = 12;
 /// Offset of `s_free_inodes_count` in the superblock.
@@ -1565,6 +1569,9 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
 
     /// Reads all xattr storage locations referenced by a raw inode.
     fn read_inode_xattrs_from_raw(&self, raw_inode: &RawInode) -> Result<InodeXattrSet> {
+        if !self.superblock.has_ext_attr() {
+            return Ok(InodeXattrSet::empty());
+        }
         let inline = xattr_storage::parse_inline_xattrs(raw_inode.inline_xattr_region()?)?;
         let Some(block) = raw_inode.xattr_block()? else {
             return Ok(inline);
@@ -1701,6 +1708,41 @@ pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal, N = Fscrypt
 }
 
 impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> {
+    /// Returns whether this mounted profile advertises extended inode fields.
+    fn extra_inode_fields(&self) -> bool {
+        self.volume.superblock.has_extra_isize()
+    }
+
+    /// Verifies that the mounted profile admits xattr storage mutation.
+    fn require_xattr_mutation(&self) -> Result<()> {
+        if self.volume.superblock.has_ext_attr() {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedWriteFeature)
+        }
+    }
+
+    /// Verifies that an inode size is representable by the mounted profile.
+    fn require_inode_size_supported(&self, size: FileSize) -> Result<()> {
+        if !self.volume.superblock.has_large_file() && size.bytes() > LEGACY_FILE_SIZE_LIMIT {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        Ok(())
+    }
+
+    /// Verifies that an inode block charge is representable by the mounted profile.
+    fn require_allocated_blocks_supported(&self, blocks: u64) -> Result<()> {
+        let sectors = blocks
+            .checked_mul(u64::from(self.volume.superblock.block_size().bytes()))
+            .ok_or(Error::ArithmeticOverflow)?
+            .checked_div(512)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if !self.volume.superblock.has_huge_file() && sectors > LEGACY_I_BLOCKS_LIMIT {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        Ok(())
+    }
+
     /// Selects any supported inode for POSIX metadata mutation.
     ///
     /// # Errors
@@ -1770,7 +1812,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         inode.require_mutation(InodeMutation::Metadata)?;
         raw_inode.set_owner(security.owner())?;
         raw_inode.set_permissions(security.permissions())?;
-        raw_inode.set_timestamps(self.now)?;
+        raw_inode.set_timestamps(self.now, self.extra_inode_fields())?;
         *self
             .inode_updates
             .get_mut(inode_index)
@@ -1797,7 +1839,12 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         let parent_inode = self.raw_inode_for_policy(parent.inode_id())?.parse()?;
         let inherited_context = self.inherited_fscrypt_context(&parent_inode)?;
         let mut raw_inode = self.allocate_inode()?;
-        raw_inode.initialize_file(metadata, self.now, self.volume.superblock.block_size())?;
+        raw_inode.initialize_file(
+            metadata,
+            self.now,
+            self.volume.superblock.block_size(),
+            self.extra_inode_fields(),
+        )?;
         self.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
         let inode_id = raw_inode.id;
         self.add_directory_entry(parent.inode_id(), name, inode_id, DirectoryEntryKind::File)?;
@@ -1835,7 +1882,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             self.free_inode(raw_inode.id)?;
             raw_inode.clear_deleted(self.now, self.volume.superblock.block_size())?;
         }
-        raw_inode.set_timestamps(self.now)?;
+        raw_inode.set_timestamps(self.now, self.extra_inode_fields())?;
         *self
             .inode_updates
             .get_mut(inode_index)
@@ -1870,7 +1917,15 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
                 .superblock
                 .blocks_in_cluster(self.volume.superblock.cluster_of_block(block)?)?,
         );
-        raw_inode.initialize_directory(metadata, self.now, block_size, block, allocated_blocks)?;
+        self.require_allocated_blocks_supported(allocated_blocks)?;
+        raw_inode.initialize_directory(
+            metadata,
+            self.now,
+            block_size,
+            block,
+            allocated_blocks,
+            self.extra_inode_fields(),
+        )?;
         self.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
 
         let mut directory = DirectoryBlock::empty(
@@ -1916,10 +1971,21 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         let mut raw_inode = self.allocate_inode()?;
         let inode_id = raw_inode.id;
         if target.is_inline() {
-            raw_inode.initialize_inline_symlink(metadata, self.now, target)?;
+            raw_inode.initialize_inline_symlink(
+                metadata,
+                self.now,
+                target,
+                self.extra_inode_fields(),
+            )?;
         } else {
             let block_size = self.volume.superblock.block_size();
-            raw_inode.initialize_extent_symlink(metadata, self.now, block_size, target)?;
+            raw_inode.initialize_extent_symlink(
+                metadata,
+                self.now,
+                block_size,
+                target,
+                self.extra_inode_fields(),
+            )?;
             let block_bytes =
                 usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
             let mut tree = MutableExtentTree::from_extents(Vec::new())?;
@@ -2070,7 +2136,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             }
         }
 
-        child_raw.set_timestamps(self.now)?;
+        child_raw.set_timestamps(self.now, self.extra_inode_fields())?;
         *self
             .inode_updates
             .get_mut(child_index)
@@ -2092,7 +2158,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             .clone();
         let inode = raw_inode.parse()?;
         inode.require_mutation(InodeMutation::Metadata)?;
-        raw_inode.set_ext4_times(times)?;
+        raw_inode.set_ext4_times(times, self.extra_inode_fields())?;
         *self
             .inode_updates
             .get_mut(inode_index)
@@ -2347,7 +2413,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             completed = end;
         }
 
-        raw_inode.set_timestamps(self.now)?;
+        raw_inode.set_timestamps(self.now, self.extra_inode_fields())?;
         self.stage_extent_tree(&mut raw_inode, tree)?;
         *self
             .inode_updates
@@ -2621,8 +2687,9 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         if new_size < inode.size() {
             return Err(Error::InvalidWriteRange);
         }
+        self.require_inode_size_supported(new_size)?;
         raw_inode.set_size(new_size)?;
-        raw_inode.set_timestamps(self.now)?;
+        raw_inode.set_timestamps(self.now, self.extra_inode_fields())?;
         *self
             .inode_updates
             .get_mut(inode_index)
@@ -2647,6 +2714,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         if new_size > inode.size() {
             return Err(Error::InvalidWriteRange);
         }
+        self.require_inode_size_supported(new_size)?;
         let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
         let mut tree = self.mutable_extent_tree(&inode)?;
         if tree.contains_uninitialized() {
@@ -2696,7 +2764,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         }
         tree.replace_extents(updated)?;
         raw_inode.set_size(new_size)?;
-        raw_inode.set_timestamps(self.now)?;
+        raw_inode.set_timestamps(self.now, self.extra_inode_fields())?;
         self.stage_extent_tree(&mut raw_inode, tree)?;
         *self
             .inode_updates
@@ -2781,7 +2849,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             self.stage_inode_stream_write(&mut tree, layout.merkle_tree_offset(), &metadata)?;
         }
         raw_inode.set_verity()?;
-        raw_inode.set_timestamps(self.now)?;
+        raw_inode.set_timestamps(self.now, self.extra_inode_fields())?;
         self.stage_extent_tree(&mut raw_inode, tree)?;
         *self
             .inode_updates
@@ -2868,6 +2936,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         let Some(context) = context else {
             return Ok(());
         };
+        self.require_xattr_mutation()?;
         raw_inode.set_encrypted()?;
         let mut set = self.xattr_set_for_raw_inode(raw_inode)?;
         set.set_encryption_context(XattrValue::new(&context.to_bytes())?);
@@ -2961,7 +3030,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if block.insert(child, &disk_name, kind)? {
                 self.stage_directory_block(physical, block.into_bytes());
-                raw_parent.set_timestamps(self.now)?;
+                raw_parent.set_timestamps(self.now, self.extra_inode_fields())?;
                 *self
                     .inode_updates
                     .get_mut(inode_index)
@@ -2997,14 +3066,16 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             return Err(Error::InvalidDirectoryEntry);
         }
         self.stage_directory_block(new_physical, block.into_bytes());
-        raw_parent.set_size(FileSize::from_bytes(
+        let new_parent_size = FileSize::from_bytes(
             parent_inode
                 .size()
                 .bytes()
                 .checked_add(block_size_u64)
                 .ok_or(Error::ArithmeticOverflow)?,
-        ))?;
-        raw_parent.set_timestamps(self.now)?;
+        );
+        self.require_inode_size_supported(new_parent_size)?;
+        raw_parent.set_size(new_parent_size)?;
+        raw_parent.set_timestamps(self.now, self.extra_inode_fields())?;
         self.stage_extent_tree(&mut raw_parent, tree)?;
         *self
             .inode_updates
@@ -3046,7 +3117,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(removed) = block.remove(&disk_name)? {
                 self.stage_directory_block(physical, block.into_bytes());
-                raw_parent.set_timestamps(self.now)?;
+                raw_parent.set_timestamps(self.now, self.extra_inode_fields())?;
                 *self
                     .inode_updates
                     .get_mut(inode_index)
@@ -3121,7 +3192,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
                     return Err(Error::InvalidDirectoryEntry);
                 }
                 self.stage_directory_block(physical, block.into_bytes());
-                raw_parent.set_timestamps(self.now)?;
+                raw_parent.set_timestamps(self.now, self.extra_inode_fields())?;
                 *self
                     .inode_updates
                     .get_mut(inode_index)
@@ -3176,7 +3247,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(replaced) = block.replace(&disk_name, child, kind)? {
                 self.stage_directory_block(physical, block.into_bytes());
-                raw_parent.set_timestamps(self.now)?;
+                raw_parent.set_timestamps(self.now, self.extra_inode_fields())?;
                 *self
                     .inode_updates
                     .get_mut(inode_index)
@@ -3247,12 +3318,14 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             self.stage_directory_block(physical, image_block);
         }
         raw_parent.set_indexed_directory()?;
-        raw_parent.set_size(FileSize::from_bytes(
+        let rebuilt_size = FileSize::from_bytes(
             target_blocks
                 .checked_mul(u64::from(block_size.bytes()))
                 .ok_or(Error::ArithmeticOverflow)?,
-        ))?;
-        raw_parent.set_timestamps(self.now)?;
+        );
+        self.require_inode_size_supported(rebuilt_size)?;
+        raw_parent.set_size(rebuilt_size)?;
+        raw_parent.set_timestamps(self.now, self.extra_inode_fields())?;
         self.stage_extent_tree(&mut raw_parent, tree)?;
         *self
             .inode_updates
@@ -3308,6 +3381,9 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
 
     /// Reads all xattrs referenced by a staged raw inode.
     fn xattr_set_for_raw_inode(&self, raw_inode: &RawInode) -> Result<InodeXattrSet> {
+        if !self.volume.superblock.has_ext_attr() {
+            return Ok(InodeXattrSet::empty());
+        }
         let inline = xattr_storage::parse_inline_xattrs(raw_inode.inline_xattr_region()?)?;
         let Some(block) = raw_inode.xattr_block()? else {
             return Ok(inline);
@@ -3324,6 +3400,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         node: TransactionNode,
         update: impl FnOnce(&mut XattrSet) -> Result<()>,
     ) -> Result<()> {
+        self.require_xattr_mutation()?;
         let inode_index = self.ensure_inode_update(node.inode_id())?;
         let mut raw_inode = self
             .inode_updates
@@ -3336,7 +3413,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         let mut set = self.xattr_set_for_raw_inode(&raw_inode)?;
         update(set.public_mut())?;
         self.store_xattr_set(&mut raw_inode, &set)?;
-        raw_inode.set_timestamps(self.now)?;
+        raw_inode.set_timestamps(self.now, self.extra_inode_fields())?;
         *self
             .inode_updates
             .get_mut(inode_index)
@@ -3548,10 +3625,9 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         let inode = raw_inode.parse()?;
         let serialized = tree.serialize(block_size, self.volume.extent_tree_context(&inode))?;
         self.stage_serialized_extent_tree(raw_inode, &serialized)?;
-        raw_inode.set_allocated_blocks(
-            self.allocated_data_blocks(&tree)?,
-            u64::from(block_size.bytes()),
-        )
+        let allocated_blocks = self.allocated_data_blocks(&tree)?;
+        self.require_allocated_blocks_supported(allocated_blocks)?;
+        raw_inode.set_allocated_blocks(allocated_blocks, u64::from(block_size.bytes()))
     }
 
     /// Counts physical blocks charged to an inode through allocation clusters.
@@ -3607,7 +3683,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             .ok_or(Error::InvalidInode)?
             .clone();
         raw_inode.increment_links_count()?;
-        raw_inode.set_timestamps(self.now)?;
+        raw_inode.set_timestamps(self.now, self.extra_inode_fields())?;
         *self
             .inode_updates
             .get_mut(inode_index)
@@ -3624,7 +3700,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             .ok_or(Error::InvalidInode)?
             .clone();
         let _links = raw_inode.decrement_links_count()?;
-        raw_inode.set_timestamps(self.now)?;
+        raw_inode.set_timestamps(self.now, self.extra_inode_fields())?;
         *self
             .inode_updates
             .get_mut(inode_index)
@@ -4477,14 +4553,15 @@ impl RawInode {
         metadata: NewFileMetadata,
         now: Ext4Timestamp,
         block_size: BlockSize,
+        extra_inode_fields: bool,
     ) -> Result<()> {
         self.bytes.fill(0);
         self.set_mode(MODE_REGULAR, metadata.permissions())?;
         self.set_owner(metadata.owner())?;
         self.set_size(FileSize::from_bytes(0))?;
         self.set_links_count(1)?;
-        self.set_timestamps(now)?;
-        self.set_creation_time(now)?;
+        self.set_timestamps(now, extra_inode_fields)?;
+        self.set_creation_time(now, extra_inode_fields)?;
         self.set_deletion_time(0)?;
         self.set_flags(EXT4_EXTENTS_FL)?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
@@ -4501,14 +4578,15 @@ impl RawInode {
         block_size: BlockSize,
         first_block: BlockAddress,
         allocated_blocks: u64,
+        extra_inode_fields: bool,
     ) -> Result<()> {
         self.bytes.fill(0);
         self.set_mode(MODE_DIRECTORY, metadata.permissions())?;
         self.set_owner(metadata.owner())?;
         self.set_size(FileSize::from_bytes(u64::from(block_size.bytes())))?;
         self.set_links_count(2)?;
-        self.set_timestamps(now)?;
-        self.set_creation_time(now)?;
+        self.set_timestamps(now, extra_inode_fields)?;
+        self.set_creation_time(now, extra_inode_fields)?;
         self.set_deletion_time(0)?;
         self.set_flags(EXT4_EXTENTS_FL)?;
         let tree = MutableExtentTree::from_extents(vec![Extent::initialized(
@@ -4527,6 +4605,7 @@ impl RawInode {
         metadata: NewSymlinkMetadata,
         now: Ext4Timestamp,
         target: &SymlinkTarget,
+        extra_inode_fields: bool,
     ) -> Result<()> {
         if !target.is_inline() {
             return Err(Error::InvalidWriteRange);
@@ -4538,8 +4617,8 @@ impl RawInode {
             u64::try_from(target.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
         ))?;
         self.set_links_count(1)?;
-        self.set_timestamps(now)?;
-        self.set_creation_time(now)?;
+        self.set_timestamps(now, extra_inode_fields)?;
+        self.set_creation_time(now, extra_inode_fields)?;
         self.set_deletion_time(0)?;
         self.set_flags(0)?;
         self.set_inline_target(target.bytes())?;
@@ -4553,6 +4632,7 @@ impl RawInode {
         now: Ext4Timestamp,
         block_size: BlockSize,
         target: &SymlinkTarget,
+        extra_inode_fields: bool,
     ) -> Result<()> {
         if target.is_inline() {
             return Err(Error::InvalidWriteRange);
@@ -4564,8 +4644,8 @@ impl RawInode {
             u64::try_from(target.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
         ))?;
         self.set_links_count(1)?;
-        self.set_timestamps(now)?;
-        self.set_creation_time(now)?;
+        self.set_timestamps(now, extra_inode_fields)?;
+        self.set_creation_time(now, extra_inode_fields)?;
         self.set_deletion_time(0)?;
         self.set_flags(EXT4_EXTENTS_FL)?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
@@ -4662,11 +4742,12 @@ impl RawInode {
     }
 
     /// Updates access, change, and modification timestamps.
-    fn set_timestamps(&mut self, now: Ext4Timestamp) -> Result<()> {
+    fn set_timestamps(&mut self, now: Ext4Timestamp, extra_inode_fields: bool) -> Result<()> {
         put_le_u32(&mut self.bytes, INODE_ATIME_OFFSET, now.seconds())?;
         put_le_u32(&mut self.bytes, INODE_CTIME_OFFSET, now.seconds())?;
         put_le_u32(&mut self.bytes, INODE_MTIME_OFFSET, now.seconds())?;
-        if self.bytes.len() > INODE_ATIME_EXTRA_OFFSET {
+        if extra_inode_fields && self.bytes.len() > INODE_ATIME_EXTRA_OFFSET {
+            self.ensure_extra_isize()?;
             put_le_u32(&mut self.bytes, INODE_ATIME_EXTRA_OFFSET, 0)?;
             put_le_u32(&mut self.bytes, INODE_CTIME_EXTRA_OFFSET, 0)?;
             put_le_u32(&mut self.bytes, INODE_MTIME_EXTRA_OFFSET, 0)?;
@@ -4675,8 +4756,8 @@ impl RawInode {
     }
 
     /// Writes creation time when the inode record has extra timestamp fields.
-    fn set_creation_time(&mut self, now: Ext4Timestamp) -> Result<()> {
-        if self.bytes.len() > INODE_CRTIME_EXTRA_OFFSET {
+    fn set_creation_time(&mut self, now: Ext4Timestamp, extra_inode_fields: bool) -> Result<()> {
+        if extra_inode_fields && self.bytes.len() > INODE_CRTIME_EXTRA_OFFSET {
             self.ensure_extra_isize()?;
             put_le_u32(&mut self.bytes, INODE_CRTIME_OFFSET, now.seconds())?;
             put_le_u32(&mut self.bytes, INODE_CRTIME_EXTRA_OFFSET, 0)?;
@@ -4713,7 +4794,7 @@ impl RawInode {
     }
 
     /// Writes explicit ext4 inode timestamps.
-    fn set_ext4_times(&mut self, times: Ext4Times) -> Result<()> {
+    fn set_ext4_times(&mut self, times: Ext4Times, extra_inode_fields: bool) -> Result<()> {
         put_le_u32(
             &mut self.bytes,
             INODE_ATIME_OFFSET,
@@ -4729,12 +4810,13 @@ impl RawInode {
             INODE_MTIME_OFFSET,
             times.modified().seconds(),
         )?;
-        if self.bytes.len() > INODE_ATIME_EXTRA_OFFSET {
+        if extra_inode_fields && self.bytes.len() > INODE_ATIME_EXTRA_OFFSET {
+            self.ensure_extra_isize()?;
             put_le_u32(&mut self.bytes, INODE_ATIME_EXTRA_OFFSET, 0)?;
             put_le_u32(&mut self.bytes, INODE_CTIME_EXTRA_OFFSET, 0)?;
             put_le_u32(&mut self.bytes, INODE_MTIME_EXTRA_OFFSET, 0)?;
         }
-        self.set_creation_time(times.created())
+        self.set_creation_time(times.created(), extra_inode_fields)
     }
 
     /// Returns the external xattr block referenced by `i_file_acl`.
