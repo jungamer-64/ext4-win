@@ -1708,11 +1708,6 @@ pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal, N = Fscrypt
 }
 
 impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> {
-    /// Returns whether this mounted profile advertises extended inode fields.
-    fn extra_inode_fields(&self) -> bool {
-        self.volume.superblock.has_extra_isize()
-    }
-
     /// Verifies that the mounted profile admits xattr storage mutation.
     fn require_xattr_mutation(&self) -> Result<()> {
         if self.volume.superblock.has_ext_attr() {
@@ -2467,17 +2462,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         physical: BlockAddress,
         in_block: u64,
         bytes: &[u8],
-        zero_plaintext: bool,
     ) -> Result<()> {
-        let mut block = if zero_plaintext {
-            vec![
-                0_u8;
-                usize::try_from(self.volume.superblock.block_size().bytes())
-                    .map_err(|_| Error::ArithmeticOverflow)?
-            ]
-        } else {
-            self.plaintext_file_block_for_update(contents_key, logical_block, physical)?
-        };
+        let mut block = self.plaintext_file_block_for_update(contents_key, logical_block, physical)?;
         let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
         let end = start
             .checked_add(bytes.len())

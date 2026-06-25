@@ -530,11 +530,6 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
     }
 }
 
-/// Returns true when a query-EA stack flag is set.
-fn query_ea_flag(stack: QueryEaStack, flag: u32) -> bool {
-    u32::from(stack.flags()) & flag != 0
-}
-
 /// Aligns a byte count to a four-byte boundary.
 fn align_to_four(value: usize) -> Result<usize, NTSTATUS> {
     let adjustment = EA_RECORD_ALIGNMENT
