@@ -726,11 +726,6 @@ fn initialize_directory_cursor(cursor: &mut DirectoryCursor, stack: QueryDirecto
     }
 }
 
-/// Returns true when a QueryDirectory stack flag is set.
-fn query_directory_flag(stack: QueryDirectoryStack, flag: wdk_sys::ULONG) -> bool {
-    u32::from(stack.flags()) & flag != 0
-}
-
 /// Emits directory entries into a caller buffer.
 fn emit_directory_entries(
     vcb: &VolumeControlBlock,
@@ -1113,8 +1108,6 @@ fn system_buffer_input(
 /// Decoded FILE_RENAME_INFORMATION payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RenameInformation {
-    /// Whether replacement of an existing target was requested.
-    replace_if_exists: bool,
     /// Root-relative target path components.
     name: Vec<WindowsName>,
 }

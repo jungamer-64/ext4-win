@@ -157,17 +157,6 @@ enum PermissionClass {
     Other,
 }
 
-/// DACL permissions while parsing allow ACEs.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ParsedDaclPermissions {
-    /// Owner class permission bits.
-    owner: Option<u16>,
-    /// Group class permission bits.
-    group: Option<u16>,
-    /// Other class permission bits.
-    other: Option<u16>,
-}
-
 /// Performs a security descriptor query.
 fn query_security(request: QuerySecurityRequest) -> NTSTATUS {
     match load_ext4_security(request.stack.file_object()).and_then(|security| {
@@ -490,26 +479,6 @@ impl<'a> ParsedSecurityDescriptor<'a> {
         let acl_len = usize::from(read_u16(header, ACL_SIZE_OFFSET)?);
         let end = start.checked_add(acl_len).ok_or(STATUS_INVALID_PARAMETER)?;
         self.bytes.get(start..end).ok_or(STATUS_INVALID_PARAMETER)
-    }
-}
-
-impl ParsedDaclPermissions {
-    /// Stores one parsed permission class.
-    fn set(&mut self, class: PermissionClass, bits: u16) -> Result<(), NTSTATUS> {
-        let target = match class {
-            PermissionClass::Owner => &mut self.owner,
-            PermissionClass::Group => &mut self.group,
-            PermissionClass::Other => &mut self.other,
-        };
-        if target.replace(bits).is_some() {
-            return Err(STATUS_NOT_SUPPORTED);
-        }
-        Ok(())
-    }
-
-    /// Converts parsed classes into POSIX rwx mode bits.
-    fn mode_bits(self) -> u16 {
-        (self.owner.unwrap_or(0) << 6) | (self.group.unwrap_or(0) << 3) | self.other.unwrap_or(0)
     }
 }
 

@@ -880,30 +880,14 @@ enum JournalFeature {
 pub(crate) struct FeatureSet {
     /// Block group descriptor layout selected by the 64-bit feature.
     descriptor_layout: BlockGroupDescriptorLayout,
-    /// Whether sparse superblock backups are enabled.
-    sparse_super: bool,
     /// Journal placement class selected by feature flags.
     journal: JournalFeature,
     /// Journal recovery state selected by `INCOMPAT_RECOVER`.
     recovery_state: RecoveryState,
-    /// Whether hashed directory indexes are enabled.
-    directory_index: bool,
     /// Metadata checksum algorithm selected by read-only-compatible features.
     metadata_checksum: MetadataChecksum,
     /// Block group descriptor checksum algorithm.
     descriptor_checksum: BlockGroupDescriptorChecksum,
-    /// Whether block bitmaps address allocation clusters instead of blocks.
-    bigalloc: bool,
-    /// Whether the metadata checksum seed is stored explicitly in the superblock.
-    explicit_checksum_seed: bool,
-    /// Whether public extended attributes are part of the write domain.
-    xattrs: bool,
-    /// Whether regular-file sizes may exceed the pre-large-file profile.
-    large_file: bool,
-    /// Whether inode block counts may use the huge-file representation.
-    huge_file: bool,
-    /// Whether extended inode fields such as creation time are advertised.
-    extra_inode_fields: bool,
 }
 
 impl FeatureSet {
@@ -1071,19 +1055,9 @@ impl FeatureSet {
         self.descriptor_layout
     }
 
-    /// Returns whether sparse superblock backups are enabled.
-    pub(crate) const fn has_sparse_super(self) -> bool {
-        self.sparse_super
-    }
-
     /// Returns whether the filesystem advertises a journal.
     pub(crate) const fn has_journal(self) -> bool {
         !matches!(self.journal, JournalFeature::None)
-    }
-
-    /// Returns whether hashed directory indexes are enabled.
-    pub(crate) const fn has_dir_index(self) -> bool {
-        self.directory_index
     }
 
     /// Returns whether the journal lives on a separate journal device.
@@ -1099,41 +1073,6 @@ impl FeatureSet {
     /// Returns the block group descriptor checksum mode.
     pub(crate) const fn descriptor_checksum(self) -> BlockGroupDescriptorChecksum {
         self.descriptor_checksum
-    }
-
-    /// Returns whether metadata CRC32C checksums are enabled.
-    pub(crate) const fn has_metadata_csum(self) -> bool {
-        matches!(self.metadata_checksum, MetadataChecksum::Crc32c)
-    }
-
-    /// Returns whether block bitmaps address clusters instead of blocks.
-    pub(crate) const fn has_bigalloc(self) -> bool {
-        self.bigalloc
-    }
-
-    /// Returns whether the checksum seed is stored explicitly in the superblock.
-    pub(crate) const fn has_checksum_seed(self) -> bool {
-        self.explicit_checksum_seed
-    }
-
-    /// Returns whether xattr storage is enabled for mutation.
-    pub(crate) const fn has_ext_attr(self) -> bool {
-        self.xattrs
-    }
-
-    /// Returns whether file sizes may use the high `i_size` field.
-    pub(crate) const fn has_large_file(self) -> bool {
-        self.large_file
-    }
-
-    /// Returns whether inode block counts may exceed the legacy sector count.
-    pub(crate) const fn has_huge_file(self) -> bool {
-        self.huge_file
-    }
-
-    /// Returns whether extended inode fields are advertised.
-    pub(crate) const fn has_extra_isize(self) -> bool {
-        self.extra_inode_fields
     }
 
     /// Returns the journal recovery state.
@@ -1492,32 +1431,6 @@ impl Superblock {
         self.default_directory_hash_version
     }
 
-    /// Returns whether hashed directory indexes are available.
-    #[must_use]
-    pub(crate) const fn has_dir_index(self) -> bool {
-        self.features.has_dir_index()
-    }
-
-    /// Returns whether public extended attributes are available for mutation.
-    pub(crate) const fn has_ext_attr(self) -> bool {
-        self.features.has_ext_attr()
-    }
-
-    /// Returns whether file sizes may exceed the pre-large-file profile.
-    pub(crate) const fn has_large_file(self) -> bool {
-        self.features.has_large_file()
-    }
-
-    /// Returns whether inode block counts may exceed the legacy sector count.
-    pub(crate) const fn has_huge_file(self) -> bool {
-        self.features.has_huge_file()
-    }
-
-    /// Returns whether extended inode fields are advertised.
-    pub(crate) const fn has_extra_isize(self) -> bool {
-        self.features.has_extra_isize()
-    }
-
     /// Metadata checksum mode.
     #[must_use]
     pub const fn metadata_checksum(self) -> MetadataChecksum {
@@ -1532,11 +1445,6 @@ impl Superblock {
     /// Returns the active block group descriptor checksum mode.
     pub(crate) const fn descriptor_checksum(self) -> BlockGroupDescriptorChecksum {
         self.features.descriptor_checksum()
-    }
-
-    /// Returns whether sparse superblock backups are enabled.
-    pub(crate) const fn has_sparse_super(self) -> bool {
-        self.features.has_sparse_super()
     }
 
     /// Returns the journal recovery state.
