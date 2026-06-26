@@ -7,7 +7,7 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     DeviceLength, Ext4Name, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey, InodeId,
-    InternalJournal, MountContext, ReadWrite, Result as Ext4Result, Volume,
+    InternalJournal, MountContext, NodeId, ReadWrite, Result as Ext4Result, Volume,
 };
 use wdk_sys::{
     ACCESS_MASK, DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT,
@@ -203,7 +203,7 @@ impl VolumeControlBlock {
     /// Opens or reuses the VCB-owned FCB for a node.
     pub(crate) fn open_file_control_block(
         mut volume: NonNull<Self>,
-        node: FileSystemNode,
+        node: NodeId,
     ) -> Option<NonNull<FileControlBlock>> {
         let vcb = unsafe {
             // SAFETY: The caller passes a live mounted VCB pointer from the
@@ -263,7 +263,7 @@ impl VolumeControlBlock {
     /// Finds a VCB-owned FCB by node identity.
     fn find_file_control_block(
         &mut self,
-        node: FileSystemNode,
+        node: NodeId,
     ) -> Option<NonNull<FileControlBlock>> {
         self.file_control_blocks.iter().copied().find(|fcb| {
             let fcb = unsafe {
@@ -426,33 +426,13 @@ fn write_vpb_label(vpb: &mut wdk_sys::VPB, label: ext4_core::Ext4VolumeLabel) ->
     Some(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Ext4 node represented by an FCB.
-pub(crate) enum FileSystemNode {
-    /// Regular file inode.
-    File(InodeId),
-    /// Directory inode.
-    Directory(InodeId),
-    /// Symbolic link inode.
-    Symlink(InodeId),
-}
-
-impl FileSystemNode {
-    /// Returns the inode represented by this node.
-    pub(crate) const fn inode(self) -> InodeId {
-        match self {
-            Self::File(inode) | Self::Directory(inode) | Self::Symlink(inode) => inode,
-        }
-    }
-}
-
 #[derive(Debug)]
 /// File control block stored in `FILE_OBJECT::FsContext`.
 pub(crate) struct FileControlBlock {
     /// Mounted volume that owns this file.
     volume: NonNull<VolumeControlBlock>,
     /// Ext4 node opened by this FCB.
-    node: FileSystemNode,
+    node: NodeId,
     /// I/O manager share-access accounting for this inode identity.
     share_access: SHARE_ACCESS,
     /// Number of open FILE_OBJECTs currently referencing this FCB.
@@ -461,7 +441,7 @@ pub(crate) struct FileControlBlock {
 
 impl FileControlBlock {
     /// Creates an FCB boundary value for a mounted node.
-    pub(crate) const fn new(volume: NonNull<VolumeControlBlock>, node: FileSystemNode) -> Self {
+    pub(crate) const fn new(volume: NonNull<VolumeControlBlock>, node: NodeId) -> Self {
         Self {
             volume,
             node,
@@ -484,12 +464,12 @@ impl FileControlBlock {
     }
 
     /// Returns the ext4 node identity opened by this FCB.
-    pub(crate) const fn node(&self) -> FileSystemNode {
+    pub(crate) const fn node(&self) -> NodeId {
         self.node
     }
 
     /// Replaces the ext4 node identity after an in-place namespace conversion.
-    pub(crate) fn replace_node(&mut self, node: FileSystemNode) {
+    pub(crate) fn replace_node(&mut self, node: NodeId) {
         self.node = node;
     }
 
@@ -602,11 +582,11 @@ pub(crate) enum OpenedHandleState {
 
 impl OpenedHandleState {
     /// Builds handle-local state from an opened node identity.
-    const fn from_node(node: FileSystemNode) -> Self {
+    const fn from_node(node: NodeId) -> Self {
         match node {
-            FileSystemNode::File(_) => Self::File,
-            FileSystemNode::Directory(_) => Self::Directory(DirectoryCursor::start()),
-            FileSystemNode::Symlink(_) => Self::Symlink,
+            NodeId::File(_) => Self::File,
+            NodeId::Directory(_) => Self::Directory(DirectoryCursor::start()),
+            NodeId::Symlink(_) => Self::Symlink,
         }
     }
 }
@@ -633,7 +613,7 @@ pub(crate) struct ContextControlBlock {
 
 impl ContextControlBlock {
     /// Creates per-handle state for an opened node.
-    pub(crate) fn new(node: FileSystemNode, path: OpenedPath) -> Self {
+    pub(crate) fn new(node: NodeId, path: OpenedPath) -> Self {
         Self {
             handle: OpenedHandleState::from_node(node),
             path,
@@ -675,7 +655,7 @@ impl ContextControlBlock {
     }
 
     /// Replaces handle-local node state after an in-place namespace conversion.
-    pub(crate) fn replace_node(&mut self, node: FileSystemNode) {
+    pub(crate) fn replace_node(&mut self, node: NodeId) {
         self.handle = OpenedHandleState::from_node(node);
     }
 }

@@ -482,9 +482,97 @@ pub struct Volume<D, State, N = FscryptNoNonceGenerator> {
     state: State,
 }
 
+/// Typed regular-file inode identity.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FileNodeId {
+    /// Backing ext4 inode.
+    inode: InodeId,
+}
+
+impl FileNodeId {
+    /// Creates a typed regular-file identity from an inode validated as a file.
+    const fn new(inode: InodeId) -> Self {
+        Self { inode }
+    }
+
+    /// Returns the raw inode for on-disk and external boundary encoding.
+    #[must_use]
+    pub const fn inode(self) -> InodeId {
+        self.inode
+    }
+}
+
+/// Typed directory inode identity.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DirectoryNodeId {
+    /// Backing ext4 inode.
+    inode: InodeId,
+}
+
+impl DirectoryNodeId {
+    /// Root directory identity.
+    pub const ROOT: Self = Self {
+        inode: InodeId::ROOT,
+    };
+
+    /// Creates a typed directory identity from an inode validated as a directory.
+    const fn new(inode: InodeId) -> Self {
+        Self { inode }
+    }
+
+    /// Returns the raw inode for on-disk and external boundary encoding.
+    #[must_use]
+    pub const fn inode(self) -> InodeId {
+        self.inode
+    }
+}
+
+/// Typed symbolic-link inode identity.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SymlinkNodeId {
+    /// Backing ext4 inode.
+    inode: InodeId,
+}
+
+impl SymlinkNodeId {
+    /// Creates a typed symbolic-link identity from an inode validated as a symlink.
+    const fn new(inode: InodeId) -> Self {
+        Self { inode }
+    }
+
+    /// Returns the raw inode for on-disk and external boundary encoding.
+    #[must_use]
+    pub const fn inode(self) -> InodeId {
+        self.inode
+    }
+}
+
+/// Typed inode identity for any node kind supported by this domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeId {
+    /// Regular file node.
+    File(FileNodeId),
+    /// Directory node.
+    Directory(DirectoryNodeId),
+    /// Symbolic link node.
+    Symlink(SymlinkNodeId),
+}
+
+impl NodeId {
+    /// Returns the raw inode for on-disk and external boundary encoding.
+    #[must_use]
+    pub const fn inode(&self) -> InodeId {
+        match self {
+            Self::File(file) => file.inode(),
+            Self::Directory(directory) => directory.inode(),
+            Self::Symlink(symlink) => symlink.inode(),
+        }
+    }
+}
+
 /// Typed node loaded from an inode.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Node {
+pub enum LoadedNode {
     /// Regular file node.
     File(FileNode),
     /// Directory node.
@@ -493,13 +581,23 @@ pub enum Node {
     Symlink(SymlinkNode),
 }
 
-impl Node {
-    /// Wraps a parsed inode in the node type selected by its inode kind.
+impl LoadedNode {
+    /// Wraps a parsed inode in the loaded node type selected by its inode kind.
     fn from_inode(inode: Inode) -> Self {
         match inode.kind() {
             InodeKind::File => Self::File(FileNode { inode }),
             InodeKind::Directory => Self::Directory(DirectoryNode { inode }),
             InodeKind::Symlink => Self::Symlink(SymlinkNode { inode }),
+        }
+    }
+
+    /// Returns this loaded node's typed identity.
+    #[must_use]
+    pub const fn id(&self) -> NodeId {
+        match self {
+            Self::File(file) => NodeId::File(file.id()),
+            Self::Directory(directory) => NodeId::Directory(directory.id()),
+            Self::Symlink(symlink) => NodeId::Symlink(symlink.id()),
         }
     }
 }
@@ -514,8 +612,8 @@ pub struct FileNode {
 impl FileNode {
     /// Inode identifier backing this file node.
     #[must_use]
-    pub const fn id(&self) -> InodeId {
-        self.inode.id()
+    pub const fn id(&self) -> FileNodeId {
+        FileNodeId::new(self.inode.id())
     }
 
     /// File size in bytes.
@@ -564,8 +662,8 @@ pub struct DirectoryNode {
 impl DirectoryNode {
     /// Inode identifier backing this directory node.
     #[must_use]
-    pub const fn id(&self) -> InodeId {
-        self.inode.id()
+    pub const fn id(&self) -> DirectoryNodeId {
+        DirectoryNodeId::new(self.inode.id())
     }
 
     /// POSIX security state parsed from the directory inode.
@@ -614,8 +712,8 @@ pub struct SymlinkNode {
 impl SymlinkNode {
     /// Inode identifier backing this symbolic link node.
     #[must_use]
-    pub const fn id(&self) -> InodeId {
-        self.inode.id()
+    pub const fn id(&self) -> SymlinkNodeId {
+        SymlinkNodeId::new(self.inode.id())
     }
 
     /// Symlink payload size in bytes.
@@ -654,11 +752,65 @@ impl SymlinkNode {
     }
 }
 
+/// Directory child selected by a lookup through a typed parent directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryChild {
+    /// Parent directory containing the child.
+    parent: DirectoryNodeId,
+    /// Child name visible at the lookup boundary.
+    name: Ext4Name,
+    /// Typed child identity.
+    node: NodeId,
+    /// File type recorded in the directory entry.
+    entry_kind: DirectoryEntryKind,
+}
+
+impl DirectoryChild {
+    /// Creates a typed directory child after validating the referenced inode.
+    fn new(
+        parent: DirectoryNodeId,
+        name: &Ext4Name,
+        node: NodeId,
+        entry_kind: DirectoryEntryKind,
+    ) -> Self {
+        Self {
+            parent,
+            name: name.clone(),
+            node,
+            entry_kind,
+        }
+    }
+
+    /// Parent directory containing the child.
+    #[must_use]
+    pub const fn parent(&self) -> DirectoryNodeId {
+        self.parent
+    }
+
+    /// Child name visible at the lookup boundary.
+    #[must_use]
+    pub const fn name(&self) -> &Ext4Name {
+        &self.name
+    }
+
+    /// Typed child identity.
+    #[must_use]
+    pub const fn node(&self) -> &NodeId {
+        &self.node
+    }
+
+    /// File type recorded in the directory entry.
+    #[must_use]
+    pub const fn entry_kind(&self) -> DirectoryEntryKind {
+        self.entry_kind
+    }
+}
+
 /// Result of a directory lookup.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LookupResult {
-    /// The child name was found.
-    Found(InodeId),
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChildLookup {
+    /// The child name was found and its inode kind was validated.
+    Found(DirectoryChild),
     /// No child matched the requested name.
     NotFound,
 }
@@ -1016,8 +1168,8 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
     /// # Errors
     /// Returns an error when the inode number is outside the volume or the inode
     /// table cannot be read and parsed.
-    pub fn read_node(&self, inode_id: InodeId) -> Result<Node> {
-        Ok(Node::from_inode(self.read_inode_record(inode_id)?))
+    pub fn load_node(&self, inode_id: InodeId) -> Result<LoadedNode> {
+        Ok(LoadedNode::from_inode(self.read_inode_record(inode_id)?))
     }
 
     /// Reads file bytes from a typed regular file node.
@@ -1214,11 +1366,11 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
-    pub fn lookup_child(&self, parent: &DirectoryNode, name: &Ext4Name) -> Result<LookupResult> {
+    pub fn lookup_child(&self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup> {
         if let Some(entry) = self.read_directory_layout(parent.inode())?.find(name) {
-            return Ok(LookupResult::Found(entry.inode()));
+            return Ok(ChildLookup::Found(self.directory_child(parent, entry)?));
         }
-        Ok(LookupResult::NotFound)
+        Ok(ChildLookup::NotFound)
     }
 
     /// Looks up a Windows-visible child name, accepting case-insensitive matches only when unique.
@@ -1230,10 +1382,10 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
         &self,
         parent: &DirectoryNode,
         requested: &WindowsName,
-    ) -> Result<LookupResult> {
+    ) -> Result<ChildLookup> {
         match self.lookup_windows_child_entry(parent, requested)? {
-            Some(entry) => Ok(LookupResult::Found(entry.inode())),
-            None => Ok(LookupResult::NotFound),
+            Some(entry) => Ok(ChildLookup::Found(self.directory_child(parent, entry)?)),
+            None => Ok(ChildLookup::NotFound),
         }
     }
 
@@ -1287,6 +1439,21 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
         }
 
         Ok(folded)
+    }
+
+    /// Converts a directory entry into a child whose inode kind is validated.
+    fn directory_child(
+        &self,
+        parent: &DirectoryNode,
+        entry: DirectoryEntry,
+    ) -> Result<DirectoryChild> {
+        let node = self.load_node(entry.inode())?.id();
+        Ok(DirectoryChild::new(
+            parent.id(),
+            entry.name(),
+            node,
+            entry.kind(),
+        ))
     }
 
     /// Loads and validates the directory layout selected by an inode.
