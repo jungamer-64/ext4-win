@@ -7,7 +7,7 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     DirectoryEntry, Ext4Name, Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes,
-    FileOffset, FileSize, InodeId, Node, WindowsName, WindowsOverlay,
+    FileSize, InodeId, Node, WindowsName, WindowsOverlay,
 };
 use wdk_sys::{
     LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
@@ -16,7 +16,10 @@ use wdk_sys::{
     STATUS_SUCCESS,
 };
 
-use crate::irp::{DispatchTarget, QueryDirectoryStack, QueryFileStack, SetFileStack};
+use crate::irp::{
+    DirectoryCursorPosition, DirectoryEntryEmission, DirectoryPatternInput, DispatchTarget,
+    IrpBufferLength, QueryDirectoryStack, QueryFileStack, SetFileStack,
+};
 use crate::state::{
     CloseDisposition, ContextControlBlock, DirectoryCursor, FileControlBlock, FileSystemNode,
     OpenedPath, VolumeControlBlock, context_control_block, file_control_block,
@@ -205,7 +208,7 @@ fn pack_file_information(request: QueryFileRequest) -> Result<wdk_sys::ULONG_PTR
         .target
         .system_buffer()
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    let length = usize::try_from(request.stack.length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let length = request.stack.length().as_usize();
     match request.stack.information_class() {
         wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => {
             pack_basic_information(buffer, length, metadata)
@@ -361,9 +364,6 @@ fn set_disposition_information(request: SetFileRequest) -> Result<(), NTSTATUS> 
 /// Applies FILE_RENAME_INFORMATION to the opened path.
 fn set_rename_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
     let rename = RenameInformation::parse(request.target, request.stack.length())?;
-    if rename.replace_if_exists {
-        return Err(STATUS_NOT_SUPPORTED);
-    }
 
     let fcb = file_control_block(request.stack.file_object()).map_err(DriverError::ntstatus)?;
     let fcb = unsafe {
@@ -479,7 +479,7 @@ fn pack_directory_information(
 ) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
     let class = DirectoryInformationClass::from_raw(request.stack.information_class())?;
     let pattern = DirectoryPattern::from_stack(request.stack)?;
-    let length = usize::try_from(request.stack.length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let length = request.stack.length().as_usize();
     let mut buffer = request
         .target
         .data_buffer(length)
@@ -581,7 +581,7 @@ enum DirectoryPattern {
 impl DirectoryPattern {
     /// Decodes the optional QueryDirectory filename pattern.
     fn from_stack(stack: QueryDirectoryStack) -> Result<Self, NTSTATUS> {
-        let Some(name) = stack.file_name() else {
+        let DirectoryPatternInput::Name(name) = stack.pattern() else {
             return Ok(Self::All);
         };
         let name = unsafe {
@@ -718,11 +718,10 @@ fn is_all_directory_pattern(units: &[u16]) -> bool {
 
 /// Applies QueryDirectory cursor reset/index flags.
 fn initialize_directory_cursor(cursor: &mut DirectoryCursor, stack: QueryDirectoryStack) {
-    if query_directory_flag(stack, wdk_sys::SL_RESTART_SCAN) || stack.file_name().is_some() {
-        cursor.seek(0);
-    }
-    if query_directory_flag(stack, wdk_sys::SL_INDEX_SPECIFIED) {
-        cursor.seek(stack.file_index());
+    match stack.cursor_position() {
+        DirectoryCursorPosition::Current => {}
+        DirectoryCursorPosition::Restart => cursor.seek(0),
+        DirectoryCursorPosition::Index(index) => cursor.seek(index.as_u32()),
     }
 }
 
@@ -790,7 +789,7 @@ fn emit_directory_entries(
             .ok_or(STATUS_INVALID_PARAMETER)?;
         cursor.seek(next_entry);
 
-        if query_directory_flag(stack, wdk_sys::SL_RETURN_SINGLE_ENTRY) {
+        if matches!(stack.entry_emission(), DirectoryEntryEmission::Single) {
             break;
         }
     }
@@ -1052,9 +1051,9 @@ fn opened_file_context(
 /// Reads a fixed-size set-information input structure.
 fn read_file_information_input<T: Copy>(
     target: DispatchTarget,
-    length: wdk_sys::ULONG,
+    length: IrpBufferLength,
 ) -> Result<T, NTSTATUS> {
-    let length = usize::try_from(length).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let length = length.as_usize();
     let buffer = system_buffer_input(target, length)?;
     let size = core::mem::size_of::<T>();
     if length < size {
@@ -1114,14 +1113,17 @@ struct RenameInformation {
 
 impl RenameInformation {
     /// Decodes a FILE_RENAME_INFORMATION variable-length input buffer.
-    fn parse(target: DispatchTarget, length: wdk_sys::ULONG) -> Result<Self, NTSTATUS> {
-        let length = usize::try_from(length).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    fn parse(target: DispatchTarget, length: IrpBufferLength) -> Result<Self, NTSTATUS> {
+        let length = length.as_usize();
         let input = system_buffer_input(target, length)?;
         let bytes = input.as_slice();
-        let replace_if_exists = *bytes
+        match bytes
             .get(FILE_RENAME_REPLACE_IF_EXISTS_OFFSET)
             .ok_or(STATUS_BUFFER_TOO_SMALL)?
-            != 0;
+        {
+            0 => {}
+            _ => return Err(STATUS_NOT_SUPPORTED),
+        }
         if root_directory_is_present(bytes)? {
             return Err(STATUS_NOT_SUPPORTED);
         }
@@ -1133,7 +1135,6 @@ impl RenameInformation {
         let name_bytes = input_range(bytes, FILE_RENAME_NAME_OFFSET, name_length)?;
         let units = utf16_units_from_le_bytes(name_bytes)?;
         Ok(Self {
-            replace_if_exists,
             name: windows_path_components(&units)?,
         })
     }
@@ -1666,12 +1667,11 @@ fn boolean(value: bool) -> wdk_sys::BOOLEAN {
 /// Reads a regular file through ext4-core into the IRP output buffer.
 fn read_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
     let stack = target.current_stack()?.read()?;
-    let length = usize::try_from(stack.length()).map_err(|_| DriverError::InvalidParameter)?;
+    let length = stack.length().as_usize();
     if length == 0 {
         target.set_information(0);
         return Ok(());
     }
-    let offset = u64::try_from(stack.byte_offset()).map_err(|_| DriverError::InvalidParameter)?;
     let mut output = target.data_buffer(length)?;
     let fcb = file_control_block(stack.file_object())?;
     let fcb = unsafe {
@@ -1689,9 +1689,9 @@ fn read_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
     let Node::File(file) = node else {
         return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
     };
-    let bytes_read =
-        vcb.volume()
-            .read_file(&file, FileOffset::from_bytes(offset), output.as_mut_slice())?;
+    let bytes_read = vcb
+        .volume()
+        .read_file(&file, stack.byte_offset(), output.as_mut_slice())?;
     target.set_information(
         wdk_sys::ULONG_PTR::try_from(bytes_read.as_usize())
             .map_err(|_| DriverError::InvalidParameter)?,
@@ -1702,12 +1702,11 @@ fn read_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
 /// Writes a regular file range through an ext4 journal transaction.
 fn write_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
     let stack = target.current_stack()?.write()?;
-    let length = usize::try_from(stack.length()).map_err(|_| DriverError::InvalidParameter)?;
+    let length = stack.length().as_usize();
     if length == 0 {
         target.set_information(0);
         return Ok(());
     }
-    let offset = u64::try_from(stack.byte_offset()).map_err(|_| DriverError::InvalidParameter)?;
     let input = target.data_buffer(length)?;
     let fcb = file_control_block(stack.file_object())?;
     let fcb = unsafe {
@@ -1731,7 +1730,7 @@ fn write_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
         .volume_mut()
         .begin_transaction(crate::time::current_ext4_timestamp()?);
     let file = transaction.file(inode)?;
-    transaction.overwrite_file_range(file, FileOffset::from_bytes(offset), input.as_slice())?;
+    transaction.overwrite_file_range(file, stack.byte_offset(), input.as_slice())?;
     transaction.commit()?;
     target.set_information(
         wdk_sys::ULONG_PTR::try_from(length).map_err(|_| DriverError::InvalidParameter)?,
@@ -1773,5 +1772,51 @@ fn release_file_contexts(mut file_object: core::ptr::NonNull<wdk_sys::FILE_OBJEC
             // FsContext2, and close is the unique release point.
             drop(Box::from_raw(ccb.cast::<ContextControlBlock>()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ptr::NonNull;
+
+    use wdk_sys::STATUS_NOT_SUPPORTED;
+
+    #[test]
+    fn rename_replace_request_is_rejected_at_decode_boundary() {
+        let mut input = [0_u8; super::FILE_RENAME_NAME_OFFSET + 2];
+        input[super::FILE_RENAME_REPLACE_IF_EXISTS_OFFSET] = 1;
+        input[super::FILE_RENAME_NAME_LENGTH_OFFSET
+            ..super::FILE_RENAME_NAME_LENGTH_OFFSET + core::mem::size_of::<u32>()]
+            .copy_from_slice(&2_u32.to_le_bytes());
+        input[super::FILE_RENAME_NAME_OFFSET..super::FILE_RENAME_NAME_OFFSET + 2]
+            .copy_from_slice(&u16::from(b'a').to_le_bytes());
+
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: file_object.as_ptr(),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
+            Length: u32::try_from(input.len()).unwrap_or(u32::MAX),
+            __bindgen_padding_0: 0,
+            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation,
+            FileObject: core::ptr::null_mut(),
+            __bindgen_anon_1:
+                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
+        };
+
+        let mut irp = wdk_sys::IRP::default();
+        irp.AssociatedIrp.SystemBuffer = input.as_mut_ptr().cast();
+        irp.Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+
+        let device = NonNull::<wdk_sys::DEVICE_OBJECT>::dangling();
+        assert_eq!(
+            super::set(device.as_ptr(), core::ptr::addr_of_mut!(irp)),
+            STATUS_NOT_SUPPORTED
+        );
     }
 }

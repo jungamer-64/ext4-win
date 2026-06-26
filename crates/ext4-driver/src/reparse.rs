@@ -42,8 +42,7 @@ const SYMLINK_PATH_BUFFER_OFFSET: usize =
 /// Handles `FSCTL_GET_REPARSE_POINT` for an opened ext4 symlink.
 pub(crate) fn get_reparse_point(target: DispatchTarget, stack: FileSystemControlStack) -> NTSTATUS {
     match read_symlink_target(stack).and_then(|symlink_target| {
-        let length =
-            usize::try_from(stack.output_buffer_length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let length = stack.output_buffer_length().as_usize();
         let mut output = target
             .data_buffer(length)
             .map_err(|error| error.ntstatus())?;
@@ -107,8 +106,7 @@ fn parse_symlink_reparse_target(
     target: DispatchTarget,
     stack: FileSystemControlStack,
 ) -> Result<SymlinkTarget, NTSTATUS> {
-    let length =
-        usize::try_from(stack.input_buffer_length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let length = stack.input_buffer_length().as_usize();
     let input = target
         .data_buffer(length)
         .map_err(|error| error.ntstatus())?;

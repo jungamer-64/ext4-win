@@ -9,7 +9,10 @@ use wdk_sys::{
     STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
 };
 
-use crate::irp::{DispatchTarget, QuerySecurityStack, SetSecurityStack};
+use crate::irp::{
+    DispatchTarget, QuerySecurityStack, SecurityComponentSelection, SecuritySelection,
+    SetSecurityStack,
+};
 use crate::state::{FileControlBlock, FileSystemNode, VolumeControlBlock, file_control_block};
 use crate::status::DriverError;
 
@@ -157,16 +160,55 @@ enum PermissionClass {
     Other,
 }
 
+/// Parsed permission bits for one POSIX class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PermissionClassBits {
+    /// POSIX class represented by an ACE.
+    class: PermissionClass,
+    /// rwx bits decoded from the Windows access mask.
+    bits: u16,
+}
+
+/// Duplicate-checking builder for POSIX permission bits parsed from a DACL.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DaclPermissionBuilder {
+    /// Permission classes observed in DACL order.
+    classes: Vec<PermissionClassBits>,
+}
+
+impl DaclPermissionBuilder {
+    /// Stores one parsed permission class.
+    fn set(&mut self, class: PermissionClass, bits: u16) -> Result<(), NTSTATUS> {
+        if self.classes.iter().any(|entry| entry.class == class) {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        self.classes.push(PermissionClassBits { class, bits });
+        Ok(())
+    }
+
+    /// Converts parsed classes into POSIX rwx mode bits.
+    fn mode_bits(&self) -> u16 {
+        let mut mode = 0_u16;
+        for entry in &self.classes {
+            match entry.class {
+                PermissionClass::Owner => mode |= entry.bits << 6,
+                PermissionClass::Group => mode |= entry.bits << 3,
+                PermissionClass::Other => mode |= entry.bits,
+            }
+        }
+        mode
+    }
+}
+
 /// Performs a security descriptor query.
 fn query_security(request: QuerySecurityRequest) -> NTSTATUS {
     match load_ext4_security(request.stack.file_object()).and_then(|security| {
-        let descriptor = security_descriptor(security, request.stack.security_information())?;
+        let descriptor = security_descriptor(security, request.stack.selection())?;
         let required = descriptor.len();
         request.target.set_information(
             wdk_sys::ULONG_PTR::try_from(required).map_err(|_| STATUS_INVALID_PARAMETER)?,
         );
-        let length =
-            usize::try_from(request.stack.length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let length = request.stack.length().as_usize();
         if length < required {
             return Err(STATUS_BUFFER_TOO_SMALL);
         }
@@ -191,11 +233,11 @@ fn set_security(request: SetSecurityRequest) -> NTSTATUS {
     match load_ext4_security_context(request.stack.file_object()).and_then(|context| {
         let descriptor = security_descriptor_bytes(
             request.stack.security_descriptor(),
-            request.stack.security_information(),
+            request.stack.selection(),
         )?;
         let security = security_from_descriptor(
             descriptor.as_slice(),
-            request.stack.security_information(),
+            request.stack.selection(),
             context.security,
         )?;
         if security == context.security {
@@ -271,18 +313,8 @@ fn security_from_node(identity: FileSystemNode, node: Node) -> Result<Ext4Securi
 /// Builds a self-relative security descriptor for requested fields.
 fn security_descriptor(
     security: Ext4Security,
-    information: wdk_sys::SECURITY_INFORMATION,
+    selection: SecuritySelection,
 ) -> Result<Vec<u8>, NTSTATUS> {
-    let supported = wdk_sys::OWNER_SECURITY_INFORMATION
-        | wdk_sys::GROUP_SECURITY_INFORMATION
-        | wdk_sys::DACL_SECURITY_INFORMATION;
-    if information & wdk_sys::SACL_SECURITY_INFORMATION != 0 {
-        return Err(DriverError::AccessDenied.ntstatus());
-    }
-    if information & !supported != 0 {
-        return Err(STATUS_NOT_SUPPORTED);
-    }
-
     let mut descriptor = vec![0; SECURITY_DESCRIPTOR_RELATIVE_BYTES];
     write_u8(
         &mut descriptor,
@@ -292,17 +324,17 @@ fn security_descriptor(
     )?;
     let mut control = wdk_sys::SE_SELF_RELATIVE;
 
-    if information & wdk_sys::OWNER_SECURITY_INFORMATION != 0 {
+    if matches!(selection.owner(), SecurityComponentSelection::Selected) {
         let owner = uid_sid(security.owner().uid().as_u32())?;
         let offset = append_component(&mut descriptor, owner.bytes.as_slice())?;
         write_u32(&mut descriptor, 4, offset)?;
     }
-    if information & wdk_sys::GROUP_SECURITY_INFORMATION != 0 {
+    if matches!(selection.group(), SecurityComponentSelection::Selected) {
         let group = gid_sid(security.owner().gid().as_u32())?;
         let offset = append_component(&mut descriptor, group.bytes.as_slice())?;
         write_u32(&mut descriptor, 8, offset)?;
     }
-    if information & wdk_sys::DACL_SECURITY_INFORMATION != 0 {
+    if matches!(selection.dacl(), SecurityComponentSelection::Selected) {
         control |= wdk_sys::SE_DACL_PRESENT;
         let dacl = dacl_from_permissions(security)?;
         let offset = append_component(&mut descriptor, dacl.as_slice())?;
@@ -320,7 +352,7 @@ fn security_descriptor(
 /// Copies the raw SetSecurity descriptor into a bounded byte image.
 fn security_descriptor_bytes(
     security_descriptor: NonNull<core::ffi::c_void>,
-    information: wdk_sys::SECURITY_INFORMATION,
+    selection: SecuritySelection,
 ) -> Result<Vec<u8>, NTSTATUS> {
     let pointer = security_descriptor.cast::<u8>();
     let mut length = SECURITY_DESCRIPTOR_RELATIVE_BYTES;
@@ -332,13 +364,13 @@ fn security_descriptor_bytes(
     };
     let descriptor = ParsedSecurityDescriptor::parse(header)?;
 
-    if information & wdk_sys::OWNER_SECURITY_INFORMATION != 0 {
+    if matches!(selection.owner(), SecurityComponentSelection::Selected) {
         length = length.max(raw_sid_end(pointer, descriptor.owner_offset)?);
     }
-    if information & wdk_sys::GROUP_SECURITY_INFORMATION != 0 {
+    if matches!(selection.group(), SecurityComponentSelection::Selected) {
         length = length.max(raw_sid_end(pointer, descriptor.group_offset)?);
     }
-    if information & wdk_sys::DACL_SECURITY_INFORMATION != 0 {
+    if matches!(selection.dacl(), SecurityComponentSelection::Selected) {
         length = length.max(raw_acl_end(pointer, descriptor.dacl_offset)?);
     }
 
@@ -353,32 +385,22 @@ fn security_descriptor_bytes(
 /// Builds new ext4 security metadata from a Windows security descriptor.
 fn security_from_descriptor(
     descriptor: &[u8],
-    information: wdk_sys::SECURITY_INFORMATION,
+    selection: SecuritySelection,
     current: Ext4Security,
 ) -> Result<Ext4Security, NTSTATUS> {
-    let supported = wdk_sys::OWNER_SECURITY_INFORMATION
-        | wdk_sys::GROUP_SECURITY_INFORMATION
-        | wdk_sys::DACL_SECURITY_INFORMATION;
-    if information & wdk_sys::SACL_SECURITY_INFORMATION != 0 {
-        return Err(DriverError::AccessDenied.ntstatus());
-    }
-    if information & !supported != 0 {
-        return Err(STATUS_NOT_SUPPORTED);
-    }
-
     let descriptor = ParsedSecurityDescriptor::parse(descriptor)?;
     let mut owner = current.owner();
-    if information & wdk_sys::OWNER_SECURITY_INFORMATION != 0 {
+    if matches!(selection.owner(), SecurityComponentSelection::Selected) {
         let uid = descriptor.owner_uid()?;
         owner = Ext4Owner::new(Ext4Uid::from_u32(uid), owner.gid());
     }
-    if information & wdk_sys::GROUP_SECURITY_INFORMATION != 0 {
+    if matches!(selection.group(), SecurityComponentSelection::Selected) {
         let gid = descriptor.group_gid()?;
         owner = Ext4Owner::new(owner.uid(), Ext4Gid::from_u32(gid));
     }
 
     let mut permissions = current.permissions().as_u16();
-    if information & wdk_sys::DACL_SECURITY_INFORMATION != 0 {
+    if matches!(selection.dacl(), SecurityComponentSelection::Selected) {
         let low_bits = descriptor.dacl_permissions(owner)?;
         permissions = (permissions & !POSIX_RWX_BITS) | low_bits;
     }
@@ -552,7 +574,7 @@ fn parse_dacl_permissions(acl: &[u8], owner: Ext4Owner) -> Result<u16, NTSTATUS>
     }
     let ace_count = usize::from(read_u16(acl, ACL_ACE_COUNT_OFFSET)?);
     let mut cursor = ACL_HEADER_BYTES;
-    let mut parsed = ParsedDaclPermissions::default();
+    let mut parsed = DaclPermissionBuilder::default();
     for _ in 0..ace_count {
         let ace_header = acl
             .get(cursor..)
@@ -583,7 +605,7 @@ fn parse_allow_ace(
     ace_flags: u8,
     ace: &[u8],
     owner: Ext4Owner,
-    parsed: &mut ParsedDaclPermissions,
+    parsed: &mut DaclPermissionBuilder,
 ) -> Result<(), NTSTATUS> {
     if u32::from(ace_type) != wdk_sys::ACCESS_ALLOWED_ACE_TYPE {
         return Err(STATUS_NOT_SUPPORTED);
@@ -904,11 +926,29 @@ mod tests {
 
     use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid};
 
+    use crate::irp::{SecurityComponentSelection, SecuritySelection};
+
     use super::{
         SidIdentity, dacl_from_permissions, gid_sid, permission_bits_from_mask,
         permission_class_mask, security_descriptor, security_from_descriptor, sid_identity,
         uid_sid,
     };
+
+    fn all_security_components() -> SecuritySelection {
+        SecuritySelection::from_components(
+            SecurityComponentSelection::Selected,
+            SecurityComponentSelection::Selected,
+            SecurityComponentSelection::Selected,
+        )
+    }
+
+    fn dacl_security_component() -> SecuritySelection {
+        SecuritySelection::from_components(
+            SecurityComponentSelection::Omitted,
+            SecurityComponentSelection::Omitted,
+            SecurityComponentSelection::Selected,
+        )
+    }
 
     #[test]
     fn uid_and_gid_sids_use_linux_sid_authority() {
@@ -960,12 +1000,7 @@ mod tests {
                 Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(100)),
                 permissions,
             );
-            let descriptor = security_descriptor(
-                security,
-                wdk_sys::OWNER_SECURITY_INFORMATION
-                    | wdk_sys::GROUP_SECURITY_INFORMATION
-                    | wdk_sys::DACL_SECURITY_INFORMATION,
-            );
+            let descriptor = security_descriptor(security, all_security_components());
             assert!(descriptor.is_ok());
             if let Ok(descriptor) = descriptor {
                 assert_eq!(read_test_u16(descriptor.as_slice(), 2), Some(32772));
@@ -993,21 +1028,14 @@ mod tests {
                 Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(100)),
                 target_permissions,
             );
-            let descriptor = security_descriptor(
-                target,
-                wdk_sys::OWNER_SECURITY_INFORMATION
-                    | wdk_sys::GROUP_SECURITY_INFORMATION
-                    | wdk_sys::DACL_SECURITY_INFORMATION,
-            );
+            let descriptor = security_descriptor(target, all_security_components());
             assert!(descriptor.is_ok());
             if let Ok(descriptor) = descriptor {
                 assert_eq!(
                     security_from_descriptor(
                         descriptor.as_slice(),
-                        wdk_sys::OWNER_SECURITY_INFORMATION
-                            | wdk_sys::GROUP_SECURITY_INFORMATION
-                            | wdk_sys::DACL_SECURITY_INFORMATION,
-                        current,
+                        all_security_components(),
+                        current
                     ),
                     Ok(target)
                 );
@@ -1032,14 +1060,13 @@ mod tests {
                 Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(2)),
                 descriptor_permissions,
             );
-            let descriptor =
-                security_descriptor(descriptor_security, wdk_sys::DACL_SECURITY_INFORMATION);
+            let descriptor = security_descriptor(descriptor_security, dacl_security_component());
             assert!(descriptor.is_ok());
             if let Ok(descriptor) = descriptor {
                 assert_eq!(
                     security_from_descriptor(
                         descriptor.as_slice(),
-                        wdk_sys::DACL_SECURITY_INFORMATION,
+                        dacl_security_component(),
                         current,
                     ),
                     Err(wdk_sys::STATUS_NOT_SUPPORTED)
@@ -1057,7 +1084,7 @@ mod tests {
                 Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(100)),
                 permissions,
             );
-            let descriptor = security_descriptor(security, wdk_sys::DACL_SECURITY_INFORMATION);
+            let descriptor = security_descriptor(security, dacl_security_component());
             assert!(descriptor.is_ok());
             if let Ok(mut descriptor) = descriptor {
                 let dacl_offset = read_test_u32(
@@ -1081,7 +1108,7 @@ mod tests {
                         assert_eq!(
                             security_from_descriptor(
                                 descriptor.as_slice(),
-                                wdk_sys::DACL_SECURITY_INFORMATION,
+                                dacl_security_component(),
                                 security,
                             ),
                             Err(wdk_sys::STATUS_NOT_SUPPORTED)

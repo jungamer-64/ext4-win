@@ -537,8 +537,7 @@ impl OptionalUserBuffer {
 
 /// Reads METHOD_BUFFERED input bytes for one user FSCTL.
 fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> Result<Vec<u8>, NTSTATUS> {
-    let length =
-        usize::try_from(stack.input_buffer_length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let length = stack.input_buffer_length().as_usize();
     let input = target.data_buffer(length).map_err(DriverError::ntstatus)?;
     Ok(input.as_slice().to_vec())
 }
@@ -560,8 +559,7 @@ fn output_buffer(
     stack: FileSystemControlStack,
     len: usize,
 ) -> Result<crate::irp::IrpDataBuffer, NTSTATUS> {
-    let output_len =
-        usize::try_from(stack.output_buffer_length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let output_len = stack.output_buffer_length().as_usize();
     if output_len < len {
         return Err(STATUS_BUFFER_TOO_SMALL);
     }

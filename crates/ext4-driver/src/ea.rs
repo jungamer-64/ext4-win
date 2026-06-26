@@ -9,7 +9,7 @@ use wdk_sys::{
     STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
 };
 
-use crate::irp::{DispatchTarget, QueryEaStack, SetEaStack};
+use crate::irp::{DispatchTarget, EaEntryEmission, EaNameSelection, QueryEaStack, SetEaStack};
 use crate::state::{FileControlBlock, VolumeControlBlock, file_control_block};
 use crate::status::DriverError;
 
@@ -101,20 +101,14 @@ struct WindowsEaEntry {
 /// Performs an EA query against mounted ext4 xattrs.
 fn query_ea(request: QueryEaRequest) -> NTSTATUS {
     match collect_query_entries(request.stack).and_then(|mut entries| {
-        if query_ea_flag(request.stack, wdk_sys::SL_INDEX_SPECIFIED)
-            || request.stack.ea_index() != 0
-        {
-            return Err(STATUS_NOT_SUPPORTED);
-        }
-        if query_ea_flag(request.stack, wdk_sys::SL_RETURN_SINGLE_ENTRY) && entries.len() > 1 {
+        if matches!(request.stack.entry_emission(), EaEntryEmission::Single) && entries.len() > 1 {
             entries.truncate(1);
         }
         if entries.is_empty() {
             return Err(STATUS_NO_EAS_ON_FILE);
         }
 
-        let length =
-            usize::try_from(request.stack.length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let length = request.stack.length().as_usize();
         let required = packed_full_ea_length(entries.as_slice())?;
         if length < required {
             return Err(STATUS_BUFFER_TOO_SMALL);
@@ -249,7 +243,7 @@ fn parse_set_ea_entries(
     target: DispatchTarget,
     stack: SetEaStack,
 ) -> Result<Vec<WindowsEaEntry>, NTSTATUS> {
-    let length = usize::try_from(stack.length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let length = stack.length().as_usize();
     if length == 0 {
         return Ok(Vec::new());
     }
@@ -261,19 +255,17 @@ fn parse_set_ea_entries(
 
 /// Parses an optional FILE_GET_EA_INFORMATION list from the query stack.
 fn requested_ea_names(stack: QueryEaStack) -> Result<Option<Vec<Vec<u8>>>, NTSTATUS> {
-    let length = usize::try_from(stack.ea_list_length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
-    if length == 0 {
-        return Ok(None);
+    match stack.name_selection() {
+        EaNameSelection::All => Ok(None),
+        EaNameSelection::Names { address, length } => {
+            let bytes = unsafe {
+                // SAFETY: QueryEa supplies EaList/EaListLength as a kernel-addressable
+                // input list for the lifetime of this dispatch callback.
+                core::slice::from_raw_parts(address.as_ptr(), length.as_usize())
+            };
+            parse_get_ea_list(bytes).map(Some)
+        }
     }
-    let Some(list) = stack.ea_list() else {
-        return Err(STATUS_INVALID_PARAMETER);
-    };
-    let bytes = unsafe {
-        // SAFETY: QueryEa supplies EaList/EaListLength as a kernel-addressable
-        // input list for the lifetime of this dispatch callback.
-        core::slice::from_raw_parts(list.as_ptr(), length)
-    };
-    parse_get_ea_list(bytes).map(Some)
 }
 
 /// Parses a FILE_FULL_EA_INFORMATION list.
