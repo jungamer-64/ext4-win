@@ -725,7 +725,8 @@ fn read_only_mount_rejects_layout_changing_features() {
         assert!(matches!(result, Err(Error::UnsupportedIncompatFeature)));
     }
 
-    for read_only_compat in [RO_COMPAT_ORPHAN_PRESENT] {
+    {
+        let read_only_compat = RO_COMPAT_ORPHAN_PRESENT;
         let mut image = fixture_image();
         put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | read_only_compat);
         let result = Superblock::parse(&image[1024..2048]);
@@ -2273,7 +2274,11 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
         SliceBlockDevice::new(&image),
         test_mount_context_with_key(master_key),
     ));
-    let child_context = must(volume.read_fscrypt_context(inode(11))).expect("child context");
+    let child_context = must(volume.read_fscrypt_context(inode(11)));
+    assert!(child_context.is_some());
+    let Some(child_context) = child_context else {
+        return;
+    };
     let parent_context = must(FscryptContextV2::parse(&context_bytes));
     assert_eq!(child_context.policy(), parent_context.policy());
     assert_eq!(
@@ -2327,7 +2332,11 @@ fn encrypted_directory_create_directory_inherits_child_context_when_key_is_prese
         SliceBlockDevice::new(&image),
         test_mount_context_with_key(master_key),
     ));
-    let child_context = must(volume.read_fscrypt_context(inode(11))).expect("child context");
+    let child_context = must(volume.read_fscrypt_context(inode(11)));
+    assert!(child_context.is_some());
+    let Some(child_context) = child_context else {
+        return;
+    };
     let parent_context = must(FscryptContextV2::parse(&context_bytes));
     assert_eq!(child_context.policy(), parent_context.policy());
     assert_eq!(

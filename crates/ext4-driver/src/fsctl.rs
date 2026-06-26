@@ -659,6 +659,35 @@ mod tests {
     /// Deterministic raw key used by fscrypt FSCTL tests.
     const RAW_KEY: [u8; 32] = [7_u8; 32];
 
+    macro_rules! must {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    let unexpected_error: Option<()> = None;
+                    assert!(
+                        unexpected_error.is_some(),
+                        "unexpected FSCTL test error: {error:?}"
+                    );
+                    return;
+                }
+            }
+        };
+    }
+
+    macro_rules! some {
+        ($option:expr) => {
+            match $option {
+                Some(value) => value,
+                None => {
+                    let missing_value: Option<()> = None;
+                    assert!(missing_value.is_some(), "missing FSCTL test value");
+                    return;
+                }
+            }
+        };
+    }
+
     #[test]
     fn fsctl_codes_are_ext4win_private_buffered_file_system_controls() {
         assert_eq!(FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY, 0x0009_2400);
@@ -669,21 +698,19 @@ mod tests {
 
     #[test]
     fn fscrypt_add_key_payload_decodes_linux_layout() {
-        let payload = add_key_payload(&RAW_KEY).expect("payload");
+        let payload = must!(add_key_payload(&RAW_KEY));
 
-        let decoded = FscryptAddKeyPayload::parse(&payload).expect("decoded add key");
+        let decoded = must!(FscryptAddKeyPayload::parse(&payload));
 
         assert_eq!(
             decoded.into_master_key().identifier(),
-            FscryptMasterKey::from_raw(&RAW_KEY)
-                .expect("master key")
-                .identifier()
+            must!(FscryptMasterKey::from_raw(&RAW_KEY)).identifier()
         );
     }
 
     #[test]
     fn fscrypt_add_key_payload_rejects_mismatched_identifier() {
-        let mut payload = add_key_payload(&RAW_KEY).expect("payload");
+        let mut payload = must!(add_key_payload(&RAW_KEY));
         let identifier_byte = FSCRYPT_KEY_SPEC_UNION_OFFSET;
         if let Some(byte) = payload.get_mut(identifier_byte) {
             *byte ^= 0xff;
@@ -697,15 +724,15 @@ mod tests {
 
     #[test]
     fn fscrypt_add_key_payload_rejects_v1_descriptor_and_hw_wrapped_keys() {
-        let mut descriptor = add_key_payload(&RAW_KEY).expect("payload");
-        write_u32(&mut descriptor, FSCRYPT_KEY_SPEC_TYPE_OFFSET, 1).expect("write type");
+        let mut descriptor = must!(add_key_payload(&RAW_KEY));
+        must!(write_u32(&mut descriptor, FSCRYPT_KEY_SPEC_TYPE_OFFSET, 1));
         assert_eq!(
             FscryptAddKeyPayload::parse(&descriptor),
             Err(STATUS_NOT_SUPPORTED)
         );
 
-        let mut hw_wrapped = add_key_payload(&RAW_KEY).expect("payload");
-        write_u32(&mut hw_wrapped, FSCRYPT_ADD_KEY_FLAGS_OFFSET, 1).expect("write flags");
+        let mut hw_wrapped = must!(add_key_payload(&RAW_KEY));
+        must!(write_u32(&mut hw_wrapped, FSCRYPT_ADD_KEY_FLAGS_OFFSET, 1));
         assert_eq!(
             FscryptAddKeyPayload::parse(&hw_wrapped),
             Err(STATUS_NOT_SUPPORTED)
@@ -714,22 +741,16 @@ mod tests {
 
     #[test]
     fn fscrypt_remove_and_status_payloads_decode_identifier() {
-        let identifier = FscryptMasterKey::from_raw(&RAW_KEY)
-            .expect("master key")
-            .identifier();
-        let remove = remove_key_payload(identifier).expect("remove payload");
-        let status = key_status_payload(identifier).expect("status payload");
+        let identifier = must!(FscryptMasterKey::from_raw(&RAW_KEY)).identifier();
+        let remove = must!(remove_key_payload(identifier));
+        let status = must!(key_status_payload(identifier));
 
         assert_eq!(
-            FscryptRemoveKeyPayload::parse(&remove)
-                .expect("remove")
-                .identifier(),
+            must!(FscryptRemoveKeyPayload::parse(&remove)).identifier(),
             identifier
         );
         assert_eq!(
-            FscryptKeyStatusPayload::parse(&status)
-                .expect("status")
-                .identifier(),
+            must!(FscryptKeyStatusPayload::parse(&status)).identifier(),
             identifier
         );
     }
@@ -737,7 +758,7 @@ mod tests {
     #[test]
     fn fscrypt_status_outputs_linux_layout() {
         let mut present = vec![0xFF; FSCRYPT_GET_KEY_STATUS_BYTES];
-        write_key_status_output(&mut present, true).expect("present output");
+        must!(write_key_status_output(&mut present, true));
 
         assert_eq!(
             read_u32(&present, FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
@@ -752,15 +773,13 @@ mod tests {
             Ok(1)
         );
         assert!(
-            present
-                .get(FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET..)
-                .expect("reserved")
+            some!(present.get(FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET..))
                 .iter()
                 .all(|byte| *byte == 0)
         );
 
         let mut absent = vec![0xFF; FSCRYPT_GET_KEY_STATUS_BYTES];
-        write_key_status_output(&mut absent, false).expect("absent output");
+        must!(write_key_status_output(&mut absent, false));
 
         assert_eq!(
             read_u32(&absent, FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
@@ -780,7 +799,7 @@ mod tests {
     fn fscrypt_remove_output_clears_status_flags() {
         let mut output = vec![0xFF; FSCRYPT_REMOVE_KEY_BYTES];
 
-        write_remove_key_output(&mut output).expect("remove output");
+        must!(write_remove_key_output(&mut output));
 
         assert_eq!(
             read_u32(&output, FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET),
@@ -801,10 +820,10 @@ mod tests {
                 address: 0x2000,
                 length: 16,
             },
-        )
-        .expect("payload");
+        );
+        let payload = must!(payload);
 
-        let decoded = FsverityEnablePayload::parse(&payload).expect("decoded verity");
+        let decoded = must!(FsverityEnablePayload::parse(&payload));
 
         assert_eq!(decoded.algorithm(), FsverityHashAlgorithm::Sha512);
         assert_eq!(decoded.block_size().bytes(), 4096);
@@ -827,12 +846,13 @@ mod tests {
                 address: 0,
                 length: 0,
             },
-        )
-        .expect("payload");
+        );
+        let payload = must!(payload);
 
-        let enable = FsverityEnablePayload::parse(&payload)
-            .and_then(FsverityEnablePayload::into_core_enable)
-            .expect("core enable");
+        let enable = must!(
+            FsverityEnablePayload::parse(&payload)
+                .and_then(FsverityEnablePayload::into_core_enable)
+        );
 
         assert_eq!(enable.algorithm(), FsverityHashAlgorithm::Sha256);
         assert_eq!(enable.block_size().bytes(), 1024);
@@ -853,8 +873,8 @@ mod tests {
                 address: 0,
                 length: 0,
             },
-        )
-        .expect("payload");
+        );
+        let payload = must!(payload);
 
         assert_eq!(
             FsverityEnablePayload::parse(&payload)
@@ -865,7 +885,7 @@ mod tests {
 
     #[test]
     fn fsverity_enable_payload_rejects_reserved_and_bad_pointer_pairs() {
-        let mut reserved = enable_verity_payload(
+        let reserved = enable_verity_payload(
             1,
             1024,
             OptionalUserBuffer {
@@ -876,9 +896,13 @@ mod tests {
                 address: 0,
                 length: 0,
             },
-        )
-        .expect("payload");
-        write_u32(&mut reserved, FSVERITY_ENABLE_RESERVED1_OFFSET, 1).expect("write reserved");
+        );
+        let mut reserved = must!(reserved);
+        must!(write_u32(
+            &mut reserved,
+            FSVERITY_ENABLE_RESERVED1_OFFSET,
+            1
+        ));
         assert_eq!(
             FsverityEnablePayload::parse(&reserved),
             Err(STATUS_INVALID_PARAMETER)
@@ -895,8 +919,8 @@ mod tests {
                 address: 0,
                 length: 0,
             },
-        )
-        .expect("payload");
+        );
+        let bad_salt = must!(bad_salt);
         assert_eq!(
             FsverityEnablePayload::parse(&bad_salt),
             Err(STATUS_INVALID_PARAMETER)
