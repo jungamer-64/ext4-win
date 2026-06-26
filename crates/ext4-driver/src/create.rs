@@ -81,7 +81,7 @@ impl CreateRequest {
 
 /// Opens or creates a root-relative ext4 object.
 fn open_or_create(request: CreateRequest) -> NTSTATUS {
-    if request.stack.ea_length() != 0 {
+    if request.stack.ea_length().as_usize() != 0 {
         return STATUS_NOT_SUPPORTED;
     }
     let Some(vcb) = MountedVolumeDevice::vcb(request.device()) else {

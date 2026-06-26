@@ -20,6 +20,8 @@ pub(crate) enum DriverError {
     InsufficientResources,
     /// Access is denied by the current FSD policy.
     AccessDenied,
+    /// Caller selected a valid but unsupported Windows filesystem behavior.
+    NotSupported,
     /// ext4-core rejected the requested filesystem operation.
     Core(Error),
 }
@@ -32,6 +34,7 @@ impl DriverError {
             Self::InvalidParameter => STATUS_INVALID_PARAMETER,
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,
+            Self::NotSupported => STATUS_NOT_SUPPORTED,
             Self::Core(error) => core_error_status(error),
         }
     }

@@ -10,7 +10,7 @@ use wdk_sys::{
 use crate::{
     block_device::query_device_length,
     ffi, fsctl,
-    irp::{DispatchTarget, FileSystemControlStack, MountVolumeStack},
+    irp::{DispatchTarget, FileSystemControlStack, IrpBufferLength, MountVolumeStack},
     reparse,
     state::{
         KernelDevice, MountCandidate, MountedVolumeDevice, MountedVolumeDeviceExtension,
@@ -116,7 +116,7 @@ struct MountVolumeRequest {
     /// Lower storage device selected by the I/O Manager.
     target_device: KernelDevice,
     /// Output buffer length supplied with the mount request.
-    output_buffer_length: wdk_sys::ULONG,
+    output_buffer_length: IrpBufferLength,
 }
 
 impl MountVolumeRequest {
@@ -149,7 +149,7 @@ impl MountVolumeRequest {
     }
 
     /// Returns the mount output buffer length.
-    const fn output_buffer_length(self) -> wdk_sys::ULONG {
+    const fn output_buffer_length(self) -> IrpBufferLength {
         self.output_buffer_length
     }
 }

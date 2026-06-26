@@ -130,10 +130,7 @@ fn query_volume(request: QueryVolumeRequest) -> NTSTATUS {
     let Some(buffer) = request.target.system_buffer() else {
         return STATUS_INVALID_PARAMETER;
     };
-    let length = match usize::try_from(request.stack.length()) {
-        Ok(length) => length,
-        Err(_) => return STATUS_INVALID_PARAMETER,
-    };
+    let length = request.stack.length().as_usize();
     let written = match request.stack.information_class() {
         FILE_FS_VOLUME_INFORMATION_CLASS => pack_volume_information(vcb, buffer, length),
         FILE_FS_SIZE_INFORMATION_CLASS => pack_size_information(vcb, buffer, length),
@@ -164,7 +161,7 @@ fn set_volume(request: SetVolumeRequest) -> NTSTATUS {
 
 /// Applies `FILE_FS_LABEL_INFORMATION` to the mounted ext4 superblock.
 fn set_volume_label(request: SetVolumeRequest) -> Result<(), NTSTATUS> {
-    let length = usize::try_from(request.stack.length()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let length = request.stack.length().as_usize();
     let input = system_buffer_input(request.target, length)?;
     let label = volume_label_from_file_fs_label(input.as_slice())?;
     let Some(mut vcb) = MountedVolumeDevice::vcb(request.device) else {

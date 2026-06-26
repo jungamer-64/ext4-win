@@ -7,7 +7,9 @@ use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
 use crate::inode::InodeId;
 use crate::name::Ext4Name;
-use crate::superblock::{ChecksumSeed, DirectoryHashSeed, DirectoryHashVersion};
+use crate::superblock::{
+    ChecksumSeed, DirectoryHashByteInterpretation, DirectoryHashSeed, DirectoryHashVersion,
+};
 
 /// Bytes occupied by the fixed header of an ext4 directory record.
 const DIRENT_HEADER_SIZE: usize = 8;
