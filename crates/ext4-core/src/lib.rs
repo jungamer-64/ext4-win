@@ -70,8 +70,9 @@ pub use verity::{
     FsveritySignature,
 };
 pub use volume::{
-    DirectoryNode, ExternalJournal, FileNode, InternalJournal, LookupResult, MountContext, Node,
-    ReadOnly, ReadWrite, SymlinkNode, TransactionDirectory, TransactionFile, TransactionNode,
+    ChildLookup, DirectoryChild, DirectoryNode, DirectoryNodeId, ExternalJournal, FileNode,
+    FileNodeId, InternalJournal, LoadedNode, MountContext, NodeId, ReadOnly, ReadWrite,
+    SymlinkNode, SymlinkNodeId, TransactionDirectory, TransactionFile, TransactionNode,
     TransactionSymlink, Volume, WriteTransaction,
 };
 pub use windows::{Ext4WindowsAttributes, WindowsOverlay};
