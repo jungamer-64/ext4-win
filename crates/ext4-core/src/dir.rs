@@ -7,7 +7,9 @@ use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
 use crate::inode::InodeId;
 use crate::name::Ext4Name;
-use crate::superblock::{ChecksumSeed, DirectoryHashSeed, DirectoryHashVersion};
+use crate::superblock::{
+    ChecksumSeed, DirectoryHashByteInterpretation, DirectoryHashSeed, DirectoryHashVersion,
+};
 
 /// Bytes occupied by the fixed header of an ext4 directory record.
 const DIRENT_HEADER_SIZE: usize = 8;
@@ -1779,14 +1781,18 @@ impl DirectoryHashContext {
     pub(crate) fn hash_name(self, name: &Ext4Name) -> DirectoryHash {
         let bytes = name.bytes();
         let mut hash = match self.version {
-            DirectoryHashVersion::Legacy => legacy_hash(bytes, true),
-            DirectoryHashVersion::LegacyUnsigned => legacy_hash(bytes, false),
+            DirectoryHashVersion::Legacy => {
+                legacy_hash(bytes, DirectoryHashByteInterpretation::Signed)
+            }
+            DirectoryHashVersion::LegacyUnsigned => {
+                legacy_hash(bytes, DirectoryHashByteInterpretation::Unsigned)
+            }
             DirectoryHashVersion::HalfMd4 | DirectoryHashVersion::HalfMd4Unsigned => {
                 let mut state = self.seed;
-                let signed = self.version.uses_signed_bytes();
+                let interpretation = self.version.byte_interpretation();
                 let mut input = bytes;
                 while !input.is_empty() {
-                    let block = str2hashbuf::<8>(input, signed);
+                    let block = str2hashbuf::<8>(input, interpretation);
                     half_md4_transform(&mut state, &block);
                     input = input.get(input.len().min(32)..).unwrap_or(&[]);
                 }
@@ -1797,10 +1803,10 @@ impl DirectoryHashContext {
             }
             DirectoryHashVersion::Tea | DirectoryHashVersion::TeaUnsigned => {
                 let mut state = self.seed;
-                let signed = self.version.uses_signed_bytes();
+                let interpretation = self.version.byte_interpretation();
                 let mut input = bytes;
                 while !input.is_empty() {
-                    let block = str2hashbuf::<4>(input, signed);
+                    let block = str2hashbuf::<4>(input, interpretation);
                     tea_transform(&mut state, &block);
                     input = input.get(input.len().min(16)..).unwrap_or(&[]);
                 }
@@ -1869,11 +1875,11 @@ fn parse_live_entry_at(bytes: &[u8], offset: usize) -> Result<DirectoryEntry> {
 }
 
 /// Calculates the legacy ext2 directory hash.
-fn legacy_hash(bytes: &[u8], signed: bool) -> DirectoryHash {
+fn legacy_hash(bytes: &[u8], interpretation: DirectoryHashByteInterpretation) -> DirectoryHash {
     let mut hash0 = 0x12a3_fe2d_u32;
     let mut hash1 = 0x37ab_e8f9_u32;
     for byte in bytes {
-        let value = hash_byte(*byte, signed);
+        let value = hash_byte(*byte, interpretation);
         let mut hash = hash1.wrapping_add(hash0 ^ value.wrapping_mul(7_152_373));
         if hash & 0x8000_0000 != 0 {
             hash = hash.wrapping_sub(0x7fff_ffff);
@@ -1888,7 +1894,10 @@ fn legacy_hash(bytes: &[u8], signed: bool) -> DirectoryHash {
 }
 
 /// Converts a directory name chunk into the integer buffer consumed by ext4 hash transforms.
-fn str2hashbuf<const WORDS: usize>(bytes: &[u8], signed: bool) -> [u32; WORDS] {
+fn str2hashbuf<const WORDS: usize>(
+    bytes: &[u8],
+    interpretation: DirectoryHashByteInterpretation,
+) -> [u32; WORDS] {
     let len = bytes.len();
     let mut pad = u32::try_from(len).unwrap_or(u32::MAX);
     pad |= pad.wrapping_shl(8);
@@ -1898,7 +1907,7 @@ fn str2hashbuf<const WORDS: usize>(bytes: &[u8], signed: bool) -> [u32; WORDS] {
     let mut written = 0_usize;
     let limit = len.min(WORDS.saturating_mul(4));
     for (index, byte) in bytes.iter().take(limit).enumerate() {
-        value = hash_byte(*byte, signed).wrapping_add(value.wrapping_shl(8));
+        value = hash_byte(*byte, interpretation).wrapping_add(value.wrapping_shl(8));
         if index % 4 == 3 {
             if let Some(slot) = buffer.get_mut(written) {
                 *slot = value;
@@ -1919,16 +1928,17 @@ fn str2hashbuf<const WORDS: usize>(bytes: &[u8], signed: bool) -> [u32; WORDS] {
 }
 
 /// Returns one name byte as the signed or unsigned integer ext4 expects.
-fn hash_byte(byte: u8, signed: bool) -> u32 {
-    if signed {
-        let signed_value = if byte < 128 {
-            i32::from(byte)
-        } else {
-            i32::from(byte).wrapping_sub(256)
-        };
-        u32::from_ne_bytes(signed_value.to_ne_bytes())
-    } else {
-        u32::from(byte)
+fn hash_byte(byte: u8, interpretation: DirectoryHashByteInterpretation) -> u32 {
+    match interpretation {
+        DirectoryHashByteInterpretation::Signed => {
+            let signed_value = if byte < 128 {
+                i32::from(byte)
+            } else {
+                i32::from(byte).wrapping_sub(256)
+            };
+            u32::from_ne_bytes(signed_value.to_ne_bytes())
+        }
+        DirectoryHashByteInterpretation::Unsigned => u32::from(byte),
     }
 }
 

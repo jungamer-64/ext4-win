@@ -681,6 +681,15 @@ pub(crate) enum DirectoryHashVersion {
     TeaUnsigned,
 }
 
+/// Byte interpretation used by ext4 directory hash algorithms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryHashByteInterpretation {
+    /// Interpret each name byte through signed 8-bit extension.
+    Signed,
+    /// Interpret each name byte as an unsigned value.
+    Unsigned,
+}
+
 impl DirectoryHashVersion {
     /// Converts the on-disk version byte to a supported hash version.
     pub(crate) fn from_raw(raw: u8) -> Result<Self> {
@@ -695,10 +704,15 @@ impl DirectoryHashVersion {
         }
     }
 
-    /// Returns whether this version interprets name bytes as signed values.
+    /// Returns how this version interprets name bytes.
     #[must_use]
-    pub(crate) const fn uses_signed_bytes(self) -> bool {
-        matches!(self, Self::Legacy | Self::HalfMd4 | Self::Tea)
+    pub(crate) const fn byte_interpretation(self) -> DirectoryHashByteInterpretation {
+        match self {
+            Self::Legacy | Self::HalfMd4 | Self::Tea => DirectoryHashByteInterpretation::Signed,
+            Self::LegacyUnsigned | Self::HalfMd4Unsigned | Self::TeaUnsigned => {
+                DirectoryHashByteInterpretation::Unsigned
+            }
+        }
     }
 
     /// Encodes this version for `dx_root_info.hash_version`.
@@ -801,18 +815,22 @@ struct RawClusterGeometry {
     blocks_per_group: BlocksPerGroup,
     /// Raw `s_clusters_per_group`.
     clusters_per_group: u32,
-    /// Whether `RO_COMPAT_BIGALLOC` is enabled.
-    bigalloc: bool,
+    /// Allocation bitmap addressing domain selected by validated features.
+    allocation_bitmap_domain: AllocationBitmapDomain,
 }
 
 impl ClusterGeometry {
     /// Validates cluster fields against feature flags and block geometry.
     fn new(raw: RawClusterGeometry) -> Result<Self> {
-        if !raw.bigalloc
-            && (raw.log_cluster_size != raw.log_block_size
-                || raw.clusters_per_group != raw.blocks_per_group.as_u32())
-        {
-            return Err(Error::InvalidClusterGeometry);
+        match raw.allocation_bitmap_domain {
+            AllocationBitmapDomain::Blocks => {
+                if raw.log_cluster_size != raw.log_block_size
+                    || raw.clusters_per_group != raw.blocks_per_group.as_u32()
+                {
+                    return Err(Error::InvalidClusterGeometry);
+                }
+            }
+            AllocationBitmapDomain::Clusters => {}
         }
         if raw.log_cluster_size < raw.log_block_size || raw.log_cluster_size > 31 {
             return Err(Error::InvalidClusterGeometry);
@@ -827,8 +845,13 @@ impl ClusterGeometry {
                 .checked_shl(ratio_shift)
                 .ok_or(Error::ArithmeticOverflow)?,
         )?;
-        if raw.bigalloc && blocks_per_cluster.as_u32() == 1 {
-            return Err(Error::InvalidClusterGeometry);
+        match raw.allocation_bitmap_domain {
+            AllocationBitmapDomain::Blocks => {}
+            AllocationBitmapDomain::Clusters => {
+                if blocks_per_cluster.as_u32() == 1 {
+                    return Err(Error::InvalidClusterGeometry);
+                }
+            }
         }
         let cluster_size = ClusterSize::new(
             raw.block_size
@@ -875,6 +898,143 @@ enum JournalFeature {
     External,
 }
 
+/// Superblock copy placement selected by sparse-super feature bits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SparseSuperblockLayout {
+    /// Every block group carries backup metadata.
+    FullCopies,
+    /// Only group zero, one, and powers of three, five, or seven carry backups.
+    SparseCopies,
+}
+
+/// Directory indexing capability selected by compatible feature bits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryIndexing {
+    /// Indexed directories are outside this mounted profile.
+    Disabled,
+    /// HTree indexed directories are part of this mounted profile.
+    Enabled,
+}
+
+impl DirectoryIndexing {
+    /// Verifies that an indexed directory can be interpreted.
+    pub(crate) const fn require_supported(self) -> Result<()> {
+        match self {
+            Self::Enabled => Ok(()),
+            Self::Disabled => Err(Error::UnsupportedDirectoryHash),
+        }
+    }
+}
+
+/// Allocation bitmap addressing domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AllocationBitmapDomain {
+    /// One bitmap bit addresses one filesystem block.
+    Blocks,
+    /// One bitmap bit addresses one allocation cluster.
+    Clusters,
+}
+
+/// Source used to construct the mounted checksum seed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChecksumSeedSource {
+    /// Checksums are disabled for metadata that uses this seed.
+    Zero,
+    /// The seed is derived from the filesystem UUID.
+    FilesystemUuid,
+    /// The seed is stored explicitly in the superblock.
+    SuperblockField,
+}
+
+impl ChecksumSeedSource {
+    /// Reads or derives the checksum seed selected by this source.
+    fn seed(self, raw: &[u8], uuid: &[u8; 16]) -> Result<ChecksumSeed> {
+        match self {
+            Self::Zero => Ok(ChecksumSeed::from_u32(0)),
+            Self::FilesystemUuid => Ok(ChecksumSeed::from_u32(crc32c(u32::MAX, uuid))),
+            Self::SuperblockField => Ok(ChecksumSeed::from_u32(le_u32(raw, 624)?)),
+        }
+    }
+}
+
+/// Public extended-attribute mutation capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum XattrMutationSupport {
+    /// Public xattrs are not advertised by this mounted profile.
+    Disabled,
+    /// Public xattrs can be read and mutated.
+    Enabled,
+}
+
+impl XattrMutationSupport {
+    /// Verifies that xattr mutation is supported.
+    pub(crate) const fn require_supported(self) -> Result<()> {
+        match self {
+            Self::Enabled => Ok(()),
+            Self::Disabled => Err(Error::UnsupportedWriteFeature),
+        }
+    }
+}
+
+/// File-size encoding available in inode records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileSizeEncoding {
+    /// Only the pre-large-file size profile is supported.
+    Legacy,
+    /// The inode high size field is available.
+    LargeFile,
+}
+
+impl FileSizeEncoding {
+    /// Verifies that `bytes` can be encoded by this profile.
+    pub(crate) const fn require_supported(self, bytes: u64, legacy_limit: u64) -> Result<()> {
+        match self {
+            Self::LargeFile => Ok(()),
+            Self::Legacy => {
+                if bytes > legacy_limit {
+                    Err(Error::UnsupportedInodeMutation)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// Inode block-count encoding available in inode records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InodeBlockCountEncoding {
+    /// `i_blocks` is limited to the legacy sector count.
+    LegacySectors,
+    /// Huge-file block count semantics are available.
+    HugeFile,
+}
+
+impl InodeBlockCountEncoding {
+    /// Verifies that `sectors` can be encoded by this profile.
+    pub(crate) const fn require_supported(self, sectors: u64, legacy_limit: u64) -> Result<()> {
+        match self {
+            Self::HugeFile => Ok(()),
+            Self::LegacySectors => {
+                if sectors > legacy_limit {
+                    Err(Error::UnsupportedInodeMutation)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// Inode timestamp encoding available in inode records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InodeTimestampEncoding {
+    /// Only legacy second-resolution fields are written.
+    LegacySeconds,
+    /// Extended inode timestamp fields may be written when the record is wide enough.
+    ExtraFields,
+}
+
 /// Validated ext4 capabilities accepted by a mount policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FeatureSet {
@@ -888,6 +1048,22 @@ pub(crate) struct FeatureSet {
     metadata_checksum: MetadataChecksum,
     /// Block group descriptor checksum algorithm.
     descriptor_checksum: BlockGroupDescriptorChecksum,
+    /// Superblock copy placement selected by sparse-super feature bits.
+    sparse_superblock_layout: SparseSuperblockLayout,
+    /// Directory indexing capability.
+    directory_indexing: DirectoryIndexing,
+    /// Allocation bitmap addressing domain.
+    allocation_bitmap_domain: AllocationBitmapDomain,
+    /// Source used to construct mounted checksum seeds.
+    checksum_seed_source: ChecksumSeedSource,
+    /// Public xattr mutation capability.
+    xattr_mutation: XattrMutationSupport,
+    /// File-size encoding supported by inode records.
+    file_size_encoding: FileSizeEncoding,
+    /// Inode block-count encoding supported by inode records.
+    inode_block_count_encoding: InodeBlockCountEncoding,
+    /// Timestamp encoding supported by inode records.
+    inode_timestamp_encoding: InodeTimestampEncoding,
 }
 
 impl FeatureSet {
@@ -1027,18 +1203,52 @@ impl FeatureSet {
             } else {
                 BlockGroupDescriptorLayout::Standard32
             },
-            sparse_super: read_only_compat & RO_COMPAT_SPARSE_SUPER != 0,
             journal,
             recovery_state,
-            directory_index: compat & COMPAT_DIR_INDEX != 0,
             metadata_checksum,
             descriptor_checksum,
-            bigalloc: read_only_compat & RO_COMPAT_BIGALLOC != 0,
-            explicit_checksum_seed: incompat & INCOMPAT_CSUM_SEED != 0,
-            xattrs: compat & COMPAT_EXT_ATTR != 0,
-            large_file: read_only_compat & RO_COMPAT_LARGE_FILE != 0,
-            huge_file: read_only_compat & RO_COMPAT_HUGE_FILE != 0,
-            extra_inode_fields: read_only_compat & RO_COMPAT_EXTRA_ISIZE != 0,
+            sparse_superblock_layout: if read_only_compat & RO_COMPAT_SPARSE_SUPER != 0 {
+                SparseSuperblockLayout::SparseCopies
+            } else {
+                SparseSuperblockLayout::FullCopies
+            },
+            directory_indexing: if compat & COMPAT_DIR_INDEX != 0 {
+                DirectoryIndexing::Enabled
+            } else {
+                DirectoryIndexing::Disabled
+            },
+            allocation_bitmap_domain: if read_only_compat & RO_COMPAT_BIGALLOC != 0 {
+                AllocationBitmapDomain::Clusters
+            } else {
+                AllocationBitmapDomain::Blocks
+            },
+            checksum_seed_source: if incompat & INCOMPAT_CSUM_SEED != 0 {
+                ChecksumSeedSource::SuperblockField
+            } else if metadata_checksum == MetadataChecksum::Crc32c {
+                ChecksumSeedSource::FilesystemUuid
+            } else {
+                ChecksumSeedSource::Zero
+            },
+            xattr_mutation: if compat & COMPAT_EXT_ATTR != 0 {
+                XattrMutationSupport::Enabled
+            } else {
+                XattrMutationSupport::Disabled
+            },
+            file_size_encoding: if read_only_compat & RO_COMPAT_LARGE_FILE != 0 {
+                FileSizeEncoding::LargeFile
+            } else {
+                FileSizeEncoding::Legacy
+            },
+            inode_block_count_encoding: if read_only_compat & RO_COMPAT_HUGE_FILE != 0 {
+                InodeBlockCountEncoding::HugeFile
+            } else {
+                InodeBlockCountEncoding::LegacySectors
+            },
+            inode_timestamp_encoding: if read_only_compat & RO_COMPAT_EXTRA_ISIZE != 0 {
+                InodeTimestampEncoding::ExtraFields
+            } else {
+                InodeTimestampEncoding::LegacySeconds
+            },
         }
     }
 
@@ -1073,6 +1283,46 @@ impl FeatureSet {
     /// Returns the block group descriptor checksum mode.
     pub(crate) const fn descriptor_checksum(self) -> BlockGroupDescriptorChecksum {
         self.descriptor_checksum
+    }
+
+    /// Returns the sparse-superblock layout.
+    pub(crate) const fn sparse_superblock_layout(self) -> SparseSuperblockLayout {
+        self.sparse_superblock_layout
+    }
+
+    /// Returns the directory indexing capability.
+    pub(crate) const fn directory_indexing(self) -> DirectoryIndexing {
+        self.directory_indexing
+    }
+
+    /// Returns the allocation bitmap addressing domain.
+    pub(crate) const fn allocation_bitmap_domain(self) -> AllocationBitmapDomain {
+        self.allocation_bitmap_domain
+    }
+
+    /// Returns the checksum seed source.
+    pub(crate) const fn checksum_seed_source(self) -> ChecksumSeedSource {
+        self.checksum_seed_source
+    }
+
+    /// Returns the public xattr mutation capability.
+    pub(crate) const fn xattr_mutation(self) -> XattrMutationSupport {
+        self.xattr_mutation
+    }
+
+    /// Returns the file-size encoding capability.
+    pub(crate) const fn file_size_encoding(self) -> FileSizeEncoding {
+        self.file_size_encoding
+    }
+
+    /// Returns the inode block-count encoding capability.
+    pub(crate) const fn inode_block_count_encoding(self) -> InodeBlockCountEncoding {
+        self.inode_block_count_encoding
+    }
+
+    /// Returns the inode timestamp encoding capability.
+    pub(crate) const fn inode_timestamp_encoding(self) -> InodeTimestampEncoding {
+        self.inode_timestamp_encoding
     }
 
     /// Returns the journal recovery state.
@@ -1233,13 +1483,18 @@ impl Superblock {
             log_cluster_size,
             blocks_per_group,
             clusters_per_group: raw_clusters_per_group,
-            bigalloc: features.has_bigalloc(),
+            allocation_bitmap_domain: features.allocation_bitmap_domain(),
         })?;
         if free_clusters_count.as_u64() > geometry.cluster_count.as_u64() {
             return Err(Error::InvalidClusterGeometry);
         }
-        if features.has_metadata_csum() && le_u32(raw, 1020)? != 0 {
-            verify_crc32c(0, raw, 1020)?;
+        match features.metadata_checksum() {
+            MetadataChecksum::None => {}
+            MetadataChecksum::Crc32c => {
+                if le_u32(raw, 1020)? != 0 {
+                    verify_crc32c(0, raw, 1020)?;
+                }
+            }
         }
         let journal_inode = le_u32(raw, 224)?;
         let mut uuid = [0_u8; 16];
@@ -1260,13 +1515,7 @@ impl Superblock {
         } else {
             JournalMode::None
         };
-        let checksum_seed = if features.has_checksum_seed() {
-            ChecksumSeed::from_u32(le_u32(raw, 624)?)
-        } else if features.has_metadata_csum() {
-            ChecksumSeed::from_u32(crc32c(u32::MAX, &uuid))
-        } else {
-            ChecksumSeed::from_u32(0)
-        };
+        let checksum_seed = features.checksum_seed_source().seed(raw, &uuid)?;
         let directory_hash_seed = DirectoryHashSeed::from_words([
             le_u32(raw, DIRECTORY_HASH_SEED_OFFSET)?,
             le_u32(raw, DIRECTORY_HASH_SEED_OFFSET + 4)?,
@@ -1431,6 +1680,36 @@ impl Superblock {
         self.default_directory_hash_version
     }
 
+    /// Returns the directory indexing capability.
+    #[must_use]
+    pub(crate) const fn directory_indexing(self) -> DirectoryIndexing {
+        self.features.directory_indexing()
+    }
+
+    /// Returns the public xattr mutation capability.
+    #[must_use]
+    pub(crate) const fn xattr_mutation(self) -> XattrMutationSupport {
+        self.features.xattr_mutation()
+    }
+
+    /// Returns the file-size encoding capability.
+    #[must_use]
+    pub(crate) const fn file_size_encoding(self) -> FileSizeEncoding {
+        self.features.file_size_encoding()
+    }
+
+    /// Returns the inode block-count encoding capability.
+    #[must_use]
+    pub(crate) const fn inode_block_count_encoding(self) -> InodeBlockCountEncoding {
+        self.features.inode_block_count_encoding()
+    }
+
+    /// Returns the inode timestamp encoding capability.
+    #[must_use]
+    pub(crate) const fn inode_timestamp_encoding(self) -> InodeTimestampEncoding {
+        self.features.inode_timestamp_encoding()
+    }
+
     /// Metadata checksum mode.
     #[must_use]
     pub const fn metadata_checksum(self) -> MetadataChecksum {
@@ -1445,6 +1724,11 @@ impl Superblock {
     /// Returns the active block group descriptor checksum mode.
     pub(crate) const fn descriptor_checksum(self) -> BlockGroupDescriptorChecksum {
         self.features.descriptor_checksum()
+    }
+
+    /// Returns the sparse-superblock layout.
+    pub(crate) const fn sparse_superblock_layout(self) -> SparseSuperblockLayout {
+        self.features.sparse_superblock_layout()
     }
 
     /// Returns the journal recovery state.
