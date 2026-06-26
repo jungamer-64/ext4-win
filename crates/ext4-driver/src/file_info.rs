@@ -1785,11 +1785,22 @@ mod tests {
     fn rename_replace_request_is_rejected_at_decode_boundary() {
         let mut input = [0_u8; super::FILE_RENAME_NAME_OFFSET + 2];
         input[super::FILE_RENAME_REPLACE_IF_EXISTS_OFFSET] = 1;
-        input[super::FILE_RENAME_NAME_LENGTH_OFFSET
-            ..super::FILE_RENAME_NAME_LENGTH_OFFSET + core::mem::size_of::<u32>()]
-            .copy_from_slice(&2_u32.to_le_bytes());
-        input[super::FILE_RENAME_NAME_OFFSET..super::FILE_RENAME_NAME_OFFSET + 2]
-            .copy_from_slice(&u16::from(b'a').to_le_bytes());
+        let name_length = input.get_mut(
+            super::FILE_RENAME_NAME_LENGTH_OFFSET
+                ..super::FILE_RENAME_NAME_LENGTH_OFFSET + core::mem::size_of::<u32>(),
+        );
+        assert!(name_length.is_some());
+        let Some(name_length) = name_length else {
+            return;
+        };
+        name_length.copy_from_slice(&2_u32.to_le_bytes());
+        let name =
+            input.get_mut(super::FILE_RENAME_NAME_OFFSET..super::FILE_RENAME_NAME_OFFSET + 2);
+        assert!(name.is_some());
+        let Some(name) = name else {
+            return;
+        };
+        name.copy_from_slice(&u16::from(b'a').to_le_bytes());
 
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
         let mut stack = wdk_sys::IO_STACK_LOCATION {

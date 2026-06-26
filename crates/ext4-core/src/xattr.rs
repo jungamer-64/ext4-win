@@ -900,14 +900,38 @@ mod tests {
 
     #[test]
     fn fscrypt_context_is_private_inode_xattr() {
-        let name = XattrName::new(XattrNamespace::User, b"visible").unwrap();
-        let value = XattrValue::new(b"public").unwrap();
-        let public = XattrSet::from_entries(vec![(name, value)]).unwrap();
-        let context = XattrValue::new(&[0xA5; 40]).unwrap();
+        let name = XattrName::new(XattrNamespace::User, b"visible");
+        assert!(name.is_ok());
+        let Ok(name) = name else {
+            return;
+        };
+        let value = XattrValue::new(b"public");
+        assert!(value.is_ok());
+        let Ok(value) = value else {
+            return;
+        };
+        let public = XattrSet::from_entries(vec![(name, value)]);
+        assert!(public.is_ok());
+        let Ok(public) = public else {
+            return;
+        };
+        let context = XattrValue::new(&[0xA5; 40]);
+        assert!(context.is_ok());
+        let Ok(context) = context else {
+            return;
+        };
         let set = InodeXattrSet::from_parts(public.clone(), Some(context.clone()));
 
-        let image = serialize_inline_xattrs(&set, 256).unwrap();
-        let parsed = parse_inline_xattrs(&image).unwrap();
+        let image = serialize_inline_xattrs(&set, 256);
+        assert!(image.is_ok());
+        let Ok(image) = image else {
+            return;
+        };
+        let parsed = parse_inline_xattrs(&image);
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else {
+            return;
+        };
 
         assert_eq!(parsed.public(), &public);
         assert_eq!(parsed.encryption_context(), Some(&context));
@@ -915,10 +939,18 @@ mod tests {
 
     #[test]
     fn duplicate_private_fscrypt_context_is_rejected() {
-        let left =
-            InodeXattrSet::from_parts(XattrSet::empty(), Some(XattrValue::new(b"a").unwrap()));
-        let right =
-            InodeXattrSet::from_parts(XattrSet::empty(), Some(XattrValue::new(b"b").unwrap()));
+        let left_context = XattrValue::new(b"a");
+        assert!(left_context.is_ok());
+        let Ok(left_context) = left_context else {
+            return;
+        };
+        let right_context = XattrValue::new(b"b");
+        assert!(right_context.is_ok());
+        let Ok(right_context) = right_context else {
+            return;
+        };
+        let left = InodeXattrSet::from_parts(XattrSet::empty(), Some(left_context));
+        let right = InodeXattrSet::from_parts(XattrSet::empty(), Some(right_context));
 
         assert!(merge_xattr_sets(left, right).is_err());
     }

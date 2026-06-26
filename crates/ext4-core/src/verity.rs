@@ -1159,14 +1159,46 @@ mod tests {
         0xa1, 0x3a, 0xc2, 0x5b,
     ];
 
+    macro_rules! must {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    let unexpected_error: Option<()> = None;
+                    assert!(
+                        unexpected_error.is_some(),
+                        "unexpected verity error: {error:?}"
+                    );
+                    return;
+                }
+            }
+        };
+    }
+
+    macro_rules! some {
+        ($option:expr) => {
+            match $option {
+                Some(value) => value,
+                None => {
+                    let missing_value: Option<()> = None;
+                    assert!(missing_value.is_some(), "missing verity test value");
+                    return;
+                }
+            }
+        };
+    }
+
     #[test]
-    fn ext4_verity_metadata_layout_places_descriptor_size_tail() -> Result<()> {
-        let layout = Ext4VerityMetadataLayout::new(
+    fn ext4_verity_metadata_layout_places_descriptor_size_tail() {
+        let layout = must!(Ext4VerityMetadataLayout::new(
             FileSize::from_bytes(1),
-            BlockSize::from_superblock_log(2)?,
+            must!(BlockSize::from_superblock_log(2)),
             8192,
-            u32::try_from(FSVERITY_DESCRIPTOR_BYTES + 16).map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
+            must!(
+                u32::try_from(FSVERITY_DESCRIPTOR_BYTES + 16)
+                    .map_err(|_| Error::ArithmeticOverflow)
+            ),
+        ));
 
         assert_eq!(layout.merkle_tree_offset(), 65_536);
         assert_eq!(layout.merkle_tree_bytes(), 8192);
@@ -1174,177 +1206,194 @@ mod tests {
         assert_eq!(layout.descriptor_bytes(), 272);
         assert_eq!(layout.descriptor_size_offset(), 77_820);
         assert_eq!(layout.metadata_end(), 77_824);
-        Ok(())
     }
 
     #[test]
-    fn ext4_verity_metadata_layout_rejects_bad_descriptor_and_overflow() -> Result<()> {
+    fn ext4_verity_metadata_layout_rejects_bad_descriptor_and_overflow() {
         assert_eq!(
             Ext4VerityMetadataLayout::new(
                 FileSize::from_bytes(0),
-                BlockSize::from_superblock_log(0)?,
+                must!(BlockSize::from_superblock_log(0)),
                 0,
-                u32::try_from(FSVERITY_DESCRIPTOR_BYTES - 1)
-                    .map_err(|_| Error::ArithmeticOverflow)?,
+                must!(
+                    u32::try_from(FSVERITY_DESCRIPTOR_BYTES - 1)
+                        .map_err(|_| Error::ArithmeticOverflow)
+                ),
             ),
             Err(Error::InvalidVerityMetadata)
         );
         assert_eq!(
             Ext4VerityMetadataLayout::new(
                 FileSize::from_bytes(u64::MAX),
-                BlockSize::from_superblock_log(0)?,
+                must!(BlockSize::from_superblock_log(0)),
                 0,
-                u32::try_from(FSVERITY_DESCRIPTOR_BYTES).map_err(|_| Error::ArithmeticOverflow)?,
+                must!(
+                    u32::try_from(FSVERITY_DESCRIPTOR_BYTES).map_err(|_| Error::ArithmeticOverflow)
+                ),
             ),
             Err(Error::ArithmeticOverflow)
         );
-        Ok(())
     }
 
     #[test]
-    fn fsverity_descriptor_round_trips_supported_layout() -> Result<()> {
-        let descriptor = small_descriptor()?;
-        let bytes = descriptor.to_bytes()?;
+    fn fsverity_descriptor_round_trips_supported_layout() {
+        let descriptor = must!(small_descriptor());
+        let bytes = must!(descriptor.to_bytes());
 
         assert_eq!(FsverityDescriptor::parse(&bytes), Ok(descriptor));
-        Ok(())
     }
 
     #[test]
-    fn fsverity_descriptor_rejects_reserved_and_unused_salt_bytes() -> Result<()> {
-        let mut reserved_word = small_descriptor()?.to_bytes()?;
-        put_le_u64(&mut reserved_word, DESCRIPTOR_RESERVED_0X04_OFFSET, 1)?;
+    fn fsverity_descriptor_rejects_reserved_and_unused_salt_bytes() {
+        let mut reserved_word = must!(must!(small_descriptor()).to_bytes());
+        must!(put_le_u64(
+            &mut reserved_word,
+            DESCRIPTOR_RESERVED_0X04_OFFSET,
+            1
+        ));
         assert_eq!(
             FsverityDescriptor::parse(&reserved_word),
             Err(Error::InvalidVerityMetadata)
         );
 
-        let mut unused_salt = small_descriptor()?.to_bytes()?;
-        set_byte(
+        let mut unused_salt = must!(must!(small_descriptor()).to_bytes());
+        must!(set_byte(
             &mut unused_salt,
-            DESCRIPTOR_SALT_OFFSET
-                .checked_add(4)
-                .ok_or(Error::ArithmeticOverflow)?,
+            some!(DESCRIPTOR_SALT_OFFSET.checked_add(4)),
             9,
-        )?;
+        ));
         assert_eq!(
             FsverityDescriptor::parse(&unused_salt),
             Err(Error::InvalidVerityMetadata)
         );
 
-        let mut trailing_reserved = small_descriptor()?.to_bytes()?;
-        set_byte(&mut trailing_reserved, DESCRIPTOR_RESERVED_OFFSET, 1)?;
+        let mut trailing_reserved = must!(must!(small_descriptor()).to_bytes());
+        must!(set_byte(
+            &mut trailing_reserved,
+            DESCRIPTOR_RESERVED_OFFSET,
+            1
+        ));
         assert_eq!(
             FsverityDescriptor::parse(&trailing_reserved),
             Err(Error::InvalidVerityMetadata)
         );
-        Ok(())
     }
 
     #[test]
-    fn fsverity_descriptor_rejects_unsupported_algorithm_and_block_size() -> Result<()> {
-        let mut algorithm = small_descriptor()?.to_bytes()?;
-        set_byte(&mut algorithm, DESCRIPTOR_HASH_ALGORITHM_OFFSET, 99)?;
+    fn fsverity_descriptor_rejects_unsupported_algorithm_and_block_size() {
+        let mut algorithm = must!(must!(small_descriptor()).to_bytes());
+        must!(set_byte(
+            &mut algorithm,
+            DESCRIPTOR_HASH_ALGORITHM_OFFSET,
+            99
+        ));
         assert_eq!(
             FsverityDescriptor::parse(&algorithm),
             Err(Error::InvalidVerityMetadata)
         );
 
-        let mut block_size = small_descriptor()?.to_bytes()?;
-        set_byte(&mut block_size, DESCRIPTOR_LOG_BLOCKSIZE_OFFSET, 9)?;
+        let mut block_size = must!(must!(small_descriptor()).to_bytes());
+        must!(set_byte(
+            &mut block_size,
+            DESCRIPTOR_LOG_BLOCKSIZE_OFFSET,
+            9
+        ));
         assert_eq!(
             FsverityDescriptor::parse(&block_size),
             Err(Error::InvalidVerityMetadata)
         );
-        Ok(())
     }
 
     #[test]
-    fn fsverity_merkle_tree_matches_sha256_single_block_vector() -> Result<()> {
-        let block_size = FsverityBlockSize::new(1024)?;
-        let salt = FsveritySalt::new(&VECTOR_SALT)?;
-        let tree = FsverityMerkleTree::build(
+    fn fsverity_merkle_tree_matches_sha256_single_block_vector() {
+        let block_size = must!(FsverityBlockSize::new(1024));
+        let salt = must!(FsveritySalt::new(&VECTOR_SALT));
+        let tree = must!(FsverityMerkleTree::build(
             b"hello world",
             FsverityHashAlgorithm::Sha256,
             block_size,
             &salt,
-        )?;
+        ));
 
         assert_eq!(
-            tree.root_hash()
-                .digest_bytes(FsverityHashAlgorithm::Sha256)?,
+            must!(tree.root_hash().digest_bytes(FsverityHashAlgorithm::Sha256)),
             &SMALL_SHA256_ROOT
         );
         assert!(tree.blocks().is_empty());
-        Ok(())
     }
 
     #[test]
-    fn fsverity_merkle_tree_matches_sha256_multi_block_vector() -> Result<()> {
-        let block_size = FsverityBlockSize::new(1024)?;
-        let salt = FsveritySalt::new(&VECTOR_SALT)?;
-        let data = repeating_data(3500)?;
-        let tree =
-            FsverityMerkleTree::build(&data, FsverityHashAlgorithm::Sha256, block_size, &salt)?;
+    fn fsverity_merkle_tree_matches_sha256_multi_block_vector() {
+        let block_size = must!(FsverityBlockSize::new(1024));
+        let salt = must!(FsveritySalt::new(&VECTOR_SALT));
+        let data = must!(repeating_data(3500));
+        let tree = must!(FsverityMerkleTree::build(
+            &data,
+            FsverityHashAlgorithm::Sha256,
+            block_size,
+            &salt
+        ));
 
         assert_eq!(
-            tree.root_hash()
-                .digest_bytes(FsverityHashAlgorithm::Sha256)?,
+            must!(tree.root_hash().digest_bytes(FsverityHashAlgorithm::Sha256)),
             &LARGE_SHA256_ROOT
         );
         assert_eq!(tree.blocks().len(), 1024);
         assert_eq!(
-            tree.blocks()
-                .get(..LARGE_TREE_FIRST_64.len())
-                .ok_or(Error::TruncatedStructure)?,
+            some!(tree.blocks().get(..LARGE_TREE_FIRST_64.len())),
             &LARGE_TREE_FIRST_64
         );
-        Ok(())
     }
 
     #[test]
-    fn fsverity_merkle_tree_verify_rejects_data_and_tree_corruption() -> Result<()> {
-        let block_size = FsverityBlockSize::new(1024)?;
-        let salt = FsveritySalt::new(&VECTOR_SALT)?;
-        let data = repeating_data(3500)?;
-        let tree =
-            FsverityMerkleTree::build(&data, FsverityHashAlgorithm::Sha256, block_size, &salt)?;
-        let descriptor = FsverityDescriptor::new(
+    fn fsverity_merkle_tree_verify_rejects_data_and_tree_corruption() {
+        let block_size = must!(FsverityBlockSize::new(1024));
+        let salt = must!(FsveritySalt::new(&VECTOR_SALT));
+        let data = must!(repeating_data(3500));
+        let tree = must!(FsverityMerkleTree::build(
+            &data,
             FsverityHashAlgorithm::Sha256,
             block_size,
-            u64::try_from(data.len()).map_err(|_| Error::ArithmeticOverflow)?,
+            &salt
+        ));
+        let descriptor = must!(FsverityDescriptor::new(
+            FsverityHashAlgorithm::Sha256,
+            block_size,
+            must!(u64::try_from(data.len()).map_err(|_| Error::ArithmeticOverflow)),
             tree.root_hash(),
             salt,
-        )?;
+        ));
 
-        tree.verify_data(&data, &descriptor)?;
+        must!(tree.verify_data(&data, &descriptor));
 
         let mut corrupt_data = data.clone();
-        set_byte(&mut corrupt_data, 17, 0xff)?;
+        must!(set_byte(&mut corrupt_data, 17, 0xff));
         assert_eq!(
             tree.verify_data(&corrupt_data, &descriptor),
             Err(Error::VerityMismatch)
         );
 
         let mut corrupt_tree = tree.clone();
-        set_byte(&mut corrupt_tree.blocks, 0, 0xff)?;
+        must!(set_byte(&mut corrupt_tree.blocks, 0, 0xff));
         assert_eq!(
             corrupt_tree.verify_data(&data, &descriptor),
             Err(Error::VerityMismatch)
         );
-        Ok(())
     }
 
     #[test]
-    fn fsverity_empty_file_has_zero_root_and_no_tree_blocks() -> Result<()> {
-        let block_size = FsverityBlockSize::new(1024)?;
+    fn fsverity_empty_file_has_zero_root_and_no_tree_blocks() {
+        let block_size = must!(FsverityBlockSize::new(1024));
         let salt = FsveritySalt::empty();
-        let tree =
-            FsverityMerkleTree::build(&[], FsverityHashAlgorithm::Sha512, block_size, &salt)?;
+        let tree = must!(FsverityMerkleTree::build(
+            &[],
+            FsverityHashAlgorithm::Sha512,
+            block_size,
+            &salt
+        ));
 
         assert_eq!(tree.root_hash(), FsverityRootHash::zero());
         assert!(tree.blocks().is_empty());
-        Ok(())
     }
 
     /// Builds the single-block vector descriptor.

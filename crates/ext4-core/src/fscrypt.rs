@@ -1080,6 +1080,35 @@ mod tests {
         0x82, 0x3e,
     ];
 
+    macro_rules! must {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    let unexpected_error: Option<()> = None;
+                    assert!(
+                        unexpected_error.is_some(),
+                        "unexpected fscrypt error: {error:?}"
+                    );
+                    return;
+                }
+            }
+        };
+    }
+
+    macro_rules! some {
+        ($option:expr) => {
+            match $option {
+                Some(value) => value,
+                None => {
+                    let missing_value: Option<()> = None;
+                    assert!(missing_value.is_some(), "missing fscrypt test value");
+                    return;
+                }
+            }
+        };
+    }
+
     #[test]
     fn fscrypt_v2_policy_parses_supported_aes_profile() {
         let policy = valid_policy_bytes();
@@ -1101,16 +1130,10 @@ mod tests {
     #[test]
     fn fscrypt_v2_context_parses_nonce_and_policy() {
         let mut context = [0_u8; FSCRYPT_CONTEXT_V2_BYTES];
-        context
-            .get_mut(..FSCRYPT_POLICY_V2_BYTES)
-            .expect("policy region")
-            .copy_from_slice(&valid_policy_bytes());
-        context
-            .get_mut(FSCRYPT_NONCE_OFFSET..FSCRYPT_CONTEXT_V2_BYTES)
-            .expect("nonce region")
-            .copy_from_slice(&VECTOR_NONCE);
+        context[..FSCRYPT_POLICY_V2_BYTES].copy_from_slice(&valid_policy_bytes());
+        context[FSCRYPT_NONCE_OFFSET..FSCRYPT_CONTEXT_V2_BYTES].copy_from_slice(&VECTOR_NONCE);
 
-        let parsed = FscryptContextV2::parse(&context).expect("valid context");
+        let parsed = must!(FscryptContextV2::parse(&context));
 
         assert_eq!(parsed.nonce(), FscryptFileNonce::new(VECTOR_NONCE));
         assert_eq!(
@@ -1121,7 +1144,7 @@ mod tests {
 
     #[test]
     fn fscrypt_v2_context_serializes_linux_layout() {
-        let parsed = FscryptContextV2::parse(&valid_context_bytes()).expect("valid context");
+        let parsed = must!(FscryptContextV2::parse(&valid_context_bytes()));
 
         assert_eq!(parsed.policy().to_bytes(), valid_policy_bytes());
         assert_eq!(parsed.to_bytes(), valid_context_bytes());
@@ -1134,34 +1157,28 @@ mod tests {
     #[test]
     fn fscrypt_v2_context_rejects_unsupported_features() {
         let mut unsupported_contents = valid_context_bytes();
-        *unsupported_contents
-            .get_mut(FSCRYPT_CONTENTS_MODE_OFFSET)
-            .expect("contents mode") = 9;
+        unsupported_contents[FSCRYPT_CONTENTS_MODE_OFFSET] = 9;
         assert_eq!(
             FscryptContextV2::parse(&unsupported_contents),
             Err(Error::InvalidEncryptionContext)
         );
 
         let mut unsupported_names = valid_context_bytes();
-        *unsupported_names
-            .get_mut(FSCRYPT_FILENAMES_MODE_OFFSET)
-            .expect("filenames mode") = 10;
+        unsupported_names[FSCRYPT_FILENAMES_MODE_OFFSET] = 10;
         assert_eq!(
             FscryptContextV2::parse(&unsupported_names),
             Err(Error::InvalidEncryptionContext)
         );
 
         let mut direct_key = valid_context_bytes();
-        *direct_key.get_mut(FSCRYPT_FLAGS_OFFSET).expect("flags") = 0x04;
+        direct_key[FSCRYPT_FLAGS_OFFSET] = 0x04;
         assert_eq!(
             FscryptContextV2::parse(&direct_key),
             Err(Error::InvalidEncryptionContext)
         );
 
         let mut custom_data_unit = valid_context_bytes();
-        *custom_data_unit
-            .get_mut(FSCRYPT_LOG2_DATA_UNIT_SIZE_OFFSET)
-            .expect("data unit size") = 12;
+        custom_data_unit[FSCRYPT_LOG2_DATA_UNIT_SIZE_OFFSET] = 12;
         assert_eq!(
             FscryptContextV2::parse(&custom_data_unit),
             Err(Error::InvalidEncryptionContext)
@@ -1172,7 +1189,7 @@ mod tests {
     fn fscrypt_v2_context_rejects_wrong_size_and_reserved_bytes() {
         let context = valid_context_bytes();
         assert_eq!(
-            FscryptContextV2::parse(context.get(..39).expect("short context")),
+            FscryptContextV2::parse(&context[..39]),
             Err(Error::TruncatedStructure)
         );
 
@@ -1184,9 +1201,7 @@ mod tests {
         );
 
         let mut reserved = valid_context_bytes();
-        *reserved
-            .get_mut(FSCRYPT_RESERVED_OFFSET)
-            .expect("reserved byte") = 1;
+        reserved[FSCRYPT_RESERVED_OFFSET] = 1;
         assert_eq!(
             FscryptContextV2::parse(&reserved),
             Err(Error::InvalidEncryptionContext)
@@ -1195,22 +1210,16 @@ mod tests {
 
     #[test]
     fn fscrypt_master_key_derives_identifier_and_per_file_keys() {
-        let master_key = FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY).expect("master key");
+        let master_key = must!(FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY));
         let nonce = FscryptFileNonce::new(VECTOR_NONCE);
 
         assert_eq!(master_key.identifier().bytes(), VECTOR_IDENTIFIER);
         assert_eq!(
-            master_key
-                .derive_contents_key(nonce)
-                .expect("contents key")
-                .bytes(),
+            must!(master_key.derive_contents_key(nonce)).bytes(),
             &VECTOR_CONTENTS_KEY
         );
         assert_eq!(
-            master_key
-                .derive_filenames_key(nonce)
-                .expect("filenames key")
-                .bytes(),
+            must!(master_key.derive_filenames_key(nonce)).bytes(),
             &VECTOR_FILENAMES_KEY
         );
     }
@@ -1229,11 +1238,11 @@ mod tests {
 
     #[test]
     fn fscrypt_key_set_is_sorted_unique_by_identifier() {
-        let first = FscryptMasterKey::from_raw(&[1_u8; 32]).expect("first key");
-        let second = FscryptMasterKey::from_raw(&[2_u8; 32]).expect("second key");
+        let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
+        let second = must!(FscryptMasterKey::from_raw(&[2_u8; 32]));
         let second_identifier = second.identifier();
 
-        let set = FscryptKeySet::from_keys(vec![second, first]).expect("key set");
+        let set = must!(FscryptKeySet::from_keys(vec![second, first]));
 
         assert!(set.get(second_identifier).is_some());
         assert_eq!(set.keys().len(), 2);
@@ -1246,8 +1255,8 @@ mod tests {
 
     #[test]
     fn fscrypt_key_set_rejects_duplicate_identifiers() {
-        let first = FscryptMasterKey::from_raw(&[1_u8; 32]).expect("first key");
-        let duplicate = FscryptMasterKey::from_raw(&[1_u8; 32]).expect("duplicate key");
+        let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
+        let duplicate = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
 
         assert_eq!(
             FscryptKeySet::from_keys(vec![first, duplicate]),
@@ -1257,12 +1266,12 @@ mod tests {
 
     #[test]
     fn fscrypt_key_set_insert_and_remove_update_mount_state() {
-        let first = FscryptMasterKey::from_raw(&[1_u8; 32]).expect("first key");
-        let duplicate = FscryptMasterKey::from_raw(&[1_u8; 32]).expect("duplicate key");
+        let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
+        let duplicate = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
         let identifier = first.identifier();
 
         let mut set = FscryptKeySet::empty();
-        set.insert(first).expect("insert first key");
+        must!(set.insert(first));
 
         assert!(set.contains(identifier));
         assert_eq!(set.insert(duplicate), Err(Error::InvalidEncryptionContext));
@@ -1273,28 +1282,21 @@ mod tests {
 
     #[test]
     fn fscrypt_filename_key_encrypts_and_decrypts_padded_name() {
-        let master_key = FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY).expect("master key");
-        let key = master_key
-            .derive_filenames_key(FscryptFileNonce::new(VECTOR_NONCE))
-            .expect("filenames key");
+        let master_key = must!(FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY));
+        let key = must!(master_key.derive_filenames_key(FscryptFileNonce::new(VECTOR_NONCE)));
 
-        let ciphertext = key
-            .encrypt_filename(b"secret.txt", FscryptFilenamePadding::Pad32)
-            .expect("encrypted name");
+        let ciphertext = must!(key.encrypt_filename(b"secret.txt", FscryptFilenamePadding::Pad32));
 
         assert_eq!(ciphertext.len(), 32);
         assert_ne!(&ciphertext, b"secret.txt");
-        assert_eq!(
-            key.decrypt_filename(&ciphertext).expect("decrypted name"),
-            b"secret.txt"
-        );
+        assert_eq!(must!(key.decrypt_filename(&ciphertext)), b"secret.txt");
     }
 
     #[test]
     fn fscrypt_nokey_name_roundtrips_ciphertext_with_windows_safe_bytes() {
         let ciphertext = b"\x00\xff/opaque encrypted name";
-        let name = FscryptNoKeyName::from_ciphertext(ciphertext).expect("no-key name");
-        let display = name.display_bytes().expect("display bytes");
+        let name = must!(FscryptNoKeyName::from_ciphertext(ciphertext));
+        let display = must!(name.display_bytes());
 
         assert!(display.starts_with(FSCRYPT_NOKEY_NAME_PREFIX));
         assert!(
@@ -1303,10 +1305,7 @@ mod tests {
                 .all(|byte| { byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-') })
         );
         assert_eq!(
-            FscryptNoKeyName::from_display(&display)
-                .expect("decoded display")
-                .expect("encoded name")
-                .ciphertext_bytes(),
+            some!(must!(FscryptNoKeyName::from_display(&display))).ciphertext_bytes(),
             ciphertext
         );
         assert_eq!(FscryptNoKeyName::from_display(b"plain"), Ok(None));
@@ -1331,21 +1330,12 @@ mod tests {
     /// Builds a supported fscrypt v2 policy byte image.
     fn valid_policy_bytes() -> [u8; FSCRYPT_POLICY_V2_BYTES] {
         let mut bytes = [0_u8; FSCRYPT_POLICY_V2_BYTES];
-        *bytes.get_mut(FSCRYPT_VERSION_OFFSET).expect("version") = FSCRYPT_POLICY_V2;
-        *bytes
-            .get_mut(FSCRYPT_CONTENTS_MODE_OFFSET)
-            .expect("contents mode") = FSCRYPT_MODE_AES_256_XTS;
-        *bytes
-            .get_mut(FSCRYPT_FILENAMES_MODE_OFFSET)
-            .expect("filenames mode") = FSCRYPT_MODE_AES_256_CTS;
-        *bytes.get_mut(FSCRYPT_FLAGS_OFFSET).expect("flags") =
-            FscryptFilenamePadding::Pad32.flags();
-        bytes
-            .get_mut(
-                FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET
-                    ..FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET + FSCRYPT_KEY_IDENTIFIER_BYTES,
-            )
-            .expect("key identifier")
+        bytes[FSCRYPT_VERSION_OFFSET] = FSCRYPT_POLICY_V2;
+        bytes[FSCRYPT_CONTENTS_MODE_OFFSET] = FSCRYPT_MODE_AES_256_XTS;
+        bytes[FSCRYPT_FILENAMES_MODE_OFFSET] = FSCRYPT_MODE_AES_256_CTS;
+        bytes[FSCRYPT_FLAGS_OFFSET] = FscryptFilenamePadding::Pad32.flags();
+        bytes[FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET
+            ..FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET + FSCRYPT_KEY_IDENTIFIER_BYTES]
             .copy_from_slice(&[0x42; 16]);
         bytes
     }
@@ -1353,14 +1343,8 @@ mod tests {
     /// Builds a supported fscrypt v2 context byte image.
     fn valid_context_bytes() -> [u8; FSCRYPT_CONTEXT_V2_BYTES] {
         let mut bytes = [0_u8; FSCRYPT_CONTEXT_V2_BYTES];
-        bytes
-            .get_mut(..FSCRYPT_POLICY_V2_BYTES)
-            .expect("policy region")
-            .copy_from_slice(&valid_policy_bytes());
-        bytes
-            .get_mut(FSCRYPT_NONCE_OFFSET..FSCRYPT_CONTEXT_V2_BYTES)
-            .expect("nonce region")
-            .copy_from_slice(&VECTOR_NONCE);
+        bytes[..FSCRYPT_POLICY_V2_BYTES].copy_from_slice(&valid_policy_bytes());
+        bytes[FSCRYPT_NONCE_OFFSET..FSCRYPT_CONTEXT_V2_BYTES].copy_from_slice(&VECTOR_NONCE);
         bytes
     }
 }

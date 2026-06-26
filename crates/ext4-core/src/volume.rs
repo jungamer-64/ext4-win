@@ -2646,7 +2646,9 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
 
             let logical_block = LogicalBlock::try_from(logical_block)?;
             let (physical, block_base) = match tree.map_logical(logical_block) {
-                BlockMapping::Physical(physical) => (physical, EncryptedBlockBase::ExistingPlaintext),
+                BlockMapping::Physical(physical) => {
+                    (physical, EncryptedBlockBase::ExistingPlaintext)
+                }
                 BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
                 BlockMapping::Hole => {
                     let physical = self.physical_block_for_hole(tree, logical_block)?;
@@ -3026,7 +3028,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if block.insert(child, &disk_name, kind)? {
                 self.stage_directory_block(physical, block.into_bytes());
-                raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+                raw_parent
+                    .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
                 *self
                     .inode_updates
                     .get_mut(inode_index)
@@ -3121,7 +3124,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(removed) = block.remove(&disk_name)? {
                 self.stage_directory_block(physical, block.into_bytes());
-                raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+                raw_parent
+                    .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
                 *self
                     .inode_updates
                     .get_mut(inode_index)
@@ -3196,7 +3200,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
                     return Err(Error::InvalidDirectoryEntry);
                 }
                 self.stage_directory_block(physical, block.into_bytes());
-                raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+                raw_parent
+                    .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
                 *self
                     .inode_updates
                     .get_mut(inode_index)
@@ -3251,7 +3256,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(replaced) = block.replace(&disk_name, child, kind)? {
                 self.stage_directory_block(physical, block.into_bytes());
-                raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+                raw_parent
+                    .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
                 *self
                     .inode_updates
                     .get_mut(inode_index)
