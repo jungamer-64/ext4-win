@@ -21,6 +21,7 @@ mod state;
 mod status;
 mod time;
 mod volume_info;
+mod wire;
 
 #[cfg(not(test))]
 extern crate wdk_panic;

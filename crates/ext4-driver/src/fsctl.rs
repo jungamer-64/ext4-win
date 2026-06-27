@@ -12,6 +12,7 @@ use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
 use crate::irp::{DispatchTarget, FileSystemControlStack};
 use crate::state::{FscryptKeyPresence, VolumeControlBlock, file_control_block};
 use crate::status::{DriverError, DriverResult};
+use crate::wire::{LittleEndianInput, LittleEndianOutput};
 
 /// Linux `FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER`.
 const FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER: u32 = 2;
@@ -225,27 +226,27 @@ fn get_encryption_key_status_result(
 
 /// Writes Linux-compatible remove-key output fields.
 fn write_remove_key_output(output: &mut [u8]) -> DriverResult<()> {
-    write_u32(output, FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET, 0)
+    LittleEndianOutput::new(output).write_u32(FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET, 0)
 }
 
 /// Writes Linux-compatible key-status output fields.
 fn write_key_status_output(output: &mut [u8], presence: FscryptKeyPresence) -> DriverResult<()> {
+    let mut output = LittleEndianOutput::new(output);
     output
-        .get_mut(FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET..FSCRYPT_GET_KEY_STATUS_BYTES)
-        .ok_or(DriverError::BufferTooSmall)?
+        .range_mut(
+            FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET,
+            FSCRYPT_GET_KEY_STATUS_BYTES - FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET,
+        )?
         .fill(0);
-    write_u32(
-        output,
+    output.write_u32(
         FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET,
         key_presence_status(presence),
     )?;
-    write_u32(
-        output,
+    output.write_u32(
         FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET,
         key_presence_status_flags(presence),
     )?;
-    write_u32(
-        output,
+    output.write_u32(
         FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET,
         key_presence_user_count(presence),
     )
@@ -288,22 +289,23 @@ impl FscryptAddKeyPayload {
         if input.len() < FSCRYPT_ADD_KEY_FIXED_BYTES {
             return Err(DriverError::BufferTooSmall);
         }
+        let fields = LittleEndianInput::new(input);
         let identifier = parse_key_identifier(input)?;
-        if read_u32(input, FSCRYPT_ADD_KEY_KEY_ID_OFFSET)? != 0
-            || read_u32(input, FSCRYPT_ADD_KEY_FLAGS_OFFSET)? != 0
-            || !all_zero(
-                input,
+        if fields.read_u32(FSCRYPT_ADD_KEY_KEY_ID_OFFSET)? != 0
+            || fields.read_u32(FSCRYPT_ADD_KEY_FLAGS_OFFSET)? != 0
+            || !fields.all_zero(
                 FSCRYPT_ADD_KEY_RESERVED_OFFSET,
                 FSCRYPT_ADD_KEY_RESERVED_BYTES,
             )?
         {
             return Err(DriverError::NotSupported);
         }
-        let raw_size = usize::try_from(read_u32(input, FSCRYPT_ADD_KEY_RAW_SIZE_OFFSET)?)
+        let raw_size = usize::try_from(fields.read_u32(FSCRYPT_ADD_KEY_RAW_SIZE_OFFSET)?)
             .map_err(|_| DriverError::InvalidParameter)?;
-        let raw = input
-            .get(FSCRYPT_ADD_KEY_FIXED_BYTES..)
-            .ok_or(DriverError::BufferTooSmall)?;
+        let raw = fields.range(
+            FSCRYPT_ADD_KEY_FIXED_BYTES,
+            input.len() - FSCRYPT_ADD_KEY_FIXED_BYTES,
+        )?;
         if raw.len() != raw_size {
             return Err(DriverError::InvalidParameter);
         }
@@ -338,9 +340,9 @@ impl FscryptRemoveKeyPayload {
             });
         }
         let identifier = parse_key_identifier(input)?;
-        if read_u32(input, FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET)? != 0
-            || !all_zero(
-                input,
+        let fields = LittleEndianInput::new(input);
+        if fields.read_u32(FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET)? != 0
+            || !fields.all_zero(
                 FSCRYPT_REMOVE_KEY_RESERVED_OFFSET,
                 FSCRYPT_REMOVE_KEY_RESERVED_BYTES,
             )?
@@ -370,8 +372,7 @@ impl FscryptKeyStatusPayload {
             return Err(DriverError::BufferTooSmall);
         }
         let identifier = parse_key_identifier(input)?;
-        if !all_zero(
-            input,
+        if !LittleEndianInput::new(input).all_zero(
             FSCRYPT_GET_KEY_STATUS_RESERVED_OFFSET,
             FSCRYPT_GET_KEY_STATUS_RESERVED_BYTES,
         )? {
@@ -409,28 +410,27 @@ impl FsverityEnablePayload {
                 DriverError::InvalidParameter
             });
         }
-        if read_u32(input, FSVERITY_ENABLE_VERSION_OFFSET)? != FSVERITY_ENABLE_VERSION {
+        let fields = LittleEndianInput::new(input);
+        if fields.read_u32(FSVERITY_ENABLE_VERSION_OFFSET)? != FSVERITY_ENABLE_VERSION {
             return Err(DriverError::InvalidParameter);
         }
-        let algorithm = FsverityHashAlgorithm::parse_u32(read_u32(
-            input,
-            FSVERITY_ENABLE_HASH_ALGORITHM_OFFSET,
-        )?)?;
+        let algorithm = FsverityHashAlgorithm::parse_u32(
+            fields.read_u32(FSVERITY_ENABLE_HASH_ALGORITHM_OFFSET)?,
+        )?;
         let block_size =
-            FsverityBlockSize::new(read_u32(input, FSVERITY_ENABLE_BLOCK_SIZE_OFFSET)?)?;
+            FsverityBlockSize::new(fields.read_u32(FSVERITY_ENABLE_BLOCK_SIZE_OFFSET)?)?;
         let salt = OptionalUserBuffer::new(
-            read_u64(input, FSVERITY_ENABLE_SALT_PTR_OFFSET)?,
-            read_u32(input, FSVERITY_ENABLE_SALT_SIZE_OFFSET)?,
+            fields.read_u64(FSVERITY_ENABLE_SALT_PTR_OFFSET)?,
+            fields.read_u32(FSVERITY_ENABLE_SALT_SIZE_OFFSET)?,
             32,
         )?;
         let signature = OptionalUserBuffer::new(
-            read_u64(input, FSVERITY_ENABLE_SIG_PTR_OFFSET)?,
-            read_u32(input, FSVERITY_ENABLE_SIG_SIZE_OFFSET)?,
+            fields.read_u64(FSVERITY_ENABLE_SIG_PTR_OFFSET)?,
+            fields.read_u32(FSVERITY_ENABLE_SIG_SIZE_OFFSET)?,
             FSVERITY_MAX_SIGNATURE_BYTES,
         )?;
-        if read_u32(input, FSVERITY_ENABLE_RESERVED1_OFFSET)? != 0
-            || !all_zero(
-                input,
+        if fields.read_u32(FSVERITY_ENABLE_RESERVED1_OFFSET)? != 0
+            || !fields.all_zero(
                 FSVERITY_ENABLE_RESERVED2_OFFSET,
                 FSVERITY_ENABLE_RESERVED2_BYTES,
             )?
@@ -547,78 +547,31 @@ fn parse_key_identifier(input: &[u8]) -> DriverResult<FscryptKeyIdentifier> {
     if input.len() < FSCRYPT_KEY_SPECIFIER_BYTES {
         return Err(DriverError::BufferTooSmall);
     }
-    if read_u32(input, FSCRYPT_KEY_SPEC_TYPE_OFFSET)? != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER {
+    let fields = LittleEndianInput::new(input);
+    if fields.read_u32(FSCRYPT_KEY_SPEC_TYPE_OFFSET)? != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER {
         return Err(DriverError::NotSupported);
     }
-    if read_u32(input, FSCRYPT_KEY_SPEC_RESERVED_OFFSET)? != 0 {
+    if fields.read_u32(FSCRYPT_KEY_SPEC_RESERVED_OFFSET)? != 0 {
         return Err(DriverError::InvalidParameter);
     }
     let identifier_offset = FSCRYPT_KEY_SPEC_UNION_OFFSET;
     let identifier_end = identifier_offset
         .checked_add(FSCRYPT_KEY_IDENTIFIER_BYTES)
         .ok_or(DriverError::InvalidParameter)?;
-    let identifier = fixed::<FSCRYPT_KEY_IDENTIFIER_BYTES>(input, identifier_offset)?;
-    if input
-        .get(identifier_end..FSCRYPT_KEY_SPECIFIER_BYTES)
-        .ok_or(DriverError::BufferTooSmall)?
+    let identifier = fields.fixed::<FSCRYPT_KEY_IDENTIFIER_BYTES>(identifier_offset)?;
+    if fields
+        .range(
+            identifier_end,
+            FSCRYPT_KEY_SPECIFIER_BYTES
+                .checked_sub(identifier_end)
+                .ok_or(DriverError::InvalidParameter)?,
+        )?
         .iter()
         .any(|byte| *byte != 0)
     {
         return Err(DriverError::InvalidParameter);
     }
     Ok(FscryptKeyIdentifier::new(identifier))
-}
-
-/// Returns whether a checked range contains only zeroes.
-fn all_zero(input: &[u8], offset: usize, len: usize) -> DriverResult<bool> {
-    let end = offset
-        .checked_add(len)
-        .ok_or(DriverError::InvalidParameter)?;
-    Ok(input
-        .get(offset..end)
-        .ok_or(DriverError::BufferTooSmall)?
-        .iter()
-        .all(|byte| *byte == 0))
-}
-
-/// Reads one little-endian `u32` from a checked offset.
-fn read_u32(input: &[u8], offset: usize) -> DriverResult<u32> {
-    Ok(u32::from_le_bytes(fixed(input, offset)?))
-}
-
-/// Reads one little-endian `u64` from a checked offset.
-fn read_u64(input: &[u8], offset: usize) -> DriverResult<u64> {
-    Ok(u64::from_le_bytes(fixed(input, offset)?))
-}
-
-/// Writes one little-endian `u32` into a checked offset.
-fn write_u32(output: &mut [u8], offset: usize, value: u32) -> DriverResult<()> {
-    let end = offset.checked_add(4).ok_or(DriverError::InvalidParameter)?;
-    output
-        .get_mut(offset..end)
-        .ok_or(DriverError::BufferTooSmall)?
-        .copy_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-/// Writes one little-endian `u64` into a checked offset.
-#[cfg(test)]
-fn write_u64(output: &mut [u8], offset: usize, value: u64) -> DriverResult<()> {
-    let end = offset.checked_add(8).ok_or(DriverError::InvalidParameter)?;
-    output
-        .get_mut(offset..end)
-        .ok_or(DriverError::BufferTooSmall)?
-        .copy_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-/// Copies a fixed byte array out of a checked range.
-fn fixed<const N: usize>(input: &[u8], offset: usize) -> DriverResult<[u8; N]> {
-    let end = offset.checked_add(N).ok_or(DriverError::InvalidParameter)?;
-    let slice = input.get(offset..end).ok_or(DriverError::BufferTooSmall)?;
-    let mut bytes = [0_u8; N];
-    bytes.copy_from_slice(slice);
-    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -688,14 +641,20 @@ mod tests {
     #[test]
     fn fscrypt_add_key_payload_rejects_v1_descriptor_and_hw_wrapped_keys() {
         let mut descriptor = must!(add_key_payload(&RAW_KEY));
-        must!(write_u32(&mut descriptor, FSCRYPT_KEY_SPEC_TYPE_OFFSET, 1));
+        {
+            let mut output = LittleEndianOutput::new(&mut descriptor);
+            must!(output.write_u32(FSCRYPT_KEY_SPEC_TYPE_OFFSET, 1));
+        }
         assert_eq!(
             FscryptAddKeyPayload::parse(&descriptor),
             Err(DriverError::NotSupported)
         );
 
         let mut hw_wrapped = must!(add_key_payload(&RAW_KEY));
-        must!(write_u32(&mut hw_wrapped, FSCRYPT_ADD_KEY_FLAGS_OFFSET, 1));
+        {
+            let mut output = LittleEndianOutput::new(&mut hw_wrapped);
+            must!(output.write_u32(FSCRYPT_ADD_KEY_FLAGS_OFFSET, 1));
+        }
         assert_eq!(
             FscryptAddKeyPayload::parse(&hw_wrapped),
             Err(DriverError::NotSupported)
@@ -725,17 +684,18 @@ mod tests {
             &mut present,
             FscryptKeyPresence::Present
         ));
+        let present_input = LittleEndianInput::new(&present);
 
         assert_eq!(
-            read_u32(&present, FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
+            present_input.read_u32(FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
             Ok(FSCRYPT_KEY_STATUS_PRESENT)
         );
         assert_eq!(
-            read_u32(&present, FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET),
+            present_input.read_u32(FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET),
             Ok(FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF)
         );
         assert_eq!(
-            read_u32(&present, FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET),
+            present_input.read_u32(FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET),
             Ok(1)
         );
         assert!(
@@ -749,17 +709,18 @@ mod tests {
             &mut absent,
             FscryptKeyPresence::Absent
         ));
+        let absent_input = LittleEndianInput::new(&absent);
 
         assert_eq!(
-            read_u32(&absent, FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
+            absent_input.read_u32(FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
             Ok(FSCRYPT_KEY_STATUS_ABSENT)
         );
         assert_eq!(
-            read_u32(&absent, FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET),
+            absent_input.read_u32(FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET),
             Ok(0)
         );
         assert_eq!(
-            read_u32(&absent, FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET),
+            absent_input.read_u32(FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET),
             Ok(0)
         );
     }
@@ -771,7 +732,7 @@ mod tests {
         must!(write_remove_key_output(&mut output));
 
         assert_eq!(
-            read_u32(&output, FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET),
+            LittleEndianInput::new(&output).read_u32(FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET),
             Ok(0)
         );
     }
@@ -867,11 +828,10 @@ mod tests {
             },
         );
         let mut reserved = must!(reserved);
-        must!(write_u32(
-            &mut reserved,
-            FSVERITY_ENABLE_RESERVED1_OFFSET,
-            1
-        ));
+        {
+            let mut output = LittleEndianOutput::new(&mut reserved);
+            must!(output.write_u32(FSVERITY_ENABLE_RESERVED1_OFFSET, 1));
+        }
         assert_eq!(
             FsverityEnablePayload::parse(&reserved),
             Err(DriverError::InvalidParameter)
@@ -901,11 +861,13 @@ mod tests {
         let identifier = FscryptMasterKey::from_raw(raw_key)?.identifier();
         let mut payload = vec![0_u8; FSCRYPT_ADD_KEY_FIXED_BYTES];
         write_key_identifier(&mut payload, identifier)?;
-        write_u32(
-            &mut payload,
-            FSCRYPT_ADD_KEY_RAW_SIZE_OFFSET,
-            u32::try_from(raw_key.len()).map_err(|_| DriverError::InvalidParameter)?,
-        )?;
+        {
+            let mut output = LittleEndianOutput::new(&mut payload);
+            output.write_u32(
+                FSCRYPT_ADD_KEY_RAW_SIZE_OFFSET,
+                u32::try_from(raw_key.len()).map_err(|_| DriverError::InvalidParameter)?,
+            )?;
+        }
         payload.extend_from_slice(raw_key);
         Ok(payload)
     }
@@ -929,18 +891,12 @@ mod tests {
         payload: &mut [u8],
         identifier: FscryptKeyIdentifier,
     ) -> DriverResult<()> {
-        write_u32(
-            payload,
+        let mut output = LittleEndianOutput::new(payload);
+        output.write_u32(
             FSCRYPT_KEY_SPEC_TYPE_OFFSET,
             FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER,
         )?;
-        let end = FSCRYPT_KEY_SPEC_UNION_OFFSET
-            .checked_add(FSCRYPT_KEY_IDENTIFIER_BYTES)
-            .ok_or(DriverError::InvalidParameter)?;
-        payload
-            .get_mut(FSCRYPT_KEY_SPEC_UNION_OFFSET..end)
-            .ok_or(DriverError::BufferTooSmall)?
-            .copy_from_slice(&identifier.bytes());
+        output.write_bytes(FSCRYPT_KEY_SPEC_UNION_OFFSET, &identifier.bytes())?;
         Ok(())
     }
 
@@ -952,29 +908,14 @@ mod tests {
         signature: OptionalUserBuffer,
     ) -> DriverResult<Vec<u8>> {
         let mut payload = vec![0_u8; FSVERITY_ENABLE_ARG_BYTES];
-        write_u32(
-            &mut payload,
-            FSVERITY_ENABLE_VERSION_OFFSET,
-            FSVERITY_ENABLE_VERSION,
-        )?;
-        write_u32(
-            &mut payload,
-            FSVERITY_ENABLE_HASH_ALGORITHM_OFFSET,
-            algorithm,
-        )?;
-        write_u32(&mut payload, FSVERITY_ENABLE_BLOCK_SIZE_OFFSET, block_size)?;
-        write_u32(&mut payload, FSVERITY_ENABLE_SALT_SIZE_OFFSET, salt.length)?;
-        write_u64(&mut payload, FSVERITY_ENABLE_SALT_PTR_OFFSET, salt.address)?;
-        write_u32(
-            &mut payload,
-            FSVERITY_ENABLE_SIG_SIZE_OFFSET,
-            signature.length,
-        )?;
-        write_u64(
-            &mut payload,
-            FSVERITY_ENABLE_SIG_PTR_OFFSET,
-            signature.address,
-        )?;
+        let mut output = LittleEndianOutput::new(&mut payload);
+        output.write_u32(FSVERITY_ENABLE_VERSION_OFFSET, FSVERITY_ENABLE_VERSION)?;
+        output.write_u32(FSVERITY_ENABLE_HASH_ALGORITHM_OFFSET, algorithm)?;
+        output.write_u32(FSVERITY_ENABLE_BLOCK_SIZE_OFFSET, block_size)?;
+        output.write_u32(FSVERITY_ENABLE_SALT_SIZE_OFFSET, salt.length)?;
+        output.write_u64(FSVERITY_ENABLE_SALT_PTR_OFFSET, salt.address)?;
+        output.write_u32(FSVERITY_ENABLE_SIG_SIZE_OFFSET, signature.length)?;
+        output.write_u64(FSVERITY_ENABLE_SIG_PTR_OFFSET, signature.address)?;
         Ok(payload)
     }
 }
