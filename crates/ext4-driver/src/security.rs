@@ -4,17 +4,15 @@ use alloc::{vec, vec::Vec};
 use core::ptr::NonNull;
 
 use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, LoadedNode, NodeId};
-use wdk_sys::{
-    NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER,
-    STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
-};
+use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::irp::{
     DispatchTarget, QuerySecurityStack, SecurityComponentSelection, SecuritySelection,
     SetSecurityStack,
 };
 use crate::state::{FileControlBlock, VolumeControlBlock, file_control_block};
-use crate::status::DriverError;
+use crate::status::{DriverError, DriverResult};
+use crate::wire::{CheckedByteRange, LittleEndianInput, LittleEndianOutput};
 
 /// SECURITY_DESCRIPTOR_RELATIVE byte size.
 const SECURITY_DESCRIPTOR_RELATIVE_BYTES: usize = 20;
@@ -178,9 +176,9 @@ struct DaclPermissionBuilder {
 
 impl DaclPermissionBuilder {
     /// Stores one parsed permission class.
-    fn set(&mut self, class: PermissionClass, bits: u16) -> Result<(), NTSTATUS> {
+    fn set(&mut self, class: PermissionClass, bits: u16) -> DriverResult<()> {
         if self.classes.iter().any(|entry| entry.class == class) {
-            return Err(STATUS_NOT_SUPPORTED);
+            return Err(DriverError::NotSupported);
         }
         self.classes.push(PermissionClassBits { class, bits });
         Ok(())
@@ -206,25 +204,18 @@ fn query_security(request: QuerySecurityRequest) -> NTSTATUS {
         let descriptor = security_descriptor(security, request.stack.selection())?;
         let required = descriptor.len();
         request.target.set_information(
-            wdk_sys::ULONG_PTR::try_from(required).map_err(|_| STATUS_INVALID_PARAMETER)?,
+            wdk_sys::ULONG_PTR::try_from(required).map_err(|_| DriverError::InvalidParameter)?,
         );
         let length = request.stack.length().as_usize();
         if length < required {
-            return Err(STATUS_BUFFER_TOO_SMALL);
+            return Err(DriverError::BufferTooSmall);
         }
-        let mut output = request
-            .target
-            .user_buffer(length)
-            .map_err(|error| error.ntstatus())?;
-        output
-            .as_mut_slice()
-            .get_mut(..required)
-            .ok_or(STATUS_BUFFER_TOO_SMALL)?
-            .copy_from_slice(descriptor.as_slice());
+        let mut output = request.target.user_buffer(length)?;
+        LittleEndianOutput::new(output.as_mut_slice()).write_bytes(0, descriptor.as_slice())?;
         Ok(())
     }) {
         Ok(()) => STATUS_SUCCESS,
-        Err(status) => status,
+        Err(error) => error.ntstatus(),
     }
 }
 
@@ -252,36 +243,29 @@ fn set_security(request: SetSecurityRequest) -> NTSTATUS {
             // mutation.
             vcb.as_mut()
         };
-        let mut transaction = vcb.volume_mut().begin_transaction(
-            crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?,
-        );
-        let node = transaction
-            .node(context.node)
-            .map_err(|error| DriverError::from(error).ntstatus())?;
-        transaction
-            .set_posix_security(node, security)
-            .map_err(|error| DriverError::from(error).ntstatus())?;
-        transaction
-            .commit()
-            .map_err(|error| DriverError::from(error).ntstatus())
+        let mut transaction = vcb
+            .volume_mut()
+            .begin_transaction(crate::time::current_ext4_timestamp()?);
+        let node = transaction.node(context.node)?;
+        transaction.set_posix_security(node, security)?;
+        transaction.commit()?;
+        Ok(())
     }) {
         Ok(()) => STATUS_SUCCESS,
-        Err(status) => status,
+        Err(error) => error.ntstatus(),
     }
 }
 
 /// Loads ext4 security metadata for an opened node.
-fn load_ext4_security(
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
-) -> Result<Ext4Security, NTSTATUS> {
+fn load_ext4_security(file_object: NonNull<wdk_sys::FILE_OBJECT>) -> DriverResult<Ext4Security> {
     load_ext4_security_context(file_object).map(|context| context.security)
 }
 
 /// Loads ext4 security context for an opened node.
 fn load_ext4_security_context(
     file_object: NonNull<wdk_sys::FILE_OBJECT>,
-) -> Result<OpenedSecurityContext, NTSTATUS> {
-    let fcb = file_control_block(file_object).map_err(DriverError::ntstatus)?;
+) -> DriverResult<OpenedSecurityContext> {
+    let fcb = file_control_block(file_object)?;
     let fcb = unsafe {
         // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
         // until close releases it, and this query runs while the FILE_OBJECT
@@ -289,10 +273,7 @@ fn load_ext4_security_context(
         fcb.as_ref()
     };
     let vcb = volume_control_block(fcb);
-    let node = vcb
-        .volume()
-        .load_node(fcb.node().inode())
-        .map_err(|error| DriverError::from(error).ntstatus())?;
+    let node = vcb.volume().load_node(fcb.node().inode())?;
     Ok(OpenedSecurityContext {
         volume: fcb.volume(),
         node: fcb.node(),
@@ -301,12 +282,12 @@ fn load_ext4_security_context(
 }
 
 /// Extracts security metadata after validating FCB kind against core metadata.
-fn security_from_node(identity: NodeId, node: LoadedNode) -> Result<Ext4Security, NTSTATUS> {
+fn security_from_node(identity: NodeId, node: LoadedNode) -> DriverResult<Ext4Security> {
     match (identity, node) {
         (NodeId::File(_), LoadedNode::File(file)) => Ok(file.security()),
         (NodeId::Directory(_), LoadedNode::Directory(directory)) => Ok(directory.security()),
         (NodeId::Symlink(_), LoadedNode::Symlink(symlink)) => Ok(symlink.security()),
-        _ => Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus()),
+        _ => Err(DriverError::from(ext4_core::Error::WrongInodeKind)),
     }
 }
 
@@ -314,37 +295,35 @@ fn security_from_node(identity: NodeId, node: LoadedNode) -> Result<Ext4Security
 fn security_descriptor(
     security: Ext4Security,
     selection: SecuritySelection,
-) -> Result<Vec<u8>, NTSTATUS> {
+) -> DriverResult<Vec<u8>> {
     let mut descriptor = vec![0; SECURITY_DESCRIPTOR_RELATIVE_BYTES];
-    write_u8(
-        &mut descriptor,
+    LittleEndianOutput::new(descriptor.as_mut_slice()).write_u8(
         0,
         u8::try_from(wdk_sys::SECURITY_DESCRIPTOR_REVISION)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            .map_err(|_| DriverError::InvalidParameter)?,
     )?;
     let mut control = wdk_sys::SE_SELF_RELATIVE;
 
     if matches!(selection.owner(), SecurityComponentSelection::Selected) {
         let owner = uid_sid(security.owner().uid().as_u32())?;
         let offset = append_component(&mut descriptor, owner.bytes.as_slice())?;
-        write_u32(&mut descriptor, 4, offset)?;
+        LittleEndianOutput::new(descriptor.as_mut_slice()).write_u32(4, offset)?;
     }
     if matches!(selection.group(), SecurityComponentSelection::Selected) {
         let group = gid_sid(security.owner().gid().as_u32())?;
         let offset = append_component(&mut descriptor, group.bytes.as_slice())?;
-        write_u32(&mut descriptor, 8, offset)?;
+        LittleEndianOutput::new(descriptor.as_mut_slice()).write_u32(8, offset)?;
     }
     if matches!(selection.dacl(), SecurityComponentSelection::Selected) {
         control |= wdk_sys::SE_DACL_PRESENT;
         let dacl = dacl_from_permissions(security)?;
         let offset = append_component(&mut descriptor, dacl.as_slice())?;
-        write_u32(&mut descriptor, 16, offset)?;
+        LittleEndianOutput::new(descriptor.as_mut_slice()).write_u32(16, offset)?;
     }
 
-    write_u16(
-        &mut descriptor,
+    LittleEndianOutput::new(descriptor.as_mut_slice()).write_u16(
         2,
-        u16::try_from(control).map_err(|_| STATUS_INVALID_PARAMETER)?,
+        u16::try_from(control).map_err(|_| DriverError::InvalidParameter)?,
     )?;
     Ok(descriptor)
 }
@@ -353,7 +332,7 @@ fn security_descriptor(
 fn security_descriptor_bytes(
     security_descriptor: NonNull<core::ffi::c_void>,
     selection: SecuritySelection,
-) -> Result<Vec<u8>, NTSTATUS> {
+) -> DriverResult<Vec<u8>> {
     let pointer = security_descriptor.cast::<u8>();
     let mut length = SECURITY_DESCRIPTOR_RELATIVE_BYTES;
     let header = unsafe {
@@ -387,7 +366,7 @@ fn security_from_descriptor(
     descriptor: &[u8],
     selection: SecuritySelection,
     current: Ext4Security,
-) -> Result<Ext4Security, NTSTATUS> {
+) -> DriverResult<Ext4Security> {
     let descriptor = ParsedSecurityDescriptor::parse(descriptor)?;
     let mut owner = current.owner();
     if matches!(selection.owner(), SecurityComponentSelection::Selected) {
@@ -405,112 +384,106 @@ fn security_from_descriptor(
         permissions = (permissions & !POSIX_RWX_BITS) | low_bits;
     }
 
-    Ok(Ext4Security::new(
-        owner,
-        Ext4Permissions::new(permissions).map_err(|error| DriverError::from(error).ntstatus())?,
-    ))
+    Ok(Ext4Security::new(owner, Ext4Permissions::new(permissions)?))
 }
 
 impl<'a> ParsedSecurityDescriptor<'a> {
     /// Parses a self-relative Windows security descriptor.
-    fn parse(bytes: &'a [u8]) -> Result<Self, NTSTATUS> {
+    fn parse(bytes: &'a [u8]) -> DriverResult<Self> {
         if bytes.len() < SECURITY_DESCRIPTOR_RELATIVE_BYTES {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
-        let revision = read_u8(bytes, 0)?;
+        let fields = LittleEndianInput::new(bytes);
+        let revision = malformed_security(fields.read_u8(0))?;
         if u32::from(revision) != wdk_sys::SECURITY_DESCRIPTOR_REVISION {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
-        let control = read_u16(bytes, 2)?;
+        let control = malformed_security(fields.read_u16(2))?;
         let self_relative =
-            u16::try_from(wdk_sys::SE_SELF_RELATIVE).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            u16::try_from(wdk_sys::SE_SELF_RELATIVE).map_err(|_| DriverError::InvalidParameter)?;
         if control & self_relative == 0 {
-            return Err(STATUS_NOT_SUPPORTED);
+            return Err(DriverError::NotSupported);
         }
         let sacl_present =
-            u16::try_from(wdk_sys::SE_SACL_PRESENT).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            u16::try_from(wdk_sys::SE_SACL_PRESENT).map_err(|_| DriverError::InvalidParameter)?;
         if control & sacl_present != 0 {
-            return Err(DriverError::AccessDenied.ntstatus());
+            return Err(DriverError::AccessDenied);
         }
 
         Ok(Self {
             bytes,
             control,
-            owner_offset: read_u32(bytes, SECURITY_DESCRIPTOR_OWNER_OFFSET)?,
-            group_offset: read_u32(bytes, SECURITY_DESCRIPTOR_GROUP_OFFSET)?,
-            dacl_offset: read_u32(bytes, SECURITY_DESCRIPTOR_DACL_OFFSET)?,
+            owner_offset: malformed_security(fields.read_u32(SECURITY_DESCRIPTOR_OWNER_OFFSET))?,
+            group_offset: malformed_security(fields.read_u32(SECURITY_DESCRIPTOR_GROUP_OFFSET))?,
+            dacl_offset: malformed_security(fields.read_u32(SECURITY_DESCRIPTOR_DACL_OFFSET))?,
         })
     }
 
     /// Returns the owner UID represented by the owner SID.
-    fn owner_uid(self) -> Result<u32, NTSTATUS> {
+    fn owner_uid(self) -> DriverResult<u32> {
         match sid_identity(self.sid_at(self.owner_offset)?)? {
             SidIdentity::LinuxUid(uid) => Ok(uid),
-            SidIdentity::LinuxGid(_) | SidIdentity::Everyone => Err(STATUS_NOT_SUPPORTED),
+            SidIdentity::LinuxGid(_) | SidIdentity::Everyone => Err(DriverError::NotSupported),
         }
     }
 
     /// Returns the group GID represented by the group SID.
-    fn group_gid(self) -> Result<u32, NTSTATUS> {
+    fn group_gid(self) -> DriverResult<u32> {
         match sid_identity(self.sid_at(self.group_offset)?)? {
             SidIdentity::LinuxGid(gid) => Ok(gid),
-            SidIdentity::LinuxUid(_) | SidIdentity::Everyone => Err(STATUS_NOT_SUPPORTED),
+            SidIdentity::LinuxUid(_) | SidIdentity::Everyone => Err(DriverError::NotSupported),
         }
     }
 
     /// Returns low POSIX rwx bits represented by the descriptor DACL.
-    fn dacl_permissions(self, owner: Ext4Owner) -> Result<u16, NTSTATUS> {
+    fn dacl_permissions(self, owner: Ext4Owner) -> DriverResult<u16> {
         let dacl_present =
-            u16::try_from(wdk_sys::SE_DACL_PRESENT).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            u16::try_from(wdk_sys::SE_DACL_PRESENT).map_err(|_| DriverError::InvalidParameter)?;
         if self.control & dacl_present == 0 || self.dacl_offset == 0 {
-            return Err(STATUS_NOT_SUPPORTED);
+            return Err(DriverError::NotSupported);
         }
         let acl = self.acl_at(self.dacl_offset)?;
         parse_dacl_permissions(acl, owner)
     }
 
     /// Returns a SID component at a self-relative descriptor offset.
-    fn sid_at(self, offset: u32) -> Result<&'a [u8], NTSTATUS> {
+    fn sid_at(self, offset: u32) -> DriverResult<&'a [u8]> {
         if offset == 0 {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
-        let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
-        let header_end = start
-            .checked_add(SID_PREFIX_BYTES)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        let header = self
-            .bytes
-            .get(start..header_end)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        let count = usize::from(read_u8(header, 1)?);
+        let start = usize::try_from(offset).map_err(|_| DriverError::InvalidParameter)?;
+        let header = security_range(self.bytes, start, SID_PREFIX_BYTES)?;
+        let count = usize::from(malformed_security(
+            LittleEndianInput::new(header).read_u8(1),
+        )?);
         let sid_len = sid_length_from_sub_authorities(count)?;
-        let end = start.checked_add(sid_len).ok_or(STATUS_INVALID_PARAMETER)?;
-        self.bytes.get(start..end).ok_or(STATUS_INVALID_PARAMETER)
+        let _end = start
+            .checked_add(sid_len)
+            .ok_or(DriverError::InvalidParameter)?;
+        security_range(self.bytes, start, sid_len)
     }
 
     /// Returns an ACL component at a self-relative descriptor offset.
-    fn acl_at(self, offset: u32) -> Result<&'a [u8], NTSTATUS> {
-        let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
-        let header_end = start
-            .checked_add(ACL_HEADER_BYTES)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        let header = self
-            .bytes
-            .get(start..header_end)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        let acl_len = usize::from(read_u16(header, ACL_SIZE_OFFSET)?);
-        let end = start.checked_add(acl_len).ok_or(STATUS_INVALID_PARAMETER)?;
-        self.bytes.get(start..end).ok_or(STATUS_INVALID_PARAMETER)
+    fn acl_at(self, offset: u32) -> DriverResult<&'a [u8]> {
+        let start = usize::try_from(offset).map_err(|_| DriverError::InvalidParameter)?;
+        let header = security_range(self.bytes, start, ACL_HEADER_BYTES)?;
+        let acl_len = usize::from(malformed_security(
+            LittleEndianInput::new(header).read_u16(ACL_SIZE_OFFSET),
+        )?);
+        let _end = start
+            .checked_add(acl_len)
+            .ok_or(DriverError::InvalidParameter)?;
+        security_range(self.bytes, start, acl_len)
     }
 }
 
 /// Returns the byte end of a raw SID component.
-fn raw_sid_end(pointer: NonNull<u8>, offset: u32) -> Result<usize, NTSTATUS> {
+fn raw_sid_end(pointer: NonNull<u8>, offset: u32) -> DriverResult<usize> {
     if offset == 0 {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
-    let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
-    let count_offset = start.checked_add(1).ok_or(STATUS_INVALID_PARAMETER)?;
+    let start = usize::try_from(offset).map_err(|_| DriverError::InvalidParameter)?;
+    let count_offset = start.checked_add(1).ok_or(DriverError::InvalidParameter)?;
     let count_pointer = unsafe {
         // SAFETY: The offset is selected from a self-relative security
         // descriptor supplied by the I/O Manager.
@@ -522,18 +495,20 @@ fn raw_sid_end(pointer: NonNull<u8>, offset: u32) -> Result<usize, NTSTATUS> {
         *count_pointer
     };
     let sid_len = sid_length_from_sub_authorities(usize::from(count))?;
-    start.checked_add(sid_len).ok_or(STATUS_INVALID_PARAMETER)
+    start
+        .checked_add(sid_len)
+        .ok_or(DriverError::InvalidParameter)
 }
 
 /// Returns the byte end of a raw ACL component.
-fn raw_acl_end(pointer: NonNull<u8>, offset: u32) -> Result<usize, NTSTATUS> {
+fn raw_acl_end(pointer: NonNull<u8>, offset: u32) -> DriverResult<usize> {
     if offset == 0 {
-        return Err(STATUS_NOT_SUPPORTED);
+        return Err(DriverError::NotSupported);
     }
-    let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let start = usize::try_from(offset).map_err(|_| DriverError::InvalidParameter)?;
     let acl_size_offset = start
         .checked_add(ACL_SIZE_OFFSET)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     let acl_size_pointer = unsafe {
         // SAFETY: The offset is selected from a self-relative security
         // descriptor supplied by the I/O Manager.
@@ -544,57 +519,60 @@ fn raw_acl_end(pointer: NonNull<u8>, offset: u32) -> Result<usize, NTSTATUS> {
         // used to bound the subsequent copy.
         core::slice::from_raw_parts(acl_size_pointer, 2)
     };
-    let acl_len = usize::from(read_u16(size_bytes, 0)?);
-    start.checked_add(acl_len).ok_or(STATUS_INVALID_PARAMETER)
+    let acl_len = usize::from(malformed_security(
+        LittleEndianInput::new(size_bytes).read_u16(0),
+    )?);
+    start
+        .checked_add(acl_len)
+        .ok_or(DriverError::InvalidParameter)
 }
 
 /// Returns the serialized SID length for a sub-authority count.
-fn sid_length_from_sub_authorities(count: usize) -> Result<usize, NTSTATUS> {
+fn sid_length_from_sub_authorities(count: usize) -> DriverResult<usize> {
     SID_PREFIX_BYTES
         .checked_add(
             count
                 .checked_mul(core::mem::size_of::<u32>())
-                .ok_or(STATUS_INVALID_PARAMETER)?,
+                .ok_or(DriverError::InvalidParameter)?,
         )
-        .ok_or(STATUS_INVALID_PARAMETER)
+        .ok_or(DriverError::InvalidParameter)
 }
 
 /// Parses a DACL into POSIX rwx permission bits.
-fn parse_dacl_permissions(acl: &[u8], owner: Ext4Owner) -> Result<u16, NTSTATUS> {
+fn parse_dacl_permissions(acl: &[u8], owner: Ext4Owner) -> DriverResult<u16> {
     if acl.len() < ACL_HEADER_BYTES {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
-    let revision = read_u8(acl, 0)?;
+    let fields = LittleEndianInput::new(acl);
+    let revision = malformed_security(fields.read_u8(0))?;
     if u32::from(revision) != wdk_sys::ACL_REVISION {
-        return Err(STATUS_NOT_SUPPORTED);
+        return Err(DriverError::NotSupported);
     }
-    let acl_len = usize::from(read_u16(acl, ACL_SIZE_OFFSET)?);
+    let acl_len = usize::from(malformed_security(fields.read_u16(ACL_SIZE_OFFSET))?);
     if acl_len != acl.len() {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
-    let ace_count = usize::from(read_u16(acl, ACL_ACE_COUNT_OFFSET)?);
+    let ace_count = usize::from(malformed_security(fields.read_u16(ACL_ACE_COUNT_OFFSET))?);
     let mut cursor = ACL_HEADER_BYTES;
     let mut parsed = DaclPermissionBuilder::default();
     for _ in 0..ace_count {
-        let ace_header = acl
-            .get(cursor..)
-            .and_then(|remaining| remaining.get(..4))
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        let ace_type = read_u8(ace_header, 0)?;
-        let ace_flags = read_u8(ace_header, 1)?;
-        let ace_size = usize::from(read_u16(ace_header, 2)?);
+        let ace_header = security_range(acl, cursor, 4)?;
+        let ace_fields = LittleEndianInput::new(ace_header);
+        let ace_type = malformed_security(ace_fields.read_u8(0))?;
+        let ace_flags = malformed_security(ace_fields.read_u8(1))?;
+        let ace_size = usize::from(malformed_security(ace_fields.read_u16(2))?);
         if ace_size < ACCESS_ALLOWED_ACE_PREFIX_BYTES {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
         let ace_end = cursor
             .checked_add(ace_size)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        let ace = acl.get(cursor..ace_end).ok_or(STATUS_INVALID_PARAMETER)?;
+            .ok_or(DriverError::InvalidParameter)?;
+        let ace = security_range(acl, cursor, ace_size)?;
         parse_allow_ace(ace_type, ace_flags, ace, owner, &mut parsed)?;
         cursor = ace_end;
     }
     if cursor != acl.len() {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
     Ok(parsed.mode_bits())
 }
@@ -606,55 +584,57 @@ fn parse_allow_ace(
     ace: &[u8],
     owner: Ext4Owner,
     parsed: &mut DaclPermissionBuilder,
-) -> Result<(), NTSTATUS> {
+) -> DriverResult<()> {
     if u32::from(ace_type) != wdk_sys::ACCESS_ALLOWED_ACE_TYPE {
-        return Err(STATUS_NOT_SUPPORTED);
+        return Err(DriverError::NotSupported);
     }
     if ace_flags != 0 {
-        return Err(STATUS_NOT_SUPPORTED);
+        return Err(DriverError::NotSupported);
     }
-    let mask = read_u32(ace, ACE_MASK_OFFSET)?;
+    let mask = malformed_security(LittleEndianInput::new(ace).read_u32(ACE_MASK_OFFSET))?;
     let bits = permission_bits_from_mask(mask)?;
-    let sid = ace.get(ACE_SID_OFFSET..).ok_or(STATUS_INVALID_PARAMETER)?;
+    let sid_len = ace
+        .len()
+        .checked_sub(ACE_SID_OFFSET)
+        .ok_or(DriverError::InvalidParameter)?;
+    let sid = security_range(ace, ACE_SID_OFFSET, sid_len)?;
     let class = permission_class_from_sid(sid_identity(sid)?, owner)?;
     parsed.set(class, bits)
 }
 
 /// Maps one accepted Windows access mask back to POSIX rwx bits.
-fn permission_bits_from_mask(mask: u32) -> Result<u16, NTSTATUS> {
+fn permission_bits_from_mask(mask: u32) -> DriverResult<u16> {
     for bits in 0..=0o7 {
         if permission_class_mask(bits) == mask {
             return Ok(bits);
         }
     }
-    Err(STATUS_NOT_SUPPORTED)
+    Err(DriverError::NotSupported)
 }
 
 /// Classifies a SID for DACL permission projection.
-fn permission_class_from_sid(
-    sid: SidIdentity,
-    owner: Ext4Owner,
-) -> Result<PermissionClass, NTSTATUS> {
+fn permission_class_from_sid(sid: SidIdentity, owner: Ext4Owner) -> DriverResult<PermissionClass> {
     match sid {
         SidIdentity::LinuxUid(uid) if uid == owner.uid().as_u32() => Ok(PermissionClass::Owner),
         SidIdentity::LinuxGid(gid) if gid == owner.gid().as_u32() => Ok(PermissionClass::Group),
         SidIdentity::Everyone => Ok(PermissionClass::Other),
-        SidIdentity::LinuxUid(_) | SidIdentity::LinuxGid(_) => Err(STATUS_NOT_SUPPORTED),
+        SidIdentity::LinuxUid(_) | SidIdentity::LinuxGid(_) => Err(DriverError::NotSupported),
     }
 }
 
 /// Parses a SID into the identities accepted by this driver.
-fn sid_identity(bytes: &[u8]) -> Result<SidIdentity, NTSTATUS> {
+fn sid_identity(bytes: &[u8]) -> DriverResult<SidIdentity> {
     if bytes.len() < SID_PREFIX_BYTES {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
-    let revision = read_u8(bytes, 0)?;
+    let fields = LittleEndianInput::new(bytes);
+    let revision = malformed_security(fields.read_u8(0))?;
     if u32::from(revision) != wdk_sys::SID_REVISION {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
-    let count = usize::from(read_u8(bytes, 1)?);
+    let count = usize::from(malformed_security(fields.read_u8(1))?);
     if bytes.len() != sid_length_from_sub_authorities(count)? {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
     let authority = sid_authority(bytes)?;
     if authority == SECURITY_WORLD_AUTHORITY && count == 1 && sid_sub_authority(bytes, 0)? == 0 {
@@ -664,41 +644,41 @@ fn sid_identity(bytes: &[u8]) -> Result<SidIdentity, NTSTATUS> {
         return match sid_sub_authority(bytes, 0)? {
             1 => Ok(SidIdentity::LinuxUid(sid_sub_authority(bytes, 1)?)),
             2 => Ok(SidIdentity::LinuxGid(sid_sub_authority(bytes, 1)?)),
-            _ => Err(STATUS_NOT_SUPPORTED),
+            _ => Err(DriverError::NotSupported),
         };
     }
-    Err(STATUS_NOT_SUPPORTED)
+    Err(DriverError::NotSupported)
 }
 
 /// Reads the big-endian SID authority.
-fn sid_authority(bytes: &[u8]) -> Result<u64, NTSTATUS> {
-    let authority = bytes.get(2..8).ok_or(STATUS_INVALID_PARAMETER)?;
+fn sid_authority(bytes: &[u8]) -> DriverResult<u64> {
+    let authority = security_range(bytes, 2, 6)?;
     Ok(u64::from_be_bytes([
         0,
         0,
-        *authority.first().ok_or(STATUS_INVALID_PARAMETER)?,
-        *authority.get(1).ok_or(STATUS_INVALID_PARAMETER)?,
-        *authority.get(2).ok_or(STATUS_INVALID_PARAMETER)?,
-        *authority.get(3).ok_or(STATUS_INVALID_PARAMETER)?,
-        *authority.get(4).ok_or(STATUS_INVALID_PARAMETER)?,
-        *authority.get(5).ok_or(STATUS_INVALID_PARAMETER)?,
+        authority[0],
+        authority[1],
+        authority[2],
+        authority[3],
+        authority[4],
+        authority[5],
     ]))
 }
 
 /// Reads a little-endian SID sub-authority by index.
-fn sid_sub_authority(bytes: &[u8], index: usize) -> Result<u32, NTSTATUS> {
+fn sid_sub_authority(bytes: &[u8], index: usize) -> DriverResult<u32> {
     let start = SID_PREFIX_BYTES
         .checked_add(
             index
                 .checked_mul(core::mem::size_of::<u32>())
-                .ok_or(STATUS_INVALID_PARAMETER)?,
+                .ok_or(DriverError::InvalidParameter)?,
         )
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    read_u32(bytes, start)
+        .ok_or(DriverError::InvalidParameter)?;
+    malformed_security(LittleEndianInput::new(bytes).read_u32(start))
 }
 
 /// Builds a DACL with owner, group, and everyone allow ACEs from POSIX mode bits.
-fn dacl_from_permissions(security: Ext4Security) -> Result<Vec<u8>, NTSTATUS> {
+fn dacl_from_permissions(security: Ext4Security) -> DriverResult<Vec<u8>> {
     let permissions = security.permissions().as_u16();
     let owner = permission_class_mask((permissions >> 6) & 0o7);
     let group = permission_class_mask((permissions >> 3) & 0o7);
@@ -724,21 +704,19 @@ fn dacl_from_permissions(security: Ext4Security) -> Result<Vec<u8>, NTSTATUS> {
     }
 
     let mut acl = vec![0; ACL_HEADER_BYTES];
-    write_u8(
-        &mut acl,
+    LittleEndianOutput::new(acl.as_mut_slice()).write_u8(
         0,
-        u8::try_from(wdk_sys::ACL_REVISION).map_err(|_| STATUS_INVALID_PARAMETER)?,
+        u8::try_from(wdk_sys::ACL_REVISION).map_err(|_| DriverError::InvalidParameter)?,
     )?;
-    write_u16(
-        &mut acl,
+    LittleEndianOutput::new(acl.as_mut_slice()).write_u16(
         4,
-        u16::try_from(aces.len()).map_err(|_| STATUS_INVALID_PARAMETER)?,
+        u16::try_from(aces.len()).map_err(|_| DriverError::InvalidParameter)?,
     )?;
     for ace in &aces {
         append_allow_ace(&mut acl, ace)?;
     }
-    let acl_len = u16::try_from(acl.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
-    write_u16(&mut acl, 2, acl_len)?;
+    let acl_len = u16::try_from(acl.len()).map_err(|_| DriverError::InvalidParameter)?;
+    LittleEndianOutput::new(acl.as_mut_slice()).write_u16(2, acl_len)?;
     Ok(acl)
 }
 
@@ -758,81 +736,79 @@ fn permission_class_mask(bits: u16) -> u32 {
 }
 
 /// Appends one component to the self-relative descriptor.
-fn append_component(descriptor: &mut Vec<u8>, component: &[u8]) -> Result<u32, NTSTATUS> {
-    let offset = u32::try_from(descriptor.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+fn append_component(descriptor: &mut Vec<u8>, component: &[u8]) -> DriverResult<u32> {
+    let offset = u32::try_from(descriptor.len()).map_err(|_| DriverError::InvalidParameter)?;
     descriptor.extend_from_slice(component);
     Ok(offset)
 }
 
 /// Appends one ACCESS_ALLOWED_ACE to an ACL image.
-fn append_allow_ace(acl: &mut Vec<u8>, ace: &AllowAce) -> Result<(), NTSTATUS> {
+fn append_allow_ace(acl: &mut Vec<u8>, ace: &AllowAce) -> DriverResult<()> {
     let ace_size = ACCESS_ALLOWED_ACE_PREFIX_BYTES
         .checked_add(ace.sid.bytes.len())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     let start = acl.len();
     acl.resize(
         start
             .checked_add(ace_size)
-            .ok_or(STATUS_INVALID_PARAMETER)?,
+            .ok_or(DriverError::InvalidParameter)?,
         0,
     );
-    write_u8(
-        acl,
+    let mut output = LittleEndianOutput::new(acl.as_mut_slice());
+    output.write_u8(
         start,
-        u8::try_from(wdk_sys::ACCESS_ALLOWED_ACE_TYPE).map_err(|_| STATUS_INVALID_PARAMETER)?,
+        u8::try_from(wdk_sys::ACCESS_ALLOWED_ACE_TYPE)
+            .map_err(|_| DriverError::InvalidParameter)?,
     )?;
-    write_u16(
-        acl,
-        start.checked_add(2).ok_or(STATUS_INVALID_PARAMETER)?,
-        u16::try_from(ace_size).map_err(|_| STATUS_INVALID_PARAMETER)?,
+    output.write_u16(
+        start.checked_add(2).ok_or(DriverError::InvalidParameter)?,
+        u16::try_from(ace_size).map_err(|_| DriverError::InvalidParameter)?,
     )?;
-    write_u32(
-        acl,
-        start.checked_add(4).ok_or(STATUS_INVALID_PARAMETER)?,
+    output.write_u32(
+        start.checked_add(4).ok_or(DriverError::InvalidParameter)?,
         ace.mask,
     )?;
-    write_bytes(
-        acl,
+    output.write_bytes(
         start
             .checked_add(ACCESS_ALLOWED_ACE_PREFIX_BYTES)
-            .ok_or(STATUS_INVALID_PARAMETER)?,
+            .ok_or(DriverError::InvalidParameter)?,
         ace.sid.bytes.as_slice(),
     )
 }
 
 /// Builds `S-1-22-1-uid`.
-fn uid_sid(uid: u32) -> Result<BinarySid, NTSTATUS> {
+fn uid_sid(uid: u32) -> DriverResult<BinarySid> {
     sid(SECURITY_NT_NON_UNIQUE_AUTHORITY, &[1, uid])
 }
 
 /// Builds `S-1-22-2-gid`.
-fn gid_sid(gid: u32) -> Result<BinarySid, NTSTATUS> {
+fn gid_sid(gid: u32) -> DriverResult<BinarySid> {
     sid(SECURITY_NT_NON_UNIQUE_AUTHORITY, &[2, gid])
 }
 
 /// Builds Everyone, `S-1-1-0`.
-fn everyone_sid() -> Result<BinarySid, NTSTATUS> {
+fn everyone_sid() -> DriverResult<BinarySid> {
     sid(SECURITY_WORLD_AUTHORITY, &[0])
 }
 
 /// Builds a binary SID from an authority and sub-authorities.
-fn sid(authority: u64, sub_authorities: &[u32]) -> Result<BinarySid, NTSTATUS> {
+fn sid(authority: u64, sub_authorities: &[u32]) -> DriverResult<BinarySid> {
     let sub_authority_count =
-        u8::try_from(sub_authorities.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        u8::try_from(sub_authorities.len()).map_err(|_| DriverError::InvalidParameter)?;
     let capacity = SID_PREFIX_BYTES
         .checked_add(
             sub_authorities
                 .len()
                 .checked_mul(core::mem::size_of::<u32>())
-                .ok_or(STATUS_INVALID_PARAMETER)?,
+                .ok_or(DriverError::InvalidParameter)?,
         )
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     let mut bytes = Vec::with_capacity(capacity);
-    bytes.push(u8::try_from(wdk_sys::SID_REVISION).map_err(|_| STATUS_INVALID_PARAMETER)?);
+    bytes.push(u8::try_from(wdk_sys::SID_REVISION).map_err(|_| DriverError::InvalidParameter)?);
     bytes.push(sub_authority_count);
     let authority = authority.to_be_bytes();
     let Some(authority) = authority.get(2..) else {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     };
     bytes.extend_from_slice(authority);
     for sub_authority in sub_authorities {
@@ -850,74 +826,17 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
     }
 }
 
-/// Reads one byte from a byte buffer.
-fn read_u8(input: &[u8], offset: usize) -> Result<u8, NTSTATUS> {
-    input.get(offset).copied().ok_or(STATUS_INVALID_PARAMETER)
+/// Normalizes malformed security descriptor field access to the Windows set-security error.
+fn malformed_security<T>(result: DriverResult<T>) -> DriverResult<T> {
+    result.map_err(|_| DriverError::InvalidParameter)
 }
 
-/// Reads a little-endian `u16`.
-fn read_u16(input: &[u8], offset: usize) -> Result<u16, NTSTATUS> {
-    let end = offset
-        .checked_add(core::mem::size_of::<u16>())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    let bytes = input.get(offset..end).ok_or(STATUS_INVALID_PARAMETER)?;
-    let array: [u8; 2] = bytes.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
-    Ok(u16::from_le_bytes(array))
-}
-
-/// Reads a little-endian `u32`.
-fn read_u32(input: &[u8], offset: usize) -> Result<u32, NTSTATUS> {
-    let end = offset
-        .checked_add(core::mem::size_of::<u32>())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    let bytes = input.get(offset..end).ok_or(STATUS_INVALID_PARAMETER)?;
-    let array: [u8; 4] = bytes.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
-    Ok(u32::from_le_bytes(array))
-}
-
-/// Writes one byte into a byte buffer.
-fn write_u8(output: &mut [u8], offset: usize, value: u8) -> Result<(), NTSTATUS> {
-    let Some(target) = output.get_mut(offset) else {
-        return Err(STATUS_BUFFER_TOO_SMALL);
-    };
-    *target = value;
-    Ok(())
-}
-
-/// Writes a little-endian `u16`.
-fn write_u16(output: &mut [u8], offset: usize, value: u16) -> Result<(), NTSTATUS> {
-    let end = offset
-        .checked_add(core::mem::size_of::<u16>())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    let Some(target) = output.get_mut(offset..end) else {
-        return Err(STATUS_BUFFER_TOO_SMALL);
-    };
-    target.copy_from_slice(value.to_le_bytes().as_slice());
-    Ok(())
-}
-
-/// Writes a little-endian `u32`.
-fn write_u32(output: &mut [u8], offset: usize, value: u32) -> Result<(), NTSTATUS> {
-    let end = offset
-        .checked_add(core::mem::size_of::<u32>())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    let Some(target) = output.get_mut(offset..end) else {
-        return Err(STATUS_BUFFER_TOO_SMALL);
-    };
-    target.copy_from_slice(value.to_le_bytes().as_slice());
-    Ok(())
-}
-
-/// Writes raw bytes into a byte buffer.
-fn write_bytes(output: &mut [u8], offset: usize, bytes: &[u8]) -> Result<(), NTSTATUS> {
-    let end = offset
-        .checked_add(bytes.len())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    let Some(target) = output.get_mut(offset..end) else {
-        return Err(STATUS_BUFFER_TOO_SMALL);
-    };
-    target.copy_from_slice(bytes);
-    Ok(())
+/// Borrows a checked security descriptor range with malformed-input error semantics.
+fn security_range(bytes: &[u8], offset: usize, length: usize) -> DriverResult<&[u8]> {
+    let range = CheckedByteRange::new(offset, length)?;
+    range
+        .read_from(bytes)
+        .map_err(|_| DriverError::InvalidParameter)
 }
 
 #[cfg(test)]
@@ -926,7 +845,11 @@ mod tests {
 
     use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid};
 
-    use crate::irp::{SecurityComponentSelection, SecuritySelection};
+    use crate::{
+        irp::{SecurityComponentSelection, SecuritySelection},
+        status::DriverError,
+        wire::LittleEndianInput,
+    };
 
     use super::{
         SidIdentity, dacl_from_permissions, gid_sid, permission_bits_from_mask,
@@ -982,11 +905,12 @@ mod tests {
             let dacl = dacl_from_permissions(security);
             assert!(dacl.is_ok());
             if let Ok(dacl) = dacl {
-                assert_eq!(read_test_u16(dacl.as_slice(), 2), Some(76));
-                assert_eq!(read_test_u16(dacl.as_slice(), 4), Some(3));
-                assert_eq!(read_test_u16(dacl.as_slice(), 10), Some(24));
-                assert_eq!(read_test_u16(dacl.as_slice(), 34), Some(24));
-                assert_eq!(read_test_u16(dacl.as_slice(), 58), Some(20));
+                let fields = LittleEndianInput::new(dacl.as_slice());
+                assert_eq!(fields.read_u16(2), Ok(76));
+                assert_eq!(fields.read_u16(4), Ok(3));
+                assert_eq!(fields.read_u16(10), Ok(24));
+                assert_eq!(fields.read_u16(34), Ok(24));
+                assert_eq!(fields.read_u16(58), Ok(20));
             }
         }
     }
@@ -1003,10 +927,11 @@ mod tests {
             let descriptor = security_descriptor(security, all_security_components());
             assert!(descriptor.is_ok());
             if let Ok(descriptor) = descriptor {
-                assert_eq!(read_test_u16(descriptor.as_slice(), 2), Some(32772));
-                assert_eq!(read_test_u32(descriptor.as_slice(), 4), Some(20));
-                assert_eq!(read_test_u32(descriptor.as_slice(), 8), Some(36));
-                assert_eq!(read_test_u32(descriptor.as_slice(), 16), Some(52));
+                let fields = LittleEndianInput::new(descriptor.as_slice());
+                assert_eq!(fields.read_u16(2), Ok(32772));
+                assert_eq!(fields.read_u32(4), Ok(20));
+                assert_eq!(fields.read_u32(8), Ok(36));
+                assert_eq!(fields.read_u32(16), Ok(52));
             }
         }
     }
@@ -1069,7 +994,7 @@ mod tests {
                         dacl_security_component(),
                         current,
                     ),
-                    Err(wdk_sys::STATUS_NOT_SUPPORTED)
+                    Err(DriverError::NotSupported)
                 );
             }
         }
@@ -1087,12 +1012,10 @@ mod tests {
             let descriptor = security_descriptor(security, dacl_security_component());
             assert!(descriptor.is_ok());
             if let Ok(mut descriptor) = descriptor {
-                let dacl_offset = read_test_u32(
-                    descriptor.as_slice(),
-                    super::SECURITY_DESCRIPTOR_DACL_OFFSET,
-                );
-                assert!(dacl_offset.is_some());
-                if let Some(dacl_offset) = dacl_offset {
+                let dacl_offset = LittleEndianInput::new(descriptor.as_slice())
+                    .read_u32(super::SECURITY_DESCRIPTOR_DACL_OFFSET);
+                assert!(dacl_offset.is_ok());
+                if let Ok(dacl_offset) = dacl_offset {
                     let ace_type_offset = usize::try_from(dacl_offset)
                         .ok()
                         .and_then(|offset| offset.checked_add(super::ACL_HEADER_BYTES));
@@ -1111,7 +1034,7 @@ mod tests {
                                 dacl_security_component(),
                                 security,
                             ),
-                            Err(wdk_sys::STATUS_NOT_SUPPORTED)
+                            Err(DriverError::NotSupported)
                         );
                     }
                 }
@@ -1131,7 +1054,7 @@ mod tests {
         );
         assert_eq!(
             sid_identity(&[1, 1, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0]),
-            Err(wdk_sys::STATUS_NOT_SUPPORTED)
+            Err(DriverError::NotSupported)
         );
     }
 
@@ -1147,21 +1070,7 @@ mod tests {
         );
         assert_eq!(
             permission_bits_from_mask(wdk_sys::FILE_GENERIC_READ | wdk_sys::DELETE),
-            Err(wdk_sys::STATUS_NOT_SUPPORTED)
+            Err(DriverError::NotSupported)
         );
-    }
-
-    fn read_test_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-        let end = offset.checked_add(core::mem::size_of::<u16>())?;
-        let slice = bytes.get(offset..end)?;
-        let array: [u8; 2] = slice.try_into().ok()?;
-        Some(u16::from_le_bytes(array))
-    }
-
-    fn read_test_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-        let end = offset.checked_add(core::mem::size_of::<u32>())?;
-        let slice = bytes.get(offset..end)?;
-        let array: [u8; 4] = slice.try_into().ok()?;
-        Some(u32::from_le_bytes(array))
     }
 }
