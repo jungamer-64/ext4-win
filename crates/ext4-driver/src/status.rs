@@ -2,11 +2,12 @@
 
 use ext4_core::Error;
 use wdk_sys::{
-    NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL, STATUS_CANNOT_DELETE,
-    STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL, STATUS_EA_LIST_INCONSISTENT, STATUS_EA_TOO_LARGE,
-    STATUS_FILE_CORRUPT_ERROR, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_INVALID_EA_NAME, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
-    STATUS_IO_DEVICE_ERROR, STATUS_NO_EAS_ON_FILE, STATUS_NOT_SUPPORTED,
+    NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
+    STATUS_CANNOT_DELETE, STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL,
+    STATUS_EA_LIST_INCONSISTENT, STATUS_EA_TOO_LARGE, STATUS_FILE_CORRUPT_ERROR,
+    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_EA_NAME,
+    STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR,
+    STATUS_NO_EAS_ON_FILE, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_NOT_SUPPORTED,
     STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
     STATUS_OBJECT_TYPE_MISMATCH, STATUS_VOLUME_DIRTY,
 };
@@ -27,6 +28,8 @@ pub(crate) enum DriverError {
     AccessDenied,
     /// Caller output buffer cannot hold the required fixed payload.
     BufferTooSmall,
+    /// Caller output buffer holds a partial variable payload.
+    BufferOverflow,
     /// Caller selected an unsupported information class.
     InvalidInfoClass,
     /// Opened node is not a reparse point.
@@ -51,6 +54,10 @@ pub(crate) enum DriverError {
     ObjectTypeMismatch,
     /// WDK share-access validation rejected this open.
     ShareAccessConflict,
+    /// Directory enumeration has no more entries for this cursor.
+    NoMoreFiles,
+    /// Exact directory enumeration pattern matched no entry.
+    NoSuchFile,
     /// Caller selected a valid but unsupported Windows filesystem behavior.
     NotSupported,
     /// ext4-core rejected the requested filesystem operation.
@@ -66,6 +73,7 @@ impl DriverError {
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,
             Self::BufferTooSmall => STATUS_BUFFER_TOO_SMALL,
+            Self::BufferOverflow => STATUS_BUFFER_OVERFLOW,
             Self::InvalidInfoClass => STATUS_INVALID_INFO_CLASS,
             Self::NotAReparsePoint => ntstatus(0xC000_0275),
             Self::ReparseTagNotHandled => ntstatus(0xC000_0279),
@@ -78,6 +86,8 @@ impl DriverError {
             Self::ObjectPathNotFound => STATUS_OBJECT_PATH_NOT_FOUND,
             Self::ObjectTypeMismatch => STATUS_OBJECT_TYPE_MISMATCH,
             Self::ShareAccessConflict => ntstatus(0xC000_0043),
+            Self::NoMoreFiles => STATUS_NO_MORE_FILES,
+            Self::NoSuchFile => STATUS_NO_SUCH_FILE,
             Self::NotSupported => STATUS_NOT_SUPPORTED,
             Self::Core(error) => core_error_status(error),
         }
