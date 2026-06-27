@@ -13,15 +13,6 @@ use crate::state::{
 };
 use crate::status::{DriverError, DriverResult};
 
-/// `FSCTL_GET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
-pub(crate) const FSCTL_GET_REPARSE_POINT: wdk_sys::ULONG = 589_992;
-
-/// `FSCTL_SET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
-pub(crate) const FSCTL_SET_REPARSE_POINT: wdk_sys::ULONG = 589_988;
-
-/// `FSCTL_DELETE_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 43, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
-pub(crate) const FSCTL_DELETE_REPARSE_POINT: wdk_sys::ULONG = 589_996;
-
 /// Reparse buffer header before the tag-specific payload.
 const REPARSE_DATA_BUFFER_HEADER_SIZE: usize = 8;
 /// SymbolicLinkReparseBuffer header before `PathBuffer`.

@@ -189,7 +189,7 @@ impl CurrentIrpStackLocation {
             file_object: self.file_object()?,
             input_buffer_length: IrpBufferLength::from_ulong(control.InputBufferLength)?,
             output_buffer_length: IrpBufferLength::from_ulong(control.OutputBufferLength)?,
-            fs_control_code: control.FsControlCode,
+            fs_control_code: FsControlCode::from_raw(control.FsControlCode)?,
         })
     }
 
@@ -765,6 +765,80 @@ fn stack_flag(flags: wdk_sys::UCHAR, bit: u32) -> bool {
     u32::from(flags) & bit != 0
 }
 
+/// Decoded user FSCTL code selected by the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FsControlCode {
+    /// Windows `FSCTL_GET_REPARSE_POINT`.
+    GetReparsePoint,
+    /// Windows `FSCTL_SET_REPARSE_POINT`.
+    SetReparsePoint,
+    /// Windows `FSCTL_DELETE_REPARSE_POINT`.
+    DeleteReparsePoint,
+    /// ext4win private fscrypt add-key control.
+    AddEncryptionKey,
+    /// ext4win private fscrypt remove-key control.
+    RemoveEncryptionKey,
+    /// ext4win private fscrypt key-status control.
+    GetEncryptionKeyStatus,
+    /// ext4win private fs-verity enable control.
+    EnableVerity,
+}
+
+impl FsControlCode {
+    /// Decodes the raw WDK control code at the IRP boundary.
+    fn from_raw(value: wdk_sys::ULONG) -> Result<Self, DriverError> {
+        match value {
+            FSCTL_GET_REPARSE_POINT => Ok(Self::GetReparsePoint),
+            FSCTL_SET_REPARSE_POINT => Ok(Self::SetReparsePoint),
+            FSCTL_DELETE_REPARSE_POINT => Ok(Self::DeleteReparsePoint),
+            FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY => Ok(Self::AddEncryptionKey),
+            FSCTL_EXT4WIN_REMOVE_ENCRYPTION_KEY => Ok(Self::RemoveEncryptionKey),
+            FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS => Ok(Self::GetEncryptionKeyStatus),
+            FSCTL_EXT4WIN_ENABLE_VERITY => Ok(Self::EnableVerity),
+            _ => Err(DriverError::NotSupported),
+        }
+    }
+}
+
+/// `FSCTL_GET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+const FSCTL_GET_REPARSE_POINT: wdk_sys::ULONG = 589_992;
+/// `FSCTL_SET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+const FSCTL_SET_REPARSE_POINT: wdk_sys::ULONG = 589_988;
+/// `FSCTL_DELETE_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 43, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+const FSCTL_DELETE_REPARSE_POINT: wdk_sys::ULONG = 589_996;
+
+/// Windows `FILE_DEVICE_FILE_SYSTEM`.
+const FILE_DEVICE_FILE_SYSTEM: wdk_sys::ULONG = 0x0000_0009;
+/// Windows `METHOD_BUFFERED`.
+const METHOD_BUFFERED: wdk_sys::ULONG = 0;
+/// Windows `FILE_ANY_ACCESS`.
+const FILE_ANY_ACCESS: wdk_sys::ULONG = 0;
+/// ext4win private function code for adding an fscrypt key.
+const EXT4WIN_ADD_ENCRYPTION_KEY_FUNCTION: wdk_sys::ULONG = 0x900;
+/// ext4win private function code for removing an fscrypt key.
+const EXT4WIN_REMOVE_ENCRYPTION_KEY_FUNCTION: wdk_sys::ULONG = 0x901;
+/// ext4win private function code for fscrypt key status.
+const EXT4WIN_GET_ENCRYPTION_KEY_STATUS_FUNCTION: wdk_sys::ULONG = 0x902;
+/// ext4win private function code for enabling fs-verity.
+const EXT4WIN_ENABLE_VERITY_FUNCTION: wdk_sys::ULONG = 0x903;
+
+/// Builds a Windows `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, function, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+const fn ext4win_fsctl(function: wdk_sys::ULONG) -> wdk_sys::ULONG {
+    (FILE_DEVICE_FILE_SYSTEM << 16) | (FILE_ANY_ACCESS << 14) | (function << 2) | METHOD_BUFFERED
+}
+
+/// ext4win FSCTL carrying Linux `struct fscrypt_add_key_arg`.
+const FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY: wdk_sys::ULONG =
+    ext4win_fsctl(EXT4WIN_ADD_ENCRYPTION_KEY_FUNCTION);
+/// ext4win FSCTL carrying Linux `struct fscrypt_remove_key_arg`.
+const FSCTL_EXT4WIN_REMOVE_ENCRYPTION_KEY: wdk_sys::ULONG =
+    ext4win_fsctl(EXT4WIN_REMOVE_ENCRYPTION_KEY_FUNCTION);
+/// ext4win FSCTL carrying Linux `struct fscrypt_get_key_status_arg`.
+const FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS: wdk_sys::ULONG =
+    ext4win_fsctl(EXT4WIN_GET_ENCRYPTION_KEY_STATUS_FUNCTION);
+/// ext4win FSCTL carrying Linux `struct fsverity_enable_arg`.
+const FSCTL_EXT4WIN_ENABLE_VERITY: wdk_sys::ULONG = ext4win_fsctl(EXT4WIN_ENABLE_VERITY_FUNCTION);
+
 /// Decoded mount-volume stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MountVolumeStack {
@@ -786,7 +860,7 @@ pub(crate) struct FileSystemControlStack {
     /// Output system-buffer length.
     output_buffer_length: IrpBufferLength,
     /// Requested FSCTL code.
-    fs_control_code: wdk_sys::ULONG,
+    fs_control_code: FsControlCode,
 }
 
 impl MountVolumeStack {
@@ -823,7 +897,7 @@ impl FileSystemControlStack {
     }
 
     /// Returns the FSCTL code.
-    pub(crate) const fn fs_control_code(self) -> wdk_sys::ULONG {
+    pub(crate) const fn fs_control_code(self) -> FsControlCode {
         self.fs_control_code
     }
 }
@@ -1193,7 +1267,7 @@ mod tests {
 
     use super::{
         CurrentIrpStackLocation, DirectoryCursorPosition, DirectoryEntryEmission,
-        DirectoryPatternInput, DispatchTarget, EaEntryEmission, EaNameSelection,
+        DirectoryPatternInput, DispatchTarget, EaEntryEmission, EaNameSelection, FsControlCode,
         SecurityComponentSelection,
     };
 
@@ -1272,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn file_system_control_stack_preserves_file_object_output_and_code() {
+    fn file_system_control_stack_decodes_supported_user_control() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
         stack.FileObject = file_object.as_ptr();
@@ -1295,9 +1369,56 @@ mod tests {
                 assert_eq!(control.file_object(), file_object);
                 assert_eq!(control.input_buffer_length().as_usize(), 32);
                 assert_eq!(control.output_buffer_length().as_usize(), 128);
-                assert_eq!(control.fs_control_code(), 589_992);
+                assert_eq!(control.fs_control_code(), FsControlCode::GetReparsePoint);
             }
         }
+    }
+
+    #[test]
+    fn file_system_control_stack_rejects_unsupported_control_before_handler() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.FileSystemControl =
+            wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_15 {
+                OutputBufferLength: 128,
+                __bindgen_padding_0: 0,
+                InputBufferLength: 32,
+                __bindgen_padding_1: 0,
+                FsControlCode: 0xFFFF_FFFF,
+                Type3InputBuffer: core::ptr::null_mut(),
+            };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            assert_eq!(
+                current
+                    .file_system_control()
+                    .err()
+                    .map(crate::status::DriverError::ntstatus),
+                Some(STATUS_NOT_SUPPORTED)
+            );
+        }
+    }
+
+    #[test]
+    fn ext4win_private_fsctl_codes_decode_to_domain_variants() {
+        assert_eq!(
+            FsControlCode::from_raw(0x0009_2400),
+            Ok(FsControlCode::AddEncryptionKey)
+        );
+        assert_eq!(
+            FsControlCode::from_raw(0x0009_2404),
+            Ok(FsControlCode::RemoveEncryptionKey)
+        );
+        assert_eq!(
+            FsControlCode::from_raw(0x0009_2408),
+            Ok(FsControlCode::GetEncryptionKeyStatus)
+        );
+        assert_eq!(
+            FsControlCode::from_raw(0x0009_240c),
+            Ok(FsControlCode::EnableVerity)
+        );
     }
 
     #[test]

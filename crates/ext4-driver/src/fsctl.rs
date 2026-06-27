@@ -13,34 +13,6 @@ use crate::irp::{DispatchTarget, FileSystemControlStack};
 use crate::state::{FscryptKeyPresence, VolumeControlBlock, file_control_block};
 use crate::status::{DriverError, DriverResult};
 
-/// Windows `FILE_DEVICE_FILE_SYSTEM`.
-const FILE_DEVICE_FILE_SYSTEM: wdk_sys::ULONG = 0x0000_0009;
-/// Windows `METHOD_BUFFERED`.
-const METHOD_BUFFERED: wdk_sys::ULONG = 0;
-/// Windows `FILE_ANY_ACCESS`.
-const FILE_ANY_ACCESS: wdk_sys::ULONG = 0;
-/// ext4win private function code for adding an fscrypt key.
-const EXT4WIN_ADD_ENCRYPTION_KEY_FUNCTION: wdk_sys::ULONG = 0x900;
-/// ext4win private function code for removing an fscrypt key.
-const EXT4WIN_REMOVE_ENCRYPTION_KEY_FUNCTION: wdk_sys::ULONG = 0x901;
-/// ext4win private function code for fscrypt key status.
-const EXT4WIN_GET_ENCRYPTION_KEY_STATUS_FUNCTION: wdk_sys::ULONG = 0x902;
-/// ext4win private function code for enabling fs-verity.
-const EXT4WIN_ENABLE_VERITY_FUNCTION: wdk_sys::ULONG = 0x903;
-
-/// ext4win FSCTL carrying Linux `struct fscrypt_add_key_arg`.
-pub(crate) const FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY: wdk_sys::ULONG =
-    ext4win_fsctl(EXT4WIN_ADD_ENCRYPTION_KEY_FUNCTION);
-/// ext4win FSCTL carrying Linux `struct fscrypt_remove_key_arg`.
-pub(crate) const FSCTL_EXT4WIN_REMOVE_ENCRYPTION_KEY: wdk_sys::ULONG =
-    ext4win_fsctl(EXT4WIN_REMOVE_ENCRYPTION_KEY_FUNCTION);
-/// ext4win FSCTL carrying Linux `struct fscrypt_get_key_status_arg`.
-pub(crate) const FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS: wdk_sys::ULONG =
-    ext4win_fsctl(EXT4WIN_GET_ENCRYPTION_KEY_STATUS_FUNCTION);
-/// ext4win FSCTL carrying Linux `struct fsverity_enable_arg`.
-pub(crate) const FSCTL_EXT4WIN_ENABLE_VERITY: wdk_sys::ULONG =
-    ext4win_fsctl(EXT4WIN_ENABLE_VERITY_FUNCTION);
-
 /// Linux `FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER`.
 const FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER: u32 = 2;
 /// Linux `struct fscrypt_key_specifier` size.
@@ -122,11 +94,6 @@ const FSVERITY_ENABLE_SIG_PTR_OFFSET: usize = 32;
 const FSVERITY_ENABLE_RESERVED2_OFFSET: usize = 40;
 /// Size of verity-enable trailing reserved words.
 const FSVERITY_ENABLE_RESERVED2_BYTES: usize = 88;
-
-/// Builds a Windows `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, function, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
-const fn ext4win_fsctl(function: wdk_sys::ULONG) -> wdk_sys::ULONG {
-    (FILE_DEVICE_FILE_SYSTEM << 16) | (FILE_ANY_ACCESS << 14) | (function << 2) | METHOD_BUFFERED
-}
 
 /// Handles fscrypt key-add FSCTL payloads.
 pub(crate) fn add_encryption_key(
@@ -690,14 +657,6 @@ mod tests {
                 }
             }
         };
-    }
-
-    #[test]
-    fn fsctl_codes_are_ext4win_private_buffered_file_system_controls() {
-        assert_eq!(FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY, 0x0009_2400);
-        assert_eq!(FSCTL_EXT4WIN_REMOVE_ENCRYPTION_KEY, 0x0009_2404);
-        assert_eq!(FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS, 0x0009_2408);
-        assert_eq!(FSCTL_EXT4WIN_ENABLE_VERITY, 0x0009_240c);
     }
 
     #[test]
