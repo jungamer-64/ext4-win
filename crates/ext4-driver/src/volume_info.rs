@@ -14,8 +14,8 @@ use wdk_sys::{
 
 use crate::{
     irp::{
-        DispatchTarget, QueryVolumeInformationClass, QueryVolumeStack, SetVolumeInformationClass,
-        SetVolumeStack,
+        DispatchTarget, InformationLength, QueryVolumeInformationClass, QueryVolumeStack,
+        SetVolumeInformationClass, SetVolumeStack,
     },
     state::{KernelDevice, MountedVolumeDevice, VolumeControlBlock},
     status::{DriverError, DriverResult},
@@ -128,7 +128,7 @@ fn set_volume(request: SetVolumeRequest) -> NTSTATUS {
 }
 
 /// Executes one volume information query before NTSTATUS completion mapping.
-fn query_volume_result(request: QueryVolumeRequest) -> DriverResult<wdk_sys::ULONG_PTR> {
+fn query_volume_result(request: QueryVolumeRequest) -> DriverResult<InformationLength> {
     let Some(mut vcb) = MountedVolumeDevice::vcb(request.device) else {
         return Err(DriverError::InvalidDeviceRequest);
     };
@@ -214,7 +214,7 @@ fn pack_volume_information(
     vcb: &VolumeControlBlock,
     buffer: core::ptr::NonNull<c_void>,
     length: usize,
-) -> DriverResult<wdk_sys::ULONG_PTR> {
+) -> DriverResult<InformationLength> {
     let label = vcb.volume_label();
     let label_bytes = label.bytes();
     let header = core::mem::offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
@@ -264,7 +264,7 @@ fn pack_size_information(
     vcb: &VolumeControlBlock,
     buffer: core::ptr::NonNull<c_void>,
     length: usize,
-) -> DriverResult<wdk_sys::ULONG_PTR> {
+) -> DriverResult<InformationLength> {
     if length < core::mem::size_of::<FILE_FS_SIZE_INFORMATION>() {
         return Err(DriverError::BufferTooSmall);
     }
@@ -291,7 +291,7 @@ fn pack_size_information(
 fn pack_device_information(
     buffer: core::ptr::NonNull<c_void>,
     length: usize,
-) -> DriverResult<wdk_sys::ULONG_PTR> {
+) -> DriverResult<InformationLength> {
     if length < core::mem::size_of::<FILE_FS_DEVICE_INFORMATION>() {
         return Err(DriverError::BufferTooSmall);
     }
@@ -314,7 +314,7 @@ fn pack_full_size_information(
     vcb: &VolumeControlBlock,
     buffer: core::ptr::NonNull<c_void>,
     length: usize,
-) -> DriverResult<wdk_sys::ULONG_PTR> {
+) -> DriverResult<InformationLength> {
     if length < core::mem::size_of::<FILE_FS_FULL_SIZE_INFORMATION>() {
         return Err(DriverError::BufferTooSmall);
     }
@@ -347,7 +347,7 @@ fn pack_full_size_information(
 fn pack_attribute_information(
     buffer: core::ptr::NonNull<c_void>,
     length: usize,
-) -> DriverResult<wdk_sys::ULONG_PTR> {
+) -> DriverResult<InformationLength> {
     let header = core::mem::offset_of!(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
     let name_len = FILE_SYSTEM_NAME
         .len()
@@ -417,8 +417,8 @@ fn sectors_per_allocation_unit(cluster_size: ClusterSize) -> DriverResult<u32> {
 }
 
 /// Converts a byte count to `IO_STATUS_BLOCK::Information`.
-fn information_length(value: usize) -> DriverResult<wdk_sys::ULONG_PTR> {
-    wdk_sys::ULONG_PTR::try_from(value).map_err(|_| DriverError::InvalidParameter)
+fn information_length(value: usize) -> DriverResult<InformationLength> {
+    InformationLength::from_usize(value)
 }
 
 #[cfg(test)]
@@ -426,7 +426,7 @@ mod tests {
     use alloc::{vec, vec::Vec};
     use core::ptr::NonNull;
 
-    use crate::{status::DriverError, wire::LittleEndianInput};
+    use crate::{irp::InformationLength, status::DriverError, wire::LittleEndianInput};
 
     use super::{pack_device_information, volume_label_from_file_fs_label};
 
@@ -476,11 +476,7 @@ mod tests {
             let written = pack_device_information(pointer, buffer.len());
             assert!(written.is_ok());
             if let Ok(written) = written {
-                let expected = wdk_sys::ULONG_PTR::try_from(buffer.len());
-                assert!(expected.is_ok());
-                if let Ok(expected) = expected {
-                    assert_eq!(written, expected);
-                }
+                assert_eq!(InformationLength::from_usize(buffer.len()), Ok(written));
                 let output = LittleEndianInput::new(buffer.as_slice());
                 assert_eq!(
                     output.read_u32(0),

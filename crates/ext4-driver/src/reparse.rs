@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use ext4_core::{LoadedNode, NodeId, SymlinkNodeId, SymlinkTarget};
 use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
 
-use crate::irp::{DispatchTarget, FileSystemControlStack};
+use crate::irp::{DispatchTarget, FileSystemControlStack, InformationLength};
 use crate::metadata;
 use crate::state::{
     FileControlBlock, OpenedPath, VolumeControlBlock, context_control_block, file_control_block,
@@ -29,9 +29,7 @@ pub(crate) fn get_reparse_point(target: DispatchTarget, stack: FileSystemControl
         let mut output = target.data_buffer(length)?;
         let written =
             pack_symlink_reparse_buffer(symlink_target.as_slice(), output.as_mut_slice())?;
-        target.set_information(
-            wdk_sys::ULONG_PTR::try_from(written).map_err(|_| DriverError::InvalidParameter)?,
-        );
+        target.set_information(InformationLength::from_usize(written)?);
         Ok(())
     }) {
         Ok(()) => STATUS_SUCCESS,
@@ -45,7 +43,7 @@ pub(crate) fn set_reparse_point(target: DispatchTarget, stack: FileSystemControl
         .and_then(|symlink_target| replace_opened_path_with_symlink(stack, &symlink_target))
     {
         Ok(()) => {
-            target.set_information(0);
+            target.set_information(InformationLength::ZERO);
             STATUS_SUCCESS
         }
         Err(error) => error.ntstatus(),
