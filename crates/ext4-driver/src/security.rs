@@ -7,7 +7,7 @@ use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, Load
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::irp::{
-    DispatchTarget, InformationLength, QuerySecurityStack, SecurityComponentSelection,
+    DispatchTarget, DriverCompletion, QuerySecurityStack, SecurityComponentSelection,
     SecuritySelection, SetSecurityStack,
 };
 use crate::state::{FileControlBlock, VolumeControlBlock, file_control_block};
@@ -200,23 +200,27 @@ impl DaclPermissionBuilder {
 
 /// Performs a security descriptor query.
 fn query_security(request: QuerySecurityRequest) -> NTSTATUS {
-    match load_ext4_security(request.stack.file_object()).and_then(|security| {
-        let descriptor = security_descriptor(security, request.stack.selection())?;
-        let required = descriptor.len();
-        request
-            .target
-            .set_information(InformationLength::from_usize(required)?);
-        let length = request.stack.length().as_usize();
-        if length < required {
-            return Err(DriverError::BufferTooSmall);
+    match query_security_result(request) {
+        Ok(completion) => {
+            request.target.complete(completion);
+            STATUS_SUCCESS
         }
-        let mut output = request.target.user_buffer(length)?;
-        LittleEndianOutput::new(output.as_mut_slice()).write_bytes(0, descriptor.as_slice())?;
-        Ok(())
-    }) {
-        Ok(()) => STATUS_SUCCESS,
         Err(error) => error.ntstatus(),
     }
+}
+
+/// Performs QUERY_SECURITY before NTSTATUS completion mapping.
+fn query_security_result(request: QuerySecurityRequest) -> DriverResult<DriverCompletion> {
+    let security = load_ext4_security(request.stack.file_object())?;
+    let descriptor = security_descriptor(security, request.stack.selection())?;
+    let required = descriptor.len();
+    let length = request.stack.length().as_usize();
+    if length < required {
+        return Err(DriverError::BufferTooSmall);
+    }
+    let mut output = request.target.user_buffer(length)?;
+    LittleEndianOutput::new(output.as_mut_slice()).write_bytes(0, descriptor.as_slice())?;
+    DriverCompletion::from_usize(required)
 }
 
 /// Performs a POSIX security mutation from a Windows security descriptor.

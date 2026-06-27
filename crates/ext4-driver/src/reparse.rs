@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use ext4_core::{LoadedNode, NodeId, SymlinkNodeId, SymlinkTarget};
 use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
 
-use crate::irp::{DispatchTarget, FileSystemControlStack, InformationLength};
+use crate::irp::{DispatchTarget, DriverCompletion, FileSystemControlStack};
 use crate::metadata;
 use crate::state::{
     FileControlBlock, OpenedPath, VolumeControlBlock, context_control_block, file_control_block,
@@ -24,17 +24,25 @@ const SYMLINK_PATH_BUFFER_OFFSET: usize =
 
 /// Handles `FSCTL_GET_REPARSE_POINT` for an opened ext4 symlink.
 pub(crate) fn get_reparse_point(target: DispatchTarget, stack: FileSystemControlStack) -> NTSTATUS {
-    match read_symlink_target(stack).and_then(|symlink_target| {
-        let length = stack.output_buffer_length().as_usize();
-        let mut output = target.data_buffer(length)?;
-        let written =
-            pack_symlink_reparse_buffer(symlink_target.as_slice(), output.as_mut_slice())?;
-        target.set_information(InformationLength::from_usize(written)?);
-        Ok(())
-    }) {
-        Ok(()) => STATUS_SUCCESS,
+    match get_reparse_point_result(target, stack) {
+        Ok(completion) => {
+            target.complete(completion);
+            STATUS_SUCCESS
+        }
         Err(error) => error.ntstatus(),
     }
+}
+
+/// Handles GET_REPARSE_POINT before NTSTATUS completion mapping.
+fn get_reparse_point_result(
+    target: DispatchTarget,
+    stack: FileSystemControlStack,
+) -> DriverResult<DriverCompletion> {
+    let symlink_target = read_symlink_target(stack)?;
+    let length = stack.output_buffer_length().as_usize();
+    let mut output = target.data_buffer(length)?;
+    let written = pack_symlink_reparse_buffer(symlink_target.as_slice(), output.as_mut_slice())?;
+    DriverCompletion::from_usize(written)
 }
 
 /// Handles `FSCTL_SET_REPARSE_POINT` by replacing the opened node with an ext4 symlink.
@@ -43,7 +51,7 @@ pub(crate) fn set_reparse_point(target: DispatchTarget, stack: FileSystemControl
         .and_then(|symlink_target| replace_opened_path_with_symlink(stack, &symlink_target))
     {
         Ok(()) => {
-            target.set_information(InformationLength::ZERO);
+            target.complete(DriverCompletion::EMPTY);
             STATUS_SUCCESS
         }
         Err(error) => error.ntstatus(),

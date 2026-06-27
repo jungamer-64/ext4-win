@@ -7,7 +7,7 @@ use ext4_core::{XattrName, XattrNamespace, XattrValue};
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::irp::{
-    DispatchTarget, EaEntryEmission, EaNameSelection, InformationLength, QueryEaStack, SetEaStack,
+    DispatchTarget, DriverCompletion, EaEntryEmission, EaNameSelection, QueryEaStack, SetEaStack,
 };
 use crate::state::{FileControlBlock, VolumeControlBlock, file_control_block};
 use crate::status::{DriverError, DriverResult};
@@ -91,29 +91,33 @@ struct WindowsEaEntry {
 
 /// Performs an EA query against mounted ext4 xattrs.
 fn query_ea(request: QueryEaRequest) -> NTSTATUS {
-    match collect_query_entries(request.stack).and_then(|mut entries| {
-        if matches!(request.stack.entry_emission(), EaEntryEmission::Single) && entries.len() > 1 {
-            entries.truncate(1);
+    match query_ea_result(request) {
+        Ok(completion) => {
+            request.target.complete(completion);
+            STATUS_SUCCESS
         }
-        if entries.is_empty() {
-            return Err(DriverError::NoEasOnFile);
-        }
-
-        let length = request.stack.length().as_usize();
-        let required = packed_full_ea_length(entries.as_slice())?;
-        if length < required {
-            return Err(DriverError::BufferTooSmall);
-        }
-        let mut output = request.target.data_buffer(length)?;
-        let written = pack_full_ea_entries(entries.as_slice(), output.as_mut_slice())?;
-        request
-            .target
-            .set_information(InformationLength::from_usize(written)?);
-        Ok(())
-    }) {
-        Ok(()) => STATUS_SUCCESS,
         Err(error) => error.ntstatus(),
     }
+}
+
+/// Performs QUERY_EA before NTSTATUS completion mapping.
+fn query_ea_result(request: QueryEaRequest) -> DriverResult<DriverCompletion> {
+    let mut entries = collect_query_entries(request.stack)?;
+    if matches!(request.stack.entry_emission(), EaEntryEmission::Single) && entries.len() > 1 {
+        entries.truncate(1);
+    }
+    if entries.is_empty() {
+        return Err(DriverError::NoEasOnFile);
+    }
+
+    let length = request.stack.length().as_usize();
+    let required = packed_full_ea_length(entries.as_slice())?;
+    if length < required {
+        return Err(DriverError::BufferTooSmall);
+    }
+    let mut output = request.target.data_buffer(length)?;
+    let written = pack_full_ea_entries(entries.as_slice(), output.as_mut_slice())?;
+    DriverCompletion::from_usize(written)
 }
 
 /// Applies set-EA records to `user.ext4win.ea.*` xattrs.
@@ -122,7 +126,7 @@ fn set_ea(request: SetEaRequest) -> NTSTATUS {
         .and_then(|entries| apply_set_ea_entries(request.stack, entries.as_slice()))
     {
         Ok(()) => {
-            request.target.set_information(InformationLength::ZERO);
+            request.target.complete(DriverCompletion::EMPTY);
             STATUS_SUCCESS
         }
         Err(error) => error.ntstatus(),

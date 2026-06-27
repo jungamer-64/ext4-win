@@ -14,7 +14,7 @@ use wdk_sys::{LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::irp::{
     DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
-    DirectoryPatternInput, DispatchTarget, InformationLength, IrpBufferLength, QueryDirectoryStack,
+    DirectoryPatternInput, DispatchTarget, DriverCompletion, IrpBufferLength, QueryDirectoryStack,
     QueryFileInformationClass, QueryFileStack, SetFileInformationClass, SetFileStack,
 };
 use crate::state::{
@@ -54,16 +54,28 @@ pub(crate) fn close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 
 /// Handles regular file data reads.
 pub(crate) fn read(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(read_regular_file) {
-        Ok(()) => STATUS_SUCCESS,
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => match read_regular_file(target) {
+            Ok(completion) => {
+                target.complete(completion);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
 
 /// Handles regular file data writes.
 pub(crate) fn write(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(write_regular_file) {
-        Ok(()) => STATUS_SUCCESS,
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => match write_regular_file(target) {
+            Ok(completion) => {
+                target.complete(completion);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
@@ -190,8 +202,8 @@ impl QueryDirectoryRequest {
 /// Handles fixed-size file information queries.
 fn query_file_information(request: QueryFileRequest) -> NTSTATUS {
     match pack_file_information(request) {
-        Ok(information) => {
-            request.target.set_information(information);
+        Ok(completion) => {
+            request.target.complete(completion);
             STATUS_SUCCESS
         }
         Err(error) => error.ntstatus(),
@@ -199,7 +211,7 @@ fn query_file_information(request: QueryFileRequest) -> NTSTATUS {
 }
 
 /// Packs one supported file information class.
-fn pack_file_information(request: QueryFileRequest) -> DriverResult<InformationLength> {
+fn pack_file_information(request: QueryFileRequest) -> DriverResult<DriverCompletion> {
     let metadata = load_file_metadata(request.stack.file_object())?;
     let buffer = request
         .target
@@ -223,7 +235,7 @@ fn pack_file_information(request: QueryFileRequest) -> DriverResult<InformationL
 fn set_file_information(request: SetFileRequest) -> NTSTATUS {
     match apply_file_information(request) {
         Ok(()) => {
-            request.target.set_information(InformationLength::ZERO);
+            request.target.complete(DriverCompletion::EMPTY);
             STATUS_SUCCESS
         }
         Err(error) => error.ntstatus(),
@@ -421,7 +433,7 @@ fn query_directory(target: DispatchTarget) -> NTSTATUS {
     match QueryDirectoryRequest::decode(target) {
         Ok(request) => match pack_directory_information(request) {
             Ok(information) => {
-                target.set_information(information);
+                target.complete(information);
                 STATUS_SUCCESS
             }
             Err(error) => error.ntstatus(),
@@ -431,7 +443,7 @@ fn query_directory(target: DispatchTarget) -> NTSTATUS {
 }
 
 /// Packs directory entries into the caller's query-directory buffer.
-fn pack_directory_information(request: QueryDirectoryRequest) -> DriverResult<InformationLength> {
+fn pack_directory_information(request: QueryDirectoryRequest) -> DriverResult<DriverCompletion> {
     let class = request.stack.information_class();
     let pattern = DirectoryPattern::from_stack(request.stack)?;
     let length = request.stack.length().as_usize();
@@ -478,7 +490,7 @@ fn pack_directory_information(request: QueryDirectoryRequest) -> DriverResult<In
         &entries,
         buffer,
     )?;
-    InformationLength::from_usize(result)
+    DriverCompletion::from_usize(result)
 }
 
 impl DirectoryInformationClass {
@@ -1350,7 +1362,7 @@ fn pack_basic_information(
     buffer: NonNull<c_void>,
     length: usize,
     metadata: FileMetadata,
-) -> DriverResult<InformationLength> {
+) -> DriverResult<DriverCompletion> {
     write_fixed(
         buffer,
         length,
@@ -1369,7 +1381,7 @@ fn pack_standard_information(
     buffer: NonNull<c_void>,
     length: usize,
     metadata: FileMetadata,
-) -> DriverResult<InformationLength> {
+) -> DriverResult<DriverCompletion> {
     write_fixed(
         buffer,
         length,
@@ -1388,7 +1400,7 @@ fn pack_internal_information(
     buffer: NonNull<c_void>,
     length: usize,
     metadata: FileMetadata,
-) -> DriverResult<InformationLength> {
+) -> DriverResult<DriverCompletion> {
     write_fixed(
         buffer,
         length,
@@ -1405,7 +1417,7 @@ fn pack_position_information(
     buffer: NonNull<c_void>,
     length: usize,
     file_object: NonNull<wdk_sys::FILE_OBJECT>,
-) -> DriverResult<InformationLength> {
+) -> DriverResult<DriverCompletion> {
     let file_object = unsafe {
         // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
         // is read only for the current byte offset field.
@@ -1429,7 +1441,7 @@ fn pack_network_open_information(
     buffer: NonNull<c_void>,
     length: usize,
     metadata: FileMetadata,
-) -> DriverResult<InformationLength> {
+) -> DriverResult<DriverCompletion> {
     write_fixed(
         buffer,
         length,
@@ -1450,7 +1462,7 @@ fn write_fixed<T>(
     buffer: NonNull<c_void>,
     length: usize,
     value: T,
-) -> DriverResult<InformationLength> {
+) -> DriverResult<DriverCompletion> {
     let size = core::mem::size_of::<T>();
     if length < size {
         return Err(DriverError::BufferTooSmall);
@@ -1462,7 +1474,7 @@ fn write_fixed<T>(
         // for fixed-size query information outputs.
         target.write(value);
     }
-    InformationLength::from_usize(size)
+    DriverCompletion::from_usize(size)
 }
 
 /// Converts an ext4 timestamp to a Windows system-time LARGE_INTEGER.
@@ -1528,12 +1540,11 @@ fn boolean(value: bool) -> wdk_sys::BOOLEAN {
 }
 
 /// Reads a regular file through ext4-core into the IRP output buffer.
-fn read_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
+fn read_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     let stack = target.current_stack()?.read()?;
     let length = stack.length().as_usize();
     if length == 0 {
-        target.set_information(InformationLength::ZERO);
-        return Ok(());
+        return Ok(DriverCompletion::EMPTY);
     }
     let mut output = target.data_buffer(length)?;
     let fcb = file_control_block(stack.file_object())?;
@@ -1555,17 +1566,15 @@ fn read_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
     let bytes_read = vcb
         .volume()
         .read_file(&file, stack.byte_offset(), output.as_mut_slice())?;
-    target.set_information(InformationLength::from_usize(bytes_read.as_usize())?);
-    Ok(())
+    DriverCompletion::from_usize(bytes_read.as_usize())
 }
 
 /// Writes a regular file range through an ext4 journal transaction.
-fn write_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
+fn write_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     let stack = target.current_stack()?.write()?;
     let length = stack.length().as_usize();
     if length == 0 {
-        target.set_information(InformationLength::ZERO);
-        return Ok(());
+        return Ok(DriverCompletion::EMPTY);
     }
     let input = target.data_buffer(length)?;
     let fcb = file_control_block(stack.file_object())?;
@@ -1592,8 +1601,7 @@ fn write_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
     let file = transaction.file(file_id)?;
     transaction.overwrite_file_range(file, stack.byte_offset(), input.as_slice())?;
     transaction.commit()?;
-    target.set_information(InformationLength::from_usize(length)?);
-    Ok(())
+    DriverCompletion::from_usize(length)
 }
 
 /// Returns the mounted VCB referenced by an FCB.
