@@ -15,7 +15,10 @@ use wdk_sys::{
 };
 
 use crate::{
-    irp::{CreateStack, DispatchTarget},
+    irp::{
+        CreateDisposition, CreateParameters, CreateStack, CreateTargetRequirement, DesiredAccess,
+        DispatchTarget, ShareAccess,
+    },
     metadata,
     state::{
         ContextControlBlock, FileControlBlock, KernelDevice, MountedVolumeDevice, OpenedPath,
@@ -23,24 +26,6 @@ use crate::{
     },
 };
 
-/// `FILE_SUPERSEDE` create disposition.
-const FILE_SUPERSEDE_DISPOSITION: wdk_sys::ULONG = 0;
-/// `FILE_OPEN` create disposition.
-const FILE_OPEN_DISPOSITION: wdk_sys::ULONG = 1;
-/// `FILE_CREATE` create disposition.
-const FILE_CREATE_DISPOSITION: wdk_sys::ULONG = 2;
-/// `FILE_OPEN_IF` create disposition.
-const FILE_OPEN_IF_DISPOSITION: wdk_sys::ULONG = 3;
-/// `FILE_OVERWRITE` create disposition.
-const FILE_OVERWRITE_DISPOSITION: wdk_sys::ULONG = 4;
-/// `FILE_OVERWRITE_IF` create disposition.
-const FILE_OVERWRITE_IF_DISPOSITION: wdk_sys::ULONG = 5;
-/// Shift for the create disposition stored in `Options`.
-const CREATE_DISPOSITION_SHIFT: u32 = 24;
-/// `FILE_DIRECTORY_FILE` create option.
-const FILE_DIRECTORY_FILE_OPTION: wdk_sys::ULONG = 0x0000_0001;
-/// `FILE_NON_DIRECTORY_FILE` create option.
-const FILE_NON_DIRECTORY_FILE_OPTION: wdk_sys::ULONG = 0x0000_0040;
 /// UTF-16 backslash separator.
 const UTF16_BACKSLASH: u16 = 0x005C;
 
@@ -79,20 +64,22 @@ impl CreateRequest {
     const fn file_object(self) -> NonNull<FILE_OBJECT> {
         self.stack.file_object()
     }
+
+    /// Returns decoded create parameters.
+    const fn parameters(self) -> CreateParameters {
+        self.stack.parameters()
+    }
 }
 
 /// Opens or creates a root-relative ext4 object.
 fn open_or_create(request: CreateRequest) -> NTSTATUS {
-    if request.stack.ea_length().as_usize() != 0 {
+    if request.parameters().ea_length().as_usize() != 0 {
         return STATUS_NOT_SUPPORTED;
     }
     let Some(vcb) = MountedVolumeDevice::vcb(request.device()) else {
         return crate::status::DriverError::InvalidDeviceRequest.ntstatus();
     };
-    let disposition = match CreateDisposition::from_options(request.stack.options()) {
-        Ok(disposition) => disposition,
-        Err(status) => return status,
-    };
+    let disposition = request.parameters().disposition();
     match resolve_path(request.file_object(), vcb) {
         Ok(PathLookup::Existing { node, path }) => {
             open_existing_node(request, vcb, disposition, node, path)
@@ -101,63 +88,6 @@ fn open_or_create(request: CreateRequest) -> NTSTATUS {
             create_missing_node(request, vcb, disposition, parent, &name)
         }
         Err(status) => status,
-    }
-}
-
-/// Requested create disposition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CreateDisposition {
-    /// Open only if the path exists.
-    Open,
-    /// Create only if the path is absent.
-    Create,
-    /// Open existing or create absent.
-    OpenIf,
-    /// Truncate an existing regular file.
-    Overwrite,
-    /// Truncate an existing regular file or create an absent object.
-    OverwriteIf,
-    /// Replace an existing regular file's data or create an absent object.
-    Supersede,
-}
-
-impl CreateDisposition {
-    /// Decodes the disposition stored in Create.Options.
-    fn from_options(options: wdk_sys::ULONG) -> Result<Self, NTSTATUS> {
-        match options >> CREATE_DISPOSITION_SHIFT {
-            FILE_OPEN_DISPOSITION => Ok(Self::Open),
-            FILE_CREATE_DISPOSITION => Ok(Self::Create),
-            FILE_OPEN_IF_DISPOSITION => Ok(Self::OpenIf),
-            FILE_SUPERSEDE_DISPOSITION => Ok(Self::Supersede),
-            FILE_OVERWRITE_DISPOSITION => Ok(Self::Overwrite),
-            FILE_OVERWRITE_IF_DISPOSITION => Ok(Self::OverwriteIf),
-            _ => Err(STATUS_INVALID_PARAMETER),
-        }
-    }
-}
-
-/// Node kind requested for a missing create target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CreateNodeKind {
-    /// Regular file.
-    File,
-    /// Directory.
-    Directory,
-}
-
-impl CreateNodeKind {
-    /// Decodes create options that select file-vs-directory creation.
-    fn from_options(options: wdk_sys::ULONG) -> Result<Self, NTSTATUS> {
-        let directory = options & FILE_DIRECTORY_FILE_OPTION != 0;
-        let non_directory = options & FILE_NON_DIRECTORY_FILE_OPTION != 0;
-        if directory && non_directory {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        if directory {
-            Ok(Self::Directory)
-        } else {
-            Ok(Self::File)
-        }
     }
 }
 
@@ -188,16 +118,17 @@ fn open_existing_node(
     node: NodeId,
     path: OpenedPath,
 ) -> NTSTATUS {
+    let parameters = request.parameters();
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
-            match validate_existing_node_options(node, request.stack.options()) {
+            match validate_existing_node_options(node, parameters.target_requirement()) {
                 Ok(()) => initialize_file_object(
                     request.file_object(),
                     vcb,
                     node,
                     path,
-                    request.stack.desired_access(),
-                    wdk_sys::ULONG::from(request.stack.share_access()),
+                    parameters.desired_access(),
+                    parameters.share_access(),
                 ),
                 Err(status) => status,
             }
@@ -206,7 +137,7 @@ fn open_existing_node(
         CreateDisposition::Overwrite
         | CreateDisposition::OverwriteIf
         | CreateDisposition::Supersede => {
-            let inode = match overwrite_file_inode(node, request.stack.options()) {
+            let inode = match overwrite_file_inode(node, parameters.target_requirement()) {
                 Ok(inode) => inode,
                 Err(status) => return status,
             };
@@ -214,8 +145,8 @@ fn open_existing_node(
                 request.file_object(),
                 vcb,
                 node,
-                request.stack.desired_access(),
-                wdk_sys::ULONG::from(request.stack.share_access()),
+                parameters.desired_access(),
+                parameters.share_access(),
             ) {
                 Ok(fcb) => fcb,
                 Err(status) => return status,
@@ -232,12 +163,15 @@ fn open_existing_node(
 }
 
 /// Resolves an existing regular file inode for overwrite-style dispositions.
-fn overwrite_file_inode(node: NodeId, options: wdk_sys::ULONG) -> Result<FileNodeId, NTSTATUS> {
-    if options & FILE_DIRECTORY_FILE_OPTION != 0 {
+fn overwrite_file_inode(
+    node: NodeId,
+    requirement: CreateTargetRequirement,
+) -> Result<FileNodeId, NTSTATUS> {
+    if matches!(requirement, CreateTargetRequirement::Directory) {
         return Err(STATUS_NOT_SUPPORTED);
     }
-    if options & FILE_NON_DIRECTORY_FILE_OPTION != 0 {
-        validate_existing_node_options(node, options)?;
+    if matches!(requirement, CreateTargetRequirement::NonDirectory) {
+        validate_existing_node_options(node, requirement)?;
     }
     match node {
         NodeId::File(file) => Ok(file),
@@ -261,11 +195,7 @@ fn create_missing_node(
         CreateDisposition::Open => return STATUS_OBJECT_NAME_NOT_FOUND,
         CreateDisposition::Overwrite => return STATUS_OBJECT_NAME_NOT_FOUND,
     }
-    let kind = match CreateNodeKind::from_options(request.stack.options()) {
-        Ok(kind) => kind,
-        Err(status) => return status,
-    };
-    let node = match create_child(vcb, parent, name, kind) {
+    let node = match create_child(vcb, parent, name, request.parameters().target_requirement()) {
         Ok(node) => node,
         Err(status) => return status,
     };
@@ -277,18 +207,25 @@ fn create_missing_node(
             parent,
             name: name.clone(),
         },
-        request.stack.desired_access(),
-        wdk_sys::ULONG::from(request.stack.share_access()),
+        request.parameters().desired_access(),
+        request.parameters().share_access(),
     )
 }
 
 /// Validates file-vs-directory options for an existing node.
-fn validate_existing_node_options(node: NodeId, options: wdk_sys::ULONG) -> Result<(), NTSTATUS> {
-    if options & FILE_DIRECTORY_FILE_OPTION != 0 && !matches!(node, NodeId::Directory(_)) {
-        return Err(STATUS_OBJECT_TYPE_MISMATCH);
-    }
-    if options & FILE_NON_DIRECTORY_FILE_OPTION != 0 && matches!(node, NodeId::Directory(_)) {
-        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+fn validate_existing_node_options(
+    node: NodeId,
+    requirement: CreateTargetRequirement,
+) -> Result<(), NTSTATUS> {
+    match requirement {
+        CreateTargetRequirement::Any => {}
+        CreateTargetRequirement::Directory if !matches!(node, NodeId::Directory(_)) => {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        CreateTargetRequirement::NonDirectory if matches!(node, NodeId::Directory(_)) => {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        CreateTargetRequirement::Directory | CreateTargetRequirement::NonDirectory => {}
     }
     Ok(())
 }
@@ -388,7 +325,7 @@ fn create_child(
     mut vcb: NonNull<crate::state::VolumeControlBlock>,
     parent: DirectoryNodeId,
     name: &Ext4Name,
-    kind: CreateNodeKind,
+    requirement: CreateTargetRequirement,
 ) -> Result<NodeId, NTSTATUS> {
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
@@ -402,8 +339,8 @@ fn create_child(
     let parent = transaction
         .directory(parent)
         .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
-    let node = match kind {
-        CreateNodeKind::File => {
+    let node = match requirement {
+        CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
             let file = transaction
                 .create_file(
                     parent,
@@ -414,7 +351,7 @@ fn create_child(
                 .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
             NodeId::File(file.id())
         }
-        CreateNodeKind::Directory => {
+        CreateTargetRequirement::Directory => {
             let directory = transaction
                 .create_directory(
                     parent,
@@ -469,8 +406,8 @@ fn initialize_file_object(
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: NodeId,
     path: OpenedPath,
-    desired_access: wdk_sys::ACCESS_MASK,
-    share_access: wdk_sys::ULONG,
+    desired_access: DesiredAccess,
+    share_access: ShareAccess,
 ) -> NTSTATUS {
     match open_shared_file_control_block(file_object, vcb, node, desired_access, share_access) {
         Ok(fcb) => attach_file_object(file_object, fcb, node, path),
@@ -483,8 +420,8 @@ fn open_shared_file_control_block(
     file_object: NonNull<FILE_OBJECT>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: NodeId,
-    desired_access: wdk_sys::ACCESS_MASK,
-    share_access: wdk_sys::ULONG,
+    desired_access: DesiredAccess,
+    share_access: ShareAccess,
 ) -> Result<NonNull<FileControlBlock>, NTSTATUS> {
     let file_object_ref = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is read
@@ -503,7 +440,11 @@ fn open_shared_file_control_block(
         // reference for this create request.
         fcb.as_mut()
     };
-    let status = fcb_ref.check_share_access(file_object, desired_access, share_access);
+    let status = fcb_ref.check_share_access(
+        file_object,
+        desired_access.as_raw(),
+        share_access.as_ulong(),
+    );
     if status < STATUS_SUCCESS {
         release_file_control_block(fcb);
         return Err(status);
@@ -542,39 +483,4 @@ fn abandon_file_control_block(
     };
     fcb_ref.remove_share_access(file_object);
     release_file_control_block(fcb);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        CREATE_DISPOSITION_SHIFT, CreateDisposition, FILE_CREATE_DISPOSITION,
-        FILE_OPEN_IF_DISPOSITION, FILE_OVERWRITE_DISPOSITION, FILE_OVERWRITE_IF_DISPOSITION,
-        FILE_SUPERSEDE_DISPOSITION,
-    };
-
-    #[test]
-    fn create_disposition_keeps_overwrite_and_supersede_distinct() {
-        assert_eq!(
-            CreateDisposition::from_options(FILE_CREATE_DISPOSITION << CREATE_DISPOSITION_SHIFT),
-            Ok(CreateDisposition::Create)
-        );
-        assert_eq!(
-            CreateDisposition::from_options(FILE_OPEN_IF_DISPOSITION << CREATE_DISPOSITION_SHIFT),
-            Ok(CreateDisposition::OpenIf)
-        );
-        assert_eq!(
-            CreateDisposition::from_options(FILE_OVERWRITE_DISPOSITION << CREATE_DISPOSITION_SHIFT),
-            Ok(CreateDisposition::Overwrite)
-        );
-        assert_eq!(
-            CreateDisposition::from_options(
-                FILE_OVERWRITE_IF_DISPOSITION << CREATE_DISPOSITION_SHIFT
-            ),
-            Ok(CreateDisposition::OverwriteIf)
-        );
-        assert_eq!(
-            CreateDisposition::from_options(FILE_SUPERSEDE_DISPOSITION << CREATE_DISPOSITION_SHIFT),
-            Ok(CreateDisposition::Supersede)
-        );
-    }
 }

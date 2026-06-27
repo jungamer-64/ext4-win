@@ -218,10 +218,12 @@ impl CurrentIrpStackLocation {
         };
         Ok(CreateStack {
             file_object,
-            desired_access: security_context.DesiredAccess,
-            options: create.Options,
-            share_access: create.ShareAccess,
-            ea_length: IrpBufferLength::from_ulong(create.EaLength)?,
+            parameters: CreateParameters::decode(
+                security_context.DesiredAccess,
+                create.Options,
+                create.ShareAccess,
+                IrpBufferLength::from_ulong(create.EaLength)?,
+            )?,
         })
     }
 
@@ -987,6 +989,196 @@ impl DirectoryInformationClass {
     }
 }
 
+/// Decoded create/open parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CreateParameters {
+    /// Desired access mask requested by the opener.
+    desired_access: DesiredAccess,
+    /// Share-access bits requested by the opener.
+    share_access: ShareAccess,
+    /// Requested create disposition.
+    disposition: CreateDisposition,
+    /// File-vs-directory create/open requirement.
+    target_requirement: CreateTargetRequirement,
+    /// Extended-attribute input length supplied with create.
+    ea_length: IrpBufferLength,
+}
+
+impl CreateParameters {
+    /// Decodes raw WDK create parameters at the IRP boundary.
+    fn decode(
+        desired_access: wdk_sys::ACCESS_MASK,
+        options: wdk_sys::ULONG,
+        share_access: wdk_sys::USHORT,
+        ea_length: IrpBufferLength,
+    ) -> Result<Self, DriverError> {
+        Ok(Self {
+            desired_access: DesiredAccess::from_raw(desired_access),
+            share_access: ShareAccess::from_raw(share_access)?,
+            disposition: CreateDisposition::from_options(options)?,
+            target_requirement: CreateTargetRequirement::from_options(options)?,
+            ea_length,
+        })
+    }
+
+    /// Returns the desired access mask.
+    pub(crate) const fn desired_access(self) -> DesiredAccess {
+        self.desired_access
+    }
+
+    /// Returns the share access.
+    pub(crate) const fn share_access(self) -> ShareAccess {
+        self.share_access
+    }
+
+    /// Returns the create disposition.
+    pub(crate) const fn disposition(self) -> CreateDisposition {
+        self.disposition
+    }
+
+    /// Returns the target kind requirement.
+    pub(crate) const fn target_requirement(self) -> CreateTargetRequirement {
+        self.target_requirement
+    }
+
+    /// Returns the input EA length.
+    pub(crate) const fn ea_length(self) -> IrpBufferLength {
+        self.ea_length
+    }
+}
+
+/// Desired access requested by a create/open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DesiredAccess {
+    /// Raw WDK access mask, retained for I/O Manager share-access accounting.
+    raw: wdk_sys::ACCESS_MASK,
+}
+
+impl DesiredAccess {
+    /// Wraps the raw WDK access mask.
+    const fn from_raw(raw: wdk_sys::ACCESS_MASK) -> Self {
+        Self { raw }
+    }
+
+    /// Returns the WDK access mask for `IoCheckShareAccess`.
+    pub(crate) const fn as_raw(self) -> wdk_sys::ACCESS_MASK {
+        self.raw
+    }
+}
+
+/// Share access requested by a create/open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ShareAccess {
+    /// Raw WDK share mask widened for I/O Manager share-access accounting.
+    raw: wdk_sys::ULONG,
+}
+
+impl ShareAccess {
+    /// Decodes the raw WDK share mask.
+    fn from_raw(raw: wdk_sys::USHORT) -> Result<Self, DriverError> {
+        if raw & !FILE_SHARE_ACCESS_MASK != 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(Self {
+            raw: wdk_sys::ULONG::from(raw),
+        })
+    }
+
+    /// Returns the WDK share mask for `IoCheckShareAccess`.
+    pub(crate) const fn as_ulong(self) -> wdk_sys::ULONG {
+        self.raw
+    }
+}
+
+/// Requested create disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateDisposition {
+    /// Open only if the path exists.
+    Open,
+    /// Create only if the path is absent.
+    Create,
+    /// Open existing or create absent.
+    OpenIf,
+    /// Truncate an existing regular file.
+    Overwrite,
+    /// Truncate an existing regular file or create an absent object.
+    OverwriteIf,
+    /// Replace an existing regular file's data or create an absent object.
+    Supersede,
+}
+
+impl CreateDisposition {
+    /// Decodes the disposition stored in Create.Options.
+    fn from_options(options: wdk_sys::ULONG) -> Result<Self, DriverError> {
+        match options >> CREATE_DISPOSITION_SHIFT {
+            FILE_OPEN_DISPOSITION => Ok(Self::Open),
+            FILE_CREATE_DISPOSITION => Ok(Self::Create),
+            FILE_OPEN_IF_DISPOSITION => Ok(Self::OpenIf),
+            FILE_SUPERSEDE_DISPOSITION => Ok(Self::Supersede),
+            FILE_OVERWRITE_DISPOSITION => Ok(Self::Overwrite),
+            FILE_OVERWRITE_IF_DISPOSITION => Ok(Self::OverwriteIf),
+            _ => Err(DriverError::InvalidParameter),
+        }
+    }
+}
+
+/// File-vs-directory target requirement requested by create options.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateTargetRequirement {
+    /// Caller accepts a file, symlink, or directory.
+    Any,
+    /// Caller requires a directory target.
+    Directory,
+    /// Caller requires a non-directory target.
+    NonDirectory,
+}
+
+impl CreateTargetRequirement {
+    /// Decodes file-vs-directory create options and rejects unsupported options.
+    fn from_options(options: wdk_sys::ULONG) -> Result<Self, DriverError> {
+        let raw_options = options & CREATE_OPTIONS_MASK;
+        if raw_options & !SUPPORTED_CREATE_OPTIONS != 0 {
+            return Err(DriverError::NotSupported);
+        }
+        let directory = raw_options & FILE_DIRECTORY_FILE_OPTION != 0;
+        let non_directory = raw_options & FILE_NON_DIRECTORY_FILE_OPTION != 0;
+        match (directory, non_directory) {
+            (true, true) => Err(DriverError::InvalidParameter),
+            (true, false) => Ok(Self::Directory),
+            (false, true) => Ok(Self::NonDirectory),
+            (false, false) => Ok(Self::Any),
+        }
+    }
+}
+
+/// `FILE_SUPERSEDE` create disposition.
+const FILE_SUPERSEDE_DISPOSITION: wdk_sys::ULONG = 0;
+/// `FILE_OPEN` create disposition.
+const FILE_OPEN_DISPOSITION: wdk_sys::ULONG = 1;
+/// `FILE_CREATE` create disposition.
+const FILE_CREATE_DISPOSITION: wdk_sys::ULONG = 2;
+/// `FILE_OPEN_IF` create disposition.
+const FILE_OPEN_IF_DISPOSITION: wdk_sys::ULONG = 3;
+/// `FILE_OVERWRITE` create disposition.
+const FILE_OVERWRITE_DISPOSITION: wdk_sys::ULONG = 4;
+/// `FILE_OVERWRITE_IF` create disposition.
+const FILE_OVERWRITE_IF_DISPOSITION: wdk_sys::ULONG = 5;
+/// Shift for the create disposition stored in `Options`.
+const CREATE_DISPOSITION_SHIFT: u32 = 24;
+/// Mask for option bits below the create disposition.
+const CREATE_OPTIONS_MASK: wdk_sys::ULONG = 0x00FF_FFFF;
+/// `FILE_DIRECTORY_FILE` create option.
+const FILE_DIRECTORY_FILE_OPTION: wdk_sys::ULONG = 0x0000_0001;
+/// `FILE_NON_DIRECTORY_FILE` create option.
+const FILE_NON_DIRECTORY_FILE_OPTION: wdk_sys::ULONG = 0x0000_0040;
+/// Create options implemented by this FSD.
+const SUPPORTED_CREATE_OPTIONS: wdk_sys::ULONG =
+    FILE_DIRECTORY_FILE_OPTION | FILE_NON_DIRECTORY_FILE_OPTION;
+/// WDK share-access bits accepted by create/open.
+const FILE_SHARE_ACCESS_MASK: wdk_sys::USHORT =
+    (wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE | wdk_sys::FILE_SHARE_DELETE)
+        as wdk_sys::USHORT;
+
 /// Decoded mount-volume stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MountVolumeStack {
@@ -1055,14 +1247,8 @@ impl FileSystemControlStack {
 pub(crate) struct CreateStack {
     /// FILE_OBJECT receiving FsContext/FsContext2 on successful create.
     file_object: NonNull<wdk_sys::FILE_OBJECT>,
-    /// Desired access mask requested by the opener.
-    desired_access: wdk_sys::ACCESS_MASK,
-    /// Packed create disposition/options field.
-    options: wdk_sys::ULONG,
-    /// Share-access bits requested by the opener.
-    share_access: wdk_sys::USHORT,
-    /// Extended-attribute input length supplied with create.
-    ea_length: IrpBufferLength,
+    /// Decoded create parameters.
+    parameters: CreateParameters,
 }
 
 impl CreateStack {
@@ -1071,24 +1257,9 @@ impl CreateStack {
         self.file_object
     }
 
-    /// Returns the requested desired access mask.
-    pub(crate) const fn desired_access(self) -> wdk_sys::ACCESS_MASK {
-        self.desired_access
-    }
-
-    /// Returns the packed create disposition/options field.
-    pub(crate) const fn options(self) -> wdk_sys::ULONG {
-        self.options
-    }
-
-    /// Returns the requested share access.
-    pub(crate) const fn share_access(self) -> wdk_sys::USHORT {
-        self.share_access
-    }
-
-    /// Returns the input EA length.
-    pub(crate) const fn ea_length(self) -> IrpBufferLength {
-        self.ea_length
+    /// Returns the decoded create parameters.
+    pub(crate) const fn parameters(self) -> CreateParameters {
+        self.parameters
     }
 }
 
@@ -1414,10 +1585,12 @@ mod tests {
     use wdk_sys::{STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
 
     use super::{
+        CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateTargetRequirement,
         CurrentIrpStackLocation, DirectoryCursorPosition, DirectoryEntryEmission,
         DirectoryInformationClass, DirectoryPatternInput, DispatchTarget, EaEntryEmission,
-        EaNameSelection, FsControlCode, QueryFileInformationClass, QueryVolumeInformationClass,
-        SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
+        EaNameSelection, FILE_OPEN_DISPOSITION, FsControlCode, QueryFileInformationClass,
+        QueryVolumeInformationClass, SecurityComponentSelection, SetFileInformationClass,
+        SetVolumeInformationClass,
     };
 
     /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
@@ -1596,15 +1769,49 @@ mod tests {
             assert!(create.is_ok());
             if let Ok(create) = create {
                 assert_eq!(create.file_object(), file_object);
-                assert_eq!(create.desired_access(), desired_access);
-                assert_eq!(create.options(), 0x0300_0040);
+                let parameters = create.parameters();
+                assert_eq!(parameters.desired_access().as_raw(), desired_access);
+                assert_eq!(parameters.disposition(), CreateDisposition::OpenIf);
                 assert_eq!(
-                    create.share_access(),
-                    u16::try_from(wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE)
-                        .unwrap_or(u16::MAX)
+                    parameters.target_requirement(),
+                    CreateTargetRequirement::NonDirectory
                 );
-                assert_eq!(create.ea_length().as_usize(), 48);
+                assert_eq!(
+                    parameters.share_access().as_ulong(),
+                    wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE
+                );
+                assert_eq!(parameters.ea_length().as_usize(), 48);
             }
+        }
+    }
+
+    #[test]
+    fn create_stack_rejects_unsupported_options_before_handler() {
+        const FILE_SEQUENTIAL_ONLY: wdk_sys::ULONG = 0x0000_0004;
+
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT) | FILE_SEQUENTIAL_ONLY,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            assert_eq!(
+                current
+                    .create()
+                    .err()
+                    .map(crate::status::DriverError::ntstatus),
+                Some(STATUS_NOT_SUPPORTED)
+            );
         }
     }
 
