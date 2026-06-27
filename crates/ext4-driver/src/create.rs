@@ -400,9 +400,7 @@ fn open_shared_file_control_block(
         return Err(DriverError::InvalidParameter);
     }
 
-    let Some(mut fcb) = VolumeControlBlock::open_file_control_block(vcb, node) else {
-        return Err(DriverError::InvalidParameter);
-    };
+    let mut fcb = VolumeControlBlock::open_file_control_block(vcb, node)?;
     let fcb_ref = unsafe {
         // SAFETY: The VCB returned a live owned FCB pointer with an open
         // reference for this create request.

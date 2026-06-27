@@ -212,7 +212,7 @@ impl VolumeControlBlock {
     pub(crate) fn open_file_control_block(
         mut volume: NonNull<Self>,
         node: NodeId,
-    ) -> Option<NonNull<FileControlBlock>> {
+    ) -> DriverResult<NonNull<FileControlBlock>> {
         let vcb = unsafe {
             // SAFETY: The caller passes a live mounted VCB pointer from the
             // mounted device extension while processing create/open.
@@ -226,13 +226,13 @@ impl VolumeControlBlock {
                 fcb.as_mut()
             };
             fcb_ref.add_open_reference()?;
-            return Some(fcb);
+            return Ok(fcb);
         }
 
         let fcb = Box::new(FileControlBlock::new(volume, node));
-        let fcb = NonNull::new(Box::into_raw(fcb))?;
+        let fcb = NonNull::from(Box::leak(fcb));
         vcb.file_control_blocks.push(fcb);
-        Some(fcb)
+        Ok(fcb)
     }
 
     /// Releases one open reference to a VCB-owned FCB.
@@ -519,9 +519,15 @@ impl FileControlBlock {
     }
 
     /// Adds one FILE_OBJECT reference to an already-open FCB.
-    fn add_open_reference(&mut self) -> Option<()> {
-        self.open_count = NonZeroU32::new(self.open_count.get().checked_add(1)?)?;
-        Some(())
+    fn add_open_reference(&mut self) -> DriverResult<()> {
+        let count = self
+            .open_count
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU32::new)
+            .ok_or(DriverError::TooManyOpenReferences)?;
+        self.open_count = count;
+        Ok(())
     }
 
     /// Releases one FILE_OBJECT reference from a non-empty FCB.
@@ -739,9 +745,12 @@ pub(crate) unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {
 
 #[cfg(test)]
 mod tests {
+    use core::num::NonZeroU32;
     use core::ptr::NonNull;
 
     use ext4_core::{DirectoryNodeId, NodeId};
+
+    use crate::status::DriverError;
 
     use super::{FileControlBlock, FileControlBlockRelease, VolumeControlBlock};
 
@@ -751,7 +760,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
 
         assert_eq!(fcb.open_count.get(), 1);
-        assert_eq!(fcb.add_open_reference(), Some(()));
+        assert_eq!(fcb.add_open_reference(), Ok(()));
         assert_eq!(fcb.open_count.get(), 2);
         assert_eq!(
             fcb.release_open_reference(),
@@ -762,6 +771,19 @@ mod tests {
             fcb.release_open_reference(),
             FileControlBlockRelease::LastReference
         );
+    }
+
+    #[test]
+    fn file_control_block_open_count_overflow_is_typed() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        fcb.open_count = NonZeroU32::MAX;
+
+        assert_eq!(
+            fcb.add_open_reference(),
+            Err(DriverError::TooManyOpenReferences)
+        );
+        assert_eq!(fcb.open_count, NonZeroU32::MAX);
     }
 
     #[test]
