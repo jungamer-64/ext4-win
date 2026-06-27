@@ -5,7 +5,7 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     FscryptKeyIdentifier, FscryptMasterKey, FsverityBlockSize, FsverityEnable,
-    FsverityHashAlgorithm, FsveritySalt, FsveritySignature,
+    FsverityHashAlgorithm, FsveritySalt, FsveritySignature, NodeId,
 };
 use wdk_sys::{
     NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
@@ -13,7 +13,7 @@ use wdk_sys::{
 };
 
 use crate::irp::{DispatchTarget, FileSystemControlStack};
-use crate::state::{FileSystemNode, VolumeControlBlock, file_control_block};
+use crate::state::{VolumeControlBlock, file_control_block};
 use crate::status::DriverError;
 
 /// Windows `FILE_DEVICE_FILE_SYSTEM`.
@@ -186,7 +186,7 @@ fn enable_verity_result(
         // FSCTL is dispatched for the opened FILE_OBJECT.
         fcb.as_ref()
     };
-    let FileSystemNode::File(inode) = fcb.node() else {
+    let NodeId::File(file_id) = fcb.node() else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus());
     };
     let mut vcb = fcb.volume();
@@ -199,7 +199,7 @@ fn enable_verity_result(
         .volume_mut()
         .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
     let file = transaction
-        .file(inode)
+        .file(file_id)
         .map_err(|error| DriverError::from(error).ntstatus())?;
     transaction
         .enable_verity(file, &enable)

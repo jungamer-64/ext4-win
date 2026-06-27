@@ -5,7 +5,9 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::{Ext4Name, FileSize, InodeId, Node, WindowsName};
+use ext4_core::{
+    ChildLookup, DirectoryNodeId, Ext4Name, FileNodeId, FileSize, LoadedNode, NodeId, WindowsName,
+};
 use wdk_sys::{
     FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
     STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
@@ -16,8 +18,8 @@ use crate::{
     irp::{CreateStack, DispatchTarget},
     metadata,
     state::{
-        ContextControlBlock, FileControlBlock, FileSystemNode, KernelDevice, MountedVolumeDevice,
-        OpenedPath, VolumeControlBlock, release_file_control_block,
+        ContextControlBlock, FileControlBlock, KernelDevice, MountedVolumeDevice, OpenedPath,
+        VolumeControlBlock, release_file_control_block,
     },
 };
 
@@ -165,14 +167,14 @@ enum PathLookup {
     /// The requested path already exists.
     Existing {
         /// Opened ext4 node.
-        node: FileSystemNode,
+        node: NodeId,
         /// Exact path identity.
         path: OpenedPath,
     },
     /// The final path component is absent under an existing parent directory.
     Missing {
         /// Parent directory inode.
-        parent: InodeId,
+        parent: DirectoryNodeId,
         /// New ext4 child name.
         name: Ext4Name,
     },
@@ -183,7 +185,7 @@ fn open_existing_node(
     request: CreateRequest,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
-    node: FileSystemNode,
+    node: NodeId,
     path: OpenedPath,
 ) -> NTSTATUS {
     match disposition {
@@ -230,10 +232,7 @@ fn open_existing_node(
 }
 
 /// Resolves an existing regular file inode for overwrite-style dispositions.
-fn overwrite_file_inode(
-    node: FileSystemNode,
-    options: wdk_sys::ULONG,
-) -> Result<InodeId, NTSTATUS> {
+fn overwrite_file_inode(node: NodeId, options: wdk_sys::ULONG) -> Result<FileNodeId, NTSTATUS> {
     if options & FILE_DIRECTORY_FILE_OPTION != 0 {
         return Err(STATUS_NOT_SUPPORTED);
     }
@@ -241,10 +240,8 @@ fn overwrite_file_inode(
         validate_existing_node_options(node, options)?;
     }
     match node {
-        FileSystemNode::File(inode) => Ok(inode),
-        FileSystemNode::Directory(_) | FileSystemNode::Symlink(_) => {
-            Err(STATUS_OBJECT_TYPE_MISMATCH)
-        }
+        NodeId::File(file) => Ok(file),
+        NodeId::Directory(_) | NodeId::Symlink(_) => Err(STATUS_OBJECT_TYPE_MISMATCH),
     }
 }
 
@@ -253,7 +250,7 @@ fn create_missing_node(
     request: CreateRequest,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
-    parent: InodeId,
+    parent: DirectoryNodeId,
     name: &Ext4Name,
 ) -> NTSTATUS {
     match disposition {
@@ -286,15 +283,11 @@ fn create_missing_node(
 }
 
 /// Validates file-vs-directory options for an existing node.
-fn validate_existing_node_options(
-    node: FileSystemNode,
-    options: wdk_sys::ULONG,
-) -> Result<(), NTSTATUS> {
-    if options & FILE_DIRECTORY_FILE_OPTION != 0 && !matches!(node, FileSystemNode::Directory(_)) {
+fn validate_existing_node_options(node: NodeId, options: wdk_sys::ULONG) -> Result<(), NTSTATUS> {
+    if options & FILE_DIRECTORY_FILE_OPTION != 0 && !matches!(node, NodeId::Directory(_)) {
         return Err(STATUS_OBJECT_TYPE_MISMATCH);
     }
-    if options & FILE_NON_DIRECTORY_FILE_OPTION != 0 && matches!(node, FileSystemNode::Directory(_))
-    {
+    if options & FILE_NON_DIRECTORY_FILE_OPTION != 0 && matches!(node, NodeId::Directory(_)) {
         return Err(STATUS_OBJECT_TYPE_MISMATCH);
     }
     Ok(())
@@ -303,7 +296,7 @@ fn validate_existing_node_options(
 /// Truncates an existing regular file for overwrite-style create dispositions.
 fn truncate_existing_file(
     mut vcb: NonNull<crate::state::VolumeControlBlock>,
-    inode: InodeId,
+    file_id: FileNodeId,
 ) -> Result<(), NTSTATUS> {
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
@@ -315,7 +308,7 @@ fn truncate_existing_file(
         crate::time::current_ext4_timestamp().map_err(crate::status::DriverError::ntstatus)?,
     );
     let file = transaction
-        .file(inode)
+        .file(file_id)
         .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
     transaction
         .truncate_file(file, FileSize::from_bytes(0))
@@ -343,58 +336,47 @@ fn resolve_path(
         // in the mounted device extension and is read only for path lookup.
         vcb.as_ref()
     };
-    let mut inode = InodeId::ROOT;
+    let mut parent_id = DirectoryNodeId::ROOT;
     let components = path_components(file_object)?;
     let mut components = components.iter().peekable();
     while let Some(component) = components.next() {
         let is_final = components.peek().is_none();
-        let parent = match vcb.volume().read_node(inode) {
-            Ok(Node::Directory(directory)) => directory,
+        let parent = match vcb.volume().load_node(parent_id.inode()) {
+            Ok(LoadedNode::Directory(directory)) => directory,
             Ok(_) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
             Err(error) => return Err(crate::status::DriverError::from(error).ntstatus()),
         };
-        let entry = match vcb.volume().lookup_windows_child_entry(&parent, component) {
-            Ok(Some(entry)) => entry,
-            Ok(None) if is_final => {
+        let child = match vcb.volume().lookup_windows_child(&parent, component) {
+            Ok(ChildLookup::Found(child)) => child,
+            Ok(ChildLookup::NotFound) if is_final => {
                 return Ok(PathLookup::Missing {
-                    parent: inode,
+                    parent: parent_id,
                     name: component
                         .to_ext4()
                         .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
                 });
             }
-            Ok(None) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
+            Ok(ChildLookup::NotFound) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
             Err(error) => return Err(crate::status::DriverError::from(error).ntstatus()),
         };
         if is_final {
-            let node = match vcb.volume().read_node(entry.inode()) {
-                Ok(Node::File(_)) => FileSystemNode::File(entry.inode()),
-                Ok(Node::Directory(_)) => FileSystemNode::Directory(entry.inode()),
-                Ok(Node::Symlink(_)) => FileSystemNode::Symlink(entry.inode()),
-                Err(error) => return Err(crate::status::DriverError::from(error).ntstatus()),
-            };
             return Ok(PathLookup::Existing {
-                node,
+                node: *child.node(),
                 path: OpenedPath::Child {
-                    parent: inode,
-                    name: entry.name().clone(),
+                    parent: child.parent(),
+                    name: child.name().clone(),
                 },
             });
         }
-        inode = entry.inode();
+        let NodeId::Directory(directory_id) = *child.node() else {
+            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+        };
+        parent_id = directory_id;
     }
 
-    match vcb.volume().read_node(inode) {
-        Ok(Node::File(_)) => Ok(PathLookup::Existing {
-            node: FileSystemNode::File(inode),
-            path: OpenedPath::Root,
-        }),
-        Ok(Node::Directory(_)) => Ok(PathLookup::Existing {
-            node: FileSystemNode::Directory(inode),
-            path: OpenedPath::Root,
-        }),
-        Ok(Node::Symlink(_)) => Ok(PathLookup::Existing {
-            node: FileSystemNode::Symlink(inode),
+    match vcb.volume().load_node(parent_id.inode()) {
+        Ok(node) => Ok(PathLookup::Existing {
+            node: node.id(),
             path: OpenedPath::Root,
         }),
         Err(error) => Err(crate::status::DriverError::from(error).ntstatus()),
@@ -404,10 +386,10 @@ fn resolve_path(
 /// Creates a file or directory under an existing parent directory.
 fn create_child(
     mut vcb: NonNull<crate::state::VolumeControlBlock>,
-    parent: InodeId,
+    parent: DirectoryNodeId,
     name: &Ext4Name,
     kind: CreateNodeKind,
-) -> Result<FileSystemNode, NTSTATUS> {
+) -> Result<NodeId, NTSTATUS> {
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
         // in the mounted device extension. The mutable borrow is the
@@ -430,7 +412,7 @@ fn create_child(
                         .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
                 )
                 .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
-            FileSystemNode::File(file.inode_id())
+            NodeId::File(file.id())
         }
         CreateNodeKind::Directory => {
             let directory = transaction
@@ -441,7 +423,7 @@ fn create_child(
                         .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
                 )
                 .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
-            FileSystemNode::Directory(directory.inode_id())
+            NodeId::Directory(directory.id())
         }
     };
     transaction
@@ -485,7 +467,7 @@ fn path_components(file_object: &FILE_OBJECT) -> Result<Vec<WindowsName>, NTSTAT
 fn initialize_file_object(
     file_object: NonNull<FILE_OBJECT>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
-    node: FileSystemNode,
+    node: NodeId,
     path: OpenedPath,
     desired_access: wdk_sys::ACCESS_MASK,
     share_access: wdk_sys::ULONG,
@@ -500,7 +482,7 @@ fn initialize_file_object(
 fn open_shared_file_control_block(
     file_object: NonNull<FILE_OBJECT>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
-    node: FileSystemNode,
+    node: NodeId,
     desired_access: wdk_sys::ACCESS_MASK,
     share_access: wdk_sys::ULONG,
 ) -> Result<NonNull<FileControlBlock>, NTSTATUS> {
@@ -534,7 +516,7 @@ fn open_shared_file_control_block(
 fn attach_file_object(
     mut file_object: NonNull<FILE_OBJECT>,
     fcb: NonNull<FileControlBlock>,
-    node: FileSystemNode,
+    node: NodeId,
     path: OpenedPath,
 ) -> NTSTATUS {
     let file_object = unsafe {

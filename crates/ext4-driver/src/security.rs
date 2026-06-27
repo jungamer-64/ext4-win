@@ -3,7 +3,7 @@
 use alloc::{vec, vec::Vec};
 use core::ptr::NonNull;
 
-use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, Node};
+use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, LoadedNode, NodeId};
 use wdk_sys::{
     NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER,
     STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
@@ -13,7 +13,7 @@ use crate::irp::{
     DispatchTarget, QuerySecurityStack, SecurityComponentSelection, SecuritySelection,
     SetSecurityStack,
 };
-use crate::state::{FileControlBlock, FileSystemNode, VolumeControlBlock, file_control_block};
+use crate::state::{FileControlBlock, VolumeControlBlock, file_control_block};
 use crate::status::DriverError;
 
 /// SECURITY_DESCRIPTOR_RELATIVE byte size.
@@ -118,7 +118,7 @@ struct OpenedSecurityContext {
     /// Mounted VCB owning the open file.
     volume: NonNull<VolumeControlBlock>,
     /// ext4 node opened by this FILE_OBJECT.
-    node: FileSystemNode,
+    node: NodeId,
     /// Current POSIX security metadata.
     security: Ext4Security,
 }
@@ -256,7 +256,7 @@ fn set_security(request: SetSecurityRequest) -> NTSTATUS {
             crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?,
         );
         let node = transaction
-            .node(context.node.inode())
+            .node(context.node)
             .map_err(|error| DriverError::from(error).ntstatus())?;
         transaction
             .set_posix_security(node, security)
@@ -291,7 +291,7 @@ fn load_ext4_security_context(
     let vcb = volume_control_block(fcb);
     let node = vcb
         .volume()
-        .read_node(fcb.node().inode())
+        .load_node(fcb.node().inode())
         .map_err(|error| DriverError::from(error).ntstatus())?;
     Ok(OpenedSecurityContext {
         volume: fcb.volume(),
@@ -301,11 +301,11 @@ fn load_ext4_security_context(
 }
 
 /// Extracts security metadata after validating FCB kind against core metadata.
-fn security_from_node(identity: FileSystemNode, node: Node) -> Result<Ext4Security, NTSTATUS> {
+fn security_from_node(identity: NodeId, node: LoadedNode) -> Result<Ext4Security, NTSTATUS> {
     match (identity, node) {
-        (FileSystemNode::File(_), Node::File(file)) => Ok(file.security()),
-        (FileSystemNode::Directory(_), Node::Directory(directory)) => Ok(directory.security()),
-        (FileSystemNode::Symlink(_), Node::Symlink(symlink)) => Ok(symlink.security()),
+        (NodeId::File(_), LoadedNode::File(file)) => Ok(file.security()),
+        (NodeId::Directory(_), LoadedNode::Directory(directory)) => Ok(directory.security()),
+        (NodeId::Symlink(_), LoadedNode::Symlink(symlink)) => Ok(symlink.security()),
         _ => Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus()),
     }
 }

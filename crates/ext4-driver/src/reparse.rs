@@ -3,7 +3,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use ext4_core::{InodeId, Node, SymlinkTarget};
+use ext4_core::{LoadedNode, NodeId, SymlinkNodeId, SymlinkTarget};
 use wdk_sys::{
     NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
     STATUS_SUCCESS,
@@ -12,8 +12,7 @@ use wdk_sys::{
 use crate::irp::{DispatchTarget, FileSystemControlStack};
 use crate::metadata;
 use crate::state::{
-    FileControlBlock, FileSystemNode, OpenedPath, VolumeControlBlock, context_control_block,
-    file_control_block,
+    FileControlBlock, OpenedPath, VolumeControlBlock, context_control_block, file_control_block,
 };
 use crate::status::DriverError;
 
@@ -80,20 +79,23 @@ fn read_symlink_target(stack: FileSystemControlStack) -> Result<Vec<u8>, NTSTATU
         // is active.
         fcb.as_ref()
     };
-    let FileSystemNode::Symlink(inode) = fcb.node() else {
+    let NodeId::Symlink(symlink_id) = fcb.node() else {
         return Err(STATUS_NOT_A_REPARSE_POINT);
     };
     let vcb = volume_control_block(fcb);
-    read_core_symlink(vcb, inode)
+    read_core_symlink(vcb, symlink_id)
 }
 
 /// Reads a symlink inode through ext4-core.
-fn read_core_symlink(vcb: &VolumeControlBlock, inode: InodeId) -> Result<Vec<u8>, NTSTATUS> {
+fn read_core_symlink(
+    vcb: &VolumeControlBlock,
+    symlink_id: SymlinkNodeId,
+) -> Result<Vec<u8>, NTSTATUS> {
     let node = vcb
         .volume()
-        .read_node(inode)
+        .load_node(symlink_id.inode())
         .map_err(|error| DriverError::from(error).ntstatus())?;
-    let Node::Symlink(symlink) = node else {
+    let LoadedNode::Symlink(symlink) = node else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus());
     };
     vcb.volume()
@@ -150,13 +152,13 @@ fn replace_opened_path_with_symlink(
         .directory(parent)
         .map_err(|error| DriverError::from(error).ntstatus())?;
     match fcb.node() {
-        FileSystemNode::File(_) => transaction
+        NodeId::File(_) => transaction
             .unlink_file(parent_directory, &name)
             .map_err(|error| DriverError::from(error).ntstatus())?,
-        FileSystemNode::Directory(_) => transaction
+        NodeId::Directory(_) => transaction
             .remove_empty_directory(parent_directory, &name)
             .map_err(|error| DriverError::from(error).ntstatus())?,
-        FileSystemNode::Symlink(_) => transaction
+        NodeId::Symlink(_) => transaction
             .remove_symlink(parent_directory, &name)
             .map_err(|error| DriverError::from(error).ntstatus())?,
     }
@@ -172,7 +174,7 @@ fn replace_opened_path_with_symlink(
     transaction
         .commit()
         .map_err(|error| DriverError::from(error).ntstatus())?;
-    let node = FileSystemNode::Symlink(symlink.inode_id());
+    let node = NodeId::Symlink(symlink.id());
     fcb.replace_node(node);
     ccb.replace_node(node);
     Ok(())

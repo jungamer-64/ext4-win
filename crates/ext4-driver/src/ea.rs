@@ -202,7 +202,7 @@ fn apply_set_ea_entries(stack: SetEaStack, entries: &[WindowsEaEntry]) -> Result
         // is active.
         fcb.as_ref()
     };
-    let inode = fcb.node().inode();
+    let node_id = fcb.node();
     let mut vcb = fcb.volume();
     let vcb = unsafe {
         // SAFETY: FCBs are constructed only from live mounted VCB pointers and
@@ -214,7 +214,7 @@ fn apply_set_ea_entries(stack: SetEaStack, entries: &[WindowsEaEntry]) -> Result
         .volume_mut()
         .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
     let node = transaction
-        .node(inode)
+        .node(node_id)
         .map_err(|error| DriverError::from(error).ntstatus())?;
     for entry in entries {
         let name = xattr_name_from_ea_name(entry.name.as_slice())?;
