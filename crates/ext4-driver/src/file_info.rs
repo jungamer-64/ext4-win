@@ -18,8 +18,8 @@ use crate::irp::{
     QueryFileInformationClass, QueryFileStack, SetFileInformationClass, SetFileStack,
 };
 use crate::state::{
-    CloseDisposition, ContextControlBlock, DirectoryCursor, FileControlBlock, OpenedPath,
-    VolumeControlBlock, context_control_block, file_control_block, release_file_control_block,
+    CloseDisposition, DirectoryCursor, FileControlBlock, OpenedHandle, OpenedPath,
+    VolumeControlBlock, file_control_block, opened_handle, release_file_control_block,
 };
 use crate::status::{DriverError, DriverResult};
 use crate::wire::{CheckedByteRange, LittleEndianInput, LittleEndianOutput};
@@ -327,17 +327,17 @@ fn set_disposition_information(request: SetFileRequest) -> DriverResult<()> {
         request.target,
         request.stack.length(),
     )?;
-    let mut ccb = context_control_block(request.stack.file_object())?;
-    let ccb = unsafe {
-        // SAFETY: Successful create stores Box<ContextControlBlock> in
+    let mut handle = opened_handle(request.stack.file_object())?;
+    let handle = unsafe {
+        // SAFETY: Successful create stores Box<OpenedHandle> in
         // FsContext2 until close releases it, and this mutation runs while the
         // FILE_OBJECT is active.
-        ccb.as_mut()
+        handle.as_mut()
     };
     if info.DeleteFile == 0 {
-        ccb.keep_on_close();
+        handle.keep_on_close();
     } else {
-        ccb.mark_delete_on_close();
+        handle.mark_delete_on_close();
     }
     Ok(())
 }
@@ -353,17 +353,17 @@ fn set_rename_information(request: SetFileRequest) -> DriverResult<()> {
         // FILE_OBJECT is active.
         fcb.as_ref()
     };
-    let mut ccb = context_control_block(request.stack.file_object())?;
-    let ccb = unsafe {
-        // SAFETY: Successful create stores Box<ContextControlBlock> in
+    let mut handle = opened_handle(request.stack.file_object())?;
+    let handle = unsafe {
+        // SAFETY: Successful create stores Box<OpenedHandle> in
         // FsContext2 until close releases it, and this mutation runs while the
         // FILE_OBJECT is active.
-        ccb.as_mut()
+        handle.as_mut()
     };
     let OpenedPath::Child {
         parent: source_parent,
         name: source_name,
-    } = ccb.path().clone()
+    } = handle.path().clone()
     else {
         return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));
     };
@@ -383,7 +383,7 @@ fn set_rename_information(request: SetFileRequest) -> DriverResult<()> {
     let target_parent = transaction.directory(target_parent)?;
     transaction.rename_child(source_parent, &source_name, target_parent, &target_name)?;
     transaction.commit()?;
-    ccb.replace_path(OpenedPath::Child {
+    handle.replace_path(OpenedPath::Child {
         parent: target_parent.id(),
         name: target_name,
     });
@@ -452,14 +452,14 @@ fn query_directory(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     };
     let entries = vcb.volume().read_directory(&directory)?;
 
-    let mut ccb = context_control_block(request.stack.file_object())?;
-    let ccb = unsafe {
-        // SAFETY: Successful create stores Box<ContextControlBlock> in
+    let mut handle = opened_handle(request.stack.file_object())?;
+    let handle = unsafe {
+        // SAFETY: Successful create stores Box<OpenedHandle> in
         // FsContext2 until close releases it, and this query runs while the
         // FILE_OBJECT is active.
-        ccb.as_mut()
+        handle.as_mut()
     };
-    let Some(cursor) = ccb.directory_cursor_mut() else {
+    let Some(cursor) = handle.directory_cursor_mut() else {
         return Err(DriverError::InvalidParameter);
     };
     initialize_directory_cursor(cursor, request.stack);
@@ -870,17 +870,17 @@ fn cleanup_file_object(file_object: NonNull<wdk_sys::FILE_OBJECT>) -> DriverResu
         // active.
         fcb.as_ref()
     };
-    let mut ccb = context_control_block(file_object)?;
-    let ccb = unsafe {
-        // SAFETY: Successful create stores Box<ContextControlBlock> in
+    let mut handle = opened_handle(file_object)?;
+    let handle = unsafe {
+        // SAFETY: Successful create stores Box<OpenedHandle> in
         // FsContext2 until close releases it, and cleanup runs while the
         // FILE_OBJECT is active.
-        ccb.as_mut()
+        handle.as_mut()
     };
-    if ccb.close_disposition() == CloseDisposition::Keep {
+    if handle.close_disposition() == CloseDisposition::Keep {
         return Ok(());
     }
-    let OpenedPath::Child { parent, name } = ccb.path().clone() else {
+    let OpenedPath::Child { parent, name } = handle.path().clone() else {
         return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));
     };
 
@@ -901,7 +901,7 @@ fn cleanup_file_object(file_object: NonNull<wdk_sys::FILE_OBJECT>) -> DriverResu
         NodeId::Symlink(_) => transaction.remove_symlink(parent, &name)?,
     }
     transaction.commit()?;
-    ccb.keep_on_close();
+    handle.keep_on_close();
     Ok(())
 }
 
@@ -1614,12 +1614,12 @@ fn release_file_contexts(mut file_object: core::ptr::NonNull<wdk_sys::FILE_OBJEC
         fcb_ref.remove_share_access(file_object_ptr);
         release_file_control_block(fcb);
     }
-    let ccb = core::mem::replace(&mut file_object.FsContext2, core::ptr::null_mut());
-    if !ccb.is_null() {
+    let handle = core::mem::replace(&mut file_object.FsContext2, core::ptr::null_mut());
+    if !handle.is_null() {
         unsafe {
-            // SAFETY: Successful create stores Box<ContextControlBlock> in
+            // SAFETY: Successful create stores Box<OpenedHandle> in
             // FsContext2, and close is the unique release point.
-            drop(Box::from_raw(ccb.cast::<ContextControlBlock>()));
+            drop(Box::from_raw(handle.cast::<OpenedHandle>()));
         }
     }
 }

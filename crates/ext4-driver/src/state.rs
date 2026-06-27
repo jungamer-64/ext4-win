@@ -593,28 +593,6 @@ pub(crate) enum OpenedPath {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Handle-local node state.
-pub(crate) enum OpenedHandleState {
-    /// Regular file handle.
-    File,
-    /// Directory handle with enumeration cursor.
-    Directory(DirectoryCursor),
-    /// Symlink handle.
-    Symlink,
-}
-
-impl OpenedHandleState {
-    /// Builds handle-local state from an opened node identity.
-    const fn from_node(node: NodeId) -> Self {
-        match node {
-            NodeId::File(_) => Self::File,
-            NodeId::Directory(_) => Self::Directory(DirectoryCursor::start()),
-            NodeId::Symlink(_) => Self::Symlink,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Action requested when the last handle cleanup occurs.
 pub(crate) enum CloseDisposition {
     /// Keep the opened object.
@@ -625,61 +603,133 @@ pub(crate) enum CloseDisposition {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Per-handle state stored in `FILE_OBJECT::FsContext2`.
-pub(crate) struct ContextControlBlock {
-    /// Handle-local node state.
-    handle: OpenedHandleState,
-    /// Path used for namespace mutations on cleanup.
-    path: OpenedPath,
-    /// Requested close disposition.
-    close_disposition: CloseDisposition,
+pub(crate) enum OpenedHandle {
+    /// Regular file handle.
+    File {
+        /// Path used for namespace mutations on cleanup.
+        path: OpenedPath,
+        /// Requested close disposition.
+        close_disposition: CloseDisposition,
+    },
+    /// Directory handle with enumeration cursor.
+    Directory {
+        /// Directory enumeration cursor.
+        cursor: DirectoryCursor,
+        /// Path used for namespace mutations on cleanup.
+        path: OpenedPath,
+        /// Requested close disposition.
+        close_disposition: CloseDisposition,
+    },
+    /// Symlink handle.
+    Symlink {
+        /// Path used for namespace mutations on cleanup.
+        path: OpenedPath,
+        /// Requested close disposition.
+        close_disposition: CloseDisposition,
+    },
 }
 
-impl ContextControlBlock {
+impl OpenedHandle {
     /// Creates per-handle state for an opened node.
     pub(crate) fn new(node: NodeId, path: OpenedPath) -> Self {
-        Self {
-            handle: OpenedHandleState::from_node(node),
-            path,
-            close_disposition: CloseDisposition::Keep,
+        Self::from_parts(node, path, CloseDisposition::Keep)
+    }
+
+    /// Creates per-handle state from explicit lifecycle fields.
+    fn from_parts(node: NodeId, path: OpenedPath, close_disposition: CloseDisposition) -> Self {
+        match node {
+            NodeId::File(_) => Self::File {
+                path,
+                close_disposition,
+            },
+            NodeId::Directory(_) => Self::Directory {
+                cursor: DirectoryCursor::start(),
+                path,
+                close_disposition,
+            },
+            NodeId::Symlink(_) => Self::Symlink {
+                path,
+                close_disposition,
+            },
         }
     }
 
     /// Returns the mutable directory cursor when this handle opened a directory.
     pub(crate) fn directory_cursor_mut(&mut self) -> Option<&mut DirectoryCursor> {
-        match &mut self.handle {
-            OpenedHandleState::Directory(cursor) => Some(cursor),
-            OpenedHandleState::File | OpenedHandleState::Symlink => None,
+        match self {
+            Self::Directory { cursor, .. } => Some(cursor),
+            Self::File { .. } | Self::Symlink { .. } => None,
         }
     }
 
     /// Marks the handle for delete-on-close cleanup.
-    pub(crate) const fn mark_delete_on_close(&mut self) {
-        self.close_disposition = CloseDisposition::Delete;
+    pub(crate) fn mark_delete_on_close(&mut self) {
+        *self.close_disposition_mut() = CloseDisposition::Delete;
     }
 
     /// Clears a delete-on-close request for this handle.
-    pub(crate) const fn keep_on_close(&mut self) {
-        self.close_disposition = CloseDisposition::Keep;
+    pub(crate) fn keep_on_close(&mut self) {
+        *self.close_disposition_mut() = CloseDisposition::Keep;
     }
 
     /// Returns the requested close disposition.
     pub(crate) const fn close_disposition(&self) -> CloseDisposition {
-        self.close_disposition
+        match self {
+            Self::File {
+                close_disposition, ..
+            }
+            | Self::Directory {
+                close_disposition, ..
+            }
+            | Self::Symlink {
+                close_disposition, ..
+            } => *close_disposition,
+        }
     }
 
     /// Returns the opened path identity.
     pub(crate) const fn path(&self) -> &OpenedPath {
-        &self.path
+        match self {
+            Self::File { path, .. } | Self::Directory { path, .. } | Self::Symlink { path, .. } => {
+                path
+            }
+        }
     }
 
     /// Replaces the opened path after a successful rename.
     pub(crate) fn replace_path(&mut self, path: OpenedPath) {
-        self.path = path;
+        *self.path_mut() = path;
     }
 
     /// Replaces handle-local node state after an in-place namespace conversion.
     pub(crate) fn replace_node(&mut self, node: NodeId) {
-        self.handle = OpenedHandleState::from_node(node);
+        let path = self.path().clone();
+        let close_disposition = self.close_disposition();
+        *self = Self::from_parts(node, path, close_disposition);
+    }
+
+    /// Returns the mutable close disposition field for this handle variant.
+    fn close_disposition_mut(&mut self) -> &mut CloseDisposition {
+        match self {
+            Self::File {
+                close_disposition, ..
+            }
+            | Self::Directory {
+                close_disposition, ..
+            }
+            | Self::Symlink {
+                close_disposition, ..
+            } => close_disposition,
+        }
+    }
+
+    /// Returns the mutable opened path field for this handle variant.
+    fn path_mut(&mut self) -> &mut OpenedPath {
+        match self {
+            Self::File { path, .. } | Self::Directory { path, .. } | Self::Symlink { path, .. } => {
+                path
+            }
+        }
     }
 }
 
@@ -710,16 +760,15 @@ pub(crate) fn release_file_control_block(fcb: NonNull<FileControlBlock>) {
 }
 
 /// Returns the CCB stored on a successfully opened FILE_OBJECT.
-pub(crate) fn context_control_block(
+pub(crate) fn opened_handle(
     file_object: NonNull<FILE_OBJECT>,
-) -> Result<NonNull<ContextControlBlock>, DriverError> {
+) -> Result<NonNull<OpenedHandle>, DriverError> {
     let file_object = unsafe {
         // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
         // is read only for filesystem-owned context pointers.
         file_object.as_ref()
     };
-    NonNull::new(file_object.FsContext2.cast::<ContextControlBlock>())
-        .ok_or(DriverError::InvalidParameter)
+    NonNull::new(file_object.FsContext2.cast::<OpenedHandle>()).ok_or(DriverError::InvalidParameter)
 }
 
 /// Driver unload callback registered in the driver object.
