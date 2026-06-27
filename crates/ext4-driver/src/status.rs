@@ -4,9 +4,10 @@ use ext4_core::Error;
 use wdk_sys::{
     NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL, STATUS_CANNOT_DELETE,
     STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL, STATUS_FILE_CORRUPT_ERROR,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
-    STATUS_IO_DEVICE_ERROR, STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_COLLISION,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_TYPE_MISMATCH, STATUS_VOLUME_DIRTY,
+    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS,
+    STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_NOT_SUPPORTED,
+    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_TYPE_MISMATCH,
+    STATUS_VOLUME_DIRTY,
 };
 
 /// Driver-local result before NTSTATUS completion mapping.
@@ -25,6 +26,8 @@ pub(crate) enum DriverError {
     AccessDenied,
     /// Caller output buffer cannot hold the required fixed payload.
     BufferTooSmall,
+    /// Caller selected an unsupported information class.
+    InvalidInfoClass,
     /// Opened node is not a reparse point.
     NotAReparsePoint,
     /// Reparse tag belongs to another handler.
@@ -44,6 +47,7 @@ impl DriverError {
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,
             Self::BufferTooSmall => STATUS_BUFFER_TOO_SMALL,
+            Self::InvalidInfoClass => STATUS_INVALID_INFO_CLASS,
             Self::NotAReparsePoint => ntstatus(0xC000_0275),
             Self::ReparseTagNotHandled => ntstatus(0xC000_0279),
             Self::NotSupported => STATUS_NOT_SUPPORTED,

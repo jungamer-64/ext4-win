@@ -9,32 +9,23 @@ use wdk_sys::{
     FILE_FS_DEVICE_INFORMATION, FILE_FS_FULL_SIZE_INFORMATION, FILE_FS_LABEL_INFORMATION,
     FILE_FS_SIZE_INFORMATION, FILE_FS_VOLUME_INFORMATION, FILE_SUPPORTS_EXTENDED_ATTRIBUTES,
     FILE_SUPPORTS_REPARSE_POINTS, FILE_UNICODE_ON_DISK, LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT,
-    PIRP, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
-    STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
+    PIRP, STATUS_SUCCESS,
 };
 
 use crate::{
-    irp::{DispatchTarget, QueryVolumeStack, SetVolumeStack},
+    irp::{
+        DispatchTarget, QueryVolumeInformationClass, QueryVolumeStack, SetVolumeInformationClass,
+        SetVolumeStack,
+    },
     state::{KernelDevice, MountedVolumeDevice, VolumeControlBlock},
-    status::DriverError,
+    status::{DriverError, DriverResult},
+    wire::{LittleEndianInput, LittleEndianOutput},
 };
 
 /// Filesystem name exposed through `FileFsAttributeInformation`.
 const FILE_SYSTEM_NAME: &[u16] = &[0x0045, 0x0058, 0x0054, 0x0034, 0x0057, 0x0049, 0x004E];
 /// Sector size reported to Windows.
 const BYTES_PER_SECTOR: u32 = 512;
-/// `FileFsVolumeInformation`.
-const FILE_FS_VOLUME_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 1;
-/// `FileFsLabelInformation`.
-const FILE_FS_LABEL_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 2;
-/// `FileFsSizeInformation`.
-const FILE_FS_SIZE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 3;
-/// `FileFsDeviceInformation`.
-const FILE_FS_DEVICE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 4;
-/// `FileFsAttributeInformation`.
-const FILE_FS_ATTRIBUTE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 5;
-/// `FileFsFullSizeInformation`.
-const FILE_FS_FULL_SIZE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 7;
 
 /// Handles volume information queries.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
@@ -119,53 +110,61 @@ impl SystemBufferInput {
 
 /// Executes one volume information query.
 fn query_volume(request: QueryVolumeRequest) -> NTSTATUS {
+    match query_volume_result(request) {
+        Ok(written) => {
+            request.target.set_information(written);
+            STATUS_SUCCESS
+        }
+        Err(error) => error.ntstatus(),
+    }
+}
+
+/// Executes one volume information mutation.
+fn set_volume(request: SetVolumeRequest) -> NTSTATUS {
+    match set_volume_result(request) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(error) => error.ntstatus(),
+    }
+}
+
+/// Executes one volume information query before NTSTATUS completion mapping.
+fn query_volume_result(request: QueryVolumeRequest) -> DriverResult<wdk_sys::ULONG_PTR> {
     let Some(mut vcb) = MountedVolumeDevice::vcb(request.device) else {
-        return crate::status::DriverError::InvalidDeviceRequest.ntstatus();
+        return Err(DriverError::InvalidDeviceRequest);
     };
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns a live VCB pointer stored in
         // this mounted device extension.
         vcb.as_mut()
     };
-    let Some(buffer) = request.target.system_buffer() else {
-        return STATUS_INVALID_PARAMETER;
-    };
+    let buffer = request
+        .target
+        .system_buffer()
+        .ok_or(DriverError::InvalidParameter)?;
     let length = request.stack.length().as_usize();
-    let written = match request.stack.information_class() {
-        FILE_FS_VOLUME_INFORMATION_CLASS => pack_volume_information(vcb, buffer, length),
-        FILE_FS_SIZE_INFORMATION_CLASS => pack_size_information(vcb, buffer, length),
-        FILE_FS_DEVICE_INFORMATION_CLASS => pack_device_information(buffer, length),
-        FILE_FS_ATTRIBUTE_INFORMATION_CLASS => pack_attribute_information(buffer, length),
-        FILE_FS_FULL_SIZE_INFORMATION_CLASS => pack_full_size_information(vcb, buffer, length),
-        _ => return STATUS_INVALID_INFO_CLASS,
-    };
-    match written {
-        Ok(bytes) => {
-            request.target.set_information(bytes);
-            STATUS_SUCCESS
-        }
-        Err(status) => status,
+    match request.stack.information_class() {
+        QueryVolumeInformationClass::Volume => pack_volume_information(vcb, buffer, length),
+        QueryVolumeInformationClass::Size => pack_size_information(vcb, buffer, length),
+        QueryVolumeInformationClass::Device => pack_device_information(buffer, length),
+        QueryVolumeInformationClass::Attribute => pack_attribute_information(buffer, length),
+        QueryVolumeInformationClass::FullSize => pack_full_size_information(vcb, buffer, length),
     }
 }
 
-/// Executes one volume information mutation.
-fn set_volume(request: SetVolumeRequest) -> NTSTATUS {
+/// Executes one volume information mutation before NTSTATUS completion mapping.
+fn set_volume_result(request: SetVolumeRequest) -> DriverResult<()> {
     match request.stack.information_class() {
-        FILE_FS_LABEL_INFORMATION_CLASS => match set_volume_label(request) {
-            Ok(()) => STATUS_SUCCESS,
-            Err(status) => status,
-        },
-        _ => STATUS_INVALID_INFO_CLASS,
+        SetVolumeInformationClass::Label => set_volume_label(request),
     }
 }
 
 /// Applies `FILE_FS_LABEL_INFORMATION` to the mounted ext4 superblock.
-fn set_volume_label(request: SetVolumeRequest) -> Result<(), NTSTATUS> {
+fn set_volume_label(request: SetVolumeRequest) -> DriverResult<()> {
     let length = request.stack.length().as_usize();
     let input = system_buffer_input(request.target, length)?;
     let label = volume_label_from_file_fs_label(input.as_slice())?;
     let Some(mut vcb) = MountedVolumeDevice::vcb(request.device) else {
-        return Err(DriverError::InvalidDeviceRequest.ntstatus());
+        return Err(DriverError::InvalidDeviceRequest);
     };
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns a live VCB pointer stored in
@@ -179,36 +178,35 @@ fn set_volume_label(request: SetVolumeRequest) -> Result<(), NTSTATUS> {
 
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
+        .begin_transaction(crate::time::current_ext4_timestamp()?);
     transaction.set_volume_label(label);
-    transaction
-        .commit()
-        .map_err(|error| DriverError::from(error).ntstatus())?;
-    MountedVolumeDevice::refresh_vpb_label(request.device, vcb).ok_or(STATUS_INVALID_PARAMETER)
+    transaction.commit()?;
+    MountedVolumeDevice::refresh_vpb_label(request.device, vcb).ok_or(DriverError::InvalidParameter)
 }
 
 /// Decodes a Windows label information buffer into an ext4 volume label.
-fn volume_label_from_file_fs_label(input: &[u8]) -> Result<Ext4VolumeLabel, NTSTATUS> {
+fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel> {
     let header = core::mem::offset_of!(FILE_FS_LABEL_INFORMATION, VolumeLabel);
     if input.len() < header {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     }
+    let input = LittleEndianInput::new(input);
     let label_length =
-        usize::try_from(read_u32(input, 0)?).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        usize::try_from(input.read_u32(0)?).map_err(|_| DriverError::InvalidParameter)?;
     if !label_length.is_multiple_of(core::mem::size_of::<u16>()) {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
     let end = header
         .checked_add(label_length)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    let label_input = input.get(header..end).ok_or(STATUS_BUFFER_TOO_SMALL)?;
+        .ok_or(DriverError::InvalidParameter)?;
+    let label_input = input.range(header, end - header)?;
     let mut label = Vec::new();
     for unit in label_input.chunks_exact(core::mem::size_of::<u16>()) {
-        let array: [u8; 2] = unit.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let array: [u8; 2] = unit.try_into().map_err(|_| DriverError::InvalidParameter)?;
         let unit = u16::from_le_bytes(array);
-        label.push(u8::try_from(unit).map_err(|_| STATUS_NOT_SUPPORTED)?);
+        label.push(u8::try_from(unit).map_err(|_| DriverError::NotSupported)?);
     }
-    Ext4VolumeLabel::new(label.as_slice()).map_err(|error| DriverError::from(error).ntstatus())
+    Ok(Ext4VolumeLabel::new(label.as_slice())?)
 }
 
 /// Packs `FILE_FS_VOLUME_INFORMATION`.
@@ -216,19 +214,19 @@ fn pack_volume_information(
     vcb: &VolumeControlBlock,
     buffer: core::ptr::NonNull<c_void>,
     length: usize,
-) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+) -> DriverResult<wdk_sys::ULONG_PTR> {
     let label = vcb.volume_label();
     let label_bytes = label.bytes();
     let header = core::mem::offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
     let label_len = label_bytes
         .len()
         .checked_mul(core::mem::size_of::<u16>())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     let required = header
         .checked_add(label_len)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     if length < required {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     }
 
     let info = unsafe {
@@ -239,10 +237,10 @@ fn pack_volume_information(
             .cast::<FILE_FS_VOLUME_INFORMATION>()
             .as_mut()
     }
-    .ok_or(STATUS_INVALID_PARAMETER)?;
+    .ok_or(DriverError::InvalidParameter)?;
     info.VolumeCreationTime = LARGE_INTEGER { QuadPart: 0 };
-    info.VolumeSerialNumber = vcb.serial_number().ok_or(STATUS_INVALID_PARAMETER)?;
-    info.VolumeLabelLength = u32::try_from(label_len).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    info.VolumeSerialNumber = vcb.serial_number().ok_or(DriverError::InvalidParameter)?;
+    info.VolumeLabelLength = u32::try_from(label_len).map_err(|_| DriverError::InvalidParameter)?;
     info.SupportsObjects = 0;
 
     let output = unsafe {
@@ -250,9 +248,8 @@ fn pack_volume_information(
         // above, and is reinterpreted only as bytes for label writing.
         core::slice::from_raw_parts_mut(buffer.as_ptr().cast::<u8>(), required)
     };
-    let label_output = output
-        .get_mut(header..required)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let mut output = LittleEndianOutput::new(output);
+    let label_output = output.range_mut(header, required - header)?;
     for (chunk, byte) in label_output
         .chunks_exact_mut(2)
         .zip(label_bytes.iter().copied())
@@ -267,23 +264,23 @@ fn pack_size_information(
     vcb: &VolumeControlBlock,
     buffer: core::ptr::NonNull<c_void>,
     length: usize,
-) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+) -> DriverResult<wdk_sys::ULONG_PTR> {
     if length < core::mem::size_of::<FILE_FS_SIZE_INFORMATION>() {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     }
     let superblock = vcb.volume().superblock();
     let info = unsafe {
         // SAFETY: The caller supplied at least FILE_FS_SIZE_INFORMATION bytes.
         buffer.as_ptr().cast::<FILE_FS_SIZE_INFORMATION>().as_mut()
     }
-    .ok_or(STATUS_INVALID_PARAMETER)?;
+    .ok_or(DriverError::InvalidParameter)?;
     info.TotalAllocationUnits = LARGE_INTEGER {
         QuadPart: i64::try_from(superblock.cluster_count().as_u64())
-            .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            .map_err(|_| DriverError::InvalidParameter)?,
     };
     info.AvailableAllocationUnits = LARGE_INTEGER {
         QuadPart: i64::try_from(superblock.free_cluster_count().as_u64())
-            .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            .map_err(|_| DriverError::InvalidParameter)?,
     };
     info.SectorsPerAllocationUnit = sectors_per_allocation_unit(superblock.cluster_size())?;
     info.BytesPerSector = BYTES_PER_SECTOR;
@@ -294,9 +291,9 @@ fn pack_size_information(
 fn pack_device_information(
     buffer: core::ptr::NonNull<c_void>,
     length: usize,
-) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+) -> DriverResult<wdk_sys::ULONG_PTR> {
     if length < core::mem::size_of::<FILE_FS_DEVICE_INFORMATION>() {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     }
     let info = unsafe {
         // SAFETY: The caller supplied at least FILE_FS_DEVICE_INFORMATION
@@ -306,7 +303,7 @@ fn pack_device_information(
             .cast::<FILE_FS_DEVICE_INFORMATION>()
             .as_mut()
     }
-    .ok_or(STATUS_INVALID_PARAMETER)?;
+    .ok_or(DriverError::InvalidParameter)?;
     info.DeviceType = wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM;
     info.Characteristics = 0;
     information_length(core::mem::size_of::<FILE_FS_DEVICE_INFORMATION>())
@@ -317,14 +314,14 @@ fn pack_full_size_information(
     vcb: &VolumeControlBlock,
     buffer: core::ptr::NonNull<c_void>,
     length: usize,
-) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+) -> DriverResult<wdk_sys::ULONG_PTR> {
     if length < core::mem::size_of::<FILE_FS_FULL_SIZE_INFORMATION>() {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     }
     let superblock = vcb.volume().superblock();
     let available = LARGE_INTEGER {
         QuadPart: i64::try_from(superblock.free_cluster_count().as_u64())
-            .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            .map_err(|_| DriverError::InvalidParameter)?,
     };
     let info = unsafe {
         // SAFETY: The caller supplied at least FILE_FS_FULL_SIZE_INFORMATION
@@ -334,10 +331,10 @@ fn pack_full_size_information(
             .cast::<FILE_FS_FULL_SIZE_INFORMATION>()
             .as_mut()
     }
-    .ok_or(STATUS_INVALID_PARAMETER)?;
+    .ok_or(DriverError::InvalidParameter)?;
     info.TotalAllocationUnits = LARGE_INTEGER {
         QuadPart: i64::try_from(superblock.cluster_count().as_u64())
-            .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            .map_err(|_| DriverError::InvalidParameter)?,
     };
     info.CallerAvailableAllocationUnits = available;
     info.ActualAvailableAllocationUnits = available;
@@ -350,17 +347,17 @@ fn pack_full_size_information(
 fn pack_attribute_information(
     buffer: core::ptr::NonNull<c_void>,
     length: usize,
-) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
+) -> DriverResult<wdk_sys::ULONG_PTR> {
     let header = core::mem::offset_of!(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
     let name_len = FILE_SYSTEM_NAME
         .len()
         .checked_mul(core::mem::size_of::<u16>())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     let required = header
         .checked_add(name_len)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     if length < required {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     }
     let info = unsafe {
         // SAFETY: The system buffer is writable for the requested query and the
@@ -370,23 +367,23 @@ fn pack_attribute_information(
             .cast::<FILE_FS_ATTRIBUTE_INFORMATION>()
             .as_mut()
     }
-    .ok_or(STATUS_INVALID_PARAMETER)?;
+    .ok_or(DriverError::InvalidParameter)?;
     info.FileSystemAttributes = FILE_CASE_SENSITIVE_SEARCH
         | FILE_CASE_PRESERVED_NAMES
         | FILE_UNICODE_ON_DISK
         | FILE_SUPPORTS_REPARSE_POINTS
         | FILE_SUPPORTS_EXTENDED_ATTRIBUTES;
     info.MaximumComponentNameLength = 255;
-    info.FileSystemNameLength = u32::try_from(name_len).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    info.FileSystemNameLength =
+        u32::try_from(name_len).map_err(|_| DriverError::InvalidParameter)?;
 
     let output = unsafe {
         // SAFETY: The system buffer is valid for `required` bytes by the check
         // above, and is reinterpreted only as bytes for name writing.
         core::slice::from_raw_parts_mut(buffer.as_ptr().cast::<u8>(), required)
     };
-    let name_output = output
-        .get_mut(header..required)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let mut output = LittleEndianOutput::new(output);
+    let name_output = output.range_mut(header, required - header)?;
     for (chunk, unit) in name_output
         .chunks_exact_mut(2)
         .zip(FILE_SYSTEM_NAME.iter().copied())
@@ -397,13 +394,12 @@ fn pack_attribute_information(
 }
 
 /// Returns the set-volume system buffer.
-fn system_buffer_input(
-    target: DispatchTarget,
-    length: usize,
-) -> Result<SystemBufferInput, NTSTATUS> {
-    let buffer = target.system_buffer().ok_or(STATUS_INVALID_PARAMETER)?;
-    if length > usize::try_from(isize::MAX).map_err(|_| STATUS_INVALID_PARAMETER)? {
-        return Err(STATUS_INVALID_PARAMETER);
+fn system_buffer_input(target: DispatchTarget, length: usize) -> DriverResult<SystemBufferInput> {
+    let buffer = target
+        .system_buffer()
+        .ok_or(DriverError::InvalidParameter)?;
+    if length > usize::try_from(isize::MAX).map_err(|_| DriverError::InvalidParameter)? {
+        return Err(DriverError::InvalidParameter);
     }
     Ok(SystemBufferInput {
         buffer: buffer.cast(),
@@ -411,34 +407,26 @@ fn system_buffer_input(
     })
 }
 
-/// Reads a little-endian `u32`.
-fn read_u32(input: &[u8], offset: usize) -> Result<u32, NTSTATUS> {
-    let end = offset
-        .checked_add(core::mem::size_of::<u32>())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    let bytes = input.get(offset..end).ok_or(STATUS_INVALID_PARAMETER)?;
-    let array: [u8; 4] = bytes.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
-    Ok(u32::from_le_bytes(array))
-}
-
 /// Returns sectors per ext4 allocation cluster for Windows allocation units.
-fn sectors_per_allocation_unit(cluster_size: ClusterSize) -> Result<u32, NTSTATUS> {
+fn sectors_per_allocation_unit(cluster_size: ClusterSize) -> DriverResult<u32> {
     cluster_size
         .bytes()
         .checked_div(BYTES_PER_SECTOR)
         .filter(|sectors| *sectors != 0)
-        .ok_or(STATUS_INVALID_PARAMETER)
+        .ok_or(DriverError::InvalidParameter)
 }
 
 /// Converts a byte count to `IO_STATUS_BLOCK::Information`.
-fn information_length(value: usize) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
-    wdk_sys::ULONG_PTR::try_from(value).map_err(|_| STATUS_INVALID_PARAMETER)
+fn information_length(value: usize) -> DriverResult<wdk_sys::ULONG_PTR> {
+    wdk_sys::ULONG_PTR::try_from(value).map_err(|_| DriverError::InvalidParameter)
 }
 
 #[cfg(test)]
 mod tests {
     use alloc::{vec, vec::Vec};
     use core::ptr::NonNull;
+
+    use crate::{status::DriverError, wire::LittleEndianInput};
 
     use super::{pack_device_information, volume_label_from_file_fs_label};
 
@@ -457,7 +445,7 @@ mod tests {
         let input = vec![1, 0, 0, 0, b'E'];
         assert_eq!(
             volume_label_from_file_fs_label(input.as_slice()),
-            Err(wdk_sys::STATUS_INVALID_PARAMETER)
+            Err(DriverError::InvalidParameter)
         );
     }
 
@@ -466,7 +454,7 @@ mod tests {
         let input = vec![2, 0, 0, 0, 0x00, 0x01];
         assert_eq!(
             volume_label_from_file_fs_label(input.as_slice()),
-            Err(wdk_sys::STATUS_NOT_SUPPORTED)
+            Err(DriverError::NotSupported)
         );
     }
 
@@ -475,7 +463,7 @@ mod tests {
         let input = label_information_bytes(&[0]);
         assert_eq!(
             volume_label_from_file_fs_label(input.as_slice()),
-            Err(wdk_sys::STATUS_INVALID_PARAMETER)
+            Err(DriverError::InvalidParameter)
         );
     }
 
@@ -493,11 +481,12 @@ mod tests {
                 if let Ok(expected) = expected {
                     assert_eq!(written, expected);
                 }
+                let output = LittleEndianInput::new(buffer.as_slice());
                 assert_eq!(
-                    read_test_u32(buffer.as_slice(), 0),
-                    Some(wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM)
+                    output.read_u32(0),
+                    Ok(wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM)
                 );
-                assert_eq!(read_test_u32(buffer.as_slice(), 4), Some(0));
+                assert_eq!(output.read_u32(4), Ok(0));
             }
         }
     }
@@ -519,13 +508,5 @@ mod tests {
             }
         }
         input
-    }
-
-    /// Reads a little-endian u32 from test bytes.
-    fn read_test_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-        let end = offset.checked_add(core::mem::size_of::<u32>())?;
-        let slice = bytes.get(offset..end)?;
-        let array: [u8; 4] = slice.try_into().ok()?;
-        Some(u32::from_le_bytes(array))
     }
 }
