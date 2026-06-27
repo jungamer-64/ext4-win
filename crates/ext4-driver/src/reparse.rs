@@ -4,17 +4,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use ext4_core::{LoadedNode, NodeId, SymlinkNodeId, SymlinkTarget};
-use wdk_sys::{
-    NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
-    STATUS_SUCCESS,
-};
+use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
 
 use crate::irp::{DispatchTarget, FileSystemControlStack};
 use crate::metadata;
 use crate::state::{
     FileControlBlock, OpenedPath, VolumeControlBlock, context_control_block, file_control_block,
 };
-use crate::status::DriverError;
+use crate::status::{DriverError, DriverResult};
 
 /// `FSCTL_GET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 pub(crate) const FSCTL_GET_REPARSE_POINT: wdk_sys::ULONG = 589_992;
@@ -24,11 +21,6 @@ pub(crate) const FSCTL_SET_REPARSE_POINT: wdk_sys::ULONG = 589_988;
 
 /// `FSCTL_DELETE_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 43, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 pub(crate) const FSCTL_DELETE_REPARSE_POINT: wdk_sys::ULONG = 589_996;
-
-/// The opened node is not a reparse point.
-const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = ntstatus(0xC000_0275);
-/// The caller supplied a reparse tag owned by another handler.
-const STATUS_IO_REPARSE_TAG_NOT_HANDLED: NTSTATUS = ntstatus(0xC000_0279);
 
 /// Reparse buffer header before the tag-specific payload.
 const REPARSE_DATA_BUFFER_HEADER_SIZE: usize = 8;
@@ -42,18 +34,16 @@ const SYMLINK_PATH_BUFFER_OFFSET: usize =
 pub(crate) fn get_reparse_point(target: DispatchTarget, stack: FileSystemControlStack) -> NTSTATUS {
     match read_symlink_target(stack).and_then(|symlink_target| {
         let length = stack.output_buffer_length().as_usize();
-        let mut output = target
-            .data_buffer(length)
-            .map_err(|error| error.ntstatus())?;
+        let mut output = target.data_buffer(length)?;
         let written =
             pack_symlink_reparse_buffer(symlink_target.as_slice(), output.as_mut_slice())?;
         target.set_information(
-            wdk_sys::ULONG_PTR::try_from(written).map_err(|_| STATUS_INVALID_PARAMETER)?,
+            wdk_sys::ULONG_PTR::try_from(written).map_err(|_| DriverError::InvalidParameter)?,
         );
         Ok(())
     }) {
         Ok(()) => STATUS_SUCCESS,
-        Err(status) => status,
+        Err(error) => error.ntstatus(),
     }
 }
 
@@ -66,13 +56,13 @@ pub(crate) fn set_reparse_point(target: DispatchTarget, stack: FileSystemControl
             target.set_information(0);
             STATUS_SUCCESS
         }
-        Err(status) => status,
+        Err(error) => error.ntstatus(),
     }
 }
 
 /// Reads the target bytes for the symlink opened by the FSCTL.
-fn read_symlink_target(stack: FileSystemControlStack) -> Result<Vec<u8>, NTSTATUS> {
-    let fcb = file_control_block(stack.file_object()).map_err(DriverError::ntstatus)?;
+fn read_symlink_target(stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
+    let fcb = file_control_block(stack.file_object())?;
     let fcb = unsafe {
         // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
         // until close releases it, and this FSCTL runs while the FILE_OBJECT
@@ -80,38 +70,28 @@ fn read_symlink_target(stack: FileSystemControlStack) -> Result<Vec<u8>, NTSTATU
         fcb.as_ref()
     };
     let NodeId::Symlink(symlink_id) = fcb.node() else {
-        return Err(STATUS_NOT_A_REPARSE_POINT);
+        return Err(DriverError::NotAReparsePoint);
     };
     let vcb = volume_control_block(fcb);
     read_core_symlink(vcb, symlink_id)
 }
 
 /// Reads a symlink inode through ext4-core.
-fn read_core_symlink(
-    vcb: &VolumeControlBlock,
-    symlink_id: SymlinkNodeId,
-) -> Result<Vec<u8>, NTSTATUS> {
-    let node = vcb
-        .volume()
-        .load_node(symlink_id.inode())
-        .map_err(|error| DriverError::from(error).ntstatus())?;
+fn read_core_symlink(vcb: &VolumeControlBlock, symlink_id: SymlinkNodeId) -> DriverResult<Vec<u8>> {
+    let node = vcb.volume().load_node(symlink_id.inode())?;
     let LoadedNode::Symlink(symlink) = node else {
-        return Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus());
+        return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
     };
-    vcb.volume()
-        .read_symlink(&symlink)
-        .map_err(|error| DriverError::from(error).ntstatus())
+    Ok(vcb.volume().read_symlink(&symlink)?)
 }
 
 /// Parses a Windows symbolic-link reparse input buffer into an ext4 symlink target.
 fn parse_symlink_reparse_target(
     target: DispatchTarget,
     stack: FileSystemControlStack,
-) -> Result<SymlinkTarget, NTSTATUS> {
+) -> DriverResult<SymlinkTarget> {
     let length = stack.input_buffer_length().as_usize();
-    let input = target
-        .data_buffer(length)
-        .map_err(|error| error.ntstatus())?;
+    let input = target.data_buffer(length)?;
     parse_symlink_reparse_buffer(input.as_slice())
 }
 
@@ -119,15 +99,15 @@ fn parse_symlink_reparse_target(
 fn replace_opened_path_with_symlink(
     stack: FileSystemControlStack,
     target: &SymlinkTarget,
-) -> Result<(), NTSTATUS> {
-    let mut fcb = file_control_block(stack.file_object()).map_err(DriverError::ntstatus)?;
+) -> DriverResult<()> {
+    let mut fcb = file_control_block(stack.file_object())?;
     let fcb = unsafe {
         // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
         // until close releases it, and this FSCTL runs while the FILE_OBJECT
         // is active.
         fcb.as_mut()
     };
-    let mut ccb = context_control_block(stack.file_object()).map_err(DriverError::ntstatus)?;
+    let mut ccb = context_control_block(stack.file_object())?;
     let ccb = unsafe {
         // SAFETY: Successful create stores Box<ContextControlBlock> in
         // FsContext2 until close releases it, and this FSCTL runs while the
@@ -135,7 +115,7 @@ fn replace_opened_path_with_symlink(
         ccb.as_mut()
     };
     let OpenedPath::Child { parent, name } = ccb.path().clone() else {
-        return Err(STATUS_NOT_SUPPORTED);
+        return Err(DriverError::NotSupported);
     };
 
     let mut vcb = fcb.volume();
@@ -147,33 +127,20 @@ fn replace_opened_path_with_symlink(
     };
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
-    let parent_directory = transaction
-        .directory(parent)
-        .map_err(|error| DriverError::from(error).ntstatus())?;
+        .begin_transaction(crate::time::current_ext4_timestamp()?);
+    let parent_directory = transaction.directory(parent)?;
     match fcb.node() {
-        NodeId::File(_) => transaction
-            .unlink_file(parent_directory, &name)
-            .map_err(|error| DriverError::from(error).ntstatus())?,
-        NodeId::Directory(_) => transaction
-            .remove_empty_directory(parent_directory, &name)
-            .map_err(|error| DriverError::from(error).ntstatus())?,
-        NodeId::Symlink(_) => transaction
-            .remove_symlink(parent_directory, &name)
-            .map_err(|error| DriverError::from(error).ntstatus())?,
+        NodeId::File(_) => transaction.unlink_file(parent_directory, &name)?,
+        NodeId::Directory(_) => transaction.remove_empty_directory(parent_directory, &name)?,
+        NodeId::Symlink(_) => transaction.remove_symlink(parent_directory, &name)?,
     }
-    let symlink = transaction
-        .create_symlink(
-            parent_directory,
-            &name,
-            target,
-            metadata::default_symlink_metadata()
-                .map_err(|error| DriverError::from(error).ntstatus())?,
-        )
-        .map_err(|error| DriverError::from(error).ntstatus())?;
-    transaction
-        .commit()
-        .map_err(|error| DriverError::from(error).ntstatus())?;
+    let symlink = transaction.create_symlink(
+        parent_directory,
+        &name,
+        target,
+        metadata::default_symlink_metadata()?,
+    )?;
+    transaction.commit()?;
     let node = NodeId::Symlink(symlink.id());
     fcb.replace_node(node);
     ccb.replace_node(node);
@@ -190,24 +157,26 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
 }
 
 /// Packs ext4 symlink bytes into a Windows symbolic-link reparse buffer.
-fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> Result<usize, NTSTATUS> {
-    let target = core::str::from_utf8(target).map_err(|_| STATUS_NOT_SUPPORTED)?;
+fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> DriverResult<usize> {
+    let target = core::str::from_utf8(target).map_err(|_| DriverError::NotSupported)?;
     let path: Vec<u16> = target.encode_utf16().collect();
     let path_bytes = utf16_byte_len(path.as_slice())?;
-    let print_name_offset = u16::try_from(path_bytes).map_err(|_| STATUS_NOT_SUPPORTED)?;
-    let path_buffer_bytes = path_bytes.checked_mul(2).ok_or(STATUS_INVALID_PARAMETER)?;
+    let print_name_offset = u16::try_from(path_bytes).map_err(|_| DriverError::NotSupported)?;
+    let path_buffer_bytes = path_bytes
+        .checked_mul(2)
+        .ok_or(DriverError::InvalidParameter)?;
     let reparse_data_length = SYMLINK_REPARSE_BUFFER_HEADER_SIZE
         .checked_add(path_buffer_bytes)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     let total_length = REPARSE_DATA_BUFFER_HEADER_SIZE
         .checked_add(reparse_data_length)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     if output.len() < total_length {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     }
     let reparse_data_length =
-        u16::try_from(reparse_data_length).map_err(|_| STATUS_NOT_SUPPORTED)?;
-    let path_bytes = u16::try_from(path_bytes).map_err(|_| STATUS_NOT_SUPPORTED)?;
+        u16::try_from(reparse_data_length).map_err(|_| DriverError::NotSupported)?;
+    let path_bytes = u16::try_from(path_bytes).map_err(|_| DriverError::NotSupported)?;
     let flags = if is_relative_symlink_target(target.as_bytes()) {
         wdk_sys::SYMLINK_FLAG_RELATIVE
     } else {
@@ -227,47 +196,47 @@ fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> Result<usize
         output,
         SYMLINK_PATH_BUFFER_OFFSET
             .checked_add(usize::from(path_bytes))
-            .ok_or(STATUS_INVALID_PARAMETER)?,
+            .ok_or(DriverError::InvalidParameter)?,
         path.as_slice(),
     )?;
     Ok(total_length)
 }
 
 /// Parses a Windows symbolic-link reparse buffer.
-fn parse_symlink_reparse_buffer(input: &[u8]) -> Result<SymlinkTarget, NTSTATUS> {
+fn parse_symlink_reparse_buffer(input: &[u8]) -> DriverResult<SymlinkTarget> {
     let tag = read_u32(input, 0)?;
     if tag != wdk_sys::IO_REPARSE_TAG_SYMLINK {
-        return Err(STATUS_IO_REPARSE_TAG_NOT_HANDLED);
+        return Err(DriverError::ReparseTagNotHandled);
     }
     let reparse_data_length = usize::from(read_u16(input, 4)?);
     let total_length = REPARSE_DATA_BUFFER_HEADER_SIZE
         .checked_add(reparse_data_length)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     if input.len() < total_length {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     }
     if reparse_data_length < SYMLINK_REPARSE_BUFFER_HEADER_SIZE {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
 
     let substitute_name_offset = usize::from(read_u16(input, 8)?);
     let substitute_name_length = usize::from(read_u16(input, 10)?);
     let flags = read_u32(input, 16)?;
     if flags & !wdk_sys::SYMLINK_FLAG_RELATIVE != 0 {
-        return Err(STATUS_NOT_SUPPORTED);
+        return Err(DriverError::NotSupported);
     }
 
     let path_buffer_length = reparse_data_length
         .checked_sub(SYMLINK_REPARSE_BUFFER_HEADER_SIZE)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     let units = reparse_path_units(
         input,
         path_buffer_length,
         substitute_name_offset,
         substitute_name_length,
     )?;
-    let target = String::from_utf16(units.as_slice()).map_err(|_| STATUS_INVALID_PARAMETER)?;
-    SymlinkTarget::new(target.as_bytes()).map_err(|error| DriverError::from(error).ntstatus())
+    let target = String::from_utf16(units.as_slice()).map_err(|_| DriverError::InvalidParameter)?;
+    Ok(SymlinkTarget::new(target.as_bytes())?)
 }
 
 /// Reads a UTF-16 path slice from a symbolic-link reparse path buffer.
@@ -276,59 +245,67 @@ fn reparse_path_units(
     path_buffer_length: usize,
     offset: usize,
     length: usize,
-) -> Result<Vec<u16>, NTSTATUS> {
+) -> DriverResult<Vec<u16>> {
     if !offset.is_multiple_of(2) || !length.is_multiple_of(2) {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
     let path_buffer_end = SYMLINK_PATH_BUFFER_OFFSET
         .checked_add(path_buffer_length)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     let start = SYMLINK_PATH_BUFFER_OFFSET
         .checked_add(offset)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    let end = start.checked_add(length).ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
+    let end = start
+        .checked_add(length)
+        .ok_or(DriverError::InvalidParameter)?;
     if end > path_buffer_end {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
-    let bytes = input.get(start..end).ok_or(STATUS_BUFFER_TOO_SMALL)?;
+    let bytes = input.get(start..end).ok_or(DriverError::BufferTooSmall)?;
     let mut chunks = bytes.chunks_exact(core::mem::size_of::<u16>());
     let mut units = Vec::new();
     for chunk in &mut chunks {
-        let unit: [u8; 2] = chunk.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let unit: [u8; 2] = chunk
+            .try_into()
+            .map_err(|_| DriverError::InvalidParameter)?;
         units.push(u16::from_le_bytes(unit));
     }
     if !chunks.remainder().is_empty() {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
     Ok(units)
 }
 
 /// Reads a little-endian `u16` from an unaligned input buffer.
-fn read_u16(input: &[u8], offset: usize) -> Result<u16, NTSTATUS> {
+fn read_u16(input: &[u8], offset: usize) -> DriverResult<u16> {
     let end = offset
         .checked_add(core::mem::size_of::<u16>())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    let bytes = input.get(offset..end).ok_or(STATUS_BUFFER_TOO_SMALL)?;
-    let bytes: [u8; 2] = bytes.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
+    let bytes = input.get(offset..end).ok_or(DriverError::BufferTooSmall)?;
+    let bytes: [u8; 2] = bytes
+        .try_into()
+        .map_err(|_| DriverError::InvalidParameter)?;
     Ok(u16::from_le_bytes(bytes))
 }
 
 /// Reads a little-endian `u32` from an unaligned input buffer.
-fn read_u32(input: &[u8], offset: usize) -> Result<u32, NTSTATUS> {
+fn read_u32(input: &[u8], offset: usize) -> DriverResult<u32> {
     let end = offset
         .checked_add(core::mem::size_of::<u32>())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-    let bytes = input.get(offset..end).ok_or(STATUS_BUFFER_TOO_SMALL)?;
-    let bytes: [u8; 4] = bytes.try_into().map_err(|_| STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
+    let bytes = input.get(offset..end).ok_or(DriverError::BufferTooSmall)?;
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| DriverError::InvalidParameter)?;
     Ok(u32::from_le_bytes(bytes))
 }
 
 /// Returns the byte count for UTF-16 code units.
-fn utf16_byte_len(units: &[u16]) -> Result<usize, NTSTATUS> {
+fn utf16_byte_len(units: &[u16]) -> DriverResult<usize> {
     units
         .len()
         .checked_mul(core::mem::size_of::<u16>())
-        .ok_or(STATUS_INVALID_PARAMETER)
+        .ok_or(DriverError::InvalidParameter)
 }
 
 /// Returns whether a symlink target should carry `SYMLINK_FLAG_RELATIVE`.
@@ -342,42 +319,37 @@ fn is_relative_symlink_target(target: &[u8]) -> bool {
     true
 }
 
-/// Converts a hexadecimal NTSTATUS payload into the signed WDK alias.
-const fn ntstatus(value: u32) -> NTSTATUS {
-    i32::from_ne_bytes(value.to_ne_bytes())
-}
-
 /// Writes a little-endian `u16` into an unaligned output buffer.
-fn write_u16(output: &mut [u8], offset: usize, value: u16) -> Result<(), NTSTATUS> {
+fn write_u16(output: &mut [u8], offset: usize, value: u16) -> DriverResult<()> {
     let end = offset
         .checked_add(core::mem::size_of::<u16>())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     let Some(target) = output.get_mut(offset..end) else {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     };
     target.copy_from_slice(value.to_le_bytes().as_slice());
     Ok(())
 }
 
 /// Writes a little-endian `u32` into an unaligned output buffer.
-fn write_u32(output: &mut [u8], offset: usize, value: u32) -> Result<(), NTSTATUS> {
+fn write_u32(output: &mut [u8], offset: usize, value: u32) -> DriverResult<()> {
     let end = offset
         .checked_add(core::mem::size_of::<u32>())
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     let Some(target) = output.get_mut(offset..end) else {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     };
     target.copy_from_slice(value.to_le_bytes().as_slice());
     Ok(())
 }
 
 /// Writes UTF-16 code units into the reparse path buffer.
-fn write_utf16(output: &mut [u8], offset: usize, units: &[u16]) -> Result<(), NTSTATUS> {
+fn write_utf16(output: &mut [u8], offset: usize, units: &[u16]) -> DriverResult<()> {
     for (index, unit) in units.iter().enumerate() {
         let unit_offset = index
             .checked_mul(core::mem::size_of::<u16>())
             .and_then(|byte_offset| offset.checked_add(byte_offset))
-            .ok_or(STATUS_INVALID_PARAMETER)?;
+            .ok_or(DriverError::InvalidParameter)?;
         write_u16(output, unit_offset, *unit)?;
     }
     Ok(())
@@ -388,9 +360,11 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
+    use crate::status::DriverError;
+
     use super::{
-        STATUS_IO_REPARSE_TAG_NOT_HANDLED, SYMLINK_PATH_BUFFER_OFFSET, pack_symlink_reparse_buffer,
-        parse_symlink_reparse_buffer, write_u32,
+        SYMLINK_PATH_BUFFER_OFFSET, pack_symlink_reparse_buffer, parse_symlink_reparse_buffer,
+        write_u32,
     };
 
     fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -455,7 +429,7 @@ mod tests {
 
         assert_eq!(
             pack_symlink_reparse_buffer(b"target", output.as_mut_slice()),
-            Err(wdk_sys::STATUS_BUFFER_TOO_SMALL)
+            Err(DriverError::BufferTooSmall)
         );
     }
 
@@ -485,7 +459,7 @@ mod tests {
 
         assert_eq!(
             parse_symlink_reparse_buffer(input.as_slice()),
-            Err(STATUS_IO_REPARSE_TAG_NOT_HANDLED)
+            Err(DriverError::ReparseTagNotHandled)
         );
     }
 
@@ -500,7 +474,7 @@ mod tests {
 
         assert_eq!(
             parse_symlink_reparse_buffer(input.as_slice()),
-            Err(wdk_sys::STATUS_NOT_SUPPORTED)
+            Err(DriverError::NotSupported)
         );
     }
 }
