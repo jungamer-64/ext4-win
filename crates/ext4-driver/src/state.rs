@@ -3,6 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
+use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
 use ext4_core::{
@@ -217,17 +218,12 @@ impl VolumeControlBlock {
                 // zero in `close_file_control_block`.
                 fcb.as_mut()
             };
-            fcb_ref.increment_open()?;
+            fcb_ref.add_open_reference()?;
             return Some(fcb);
         }
 
         let fcb = Box::new(FileControlBlock::new(volume, node));
-        let mut fcb = NonNull::new(Box::into_raw(fcb))?;
-        let fcb_ref = unsafe {
-            // SAFETY: `fcb` was just allocated and is not aliased mutably.
-            fcb.as_mut()
-        };
-        fcb_ref.increment_open()?;
+        let fcb = NonNull::new(Box::into_raw(fcb))?;
         vcb.file_control_blocks.push(fcb);
         Some(fcb)
     }
@@ -246,9 +242,9 @@ impl VolumeControlBlock {
             // SAFETY: The FCB was found in this VCB's ownership table.
             fcb.as_mut()
         };
-        match fcb_ref.decrement_open() {
-            Some(FileControlBlockOpenState::StillOpen) => {}
-            Some(FileControlBlockOpenState::LastReference) | None => {
+        match fcb_ref.release_open_reference() {
+            FileControlBlockRelease::StillOpen => {}
+            FileControlBlockRelease::LastReference => {
                 let removed = self.file_control_blocks.swap_remove(index);
                 unsafe {
                     // SAFETY: The pointer was removed from the ownership table
@@ -433,11 +429,11 @@ pub(crate) struct FileControlBlock {
     /// I/O manager share-access accounting for this inode identity.
     share_access: SHARE_ACCESS,
     /// Number of open FILE_OBJECTs currently referencing this FCB.
-    open_count: u32,
+    open_count: NonZeroU32,
 }
 
 impl FileControlBlock {
-    /// Creates an FCB boundary value for a mounted node.
+    /// Creates an FCB boundary value for a mounted node with one open reference.
     pub(crate) const fn new(volume: NonNull<VolumeControlBlock>, node: NodeId) -> Self {
         Self {
             volume,
@@ -451,7 +447,7 @@ impl FileControlBlock {
                 SharedWrite: 0,
                 SharedDelete: 0,
             },
-            open_count: 0,
+            open_count: NonZeroU32::MIN,
         }
     }
 
@@ -502,26 +498,30 @@ impl FileControlBlock {
         }
     }
 
-    /// Increments the number of open FILE_OBJECT references.
-    fn increment_open(&mut self) -> Option<()> {
-        self.open_count = self.open_count.checked_add(1)?;
+    /// Adds one FILE_OBJECT reference to an already-open FCB.
+    fn add_open_reference(&mut self) -> Option<()> {
+        self.open_count = NonZeroU32::new(self.open_count.get().checked_add(1)?)?;
         Some(())
     }
 
-    /// Decrements the open reference count.
-    fn decrement_open(&mut self) -> Option<FileControlBlockOpenState> {
-        self.open_count = self.open_count.checked_sub(1)?;
-        if self.open_count == 0 {
-            Some(FileControlBlockOpenState::LastReference)
-        } else {
-            Some(FileControlBlockOpenState::StillOpen)
-        }
+    /// Releases one FILE_OBJECT reference from a non-empty FCB.
+    fn release_open_reference(&mut self) -> FileControlBlockRelease {
+        let Some(remaining) = self
+            .open_count
+            .get()
+            .checked_sub(1)
+            .and_then(NonZeroU32::new)
+        else {
+            return FileControlBlockRelease::LastReference;
+        };
+        self.open_count = remaining;
+        FileControlBlockRelease::StillOpen
     }
 }
 
 /// FCB lifetime state after releasing one open reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FileControlBlockOpenState {
+enum FileControlBlockRelease {
     /// Other FILE_OBJECTs still reference this FCB.
     StillOpen,
     /// The released reference was the final open reference.
@@ -723,25 +723,25 @@ mod tests {
 
     use ext4_core::{DirectoryNodeId, NodeId};
 
-    use super::{FileControlBlock, FileControlBlockOpenState, VolumeControlBlock};
+    use super::{FileControlBlock, FileControlBlockRelease, VolumeControlBlock};
 
     #[test]
-    fn file_control_block_open_count_tracks_last_reference() {
+    fn file_control_block_open_count_cannot_represent_zero() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
 
-        assert_eq!(fcb.decrement_open(), None);
-        assert_eq!(fcb.increment_open(), Some(()));
-        assert_eq!(fcb.increment_open(), Some(()));
+        assert_eq!(fcb.open_count.get(), 1);
+        assert_eq!(fcb.add_open_reference(), Some(()));
+        assert_eq!(fcb.open_count.get(), 2);
         assert_eq!(
-            fcb.decrement_open(),
-            Some(FileControlBlockOpenState::StillOpen)
+            fcb.release_open_reference(),
+            FileControlBlockRelease::StillOpen
         );
+        assert_eq!(fcb.open_count.get(), 1);
         assert_eq!(
-            fcb.decrement_open(),
-            Some(FileControlBlockOpenState::LastReference)
+            fcb.release_open_reference(),
+            FileControlBlockRelease::LastReference
         );
-        assert_eq!(fcb.decrement_open(), None);
     }
 
     #[test]
