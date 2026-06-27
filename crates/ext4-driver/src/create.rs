@@ -29,7 +29,10 @@ const UTF16_BACKSLASH: u16 = 0x005C;
 /// Handles create/open IRPs.
 pub(crate) fn dispatch(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(CreateRequest::decode) {
-        Ok(request) => open_or_create(request),
+        Ok(request) => match open_or_create(request) {
+            Ok(()) => STATUS_SUCCESS,
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
@@ -69,15 +72,7 @@ impl CreateRequest {
 }
 
 /// Opens or creates a root-relative ext4 object.
-fn open_or_create(request: CreateRequest) -> NTSTATUS {
-    match open_or_create_result(request) {
-        Ok(()) => STATUS_SUCCESS,
-        Err(error) => error.ntstatus(),
-    }
-}
-
-/// Opens or creates a root-relative ext4 object before NTSTATUS completion mapping.
-fn open_or_create_result(request: CreateRequest) -> DriverResult<()> {
+fn open_or_create(request: CreateRequest) -> DriverResult<()> {
     if request.parameters().ea_length().as_usize() != 0 {
         return Err(DriverError::NotSupported);
     }

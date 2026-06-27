@@ -3,9 +3,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use ext4_core::{LoadedNode, NodeId, SymlinkNodeId, SymlinkTarget};
-use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
-
 use crate::irp::{DispatchTarget, DriverCompletion, FileSystemControlStack};
 use crate::metadata;
 use crate::state::{
@@ -13,6 +10,7 @@ use crate::state::{
 };
 use crate::status::{DriverError, DriverResult};
 use crate::wire::{LittleEndianInput, LittleEndianOutput};
+use ext4_core::{LoadedNode, NodeId, SymlinkNodeId, SymlinkTarget};
 
 /// Reparse buffer header before the tag-specific payload.
 const REPARSE_DATA_BUFFER_HEADER_SIZE: usize = 8;
@@ -23,18 +21,7 @@ const SYMLINK_PATH_BUFFER_OFFSET: usize =
     REPARSE_DATA_BUFFER_HEADER_SIZE + SYMLINK_REPARSE_BUFFER_HEADER_SIZE;
 
 /// Handles `FSCTL_GET_REPARSE_POINT` for an opened ext4 symlink.
-pub(crate) fn get_reparse_point(target: DispatchTarget, stack: FileSystemControlStack) -> NTSTATUS {
-    match get_reparse_point_result(target, stack) {
-        Ok(completion) => {
-            target.complete(completion);
-            STATUS_SUCCESS
-        }
-        Err(error) => error.ntstatus(),
-    }
-}
-
-/// Handles GET_REPARSE_POINT before NTSTATUS completion mapping.
-fn get_reparse_point_result(
+pub(crate) fn get_reparse_point(
     target: DispatchTarget,
     stack: FileSystemControlStack,
 ) -> DriverResult<DriverCompletion> {
@@ -46,16 +33,13 @@ fn get_reparse_point_result(
 }
 
 /// Handles `FSCTL_SET_REPARSE_POINT` by replacing the opened node with an ext4 symlink.
-pub(crate) fn set_reparse_point(target: DispatchTarget, stack: FileSystemControlStack) -> NTSTATUS {
-    match parse_symlink_reparse_target(target, stack)
-        .and_then(|symlink_target| replace_opened_path_with_symlink(stack, &symlink_target))
-    {
-        Ok(()) => {
-            target.complete(DriverCompletion::EMPTY);
-            STATUS_SUCCESS
-        }
-        Err(error) => error.ntstatus(),
-    }
+pub(crate) fn set_reparse_point(
+    target: DispatchTarget,
+    stack: FileSystemControlStack,
+) -> DriverResult<DriverCompletion> {
+    let symlink_target = parse_symlink_reparse_target(target, stack)?;
+    replace_opened_path_with_symlink(stack, &symlink_target)?;
+    Ok(DriverCompletion::EMPTY)
 }
 
 /// Reads the target bytes for the symlink opened by the FSCTL.

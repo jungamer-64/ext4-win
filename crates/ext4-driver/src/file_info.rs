@@ -91,7 +91,13 @@ pub(crate) fn flush(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 /// Handles file information queries.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(QueryFileRequest::decode) {
-        Ok(request) => query_file_information(request),
+        Ok(request) => match query_file_information(request) {
+            Ok(completion) => {
+                request.target.complete(completion);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
@@ -99,7 +105,13 @@ pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 /// Handles file information mutations.
 pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(SetFileRequest::decode) {
-        Ok(request) => set_file_information(request),
+        Ok(request) => match set_file_information(request) {
+            Ok(completion) => {
+                request.target.complete(completion);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
@@ -109,7 +121,13 @@ pub(crate) fn directory_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp) {
         Ok(target) => match target.current_stack() {
             Ok(stack) if u32::from(stack.minor_function()) == wdk_sys::IRP_MN_QUERY_DIRECTORY => {
-                query_directory(target)
+                match query_directory(target) {
+                    Ok(completion) => {
+                        target.complete(completion);
+                        STATUS_SUCCESS
+                    }
+                    Err(error) => error.ntstatus(),
+                }
             }
             Ok(stack)
                 if u32::from(stack.minor_function()) == wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY
@@ -127,19 +145,18 @@ pub(crate) fn directory_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 
 /// Handles byte-range lock requests.
 pub(crate) fn lock_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    decoded_not_supported(device, irp)
+    match decoded_not_supported(device, irp) {
+        Ok(()) => DriverError::NotSupported.ntstatus(),
+        Err(error) => error.ntstatus(),
+    }
 }
 
 /// Rejects a decoded file-object request until its domain path exists.
-fn decoded_not_supported(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => {
-            let _device = target.device();
-            let _irp = target.irp();
-            DriverError::NotSupported.ntstatus()
-        }
-        Err(error) => error.ntstatus(),
-    }
+fn decoded_not_supported(device: PDEVICE_OBJECT, irp: PIRP) -> DriverResult<()> {
+    let target = DispatchTarget::decode(device, irp)?;
+    let _device = target.device();
+    let _irp = target.irp();
+    Ok(())
 }
 
 /// Decoded query-file-information request.
@@ -199,19 +216,8 @@ impl QueryDirectoryRequest {
     }
 }
 
-/// Handles fixed-size file information queries.
-fn query_file_information(request: QueryFileRequest) -> NTSTATUS {
-    match pack_file_information(request) {
-        Ok(completion) => {
-            request.target.complete(completion);
-            STATUS_SUCCESS
-        }
-        Err(error) => error.ntstatus(),
-    }
-}
-
 /// Packs one supported file information class.
-fn pack_file_information(request: QueryFileRequest) -> DriverResult<DriverCompletion> {
+fn query_file_information(request: QueryFileRequest) -> DriverResult<DriverCompletion> {
     let metadata = load_file_metadata(request.stack.file_object())?;
     let buffer = request
         .target
@@ -231,19 +237,8 @@ fn pack_file_information(request: QueryFileRequest) -> DriverResult<DriverComple
     }
 }
 
-/// Handles supported file information mutations.
-fn set_file_information(request: SetFileRequest) -> NTSTATUS {
-    match apply_file_information(request) {
-        Ok(()) => {
-            request.target.complete(DriverCompletion::EMPTY);
-            STATUS_SUCCESS
-        }
-        Err(error) => error.ntstatus(),
-    }
-}
-
 /// Applies one supported set-file-information class.
-fn apply_file_information(request: SetFileRequest) -> DriverResult<()> {
+fn set_file_information(request: SetFileRequest) -> DriverResult<DriverCompletion> {
     match request.stack.information_class() {
         SetFileInformationClass::Basic => set_basic_information(request),
         SetFileInformationClass::EndOfFile => set_end_of_file_information(request),
@@ -252,7 +247,8 @@ fn apply_file_information(request: SetFileRequest) -> DriverResult<()> {
         SetFileInformationClass::DispositionEx => Err(DriverError::NotSupported),
         SetFileInformationClass::Rename => set_rename_information(request),
         SetFileInformationClass::RenameEx => Err(DriverError::NotSupported),
-    }
+    }?;
+    Ok(DriverCompletion::EMPTY)
 }
 
 /// Applies FILE_BASIC_INFORMATION timestamps and overlay attributes.
@@ -428,22 +424,9 @@ fn set_regular_file_size(
     Ok(())
 }
 
-/// Handles directory enumeration queries.
-fn query_directory(target: DispatchTarget) -> NTSTATUS {
-    match QueryDirectoryRequest::decode(target) {
-        Ok(request) => match pack_directory_information(request) {
-            Ok(information) => {
-                target.complete(information);
-                STATUS_SUCCESS
-            }
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
-    }
-}
-
 /// Packs directory entries into the caller's query-directory buffer.
-fn pack_directory_information(request: QueryDirectoryRequest) -> DriverResult<DriverCompletion> {
+fn query_directory(target: DispatchTarget) -> DriverResult<DriverCompletion> {
+    let request = QueryDirectoryRequest::decode(target)?;
     let class = request.stack.information_class();
     let pattern = DirectoryPattern::from_stack(request.stack)?;
     let length = request.stack.length().as_usize();

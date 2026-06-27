@@ -46,7 +46,13 @@ const POSIX_RWX_BITS: u16 = 0o777;
 /// Handles IRP_MJ_QUERY_SECURITY.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(QuerySecurityRequest::decode) {
-        Ok(request) => query_security(request),
+        Ok(request) => match query_security(request) {
+            Ok(completion) => {
+                request.target.complete(completion);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
@@ -54,7 +60,13 @@ pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 /// Handles IRP_MJ_SET_SECURITY.
 pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(SetSecurityRequest::decode) {
-        Ok(request) => set_security(request),
+        Ok(request) => match set_security(request) {
+            Ok(completion) => {
+                request.target.complete(completion);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
@@ -81,6 +93,8 @@ impl QuerySecurityRequest {
 /// Decoded set-security request.
 #[derive(Clone, Copy, Debug)]
 struct SetSecurityRequest {
+    /// Dispatch target receiving completion.
+    target: DispatchTarget,
     /// Decoded set-security stack.
     stack: SetSecurityStack,
 }
@@ -89,6 +103,7 @@ impl SetSecurityRequest {
     /// Decodes a set-security request.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         Ok(Self {
+            target,
             stack: target.current_stack()?.set_security()?,
         })
     }
@@ -199,18 +214,7 @@ impl DaclPermissionBuilder {
 }
 
 /// Performs a security descriptor query.
-fn query_security(request: QuerySecurityRequest) -> NTSTATUS {
-    match query_security_result(request) {
-        Ok(completion) => {
-            request.target.complete(completion);
-            STATUS_SUCCESS
-        }
-        Err(error) => error.ntstatus(),
-    }
-}
-
-/// Performs QUERY_SECURITY before NTSTATUS completion mapping.
-fn query_security_result(request: QuerySecurityRequest) -> DriverResult<DriverCompletion> {
+fn query_security(request: QuerySecurityRequest) -> DriverResult<DriverCompletion> {
     let security = load_ext4_security(request.stack.file_object())?;
     let descriptor = security_descriptor(security, request.stack.selection())?;
     let required = descriptor.len();
@@ -224,40 +228,35 @@ fn query_security_result(request: QuerySecurityRequest) -> DriverResult<DriverCo
 }
 
 /// Performs a POSIX security mutation from a Windows security descriptor.
-fn set_security(request: SetSecurityRequest) -> NTSTATUS {
-    match load_ext4_security_context(request.stack.file_object()).and_then(|context| {
-        let descriptor = security_descriptor_bytes(
-            request.stack.security_descriptor(),
-            request.stack.selection(),
-        )?;
-        let security = security_from_descriptor(
-            descriptor.as_slice(),
-            request.stack.selection(),
-            context.security,
-        )?;
-        if security == context.security {
-            return Ok(());
-        }
-
-        let mut vcb = context.volume;
-        let vcb = unsafe {
-            // SAFETY: FCBs are constructed only from live mounted VCB pointers
-            // and remain valid while file objects are open. The mutable borrow
-            // is the transaction boundary for this synchronous security
-            // mutation.
-            vcb.as_mut()
-        };
-        let mut transaction = vcb
-            .volume_mut()
-            .begin_transaction(crate::time::current_ext4_timestamp()?);
-        let node = transaction.node(context.node)?;
-        transaction.set_posix_security(node, security)?;
-        transaction.commit()?;
-        Ok(())
-    }) {
-        Ok(()) => STATUS_SUCCESS,
-        Err(error) => error.ntstatus(),
+fn set_security(request: SetSecurityRequest) -> DriverResult<DriverCompletion> {
+    let context = load_ext4_security_context(request.stack.file_object())?;
+    let descriptor = security_descriptor_bytes(
+        request.stack.security_descriptor(),
+        request.stack.selection(),
+    )?;
+    let security = security_from_descriptor(
+        descriptor.as_slice(),
+        request.stack.selection(),
+        context.security,
+    )?;
+    if security == context.security {
+        return Ok(DriverCompletion::EMPTY);
     }
+
+    let mut vcb = context.volume;
+    let vcb = unsafe {
+        // SAFETY: FCBs are constructed only from live mounted VCB pointers
+        // and remain valid while file objects are open. The mutable borrow is
+        // the transaction boundary for this synchronous security mutation.
+        vcb.as_mut()
+    };
+    let mut transaction = vcb
+        .volume_mut()
+        .begin_transaction(crate::time::current_ext4_timestamp()?);
+    let node = transaction.node(context.node)?;
+    transaction.set_posix_security(node, security)?;
+    transaction.commit()?;
+    Ok(DriverCompletion::EMPTY)
 }
 
 /// Loads ext4 security metadata for an opened node.
