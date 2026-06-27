@@ -286,7 +286,7 @@ impl CurrentIrpStackLocation {
         Ok(QueryFileStack {
             file_object: self.file_object()?,
             length: IrpBufferLength::from_ulong(query.Length)?,
-            information_class: query.FileInformationClass,
+            information_class: QueryFileInformationClass::from_raw(query.FileInformationClass)?,
         })
     }
 
@@ -305,7 +305,7 @@ impl CurrentIrpStackLocation {
         Ok(SetFileStack {
             file_object: self.file_object()?,
             length: IrpBufferLength::from_ulong(set.Length)?,
-            information_class: set.FileInformationClass,
+            information_class: SetFileInformationClass::from_raw(set.FileInformationClass)?,
         })
     }
 
@@ -345,7 +345,7 @@ impl CurrentIrpStackLocation {
             pattern,
             entry_emission,
             length: IrpBufferLength::from_ulong(query.Length)?,
-            information_class: query.FileInformationClass,
+            information_class: DirectoryInformationClass::from_raw(query.FileInformationClass)?,
         })
     }
 
@@ -898,6 +898,95 @@ const FILE_FS_ATTRIBUTE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 5;
 /// `FileFsFullSizeInformation`.
 const FILE_FS_FULL_SIZE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 7;
 
+/// Decoded query-file information class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryFileInformationClass {
+    /// Windows `FileBasicInformation`.
+    Basic,
+    /// Windows `FileStandardInformation`.
+    Standard,
+    /// Windows `FileInternalInformation`.
+    Internal,
+    /// Windows `FilePositionInformation`.
+    Position,
+    /// Windows `FileNetworkOpenInformation`.
+    NetworkOpen,
+}
+
+impl QueryFileInformationClass {
+    /// Decodes a raw WDK file information class for fixed file queries.
+    fn from_raw(value: wdk_sys::FILE_INFORMATION_CLASS) -> Result<Self, DriverError> {
+        match value {
+            wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => Ok(Self::Basic),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation => Ok(Self::Standard),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileInternalInformation => Ok(Self::Internal),
+            wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => Ok(Self::Position),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileNetworkOpenInformation => Ok(Self::NetworkOpen),
+            _ => Err(DriverError::InvalidInfoClass),
+        }
+    }
+}
+
+/// Decoded set-file information class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SetFileInformationClass {
+    /// Windows `FileBasicInformation`.
+    Basic,
+    /// Windows `FileEndOfFileInformation`.
+    EndOfFile,
+    /// Windows `FileAllocationInformation`.
+    Allocation,
+    /// Windows `FileDispositionInformation`.
+    Disposition,
+    /// Windows `FileDispositionInformationEx`.
+    DispositionEx,
+    /// Windows `FileRenameInformation`.
+    Rename,
+    /// Windows `FileRenameInformationEx`.
+    RenameEx,
+}
+
+impl SetFileInformationClass {
+    /// Decodes a raw WDK file information class for file mutations.
+    fn from_raw(value: wdk_sys::FILE_INFORMATION_CLASS) -> Result<Self, DriverError> {
+        match value {
+            wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => Ok(Self::Basic),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation => Ok(Self::EndOfFile),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileAllocationInformation => Ok(Self::Allocation),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformation => Ok(Self::Disposition),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformationEx => {
+                Ok(Self::DispositionEx)
+            }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation => Ok(Self::Rename),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformationEx => Ok(Self::RenameEx),
+            _ => Err(DriverError::InvalidInfoClass),
+        }
+    }
+}
+
+/// Decoded query-directory information class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryInformationClass {
+    /// Windows `FileDirectoryInformation`.
+    Directory,
+    /// Windows `FileFullDirectoryInformation`.
+    Full,
+    /// Windows `FileBothDirectoryInformation`.
+    Both,
+}
+
+impl DirectoryInformationClass {
+    /// Decodes a raw WDK file information class for directory enumeration.
+    fn from_raw(value: wdk_sys::FILE_INFORMATION_CLASS) -> Result<Self, DriverError> {
+        match value {
+            wdk_sys::_FILE_INFORMATION_CLASS::FileDirectoryInformation => Ok(Self::Directory),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileFullDirectoryInformation => Ok(Self::Full),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileBothDirectoryInformation => Ok(Self::Both),
+            _ => Err(DriverError::InvalidInfoClass),
+        }
+    }
+}
+
 /// Decoded mount-volume stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MountVolumeStack {
@@ -1029,7 +1118,7 @@ pub(crate) struct QueryFileStack {
     /// Output buffer length.
     length: IrpBufferLength,
     /// Requested file information class.
-    information_class: wdk_sys::FILE_INFORMATION_CLASS,
+    information_class: QueryFileInformationClass,
 }
 
 /// Decoded set-file-information stack parameters.
@@ -1040,7 +1129,7 @@ pub(crate) struct SetFileStack {
     /// Input buffer length.
     length: IrpBufferLength,
     /// Requested file information class.
-    information_class: wdk_sys::FILE_INFORMATION_CLASS,
+    information_class: SetFileInformationClass,
 }
 
 /// Decoded query-directory stack parameters.
@@ -1057,7 +1146,7 @@ pub(crate) struct QueryDirectoryStack {
     /// Output buffer length.
     length: IrpBufferLength,
     /// Requested directory information class.
-    information_class: wdk_sys::FILE_INFORMATION_CLASS,
+    information_class: DirectoryInformationClass,
 }
 
 /// Decoded query-EA stack parameters.
@@ -1196,7 +1285,7 @@ impl QueryFileStack {
     }
 
     /// Returns the requested file information class.
-    pub(crate) const fn information_class(self) -> wdk_sys::FILE_INFORMATION_CLASS {
+    pub(crate) const fn information_class(self) -> QueryFileInformationClass {
         self.information_class
     }
 }
@@ -1213,7 +1302,7 @@ impl SetFileStack {
     }
 
     /// Returns the requested file information class.
-    pub(crate) const fn information_class(self) -> wdk_sys::FILE_INFORMATION_CLASS {
+    pub(crate) const fn information_class(self) -> SetFileInformationClass {
         self.information_class
     }
 }
@@ -1245,7 +1334,7 @@ impl QueryDirectoryStack {
     }
 
     /// Returns the requested directory information class.
-    pub(crate) const fn information_class(self) -> wdk_sys::FILE_INFORMATION_CLASS {
+    pub(crate) const fn information_class(self) -> DirectoryInformationClass {
         self.information_class
     }
 }
@@ -1326,8 +1415,9 @@ mod tests {
 
     use super::{
         CurrentIrpStackLocation, DirectoryCursorPosition, DirectoryEntryEmission,
-        DirectoryPatternInput, DispatchTarget, EaEntryEmission, EaNameSelection, FsControlCode,
-        QueryVolumeInformationClass, SecurityComponentSelection, SetVolumeInformationClass,
+        DirectoryInformationClass, DirectoryPatternInput, DispatchTarget, EaEntryEmission,
+        EaNameSelection, FsControlCode, QueryFileInformationClass, QueryVolumeInformationClass,
+        SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
     };
 
     /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
@@ -1911,7 +2001,7 @@ mod tests {
                 assert_eq!(query.length().as_usize(), 64);
                 assert_eq!(
                     query.information_class(),
-                    wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation
+                    QueryFileInformationClass::Standard
                 );
             }
         }
@@ -1939,11 +2029,32 @@ mod tests {
             if let Ok(set) = set {
                 assert_eq!(set.file_object(), file_object);
                 assert_eq!(set.length().as_usize(), 40);
-                assert_eq!(
-                    set.information_class(),
-                    wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation
-                );
+                assert_eq!(set.information_class(), SetFileInformationClass::Basic);
             }
+        }
+    }
+
+    #[test]
+    fn file_information_stack_rejects_unsupported_class_before_handler() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
+            Length: 64,
+            __bindgen_padding_0: 0,
+            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            assert_eq!(
+                current
+                    .query_file()
+                    .err()
+                    .map(crate::status::DriverError::ntstatus),
+                Some(wdk_sys::STATUS_INVALID_INFO_CLASS)
+            );
         }
     }
 
@@ -1976,7 +2087,7 @@ mod tests {
                 assert_eq!(query.length().as_usize(), 128);
                 assert_eq!(
                     query.information_class(),
-                    wdk_sys::_FILE_INFORMATION_CLASS::FileDirectoryInformation
+                    DirectoryInformationClass::Directory
                 );
             }
         }
