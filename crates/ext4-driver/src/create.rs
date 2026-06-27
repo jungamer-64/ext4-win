@@ -17,7 +17,7 @@ use crate::{
     },
     metadata,
     state::{
-        ContextControlBlock, FileControlBlock, KernelDevice, MountedVolumeDevice, OpenedPath,
+        FileControlBlock, KernelDevice, MountedVolumeDevice, OpenedHandle, OpenedPath,
         VolumeControlBlock, release_file_control_block,
     },
     status::{DriverError, DriverResult},
@@ -425,9 +425,9 @@ fn attach_file_object(
         // writable during successful create processing.
         file_object.as_mut()
     };
-    let ccb = Box::new(ContextControlBlock::new(node, path));
+    let handle = Box::new(OpenedHandle::new(node, path));
     file_object.FsContext = fcb.as_ptr().cast::<c_void>();
-    file_object.FsContext2 = Box::into_raw(ccb).cast::<c_void>();
+    file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
     Ok(())
 }
 

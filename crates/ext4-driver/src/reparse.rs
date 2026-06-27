@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use crate::irp::{DispatchTarget, DriverCompletion, FileSystemControlStack};
 use crate::metadata;
 use crate::state::{
-    FileControlBlock, OpenedPath, VolumeControlBlock, context_control_block, file_control_block,
+    FileControlBlock, OpenedPath, VolumeControlBlock, file_control_block, opened_handle,
 };
 use crate::status::{DriverError, DriverResult};
 use crate::wire::{LittleEndianInput, LittleEndianOutput};
@@ -89,14 +89,14 @@ fn replace_opened_path_with_symlink(
         // is active.
         fcb.as_mut()
     };
-    let mut ccb = context_control_block(stack.file_object())?;
-    let ccb = unsafe {
-        // SAFETY: Successful create stores Box<ContextControlBlock> in
+    let mut handle = opened_handle(stack.file_object())?;
+    let handle = unsafe {
+        // SAFETY: Successful create stores Box<OpenedHandle> in
         // FsContext2 until close releases it, and this FSCTL runs while the
         // FILE_OBJECT is active.
-        ccb.as_mut()
+        handle.as_mut()
     };
-    let OpenedPath::Child { parent, name } = ccb.path().clone() else {
+    let OpenedPath::Child { parent, name } = handle.path().clone() else {
         return Err(DriverError::NotSupported);
     };
 
@@ -125,7 +125,7 @@ fn replace_opened_path_with_symlink(
     transaction.commit()?;
     let node = NodeId::Symlink(symlink.id());
     fcb.replace_node(node);
-    ccb.replace_node(node);
+    handle.replace_node(node);
     Ok(())
 }
 
