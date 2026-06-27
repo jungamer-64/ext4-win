@@ -241,26 +241,6 @@ pub(crate) enum DirectoryLayout {
 }
 
 impl DirectoryLayout {
-    /// Parses a directory file into the layout selected by the inode flags.
-    pub(crate) fn parse(
-        indexed: bool,
-        blocks: Vec<DirectoryBlockData>,
-        hash_seed: DirectoryHashSeed,
-        default_hash_version: DirectoryHashVersion,
-        checksum: DirectoryChecksum,
-    ) -> Result<Self> {
-        if indexed {
-            Ok(Self::HTree(HtreeDirectory::parse(
-                &blocks,
-                hash_seed,
-                default_hash_version,
-                checksum,
-            )?))
-        } else {
-            Ok(Self::Linear(LinearDirectory::parse(blocks)?))
-        }
-    }
-
     /// Returns all live entries in directory traversal order.
     pub(crate) fn entries(&self) -> Vec<DirectoryEntry> {
         match self {

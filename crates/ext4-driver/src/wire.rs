@@ -47,46 +47,6 @@ impl<'a> LittleEndianInput<'a> {
     pub(crate) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
     }
-
-    /// Borrows a checked range from the payload.
-    pub(crate) fn range(self, offset: usize, length: usize) -> DriverResult<&'a [u8]> {
-        CheckedByteRange::new(offset, length)?.read_from(self.bytes)
-    }
-
-    /// Returns whether a checked range contains only zero bytes.
-    pub(crate) fn all_zero(self, offset: usize, length: usize) -> DriverResult<bool> {
-        Ok(self.range(offset, length)?.iter().all(|byte| *byte == 0))
-    }
-
-    /// Copies a fixed-size byte array from a checked range.
-    pub(crate) fn fixed<const N: usize>(self, offset: usize) -> DriverResult<[u8; N]> {
-        let mut bytes = [0_u8; N];
-        bytes.copy_from_slice(self.range(offset, N)?);
-        Ok(bytes)
-    }
-
-    /// Reads a little-endian `u16` from the payload.
-    pub(crate) fn read_u16(self, offset: usize) -> DriverResult<u16> {
-        Ok(u16::from_le_bytes(self.fixed(offset)?))
-    }
-
-    /// Reads one byte from the payload.
-    pub(crate) fn read_u8(self, offset: usize) -> DriverResult<u8> {
-        self.bytes
-            .get(offset)
-            .copied()
-            .ok_or(DriverError::BufferTooSmall)
-    }
-
-    /// Reads a little-endian `u32` from the payload.
-    pub(crate) fn read_u32(self, offset: usize) -> DriverResult<u32> {
-        Ok(u32::from_le_bytes(self.fixed(offset)?))
-    }
-
-    /// Reads a little-endian `u64` from the payload.
-    pub(crate) fn read_u64(self, offset: usize) -> DriverResult<u64> {
-        Ok(u64::from_le_bytes(self.fixed(offset)?))
-    }
 }
 
 /// Little-endian writer over a checked external payload.
@@ -100,41 +60,5 @@ impl<'a> LittleEndianOutput<'a> {
     /// Wraps external payload bytes.
     pub(crate) fn new(bytes: &'a mut [u8]) -> Self {
         Self { bytes }
-    }
-
-    /// Borrows a checked mutable range from the payload.
-    pub(crate) fn range_mut(&mut self, offset: usize, length: usize) -> DriverResult<&mut [u8]> {
-        CheckedByteRange::new(offset, length)?.write_to(self.bytes)
-    }
-
-    /// Writes raw bytes into a checked range.
-    pub(crate) fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> DriverResult<()> {
-        self.range_mut(offset, bytes.len())?.copy_from_slice(bytes);
-        Ok(())
-    }
-
-    /// Writes a little-endian `u16` into the payload.
-    pub(crate) fn write_u16(&mut self, offset: usize, value: u16) -> DriverResult<()> {
-        self.write_bytes(offset, value.to_le_bytes().as_slice())
-    }
-
-    /// Writes one byte into the payload.
-    pub(crate) fn write_u8(&mut self, offset: usize, value: u8) -> DriverResult<()> {
-        *self
-            .bytes
-            .get_mut(offset)
-            .ok_or(DriverError::BufferTooSmall)? = value;
-        Ok(())
-    }
-
-    /// Writes a little-endian `u32` into the payload.
-    pub(crate) fn write_u32(&mut self, offset: usize, value: u32) -> DriverResult<()> {
-        self.write_bytes(offset, value.to_le_bytes().as_slice())
-    }
-
-    /// Writes a little-endian `u64` into the payload.
-    #[cfg(test)]
-    pub(crate) fn write_u64(&mut self, offset: usize, value: u64) -> DriverResult<()> {
-        self.write_bytes(offset, value.to_le_bytes().as_slice())
     }
 }
