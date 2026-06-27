@@ -197,16 +197,6 @@ impl CurrentIrpStackLocation {
         Ok(Self { stack })
     }
 
-    /// Returns the IRP minor function.
-    pub(crate) fn minor_function(self) -> wdk_sys::UCHAR {
-        let stack = unsafe {
-            // SAFETY: `stack` is non-null and belongs to the active IRP stack
-            // for the current dispatch callback.
-            self.stack.as_ref()
-        };
-        stack.MinorFunction
-    }
-
     /// Decodes mount-volume parameters from the current stack location.
     pub(crate) fn mount_volume(self) -> Result<MountVolumeStack, DriverError> {
         let stack = unsafe {
@@ -286,16 +276,6 @@ impl CurrentIrpStackLocation {
                 IrpBufferLength::from_ulong(create.EaLength)?,
             )?,
         })
-    }
-
-    /// Decodes the FILE_OBJECT carried by the current stack location.
-    pub(crate) fn file_object(self) -> Result<NonNull<wdk_sys::FILE_OBJECT>, DriverError> {
-        let stack = unsafe {
-            // SAFETY: `stack` is non-null and belongs to the active IRP stack
-            // for the current dispatch callback.
-            self.stack.as_ref()
-        };
-        NonNull::new(stack.FileObject).ok_or(DriverError::InvalidParameter)
     }
 
     /// Decodes query-volume-information parameters.
@@ -1265,16 +1245,6 @@ pub(crate) struct FileSystemControlStack {
 }
 
 impl MountVolumeStack {
-    /// Returns the VPB supplied for the mount.
-    pub(crate) const fn vpb(self) -> NonNull<wdk_sys::VPB> {
-        self.vpb
-    }
-
-    /// Returns the lower storage device object.
-    pub(crate) const fn target_device(self) -> NonNull<wdk_sys::DEVICE_OBJECT> {
-        self.target_device
-    }
-
     /// Returns the mount request output buffer length.
     pub(crate) const fn output_buffer_length(self) -> IrpBufferLength {
         self.output_buffer_length
@@ -1282,11 +1252,6 @@ impl MountVolumeStack {
 }
 
 impl FileSystemControlStack {
-    /// Returns the FILE_OBJECT carrying this FSCTL.
-    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
-        self.file_object
-    }
-
     /// Returns the input system-buffer length.
     pub(crate) const fn input_buffer_length(self) -> IrpBufferLength {
         self.input_buffer_length
@@ -1313,11 +1278,6 @@ pub(crate) struct CreateStack {
 }
 
 impl CreateStack {
-    /// Returns the FILE_OBJECT receiving this create request.
-    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
-        self.file_object
-    }
-
     /// Returns the decoded create parameters.
     pub(crate) const fn parameters(self) -> CreateParameters {
         self.parameters
@@ -1437,11 +1397,6 @@ pub(crate) struct ReadStack {
 }
 
 impl ReadStack {
-    /// Returns the FILE_OBJECT carrying this read.
-    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
-        self.file_object
-    }
-
     /// Returns the requested byte count.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -1465,11 +1420,6 @@ pub(crate) struct WriteStack {
 }
 
 impl WriteStack {
-    /// Returns the FILE_OBJECT carrying this write.
-    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
-        self.file_object
-    }
-
     /// Returns the requested byte count.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -1506,11 +1456,6 @@ impl SetVolumeStack {
 }
 
 impl QueryFileStack {
-    /// Returns the FILE_OBJECT carrying this query.
-    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
-        self.file_object
-    }
-
     /// Returns the output buffer length.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -1523,11 +1468,6 @@ impl QueryFileStack {
 }
 
 impl SetFileStack {
-    /// Returns the FILE_OBJECT carrying this mutation.
-    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
-        self.file_object
-    }
-
     /// Returns the input buffer length.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -1540,11 +1480,6 @@ impl SetFileStack {
 }
 
 impl QueryDirectoryStack {
-    /// Returns the FILE_OBJECT carrying this query.
-    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
-        self.file_object
-    }
-
     /// Returns the initial directory cursor position.
     pub(crate) const fn cursor_position(self) -> DirectoryCursorPosition {
         self.cursor_position
@@ -1572,11 +1507,6 @@ impl QueryDirectoryStack {
 }
 
 impl QueryEaStack {
-    /// Returns the FILE_OBJECT carrying this query.
-    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
-        self.file_object
-    }
-
     /// Returns the EA name selection.
     pub(crate) const fn name_selection(self) -> EaNameSelection {
         self.name_selection
@@ -1594,11 +1524,6 @@ impl QueryEaStack {
 }
 
 impl SetEaStack {
-    /// Returns the FILE_OBJECT carrying this mutation.
-    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
-        self.file_object
-    }
-
     /// Returns the input FILE_FULL_EA_INFORMATION byte length.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -1606,11 +1531,6 @@ impl SetEaStack {
 }
 
 impl QuerySecurityStack {
-    /// Returns the FILE_OBJECT carrying this query.
-    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
-        self.file_object
-    }
-
     /// Returns selected security descriptor components.
     pub(crate) const fn selection(self) -> SecuritySelection {
         self.selection
@@ -1623,20 +1543,11 @@ impl QuerySecurityStack {
 }
 
 impl SetSecurityStack {
-    /// Returns the FILE_OBJECT carrying this mutation.
-    pub(crate) const fn file_object(self) -> NonNull<wdk_sys::FILE_OBJECT> {
-        self.file_object
-    }
-
     /// Returns selected security descriptor components.
     pub(crate) const fn selection(self) -> SecuritySelection {
         self.selection
     }
 
-    /// Returns the caller-supplied security descriptor.
-    pub(crate) const fn security_descriptor(self) -> NonNull<c_void> {
-        self.security_descriptor
-    }
 }
 
 #[cfg(test)]
