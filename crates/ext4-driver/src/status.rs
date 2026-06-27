@@ -2,12 +2,15 @@
 
 use ext4_core::Error;
 use wdk_sys::{
-    NTSTATUS, STATUS_ACCESS_DENIED, STATUS_CANNOT_DELETE, STATUS_DIRECTORY_NOT_EMPTY,
-    STATUS_DISK_FULL, STATUS_FILE_CORRUPT_ERROR, STATUS_INSUFFICIENT_RESOURCES,
-    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR,
-    STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
-    STATUS_OBJECT_TYPE_MISMATCH, STATUS_VOLUME_DIRTY,
+    NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL, STATUS_CANNOT_DELETE,
+    STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL, STATUS_FILE_CORRUPT_ERROR,
+    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
+    STATUS_IO_DEVICE_ERROR, STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_COLLISION,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_TYPE_MISMATCH, STATUS_VOLUME_DIRTY,
 };
+
+/// Driver-local result before NTSTATUS completion mapping.
+pub(crate) type DriverResult<T> = Result<T, DriverError>;
 
 /// Driver failure after IRP decoding and ext4-core execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +23,12 @@ pub(crate) enum DriverError {
     InsufficientResources,
     /// Access is denied by the current FSD policy.
     AccessDenied,
+    /// Caller output buffer cannot hold the required fixed payload.
+    BufferTooSmall,
+    /// Opened node is not a reparse point.
+    NotAReparsePoint,
+    /// Reparse tag belongs to another handler.
+    ReparseTagNotHandled,
     /// Caller selected a valid but unsupported Windows filesystem behavior.
     NotSupported,
     /// ext4-core rejected the requested filesystem operation.
@@ -34,6 +43,9 @@ impl DriverError {
             Self::InvalidParameter => STATUS_INVALID_PARAMETER,
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,
+            Self::BufferTooSmall => STATUS_BUFFER_TOO_SMALL,
+            Self::NotAReparsePoint => ntstatus(0xC000_0275),
+            Self::ReparseTagNotHandled => ntstatus(0xC000_0279),
             Self::NotSupported => STATUS_NOT_SUPPORTED,
             Self::Core(error) => core_error_status(error),
         }
@@ -44,6 +56,11 @@ impl From<Error> for DriverError {
     fn from(value: Error) -> Self {
         Self::Core(value)
     }
+}
+
+/// Converts a hexadecimal NTSTATUS payload into the signed WDK alias.
+const fn ntstatus(value: u32) -> NTSTATUS {
+    i32::from_ne_bytes(value.to_ne_bytes())
 }
 
 /// Maps ext4-core domain errors to the closest NTSTATUS value.
