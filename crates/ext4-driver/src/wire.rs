@@ -70,6 +70,14 @@ impl<'a> LittleEndianInput<'a> {
         Ok(u16::from_le_bytes(self.fixed(offset)?))
     }
 
+    /// Reads one byte from the payload.
+    pub(crate) fn read_u8(self, offset: usize) -> DriverResult<u8> {
+        self.bytes
+            .get(offset)
+            .copied()
+            .ok_or(DriverError::BufferTooSmall)
+    }
+
     /// Reads a little-endian `u32` from the payload.
     pub(crate) fn read_u32(self, offset: usize) -> DriverResult<u32> {
         Ok(u32::from_le_bytes(self.fixed(offset)?))
@@ -108,6 +116,15 @@ impl<'a> LittleEndianOutput<'a> {
     /// Writes a little-endian `u16` into the payload.
     pub(crate) fn write_u16(&mut self, offset: usize, value: u16) -> DriverResult<()> {
         self.write_bytes(offset, value.to_le_bytes().as_slice())
+    }
+
+    /// Writes one byte into the payload.
+    pub(crate) fn write_u8(&mut self, offset: usize, value: u8) -> DriverResult<()> {
+        *self
+            .bytes
+            .get_mut(offset)
+            .ok_or(DriverError::BufferTooSmall)? = value;
+        Ok(())
     }
 
     /// Writes a little-endian `u32` into the payload.
