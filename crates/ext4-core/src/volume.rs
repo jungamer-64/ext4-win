@@ -294,7 +294,9 @@ impl ClusterReferenceIndex {
         block: BlockAddress,
     ) -> Result<()> {
         let cluster = volume.superblock.cluster_of_block(block)?;
-        if !cluster_bitmap_bit(&volume.device, &volume.superblock, cluster)? {
+        if cluster_bitmap_state(&volume.device, &volume.superblock, cluster)?
+            != BitmapBitState::Used
+        {
             return Err(Error::ClusterReferenceConflict);
         }
         self.apply_delta(cluster, 1)?;
@@ -355,7 +357,9 @@ impl ClusterReferenceIndex {
     ) -> Result<()> {
         for inode_number in 1..=volume.superblock.inode_count().as_u32() {
             let inode_id = InodeId::try_from(inode_number)?;
-            if !inode_bitmap_bit(&volume.device, &volume.superblock, inode_id)? {
+            if inode_bitmap_state(&volume.device, &volume.superblock, inode_id)?
+                != BitmapBitState::Used
+            {
                 continue;
             }
             let raw_inode = volume.read_raw_inode(inode_id)?;
@@ -3956,9 +3960,9 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
                         .block_bitmap_updates
                         .get(bitmap_index)
                         .ok_or(Error::InvalidSuperblock)?;
-                    bitmap_bit(bitmap.bytes.as_slice(), bit)?
+                    bitmap_bit_state(bitmap.bytes.as_slice(), bit)?
                 };
-                if occupied {
+                if occupied == BitmapBitState::Used {
                     continue;
                 }
                 if self.staged_cluster_reference_count(cluster)? != 0 {
@@ -3968,7 +3972,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
                     .block_bitmap_updates
                     .get_mut(bitmap_index)
                     .ok_or(Error::InvalidSuperblock)?;
-                set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, true)?;
+                set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, BitmapBitState::Used)?;
                 self.record_group_free_clusters_delta(group, FreeClusterDelta::from_i64(-1))?;
                 self.free_clusters_delta = self.free_clusters_delta.checked_add(-1)?;
                 self.record_cluster_reference_delta(cluster, 1)?;
@@ -4065,8 +4069,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             .volume
             .superblock
             .cluster_bit_in_group(cluster, group)?;
-        if bitmap_bit(bitmap.bytes.as_slice(), bit)? {
-            set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, false)?;
+        if bitmap_bit_state(bitmap.bytes.as_slice(), bit)? == BitmapBitState::Used {
+            set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, BitmapBitState::Free)?;
             self.record_group_free_clusters_delta(group, FreeClusterDelta::from_i64(1))?;
             self.free_clusters_delta = self.free_clusters_delta.checked_add(1)?;
             Ok(())
@@ -4125,8 +4129,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
                     .inode_bitmap_updates
                     .get_mut(bitmap_index)
                     .ok_or(Error::InvalidSuperblock)?;
-                if !bitmap_bit(bitmap.bytes.as_slice(), bit)? {
-                    set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, true)?;
+                if bitmap_bit_state(bitmap.bytes.as_slice(), bit)? == BitmapBitState::Free {
+                    set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, BitmapBitState::Used)?;
                     self.record_group_free_inodes_delta(group, -1)?;
                     return self.empty_raw_inode(inode_id);
                 }
@@ -4148,8 +4152,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             .inode_bitmap_updates
             .get_mut(bitmap_index)
             .ok_or(Error::InvalidSuperblock)?;
-        if bitmap_bit(bitmap.bytes.as_slice(), bit)? {
-            set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, false)?;
+        if bitmap_bit_state(bitmap.bytes.as_slice(), bit)? == BitmapBitState::Used {
+            set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, BitmapBitState::Free)?;
             self.record_group_free_inodes_delta(group, 1)?;
         }
         Ok(())
@@ -5397,35 +5401,47 @@ fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
         .ok_or(Error::ArithmeticOverflow)
 }
 
+/// Allocation bitmap bit state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BitmapBitState {
+    /// The represented inode or cluster is allocated.
+    Used,
+    /// The represented inode or cluster is free.
+    Free,
+}
+
 /// Reads one allocation bitmap bit.
-fn bitmap_bit(bytes: &[u8], bit: u32) -> Result<bool> {
+fn bitmap_bit_state(bytes: &[u8], bit: u32) -> Result<BitmapBitState> {
     let byte_index = usize::try_from(bit.checked_div(8).ok_or(Error::ArithmeticOverflow)?)
         .map_err(|_| Error::ArithmeticOverflow)?;
     let bit_index = bit.checked_rem(8).ok_or(Error::ArithmeticOverflow)?;
     let byte = bytes.get(byte_index).ok_or(Error::InvalidSuperblock)?;
-    Ok(byte & (1_u8 << bit_index) != 0)
+    if byte & (1_u8 << bit_index) != 0 {
+        Ok(BitmapBitState::Used)
+    } else {
+        Ok(BitmapBitState::Free)
+    }
 }
 
 /// Writes one allocation bitmap bit.
-fn set_bitmap_bit(bytes: &mut [u8], bit: u32, value: bool) -> Result<()> {
+fn set_bitmap_bit(bytes: &mut [u8], bit: u32, state: BitmapBitState) -> Result<()> {
     let byte_index = usize::try_from(bit.checked_div(8).ok_or(Error::ArithmeticOverflow)?)
         .map_err(|_| Error::ArithmeticOverflow)?;
     let bit_index = bit.checked_rem(8).ok_or(Error::ArithmeticOverflow)?;
     let byte = bytes.get_mut(byte_index).ok_or(Error::InvalidSuperblock)?;
-    if value {
-        *byte |= 1_u8 << bit_index;
-    } else {
-        *byte &= !(1_u8 << bit_index);
+    match state {
+        BitmapBitState::Used => *byte |= 1_u8 << bit_index,
+        BitmapBitState::Free => *byte &= !(1_u8 << bit_index),
     }
     Ok(())
 }
 
 /// Reads the allocation bitmap bit for one cluster.
-fn cluster_bitmap_bit(
+fn cluster_bitmap_state(
     reader: &impl BlockReader,
     superblock: &Superblock,
     cluster: ClusterAddress,
-) -> Result<bool> {
+) -> Result<BitmapBitState> {
     let group = superblock.cluster_group_of(cluster)?;
     let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
     let mut bytes = vec![
@@ -5439,18 +5455,18 @@ fn cluster_bitmap_bit(
             .offset_of(descriptor.block_bitmap())?,
         &mut bytes,
     )?;
-    bitmap_bit(
+    bitmap_bit_state(
         bytes.as_slice(),
         superblock.cluster_bit_in_group(cluster, group)?,
     )
 }
 
 /// Reads the inode bitmap bit for one inode.
-fn inode_bitmap_bit(
+fn inode_bitmap_state(
     reader: &impl BlockReader,
     superblock: &Superblock,
     inode_id: InodeId,
-) -> Result<bool> {
+) -> Result<BitmapBitState> {
     let (group, bit) = inode_group_bit(superblock, inode_id)?;
     let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
     let mut bytes = vec![
@@ -5464,7 +5480,7 @@ fn inode_bitmap_bit(
             .offset_of(descriptor.inode_bitmap())?,
         &mut bytes,
     )?;
-    bitmap_bit(bytes.as_slice(), bit)
+    bitmap_bit_state(bytes.as_slice(), bit)
 }
 
 /// Returns the first physical block in a block group.
