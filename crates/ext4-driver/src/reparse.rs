@@ -12,6 +12,7 @@ use crate::state::{
     FileControlBlock, OpenedPath, VolumeControlBlock, context_control_block, file_control_block,
 };
 use crate::status::{DriverError, DriverResult};
+use crate::wire::{LittleEndianInput, LittleEndianOutput};
 
 /// Reparse buffer header before the tag-specific payload.
 const REPARSE_DATA_BUFFER_HEADER_SIZE: usize = 8;
@@ -174,17 +175,18 @@ fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> DriverResult
         0
     };
 
-    write_u32(output, 0, wdk_sys::IO_REPARSE_TAG_SYMLINK)?;
-    write_u16(output, 4, reparse_data_length)?;
-    write_u16(output, 6, 0)?;
-    write_u16(output, 8, 0)?;
-    write_u16(output, 10, path_bytes)?;
-    write_u16(output, 12, print_name_offset)?;
-    write_u16(output, 14, path_bytes)?;
-    write_u32(output, 16, flags)?;
-    write_utf16(output, SYMLINK_PATH_BUFFER_OFFSET, path.as_slice())?;
+    let mut output = LittleEndianOutput::new(output);
+    output.write_u32(0, wdk_sys::IO_REPARSE_TAG_SYMLINK)?;
+    output.write_u16(4, reparse_data_length)?;
+    output.write_u16(6, 0)?;
+    output.write_u16(8, 0)?;
+    output.write_u16(10, path_bytes)?;
+    output.write_u16(12, print_name_offset)?;
+    output.write_u16(14, path_bytes)?;
+    output.write_u32(16, flags)?;
+    write_utf16(&mut output, SYMLINK_PATH_BUFFER_OFFSET, path.as_slice())?;
     write_utf16(
-        output,
+        &mut output,
         SYMLINK_PATH_BUFFER_OFFSET
             .checked_add(usize::from(path_bytes))
             .ok_or(DriverError::InvalidParameter)?,
@@ -195,24 +197,26 @@ fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> DriverResult
 
 /// Parses a Windows symbolic-link reparse buffer.
 fn parse_symlink_reparse_buffer(input: &[u8]) -> DriverResult<SymlinkTarget> {
-    let tag = read_u32(input, 0)?;
+    let input_len = input.len();
+    let input = LittleEndianInput::new(input);
+    let tag = input.read_u32(0)?;
     if tag != wdk_sys::IO_REPARSE_TAG_SYMLINK {
         return Err(DriverError::ReparseTagNotHandled);
     }
-    let reparse_data_length = usize::from(read_u16(input, 4)?);
+    let reparse_data_length = usize::from(input.read_u16(4)?);
     let total_length = REPARSE_DATA_BUFFER_HEADER_SIZE
         .checked_add(reparse_data_length)
         .ok_or(DriverError::InvalidParameter)?;
-    if input.len() < total_length {
+    if input_len < total_length {
         return Err(DriverError::BufferTooSmall);
     }
     if reparse_data_length < SYMLINK_REPARSE_BUFFER_HEADER_SIZE {
         return Err(DriverError::InvalidParameter);
     }
 
-    let substitute_name_offset = usize::from(read_u16(input, 8)?);
-    let substitute_name_length = usize::from(read_u16(input, 10)?);
-    let flags = read_u32(input, 16)?;
+    let substitute_name_offset = usize::from(input.read_u16(8)?);
+    let substitute_name_length = usize::from(input.read_u16(10)?);
+    let flags = input.read_u32(16)?;
     if flags & !wdk_sys::SYMLINK_FLAG_RELATIVE != 0 {
         return Err(DriverError::NotSupported);
     }
@@ -232,7 +236,7 @@ fn parse_symlink_reparse_buffer(input: &[u8]) -> DriverResult<SymlinkTarget> {
 
 /// Reads a UTF-16 path slice from a symbolic-link reparse path buffer.
 fn reparse_path_units(
-    input: &[u8],
+    input: LittleEndianInput<'_>,
     path_buffer_length: usize,
     offset: usize,
     length: usize,
@@ -252,7 +256,7 @@ fn reparse_path_units(
     if end > path_buffer_end {
         return Err(DriverError::InvalidParameter);
     }
-    let bytes = input.get(start..end).ok_or(DriverError::BufferTooSmall)?;
+    let bytes = input.range(start, length)?;
     let mut chunks = bytes.chunks_exact(core::mem::size_of::<u16>());
     let mut units = Vec::new();
     for chunk in &mut chunks {
@@ -265,30 +269,6 @@ fn reparse_path_units(
         return Err(DriverError::InvalidParameter);
     }
     Ok(units)
-}
-
-/// Reads a little-endian `u16` from an unaligned input buffer.
-fn read_u16(input: &[u8], offset: usize) -> DriverResult<u16> {
-    let end = offset
-        .checked_add(core::mem::size_of::<u16>())
-        .ok_or(DriverError::InvalidParameter)?;
-    let bytes = input.get(offset..end).ok_or(DriverError::BufferTooSmall)?;
-    let bytes: [u8; 2] = bytes
-        .try_into()
-        .map_err(|_| DriverError::InvalidParameter)?;
-    Ok(u16::from_le_bytes(bytes))
-}
-
-/// Reads a little-endian `u32` from an unaligned input buffer.
-fn read_u32(input: &[u8], offset: usize) -> DriverResult<u32> {
-    let end = offset
-        .checked_add(core::mem::size_of::<u32>())
-        .ok_or(DriverError::InvalidParameter)?;
-    let bytes = input.get(offset..end).ok_or(DriverError::BufferTooSmall)?;
-    let bytes: [u8; 4] = bytes
-        .try_into()
-        .map_err(|_| DriverError::InvalidParameter)?;
-    Ok(u32::from_le_bytes(bytes))
 }
 
 /// Returns the byte count for UTF-16 code units.
@@ -310,38 +290,18 @@ fn is_relative_symlink_target(target: &[u8]) -> bool {
     true
 }
 
-/// Writes a little-endian `u16` into an unaligned output buffer.
-fn write_u16(output: &mut [u8], offset: usize, value: u16) -> DriverResult<()> {
-    let end = offset
-        .checked_add(core::mem::size_of::<u16>())
-        .ok_or(DriverError::InvalidParameter)?;
-    let Some(target) = output.get_mut(offset..end) else {
-        return Err(DriverError::BufferTooSmall);
-    };
-    target.copy_from_slice(value.to_le_bytes().as_slice());
-    Ok(())
-}
-
-/// Writes a little-endian `u32` into an unaligned output buffer.
-fn write_u32(output: &mut [u8], offset: usize, value: u32) -> DriverResult<()> {
-    let end = offset
-        .checked_add(core::mem::size_of::<u32>())
-        .ok_or(DriverError::InvalidParameter)?;
-    let Some(target) = output.get_mut(offset..end) else {
-        return Err(DriverError::BufferTooSmall);
-    };
-    target.copy_from_slice(value.to_le_bytes().as_slice());
-    Ok(())
-}
-
 /// Writes UTF-16 code units into the reparse path buffer.
-fn write_utf16(output: &mut [u8], offset: usize, units: &[u16]) -> DriverResult<()> {
+fn write_utf16(
+    output: &mut LittleEndianOutput<'_>,
+    offset: usize,
+    units: &[u16],
+) -> DriverResult<()> {
     for (index, unit) in units.iter().enumerate() {
         let unit_offset = index
             .checked_mul(core::mem::size_of::<u16>())
             .and_then(|byte_offset| offset.checked_add(byte_offset))
             .ok_or(DriverError::InvalidParameter)?;
-        write_u16(output, unit_offset, *unit)?;
+        output.write_u16(unit_offset, *unit)?;
     }
     Ok(())
 }
@@ -352,25 +312,11 @@ mod tests {
     use alloc::vec::Vec;
 
     use crate::status::DriverError;
+    use crate::wire::{LittleEndianInput, LittleEndianOutput};
 
     use super::{
         SYMLINK_PATH_BUFFER_OFFSET, pack_symlink_reparse_buffer, parse_symlink_reparse_buffer,
-        write_u32,
     };
-
-    fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-        let end = offset.checked_add(core::mem::size_of::<u16>())?;
-        let slice = bytes.get(offset..end)?;
-        let array: [u8; 2] = slice.try_into().ok()?;
-        Some(u16::from_le_bytes(array))
-    }
-
-    fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-        let end = offset.checked_add(core::mem::size_of::<u32>())?;
-        let slice = bytes.get(offset..end)?;
-        let array: [u8; 4] = slice.try_into().ok()?;
-        Some(u32::from_le_bytes(array))
-    }
 
     #[test]
     fn packs_relative_symlink_reparse_buffer() {
@@ -383,21 +329,19 @@ mod tests {
             Ok(WRITTEN_LENGTH)
         );
         assert_eq!(
-            read_u32(output.as_slice(), 0),
-            Some(wdk_sys::IO_REPARSE_TAG_SYMLINK)
+            LittleEndianInput::new(output.as_slice()).read_u32(0),
+            Ok(wdk_sys::IO_REPARSE_TAG_SYMLINK)
         );
-        assert_eq!(read_u16(output.as_slice(), 4), Some(REPARSE_DATA_LENGTH));
-        assert_eq!(read_u16(output.as_slice(), 8), Some(0));
-        assert_eq!(read_u16(output.as_slice(), 10), Some(16));
-        assert_eq!(read_u16(output.as_slice(), 12), Some(16));
-        assert_eq!(read_u16(output.as_slice(), 14), Some(16));
+        let output = LittleEndianInput::new(output.as_slice());
+        assert_eq!(output.read_u16(4), Ok(REPARSE_DATA_LENGTH));
+        assert_eq!(output.read_u16(8), Ok(0));
+        assert_eq!(output.read_u16(10), Ok(16));
+        assert_eq!(output.read_u16(12), Ok(16));
+        assert_eq!(output.read_u16(14), Ok(16));
+        assert_eq!(output.read_u32(16), Ok(wdk_sys::SYMLINK_FLAG_RELATIVE));
         assert_eq!(
-            read_u32(output.as_slice(), 16),
-            Some(wdk_sys::SYMLINK_FLAG_RELATIVE)
-        );
-        assert_eq!(
-            read_u16(output.as_slice(), SYMLINK_PATH_BUFFER_OFFSET),
-            Some(u16::from(b'd'))
+            output.read_u16(SYMLINK_PATH_BUFFER_OFFSET),
+            Ok(u16::from(b'd'))
         );
     }
 
@@ -410,7 +354,10 @@ mod tests {
             pack_symlink_reparse_buffer(br"\??\C:\target", output.as_mut_slice()),
             Ok(WRITTEN_LENGTH)
         );
-        assert_eq!(read_u32(output.as_slice(), 16), Some(0));
+        assert_eq!(
+            LittleEndianInput::new(output.as_slice()).read_u32(16),
+            Ok(0)
+        );
     }
 
     #[test]
@@ -446,7 +393,10 @@ mod tests {
             pack_symlink_reparse_buffer(b"target", input.as_mut_slice()),
             Ok(44)
         );
-        assert_eq!(write_u32(input.as_mut_slice(), 0, 0), Ok(()));
+        assert_eq!(
+            LittleEndianOutput::new(input.as_mut_slice()).write_u32(0, 0),
+            Ok(())
+        );
 
         assert_eq!(
             parse_symlink_reparse_buffer(input.as_slice()),
@@ -461,7 +411,10 @@ mod tests {
             pack_symlink_reparse_buffer(b"target", input.as_mut_slice()),
             Ok(44)
         );
-        assert_eq!(write_u32(input.as_mut_slice(), 16, 2), Ok(()));
+        assert_eq!(
+            LittleEndianOutput::new(input.as_mut_slice()).write_u32(16, 2),
+            Ok(())
+        );
 
         assert_eq!(
             parse_symlink_reparse_buffer(input.as_slice()),
