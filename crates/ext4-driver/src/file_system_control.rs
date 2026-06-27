@@ -2,10 +2,7 @@
 
 use alloc::boxed::Box;
 
-use wdk_sys::{
-    NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
-    STATUS_UNRECOGNIZED_VOLUME,
-};
+use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::{
     block_device::query_device_length,
@@ -18,7 +15,7 @@ use crate::{
         KernelDevice, MountCandidate, MountedVolumeDevice, MountedVolumeDeviceExtension,
         VolumeControlBlock,
     },
-    status::DriverError,
+    status::{DriverError, DriverResult},
 };
 
 /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
@@ -158,29 +155,34 @@ impl MountVolumeRequest {
 
 /// Handles a decoded mount request.
 fn mount_volume(request: MountVolumeRequest) -> NTSTATUS {
-    let length = match query_device_length(request.target_device()) {
-        Ok(length) => length,
-        Err(error) => return DriverError::from(error).ntstatus(),
-    };
+    match mount_volume_result(request) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(error) => error.ntstatus(),
+    }
+}
+
+/// Handles a decoded mount request before NTSTATUS completion mapping.
+fn mount_volume_result(request: MountVolumeRequest) -> DriverResult<()> {
+    let length = query_device_length(request.target_device())?;
     let candidate = MountCandidate::new(request.target_device(), length);
     let vcb =
         match VolumeControlBlock::mount_read_write(candidate.target_device(), candidate.length()) {
             Ok(vcb) => vcb,
             Err(ext4_core::Error::InvalidMagic | ext4_core::Error::InvalidSuperblock) => {
-                return STATUS_UNRECOGNIZED_VOLUME;
+                return Err(DriverError::UnrecognizedVolume);
             }
-            Err(error) => return DriverError::from(error).ntstatus(),
+            Err(error) => return Err(DriverError::from(error)),
         };
     let _output_buffer_length = request.output_buffer_length();
     let Some(driver_object) = request.file_system_device().driver_object() else {
-        return STATUS_INVALID_PARAMETER;
+        return Err(DriverError::InvalidParameter);
     };
 
     let mut device = core::ptr::null_mut();
     let extension_size =
         match wdk_sys::ULONG::try_from(core::mem::size_of::<MountedVolumeDeviceExtension>()) {
             Ok(size) => size,
-            Err(_) => return STATUS_INVALID_PARAMETER,
+            Err(_) => return Err(DriverError::InvalidParameter),
         };
     let status = unsafe {
         // SAFETY: `driver_object` belongs to the control device receiving the
@@ -196,7 +198,7 @@ fn mount_volume(request: MountVolumeRequest) -> NTSTATUS {
         )
     };
     if status < STATUS_SUCCESS {
-        return status;
+        return Err(DriverError::InsufficientResources);
     }
 
     if MountedVolumeDevice::initialize_vpb_identity(request.vpb(), &vcb).is_none() {
@@ -205,7 +207,7 @@ fn mount_volume(request: MountVolumeRequest) -> NTSTATUS {
             // and has not been published as a mounted volume.
             ffi::IoDeleteDevice(device);
         }
-        return STATUS_INVALID_PARAMETER;
+        return Err(DriverError::InvalidParameter);
     }
 
     let Some(mounted_device) = MountedVolumeDevice::initialize(
@@ -219,10 +221,10 @@ fn mount_volume(request: MountVolumeRequest) -> NTSTATUS {
             // and no initialized extension owns heap state on this path.
             ffi::IoDeleteDevice(device);
         }
-        return STATUS_INVALID_PARAMETER;
+        return Err(DriverError::InvalidParameter);
     };
     let _mounted_device = mounted_device.as_ptr();
-    STATUS_SUCCESS
+    Ok(())
 }
 
 /// Handles path-scoped user FSCTL requests.

@@ -9,7 +9,7 @@ use wdk_sys::{
     STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR,
     STATUS_NO_EAS_ON_FILE, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_NOT_SUPPORTED,
     STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-    STATUS_OBJECT_TYPE_MISMATCH, STATUS_VOLUME_DIRTY,
+    STATUS_OBJECT_TYPE_MISMATCH, STATUS_UNRECOGNIZED_VOLUME, STATUS_VOLUME_DIRTY,
 };
 
 /// Driver-local result before NTSTATUS completion mapping.
@@ -58,6 +58,8 @@ pub(crate) enum DriverError {
     NoMoreFiles,
     /// Exact directory enumeration pattern matched no entry.
     NoSuchFile,
+    /// Candidate volume does not contain a mountable ext4 filesystem.
+    UnrecognizedVolume,
     /// Caller selected a valid but unsupported Windows filesystem behavior.
     NotSupported,
     /// ext4-core rejected the requested filesystem operation.
@@ -88,6 +90,7 @@ impl DriverError {
             Self::ShareAccessConflict => ntstatus(0xC000_0043),
             Self::NoMoreFiles => STATUS_NO_MORE_FILES,
             Self::NoSuchFile => STATUS_NO_SUCH_FILE,
+            Self::UnrecognizedVolume => STATUS_UNRECOGNIZED_VOLUME,
             Self::NotSupported => STATUS_NOT_SUPPORTED,
             Self::Core(error) => core_error_status(error),
         }

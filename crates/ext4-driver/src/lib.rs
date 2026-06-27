@@ -28,9 +28,7 @@ extern crate wdk_panic;
 
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
-use wdk_sys::{
-    NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
-};
+use wdk_sys::{NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_SUCCESS};
 
 #[cfg(not(test))]
 #[global_allocator]
@@ -54,11 +52,11 @@ pub unsafe extern "system" fn driver_entry(
         // when loading the driver. Null is still handled defensively.
         driver.as_mut()
     }) else {
-        return wdk_sys::STATUS_INVALID_PARAMETER;
+        return status::DriverError::InvalidParameter.ntstatus();
     };
 
     if dispatch::install(driver_object).is_err() {
-        return STATUS_INVALID_PARAMETER;
+        return status::DriverError::InvalidParameter.ntstatus();
     }
 
     let mut device = core::ptr::null_mut();
@@ -76,11 +74,11 @@ pub unsafe extern "system" fn driver_entry(
         )
     };
     if status != STATUS_SUCCESS {
-        return status;
+        return status::DriverError::InsufficientResources.ntstatus();
     }
 
     let Some(control_device) = state::ControlDevice::registered(device) else {
-        return STATUS_INVALID_PARAMETER;
+        return status::DriverError::InvalidParameter.ntstatus();
     };
 
     unsafe {
