@@ -20,15 +20,15 @@ use crate::{
     Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid,
     Ext4VerityMetadataLayout, Ext4VolumeLabel, Ext4WindowsAttributes, Extent, ExtentLength,
     ExtentTree, ExtentTreeContext, ExternalJournal, FSVERITY_DESCRIPTOR_BYTES, FileNode,
-    FileOffset, FileSize, FscryptContextV2, FscryptFileNonce, FscryptKeySet, FscryptMasterKey,
-    FscryptNoNonceGenerator, FscryptNonceGenerator, FsverityBlockSize, FsverityDescriptor,
-    FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt, FsveritySignature,
-    InodeExtentRoot, InodeId, InodeProtection, JournalMode, LogicalBlock, LookupResult,
-    MountContext, MutableExtentTree, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
-    Node, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite, SliceBlockDevice,
-    SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget, TransactionDirectory,
-    TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName, XattrNamespace, XattrSet,
-    XattrValue,
+    FileNodeId, FileOffset, FileSize, FscryptContextV2, FscryptFileNonce, FscryptKeySet,
+    FscryptMasterKey, FscryptNoNonceGenerator, FscryptNonceGenerator, FsverityBlockSize,
+    FsverityDescriptor, FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt,
+    FsveritySignature, InodeExtentRoot, InodeId, InodeProtection, JournalMode, LoadedNode,
+    LogicalBlock, MountContext, MutableExtentTree, NewDirectoryMetadata, NewFileMetadata,
+    NewSymlinkMetadata, NodeId, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite,
+    SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget,
+    TransactionDirectory, TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName,
+    XattrNamespace, XattrSet, XattrValue,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -116,29 +116,40 @@ fn inode(value: u32) -> InodeId {
 }
 
 fn file_node<D: BlockReader, State, N>(volume: &Volume<D, State, N>, inode_id: u32) -> FileNode {
-    match must(volume.read_node(inode(inode_id))) {
-        Node::File(file) => file,
-        Node::Directory(_) | Node::Symlink(_) => panic!("expected file node"),
+    match must(volume.load_node(inode(inode_id))) {
+        LoadedNode::File(file) => file,
+        LoadedNode::Directory(_) | LoadedNode::Symlink(_) => panic!("expected file node"),
     }
+}
+
+fn file_node_id<D: BlockReader, State, N>(
+    volume: &Volume<D, State, N>,
+    inode_id: u32,
+) -> FileNodeId {
+    file_node(volume, inode_id).id()
 }
 
 fn directory_node<D: BlockReader, State, N>(
     volume: &Volume<D, State, N>,
     inode_id: InodeId,
 ) -> DirectoryNode {
-    match must(volume.read_node(inode_id)) {
-        Node::Directory(directory) => directory,
-        Node::File(_) | Node::Symlink(_) => panic!("expected directory node"),
+    match must(volume.load_node(inode_id)) {
+        LoadedNode::Directory(directory) => directory,
+        LoadedNode::File(_) | LoadedNode::Symlink(_) => panic!("expected directory node"),
     }
+}
+
+fn node_id<D: BlockReader, State, N>(volume: &Volume<D, State, N>, inode_id: InodeId) -> NodeId {
+    must(volume.load_node(inode_id)).id()
 }
 
 fn symlink_node<D: BlockReader, State, N>(
     volume: &Volume<D, State, N>,
     inode_id: u32,
 ) -> SymlinkNode {
-    match must(volume.read_node(inode(inode_id))) {
-        Node::Symlink(symlink) => symlink,
-        Node::File(_) | Node::Directory(_) => panic!("expected symlink node"),
+    match must(volume.load_node(inode(inode_id))) {
+        LoadedNode::Symlink(symlink) => symlink,
+        LoadedNode::File(_) | LoadedNode::Directory(_) => panic!("expected symlink node"),
     }
 }
 
@@ -178,7 +189,7 @@ fn lookup_ext4<D: BlockReader, State, N>(
     volume: &Volume<D, State, N>,
     parent: InodeId,
     name: &[u8],
-) -> LookupResult {
+) -> crate::ChildLookup {
     let directory = directory_node(volume, parent);
     let name = must(Ext4Name::new(name));
     must(volume.lookup_child(&directory, &name))
@@ -188,31 +199,53 @@ fn lookup_windows<D: BlockReader, State, N>(
     volume: &Volume<D, State, N>,
     parent: InodeId,
     name: &[u16],
-) -> LookupResult {
+) -> crate::ChildLookup {
     let directory = directory_node(volume, parent);
     let name = must(WindowsName::from_utf16(name));
     must(volume.lookup_windows_child(&directory, &name))
 }
 
+fn lookup_ext4_inode<D: BlockReader, State, N>(
+    volume: &Volume<D, State, N>,
+    parent: InodeId,
+    name: &[u8],
+) -> Option<InodeId> {
+    match lookup_ext4(volume, parent, name) {
+        crate::ChildLookup::Found(child) => Some(child.node().inode()),
+        crate::ChildLookup::NotFound => None,
+    }
+}
+
+fn lookup_windows_inode<D: BlockReader, State, N>(
+    volume: &Volume<D, State, N>,
+    parent: InodeId,
+    name: &[u16],
+) -> Option<InodeId> {
+    match lookup_windows(volume, parent, name) {
+        crate::ChildLookup::Found(child) => Some(child.node().inode()),
+        crate::ChildLookup::NotFound => None,
+    }
+}
+
 fn transaction_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
     transaction: &crate::WriteTransaction<'_, D, J, N>,
-    inode_id: u32,
+    file_id: FileNodeId,
 ) -> TransactionFile {
-    must(transaction.file(inode(inode_id)))
+    must(transaction.file(file_id))
 }
 
 fn transaction_directory<D: BlockWriter, J, N: FscryptNonceGenerator>(
     transaction: &crate::WriteTransaction<'_, D, J, N>,
-    inode_id: InodeId,
+    directory_id: crate::DirectoryNodeId,
 ) -> TransactionDirectory {
-    must(transaction.directory(inode_id))
+    must(transaction.directory(directory_id))
 }
 
 fn transaction_node<D: BlockWriter, J, N: FscryptNonceGenerator>(
     transaction: &crate::WriteTransaction<'_, D, J, N>,
-    inode_id: InodeId,
+    id: NodeId,
 ) -> crate::TransactionNode {
-    must(transaction.node(inode_id))
+    must(transaction.node(id))
 }
 
 fn test_owner() -> Ext4Owner {
@@ -329,29 +362,29 @@ fn encrypt_modern_root_file_name(image: &mut [u8], master_key: &FscryptMasterKey
 
 fn overwrite_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
     transaction: &mut crate::WriteTransaction<'_, D, J, N>,
-    inode_id: u32,
+    file_id: FileNodeId,
     offset: u64,
     bytes: &[u8],
 ) {
-    let file = transaction_file(transaction, inode_id);
+    let file = transaction_file(transaction, file_id);
     must(transaction.overwrite_file_range(file, FileOffset::from_bytes(offset), bytes));
 }
 
 fn extend_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
     transaction: &mut crate::WriteTransaction<'_, D, J, N>,
-    inode_id: u32,
+    file_id: FileNodeId,
     new_size: u64,
 ) {
-    let file = transaction_file(transaction, inode_id);
+    let file = transaction_file(transaction, file_id);
     must(transaction.extend_file(file, FileSize::from_bytes(new_size)));
 }
 
 fn truncate_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
     transaction: &mut crate::WriteTransaction<'_, D, J, N>,
-    inode_id: u32,
+    file_id: FileNodeId,
     new_size: u64,
 ) {
-    let file = transaction_file(transaction, inode_id);
+    let file = transaction_file(transaction, file_id);
     must(transaction.truncate_file(file, FileSize::from_bytes(new_size)));
 }
 
@@ -465,7 +498,11 @@ fn exact_ext4_lookup_uses_raw_bytes() {
     ));
     let child = lookup_ext4(&volume, InodeId::ROOT, b"file");
 
-    assert_eq!(child, LookupResult::Found(inode(3)));
+    let crate::ChildLookup::Found(child) = child else {
+        panic!("expected typed directory child");
+    };
+    assert_eq!(child.parent(), crate::DirectoryNodeId::ROOT);
+    assert_eq!(child.node().inode(), inode(3));
 }
 
 #[test]
@@ -485,7 +522,11 @@ fn windows_lookup_accepts_unique_ascii_case_fold() {
     ));
     let child = lookup_windows(&volume, InodeId::ROOT, &[0x0046, 0x0049, 0x004C, 0x0045]);
 
-    assert_eq!(child, LookupResult::Found(inode(3)));
+    let crate::ChildLookup::Found(child) = child else {
+        panic!("expected typed directory child");
+    };
+    assert_eq!(child.parent(), crate::DirectoryNodeId::ROOT);
+    assert_eq!(child.node().inode(), inode(3));
 }
 
 #[test]
@@ -508,10 +549,7 @@ fn lookup_reports_not_found_without_option() {
         test_mount_context(),
     ));
 
-    assert_eq!(
-        lookup_ext4(&volume, InodeId::ROOT, b"missing"),
-        LookupResult::NotFound
-    );
+    assert_eq!(lookup_ext4_inode(&volume, InodeId::ROOT, b"missing"), None);
 }
 
 #[test]
@@ -651,7 +689,7 @@ fn bad_metadata_descriptor_checksum_is_rejected() {
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    let result = volume.read_node(InodeId::ROOT);
+    let result = volume.load_node(InodeId::ROOT);
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -679,7 +717,7 @@ fn bad_gdt_descriptor_checksum_is_rejected() {
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    let result = volume.read_node(InodeId::ROOT);
+    let result = volume.load_node(InodeId::ROOT);
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -791,7 +829,7 @@ fn gdt_csum_minimal_profile_refreshes_descriptor_checksum_after_write() {
             test_mount_context(),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         must(transaction.create_file(root, &must(Ext4Name::new(b"new")), test_file_metadata()));
         must(transaction.commit());
     }
@@ -802,8 +840,8 @@ fn gdt_csum_minimal_profile_refreshes_descriptor_checksum_after_write() {
         test_mount_context(),
     ));
     assert_eq!(
-        lookup_ext4(&volume, InodeId::ROOT, b"new"),
-        LookupResult::Found(inode(11))
+        lookup_ext4_inode(&volume, InodeId::ROOT, b"new"),
+        Some(inode(11))
     );
 }
 
@@ -909,8 +947,9 @@ fn overwrite_existing_file_range_commits() {
         test_mount_context(),
     ));
 
+    let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
-    overwrite_file(&mut transaction, 3, 0, b"HELLO");
+    overwrite_file(&mut transaction, file_id, 0, b"HELLO");
     must(transaction.commit());
 
     let mut output = [0_u8; 5];
@@ -928,8 +967,9 @@ fn sparse_hole_write_allocates_block() {
         test_mount_context(),
     ));
 
+    let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
-    overwrite_file(&mut transaction, 3, 1024, b"hole");
+    overwrite_file(&mut transaction, file_id, 1024, b"hole");
     must(transaction.commit());
 
     let mut output = [0_u8; 4];
@@ -950,8 +990,9 @@ fn bigalloc_hole_write_reuses_logical_cluster() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        overwrite_file(&mut transaction, 3, 1024, b"hole");
+        overwrite_file(&mut transaction, file_id, 1024, b"hole");
         must(transaction.commit());
 
         assert_eq!(
@@ -983,15 +1024,16 @@ fn bigalloc_sparse_extension_allocates_one_cluster() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
-            3,
+            file_id,
             u64::try_from(BLOCK_SIZE * 5).unwrap_or(u64::MAX),
         );
         overwrite_file(
             &mut transaction,
-            3,
+            file_id,
             u64::try_from(BLOCK_SIZE * 4).unwrap_or(u64::MAX),
             b"next",
         );
@@ -1033,10 +1075,11 @@ fn bigalloc_partial_truncate_preserves_referenced_cluster() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         truncate_file(
             &mut transaction,
-            3,
+            file_id,
             u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX),
         );
         must(transaction.commit());
@@ -1063,8 +1106,9 @@ fn bigalloc_full_truncate_frees_last_cluster_reference() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        truncate_file(&mut transaction, 3, 0);
+        truncate_file(&mut transaction, file_id, 0);
         must(transaction.commit());
 
         assert_eq!(
@@ -1091,7 +1135,7 @@ fn bigalloc_unlink_file_frees_last_cluster_reference() {
             test_mount_context(),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         must(transaction.unlink_file(root, &must(Ext4Name::new(b"file"))));
         must(transaction.commit());
 
@@ -1133,10 +1177,11 @@ fn bigalloc_two_extents_in_same_physical_cluster_are_indexed() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         truncate_file(
             &mut transaction,
-            3,
+            file_id,
             u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX),
         );
         must(transaction.commit());
@@ -1206,15 +1251,16 @@ fn bigalloc_allocated_unreferenced_cluster_remains_unavailable() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
-            3,
+            file_id,
             u64::try_from(BLOCK_SIZE * 5).unwrap_or(u64::MAX),
         );
         overwrite_file(
             &mut transaction,
-            3,
+            file_id,
             u64::try_from(BLOCK_SIZE * 4).unwrap_or(u64::MAX),
             b"next",
         );
@@ -1238,14 +1284,14 @@ fn bigalloc_directory_create_remove_returns_cluster_count() {
             test_mount_context(),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         let child = must(transaction.create_directory(
             root,
             &must(Ext4Name::new(b"child")),
             test_directory_metadata(),
         ));
         must(transaction.remove_empty_directory(root, &must(Ext4Name::new(b"child"))));
-        assert_eq!(child.inode_id().as_u32(), 11);
+        assert_eq!(child.id().inode().as_u32(), 11);
         must(transaction.commit());
 
         assert_eq!(
@@ -1267,16 +1313,17 @@ fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
-            3,
+            file_id,
             u64::try_from(BLOCK_SIZE * 10).unwrap_or(u64::MAX),
         );
         for logical in [0_u64, 2, 4, 6, 8] {
             overwrite_file(
                 &mut transaction,
-                3,
+                file_id,
                 logical.saturating_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX)),
                 b"x",
             );
@@ -1332,16 +1379,17 @@ fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
-            3,
+            file_id,
             u64::try_from(BLOCK_SIZE * 10).unwrap_or(u64::MAX),
         );
         for logical in [0_u64, 2, 4, 6, 8] {
             overwrite_file(
                 &mut transaction,
-                3,
+                file_id,
                 logical.saturating_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX)),
                 b"x",
             );
@@ -1410,16 +1458,17 @@ fn external_extent_block_checksum_mismatch_is_rejected() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
-            3,
+            file_id,
             u64::try_from(BLOCK_SIZE * 10).unwrap_or(u64::MAX),
         );
         for logical in [0_u64, 2, 4, 6, 8] {
             overwrite_file(
                 &mut transaction,
-                3,
+                file_id,
                 logical.saturating_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX)),
                 b"x",
             );
@@ -1451,8 +1500,9 @@ fn uninitialized_extent_write_is_rejected() {
         device,
         test_mount_context(),
     ));
+    let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
-    let file = transaction_file(&transaction, 3);
+    let file = transaction_file(&transaction, file_id);
     let result = transaction.overwrite_file_range(file, FileOffset::ZERO, b"x");
 
     assert_eq!(result, Err(Error::UnsupportedInodeMutation));
@@ -1473,9 +1523,10 @@ fn inode_protection_flags_are_typed_before_mutation_policy() {
 
     let file = file_node(&volume, 3);
     assert_eq!(file.protection(), InodeProtection::EncryptedVerity);
+    let file_id = file.id();
 
     let mut transaction = volume.begin_transaction(NOW);
-    let file = transaction_file(&transaction, 3);
+    let file = transaction_file(&transaction, file_id);
     let result = transaction.overwrite_file_range(file, FileOffset::ZERO, b"x");
 
     assert_eq!(result, Err(Error::MissingEncryptionKey));
@@ -1490,8 +1541,9 @@ fn extend_file_creates_sparse_range() {
         test_mount_context(),
     ));
 
+    let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
-    extend_file(&mut transaction, 3, 3072);
+    extend_file(&mut transaction, file_id, 3072);
     must(transaction.commit());
 
     let file = file_node(&volume, 3);
@@ -1510,8 +1562,9 @@ fn minimal_profile_rejects_file_size_beyond_large_file_boundary() {
         device,
         test_mount_context(),
     ));
+    let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
-    let file = transaction_file(&transaction, 3);
+    let file = transaction_file(&transaction, file_id);
     let result = transaction.extend_file(file, FileSize::from_bytes(0x8000_0000));
 
     assert_eq!(result, Err(Error::UnsupportedInodeMutation));
@@ -1526,11 +1579,12 @@ fn truncate_file_releases_blocks() {
         test_mount_context(),
     ));
 
+    let file_id = file_node_id(&volume, 3);
     let mut write = volume.begin_transaction(NOW);
-    overwrite_file(&mut write, 3, 1024, b"hole");
+    overwrite_file(&mut write, file_id, 1024, b"hole");
     must(write.commit());
     let mut truncate = volume.begin_transaction(NOW);
-    truncate_file(&mut truncate, 3, 0);
+    truncate_file(&mut truncate, file_id, 0);
     must(truncate.commit());
 
     let file = file_node(&volume, 3);
@@ -1547,12 +1601,13 @@ fn minimal_profile_supports_file_and_namespace_mutations() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
 
         let mut overwrite = volume.begin_transaction(NOW);
-        overwrite_file(&mut overwrite, 3, 0, b"HELLO");
-        extend_file(&mut overwrite, 3, 3072);
-        overwrite_file(&mut overwrite, 3, 2048, b"tail");
-        truncate_file(&mut overwrite, 3, 1024);
+        overwrite_file(&mut overwrite, file_id, 0, b"HELLO");
+        extend_file(&mut overwrite, file_id, 3072);
+        overwrite_file(&mut overwrite, file_id, 2048, b"tail");
+        truncate_file(&mut overwrite, file_id, 1024);
         must(overwrite.commit());
 
         let mut output = [0_u8; 5];
@@ -1561,29 +1616,27 @@ fn minimal_profile_supports_file_and_namespace_mutations() {
         assert_eq!(file_node(&volume, 3).size().bytes(), 1024);
 
         let root = InodeId::ROOT;
+        let root_id = crate::DirectoryNodeId::ROOT;
         let old_name = must(Ext4Name::new(b"old"));
         let new_name = must(Ext4Name::new(b"renamed"));
 
         let mut create = volume.begin_transaction(NOW);
-        let root_directory = transaction_directory(&create, root);
+        let root_directory = transaction_directory(&create, root_id);
         let file = must(create.create_file(root_directory, &old_name, test_file_metadata()));
-        assert_eq!(file.inode_id(), inode(11));
+        assert_eq!(file.id().inode(), inode(11));
         must(create.commit());
 
         let mut rename = volume.begin_transaction(NOW);
-        let root_directory = transaction_directory(&rename, root);
+        let root_directory = transaction_directory(&rename, root_id);
         must(rename.rename_child(root_directory, &old_name, root_directory, &new_name));
         must(rename.commit());
 
         let mut unlink = volume.begin_transaction(NOW);
-        let root_directory = transaction_directory(&unlink, root);
+        let root_directory = transaction_directory(&unlink, root_id);
         must(unlink.unlink_file(root_directory, &new_name));
         must(unlink.commit());
 
-        assert_eq!(
-            lookup_ext4(&volume, root, b"renamed"),
-            LookupResult::NotFound
-        );
+        assert_eq!(lookup_ext4_inode(&volume, root, b"renamed"), None);
     }
 
     assert_eq!(
@@ -1600,9 +1653,10 @@ fn transaction_too_large_is_rejected_before_writes() {
         device,
         test_mount_context(),
     ));
+    let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
 
-    overwrite_file(&mut transaction, 3, 1024, b"hole");
+    overwrite_file(&mut transaction, file_id, 1024, b"hole");
     let result = transaction.commit();
 
     assert!(matches!(result, Err(Error::TransactionTooLarge)));
@@ -1619,15 +1673,15 @@ fn create_file_adds_directory_entry_and_inode() {
             test_mount_context(),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         let name = must(Ext4Name::new(b"new"));
         let file = must(transaction.create_file(root, &name, test_file_metadata()));
-        assert_eq!(file.inode_id(), inode(11));
+        assert_eq!(file.id().inode(), inode(11));
         must(transaction.commit());
 
         assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"new"),
-            LookupResult::Found(inode(11))
+            lookup_ext4_inode(&volume, InodeId::ROOT, b"new"),
+            Some(inode(11))
         );
         let file = file_node(&volume, 11);
         assert_eq!(file.size().bytes(), 0);
@@ -1645,7 +1699,7 @@ fn create_file_rejects_duplicate_name() {
         test_mount_context(),
     ));
     let mut transaction = volume.begin_transaction(NOW);
-    let root = transaction_directory(&transaction, InodeId::ROOT);
+    let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
     let name = must(Ext4Name::new(b"file"));
     let result = transaction.create_file(root, &name, test_file_metadata());
 
@@ -1711,9 +1765,10 @@ fn set_posix_security_updates_owner_and_permissions() {
             ),
             must(Ext4Permissions::new(0o6750)),
         );
+        let node_id = node_id(&volume, inode(3));
 
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, inode(3));
+        let node = transaction_node(&transaction, node_id);
         must(transaction.set_posix_security(node, security));
         must(transaction.commit());
 
@@ -1745,8 +1800,9 @@ fn set_times_updates_inode_timestamp_fields() {
             device,
             test_mount_context(),
         ));
+        let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, inode(3));
+        let node = transaction_node(&transaction, node_id);
         must(transaction.set_times(node, times));
         must(transaction.commit());
     }
@@ -1774,8 +1830,9 @@ fn minimal_profile_does_not_write_extra_inode_timestamp_fields() {
             device,
             test_mount_context(),
         ));
+        let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, inode(3));
+        let node = transaction_node(&transaction, node_id);
         must(transaction.set_times(node, times));
         must(transaction.commit());
     }
@@ -1836,8 +1893,9 @@ fn in_inode_xattr_round_trips_through_inode_body() {
             device,
             test_mount_context(),
         ));
+        let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, inode(3));
+        let node = transaction_node(&transaction, node_id);
         must(transaction.set_xattr(node, name.clone(), value.clone()));
         must(transaction.commit());
     }
@@ -1886,8 +1944,9 @@ fn public_xattr_update_preserves_private_fscrypt_context() {
             device,
             test_mount_context(),
         ));
+        let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, inode(3));
+        let node = transaction_node(&transaction, node_id);
         must(transaction.set_xattr(node, name.clone(), value.clone()));
         must(transaction.commit());
     }
@@ -1958,8 +2017,9 @@ fn encrypted_file_overwrite_roundtrips_ciphertext() {
             SliceBlockDeviceMut::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        overwrite_file(&mut transaction, 3, 1, b"EL");
+        overwrite_file(&mut transaction, file_id, 1, b"EL");
         must(transaction.commit());
     }
 
@@ -1988,13 +2048,14 @@ fn encrypted_truncate_zeroes_plaintext_tail() {
             SliceBlockDeviceMut::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut truncate = volume.begin_transaction(NOW);
-        let file = transaction_file(&truncate, 3);
+        let file = transaction_file(&truncate, file_id);
         must(truncate.truncate_file(file, FileSize::from_bytes(3)));
         must(truncate.commit());
 
         let mut extend = volume.begin_transaction(NOW);
-        let file = transaction_file(&extend, 3);
+        let file = transaction_file(&extend, file_id);
         must(extend.extend_file(file, FileSize::from_bytes(5)));
         must(extend.commit());
     }
@@ -2066,8 +2127,9 @@ fn enable_verity_commits_metadata_and_remount_verifies() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        let file = transaction_file(&transaction, 3);
+        let file = transaction_file(&transaction, file_id);
         let enable = FsverityEnable::new(
             FsverityHashAlgorithm::Sha256,
             must(FsverityBlockSize::new(
@@ -2111,8 +2173,9 @@ fn encrypted_enable_verity_remount_verifies_after_decrypt() {
             SliceBlockDeviceMut::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        let file = transaction_file(&transaction, 3);
+        let file = transaction_file(&transaction, file_id);
         let enable = FsverityEnable::new(
             FsverityHashAlgorithm::Sha256,
             must(FsverityBlockSize::new(
@@ -2153,7 +2216,7 @@ fn encrypted_directory_create_requires_mount_key() {
         test_mount_context(),
     ));
     let mut transaction = volume.begin_transaction(NOW);
-    let root = transaction_directory(&transaction, InodeId::ROOT);
+    let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
     let name = must(Ext4Name::new(b"new"));
 
     assert_eq!(
@@ -2206,7 +2269,7 @@ fn encrypted_directory_windows_lookup_encrypts_requested_name() {
     ));
 
     assert_eq!(
-        lookup_windows(
+        lookup_windows_inode(
             &volume,
             InodeId::ROOT,
             &[
@@ -2216,7 +2279,7 @@ fn encrypted_directory_windows_lookup_encrypts_requested_name() {
                 u16::from(b'e'),
             ],
         ),
-        LookupResult::Found(inode(3))
+        Some(inode(3))
     );
 }
 
@@ -2236,8 +2299,8 @@ fn encrypted_directory_encoded_lookup_does_not_require_mount_key() {
     let requested: Vec<u16> = encoded.bytes().iter().copied().map(u16::from).collect();
 
     assert_eq!(
-        lookup_windows(&volume, InodeId::ROOT, &requested),
-        LookupResult::Found(inode(3))
+        lookup_windows_inode(&volume, InodeId::ROOT, &requested),
+        Some(inode(3))
     );
 }
 
@@ -2255,10 +2318,10 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
             test_mount_context_with_key_and_nonce_source(master_key.clone()),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         let name = must(Ext4Name::new(b"created"));
         let file = must(transaction.create_file(root, &name, test_file_metadata()));
-        assert_eq!(file.inode_id(), inode(11));
+        assert_eq!(file.id().inode(), inode(11));
         must(transaction.commit());
     }
 
@@ -2286,11 +2349,11 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
         FscryptFileNonce::new([TestFscryptNonceGenerator::FIRST_NONCE_BYTE; 16])
     );
     assert!(matches!(
-        must(volume.read_node(inode(11))),
-        Node::File(file) if file.protection() == InodeProtection::Encrypted
+        must(volume.load_node(inode(11))),
+        LoadedNode::File(file) if file.protection() == InodeProtection::Encrypted
     ));
     assert_eq!(
-        lookup_windows(
+        lookup_windows_inode(
             &volume,
             InodeId::ROOT,
             &[
@@ -2303,7 +2366,7 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
                 u16::from(b'd'),
             ],
         ),
-        LookupResult::Found(inode(11))
+        Some(inode(11))
     );
 }
 
@@ -2321,10 +2384,10 @@ fn encrypted_directory_create_directory_inherits_child_context_when_key_is_prese
             test_mount_context_with_key_and_nonce_source(master_key.clone()),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         let name = must(Ext4Name::new(b"childdir"));
         let directory = must(transaction.create_directory(root, &name, test_directory_metadata()));
-        assert_eq!(directory.inode_id(), inode(11));
+        assert_eq!(directory.id().inode(), inode(11));
         must(transaction.commit());
     }
 
@@ -2344,11 +2407,11 @@ fn encrypted_directory_create_directory_inherits_child_context_when_key_is_prese
         FscryptFileNonce::new([TestFscryptNonceGenerator::FIRST_NONCE_BYTE; 16])
     );
     assert!(matches!(
-        must(volume.read_node(inode(11))),
-        Node::Directory(directory) if directory.protection() == InodeProtection::Encrypted
+        must(volume.load_node(inode(11))),
+        LoadedNode::Directory(directory) if directory.protection() == InodeProtection::Encrypted
     ));
     assert_eq!(
-        lookup_windows(
+        lookup_windows_inode(
             &volume,
             InodeId::ROOT,
             &[
@@ -2362,7 +2425,7 @@ fn encrypted_directory_create_directory_inherits_child_context_when_key_is_prese
                 u16::from(b'r'),
             ],
         ),
-        LookupResult::Found(inode(11))
+        Some(inode(11))
     );
 }
 
@@ -2378,7 +2441,7 @@ fn encrypted_directory_create_symlink_rejects_plaintext_target() {
         test_mount_context_with_key_and_nonce_source(master_key),
     ));
     let mut transaction = volume.begin_transaction(NOW);
-    let root = transaction_directory(&transaction, InodeId::ROOT);
+    let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
     let name = must(Ext4Name::new(b"link"));
     let target = must(SymlinkTarget::new(b"target"));
 
@@ -2402,7 +2465,7 @@ fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
             test_mount_context_with_key(master_key.clone()),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         let old_name = must(Ext4Name::new(b"file"));
         let new_name = must(Ext4Name::new(b"renamed"));
         must(transaction.rename_child(root, &old_name, root, &new_name));
@@ -2422,7 +2485,7 @@ fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
         test_mount_context_with_key(master_key),
     ));
     assert_eq!(
-        lookup_windows(
+        lookup_windows_inode(
             &volume,
             InodeId::ROOT,
             &[
@@ -2435,7 +2498,7 @@ fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
                 u16::from(b'd'),
             ],
         ),
-        LookupResult::Found(inode(3))
+        Some(inode(3))
     );
 }
 
@@ -2463,7 +2526,7 @@ fn encrypted_directory_encoded_delete_does_not_require_mount_key() {
             test_mount_context(),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         must(transaction.unlink_file(root, &encoded));
         must(transaction.commit());
     }
@@ -2492,8 +2555,9 @@ fn external_xattr_block_is_allocated_and_removed() {
             device,
             test_mount_context(),
         ));
+        let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, inode(3));
+        let node = transaction_node(&transaction, node_id);
         must(transaction.set_xattr(node, name.clone(), value.clone()));
         must(transaction.commit());
     }
@@ -2519,8 +2583,9 @@ fn external_xattr_block_is_allocated_and_removed() {
             device,
             test_mount_context(),
         ));
+        let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, inode(3));
+        let node = transaction_node(&transaction, node_id);
         assert_eq!(
             must(transaction.remove_xattr(node, &name)),
             Some(must(XattrValue::new(&payload)))
@@ -2550,8 +2615,9 @@ fn bigalloc_external_xattr_allocation_uses_cluster_accounting() {
             device,
             test_mount_context(),
         ));
+        let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, inode(3));
+        let node = transaction_node(&transaction, node_id);
         must(transaction.set_xattr(node, name.clone(), value.clone()));
         must(transaction.commit());
 
@@ -2573,8 +2639,9 @@ fn bigalloc_external_xattr_allocation_uses_cluster_accounting() {
             device,
             test_mount_context(),
         ));
+        let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, inode(3));
+        let node = transaction_node(&transaction, node_id);
         assert_eq!(must(transaction.remove_xattr(node, &name)), Some(value));
         must(transaction.commit());
 
@@ -2607,8 +2674,9 @@ fn posix_acl_uses_typed_acl_boundary() {
             device,
             test_mount_context(),
         ));
+        let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, inode(3));
+        let node = transaction_node(&transaction, node_id);
         must(transaction.set_posix_acl(node, PosixAclKind::Access, acl.clone()));
         must(transaction.commit());
     }
@@ -2640,8 +2708,9 @@ fn windows_overlay_is_stored_in_user_ext4win_xattr() {
             device,
             test_mount_context(),
         ));
+        let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, inode(3));
+        let node = transaction_node(&transaction, node_id);
         must(transaction.set_windows_overlay(node, overlay));
         must(transaction.commit());
     }
@@ -2683,8 +2752,9 @@ fn minimal_profile_mounts_without_ext_attr_but_rejects_xattr_mutations() {
     );
     assert_eq!(must(volume.read_windows_overlay(inode(3))), None);
 
+    let node_id = node_id(&volume, inode(3));
     let mut xattr = volume.begin_transaction(NOW);
-    let node = transaction_node(&xattr, inode(3));
+    let node = transaction_node(&xattr, node_id);
     let result = xattr.set_xattr(
         node,
         must(XattrName::new(XattrNamespace::User, b"name")),
@@ -2693,12 +2763,12 @@ fn minimal_profile_mounts_without_ext_attr_but_rejects_xattr_mutations() {
     assert_eq!(result, Err(Error::UnsupportedWriteFeature));
 
     let mut posix_acl = volume.begin_transaction(NOW);
-    let node = transaction_node(&posix_acl, inode(3));
+    let node = transaction_node(&posix_acl, node_id);
     let result = posix_acl.set_posix_acl(node, PosixAclKind::Access, acl);
     assert_eq!(result, Err(Error::UnsupportedWriteFeature));
 
     let mut windows = volume.begin_transaction(NOW);
-    let node = transaction_node(&windows, inode(3));
+    let node = transaction_node(&windows, node_id);
     let result = windows.set_windows_overlay(node, overlay);
     assert_eq!(result, Err(Error::UnsupportedWriteFeature));
 }
@@ -2716,19 +2786,16 @@ fn unlink_file_removes_directory_entry_and_frees_inode() {
         let name = must(Ext4Name::new(b"new"));
 
         let mut create = volume.begin_transaction(NOW);
-        let root = transaction_directory(&create, InodeId::ROOT);
+        let root = transaction_directory(&create, crate::DirectoryNodeId::ROOT);
         let _file = must(create.create_file(root, &name, test_file_metadata()));
         must(create.commit());
 
         let mut unlink = volume.begin_transaction(NOW);
-        let root = transaction_directory(&unlink, InodeId::ROOT);
+        let root = transaction_directory(&unlink, crate::DirectoryNodeId::ROOT);
         must(unlink.unlink_file(root, &name));
         must(unlink.commit());
 
-        assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"new"),
-            LookupResult::NotFound
-        );
+        assert_eq!(lookup_ext4_inode(&volume, InodeId::ROOT, b"new"), None);
     }
 
     assert_eq!(get_u32(&image, 1024 + 16), 6);
@@ -2743,7 +2810,7 @@ fn unlink_file_reports_missing_entry() {
         test_mount_context(),
     ));
     let mut transaction = volume.begin_transaction(NOW);
-    let root = transaction_directory(&transaction, InodeId::ROOT);
+    let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
     let name = must(Ext4Name::new(b"missing"));
     let result = transaction.unlink_file(root, &name);
 
@@ -2761,21 +2828,18 @@ fn rename_file_updates_staged_directory_entry() {
             test_mount_context(),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         let old_name = must(Ext4Name::new(b"old"));
         let new_name = must(Ext4Name::new(b"new"));
         let file = must(transaction.create_file(root, &old_name, test_file_metadata()));
         must(transaction.rename_child(root, &old_name, root, &new_name));
-        assert_eq!(file.inode_id(), inode(11));
+        assert_eq!(file.id().inode(), inode(11));
         must(transaction.commit());
 
+        assert_eq!(lookup_ext4_inode(&volume, InodeId::ROOT, b"old"), None);
         assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"old"),
-            LookupResult::NotFound
-        );
-        assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"new"),
-            LookupResult::Found(inode(11))
+            lookup_ext4_inode(&volume, InodeId::ROOT, b"new"),
+            Some(inode(11))
         );
     }
 
@@ -2791,7 +2855,7 @@ fn rename_rejects_existing_target() {
         test_mount_context(),
     ));
     let mut transaction = volume.begin_transaction(NOW);
-    let root = transaction_directory(&transaction, InodeId::ROOT);
+    let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
     let source = must(Ext4Name::new(b"file"));
     let target = must(Ext4Name::new(b"target"));
     let _target_file = must(transaction.create_file(root, &target, test_file_metadata()));
@@ -2813,9 +2877,9 @@ fn create_and_remove_empty_directory_updates_namespace() {
         let name = must(Ext4Name::new(b"dir"));
 
         let mut create = volume.begin_transaction(NOW);
-        let root = transaction_directory(&create, InodeId::ROOT);
+        let root = transaction_directory(&create, crate::DirectoryNodeId::ROOT);
         let directory = must(create.create_directory(root, &name, test_directory_metadata()));
-        assert_eq!(directory.inode_id(), inode(11));
+        assert_eq!(directory.id().inode(), inode(11));
         must(create.commit());
 
         let entries = read_directory(&volume, inode(11));
@@ -2824,14 +2888,11 @@ fn create_and_remove_empty_directory_updates_namespace() {
         assert_eq!(entries[1].name().bytes(), b"..");
 
         let mut remove = volume.begin_transaction(NOW);
-        let root = transaction_directory(&remove, InodeId::ROOT);
+        let root = transaction_directory(&remove, crate::DirectoryNodeId::ROOT);
         must(remove.remove_empty_directory(root, &name));
         must(remove.commit());
 
-        assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"dir"),
-            LookupResult::NotFound
-        );
+        assert_eq!(lookup_ext4_inode(&volume, InodeId::ROOT, b"dir"), None);
     }
 
     assert_eq!(get_u32(&image, 1024 + 16), 6);
@@ -2848,17 +2909,17 @@ fn create_inline_symlink_adds_directory_entry_and_inode() {
             test_mount_context(),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         let name = must(Ext4Name::new(b"inline-link"));
         let target = must(SymlinkTarget::new(b"file"));
         let symlink =
             must(transaction.create_symlink(root, &name, &target, test_symlink_metadata()));
-        assert_eq!(symlink.inode_id(), inode(11));
+        assert_eq!(symlink.id().inode(), inode(11));
         must(transaction.commit());
 
         assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"inline-link"),
-            LookupResult::Found(inode(11))
+            lookup_ext4_inode(&volume, InodeId::ROOT, b"inline-link"),
+            Some(inode(11))
         );
         let symlink = symlink_node(&volume, 11);
         assert_eq!(must(volume.read_symlink(&symlink)), b"file");
@@ -2877,12 +2938,12 @@ fn create_extent_symlink_writes_target_blocks() {
             test_mount_context(),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         let name = must(Ext4Name::new(b"extent-link"));
         let target = must(SymlinkTarget::new(&target_bytes));
         let symlink =
             must(transaction.create_symlink(root, &name, &target, test_symlink_metadata()));
-        assert_eq!(symlink.inode_id(), inode(11));
+        assert_eq!(symlink.id().inode(), inode(11));
         must(transaction.commit());
 
         let symlink = symlink_node(&volume, 11);
@@ -2904,18 +2965,18 @@ fn remove_symlink_removes_directory_entry_and_frees_inode() {
         let target = must(SymlinkTarget::new(b"file"));
 
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         must(transaction.create_symlink(root, &name, &target, test_symlink_metadata()));
         must(transaction.commit());
 
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         must(transaction.remove_symlink(root, &name));
         must(transaction.commit());
 
         assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"delete-link"),
-            LookupResult::NotFound
+            lookup_ext4_inode(&volume, InodeId::ROOT, b"delete-link"),
+            None
         );
     }
 }
@@ -2935,35 +2996,33 @@ fn rename_directory_across_parents_updates_dotdot() {
         let moved_name = must(Ext4Name::new(b"moved"));
 
         let mut create_source = volume.begin_transaction(NOW);
-        let root = transaction_directory(&create_source, InodeId::ROOT);
+        let root = transaction_directory(&create_source, crate::DirectoryNodeId::ROOT);
         let source =
             must(create_source.create_directory(root, &source_name, test_directory_metadata()));
-        assert_eq!(source.inode_id(), inode(11));
+        assert_eq!(source.id().inode(), inode(11));
         must(create_source.commit());
 
         let mut create_target = volume.begin_transaction(NOW);
-        let root = transaction_directory(&create_target, InodeId::ROOT);
+        let root = transaction_directory(&create_target, crate::DirectoryNodeId::ROOT);
         let target_parent = must(create_target.create_directory(
             root,
             &target_parent_name,
             test_directory_metadata(),
         ));
-        assert_eq!(target_parent.inode_id(), inode(12));
+        assert_eq!(target_parent.id().inode(), inode(12));
+        let target_parent_id = target_parent.id();
         must(create_target.commit());
 
         let mut rename = volume.begin_transaction(NOW);
-        let root = transaction_directory(&rename, InodeId::ROOT);
-        let target_parent = transaction_directory(&rename, inode(12));
+        let root = transaction_directory(&rename, crate::DirectoryNodeId::ROOT);
+        let target_parent = transaction_directory(&rename, target_parent_id);
         must(rename.rename_child(root, &source_name, target_parent, &moved_name));
         must(rename.commit());
 
+        assert_eq!(lookup_ext4_inode(&volume, InodeId::ROOT, b"a"), None);
         assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"a"),
-            LookupResult::NotFound
-        );
-        assert_eq!(
-            lookup_ext4(&volume, inode(12), b"moved"),
-            LookupResult::Found(inode(11))
+            lookup_ext4_inode(&volume, inode(12), b"moved"),
+            Some(inode(11))
         );
         let moved_entries = read_directory(&volume, inode(11));
         let dotdot = moved_entries
@@ -2990,17 +3049,17 @@ fn remove_directory_rejects_non_empty_child() {
     let file_name = must(Ext4Name::new(b"child"));
 
     let mut create_dir = volume.begin_transaction(NOW);
-    let root = transaction_directory(&create_dir, InodeId::ROOT);
+    let root = transaction_directory(&create_dir, crate::DirectoryNodeId::ROOT);
     let directory = must(create_dir.create_directory(root, &dir_name, test_directory_metadata()));
     must(create_dir.commit());
 
     let mut create_file = volume.begin_transaction(NOW);
-    let child_parent = transaction_directory(&create_file, directory.inode_id());
+    let child_parent = transaction_directory(&create_file, directory.id());
     let _file = must(create_file.create_file(child_parent, &file_name, test_file_metadata()));
     must(create_file.commit());
 
     let mut remove = volume.begin_transaction(NOW);
-    let root = transaction_directory(&remove, InodeId::ROOT);
+    let root = transaction_directory(&remove, crate::DirectoryNodeId::ROOT);
     let result = remove.remove_empty_directory(root, &dir_name);
 
     assert_eq!(result, Err(Error::DirectoryNotEmpty));
@@ -3015,7 +3074,7 @@ fn remove_directory_rejects_root_entry() {
         test_mount_context(),
     ));
     let mut transaction = volume.begin_transaction(NOW);
-    let root = transaction_directory(&transaction, InodeId::ROOT);
+    let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
     let dot = must(Ext4Name::new(b"."));
     let result = transaction.remove_empty_directory(root, &dot);
 
@@ -3034,15 +3093,15 @@ fn indexed_directory_create_rebuilds_real_htree() {
             test_mount_context(),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, InodeId::ROOT);
+        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         let name = must(Ext4Name::new(b"idx"));
         let file = must(transaction.create_file(root, &name, test_file_metadata()));
-        assert_eq!(file.inode_id(), inode(11));
+        assert_eq!(file.id().inode(), inode(11));
         must(transaction.commit());
 
         assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"idx"),
-            LookupResult::Found(inode(11))
+            lookup_ext4_inode(&volume, InodeId::ROOT, b"idx"),
+            Some(inode(11))
         );
     }
 
@@ -3071,11 +3130,11 @@ fn htree_directory_read_lookup_and_windows_lookup_use_real_index() {
     assert!(entries.iter().any(|entry| entry.name().bytes() == b".."));
     assert!(entries.iter().any(|entry| entry.name().bytes() == b"file"));
     assert_eq!(
-        lookup_ext4(&volume, InodeId::ROOT, b"file"),
-        LookupResult::Found(inode(3))
+        lookup_ext4_inode(&volume, InodeId::ROOT, b"file"),
+        Some(inode(3))
     );
     assert_eq!(
-        lookup_windows(
+        lookup_windows_inode(
             &volume,
             InodeId::ROOT,
             &[
@@ -3085,7 +3144,7 @@ fn htree_directory_read_lookup_and_windows_lookup_use_real_index() {
                 u16::from(b'E'),
             ],
         ),
-        LookupResult::Found(inode(3))
+        Some(inode(3))
     );
 }
 
@@ -3134,7 +3193,7 @@ fn linear_directory_converts_to_htree_when_full() {
             bytes.push(b'0' + index);
             let name = must(Ext4Name::new(&bytes));
             let mut transaction = volume.begin_transaction(NOW);
-            let root = transaction_directory(&transaction, InodeId::ROOT);
+            let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
             let _file = must(transaction.create_file(root, &name, test_file_metadata()));
             must(transaction.commit());
         }
@@ -3168,33 +3227,27 @@ fn indexed_directory_rename_and_unlink_rebuild_htree_consistently() {
         let renamed_name = must(Ext4Name::new(b"renamed"));
 
         let mut create = volume.begin_transaction(NOW);
-        let root = transaction_directory(&create, InodeId::ROOT);
+        let root = transaction_directory(&create, crate::DirectoryNodeId::ROOT);
         let file = must(create.create_file(root, &old_name, test_file_metadata()));
         must(create.commit());
 
         let mut rename = volume.begin_transaction(NOW);
-        let root = transaction_directory(&rename, InodeId::ROOT);
+        let root = transaction_directory(&rename, crate::DirectoryNodeId::ROOT);
         must(rename.rename_child(root, &old_name, root, &renamed_name));
         must(rename.commit());
 
+        assert_eq!(lookup_ext4_inode(&volume, InodeId::ROOT, b"temp"), None);
         assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"temp"),
-            LookupResult::NotFound
-        );
-        assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"renamed"),
-            LookupResult::Found(file.inode_id())
+            lookup_ext4_inode(&volume, InodeId::ROOT, b"renamed"),
+            Some(file.id().inode())
         );
 
         let mut unlink = volume.begin_transaction(NOW);
-        let root = transaction_directory(&unlink, InodeId::ROOT);
+        let root = transaction_directory(&unlink, crate::DirectoryNodeId::ROOT);
         must(unlink.unlink_file(root, &renamed_name));
         must(unlink.commit());
 
-        assert_eq!(
-            lookup_ext4(&volume, InodeId::ROOT, b"renamed"),
-            LookupResult::NotFound
-        );
+        assert_eq!(lookup_ext4_inode(&volume, InodeId::ROOT, b"renamed"), None);
     }
 }
 
@@ -3407,8 +3460,9 @@ fn write_transaction_emits_descriptor_data_and_commit_records() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        overwrite_file(&mut transaction, 3, 0, b"HELLO");
+        overwrite_file(&mut transaction, file_id, 0, b"HELLO");
         must(transaction.commit());
     }
 
@@ -3433,8 +3487,9 @@ fn emitted_committed_records_are_replayable_after_checkpoint_loss() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        extend_file(&mut transaction, 3, 3072);
+        extend_file(&mut transaction, file_id, 3072);
         must(transaction.commit());
     }
 
@@ -3704,8 +3759,9 @@ fn emitted_journal_data_escapes_jbd2_magic_prefix() {
             device,
             test_mount_context(),
         ));
+        let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        overwrite_file(&mut transaction, 3, 0, b"MAGIC");
+        overwrite_file(&mut transaction, file_id, 0, b"MAGIC");
         must(transaction.commit());
     }
 
@@ -4057,8 +4113,9 @@ fn fragmented_internal_journal_is_mapped_on_demand() {
     assert_eq!(read, 5);
     assert_eq!(&output, b"FRAG!");
 
+    let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
-    overwrite_file(&mut transaction, 3, 1024, b"hole");
+    overwrite_file(&mut transaction, file_id, 1024, b"hole");
     must(transaction.commit());
     let mut committed = [0_u8; 4];
     let read = read_file(&volume, 3, 1024, &mut committed);

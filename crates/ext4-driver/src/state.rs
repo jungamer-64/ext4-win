@@ -6,8 +6,8 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    DeviceLength, Ext4Name, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey, InodeId,
-    InternalJournal, MountContext, NodeId, ReadWrite, Result as Ext4Result, Volume,
+    DeviceLength, DirectoryNodeId, Ext4Name, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey,
+    InodeId, InternalJournal, MountContext, NodeId, ReadWrite, Result as Ext4Result, Volume,
 };
 use wdk_sys::{
     ACCESS_MASK, DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT,
@@ -261,10 +261,7 @@ impl VolumeControlBlock {
     }
 
     /// Finds a VCB-owned FCB by node identity.
-    fn find_file_control_block(
-        &mut self,
-        node: NodeId,
-    ) -> Option<NonNull<FileControlBlock>> {
+    fn find_file_control_block(&mut self, node: NodeId) -> Option<NonNull<FileControlBlock>> {
         self.file_control_blocks.iter().copied().find(|fcb| {
             let fcb = unsafe {
                 // SAFETY: FCB pointers in this table are owned by the VCB.
@@ -563,7 +560,7 @@ pub(crate) enum OpenedPath {
     /// Child entry under a parent directory.
     Child {
         /// Parent directory inode.
-        parent: InodeId,
+        parent: DirectoryNodeId,
         /// Exact ext4 directory entry name.
         name: Ext4Name,
     },
@@ -724,14 +721,14 @@ pub(crate) unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {
 mod tests {
     use core::ptr::NonNull;
 
-    use ext4_core::InodeId;
+    use ext4_core::{DirectoryNodeId, NodeId};
 
-    use super::{FileControlBlock, FileControlBlockOpenState, FileSystemNode, VolumeControlBlock};
+    use super::{FileControlBlock, FileControlBlockOpenState, VolumeControlBlock};
 
     #[test]
     fn file_control_block_open_count_tracks_last_reference() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, FileSystemNode::Directory(InodeId::ROOT));
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
 
         assert_eq!(fcb.decrement_open(), None);
         assert_eq!(fcb.increment_open(), Some(()));
@@ -750,7 +747,7 @@ mod tests {
     #[test]
     fn file_control_block_starts_with_empty_share_access() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let fcb = FileControlBlock::new(volume, FileSystemNode::Directory(InodeId::ROOT));
+        let fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
 
         assert_eq!(fcb.share_access.OpenCount, 0);
         assert_eq!(fcb.share_access.Readers, 0);

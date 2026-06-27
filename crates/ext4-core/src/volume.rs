@@ -1787,14 +1787,19 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionFile {
     /// Mutable regular-file inode selected for this transaction.
-    inode_id: InodeId,
+    id: FileNodeId,
 }
 
 impl TransactionFile {
-    /// Inode identifier backing this transaction file.
+    /// Typed inode identifier backing this transaction file.
     #[must_use]
-    pub const fn inode_id(self) -> InodeId {
-        self.inode_id
+    pub const fn id(self) -> FileNodeId {
+        self.id
+    }
+
+    /// Raw inode backing this transaction file.
+    const fn inode(self) -> InodeId {
+        self.id.inode()
     }
 }
 
@@ -1802,14 +1807,19 @@ impl TransactionFile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionDirectory {
     /// Mutable directory inode selected for this transaction.
-    inode_id: InodeId,
+    id: DirectoryNodeId,
 }
 
 impl TransactionDirectory {
-    /// Inode identifier backing this transaction directory.
+    /// Typed inode identifier backing this transaction directory.
     #[must_use]
-    pub const fn inode_id(self) -> InodeId {
-        self.inode_id
+    pub const fn id(self) -> DirectoryNodeId {
+        self.id
+    }
+
+    /// Raw inode backing this transaction directory.
+    const fn inode(self) -> InodeId {
+        self.id.inode()
     }
 }
 
@@ -1817,14 +1827,14 @@ impl TransactionDirectory {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionSymlink {
     /// Mutable symbolic-link inode selected for this transaction.
-    inode_id: InodeId,
+    id: SymlinkNodeId,
 }
 
 impl TransactionSymlink {
-    /// Inode identifier backing this transaction symlink.
+    /// Typed inode identifier backing this transaction symlink.
     #[must_use]
-    pub const fn inode_id(self) -> InodeId {
-        self.inode_id
+    pub const fn id(self) -> SymlinkNodeId {
+        self.id
     }
 }
 
@@ -1832,14 +1842,19 @@ impl TransactionSymlink {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionNode {
     /// Mutable inode selected for metadata updates.
-    inode_id: InodeId,
+    id: NodeId,
 }
 
 impl TransactionNode {
-    /// Inode identifier backing this transaction node.
+    /// Typed inode identifier backing this transaction node.
     #[must_use]
-    pub const fn inode_id(self) -> InodeId {
-        self.inode_id
+    pub const fn id(self) -> NodeId {
+        self.id
+    }
+
+    /// Raw inode backing this transaction node.
+    const fn inode(self) -> InodeId {
+        self.id.inode()
     }
 }
 
@@ -1908,34 +1923,39 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     /// # Errors
     /// Returns an error when the inode cannot be read or carries mutation
     /// semantics outside the write domain.
-    pub fn node(&self, inode_id: InodeId) -> Result<TransactionNode> {
-        let inode = self.volume.read_inode_record(inode_id)?;
+    pub fn node(&self, id: NodeId) -> Result<TransactionNode> {
+        let inode = self.volume.read_inode_record(id.inode())?;
         inode.require_mutation(InodeMutation::Metadata)?;
-        Ok(TransactionNode { inode_id })
+        match (id, inode.kind()) {
+            (NodeId::File(_), InodeKind::File)
+            | (NodeId::Directory(_), InodeKind::Directory)
+            | (NodeId::Symlink(_), InodeKind::Symlink) => Ok(TransactionNode { id }),
+            _ => Err(Error::WrongInodeKind),
+        }
     }
 
     /// Selects a regular file for mutation.
     ///
     /// # Errors
     /// Returns an error when the inode is not a regular file or cannot be read.
-    pub fn file(&self, inode_id: InodeId) -> Result<TransactionFile> {
-        let inode = self.volume.read_inode_record(inode_id)?;
+    pub fn file(&self, id: FileNodeId) -> Result<TransactionFile> {
+        let inode = self.volume.read_inode_record(id.inode())?;
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
-        Ok(TransactionFile { inode_id })
+        Ok(TransactionFile { id })
     }
 
     /// Selects a directory for mutation.
     ///
     /// # Errors
     /// Returns an error when the inode is not a directory or cannot be read.
-    pub fn directory(&self, inode_id: InodeId) -> Result<TransactionDirectory> {
-        let inode = self.volume.read_inode_record(inode_id)?;
+    pub fn directory(&self, id: DirectoryNodeId) -> Result<TransactionDirectory> {
+        let inode = self.volume.read_inode_record(id.inode())?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        Ok(TransactionDirectory { inode_id })
+        Ok(TransactionDirectory { id })
     }
 
     /// Selects a symbolic link for mutation.
@@ -1943,13 +1963,13 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     /// # Errors
     /// Returns an error when the inode is not a symbolic link or carries
     /// mutation semantics outside the write domain.
-    pub fn symlink(&self, inode_id: InodeId) -> Result<TransactionSymlink> {
-        let inode = self.volume.read_inode_record(inode_id)?;
+    pub fn symlink(&self, id: SymlinkNodeId) -> Result<TransactionSymlink> {
+        let inode = self.volume.read_inode_record(id.inode())?;
         if inode.kind() != InodeKind::Symlink {
             return Err(Error::WrongInodeKind);
         }
         self.require_file_data_mutation(&inode)?;
-        Ok(TransactionSymlink { inode_id })
+        Ok(TransactionSymlink { id })
     }
 
     /// Updates POSIX owner and permission state representable by ext4 inode fields.
@@ -1962,7 +1982,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         node: TransactionNode,
         security: Ext4Security,
     ) -> Result<()> {
-        let inode_index = self.ensure_inode_update(node.inode_id())?;
+        let inode_index = self.ensure_inode_update(node.inode())?;
         let mut raw_inode = self
             .inode_updates
             .get(inode_index)
@@ -1991,12 +2011,9 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         name: &Ext4Name,
         metadata: NewFileMetadata,
     ) -> Result<TransactionFile> {
-        self.ensure_child_absent(parent.inode_id(), name)?;
-        self.require_directory_entry_mutation(
-            parent.inode_id(),
-            InodeMutation::DirectoryEntryCreate,
-        )?;
-        let parent_inode = self.raw_inode_for_policy(parent.inode_id())?.parse()?;
+        self.ensure_child_absent(parent.inode(), name)?;
+        self.require_directory_entry_mutation(parent.inode(), InodeMutation::DirectoryEntryCreate)?;
+        let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
         let inherited_context = self.inherited_fscrypt_context(&parent_inode)?;
         let mut raw_inode = self.allocate_inode()?;
         raw_inode.initialize_file(
@@ -2007,9 +2024,11 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         )?;
         self.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
         let inode_id = raw_inode.id;
-        self.add_directory_entry(parent.inode_id(), name, inode_id, DirectoryEntryKind::File)?;
+        self.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::File)?;
         self.inode_updates.push(raw_inode);
-        Ok(TransactionFile { inode_id })
+        Ok(TransactionFile {
+            id: FileNodeId::new(inode_id),
+        })
     }
 
     /// Removes a regular file directory entry and releases its inode when the
@@ -2019,7 +2038,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     /// Returns an error when the entry is absent, the child is not a mutable
     /// regular file, or metadata cannot be updated.
     pub fn unlink_file(&mut self, parent: TransactionDirectory, name: &Ext4Name) -> Result<()> {
-        let removed = self.remove_directory_entry(parent.inode_id(), name)?;
+        let removed = self.remove_directory_entry(parent.inode(), name)?;
         let inode_index = self.ensure_inode_update(removed.inode())?;
         let mut raw_inode = self
             .inode_updates
@@ -2061,12 +2080,9 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         name: &Ext4Name,
         metadata: NewDirectoryMetadata,
     ) -> Result<TransactionDirectory> {
-        self.ensure_child_absent(parent.inode_id(), name)?;
-        self.require_directory_entry_mutation(
-            parent.inode_id(),
-            InodeMutation::DirectoryEntryCreate,
-        )?;
-        let parent_inode = self.raw_inode_for_policy(parent.inode_id())?.parse()?;
+        self.ensure_child_absent(parent.inode(), name)?;
+        self.require_directory_entry_mutation(parent.inode(), InodeMutation::DirectoryEntryCreate)?;
+        let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
         let inherited_context = self.inherited_fscrypt_context(&parent_inode)?;
         let block = self.allocate_cluster()?;
         let mut raw_inode = self.allocate_inode()?;
@@ -2091,20 +2107,22 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         let mut directory = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
         );
-        directory.initialize_dot_entries(inode_id, parent.inode_id())?;
+        directory.initialize_dot_entries(inode_id, parent.inode())?;
         self.stage_directory_block(block, directory.into_bytes());
 
         self.add_directory_entry(
-            parent.inode_id(),
+            parent.inode(),
             name,
             inode_id,
             DirectoryEntryKind::Directory,
         )?;
-        self.increment_directory_links(parent.inode_id())?;
+        self.increment_directory_links(parent.inode())?;
         let (group, _) = inode_group_bit(&self.volume.superblock, inode_id)?;
         self.record_group_used_dirs_delta(group, 1)?;
         self.inode_updates.push(raw_inode);
-        Ok(TransactionDirectory { inode_id })
+        Ok(TransactionDirectory {
+            id: DirectoryNodeId::new(inode_id),
+        })
     }
 
     /// Creates a symbolic link under a directory.
@@ -2119,12 +2137,9 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         target: &SymlinkTarget,
         metadata: NewSymlinkMetadata,
     ) -> Result<TransactionSymlink> {
-        self.ensure_child_absent(parent.inode_id(), name)?;
-        self.require_directory_entry_mutation(
-            parent.inode_id(),
-            InodeMutation::DirectoryEntryCreate,
-        )?;
-        let parent_inode = self.raw_inode_for_policy(parent.inode_id())?.parse()?;
+        self.ensure_child_absent(parent.inode(), name)?;
+        self.require_directory_entry_mutation(parent.inode(), InodeMutation::DirectoryEntryCreate)?;
+        let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
         if parent_inode.protection().is_encrypted() {
             return Err(Error::UnsupportedEncryption);
         }
@@ -2169,14 +2184,11 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             }
             self.stage_extent_tree(&mut raw_inode, tree)?;
         }
-        self.add_directory_entry(
-            parent.inode_id(),
-            name,
-            inode_id,
-            DirectoryEntryKind::Symlink,
-        )?;
+        self.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::Symlink)?;
         self.inode_updates.push(raw_inode);
-        Ok(TransactionSymlink { inode_id })
+        Ok(TransactionSymlink {
+            id: SymlinkNodeId::new(inode_id),
+        })
     }
 
     /// Removes an empty child directory.
@@ -2189,7 +2201,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         parent: TransactionDirectory,
         name: &Ext4Name,
     ) -> Result<()> {
-        let removed = self.find_child_entry(parent.inode_id(), name)?;
+        let removed = self.find_child_entry(parent.inode(), name)?;
         if removed.inode() == InodeId::ROOT {
             return Err(Error::CannotRemoveRoot);
         }
@@ -2207,7 +2219,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         if !self.directory_is_empty(&inode)? {
             return Err(Error::DirectoryNotEmpty);
         }
-        let _removed = self.remove_directory_entry(parent.inode_id(), name)?;
+        let _removed = self.remove_directory_entry(parent.inode(), name)?;
         let tree = self.mutable_extent_tree(&inode)?;
         for extent in tree.extents().iter().copied() {
             self.free_extent(extent, 0)?;
@@ -2221,7 +2233,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             .inode_updates
             .get_mut(inode_index)
             .ok_or(Error::InvalidInode)? = raw_inode;
-        self.decrement_directory_links(parent.inode_id())?;
+        self.decrement_directory_links(parent.inode())?;
         let (group, _) = inode_group_bit(&self.volume.superblock, removed.inode())?;
         self.record_group_used_dirs_delta(group, -1)
     }
@@ -2242,8 +2254,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         reject_reserved_directory_name(source_name)?;
         reject_reserved_directory_name(target_name)?;
 
-        let source_parent = source_parent.inode_id();
-        let target_parent = target_parent.inode_id();
+        let source_parent = source_parent.inode();
+        let target_parent = target_parent.inode();
         let source = self.find_child_entry(source_parent, source_name)?;
         if source_parent == target_parent && source_name == target_name {
             return Ok(());
@@ -2310,7 +2322,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     /// Returns an error when the inode leaves the mutable write domain or the
     /// inode record cannot be rewritten.
     pub fn set_times(&mut self, node: TransactionNode, times: Ext4Times) -> Result<()> {
-        let inode_index = self.ensure_inode_update(node.inode_id())?;
+        let inode_index = self.ensure_inode_update(node.inode())?;
         let mut raw_inode = self
             .inode_updates
             .get(inode_index)
@@ -2409,7 +2421,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     /// Returns an error when the entry is absent, not a symbolic link, or
     /// metadata cannot be updated.
     pub fn remove_symlink(&mut self, parent: TransactionDirectory, name: &Ext4Name) -> Result<()> {
-        let removed = self.remove_directory_entry(parent.inode_id(), name)?;
+        let removed = self.remove_directory_entry(parent.inode(), name)?;
         let inode_index = self.ensure_inode_update(removed.inode())?;
         let mut raw_inode = self
             .inode_updates
@@ -2453,7 +2465,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         if bytes.is_empty() {
             return Ok(());
         }
-        let inode_index = self.ensure_inode_update(file.inode_id())?;
+        let inode_index = self.ensure_inode_update(file.inode())?;
         let mut raw_inode = self
             .inode_updates
             .get(inode_index)
@@ -2841,7 +2853,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     /// # Errors
     /// Returns an error when `new_size` would shrink the file.
     pub fn extend_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
-        let inode_index = self.ensure_inode_update(file.inode_id())?;
+        let inode_index = self.ensure_inode_update(file.inode())?;
         let mut raw_inode = self
             .inode_updates
             .get(inode_index)
@@ -2868,7 +2880,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     /// Returns an error when `new_size` would extend the file or root extent
     /// updates cannot fit in the inode.
     pub fn truncate_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
-        let inode_index = self.ensure_inode_update(file.inode_id())?;
+        let inode_index = self.ensure_inode_update(file.inode())?;
         let mut raw_inode = self
             .inode_updates
             .get(inode_index)
@@ -2946,7 +2958,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     /// cannot be read into the verification domain, metadata allocation fails,
     /// or the extent tree cannot represent the post-EOF metadata.
     pub fn enable_verity(&mut self, file: TransactionFile, enable: &FsverityEnable) -> Result<()> {
-        let inode_index = self.ensure_inode_update(file.inode_id())?;
+        let inode_index = self.ensure_inode_update(file.inode())?;
         let mut raw_inode = self
             .inode_updates
             .get(inode_index)
@@ -3579,7 +3591,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         update: impl FnOnce(&mut XattrSet) -> Result<()>,
     ) -> Result<()> {
         self.require_xattr_mutation()?;
-        let inode_index = self.ensure_inode_update(node.inode_id())?;
+        let inode_index = self.ensure_inode_update(node.inode())?;
         let mut raw_inode = self
             .inode_updates
             .get(inode_index)

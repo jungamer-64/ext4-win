@@ -6,8 +6,9 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    DirectoryEntry, Ext4Name, Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes,
-    FileSize, InodeId, Node, WindowsName, WindowsOverlay,
+    ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4Name, Ext4Security, Ext4Times, Ext4Timestamp,
+    Ext4WindowsAttributes, FileNodeId, FileSize, InodeId, LoadedNode, NodeId, WindowsName,
+    WindowsOverlay,
 };
 use wdk_sys::{
     LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
@@ -21,9 +22,8 @@ use crate::irp::{
     IrpBufferLength, QueryDirectoryStack, QueryFileStack, SetFileStack,
 };
 use crate::state::{
-    CloseDisposition, ContextControlBlock, DirectoryCursor, FileControlBlock, FileSystemNode,
-    OpenedPath, VolumeControlBlock, context_control_block, file_control_block,
-    release_file_control_block,
+    CloseDisposition, ContextControlBlock, DirectoryCursor, FileControlBlock, OpenedPath,
+    VolumeControlBlock, context_control_block, file_control_block, release_file_control_block,
 };
 use crate::status::DriverError;
 
@@ -286,7 +286,7 @@ fn set_basic_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
         .volume_mut()
         .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
     let node = transaction
-        .node(context.node.inode())
+        .node(context.node)
         .map_err(|error| DriverError::from(error).ntstatus())?;
     if times != metadata.times {
         transaction
@@ -324,7 +324,7 @@ fn set_allocation_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
     let requested = file_size_from_large_integer(info.AllocationSize)?;
     let context =
         opened_file_context(request.stack.file_object()).map_err(DriverError::ntstatus)?;
-    let FileSystemNode::File(inode) = context.node else {
+    let NodeId::File(file_id) = context.node else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus());
     };
     let vcb = unsafe {
@@ -332,7 +332,7 @@ fn set_allocation_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
         // remain valid while file objects are open.
         context.volume.as_ref()
     };
-    let current = regular_file_size(vcb, inode)?;
+    let current = regular_file_size(vcb, file_id)?;
     if requested >= current {
         return Ok(());
     }
@@ -412,7 +412,7 @@ fn set_rename_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
         .commit()
         .map_err(|error| DriverError::from(error).ntstatus())?;
     ccb.replace_path(OpenedPath::Child {
-        parent: target_parent.inode_id(),
+        parent: target_parent.id(),
         name: target_name,
     });
     Ok(())
@@ -424,7 +424,7 @@ fn set_regular_file_size(
     new_size: FileSize,
 ) -> Result<(), NTSTATUS> {
     let context = opened_file_context(file_object).map_err(DriverError::ntstatus)?;
-    let FileSystemNode::File(inode) = context.node else {
+    let NodeId::File(file_id) = context.node else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus());
     };
     let mut vcb = context.volume;
@@ -434,7 +434,7 @@ fn set_regular_file_size(
         // transaction boundary for this synchronous size mutation.
         vcb.as_mut()
     };
-    let current = regular_file_size(vcb, inode)?;
+    let current = regular_file_size(vcb, file_id)?;
     if new_size == current {
         return Ok(());
     }
@@ -443,7 +443,7 @@ fn set_regular_file_size(
         .volume_mut()
         .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
     let file = transaction
-        .file(inode)
+        .file(file_id)
         .map_err(|error| DriverError::from(error).ntstatus())?;
     if new_size > current {
         transaction
@@ -494,16 +494,16 @@ fn pack_directory_information(
         fcb.as_ref()
     };
     let vcb = volume_control_block(fcb);
-    let FileSystemNode::Directory(inode) = fcb.node() else {
+    let NodeId::Directory(directory_id) = fcb.node() else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus());
     };
     let directory = match vcb
         .volume()
-        .read_node(inode)
+        .load_node(directory_id.inode())
         .map_err(|error| DriverError::from(error).ntstatus())?
     {
-        Node::Directory(directory) => directory,
-        Node::File(_) | Node::Symlink(_) => {
+        LoadedNode::Directory(directory) => directory,
+        LoadedNode::File(_) | LoadedNode::Symlink(_) => {
             return Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus());
         }
     };
@@ -755,9 +755,9 @@ fn emit_directory_entries(
 
         let node = vcb
             .volume()
-            .read_node(entry.inode())
+            .load_node(entry.inode())
             .map_err(|error| DriverError::from(error).ntstatus())?;
-        let metadata = metadata_from_node(vcb, entry.inode(), node)?;
+        let metadata = metadata_from_node(vcb, node.id(), node)?;
         let layout = DirectoryRecordLayout::new(class, &name)?;
         let required = written
             .checked_add(layout.unpadded_size)
@@ -1005,13 +1005,13 @@ fn cleanup_file_object(file_object: NonNull<wdk_sys::FILE_OBJECT>) -> Result<(),
         .directory(parent)
         .map_err(|error| DriverError::from(error).ntstatus())?;
     match fcb.node() {
-        FileSystemNode::File(_) => transaction
+        NodeId::File(_) => transaction
             .unlink_file(parent, &name)
             .map_err(|error| DriverError::from(error).ntstatus())?,
-        FileSystemNode::Directory(_) => transaction
+        NodeId::Directory(_) => transaction
             .remove_empty_directory(parent, &name)
             .map_err(|error| DriverError::from(error).ntstatus())?,
-        FileSystemNode::Symlink(_) => transaction
+        NodeId::Symlink(_) => transaction
             .remove_symlink(parent, &name)
             .map_err(|error| DriverError::from(error).ntstatus())?,
     }
@@ -1028,7 +1028,7 @@ struct OpenedFileContext {
     /// Mounted VCB owning the open file.
     volume: NonNull<VolumeControlBlock>,
     /// ext4 node opened by this FILE_OBJECT.
-    node: FileSystemNode,
+    node: NodeId,
 }
 
 /// Returns the opened FCB identity and VCB pointer.
@@ -1198,29 +1198,36 @@ fn windows_path_components(units: &[u16]) -> Result<Vec<WindowsName>, NTSTATUS> 
 fn resolve_rename_target(
     vcb: &VolumeControlBlock,
     components: &[WindowsName],
-) -> Result<(InodeId, Ext4Name), NTSTATUS> {
+) -> Result<(DirectoryNodeId, Ext4Name), NTSTATUS> {
     let (target_name, parents) = components.split_last().ok_or(STATUS_INVALID_PARAMETER)?;
-    let mut parent_inode = InodeId::ROOT;
+    let mut parent_id = DirectoryNodeId::ROOT;
     for component in parents {
         let parent = match vcb
             .volume()
-            .read_node(parent_inode)
+            .load_node(parent_id.inode())
             .map_err(|error| DriverError::from(error).ntstatus())?
         {
-            Node::Directory(directory) => directory,
-            Node::File(_) | Node::Symlink(_) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
+            LoadedNode::Directory(directory) => directory,
+            LoadedNode::File(_) | LoadedNode::Symlink(_) => {
+                return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+            }
         };
-        let Some(entry) = vcb
+        let child = vcb
             .volume()
-            .lookup_windows_child_entry(&parent, component)
-            .map_err(|error| DriverError::from(error).ntstatus())?
-        else {
-            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+            .lookup_windows_child(&parent, component)
+            .map_err(|error| DriverError::from(error).ntstatus())?;
+        match child {
+            ChildLookup::Found(child) => {
+                let NodeId::Directory(directory_id) = *child.node() else {
+                    return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+                };
+                parent_id = directory_id;
+            }
+            ChildLookup::NotFound => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
         };
-        parent_inode = entry.inode();
     }
     Ok((
-        parent_inode,
+        parent_id,
         target_name
             .to_ext4()
             .map_err(|error| DriverError::from(error).ntstatus())?,
@@ -1347,14 +1354,14 @@ fn file_size_from_large_integer(value: LARGE_INTEGER) -> Result<FileSize, NTSTAT
 }
 
 /// Returns the current size of a regular file inode.
-fn regular_file_size(vcb: &VolumeControlBlock, inode: InodeId) -> Result<FileSize, NTSTATUS> {
+fn regular_file_size(vcb: &VolumeControlBlock, file_id: FileNodeId) -> Result<FileSize, NTSTATUS> {
     match vcb
         .volume()
-        .read_node(inode)
+        .load_node(file_id.inode())
         .map_err(|error| DriverError::from(error).ntstatus())?
     {
-        Node::File(file) => Ok(file.size()),
-        Node::Directory(_) | Node::Symlink(_) => {
+        LoadedNode::File(file) => Ok(file.size()),
+        LoadedNode::Directory(_) | LoadedNode::Symlink(_) => {
             Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus())
         }
     }
@@ -1413,12 +1420,12 @@ fn load_file_metadata(
         fcb.as_ref()
     };
     let vcb = volume_control_block(fcb);
-    let inode = fcb.node().inode();
+    let node_id = fcb.node();
     let node = vcb
         .volume()
-        .read_node(inode)
+        .load_node(node_id.inode())
         .map_err(|error| DriverError::from(error).ntstatus())?;
-    let metadata = metadata_from_node(vcb, inode, node)?;
+    let metadata = metadata_from_node(vcb, node_id, node)?;
     if fcb_node_matches_metadata(fcb.node(), metadata.kind) {
         Ok(metadata)
     } else {
@@ -1427,21 +1434,22 @@ fn load_file_metadata(
 }
 
 /// Returns true when an FCB node identity still matches loaded core metadata.
-const fn fcb_node_matches_metadata(node: FileSystemNode, kind: FileMetadataKind) -> bool {
+const fn fcb_node_matches_metadata(node: NodeId, kind: FileMetadataKind) -> bool {
     matches!(
         (node, kind),
-        (FileSystemNode::File(_), FileMetadataKind::File)
-            | (FileSystemNode::Directory(_), FileMetadataKind::Directory)
-            | (FileSystemNode::Symlink(_), FileMetadataKind::Symlink)
+        (NodeId::File(_), FileMetadataKind::File)
+            | (NodeId::Directory(_), FileMetadataKind::Directory)
+            | (NodeId::Symlink(_), FileMetadataKind::Symlink)
     )
 }
 
 /// Builds Windows-facing metadata from a loaded ext4 node.
 fn metadata_from_node(
     vcb: &VolumeControlBlock,
-    inode: InodeId,
-    node: Node,
+    node_id: NodeId,
+    node: LoadedNode,
 ) -> Result<FileMetadata, NTSTATUS> {
+    let inode = node_id.inode();
     let overlay_attributes = vcb
         .volume()
         .read_windows_overlay(inode)
@@ -1451,7 +1459,7 @@ fn metadata_from_node(
 
     let block_size = vcb.volume().superblock().block_size();
     match node {
-        Node::File(file) => Ok(FileMetadata {
+        LoadedNode::File(file) => Ok(FileMetadata {
             inode,
             kind: FileMetadataKind::File,
             size: file.size(),
@@ -1461,7 +1469,7 @@ fn metadata_from_node(
             overlay_attributes,
             block_size,
         }),
-        Node::Directory(directory) => Ok(FileMetadata {
+        LoadedNode::Directory(directory) => Ok(FileMetadata {
             inode,
             kind: FileMetadataKind::Directory,
             size: directory.size(),
@@ -1471,7 +1479,7 @@ fn metadata_from_node(
             overlay_attributes,
             block_size,
         }),
-        Node::Symlink(symlink) => Ok(FileMetadata {
+        LoadedNode::Symlink(symlink) => Ok(FileMetadata {
             inode,
             kind: FileMetadataKind::Symlink,
             size: symlink.size(),
@@ -1681,12 +1689,12 @@ fn read_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
         fcb.as_ref()
     };
     let vcb = volume_control_block(fcb);
-    let FileSystemNode::File(inode) = fcb.node() else {
+    let NodeId::File(file_id) = fcb.node() else {
         return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
     };
 
-    let node = vcb.volume().read_node(inode)?;
-    let Node::File(file) = node else {
+    let node = vcb.volume().load_node(file_id.inode())?;
+    let LoadedNode::File(file) = node else {
         return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
     };
     let bytes_read = vcb
@@ -1722,14 +1730,14 @@ fn write_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
         // transaction boundary for this synchronous write path.
         vcb.as_mut()
     };
-    let FileSystemNode::File(inode) = fcb.node() else {
+    let NodeId::File(file_id) = fcb.node() else {
         return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
     };
 
     let mut transaction = vcb
         .volume_mut()
         .begin_transaction(crate::time::current_ext4_timestamp()?);
-    let file = transaction.file(inode)?;
+    let file = transaction.file(file_id)?;
     transaction.overwrite_file_range(file, stack.byte_offset(), input.as_slice())?;
     transaction.commit()?;
     target.set_information(
