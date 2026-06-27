@@ -196,9 +196,16 @@ impl VolumeControlBlock {
         self.volume.remove_fscrypt_key(identifier)
     }
 
-    /// Returns whether the mounted volume has a fscrypt key.
-    pub(crate) fn contains_fscrypt_key(&self, identifier: FscryptKeyIdentifier) -> bool {
-        self.volume.contains_fscrypt_key(identifier)
+    /// Returns the mounted volume's fscrypt key presence for one identifier.
+    pub(crate) fn fscrypt_key_presence(
+        &self,
+        identifier: FscryptKeyIdentifier,
+    ) -> FscryptKeyPresence {
+        if self.volume.contains_fscrypt_key(identifier) {
+            FscryptKeyPresence::Present
+        } else {
+            FscryptKeyPresence::Absent
+        }
     }
 
     /// Opens or reuses the VCB-owned FCB for a node.
@@ -266,6 +273,15 @@ impl VolumeControlBlock {
             fcb.node() == node
         })
     }
+}
+
+/// Mount-local fscrypt master-key presence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FscryptKeyPresence {
+    /// The key is installed in this mounted volume.
+    Present,
+    /// The key is absent from this mounted volume.
+    Absent,
 }
 
 impl Drop for VolumeControlBlock {

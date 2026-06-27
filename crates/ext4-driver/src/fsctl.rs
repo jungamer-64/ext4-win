@@ -13,7 +13,7 @@ use wdk_sys::{
 };
 
 use crate::irp::{DispatchTarget, FileSystemControlStack};
-use crate::state::{VolumeControlBlock, file_control_block};
+use crate::state::{FscryptKeyPresence, VolumeControlBlock, file_control_block};
 use crate::status::DriverError;
 
 /// Windows `FILE_DEVICE_FILE_SYSTEM`.
@@ -256,15 +256,15 @@ fn get_encryption_key_status_result(
     let input = read_input(target, stack)?;
     let payload = FscryptKeyStatusPayload::parse(input.as_slice())?;
     let vcb = mounted_vcb(stack)?;
-    let present = unsafe {
+    let presence = unsafe {
         // SAFETY: The VCB pointer comes from an open FCB that is valid for the
         // duration of this synchronous FSCTL dispatch.
         vcb.as_ref()
     }
-    .contains_fscrypt_key(payload.identifier());
+    .fscrypt_key_presence(payload.identifier());
 
     let mut output = output_buffer(target, stack, FSCRYPT_GET_KEY_STATUS_BYTES)?;
-    write_key_status_output(output.as_mut_slice(), present)?;
+    write_key_status_output(output.as_mut_slice(), presence)?;
     set_information(target, FSCRYPT_GET_KEY_STATUS_BYTES)
 }
 
@@ -274,7 +274,10 @@ fn write_remove_key_output(output: &mut [u8]) -> Result<(), NTSTATUS> {
 }
 
 /// Writes Linux-compatible key-status output fields.
-fn write_key_status_output(output: &mut [u8], present: bool) -> Result<(), NTSTATUS> {
+fn write_key_status_output(
+    output: &mut [u8],
+    presence: FscryptKeyPresence,
+) -> Result<(), NTSTATUS> {
     output
         .get_mut(FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET..FSCRYPT_GET_KEY_STATUS_BYTES)
         .ok_or(STATUS_BUFFER_TOO_SMALL)?
@@ -282,26 +285,42 @@ fn write_key_status_output(output: &mut [u8], present: bool) -> Result<(), NTSTA
     write_u32(
         output,
         FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET,
-        if present {
-            FSCRYPT_KEY_STATUS_PRESENT
-        } else {
-            FSCRYPT_KEY_STATUS_ABSENT
-        },
+        key_presence_status(presence),
     )?;
     write_u32(
         output,
         FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET,
-        if present {
-            FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF
-        } else {
-            0
-        },
+        key_presence_status_flags(presence),
     )?;
     write_u32(
         output,
         FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET,
-        u32::from(present),
+        key_presence_user_count(presence),
     )
+}
+
+/// Linux key-status value for the mount-local presence state.
+const fn key_presence_status(presence: FscryptKeyPresence) -> u32 {
+    match presence {
+        FscryptKeyPresence::Present => FSCRYPT_KEY_STATUS_PRESENT,
+        FscryptKeyPresence::Absent => FSCRYPT_KEY_STATUS_ABSENT,
+    }
+}
+
+/// Linux key-status flags for the mount-local presence state.
+const fn key_presence_status_flags(presence: FscryptKeyPresence) -> u32 {
+    match presence {
+        FscryptKeyPresence::Present => FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF,
+        FscryptKeyPresence::Absent => 0,
+    }
+}
+
+/// Linux key-status user count for the mount-local presence state.
+const fn key_presence_user_count(presence: FscryptKeyPresence) -> u32 {
+    match presence {
+        FscryptKeyPresence::Present => 1,
+        FscryptKeyPresence::Absent => 0,
+    }
 }
 
 /// Parsed fscrypt add-key payload.
@@ -758,7 +777,10 @@ mod tests {
     #[test]
     fn fscrypt_status_outputs_linux_layout() {
         let mut present = vec![0xFF; FSCRYPT_GET_KEY_STATUS_BYTES];
-        must!(write_key_status_output(&mut present, true));
+        must!(write_key_status_output(
+            &mut present,
+            FscryptKeyPresence::Present
+        ));
 
         assert_eq!(
             read_u32(&present, FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
@@ -779,7 +801,10 @@ mod tests {
         );
 
         let mut absent = vec![0xFF; FSCRYPT_GET_KEY_STATUS_BYTES];
-        must!(write_key_status_output(&mut absent, false));
+        must!(write_key_status_output(
+            &mut absent,
+            FscryptKeyPresence::Absent
+        ));
 
         assert_eq!(
             read_u32(&absent, FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
