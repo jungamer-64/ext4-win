@@ -9,7 +9,7 @@ use ext4_core::{
 };
 use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
 
-use crate::irp::{DispatchTarget, FileSystemControlStack};
+use crate::irp::{DispatchTarget, FileSystemControlStack, InformationLength};
 use crate::state::{FscryptKeyPresence, VolumeControlBlock, file_control_block};
 use crate::status::{DriverError, DriverResult};
 use crate::wire::{LittleEndianInput, LittleEndianOutput};
@@ -180,7 +180,7 @@ fn add_encryption_key_result(
         vcb.as_mut()
     };
     vcb.add_fscrypt_key(payload.into_master_key())?;
-    target.set_information(0);
+    target.set_information(InformationLength::ZERO);
     Ok(())
 }
 
@@ -536,9 +536,7 @@ fn output_buffer(
 
 /// Stores an FSCTL output byte count.
 fn set_information(target: DispatchTarget, len: usize) -> DriverResult<()> {
-    target.set_information(
-        wdk_sys::ULONG_PTR::try_from(len).map_err(|_| DriverError::InvalidParameter)?,
-    );
+    target.set_information(InformationLength::from_usize(len)?);
     Ok(())
 }
 

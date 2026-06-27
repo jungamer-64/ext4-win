@@ -6,7 +6,32 @@ use core::ptr::NonNull;
 use ext4_core::FileOffset;
 use wdk_sys::{PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP};
 
-use crate::status::DriverError;
+use crate::status::{DriverError, DriverResult};
+
+/// Byte count completed in `IO_STATUS_BLOCK::Information`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InformationLength {
+    /// WDK-sized information payload.
+    bytes: wdk_sys::ULONG_PTR,
+}
+
+impl InformationLength {
+    /// Zero-byte completion.
+    pub(crate) const ZERO: Self = Self { bytes: 0 };
+
+    /// Builds an information length from a Rust byte count.
+    pub(crate) fn from_usize(bytes: usize) -> DriverResult<Self> {
+        Ok(Self {
+            bytes: wdk_sys::ULONG_PTR::try_from(bytes)
+                .map_err(|_| DriverError::InvalidParameter)?,
+        })
+    }
+
+    /// Returns the WDK payload for the IRP boundary.
+    const fn as_ulong_ptr(self) -> wdk_sys::ULONG_PTR {
+        self.bytes
+    }
+}
 
 /// Non-null dispatch target decoded from raw WDK callback inputs.
 #[derive(Clone, Copy, Debug)]
@@ -85,14 +110,14 @@ impl DispatchTarget {
     }
 
     /// Stores the byte count returned by this IRP.
-    pub(crate) fn set_information(self, information: wdk_sys::ULONG_PTR) {
+    pub(crate) fn set_information(self, information: InformationLength) {
         let irp = unsafe {
             // SAFETY: DispatchTarget owns a non-null IRP pointer decoded from
             // the WDK dispatch boundary for the duration of this callback.
             self.irp.as_ptr().as_mut()
         };
         if let Some(irp) = irp {
-            irp.IoStatus.Information = information;
+            irp.IoStatus.Information = information.as_ulong_ptr();
         }
     }
 

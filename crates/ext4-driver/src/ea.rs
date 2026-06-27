@@ -6,7 +6,9 @@ use core::ptr::NonNull;
 use ext4_core::{XattrName, XattrNamespace, XattrValue};
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
-use crate::irp::{DispatchTarget, EaEntryEmission, EaNameSelection, QueryEaStack, SetEaStack};
+use crate::irp::{
+    DispatchTarget, EaEntryEmission, EaNameSelection, InformationLength, QueryEaStack, SetEaStack,
+};
 use crate::state::{FileControlBlock, VolumeControlBlock, file_control_block};
 use crate::status::{DriverError, DriverResult};
 use crate::wire::{LittleEndianInput, LittleEndianOutput};
@@ -104,9 +106,9 @@ fn query_ea(request: QueryEaRequest) -> NTSTATUS {
         }
         let mut output = request.target.data_buffer(length)?;
         let written = pack_full_ea_entries(entries.as_slice(), output.as_mut_slice())?;
-        request.target.set_information(
-            wdk_sys::ULONG_PTR::try_from(written).map_err(|_| DriverError::InvalidParameter)?,
-        );
+        request
+            .target
+            .set_information(InformationLength::from_usize(written)?);
         Ok(())
     }) {
         Ok(()) => STATUS_SUCCESS,
@@ -120,7 +122,7 @@ fn set_ea(request: SetEaRequest) -> NTSTATUS {
         .and_then(|entries| apply_set_ea_entries(request.stack, entries.as_slice()))
     {
         Ok(()) => {
-            request.target.set_information(0);
+            request.target.set_information(InformationLength::ZERO);
             STATUS_SUCCESS
         }
         Err(error) => error.ntstatus(),

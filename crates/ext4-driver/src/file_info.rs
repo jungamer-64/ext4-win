@@ -14,7 +14,7 @@ use wdk_sys::{LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::irp::{
     DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
-    DirectoryPatternInput, DispatchTarget, IrpBufferLength, QueryDirectoryStack,
+    DirectoryPatternInput, DispatchTarget, InformationLength, IrpBufferLength, QueryDirectoryStack,
     QueryFileInformationClass, QueryFileStack, SetFileInformationClass, SetFileStack,
 };
 use crate::state::{
@@ -199,7 +199,7 @@ fn query_file_information(request: QueryFileRequest) -> NTSTATUS {
 }
 
 /// Packs one supported file information class.
-fn pack_file_information(request: QueryFileRequest) -> DriverResult<wdk_sys::ULONG_PTR> {
+fn pack_file_information(request: QueryFileRequest) -> DriverResult<InformationLength> {
     let metadata = load_file_metadata(request.stack.file_object())?;
     let buffer = request
         .target
@@ -223,7 +223,7 @@ fn pack_file_information(request: QueryFileRequest) -> DriverResult<wdk_sys::ULO
 fn set_file_information(request: SetFileRequest) -> NTSTATUS {
     match apply_file_information(request) {
         Ok(()) => {
-            request.target.set_information(0);
+            request.target.set_information(InformationLength::ZERO);
             STATUS_SUCCESS
         }
         Err(error) => error.ntstatus(),
@@ -431,7 +431,7 @@ fn query_directory(target: DispatchTarget) -> NTSTATUS {
 }
 
 /// Packs directory entries into the caller's query-directory buffer.
-fn pack_directory_information(request: QueryDirectoryRequest) -> DriverResult<wdk_sys::ULONG_PTR> {
+fn pack_directory_information(request: QueryDirectoryRequest) -> DriverResult<InformationLength> {
     let class = request.stack.information_class();
     let pattern = DirectoryPattern::from_stack(request.stack)?;
     let length = request.stack.length().as_usize();
@@ -478,7 +478,7 @@ fn pack_directory_information(request: QueryDirectoryRequest) -> DriverResult<wd
         &entries,
         buffer,
     )?;
-    wdk_sys::ULONG_PTR::try_from(result).map_err(|_| DriverError::InvalidParameter)
+    InformationLength::from_usize(result)
 }
 
 impl DirectoryInformationClass {
@@ -1350,7 +1350,7 @@ fn pack_basic_information(
     buffer: NonNull<c_void>,
     length: usize,
     metadata: FileMetadata,
-) -> DriverResult<wdk_sys::ULONG_PTR> {
+) -> DriverResult<InformationLength> {
     write_fixed(
         buffer,
         length,
@@ -1369,7 +1369,7 @@ fn pack_standard_information(
     buffer: NonNull<c_void>,
     length: usize,
     metadata: FileMetadata,
-) -> DriverResult<wdk_sys::ULONG_PTR> {
+) -> DriverResult<InformationLength> {
     write_fixed(
         buffer,
         length,
@@ -1388,7 +1388,7 @@ fn pack_internal_information(
     buffer: NonNull<c_void>,
     length: usize,
     metadata: FileMetadata,
-) -> DriverResult<wdk_sys::ULONG_PTR> {
+) -> DriverResult<InformationLength> {
     write_fixed(
         buffer,
         length,
@@ -1405,7 +1405,7 @@ fn pack_position_information(
     buffer: NonNull<c_void>,
     length: usize,
     file_object: NonNull<wdk_sys::FILE_OBJECT>,
-) -> DriverResult<wdk_sys::ULONG_PTR> {
+) -> DriverResult<InformationLength> {
     let file_object = unsafe {
         // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
         // is read only for the current byte offset field.
@@ -1429,7 +1429,7 @@ fn pack_network_open_information(
     buffer: NonNull<c_void>,
     length: usize,
     metadata: FileMetadata,
-) -> DriverResult<wdk_sys::ULONG_PTR> {
+) -> DriverResult<InformationLength> {
     write_fixed(
         buffer,
         length,
@@ -1450,7 +1450,7 @@ fn write_fixed<T>(
     buffer: NonNull<c_void>,
     length: usize,
     value: T,
-) -> DriverResult<wdk_sys::ULONG_PTR> {
+) -> DriverResult<InformationLength> {
     let size = core::mem::size_of::<T>();
     if length < size {
         return Err(DriverError::BufferTooSmall);
@@ -1462,7 +1462,7 @@ fn write_fixed<T>(
         // for fixed-size query information outputs.
         target.write(value);
     }
-    wdk_sys::ULONG_PTR::try_from(size).map_err(|_| DriverError::InvalidParameter)
+    InformationLength::from_usize(size)
 }
 
 /// Converts an ext4 timestamp to a Windows system-time LARGE_INTEGER.
@@ -1532,7 +1532,7 @@ fn read_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
     let stack = target.current_stack()?.read()?;
     let length = stack.length().as_usize();
     if length == 0 {
-        target.set_information(0);
+        target.set_information(InformationLength::ZERO);
         return Ok(());
     }
     let mut output = target.data_buffer(length)?;
@@ -1555,10 +1555,7 @@ fn read_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
     let bytes_read = vcb
         .volume()
         .read_file(&file, stack.byte_offset(), output.as_mut_slice())?;
-    target.set_information(
-        wdk_sys::ULONG_PTR::try_from(bytes_read.as_usize())
-            .map_err(|_| DriverError::InvalidParameter)?,
-    );
+    target.set_information(InformationLength::from_usize(bytes_read.as_usize())?);
     Ok(())
 }
 
@@ -1567,7 +1564,7 @@ fn write_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
     let stack = target.current_stack()?.write()?;
     let length = stack.length().as_usize();
     if length == 0 {
-        target.set_information(0);
+        target.set_information(InformationLength::ZERO);
         return Ok(());
     }
     let input = target.data_buffer(length)?;
@@ -1595,9 +1592,7 @@ fn write_regular_file(target: DispatchTarget) -> Result<(), DriverError> {
     let file = transaction.file(file_id)?;
     transaction.overwrite_file_range(file, stack.byte_offset(), input.as_slice())?;
     transaction.commit()?;
-    target.set_information(
-        wdk_sys::ULONG_PTR::try_from(length).map_err(|_| DriverError::InvalidParameter)?,
-    );
+    target.set_information(InformationLength::from_usize(length)?);
     Ok(())
 }
 

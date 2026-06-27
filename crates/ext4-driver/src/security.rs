@@ -7,8 +7,8 @@ use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, Load
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::irp::{
-    DispatchTarget, QuerySecurityStack, SecurityComponentSelection, SecuritySelection,
-    SetSecurityStack,
+    DispatchTarget, InformationLength, QuerySecurityStack, SecurityComponentSelection,
+    SecuritySelection, SetSecurityStack,
 };
 use crate::state::{FileControlBlock, VolumeControlBlock, file_control_block};
 use crate::status::{DriverError, DriverResult};
@@ -203,9 +203,9 @@ fn query_security(request: QuerySecurityRequest) -> NTSTATUS {
     match load_ext4_security(request.stack.file_object()).and_then(|security| {
         let descriptor = security_descriptor(security, request.stack.selection())?;
         let required = descriptor.len();
-        request.target.set_information(
-            wdk_sys::ULONG_PTR::try_from(required).map_err(|_| DriverError::InvalidParameter)?,
-        );
+        request
+            .target
+            .set_information(InformationLength::from_usize(required)?);
         let length = request.stack.length().as_usize();
         if length < required {
             return Err(DriverError::BufferTooSmall);
