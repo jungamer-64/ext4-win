@@ -3,14 +3,16 @@
 use alloc::boxed::Box;
 
 use wdk_sys::{
-    NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
+    NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
     STATUS_UNRECOGNIZED_VOLUME,
 };
 
 use crate::{
     block_device::query_device_length,
     ffi, fsctl,
-    irp::{DispatchTarget, FileSystemControlStack, IrpBufferLength, MountVolumeStack},
+    irp::{
+        DispatchTarget, FileSystemControlStack, FsControlCode, IrpBufferLength, MountVolumeStack,
+    },
     reparse,
     state::{
         KernelDevice, MountCandidate, MountedVolumeDevice, MountedVolumeDeviceExtension,
@@ -27,7 +29,7 @@ pub(crate) fn dispatch(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(FileSystemControlRequest::decode) {
         Ok(FileSystemControlRequest::MountVolume(request)) => mount_volume(request),
         Ok(FileSystemControlRequest::UserFsControl(request)) => user_fs_control(request),
-        Ok(FileSystemControlRequest::Unsupported) => STATUS_NOT_SUPPORTED,
+        Ok(FileSystemControlRequest::Unsupported) => DriverError::NotSupported.ntstatus(),
         Err(error) => error.ntstatus(),
     }
 }
@@ -101,7 +103,7 @@ impl UserFsControlRequest {
     }
 
     /// Returns the requested FSCTL code.
-    const fn fs_control_code(self) -> wdk_sys::ULONG {
+    const fn fs_control_code(self) -> FsControlCode {
         self.stack.fs_control_code()
     }
 }
@@ -226,25 +228,22 @@ fn mount_volume(request: MountVolumeRequest) -> NTSTATUS {
 /// Handles path-scoped user FSCTL requests.
 fn user_fs_control(request: UserFsControlRequest) -> NTSTATUS {
     match request.fs_control_code() {
-        reparse::FSCTL_GET_REPARSE_POINT => {
+        FsControlCode::GetReparsePoint => {
             reparse::get_reparse_point(request.target(), request.stack())
         }
-        reparse::FSCTL_SET_REPARSE_POINT => {
+        FsControlCode::SetReparsePoint => {
             reparse::set_reparse_point(request.target(), request.stack())
         }
-        reparse::FSCTL_DELETE_REPARSE_POINT => STATUS_NOT_SUPPORTED,
-        fsctl::FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY => {
+        FsControlCode::DeleteReparsePoint => DriverError::NotSupported.ntstatus(),
+        FsControlCode::AddEncryptionKey => {
             fsctl::add_encryption_key(request.target(), request.stack())
         }
-        fsctl::FSCTL_EXT4WIN_REMOVE_ENCRYPTION_KEY => {
+        FsControlCode::RemoveEncryptionKey => {
             fsctl::remove_encryption_key(request.target(), request.stack())
         }
-        fsctl::FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS => {
+        FsControlCode::GetEncryptionKeyStatus => {
             fsctl::get_encryption_key_status(request.target(), request.stack())
         }
-        fsctl::FSCTL_EXT4WIN_ENABLE_VERITY => {
-            fsctl::enable_verity(request.target(), request.stack())
-        }
-        _ => STATUS_NOT_SUPPORTED,
+        FsControlCode::EnableVerity => fsctl::enable_verity(request.target(), request.stack()),
     }
 }
