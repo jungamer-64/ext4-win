@@ -7,14 +7,11 @@ use ext4_core::{
     FscryptKeyIdentifier, FscryptMasterKey, FsverityBlockSize, FsverityEnable,
     FsverityHashAlgorithm, FsveritySalt, FsveritySignature, NodeId,
 };
-use wdk_sys::{
-    NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
-    STATUS_SUCCESS,
-};
+use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
 
 use crate::irp::{DispatchTarget, FileSystemControlStack};
 use crate::state::{FscryptKeyPresence, VolumeControlBlock, file_control_block};
-use crate::status::DriverError;
+use crate::status::{DriverError, DriverResult};
 
 /// Windows `FILE_DEVICE_FILE_SYSTEM`.
 const FILE_DEVICE_FILE_SYSTEM: wdk_sys::ULONG = 0x0000_0009;
@@ -138,7 +135,7 @@ pub(crate) fn add_encryption_key(
 ) -> NTSTATUS {
     match add_encryption_key_result(target, stack) {
         Ok(()) => STATUS_SUCCESS,
-        Err(status) => status,
+        Err(error) => error.ntstatus(),
     }
 }
 
@@ -149,7 +146,7 @@ pub(crate) fn remove_encryption_key(
 ) -> NTSTATUS {
     match remove_encryption_key_result(target, stack) {
         Ok(()) => STATUS_SUCCESS,
-        Err(status) => status,
+        Err(error) => error.ntstatus(),
     }
 }
 
@@ -160,7 +157,7 @@ pub(crate) fn get_encryption_key_status(
 ) -> NTSTATUS {
     match get_encryption_key_status_result(target, stack) {
         Ok(()) => STATUS_SUCCESS,
-        Err(status) => status,
+        Err(error) => error.ntstatus(),
     }
 }
 
@@ -168,26 +165,23 @@ pub(crate) fn get_encryption_key_status(
 pub(crate) fn enable_verity(target: DispatchTarget, stack: FileSystemControlStack) -> NTSTATUS {
     match enable_verity_result(target, stack) {
         Ok(()) => STATUS_SUCCESS,
-        Err(status) => status,
+        Err(error) => error.ntstatus(),
     }
 }
 
 /// Enables fs-verity on the opened regular file.
-fn enable_verity_result(
-    target: DispatchTarget,
-    stack: FileSystemControlStack,
-) -> Result<(), NTSTATUS> {
+fn enable_verity_result(target: DispatchTarget, stack: FileSystemControlStack) -> DriverResult<()> {
     let payload = read_input(target, stack)
         .and_then(|input| FsverityEnablePayload::parse(input.as_slice()))?;
     let enable = payload.into_core_enable()?;
-    let fcb = file_control_block(stack.file_object()).map_err(DriverError::ntstatus)?;
+    let fcb = file_control_block(stack.file_object())?;
     let fcb = unsafe {
         // SAFETY: Successful create stores a live FCB in FsContext while this
         // FSCTL is dispatched for the opened FILE_OBJECT.
         fcb.as_ref()
     };
     let NodeId::File(file_id) = fcb.node() else {
-        return Err(DriverError::from(ext4_core::Error::WrongInodeKind).ntstatus());
+        return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
     };
     let mut vcb = fcb.volume();
     let vcb = unsafe {
@@ -197,23 +191,18 @@ fn enable_verity_result(
     };
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp().map_err(DriverError::ntstatus)?);
-    let file = transaction
-        .file(file_id)
-        .map_err(|error| DriverError::from(error).ntstatus())?;
-    transaction
-        .enable_verity(file, &enable)
-        .map_err(|error| DriverError::from(error).ntstatus())?;
-    transaction
-        .commit()
-        .map_err(|error| DriverError::from(error).ntstatus())
+        .begin_transaction(crate::time::current_ext4_timestamp()?);
+    let file = transaction.file(file_id)?;
+    transaction.enable_verity(file, &enable)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 /// Adds an fscrypt master key to the mounted VCB.
 fn add_encryption_key_result(
     target: DispatchTarget,
     stack: FileSystemControlStack,
-) -> Result<(), NTSTATUS> {
+) -> DriverResult<()> {
     let input = read_input(target, stack)?;
     let payload = FscryptAddKeyPayload::parse(input.as_slice())?;
     let mut vcb = mounted_vcb(stack)?;
@@ -222,8 +211,7 @@ fn add_encryption_key_result(
         // duration of this synchronous FSCTL dispatch.
         vcb.as_mut()
     };
-    vcb.add_fscrypt_key(payload.into_master_key())
-        .map_err(|error| DriverError::from(error).ntstatus())?;
+    vcb.add_fscrypt_key(payload.into_master_key())?;
     target.set_information(0);
     Ok(())
 }
@@ -232,7 +220,7 @@ fn add_encryption_key_result(
 fn remove_encryption_key_result(
     target: DispatchTarget,
     stack: FileSystemControlStack,
-) -> Result<(), NTSTATUS> {
+) -> DriverResult<()> {
     let input = read_input(target, stack)?;
     let payload = FscryptRemoveKeyPayload::parse(input.as_slice())?;
     let mut vcb = mounted_vcb(stack)?;
@@ -252,7 +240,7 @@ fn remove_encryption_key_result(
 fn get_encryption_key_status_result(
     target: DispatchTarget,
     stack: FileSystemControlStack,
-) -> Result<(), NTSTATUS> {
+) -> DriverResult<()> {
     let input = read_input(target, stack)?;
     let payload = FscryptKeyStatusPayload::parse(input.as_slice())?;
     let vcb = mounted_vcb(stack)?;
@@ -269,18 +257,15 @@ fn get_encryption_key_status_result(
 }
 
 /// Writes Linux-compatible remove-key output fields.
-fn write_remove_key_output(output: &mut [u8]) -> Result<(), NTSTATUS> {
+fn write_remove_key_output(output: &mut [u8]) -> DriverResult<()> {
     write_u32(output, FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET, 0)
 }
 
 /// Writes Linux-compatible key-status output fields.
-fn write_key_status_output(
-    output: &mut [u8],
-    presence: FscryptKeyPresence,
-) -> Result<(), NTSTATUS> {
+fn write_key_status_output(output: &mut [u8], presence: FscryptKeyPresence) -> DriverResult<()> {
     output
         .get_mut(FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET..FSCRYPT_GET_KEY_STATUS_BYTES)
-        .ok_or(STATUS_BUFFER_TOO_SMALL)?
+        .ok_or(DriverError::BufferTooSmall)?
         .fill(0);
     write_u32(
         output,
@@ -332,9 +317,9 @@ struct FscryptAddKeyPayload {
 
 impl FscryptAddKeyPayload {
     /// Parses Linux `struct fscrypt_add_key_arg`.
-    fn parse(input: &[u8]) -> Result<Self, NTSTATUS> {
+    fn parse(input: &[u8]) -> DriverResult<Self> {
         if input.len() < FSCRYPT_ADD_KEY_FIXED_BYTES {
-            return Err(STATUS_BUFFER_TOO_SMALL);
+            return Err(DriverError::BufferTooSmall);
         }
         let identifier = parse_key_identifier(input)?;
         if read_u32(input, FSCRYPT_ADD_KEY_KEY_ID_OFFSET)? != 0
@@ -345,20 +330,19 @@ impl FscryptAddKeyPayload {
                 FSCRYPT_ADD_KEY_RESERVED_BYTES,
             )?
         {
-            return Err(STATUS_NOT_SUPPORTED);
+            return Err(DriverError::NotSupported);
         }
         let raw_size = usize::try_from(read_u32(input, FSCRYPT_ADD_KEY_RAW_SIZE_OFFSET)?)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+            .map_err(|_| DriverError::InvalidParameter)?;
         let raw = input
             .get(FSCRYPT_ADD_KEY_FIXED_BYTES..)
-            .ok_or(STATUS_BUFFER_TOO_SMALL)?;
+            .ok_or(DriverError::BufferTooSmall)?;
         if raw.len() != raw_size {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
-        let master_key =
-            FscryptMasterKey::from_raw(raw).map_err(|error| DriverError::from(error).ntstatus())?;
+        let master_key = FscryptMasterKey::from_raw(raw)?;
         if master_key.identifier() != identifier {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
         Ok(Self { master_key })
     }
@@ -378,12 +362,12 @@ struct FscryptRemoveKeyPayload {
 
 impl FscryptRemoveKeyPayload {
     /// Parses Linux `struct fscrypt_remove_key_arg`.
-    fn parse(input: &[u8]) -> Result<Self, NTSTATUS> {
+    fn parse(input: &[u8]) -> DriverResult<Self> {
         if input.len() != FSCRYPT_REMOVE_KEY_BYTES {
             return Err(if input.len() < FSCRYPT_REMOVE_KEY_BYTES {
-                STATUS_BUFFER_TOO_SMALL
+                DriverError::BufferTooSmall
             } else {
-                STATUS_INVALID_PARAMETER
+                DriverError::InvalidParameter
             });
         }
         let identifier = parse_key_identifier(input)?;
@@ -394,7 +378,7 @@ impl FscryptRemoveKeyPayload {
                 FSCRYPT_REMOVE_KEY_RESERVED_BYTES,
             )?
         {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
         Ok(Self { identifier })
     }
@@ -414,9 +398,9 @@ struct FscryptKeyStatusPayload {
 
 impl FscryptKeyStatusPayload {
     /// Parses the input fields of Linux `struct fscrypt_get_key_status_arg`.
-    fn parse(input: &[u8]) -> Result<Self, NTSTATUS> {
+    fn parse(input: &[u8]) -> DriverResult<Self> {
         if input.len() < FSCRYPT_GET_KEY_STATUS_INPUT_BYTES {
-            return Err(STATUS_BUFFER_TOO_SMALL);
+            return Err(DriverError::BufferTooSmall);
         }
         let identifier = parse_key_identifier(input)?;
         if !all_zero(
@@ -424,7 +408,7 @@ impl FscryptKeyStatusPayload {
             FSCRYPT_GET_KEY_STATUS_RESERVED_OFFSET,
             FSCRYPT_GET_KEY_STATUS_RESERVED_BYTES,
         )? {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
         Ok(Self { identifier })
     }
@@ -450,25 +434,23 @@ struct FsverityEnablePayload {
 
 impl FsverityEnablePayload {
     /// Parses Linux `struct fsverity_enable_arg`.
-    fn parse(input: &[u8]) -> Result<Self, NTSTATUS> {
+    fn parse(input: &[u8]) -> DriverResult<Self> {
         if input.len() != FSVERITY_ENABLE_ARG_BYTES {
             return Err(if input.len() < FSVERITY_ENABLE_ARG_BYTES {
-                STATUS_BUFFER_TOO_SMALL
+                DriverError::BufferTooSmall
             } else {
-                STATUS_INVALID_PARAMETER
+                DriverError::InvalidParameter
             });
         }
         if read_u32(input, FSVERITY_ENABLE_VERSION_OFFSET)? != FSVERITY_ENABLE_VERSION {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
         let algorithm = FsverityHashAlgorithm::parse_u32(read_u32(
             input,
             FSVERITY_ENABLE_HASH_ALGORITHM_OFFSET,
-        )?)
-        .map_err(|error| DriverError::from(error).ntstatus())?;
+        )?)?;
         let block_size =
-            FsverityBlockSize::new(read_u32(input, FSVERITY_ENABLE_BLOCK_SIZE_OFFSET)?)
-                .map_err(|error| DriverError::from(error).ntstatus())?;
+            FsverityBlockSize::new(read_u32(input, FSVERITY_ENABLE_BLOCK_SIZE_OFFSET)?)?;
         let salt = OptionalUserBuffer::new(
             read_u64(input, FSVERITY_ENABLE_SALT_PTR_OFFSET)?,
             read_u32(input, FSVERITY_ENABLE_SALT_SIZE_OFFSET)?,
@@ -486,7 +468,7 @@ impl FsverityEnablePayload {
                 FSVERITY_ENABLE_RESERVED2_BYTES,
             )?
         {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
         Ok(Self {
             algorithm,
@@ -497,11 +479,11 @@ impl FsverityEnablePayload {
     }
 
     /// Converts this decoded payload into the ext4-core enable domain.
-    fn into_core_enable(self) -> Result<FsverityEnable, NTSTATUS> {
+    fn into_core_enable(self) -> DriverResult<FsverityEnable> {
         let salt = self.salt();
         let signature = self.signature();
         if salt.length != 0 || signature.length != 0 {
-            return Err(STATUS_NOT_SUPPORTED);
+            return Err(DriverError::NotSupported);
         }
         Ok(FsverityEnable::new(
             self.algorithm(),
@@ -543,27 +525,27 @@ struct OptionalUserBuffer {
 
 impl OptionalUserBuffer {
     /// Creates a validated optional pointer/length pair.
-    fn new(address: u64, length: u32, max_length: u32) -> Result<Self, NTSTATUS> {
+    fn new(address: u64, length: u32, max_length: u32) -> DriverResult<Self> {
         if length > max_length {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
         if (length == 0) != (address == 0) {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(DriverError::InvalidParameter);
         }
         Ok(Self { address, length })
     }
 }
 
 /// Reads METHOD_BUFFERED input bytes for one user FSCTL.
-fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> Result<Vec<u8>, NTSTATUS> {
+fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
     let length = stack.input_buffer_length().as_usize();
-    let input = target.data_buffer(length).map_err(DriverError::ntstatus)?;
+    let input = target.data_buffer(length)?;
     Ok(input.as_slice().to_vec())
 }
 
 /// Returns a mounted VCB from a path-scoped FSCTL stack.
-fn mounted_vcb(stack: FileSystemControlStack) -> Result<NonNull<VolumeControlBlock>, NTSTATUS> {
-    let fcb = file_control_block(stack.file_object()).map_err(DriverError::ntstatus)?;
+fn mounted_vcb(stack: FileSystemControlStack) -> DriverResult<NonNull<VolumeControlBlock>> {
+    let fcb = file_control_block(stack.file_object())?;
     let fcb = unsafe {
         // SAFETY: The FCB pointer is read from a live FILE_OBJECT owned by this
         // filesystem for the duration of this FSCTL dispatch.
@@ -577,93 +559,96 @@ fn output_buffer(
     target: DispatchTarget,
     stack: FileSystemControlStack,
     len: usize,
-) -> Result<crate::irp::IrpDataBuffer, NTSTATUS> {
+) -> DriverResult<crate::irp::IrpDataBuffer> {
     let output_len = stack.output_buffer_length().as_usize();
     if output_len < len {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     }
-    target.data_buffer(len).map_err(DriverError::ntstatus)
+    target.data_buffer(len)
 }
 
 /// Stores an FSCTL output byte count.
-fn set_information(target: DispatchTarget, len: usize) -> Result<(), NTSTATUS> {
-    target
-        .set_information(wdk_sys::ULONG_PTR::try_from(len).map_err(|_| STATUS_INVALID_PARAMETER)?);
+fn set_information(target: DispatchTarget, len: usize) -> DriverResult<()> {
+    target.set_information(
+        wdk_sys::ULONG_PTR::try_from(len).map_err(|_| DriverError::InvalidParameter)?,
+    );
     Ok(())
 }
 
 /// Parses a Linux fscrypt v2 key identifier specifier.
-fn parse_key_identifier(input: &[u8]) -> Result<FscryptKeyIdentifier, NTSTATUS> {
+fn parse_key_identifier(input: &[u8]) -> DriverResult<FscryptKeyIdentifier> {
     if input.len() < FSCRYPT_KEY_SPECIFIER_BYTES {
-        return Err(STATUS_BUFFER_TOO_SMALL);
+        return Err(DriverError::BufferTooSmall);
     }
     if read_u32(input, FSCRYPT_KEY_SPEC_TYPE_OFFSET)? != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER {
-        return Err(STATUS_NOT_SUPPORTED);
+        return Err(DriverError::NotSupported);
     }
     if read_u32(input, FSCRYPT_KEY_SPEC_RESERVED_OFFSET)? != 0 {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
     let identifier_offset = FSCRYPT_KEY_SPEC_UNION_OFFSET;
     let identifier_end = identifier_offset
         .checked_add(FSCRYPT_KEY_IDENTIFIER_BYTES)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or(DriverError::InvalidParameter)?;
     let identifier = fixed::<FSCRYPT_KEY_IDENTIFIER_BYTES>(input, identifier_offset)?;
     if input
         .get(identifier_end..FSCRYPT_KEY_SPECIFIER_BYTES)
-        .ok_or(STATUS_BUFFER_TOO_SMALL)?
+        .ok_or(DriverError::BufferTooSmall)?
         .iter()
         .any(|byte| *byte != 0)
     {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
     Ok(FscryptKeyIdentifier::new(identifier))
 }
 
 /// Returns whether a checked range contains only zeroes.
-fn all_zero(input: &[u8], offset: usize, len: usize) -> Result<bool, NTSTATUS> {
-    let end = offset.checked_add(len).ok_or(STATUS_INVALID_PARAMETER)?;
+fn all_zero(input: &[u8], offset: usize, len: usize) -> DriverResult<bool> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(DriverError::InvalidParameter)?;
     Ok(input
         .get(offset..end)
-        .ok_or(STATUS_BUFFER_TOO_SMALL)?
+        .ok_or(DriverError::BufferTooSmall)?
         .iter()
         .all(|byte| *byte == 0))
 }
 
 /// Reads one little-endian `u32` from a checked offset.
-fn read_u32(input: &[u8], offset: usize) -> Result<u32, NTSTATUS> {
+fn read_u32(input: &[u8], offset: usize) -> DriverResult<u32> {
     Ok(u32::from_le_bytes(fixed(input, offset)?))
 }
 
 /// Reads one little-endian `u64` from a checked offset.
-fn read_u64(input: &[u8], offset: usize) -> Result<u64, NTSTATUS> {
+fn read_u64(input: &[u8], offset: usize) -> DriverResult<u64> {
     Ok(u64::from_le_bytes(fixed(input, offset)?))
 }
 
 /// Writes one little-endian `u32` into a checked offset.
-fn write_u32(output: &mut [u8], offset: usize, value: u32) -> Result<(), NTSTATUS> {
-    let end = offset.checked_add(4).ok_or(STATUS_INVALID_PARAMETER)?;
+fn write_u32(output: &mut [u8], offset: usize, value: u32) -> DriverResult<()> {
+    let end = offset.checked_add(4).ok_or(DriverError::InvalidParameter)?;
     output
         .get_mut(offset..end)
-        .ok_or(STATUS_BUFFER_TOO_SMALL)?
+        .ok_or(DriverError::BufferTooSmall)?
         .copy_from_slice(&value.to_le_bytes());
     Ok(())
 }
 
 /// Writes one little-endian `u64` into a checked offset.
 #[cfg(test)]
-fn write_u64(output: &mut [u8], offset: usize, value: u64) -> Result<(), NTSTATUS> {
-    let end = offset.checked_add(8).ok_or(STATUS_INVALID_PARAMETER)?;
+fn write_u64(output: &mut [u8], offset: usize, value: u64) -> DriverResult<()> {
+    let end = offset.checked_add(8).ok_or(DriverError::InvalidParameter)?;
     output
         .get_mut(offset..end)
-        .ok_or(STATUS_BUFFER_TOO_SMALL)?
+        .ok_or(DriverError::BufferTooSmall)?
         .copy_from_slice(&value.to_le_bytes());
     Ok(())
 }
 
 /// Copies a fixed byte array out of a checked range.
-fn fixed<const N: usize>(input: &[u8], offset: usize) -> Result<[u8; N], NTSTATUS> {
-    let end = offset.checked_add(N).ok_or(STATUS_INVALID_PARAMETER)?;
-    let slice = input.get(offset..end).ok_or(STATUS_BUFFER_TOO_SMALL)?;
+fn fixed<const N: usize>(input: &[u8], offset: usize) -> DriverResult<[u8; N]> {
+    let end = offset.checked_add(N).ok_or(DriverError::InvalidParameter)?;
+    let slice = input.get(offset..end).ok_or(DriverError::BufferTooSmall)?;
     let mut bytes = [0_u8; N];
     bytes.copy_from_slice(slice);
     Ok(bytes)
@@ -737,7 +722,7 @@ mod tests {
 
         assert_eq!(
             FscryptAddKeyPayload::parse(&payload),
-            Err(STATUS_INVALID_PARAMETER)
+            Err(DriverError::InvalidParameter)
         );
     }
 
@@ -747,14 +732,14 @@ mod tests {
         must!(write_u32(&mut descriptor, FSCRYPT_KEY_SPEC_TYPE_OFFSET, 1));
         assert_eq!(
             FscryptAddKeyPayload::parse(&descriptor),
-            Err(STATUS_NOT_SUPPORTED)
+            Err(DriverError::NotSupported)
         );
 
         let mut hw_wrapped = must!(add_key_payload(&RAW_KEY));
         must!(write_u32(&mut hw_wrapped, FSCRYPT_ADD_KEY_FLAGS_OFFSET, 1));
         assert_eq!(
             FscryptAddKeyPayload::parse(&hw_wrapped),
-            Err(STATUS_NOT_SUPPORTED)
+            Err(DriverError::NotSupported)
         );
     }
 
@@ -904,7 +889,7 @@ mod tests {
         assert_eq!(
             FsverityEnablePayload::parse(&payload)
                 .and_then(FsverityEnablePayload::into_core_enable),
-            Err(STATUS_NOT_SUPPORTED)
+            Err(DriverError::NotSupported)
         );
     }
 
@@ -930,7 +915,7 @@ mod tests {
         ));
         assert_eq!(
             FsverityEnablePayload::parse(&reserved),
-            Err(STATUS_INVALID_PARAMETER)
+            Err(DriverError::InvalidParameter)
         );
 
         let bad_salt = enable_verity_payload(
@@ -948,35 +933,33 @@ mod tests {
         let bad_salt = must!(bad_salt);
         assert_eq!(
             FsverityEnablePayload::parse(&bad_salt),
-            Err(STATUS_INVALID_PARAMETER)
+            Err(DriverError::InvalidParameter)
         );
     }
 
     /// Builds a Linux fscrypt add-key payload.
-    fn add_key_payload(raw_key: &[u8]) -> Result<Vec<u8>, NTSTATUS> {
-        let identifier = FscryptMasterKey::from_raw(raw_key)
-            .map_err(|error| DriverError::from(error).ntstatus())?
-            .identifier();
+    fn add_key_payload(raw_key: &[u8]) -> DriverResult<Vec<u8>> {
+        let identifier = FscryptMasterKey::from_raw(raw_key)?.identifier();
         let mut payload = vec![0_u8; FSCRYPT_ADD_KEY_FIXED_BYTES];
         write_key_identifier(&mut payload, identifier)?;
         write_u32(
             &mut payload,
             FSCRYPT_ADD_KEY_RAW_SIZE_OFFSET,
-            u32::try_from(raw_key.len()).map_err(|_| STATUS_INVALID_PARAMETER)?,
+            u32::try_from(raw_key.len()).map_err(|_| DriverError::InvalidParameter)?,
         )?;
         payload.extend_from_slice(raw_key);
         Ok(payload)
     }
 
     /// Builds a Linux fscrypt remove-key payload.
-    fn remove_key_payload(identifier: FscryptKeyIdentifier) -> Result<Vec<u8>, NTSTATUS> {
+    fn remove_key_payload(identifier: FscryptKeyIdentifier) -> DriverResult<Vec<u8>> {
         let mut payload = vec![0_u8; FSCRYPT_REMOVE_KEY_BYTES];
         write_key_identifier(&mut payload, identifier)?;
         Ok(payload)
     }
 
     /// Builds a Linux fscrypt key-status payload.
-    fn key_status_payload(identifier: FscryptKeyIdentifier) -> Result<Vec<u8>, NTSTATUS> {
+    fn key_status_payload(identifier: FscryptKeyIdentifier) -> DriverResult<Vec<u8>> {
         let mut payload = vec![0_u8; FSCRYPT_GET_KEY_STATUS_INPUT_BYTES];
         write_key_identifier(&mut payload, identifier)?;
         Ok(payload)
@@ -986,7 +969,7 @@ mod tests {
     fn write_key_identifier(
         payload: &mut [u8],
         identifier: FscryptKeyIdentifier,
-    ) -> Result<(), NTSTATUS> {
+    ) -> DriverResult<()> {
         write_u32(
             payload,
             FSCRYPT_KEY_SPEC_TYPE_OFFSET,
@@ -994,10 +977,10 @@ mod tests {
         )?;
         let end = FSCRYPT_KEY_SPEC_UNION_OFFSET
             .checked_add(FSCRYPT_KEY_IDENTIFIER_BYTES)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
+            .ok_or(DriverError::InvalidParameter)?;
         payload
             .get_mut(FSCRYPT_KEY_SPEC_UNION_OFFSET..end)
-            .ok_or(STATUS_BUFFER_TOO_SMALL)?
+            .ok_or(DriverError::BufferTooSmall)?
             .copy_from_slice(&identifier.bytes());
         Ok(())
     }
@@ -1008,7 +991,7 @@ mod tests {
         block_size: u32,
         salt: OptionalUserBuffer,
         signature: OptionalUserBuffer,
-    ) -> Result<Vec<u8>, NTSTATUS> {
+    ) -> DriverResult<Vec<u8>> {
         let mut payload = vec![0_u8; FSVERITY_ENABLE_ARG_BYTES];
         write_u32(
             &mut payload,
