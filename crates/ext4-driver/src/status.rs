@@ -54,6 +54,8 @@ pub(crate) enum DriverError {
     ObjectTypeMismatch,
     /// WDK share-access validation rejected this open.
     ShareAccessConflict,
+    /// FCB open reference count reached the representable boundary.
+    TooManyOpenReferences,
     /// Directory enumeration has no more entries for this cursor.
     NoMoreFiles,
     /// Exact directory enumeration pattern matched no entry.
@@ -88,6 +90,7 @@ impl DriverError {
             Self::ObjectPathNotFound => STATUS_OBJECT_PATH_NOT_FOUND,
             Self::ObjectTypeMismatch => STATUS_OBJECT_TYPE_MISMATCH,
             Self::ShareAccessConflict => ntstatus(0xC000_0043),
+            Self::TooManyOpenReferences => STATUS_INSUFFICIENT_RESOURCES,
             Self::NoMoreFiles => STATUS_NO_MORE_FILES,
             Self::NoSuchFile => STATUS_NO_SUCH_FILE,
             Self::UnrecognizedVolume => STATUS_UNRECOGNIZED_VOLUME,
