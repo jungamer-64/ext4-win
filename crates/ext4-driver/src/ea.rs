@@ -27,7 +27,13 @@ const EA_RECORD_ALIGNMENT: usize = 4;
 /// Handles IRP_MJ_QUERY_EA.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(QueryEaRequest::decode) {
-        Ok(request) => query_ea(request),
+        Ok(request) => match query_ea(request) {
+            Ok(completion) => {
+                request.target.complete(completion);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
@@ -35,7 +41,13 @@ pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 /// Handles IRP_MJ_SET_EA.
 pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(SetEaRequest::decode) {
-        Ok(request) => set_ea(request),
+        Ok(request) => match set_ea(request) {
+            Ok(completion) => {
+                request.target.complete(completion);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
@@ -90,18 +102,7 @@ struct WindowsEaEntry {
 }
 
 /// Performs an EA query against mounted ext4 xattrs.
-fn query_ea(request: QueryEaRequest) -> NTSTATUS {
-    match query_ea_result(request) {
-        Ok(completion) => {
-            request.target.complete(completion);
-            STATUS_SUCCESS
-        }
-        Err(error) => error.ntstatus(),
-    }
-}
-
-/// Performs QUERY_EA before NTSTATUS completion mapping.
-fn query_ea_result(request: QueryEaRequest) -> DriverResult<DriverCompletion> {
+fn query_ea(request: QueryEaRequest) -> DriverResult<DriverCompletion> {
     let mut entries = collect_query_entries(request.stack)?;
     if matches!(request.stack.entry_emission(), EaEntryEmission::Single) && entries.len() > 1 {
         entries.truncate(1);
@@ -121,16 +122,10 @@ fn query_ea_result(request: QueryEaRequest) -> DriverResult<DriverCompletion> {
 }
 
 /// Applies set-EA records to `user.ext4win.ea.*` xattrs.
-fn set_ea(request: SetEaRequest) -> NTSTATUS {
-    match parse_set_ea_entries(request.target, request.stack)
-        .and_then(|entries| apply_set_ea_entries(request.stack, entries.as_slice()))
-    {
-        Ok(()) => {
-            request.target.complete(DriverCompletion::EMPTY);
-            STATUS_SUCCESS
-        }
-        Err(error) => error.ntstatus(),
-    }
+fn set_ea(request: SetEaRequest) -> DriverResult<DriverCompletion> {
+    let entries = parse_set_ea_entries(request.target, request.stack)?;
+    apply_set_ea_entries(request.stack, entries.as_slice())?;
+    Ok(DriverCompletion::EMPTY)
 }
 
 /// Collects Windows EA entries selected by a query request.

@@ -8,7 +8,8 @@ use crate::{
     block_device::query_device_length,
     ffi, fsctl,
     irp::{
-        DispatchTarget, FileSystemControlStack, FsControlCode, IrpBufferLength, MountVolumeStack,
+        DispatchTarget, DriverCompletion, FileSystemControlStack, FsControlCode, IrpBufferLength,
+        MountVolumeStack,
     },
     reparse,
     state::{
@@ -24,8 +25,17 @@ const MOUNT_VOLUME_MINOR: wdk_sys::UCHAR = 1;
 /// Handles file-system control requests, including mount and reparse controls.
 pub(crate) fn dispatch(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(FileSystemControlRequest::decode) {
-        Ok(FileSystemControlRequest::MountVolume(request)) => mount_volume(request),
-        Ok(FileSystemControlRequest::UserFsControl(request)) => user_fs_control(request),
+        Ok(FileSystemControlRequest::MountVolume(request)) => match mount_volume(request) {
+            Ok(()) => STATUS_SUCCESS,
+            Err(error) => error.ntstatus(),
+        },
+        Ok(FileSystemControlRequest::UserFsControl(request)) => match user_fs_control(request) {
+            Ok(completion) => {
+                request.target().complete(completion);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
         Ok(FileSystemControlRequest::Unsupported) => DriverError::NotSupported.ntstatus(),
         Err(error) => error.ntstatus(),
     }
@@ -154,15 +164,7 @@ impl MountVolumeRequest {
 }
 
 /// Handles a decoded mount request.
-fn mount_volume(request: MountVolumeRequest) -> NTSTATUS {
-    match mount_volume_result(request) {
-        Ok(()) => STATUS_SUCCESS,
-        Err(error) => error.ntstatus(),
-    }
-}
-
-/// Handles a decoded mount request before NTSTATUS completion mapping.
-fn mount_volume_result(request: MountVolumeRequest) -> DriverResult<()> {
+fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
     let length = query_device_length(request.target_device())?;
     let candidate = MountCandidate::new(request.target_device(), length);
     let vcb =
@@ -228,7 +230,7 @@ fn mount_volume_result(request: MountVolumeRequest) -> DriverResult<()> {
 }
 
 /// Handles path-scoped user FSCTL requests.
-fn user_fs_control(request: UserFsControlRequest) -> NTSTATUS {
+fn user_fs_control(request: UserFsControlRequest) -> DriverResult<DriverCompletion> {
     match request.fs_control_code() {
         FsControlCode::GetReparsePoint => {
             reparse::get_reparse_point(request.target(), request.stack())
@@ -236,7 +238,7 @@ fn user_fs_control(request: UserFsControlRequest) -> NTSTATUS {
         FsControlCode::SetReparsePoint => {
             reparse::set_reparse_point(request.target(), request.stack())
         }
-        FsControlCode::DeleteReparsePoint => DriverError::NotSupported.ntstatus(),
+        FsControlCode::DeleteReparsePoint => Err(DriverError::NotSupported),
         FsControlCode::AddEncryptionKey => {
             fsctl::add_encryption_key(request.target(), request.stack())
         }

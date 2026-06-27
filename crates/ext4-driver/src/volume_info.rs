@@ -30,7 +30,13 @@ const BYTES_PER_SECTOR: u32 = 512;
 /// Handles volume information queries.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(QueryVolumeRequest::decode) {
-        Ok(request) => query_volume(request),
+        Ok(request) => match query_volume(request) {
+            Ok(completion) => {
+                request.target.complete(completion);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
@@ -38,7 +44,13 @@ pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 /// Handles volume information mutations.
 pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(SetVolumeRequest::decode) {
-        Ok(request) => set_volume(request),
+        Ok(request) => match set_volume(request) {
+            Ok(completion) => {
+                request.target.complete(completion);
+                STATUS_SUCCESS
+            }
+            Err(error) => error.ntstatus(),
+        },
         Err(error) => error.ntstatus(),
     }
 }
@@ -109,26 +121,7 @@ impl SystemBufferInput {
 }
 
 /// Executes one volume information query.
-fn query_volume(request: QueryVolumeRequest) -> NTSTATUS {
-    match query_volume_result(request) {
-        Ok(completion) => {
-            request.target.complete(completion);
-            STATUS_SUCCESS
-        }
-        Err(error) => error.ntstatus(),
-    }
-}
-
-/// Executes one volume information mutation.
-fn set_volume(request: SetVolumeRequest) -> NTSTATUS {
-    match set_volume_result(request) {
-        Ok(()) => STATUS_SUCCESS,
-        Err(error) => error.ntstatus(),
-    }
-}
-
-/// Executes one volume information query before NTSTATUS completion mapping.
-fn query_volume_result(request: QueryVolumeRequest) -> DriverResult<DriverCompletion> {
+fn query_volume(request: QueryVolumeRequest) -> DriverResult<DriverCompletion> {
     let Some(mut vcb) = MountedVolumeDevice::vcb(request.device) else {
         return Err(DriverError::InvalidDeviceRequest);
     };
@@ -151,11 +144,12 @@ fn query_volume_result(request: QueryVolumeRequest) -> DriverResult<DriverComple
     }
 }
 
-/// Executes one volume information mutation before NTSTATUS completion mapping.
-fn set_volume_result(request: SetVolumeRequest) -> DriverResult<()> {
+/// Executes one volume information mutation.
+fn set_volume(request: SetVolumeRequest) -> DriverResult<DriverCompletion> {
     match request.stack.information_class() {
         SetVolumeInformationClass::Label => set_volume_label(request),
-    }
+    }?;
+    Ok(DriverCompletion::EMPTY)
 }
 
 /// Applies `FILE_FS_LABEL_INFORMATION` to the mounted ext4 superblock.
