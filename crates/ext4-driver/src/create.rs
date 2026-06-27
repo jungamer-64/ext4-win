@@ -8,11 +8,7 @@ use core::ptr::NonNull;
 use ext4_core::{
     ChildLookup, DirectoryNodeId, Ext4Name, FileNodeId, FileSize, LoadedNode, NodeId, WindowsName,
 };
-use wdk_sys::{
-    FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
-    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-    STATUS_OBJECT_TYPE_MISMATCH, STATUS_SUCCESS,
-};
+use wdk_sys::{FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::{
     irp::{
@@ -24,6 +20,7 @@ use crate::{
         ContextControlBlock, FileControlBlock, KernelDevice, MountedVolumeDevice, OpenedPath,
         VolumeControlBlock, release_file_control_block,
     },
+    status::{DriverError, DriverResult},
 };
 
 /// UTF-16 backslash separator.
@@ -73,11 +70,19 @@ impl CreateRequest {
 
 /// Opens or creates a root-relative ext4 object.
 fn open_or_create(request: CreateRequest) -> NTSTATUS {
+    match open_or_create_result(request) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(error) => error.ntstatus(),
+    }
+}
+
+/// Opens or creates a root-relative ext4 object before NTSTATUS completion mapping.
+fn open_or_create_result(request: CreateRequest) -> DriverResult<()> {
     if request.parameters().ea_length().as_usize() != 0 {
-        return STATUS_NOT_SUPPORTED;
+        return Err(DriverError::NotSupported);
     }
     let Some(vcb) = MountedVolumeDevice::vcb(request.device()) else {
-        return crate::status::DriverError::InvalidDeviceRequest.ntstatus();
+        return Err(DriverError::InvalidDeviceRequest);
     };
     let disposition = request.parameters().disposition();
     match resolve_path(request.file_object(), vcb) {
@@ -87,7 +92,7 @@ fn open_or_create(request: CreateRequest) -> NTSTATUS {
         Ok(PathLookup::Missing { parent, name }) => {
             create_missing_node(request, vcb, disposition, parent, &name)
         }
-        Err(status) => status,
+        Err(error) => Err(error),
     }
 }
 
@@ -117,45 +122,37 @@ fn open_existing_node(
     disposition: CreateDisposition,
     node: NodeId,
     path: OpenedPath,
-) -> NTSTATUS {
+) -> DriverResult<()> {
     let parameters = request.parameters();
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
-            match validate_existing_node_options(node, parameters.target_requirement()) {
-                Ok(()) => initialize_file_object(
-                    request.file_object(),
-                    vcb,
-                    node,
-                    path,
-                    parameters.desired_access(),
-                    parameters.share_access(),
-                ),
-                Err(status) => status,
-            }
+            validate_existing_node_options(node, parameters.target_requirement())?;
+            initialize_file_object(
+                request.file_object(),
+                vcb,
+                node,
+                path,
+                parameters.desired_access(),
+                parameters.share_access(),
+            )
         }
-        CreateDisposition::Create => STATUS_OBJECT_NAME_COLLISION,
+        CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
         CreateDisposition::Overwrite
         | CreateDisposition::OverwriteIf
         | CreateDisposition::Supersede => {
-            let inode = match overwrite_file_inode(node, parameters.target_requirement()) {
-                Ok(inode) => inode,
-                Err(status) => return status,
-            };
-            let fcb = match open_shared_file_control_block(
+            let inode = overwrite_file_inode(node, parameters.target_requirement())?;
+            let fcb = open_shared_file_control_block(
                 request.file_object(),
                 vcb,
                 node,
                 parameters.desired_access(),
                 parameters.share_access(),
-            ) {
-                Ok(fcb) => fcb,
-                Err(status) => return status,
-            };
+            )?;
             match truncate_existing_file(vcb, inode) {
                 Ok(()) => attach_file_object(request.file_object(), fcb, node, path),
-                Err(status) => {
+                Err(error) => {
                     abandon_file_control_block(request.file_object(), fcb);
-                    status
+                    Err(error)
                 }
             }
         }
@@ -166,16 +163,16 @@ fn open_existing_node(
 fn overwrite_file_inode(
     node: NodeId,
     requirement: CreateTargetRequirement,
-) -> Result<FileNodeId, NTSTATUS> {
+) -> DriverResult<FileNodeId> {
     if matches!(requirement, CreateTargetRequirement::Directory) {
-        return Err(STATUS_NOT_SUPPORTED);
+        return Err(DriverError::NotSupported);
     }
     if matches!(requirement, CreateTargetRequirement::NonDirectory) {
         validate_existing_node_options(node, requirement)?;
     }
     match node {
         NodeId::File(file) => Ok(file),
-        NodeId::Directory(_) | NodeId::Symlink(_) => Err(STATUS_OBJECT_TYPE_MISMATCH),
+        NodeId::Directory(_) | NodeId::Symlink(_) => Err(DriverError::ObjectTypeMismatch),
     }
 }
 
@@ -186,19 +183,16 @@ fn create_missing_node(
     disposition: CreateDisposition,
     parent: DirectoryNodeId,
     name: &Ext4Name,
-) -> NTSTATUS {
+) -> DriverResult<()> {
     match disposition {
         CreateDisposition::Create
         | CreateDisposition::OpenIf
         | CreateDisposition::OverwriteIf
         | CreateDisposition::Supersede => {}
-        CreateDisposition::Open => return STATUS_OBJECT_NAME_NOT_FOUND,
-        CreateDisposition::Overwrite => return STATUS_OBJECT_NAME_NOT_FOUND,
+        CreateDisposition::Open => return Err(DriverError::ObjectNameNotFound),
+        CreateDisposition::Overwrite => return Err(DriverError::ObjectNameNotFound),
     }
-    let node = match create_child(vcb, parent, name, request.parameters().target_requirement()) {
-        Ok(node) => node,
-        Err(status) => return status,
-    };
+    let node = create_child(vcb, parent, name, request.parameters().target_requirement())?;
     initialize_file_object(
         request.file_object(),
         vcb,
@@ -216,14 +210,14 @@ fn create_missing_node(
 fn validate_existing_node_options(
     node: NodeId,
     requirement: CreateTargetRequirement,
-) -> Result<(), NTSTATUS> {
+) -> DriverResult<()> {
     match requirement {
         CreateTargetRequirement::Any => {}
         CreateTargetRequirement::Directory if !matches!(node, NodeId::Directory(_)) => {
-            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+            return Err(DriverError::ObjectTypeMismatch);
         }
         CreateTargetRequirement::NonDirectory if matches!(node, NodeId::Directory(_)) => {
-            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+            return Err(DriverError::ObjectTypeMismatch);
         }
         CreateTargetRequirement::Directory | CreateTargetRequirement::NonDirectory => {}
     }
@@ -234,39 +228,34 @@ fn validate_existing_node_options(
 fn truncate_existing_file(
     mut vcb: NonNull<crate::state::VolumeControlBlock>,
     file_id: FileNodeId,
-) -> Result<(), NTSTATUS> {
+) -> DriverResult<()> {
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
         // in the mounted device extension. The mutable borrow is the
         // transaction boundary for this overwrite request.
         vcb.as_mut()
     };
-    let mut transaction = vcb.volume_mut().begin_transaction(
-        crate::time::current_ext4_timestamp().map_err(crate::status::DriverError::ntstatus)?,
-    );
-    let file = transaction
-        .file(file_id)
-        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
-    transaction
-        .truncate_file(file, FileSize::from_bytes(0))
-        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
-    transaction
-        .commit()
-        .map_err(|error| crate::status::DriverError::from(error).ntstatus())
+    let mut transaction = vcb
+        .volume_mut()
+        .begin_transaction(crate::time::current_ext4_timestamp()?);
+    let file = transaction.file(file_id)?;
+    transaction.truncate_file(file, FileSize::from_bytes(0))?;
+    transaction.commit()?;
+    Ok(())
 }
 
 /// Resolves a root-relative Windows path to an existing node or missing leaf.
 fn resolve_path(
     file_object: NonNull<FILE_OBJECT>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
-) -> Result<PathLookup, NTSTATUS> {
+) -> DriverResult<PathLookup> {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is read
         // only for immutable path fields.
         file_object.as_ref()
     };
     if !file_object.RelatedFileObject.is_null() {
-        return Err(STATUS_NOT_SUPPORTED);
+        return Err(DriverError::NotSupported);
     }
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
@@ -280,21 +269,19 @@ fn resolve_path(
         let is_final = components.peek().is_none();
         let parent = match vcb.volume().load_node(parent_id.inode()) {
             Ok(LoadedNode::Directory(directory)) => directory,
-            Ok(_) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
-            Err(error) => return Err(crate::status::DriverError::from(error).ntstatus()),
+            Ok(_) => return Err(DriverError::ObjectPathNotFound),
+            Err(error) => return Err(DriverError::from(error)),
         };
         let child = match vcb.volume().lookup_windows_child(&parent, component) {
             Ok(ChildLookup::Found(child)) => child,
             Ok(ChildLookup::NotFound) if is_final => {
                 return Ok(PathLookup::Missing {
                     parent: parent_id,
-                    name: component
-                        .to_ext4()
-                        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
+                    name: component.to_ext4()?,
                 });
             }
-            Ok(ChildLookup::NotFound) => return Err(STATUS_OBJECT_PATH_NOT_FOUND),
-            Err(error) => return Err(crate::status::DriverError::from(error).ntstatus()),
+            Ok(ChildLookup::NotFound) => return Err(DriverError::ObjectPathNotFound),
+            Err(error) => return Err(DriverError::from(error)),
         };
         if is_final {
             return Ok(PathLookup::Existing {
@@ -306,7 +293,7 @@ fn resolve_path(
             });
         }
         let NodeId::Directory(directory_id) = *child.node() else {
-            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+            return Err(DriverError::ObjectPathNotFound);
         };
         parent_id = directory_id;
     }
@@ -316,7 +303,7 @@ fn resolve_path(
             node: node.id(),
             path: OpenedPath::Root,
         }),
-        Err(error) => Err(crate::status::DriverError::from(error).ntstatus()),
+        Err(error) => Err(DriverError::from(error)),
     }
 }
 
@@ -326,57 +313,43 @@ fn create_child(
     parent: DirectoryNodeId,
     name: &Ext4Name,
     requirement: CreateTargetRequirement,
-) -> Result<NodeId, NTSTATUS> {
+) -> DriverResult<NodeId> {
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
         // in the mounted device extension. The mutable borrow is the
         // transaction boundary for this create request.
         vcb.as_mut()
     };
-    let mut transaction = vcb.volume_mut().begin_transaction(
-        crate::time::current_ext4_timestamp().map_err(crate::status::DriverError::ntstatus)?,
-    );
-    let parent = transaction
-        .directory(parent)
-        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
+    let mut transaction = vcb
+        .volume_mut()
+        .begin_transaction(crate::time::current_ext4_timestamp()?);
+    let parent = transaction.directory(parent)?;
     let node = match requirement {
         CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
-            let file = transaction
-                .create_file(
-                    parent,
-                    name,
-                    metadata::default_file_metadata()
-                        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
-                )
-                .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
+            let file = transaction.create_file(parent, name, metadata::default_file_metadata()?)?;
             NodeId::File(file.id())
         }
         CreateTargetRequirement::Directory => {
-            let directory = transaction
-                .create_directory(
-                    parent,
-                    name,
-                    metadata::default_directory_metadata()
-                        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
-                )
-                .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
+            let directory = transaction.create_directory(
+                parent,
+                name,
+                metadata::default_directory_metadata()?,
+            )?;
             NodeId::Directory(directory.id())
         }
     };
-    transaction
-        .commit()
-        .map_err(|error| crate::status::DriverError::from(error).ntstatus())?;
+    transaction.commit()?;
     Ok(node)
 }
 
 /// Splits the FILE_OBJECT name into validated root-relative Windows components.
-fn path_components(file_object: &FILE_OBJECT) -> Result<Vec<WindowsName>, NTSTATUS> {
+fn path_components(file_object: &FILE_OBJECT) -> DriverResult<Vec<WindowsName>> {
     let name = file_object.FileName;
     if name.Length == 0 {
         return Ok(Vec::new());
     }
     if !name.Length.is_multiple_of(2) || name.Buffer.is_null() {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
     let units = unsafe {
         // SAFETY: UNICODE_STRING Length is byte length; the odd-length and null
@@ -392,10 +365,7 @@ fn path_components(file_object: &FILE_OBJECT) -> Result<Vec<WindowsName>, NTSTAT
     }
     let mut components = Vec::new();
     for component in trimmed.split(|unit| *unit == UTF16_BACKSLASH) {
-        components.push(
-            WindowsName::from_utf16(component)
-                .map_err(|error| crate::status::DriverError::from(error).ntstatus())?,
-        );
+        components.push(WindowsName::from_utf16(component)?);
     }
     Ok(components)
 }
@@ -408,11 +378,9 @@ fn initialize_file_object(
     path: OpenedPath,
     desired_access: DesiredAccess,
     share_access: ShareAccess,
-) -> NTSTATUS {
-    match open_shared_file_control_block(file_object, vcb, node, desired_access, share_access) {
-        Ok(fcb) => attach_file_object(file_object, fcb, node, path),
-        Err(status) => status,
-    }
+) -> DriverResult<()> {
+    let fcb = open_shared_file_control_block(file_object, vcb, node, desired_access, share_access)?;
+    attach_file_object(file_object, fcb, node, path)
 }
 
 /// Opens the shared FCB for a node and records the create share-access claim.
@@ -422,32 +390,31 @@ fn open_shared_file_control_block(
     node: NodeId,
     desired_access: DesiredAccess,
     share_access: ShareAccess,
-) -> Result<NonNull<FileControlBlock>, NTSTATUS> {
+) -> DriverResult<NonNull<FileControlBlock>> {
     let file_object_ref = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is read
         // only for filesystem-owned context pointers before initialization.
         file_object.as_ref()
     };
     if !file_object_ref.FsContext.is_null() || !file_object_ref.FsContext2.is_null() {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     }
 
     let Some(mut fcb) = VolumeControlBlock::open_file_control_block(vcb, node) else {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(DriverError::InvalidParameter);
     };
     let fcb_ref = unsafe {
         // SAFETY: The VCB returned a live owned FCB pointer with an open
         // reference for this create request.
         fcb.as_mut()
     };
-    let status = fcb_ref.check_share_access(
+    if let Err(error) = fcb_ref.check_share_access(
         file_object,
         desired_access.as_raw(),
         share_access.as_ulong(),
-    );
-    if status < STATUS_SUCCESS {
+    ) {
         release_file_control_block(fcb);
-        return Err(status);
+        return Err(error);
     }
 
     Ok(fcb)
@@ -459,7 +426,7 @@ fn attach_file_object(
     fcb: NonNull<FileControlBlock>,
     node: NodeId,
     path: OpenedPath,
-) -> NTSTATUS {
+) -> DriverResult<()> {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is
         // writable during successful create processing.
@@ -468,7 +435,7 @@ fn attach_file_object(
     let ccb = Box::new(ContextControlBlock::new(node, path));
     file_object.FsContext = fcb.as_ptr().cast::<c_void>();
     file_object.FsContext2 = Box::into_raw(ccb).cast::<c_void>();
-    STATUS_SUCCESS
+    Ok(())
 }
 
 /// Rolls back an FCB open whose FILE_OBJECT was not attached.
