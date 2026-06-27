@@ -206,7 +206,7 @@ fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel
         let unit = u16::from_le_bytes(array);
         label.push(u8::try_from(unit).map_err(|_| DriverError::NotSupported)?);
     }
-    Ok(Ext4VolumeLabel::new(label.as_slice())?)
+    Ext4VolumeLabel::new(label.as_slice()).map_err(|_| DriverError::InvalidParameter)
 }
 
 /// Packs `FILE_FS_VOLUME_INFORMATION`.
