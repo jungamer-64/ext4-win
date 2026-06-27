@@ -12,14 +12,14 @@ use ext4_core::{
 };
 use wdk_sys::{
     LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
-    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
-    STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_NOT_SUPPORTED, STATUS_OBJECT_PATH_NOT_FOUND,
-    STATUS_SUCCESS,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_NO_MORE_FILES,
+    STATUS_NO_SUCH_FILE, STATUS_NOT_SUPPORTED, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS,
 };
 
 use crate::irp::{
-    DirectoryCursorPosition, DirectoryEntryEmission, DirectoryPatternInput, DispatchTarget,
-    IrpBufferLength, QueryDirectoryStack, QueryFileStack, SetFileStack,
+    DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
+    DirectoryPatternInput, DispatchTarget, IrpBufferLength, QueryDirectoryStack,
+    QueryFileInformationClass, QueryFileStack, SetFileInformationClass, SetFileStack,
 };
 use crate::state::{
     CloseDisposition, ContextControlBlock, DirectoryCursor, FileControlBlock, OpenedPath,
@@ -210,22 +210,15 @@ fn pack_file_information(request: QueryFileRequest) -> Result<wdk_sys::ULONG_PTR
         .ok_or(STATUS_INVALID_PARAMETER)?;
     let length = request.stack.length().as_usize();
     match request.stack.information_class() {
-        wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => {
-            pack_basic_information(buffer, length, metadata)
-        }
-        wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation => {
-            pack_standard_information(buffer, length, metadata)
-        }
-        wdk_sys::_FILE_INFORMATION_CLASS::FileInternalInformation => {
-            pack_internal_information(buffer, length, metadata)
-        }
-        wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => {
+        QueryFileInformationClass::Basic => pack_basic_information(buffer, length, metadata),
+        QueryFileInformationClass::Standard => pack_standard_information(buffer, length, metadata),
+        QueryFileInformationClass::Internal => pack_internal_information(buffer, length, metadata),
+        QueryFileInformationClass::Position => {
             pack_position_information(buffer, length, request.stack.file_object())
         }
-        wdk_sys::_FILE_INFORMATION_CLASS::FileNetworkOpenInformation => {
+        QueryFileInformationClass::NetworkOpen => {
             pack_network_open_information(buffer, length, metadata)
         }
-        _ => Err(STATUS_INVALID_INFO_CLASS),
     }
 }
 
@@ -243,20 +236,13 @@ fn set_file_information(request: SetFileRequest) -> NTSTATUS {
 /// Applies one supported set-file-information class.
 fn apply_file_information(request: SetFileRequest) -> Result<(), NTSTATUS> {
     match request.stack.information_class() {
-        wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => set_basic_information(request),
-        wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation => {
-            set_end_of_file_information(request)
-        }
-        wdk_sys::_FILE_INFORMATION_CLASS::FileAllocationInformation => {
-            set_allocation_information(request)
-        }
-        wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformation => {
-            set_disposition_information(request)
-        }
-        wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformationEx => Err(STATUS_NOT_SUPPORTED),
-        wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation => set_rename_information(request),
-        wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformationEx => Err(STATUS_NOT_SUPPORTED),
-        _ => Err(STATUS_INVALID_INFO_CLASS),
+        SetFileInformationClass::Basic => set_basic_information(request),
+        SetFileInformationClass::EndOfFile => set_end_of_file_information(request),
+        SetFileInformationClass::Allocation => set_allocation_information(request),
+        SetFileInformationClass::Disposition => set_disposition_information(request),
+        SetFileInformationClass::DispositionEx => Err(STATUS_NOT_SUPPORTED),
+        SetFileInformationClass::Rename => set_rename_information(request),
+        SetFileInformationClass::RenameEx => Err(STATUS_NOT_SUPPORTED),
     }
 }
 
@@ -477,7 +463,7 @@ fn query_directory(target: DispatchTarget) -> NTSTATUS {
 fn pack_directory_information(
     request: QueryDirectoryRequest,
 ) -> Result<wdk_sys::ULONG_PTR, NTSTATUS> {
-    let class = DirectoryInformationClass::from_raw(request.stack.information_class())?;
+    let class = request.stack.information_class();
     let pattern = DirectoryPattern::from_stack(request.stack)?;
     let length = request.stack.length().as_usize();
     let mut buffer = request
@@ -537,28 +523,7 @@ fn pack_directory_information(
     wdk_sys::ULONG_PTR::try_from(result).map_err(|_| STATUS_INVALID_PARAMETER)
 }
 
-/// Directory information classes supported by the variable-length packer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DirectoryInformationClass {
-    /// FILE_DIRECTORY_INFORMATION.
-    Directory,
-    /// FILE_FULL_DIR_INFORMATION.
-    Full,
-    /// FILE_BOTH_DIR_INFORMATION.
-    Both,
-}
-
 impl DirectoryInformationClass {
-    /// Decodes the WDK information class.
-    fn from_raw(value: wdk_sys::FILE_INFORMATION_CLASS) -> Result<Self, NTSTATUS> {
-        match value {
-            wdk_sys::_FILE_INFORMATION_CLASS::FileDirectoryInformation => Ok(Self::Directory),
-            wdk_sys::_FILE_INFORMATION_CLASS::FileFullDirectoryInformation => Ok(Self::Full),
-            wdk_sys::_FILE_INFORMATION_CLASS::FileBothDirectoryInformation => Ok(Self::Both),
-            _ => Err(STATUS_INVALID_INFO_CLASS),
-        }
-    }
-
     /// Returns the byte offset where the UTF-16 file name starts.
     const fn name_offset(self) -> usize {
         match self {
