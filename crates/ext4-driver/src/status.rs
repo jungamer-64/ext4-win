@@ -3,9 +3,10 @@
 use ext4_core::Error;
 use wdk_sys::{
     NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL, STATUS_CANNOT_DELETE,
-    STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL, STATUS_FILE_CORRUPT_ERROR,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS,
-    STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_NOT_SUPPORTED,
+    STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL, STATUS_EA_LIST_INCONSISTENT, STATUS_EA_TOO_LARGE,
+    STATUS_FILE_CORRUPT_ERROR, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
+    STATUS_INVALID_EA_NAME, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
+    STATUS_IO_DEVICE_ERROR, STATUS_NO_EAS_ON_FILE, STATUS_NOT_SUPPORTED,
     STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_TYPE_MISMATCH,
     STATUS_VOLUME_DIRTY,
 };
@@ -32,6 +33,14 @@ pub(crate) enum DriverError {
     NotAReparsePoint,
     /// Reparse tag belongs to another handler.
     ReparseTagNotHandled,
+    /// EA name is not representable by the Windows EA boundary.
+    InvalidEaName,
+    /// EA list structure is internally inconsistent.
+    EaListInconsistent,
+    /// Opened node has no extended attributes.
+    NoEasOnFile,
+    /// EA payload is too large for the Windows EA boundary.
+    EaTooLarge,
     /// Caller selected a valid but unsupported Windows filesystem behavior.
     NotSupported,
     /// ext4-core rejected the requested filesystem operation.
@@ -50,6 +59,10 @@ impl DriverError {
             Self::InvalidInfoClass => STATUS_INVALID_INFO_CLASS,
             Self::NotAReparsePoint => ntstatus(0xC000_0275),
             Self::ReparseTagNotHandled => ntstatus(0xC000_0279),
+            Self::InvalidEaName => STATUS_INVALID_EA_NAME,
+            Self::EaListInconsistent => STATUS_EA_LIST_INCONSISTENT,
+            Self::NoEasOnFile => STATUS_NO_EAS_ON_FILE,
+            Self::EaTooLarge => STATUS_EA_TOO_LARGE,
             Self::NotSupported => STATUS_NOT_SUPPORTED,
             Self::Core(error) => core_error_status(error),
         }
