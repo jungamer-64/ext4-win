@@ -249,7 +249,7 @@ impl CurrentIrpStackLocation {
         };
         Ok(QueryVolumeStack {
             length: IrpBufferLength::from_ulong(query.Length)?,
-            information_class: query.FsInformationClass,
+            information_class: QueryVolumeInformationClass::from_raw(query.FsInformationClass)?,
         })
     }
 
@@ -267,7 +267,7 @@ impl CurrentIrpStackLocation {
         };
         Ok(SetVolumeStack {
             length: IrpBufferLength::from_ulong(set.Length)?,
-            information_class: set.FsInformationClass,
+            information_class: SetVolumeInformationClass::from_raw(set.FsInformationClass)?,
         })
     }
 
@@ -839,6 +839,65 @@ const FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS: wdk_sys::ULONG =
 /// ext4win FSCTL carrying Linux `struct fsverity_enable_arg`.
 const FSCTL_EXT4WIN_ENABLE_VERITY: wdk_sys::ULONG = ext4win_fsctl(EXT4WIN_ENABLE_VERITY_FUNCTION);
 
+/// Decoded query-volume filesystem information class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryVolumeInformationClass {
+    /// Windows `FileFsVolumeInformation`.
+    Volume,
+    /// Windows `FileFsSizeInformation`.
+    Size,
+    /// Windows `FileFsDeviceInformation`.
+    Device,
+    /// Windows `FileFsAttributeInformation`.
+    Attribute,
+    /// Windows `FileFsFullSizeInformation`.
+    FullSize,
+}
+
+impl QueryVolumeInformationClass {
+    /// Decodes a raw WDK filesystem information class for volume queries.
+    fn from_raw(value: wdk_sys::FS_INFORMATION_CLASS) -> Result<Self, DriverError> {
+        match value {
+            FILE_FS_VOLUME_INFORMATION_CLASS => Ok(Self::Volume),
+            FILE_FS_SIZE_INFORMATION_CLASS => Ok(Self::Size),
+            FILE_FS_DEVICE_INFORMATION_CLASS => Ok(Self::Device),
+            FILE_FS_ATTRIBUTE_INFORMATION_CLASS => Ok(Self::Attribute),
+            FILE_FS_FULL_SIZE_INFORMATION_CLASS => Ok(Self::FullSize),
+            _ => Err(DriverError::InvalidInfoClass),
+        }
+    }
+}
+
+/// Decoded set-volume filesystem information class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SetVolumeInformationClass {
+    /// Windows `FileFsLabelInformation`.
+    Label,
+}
+
+impl SetVolumeInformationClass {
+    /// Decodes a raw WDK filesystem information class for volume mutations.
+    fn from_raw(value: wdk_sys::FS_INFORMATION_CLASS) -> Result<Self, DriverError> {
+        match value {
+            FILE_FS_LABEL_INFORMATION_CLASS => Ok(Self::Label),
+            _ => Err(DriverError::InvalidInfoClass),
+        }
+    }
+}
+
+/// `FileFsVolumeInformation`.
+const FILE_FS_VOLUME_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 1;
+/// `FileFsLabelInformation`.
+const FILE_FS_LABEL_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 2;
+/// `FileFsSizeInformation`.
+const FILE_FS_SIZE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 3;
+/// `FileFsDeviceInformation`.
+const FILE_FS_DEVICE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 4;
+/// `FileFsAttributeInformation`.
+const FILE_FS_ATTRIBUTE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 5;
+/// `FileFsFullSizeInformation`.
+const FILE_FS_FULL_SIZE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 7;
+
 /// Decoded mount-volume stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MountVolumeStack {
@@ -950,7 +1009,7 @@ pub(crate) struct QueryVolumeStack {
     /// Output buffer length.
     length: IrpBufferLength,
     /// Requested filesystem information class.
-    information_class: wdk_sys::FS_INFORMATION_CLASS,
+    information_class: QueryVolumeInformationClass,
 }
 
 /// Decoded set-volume-information stack parameters.
@@ -959,7 +1018,7 @@ pub(crate) struct SetVolumeStack {
     /// Input buffer length.
     length: IrpBufferLength,
     /// Requested filesystem information class.
-    information_class: wdk_sys::FS_INFORMATION_CLASS,
+    information_class: SetVolumeInformationClass,
 }
 
 /// Decoded query-file-information stack parameters.
@@ -1108,7 +1167,7 @@ impl QueryVolumeStack {
     }
 
     /// Returns the requested filesystem information class.
-    pub(crate) const fn information_class(self) -> wdk_sys::FS_INFORMATION_CLASS {
+    pub(crate) const fn information_class(self) -> QueryVolumeInformationClass {
         self.information_class
     }
 }
@@ -1120,7 +1179,7 @@ impl SetVolumeStack {
     }
 
     /// Returns the requested filesystem information class.
-    pub(crate) const fn information_class(self) -> wdk_sys::FS_INFORMATION_CLASS {
+    pub(crate) const fn information_class(self) -> SetVolumeInformationClass {
         self.information_class
     }
 }
@@ -1268,7 +1327,7 @@ mod tests {
     use super::{
         CurrentIrpStackLocation, DirectoryCursorPosition, DirectoryEntryEmission,
         DirectoryPatternInput, DispatchTarget, EaEntryEmission, EaNameSelection, FsControlCode,
-        SecurityComponentSelection,
+        QueryVolumeInformationClass, SecurityComponentSelection, SetVolumeInformationClass,
     };
 
     /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
@@ -1643,11 +1702,54 @@ mod tests {
             assert!(set.is_ok());
             if let Ok(set) = set {
                 assert_eq!(set.length().as_usize(), 24);
+                assert_eq!(set.information_class(), SetVolumeInformationClass::Label);
+            }
+        }
+    }
+
+    #[test]
+    fn query_volume_stack_decodes_supported_information_class() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        stack.Parameters.QueryVolume = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_13 {
+            Length: 128,
+            __bindgen_padding_0: 0,
+            FsInformationClass: wdk_sys::_FSINFOCLASS::FileFsFullSizeInformation,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let query = current.query_volume();
+            assert!(query.is_ok());
+            if let Ok(query) = query {
+                assert_eq!(query.length().as_usize(), 128);
                 assert_eq!(
-                    set.information_class(),
-                    wdk_sys::_FSINFOCLASS::FileFsLabelInformation
+                    query.information_class(),
+                    QueryVolumeInformationClass::FullSize
                 );
             }
+        }
+    }
+
+    #[test]
+    fn volume_information_stack_rejects_unsupported_class_before_handler() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        stack.Parameters.QueryVolume = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_13 {
+            Length: 128,
+            __bindgen_padding_0: 0,
+            FsInformationClass: 0x7FFF_FFFF,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            assert_eq!(
+                current
+                    .query_volume()
+                    .err()
+                    .map(crate::status::DriverError::ntstatus),
+                Some(wdk_sys::STATUS_INVALID_INFO_CLASS)
+            );
         }
     }
 
