@@ -7,8 +7,8 @@ use wdk_sys::{
     STATUS_FILE_CORRUPT_ERROR, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
     STATUS_INVALID_EA_NAME, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
     STATUS_IO_DEVICE_ERROR, STATUS_NO_EAS_ON_FILE, STATUS_NOT_SUPPORTED,
-    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_TYPE_MISMATCH,
-    STATUS_VOLUME_DIRTY,
+    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+    STATUS_OBJECT_TYPE_MISMATCH, STATUS_VOLUME_DIRTY,
 };
 
 /// Driver-local result before NTSTATUS completion mapping.
@@ -41,6 +41,16 @@ pub(crate) enum DriverError {
     NoEasOnFile,
     /// EA payload is too large for the Windows EA boundary.
     EaTooLarge,
+    /// Create target already exists where creation requires absence.
+    ObjectNameCollision,
+    /// Create target name is absent where opening requires presence.
+    ObjectNameNotFound,
+    /// Intermediate create path component is absent or not a directory.
+    ObjectPathNotFound,
+    /// Create target kind does not satisfy the requested file/directory constraint.
+    ObjectTypeMismatch,
+    /// WDK share-access validation rejected this open.
+    ShareAccessConflict,
     /// Caller selected a valid but unsupported Windows filesystem behavior.
     NotSupported,
     /// ext4-core rejected the requested filesystem operation.
@@ -63,6 +73,11 @@ impl DriverError {
             Self::EaListInconsistent => STATUS_EA_LIST_INCONSISTENT,
             Self::NoEasOnFile => STATUS_NO_EAS_ON_FILE,
             Self::EaTooLarge => STATUS_EA_TOO_LARGE,
+            Self::ObjectNameCollision => STATUS_OBJECT_NAME_COLLISION,
+            Self::ObjectNameNotFound => STATUS_OBJECT_NAME_NOT_FOUND,
+            Self::ObjectPathNotFound => STATUS_OBJECT_PATH_NOT_FOUND,
+            Self::ObjectTypeMismatch => STATUS_OBJECT_TYPE_MISMATCH,
+            Self::ShareAccessConflict => ntstatus(0xC000_0043),
             Self::NotSupported => STATUS_NOT_SUPPORTED,
             Self::Core(error) => core_error_status(error),
         }

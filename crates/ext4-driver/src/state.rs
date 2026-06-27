@@ -11,12 +11,12 @@ use ext4_core::{
     InodeId, InternalJournal, MountContext, NodeId, ReadWrite, Result as Ext4Result, Volume,
 };
 use wdk_sys::{
-    ACCESS_MASK, DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT,
-    PDRIVER_OBJECT, SHARE_ACCESS, VPB_MOUNTED,
+    ACCESS_MASK, DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT,
+    SHARE_ACCESS, STATUS_SUCCESS, VPB_MOUNTED,
 };
 
 use crate::cng::CngFscryptNonceGenerator;
-use crate::status::DriverError;
+use crate::status::{DriverError, DriverResult};
 use crate::{block_device::KernelBlockDevice, ffi};
 
 /// Non-null kernel device object pointer at the WDK boundary.
@@ -488,8 +488,8 @@ impl FileControlBlock {
         file_object: NonNull<FILE_OBJECT>,
         desired_access: ACCESS_MASK,
         share_access: wdk_sys::ULONG,
-    ) -> NTSTATUS {
-        unsafe {
+    ) -> DriverResult<()> {
+        let status = unsafe {
             // SAFETY: The FCB owns this SHARE_ACCESS record for the opened
             // inode identity, and FILE_OBJECT is the active create target.
             ffi::IoCheckShareAccess(
@@ -499,7 +499,11 @@ impl FileControlBlock {
                 core::ptr::addr_of_mut!(self.share_access),
                 1,
             )
+        };
+        if status < STATUS_SUCCESS {
+            return Err(DriverError::ShareAccessConflict);
         }
+        Ok(())
     }
 
     /// Removes one FILE_OBJECT's recorded share-access claim.
