@@ -6,8 +6,8 @@ use core::ptr::NonNull;
 use ext4_core::FileOffset;
 use wdk_sys::{PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP};
 
+use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb};
-use crate::status::{DriverError, DriverResult};
 
 /// Byte count completed in `IO_STATUS_BLOCK::Information`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -684,7 +684,7 @@ fn mapped_mdl_address(
     let address = unsafe {
         // SAFETY: The MDL belongs to the active IRP and describes locked pages
         // supplied by the I/O Manager for direct I/O.
-        crate::ffi::MmMapLockedPagesSpecifyCache(
+        crate::kernel::ffi::MmMapLockedPagesSpecifyCache(
             mdl.as_ptr(),
             kernel_mode,
             wdk_sys::_MEMORY_CACHING_TYPE::MmCached,
@@ -1733,13 +1733,13 @@ mod tests {
         assert_eq!(
             DispatchTarget::decode(core::ptr::null_mut(), opaque::<wdk_sys::IRP>())
                 .err()
-                .map(crate::status::DriverError::ntstatus),
+                .map(crate::kernel::status::DriverError::ntstatus),
             Some(STATUS_INVALID_PARAMETER)
         );
         assert_eq!(
             DispatchTarget::decode(opaque::<wdk_sys::DEVICE_OBJECT>(), core::ptr::null_mut())
                 .err()
-                .map(crate::status::DriverError::ntstatus),
+                .map(crate::kernel::status::DriverError::ntstatus),
             Some(STATUS_INVALID_PARAMETER)
         );
     }
@@ -1760,7 +1760,7 @@ mod tests {
         assert_eq!(
             CurrentIrpStackLocation::from_raw(core::ptr::null_mut())
                 .err()
-                .map(crate::status::DriverError::ntstatus),
+                .map(crate::kernel::status::DriverError::ntstatus),
             Some(STATUS_INVALID_PARAMETER)
         );
     }
@@ -1882,7 +1882,7 @@ mod tests {
                 current
                     .file_system_control()
                     .err()
-                    .map(crate::status::DriverError::ntstatus),
+                    .map(crate::kernel::status::DriverError::ntstatus),
                 Some(STATUS_NOT_SUPPORTED)
             );
         }
@@ -1981,7 +1981,7 @@ mod tests {
                 current
                     .create()
                     .err()
-                    .map(crate::status::DriverError::ntstatus),
+                    .map(crate::kernel::status::DriverError::ntstatus),
                 Some(STATUS_NOT_SUPPORTED)
             );
         }
@@ -2046,7 +2046,7 @@ mod tests {
                 current
                     .query_ea()
                     .err()
-                    .map(crate::status::DriverError::ntstatus),
+                    .map(crate::kernel::status::DriverError::ntstatus),
                 Some(STATUS_NOT_SUPPORTED)
             );
         }
@@ -2132,7 +2132,7 @@ mod tests {
                 current
                     .query_security()
                     .err()
-                    .map(crate::status::DriverError::ntstatus),
+                    .map(crate::kernel::status::DriverError::ntstatus),
                 Some(STATUS_ACCESS_DENIED)
             );
         }
@@ -2158,7 +2158,7 @@ mod tests {
                 current
                     .query_security()
                     .err()
-                    .map(crate::status::DriverError::ntstatus),
+                    .map(crate::kernel::status::DriverError::ntstatus),
                 Some(STATUS_NOT_SUPPORTED)
             );
         }
@@ -2225,7 +2225,7 @@ mod tests {
                 current
                     .query_volume()
                     .err()
-                    .map(crate::status::DriverError::ntstatus),
+                    .map(crate::kernel::status::DriverError::ntstatus),
                 Some(wdk_sys::STATUS_INVALID_INFO_CLASS)
             );
         }
@@ -2319,7 +2319,7 @@ mod tests {
                 current
                     .read()
                     .err()
-                    .map(crate::status::DriverError::ntstatus),
+                    .map(crate::kernel::status::DriverError::ntstatus),
                 Some(STATUS_INVALID_PARAMETER)
             );
         }
@@ -2374,7 +2374,7 @@ mod tests {
                 current
                     .write()
                     .err()
-                    .map(crate::status::DriverError::ntstatus),
+                    .map(crate::kernel::status::DriverError::ntstatus),
                 Some(STATUS_INVALID_PARAMETER)
             );
         }
@@ -2458,7 +2458,7 @@ mod tests {
                 current
                     .query_file()
                     .err()
-                    .map(crate::status::DriverError::ntstatus),
+                    .map(crate::kernel::status::DriverError::ntstatus),
                 Some(wdk_sys::STATUS_INVALID_INFO_CLASS)
             );
         }

@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use crate::endian::{DiskOffset, le_u16, le_u32};
+use crate::disk::endian::{DiskOffset, le_u16, le_u32};
 use crate::error::{Error, Result};
 
 /// Mask selecting file-type bits from `i_mode`.
@@ -892,7 +892,7 @@ fn parse_times(raw: &[u8]) -> Result<Ext4Times> {
 #[cfg(test)]
 mod tests {
     use super::{DirectoryStorageKind, Inode, InodeId, MODE_DIRECTORY, MODE_REGULAR};
-    use crate::endian::{put_le_u16, put_le_u32};
+    use crate::disk::endian::{put_le_u16, put_le_u32};
     use crate::error::{Error, Result};
 
     fn inode_id() -> Result<InodeId> {

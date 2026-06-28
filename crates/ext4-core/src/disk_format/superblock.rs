@@ -1,10 +1,10 @@
 //! Superblock parsing and mount-policy validation.
 
-use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
-use crate::checksum::{crc32c, verify_crc32c};
-use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u32};
+use crate::disk::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
+use crate::disk::checksum::{crc32c, verify_crc32c};
+use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u32};
+use crate::disk_format::inode::InodeId;
 use crate::error::{Error, Result};
-use crate::inode::InodeId;
 
 // ext4 superblock and feature-policy constants. Feature masks stay here so the
 // mount boundary is the only place where unsupported on-disk formats enter.

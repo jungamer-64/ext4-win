@@ -2,10 +2,10 @@
 
 use alloc::{vec, vec::Vec};
 
-use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::disk_format::inode::{Ext4Gid, Ext4Permissions, Ext4Uid};
+use crate::disk_format::xattr::{XattrName, XattrNamespace, XattrValue};
 use crate::error::{Error, Result};
-use crate::inode::{Ext4Gid, Ext4Permissions, Ext4Uid};
-use crate::xattr::{XattrName, XattrNamespace, XattrValue};
 
 /// POSIX ACL xattr payload version.
 const POSIX_ACL_XATTR_VERSION: u32 = 0x0002;

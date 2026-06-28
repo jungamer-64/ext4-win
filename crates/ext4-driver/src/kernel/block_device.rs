@@ -8,7 +8,7 @@ use wdk_sys::{
     KPROCESSOR_MODE, LARGE_INTEGER, NTSTATUS, PIRP, PVOID, STATUS_PENDING, STATUS_SUCCESS,
 };
 
-use crate::{ffi, state::KernelDevice};
+use crate::{kernel::ffi, state::KernelDevice};
 
 /// `FALSE` represented as WDK `BOOLEAN`.
 const BOOLEAN_FALSE: BOOLEAN = 0;

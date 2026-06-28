@@ -3,11 +3,11 @@
 use alloc::{vec, vec::Vec};
 use core::cmp::Ordering;
 
-use crate::block::BlockAddress;
-use crate::checksum::crc32c;
-use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::disk::block::BlockAddress;
+use crate::disk::checksum::crc32c;
+use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::disk_format::superblock::{MetadataChecksum, Superblock};
 use crate::error::{Error, Result};
-use crate::superblock::{MetadataChecksum, Superblock};
 
 /// ext4 xattr header magic.
 const EXT4_XATTR_MAGIC: u32 = 0xEA02_0000;

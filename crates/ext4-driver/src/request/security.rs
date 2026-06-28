@@ -10,8 +10,8 @@ use crate::irp::{
     DispatchTarget, DriverCompletion, QuerySecurityStack, SecurityComponentSelection,
     SecuritySelection, SetSecurityStack,
 };
+use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{FileControlBlock, OpenedFileObject, VolumeControlBlock};
-use crate::status::{DriverError, DriverResult};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
 /// SECURITY_DESCRIPTOR_RELATIVE byte size.
@@ -263,7 +263,7 @@ fn set_security(request: &SetSecurityRequest) -> DriverResult<DriverCompletion> 
     };
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let node = transaction.node(context.node)?;
     transaction.set_posix_security(node, security)?;
     transaction.commit()?;
@@ -871,7 +871,7 @@ mod tests {
 
     use crate::{
         irp::{SecurityComponentSelection, SecuritySelection},
-        status::DriverError,
+        kernel::status::DriverError,
         wire::LittleEndianInput,
     };
 

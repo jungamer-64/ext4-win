@@ -18,11 +18,11 @@ use crate::irp::{
     IrpBufferLength, QueryDirectoryStack, QueryFileInformationClass, QueryFileStack,
     SetFileInformationClass, SetFileStack,
 };
+use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{
     CloseDisposition, DirectoryCursor, FileControlBlock, KernelFileObject, OpenedFileObject,
     OpenedHandle, OpenedPath, VolumeControlBlock, release_file_control_block,
 };
-use crate::status::{DriverError, DriverResult};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
 /// Handles cleanup IRPs.
@@ -293,7 +293,7 @@ fn set_basic_information(request: SetFileRequest) -> DriverResult<()> {
     };
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let node = transaction.node(context.node)?;
     if times != metadata.times {
         transaction.set_times(node, times)?;
@@ -377,7 +377,7 @@ fn set_rename_information(mut request: SetFileRequest) -> DriverResult<()> {
     let (target_parent, target_name) = resolve_rename_target(vcb, &rename.name)?;
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let source_parent = transaction.directory(source_parent)?;
     let target_parent = transaction.directory(target_parent)?;
     transaction.rename_child(source_parent, &source_name, target_parent, &target_name)?;
@@ -410,7 +410,7 @@ fn set_regular_file_size(opened_file: &OpenedFileObject, new_size: FileSize) -> 
 
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let file = transaction.file(file_id)?;
     if new_size > current {
         transaction.extend_file(file, new_size)?;
@@ -883,7 +883,7 @@ fn cleanup_file_object(file_object: KernelFileObject) -> DriverResult<()> {
     };
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let parent = transaction.directory(parent)?;
     match opened_file.node() {
         NodeId::File(_) => transaction.unlink_file(parent, &name)?,
@@ -1120,7 +1120,7 @@ fn windows_time_field(value: LARGE_INTEGER, current: Ext4Timestamp) -> DriverRes
     let converted = unsafe {
         // SAFETY: Both pointers reference writable stack storage valid for the
         // duration of the conversion call.
-        crate::ffi::RtlTimeToSecondsSince1970(
+        crate::kernel::ffi::RtlTimeToSecondsSince1970(
             core::ptr::addr_of_mut!(time),
             core::ptr::addr_of_mut!(seconds),
         )
@@ -1441,7 +1441,10 @@ fn windows_time(timestamp: Ext4Timestamp) -> LARGE_INTEGER {
     unsafe {
         // SAFETY: `time` points to writable stack storage for the conversion
         // result.
-        crate::ffi::RtlSecondsSince1970ToTime(timestamp.seconds(), core::ptr::addr_of_mut!(time));
+        crate::kernel::ffi::RtlSecondsSince1970ToTime(
+            timestamp.seconds(),
+            core::ptr::addr_of_mut!(time),
+        );
     }
     time
 }
@@ -1545,7 +1548,7 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> 
 
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let file = transaction.file(file_id)?;
     transaction.overwrite_file_range(file, stack.byte_offset(), input.as_slice())?;
     transaction.commit()?;

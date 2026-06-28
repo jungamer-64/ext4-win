@@ -4,23 +4,10 @@
 
 extern crate alloc;
 
-mod block_device;
-mod cng;
-mod create;
-mod dispatch;
-mod ea;
-mod ffi;
-mod file_info;
-mod file_system_control;
-mod fsctl;
 mod irp;
-mod metadata;
-mod reparse;
-mod security;
+mod kernel;
+mod request;
 mod state;
-mod status;
-mod time;
-mod volume_info;
 mod wire;
 
 #[cfg(not(test))]
@@ -34,9 +21,6 @@ use wdk_sys::{NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_SUCCESS};
 #[global_allocator]
 /// Kernel allocator used by WDK-backed driver builds.
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
-
-/// Registered control device observed by the unload callback.
-static mut CONTROL_DEVICE: Option<state::ControlDevice> = None;
 
 /// Driver entry point called by the Windows kernel loader.
 ///
@@ -52,45 +36,40 @@ pub unsafe extern "system" fn driver_entry(
         // when loading the driver. Null is still handled defensively.
         driver.as_mut()
     }) else {
-        return status::DriverError::InvalidParameter.ntstatus();
+        return kernel::status::DriverError::InvalidParameter.ntstatus();
     };
 
-    if dispatch::install(driver_object).is_err() {
-        return status::DriverError::InvalidParameter.ntstatus();
+    if request::dispatch::install(driver_object).is_err() {
+        return kernel::status::DriverError::InvalidParameter.ntstatus();
     }
 
     let mut device = core::ptr::null_mut();
     let status = unsafe {
         // SAFETY: The driver object is valid for DriverEntry, the device name
         // is intentionally unnamed, and `device` points to writable storage.
-        ffi::IoCreateDevice(
+        kernel::ffi::IoCreateDevice(
             driver,
             0,
             core::ptr::null_mut(),
-            ffi::FILE_DEVICE_DISK_FILE_SYSTEM,
+            kernel::ffi::FILE_DEVICE_DISK_FILE_SYSTEM,
             0,
             0,
             &mut device,
         )
     };
     if status != STATUS_SUCCESS {
-        return status::DriverError::InsufficientResources.ntstatus();
+        return kernel::status::DriverError::InsufficientResources.ntstatus();
     }
 
     let Some(control_device) = state::ControlDevice::registered(device) else {
-        return status::DriverError::InvalidParameter.ntstatus();
+        return kernel::status::DriverError::InvalidParameter.ntstatus();
     };
 
     unsafe {
         // SAFETY: `control_device` was initialized by a successful IoCreateDevice call.
-        ffi::IoRegisterFileSystem(control_device.as_ptr());
+        kernel::ffi::IoRegisterFileSystem(control_device.as_ptr());
     }
-    let control_device_slot = core::ptr::addr_of_mut!(CONTROL_DEVICE);
-    unsafe {
-        // SAFETY: `control_device_slot` points to the driver-owned global state.
-        // Raw pointer write avoids borrowing the mutable static.
-        core::ptr::write(control_device_slot, Some(control_device));
-    };
+    state::publish_control_device(control_device);
 
     STATUS_SUCCESS
 }

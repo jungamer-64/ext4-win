@@ -2,7 +2,7 @@
 
 use ext4_core::Ext4Timestamp;
 
-use crate::status::DriverError;
+use crate::kernel::status::DriverError;
 
 /// Returns the current system time as an ext4 inode timestamp.
 pub(crate) fn current_ext4_timestamp() -> Result<Ext4Timestamp, DriverError> {
@@ -10,13 +10,13 @@ pub(crate) fn current_ext4_timestamp() -> Result<Ext4Timestamp, DriverError> {
     unsafe {
         // SAFETY: `time` points to writable stack storage for the kernel to
         // receive the current system time.
-        crate::ffi::KeQuerySystemTimePrecise(core::ptr::addr_of_mut!(time));
+        crate::kernel::ffi::KeQuerySystemTimePrecise(core::ptr::addr_of_mut!(time));
     }
     let mut seconds: wdk_sys::ULONG = 0;
     let converted = unsafe {
         // SAFETY: Both pointers reference writable stack storage valid for the
         // duration of the conversion call.
-        crate::ffi::RtlTimeToSecondsSince1970(
+        crate::kernel::ffi::RtlTimeToSecondsSince1970(
             core::ptr::addr_of_mut!(time),
             core::ptr::addr_of_mut!(seconds),
         )

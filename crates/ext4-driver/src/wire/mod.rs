@@ -1,6 +1,6 @@
 //! Checked byte-range and little-endian wire helpers for external payloads.
 
-use crate::status::{DriverError, DriverResult};
+use crate::kernel::status::{DriverError, DriverResult};
 
 /// Byte offset inside one decoded wire payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,7 +203,7 @@ impl<'a> LittleEndianOutput<'a> {
 #[cfg(test)]
 mod tests {
     use super::{WireByteLen, WireOffset, WireRange};
-    use crate::status::DriverError;
+    use crate::kernel::status::DriverError;
 
     #[test]
     fn wire_range_rejects_overflowing_end() {

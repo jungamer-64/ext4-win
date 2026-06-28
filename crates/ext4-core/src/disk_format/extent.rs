@@ -2,11 +2,11 @@
 
 use alloc::{vec, vec::Vec};
 
-use crate::block::{BlockAddress, BlockReader, BlockSize};
-use crate::checksum::crc32c;
-use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::disk::block::{BlockAddress, BlockReader, BlockSize};
+use crate::disk::checksum::crc32c;
+use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::disk_format::inode::{InodeExtentRoot, InodeId};
 use crate::error::{Error, Result};
-use crate::inode::{InodeExtentRoot, InodeId};
 
 /// Magic value stored at the start of every ext4 extent header.
 const EXTENT_MAGIC: u16 = 0xF30A;

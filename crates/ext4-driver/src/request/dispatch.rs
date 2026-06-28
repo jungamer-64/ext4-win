@@ -99,7 +99,7 @@ impl<'driver> DispatchTable<'driver> {
 /// Installs the ext4 file-system dispatch table.
 pub(crate) fn install(driver: &mut DRIVER_OBJECT) -> Result<(), DispatchInstallError> {
     let mut table = DispatchTable::new(driver);
-    table.unload(super::state::driver_unload);
+    table.unload(crate::state::driver_unload);
     table.set(MajorFunction::CREATE, create)?;
     table.set(MajorFunction::CLOSE, close)?;
     table.set(MajorFunction::CLEANUP, cleanup)?;
@@ -132,72 +132,72 @@ pub(crate) fn install(driver: &mut DRIVER_OBJECT) -> Result<(), DispatchInstallE
 
 /// Handles create/open IRPs.
 unsafe extern "C" fn create(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::create::dispatch(device, irp)
+    crate::request::create::dispatch(device, irp)
 }
 
 /// Handles close IRPs.
 unsafe extern "C" fn close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::close(device, irp)
+    crate::request::file_info::close(device, irp)
 }
 
 /// Handles cleanup IRPs.
 unsafe extern "C" fn cleanup(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::cleanup(device, irp)
+    crate::request::file_info::cleanup(device, irp)
 }
 
 /// Handles read IRPs.
 unsafe extern "C" fn read(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::read(device, irp)
+    crate::request::file_info::read(device, irp)
 }
 
 /// Handles write IRPs.
 unsafe extern "C" fn write(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::write(device, irp)
+    crate::request::file_info::write(device, irp)
 }
 
 /// Handles file information queries.
 unsafe extern "C" fn query_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::query(device, irp)
+    crate::request::file_info::query(device, irp)
 }
 
 /// Handles file information mutations.
 unsafe extern "C" fn set_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::set(device, irp)
+    crate::request::file_info::set(device, irp)
 }
 
 /// Handles volume information queries.
 unsafe extern "C" fn query_volume_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::volume_info::query(device, irp)
+    crate::request::volume_info::query(device, irp)
 }
 
 /// Handles volume information mutations.
 unsafe extern "C" fn set_volume_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::volume_info::set(device, irp)
+    crate::request::volume_info::set(device, irp)
 }
 
 /// Handles directory enumeration and change notification.
 unsafe extern "C" fn directory_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::directory_control(device, irp)
+    crate::request::file_info::directory_control(device, irp)
 }
 
 /// Handles file-system control requests.
 unsafe extern "C" fn file_system_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_system_control::dispatch(device, irp)
+    crate::request::file_system_control::dispatch(device, irp)
 }
 
 /// Rejects unsupported device-control requests.
 unsafe extern "C" fn device_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_system_control::device_control(device, irp)
+    crate::request::file_system_control::device_control(device, irp)
 }
 
 /// Handles security descriptor queries.
 unsafe extern "C" fn query_security(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::security::query(device, irp)
+    crate::request::security::query(device, irp)
 }
 
 /// Handles security descriptor mutations.
 unsafe extern "C" fn set_security(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::security::set(device, irp)
+    crate::request::security::set(device, irp)
 }
 
 /// Completes IRPs whose current minimal behavior is successful no-op.
@@ -210,31 +210,31 @@ unsafe extern "C" fn success(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 
 /// Handles flush requests.
 unsafe extern "C" fn flush_buffers(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::flush(device, irp)
+    crate::request::file_info::flush(device, irp)
 }
 
 /// Handles extended-attribute queries.
 unsafe extern "C" fn query_ea(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::ea::query(device, irp)
+    crate::request::ea::query(device, irp)
 }
 
 /// Handles extended-attribute mutations.
 unsafe extern "C" fn set_ea(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::ea::set(device, irp)
+    crate::request::ea::set(device, irp)
 }
 
 /// Handles byte-range lock requests.
 unsafe extern "C" fn lock_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    crate::file_info::lock_control(device, irp)
+    crate::request::file_info::lock_control(device, irp)
 }
 
 /// Decodes the current dispatch boundary enough to reject null kernel inputs.
 fn decode_dispatch_target(
     device: PDEVICE_OBJECT,
     irp: PIRP,
-) -> Result<(), crate::status::DriverError> {
+) -> Result<(), crate::kernel::status::DriverError> {
     if device.is_null() || irp.is_null() {
-        Err(crate::status::DriverError::InvalidParameter)
+        Err(crate::kernel::status::DriverError::InvalidParameter)
     } else {
         Ok(())
     }

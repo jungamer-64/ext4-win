@@ -6,14 +6,14 @@
 
 use alloc::vec::Vec;
 
-use crate::block::{BlockAddress, BlockReader, BlockSize, ByteOffset};
-use crate::checksum::{crc16, crc32c};
-use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u16};
-use crate::error::{Error, Result};
-use crate::superblock::{
+use crate::disk::block::{BlockAddress, BlockReader, BlockSize, ByteOffset};
+use crate::disk::checksum::{crc16, crc32c};
+use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16};
+use crate::disk_format::superblock::{
     BlockGroupDescriptorChecksum, BlockGroupDescriptorLayout, BlockGroupDescriptorSize,
     BlockGroupId, FreeClusterDelta, Superblock,
 };
+use crate::error::{Error, Result};
 
 // Low 32-bit descriptor fields are present in both 32-byte and 64-byte layouts.
 /// Offset of `bg_block_bitmap_lo` in a block group descriptor.

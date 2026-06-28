@@ -4,9 +4,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::irp::{DispatchTarget, DriverCompletion, FileSystemControlStack};
-use crate::metadata;
+use crate::kernel::status::{DriverError, DriverResult};
+use crate::request::metadata;
 use crate::state::{FileControlBlock, OpenedFileObject, OpenedPath, VolumeControlBlock};
-use crate::status::{DriverError, DriverResult};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{LoadedNode, NodeId, SymlinkNodeId, SymlinkTarget};
 
@@ -99,7 +99,7 @@ fn replace_opened_path_with_symlink(
     };
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let parent_directory = transaction.directory(parent)?;
     match opened_file.node() {
         NodeId::File(_) => transaction.unlink_file(parent_directory, &name)?,
@@ -291,7 +291,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use crate::status::DriverError;
+    use crate::kernel::status::DriverError;
     use crate::wire::{LittleEndianInput, LittleEndianOutput};
 
     use super::{

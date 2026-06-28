@@ -1,7 +1,7 @@
 //! Windows metadata projected onto ext4 domain types.
 
+use crate::disk_format::xattr::{XattrName, XattrNamespace, XattrValue};
 use crate::error::{Error, Result};
-use crate::xattr::{XattrName, XattrNamespace, XattrValue};
 
 /// File attributes that cannot be represented by POSIX mode bits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
