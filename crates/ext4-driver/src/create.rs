@@ -17,8 +17,8 @@ use crate::{
     },
     metadata,
     state::{
-        FileControlBlock, KernelDevice, MountedVolumeDevice, OpenedHandle, OpenedPath,
-        VolumeControlBlock, release_file_control_block,
+        FileControlBlock, KernelDevice, KernelFileObject, MountedVolumeDevice, OpenedHandle,
+        OpenedPath, UninitializedFileObject, VolumeControlBlock, release_file_control_block,
     },
     status::{DriverError, DriverResult},
 };
@@ -44,14 +44,19 @@ struct CreateRequest {
     device: KernelDevice,
     /// Create stack parameters.
     stack: CreateStack,
+    /// FILE_OBJECT before filesystem contexts are attached.
+    file_object: UninitializedFileObject,
 }
 
 impl CreateRequest {
     /// Decodes the create request from the current IRP stack.
     fn decode(target: DispatchTarget) -> Result<Self, crate::status::DriverError> {
+        let stack = target.current_stack()?.create()?;
+        let file_object = UninitializedFileObject::decode(stack.file_object())?;
         Ok(Self {
-            device: KernelDevice::from_non_null(target.device()),
-            stack: target.current_stack()?.create()?,
+            device: target.device(),
+            stack,
+            file_object,
         })
     }
 
@@ -61,8 +66,8 @@ impl CreateRequest {
     }
 
     /// Returns the file object to initialize.
-    const fn file_object(self) -> NonNull<FILE_OBJECT> {
-        self.stack.file_object()
+    const fn file_object(self) -> UninitializedFileObject {
+        self.file_object
     }
 
     /// Returns decoded create parameters.
@@ -146,7 +151,7 @@ fn open_existing_node(
             match truncate_existing_file(vcb, inode) {
                 Ok(()) => attach_file_object(request.file_object(), fcb, node, path),
                 Err(error) => {
-                    abandon_file_control_block(request.file_object(), fcb);
+                    abandon_file_control_block(request.file_object().kernel_file_object(), fcb);
                     Err(error)
                 }
             }
@@ -241,7 +246,7 @@ fn truncate_existing_file(
 
 /// Resolves a root-relative Windows path to an existing node or missing leaf.
 fn resolve_path(
-    file_object: NonNull<FILE_OBJECT>,
+    file_object: UninitializedFileObject,
     vcb: NonNull<crate::state::VolumeControlBlock>,
 ) -> DriverResult<PathLookup> {
     let file_object = unsafe {
@@ -367,7 +372,7 @@ fn path_components(file_object: &FILE_OBJECT) -> DriverResult<Vec<WindowsName>> 
 
 /// Stores FCB/CCB context pointers in the FILE_OBJECT.
 fn initialize_file_object(
-    file_object: NonNull<FILE_OBJECT>,
+    file_object: UninitializedFileObject,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: NodeId,
     path: OpenedPath,
@@ -380,21 +385,12 @@ fn initialize_file_object(
 
 /// Opens the shared FCB for a node and records the create share-access claim.
 fn open_shared_file_control_block(
-    file_object: NonNull<FILE_OBJECT>,
+    file_object: UninitializedFileObject,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: NodeId,
     desired_access: DesiredAccess,
     share_access: ShareAccess,
 ) -> DriverResult<NonNull<FileControlBlock>> {
-    let file_object_ref = unsafe {
-        // SAFETY: `file_object` comes from the active create stack and is read
-        // only for filesystem-owned context pointers before initialization.
-        file_object.as_ref()
-    };
-    if !file_object_ref.FsContext.is_null() || !file_object_ref.FsContext2.is_null() {
-        return Err(DriverError::InvalidParameter);
-    }
-
     let mut fcb = VolumeControlBlock::open_file_control_block(vcb, node)?;
     let fcb_ref = unsafe {
         // SAFETY: The VCB returned a live owned FCB pointer with an open
@@ -402,9 +398,9 @@ fn open_shared_file_control_block(
         fcb.as_mut()
     };
     if let Err(error) = fcb_ref.check_share_access(
-        file_object,
-        desired_access.as_raw(),
-        share_access.as_ulong(),
+        file_object.kernel_file_object(),
+        desired_access,
+        share_access,
     ) {
         release_file_control_block(fcb);
         return Err(error);
@@ -415,7 +411,7 @@ fn open_shared_file_control_block(
 
 /// Stores already-opened FCB and new CCB context pointers in the FILE_OBJECT.
 fn attach_file_object(
-    mut file_object: NonNull<FILE_OBJECT>,
+    file_object: UninitializedFileObject,
     fcb: NonNull<FileControlBlock>,
     node: NodeId,
     path: OpenedPath,
@@ -432,10 +428,7 @@ fn attach_file_object(
 }
 
 /// Rolls back an FCB open whose FILE_OBJECT was not attached.
-fn abandon_file_control_block(
-    file_object: NonNull<FILE_OBJECT>,
-    mut fcb: NonNull<FileControlBlock>,
-) {
+fn abandon_file_control_block(file_object: KernelFileObject, mut fcb: NonNull<FileControlBlock>) {
     let fcb_ref = unsafe {
         // SAFETY: The FCB was opened for this create request and has not been
         // published into FILE_OBJECT::FsContext.

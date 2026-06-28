@@ -11,7 +11,7 @@ use core::marker::PhantomData;
 
 use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
 use crate::checksum::crc32c;
-use crate::endian::{be_u16, be_u32, be_u64, put_be_u16, put_be_u32};
+use crate::endian::{DiskOffset, be_u16, be_u32, be_u64, put_be_u16, put_be_u32};
 use crate::error::{Error, Result};
 use crate::extent::{ExtentTree, ExtentTreeContext};
 use crate::inode::Inode;
@@ -31,6 +31,11 @@ const JBD2_SUPERBLOCK_V1: u32 = 3;
 const JBD2_SUPERBLOCK_V2: u32 = 4;
 /// JBD2 block type for revoke records.
 const JBD2_REVOKE_BLOCK: u32 = 5;
+
+/// Builds a JBD2 control-structure field offset.
+const fn disk_offset(offset: usize) -> DiskOffset {
+    DiskOffset::new(offset)
+}
 
 // Incompatible feature bits are validated before replay because unsupported
 // features can change transaction interpretation.
@@ -430,7 +435,7 @@ impl<State> Journal<State> {
             }
             let mut data = metadata.bytes().to_vec();
             if starts_with_jbd2_magic(&data) {
-                put_be_u32(&mut data, 0, 0)?;
+                put_be_u32(&mut data, disk_offset(0), 0)?;
             }
             data_blocks.push(data);
         }
@@ -548,10 +553,10 @@ impl<State> Journal<State> {
                         if tag.flags & JBD2_TAG_FLAG_DELETED == 0 {
                             self.verify_tag_checksum(sequence, &tag, &data)?;
                             if tag.flags & JBD2_TAG_FLAG_ESCAPE != 0 {
-                                if be_u32(&data, 0)? != 0 {
+                                if be_u32(&data, disk_offset(0))? != 0 {
                                     return Err(Error::JournalCorrupt);
                                 }
-                                put_be_u32(&mut data, 0, JBD2_MAGIC)?;
+                                put_be_u32(&mut data, disk_offset(0), JBD2_MAGIC)?;
                             }
                             self.validate_replay_target(tag.block)?;
                             if transaction.events.iter().any(|event| {
@@ -672,19 +677,10 @@ impl<State> Journal<State> {
             {
                 return Ok(None);
             }
-            let block_low = u64::from(be_u32(block, offset)?);
-            let flags = be_u32(
-                block,
-                offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
-            )?;
-            let block_high = u64::from(be_u32(
-                block,
-                offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
-            )?);
-            let checksum = be_u32(
-                block,
-                offset.checked_add(12).ok_or(Error::ArithmeticOverflow)?,
-            )?;
+            let block_low = u64::from(be_u32(block, disk_offset(offset))?);
+            let flags = be_u32(block, disk_offset(offset).checked_add_bytes(4)?)?;
+            let block_high = u64::from(be_u32(block, disk_offset(offset).checked_add_bytes(8)?)?);
+            let checksum = be_u32(block, disk_offset(offset).checked_add_bytes(12)?)?;
             if block_low == 0 && block_high == 0 && flags == 0 && checksum == 0 {
                 return Ok(None);
             }
@@ -731,25 +727,16 @@ impl<State> Journal<State> {
         {
             return Ok(None);
         }
-        let block_low = u64::from(be_u32(block, offset)?);
-        let checksum = u32::from(be_u16(
-            block,
-            offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
-        )?);
-        let flags = u32::from(be_u16(
-            block,
-            offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
-        )?);
+        let block_low = u64::from(be_u32(block, disk_offset(offset))?);
+        let checksum = u32::from(be_u16(block, disk_offset(offset).checked_add_bytes(4)?)?);
+        let flags = u32::from(be_u16(block, disk_offset(offset).checked_add_bytes(6)?)?);
         if block_low == 0 && flags == 0 && checksum == 0 {
             return Ok(None);
         }
         validate_tag_flags(flags)?;
         let high_size = if self.superblock.has_64bit() { 4 } else { 0 };
         let block_high = if high_size == 4 {
-            u64::from(be_u32(
-                block,
-                offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
-            )?)
+            u64::from(be_u32(block, disk_offset(offset).checked_add_bytes(8)?)?)
         } else {
             0
         };
@@ -791,7 +778,7 @@ impl<State> Journal<State> {
     /// Parses a revoke block into the home blocks it cancels.
     fn parse_revoke_block(&self, block: &[u8]) -> Result<JournalRevoke> {
         self.verify_block_tail_checksum(block)?;
-        let used = usize::try_from(be_u32(block, JOURNAL_HEADER_BYTES)?)
+        let used = usize::try_from(be_u32(block, disk_offset(JOURNAL_HEADER_BYTES))?)
             .map_err(|_| Error::JournalCorrupt)?;
         if used < 16 || used > block.len() {
             return Err(Error::JournalCorrupt);
@@ -811,9 +798,9 @@ impl<State> Journal<State> {
             <= limit
         {
             let block = if entry_size == 8 {
-                be_u64(block, offset)?
+                be_u64(block, disk_offset(offset))?
             } else {
-                u64::from(be_u32(block, offset)?)
+                u64::from(be_u32(block, disk_offset(offset))?)
             };
             blocks.push(BlockAddress::new(block));
             offset = offset
@@ -901,26 +888,18 @@ impl<State> Journal<State> {
             }
             put_be_u32(
                 block,
-                offset,
+                disk_offset(offset),
                 u32::try_from(metadata.block().get() & u64::from(u32::MAX))
                     .map_err(|_| Error::ArithmeticOverflow)?,
             )?;
+            put_be_u32(block, disk_offset(offset).checked_add_bytes(4)?, flags)?;
             put_be_u32(
                 block,
-                offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
-                flags,
-            )?;
-            put_be_u32(
-                block,
-                offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+                disk_offset(offset).checked_add_bytes(8)?,
                 u32::try_from(metadata.block().get() >> 32)
                     .map_err(|_| Error::ArithmeticOverflow)?,
             )?;
-            put_be_u32(
-                block,
-                offset.checked_add(12).ok_or(Error::ArithmeticOverflow)?,
-                checksum,
-            )?;
+            put_be_u32(block, disk_offset(offset).checked_add_bytes(12)?, checksum)?;
             return Ok(next);
         }
 
@@ -934,24 +913,24 @@ impl<State> Journal<State> {
         }
         put_be_u32(
             block,
-            offset,
+            disk_offset(offset),
             u32::try_from(metadata.block().get() & u64::from(u32::MAX))
                 .map_err(|_| Error::ArithmeticOverflow)?,
         )?;
         put_be_u16(
             block,
-            offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+            disk_offset(offset).checked_add_bytes(4)?,
             u16::try_from(checksum & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
         put_be_u16(
             block,
-            offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
+            disk_offset(offset).checked_add_bytes(6)?,
             u16::try_from(flags).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
         if high_size == 4 {
             put_be_u32(
                 block,
-                offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+                disk_offset(offset).checked_add_bytes(8)?,
                 u32::try_from(metadata.block().get() >> 32)
                     .map_err(|_| Error::ArithmeticOverflow)?,
             )?;
@@ -972,7 +951,7 @@ impl<State> Journal<State> {
             *block.get_mut(0x0C).ok_or(Error::TruncatedStructure)? = JBD2_CHECKSUM_CRC32C;
             *block.get_mut(0x0D).ok_or(Error::TruncatedStructure)? = 4;
             let checksum = self.block_checksum_with_zeroed(&block, 0x10)?;
-            put_be_u32(&mut block, 0x10, checksum)?;
+            put_be_u32(&mut block, disk_offset(0x10), checksum)?;
         }
         Ok(block)
     }
@@ -1070,7 +1049,7 @@ impl<State> Journal<State> {
     /// Computes the JBD2 checksum for one journal data block.
     fn tag_checksum(&self, sequence: JournalSequence, data: &[u8]) -> Result<u32> {
         let mut sequence_bytes = [0_u8; 4];
-        put_be_u32(&mut sequence_bytes, 0, sequence.get())?;
+        put_be_u32(&mut sequence_bytes, disk_offset(0), sequence.get())?;
         let seed = crc32c(0, self.superblock.uuid());
         let seed = crc32c(seed, &sequence_bytes);
         Ok(crc32c(seed, data))
@@ -1082,7 +1061,7 @@ impl<State> Journal<State> {
             return Ok(());
         }
         let offset = block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)?;
-        let expected = be_u32(block, offset)?;
+        let expected = be_u32(block, disk_offset(offset))?;
         let actual = self.block_checksum_with_zeroed(block, offset)?;
         if actual == expected {
             Ok(())
@@ -1098,12 +1077,12 @@ impl<State> Journal<State> {
         }
         let offset = block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)?;
         let checksum = self.block_checksum_with_zeroed(block, offset)?;
-        put_be_u32(block, offset, checksum)
+        put_be_u32(block, disk_offset(offset), checksum)
     }
 
     /// Verifies the checksum field embedded in a commit block.
     fn verify_commit_checksum(&self, block: &[u8]) -> Result<()> {
-        let expected = be_u32(block, 0x10)?;
+        let expected = be_u32(block, disk_offset(0x10))?;
         let actual = self.block_checksum_with_zeroed(block, 0x10)?;
         if expected == actual {
             Ok(())
@@ -1451,19 +1430,19 @@ impl JournalSuperblock {
         }
         let mut uuid = [0_u8; 16];
         uuid.copy_from_slice(bytes.get(0x30..0x40).ok_or(Error::TruncatedStructure)?);
-        if be_u32(bytes, 0xFC)? != 0 {
+        if be_u32(bytes, disk_offset(0xFC))? != 0 {
             verify_journal_superblock_checksum(bytes)?;
         }
         Ok(Self {
             raw: bytes.to_vec(),
-            block_size: be_u32(bytes, 0x0C)?,
-            maxlen: be_u32(bytes, 0x10)?,
-            first: be_u32(bytes, 0x14)?,
-            sequence: JournalSequence::new(be_u32(bytes, 0x18)?),
-            start: be_u32(bytes, 0x1C)?,
-            compat: be_u32(bytes, 0x24)?,
-            incompat: be_u32(bytes, 0x28)?,
-            ro_compat: be_u32(bytes, 0x2C)?,
+            block_size: be_u32(bytes, disk_offset(0x0C))?,
+            maxlen: be_u32(bytes, disk_offset(0x10))?,
+            first: be_u32(bytes, disk_offset(0x14))?,
+            sequence: JournalSequence::new(be_u32(bytes, disk_offset(0x18))?),
+            start: be_u32(bytes, disk_offset(0x1C))?,
+            compat: be_u32(bytes, disk_offset(0x24))?,
+            incompat: be_u32(bytes, disk_offset(0x28))?,
+            ro_compat: be_u32(bytes, disk_offset(0x2C))?,
             uuid,
             checksum_type: *bytes.get(0x50).ok_or(Error::TruncatedStructure)?,
         })
@@ -1511,8 +1490,8 @@ impl JournalSuperblock {
             return Err(Error::JournalCorrupt);
         }
         let mut block = self.raw.clone();
-        put_be_u32(&mut block, 0x18, sequence.get())?;
-        put_be_u32(&mut block, 0x1C, start)?;
+        put_be_u32(&mut block, disk_offset(0x18), sequence.get())?;
+        put_be_u32(&mut block, disk_offset(0x1C), start)?;
         if self.has_superblock_checksum()? {
             refresh_journal_superblock_checksum(&mut block)?;
         }
@@ -1595,7 +1574,7 @@ impl JournalSuperblock {
 
     /// Returns whether the journal superblock checksum field is populated.
     fn has_superblock_checksum(&self) -> Result<bool> {
-        Ok(be_u32(&self.raw, 0xFC)? != 0)
+        Ok(be_u32(&self.raw, disk_offset(0xFC))? != 0)
     }
 }
 
@@ -1614,12 +1593,12 @@ impl Jbd2Header {
         if bytes.len() < JOURNAL_HEADER_BYTES {
             return Err(Error::TruncatedStructure);
         }
-        if be_u32(bytes, 0)? != JBD2_MAGIC {
+        if be_u32(bytes, disk_offset(0))? != JBD2_MAGIC {
             return Err(Error::JournalCorrupt);
         }
         Ok(Self {
-            block_type: be_u32(bytes, 4)?,
-            sequence: be_u32(bytes, 8)?,
+            block_type: be_u32(bytes, disk_offset(4))?,
+            sequence: be_u32(bytes, disk_offset(8))?,
         })
     }
 
@@ -1644,9 +1623,9 @@ impl Jbd2Header {
         if bytes.len() < JOURNAL_HEADER_BYTES {
             return Err(Error::TruncatedStructure);
         }
-        put_be_u32(bytes, 0, JBD2_MAGIC)?;
-        put_be_u32(bytes, 4, self.block_type)?;
-        put_be_u32(bytes, 8, self.sequence)
+        put_be_u32(bytes, disk_offset(0), JBD2_MAGIC)?;
+        put_be_u32(bytes, disk_offset(4), self.block_type)?;
+        put_be_u32(bytes, disk_offset(8), self.sequence)
     }
 
     /// Returns the JBD2 control block type.
@@ -1976,7 +1955,7 @@ fn transaction_tail(consumed: u32) -> JournalTransactionScan {
 
 /// Verifies the checksum stored in a journal superblock.
 fn verify_journal_superblock_checksum(block: &[u8]) -> Result<()> {
-    let expected = be_u32(block, 0xFC)?;
+    let expected = be_u32(block, disk_offset(0xFC))?;
     let actual = journal_superblock_checksum(block)?;
     if expected == actual {
         Ok(())
@@ -1987,9 +1966,9 @@ fn verify_journal_superblock_checksum(block: &[u8]) -> Result<()> {
 
 /// Recomputes and writes the journal superblock checksum.
 fn refresh_journal_superblock_checksum(block: &mut [u8]) -> Result<()> {
-    put_be_u32(block, 0xFC, 0)?;
+    put_be_u32(block, disk_offset(0xFC), 0)?;
     let checksum = journal_superblock_checksum(block)?;
-    put_be_u32(block, 0xFC, checksum)
+    put_be_u32(block, disk_offset(0xFC), checksum)
 }
 
 /// Computes a journal superblock checksum with its checksum field zeroed.

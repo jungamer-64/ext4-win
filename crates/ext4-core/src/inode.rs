@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use crate::endian::{le_u16, le_u32};
+use crate::endian::{DiskOffset, le_u16, le_u32};
 use crate::error::{Error, Result};
 
 /// Mask selecting file-type bits from `i_mode`.
@@ -29,6 +29,11 @@ const INODE_CTIME_OFFSET: usize = 12;
 const INODE_MTIME_OFFSET: usize = 16;
 /// Creation time field offset inside a large inode record.
 const INODE_CRTIME_OFFSET: usize = 144;
+
+/// Builds an inode-record field offset.
+const fn disk_offset(offset: usize) -> DiskOffset {
+    DiskOffset::new(offset)
+}
 /// Inode flag selecting extent-based data mapping.
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 /// Inode flag selecting indexed directory data.
@@ -492,6 +497,15 @@ pub enum InodeKind {
     Symlink,
 }
 
+/// Directory storage shape selected by a validated directory inode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryStorageKind {
+    /// Directory entries are stored as a linear dirent stream.
+    Linear,
+    /// Directory entries are indexed by an ext4 HTree.
+    HTree,
+}
+
 /// Write-domain operation requested against an inode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InodeMutation {
@@ -630,7 +644,7 @@ impl Inode {
         if raw.len() < 128 {
             return Err(Error::TruncatedStructure);
         }
-        let mode = le_u16(raw, 0)?;
+        let mode = le_u16(raw, disk_offset(0))?;
         let permissions = Ext4Permissions::new(mode & PERMISSION_BITS)?;
         let owner = Ext4Owner::new(
             Ext4Uid::from_u32(parse_uid(raw)?),
@@ -642,12 +656,14 @@ impl Inode {
             MODE_SYMLINK => InodeKind::Symlink,
             _ => return Err(Error::WrongInodeKind),
         };
-        let size =
-            FileSize::from_bytes(u64::from(le_u32(raw, 4)?) | (u64::from(le_u32(raw, 108)?) << 32));
+        let size = FileSize::from_bytes(
+            u64::from(le_u32(raw, disk_offset(4))?)
+                | (u64::from(le_u32(raw, disk_offset(108))?) << 32),
+        );
         let times = parse_times(raw)?;
-        let links_count = le_u16(raw, 26)?;
-        let flags = le_u32(raw, 32)?;
-        let generation = le_u32(raw, 100)?;
+        let links_count = le_u16(raw, disk_offset(26))?;
+        let flags = le_u32(raw, disk_offset(32))?;
+        let generation = le_u32(raw, disk_offset(100))?;
         let block_slice = raw.get(40..100).ok_or(Error::TruncatedStructure)?;
         let mut block = [0_u8; 60];
         block.copy_from_slice(block_slice);
@@ -725,10 +741,19 @@ impl Inode {
         self.generation
     }
 
-    /// Returns true when this directory uses htree indexes.
-    #[must_use]
-    pub fn is_indexed_directory(&self) -> bool {
-        self.kind == InodeKind::Directory && self.flags & EXT4_INDEX_FL != 0
+    /// Directory storage shape selected by this directory inode.
+    ///
+    /// # Errors
+    /// Returns an error when the inode is not a directory.
+    pub fn directory_storage_kind(&self) -> Result<DirectoryStorageKind> {
+        if self.kind != InodeKind::Directory {
+            return Err(Error::WrongInodeKind);
+        }
+        if self.flags & EXT4_INDEX_FL != 0 {
+            Ok(DirectoryStorageKind::HTree)
+        } else {
+            Ok(DirectoryStorageKind::Linear)
+        }
     }
 
     /// Contents protection selected by inode flags.
@@ -817,12 +842,12 @@ impl Inode {
 
 /// Combines the low and optional high inode UID fields.
 fn parse_uid(raw: &[u8]) -> Result<u32> {
-    let low = u32::from(le_u16(raw, INODE_UID_LO_OFFSET)?);
+    let low = u32::from(le_u16(raw, disk_offset(INODE_UID_LO_OFFSET))?);
     let high_offset_end = INODE_UID_HI_OFFSET
         .checked_add(2)
         .ok_or(Error::ArithmeticOverflow)?;
     let high = if raw.len() >= high_offset_end {
-        u32::from(le_u16(raw, INODE_UID_HI_OFFSET)?) << 16
+        u32::from(le_u16(raw, disk_offset(INODE_UID_HI_OFFSET))?) << 16
     } else {
         0
     };
@@ -831,12 +856,12 @@ fn parse_uid(raw: &[u8]) -> Result<u32> {
 
 /// Combines the low and optional high inode GID fields.
 fn parse_gid(raw: &[u8]) -> Result<u32> {
-    let low = u32::from(le_u16(raw, INODE_GID_LO_OFFSET)?);
+    let low = u32::from(le_u16(raw, disk_offset(INODE_GID_LO_OFFSET))?);
     let high_offset_end = INODE_GID_HI_OFFSET
         .checked_add(2)
         .ok_or(Error::ArithmeticOverflow)?;
     let high = if raw.len() >= high_offset_end {
-        u32::from(le_u16(raw, INODE_GID_HI_OFFSET)?) << 16
+        u32::from(le_u16(raw, disk_offset(INODE_GID_HI_OFFSET))?) << 16
     } else {
         0
     };
@@ -845,9 +870,9 @@ fn parse_gid(raw: &[u8]) -> Result<u32> {
 
 /// Parses ext4 inode timestamps.
 fn parse_times(raw: &[u8]) -> Result<Ext4Times> {
-    let accessed = Ext4Timestamp::from_unix_seconds(le_u32(raw, INODE_ATIME_OFFSET)?);
-    let changed = Ext4Timestamp::from_unix_seconds(le_u32(raw, INODE_CTIME_OFFSET)?);
-    let modified = Ext4Timestamp::from_unix_seconds(le_u32(raw, INODE_MTIME_OFFSET)?);
+    let accessed = Ext4Timestamp::from_unix_seconds(le_u32(raw, disk_offset(INODE_ATIME_OFFSET))?);
+    let changed = Ext4Timestamp::from_unix_seconds(le_u32(raw, disk_offset(INODE_CTIME_OFFSET))?);
+    let modified = Ext4Timestamp::from_unix_seconds(le_u32(raw, disk_offset(INODE_MTIME_OFFSET))?);
     let created = if raw
         .get(
             INODE_CRTIME_OFFSET
@@ -857,9 +882,67 @@ fn parse_times(raw: &[u8]) -> Result<Ext4Times> {
         )
         .is_some()
     {
-        Ext4Timestamp::from_unix_seconds(le_u32(raw, INODE_CRTIME_OFFSET)?)
+        Ext4Timestamp::from_unix_seconds(le_u32(raw, disk_offset(INODE_CRTIME_OFFSET))?)
     } else {
         changed
     };
     Ok(Ext4Times::new(accessed, modified, changed, created))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DirectoryStorageKind, Inode, InodeId, MODE_DIRECTORY, MODE_REGULAR};
+    use crate::endian::{put_le_u16, put_le_u32};
+    use crate::error::{Error, Result};
+
+    fn inode_id() -> Result<InodeId> {
+        InodeId::try_from(11)
+    }
+
+    fn inode_bytes(mode: u16, flags: u32) -> Result<[u8; 128]> {
+        let mut raw = [0_u8; 128];
+        put_le_u16(&mut raw, super::disk_offset(0), mode)?;
+        put_le_u16(&mut raw, super::disk_offset(26), 1)?;
+        put_le_u32(&mut raw, super::disk_offset(32), flags)?;
+        Ok(raw)
+    }
+
+    #[test]
+    fn directory_storage_kind_decodes_linear_and_htree() {
+        let linear = inode_id().and_then(|id| {
+            inode_bytes(MODE_DIRECTORY, 0).and_then(|bytes| Inode::parse(id, &bytes))
+        });
+        assert!(linear.is_ok());
+        let Ok(linear) = linear else {
+            return;
+        };
+        assert_eq!(
+            linear.directory_storage_kind(),
+            Ok(DirectoryStorageKind::Linear)
+        );
+
+        let htree = inode_id().and_then(|id| {
+            inode_bytes(MODE_DIRECTORY, super::EXT4_INDEX_FL)
+                .and_then(|bytes| Inode::parse(id, &bytes))
+        });
+        assert!(htree.is_ok());
+        let Ok(htree) = htree else {
+            return;
+        };
+        assert_eq!(
+            htree.directory_storage_kind(),
+            Ok(DirectoryStorageKind::HTree)
+        );
+    }
+
+    #[test]
+    fn directory_storage_kind_rejects_non_directory_inode() {
+        let file = inode_id()
+            .and_then(|id| inode_bytes(MODE_REGULAR, 0).and_then(|bytes| Inode::parse(id, &bytes)));
+        assert!(file.is_ok());
+        let Ok(file) = file else {
+            return;
+        };
+        assert_eq!(file.directory_storage_kind(), Err(Error::WrongInodeKind));
+    }
 }

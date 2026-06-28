@@ -3,9 +3,9 @@
 use alloc::vec::Vec;
 
 use crate::checksum::crc32c;
-use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
-use crate::inode::InodeId;
+use crate::inode::{DirectoryStorageKind, InodeId};
 use crate::name::Ext4Name;
 use crate::superblock::{
     ChecksumSeed, DirectoryHashByteInterpretation, DirectoryHashSeed, DirectoryHashVersion,
@@ -33,6 +33,11 @@ const DIRENT_TAIL_BYTES: usize = 12;
 const DIRENT_TAIL_FILE_TYPE: u8 = 0xde;
 /// HTree block pointers reserve their upper four bits.
 const DX_BLOCK_MASK: u32 = 0x0fff_ffff;
+
+/// Builds a directory-block field offset.
+const fn disk_offset(offset: usize) -> DiskOffset {
+    DiskOffset::new(offset)
+}
 /// Maximum HTree indirect depth accepted while `largedir` remains unsupported.
 const DX_MAX_DEPTH_WITHOUT_LARGEDIR: u8 = 2;
 /// Default seed used by ext4 when all four superblock seed words are zero.
@@ -134,11 +139,8 @@ impl DirectoryEntry {
                 return Err(Error::InvalidDirectoryEntry);
             }
 
-            let inode = le_u32(bytes, offset)?;
-            let rec_len = usize::from(le_u16(
-                bytes,
-                offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
-            )?);
+            let inode = le_u32(bytes, disk_offset(offset))?;
+            let rec_len = usize::from(le_u16(bytes, disk_offset(offset).checked_add_bytes(4)?)?);
             let name_len = usize::from(
                 *bytes
                     .get(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
@@ -241,6 +243,25 @@ pub(crate) enum DirectoryLayout {
 }
 
 impl DirectoryLayout {
+    /// Parses a directory file into the storage shape selected by the inode.
+    pub(crate) fn from_storage_kind(
+        storage: DirectoryStorageKind,
+        blocks: Vec<DirectoryBlockData>,
+        hash_seed: DirectoryHashSeed,
+        default_hash_version: DirectoryHashVersion,
+        checksum: DirectoryChecksum,
+    ) -> Result<Self> {
+        match storage {
+            DirectoryStorageKind::Linear => Ok(Self::Linear(LinearDirectory::parse(blocks)?)),
+            DirectoryStorageKind::HTree => Ok(Self::HTree(HtreeDirectory::parse(
+                &blocks,
+                hash_seed,
+                default_hash_version,
+                checksum,
+            )?)),
+        }
+    }
+
     /// Returns all live entries in directory traversal order.
     pub(crate) fn entries(&self) -> Vec<DirectoryEntry> {
         match self {
@@ -332,12 +353,10 @@ impl DirectoryChecksum {
         let Self::Crc32c { inode_seed } = self else {
             return Ok(());
         };
-        put_le_u32(bytes, tail_offset, 0)?;
+        put_le_u32(bytes, disk_offset(tail_offset), 0)?;
         put_le_u16(
             bytes,
-            tail_offset
-                .checked_add(4)
-                .ok_or(Error::ArithmeticOverflow)?,
+            disk_offset(tail_offset).checked_add_bytes(4)?,
             u16::try_from(DIRENT_TAIL_BYTES).map_err(|_| Error::InvalidDirectoryEntry)?,
         )?;
         *bytes
@@ -356,9 +375,7 @@ impl DirectoryChecksum {
             .ok_or(Error::InvalidDirectoryEntry)? = DIRENT_TAIL_FILE_TYPE;
         put_le_u32(
             bytes,
-            tail_offset
-                .checked_add(8)
-                .ok_or(Error::ArithmeticOverflow)?,
+            disk_offset(tail_offset).checked_add_bytes(8)?,
             crc32c(
                 inode_seed,
                 bytes
@@ -377,12 +394,10 @@ impl DirectoryChecksum {
             .len()
             .checked_sub(DIRENT_TAIL_BYTES)
             .ok_or(Error::InvalidDirectoryEntry)?;
-        if le_u32(bytes, tail_offset)? != 0
+        if le_u32(bytes, disk_offset(tail_offset))? != 0
             || usize::from(le_u16(
                 bytes,
-                tail_offset
-                    .checked_add(4)
-                    .ok_or(Error::ArithmeticOverflow)?,
+                disk_offset(tail_offset).checked_add_bytes(4)?,
             )?) != DIRENT_TAIL_BYTES
             || *bytes
                 .get(
@@ -409,12 +424,7 @@ impl DirectoryChecksum {
                 .get(..tail_offset)
                 .ok_or(Error::InvalidDirectoryEntry)?,
         );
-        let actual = le_u32(
-            bytes,
-            tail_offset
-                .checked_add(8)
-                .ok_or(Error::ArithmeticOverflow)?,
-        )?;
+        let actual = le_u32(bytes, disk_offset(tail_offset).checked_add_bytes(8)?)?;
         if actual != expected {
             return Err(Error::ChecksumMismatch);
         }
@@ -449,8 +459,8 @@ impl DirectoryChecksum {
         {
             return Err(Error::InvalidDirectoryEntry);
         }
-        put_le_u32(bytes, tail_offset, 0)?;
-        put_le_u32(bytes, checksum_offset, 0)?;
+        put_le_u32(bytes, disk_offset(tail_offset), 0)?;
+        put_le_u32(bytes, disk_offset(checksum_offset), 0)?;
         let table_end = count_offset
             .checked_add(
                 count
@@ -469,7 +479,7 @@ impl DirectoryChecksum {
                 .ok_or(Error::InvalidDirectoryEntry)?,
         );
         checksum = crc32c(checksum, &0_u32.to_le_bytes());
-        put_le_u32(bytes, checksum_offset, checksum)
+        put_le_u32(bytes, disk_offset(checksum_offset), checksum)
     }
 
     /// Verifies an HTree dx tail when enabled.
@@ -500,7 +510,7 @@ impl DirectoryChecksum {
         {
             return Err(Error::InvalidDirectoryEntry);
         }
-        if le_u32(bytes, tail_offset)? != 0 {
+        if le_u32(bytes, disk_offset(tail_offset))? != 0 {
             return Err(Error::InvalidDirectoryEntry);
         }
         let table_end = count_offset
@@ -521,7 +531,7 @@ impl DirectoryChecksum {
                 .ok_or(Error::InvalidDirectoryEntry)?,
         );
         checksum = crc32c(checksum, &0_u32.to_le_bytes());
-        if le_u32(bytes, checksum_offset)? != checksum {
+        if le_u32(bytes, disk_offset(checksum_offset))? != checksum {
             return Err(Error::ChecksumMismatch);
         }
         Ok(())
@@ -934,7 +944,7 @@ fn write_leaf_block(
         .checked_sub(checksum.dirent_tail_bytes())
         .ok_or(Error::InvalidDirectoryEntry)?;
     if entries.is_empty() {
-        put_le_u16(bytes, 4, checked_u16(live_limit)?)?;
+        put_le_u16(bytes, disk_offset(4), checked_u16(live_limit)?)?;
     } else {
         let mut offset = 0_usize;
         let last_index = entries
@@ -972,7 +982,7 @@ fn write_index_node(
     checksum: DirectoryChecksum,
 ) -> Result<()> {
     bytes.fill(0);
-    put_le_u16(bytes, 4, checked_u16(bytes.len())?)?;
+    put_le_u16(bytes, disk_offset(4), checked_u16(bytes.len())?)?;
     write_dx_table(bytes, DX_NODE_COUNT_OFFSET, entries, checksum)
 }
 
@@ -1008,7 +1018,7 @@ fn write_htree_root(
         b"..",
         DirectoryEntryKind::Directory,
     )?;
-    put_le_u32(bytes, DX_ROOT_INFO_OFFSET, 0)?;
+    put_le_u32(bytes, disk_offset(DX_ROOT_INFO_OFFSET), 0)?;
     *bytes
         .get_mut(DX_ROOT_INFO_OFFSET + 4)
         .ok_or(Error::InvalidDirectoryEntry)? = hash_version.to_raw();
@@ -1035,12 +1045,10 @@ fn write_dx_table(
     if entries.is_empty() || entries.len() > limit {
         return Err(Error::InvalidDirectoryEntry);
     }
-    put_le_u16(bytes, count_offset, checked_u16(limit)?)?;
+    put_le_u16(bytes, disk_offset(count_offset), checked_u16(limit)?)?;
     put_le_u16(
         bytes,
-        count_offset
-            .checked_add(2)
-            .ok_or(Error::ArithmeticOverflow)?,
+        disk_offset(count_offset).checked_add_bytes(2)?,
         checked_u16(entries.len())?,
     )?;
     for (index, entry) in entries.iter().enumerate() {
@@ -1052,11 +1060,11 @@ fn write_dx_table(
             )
             .ok_or(Error::ArithmeticOverflow)?;
         if index != 0 {
-            put_le_u32(bytes, offset, entry.hash)?;
+            put_le_u32(bytes, disk_offset(offset), entry.hash)?;
         }
         put_le_u32(
             bytes,
-            offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+            disk_offset(offset).checked_add_bytes(4)?,
             entry.block & DX_BLOCK_MASK,
         )?;
     }
@@ -1237,7 +1245,7 @@ impl HtreeRoot {
         if dotdot.name().bytes() != b".." {
             return Err(Error::InvalidDirectoryEntry);
         }
-        if le_u32(bytes, DX_ROOT_INFO_OFFSET)? != 0 {
+        if le_u32(bytes, disk_offset(DX_ROOT_INFO_OFFSET))? != 0 {
             return Err(Error::InvalidDirectoryEntry);
         }
         let root_hash_version = *bytes
@@ -1307,12 +1315,10 @@ struct DxIndex {
 impl DxIndex {
     /// Parses a root or interior HTree index table.
     fn parse(bytes: &[u8], count_offset: usize, checksum: DirectoryChecksum) -> Result<Self> {
-        let limit = usize::from(le_u16(bytes, count_offset)?);
+        let limit = usize::from(le_u16(bytes, disk_offset(count_offset))?);
         let count = usize::from(le_u16(
             bytes,
-            count_offset
-                .checked_add(2)
-                .ok_or(Error::ArithmeticOverflow)?,
+            disk_offset(count_offset).checked_add_bytes(2)?,
         )?);
         let capacity = dx_capacity(bytes.len(), count_offset, checksum)?;
         if count == 0 || count > limit || limit > capacity {
@@ -1341,14 +1347,10 @@ impl DxIndex {
             let hash = if index == 0 {
                 0
             } else {
-                le_u32(bytes, entry_offset)?
+                le_u32(bytes, disk_offset(entry_offset))?
             };
-            let block = le_u32(
-                bytes,
-                entry_offset
-                    .checked_add(4)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )? & DX_BLOCK_MASK;
+            let block =
+                le_u32(bytes, disk_offset(entry_offset).checked_add_bytes(4)?)? & DX_BLOCK_MASK;
             if block == 0 {
                 return Err(Error::InvalidDirectoryEntry);
             }
@@ -1481,7 +1483,7 @@ impl DirectoryBlock {
     pub(crate) fn initialize_free_space(&mut self) -> Result<()> {
         let rec_len = checked_u16(self.bytes.len())?;
         self.bytes.fill(0);
-        put_le_u16(&mut self.bytes, 4, rec_len)
+        put_le_u16(&mut self.bytes, disk_offset(4), rec_len)
     }
 
     /// Parses live entries from the current block image.
@@ -1518,7 +1520,7 @@ impl DirectoryBlock {
         while offset < self.bytes.len() {
             let rec_len = usize::from(le_u16(
                 &self.bytes,
-                offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+                disk_offset(offset).checked_add_bytes(4)?,
             )?);
             if rec_len < DIRENT_HEADER_SIZE
                 || offset
@@ -1528,7 +1530,7 @@ impl DirectoryBlock {
             {
                 return Err(Error::InvalidDirectoryEntry);
             }
-            let live_inode = le_u32(&self.bytes, offset)?;
+            let live_inode = le_u32(&self.bytes, disk_offset(offset))?;
             let name_len = usize::from(
                 *self
                     .bytes
@@ -1556,7 +1558,7 @@ impl DirectoryBlock {
             {
                 put_le_u16(
                     &mut self.bytes,
-                    offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+                    disk_offset(offset).checked_add_bytes(4)?,
                     checked_u16(used)?,
                 )?;
                 let insert_offset = offset.checked_add(used).ok_or(Error::ArithmeticOverflow)?;
@@ -1584,7 +1586,7 @@ impl DirectoryBlock {
         while offset < self.bytes.len() {
             let rec_len = usize::from(le_u16(
                 &self.bytes,
-                offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+                disk_offset(offset).checked_add_bytes(4)?,
             )?);
             if rec_len < DIRENT_HEADER_SIZE
                 || offset
@@ -1594,7 +1596,7 @@ impl DirectoryBlock {
             {
                 return Err(Error::InvalidDirectoryEntry);
             }
-            let inode = le_u32(&self.bytes, offset)?;
+            let inode = le_u32(&self.bytes, disk_offset(offset))?;
             let name_len = usize::from(
                 *self
                     .bytes
@@ -1625,7 +1627,7 @@ impl DirectoryBlock {
                     name: Ext4Name::from_disk(name.bytes())?,
                     kind,
                 };
-                put_le_u32(&mut self.bytes, offset, 0)?;
+                put_le_u32(&mut self.bytes, disk_offset(offset), 0)?;
                 return Ok(Some(removed));
             }
             offset = offset
@@ -1669,7 +1671,7 @@ impl DirectoryBlock {
         while offset < self.bytes.len() {
             let rec_len = usize::from(le_u16(
                 &self.bytes,
-                offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+                disk_offset(offset).checked_add_bytes(4)?,
             )?);
             if rec_len < DIRENT_HEADER_SIZE
                 || offset
@@ -1679,7 +1681,7 @@ impl DirectoryBlock {
             {
                 return Err(Error::InvalidDirectoryEntry);
             }
-            let live_inode = le_u32(&self.bytes, offset)?;
+            let live_inode = le_u32(&self.bytes, disk_offset(offset))?;
             let name_len = usize::from(
                 *self
                     .bytes
@@ -1806,10 +1808,7 @@ impl DirectoryHashContext {
 
 /// Parses one live directory entry at a fixed offset.
 fn parse_live_entry_at(bytes: &[u8], offset: usize) -> Result<DirectoryEntry> {
-    let rec_len = usize::from(le_u16(
-        bytes,
-        offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
-    )?);
+    let rec_len = usize::from(le_u16(bytes, disk_offset(offset).checked_add_bytes(4)?)?);
     if rec_len < DIRENT_HEADER_SIZE
         || offset
             .checked_add(rec_len)
@@ -1818,7 +1817,7 @@ fn parse_live_entry_at(bytes: &[u8], offset: usize) -> Result<DirectoryEntry> {
     {
         return Err(Error::InvalidDirectoryEntry);
     }
-    let inode = le_u32(bytes, offset)?;
+    let inode = le_u32(bytes, disk_offset(offset))?;
     if inode == 0 {
         return Err(Error::InvalidDirectoryEntry);
     }
@@ -2038,12 +2037,8 @@ fn write_entry(
     {
         return Err(Error::InvalidDirectoryEntry);
     }
-    put_le_u32(bytes, offset, inode.as_u32())?;
-    put_le_u16(
-        bytes,
-        offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
-        rec_len,
-    )?;
+    put_le_u32(bytes, disk_offset(offset), inode.as_u32())?;
+    put_le_u16(bytes, disk_offset(offset).checked_add_bytes(4)?, rec_len)?;
     *bytes
         .get_mut(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
         .ok_or(Error::InvalidDirectoryEntry)? =
@@ -2120,7 +2115,7 @@ mod tests {
         DirectoryHashSeed, DirectoryHashVersion, DirectoryLayout, Error, HtreeBuildPlan, Result,
         build_htree_directory,
     };
-    use crate::inode::InodeId;
+    use crate::inode::{DirectoryStorageKind, InodeId};
     use crate::name::Ext4Name;
 
     fn inode(value: u32) -> Result<InodeId> {
@@ -2174,8 +2169,8 @@ mod tests {
                 bytes.clone(),
             ));
         }
-        let layout = DirectoryLayout::parse(
-            true,
+        let layout = DirectoryLayout::from_storage_kind(
+            DirectoryStorageKind::HTree,
             blocks,
             DirectoryHashSeed::from_words([0; 4]),
             DirectoryHashVersion::Legacy,

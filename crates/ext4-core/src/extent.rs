@@ -4,7 +4,7 @@ use alloc::{vec, vec::Vec};
 
 use crate::block::{BlockAddress, BlockReader, BlockSize};
 use crate::checksum::crc32c;
-use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
 use crate::inode::{InodeExtentRoot, InodeId};
 
@@ -24,6 +24,11 @@ const INODE_ROOT_ENTRY_CAPACITY: usize = 4;
 const EXTENT_TAIL_SIZE: usize = 4;
 /// ext4 extent trees are bounded; deeper trees are rejected before recursion.
 const MAX_EXTENT_DEPTH: u16 = 5;
+
+/// Builds an extent-tree field offset.
+const fn disk_offset(offset: usize) -> DiskOffset {
+    DiskOffset::new(offset)
+}
 
 /// Logical block address inside a file.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -659,11 +664,11 @@ fn parse_index_node(
         }
         let leaf_lo = u64::from(le_u32(
             raw,
-            offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+            disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
         )?);
         let leaf_hi = u64::from(le_u16(
             raw,
-            offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+            disk_offset(offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?),
         )?);
         let leaf = BlockAddress::new((leaf_hi << 32) | leaf_lo);
         if metadata_blocks.contains(&leaf) {
@@ -697,12 +702,12 @@ fn parse_index_node(
 
 /// Parses one extent tree node and appends leaf extents when the node is a leaf.
 fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>) -> Result<u16> {
-    if le_u16(raw, 0)? != EXTENT_MAGIC {
+    if le_u16(raw, disk_offset(0))? != EXTENT_MAGIC {
         return Err(Error::InvalidExtentTree);
     }
     let entries = header_entries(raw)?;
-    let max_entries = usize::from(le_u16(raw, 4)?);
-    let depth = le_u16(raw, 6)?;
+    let max_entries = usize::from(le_u16(raw, disk_offset(4))?);
+    let depth = le_u16(raw, disk_offset(6))?;
     if depth > MAX_EXTENT_DEPTH {
         return Err(Error::UnsupportedExtentDepth);
     }
@@ -732,8 +737,11 @@ fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>
 
 /// Parses one leaf extent entry from `raw`.
 fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
-    let logical_start = LogicalBlock::from_u32(le_u32(raw, offset)?);
-    let raw_len = le_u16(raw, offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?)?;
+    let logical_start = LogicalBlock::from_u32(le_u32(raw, disk_offset(offset))?);
+    let raw_len = le_u16(
+        raw,
+        disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
+    )?;
     let len = ExtentLength::new(raw_len & !EXTENT_LEN_UNINITIALIZED)?;
     let initialization = if raw_len & EXTENT_LEN_UNINITIALIZED == 0 {
         ExtentInitialization::Initialized
@@ -742,11 +750,11 @@ fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
     };
     let start_hi = u64::from(le_u16(
         raw,
-        offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
+        disk_offset(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?),
     )?);
     let start_lo = u64::from(le_u32(
         raw,
-        offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+        disk_offset(offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?),
     )?);
     let physical_start = BlockAddress::new((start_hi << 32) | start_lo);
     Ok(match initialization {
@@ -764,7 +772,7 @@ fn header_entries(raw: &[u8]) -> Result<usize> {
     if raw.len() < EXTENT_HEADER_SIZE {
         return Err(Error::InvalidExtentTree);
     }
-    Ok(usize::from(le_u16(raw, 2)?))
+    Ok(usize::from(le_u16(raw, disk_offset(2))?))
 }
 
 /// Computes the byte offset of one extent or index entry.
@@ -947,19 +955,19 @@ fn write_header(raw: &mut [u8], entries: usize, max_entries: usize, depth: u16) 
     if entries > max_entries {
         return Err(Error::InvalidExtentTree);
     }
-    put_le_u16(raw, 0, EXTENT_MAGIC)?;
+    put_le_u16(raw, disk_offset(0), EXTENT_MAGIC)?;
     put_le_u16(
         raw,
-        2,
+        disk_offset(2),
         u16::try_from(entries).map_err(|_| Error::ArithmeticOverflow)?,
     )?;
     put_le_u16(
         raw,
-        4,
+        disk_offset(4),
         u16::try_from(max_entries).map_err(|_| Error::ArithmeticOverflow)?,
     )?;
-    put_le_u16(raw, 6, depth)?;
-    put_le_u32(raw, 8, 0)
+    put_le_u16(raw, disk_offset(6), depth)?;
+    put_le_u32(raw, disk_offset(8), 0)
 }
 
 /// Writes one leaf extent entry.
@@ -974,21 +982,21 @@ fn write_extent_entry(raw: &mut [u8], offset: usize, extent: Extent) -> Result<(
         ExtentInitialization::Initialized => extent.len().as_u16(),
         ExtentInitialization::Uninitialized => extent.len().as_u16() | EXTENT_LEN_UNINITIALIZED,
     };
-    put_le_u32(raw, offset, extent.logical_start().as_u32())?;
+    put_le_u32(raw, disk_offset(offset), extent.logical_start().as_u32())?;
     put_le_u16(
         raw,
-        offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+        disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
         len,
     )?;
     put_le_u16(
         raw,
-        offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?,
+        disk_offset(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?),
         u16::try_from(extent.physical_start().get() >> 32)
             .map_err(|_| Error::ArithmeticOverflow)?,
     )?;
     put_le_u32(
         raw,
-        offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+        disk_offset(offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?),
         u32::try_from(extent.physical_start().get() & u64::from(u32::MAX))
             .map_err(|_| Error::ArithmeticOverflow)?,
     )
@@ -1002,21 +1010,21 @@ fn write_index_entry(raw: &mut [u8], offset: usize, node: &SerializedNode) -> Re
     if end > raw.len() {
         return Err(Error::InvalidExtentTree);
     }
-    put_le_u32(raw, offset, node.first_logical.as_u32())?;
+    put_le_u32(raw, disk_offset(offset), node.first_logical.as_u32())?;
     put_le_u32(
         raw,
-        offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+        disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
         u32::try_from(node.block.get() & u64::from(u32::MAX))
             .map_err(|_| Error::ArithmeticOverflow)?,
     )?;
     put_le_u16(
         raw,
-        offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+        disk_offset(offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?),
         u16::try_from(node.block.get() >> 32).map_err(|_| Error::ArithmeticOverflow)?,
     )?;
     put_le_u16(
         raw,
-        offset.checked_add(10).ok_or(Error::ArithmeticOverflow)?,
+        disk_offset(offset.checked_add(10).ok_or(Error::ArithmeticOverflow)?),
         0,
     )
 }
@@ -1030,7 +1038,7 @@ fn verify_external_extent_block_checksum(context: ExtentTreeContext, raw: &[u8])
         .len()
         .checked_sub(EXTENT_TAIL_SIZE)
         .ok_or(Error::InvalidExtentTree)?;
-    let expected = le_u32(raw, offset)?;
+    let expected = le_u32(raw, disk_offset(offset))?;
     if extent_block_checksum(checksum, raw, offset)? == expected {
         Ok(())
     } else {
@@ -1050,9 +1058,9 @@ fn refresh_external_extent_block_checksum(
         .len()
         .checked_sub(EXTENT_TAIL_SIZE)
         .ok_or(Error::InvalidExtentTree)?;
-    put_le_u32(raw, offset, 0)?;
+    put_le_u32(raw, disk_offset(offset), 0)?;
     let checksum = extent_block_checksum(checksum, raw, offset)?;
-    put_le_u32(raw, offset, checksum)
+    put_le_u32(raw, disk_offset(offset), checksum)
 }
 
 /// Computes the crc32c checksum for one external extent block.

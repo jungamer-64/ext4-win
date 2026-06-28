@@ -8,19 +8,16 @@ use crate::{
     block_device::query_device_length,
     ffi, fsctl,
     irp::{
-        DispatchTarget, DriverCompletion, FileSystemControlStack, FsControlCode, IrpBufferLength,
-        MountVolumeStack,
+        DispatchTarget, DriverCompletion, FileSystemControlMinorFunction, FileSystemControlStack,
+        FsControlCode, IrpBufferLength, MountVolumeStack,
     },
     reparse,
     state::{
-        KernelDevice, MountCandidate, MountedVolumeDevice, MountedVolumeDeviceExtension,
+        KernelDevice, KernelVpb, MountCandidate, MountedVolumeDevice, MountedVolumeDeviceExtension,
         VolumeControlBlock,
     },
     status::{DriverError, DriverResult},
 };
-
-/// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
-const MOUNT_VOLUME_MINOR: wdk_sys::UCHAR = 1;
 
 /// Handles file-system control requests, including mount and reparse controls.
 pub(crate) fn dispatch(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
@@ -46,7 +43,6 @@ pub(crate) fn device_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp) {
         Ok(target) => {
             let _device = target.device();
-            let _irp = target.irp();
             crate::status::DriverError::InvalidDeviceRequest.ntstatus()
         }
         Err(error) => error.ntstatus(),
@@ -68,19 +64,15 @@ impl FileSystemControlRequest {
     /// Decodes the current FSCTL stack location.
     fn decode(target: DispatchTarget) -> Result<Self, crate::status::DriverError> {
         let stack = target.current_stack()?;
-        if stack.minor_function() == MOUNT_VOLUME_MINOR {
-            return Ok(Self::MountVolume(MountVolumeRequest::from_stack(
-                target.device(),
-                stack.mount_volume()?,
-            )));
+        match stack.file_system_control_minor() {
+            FileSystemControlMinorFunction::MountVolume => Ok(Self::MountVolume(
+                MountVolumeRequest::from_stack(target.device(), stack.mount_volume()?),
+            )),
+            FileSystemControlMinorFunction::UserFsRequest => Ok(Self::UserFsControl(
+                UserFsControlRequest::from_stack(target, stack.file_system_control()?),
+            )),
+            FileSystemControlMinorFunction::Unsupported => Ok(Self::Unsupported),
         }
-        if u32::from(stack.minor_function()) == wdk_sys::IRP_MN_USER_FS_REQUEST {
-            return Ok(Self::UserFsControl(UserFsControlRequest::from_stack(
-                target,
-                stack.file_system_control()?,
-            )));
-        }
-        Ok(Self::Unsupported)
     }
 }
 
@@ -121,7 +113,7 @@ struct MountVolumeRequest {
     /// File-system control device receiving the mount IRP.
     file_system_device: KernelDevice,
     /// VPB supplied by the I/O Manager for this mount.
-    vpb: core::ptr::NonNull<wdk_sys::VPB>,
+    vpb: KernelVpb,
     /// Lower storage device selected by the I/O Manager.
     target_device: KernelDevice,
     /// Output buffer length supplied with the mount request.
@@ -130,14 +122,11 @@ struct MountVolumeRequest {
 
 impl MountVolumeRequest {
     /// Converts decoded stack parameters into the mount domain boundary.
-    fn from_stack(
-        file_system_device: core::ptr::NonNull<wdk_sys::DEVICE_OBJECT>,
-        stack: MountVolumeStack,
-    ) -> Self {
+    fn from_stack(file_system_device: KernelDevice, stack: MountVolumeStack) -> Self {
         Self {
-            file_system_device: KernelDevice::from_non_null(file_system_device),
+            file_system_device,
             vpb: stack.vpb(),
-            target_device: KernelDevice::from_non_null(stack.target_device()),
+            target_device: stack.target_device(),
             output_buffer_length: stack.output_buffer_length(),
         }
     }
@@ -148,7 +137,7 @@ impl MountVolumeRequest {
     }
 
     /// Returns the VPB supplied by the I/O Manager.
-    const fn vpb(self) -> core::ptr::NonNull<wdk_sys::VPB> {
+    const fn vpb(self) -> KernelVpb {
         self.vpb
     }
 
@@ -203,7 +192,7 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
         return Err(DriverError::InsufficientResources);
     }
 
-    if MountedVolumeDevice::initialize_vpb_identity(request.vpb(), &vcb).is_none() {
+    if MountedVolumeDevice::initialize_vpb_identity(request.vpb().as_non_null(), &vcb).is_none() {
         unsafe {
             // SAFETY: `device` was returned by a successful IoCreateDevice call
             // and has not been published as a mounted volume.
@@ -215,7 +204,7 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
     let Some(mounted_device) = MountedVolumeDevice::initialize(
         device,
         Box::new(vcb),
-        request.vpb(),
+        request.vpb().as_non_null(),
         candidate.target_device(),
     ) else {
         unsafe {

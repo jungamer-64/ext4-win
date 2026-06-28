@@ -19,7 +19,7 @@ use crate::{
     },
     state::{KernelDevice, MountedVolumeDevice, VolumeControlBlock},
     status::{DriverError, DriverResult},
-    wire::{LittleEndianInput, LittleEndianOutput},
+    wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
 
 /// Filesystem name exposed through `FileFsAttributeInformation`.
@@ -70,7 +70,7 @@ impl QueryVolumeRequest {
     /// Decodes query-volume parameters.
     fn decode(target: DispatchTarget) -> Result<Self, crate::status::DriverError> {
         Ok(Self {
-            device: KernelDevice::from_non_null(target.device()),
+            device: target.device(),
             target,
             stack: target.current_stack()?.query_volume()?,
         })
@@ -92,7 +92,7 @@ impl SetVolumeRequest {
     /// Decodes set-volume parameters.
     fn decode(target: DispatchTarget) -> Result<Self, crate::status::DriverError> {
         Ok(Self {
-            device: KernelDevice::from_non_null(target.device()),
+            device: target.device(),
             target,
             stack: target.current_stack()?.set_volume()?,
         })
@@ -185,15 +185,18 @@ fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel
         return Err(DriverError::BufferTooSmall);
     }
     let input = LittleEndianInput::new(input);
-    let label_length =
-        usize::try_from(input.read_u32(0)?).map_err(|_| DriverError::InvalidParameter)?;
+    let label_length = usize::try_from(input.read_u32(WireOffset::new(0))?)
+        .map_err(|_| DriverError::InvalidParameter)?;
     if !label_length.is_multiple_of(core::mem::size_of::<u16>()) {
         return Err(DriverError::InvalidParameter);
     }
     let end = header
         .checked_add(label_length)
         .ok_or(DriverError::InvalidParameter)?;
-    let label_input = input.range(header, end - header)?;
+    let label_input = input.range(WireRange::span(
+        WireOffset::new(header),
+        WireOffset::new(end),
+    )?)?;
     let mut label = Vec::new();
     for unit in label_input.chunks_exact(core::mem::size_of::<u16>()) {
         let array: [u8; 2] = unit.try_into().map_err(|_| DriverError::InvalidParameter)?;
@@ -233,7 +236,7 @@ fn pack_volume_information(
     }
     .ok_or(DriverError::InvalidParameter)?;
     info.VolumeCreationTime = LARGE_INTEGER { QuadPart: 0 };
-    info.VolumeSerialNumber = vcb.serial_number().ok_or(DriverError::InvalidParameter)?;
+    info.VolumeSerialNumber = vcb.serial_number().as_u32();
     info.VolumeLabelLength = u32::try_from(label_len).map_err(|_| DriverError::InvalidParameter)?;
     info.SupportsObjects = 0;
 
@@ -243,7 +246,10 @@ fn pack_volume_information(
         core::slice::from_raw_parts_mut(buffer.as_ptr().cast::<u8>(), required)
     };
     let mut output = LittleEndianOutput::new(output);
-    let label_output = output.range_mut(header, required - header)?;
+    let label_output = output.range_mut(WireRange::span(
+        WireOffset::new(header),
+        WireOffset::new(required),
+    )?)?;
     for (chunk, byte) in label_output
         .chunks_exact_mut(2)
         .zip(label_bytes.iter().copied())
@@ -377,7 +383,10 @@ fn pack_attribute_information(
         core::slice::from_raw_parts_mut(buffer.as_ptr().cast::<u8>(), required)
     };
     let mut output = LittleEndianOutput::new(output);
-    let name_output = output.range_mut(header, required - header)?;
+    let name_output = output.range_mut(WireRange::span(
+        WireOffset::new(header),
+        WireOffset::new(required),
+    )?)?;
     for (chunk, unit) in name_output
         .chunks_exact_mut(2)
         .zip(FILE_SYSTEM_NAME.iter().copied())
@@ -420,7 +429,11 @@ mod tests {
     use alloc::{vec, vec::Vec};
     use core::ptr::NonNull;
 
-    use crate::{irp::DriverCompletion, status::DriverError, wire::LittleEndianInput};
+    use crate::{
+        irp::DriverCompletion,
+        status::DriverError,
+        wire::{LittleEndianInput, WireOffset},
+    };
 
     use super::{pack_device_information, volume_label_from_file_fs_label};
 
@@ -473,10 +486,10 @@ mod tests {
                 assert_eq!(DriverCompletion::from_usize(buffer.len()), Ok(written));
                 let output = LittleEndianInput::new(buffer.as_slice());
                 assert_eq!(
-                    output.read_u32(0),
+                    output.read_u32(WireOffset::new(0)),
                     Ok(wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM)
                 );
-                assert_eq!(output.read_u32(4), Ok(0));
+                assert_eq!(output.read_u32(WireOffset::new(4)), Ok(0));
             }
         }
     }

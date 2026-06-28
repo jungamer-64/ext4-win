@@ -7,20 +7,22 @@ use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    DeviceLength, DirectoryNodeId, Ext4Name, FscryptKeyIdentifier, FscryptKeySet, FscryptMasterKey,
-    InodeId, InternalJournal, MountContext, NodeId, ReadWrite, Result as Ext4Result, Volume,
+    DeviceLength, DirectoryNodeId, Ext4Name, FscryptKeyIdentifier, FscryptKeyPresence,
+    FscryptKeySet, FscryptMasterKey, InodeId, InternalJournal, MountContext, NodeId, ReadWrite,
+    Result as Ext4Result, Volume,
 };
 use wdk_sys::{
-    ACCESS_MASK, DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT,
+    DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT,
     SHARE_ACCESS, STATUS_SUCCESS, VPB_MOUNTED,
 };
 
 use crate::cng::CngFscryptNonceGenerator;
+use crate::irp::{DesiredAccess, ShareAccess};
 use crate::status::{DriverError, DriverResult};
 use crate::{block_device::KernelBlockDevice, ffi};
 
 /// Non-null kernel device object pointer at the WDK boundary.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KernelDevice {
     /// Non-null opaque WDK device pointer.
     device: NonNull<c_void>,
@@ -30,13 +32,6 @@ impl KernelDevice {
     /// Converts a raw WDK device pointer into the non-null boundary type.
     pub(crate) fn from_raw(device: PDEVICE_OBJECT) -> Option<Self> {
         NonNull::new(device.cast()).map(|device| Self { device })
-    }
-
-    /// Creates a kernel device from a non-null WDK device pointer.
-    pub(crate) fn from_non_null(device: NonNull<wdk_sys::DEVICE_OBJECT>) -> Self {
-        Self {
-            device: device.cast(),
-        }
     }
 
     /// Returns the raw WDK device pointer for FFI calls.
@@ -62,6 +57,126 @@ impl KernelDevice {
             self.as_ptr().as_ref()
         }?;
         Some(device.StackSize)
+    }
+}
+
+/// Non-null kernel file object pointer at the WDK boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KernelFileObject {
+    /// Non-null opaque WDK file object pointer.
+    file_object: NonNull<FILE_OBJECT>,
+}
+
+impl KernelFileObject {
+    /// Converts a raw WDK file object pointer into the non-null boundary type.
+    pub(crate) fn from_raw(file_object: *mut FILE_OBJECT) -> Option<Self> {
+        NonNull::new(file_object).map(|file_object| Self { file_object })
+    }
+
+    /// Returns an immutable WDK file object reference.
+    pub(crate) unsafe fn as_ref<'a>(self) -> &'a FILE_OBJECT {
+        unsafe {
+            // SAFETY: The caller ties the returned reference to the active WDK
+            // callback lifetime that supplied this non-null FILE_OBJECT.
+            self.file_object.as_ref()
+        }
+    }
+
+    /// Returns a mutable WDK file object reference.
+    pub(crate) unsafe fn as_mut<'a>(mut self) -> &'a mut FILE_OBJECT {
+        unsafe {
+            // SAFETY: The caller owns the active mutation point for this
+            // FILE_OBJECT during the current dispatch callback.
+            self.file_object.as_mut()
+        }
+    }
+
+    /// Returns the raw WDK pointer for FFI calls that require FILE_OBJECT.
+    fn as_ptr(self) -> *mut FILE_OBJECT {
+        self.file_object.as_ptr()
+    }
+}
+
+/// FILE_OBJECT during create before filesystem contexts are attached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UninitializedFileObject {
+    /// Kernel FILE_OBJECT that has not yet been opened by this filesystem.
+    file_object: KernelFileObject,
+}
+
+impl UninitializedFileObject {
+    /// Decodes a create target whose FCB and CCB slots are both empty.
+    pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
+        let object = unsafe {
+            // SAFETY: The FILE_OBJECT pointer comes from the active create
+            // stack and is read only for filesystem-owned context pointers.
+            file_object.as_ref()
+        };
+        if !object.FsContext.is_null() || !object.FsContext2.is_null() {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(Self { file_object })
+    }
+
+    /// Returns the underlying kernel FILE_OBJECT for FFI calls.
+    pub(crate) const fn kernel_file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
+    /// Returns an immutable WDK FILE_OBJECT reference.
+    pub(crate) unsafe fn as_ref<'a>(self) -> &'a FILE_OBJECT {
+        unsafe {
+            // SAFETY: The caller ties the returned reference to the active
+            // create dispatch lifetime that supplied this FILE_OBJECT.
+            self.file_object.as_ref()
+        }
+    }
+
+    /// Returns a mutable WDK FILE_OBJECT reference.
+    pub(crate) unsafe fn as_mut<'a>(self) -> &'a mut FILE_OBJECT {
+        unsafe {
+            // SAFETY: The caller owns the successful create attach point for
+            // this not-yet-initialized FILE_OBJECT.
+            self.file_object.as_mut()
+        }
+    }
+}
+
+/// Non-null VPB pointer supplied by the I/O Manager.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KernelVpb {
+    /// Non-null WDK VPB pointer.
+    vpb: NonNull<wdk_sys::VPB>,
+}
+
+impl KernelVpb {
+    /// Converts a raw WDK VPB pointer into the non-null boundary type.
+    pub(crate) fn from_raw(vpb: *mut wdk_sys::VPB) -> Option<Self> {
+        NonNull::new(vpb).map(|vpb| Self { vpb })
+    }
+
+    /// Returns the non-null VPB pointer for mount-time device initialization.
+    pub(crate) const fn as_non_null(self) -> NonNull<wdk_sys::VPB> {
+        self.vpb
+    }
+}
+
+/// Non-null security descriptor pointer supplied by the I/O Manager.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KernelSecurityDescriptor {
+    /// Non-null opaque security descriptor pointer.
+    descriptor: NonNull<c_void>,
+}
+
+impl KernelSecurityDescriptor {
+    /// Converts a raw WDK security descriptor pointer into the non-null boundary type.
+    pub(crate) fn from_raw(descriptor: *mut c_void) -> Option<Self> {
+        NonNull::new(descriptor).map(|descriptor| Self { descriptor })
+    }
+
+    /// Returns an immutable descriptor reference as an opaque pointer.
+    pub(crate) const fn as_non_null(self) -> NonNull<c_void> {
+        self.descriptor
     }
 }
 
@@ -158,10 +273,10 @@ impl VolumeControlBlock {
     }
 
     /// Returns a stable serial number derived from the ext4 filesystem UUID.
-    pub(crate) fn serial_number(&self) -> Option<u32> {
+    pub(crate) fn serial_number(&self) -> VolumeSerialNumber {
         let uuid = self.volume.superblock().uuid().bytes();
-        let bytes: [u8; 4] = uuid.get(0..4)?.try_into().ok()?;
-        Some(u32::from_le_bytes(bytes))
+        let [a, b, c, d, ..] = uuid;
+        VolumeSerialNumber::from_le_bytes([a, b, c, d])
     }
 
     /// Returns the mounted ext4 volume.
@@ -201,11 +316,7 @@ impl VolumeControlBlock {
         &self,
         identifier: FscryptKeyIdentifier,
     ) -> FscryptKeyPresence {
-        if self.volume.contains_fscrypt_key(identifier) {
-            FscryptKeyPresence::Present
-        } else {
-            FscryptKeyPresence::Absent
-        }
+        self.volume.fscrypt_key_presence(identifier)
     }
 
     /// Opens or reuses the VCB-owned FCB for a node.
@@ -275,13 +386,25 @@ impl VolumeControlBlock {
     }
 }
 
-/// Mount-local fscrypt master-key presence.
+/// Windows volume serial number derived from the ext4 filesystem UUID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FscryptKeyPresence {
-    /// The key is installed in this mounted volume.
-    Present,
-    /// The key is absent from this mounted volume.
-    Absent,
+pub(crate) struct VolumeSerialNumber {
+    /// Raw serial value expected by WDK structures.
+    value: u32,
+}
+
+impl VolumeSerialNumber {
+    /// Builds a serial number from little-endian UUID bytes.
+    const fn from_le_bytes(bytes: [u8; 4]) -> Self {
+        Self {
+            value: u32::from_le_bytes(bytes),
+        }
+    }
+
+    /// Returns the WDK serial number payload.
+    pub(crate) const fn as_u32(self) -> u32 {
+        self.value
+    }
 }
 
 impl Drop for VolumeControlBlock {
@@ -399,7 +522,7 @@ impl MountedVolumeDevice {
             // writable until the mount IRP is completed.
             vpb.as_ptr().as_mut()
         }?;
-        vpb.SerialNumber = vcb.serial_number()?;
+        vpb.SerialNumber = vcb.serial_number().as_u32();
         write_vpb_label(vpb, vcb.volume_label())
     }
 
@@ -485,16 +608,16 @@ impl FileControlBlock {
     /// Checks and records one FILE_OBJECT's share-access claim.
     pub(crate) fn check_share_access(
         &mut self,
-        file_object: NonNull<FILE_OBJECT>,
-        desired_access: ACCESS_MASK,
-        share_access: wdk_sys::ULONG,
+        file_object: KernelFileObject,
+        desired_access: DesiredAccess,
+        share_access: ShareAccess,
     ) -> DriverResult<()> {
         let status = unsafe {
             // SAFETY: The FCB owns this SHARE_ACCESS record for the opened
             // inode identity, and FILE_OBJECT is the active create target.
             ffi::IoCheckShareAccess(
-                desired_access,
-                share_access,
+                desired_access.as_raw(),
+                share_access.as_ulong(),
                 file_object.as_ptr(),
                 core::ptr::addr_of_mut!(self.share_access),
                 1,
@@ -507,7 +630,7 @@ impl FileControlBlock {
     }
 
     /// Removes one FILE_OBJECT's recorded share-access claim.
-    pub(crate) fn remove_share_access(&mut self, file_object: NonNull<FILE_OBJECT>) {
+    pub(crate) fn remove_share_access(&mut self, file_object: KernelFileObject) {
         unsafe {
             // SAFETY: Successful create recorded this FILE_OBJECT against this
             // FCB-owned SHARE_ACCESS, and close is the unique removal point.
@@ -733,17 +856,88 @@ impl OpenedHandle {
     }
 }
 
-/// Returns the FCB stored on a successfully opened FILE_OBJECT.
-pub(crate) fn file_control_block(
-    file_object: NonNull<FILE_OBJECT>,
-) -> Result<NonNull<FileControlBlock>, DriverError> {
-    let file_object = unsafe {
-        // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
-        // is read only for filesystem-owned context pointers.
-        file_object.as_ref()
-    };
-    NonNull::new(file_object.FsContext.cast::<FileControlBlock>())
-        .ok_or(DriverError::InvalidParameter)
+/// FILE_OBJECT whose FCB and CCB contexts have both been initialized by create.
+#[derive(Debug)]
+pub(crate) struct OpenedFileObject {
+    /// Kernel FILE_OBJECT carrying the contexts.
+    file_object: KernelFileObject,
+    /// Shared file control block stored in FsContext.
+    fcb: NonNull<FileControlBlock>,
+    /// Per-handle context stored in FsContext2.
+    handle: NonNull<OpenedHandle>,
+}
+
+impl OpenedFileObject {
+    /// Decodes an initialized FILE_OBJECT context pair.
+    pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
+        let object = unsafe {
+            // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack
+            // and is read only for filesystem-owned context pointers.
+            file_object.as_ref()
+        };
+        let fcb = NonNull::new(object.FsContext.cast::<FileControlBlock>())
+            .ok_or(DriverError::InvalidParameter)?;
+        let handle = NonNull::new(object.FsContext2.cast::<OpenedHandle>())
+            .ok_or(DriverError::InvalidParameter)?;
+        Ok(Self {
+            file_object,
+            fcb,
+            handle,
+        })
+    }
+
+    /// Returns the kernel FILE_OBJECT associated with this opened handle.
+    pub(crate) const fn file_object(&self) -> KernelFileObject {
+        self.file_object
+    }
+
+    /// Returns the mounted VCB pointer owning this opened node.
+    pub(crate) fn volume(&self) -> NonNull<VolumeControlBlock> {
+        self.file_control_block().volume()
+    }
+
+    /// Returns the ext4 node identity opened by this FILE_OBJECT.
+    pub(crate) fn node(&self) -> NodeId {
+        self.file_control_block().node()
+    }
+
+    /// Returns the decoded file control block.
+    pub(crate) fn file_control_block(&self) -> &FileControlBlock {
+        unsafe {
+            // SAFETY: `decode` only constructs this type from a non-null
+            // FsContext written by successful create and used during the
+            // active FILE_OBJECT lifetime.
+            self.fcb.as_ref()
+        }
+    }
+
+    /// Returns mutable decoded file control block state for the active dispatch.
+    pub(crate) fn file_control_block_mut(&mut self) -> &mut FileControlBlock {
+        unsafe {
+            // SAFETY: Mutating FCB-local identity is limited to the active
+            // synchronous dispatch path that owns `&mut self`.
+            self.fcb.as_mut()
+        }
+    }
+
+    /// Returns the decoded per-handle state.
+    pub(crate) fn handle(&self) -> &OpenedHandle {
+        unsafe {
+            // SAFETY: `decode` only constructs this type from a non-null
+            // FsContext2 written by successful create and used during the
+            // active FILE_OBJECT lifetime.
+            self.handle.as_ref()
+        }
+    }
+
+    /// Returns mutable per-handle state for the active dispatch.
+    pub(crate) fn handle_mut(&mut self) -> &mut OpenedHandle {
+        unsafe {
+            // SAFETY: Mutating handle-local state is serialized by the active
+            // synchronous dispatch path that owns `&mut self`.
+            self.handle.as_mut()
+        }
+    }
 }
 
 /// Releases one FILE_OBJECT reference to a VCB-owned FCB.
@@ -757,18 +951,6 @@ pub(crate) fn release_file_control_block(fcb: NonNull<FileControlBlock>) {
         volume.as_mut()
     };
     vcb.close_file_control_block(fcb);
-}
-
-/// Returns the CCB stored on a successfully opened FILE_OBJECT.
-pub(crate) fn opened_handle(
-    file_object: NonNull<FILE_OBJECT>,
-) -> Result<NonNull<OpenedHandle>, DriverError> {
-    let file_object = unsafe {
-        // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
-        // is read only for filesystem-owned context pointers.
-        file_object.as_ref()
-    };
-    NonNull::new(file_object.FsContext2.cast::<OpenedHandle>()).ok_or(DriverError::InvalidParameter)
 }
 
 /// Driver unload callback registered in the driver object.
@@ -801,7 +983,114 @@ mod tests {
 
     use crate::status::DriverError;
 
-    use super::{FileControlBlock, FileControlBlockRelease, VolumeControlBlock};
+    use super::{
+        FileControlBlock, FileControlBlockRelease, KernelFileObject, OpenedFileObject,
+        UninitializedFileObject, VolumeControlBlock,
+    };
+
+    fn file_object_with_contexts(
+        fs_context: *mut core::ffi::c_void,
+        fs_context2: *mut core::ffi::c_void,
+    ) -> wdk_sys::FILE_OBJECT {
+        wdk_sys::FILE_OBJECT {
+            FsContext: fs_context,
+            FsContext2: fs_context2,
+            ..wdk_sys::FILE_OBJECT::default()
+        }
+    }
+
+    /// Builds the typed FILE_OBJECT boundary from a local non-null test object.
+    fn kernel_file_object(file: &mut wdk_sys::FILE_OBJECT) -> Option<KernelFileObject> {
+        KernelFileObject::from_raw(core::ptr::addr_of_mut!(*file))
+    }
+
+    #[test]
+    fn kernel_file_object_rejects_null_raw_pointer() {
+        assert_eq!(KernelFileObject::from_raw(core::ptr::null_mut()), None);
+    }
+
+    #[test]
+    fn opened_file_object_requires_both_contexts() {
+        let mut file = file_object_with_contexts(core::ptr::null_mut(), core::ptr::null_mut());
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+
+        assert_eq!(
+            OpenedFileObject::decode(file_object).err(),
+            Some(DriverError::InvalidParameter)
+        );
+
+        let mut file = file_object_with_contexts(
+            NonNull::<FileControlBlock>::dangling().as_ptr().cast(),
+            core::ptr::null_mut(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        assert_eq!(
+            OpenedFileObject::decode(file_object).err(),
+            Some(DriverError::InvalidParameter)
+        );
+
+        let mut file = file_object_with_contexts(
+            core::ptr::null_mut(),
+            NonNull::<super::OpenedHandle>::dangling().as_ptr().cast(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        assert_eq!(
+            OpenedFileObject::decode(file_object).err(),
+            Some(DriverError::InvalidParameter)
+        );
+    }
+
+    #[test]
+    fn uninitialized_file_object_rejects_existing_contexts() {
+        let mut file = file_object_with_contexts(core::ptr::null_mut(), core::ptr::null_mut());
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+
+        assert!(UninitializedFileObject::decode(file_object).is_ok());
+
+        let mut file = file_object_with_contexts(
+            NonNull::<FileControlBlock>::dangling().as_ptr().cast(),
+            core::ptr::null_mut(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        assert_eq!(
+            UninitializedFileObject::decode(file_object),
+            Err(DriverError::InvalidParameter)
+        );
+
+        let mut file = file_object_with_contexts(
+            core::ptr::null_mut(),
+            NonNull::<super::OpenedHandle>::dangling().as_ptr().cast(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        assert_eq!(
+            UninitializedFileObject::decode(file_object),
+            Err(DriverError::InvalidParameter)
+        );
+    }
 
     #[test]
     fn file_control_block_open_count_cannot_represent_zero() {

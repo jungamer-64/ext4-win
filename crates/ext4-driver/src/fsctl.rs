@@ -4,11 +4,11 @@ use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use crate::irp::{DispatchTarget, DriverCompletion, FileSystemControlStack};
-use crate::state::{FscryptKeyPresence, VolumeControlBlock, file_control_block};
+use crate::state::{OpenedFileObject, VolumeControlBlock};
 use crate::status::{DriverError, DriverResult};
-use crate::wire::{LittleEndianInput, LittleEndianOutput};
+use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{
-    FscryptKeyIdentifier, FscryptMasterKey, FsverityBlockSize, FsverityEnable,
+    FscryptKeyIdentifier, FscryptKeyPresence, FscryptMasterKey, FsverityBlockSize, FsverityEnable,
     FsverityHashAlgorithm, FsveritySalt, FsveritySignature, NodeId,
 };
 
@@ -94,6 +94,16 @@ const FSVERITY_ENABLE_RESERVED2_OFFSET: usize = 40;
 /// Size of verity-enable trailing reserved words.
 const FSVERITY_ENABLE_RESERVED2_BYTES: usize = 88;
 
+/// Creates a wire offset from a fixed FSCTL structure byte position.
+const fn wire_offset(offset: usize) -> WireOffset {
+    WireOffset::new(offset)
+}
+
+/// Creates a checked FSCTL payload range.
+fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
+    WireRange::new(wire_offset(offset), WireByteLen::new(length))
+}
+
 /// Enables fs-verity on the opened regular file.
 pub(crate) fn enable_verity(
     target: DispatchTarget,
@@ -102,16 +112,11 @@ pub(crate) fn enable_verity(
     let payload = read_input(target, stack)
         .and_then(|input| FsverityEnablePayload::parse(input.as_slice()))?;
     let enable = payload.into_core_enable()?;
-    let fcb = file_control_block(stack.file_object())?;
-    let fcb = unsafe {
-        // SAFETY: Successful create stores a live FCB in FsContext while this
-        // FSCTL is dispatched for the opened FILE_OBJECT.
-        fcb.as_ref()
-    };
-    let NodeId::File(file_id) = fcb.node() else {
+    let opened_file = OpenedFileObject::decode(stack.file_object())?;
+    let NodeId::File(file_id) = opened_file.node() else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
     };
-    let mut vcb = fcb.volume();
+    let mut vcb = opened_file.volume();
     let vcb = unsafe {
         // SAFETY: FCBs only store live mounted VCB pointers. The mutable borrow
         // is the transaction boundary for this synchronous FSCTL.
@@ -185,28 +190,29 @@ pub(crate) fn get_encryption_key_status(
 
 /// Writes Linux-compatible remove-key output fields.
 fn write_remove_key_output(output: &mut [u8]) -> DriverResult<()> {
-    LittleEndianOutput::new(output).write_u32(FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET, 0)
+    LittleEndianOutput::new(output)
+        .write_u32(wire_offset(FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET), 0)
 }
 
 /// Writes Linux-compatible key-status output fields.
 fn write_key_status_output(output: &mut [u8], presence: FscryptKeyPresence) -> DriverResult<()> {
     let mut output = LittleEndianOutput::new(output);
     output
-        .range_mut(
-            FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET,
-            FSCRYPT_GET_KEY_STATUS_BYTES - FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET,
-        )?
+        .range_mut(WireRange::span(
+            wire_offset(FSCRYPT_GET_KEY_STATUS_OUT_RESERVED_OFFSET),
+            wire_offset(FSCRYPT_GET_KEY_STATUS_BYTES),
+        )?)?
         .fill(0);
     output.write_u32(
-        FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET,
+        wire_offset(FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
         key_presence_status(presence),
     )?;
     output.write_u32(
-        FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET,
+        wire_offset(FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET),
         key_presence_status_flags(presence),
     )?;
     output.write_u32(
-        FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET,
+        wire_offset(FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET),
         key_presence_user_count(presence),
     )
 }
@@ -250,21 +256,22 @@ impl FscryptAddKeyPayload {
         }
         let fields = LittleEndianInput::new(input);
         let identifier = parse_key_identifier(input)?;
-        if fields.read_u32(FSCRYPT_ADD_KEY_KEY_ID_OFFSET)? != 0
-            || fields.read_u32(FSCRYPT_ADD_KEY_FLAGS_OFFSET)? != 0
-            || !fields.all_zero(
+        if fields.read_u32(wire_offset(FSCRYPT_ADD_KEY_KEY_ID_OFFSET))? != 0
+            || fields.read_u32(wire_offset(FSCRYPT_ADD_KEY_FLAGS_OFFSET))? != 0
+            || !fields.all_zero(wire_range(
                 FSCRYPT_ADD_KEY_RESERVED_OFFSET,
                 FSCRYPT_ADD_KEY_RESERVED_BYTES,
-            )?
+            )?)?
         {
             return Err(DriverError::NotSupported);
         }
-        let raw_size = usize::try_from(fields.read_u32(FSCRYPT_ADD_KEY_RAW_SIZE_OFFSET)?)
-            .map_err(|_| DriverError::InvalidParameter)?;
-        let raw = fields.range(
-            FSCRYPT_ADD_KEY_FIXED_BYTES,
-            input.len() - FSCRYPT_ADD_KEY_FIXED_BYTES,
-        )?;
+        let raw_size =
+            usize::try_from(fields.read_u32(wire_offset(FSCRYPT_ADD_KEY_RAW_SIZE_OFFSET))?)
+                .map_err(|_| DriverError::InvalidParameter)?;
+        let raw = fields.range(WireRange::span(
+            wire_offset(FSCRYPT_ADD_KEY_FIXED_BYTES),
+            wire_offset(input.len()),
+        )?)?;
         if raw.len() != raw_size {
             return Err(DriverError::InvalidParameter);
         }
@@ -300,11 +307,11 @@ impl FscryptRemoveKeyPayload {
         }
         let identifier = parse_key_identifier(input)?;
         let fields = LittleEndianInput::new(input);
-        if fields.read_u32(FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET)? != 0
-            || !fields.all_zero(
+        if fields.read_u32(wire_offset(FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET))? != 0
+            || !fields.all_zero(wire_range(
                 FSCRYPT_REMOVE_KEY_RESERVED_OFFSET,
                 FSCRYPT_REMOVE_KEY_RESERVED_BYTES,
-            )?
+            )?)?
         {
             return Err(DriverError::InvalidParameter);
         }
@@ -331,10 +338,10 @@ impl FscryptKeyStatusPayload {
             return Err(DriverError::BufferTooSmall);
         }
         let identifier = parse_key_identifier(input)?;
-        if !LittleEndianInput::new(input).all_zero(
+        if !LittleEndianInput::new(input).all_zero(wire_range(
             FSCRYPT_GET_KEY_STATUS_RESERVED_OFFSET,
             FSCRYPT_GET_KEY_STATUS_RESERVED_BYTES,
-        )? {
+        )?)? {
             return Err(DriverError::InvalidParameter);
         }
         Ok(Self { identifier })
@@ -370,29 +377,31 @@ impl FsverityEnablePayload {
             });
         }
         let fields = LittleEndianInput::new(input);
-        if fields.read_u32(FSVERITY_ENABLE_VERSION_OFFSET)? != FSVERITY_ENABLE_VERSION {
+        if fields.read_u32(wire_offset(FSVERITY_ENABLE_VERSION_OFFSET))? != FSVERITY_ENABLE_VERSION
+        {
             return Err(DriverError::InvalidParameter);
         }
         let algorithm = FsverityHashAlgorithm::parse_u32(
-            fields.read_u32(FSVERITY_ENABLE_HASH_ALGORITHM_OFFSET)?,
+            fields.read_u32(wire_offset(FSVERITY_ENABLE_HASH_ALGORITHM_OFFSET))?,
         )?;
-        let block_size =
-            FsverityBlockSize::new(fields.read_u32(FSVERITY_ENABLE_BLOCK_SIZE_OFFSET)?)?;
+        let block_size = FsverityBlockSize::new(
+            fields.read_u32(wire_offset(FSVERITY_ENABLE_BLOCK_SIZE_OFFSET))?,
+        )?;
         let salt = OptionalUserBuffer::new(
-            fields.read_u64(FSVERITY_ENABLE_SALT_PTR_OFFSET)?,
-            fields.read_u32(FSVERITY_ENABLE_SALT_SIZE_OFFSET)?,
+            fields.read_u64(wire_offset(FSVERITY_ENABLE_SALT_PTR_OFFSET))?,
+            fields.read_u32(wire_offset(FSVERITY_ENABLE_SALT_SIZE_OFFSET))?,
             32,
         )?;
         let signature = OptionalUserBuffer::new(
-            fields.read_u64(FSVERITY_ENABLE_SIG_PTR_OFFSET)?,
-            fields.read_u32(FSVERITY_ENABLE_SIG_SIZE_OFFSET)?,
+            fields.read_u64(wire_offset(FSVERITY_ENABLE_SIG_PTR_OFFSET))?,
+            fields.read_u32(wire_offset(FSVERITY_ENABLE_SIG_SIZE_OFFSET))?,
             FSVERITY_MAX_SIGNATURE_BYTES,
         )?;
-        if fields.read_u32(FSVERITY_ENABLE_RESERVED1_OFFSET)? != 0
-            || !fields.all_zero(
+        if fields.read_u32(wire_offset(FSVERITY_ENABLE_RESERVED1_OFFSET))? != 0
+            || !fields.all_zero(wire_range(
                 FSVERITY_ENABLE_RESERVED2_OFFSET,
                 FSVERITY_ENABLE_RESERVED2_BYTES,
-            )?
+            )?)?
         {
             return Err(DriverError::InvalidParameter);
         }
@@ -471,13 +480,7 @@ fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> DriverRe
 
 /// Returns a mounted VCB from a path-scoped FSCTL stack.
 fn mounted_vcb(stack: FileSystemControlStack) -> DriverResult<NonNull<VolumeControlBlock>> {
-    let fcb = file_control_block(stack.file_object())?;
-    let fcb = unsafe {
-        // SAFETY: The FCB pointer is read from a live FILE_OBJECT owned by this
-        // filesystem for the duration of this FSCTL dispatch.
-        fcb.as_ref()
-    };
-    Ok(fcb.volume())
+    Ok(OpenedFileObject::decode(stack.file_object())?.volume())
 }
 
 /// Returns a METHOD_BUFFERED output buffer after stack length validation.
@@ -504,24 +507,25 @@ fn parse_key_identifier(input: &[u8]) -> DriverResult<FscryptKeyIdentifier> {
         return Err(DriverError::BufferTooSmall);
     }
     let fields = LittleEndianInput::new(input);
-    if fields.read_u32(FSCRYPT_KEY_SPEC_TYPE_OFFSET)? != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER {
+    if fields.read_u32(wire_offset(FSCRYPT_KEY_SPEC_TYPE_OFFSET))?
+        != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER
+    {
         return Err(DriverError::NotSupported);
     }
-    if fields.read_u32(FSCRYPT_KEY_SPEC_RESERVED_OFFSET)? != 0 {
+    if fields.read_u32(wire_offset(FSCRYPT_KEY_SPEC_RESERVED_OFFSET))? != 0 {
         return Err(DriverError::InvalidParameter);
     }
     let identifier_offset = FSCRYPT_KEY_SPEC_UNION_OFFSET;
     let identifier_end = identifier_offset
         .checked_add(FSCRYPT_KEY_IDENTIFIER_BYTES)
         .ok_or(DriverError::InvalidParameter)?;
-    let identifier = fields.fixed::<FSCRYPT_KEY_IDENTIFIER_BYTES>(identifier_offset)?;
+    let identifier =
+        fields.fixed::<FSCRYPT_KEY_IDENTIFIER_BYTES>(wire_offset(identifier_offset))?;
     if fields
-        .range(
-            identifier_end,
-            FSCRYPT_KEY_SPECIFIER_BYTES
-                .checked_sub(identifier_end)
-                .ok_or(DriverError::InvalidParameter)?,
-        )?
+        .range(WireRange::span(
+            wire_offset(identifier_end),
+            wire_offset(FSCRYPT_KEY_SPECIFIER_BYTES),
+        )?)?
         .iter()
         .any(|byte| *byte != 0)
     {
@@ -599,7 +603,7 @@ mod tests {
         let mut descriptor = must!(add_key_payload(&RAW_KEY));
         {
             let mut output = LittleEndianOutput::new(&mut descriptor);
-            must!(output.write_u32(FSCRYPT_KEY_SPEC_TYPE_OFFSET, 1));
+            must!(output.write_u32(wire_offset(FSCRYPT_KEY_SPEC_TYPE_OFFSET), 1));
         }
         assert_eq!(
             FscryptAddKeyPayload::parse(&descriptor),
@@ -609,7 +613,7 @@ mod tests {
         let mut hw_wrapped = must!(add_key_payload(&RAW_KEY));
         {
             let mut output = LittleEndianOutput::new(&mut hw_wrapped);
-            must!(output.write_u32(FSCRYPT_ADD_KEY_FLAGS_OFFSET, 1));
+            must!(output.write_u32(wire_offset(FSCRYPT_ADD_KEY_FLAGS_OFFSET), 1));
         }
         assert_eq!(
             FscryptAddKeyPayload::parse(&hw_wrapped),
@@ -643,15 +647,15 @@ mod tests {
         let present_input = LittleEndianInput::new(&present);
 
         assert_eq!(
-            present_input.read_u32(FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
+            present_input.read_u32(wire_offset(FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET)),
             Ok(FSCRYPT_KEY_STATUS_PRESENT)
         );
         assert_eq!(
-            present_input.read_u32(FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET),
+            present_input.read_u32(wire_offset(FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET)),
             Ok(FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF)
         );
         assert_eq!(
-            present_input.read_u32(FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET),
+            present_input.read_u32(wire_offset(FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET)),
             Ok(1)
         );
         assert!(
@@ -668,15 +672,15 @@ mod tests {
         let absent_input = LittleEndianInput::new(&absent);
 
         assert_eq!(
-            absent_input.read_u32(FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET),
+            absent_input.read_u32(wire_offset(FSCRYPT_GET_KEY_STATUS_STATUS_OFFSET)),
             Ok(FSCRYPT_KEY_STATUS_ABSENT)
         );
         assert_eq!(
-            absent_input.read_u32(FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET),
+            absent_input.read_u32(wire_offset(FSCRYPT_GET_KEY_STATUS_STATUS_FLAGS_OFFSET)),
             Ok(0)
         );
         assert_eq!(
-            absent_input.read_u32(FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET),
+            absent_input.read_u32(wire_offset(FSCRYPT_GET_KEY_STATUS_USER_COUNT_OFFSET)),
             Ok(0)
         );
     }
@@ -688,7 +692,8 @@ mod tests {
         must!(write_remove_key_output(&mut output));
 
         assert_eq!(
-            LittleEndianInput::new(&output).read_u32(FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET),
+            LittleEndianInput::new(&output)
+                .read_u32(wire_offset(FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET)),
             Ok(0)
         );
     }
@@ -786,7 +791,7 @@ mod tests {
         let mut reserved = must!(reserved);
         {
             let mut output = LittleEndianOutput::new(&mut reserved);
-            must!(output.write_u32(FSVERITY_ENABLE_RESERVED1_OFFSET, 1));
+            must!(output.write_u32(wire_offset(FSVERITY_ENABLE_RESERVED1_OFFSET), 1));
         }
         assert_eq!(
             FsverityEnablePayload::parse(&reserved),
@@ -820,7 +825,7 @@ mod tests {
         {
             let mut output = LittleEndianOutput::new(&mut payload);
             output.write_u32(
-                FSCRYPT_ADD_KEY_RAW_SIZE_OFFSET,
+                wire_offset(FSCRYPT_ADD_KEY_RAW_SIZE_OFFSET),
                 u32::try_from(raw_key.len()).map_err(|_| DriverError::InvalidParameter)?,
             )?;
         }
@@ -849,10 +854,13 @@ mod tests {
     ) -> DriverResult<()> {
         let mut output = LittleEndianOutput::new(payload);
         output.write_u32(
-            FSCRYPT_KEY_SPEC_TYPE_OFFSET,
+            wire_offset(FSCRYPT_KEY_SPEC_TYPE_OFFSET),
             FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER,
         )?;
-        output.write_bytes(FSCRYPT_KEY_SPEC_UNION_OFFSET, &identifier.bytes())?;
+        output.write_bytes(
+            wire_offset(FSCRYPT_KEY_SPEC_UNION_OFFSET),
+            &identifier.bytes(),
+        )?;
         Ok(())
     }
 
@@ -865,13 +873,25 @@ mod tests {
     ) -> DriverResult<Vec<u8>> {
         let mut payload = vec![0_u8; FSVERITY_ENABLE_ARG_BYTES];
         let mut output = LittleEndianOutput::new(&mut payload);
-        output.write_u32(FSVERITY_ENABLE_VERSION_OFFSET, FSVERITY_ENABLE_VERSION)?;
-        output.write_u32(FSVERITY_ENABLE_HASH_ALGORITHM_OFFSET, algorithm)?;
-        output.write_u32(FSVERITY_ENABLE_BLOCK_SIZE_OFFSET, block_size)?;
-        output.write_u32(FSVERITY_ENABLE_SALT_SIZE_OFFSET, salt.length)?;
-        output.write_u64(FSVERITY_ENABLE_SALT_PTR_OFFSET, salt.address)?;
-        output.write_u32(FSVERITY_ENABLE_SIG_SIZE_OFFSET, signature.length)?;
-        output.write_u64(FSVERITY_ENABLE_SIG_PTR_OFFSET, signature.address)?;
+        output.write_u32(
+            wire_offset(FSVERITY_ENABLE_VERSION_OFFSET),
+            FSVERITY_ENABLE_VERSION,
+        )?;
+        output.write_u32(
+            wire_offset(FSVERITY_ENABLE_HASH_ALGORITHM_OFFSET),
+            algorithm,
+        )?;
+        output.write_u32(wire_offset(FSVERITY_ENABLE_BLOCK_SIZE_OFFSET), block_size)?;
+        output.write_u32(wire_offset(FSVERITY_ENABLE_SALT_SIZE_OFFSET), salt.length)?;
+        output.write_u64(wire_offset(FSVERITY_ENABLE_SALT_PTR_OFFSET), salt.address)?;
+        output.write_u32(
+            wire_offset(FSVERITY_ENABLE_SIG_SIZE_OFFSET),
+            signature.length,
+        )?;
+        output.write_u64(
+            wire_offset(FSVERITY_ENABLE_SIG_PTR_OFFSET),
+            signature.address,
+        )?;
         Ok(payload)
     }
 }

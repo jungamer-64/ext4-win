@@ -70,6 +70,15 @@ const BASE64URL_ALPHABET: &[u8; 64] =
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FscryptKeyIdentifier([u8; FSCRYPT_KEY_IDENTIFIER_BYTES]);
 
+/// Mount-local fscrypt master-key presence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FscryptKeyPresence {
+    /// The key is installed in this mount context.
+    Present,
+    /// The key is absent from this mount context.
+    Absent,
+}
+
 impl FscryptKeyIdentifier {
     /// Creates a key identifier from the 16-byte fscrypt v2 key id.
     #[must_use]

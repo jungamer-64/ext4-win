@@ -2,7 +2,7 @@
 
 use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
 use crate::checksum::{crc32c, verify_crc32c};
-use crate::endian::{le_u16, le_u32, put_le_u32};
+use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u32};
 use crate::error::{Error, Result};
 use crate::inode::InodeId;
 
@@ -26,6 +26,11 @@ const DIRECTORY_HASH_SEED_OFFSET: usize = 236;
 const DIRECTORY_HASH_SEED_WORDS: usize = 4;
 /// Byte offset of `s_def_hash_version` inside the superblock.
 const DEFAULT_DIRECTORY_HASH_VERSION_OFFSET: usize = 252;
+
+/// Builds a typed superblock field offset.
+const fn disk_offset(offset: usize) -> DiskOffset {
+    DiskOffset::new(offset)
+}
 
 // Compatible feature bits can usually be ignored for reads, but the write domain
 // requires an explicit supported set because mutation changes their invariants.
@@ -952,7 +957,7 @@ impl ChecksumSeedSource {
         match self {
             Self::Zero => Ok(ChecksumSeed::from_u32(0)),
             Self::FilesystemUuid => Ok(ChecksumSeed::from_u32(crc32c(u32::MAX, uuid))),
-            Self::SuperblockField => Ok(ChecksumSeed::from_u32(le_u32(raw, 624)?)),
+            Self::SuperblockField => Ok(ChecksumSeed::from_u32(le_u32(raw, disk_offset(624))?)),
         }
     }
 }
@@ -1427,29 +1432,33 @@ impl Superblock {
         if raw.len() < SUPERBLOCK_SIZE {
             return Err(Error::TruncatedStructure);
         }
-        if le_u16(raw, 56)? != EXT4_SUPER_MAGIC {
+        if le_u16(raw, disk_offset(56))? != EXT4_SUPER_MAGIC {
             return Err(Error::InvalidMagic);
         }
-        if le_u16(raw, 58)? & EXT4_VALID_FS == 0 {
+        if le_u16(raw, disk_offset(58))? & EXT4_VALID_FS == 0 {
             return Err(Error::DirtyVolume);
         }
 
-        let inode_count = InodeCount::new(le_u32(raw, 0)?)?;
-        let block_count_lo = le_u32(raw, 4)?;
-        let free_blocks_count_lo = le_u32(raw, 12)?;
-        let free_inodes_count = FreeInodeCount::new(le_u32(raw, 16)?);
-        let first_data_block = BlockAddress::new(u64::from(le_u32(raw, 20)?));
-        let log_block_size = le_u32(raw, 24)?;
-        let log_cluster_size = le_u32(raw, 28)?;
+        let inode_count = InodeCount::new(le_u32(raw, disk_offset(0))?)?;
+        let block_count_lo = le_u32(raw, disk_offset(4))?;
+        let free_blocks_count_lo = le_u32(raw, disk_offset(12))?;
+        let free_inodes_count = FreeInodeCount::new(le_u32(raw, disk_offset(16))?);
+        let first_data_block = BlockAddress::new(u64::from(le_u32(raw, disk_offset(20))?));
+        let log_block_size = le_u32(raw, disk_offset(24))?;
+        let log_cluster_size = le_u32(raw, disk_offset(28))?;
         let block_size = BlockSize::from_superblock_log(log_block_size)?;
-        let blocks_per_group = BlocksPerGroup::new(le_u32(raw, 32)?)?;
-        let raw_clusters_per_group = le_u32(raw, 36)?;
-        let inodes_per_group = InodesPerGroup::new(le_u32(raw, 40)?)?;
-        let first_inode = InodeId::try_from(le_u32(raw, 84)?)?;
-        let inode_size = InodeRecordSize::new(le_u16(raw, 88)?, block_size)?;
-        let features = validate_features(le_u32(raw, 92)?, le_u32(raw, 96)?, le_u32(raw, 100)?)?;
+        let blocks_per_group = BlocksPerGroup::new(le_u32(raw, disk_offset(32))?)?;
+        let raw_clusters_per_group = le_u32(raw, disk_offset(36))?;
+        let inodes_per_group = InodesPerGroup::new(le_u32(raw, disk_offset(40))?)?;
+        let first_inode = InodeId::try_from(le_u32(raw, disk_offset(84))?)?;
+        let inode_size = InodeRecordSize::new(le_u16(raw, disk_offset(88))?, block_size)?;
+        let features = validate_features(
+            le_u32(raw, disk_offset(92))?,
+            le_u32(raw, disk_offset(96))?,
+            le_u32(raw, disk_offset(100))?,
+        )?;
         let raw_descriptor_size = if features.has_64bit() {
-            let raw_size = le_u16(raw, 254)?;
+            let raw_size = le_u16(raw, disk_offset(254))?;
             if raw_size == 0 {
                 DEFAULT_64BIT_DESCRIPTOR_SIZE
             } else {
@@ -1462,7 +1471,7 @@ impl Superblock {
         let block_count = BlockCount::new(
             u64::from(block_count_lo)
                 | if features.has_64bit() {
-                    u64::from(le_u32(raw, 336)?) << 32
+                    u64::from(le_u32(raw, disk_offset(336))?) << 32
                 } else {
                     0
                 },
@@ -1470,7 +1479,7 @@ impl Superblock {
         let free_clusters_count = FreeClusterCount::new(
             u64::from(free_blocks_count_lo)
                 | if features.has_64bit() {
-                    u64::from(le_u32(raw, 344)?) << 32
+                    u64::from(le_u32(raw, disk_offset(344))?) << 32
                 } else {
                     0
                 },
@@ -1491,12 +1500,12 @@ impl Superblock {
         match features.metadata_checksum() {
             MetadataChecksum::None => {}
             MetadataChecksum::Crc32c => {
-                if le_u32(raw, 1020)? != 0 {
-                    verify_crc32c(0, raw, 1020)?;
+                if le_u32(raw, disk_offset(1020))? != 0 {
+                    verify_crc32c(0, raw, disk_offset(1020))?;
                 }
             }
         }
-        let journal_inode = le_u32(raw, 224)?;
+        let journal_inode = le_u32(raw, disk_offset(224))?;
         let mut uuid = [0_u8; 16];
         uuid.copy_from_slice(raw.get(104..120).ok_or(Error::TruncatedStructure)?);
         let volume_label = Ext4VolumeLabel::parse(raw)?;
@@ -1517,10 +1526,10 @@ impl Superblock {
         };
         let checksum_seed = features.checksum_seed_source().seed(raw, &uuid)?;
         let directory_hash_seed = DirectoryHashSeed::from_words([
-            le_u32(raw, DIRECTORY_HASH_SEED_OFFSET)?,
-            le_u32(raw, DIRECTORY_HASH_SEED_OFFSET + 4)?,
-            le_u32(raw, DIRECTORY_HASH_SEED_OFFSET + 8)?,
-            le_u32(raw, DIRECTORY_HASH_SEED_OFFSET + 12)?,
+            le_u32(raw, disk_offset(DIRECTORY_HASH_SEED_OFFSET))?,
+            le_u32(raw, disk_offset(DIRECTORY_HASH_SEED_OFFSET + 4))?,
+            le_u32(raw, disk_offset(DIRECTORY_HASH_SEED_OFFSET + 8))?,
+            le_u32(raw, disk_offset(DIRECTORY_HASH_SEED_OFFSET + 12))?,
         ]);
         let default_directory_hash_version = DirectoryHashVersion::from_raw(
             *raw.get(DEFAULT_DIRECTORY_HASH_VERSION_OFFSET)
@@ -1744,8 +1753,8 @@ impl Superblock {
     pub fn clear_recover_on_device(device: &mut impl BlockWriter) -> Result<()> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
         device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
-        let incompat = le_u32(&raw, 96)? & !INCOMPAT_RECOVER;
-        put_le_u32(&mut raw, 96, incompat)?;
+        let incompat = le_u32(&raw, disk_offset(96))? & !INCOMPAT_RECOVER;
+        put_le_u32(&mut raw, disk_offset(96), incompat)?;
         Self::refresh_checksum(&mut raw)?;
         device.write_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &raw)?;
         device.flush()
@@ -1753,12 +1762,12 @@ impl Superblock {
 
     /// Recomputes the primary superblock checksum when the on-disk checksum is present.
     pub(crate) fn refresh_checksum(raw: &mut [u8]) -> Result<()> {
-        if le_u32(raw, 1020)? == 0 {
+        if le_u32(raw, disk_offset(1020))? == 0 {
             return Ok(());
         }
-        put_le_u32(raw, 1020, 0)?;
+        put_le_u32(raw, disk_offset(1020), 0)?;
         let checksum = crc32c(0, raw);
-        put_le_u32(raw, 1020, checksum)
+        put_le_u32(raw, disk_offset(1020), checksum)
     }
 
     /// Number of block groups implied by the superblock.
