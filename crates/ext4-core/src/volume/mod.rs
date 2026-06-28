@@ -139,7 +139,7 @@ const SUPERBLOCK_OFFSET: u64 = 1024;
 
 /// Read-only mounted volume state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReadOnly;
+struct ReadOnly;
 
 /// Mount-time context that keeps external fscrypt material out of superblock parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,14 +204,14 @@ impl<N> MountContext<N> {
 
 /// Journal stored as a hidden ext4 inode on the filesystem device.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InternalJournal {
+struct InternalJournal {
     /// Clean journal state ready to accept write transactions.
     journal: Journal,
 }
 
 /// External journal stored on a separate journal device.
 #[derive(Debug)]
-pub struct ExternalJournal<J> {
+struct ExternalJournal<J> {
     /// External journal block device.
     device: J,
     /// Clean journal state loaded from the external device.
@@ -220,7 +220,7 @@ pub struct ExternalJournal<J> {
 
 /// Journaled read-write mounted volume state.
 #[derive(Debug)]
-pub struct ReadWrite<J = InternalJournal> {
+struct ReadWrite<J = InternalJournal> {
     /// Journal backend selected at mount.
     journal: J,
     /// Mounted cluster reference counts constructed before any mutation.
@@ -486,7 +486,7 @@ struct ClusterReferenceDelta {
 
 /// Mounted ext4 volume with typestate-selected mutation capability.
 #[derive(Debug)]
-pub struct Volume<D, State, N = FscryptNoNonceGenerator> {
+struct Volume<D, State, N = FscryptNoNonceGenerator> {
     /// Backing filesystem block device.
     device: D,
     /// Validated superblock and mount policy.
@@ -1881,7 +1881,7 @@ impl TransactionNode {
 
 /// In-progress ext4 write transaction.
 #[derive(Debug)]
-pub struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal, N = FscryptNoNonceGenerator> {
+struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal, N = FscryptNoNonceGenerator> {
     /// Mounted read-write volume being mutated.
     volume: &'a mut Volume<D, ReadWrite<J>, N>,
     /// Timestamp applied consistently to staged inode updates.
