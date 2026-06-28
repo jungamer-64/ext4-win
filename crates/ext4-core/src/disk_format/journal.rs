@@ -9,13 +9,13 @@
 use alloc::{vec, vec::Vec};
 use core::marker::PhantomData;
 
-use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
-use crate::checksum::crc32c;
-use crate::endian::{DiskOffset, be_u16, be_u32, be_u64, put_be_u16, put_be_u32};
+use crate::disk::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
+use crate::disk::checksum::crc32c;
+use crate::disk::endian::{DiskOffset, be_u16, be_u32, be_u64, put_be_u16, put_be_u32};
+use crate::disk_format::extent::{ExtentTree, ExtentTreeContext};
+use crate::disk_format::inode::Inode;
+use crate::disk_format::superblock::RecoveryState;
 use crate::error::{Error, Result};
-use crate::extent::{ExtentTree, ExtentTreeContext};
-use crate::inode::Inode;
-use crate::superblock::RecoveryState;
 use crate::volume::MetadataBlock;
 
 // Common JBD2 block header fields. JBD2 stores its control structures big-endian.
@@ -1206,7 +1206,7 @@ struct InternalJournalLayout {
 
 impl InternalJournalLayout {
     /// Converts inode extents into a contiguous logical journal layout.
-    fn new(extents: &[crate::extent::Extent], capacity_blocks: u32) -> Result<Self> {
+    fn new(extents: &[crate::disk_format::extent::Extent], capacity_blocks: u32) -> Result<Self> {
         let mut mapped = Vec::with_capacity(extents.len());
         for extent in extents {
             let len = extent.len().as_u32();

@@ -4,9 +4,9 @@ use alloc::{vec, vec::Vec};
 
 use sha2::{Digest, Sha256, Sha512};
 
-use crate::block::BlockSize;
+use crate::disk::block::BlockSize;
+use crate::disk_format::inode::FileSize;
 use crate::error::{Error, Result};
-use crate::inode::FileSize;
 
 /// Serialized Linux `struct fsverity_descriptor` size without signature bytes.
 pub const FSVERITY_DESCRIPTOR_BYTES: usize = 256;

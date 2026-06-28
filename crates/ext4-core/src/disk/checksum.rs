@@ -4,7 +4,7 @@
 //! and byte ranges. Feature-specific seed construction stays with the parser that
 //! understands that structure.
 
-use crate::endian::{DiskByteLen, DiskOffset, DiskRange, le_u32};
+use crate::disk::endian::{DiskByteLen, DiskOffset, DiskRange, le_u32};
 use crate::error::{Error, Result};
 
 /// Reversed Castagnoli polynomial used by ext4 metadata checksums.

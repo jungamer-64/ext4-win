@@ -15,12 +15,12 @@ use crate::{
         CreateDisposition, CreateParameters, CreateStack, CreateTargetRequirement, DesiredAccess,
         DispatchTarget, ShareAccess,
     },
-    metadata,
+    kernel::status::{DriverError, DriverResult},
+    request::metadata,
     state::{
         FileControlBlock, KernelDevice, KernelFileObject, MountedVolumeDevice, OpenedHandle,
         OpenedPath, UninitializedFileObject, VolumeControlBlock, release_file_control_block,
     },
-    status::{DriverError, DriverResult},
 };
 
 /// UTF-16 backslash separator.
@@ -50,7 +50,7 @@ struct CreateRequest {
 
 impl CreateRequest {
     /// Decodes the create request from the current IRP stack.
-    fn decode(target: DispatchTarget) -> Result<Self, crate::status::DriverError> {
+    fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
         let stack = target.current_stack()?.create()?;
         let file_object = UninitializedFileObject::decode(stack.file_object())?;
         Ok(Self {
@@ -237,7 +237,7 @@ fn truncate_existing_file(
     };
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let file = transaction.file(file_id)?;
     transaction.truncate_file(file, FileSize::from_bytes(0))?;
     transaction.commit()?;
@@ -322,7 +322,7 @@ fn create_child(
     };
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let parent = transaction.directory(parent)?;
     let node = match requirement {
         CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {

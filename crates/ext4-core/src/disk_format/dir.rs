@@ -2,14 +2,14 @@
 
 use alloc::vec::Vec;
 
-use crate::checksum::crc32c;
-use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
-use crate::error::{Error, Result};
-use crate::inode::{DirectoryStorageKind, InodeId};
-use crate::name::Ext4Name;
-use crate::superblock::{
+use crate::disk::checksum::crc32c;
+use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::disk_format::inode::{DirectoryStorageKind, InodeId};
+use crate::disk_format::superblock::{
     ChecksumSeed, DirectoryHashByteInterpretation, DirectoryHashSeed, DirectoryHashVersion,
 };
+use crate::error::{Error, Result};
+use crate::platform::name::Ext4Name;
 
 /// Bytes occupied by the fixed header of an ext4 directory record.
 const DIRENT_HEADER_SIZE: usize = 8;
@@ -1866,8 +1866,8 @@ mod tests {
         DirectoryHashSeed, DirectoryHashVersion, DirectoryLayout, Error, HtreeBuildPlan, Result,
         build_htree_directory,
     };
-    use crate::inode::{DirectoryStorageKind, InodeId};
-    use crate::name::Ext4Name;
+    use crate::disk_format::inode::{DirectoryStorageKind, InodeId};
+    use crate::platform::name::Ext4Name;
 
     fn inode(value: u32) -> Result<InodeId> {
         InodeId::try_from(value)
@@ -2318,8 +2318,8 @@ mod directory_hash_tests {
     use alloc::vec;
 
     use super::{DirectoryHash, DirectoryHashScheme};
-    use crate::name::Ext4Name;
-    use crate::superblock::{DirectoryHashSeed, DirectoryHashVersion};
+    use crate::disk_format::superblock::{DirectoryHashSeed, DirectoryHashVersion};
+    use crate::platform::name::Ext4Name;
 
     /// Seed supplied to the independent e2fsprogs `debugfs dx_hash` oracle.
     const ORACLE_SEED: DirectoryHashSeed =
@@ -2331,7 +2331,7 @@ mod directory_hash_tests {
     /// results.
     #[test]
     fn all_versions_match_high_byte_known_answers() {
-        let Ok(name) = Ext4Name::new(&[0x80, b'x']) else {
+        let Ok(name) = Ext4Name::from_disk(&[0x80, b'x']) else {
             return;
         };
         let cases = [

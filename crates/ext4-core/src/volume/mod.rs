@@ -2,44 +2,46 @@
 
 use alloc::{vec, vec::Vec};
 
-use crate::acl::{PosixAcl, PosixAclKind};
-use crate::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
-use crate::checksum::crc32c;
-use crate::dir::{
+use crate::disk::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
+use crate::disk::checksum::crc32c;
+use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::disk_format::acl::{PosixAcl, PosixAclKind};
+use crate::disk_format::dir::{
     DirectoryBlock, DirectoryBlockData, DirectoryChecksum, DirectoryEntry, DirectoryEntryKind,
     DirectoryLayout, build_htree_directory,
 };
-use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
-use crate::error::{Error, Result};
-use crate::extent::{
+use crate::disk_format::extent::{
     BlockMapping, Extent, ExtentLength, ExtentTree, ExtentTreeContext, LogicalBlock,
     MutableExtentTree, SerializedExtentTree,
 };
-use crate::fscrypt::{
-    FscryptContentsKey, FscryptContextV2, FscryptFileNonce, FscryptFilenamePadding,
-    FscryptFilenamesKey, FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey,
-    FscryptNoKeyName, FscryptNoNonceGenerator, FscryptNonceGenerator,
-};
-use crate::group::BlockGroupDescriptor;
-use crate::inode::{
+use crate::disk_format::group::BlockGroupDescriptor;
+use crate::disk_format::inode::{
     DirectoryStorageKind, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
     FileOffset, FileSize, Inode, InodeId, InodeKind, InodeMutation, InodeProtection, InodeStorage,
     NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
-use crate::journal::{Journal, LoadedJournal};
-use crate::name::Ext4Name;
-use crate::name::WindowsName;
-use crate::superblock::{
+use crate::disk_format::journal::{Journal, LoadedJournal};
+use crate::disk_format::superblock::{
     BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel, FreeClusterDelta,
     InodeTimestampEncoding, JournalMode, MetadataChecksum, RecoveryState, SparseSuperblockLayout,
     Superblock, XattrMutationSupport,
 };
-use crate::verity::{
+use crate::disk_format::xattr::{
+    self as xattr_storage, InodeXattrSet, XattrName, XattrSet, XattrValue,
+};
+use crate::error::{Error, Result};
+use crate::platform::name::Ext4Name;
+use crate::platform::name::WindowsName;
+use crate::platform::windows::WindowsOverlay;
+use crate::protection::fscrypt::{
+    FscryptContentsKey, FscryptContextV2, FscryptFileNonce, FscryptFilenamePadding,
+    FscryptFilenamesKey, FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey,
+    FscryptNoKeyName, FscryptNoNonceGenerator, FscryptNonceGenerator,
+};
+use crate::protection::verity::{
     Ext4VerityMetadata, Ext4VerityMetadataLayout, FSVERITY_DESCRIPTOR_BYTES, FsverityDescriptor,
     FsverityEnable, FsverityMerkleTree,
 };
-use crate::windows::WindowsOverlay;
-use crate::xattr::{self as xattr_storage, InodeXattrSet, XattrName, XattrSet, XattrValue};
 
 /// Builds a volume-owned on-disk field offset.
 const fn disk_offset(offset: usize) -> DiskOffset {
@@ -5875,7 +5877,7 @@ fn inode_offset_on_device(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inode::{Ext4Gid, Ext4Uid};
+    use crate::disk_format::inode::{Ext4Gid, Ext4Uid};
 
     fn raw_record(value: u32) -> Result<RawInodeRecord> {
         Ok(RawInodeRecord {

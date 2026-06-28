@@ -16,10 +16,13 @@ use wdk_sys::{
     SHARE_ACCESS, STATUS_SUCCESS, VPB_MOUNTED,
 };
 
-use crate::cng::CngFscryptNonceGenerator;
 use crate::irp::{DesiredAccess, ShareAccess};
-use crate::status::{DriverError, DriverResult};
-use crate::{block_device::KernelBlockDevice, ffi};
+use crate::kernel::cng::CngFscryptNonceGenerator;
+use crate::kernel::status::{DriverError, DriverResult};
+use crate::kernel::{block_device::KernelBlockDevice, ffi};
+
+/// Registered control device observed by the unload callback.
+static mut CONTROL_DEVICE: Option<ControlDevice> = None;
 
 /// Non-null kernel device object pointer at the WDK boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,6 +199,16 @@ impl ControlDevice {
     /// Returns the raw WDK device pointer for FFI calls.
     pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
         self.device.as_ptr()
+    }
+}
+
+/// Publishes the registered control device for driver unload teardown.
+pub(crate) fn publish_control_device(control_device: ControlDevice) {
+    let control_device_slot = core::ptr::addr_of_mut!(CONTROL_DEVICE);
+    unsafe {
+        // SAFETY: `control_device_slot` points to the driver-owned global state.
+        // Raw pointer write avoids borrowing the mutable static.
+        core::ptr::write(control_device_slot, Some(control_device));
     }
 }
 
@@ -955,7 +968,7 @@ pub(crate) fn release_file_control_block(fcb: NonNull<FileControlBlock>) {
 
 /// Driver unload callback registered in the driver object.
 pub(crate) unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {
-    let control_device = core::ptr::addr_of_mut!(crate::CONTROL_DEVICE);
+    let control_device = core::ptr::addr_of_mut!(CONTROL_DEVICE);
     let device = unsafe {
         // SAFETY: `control_device` points to the driver-owned global state.
         // Replacement takes ownership of the registered device for teardown.
@@ -981,7 +994,7 @@ mod tests {
 
     use ext4_core::{DirectoryNodeId, NodeId};
 
-    use crate::status::DriverError;
+    use crate::kernel::status::DriverError;
 
     use super::{
         FileControlBlock, FileControlBlockRelease, KernelFileObject, OpenedFileObject,

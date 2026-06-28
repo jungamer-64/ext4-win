@@ -17,8 +17,8 @@ use crate::{
         DispatchTarget, DriverCompletion, QueryVolumeInformationClass, QueryVolumeStack,
         SetVolumeInformationClass, SetVolumeStack,
     },
+    kernel::status::{DriverError, DriverResult},
     state::{KernelDevice, MountedVolumeDevice, VolumeControlBlock},
-    status::{DriverError, DriverResult},
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
 
@@ -68,7 +68,7 @@ struct QueryVolumeRequest {
 
 impl QueryVolumeRequest {
     /// Decodes query-volume parameters.
-    fn decode(target: DispatchTarget) -> Result<Self, crate::status::DriverError> {
+    fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
         Ok(Self {
             device: target.device(),
             target,
@@ -90,7 +90,7 @@ struct SetVolumeRequest {
 
 impl SetVolumeRequest {
     /// Decodes set-volume parameters.
-    fn decode(target: DispatchTarget) -> Result<Self, crate::status::DriverError> {
+    fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
         Ok(Self {
             device: target.device(),
             target,
@@ -172,7 +172,7 @@ fn set_volume_label(request: SetVolumeRequest) -> DriverResult<()> {
 
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     transaction.set_volume_label(label);
     transaction.commit()?;
     MountedVolumeDevice::refresh_vpb_label(request.device, vcb).ok_or(DriverError::InvalidParameter)
@@ -431,7 +431,7 @@ mod tests {
 
     use crate::{
         irp::DriverCompletion,
-        status::DriverError,
+        kernel::status::DriverError,
         wire::{LittleEndianInput, WireOffset},
     };
 

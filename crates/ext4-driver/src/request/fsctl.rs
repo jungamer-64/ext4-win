@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use crate::irp::{DispatchTarget, DriverCompletion, FileSystemControlStack};
+use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{OpenedFileObject, VolumeControlBlock};
-use crate::status::{DriverError, DriverResult};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{
     FscryptKeyIdentifier, FscryptKeyPresence, FscryptMasterKey, FsverityBlockSize, FsverityEnable,
@@ -124,7 +124,7 @@ pub(crate) fn enable_verity(
     };
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let file = transaction.file(file_id)?;
     transaction.enable_verity(file, &enable)?;
     transaction.commit()?;

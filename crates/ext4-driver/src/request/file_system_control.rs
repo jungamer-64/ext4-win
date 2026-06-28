@@ -5,18 +5,20 @@ use alloc::boxed::Box;
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::{
-    block_device::query_device_length,
-    ffi, fsctl,
     irp::{
         DispatchTarget, DriverCompletion, FileSystemControlMinorFunction, FileSystemControlStack,
         FsControlCode, IrpBufferLength, MountVolumeStack,
     },
-    reparse,
+    kernel::{
+        block_device::query_device_length,
+        ffi,
+        status::{DriverError, DriverResult},
+    },
+    request::{fsctl, reparse},
     state::{
         KernelDevice, KernelVpb, MountCandidate, MountedVolumeDevice, MountedVolumeDeviceExtension,
         VolumeControlBlock,
     },
-    status::{DriverError, DriverResult},
 };
 
 /// Handles file-system control requests, including mount and reparse controls.
@@ -43,7 +45,7 @@ pub(crate) fn device_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp) {
         Ok(target) => {
             let _device = target.device();
-            crate::status::DriverError::InvalidDeviceRequest.ntstatus()
+            crate::kernel::status::DriverError::InvalidDeviceRequest.ntstatus()
         }
         Err(error) => error.ntstatus(),
     }
@@ -62,7 +64,7 @@ enum FileSystemControlRequest {
 
 impl FileSystemControlRequest {
     /// Decodes the current FSCTL stack location.
-    fn decode(target: DispatchTarget) -> Result<Self, crate::status::DriverError> {
+    fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
         let stack = target.current_stack()?;
         match stack.file_system_control_minor() {
             FileSystemControlMinorFunction::MountVolume => Ok(Self::MountVolume(

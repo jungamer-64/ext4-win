@@ -7,8 +7,8 @@ use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 use crate::irp::{
     DispatchTarget, DriverCompletion, EaEntryEmission, EaNameSelection, QueryEaStack, SetEaStack,
 };
+use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{FileControlBlock, OpenedFileObject, VolumeControlBlock};
-use crate::status::{DriverError, DriverResult};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
 /// Local xattr prefix used to store Windows EA records under `user.*`.
@@ -206,7 +206,7 @@ fn apply_set_ea_entries(
     };
     let mut transaction = vcb
         .volume_mut()
-        .begin_transaction(crate::time::current_ext4_timestamp()?);
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let node = transaction.node(node_id)?;
     for entry in entries {
         let name = xattr_name_from_ea_name(entry.name.as_slice())?;
@@ -521,7 +521,7 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     use crate::{
-        status::DriverError,
+        kernel::status::DriverError,
         wire::{LittleEndianInput, LittleEndianOutput},
     };
 
