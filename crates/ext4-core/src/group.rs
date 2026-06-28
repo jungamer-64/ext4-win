@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use crate::block::{BlockAddress, BlockReader, BlockSize, ByteOffset};
 use crate::checksum::{crc16, crc32c};
-use crate::endian::{le_u16, le_u32, put_le_u16};
+use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u16};
 use crate::error::{Error, Result};
 use crate::superblock::{
     BlockGroupDescriptorChecksum, BlockGroupDescriptorLayout, BlockGroupDescriptorSize,
@@ -57,6 +57,11 @@ const BG_ITABLE_UNUSED_HI_OFFSET: usize = 50;
 const BG_BLOCK_BITMAP_CSUM_HI_OFFSET: usize = 56;
 /// Offset of the high inode bitmap checksum field.
 const BG_INODE_BITMAP_CSUM_HI_OFFSET: usize = 58;
+
+/// Builds a block-group descriptor field offset.
+const fn disk_offset(offset: usize) -> DiskOffset {
+    DiskOffset::new(offset)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Decoded block group descriptor backed by its writable raw bytes.
@@ -200,13 +205,13 @@ impl BlockGroupDescriptor {
         };
         put_le_u16(
             &mut self.bytes,
-            BG_FREE_BLOCKS_LO_OFFSET,
+            disk_offset(BG_FREE_BLOCKS_LO_OFFSET),
             u16::try_from(updated & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
         if superblock.descriptor_layout().has_high_fields() {
             put_le_u16(
                 &mut self.bytes,
-                BG_FREE_BLOCKS_HI_OFFSET,
+                disk_offset(BG_FREE_BLOCKS_HI_OFFSET),
                 u16::try_from(updated >> 16).map_err(|_| Error::ArithmeticOverflow)?,
             )?;
         }
@@ -298,13 +303,13 @@ impl BlockGroupDescriptor {
         let checksum = bitmap_checksum(superblock, group, bitmap);
         put_le_u16(
             &mut self.bytes,
-            lo_offset,
+            disk_offset(lo_offset),
             u16::try_from(checksum & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
         if superblock.descriptor_layout().has_high_fields() {
             put_le_u16(
                 &mut self.bytes,
-                hi_offset,
+                disk_offset(hi_offset),
                 u16::try_from(checksum >> 16).map_err(|_| Error::ArithmeticOverflow)?,
             )?;
         }
@@ -322,7 +327,7 @@ pub(crate) fn write_block_group_descriptor_checksum(
         return Ok(());
     }
     let checksum = block_group_descriptor_checksum(superblock, group, bytes)?;
-    put_le_u16(bytes, BG_CHECKSUM_OFFSET, checksum)
+    put_le_u16(bytes, disk_offset(BG_CHECKSUM_OFFSET), checksum)
 }
 
 /// Verifies the block group descriptor checksum selected by the superblock.
@@ -334,7 +339,7 @@ fn verify_block_group_descriptor_checksum(
     if superblock.descriptor_checksum() == BlockGroupDescriptorChecksum::None {
         return Ok(());
     }
-    let expected = le_u16(bytes, BG_CHECKSUM_OFFSET)?;
+    let expected = le_u16(bytes, disk_offset(BG_CHECKSUM_OFFSET))?;
     if block_group_descriptor_checksum(superblock, group, bytes)? == expected {
         Ok(())
     } else {
@@ -434,9 +439,9 @@ fn descriptor_block_address(
     hi_offset: usize,
     layout: BlockGroupDescriptorLayout,
 ) -> Result<BlockAddress> {
-    let low = u64::from(le_u32(bytes, lo_offset)?);
+    let low = u64::from(le_u32(bytes, disk_offset(lo_offset))?);
     let high = if layout.has_high_fields() {
-        u64::from(le_u32(bytes, hi_offset)?)
+        u64::from(le_u32(bytes, disk_offset(hi_offset))?)
     } else {
         0
     };
@@ -450,9 +455,9 @@ fn descriptor_count(
     hi_offset: usize,
     layout: BlockGroupDescriptorLayout,
 ) -> Result<u32> {
-    let low = u32::from(le_u16(bytes, lo_offset)?);
+    let low = u32::from(le_u16(bytes, disk_offset(lo_offset))?);
     let high = if layout.has_high_fields() {
-        u32::from(le_u16(bytes, hi_offset)?)
+        u32::from(le_u16(bytes, disk_offset(hi_offset))?)
     } else {
         0
     };
@@ -469,13 +474,13 @@ fn write_descriptor_count(
 ) -> Result<()> {
     put_le_u16(
         bytes,
-        lo_offset,
+        disk_offset(lo_offset),
         u16::try_from(value & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
     )?;
     if layout.has_high_fields() {
         put_le_u16(
             bytes,
-            hi_offset,
+            disk_offset(hi_offset),
             u16::try_from(value >> 16).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
     }

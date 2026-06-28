@@ -2,7 +2,7 @@
 
 use alloc::{vec, vec::Vec};
 
-use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
 use crate::inode::{Ext4Gid, Ext4Permissions, Ext4Uid};
 use crate::xattr::{XattrName, XattrNamespace, XattrValue};
@@ -96,7 +96,7 @@ impl PosixAcl {
                 .ok_or(Error::ArithmeticOverflow)?
                 % ACL_ENTRY_BYTES
                 != 0
-            || le_u32(bytes, 0)? != POSIX_ACL_XATTR_VERSION
+            || le_u32(bytes, disk_offset(0))? != POSIX_ACL_XATTR_VERSION
         {
             return Err(Error::InvalidAcl);
         }
@@ -104,14 +104,14 @@ impl PosixAcl {
         let mut entries = Vec::new();
         let mut offset = ACL_HEADER_BYTES;
         while offset < bytes.len() {
-            let tag = le_u16(bytes, offset)?;
+            let tag = le_u16(bytes, disk_offset(offset))?;
             let permissions = Ext4Permissions::new(le_u16(
                 bytes,
-                offset.checked_add(2).ok_or(Error::ArithmeticOverflow)?,
+                disk_offset(offset.checked_add(2).ok_or(Error::ArithmeticOverflow)?),
             )?)?;
             let id = le_u32(
                 bytes,
-                offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+                disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
             )?;
             entries.push(parse_entry(tag, permissions, id)?);
             offset = offset
@@ -135,19 +135,19 @@ impl PosixAcl {
             )
             .ok_or(Error::ArithmeticOverflow)?;
         let mut bytes = vec![0_u8; len];
-        put_le_u32(&mut bytes, 0, POSIX_ACL_XATTR_VERSION)?;
+        put_le_u32(&mut bytes, disk_offset(0), POSIX_ACL_XATTR_VERSION)?;
         let mut offset = ACL_HEADER_BYTES;
         for entry in &self.entries {
             let (tag, permissions, id) = entry_fields(entry);
-            put_le_u16(&mut bytes, offset, tag)?;
+            put_le_u16(&mut bytes, disk_offset(offset), tag)?;
             put_le_u16(
                 &mut bytes,
-                offset.checked_add(2).ok_or(Error::ArithmeticOverflow)?,
+                disk_offset(offset.checked_add(2).ok_or(Error::ArithmeticOverflow)?),
                 permissions.as_u16(),
             )?;
             put_le_u32(
                 &mut bytes,
-                offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
+                disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
                 id,
             )?;
             offset = offset
@@ -179,6 +179,11 @@ pub enum PosixAclEntry {
     Mask(Ext4Permissions),
     /// Permissions for all other users.
     Other(Ext4Permissions),
+}
+
+/// Builds a POSIX ACL payload offset after local arithmetic has been checked.
+const fn disk_offset(offset: usize) -> DiskOffset {
+    DiskOffset::new(offset)
 }
 
 /// Parses one serialized ACL entry.

@@ -5,7 +5,7 @@ use core::cmp::Ordering;
 
 use crate::block::BlockAddress;
 use crate::checksum::crc32c;
-use crate::endian::{le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::error::{Error, Result};
 use crate::superblock::{MetadataChecksum, Superblock};
 
@@ -33,6 +33,11 @@ const EXT4_XATTR_INDEX_SECURITY: u8 = 6;
 const EXT4_XATTR_INDEX_SYSTEM: u8 = 7;
 /// Serialized index for ext4's private fscrypt context xattr.
 const EXT4_XATTR_INDEX_ENCRYPTION: u8 = 9;
+
+/// Builds an xattr structure field offset.
+const fn disk_offset(offset: usize) -> DiskOffset {
+    DiskOffset::new(offset)
+}
 /// Local name exposed for access ACLs at the public xattr boundary.
 const POSIX_ACL_ACCESS_NAME: &[u8] = b"posix_acl_access";
 /// Local name exposed for default ACLs at the public xattr boundary.
@@ -322,7 +327,7 @@ pub(crate) fn parse_inline_xattrs(region: &[u8]) -> Result<InodeXattrSet> {
     if region.len() < EXT4_XATTR_INODE_HEADER_BYTES || region.iter().all(|byte| *byte == 0) {
         return Ok(InodeXattrSet::empty());
     }
-    if le_u32(region, 0)? != EXT4_XATTR_MAGIC {
+    if le_u32(region, disk_offset(0))? != EXT4_XATTR_MAGIC {
         return Err(Error::InvalidXattr);
     }
     parse_xattr_entries(
@@ -342,7 +347,7 @@ pub(crate) fn serialize_inline_xattrs(set: &InodeXattrSet, capacity: usize) -> R
     if capacity < EXT4_XATTR_INODE_HEADER_BYTES {
         return Err(Error::NoSpace);
     }
-    put_le_u32(&mut bytes, 0, EXT4_XATTR_MAGIC)?;
+    put_le_u32(&mut bytes, disk_offset(0), EXT4_XATTR_MAGIC)?;
     serialize_xattr_entries(
         set,
         &mut bytes,
@@ -380,9 +385,9 @@ pub(crate) fn serialize_external_xattr_block(
         return Err(Error::InvalidXattr);
     }
     let mut bytes = vec![0_u8; block_size];
-    put_le_u32(&mut bytes, 0, EXT4_XATTR_MAGIC)?;
-    put_le_u32(&mut bytes, 4, 1)?;
-    put_le_u32(&mut bytes, 8, 1)?;
+    put_le_u32(&mut bytes, disk_offset(0), EXT4_XATTR_MAGIC)?;
+    put_le_u32(&mut bytes, disk_offset(4), 1)?;
+    put_le_u32(&mut bytes, disk_offset(8), 1)?;
     serialize_xattr_entries(
         set,
         &mut bytes,
@@ -408,10 +413,10 @@ pub(crate) fn ensure_external_xattrs_fit(set: &InodeXattrSet, block_size: usize)
 
 /// Reads the external xattr block reference count.
 pub(crate) fn external_xattr_refcount(bytes: &[u8]) -> Result<u32> {
-    if le_u32(bytes, 0)? != EXT4_XATTR_MAGIC {
+    if le_u32(bytes, disk_offset(0))? != EXT4_XATTR_MAGIC {
         return Err(Error::InvalidXattr);
     }
-    let refcount = le_u32(bytes, 4)?;
+    let refcount = le_u32(bytes, disk_offset(4))?;
     if refcount == 0 {
         return Err(Error::InvalidXattr);
     }
@@ -428,10 +433,10 @@ pub(crate) fn set_external_xattr_refcount(
     if refcount == 0 {
         return Err(Error::InvalidXattr);
     }
-    if le_u32(bytes, 0)? != EXT4_XATTR_MAGIC {
+    if le_u32(bytes, disk_offset(0))? != EXT4_XATTR_MAGIC {
         return Err(Error::InvalidXattr);
     }
-    put_le_u32(bytes, 4, refcount)?;
+    put_le_u32(bytes, disk_offset(4), refcount)?;
     refresh_external_xattr_checksum(bytes, block, superblock)
 }
 
@@ -526,7 +531,7 @@ fn parse_xattr_entries(
         {
             return Err(Error::InvalidXattr);
         }
-        if le_u32(storage, cursor)? == 0 {
+        if le_u32(storage, disk_offset(cursor))? == 0 {
             entries_end = align_up(
                 cursor
                     .checked_add(EXT4_XATTR_TERMINATOR_BYTES)
@@ -545,23 +550,12 @@ fn parse_xattr_entries(
         let index = *storage
             .get(cursor.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
             .ok_or(Error::InvalidXattr)?;
-        let value_offset = usize::from(le_u16(
-            storage,
-            cursor.checked_add(2).ok_or(Error::ArithmeticOverflow)?,
-        )?);
-        let value_inum = le_u32(
-            storage,
-            cursor.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
-        )?;
-        let value_size = usize::try_from(le_u32(
-            storage,
-            cursor.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
-        )?)
-        .map_err(|_| Error::ArithmeticOverflow)?;
-        let entry_hash = le_u32(
-            storage,
-            cursor.checked_add(12).ok_or(Error::ArithmeticOverflow)?,
-        )?;
+        let value_offset = usize::from(le_u16(storage, disk_offset(cursor).checked_add_bytes(2)?)?);
+        let value_inum = le_u32(storage, disk_offset(cursor).checked_add_bytes(4)?)?;
+        let value_size =
+            usize::try_from(le_u32(storage, disk_offset(cursor).checked_add_bytes(8)?)?)
+                .map_err(|_| Error::ArithmeticOverflow)?;
+        let entry_hash = le_u32(storage, disk_offset(cursor).checked_add_bytes(12)?)?;
         if value_inum != 0 || (placement == XattrValuePlacement::InInode && entry_hash != 0) {
             return Err(Error::InvalidXattr);
         }
@@ -701,25 +695,17 @@ fn serialize_xattr_entries(
             .ok_or(Error::NoSpace)? = entry.key.index;
         put_le_u16(
             storage,
-            cursor.checked_add(2).ok_or(Error::ArithmeticOverflow)?,
+            disk_offset(cursor).checked_add_bytes(2)?,
             u16::try_from(*value_offsets.get(index).ok_or(Error::ArithmeticOverflow)?)
                 .map_err(|_| Error::NoSpace)?,
         )?;
+        put_le_u32(storage, disk_offset(cursor).checked_add_bytes(4)?, 0)?;
         put_le_u32(
             storage,
-            cursor.checked_add(4).ok_or(Error::ArithmeticOverflow)?,
-            0,
-        )?;
-        put_le_u32(
-            storage,
-            cursor.checked_add(8).ok_or(Error::ArithmeticOverflow)?,
+            disk_offset(cursor).checked_add_bytes(8)?,
             u32::try_from(entry.value.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        put_le_u32(
-            storage,
-            cursor.checked_add(12).ok_or(Error::ArithmeticOverflow)?,
-            0,
-        )?;
+        put_le_u32(storage, disk_offset(cursor).checked_add_bytes(12)?, 0)?;
         let name_start = cursor
             .checked_add(EXT4_XATTR_ENTRY_BYTES)
             .ok_or(Error::ArithmeticOverflow)?;
@@ -734,7 +720,7 @@ fn serialize_xattr_entries(
     }
 
     if placement == XattrValuePlacement::ExternalBlock {
-        put_le_u32(storage, 12, 0)?;
+        put_le_u32(storage, disk_offset(12), 0)?;
     }
     Ok(())
 }
@@ -816,16 +802,16 @@ fn validate_external_xattr_block(
     superblock: &Superblock,
 ) -> Result<()> {
     if bytes.len() < EXT4_XATTR_BLOCK_HEADER_BYTES
-        || le_u32(bytes, 0)? != EXT4_XATTR_MAGIC
-        || le_u32(bytes, 4)? == 0
-        || le_u32(bytes, 8)? != 1
+        || le_u32(bytes, disk_offset(0))? != EXT4_XATTR_MAGIC
+        || le_u32(bytes, disk_offset(4))? == 0
+        || le_u32(bytes, disk_offset(8))? != 1
     {
         return Err(Error::InvalidXattr);
     }
     if superblock.metadata_checksum() == MetadataChecksum::Crc32c {
-        let expected = le_u32(bytes, 16)?;
+        let expected = le_u32(bytes, disk_offset(16))?;
         let mut checksum_bytes = bytes.to_vec();
-        put_le_u32(&mut checksum_bytes, 16, 0)?;
+        put_le_u32(&mut checksum_bytes, disk_offset(16), 0)?;
         let seed = crc32c(
             superblock.checksum_seed().as_u32(),
             &block.get().to_le_bytes(),
@@ -843,14 +829,14 @@ fn refresh_external_xattr_checksum(
     block: BlockAddress,
     superblock: &Superblock,
 ) -> Result<()> {
-    put_le_u32(bytes, 16, 0)?;
+    put_le_u32(bytes, disk_offset(16), 0)?;
     if superblock.metadata_checksum() == MetadataChecksum::Crc32c {
         let seed = crc32c(
             superblock.checksum_seed().as_u32(),
             &block.get().to_le_bytes(),
         );
         let checksum = crc32c(seed, bytes);
-        put_le_u32(bytes, 16, checksum)?;
+        put_le_u32(bytes, disk_offset(16), checksum)?;
     }
     Ok(())
 }

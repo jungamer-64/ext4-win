@@ -13,16 +13,17 @@ use ext4_core::{
 use wdk_sys::{LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::irp::{
-    DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
-    DirectoryPatternInput, DispatchTarget, DriverCompletion, IrpBufferLength, QueryDirectoryStack,
-    QueryFileInformationClass, QueryFileStack, SetFileInformationClass, SetFileStack,
+    DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
+    DirectoryInformationClass, DirectoryPatternInput, DispatchTarget, DriverCompletion,
+    IrpBufferLength, QueryDirectoryStack, QueryFileInformationClass, QueryFileStack,
+    SetFileInformationClass, SetFileStack,
 };
 use crate::state::{
-    CloseDisposition, DirectoryCursor, FileControlBlock, OpenedHandle, OpenedPath,
-    VolumeControlBlock, file_control_block, opened_handle, release_file_control_block,
+    CloseDisposition, DirectoryCursor, FileControlBlock, KernelFileObject, OpenedFileObject,
+    OpenedHandle, OpenedPath, VolumeControlBlock, release_file_control_block,
 };
 use crate::status::{DriverError, DriverResult};
-use crate::wire::{CheckedByteRange, LittleEndianInput, LittleEndianOutput};
+use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
 /// Handles cleanup IRPs.
 pub(crate) fn cleanup(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
@@ -91,13 +92,16 @@ pub(crate) fn flush(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 /// Handles file information queries.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(QueryFileRequest::decode) {
-        Ok(request) => match query_file_information(request) {
-            Ok(completion) => {
-                request.target.complete(completion);
-                STATUS_SUCCESS
+        Ok(request) => {
+            let target = request.target;
+            match query_file_information(request) {
+                Ok(completion) => {
+                    target.complete(completion);
+                    STATUS_SUCCESS
+                }
+                Err(error) => error.ntstatus(),
             }
-            Err(error) => error.ntstatus(),
-        },
+        }
         Err(error) => error.ntstatus(),
     }
 }
@@ -105,13 +109,16 @@ pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 /// Handles file information mutations.
 pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp).and_then(SetFileRequest::decode) {
-        Ok(request) => match set_file_information(request) {
-            Ok(completion) => {
-                request.target.complete(completion);
-                STATUS_SUCCESS
+        Ok(request) => {
+            let target = request.target;
+            match set_file_information(request) {
+                Ok(completion) => {
+                    target.complete(completion);
+                    STATUS_SUCCESS
+                }
+                Err(error) => error.ntstatus(),
             }
-            Err(error) => error.ntstatus(),
-        },
+        }
         Err(error) => error.ntstatus(),
     }
 }
@@ -120,23 +127,21 @@ pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 pub(crate) fn directory_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp) {
         Ok(target) => match target.current_stack() {
-            Ok(stack) if u32::from(stack.minor_function()) == wdk_sys::IRP_MN_QUERY_DIRECTORY => {
-                match query_directory(target) {
+            Ok(stack) => match stack.directory_control_minor() {
+                DirectoryControlMinorFunction::QueryDirectory => match query_directory(target) {
                     Ok(completion) => {
                         target.complete(completion);
                         STATUS_SUCCESS
                     }
                     Err(error) => error.ntstatus(),
+                },
+                DirectoryControlMinorFunction::NotifyChangeDirectory => {
+                    DriverError::NotSupported.ntstatus()
                 }
-            }
-            Ok(stack)
-                if u32::from(stack.minor_function()) == wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY
-                    || u32::from(stack.minor_function())
-                        == wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX =>
-            {
-                DriverError::NotSupported.ntstatus()
-            }
-            Ok(_) => DriverError::InvalidDeviceRequest.ntstatus(),
+                DirectoryControlMinorFunction::Unsupported => {
+                    DriverError::InvalidDeviceRequest.ntstatus()
+                }
+            },
             Err(error) => error.ntstatus(),
         },
         Err(error) => error.ntstatus(),
@@ -155,70 +160,84 @@ pub(crate) fn lock_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 fn decoded_not_supported(device: PDEVICE_OBJECT, irp: PIRP) -> DriverResult<()> {
     let target = DispatchTarget::decode(device, irp)?;
     let _device = target.device();
-    let _irp = target.irp();
     Ok(())
 }
 
 /// Decoded query-file-information request.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct QueryFileRequest {
     /// Dispatch target receiving the query.
     target: DispatchTarget,
     /// Decoded query stack.
     stack: QueryFileStack,
+    /// Opened file contexts decoded before handler execution.
+    opened_file: OpenedFileObject,
 }
 
 impl QueryFileRequest {
     /// Decodes a query-file-information request.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
+        let stack = target.current_stack()?.query_file()?;
+        let opened_file = OpenedFileObject::decode(stack.file_object())?;
         Ok(Self {
             target,
-            stack: target.current_stack()?.query_file()?,
+            stack,
+            opened_file,
         })
     }
 }
 
 /// Decoded set-file-information request.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct SetFileRequest {
     /// Dispatch target receiving the mutation.
     target: DispatchTarget,
     /// Decoded set stack.
     stack: SetFileStack,
+    /// Opened file contexts decoded before handler execution.
+    opened_file: OpenedFileObject,
 }
 
 impl SetFileRequest {
     /// Decodes a set-file-information request.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
+        let stack = target.current_stack()?.set_file()?;
+        let opened_file = OpenedFileObject::decode(stack.file_object())?;
         Ok(Self {
             target,
-            stack: target.current_stack()?.set_file()?,
+            stack,
+            opened_file,
         })
     }
 }
 
 /// Decoded query-directory request.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct QueryDirectoryRequest {
     /// Dispatch target receiving the query.
     target: DispatchTarget,
     /// Decoded query-directory stack.
     stack: QueryDirectoryStack,
+    /// Opened directory contexts decoded before handler execution.
+    opened_file: OpenedFileObject,
 }
 
 impl QueryDirectoryRequest {
     /// Decodes a query-directory request.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
+        let stack = target.current_stack()?.query_directory()?;
+        let opened_file = OpenedFileObject::decode(stack.file_object())?;
         Ok(Self {
             target,
-            stack: target.current_stack()?.query_directory()?,
+            stack,
+            opened_file,
         })
     }
 }
 
 /// Packs one supported file information class.
 fn query_file_information(request: QueryFileRequest) -> DriverResult<DriverCompletion> {
-    let metadata = load_file_metadata(request.stack.file_object())?;
+    let metadata = load_file_metadata(&request.opened_file)?;
     let buffer = request
         .target
         .system_buffer()
@@ -229,7 +248,7 @@ fn query_file_information(request: QueryFileRequest) -> DriverResult<DriverCompl
         QueryFileInformationClass::Standard => pack_standard_information(buffer, length, metadata),
         QueryFileInformationClass::Internal => pack_internal_information(buffer, length, metadata),
         QueryFileInformationClass::Position => {
-            pack_position_information(buffer, length, request.stack.file_object())
+            pack_position_information(buffer, length, &request.opened_file)
         }
         QueryFileInformationClass::NetworkOpen => {
             pack_network_open_information(buffer, length, metadata)
@@ -257,14 +276,14 @@ fn set_basic_information(request: SetFileRequest) -> DriverResult<()> {
         request.target,
         request.stack.length(),
     )?;
-    let metadata = load_file_metadata(request.stack.file_object())?;
+    let metadata = load_file_metadata(&request.opened_file)?;
     let times = set_basic_times(metadata.times, info)?;
     let overlay = set_basic_overlay(metadata, info.FileAttributes)?;
     if times == metadata.times && overlay.is_none() {
         return Ok(());
     }
 
-    let context = opened_file_context(request.stack.file_object())?;
+    let context = opened_file_context(&request.opened_file);
     let mut vcb = context.volume;
     let vcb = unsafe {
         // SAFETY: FCBs are constructed only from live mounted VCB pointers and
@@ -293,7 +312,7 @@ fn set_end_of_file_information(request: SetFileRequest) -> DriverResult<()> {
         request.stack.length(),
     )?;
     set_regular_file_size(
-        request.stack.file_object(),
+        &request.opened_file,
         file_size_from_large_integer(info.EndOfFile)?,
     )
 }
@@ -305,7 +324,7 @@ fn set_allocation_information(request: SetFileRequest) -> DriverResult<()> {
         request.stack.length(),
     )?;
     let requested = file_size_from_large_integer(info.AllocationSize)?;
-    let context = opened_file_context(request.stack.file_object())?;
+    let context = opened_file_context(&request.opened_file);
     let NodeId::File(file_id) = context.node else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
     };
@@ -318,22 +337,16 @@ fn set_allocation_information(request: SetFileRequest) -> DriverResult<()> {
     if requested >= current {
         return Ok(());
     }
-    set_regular_file_size(request.stack.file_object(), requested)
+    set_regular_file_size(&request.opened_file, requested)
 }
 
 /// Applies FILE_DISPOSITION_INFORMATION to the handle-local close disposition.
-fn set_disposition_information(request: SetFileRequest) -> DriverResult<()> {
+fn set_disposition_information(mut request: SetFileRequest) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION>(
         request.target,
         request.stack.length(),
     )?;
-    let mut handle = opened_handle(request.stack.file_object())?;
-    let handle = unsafe {
-        // SAFETY: Successful create stores Box<OpenedHandle> in
-        // FsContext2 until close releases it, and this mutation runs while the
-        // FILE_OBJECT is active.
-        handle.as_mut()
-    };
+    let handle = request.opened_file.handle_mut();
     if info.DeleteFile == 0 {
         handle.keep_on_close();
     } else {
@@ -343,32 +356,18 @@ fn set_disposition_information(request: SetFileRequest) -> DriverResult<()> {
 }
 
 /// Applies FILE_RENAME_INFORMATION to the opened path.
-fn set_rename_information(request: SetFileRequest) -> DriverResult<()> {
+fn set_rename_information(mut request: SetFileRequest) -> DriverResult<()> {
     let rename = RenameInformation::parse(request.target, request.stack.length())?;
 
-    let fcb = file_control_block(request.stack.file_object())?;
-    let fcb = unsafe {
-        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
-        // until close releases it, and this mutation runs while the
-        // FILE_OBJECT is active.
-        fcb.as_ref()
-    };
-    let mut handle = opened_handle(request.stack.file_object())?;
-    let handle = unsafe {
-        // SAFETY: Successful create stores Box<OpenedHandle> in
-        // FsContext2 until close releases it, and this mutation runs while the
-        // FILE_OBJECT is active.
-        handle.as_mut()
-    };
     let OpenedPath::Child {
         parent: source_parent,
         name: source_name,
-    } = handle.path().clone()
+    } = request.opened_file.handle().path().clone()
     else {
         return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));
     };
 
-    let mut vcb = fcb.volume();
+    let mut vcb = request.opened_file.volume();
     let vcb = unsafe {
         // SAFETY: FCBs are constructed only from live mounted VCB pointers and
         // remain valid while file objects are open. The mutable borrow is the
@@ -383,6 +382,7 @@ fn set_rename_information(request: SetFileRequest) -> DriverResult<()> {
     let target_parent = transaction.directory(target_parent)?;
     transaction.rename_child(source_parent, &source_name, target_parent, &target_name)?;
     transaction.commit()?;
+    let handle = request.opened_file.handle_mut();
     handle.replace_path(OpenedPath::Child {
         parent: target_parent.id(),
         name: target_name,
@@ -391,11 +391,8 @@ fn set_rename_information(request: SetFileRequest) -> DriverResult<()> {
 }
 
 /// Sets a regular file size by extending sparse or truncating allocated ranges.
-fn set_regular_file_size(
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
-    new_size: FileSize,
-) -> DriverResult<()> {
-    let context = opened_file_context(file_object)?;
+fn set_regular_file_size(opened_file: &OpenedFileObject, new_size: FileSize) -> DriverResult<()> {
+    let context = opened_file_context(opened_file);
     let NodeId::File(file_id) = context.node else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
     };
@@ -426,22 +423,20 @@ fn set_regular_file_size(
 
 /// Packs directory entries into the caller's query-directory buffer.
 fn query_directory(target: DispatchTarget) -> DriverResult<DriverCompletion> {
-    let request = QueryDirectoryRequest::decode(target)?;
+    let mut request = QueryDirectoryRequest::decode(target)?;
     let class = request.stack.information_class();
     let pattern = DirectoryPattern::from_stack(request.stack)?;
     let length = request.stack.length().as_usize();
     let mut buffer = request.target.data_buffer(length)?;
     let buffer = buffer.as_mut_slice();
 
-    let fcb = file_control_block(request.stack.file_object())?;
-    let fcb = unsafe {
-        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
-        // until close releases it, and this query runs while the FILE_OBJECT is
-        // active.
-        fcb.as_ref()
+    let volume = request.opened_file.volume();
+    let vcb = unsafe {
+        // SAFETY: OpenedFileObject is decoded from a live FCB whose VCB
+        // pointer remains valid for the opened FILE_OBJECT lifetime.
+        volume.as_ref()
     };
-    let vcb = volume_control_block(fcb);
-    let NodeId::Directory(directory_id) = fcb.node() else {
+    let NodeId::Directory(directory_id) = request.opened_file.node() else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
     };
     let directory = match vcb.volume().load_node(directory_id.inode())? {
@@ -452,13 +447,7 @@ fn query_directory(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     };
     let entries = vcb.volume().read_directory(&directory)?;
 
-    let mut handle = opened_handle(request.stack.file_object())?;
-    let handle = unsafe {
-        // SAFETY: Successful create stores Box<OpenedHandle> in
-        // FsContext2 until close releases it, and this query runs while the
-        // FILE_OBJECT is active.
-        handle.as_mut()
-    };
+    let handle = request.opened_file.handle_mut();
     let Some(cursor) = handle.directory_cursor_mut() else {
         return Err(DriverError::InvalidParameter);
     };
@@ -691,7 +680,7 @@ fn emit_directory_entries(
                 .checked_sub(previous_start)
                 .ok_or(DriverError::InvalidParameter)?;
             LittleEndianOutput::new(buffer).write_u32(
-                field_offset(previous_start, DIRECTORY_NEXT_ENTRY_OFFSET)?,
+                record_field_offset(previous_start, DIRECTORY_NEXT_ENTRY_OFFSET)?,
                 u32::try_from(next_offset).map_err(|_| DriverError::InvalidParameter)?,
             )?;
         }
@@ -731,54 +720,54 @@ fn pack_directory_record(
 ) -> DriverResult<()> {
     clear_record(buffer, start, layout.unpadded_size)?;
     LittleEndianOutput::new(buffer)
-        .write_u32(field_offset(start, DIRECTORY_NEXT_ENTRY_OFFSET)?, 0)?;
+        .write_u32(record_field_offset(start, DIRECTORY_NEXT_ENTRY_OFFSET)?, 0)?;
     LittleEndianOutput::new(buffer).write_u32(
-        field_offset(start, DIRECTORY_FILE_INDEX_OFFSET)?,
+        record_field_offset(start, DIRECTORY_FILE_INDEX_OFFSET)?,
         file_index,
     )?;
     LittleEndianOutput::new(buffer).write_bytes(
-        field_offset(start, DIRECTORY_CREATION_TIME_OFFSET)?,
+        record_field_offset(start, DIRECTORY_CREATION_TIME_OFFSET)?,
         &windows_time_quad(metadata.times.created()).to_le_bytes(),
     )?;
     LittleEndianOutput::new(buffer).write_bytes(
-        field_offset(start, DIRECTORY_LAST_ACCESS_TIME_OFFSET)?,
+        record_field_offset(start, DIRECTORY_LAST_ACCESS_TIME_OFFSET)?,
         &windows_time_quad(metadata.times.accessed()).to_le_bytes(),
     )?;
     LittleEndianOutput::new(buffer).write_bytes(
-        field_offset(start, DIRECTORY_LAST_WRITE_TIME_OFFSET)?,
+        record_field_offset(start, DIRECTORY_LAST_WRITE_TIME_OFFSET)?,
         &windows_time_quad(metadata.times.modified()).to_le_bytes(),
     )?;
     LittleEndianOutput::new(buffer).write_bytes(
-        field_offset(start, DIRECTORY_CHANGE_TIME_OFFSET)?,
+        record_field_offset(start, DIRECTORY_CHANGE_TIME_OFFSET)?,
         &windows_time_quad(metadata.times.changed()).to_le_bytes(),
     )?;
     LittleEndianOutput::new(buffer).write_bytes(
-        field_offset(start, DIRECTORY_END_OF_FILE_OFFSET)?,
+        record_field_offset(start, DIRECTORY_END_OF_FILE_OFFSET)?,
         &signed_i64(metadata.size.bytes())?.to_le_bytes(),
     )?;
     LittleEndianOutput::new(buffer).write_bytes(
-        field_offset(start, DIRECTORY_ALLOCATION_SIZE_OFFSET)?,
+        record_field_offset(start, DIRECTORY_ALLOCATION_SIZE_OFFSET)?,
         &signed_i64(allocation_size(metadata)?)?.to_le_bytes(),
     )?;
     LittleEndianOutput::new(buffer).write_u32(
-        field_offset(start, DIRECTORY_FILE_ATTRIBUTES_OFFSET)?,
+        record_field_offset(start, DIRECTORY_FILE_ATTRIBUTES_OFFSET)?,
         file_attributes(metadata),
     )?;
     LittleEndianOutput::new(buffer).write_u32(
-        field_offset(start, DIRECTORY_FILE_NAME_LENGTH_OFFSET)?,
+        record_field_offset(start, DIRECTORY_FILE_NAME_LENGTH_OFFSET)?,
         u32::try_from(utf16_byte_len(name.utf16())?).map_err(|_| DriverError::InvalidParameter)?,
     )?;
     match class {
         DirectoryInformationClass::Directory => {}
         DirectoryInformationClass::Full => {
             LittleEndianOutput::new(buffer)
-                .write_u32(field_offset(start, DIRECTORY_EA_SIZE_OFFSET)?, 0)?;
+                .write_u32(record_field_offset(start, DIRECTORY_EA_SIZE_OFFSET)?, 0)?;
         }
         DirectoryInformationClass::Both => {
             LittleEndianOutput::new(buffer)
-                .write_u32(field_offset(start, DIRECTORY_EA_SIZE_OFFSET)?, 0)?;
+                .write_u32(record_field_offset(start, DIRECTORY_EA_SIZE_OFFSET)?, 0)?;
             LittleEndianOutput::new(buffer).write_u8(
-                field_offset(start, BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET)?,
+                record_field_offset(start, BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET)?,
                 0,
             )?;
         }
@@ -801,7 +790,7 @@ fn clear_record(buffer: &mut [u8], start: usize, length: usize) -> DriverResult<
 fn write_utf16(buffer: &mut [u8], offset: usize, units: &[u16]) -> DriverResult<()> {
     let mut cursor = offset;
     for unit in units {
-        LittleEndianOutput::new(buffer).write_u16(cursor, *unit)?;
+        LittleEndianOutput::new(buffer).write_u16(wire_offset(cursor), *unit)?;
         cursor = cursor.checked_add(2).ok_or(DriverError::InvalidParameter)?;
     }
     Ok(())
@@ -809,10 +798,19 @@ fn write_utf16(buffer: &mut [u8], offset: usize, units: &[u16]) -> DriverResult<
 
 /// Returns a checked mutable byte range.
 fn mutable_bytes(buffer: &mut [u8], offset: usize, length: usize) -> DriverResult<&mut [u8]> {
-    let range = CheckedByteRange::new(offset, length)?;
-    range
+    wire_range(offset, length)?
         .write_to(buffer)
         .map_err(|_| DriverError::BufferOverflow)
+}
+
+/// Builds a wire offset after the caller has checked domain arithmetic.
+const fn wire_offset(offset: usize) -> WireOffset {
+    WireOffset::new(offset)
+}
+
+/// Builds a checked wire byte range from raw FILE_INFORMATION_CLASS fields.
+fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
+    WireRange::new(wire_offset(offset), WireByteLen::new(length))
 }
 
 /// Computes an absolute field offset from a record start.
@@ -820,6 +818,11 @@ fn field_offset(start: usize, offset: usize) -> DriverResult<usize> {
     start
         .checked_add(offset)
         .ok_or(DriverError::InvalidParameter)
+}
+
+/// Computes an absolute directory record field offset for wire output.
+fn record_field_offset(start: usize, offset: usize) -> DriverResult<WireOffset> {
+    field_offset(start, offset).map(wire_offset)
 }
 
 /// Returns the byte count for UTF-16 code units.
@@ -862,29 +865,16 @@ fn windows_time_quad(timestamp: Ext4Timestamp) -> i64 {
 }
 
 /// Applies cleanup-time namespace mutations requested by this handle.
-fn cleanup_file_object(file_object: NonNull<wdk_sys::FILE_OBJECT>) -> DriverResult<()> {
-    let fcb = file_control_block(file_object)?;
-    let fcb = unsafe {
-        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
-        // until close releases it, and cleanup runs while the FILE_OBJECT is
-        // active.
-        fcb.as_ref()
-    };
-    let mut handle = opened_handle(file_object)?;
-    let handle = unsafe {
-        // SAFETY: Successful create stores Box<OpenedHandle> in
-        // FsContext2 until close releases it, and cleanup runs while the
-        // FILE_OBJECT is active.
-        handle.as_mut()
-    };
-    if handle.close_disposition() == CloseDisposition::Keep {
+fn cleanup_file_object(file_object: KernelFileObject) -> DriverResult<()> {
+    let mut opened_file = OpenedFileObject::decode(file_object)?;
+    if opened_file.handle().close_disposition() == CloseDisposition::Keep {
         return Ok(());
     }
-    let OpenedPath::Child { parent, name } = handle.path().clone() else {
+    let OpenedPath::Child { parent, name } = opened_file.handle().path().clone() else {
         return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));
     };
 
-    let mut vcb = fcb.volume();
+    let mut vcb = opened_file.volume();
     let vcb = unsafe {
         // SAFETY: FCBs are constructed only from live mounted VCB pointers and
         // remain valid while file objects are open. The mutable borrow is the
@@ -895,13 +885,13 @@ fn cleanup_file_object(file_object: NonNull<wdk_sys::FILE_OBJECT>) -> DriverResu
         .volume_mut()
         .begin_transaction(crate::time::current_ext4_timestamp()?);
     let parent = transaction.directory(parent)?;
-    match fcb.node() {
+    match opened_file.node() {
         NodeId::File(_) => transaction.unlink_file(parent, &name)?,
         NodeId::Directory(_) => transaction.remove_empty_directory(parent, &name)?,
         NodeId::Symlink(_) => transaction.remove_symlink(parent, &name)?,
     }
     transaction.commit()?;
-    handle.keep_on_close();
+    opened_file.handle_mut().keep_on_close();
     Ok(())
 }
 
@@ -915,20 +905,11 @@ struct OpenedFileContext {
 }
 
 /// Returns the opened FCB identity and VCB pointer.
-fn opened_file_context(
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
-) -> Result<OpenedFileContext, DriverError> {
-    let fcb = file_control_block(file_object)?;
-    let fcb = unsafe {
-        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
-        // until close releases it, and this access runs while the FILE_OBJECT
-        // is active.
-        fcb.as_ref()
-    };
-    Ok(OpenedFileContext {
-        volume: fcb.volume(),
-        node: fcb.node(),
-    })
+fn opened_file_context(opened_file: &OpenedFileObject) -> OpenedFileContext {
+    OpenedFileContext {
+        volume: opened_file.volume(),
+        node: opened_file.node(),
+    }
 }
 
 /// Reads a fixed-size set-information input structure.
@@ -1008,7 +989,7 @@ impl RenameInformation {
             return Err(DriverError::NotSupported);
         }
         let name_length = usize::try_from(
-            LittleEndianInput::new(bytes).read_u32(FILE_RENAME_NAME_LENGTH_OFFSET)?,
+            LittleEndianInput::new(bytes).read_u32(wire_offset(FILE_RENAME_NAME_LENGTH_OFFSET))?,
         )
         .map_err(|_| DriverError::InvalidParameter)?;
         if name_length == 0 || name_length & 1 != 0 {
@@ -1109,8 +1090,7 @@ fn resolve_rename_target(
 
 /// Returns an immutable checked input byte range.
 fn input_range(bytes: &[u8], offset: usize, length: usize) -> DriverResult<&[u8]> {
-    let range = CheckedByteRange::new(offset, length)?;
-    range.read_from(bytes)
+    wire_range(offset, length)?.read_from(bytes)
 }
 
 /// Builds a complete ext4 timestamp set from FILE_BASIC_INFORMATION.
@@ -1262,15 +1242,9 @@ enum FileMetadataKind {
     Symlink,
 }
 
-/// Loads metadata for the file object currently being queried.
-fn load_file_metadata(file_object: NonNull<wdk_sys::FILE_OBJECT>) -> DriverResult<FileMetadata> {
-    let fcb = file_control_block(file_object)?;
-    let fcb = unsafe {
-        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
-        // until close releases it, and this query runs while the FILE_OBJECT is
-        // active.
-        fcb.as_ref()
-    };
+/// Loads metadata for the opened file currently being queried.
+fn load_file_metadata(opened_file: &OpenedFileObject) -> DriverResult<FileMetadata> {
+    let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
     let node_id = fcb.node();
     let node = vcb.volume().load_node(node_id.inode())?;
@@ -1399,8 +1373,9 @@ fn pack_internal_information(
 fn pack_position_information(
     buffer: NonNull<c_void>,
     length: usize,
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    opened_file: &OpenedFileObject,
 ) -> DriverResult<DriverCompletion> {
+    let file_object = opened_file.file_object();
     let file_object = unsafe {
         // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
         // is read only for the current byte offset field.
@@ -1525,18 +1500,13 @@ fn boolean(value: bool) -> wdk_sys::BOOLEAN {
 /// Reads a regular file through ext4-core into the IRP output buffer.
 fn read_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     let stack = target.current_stack()?.read()?;
+    let opened_file = OpenedFileObject::decode(stack.file_object())?;
     let length = stack.length().as_usize();
     if length == 0 {
         return Ok(DriverCompletion::EMPTY);
     }
     let mut output = target.data_buffer(length)?;
-    let fcb = file_control_block(stack.file_object())?;
-    let fcb = unsafe {
-        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
-        // until close releases it, and this read runs while the FILE_OBJECT is
-        // active.
-        fcb.as_ref()
-    };
+    let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
     let NodeId::File(file_id) = fcb.node() else {
         return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
@@ -1555,18 +1525,13 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
 /// Writes a regular file range through an ext4 journal transaction.
 fn write_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     let stack = target.current_stack()?.write()?;
+    let opened_file = OpenedFileObject::decode(stack.file_object())?;
     let length = stack.length().as_usize();
     if length == 0 {
         return Ok(DriverCompletion::EMPTY);
     }
     let input = target.data_buffer(length)?;
-    let fcb = file_control_block(stack.file_object())?;
-    let fcb = unsafe {
-        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
-        // until close releases it, and this write runs while the FILE_OBJECT is
-        // active.
-        fcb.as_ref()
-    };
+    let fcb = opened_file.file_control_block();
     let mut vcb = fcb.volume();
     let vcb = unsafe {
         // SAFETY: FCBs are constructed only from live mounted VCB pointers and
@@ -1597,7 +1562,7 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
 }
 
 /// Releases heap-owned FCB and CCB pointers stored on a FILE_OBJECT.
-fn release_file_contexts(mut file_object: core::ptr::NonNull<wdk_sys::FILE_OBJECT>) {
+fn release_file_contexts(file_object: KernelFileObject) {
     let file_object_ptr = file_object;
     let file_object = unsafe {
         // SAFETY: Close receives the final FILE_OBJECT and may clear its
@@ -1631,29 +1596,43 @@ mod tests {
     use wdk_sys::STATUS_NOT_SUPPORTED;
 
     #[test]
-    fn rename_replace_request_is_rejected_at_decode_boundary() {
+    fn rename_replace_flag_decode_boundary_rejects() {
         let mut input = [0_u8; super::FILE_RENAME_NAME_OFFSET + 2];
         input[super::FILE_RENAME_REPLACE_IF_EXISTS_OFFSET] = 1;
         let name_length = input.get_mut(
             super::FILE_RENAME_NAME_LENGTH_OFFSET
                 ..super::FILE_RENAME_NAME_LENGTH_OFFSET + core::mem::size_of::<u32>(),
         );
-        assert!(name_length.is_some());
+        assert!(
+            name_length.is_some(),
+            "test rename buffer contains the name length field"
+        );
         let Some(name_length) = name_length else {
             return;
         };
         name_length.copy_from_slice(&2_u32.to_le_bytes());
         let name =
             input.get_mut(super::FILE_RENAME_NAME_OFFSET..super::FILE_RENAME_NAME_OFFSET + 2);
-        assert!(name.is_some());
+        assert!(
+            name.is_some(),
+            "test rename buffer contains the first UTF-16 code unit"
+        );
         let Some(name) = name else {
             return;
         };
         name.copy_from_slice(&u16::from(b'a').to_le_bytes());
 
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object = wdk_sys::FILE_OBJECT {
+            FsContext: NonNull::<crate::state::FileControlBlock>::dangling()
+                .as_ptr()
+                .cast(),
+            FsContext2: NonNull::<crate::state::OpenedHandle>::dangling()
+                .as_ptr()
+                .cast(),
+            ..wdk_sys::FILE_OBJECT::default()
+        };
         let mut stack = wdk_sys::IO_STACK_LOCATION {
-            FileObject: file_object.as_ptr(),
+            FileObject: core::ptr::addr_of_mut!(file_object),
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
         stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
@@ -1673,9 +1652,12 @@ mod tests {
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
 
-        let device = NonNull::<wdk_sys::DEVICE_OBJECT>::dangling();
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
         assert_eq!(
-            super::set(device.as_ptr(), core::ptr::addr_of_mut!(irp)),
+            super::set(
+                core::ptr::addr_of_mut!(device),
+                core::ptr::addr_of_mut!(irp)
+            ),
             STATUS_NOT_SUPPORTED
         );
     }

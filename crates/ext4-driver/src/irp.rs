@@ -6,6 +6,7 @@ use core::ptr::NonNull;
 use ext4_core::FileOffset;
 use wdk_sys::{PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP};
 
+use crate::state::{KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb};
 use crate::status::{DriverError, DriverResult};
 
 /// Byte count completed in `IO_STATUS_BLOCK::Information`.
@@ -68,40 +69,32 @@ impl DriverCompletion {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DispatchTarget {
     /// Device object receiving the IRP.
-    device: NonNull<wdk_sys::DEVICE_OBJECT>,
+    device: KernelDevice,
     /// IRP being dispatched.
-    irp: NonNull<wdk_sys::IRP>,
+    irp: KernelIrp,
 }
 
 impl DispatchTarget {
     /// Decodes raw WDK dispatch pointers.
     pub(crate) fn decode(device: PDEVICE_OBJECT, irp: PIRP) -> Result<Self, DriverError> {
-        let Some(device) = NonNull::new(device) else {
+        let Some(device) = KernelDevice::from_raw(device) else {
             return Err(DriverError::InvalidParameter);
         };
-        let Some(irp) = NonNull::new(irp) else {
+        let Some(irp) = KernelIrp::from_raw(irp) else {
             return Err(DriverError::InvalidParameter);
         };
         Ok(Self { device, irp })
     }
 
-    /// Returns the raw device object pointer.
-    pub(crate) const fn device(self) -> NonNull<wdk_sys::DEVICE_OBJECT> {
+    /// Returns the typed device object boundary.
+    pub(crate) const fn device(self) -> KernelDevice {
         self.device
-    }
-
-    /// Returns the raw IRP pointer.
-    pub(crate) const fn irp(self) -> NonNull<wdk_sys::IRP> {
-        self.irp
     }
 
     /// Returns the buffered I/O system buffer for this IRP.
     pub(crate) fn system_buffer(self) -> Option<NonNull<core::ffi::c_void>> {
-        let irp = unsafe {
-            // SAFETY: DispatchTarget owns a non-null IRP pointer decoded from
-            // the WDK dispatch boundary for the duration of this callback.
-            self.irp.as_ref()
-        };
+        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
+        let irp = unsafe { self.irp.as_ref() };
         let system_buffer = unsafe {
             // SAFETY: SystemBuffer is the active AssociatedIrp arm for
             // buffered requests delivered to this driver.
@@ -116,11 +109,8 @@ impl DispatchTarget {
             return IrpDataBuffer::new(system_buffer.cast(), length);
         }
 
-        let irp = unsafe {
-            // SAFETY: DispatchTarget owns a non-null IRP pointer decoded from
-            // the WDK dispatch boundary for the duration of this callback.
-            self.irp.as_ref()
-        };
+        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
+        let irp = unsafe { self.irp.as_ref() };
         let Some(mdl) = NonNull::new(irp.MdlAddress) else {
             return Err(DriverError::InvalidParameter);
         };
@@ -129,11 +119,8 @@ impl DispatchTarget {
 
     /// Returns the IRP user buffer as kernel-addressable memory.
     pub(crate) fn user_buffer(self, length: usize) -> Result<IrpDataBuffer, DriverError> {
-        let irp = unsafe {
-            // SAFETY: DispatchTarget owns a non-null IRP pointer decoded from
-            // the WDK dispatch boundary for the duration of this callback.
-            self.irp.as_ref()
-        };
+        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
+        let irp = unsafe { self.irp.as_ref() };
         let Some(buffer) = NonNull::new(irp.UserBuffer) else {
             return Err(DriverError::InvalidParameter);
         };
@@ -142,11 +129,9 @@ impl DispatchTarget {
 
     /// Stores the byte count returned by this IRP.
     pub(crate) fn set_information(self, information: InformationLength) {
-        let irp = unsafe {
-            // SAFETY: DispatchTarget owns a non-null IRP pointer decoded from
-            // the WDK dispatch boundary for the duration of this callback.
-            self.irp.as_ptr().as_mut()
-        };
+        // SAFETY: `KernelIrp` owns a non-null IRP pointer, and completion writes
+        // only the IRP status block for the active dispatch.
+        let irp = unsafe { self.irp.as_mut_ptr().as_mut() };
         if let Some(irp) = irp {
             irp.IoStatus.Information = information.as_ulong_ptr();
         }
@@ -159,11 +144,8 @@ impl DispatchTarget {
 
     /// Returns the current stack location selected by the I/O Manager.
     pub(crate) fn current_stack(self) -> Result<CurrentIrpStackLocation, DriverError> {
-        let irp = unsafe {
-            // SAFETY: DispatchTarget owns a non-null IRP pointer decoded from
-            // the WDK dispatch boundary for the duration of this callback.
-            self.irp.as_ref()
-        };
+        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
+        let irp = unsafe { self.irp.as_ref() };
         let tail_overlay = unsafe {
             // SAFETY: CurrentStackLocation is stored through the IRP tail
             // overlay for active IRPs delivered to driver dispatch routines.
@@ -178,6 +160,34 @@ impl DispatchTarget {
                 .CurrentStackLocation
         };
         CurrentIrpStackLocation::from_raw(current_stack)
+    }
+}
+
+/// Non-null IRP pointer kept private to the typed dispatch boundary.
+#[derive(Clone, Copy, Debug)]
+struct KernelIrp {
+    /// Non-null WDK IRP pointer.
+    irp: NonNull<wdk_sys::IRP>,
+}
+
+impl KernelIrp {
+    /// Converts a raw WDK IRP pointer into the private non-null boundary type.
+    fn from_raw(irp: PIRP) -> Option<Self> {
+        NonNull::new(irp).map(|irp| Self { irp })
+    }
+
+    /// Returns an immutable IRP reference for active dispatch decoding.
+    unsafe fn as_ref<'a>(self) -> &'a wdk_sys::IRP {
+        unsafe {
+            // SAFETY: The caller ties the returned reference to the current WDK
+            // dispatch callback that supplied this IRP.
+            self.irp.as_ref()
+        }
+    }
+
+    /// Returns the raw IRP pointer for writes to the WDK completion fields.
+    fn as_mut_ptr(self) -> *mut wdk_sys::IRP {
+        self.irp.as_ptr()
     }
 }
 
@@ -197,6 +207,58 @@ impl CurrentIrpStackLocation {
         Ok(Self { stack })
     }
 
+    /// Decodes this stack location's filesystem-control minor function.
+    pub(crate) fn file_system_control_minor(self) -> FileSystemControlMinorFunction {
+        match u32::from(self.raw_minor_function()) {
+            MOUNT_VOLUME_MINOR_FUNCTION => FileSystemControlMinorFunction::MountVolume,
+            value if value == wdk_sys::IRP_MN_USER_FS_REQUEST => {
+                FileSystemControlMinorFunction::UserFsRequest
+            }
+            _ => FileSystemControlMinorFunction::Unsupported,
+        }
+    }
+
+    /// Decodes this stack location's directory-control minor function.
+    pub(crate) fn directory_control_minor(self) -> DirectoryControlMinorFunction {
+        match u32::from(self.raw_minor_function()) {
+            value if value == wdk_sys::IRP_MN_QUERY_DIRECTORY => {
+                DirectoryControlMinorFunction::QueryDirectory
+            }
+            value
+                if value == wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY
+                    || value == wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX =>
+            {
+                DirectoryControlMinorFunction::NotifyChangeDirectory
+            }
+            _ => DirectoryControlMinorFunction::Unsupported,
+        }
+    }
+
+    /// Returns the raw minor-function byte for local enum decoding only.
+    fn raw_minor_function(self) -> wdk_sys::UCHAR {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        stack.MinorFunction
+    }
+
+    /// Decodes the FILE_OBJECT carried by the current stack location.
+    pub(crate) fn file_object(self) -> Result<KernelFileObject, DriverError> {
+        self.kernel_file_object()
+    }
+
+    /// Decodes the FILE_OBJECT carried by the current stack location.
+    fn kernel_file_object(self) -> Result<KernelFileObject, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        KernelFileObject::from_raw(stack.FileObject).ok_or(DriverError::InvalidParameter)
+    }
+
     /// Decodes mount-volume parameters from the current stack location.
     pub(crate) fn mount_volume(self) -> Result<MountVolumeStack, DriverError> {
         let stack = unsafe {
@@ -210,10 +272,10 @@ impl CurrentIrpStackLocation {
             stack.Parameters.MountVolume
         };
 
-        let Some(vpb) = NonNull::new(mount.Vpb) else {
+        let Some(vpb) = KernelVpb::from_raw(mount.Vpb) else {
             return Err(DriverError::InvalidParameter);
         };
-        let Some(target_device) = NonNull::new(mount.DeviceObject) else {
+        let Some(target_device) = KernelDevice::from_raw(mount.DeviceObject) else {
             return Err(DriverError::InvalidParameter);
         };
 
@@ -237,7 +299,7 @@ impl CurrentIrpStackLocation {
             stack.Parameters.FileSystemControl
         };
         Ok(FileSystemControlStack {
-            file_object: self.file_object()?,
+            file_object: self.kernel_file_object()?,
             input_buffer_length: IrpBufferLength::from_ulong(control.InputBufferLength)?,
             output_buffer_length: IrpBufferLength::from_ulong(control.OutputBufferLength)?,
             fs_control_code: FsControlCode::from_raw(control.FsControlCode)?,
@@ -256,9 +318,7 @@ impl CurrentIrpStackLocation {
             // where the Create union arm is active.
             stack.Parameters.Create
         };
-        let Some(file_object) = NonNull::new(stack.FileObject) else {
-            return Err(DriverError::InvalidParameter);
-        };
+        let file_object = self.kernel_file_object()?;
         let Some(security_context) = NonNull::new(create.SecurityContext) else {
             return Err(DriverError::InvalidParameter);
         };
@@ -327,7 +387,7 @@ impl CurrentIrpStackLocation {
             stack.Parameters.QueryFile
         };
         Ok(QueryFileStack {
-            file_object: self.file_object()?,
+            file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(query.Length)?,
             information_class: QueryFileInformationClass::from_raw(query.FileInformationClass)?,
         })
@@ -346,7 +406,7 @@ impl CurrentIrpStackLocation {
             stack.Parameters.SetFile
         };
         Ok(SetFileStack {
-            file_object: self.file_object()?,
+            file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(set.Length)?,
             information_class: SetFileInformationClass::from_raw(set.FileInformationClass)?,
         })
@@ -383,7 +443,7 @@ impl CurrentIrpStackLocation {
             DirectoryEntryEmission::Multiple
         };
         Ok(QueryDirectoryStack {
-            file_object: self.file_object()?,
+            file_object: self.kernel_file_object()?,
             cursor_position,
             pattern,
             entry_emission,
@@ -425,7 +485,7 @@ impl CurrentIrpStackLocation {
             EaEntryEmission::Multiple
         };
         Ok(QueryEaStack {
-            file_object: self.file_object()?,
+            file_object: self.kernel_file_object()?,
             name_selection,
             entry_emission,
             length: IrpBufferLength::from_ulong(query.Length)?,
@@ -445,7 +505,7 @@ impl CurrentIrpStackLocation {
             stack.Parameters.SetEa
         };
         Ok(SetEaStack {
-            file_object: self.file_object()?,
+            file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(set.Length)?,
         })
     }
@@ -463,7 +523,7 @@ impl CurrentIrpStackLocation {
             stack.Parameters.QuerySecurity
         };
         Ok(QuerySecurityStack {
-            file_object: self.file_object()?,
+            file_object: self.kernel_file_object()?,
             selection: SecuritySelection::from_raw(query.SecurityInformation)?,
             length: IrpBufferLength::from_ulong(query.Length)?,
         })
@@ -481,12 +541,12 @@ impl CurrentIrpStackLocation {
             // IRP_MJ_SET_SECURITY, where SetSecurity is active.
             stack.Parameters.SetSecurity
         };
-        let Some(security_descriptor) = NonNull::new(set.SecurityDescriptor.cast::<c_void>())
+        let Some(security_descriptor) = KernelSecurityDescriptor::from_raw(set.SecurityDescriptor)
         else {
             return Err(DriverError::InvalidParameter);
         };
         Ok(SetSecurityStack {
-            file_object: self.file_object()?,
+            file_object: self.kernel_file_object()?,
             selection: SecuritySelection::from_raw(set.SecurityInformation)?,
             security_descriptor,
         })
@@ -513,7 +573,7 @@ impl CurrentIrpStackLocation {
             u64::try_from(byte_offset).map_err(|_| DriverError::InvalidParameter)?,
         );
         Ok(ReadStack {
-            file_object: self.file_object()?,
+            file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(read.Length)?,
             byte_offset,
         })
@@ -540,7 +600,7 @@ impl CurrentIrpStackLocation {
             u64::try_from(byte_offset).map_err(|_| DriverError::InvalidParameter)?,
         );
         Ok(WriteStack {
-            file_object: self.file_object()?,
+            file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(write.Length)?,
             byte_offset,
         })
@@ -807,6 +867,31 @@ fn security_component(
 fn stack_flag(flags: wdk_sys::UCHAR, bit: u32) -> bool {
     u32::from(flags) & bit != 0
 }
+
+/// Decoded file-system-control minor function.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileSystemControlMinorFunction {
+    /// I/O Manager mount request.
+    MountVolume,
+    /// User FSCTL request.
+    UserFsRequest,
+    /// Unsupported file-system-control minor function.
+    Unsupported,
+}
+
+/// Decoded directory-control minor function.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryControlMinorFunction {
+    /// Directory enumeration request.
+    QueryDirectory,
+    /// Directory change notification request.
+    NotifyChangeDirectory,
+    /// Unsupported directory-control minor function.
+    Unsupported,
+}
+
+/// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
+const MOUNT_VOLUME_MINOR_FUNCTION: u32 = 1;
 
 /// Decoded user FSCTL code selected by the caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1216,17 +1301,15 @@ const FILE_NON_DIRECTORY_FILE_OPTION: wdk_sys::ULONG = 0x0000_0040;
 const SUPPORTED_CREATE_OPTIONS: wdk_sys::ULONG =
     FILE_DIRECTORY_FILE_OPTION | FILE_NON_DIRECTORY_FILE_OPTION;
 /// WDK share-access bits accepted by create/open.
-const FILE_SHARE_ACCESS_MASK: wdk_sys::USHORT =
-    (wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE | wdk_sys::FILE_SHARE_DELETE)
-        as wdk_sys::USHORT;
+const FILE_SHARE_ACCESS_MASK: wdk_sys::USHORT = 0x0007;
 
 /// Decoded mount-volume stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MountVolumeStack {
     /// VPB supplied by the I/O Manager for the target volume.
-    vpb: NonNull<wdk_sys::VPB>,
+    vpb: KernelVpb,
     /// Lower storage device object to mount.
-    target_device: NonNull<wdk_sys::DEVICE_OBJECT>,
+    target_device: KernelDevice,
     /// Output buffer length supplied with the mount request.
     output_buffer_length: IrpBufferLength,
 }
@@ -1235,7 +1318,7 @@ pub(crate) struct MountVolumeStack {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FileSystemControlStack {
     /// FILE_OBJECT carrying the FCB/CCB for path-scoped controls.
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    file_object: KernelFileObject,
     /// Input system-buffer length.
     input_buffer_length: IrpBufferLength,
     /// Output system-buffer length.
@@ -1245,6 +1328,16 @@ pub(crate) struct FileSystemControlStack {
 }
 
 impl MountVolumeStack {
+    /// Returns the VPB supplied for the mount.
+    pub(crate) const fn vpb(self) -> KernelVpb {
+        self.vpb
+    }
+
+    /// Returns the lower storage device object.
+    pub(crate) const fn target_device(self) -> KernelDevice {
+        self.target_device
+    }
+
     /// Returns the mount request output buffer length.
     pub(crate) const fn output_buffer_length(self) -> IrpBufferLength {
         self.output_buffer_length
@@ -1252,6 +1345,11 @@ impl MountVolumeStack {
 }
 
 impl FileSystemControlStack {
+    /// Returns the FILE_OBJECT carrying this FSCTL.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Returns the input system-buffer length.
     pub(crate) const fn input_buffer_length(self) -> IrpBufferLength {
         self.input_buffer_length
@@ -1272,12 +1370,17 @@ impl FileSystemControlStack {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CreateStack {
     /// FILE_OBJECT receiving FsContext/FsContext2 on successful create.
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    file_object: KernelFileObject,
     /// Decoded create parameters.
     parameters: CreateParameters,
 }
 
 impl CreateStack {
+    /// Returns the FILE_OBJECT receiving this create request.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Returns the decoded create parameters.
     pub(crate) const fn parameters(self) -> CreateParameters {
         self.parameters
@@ -1306,7 +1409,7 @@ pub(crate) struct SetVolumeStack {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryFileStack {
     /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    file_object: KernelFileObject,
     /// Output buffer length.
     length: IrpBufferLength,
     /// Requested file information class.
@@ -1317,7 +1420,7 @@ pub(crate) struct QueryFileStack {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SetFileStack {
     /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    file_object: KernelFileObject,
     /// Input buffer length.
     length: IrpBufferLength,
     /// Requested file information class.
@@ -1328,7 +1431,7 @@ pub(crate) struct SetFileStack {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryDirectoryStack {
     /// FILE_OBJECT carrying the directory CCB.
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    file_object: KernelFileObject,
     /// Initial CCB cursor position.
     cursor_position: DirectoryCursorPosition,
     /// Filename pattern supplied by the caller.
@@ -1345,7 +1448,7 @@ pub(crate) struct QueryDirectoryStack {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryEaStack {
     /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    file_object: KernelFileObject,
     /// EA name selection requested by the caller.
     name_selection: EaNameSelection,
     /// EA entry emission cardinality.
@@ -1358,7 +1461,7 @@ pub(crate) struct QueryEaStack {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SetEaStack {
     /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    file_object: KernelFileObject,
     /// Input FILE_FULL_EA_INFORMATION byte length.
     length: IrpBufferLength,
 }
@@ -1367,7 +1470,7 @@ pub(crate) struct SetEaStack {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QuerySecurityStack {
     /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    file_object: KernelFileObject,
     /// Selected security descriptor components.
     selection: SecuritySelection,
     /// Output buffer length.
@@ -1378,18 +1481,18 @@ pub(crate) struct QuerySecurityStack {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SetSecurityStack {
     /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    file_object: KernelFileObject,
     /// Selected security descriptor components.
     selection: SecuritySelection,
     /// Caller-supplied security descriptor.
-    security_descriptor: NonNull<c_void>,
+    security_descriptor: KernelSecurityDescriptor,
 }
 
 /// Decoded read stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadStack {
     /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    file_object: KernelFileObject,
     /// Requested byte count.
     length: IrpBufferLength,
     /// Requested byte offset.
@@ -1397,6 +1500,11 @@ pub(crate) struct ReadStack {
 }
 
 impl ReadStack {
+    /// Returns the FILE_OBJECT carrying this read.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Returns the requested byte count.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -1412,7 +1520,7 @@ impl ReadStack {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WriteStack {
     /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    file_object: KernelFileObject,
     /// Requested byte count.
     length: IrpBufferLength,
     /// Requested byte offset.
@@ -1420,6 +1528,11 @@ pub(crate) struct WriteStack {
 }
 
 impl WriteStack {
+    /// Returns the FILE_OBJECT carrying this write.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Returns the requested byte count.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -1456,6 +1569,11 @@ impl SetVolumeStack {
 }
 
 impl QueryFileStack {
+    /// Returns the FILE_OBJECT carrying this query.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Returns the output buffer length.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -1468,6 +1586,11 @@ impl QueryFileStack {
 }
 
 impl SetFileStack {
+    /// Returns the FILE_OBJECT carrying this mutation.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Returns the input buffer length.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -1480,6 +1603,11 @@ impl SetFileStack {
 }
 
 impl QueryDirectoryStack {
+    /// Returns the FILE_OBJECT carrying this query.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Returns the initial directory cursor position.
     pub(crate) const fn cursor_position(self) -> DirectoryCursorPosition {
         self.cursor_position
@@ -1507,6 +1635,11 @@ impl QueryDirectoryStack {
 }
 
 impl QueryEaStack {
+    /// Returns the FILE_OBJECT carrying this query.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Returns the EA name selection.
     pub(crate) const fn name_selection(self) -> EaNameSelection {
         self.name_selection
@@ -1524,6 +1657,11 @@ impl QueryEaStack {
 }
 
 impl SetEaStack {
+    /// Returns the FILE_OBJECT carrying this mutation.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Returns the input FILE_FULL_EA_INFORMATION byte length.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -1531,6 +1669,11 @@ impl SetEaStack {
 }
 
 impl QuerySecurityStack {
+    /// Returns the FILE_OBJECT carrying this query.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Returns selected security descriptor components.
     pub(crate) const fn selection(self) -> SecuritySelection {
         self.selection
@@ -1543,11 +1686,20 @@ impl QuerySecurityStack {
 }
 
 impl SetSecurityStack {
+    /// Returns the FILE_OBJECT carrying this mutation.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Returns selected security descriptor components.
     pub(crate) const fn selection(self) -> SecuritySelection {
         self.selection
     }
 
+    /// Returns the caller-supplied security descriptor.
+    pub(crate) const fn security_descriptor(self) -> KernelSecurityDescriptor {
+        self.security_descriptor
+    }
 }
 
 #[cfg(test)]
@@ -1558,12 +1710,13 @@ mod tests {
 
     use super::{
         CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateTargetRequirement,
-        CurrentIrpStackLocation, DirectoryCursorPosition, DirectoryEntryEmission,
-        DirectoryInformationClass, DirectoryPatternInput, DispatchTarget, EaEntryEmission,
-        EaNameSelection, FILE_OPEN_DISPOSITION, FsControlCode, QueryFileInformationClass,
-        QueryVolumeInformationClass, SecurityComponentSelection, SetFileInformationClass,
-        SetVolumeInformationClass,
+        CurrentIrpStackLocation, DirectoryControlMinorFunction, DirectoryCursorPosition,
+        DirectoryEntryEmission, DirectoryInformationClass, DirectoryPatternInput, DispatchTarget,
+        EaEntryEmission, EaNameSelection, FILE_OPEN_DISPOSITION, FileSystemControlMinorFunction,
+        FsControlCode, QueryFileInformationClass, QueryVolumeInformationClass,
+        SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
     };
+    use crate::state::{KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb};
 
     /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
     const MOUNT_VOLUME_MINOR: wdk_sys::UCHAR = 1;
@@ -1599,7 +1752,6 @@ mod tests {
         assert!(decoded.is_ok());
         if let Ok(target) = decoded {
             assert_eq!(target.device().as_ptr(), device);
-            assert_eq!(target.irp().as_ptr(), irp);
         }
     }
 
@@ -1610,6 +1762,34 @@ mod tests {
                 .err()
                 .map(crate::status::DriverError::ntstatus),
             Some(STATUS_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn unsupported_filesystem_control_minor_decodes_as_unsupported() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            MinorFunction: u8::MAX,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack))
+                .map(|current| current.file_system_control_minor()),
+            Ok(FileSystemControlMinorFunction::Unsupported)
+        );
+    }
+
+    #[test]
+    fn unsupported_directory_control_minor_decodes_as_unsupported() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            MinorFunction: u8::MAX,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack))
+                .map(|current| current.directory_control_minor()),
+            Ok(DirectoryControlMinorFunction::Unsupported)
         );
     }
 
@@ -1628,12 +1808,18 @@ mod tests {
         let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
         assert!(current.is_ok());
         if let Ok(current) = current {
-            assert_eq!(current.minor_function(), MOUNT_VOLUME_MINOR);
+            assert_eq!(
+                current.file_system_control_minor(),
+                FileSystemControlMinorFunction::MountVolume
+            );
             let mount = current.mount_volume();
             assert!(mount.is_ok());
             if let Ok(mount) = mount {
-                assert_eq!(mount.vpb(), vpb);
-                assert_eq!(mount.target_device(), target);
+                assert_eq!(Some(mount.vpb()), KernelVpb::from_raw(vpb.as_ptr()));
+                assert_eq!(
+                    Some(mount.target_device()),
+                    KernelDevice::from_raw(target.as_ptr())
+                );
                 assert_eq!(mount.output_buffer_length().as_usize(), 16);
             }
         }
@@ -1641,9 +1827,11 @@ mod tests {
 
     #[test]
     fn file_system_control_stack_decodes_supported_user_control() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
-        stack.FileObject = file_object.as_ptr();
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: file_object.as_ptr(),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
         stack.Parameters.FileSystemControl =
             wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_15 {
                 OutputBufferLength: 128,
@@ -1660,7 +1848,10 @@ mod tests {
             let control = current.file_system_control();
             assert!(control.is_ok());
             if let Ok(control) = control {
-                assert_eq!(control.file_object(), file_object);
+                assert_eq!(
+                    Some(control.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
                 assert_eq!(control.input_buffer_length().as_usize(), 32);
                 assert_eq!(control.output_buffer_length().as_usize(), 128);
                 assert_eq!(control.fs_control_code(), FsControlCode::GetReparsePoint);
@@ -1670,8 +1861,10 @@ mod tests {
 
     #[test]
     fn file_system_control_stack_rejects_unsupported_control_before_handler() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
         stack.Parameters.FileSystemControl =
             wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_15 {
                 OutputBufferLength: 128,
@@ -1717,12 +1910,16 @@ mod tests {
 
     #[test]
     fn create_stack_preserves_access_share_options_and_ea_length() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
         let desired_access = wdk_sys::FILE_READ_DATA | wdk_sys::FILE_WRITE_DATA;
-        security_context.DesiredAccess = desired_access;
-        stack.FileObject = file_object.as_ptr();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
+            DesiredAccess: desired_access,
+            ..wdk_sys::IO_SECURITY_CONTEXT::default()
+        };
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: file_object.as_ptr(),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::addr_of_mut!(security_context),
             Options: 0x0300_0040,
@@ -1740,7 +1937,10 @@ mod tests {
             let create = current.create();
             assert!(create.is_ok());
             if let Ok(create) = create {
-                assert_eq!(create.file_object(), file_object);
+                assert_eq!(
+                    Some(create.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
                 let parameters = create.parameters();
                 assert_eq!(parameters.desired_access().as_raw(), desired_access);
                 assert_eq!(parameters.disposition(), CreateDisposition::OpenIf);
@@ -1808,7 +2008,10 @@ mod tests {
             let query = current.query_ea();
             assert!(query.is_ok());
             if let Ok(query) = query {
-                assert_eq!(query.file_object(), file_object);
+                assert_eq!(
+                    Some(query.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
                 assert_eq!(query.entry_emission(), EaEntryEmission::Single);
                 assert_eq!(query.length().as_usize(), 128);
                 assert_eq!(
@@ -1863,7 +2066,10 @@ mod tests {
             let set = current.set_ea();
             assert!(set.is_ok());
             if let Ok(set) = set {
-                assert_eq!(set.file_object(), file_object);
+                assert_eq!(
+                    Some(set.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
                 assert_eq!(set.length().as_usize(), 64);
             }
         }
@@ -1887,7 +2093,10 @@ mod tests {
             let query = current.query_security();
             assert!(query.is_ok());
             if let Ok(query) = query {
-                assert_eq!(query.file_object(), file_object);
+                assert_eq!(
+                    Some(query.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
                 assert_eq!(
                     query.selection().owner(),
                     SecurityComponentSelection::Selected
@@ -2040,7 +2249,10 @@ mod tests {
             let set = current.set_security();
             assert!(set.is_ok());
             if let Ok(set) = set {
-                assert_eq!(set.file_object(), file_object);
+                assert_eq!(
+                    Some(set.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
                 assert_eq!(
                     set.selection().owner(),
                     SecurityComponentSelection::Selected
@@ -2050,7 +2262,10 @@ mod tests {
                     SecurityComponentSelection::Selected
                 );
                 assert_eq!(set.selection().dacl(), SecurityComponentSelection::Omitted);
-                assert_eq!(set.security_descriptor(), descriptor);
+                assert_eq!(
+                    Some(set.security_descriptor()),
+                    KernelSecurityDescriptor::from_raw(descriptor.as_ptr())
+                );
             }
         }
     }
@@ -2074,7 +2289,10 @@ mod tests {
             let read = current.read();
             assert!(read.is_ok());
             if let Ok(read) = read {
-                assert_eq!(read.file_object(), file_object);
+                assert_eq!(
+                    Some(read.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
                 assert_eq!(read.length().as_usize(), 4096);
                 assert_eq!(read.byte_offset().bytes(), 8192);
             }
@@ -2126,7 +2344,10 @@ mod tests {
             let write = current.write();
             assert!(write.is_ok());
             if let Ok(write) = write {
-                assert_eq!(write.file_object(), file_object);
+                assert_eq!(
+                    Some(write.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
                 assert_eq!(write.length().as_usize(), 2048);
                 assert_eq!(write.byte_offset().bytes(), 4096);
             }
@@ -2176,7 +2397,10 @@ mod tests {
             let query = current.query_file();
             assert!(query.is_ok());
             if let Ok(query) = query {
-                assert_eq!(query.file_object(), file_object);
+                assert_eq!(
+                    Some(query.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
                 assert_eq!(query.length().as_usize(), 64);
                 assert_eq!(
                     query.information_class(),
@@ -2206,7 +2430,10 @@ mod tests {
             let set = current.set_file();
             assert!(set.is_ok());
             if let Ok(set) = set {
-                assert_eq!(set.file_object(), file_object);
+                assert_eq!(
+                    Some(set.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
                 assert_eq!(set.length().as_usize(), 40);
                 assert_eq!(set.information_class(), SetFileInformationClass::Basic);
             }
@@ -2259,7 +2486,10 @@ mod tests {
             let query = current.query_directory();
             assert!(query.is_ok());
             if let Ok(query) = query {
-                assert_eq!(query.file_object(), file_object);
+                assert_eq!(
+                    Some(query.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
                 assert_eq!(query.cursor_position(), DirectoryCursorPosition::Restart);
                 assert_eq!(query.pattern(), DirectoryPatternInput::Name(file_name));
                 assert_eq!(query.entry_emission(), DirectoryEntryEmission::Single);

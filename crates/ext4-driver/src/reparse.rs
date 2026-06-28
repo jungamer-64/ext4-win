@@ -5,11 +5,9 @@ use alloc::vec::Vec;
 
 use crate::irp::{DispatchTarget, DriverCompletion, FileSystemControlStack};
 use crate::metadata;
-use crate::state::{
-    FileControlBlock, OpenedPath, VolumeControlBlock, file_control_block, opened_handle,
-};
+use crate::state::{FileControlBlock, OpenedFileObject, OpenedPath, VolumeControlBlock};
 use crate::status::{DriverError, DriverResult};
-use crate::wire::{LittleEndianInput, LittleEndianOutput};
+use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{LoadedNode, NodeId, SymlinkNodeId, SymlinkTarget};
 
 /// Reparse buffer header before the tag-specific payload.
@@ -19,6 +17,16 @@ const SYMLINK_REPARSE_BUFFER_HEADER_SIZE: usize = 12;
 /// Offset of `PathBuffer` inside `REPARSE_DATA_BUFFER`.
 const SYMLINK_PATH_BUFFER_OFFSET: usize =
     REPARSE_DATA_BUFFER_HEADER_SIZE + SYMLINK_REPARSE_BUFFER_HEADER_SIZE;
+
+/// Creates a wire offset from a reparse-buffer byte position.
+const fn wire_offset(offset: usize) -> WireOffset {
+    WireOffset::new(offset)
+}
+
+/// Creates a checked reparse-buffer range.
+fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
+    WireRange::new(wire_offset(offset), WireByteLen::new(length))
+}
 
 /// Handles `FSCTL_GET_REPARSE_POINT` for an opened ext4 symlink.
 pub(crate) fn get_reparse_point(
@@ -44,14 +52,9 @@ pub(crate) fn set_reparse_point(
 
 /// Reads the target bytes for the symlink opened by the FSCTL.
 fn read_symlink_target(stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
-    let fcb = file_control_block(stack.file_object())?;
-    let fcb = unsafe {
-        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
-        // until close releases it, and this FSCTL runs while the FILE_OBJECT
-        // is active.
-        fcb.as_ref()
-    };
-    let NodeId::Symlink(symlink_id) = fcb.node() else {
+    let opened_file = OpenedFileObject::decode(stack.file_object())?;
+    let fcb = opened_file.file_control_block();
+    let NodeId::Symlink(symlink_id) = opened_file.node() else {
         return Err(DriverError::NotAReparsePoint);
     };
     let vcb = volume_control_block(fcb);
@@ -82,25 +85,12 @@ fn replace_opened_path_with_symlink(
     stack: FileSystemControlStack,
     target: &SymlinkTarget,
 ) -> DriverResult<()> {
-    let mut fcb = file_control_block(stack.file_object())?;
-    let fcb = unsafe {
-        // SAFETY: Successful create stores Box<FileControlBlock> in FsContext
-        // until close releases it, and this FSCTL runs while the FILE_OBJECT
-        // is active.
-        fcb.as_mut()
-    };
-    let mut handle = opened_handle(stack.file_object())?;
-    let handle = unsafe {
-        // SAFETY: Successful create stores Box<OpenedHandle> in
-        // FsContext2 until close releases it, and this FSCTL runs while the
-        // FILE_OBJECT is active.
-        handle.as_mut()
-    };
-    let OpenedPath::Child { parent, name } = handle.path().clone() else {
+    let mut opened_file = OpenedFileObject::decode(stack.file_object())?;
+    let OpenedPath::Child { parent, name } = opened_file.handle().path().clone() else {
         return Err(DriverError::NotSupported);
     };
 
-    let mut vcb = fcb.volume();
+    let mut vcb = opened_file.volume();
     let vcb = unsafe {
         // SAFETY: FCBs are constructed only from live mounted VCB pointers and
         // remain valid while file objects are open. The mutable borrow is the
@@ -111,7 +101,7 @@ fn replace_opened_path_with_symlink(
         .volume_mut()
         .begin_transaction(crate::time::current_ext4_timestamp()?);
     let parent_directory = transaction.directory(parent)?;
-    match fcb.node() {
+    match opened_file.node() {
         NodeId::File(_) => transaction.unlink_file(parent_directory, &name)?,
         NodeId::Directory(_) => transaction.remove_empty_directory(parent_directory, &name)?,
         NodeId::Symlink(_) => transaction.remove_symlink(parent_directory, &name)?,
@@ -124,8 +114,8 @@ fn replace_opened_path_with_symlink(
     )?;
     transaction.commit()?;
     let node = NodeId::Symlink(symlink.id());
-    fcb.replace_node(node);
-    handle.replace_node(node);
+    opened_file.file_control_block_mut().replace_node(node);
+    opened_file.handle_mut().replace_node(node);
     Ok(())
 }
 
@@ -166,14 +156,14 @@ fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> DriverResult
     };
 
     let mut output = LittleEndianOutput::new(output);
-    output.write_u32(0, wdk_sys::IO_REPARSE_TAG_SYMLINK)?;
-    output.write_u16(4, reparse_data_length)?;
-    output.write_u16(6, 0)?;
-    output.write_u16(8, 0)?;
-    output.write_u16(10, path_bytes)?;
-    output.write_u16(12, print_name_offset)?;
-    output.write_u16(14, path_bytes)?;
-    output.write_u32(16, flags)?;
+    output.write_u32(wire_offset(0), wdk_sys::IO_REPARSE_TAG_SYMLINK)?;
+    output.write_u16(wire_offset(4), reparse_data_length)?;
+    output.write_u16(wire_offset(6), 0)?;
+    output.write_u16(wire_offset(8), 0)?;
+    output.write_u16(wire_offset(10), path_bytes)?;
+    output.write_u16(wire_offset(12), print_name_offset)?;
+    output.write_u16(wire_offset(14), path_bytes)?;
+    output.write_u32(wire_offset(16), flags)?;
     write_utf16(&mut output, SYMLINK_PATH_BUFFER_OFFSET, path.as_slice())?;
     write_utf16(
         &mut output,
@@ -189,11 +179,11 @@ fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> DriverResult
 fn parse_symlink_reparse_buffer(input: &[u8]) -> DriverResult<SymlinkTarget> {
     let input_len = input.len();
     let input = LittleEndianInput::new(input);
-    let tag = input.read_u32(0)?;
+    let tag = input.read_u32(wire_offset(0))?;
     if tag != wdk_sys::IO_REPARSE_TAG_SYMLINK {
         return Err(DriverError::ReparseTagNotHandled);
     }
-    let reparse_data_length = usize::from(input.read_u16(4)?);
+    let reparse_data_length = usize::from(input.read_u16(wire_offset(4))?);
     let total_length = REPARSE_DATA_BUFFER_HEADER_SIZE
         .checked_add(reparse_data_length)
         .ok_or(DriverError::InvalidParameter)?;
@@ -204,9 +194,9 @@ fn parse_symlink_reparse_buffer(input: &[u8]) -> DriverResult<SymlinkTarget> {
         return Err(DriverError::InvalidParameter);
     }
 
-    let substitute_name_offset = usize::from(input.read_u16(8)?);
-    let substitute_name_length = usize::from(input.read_u16(10)?);
-    let flags = input.read_u32(16)?;
+    let substitute_name_offset = usize::from(input.read_u16(wire_offset(8))?);
+    let substitute_name_length = usize::from(input.read_u16(wire_offset(10))?);
+    let flags = input.read_u32(wire_offset(16))?;
     if flags & !wdk_sys::SYMLINK_FLAG_RELATIVE != 0 {
         return Err(DriverError::NotSupported);
     }
@@ -246,7 +236,7 @@ fn reparse_path_units(
     if end > path_buffer_end {
         return Err(DriverError::InvalidParameter);
     }
-    let bytes = input.range(start, length)?;
+    let bytes = input.range(wire_range(start, length)?)?;
     let mut chunks = bytes.chunks_exact(core::mem::size_of::<u16>());
     let mut units = Vec::new();
     for chunk in &mut chunks {
@@ -291,7 +281,7 @@ fn write_utf16(
             .checked_mul(core::mem::size_of::<u16>())
             .and_then(|byte_offset| offset.checked_add(byte_offset))
             .ok_or(DriverError::InvalidParameter)?;
-        output.write_u16(unit_offset, *unit)?;
+        output.write_u16(wire_offset(unit_offset), *unit)?;
     }
     Ok(())
 }
@@ -306,6 +296,7 @@ mod tests {
 
     use super::{
         SYMLINK_PATH_BUFFER_OFFSET, pack_symlink_reparse_buffer, parse_symlink_reparse_buffer,
+        wire_offset,
     };
 
     #[test]
@@ -319,18 +310,21 @@ mod tests {
             Ok(WRITTEN_LENGTH)
         );
         assert_eq!(
-            LittleEndianInput::new(output.as_slice()).read_u32(0),
+            LittleEndianInput::new(output.as_slice()).read_u32(wire_offset(0)),
             Ok(wdk_sys::IO_REPARSE_TAG_SYMLINK)
         );
         let output = LittleEndianInput::new(output.as_slice());
-        assert_eq!(output.read_u16(4), Ok(REPARSE_DATA_LENGTH));
-        assert_eq!(output.read_u16(8), Ok(0));
-        assert_eq!(output.read_u16(10), Ok(16));
-        assert_eq!(output.read_u16(12), Ok(16));
-        assert_eq!(output.read_u16(14), Ok(16));
-        assert_eq!(output.read_u32(16), Ok(wdk_sys::SYMLINK_FLAG_RELATIVE));
+        assert_eq!(output.read_u16(wire_offset(4)), Ok(REPARSE_DATA_LENGTH));
+        assert_eq!(output.read_u16(wire_offset(8)), Ok(0));
+        assert_eq!(output.read_u16(wire_offset(10)), Ok(16));
+        assert_eq!(output.read_u16(wire_offset(12)), Ok(16));
+        assert_eq!(output.read_u16(wire_offset(14)), Ok(16));
         assert_eq!(
-            output.read_u16(SYMLINK_PATH_BUFFER_OFFSET),
+            output.read_u32(wire_offset(16)),
+            Ok(wdk_sys::SYMLINK_FLAG_RELATIVE)
+        );
+        assert_eq!(
+            output.read_u16(wire_offset(SYMLINK_PATH_BUFFER_OFFSET)),
             Ok(u16::from(b'd'))
         );
     }
@@ -345,7 +339,7 @@ mod tests {
             Ok(WRITTEN_LENGTH)
         );
         assert_eq!(
-            LittleEndianInput::new(output.as_slice()).read_u32(16),
+            LittleEndianInput::new(output.as_slice()).read_u32(wire_offset(16)),
             Ok(0)
         );
     }
@@ -384,7 +378,7 @@ mod tests {
             Ok(44)
         );
         assert_eq!(
-            LittleEndianOutput::new(input.as_mut_slice()).write_u32(0, 0),
+            LittleEndianOutput::new(input.as_mut_slice()).write_u32(wire_offset(0), 0),
             Ok(())
         );
 
@@ -402,7 +396,7 @@ mod tests {
             Ok(44)
         );
         assert_eq!(
-            LittleEndianOutput::new(input.as_mut_slice()).write_u32(16, 2),
+            LittleEndianOutput::new(input.as_mut_slice()).write_u32(wire_offset(16), 2),
             Ok(())
         );
 
