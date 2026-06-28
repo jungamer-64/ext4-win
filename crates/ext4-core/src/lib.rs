@@ -19,29 +19,15 @@ mod platform;
 mod protection;
 mod volume;
 
-pub use disk::block::{
-    BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset, DeviceLength, SliceBlockDevice,
-    SliceBlockDeviceMut,
-};
+pub use disk::block::{BlockReader, BlockWriter, ByteOffset, DeviceLength};
 pub use disk_format::acl::{PosixAcl, PosixAclEntry, PosixAclKind};
-pub use disk_format::dir::{DirectoryEntry, DirectoryEntryKind};
-pub use disk_format::extent::{
-    BlockMapping, Extent, ExtentInitialization, ExtentLength, ExtentTree, ExtentTreeContext,
-    LogicalBlock, MutableExtentTree, SerializedExtentBlock, SerializedExtentTree,
-};
+pub use disk_format::dir::DirectoryEntry;
 pub use disk_format::inode::{
-    DirectoryStorageKind, Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times,
-    Ext4Timestamp, Ext4Uid, FileOffset, FileSize, Inode, InodeExtentRoot, InodeId,
-    InodeInlineBytes, InodeKind, InodeMutation, InodeProtection, InodeStorage,
-    NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
+    Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid,
+    FileOffset, FileSize, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, ReadBytes,
+    SymlinkTarget,
 };
-pub use disk_format::superblock::{
-    BlockCount, BlockGroupCount, BlockGroupDescriptorSize, BlockGroupId, BlocksPerCluster,
-    BlocksPerGroup, ChecksumSeed, ClusterAddress, ClusterCount, ClusterSize, ClustersPerGroup,
-    Ext4VolumeLabel, FilesystemUuid, FreeClusterCount, FreeInodeCount, FreeInodeDelta, InodeCount,
-    InodeRecordSize, InodesPerGroup, JournalMode, JournalUuid, MetadataChecksum, RecoveryState,
-    Superblock,
-};
+pub use disk_format::superblock::{Ext4VolumeLabel, FilesystemUuid};
 pub use disk_format::xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 pub use error::{Error, Result};
 pub use platform::name::{Ext4Name, WindowsName};
@@ -61,10 +47,9 @@ pub use protection::verity::{
     FsveritySignature,
 };
 pub use volume::{
-    ChildLookup, DirectoryChild, DirectoryNode, DirectoryNodeId, ExternalJournal, FileNode,
-    FileNodeId, InternalJournal, LoadedNode, MountContext, NodeId, ReadOnly, ReadWrite,
-    SymlinkNode, SymlinkNodeId, TransactionDirectory, TransactionFile, TransactionNode,
-    TransactionSymlink, Volume, WriteTransaction,
+    ChildLookup, DirectoryChild, DirectoryNode, DirectoryNodeId, FileNode, FileNodeId, LoadedNode,
+    MountContext, NodeId, SymlinkNode, SymlinkNodeId, TransactionDirectory, TransactionFile,
+    TransactionNode, TransactionSymlink,
 };
 
 #[cfg(test)]
