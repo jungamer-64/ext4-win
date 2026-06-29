@@ -35,7 +35,7 @@ pub(crate) fn get_reparse_point(
 ) -> DriverResult<DriverCompletion> {
     let symlink_target = read_symlink_target(stack)?;
     let length = stack.output_buffer_length().as_usize();
-    let mut output = target.data_buffer(length)?;
+    let mut output = target.buffered_output(length)?;
     let written = pack_symlink_reparse_buffer(symlink_target.as_slice(), output.as_mut_slice())?;
     DriverCompletion::from_usize(written)
 }
@@ -63,7 +63,7 @@ fn read_symlink_target(stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
 
 /// Reads a symlink inode through ext4-core.
 fn read_core_symlink(vcb: &VolumeControlBlock, symlink_id: SymlinkNodeId) -> DriverResult<Vec<u8>> {
-    let node = vcb.volume().load_node(symlink_id.inode())?;
+    let node = vcb.volume().load(NodeId::Symlink(symlink_id))?;
     let LoadedNode::Symlink(symlink) = node else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
     };
@@ -76,7 +76,7 @@ fn parse_symlink_reparse_target(
     stack: FileSystemControlStack,
 ) -> DriverResult<SymlinkTarget> {
     let length = stack.input_buffer_length().as_usize();
-    let input = target.data_buffer(length)?;
+    let input = target.buffered_input(length)?;
     parse_symlink_reparse_buffer(input.as_slice())
 }
 

@@ -91,8 +91,38 @@ impl DispatchTarget {
         self.device
     }
 
-    /// Returns the buffered I/O system buffer for this IRP.
-    pub(crate) fn system_buffer(self) -> Option<NonNull<core::ffi::c_void>> {
+    /// Returns METHOD_BUFFERED input bytes from the IRP system buffer.
+    pub(crate) fn buffered_input(self, length: usize) -> Result<BufferedInput, DriverError> {
+        BufferedInput::new(self.associated_system_buffer()?, length)
+    }
+
+    /// Returns METHOD_BUFFERED output bytes from the IRP system buffer.
+    pub(crate) fn buffered_output(self, length: usize) -> Result<BufferedOutput, DriverError> {
+        BufferedOutput::new(self.associated_system_buffer()?, length)
+    }
+
+    /// Returns read-like IRP data bytes as immutable kernel memory.
+    pub(crate) fn data_input(self, length: usize) -> Result<BufferedInput, DriverError> {
+        BufferedInput::new(self.data_buffer_address(length)?, length)
+    }
+
+    /// Returns write-like IRP data bytes as mutable kernel memory.
+    pub(crate) fn data_output(self, length: usize) -> Result<BufferedOutput, DriverError> {
+        BufferedOutput::new(self.data_buffer_address(length)?, length)
+    }
+
+    /// Returns the IRP user output buffer as kernel-addressable memory.
+    pub(crate) fn user_output(self, length: usize) -> Result<UserOutput, DriverError> {
+        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
+        let irp = unsafe { self.irp.as_ref() };
+        let Some(buffer) = NonNull::new(irp.UserBuffer) else {
+            return Err(DriverError::InvalidParameter);
+        };
+        UserOutput::new(buffer.cast(), length)
+    }
+
+    /// Returns the buffered I/O system buffer address for this IRP.
+    fn associated_system_buffer(self) -> Result<NonNull<u8>, DriverError> {
         // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
         let irp = unsafe { self.irp.as_ref() };
         let system_buffer = unsafe {
@@ -101,12 +131,14 @@ impl DispatchTarget {
             irp.AssociatedIrp.SystemBuffer
         };
         NonNull::new(system_buffer)
+            .map(NonNull::cast)
+            .ok_or(DriverError::InvalidParameter)
     }
 
-    /// Returns the read/write IRP data buffer as kernel memory.
-    pub(crate) fn data_buffer(self, length: usize) -> Result<IrpDataBuffer, DriverError> {
-        if let Some(system_buffer) = self.system_buffer() {
-            return IrpDataBuffer::new(system_buffer.cast(), length);
+    /// Returns the read/write IRP data buffer address as kernel memory.
+    fn data_buffer_address(self, length: usize) -> Result<NonNull<u8>, DriverError> {
+        if let Ok(system_buffer) = self.associated_system_buffer() {
+            return Ok(system_buffer);
         }
 
         // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
@@ -114,17 +146,7 @@ impl DispatchTarget {
         let Some(mdl) = NonNull::new(irp.MdlAddress) else {
             return Err(DriverError::InvalidParameter);
         };
-        mdl_data_buffer(mdl, length)
-    }
-
-    /// Returns the IRP user buffer as kernel-addressable memory.
-    pub(crate) fn user_buffer(self, length: usize) -> Result<IrpDataBuffer, DriverError> {
-        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
-        let irp = unsafe { self.irp.as_ref() };
-        let Some(buffer) = NonNull::new(irp.UserBuffer) else {
-            return Err(DriverError::InvalidParameter);
-        };
-        IrpDataBuffer::new(buffer.cast(), length)
+        mdl_data_buffer_address(mdl, length)
     }
 
     /// Stores the byte count returned by this IRP.
@@ -607,17 +629,17 @@ impl CurrentIrpStackLocation {
     }
 }
 
-/// Kernel-addressable buffer decoded from a read/write IRP boundary.
+/// Kernel-addressable bytes decoded at the IRP boundary.
 #[derive(Debug)]
-pub(crate) struct IrpDataBuffer {
+struct IrpByteBuffer {
     /// First buffer byte.
     address: NonNull<u8>,
     /// Buffer byte count.
     length: usize,
 }
 
-impl IrpDataBuffer {
-    /// Creates a data buffer after length validation.
+impl IrpByteBuffer {
+    /// Creates byte buffer after length validation.
     fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
         let max_slice_len =
             usize::try_from(isize::MAX).map_err(|_| DriverError::InvalidParameter)?;
@@ -628,29 +650,109 @@ impl IrpDataBuffer {
     }
 
     /// Returns the buffer as a byte slice.
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    fn as_slice(&self) -> &[u8] {
         unsafe {
-            // SAFETY: IrpDataBuffer is constructed only after the active IRP
+            // SAFETY: IrpByteBuffer is constructed only after the active IRP
             // exposes a kernel-addressable buffer for `length` bytes.
             core::slice::from_raw_parts(self.address.as_ptr(), self.length)
         }
     }
 
     /// Returns the buffer as a mutable byte slice.
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe {
-            // SAFETY: IrpDataBuffer is constructed only after the active IRP
+            // SAFETY: IrpByteBuffer is constructed only after the active IRP
             // exposes a kernel-addressable buffer for `length` bytes.
             core::slice::from_raw_parts_mut(self.address.as_ptr(), self.length)
         }
     }
+
+    /// Copies an unaligned fixed-size payload out of the buffer.
+    fn read_unaligned<T: Copy>(&self) -> DriverResult<T> {
+        if self.length < core::mem::size_of::<T>() {
+            return Err(DriverError::BufferTooSmall);
+        }
+        Ok(unsafe {
+            // SAFETY: The buffer length was checked above and unaligned read
+            // avoids imposing an alignment contract on I/O manager storage.
+            self.address.as_ptr().cast::<T>().read_unaligned()
+        })
+    }
 }
 
-/// Returns an IRP MDL data buffer as kernel memory.
-fn mdl_data_buffer(
+/// Immutable bytes decoded from a buffered or data-input IRP boundary.
+#[derive(Debug)]
+pub(crate) struct BufferedInput {
+    /// Kernel-addressable IRP bytes.
+    bytes: IrpByteBuffer,
+}
+
+impl BufferedInput {
+    /// Creates an immutable buffer view after length validation.
+    fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
+        Ok(Self {
+            bytes: IrpByteBuffer::new(address, length)?,
+        })
+    }
+
+    /// Returns input bytes.
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+
+    /// Copies an unaligned fixed-size input payload.
+    pub(crate) fn read_unaligned<T: Copy>(&self) -> DriverResult<T> {
+        self.bytes.read_unaligned()
+    }
+}
+
+/// Mutable bytes decoded from a buffered or data-output IRP boundary.
+#[derive(Debug)]
+pub(crate) struct BufferedOutput {
+    /// Kernel-addressable IRP bytes.
+    bytes: IrpByteBuffer,
+}
+
+impl BufferedOutput {
+    /// Creates a mutable buffer view after length validation.
+    fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
+        Ok(Self {
+            bytes: IrpByteBuffer::new(address, length)?,
+        })
+    }
+
+    /// Returns output bytes.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.bytes.as_mut_slice()
+    }
+}
+
+/// Mutable bytes decoded from an IRP user output buffer.
+#[derive(Debug)]
+pub(crate) struct UserOutput {
+    /// Kernel-addressable IRP bytes.
+    bytes: IrpByteBuffer,
+}
+
+impl UserOutput {
+    /// Creates a mutable user output view after length validation.
+    fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
+        Ok(Self {
+            bytes: IrpByteBuffer::new(address, length)?,
+        })
+    }
+
+    /// Returns user output bytes.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.bytes.as_mut_slice()
+    }
+}
+
+/// Returns an IRP MDL data buffer address as kernel memory.
+fn mdl_data_buffer_address(
     mdl: NonNull<wdk_sys::MDL>,
     length: usize,
-) -> Result<IrpDataBuffer, DriverError> {
+) -> Result<NonNull<u8>, DriverError> {
     let mdl_ref = unsafe {
         // SAFETY: The IRP's MdlAddress is non-null and owned by the I/O
         // Manager for the lifetime of this dispatch callback.
@@ -662,7 +764,7 @@ fn mdl_data_buffer(
     }
 
     let address = mapped_mdl_address(mdl, mdl_ref)?;
-    IrpDataBuffer::new(address.cast(), length)
+    Ok(address.cast())
 }
 
 /// Implements the address-selection behavior of `MmGetSystemAddressForMdlSafe`.

@@ -7,8 +7,8 @@ use crate::disk::checksum::crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::disk_format::acl::{PosixAcl, PosixAclKind};
 use crate::disk_format::dir::{
-    DirectoryBlock, DirectoryBlockData, DirectoryChecksum, DirectoryEntry, DirectoryEntryKind,
-    DirectoryLayout, build_htree_directory,
+    DirectoryBlock, DirectoryBlockData, DirectoryChecksum, DirectoryEntry as RawDirectoryEntry,
+    DirectoryEntryKind, DirectoryLayout, build_htree_directory,
 };
 use crate::disk_format::extent::{
     BlockMapping, Extent, ExtentLength, ExtentTree, ExtentTreeContext, LogicalBlock,
@@ -22,9 +22,9 @@ use crate::disk_format::inode::{
 };
 use crate::disk_format::journal::{Journal, LoadedJournal};
 use crate::disk_format::superblock::{
-    BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel, FreeClusterDelta,
-    InodeTimestampEncoding, JournalMode, MetadataChecksum, RecoveryState, SparseSuperblockLayout,
-    Superblock, XattrMutationSupport,
+    BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel, FreeClusterCount,
+    FreeClusterDelta, InodeTimestampEncoding, JournalMode, MetadataChecksum, RecoveryState,
+    SparseSuperblockLayout, Superblock, XattrMutationSupport,
 };
 use crate::disk_format::xattr::{
     self as xattr_storage, InodeXattrSet, XattrName, XattrSet, XattrValue,
@@ -139,7 +139,7 @@ const SUPERBLOCK_OFFSET: u64 = 1024;
 
 /// Read-only mounted volume state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ReadOnly;
+struct ReadOnlyMount;
 
 /// Mount-time context that keeps external fscrypt material out of superblock parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,14 +204,14 @@ impl<N> MountContext<N> {
 
 /// Journal stored as a hidden ext4 inode on the filesystem device.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct InternalJournal {
+pub struct InternalJournal {
     /// Clean journal state ready to accept write transactions.
     journal: Journal,
 }
 
 /// External journal stored on a separate journal device.
 #[derive(Debug)]
-struct ExternalJournal<J> {
+pub struct ExternalJournal<J> {
     /// External journal block device.
     device: J,
     /// Clean journal state loaded from the external device.
@@ -220,7 +220,7 @@ struct ExternalJournal<J> {
 
 /// Journaled read-write mounted volume state.
 #[derive(Debug)]
-struct ReadWrite<J = InternalJournal> {
+struct JournaledMount<J = InternalJournal> {
     /// Journal backend selected at mount.
     journal: J,
     /// Mounted cluster reference counts constructed before any mutation.
@@ -240,7 +240,7 @@ struct ClusterReferenceIndex {
 
 impl ClusterReferenceIndex {
     /// Builds the mounted reference index from static metadata and live inodes.
-    fn load<D: BlockReader, State, N>(volume: &Volume<D, State, N>) -> Result<Self> {
+    fn load<D: BlockReader, State, N>(volume: &MountedVolume<D, State, N>) -> Result<Self> {
         let mut index = Self {
             refs: Vec::new(),
             exclusive_blocks: Vec::new(),
@@ -273,7 +273,7 @@ impl ClusterReferenceIndex {
     /// Adds one exclusive mounted reference after validating bitmap allocation.
     fn add_exclusive_reference<D: BlockReader, State, N>(
         &mut self,
-        volume: &Volume<D, State, N>,
+        volume: &MountedVolume<D, State, N>,
         block: BlockAddress,
     ) -> Result<()> {
         if self.exclusive_blocks.contains(&block) || self.xattr_blocks.contains(&block) {
@@ -286,7 +286,7 @@ impl ClusterReferenceIndex {
     /// Adds one external-xattr mounted reference after validating bitmap allocation.
     fn add_xattr_reference<D: BlockReader, State, N>(
         &mut self,
-        volume: &Volume<D, State, N>,
+        volume: &MountedVolume<D, State, N>,
         block: BlockAddress,
     ) -> Result<()> {
         if self.exclusive_blocks.contains(&block) {
@@ -301,7 +301,7 @@ impl ClusterReferenceIndex {
     /// Adds one mounted cluster reference after validating bitmap allocation.
     fn add_cluster_reference<D: BlockReader, State, N>(
         &mut self,
-        volume: &Volume<D, State, N>,
+        volume: &MountedVolume<D, State, N>,
         block: BlockAddress,
     ) -> Result<()> {
         let cluster = volume.superblock.cluster_of_block(block)?;
@@ -317,7 +317,7 @@ impl ClusterReferenceIndex {
     /// Adds all static metadata ranges that must keep their clusters allocated.
     fn add_static_metadata<D: BlockReader, State, N>(
         &mut self,
-        volume: &Volume<D, State, N>,
+        volume: &MountedVolume<D, State, N>,
     ) -> Result<()> {
         let groups = volume.superblock.block_group_count()?;
         let descriptor_blocks = descriptor_table_blocks(&volume.superblock)?;
@@ -364,7 +364,7 @@ impl ClusterReferenceIndex {
     /// Adds data and dynamic metadata references from allocated inode records.
     fn add_live_inodes<D: BlockReader, State, N>(
         &mut self,
-        volume: &Volume<D, State, N>,
+        volume: &MountedVolume<D, State, N>,
     ) -> Result<()> {
         for inode_number in 1..=volume.superblock.inode_count().as_u32() {
             let inode_id = InodeId::try_from(inode_number)?;
@@ -410,7 +410,7 @@ impl ClusterReferenceIndex {
     /// Adds references for every physical block represented by an extent.
     fn add_extent_references<D: BlockReader, State, N>(
         &mut self,
-        volume: &Volume<D, State, N>,
+        volume: &MountedVolume<D, State, N>,
         extent: Extent,
     ) -> Result<()> {
         for offset in 0..extent.len().as_u64() {
@@ -484,9 +484,103 @@ struct ClusterReferenceDelta {
     delta: i32,
 }
 
+/// Position of one allocation cluster bit inside a block-group bitmap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClusterBitmapPosition {
+    /// Block group owning the bitmap.
+    group: BlockGroupId,
+    /// Group-local cluster bit.
+    bit: u32,
+}
+
+impl ClusterBitmapPosition {
+    /// Creates a bitmap position for a validated group-local cluster bit.
+    const fn new(group: BlockGroupId, bit: u32) -> Self {
+        Self { group, bit }
+    }
+
+    /// Computes the cluster bitmap position for an absolute cluster address.
+    fn from_cluster(superblock: &Superblock, cluster: ClusterAddress) -> Result<Self> {
+        let group = superblock.cluster_group_of(cluster)?;
+        Ok(Self {
+            group,
+            bit: superblock.cluster_bit_in_group(cluster, group)?,
+        })
+    }
+
+    /// Block group owning the bitmap.
+    const fn group(self) -> BlockGroupId {
+        self.group
+    }
+
+    /// Group-local cluster bit.
+    const fn bit(self) -> u32 {
+        self.bit
+    }
+}
+
+/// Position of one inode bit inside a block-group bitmap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InodeBitmapPosition {
+    /// Block group owning the bitmap.
+    group: BlockGroupId,
+    /// Group-local inode bit.
+    bit: u32,
+}
+
+impl InodeBitmapPosition {
+    /// Creates a bitmap position for a validated group-local inode bit.
+    const fn new(group: BlockGroupId, bit: u32) -> Self {
+        Self { group, bit }
+    }
+
+    /// Computes the inode bitmap position for an absolute inode id.
+    fn from_inode(superblock: &Superblock, inode_id: InodeId) -> Result<Self> {
+        if inode_id.as_u32() > superblock.inode_count().as_u32() {
+            return Err(Error::InvalidInode);
+        }
+        let zero_based = inode_id
+            .as_u32()
+            .checked_sub(1)
+            .ok_or(Error::InvalidInode)?;
+        let group = zero_based
+            .checked_div(superblock.inodes_per_group().as_u32())
+            .ok_or(Error::InvalidSuperblock)?;
+        let bit = zero_based
+            .checked_rem(superblock.inodes_per_group().as_u32())
+            .ok_or(Error::InvalidSuperblock)?;
+        Ok(Self {
+            group: BlockGroupId::from_u32(group),
+            bit,
+        })
+    }
+
+    /// Converts this bitmap position into its absolute inode id.
+    fn inode_id(self, superblock: &Superblock) -> Result<InodeId> {
+        let zero_based = self
+            .group
+            .as_u32()
+            .checked_mul(superblock.inodes_per_group().as_u32())
+            .ok_or(Error::ArithmeticOverflow)?
+            .checked_add(self.bit)
+            .ok_or(Error::ArithmeticOverflow)?;
+        InodeId::try_from(zero_based.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
+    }
+
+    /// Block group owning the bitmap.
+    const fn group(self) -> BlockGroupId {
+        self.group
+    }
+
+    /// Group-local inode bit.
+    const fn bit(self) -> u32 {
+        self.bit
+    }
+}
+
 /// Mounted ext4 volume with typestate-selected mutation capability.
 #[derive(Debug)]
-struct Volume<D, State, N = FscryptNoNonceGenerator> {
+struct MountedVolume<D, State, N = FscryptNoNonceGenerator> {
     /// Backing filesystem block device.
     device: D,
     /// Validated superblock and mount policy.
@@ -495,6 +589,82 @@ struct Volume<D, State, N = FscryptNoNonceGenerator> {
     mount_context: MountContext<N>,
     /// Typestate carrying read-only or journaled read-write capability.
     state: State,
+}
+
+/// Mounted read-only ext4 volume.
+#[derive(Debug)]
+pub struct ReadOnlyVolume<D, N = FscryptNoNonceGenerator> {
+    /// Private mounted state with read traversal capability only.
+    volume: MountedVolume<D, ReadOnlyMount, N>,
+}
+
+/// Mounted journaled ext4 volume with mutation capability.
+#[derive(Debug)]
+pub struct JournaledVolume<D, J = InternalJournal, N = FscryptNoNonceGenerator> {
+    /// Private mounted state with journaled mutation capability.
+    volume: MountedVolume<D, JournaledMount<J>, N>,
+}
+
+/// Stable filesystem identity exposed outside the raw superblock domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VolumeIdentity {
+    /// Filesystem UUID.
+    uuid: crate::disk_format::superblock::FilesystemUuid,
+    /// Filesystem volume label.
+    label: Ext4VolumeLabel,
+}
+
+impl VolumeIdentity {
+    /// Filesystem UUID.
+    #[must_use]
+    pub const fn uuid(self) -> crate::disk_format::superblock::FilesystemUuid {
+        self.uuid
+    }
+
+    /// Filesystem volume label.
+    #[must_use]
+    pub const fn label(self) -> Ext4VolumeLabel {
+        self.label
+    }
+}
+
+/// Allocation geometry exposed outside the raw superblock domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VolumeGeometry {
+    /// Filesystem block size.
+    block_size: BlockSize,
+    /// Allocation cluster size.
+    cluster_size: crate::disk_format::superblock::ClusterSize,
+    /// Total allocation cluster count.
+    cluster_count: crate::disk_format::superblock::ClusterCount,
+    /// Currently free allocation cluster count.
+    free_cluster_count: FreeClusterCount,
+}
+
+impl VolumeGeometry {
+    /// Filesystem block size.
+    #[must_use]
+    pub const fn block_size(self) -> BlockSize {
+        self.block_size
+    }
+
+    /// Allocation cluster size.
+    #[must_use]
+    pub const fn cluster_size(self) -> crate::disk_format::superblock::ClusterSize {
+        self.cluster_size
+    }
+
+    /// Total allocation cluster count.
+    #[must_use]
+    pub const fn cluster_count(self) -> crate::disk_format::superblock::ClusterCount {
+        self.cluster_count
+    }
+
+    /// Currently free allocation cluster count.
+    #[must_use]
+    pub const fn free_cluster_count(self) -> FreeClusterCount {
+        self.free_cluster_count
+    }
 }
 
 /// Typed regular-file inode identity.
@@ -821,6 +991,46 @@ impl DirectoryChild {
     }
 }
 
+/// Directory entry whose referenced inode kind has been validated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryEntry {
+    /// Child name visible at the listing boundary.
+    name: Ext4Name,
+    /// Typed child identity.
+    node: NodeId,
+    /// File type recorded in the directory entry.
+    entry_kind: DirectoryEntryKind,
+}
+
+impl DirectoryEntry {
+    /// Creates a listed entry after validating the referenced inode.
+    fn new(name: &Ext4Name, node: NodeId, entry_kind: DirectoryEntryKind) -> Self {
+        Self {
+            name: name.clone(),
+            node,
+            entry_kind,
+        }
+    }
+
+    /// Child name visible at the listing boundary.
+    #[must_use]
+    pub const fn name(&self) -> &Ext4Name {
+        &self.name
+    }
+
+    /// Typed child identity.
+    #[must_use]
+    pub const fn node(&self) -> &NodeId {
+        &self.node
+    }
+
+    /// File type recorded in the directory entry.
+    #[must_use]
+    pub const fn entry_kind(&self) -> DirectoryEntryKind {
+        self.entry_kind
+    }
+}
+
 /// Result of a directory lookup.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChildLookup {
@@ -830,37 +1040,51 @@ pub enum ChildLookup {
     NotFound,
 }
 
-impl<D: BlockReader, N> Volume<D, ReadOnly, N> {
+impl<D: BlockReader, N> MountedVolume<D, ReadOnlyMount, N> {
     /// Validates an ext4 volume and constructs read-only mounted state.
     ///
     /// # Errors
     /// Returns an error when the device does not contain a supported ext4 superblock.
-    pub fn mount_read_only(device: D, mount_context: MountContext<N>) -> Result<Self> {
+    fn mount(device: D, mount_context: MountContext<N>) -> Result<Self> {
         let superblock = Superblock::read_from(&device)?;
         Ok(Self {
             device,
             superblock,
             mount_context,
-            state: ReadOnly,
+            state: ReadOnlyMount,
         })
     }
 }
 
-impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> Volume<D, ReadWrite<InternalJournal>, N> {
+impl<D: BlockReader, N> ReadOnlyVolume<D, N> {
+    /// Validates an ext4 volume and constructs read-only mounted state.
+    ///
+    /// # Errors
+    /// Returns an error when the device does not contain a supported ext4 superblock.
+    pub fn mount(device: D, mount_context: MountContext<N>) -> Result<Self> {
+        Ok(Self {
+            volume: MountedVolume::mount(device, mount_context)?,
+        })
+    }
+}
+
+impl<D: BlockWriter, N: FscryptNonceGenerator + Clone>
+    MountedVolume<D, JournaledMount<InternalJournal>, N>
+{
     /// Replays the internal journal boundary and constructs journaled read-write state.
     ///
     /// # Errors
     /// Returns an error when the device is not a supported journaled ext4 volume.
-    pub fn mount_read_write(mut device: D, mount_context: MountContext<N>) -> Result<Self> {
+    fn mount_internal_journal(mut device: D, mount_context: MountContext<N>) -> Result<Self> {
         let mut superblock = Superblock::read_write_from(&device)?;
         let JournalMode::Internal(journal_inode_id) = superblock.journal_mode() else {
             return Err(Error::UnsupportedJournal);
         };
-        let read_only = Volume::<&mut D, ReadOnly, N> {
+        let read_only = MountedVolume::<&mut D, ReadOnlyMount, N> {
             device: &mut device,
             superblock,
             mount_context: mount_context.clone(),
-            state: ReadOnly,
+            state: ReadOnlyMount,
         };
         let journal_inode = read_only.read_inode_record(journal_inode_id)?;
         let journal = Journal::<LoadedJournal>::from_inode(
@@ -881,11 +1105,11 @@ impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> Volume<D, ReadWrite<Inter
             superblock = Superblock::read_write_from(&device)?;
         }
         let clusters = {
-            let recovered = Volume::<&mut D, ReadOnly, N> {
+            let recovered = MountedVolume::<&mut D, ReadOnlyMount, N> {
                 device: &mut device,
                 superblock,
                 mount_context: mount_context.clone(),
-                state: ReadOnly,
+                state: ReadOnlyMount,
             };
             ClusterReferenceIndex::load(&recovered)?
         };
@@ -893,7 +1117,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> Volume<D, ReadWrite<Inter
             device,
             superblock,
             mount_context,
-            state: ReadWrite { journal, clusters },
+            state: JournaledMount { journal, clusters },
         })
     }
 
@@ -902,8 +1126,8 @@ impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> Volume<D, ReadWrite<Inter
     pub fn begin_transaction(
         &mut self,
         now: Ext4Timestamp,
-    ) -> WriteTransaction<'_, D, InternalJournal, N> {
-        WriteTransaction {
+    ) -> JournalTransaction<'_, D, InternalJournal, N> {
+        JournalTransaction {
             volume: self,
             now,
             inode_updates: Vec::new(),
@@ -922,14 +1146,35 @@ impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> Volume<D, ReadWrite<Inter
     }
 }
 
+impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> JournaledVolume<D, InternalJournal, N> {
+    /// Replays the internal journal boundary and constructs journaled read-write state.
+    ///
+    /// # Errors
+    /// Returns an error when the device is not a supported journaled ext4 volume.
+    pub fn mount(device: D, mount_context: MountContext<N>) -> Result<Self> {
+        Ok(Self {
+            volume: MountedVolume::mount_internal_journal(device, mount_context)?,
+        })
+    }
+
+    /// Starts a write transaction with caller-supplied inode timestamps.
+    #[must_use]
+    pub fn begin_transaction(
+        &mut self,
+        now: Ext4Timestamp,
+    ) -> JournalTransaction<'_, D, InternalJournal, N> {
+        self.volume.begin_transaction(now)
+    }
+}
+
 impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
-    Volume<D, ReadWrite<ExternalJournal<J>>, N>
+    MountedVolume<D, JournaledMount<ExternalJournal<J>>, N>
 {
     /// Replays an external journal and constructs journaled read-write state.
     ///
     /// # Errors
     /// Returns an error when either device cannot support the external journal contract.
-    pub fn mount_read_write_with_external_journal(
+    fn mount_external_journal(
         mut device: D,
         journal_device: J,
         mount_context: MountContext<N>,
@@ -961,11 +1206,11 @@ impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
             superblock = Superblock::read_write_from(&device)?;
         }
         let clusters = {
-            let recovered = Volume::<&mut D, ReadOnly, N> {
+            let recovered = MountedVolume::<&mut D, ReadOnlyMount, N> {
                 device: &mut device,
                 superblock,
                 mount_context: mount_context.clone(),
-                state: ReadOnly,
+                state: ReadOnlyMount,
             };
             ClusterReferenceIndex::load(&recovered)?
         };
@@ -973,7 +1218,7 @@ impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
             device,
             superblock,
             mount_context,
-            state: ReadWrite { journal, clusters },
+            state: JournaledMount { journal, clusters },
         })
     }
 
@@ -982,8 +1227,8 @@ impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
     pub fn begin_transaction(
         &mut self,
         now: Ext4Timestamp,
-    ) -> WriteTransaction<'_, D, ExternalJournal<J>, N> {
-        WriteTransaction {
+    ) -> JournalTransaction<'_, D, ExternalJournal<J>, N> {
+        JournalTransaction {
             volume: self,
             now,
             inode_updates: Vec::new(),
@@ -1002,11 +1247,251 @@ impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
     }
 }
 
-impl<D: BlockReader, State, N> Volume<D, State, N> {
-    /// Validated superblock.
+impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
+    JournaledVolume<D, ExternalJournal<J>, N>
+{
+    /// Replays an external journal and constructs journaled read-write state.
+    ///
+    /// # Errors
+    /// Returns an error when either device cannot support the external journal contract.
+    pub fn mount_with_external_journal(
+        device: D,
+        journal_device: J,
+        mount_context: MountContext<N>,
+    ) -> Result<Self> {
+        Ok(Self {
+            volume: MountedVolume::mount_external_journal(device, journal_device, mount_context)?,
+        })
+    }
+
+    /// Starts a write transaction with caller-supplied inode timestamps.
     #[must_use]
-    pub const fn superblock(&self) -> Superblock {
-        self.superblock
+    pub fn begin_transaction(
+        &mut self,
+        now: Ext4Timestamp,
+    ) -> JournalTransaction<'_, D, ExternalJournal<J>, N> {
+        self.volume.begin_transaction(now)
+    }
+}
+
+/// Implements the public read/traversal surface shared by mounted volume capabilities.
+macro_rules! impl_volume_read_api {
+    ($volume:ident < $($generic:ident),+ >) => {
+        impl<$($generic),+> $volume<$($generic),+>
+        where
+            D: BlockReader,
+        {
+            /// Stable filesystem identity.
+            #[must_use]
+            pub const fn identity(&self) -> VolumeIdentity {
+                self.volume.identity()
+            }
+
+            /// Mounted filesystem allocation geometry.
+            #[must_use]
+            pub const fn geometry(&self) -> VolumeGeometry {
+                self.volume.geometry()
+            }
+
+            /// Mount context used by this volume.
+            #[must_use]
+            pub const fn mount_context(&self) -> &MountContext<N> {
+                self.volume.mount_context()
+            }
+
+            /// Adds one fscrypt master key to this mounted volume.
+            ///
+            /// # Errors
+            /// Returns an error when the key identifier is already present.
+            pub fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> Result<()> {
+                self.volume.add_fscrypt_key(key)
+            }
+
+            /// Removes one fscrypt master key from this mounted volume.
+            #[must_use]
+            pub fn remove_fscrypt_key(
+                &mut self,
+                identifier: FscryptKeyIdentifier,
+            ) -> Option<FscryptMasterKey> {
+                self.volume.remove_fscrypt_key(identifier)
+            }
+
+            /// Returns this mounted volume's fscrypt key presence for one identifier.
+            #[must_use]
+            pub fn fscrypt_key_presence(
+                &self,
+                identifier: FscryptKeyIdentifier,
+            ) -> FscryptKeyPresence {
+                self.volume.fscrypt_key_presence(identifier)
+            }
+
+            /// Filesystem volume label parsed from the mounted superblock.
+            #[must_use]
+            pub const fn volume_label(&self) -> Ext4VolumeLabel {
+                self.volume.volume_label()
+            }
+
+            /// Loads the root directory.
+            ///
+            /// # Errors
+            /// Returns an error when the root inode cannot be read as a directory.
+            pub fn root_directory(&self) -> Result<DirectoryNode> {
+                match self.volume.load_inode_node(DirectoryNodeId::ROOT.inode())? {
+                    LoadedNode::Directory(directory) => Ok(directory),
+                    _ => Err(Error::InvalidInode),
+                }
+            }
+
+            /// Loads a node by previously validated identity.
+            ///
+            /// # Errors
+            /// Returns an error when the inode cannot be read or no longer has the recorded kind.
+            pub fn load(&self, id: NodeId) -> Result<LoadedNode> {
+                self.volume.load_validated_node(id)
+            }
+
+            /// Reads all extended attributes attached to a typed node.
+            ///
+            /// # Errors
+            /// Returns an error when the inode or its external xattr block is malformed.
+            pub fn read_xattrs(&self, node: NodeId) -> Result<XattrSet> {
+                self.volume.read_inode_xattrs(node.inode())
+            }
+
+            /// Reads one extended attribute value by name.
+            ///
+            /// # Errors
+            /// Returns an error when the inode or its external xattr block is malformed.
+            pub fn read_xattr(
+                &self,
+                node: NodeId,
+                name: &XattrName,
+            ) -> Result<Option<XattrValue>> {
+                self.volume.read_inode_xattr(node.inode(), name)
+            }
+
+            /// Reads a POSIX ACL from its ext4 xattr slot.
+            ///
+            /// # Errors
+            /// Returns an error when the backing xattr or ACL payload is malformed.
+            pub fn read_posix_acl(
+                &self,
+                node: NodeId,
+                kind: PosixAclKind,
+            ) -> Result<Option<PosixAcl>> {
+                self.volume.read_inode_posix_acl(node.inode(), kind)
+            }
+
+            /// Reads Windows overlay metadata isolated in `user.ext4win.*` xattrs.
+            ///
+            /// # Errors
+            /// Returns an error when the overlay xattr payload is malformed.
+            pub fn read_windows_overlay(&self, node: NodeId) -> Result<Option<WindowsOverlay>> {
+                self.volume.read_inode_windows_overlay(node.inode())
+            }
+
+            /// Reads the fscrypt v2 context stored in ext4's private inode xattr slot.
+            ///
+            /// # Errors
+            /// Returns an error when the inode's xattr storage is malformed or the
+            /// stored fscrypt context is not in the supported v2 AES profile.
+            pub fn read_fscrypt_context(&self, node: NodeId) -> Result<Option<FscryptContextV2>> {
+                self.volume.read_inode_fscrypt_context(node.inode())
+            }
+
+            /// Reads file bytes from a typed regular file node.
+            ///
+            /// # Errors
+            /// Returns an error when the file extent mapping cannot be traversed.
+            pub fn read_file(
+                &self,
+                file: &FileNode,
+                offset: FileOffset,
+                out: &mut [u8],
+            ) -> Result<ReadBytes> {
+                self.volume.read_file(file, offset, out)
+            }
+
+            /// Reads a typed symlink target as bytes.
+            ///
+            /// # Errors
+            /// Returns an error when the symlink target cannot be read.
+            pub fn read_symlink(&self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
+                self.volume.read_symlink(symlink)
+            }
+
+            /// Enumerates directory entries as validated node identities.
+            ///
+            /// # Errors
+            /// Returns an error when the directory is too large for eager
+            /// enumeration, contains malformed entries, or references an invalid inode.
+            pub fn read_directory(&self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
+                self.volume.read_directory(directory)
+            }
+
+            /// Looks up an exact ext4 child name under a directory.
+            ///
+            /// # Errors
+            /// Returns an error when the parent cannot be enumerated.
+            pub fn lookup_child(
+                &self,
+                parent: &DirectoryNode,
+                name: &Ext4Name,
+            ) -> Result<ChildLookup> {
+                self.volume.lookup_child(parent, name)
+            }
+
+            /// Looks up a Windows-visible child name, accepting case-insensitive matches only when unique.
+            ///
+            /// # Errors
+            /// Returns an error when the parent cannot be enumerated or the
+            /// case-insensitive Windows projection is ambiguous.
+            pub fn lookup_windows_child(
+                &self,
+                parent: &DirectoryNode,
+                requested: &WindowsName,
+            ) -> Result<ChildLookup> {
+                self.volume.lookup_windows_child(parent, requested)
+            }
+
+            /// Looks up a Windows-visible child name and returns the matched directory entry.
+            ///
+            /// # Errors
+            /// Returns an error when the parent cannot be enumerated or the
+            /// case-insensitive Windows projection is ambiguous.
+            pub fn lookup_windows_child_entry(
+                &self,
+                parent: &DirectoryNode,
+                requested: &WindowsName,
+            ) -> Result<Option<DirectoryEntry>> {
+                self.volume.lookup_windows_child_entry(parent, requested)
+            }
+        }
+    };
+}
+
+impl_volume_read_api!(ReadOnlyVolume<D, N>);
+impl_volume_read_api!(JournaledVolume<D, J, N>);
+
+impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
+    /// Stable filesystem identity.
+    #[must_use]
+    const fn identity(&self) -> VolumeIdentity {
+        VolumeIdentity {
+            uuid: self.superblock.uuid(),
+            label: self.superblock.volume_label(),
+        }
+    }
+
+    /// Mounted filesystem allocation geometry.
+    #[must_use]
+    const fn geometry(&self) -> VolumeGeometry {
+        VolumeGeometry {
+            block_size: self.superblock.block_size(),
+            cluster_size: self.superblock.cluster_size(),
+            cluster_count: self.superblock.cluster_count(),
+            free_cluster_count: self.superblock.free_cluster_count(),
+        }
     }
 
     /// Mount context used by this volume.
@@ -1048,7 +1533,7 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
-    pub fn read_xattrs(&self, inode_id: InodeId) -> Result<XattrSet> {
+    fn read_inode_xattrs(&self, inode_id: InodeId) -> Result<XattrSet> {
         Ok(self
             .read_inode_xattrs_from_live(&self.read_live_inode_record(inode_id)?)?
             .public()
@@ -1059,20 +1544,20 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
-    pub fn read_xattr(&self, inode_id: InodeId, name: &XattrName) -> Result<Option<XattrValue>> {
-        Ok(self.read_xattrs(inode_id)?.get(name).cloned())
+    fn read_inode_xattr(&self, inode_id: InodeId, name: &XattrName) -> Result<Option<XattrValue>> {
+        Ok(self.read_inode_xattrs(inode_id)?.get(name).cloned())
     }
 
     /// Reads a POSIX ACL from its ext4 xattr slot.
     ///
     /// # Errors
     /// Returns an error when the backing xattr or ACL payload is malformed.
-    pub fn read_posix_acl(
+    fn read_inode_posix_acl(
         &self,
         inode_id: InodeId,
         kind: PosixAclKind,
     ) -> Result<Option<PosixAcl>> {
-        let Some(value) = self.read_xattr(inode_id, &PosixAcl::xattr_name(kind)?)? else {
+        let Some(value) = self.read_inode_xattr(inode_id, &PosixAcl::xattr_name(kind)?)? else {
             return Ok(None);
         };
         Ok(Some(PosixAcl::parse(&value)?))
@@ -1082,8 +1567,9 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the overlay xattr payload is malformed.
-    pub fn read_windows_overlay(&self, inode_id: InodeId) -> Result<Option<WindowsOverlay>> {
-        let Some(value) = self.read_xattr(inode_id, &WindowsOverlay::attributes_xattr_name()?)?
+    fn read_inode_windows_overlay(&self, inode_id: InodeId) -> Result<Option<WindowsOverlay>> {
+        let Some(value) =
+            self.read_inode_xattr(inode_id, &WindowsOverlay::attributes_xattr_name()?)?
         else {
             return Ok(None);
         };
@@ -1095,7 +1581,7 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
     /// # Errors
     /// Returns an error when the inode's xattr storage is malformed or the
     /// stored fscrypt context is not in the supported v2 AES profile.
-    pub fn read_fscrypt_context(&self, inode_id: InodeId) -> Result<Option<FscryptContextV2>> {
+    fn read_inode_fscrypt_context(&self, inode_id: InodeId) -> Result<Option<FscryptContextV2>> {
         let xattrs = self.read_inode_xattrs_from_live(&self.read_live_inode_record(inode_id)?)?;
         let Some(value) = xattrs.encryption_context() else {
             return Ok(None);
@@ -1117,7 +1603,7 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
         &self,
         inode: &Inode,
     ) -> Result<(FscryptContextV2, &FscryptMasterKey)> {
-        let Some(context) = self.read_fscrypt_context(inode.id())? else {
+        let Some(context) = self.read_inode_fscrypt_context(inode.id())? else {
             return Err(Error::InvalidEncryptionContext);
         };
         let Some(key) = self
@@ -1183,8 +1669,18 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
     /// # Errors
     /// Returns an error when the inode number is outside the volume or the inode
     /// table cannot be read and parsed.
-    pub fn load_node(&self, inode_id: InodeId) -> Result<LoadedNode> {
+    fn load_inode_node(&self, inode_id: InodeId) -> Result<LoadedNode> {
         Ok(LoadedNode::from_inode(self.read_inode_record(inode_id)?))
+    }
+
+    /// Loads an inode through a previously validated public identity.
+    fn load_validated_node(&self, id: NodeId) -> Result<LoadedNode> {
+        let node = self.load_inode_node(id.inode())?;
+        if node.id() == id {
+            Ok(node)
+        } else {
+            Err(Error::InvalidInode)
+        }
     }
 
     /// Reads file bytes from a typed regular file node.
@@ -1325,37 +1821,41 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
     /// enumeration, or contains malformed entries.
     pub fn read_directory(&self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
         let entries = self.read_directory_layout(directory.inode())?.entries();
-        if !directory.protection().is_encrypted() {
-            return Ok(entries);
-        }
-        match self.decrypt_directory_entries(directory.inode(), &entries) {
-            Err(Error::MissingEncryptionKey) => Self::project_locked_directory_entries(entries),
-            result => result,
-        }
+        let entries = if directory.protection().is_encrypted() {
+            match self.decrypt_directory_entries(directory.inode(), &entries) {
+                Err(Error::MissingEncryptionKey) => {
+                    Self::project_locked_directory_entries(entries)?
+                }
+                result => result?,
+            }
+        } else {
+            entries
+        };
+        self.validate_directory_entries(entries)
     }
 
     /// Decrypts directory-entry names for an unlocked encrypted directory.
     fn decrypt_directory_entries(
         &self,
         directory: &Inode,
-        entries: &[DirectoryEntry],
-    ) -> Result<Vec<DirectoryEntry>> {
+        entries: &[RawDirectoryEntry],
+    ) -> Result<Vec<RawDirectoryEntry>> {
         let mut decrypted = Vec::with_capacity(entries.len());
         for entry in entries {
             let name = self.decrypt_directory_child_name(directory, entry.name())?;
-            decrypted.push(DirectoryEntry::new(entry.inode(), &name, entry.kind()));
+            decrypted.push(RawDirectoryEntry::new(entry.inode(), &name, entry.kind()));
         }
         Ok(decrypted)
     }
 
     /// Projects encrypted on-disk dirent names into reversible no-key names.
     fn project_locked_directory_entries(
-        entries: Vec<DirectoryEntry>,
-    ) -> Result<Vec<DirectoryEntry>> {
+        entries: Vec<RawDirectoryEntry>,
+    ) -> Result<Vec<RawDirectoryEntry>> {
         let mut projected = Vec::with_capacity(entries.len());
         for entry in entries {
             let name = Self::project_locked_directory_name(entry.name())?;
-            projected.push(DirectoryEntry::new(entry.inode(), &name, entry.kind()));
+            projected.push(RawDirectoryEntry::new(entry.inode(), &name, entry.kind()));
         }
         Ok(projected)
     }
@@ -1399,7 +1899,12 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
         requested: &WindowsName,
     ) -> Result<ChildLookup> {
         match self.lookup_windows_child_entry(parent, requested)? {
-            Some(entry) => Ok(ChildLookup::Found(self.directory_child(parent, entry)?)),
+            Some(entry) => Ok(ChildLookup::Found(DirectoryChild::new(
+                parent.id(),
+                entry.name(),
+                *entry.node(),
+                entry.entry_kind(),
+            ))),
             None => Ok(ChildLookup::NotFound),
         }
     }
@@ -1428,10 +1933,11 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
                 }
                 Err(error) => return Err(error),
             };
-            return Ok(self
+            return self
                 .read_directory_layout(parent.inode())?
                 .find(&ciphertext)
-                .map(|entry| DirectoryEntry::new(entry.inode(), &visible_name, entry.kind())));
+                .map(|entry| self.validate_directory_entry(entry, &visible_name))
+                .transpose();
         }
         if parent.protection().is_verity() {
             return Err(Error::UnsupportedVerity);
@@ -1460,15 +1966,38 @@ impl<D: BlockReader, State, N> Volume<D, State, N> {
     fn directory_child(
         &self,
         parent: &DirectoryNode,
-        entry: DirectoryEntry,
+        entry: RawDirectoryEntry,
     ) -> Result<DirectoryChild> {
-        let node = self.load_node(entry.inode())?.id();
+        let node = self.load_inode_node(entry.inode())?.id();
         Ok(DirectoryChild::new(
             parent.id(),
             entry.name(),
             node,
             entry.kind(),
         ))
+    }
+
+    /// Converts raw directory entries into public entries with validated node identity.
+    fn validate_directory_entries(
+        &self,
+        entries: Vec<RawDirectoryEntry>,
+    ) -> Result<Vec<DirectoryEntry>> {
+        let mut validated = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let node = self.load_inode_node(entry.inode())?.id();
+            validated.push(DirectoryEntry::new(entry.name(), node, entry.kind()));
+        }
+        Ok(validated)
+    }
+
+    /// Converts one raw directory entry into a public entry using an explicit visible name.
+    fn validate_directory_entry(
+        &self,
+        entry: RawDirectoryEntry,
+        visible_name: &Ext4Name,
+    ) -> Result<DirectoryEntry> {
+        let node = self.load_inode_node(entry.inode())?.id();
+        Ok(DirectoryEntry::new(visible_name, node, entry.kind()))
     }
 
     /// Loads and validates the directory layout selected by an inode.
@@ -1881,9 +2410,10 @@ impl TransactionNode {
 
 /// In-progress ext4 write transaction.
 #[derive(Debug)]
-struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal, N = FscryptNoNonceGenerator> {
+pub struct JournalTransaction<'a, D: BlockWriter, J = InternalJournal, N = FscryptNoNonceGenerator>
+{
     /// Mounted read-write volume being mutated.
-    volume: &'a mut Volume<D, ReadWrite<J>, N>,
+    volume: &'a mut MountedVolume<D, JournaledMount<J>, N>,
     /// Timestamp applied consistently to staged inode updates.
     now: Ext4Timestamp,
     /// Inode records staged for rewrite at commit.
@@ -1912,7 +2442,7 @@ struct WriteTransaction<'a, D: BlockWriter, J = InternalJournal, N = FscryptNoNo
     volume_label_update: Option<Ext4VolumeLabel>,
 }
 
-impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> {
+impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N> {
     /// Verifies that the mounted profile admits xattr storage mutation.
     fn require_xattr_mutation(&self) -> Result<()> {
         self.volume.superblock.xattr_mutation().require_supported()
@@ -2134,7 +2664,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             DirectoryEntryKind::Directory,
         )?;
         self.increment_directory_links(parent.inode())?;
-        let (group, _) = inode_group_bit(&self.volume.superblock, inode_id)?;
+        let group = InodeBitmapPosition::from_inode(&self.volume.superblock, inode_id)?.group();
         self.record_group_used_dirs_delta(group, 1)?;
         self.inode_updates.push(raw_inode.into());
         Ok(TransactionDirectory {
@@ -2245,7 +2775,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         let deleted = raw_inode.delete(self.now, self.volume.superblock.block_size())?;
         self.replace_deleted_inode(inode_index, deleted)?;
         self.decrement_directory_links(parent.inode())?;
-        let (group, _) = inode_group_bit(&self.volume.superblock, removed.inode())?;
+        let group =
+            InodeBitmapPosition::from_inode(&self.volume.superblock, removed.inode())?.group();
         self.record_group_used_dirs_delta(group, -1)
     }
 
@@ -3104,7 +3635,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     }
 
     /// Finds a live directory entry by exact ext4 name.
-    fn find_child_entry(&self, parent: InodeId, name: &Ext4Name) -> Result<DirectoryEntry> {
+    fn find_child_entry(&self, parent: InodeId, name: &Ext4Name) -> Result<RawDirectoryEntry> {
         let inode = self.volume.read_inode_record(parent)?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
@@ -3120,7 +3651,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     fn directory_lookup_name(&self, directory: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
         match self.volume.encrypt_directory_child_name(directory, name) {
             Err(Error::MissingEncryptionKey) => Ok(
-                Volume::<D, ReadWrite<J>, N>::locked_directory_ciphertext_name(name)?
+                MountedVolume::<D, JournaledMount<J>, N>::locked_directory_ciphertext_name(name)?
                     .unwrap_or_else(|| name.clone()),
             ),
             result => result,
@@ -3160,7 +3691,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             DirectoryStorageKind::HTree
         ) {
             let mut entries = self.directory_layout(&parent_inode)?.entries();
-            entries.push(DirectoryEntry::new(child, &disk_name, kind));
+            entries.push(RawDirectoryEntry::new(child, &disk_name, kind));
             self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
             return Ok(());
         }
@@ -3178,7 +3709,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         match self.volume.superblock.directory_indexing() {
             DirectoryIndexing::Enabled => {
                 let mut entries = self.directory_layout(&parent_inode)?.entries();
-                entries.push(DirectoryEntry::new(child, &disk_name, kind));
+                entries.push(RawDirectoryEntry::new(child, &disk_name, kind));
                 self.stage_rebuilt_htree_directory(
                     inode_index,
                     raw_parent,
@@ -3230,7 +3761,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         &mut self,
         parent: InodeId,
         name: &Ext4Name,
-    ) -> Result<DirectoryEntry> {
+    ) -> Result<RawDirectoryEntry> {
         let inode_index = self.ensure_inode_update(parent)?;
         let mut raw_parent = self.staged_live_inode(inode_index)?;
         let parent_inode = raw_parent.parse()?;
@@ -3274,7 +3805,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         new_name: &Ext4Name,
         child: InodeId,
         kind: DirectoryEntryKind,
-    ) -> Result<DirectoryEntry> {
+    ) -> Result<RawDirectoryEntry> {
         let inode_index = self.ensure_inode_update(parent)?;
         let mut raw_parent = self.staged_live_inode(inode_index)?;
         let parent_inode = raw_parent.parse()?;
@@ -3315,7 +3846,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             *entries
                 .get_mut(position)
                 .ok_or(Error::InvalidDirectoryEntry)? =
-                DirectoryEntry::new(child, &new_disk_name, kind);
+                RawDirectoryEntry::new(child, &new_disk_name, kind);
             self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
             return Ok(renamed);
         }
@@ -3345,7 +3876,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         name: &Ext4Name,
         child: InodeId,
         kind: DirectoryEntryKind,
-    ) -> Result<DirectoryEntry> {
+    ) -> Result<RawDirectoryEntry> {
         let inode_index = self.ensure_inode_update(parent)?;
         let mut raw_parent = self.staged_live_inode(inode_index)?;
         let parent_inode = raw_parent.parse()?;
@@ -3374,7 +3905,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             *entries
                 .get_mut(position)
                 .ok_or(Error::InvalidDirectoryEntry)? =
-                DirectoryEntry::new(child, &disk_name, kind);
+                RawDirectoryEntry::new(child, &disk_name, kind);
             self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
             return Ok(replaced);
         }
@@ -3396,7 +3927,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         inode_index: usize,
         mut raw_parent: LiveInodeRecord,
         parent_inode: &Inode,
-        entries: &[DirectoryEntry],
+        entries: &[RawDirectoryEntry],
     ) -> Result<()> {
         let dot = entries
             .iter()
@@ -3887,6 +4418,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             let bitmap_index = self.ensure_block_bitmap_update(descriptor.block_bitmap())?;
             let clusters_in_group = self.volume.superblock.clusters_in_group(group)?;
             for bit in 0..clusters_in_group {
+                let position = ClusterBitmapPosition::new(group, bit);
                 let cluster = ClusterAddress::new(
                     u64::from(group.as_u32())
                         .checked_mul(u64::from(
@@ -3909,7 +4441,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
                         .block_bitmap_updates
                         .get(bitmap_index)
                         .ok_or(Error::InvalidSuperblock)?;
-                    bitmap_bit_state(bitmap.bytes.as_slice(), bit)?
+                    cluster_bitmap_bit_state(bitmap.bytes.as_slice(), position)?
                 };
                 if occupied == BitmapBitState::Used {
                     continue;
@@ -3921,7 +4453,11 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
                     .block_bitmap_updates
                     .get_mut(bitmap_index)
                     .ok_or(Error::InvalidSuperblock)?;
-                set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, BitmapBitState::Used)?;
+                set_cluster_bitmap_bit(
+                    bitmap.bytes.as_mut_slice(),
+                    position,
+                    BitmapBitState::Used,
+                )?;
                 self.record_group_free_clusters_delta(group, FreeClusterDelta::from_i64(-1))?;
                 self.free_clusters_delta = self.free_clusters_delta.checked_add(-1)?;
                 self.record_cluster_reference_delta(cluster, 1)?;
@@ -4006,7 +4542,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
 
     /// Clears one cluster bitmap bit and records the affected accounting deltas.
     fn free_cluster(&mut self, cluster: ClusterAddress) -> Result<()> {
-        let group = self.volume.superblock.cluster_group_of(cluster)?;
+        let position = ClusterBitmapPosition::from_cluster(&self.volume.superblock, cluster)?;
+        let group = position.group();
         let descriptor =
             BlockGroupDescriptor::read_from(&self.volume.device, &self.volume.superblock, group)?;
         let bitmap_index = self.ensure_block_bitmap_update(descriptor.block_bitmap())?;
@@ -4014,12 +4551,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             .block_bitmap_updates
             .get_mut(bitmap_index)
             .ok_or(Error::InvalidSuperblock)?;
-        let bit = self
-            .volume
-            .superblock
-            .cluster_bit_in_group(cluster, group)?;
-        if bitmap_bit_state(bitmap.bytes.as_slice(), bit)? == BitmapBitState::Used {
-            set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, BitmapBitState::Free)?;
+        if cluster_bitmap_bit_state(bitmap.bytes.as_slice(), position)? == BitmapBitState::Used {
+            set_cluster_bitmap_bit(bitmap.bytes.as_mut_slice(), position, BitmapBitState::Free)?;
             self.record_group_free_clusters_delta(group, FreeClusterDelta::from_i64(1))?;
             self.free_clusters_delta = self.free_clusters_delta.checked_add(1)?;
             Ok(())
@@ -4070,7 +4603,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             let bitmap_index = self.ensure_inode_bitmap_update(descriptor.inode_bitmap())?;
             let inodes_in_group = self.inodes_in_group(group)?;
             for bit in 0..inodes_in_group {
-                let inode_id = self.inode_id_in_group(group, bit)?;
+                let position = InodeBitmapPosition::new(group, bit);
+                let inode_id = position.inode_id(&self.volume.superblock)?;
                 if inode_id.as_u32() < self.volume.superblock.first_inode().as_u32() {
                     continue;
                 }
@@ -4078,8 +4612,14 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
                     .inode_bitmap_updates
                     .get_mut(bitmap_index)
                     .ok_or(Error::InvalidSuperblock)?;
-                if bitmap_bit_state(bitmap.bytes.as_slice(), bit)? == BitmapBitState::Free {
-                    set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, BitmapBitState::Used)?;
+                if inode_bitmap_bit_state(bitmap.bytes.as_slice(), position)?
+                    == BitmapBitState::Free
+                {
+                    set_inode_bitmap_bit(
+                        bitmap.bytes.as_mut_slice(),
+                        position,
+                        BitmapBitState::Used,
+                    )?;
                     self.record_group_free_inodes_delta(group, -1)?;
                     return self.empty_allocated_inode_record(inode_id);
                 }
@@ -4093,7 +4633,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
         if inode_id == InodeId::ROOT {
             return Err(Error::CannotRemoveRoot);
         }
-        let (group, bit) = inode_group_bit(&self.volume.superblock, inode_id)?;
+        let position = InodeBitmapPosition::from_inode(&self.volume.superblock, inode_id)?;
+        let group = position.group();
         let descriptor =
             BlockGroupDescriptor::read_from(&self.volume.device, &self.volume.superblock, group)?;
         let bitmap_index = self.ensure_inode_bitmap_update(descriptor.inode_bitmap())?;
@@ -4101,8 +4642,8 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             .inode_bitmap_updates
             .get_mut(bitmap_index)
             .ok_or(Error::InvalidSuperblock)?;
-        if bitmap_bit_state(bitmap.bytes.as_slice(), bit)? == BitmapBitState::Used {
-            set_bitmap_bit(bitmap.bytes.as_mut_slice(), bit, BitmapBitState::Free)?;
+        if inode_bitmap_bit_state(bitmap.bytes.as_slice(), position)? == BitmapBitState::Used {
+            set_inode_bitmap_bit(bitmap.bytes.as_mut_slice(), position, BitmapBitState::Free)?;
             self.record_group_free_inodes_delta(group, 1)?;
         }
         Ok(())
@@ -4261,17 +4802,6 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
             self.volume.superblock.inodes_per_group().as_u32(),
             u32::try_from(remaining).unwrap_or(u32::MAX),
         ))
-    }
-
-    /// Converts a group-local inode bitmap bit into an inode number.
-    fn inode_id_in_group(&self, group: BlockGroupId, bit: u32) -> Result<InodeId> {
-        let zero_based = group
-            .as_u32()
-            .checked_mul(self.volume.superblock.inodes_per_group().as_u32())
-            .ok_or(Error::ArithmeticOverflow)?
-            .checked_add(bit)
-            .ok_or(Error::ArithmeticOverflow)?;
-        InodeId::try_from(zero_based.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
     }
 
     /// Creates a zeroed inode record at the allocated inode's device offset.
@@ -4592,7 +5122,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> WriteTransaction<'_, D, J, N> 
     }
 }
 
-impl<D: BlockWriter, N: FscryptNonceGenerator> WriteTransaction<'_, D, InternalJournal, N> {
+impl<D: BlockWriter, N: FscryptNonceGenerator> JournalTransaction<'_, D, InternalJournal, N> {
     /// Commits staged data and metadata through the internal journal.
     ///
     /// # Errors
@@ -4622,7 +5152,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator> WriteTransaction<'_, D, InternalJ
 }
 
 impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator>
-    WriteTransaction<'_, D, ExternalJournal<J>, N>
+    JournalTransaction<'_, D, ExternalJournal<J>, N>
 {
     /// Commits staged data and metadata through the external journal device.
     ///
@@ -5703,6 +6233,19 @@ fn bitmap_bit_state(bytes: &[u8], bit: u32) -> Result<BitmapBitState> {
     }
 }
 
+/// Reads one typed allocation-cluster bitmap bit.
+fn cluster_bitmap_bit_state(
+    bytes: &[u8],
+    position: ClusterBitmapPosition,
+) -> Result<BitmapBitState> {
+    bitmap_bit_state(bytes, position.bit())
+}
+
+/// Reads one typed inode bitmap bit.
+fn inode_bitmap_bit_state(bytes: &[u8], position: InodeBitmapPosition) -> Result<BitmapBitState> {
+    bitmap_bit_state(bytes, position.bit())
+}
+
 /// Writes one allocation bitmap bit.
 fn set_bitmap_bit(bytes: &mut [u8], bit: u32, state: BitmapBitState) -> Result<()> {
     let byte_index = usize::try_from(bit.checked_div(8).ok_or(Error::ArithmeticOverflow)?)
@@ -5716,13 +6259,32 @@ fn set_bitmap_bit(bytes: &mut [u8], bit: u32, state: BitmapBitState) -> Result<(
     Ok(())
 }
 
+/// Writes one typed allocation-cluster bitmap bit.
+fn set_cluster_bitmap_bit(
+    bytes: &mut [u8],
+    position: ClusterBitmapPosition,
+    state: BitmapBitState,
+) -> Result<()> {
+    set_bitmap_bit(bytes, position.bit(), state)
+}
+
+/// Writes one typed inode bitmap bit.
+fn set_inode_bitmap_bit(
+    bytes: &mut [u8],
+    position: InodeBitmapPosition,
+    state: BitmapBitState,
+) -> Result<()> {
+    set_bitmap_bit(bytes, position.bit(), state)
+}
+
 /// Reads the allocation bitmap bit for one cluster.
 fn cluster_bitmap_state(
     reader: &impl BlockReader,
     superblock: &Superblock,
     cluster: ClusterAddress,
 ) -> Result<BitmapBitState> {
-    let group = superblock.cluster_group_of(cluster)?;
+    let position = ClusterBitmapPosition::from_cluster(superblock, cluster)?;
+    let group = position.group();
     let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
     let mut bytes = vec![
         0_u8;
@@ -5735,10 +6297,7 @@ fn cluster_bitmap_state(
             .offset_of(descriptor.block_bitmap())?,
         &mut bytes,
     )?;
-    bitmap_bit_state(
-        bytes.as_slice(),
-        superblock.cluster_bit_in_group(cluster, group)?,
-    )
+    cluster_bitmap_bit_state(bytes.as_slice(), position)
 }
 
 /// Reads the inode bitmap bit for one inode.
@@ -5747,7 +6306,8 @@ fn inode_bitmap_state(
     superblock: &Superblock,
     inode_id: InodeId,
 ) -> Result<BitmapBitState> {
-    let (group, bit) = inode_group_bit(superblock, inode_id)?;
+    let position = InodeBitmapPosition::from_inode(superblock, inode_id)?;
+    let group = position.group();
     let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
     let mut bytes = vec![
         0_u8;
@@ -5760,7 +6320,7 @@ fn inode_bitmap_state(
             .offset_of(descriptor.inode_bitmap())?,
         &mut bytes,
     )?;
-    bitmap_bit_state(bytes.as_slice(), bit)
+    inode_bitmap_bit_state(bytes.as_slice(), position)
 }
 
 /// Returns the first physical block in a block group.
@@ -5779,7 +6339,10 @@ fn group_start_block(superblock: &Superblock, group: BlockGroupId) -> Result<Blo
 }
 
 /// Returns whether a group carries a superblock and descriptor-table copy.
-fn group_has_superblock<D, State, N>(volume: &Volume<D, State, N>, group: BlockGroupId) -> bool {
+fn group_has_superblock<D, State, N>(
+    volume: &MountedVolume<D, State, N>,
+    group: BlockGroupId,
+) -> bool {
     let value = group.as_u32();
     match volume.superblock.sparse_superblock_layout() {
         SparseSuperblockLayout::FullCopies => true,
@@ -5834,31 +6397,14 @@ fn inode_table_blocks(superblock: &Superblock, group: BlockGroupId) -> Result<u6
     round_up_div(inode_bytes, u64::from(superblock.block_size().bytes()))
 }
 
-/// Computes the inode bitmap group and bit for an inode number.
-fn inode_group_bit(superblock: &Superblock, inode_id: InodeId) -> Result<(BlockGroupId, u32)> {
-    if inode_id.as_u32() > superblock.inode_count().as_u32() {
-        return Err(Error::InvalidInode);
-    }
-    let zero_based = inode_id
-        .as_u32()
-        .checked_sub(1)
-        .ok_or(Error::InvalidInode)?;
-    let group = zero_based
-        .checked_div(superblock.inodes_per_group().as_u32())
-        .ok_or(Error::InvalidSuperblock)?;
-    let bit = zero_based
-        .checked_rem(superblock.inodes_per_group().as_u32())
-        .ok_or(Error::InvalidSuperblock)?;
-    Ok((BlockGroupId::from_u32(group), bit))
-}
-
 /// Computes the absolute device offset of an inode record.
 fn inode_offset_on_device(
     reader: &impl BlockReader,
     superblock: &Superblock,
     inode_id: InodeId,
 ) -> Result<ByteOffset> {
-    let (group, index) = inode_group_bit(superblock, inode_id)?;
+    let position = InodeBitmapPosition::from_inode(superblock, inode_id)?;
+    let group = position.group();
     let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
     let inode_size = u64::from(superblock.inode_size().as_u16());
     let offset = superblock
@@ -5866,7 +6412,7 @@ fn inode_offset_on_device(
         .offset_of(descriptor.inode_table())?
         .get()
         .checked_add(
-            u64::from(index)
+            u64::from(position.bit())
                 .checked_mul(inode_size)
                 .ok_or(Error::ArithmeticOverflow)?,
         )

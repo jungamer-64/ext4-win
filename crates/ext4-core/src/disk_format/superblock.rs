@@ -355,12 +355,6 @@ impl FreeInodeCount {
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
-
-    /// Returns the count for on-disk accounting.
-    #[must_use]
-    pub const fn as_u32(self) -> u32 {
-        self.0
-    }
 }
 
 /// Blocks per ext4 block group.
@@ -492,43 +486,6 @@ impl BlockGroupCount {
     #[must_use]
     pub const fn as_u32(self) -> u32 {
         self.0
-    }
-}
-
-/// Signed free-inode count delta.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FreeInodeDelta(i64);
-
-impl FreeInodeDelta {
-    /// Zero free-inode delta.
-    pub const ZERO: Self = Self(0);
-
-    /// Creates a free-inode delta from a signed count.
-    #[must_use]
-    pub const fn from_i64(value: i64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the delta for checked arithmetic at metadata encoding boundaries.
-    #[must_use]
-    pub const fn as_i64(self) -> i64 {
-        self.0
-    }
-
-    /// Returns true when the delta has no effect.
-    #[must_use]
-    pub const fn is_zero(self) -> bool {
-        self.0 == 0
-    }
-
-    /// Adds another delta.
-    ///
-    /// # Errors
-    /// Returns an error when the signed delta would overflow.
-    pub fn checked_add(self, delta: i64) -> Result<Self> {
-        Ok(Self(
-            self.0.checked_add(delta).ok_or(Error::ArithmeticOverflow)?,
-        ))
     }
 }
 
@@ -1603,12 +1560,6 @@ impl Superblock {
     #[must_use]
     pub const fn free_cluster_count(self) -> FreeClusterCount {
         self.free_clusters_count
-    }
-
-    /// Total free inode count.
-    #[must_use]
-    pub const fn free_inodes_count(self) -> FreeInodeCount {
-        self.free_inodes_count
     }
 
     /// First data block.

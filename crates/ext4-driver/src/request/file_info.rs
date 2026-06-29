@@ -2,13 +2,11 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::{
     ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4Name, Ext4Security, Ext4Times, Ext4Timestamp,
-    Ext4WindowsAttributes, FileNodeId, FileSize, InodeId, LoadedNode, NodeId, WindowsName,
-    WindowsOverlay,
+    Ext4WindowsAttributes, FileNodeId, FileSize, LoadedNode, NodeId, WindowsName, WindowsOverlay,
 };
 use wdk_sys::{LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
@@ -238,21 +236,17 @@ impl QueryDirectoryRequest {
 /// Packs one supported file information class.
 fn query_file_information(request: QueryFileRequest) -> DriverResult<DriverCompletion> {
     let metadata = load_file_metadata(&request.opened_file)?;
-    let buffer = request
-        .target
-        .system_buffer()
-        .ok_or(DriverError::InvalidParameter)?;
     let length = request.stack.length().as_usize();
+    let mut buffer = request.target.buffered_output(length)?;
+    let output = buffer.as_mut_slice();
     match request.stack.information_class() {
-        QueryFileInformationClass::Basic => pack_basic_information(buffer, length, metadata),
-        QueryFileInformationClass::Standard => pack_standard_information(buffer, length, metadata),
-        QueryFileInformationClass::Internal => pack_internal_information(buffer, length, metadata),
+        QueryFileInformationClass::Basic => pack_basic_information(output, metadata),
+        QueryFileInformationClass::Standard => pack_standard_information(output, metadata),
+        QueryFileInformationClass::Internal => pack_internal_information(output, metadata),
         QueryFileInformationClass::Position => {
-            pack_position_information(buffer, length, &request.opened_file)
+            pack_position_information(output, &request.opened_file)
         }
-        QueryFileInformationClass::NetworkOpen => {
-            pack_network_open_information(buffer, length, metadata)
-        }
+        QueryFileInformationClass::NetworkOpen => pack_network_open_information(output, metadata),
     }
 }
 
@@ -427,7 +421,7 @@ fn query_directory(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     let class = request.stack.information_class();
     let pattern = DirectoryPattern::from_stack(request.stack)?;
     let length = request.stack.length().as_usize();
-    let mut buffer = request.target.data_buffer(length)?;
+    let mut buffer = request.target.data_output(length)?;
     let buffer = buffer.as_mut_slice();
 
     let volume = request.opened_file.volume();
@@ -439,7 +433,7 @@ fn query_directory(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     let NodeId::Directory(directory_id) = request.opened_file.node() else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
     };
-    let directory = match vcb.volume().load_node(directory_id.inode())? {
+    let directory = match vcb.volume().load(NodeId::Directory(directory_id))? {
         LoadedNode::Directory(directory) => directory,
         LoadedNode::File(_) | LoadedNode::Symlink(_) => {
             return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
@@ -662,8 +656,8 @@ fn emit_directory_entries(
             continue;
         }
 
-        let node = vcb.volume().load_node(entry.inode())?;
-        let metadata = metadata_from_node(vcb, node.id(), node)?;
+        let node = vcb.volume().load(*entry.node())?;
+        let metadata = metadata_from_node(vcb, *entry.node(), node)?;
         let layout = DirectoryRecordLayout::new(class, &name)?;
         let required = written
             .checked_add(layout.unpadded_size)
@@ -918,51 +912,7 @@ fn read_file_information_input<T: Copy>(
     length: IrpBufferLength,
 ) -> DriverResult<T> {
     let length = length.as_usize();
-    let buffer = system_buffer_input(target, length)?;
-    let size = core::mem::size_of::<T>();
-    if length < size {
-        return Err(DriverError::BufferTooSmall);
-    }
-    Ok(unsafe {
-        // SAFETY: The set-information system buffer is at least `size` bytes
-        // and is copied out immediately. Unaligned read avoids imposing a
-        // stronger alignment contract on the I/O Manager buffer.
-        buffer.address.cast::<T>().as_ptr().read_unaligned()
-    })
-}
-
-/// Immutable system buffer view for set-information parsing.
-#[derive(Clone, Copy, Debug)]
-struct SystemBufferInput {
-    /// First byte of the system buffer.
-    address: NonNull<u8>,
-    /// Byte length supplied by the IRP stack.
-    length: usize,
-}
-
-impl SystemBufferInput {
-    /// Returns the system buffer as bytes.
-    fn as_slice(&self) -> &[u8] {
-        unsafe {
-            // SAFETY: SystemBufferInput is constructed only after the active
-            // IRP exposes a kernel-addressable system buffer for `length`
-            // bytes. The returned slice is consumed within this dispatch path.
-            core::slice::from_raw_parts(self.address.as_ptr(), self.length)
-        }
-    }
-}
-
-/// Returns a checked immutable view of the set-information system buffer.
-fn system_buffer_input(target: DispatchTarget, length: usize) -> DriverResult<SystemBufferInput> {
-    let address = target
-        .system_buffer()
-        .ok_or(DriverError::InvalidParameter)?
-        .cast::<u8>();
-    let max_slice_len = usize::try_from(isize::MAX).map_err(|_| DriverError::InvalidParameter)?;
-    if length > max_slice_len {
-        return Err(DriverError::InvalidParameter);
-    }
-    Ok(SystemBufferInput { address, length })
+    target.buffered_input(length)?.read_unaligned()
 }
 
 /// Decoded FILE_RENAME_INFORMATION payload.
@@ -976,7 +926,7 @@ impl RenameInformation {
     /// Decodes a FILE_RENAME_INFORMATION variable-length input buffer.
     fn parse(target: DispatchTarget, length: IrpBufferLength) -> DriverResult<Self> {
         let length = length.as_usize();
-        let input = system_buffer_input(target, length)?;
+        let input = target.buffered_input(length)?;
         let bytes = input.as_slice();
         match bytes
             .get(FILE_RENAME_REPLACE_IF_EXISTS_OFFSET)
@@ -1068,7 +1018,7 @@ fn resolve_rename_target(
         .ok_or(DriverError::InvalidParameter)?;
     let mut parent_id = DirectoryNodeId::ROOT;
     for component in parents {
-        let parent = match vcb.volume().load_node(parent_id.inode())? {
+        let parent = match vcb.volume().load(NodeId::Directory(parent_id))? {
             LoadedNode::Directory(directory) => directory,
             LoadedNode::File(_) | LoadedNode::Symlink(_) => {
                 return Err(DriverError::ObjectPathNotFound);
@@ -1193,7 +1143,7 @@ fn file_size_from_large_integer(value: LARGE_INTEGER) -> DriverResult<FileSize> 
 
 /// Returns the current size of a regular file inode.
 fn regular_file_size(vcb: &VolumeControlBlock, file_id: FileNodeId) -> DriverResult<FileSize> {
-    match vcb.volume().load_node(file_id.inode())? {
+    match vcb.volume().load(NodeId::File(file_id))? {
         LoadedNode::File(file) => Ok(file.size()),
         LoadedNode::Directory(_) | LoadedNode::Symlink(_) => {
             Err(DriverError::from(ext4_core::Error::WrongInodeKind))
@@ -1213,8 +1163,8 @@ fn large_integer_quad(value: LARGE_INTEGER) -> i64 {
 /// File metadata needed by fixed-size Windows information classes.
 #[derive(Clone, Copy, Debug)]
 struct FileMetadata {
-    /// Stable ext4 inode id.
-    inode: InodeId,
+    /// Stable ext4 inode id encoded for Windows file-index payloads.
+    file_index: u32,
     /// Open node kind.
     kind: FileMetadataKind,
     /// Payload size in bytes.
@@ -1247,7 +1197,7 @@ fn load_file_metadata(opened_file: &OpenedFileObject) -> DriverResult<FileMetada
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
     let node_id = fcb.node();
-    let node = vcb.volume().load_node(node_id.inode())?;
+    let node = vcb.volume().load(node_id)?;
     let metadata = metadata_from_node(vcb, node_id, node)?;
     if fcb_node_matches_metadata(fcb.node(), metadata.kind) {
         Ok(metadata)
@@ -1275,14 +1225,15 @@ fn metadata_from_node(
     let inode = node_id.inode();
     let overlay_attributes = vcb
         .volume()
-        .read_windows_overlay(inode)?
+        .read_windows_overlay(node_id)?
         .map(|overlay| overlay.attributes().bits())
         .unwrap_or(0);
 
-    let block_size = vcb.volume().superblock().block_size();
+    let file_index = inode.as_u32();
+    let block_size = vcb.volume().geometry().block_size();
     match node {
         LoadedNode::File(file) => Ok(FileMetadata {
-            inode,
+            file_index,
             kind: FileMetadataKind::File,
             size: file.size(),
             security: file.security(),
@@ -1292,7 +1243,7 @@ fn metadata_from_node(
             block_size,
         }),
         LoadedNode::Directory(directory) => Ok(FileMetadata {
-            inode,
+            file_index,
             kind: FileMetadataKind::Directory,
             size: directory.size(),
             security: directory.security(),
@@ -1302,7 +1253,7 @@ fn metadata_from_node(
             block_size,
         }),
         LoadedNode::Symlink(symlink) => Ok(FileMetadata {
-            inode,
+            file_index,
             kind: FileMetadataKind::Symlink,
             size: symlink.size(),
             security: symlink.security(),
@@ -1316,13 +1267,11 @@ fn metadata_from_node(
 
 /// Packs FILE_BASIC_INFORMATION.
 fn pack_basic_information(
-    buffer: NonNull<c_void>,
-    length: usize,
+    output: &mut [u8],
     metadata: FileMetadata,
 ) -> DriverResult<DriverCompletion> {
     write_fixed(
-        buffer,
-        length,
+        output,
         wdk_sys::FILE_BASIC_INFORMATION {
             CreationTime: windows_time(metadata.times.created()),
             LastAccessTime: windows_time(metadata.times.accessed()),
@@ -1335,13 +1284,11 @@ fn pack_basic_information(
 
 /// Packs FILE_STANDARD_INFORMATION.
 fn pack_standard_information(
-    buffer: NonNull<c_void>,
-    length: usize,
+    output: &mut [u8],
     metadata: FileMetadata,
 ) -> DriverResult<DriverCompletion> {
     write_fixed(
-        buffer,
-        length,
+        output,
         wdk_sys::FILE_STANDARD_INFORMATION {
             AllocationSize: large_integer_from_u64(allocation_size(metadata)?)?,
             EndOfFile: large_integer_from_u64(metadata.size.bytes())?,
@@ -1354,16 +1301,14 @@ fn pack_standard_information(
 
 /// Packs FILE_INTERNAL_INFORMATION.
 fn pack_internal_information(
-    buffer: NonNull<c_void>,
-    length: usize,
+    output: &mut [u8],
     metadata: FileMetadata,
 ) -> DriverResult<DriverCompletion> {
     write_fixed(
-        buffer,
-        length,
+        output,
         wdk_sys::FILE_INTERNAL_INFORMATION {
             IndexNumber: LARGE_INTEGER {
-                QuadPart: i64::from(metadata.inode.as_u32()),
+                QuadPart: i64::from(metadata.file_index),
             },
         },
     )
@@ -1371,8 +1316,7 @@ fn pack_internal_information(
 
 /// Packs FILE_POSITION_INFORMATION.
 fn pack_position_information(
-    buffer: NonNull<c_void>,
-    length: usize,
+    output: &mut [u8],
     opened_file: &OpenedFileObject,
 ) -> DriverResult<DriverCompletion> {
     let file_object = opened_file.file_object();
@@ -1386,8 +1330,7 @@ fn pack_position_information(
         file_object.CurrentByteOffset.QuadPart
     };
     write_fixed(
-        buffer,
-        length,
+        output,
         wdk_sys::FILE_POSITION_INFORMATION {
             CurrentByteOffset: LARGE_INTEGER { QuadPart: current },
         },
@@ -1396,13 +1339,11 @@ fn pack_position_information(
 
 /// Packs FILE_NETWORK_OPEN_INFORMATION.
 fn pack_network_open_information(
-    buffer: NonNull<c_void>,
-    length: usize,
+    output: &mut [u8],
     metadata: FileMetadata,
 ) -> DriverResult<DriverCompletion> {
     write_fixed(
-        buffer,
-        length,
+        output,
         wdk_sys::FILE_NETWORK_OPEN_INFORMATION {
             CreationTime: windows_time(metadata.times.created()),
             LastAccessTime: windows_time(metadata.times.accessed()),
@@ -1416,21 +1357,16 @@ fn pack_network_open_information(
 }
 
 /// Writes one fixed-size information structure into the caller's buffer.
-fn write_fixed<T>(
-    buffer: NonNull<c_void>,
-    length: usize,
-    value: T,
-) -> DriverResult<DriverCompletion> {
+fn write_fixed<T>(output: &mut [u8], value: T) -> DriverResult<DriverCompletion> {
     let size = core::mem::size_of::<T>();
-    if length < size {
+    if output.len() < size {
         return Err(DriverError::BufferTooSmall);
     }
-    let target = buffer.cast::<T>().as_ptr();
     unsafe {
-        // SAFETY: The caller supplied a system buffer of at least `size`
-        // bytes, and `target` is aligned according to the WDK buffer contract
-        // for fixed-size query information outputs.
-        target.write(value);
+        // SAFETY: The output slice is at least `size_of::<T>()` bytes and the
+        // write does not read from the destination. Unaligned write avoids
+        // imposing an alignment requirement on the system buffer.
+        output.as_mut_ptr().cast::<T>().write_unaligned(value);
     }
     DriverCompletion::from_usize(size)
 }
@@ -1508,14 +1444,14 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     if length == 0 {
         return Ok(DriverCompletion::EMPTY);
     }
-    let mut output = target.data_buffer(length)?;
+    let mut output = target.data_output(length)?;
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
     let NodeId::File(file_id) = fcb.node() else {
         return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
     };
 
-    let node = vcb.volume().load_node(file_id.inode())?;
+    let node = vcb.volume().load(NodeId::File(file_id))?;
     let LoadedNode::File(file) = node else {
         return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
     };
@@ -1533,7 +1469,7 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> 
     if length == 0 {
         return Ok(DriverCompletion::EMPTY);
     }
-    let input = target.data_buffer(length)?;
+    let input = target.data_input(length)?;
     let fcb = opened_file.file_control_block();
     let mut vcb = fcb.volume();
     let vcb = unsafe {

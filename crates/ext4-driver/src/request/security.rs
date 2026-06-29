@@ -232,7 +232,7 @@ fn query_security(request: &QuerySecurityRequest) -> DriverResult<DriverCompleti
     if length < required {
         return Err(DriverError::BufferTooSmall);
     }
-    let mut output = request.target.user_buffer(length)?;
+    let mut output = request.target.user_output(length)?;
     LittleEndianOutput::new(output.as_mut_slice())
         .write_bytes(wire_offset(0), descriptor.as_slice())?;
     DriverCompletion::from_usize(required)
@@ -281,7 +281,7 @@ fn load_ext4_security_context(
 ) -> DriverResult<OpenedSecurityContext> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
-    let node = vcb.volume().load_node(fcb.node().inode())?;
+    let node = vcb.volume().load(fcb.node())?;
     Ok(OpenedSecurityContext {
         volume: fcb.volume(),
         node: fcb.node(),

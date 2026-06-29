@@ -267,7 +267,7 @@ fn resolve_path(
     let mut components = components.iter().peekable();
     while let Some(component) = components.next() {
         let is_final = components.peek().is_none();
-        let parent = match vcb.volume().load_node(parent_id.inode()) {
+        let parent = match vcb.volume().load(NodeId::Directory(parent_id)) {
             Ok(LoadedNode::Directory(directory)) => directory,
             Ok(_) => return Err(DriverError::ObjectPathNotFound),
             Err(error) => return Err(DriverError::from(error)),
@@ -298,7 +298,7 @@ fn resolve_path(
         parent_id = directory_id;
     }
 
-    match vcb.volume().load_node(parent_id.inode()) {
+    match vcb.volume().load(NodeId::Directory(parent_id)) {
         Ok(node) => Ok(PathLookup::Existing {
             node: node.id(),
             path: OpenedPath::Root,

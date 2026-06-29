@@ -4,8 +4,7 @@ use super::*;
 fn dirty_volume_is_rejected() {
     let mut image = fixture_image();
     put_u16(&mut image, 1024 + 58, 0);
-    let result =
-        Volume::<_, ReadOnly>::mount_read_only(SliceBlockDevice::new(&image), test_mount_context());
+    let result = ReadOnlyVolume::mount(SliceBlockDevice::new(&image), test_mount_context());
 
     assert!(matches!(result, Err(Error::DirtyVolume)));
 }
@@ -13,7 +12,7 @@ fn dirty_volume_is_rejected() {
 #[test]
 fn metadata_descriptor_checksum_is_verified() {
     let image = modern_fixture_image();
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
@@ -25,11 +24,11 @@ fn metadata_descriptor_checksum_is_verified() {
 fn bad_metadata_descriptor_checksum_is_rejected() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     corrupt_primary_block_group_descriptor_checksum(&mut image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    let result = volume.load_node(InodeId::ROOT);
+    let result = volume.root_directory();
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -39,7 +38,7 @@ fn gdt_descriptor_checksum_is_verified() {
     let mut image = fixture_image();
     put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | RO_COMPAT_GDT_CSUM);
     refresh_primary_block_group_descriptor_checksum(&mut image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
@@ -53,11 +52,11 @@ fn bad_gdt_descriptor_checksum_is_rejected() {
     put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | RO_COMPAT_GDT_CSUM);
     refresh_primary_block_group_descriptor_checksum(&mut image);
     corrupt_primary_block_group_descriptor_checksum(&mut image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    let result = volume.load_node(InodeId::ROOT);
+    let result = volume.root_directory();
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -75,16 +74,11 @@ fn jbd2_header_is_big_endian() {
 #[test]
 fn write_mount_accepts_minimal_journaled_profile() {
     let mut image = minimal_write_fixture_image();
+    let superblock = must(Superblock::parse_read_write(&image[1024..2048]));
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
 
-    assert_eq!(
-        volume.superblock().journal_mode(),
-        JournalMode::Internal(inode(8))
-    );
+    assert_eq!(superblock.journal_mode(), JournalMode::Internal(inode(8)));
     let mut output = [0_u8; 5];
     assert_eq!(read_file(&volume, 3, 0, &mut output), 5);
     assert_eq!(&output, b"hello");
@@ -98,10 +92,7 @@ fn gdt_csum_minimal_profile_refreshes_descriptor_checksum_after_write() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         must(transaction.create_file(root, &must(Ext4Name::new(b"new")), test_file_metadata()));
@@ -109,7 +100,7 @@ fn gdt_csum_minimal_profile_refreshes_descriptor_checksum_after_write() {
     }
 
     assert_ne!(get_u16(&image, checksum_offset), before);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
@@ -123,10 +114,7 @@ fn gdt_csum_minimal_profile_refreshes_descriptor_checksum_after_write() {
 fn overwrite_existing_file_range_commits() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
 
     let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
@@ -150,10 +138,7 @@ fn committed_dirty_journal_transaction_is_replayed() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let volume = must(JournaledVolume::mount(device, test_mount_context()));
         let mut output = [0_u8; 6];
         let read = read_file(&volume, 3, 0, &mut output);
         assert_eq!(read, 6);
@@ -173,10 +158,7 @@ fn descriptor_without_commit_is_ignored() {
     write_jbd2_descriptor(&mut image, 1, 8, MODERN_FILE_DATA_BLOCK, 0);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -196,10 +178,7 @@ fn later_revoke_prevents_stale_metadata_replay() {
     write_jbd2_commit(&mut image, 5, 11);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -217,10 +196,7 @@ fn circular_journal_wraparound_is_replayed() {
     write_jbd2_commit(&mut image, 1, 12);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -244,10 +220,7 @@ fn escaped_journal_data_block_is_unescaped_on_replay() {
     write_jbd2_commit(&mut image, 3, 13);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -268,10 +241,7 @@ fn checkpointed_dirty_journal_replay_is_idempotent() {
     write_jbd2_commit(&mut image, 3, 14);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -294,8 +264,8 @@ fn external_journal_uuid_mismatch_is_rejected() {
         default_journal_incompat(),
     );
 
-    let result: crate::Result<Volume<_, ReadWrite<ExternalJournal<_>>>> =
-        Volume::mount_read_write_with_external_journal(
+    let result: crate::Result<JournaledVolume<_, ExternalJournal<_>>> =
+        JournaledVolume::mount_with_external_journal(
             SliceBlockDeviceMut::new(&mut image),
             SliceBlockDeviceMut::new(&mut journal),
             test_mount_context(),
@@ -317,7 +287,7 @@ fn fast_commit_journal_feature_is_rejected() {
         default_journal_incompat() | JBD2_FEATURE_INCOMPAT_FAST_COMMIT,
     );
     let device = SliceBlockDeviceMut::new(&mut image);
-    let result = Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context());
+    let result = JournaledVolume::mount(device, test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -327,10 +297,7 @@ fn write_transaction_emits_descriptor_data_and_commit_records() {
     let mut image = modern_fixture_image();
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         overwrite_file(&mut transaction, file_id, 0, b"HELLO");
@@ -354,10 +321,7 @@ fn emitted_committed_records_are_replayable_after_checkpoint_loss() {
     let mut image = modern_fixture_image();
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(&mut transaction, file_id, 3072);
@@ -369,10 +333,7 @@ fn emitted_committed_records_are_replayable_after_checkpoint_loss() {
     write_dirty_journal_superblock(&mut image, 1, 1);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let file = file_node(&volume, 3);
 
     assert_eq!(file.size().bytes(), 3072);
@@ -388,10 +349,7 @@ fn legacy_32bit_descriptor_tag_is_replayed() {
     write_jbd2_commit(&mut image, 3, 15);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -418,10 +376,7 @@ fn csum_v2_descriptor_tail_and_commit_checksum_are_verified() {
     write_jbd2_commit_with_checksum(&mut image, 3, 16, uuid);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -438,10 +393,7 @@ fn zero_tag_checksum_is_rejected() {
     write_jbd2_descriptor_with_checksum(&mut image, 1, 17, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_commit(&mut image, 3, 17);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -456,10 +408,7 @@ fn zero_descriptor_tail_checksum_is_rejected() {
     put_be_u32(&mut image, journal_log_offset(1) + BLOCK_SIZE - 4, 0);
     write_jbd2_commit(&mut image, 3, 18);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -474,10 +423,7 @@ fn invalid_commit_checksum_is_rejected() {
     write_jbd2_commit(&mut image, 3, 19);
     put_be_u32(&mut image, journal_log_offset(3) + 0x10, 0xDEAD_BEEF);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -495,10 +441,7 @@ fn invalid_revoke_tail_checksum_is_rejected() {
     );
     write_jbd2_commit(&mut image, 2, 20);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -516,10 +459,7 @@ fn journal_superblock_fields_and_checksum_are_preserved_when_cleaned() {
     write_jbd2_commit(&mut image, 3, 21);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let _volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let _volume = must(JournaledVolume::mount(device, test_mount_context()));
 
     assert_eq!(get_be_u32(&image, base + 0x18), 22);
     assert_eq!(get_be_u32(&image, base + 0x1C), 0);
@@ -540,10 +480,7 @@ fn journal_sequence_wraps_after_max_transaction() {
     write_jbd2_commit(&mut image, 3, u32::MAX);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let _volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let _volume = must(JournaledVolume::mount(device, test_mount_context()));
 
     assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x18), 0);
     assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x1C), 0);
@@ -554,10 +491,7 @@ fn nonzero_journal_ro_compat_is_rejected() {
     let mut image = modern_fixture_image();
     put_be_u32(&mut image, journal_log_offset(0) + 0x2C, 1);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -567,10 +501,7 @@ fn recovery_required_with_zero_journal_start_is_rejected() {
     let mut image = modern_fixture_image();
     mark_filesystem_needs_recovery(&mut image);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
     assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
@@ -591,10 +522,7 @@ fn replay_target_outside_filesystem_is_rejected() {
     );
     write_jbd2_commit(&mut image, 3, 22);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -608,10 +536,7 @@ fn replay_target_inside_internal_journal_is_rejected() {
     write_jbd2_descriptor(&mut image, 1, 23, MODERN_JOURNAL_BLOCK, 0);
     write_jbd2_commit(&mut image, 3, 23);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -626,10 +551,7 @@ fn emitted_journal_data_escapes_jbd2_magic_prefix() {
     );
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         overwrite_file(&mut transaction, file_id, 0, b"MAGIC");
@@ -683,10 +605,7 @@ fn descriptor_tag_uuid_mismatch_is_rejected() {
     );
     write_jbd2_commit_with_checksum(&mut image, 3, 24, journal_uuid);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -717,10 +636,7 @@ fn descriptor_tag_uuid_match_is_replayed() {
     write_jbd2_commit_with_checksum(&mut image, 3, 25, journal_uuid);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -743,10 +659,7 @@ fn descriptor_without_last_tag_is_rejected() {
     write_jbd2_block_tail_checksum(&mut image, 1, [0; 16]);
     write_jbd2_commit(&mut image, 3, 26);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -762,10 +675,7 @@ fn empty_descriptor_commit_is_rejected() {
     write_jbd2_block_tail_checksum(&mut image, 1, [0; 16]);
     write_jbd2_commit(&mut image, 2, 27);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -787,10 +697,7 @@ fn duplicate_home_block_in_transaction_is_rejected() {
     );
     write_jbd2_commit(&mut image, 4, 28);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -806,10 +713,7 @@ fn second_descriptor_block_is_rejected() {
     write_jbd2_descriptor(&mut image, 3, 29, MODERN_ROOT_DIR_BLOCK, 0);
     write_jbd2_commit(&mut image, 5, 29);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -823,10 +727,7 @@ fn commit_sequence_mismatch_is_rejected() {
     write_jbd2_descriptor(&mut image, 1, 30, MODERN_FILE_DATA_BLOCK, 0);
     write_jbd2_commit(&mut image, 3, 31);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
     assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
@@ -843,10 +744,7 @@ fn same_transaction_later_revoke_prevents_replay() {
     write_jbd2_commit(&mut image, 4, 31);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -864,10 +762,7 @@ fn malformed_revoke_remainder_is_rejected() {
     write_jbd2_block_tail_checksum(&mut image, 1, [0; 16]);
     write_jbd2_commit(&mut image, 2, 32);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
@@ -884,10 +779,7 @@ fn wrapped_later_revoke_prevents_old_sequence_replay() {
     write_jbd2_commit(&mut image, 5, 0);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -900,10 +792,7 @@ fn nonzero_journal_compat_is_rejected() {
     let mut image = modern_fixture_image();
     put_be_u32(&mut image, journal_log_offset(0) + 0x24, 1);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -913,10 +802,7 @@ fn journal_first_block_must_be_one() {
     let mut image = modern_fixture_image();
     put_be_u32(&mut image, journal_log_offset(0) + 0x14, 2);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -926,10 +812,7 @@ fn journal_maxlen_beyond_inode_capacity_is_rejected() {
     let mut image = modern_fixture_image();
     put_be_u32(&mut image, journal_log_offset(0) + 0x10, 9);
 
-    let result = Volume::<_, ReadWrite>::mount_read_write(
-        SliceBlockDeviceMut::new(&mut image),
-        test_mount_context(),
-    );
+    let result = JournaledVolume::mount(SliceBlockDeviceMut::new(&mut image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
@@ -950,8 +833,8 @@ fn external_journal_short_device_is_rejected() {
         default_journal_incompat(),
     );
 
-    let result: crate::Result<Volume<_, ReadWrite<ExternalJournal<_>>>> =
-        Volume::mount_read_write_with_external_journal(
+    let result: crate::Result<JournaledVolume<_, ExternalJournal<_>>> =
+        JournaledVolume::mount_with_external_journal(
             SliceBlockDeviceMut::new(&mut image),
             SliceBlockDeviceMut::new(&mut journal),
             test_mount_context(),
@@ -974,10 +857,7 @@ fn fragmented_internal_journal_is_mapped_on_demand() {
     move_journal_block(&mut image, 6, 30);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
@@ -1008,17 +888,14 @@ fn checkpoint_failure_leaves_replayable_dirty_journal() {
             u64::try_from(block_offset(MODERN_FILE_DATA_BLOCK)).unwrap_or(u64::MAX),
         );
         let device = FailOneWriteAt::new(&mut image, fail_offset);
-        let result = Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context());
+        let result = JournaledVolume::mount(device, test_mount_context());
         assert!(matches!(result, Err(Error::DeviceRange)));
     }
     assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x1C), 1);
     assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut output = [0_u8; 5];
     let read = read_file(&volume, 3, 0, &mut output);
 
