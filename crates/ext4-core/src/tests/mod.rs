@@ -13,22 +13,29 @@
 
 use alloc::{vec, vec::Vec};
 
+use crate::disk::block::{
+    BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset, DeviceLength, SliceBlockDevice,
+    SliceBlockDeviceMut,
+};
+use crate::disk_format::dir::{DirectoryEntry as RawDirectoryEntry, DirectoryEntryKind};
+use crate::disk_format::extent::{
+    BlockMapping, Extent, ExtentLength, ExtentTree, ExtentTreeContext, LogicalBlock,
+    MutableExtentTree,
+};
+use crate::disk_format::inode::{InodeExtentRoot, InodeId, InodeProtection};
+use crate::disk_format::superblock::{BlockGroupId, JournalMode, Superblock};
 use crate::disk_format::xattr::{self as xattr_storage, InodeXattrSet};
 use crate::{
-    BlockAddress, BlockGroupId, BlockMapping, BlockReader, BlockSize, BlockWriter, ByteOffset,
-    DeviceLength, DirectoryEntry, DirectoryEntryKind, DirectoryNode, Error, Ext4Gid, Ext4Name,
-    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid,
-    Ext4VerityMetadataLayout, Ext4VolumeLabel, Ext4WindowsAttributes, Extent, ExtentLength,
-    ExtentTree, ExtentTreeContext, ExternalJournal, FSVERITY_DESCRIPTOR_BYTES, FileNode,
+    DirectoryEntry, DirectoryNode, DirectoryNodeId, Error, Ext4Gid, Ext4Name, Ext4Owner,
+    Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, Ext4VerityMetadataLayout,
+    Ext4VolumeLabel, Ext4WindowsAttributes, ExternalJournal, FSVERITY_DESCRIPTOR_BYTES, FileNode,
     FileNodeId, FileOffset, FileSize, FscryptContextV2, FscryptFileNonce, FscryptKeySet,
     FscryptMasterKey, FscryptNoNonceGenerator, FscryptNonceGenerator, FsverityBlockSize,
     FsverityDescriptor, FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt,
-    FsveritySignature, InodeExtentRoot, InodeId, InodeProtection, JournalMode, LoadedNode,
-    LogicalBlock, MountContext, MutableExtentTree, NewDirectoryMetadata, NewFileMetadata,
-    NewSymlinkMetadata, NodeId, PosixAcl, PosixAclEntry, PosixAclKind, ReadOnly, ReadWrite,
-    SliceBlockDevice, SliceBlockDeviceMut, Superblock, SymlinkNode, SymlinkTarget,
-    TransactionDirectory, TransactionFile, Volume, WindowsName, WindowsOverlay, XattrName,
-    XattrNamespace, XattrSet, XattrValue,
+    FsveritySignature, InternalJournal, JournalTransaction, JournaledVolume, LoadedNode,
+    MountContext, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, NodeId, PosixAcl,
+    PosixAclEntry, PosixAclKind, ReadOnlyVolume, SymlinkNode, SymlinkTarget, TransactionDirectory,
+    TransactionFile, WindowsName, WindowsOverlay, XattrName, XattrNamespace, XattrSet, XattrValue,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -115,46 +122,172 @@ fn inode(value: u32) -> InodeId {
     must(InodeId::try_from(value))
 }
 
-fn file_node<D: BlockReader, State, N>(volume: &Volume<D, State, N>, inode_id: u32) -> FileNode {
-    match must(volume.load_node(inode(inode_id))) {
+trait MountedVolumeTestExt {
+    fn load(&self, id: NodeId) -> crate::Result<LoadedNode>;
+    fn read_file(
+        &self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> crate::Result<crate::ReadBytes>;
+    fn read_directory(&self, directory: &DirectoryNode) -> crate::Result<Vec<DirectoryEntry>>;
+    fn read_symlink(&self, symlink: &SymlinkNode) -> crate::Result<Vec<u8>>;
+    fn lookup_child(
+        &self,
+        parent: &DirectoryNode,
+        name: &Ext4Name,
+    ) -> crate::Result<crate::ChildLookup>;
+    fn lookup_windows_child(
+        &self,
+        parent: &DirectoryNode,
+        requested: &WindowsName,
+    ) -> crate::Result<crate::ChildLookup>;
+}
+
+impl<D: BlockReader, N> MountedVolumeTestExt for ReadOnlyVolume<D, N> {
+    fn load(&self, id: NodeId) -> crate::Result<LoadedNode> {
+        Self::load(self, id)
+    }
+
+    fn read_file(
+        &self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> crate::Result<crate::ReadBytes> {
+        Self::read_file(self, file, offset, out)
+    }
+
+    fn read_directory(&self, directory: &DirectoryNode) -> crate::Result<Vec<DirectoryEntry>> {
+        Self::read_directory(self, directory)
+    }
+
+    fn read_symlink(&self, symlink: &SymlinkNode) -> crate::Result<Vec<u8>> {
+        Self::read_symlink(self, symlink)
+    }
+
+    fn lookup_child(
+        &self,
+        parent: &DirectoryNode,
+        name: &Ext4Name,
+    ) -> crate::Result<crate::ChildLookup> {
+        Self::lookup_child(self, parent, name)
+    }
+
+    fn lookup_windows_child(
+        &self,
+        parent: &DirectoryNode,
+        requested: &WindowsName,
+    ) -> crate::Result<crate::ChildLookup> {
+        Self::lookup_windows_child(self, parent, requested)
+    }
+}
+
+impl<D: BlockReader, J, N> MountedVolumeTestExt for JournaledVolume<D, J, N> {
+    fn load(&self, id: NodeId) -> crate::Result<LoadedNode> {
+        Self::load(self, id)
+    }
+
+    fn read_file(
+        &self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> crate::Result<crate::ReadBytes> {
+        Self::read_file(self, file, offset, out)
+    }
+
+    fn read_directory(&self, directory: &DirectoryNode) -> crate::Result<Vec<DirectoryEntry>> {
+        Self::read_directory(self, directory)
+    }
+
+    fn read_symlink(&self, symlink: &SymlinkNode) -> crate::Result<Vec<u8>> {
+        Self::read_symlink(self, symlink)
+    }
+
+    fn lookup_child(
+        &self,
+        parent: &DirectoryNode,
+        name: &Ext4Name,
+    ) -> crate::Result<crate::ChildLookup> {
+        Self::lookup_child(self, parent, name)
+    }
+
+    fn lookup_windows_child(
+        &self,
+        parent: &DirectoryNode,
+        requested: &WindowsName,
+    ) -> crate::Result<crate::ChildLookup> {
+        Self::lookup_windows_child(self, parent, requested)
+    }
+}
+
+fn node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> NodeId {
+    if inode_id == InodeId::ROOT {
+        return NodeId::Directory(DirectoryNodeId::ROOT);
+    }
+
+    let mut pending = vec![DirectoryNodeId::ROOT];
+    let mut visited = Vec::new();
+    while let Some(directory_id) = pending.pop() {
+        if visited
+            .iter()
+            .any(|visited| *visited == directory_id.inode())
+        {
+            continue;
+        }
+        visited.push(directory_id.inode());
+        let directory = match must(volume.load(NodeId::Directory(directory_id))) {
+            LoadedNode::Directory(directory) => directory,
+            LoadedNode::File(_) | LoadedNode::Symlink(_) => panic!("expected directory node"),
+        };
+        for entry in must(volume.read_directory(&directory)) {
+            if entry.node().inode() == inode_id {
+                return *entry.node();
+            }
+            let NodeId::Directory(child_id) = *entry.node() else {
+                continue;
+            };
+            if matches!(entry.name().bytes(), b"." | b"..") {
+                continue;
+            }
+            pending.push(child_id);
+        }
+    }
+    panic!("expected reachable node");
+}
+
+fn load_fixture_node<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> LoadedNode {
+    must(volume.load(node_id(volume, inode_id)))
+}
+
+fn file_node<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> FileNode {
+    match load_fixture_node(volume, inode(inode_id)) {
         LoadedNode::File(file) => file,
         LoadedNode::Directory(_) | LoadedNode::Symlink(_) => panic!("expected file node"),
     }
 }
 
-fn file_node_id<D: BlockReader, State, N>(
-    volume: &Volume<D, State, N>,
-    inode_id: u32,
-) -> FileNodeId {
+fn file_node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> FileNodeId {
     file_node(volume, inode_id).id()
 }
 
-fn directory_node<D: BlockReader, State, N>(
-    volume: &Volume<D, State, N>,
-    inode_id: InodeId,
-) -> DirectoryNode {
-    match must(volume.load_node(inode_id)) {
+fn directory_node<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> DirectoryNode {
+    match load_fixture_node(volume, inode_id) {
         LoadedNode::Directory(directory) => directory,
         LoadedNode::File(_) | LoadedNode::Symlink(_) => panic!("expected directory node"),
     }
 }
 
-fn node_id<D: BlockReader, State, N>(volume: &Volume<D, State, N>, inode_id: InodeId) -> NodeId {
-    must(volume.load_node(inode_id)).id()
-}
-
-fn symlink_node<D: BlockReader, State, N>(
-    volume: &Volume<D, State, N>,
-    inode_id: u32,
-) -> SymlinkNode {
-    match must(volume.load_node(inode(inode_id))) {
+fn symlink_node<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> SymlinkNode {
+    match load_fixture_node(volume, inode(inode_id)) {
         LoadedNode::Symlink(symlink) => symlink,
         LoadedNode::File(_) | LoadedNode::Directory(_) => panic!("expected symlink node"),
     }
 }
 
-fn read_file<D: BlockReader, State, N>(
-    volume: &Volume<D, State, N>,
+fn read_file<V: MountedVolumeTestExt>(
+    volume: &V,
     inode_id: u32,
     offset: u64,
     out: &mut [u8],
@@ -163,30 +296,27 @@ fn read_file<D: BlockReader, State, N>(
     must(volume.read_file(&file, FileOffset::from_bytes(offset), out)).as_usize()
 }
 
-fn read_directory<D: BlockReader, State, N>(
-    volume: &Volume<D, State, N>,
-    inode_id: InodeId,
-) -> Vec<DirectoryEntry> {
+fn read_directory<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> Vec<DirectoryEntry> {
     let directory = directory_node(volume, inode_id);
     must(volume.read_directory(&directory))
 }
 
 fn directory_entry_name(entries: &[DirectoryEntry], inode_id: InodeId) -> Ext4Name {
     for entry in entries {
-        if entry.inode() == inode_id {
+        if entry.node().inode() == inode_id {
             return entry.name().clone();
         }
     }
     panic!("expected directory entry");
 }
 
-fn read_symlink<D: BlockReader, State, N>(volume: &Volume<D, State, N>, inode_id: u32) -> Vec<u8> {
+fn read_symlink<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> Vec<u8> {
     let symlink = symlink_node(volume, inode_id);
     must(volume.read_symlink(&symlink))
 }
 
-fn lookup_ext4<D: BlockReader, State, N>(
-    volume: &Volume<D, State, N>,
+fn lookup_ext4<V: MountedVolumeTestExt>(
+    volume: &V,
     parent: InodeId,
     name: &[u8],
 ) -> crate::ChildLookup {
@@ -195,8 +325,8 @@ fn lookup_ext4<D: BlockReader, State, N>(
     must(volume.lookup_child(&directory, &name))
 }
 
-fn lookup_windows<D: BlockReader, State, N>(
-    volume: &Volume<D, State, N>,
+fn lookup_windows<V: MountedVolumeTestExt>(
+    volume: &V,
     parent: InodeId,
     name: &[u16],
 ) -> crate::ChildLookup {
@@ -205,8 +335,8 @@ fn lookup_windows<D: BlockReader, State, N>(
     must(volume.lookup_windows_child(&directory, &name))
 }
 
-fn lookup_ext4_inode<D: BlockReader, State, N>(
-    volume: &Volume<D, State, N>,
+fn lookup_ext4_inode<V: MountedVolumeTestExt>(
+    volume: &V,
     parent: InodeId,
     name: &[u8],
 ) -> Option<InodeId> {
@@ -216,8 +346,8 @@ fn lookup_ext4_inode<D: BlockReader, State, N>(
     }
 }
 
-fn lookup_windows_inode<D: BlockReader, State, N>(
-    volume: &Volume<D, State, N>,
+fn lookup_windows_inode<V: MountedVolumeTestExt>(
+    volume: &V,
     parent: InodeId,
     name: &[u16],
 ) -> Option<InodeId> {
@@ -228,21 +358,21 @@ fn lookup_windows_inode<D: BlockReader, State, N>(
 }
 
 fn transaction_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &crate::WriteTransaction<'_, D, J, N>,
+    transaction: &JournalTransaction<'_, D, J, N>,
     file_id: FileNodeId,
 ) -> TransactionFile {
     must(transaction.file(file_id))
 }
 
 fn transaction_directory<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &crate::WriteTransaction<'_, D, J, N>,
-    directory_id: crate::DirectoryNodeId,
+    transaction: &JournalTransaction<'_, D, J, N>,
+    directory_id: DirectoryNodeId,
 ) -> TransactionDirectory {
     must(transaction.directory(directory_id))
 }
 
 fn transaction_node<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &crate::WriteTransaction<'_, D, J, N>,
+    transaction: &JournalTransaction<'_, D, J, N>,
     id: NodeId,
 ) -> crate::TransactionNode {
     must(transaction.node(id))
@@ -361,7 +491,7 @@ fn encrypt_modern_root_file_name(image: &mut [u8], master_key: &FscryptMasterKey
 }
 
 fn overwrite_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &mut crate::WriteTransaction<'_, D, J, N>,
+    transaction: &mut JournalTransaction<'_, D, J, N>,
     file_id: FileNodeId,
     offset: u64,
     bytes: &[u8],
@@ -371,7 +501,7 @@ fn overwrite_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
 }
 
 fn extend_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &mut crate::WriteTransaction<'_, D, J, N>,
+    transaction: &mut JournalTransaction<'_, D, J, N>,
     file_id: FileNodeId,
     new_size: u64,
 ) {
@@ -380,7 +510,7 @@ fn extend_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
 }
 
 fn truncate_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &mut crate::WriteTransaction<'_, D, J, N>,
+    transaction: &mut JournalTransaction<'_, D, J, N>,
     file_id: FileNodeId,
     new_size: u64,
 ) {

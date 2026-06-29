@@ -8,8 +8,8 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     DeviceLength, DirectoryNodeId, Ext4Name, FscryptKeyIdentifier, FscryptKeyPresence,
-    FscryptKeySet, FscryptMasterKey, InodeId, InternalJournal, MountContext, NodeId, ReadWrite,
-    Result as Ext4Result, Volume,
+    FscryptKeySet, FscryptMasterKey, InternalJournal, JournaledVolume, MountContext, NodeId,
+    Result as Ext4Result,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT,
@@ -252,42 +252,35 @@ impl MountCandidate {
     }
 }
 
-#[expect(
-    dead_code,
-    reason = "VCB state is defined before mount FSCTL allocates device extensions"
-)]
 #[derive(Debug)]
 /// Volume control block stored in a mounted volume device extension.
 pub(crate) struct VolumeControlBlock {
     /// Mounted journaled read-write ext4 volume.
-    volume: Volume<KernelBlockDevice, ReadWrite<InternalJournal>, CngFscryptNonceGenerator>,
-    /// Root directory inode of the mounted volume.
-    root_inode: InodeId,
+    volume: JournaledVolume<KernelBlockDevice, InternalJournal, CngFscryptNonceGenerator>,
     /// VCB-owned FCBs keyed by ext4 node identity.
     file_control_blocks: Vec<NonNull<FileControlBlock>>,
 }
 
 impl VolumeControlBlock {
     /// Mounts a journaled read-write ext4 VCB.
-    pub(crate) fn mount_read_write(
+    pub(crate) fn mount_journaled(
         target_device: KernelDevice,
         length: DeviceLength,
     ) -> Ext4Result<Self> {
         let block_device = KernelBlockDevice::new(target_device, length);
-        let volume = Volume::<_, ReadWrite<InternalJournal>, _>::mount_read_write(
+        let volume = JournaledVolume::<_, InternalJournal, _>::mount(
             block_device,
             MountContext::new(FscryptKeySet::empty(), CngFscryptNonceGenerator),
         )?;
         Ok(Self {
             volume,
-            root_inode: InodeId::ROOT,
             file_control_blocks: Vec::new(),
         })
     }
 
     /// Returns a stable serial number derived from the ext4 filesystem UUID.
     pub(crate) fn serial_number(&self) -> VolumeSerialNumber {
-        let uuid = self.volume.superblock().uuid().bytes();
+        let uuid = self.volume.identity().uuid().bytes();
         let [a, b, c, d, ..] = uuid;
         VolumeSerialNumber::from_le_bytes([a, b, c, d])
     }
@@ -295,14 +288,14 @@ impl VolumeControlBlock {
     /// Returns the mounted ext4 volume.
     pub(crate) const fn volume(
         &self,
-    ) -> &Volume<KernelBlockDevice, ReadWrite<InternalJournal>, CngFscryptNonceGenerator> {
+    ) -> &JournaledVolume<KernelBlockDevice, InternalJournal, CngFscryptNonceGenerator> {
         &self.volume
     }
 
     /// Returns the mounted ext4 volume for journaled mutation.
     pub(crate) const fn volume_mut(
         &mut self,
-    ) -> &mut Volume<KernelBlockDevice, ReadWrite<InternalJournal>, CngFscryptNonceGenerator> {
+    ) -> &mut JournaledVolume<KernelBlockDevice, InternalJournal, CngFscryptNonceGenerator> {
         &mut self.volume
     }
 

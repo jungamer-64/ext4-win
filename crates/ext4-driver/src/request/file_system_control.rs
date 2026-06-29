@@ -159,7 +159,7 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
     let length = query_device_length(request.target_device())?;
     let candidate = MountCandidate::new(request.target_device(), length);
     let vcb =
-        match VolumeControlBlock::mount_read_write(candidate.target_device(), candidate.length()) {
+        match VolumeControlBlock::mount_journaled(candidate.target_device(), candidate.length()) {
             Ok(vcb) => vcb,
             Err(ext4_core::Error::InvalidMagic | ext4_core::Error::InvalidSuperblock) => {
                 return Err(DriverError::UnrecognizedVolume);

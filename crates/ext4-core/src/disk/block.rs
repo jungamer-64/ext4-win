@@ -157,11 +157,13 @@ impl<T: BlockWriter + ?Sized> BlockWriter for &mut T {
 
 /// In-memory block device used by host tests and parser fixtures.
 #[derive(Clone, Copy, Debug)]
+#[cfg(test)]
 pub struct SliceBlockDevice<'a> {
     /// Whole device image exposed through checked random-access reads.
     bytes: &'a [u8],
 }
 
+#[cfg(test)]
 impl<'a> SliceBlockDevice<'a> {
     /// Creates a read-only in-memory device.
     #[must_use]
@@ -170,6 +172,7 @@ impl<'a> SliceBlockDevice<'a> {
     }
 }
 
+#[cfg(test)]
 impl BlockReader for SliceBlockDevice<'_> {
     fn len(&self) -> DeviceLength {
         DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
@@ -186,11 +189,13 @@ impl BlockReader for SliceBlockDevice<'_> {
 
 /// Mutable in-memory block device used by write transaction tests.
 #[derive(Debug)]
+#[cfg(test)]
 pub struct SliceBlockDeviceMut<'a> {
     /// Whole mutable device image exposed through checked random-access I/O.
     bytes: &'a mut [u8],
 }
 
+#[cfg(test)]
 impl<'a> SliceBlockDeviceMut<'a> {
     /// Creates a mutable read-write in-memory device.
     #[must_use]
@@ -199,6 +204,7 @@ impl<'a> SliceBlockDeviceMut<'a> {
     }
 }
 
+#[cfg(test)]
 impl BlockReader for SliceBlockDeviceMut<'_> {
     fn len(&self) -> DeviceLength {
         DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
@@ -213,6 +219,7 @@ impl BlockReader for SliceBlockDeviceMut<'_> {
     }
 }
 
+#[cfg(test)]
 impl BlockWriter for SliceBlockDeviceMut<'_> {
     fn write_exact_at(&mut self, offset: ByteOffset, bytes: &[u8]) -> Result<()> {
         let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;

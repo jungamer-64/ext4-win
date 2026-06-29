@@ -4,13 +4,11 @@ use super::*;
 fn clean_superblock_mounts() {
     let image = fixture_image();
     let device = SliceBlockDevice::new(&image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(ReadOnlyVolume::mount(device, test_mount_context()));
+    let superblock = must(Superblock::parse(&image[1024..2048]));
 
-    assert_eq!(volume.superblock().block_size().bytes(), 1024);
-    assert_eq!(volume.superblock().inode_count().as_u32(), 16);
+    assert_eq!(volume.geometry().block_size().bytes(), 1024);
+    assert_eq!(superblock.inode_count().as_u32(), 16);
 }
 
 #[test]
@@ -26,8 +24,7 @@ fn invalid_magic_is_rejected() {
 fn unsupported_incompat_feature_is_rejected() {
     let mut image = fixture_image();
     put_u32(&mut image, 1024 + 96, 0x0010 | 0x0040);
-    let result =
-        Volume::<_, ReadOnly>::mount_read_only(SliceBlockDevice::new(&image), test_mount_context());
+    let result = ReadOnlyVolume::mount(SliceBlockDevice::new(&image), test_mount_context());
 
     assert!(matches!(result, Err(Error::UnsupportedIncompatFeature)));
 }
@@ -62,7 +59,7 @@ fn metadata_checksum_mismatch_is_rejected() {
 fn larger_block_sizes_mount_and_read_file() {
     for block_size in [8192_usize, 16_384, 65_536] {
         let image = variable_block_fixture_image(block_size);
-        let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+        let volume = must(ReadOnlyVolume::mount(
             SliceBlockDevice::new(&image),
             test_mount_context(),
         ));
@@ -70,7 +67,7 @@ fn larger_block_sizes_mount_and_read_file() {
         let read = read_file(&volume, 3, 0, &mut output);
 
         assert_eq!(
-            volume.superblock().block_size().bytes(),
+            volume.geometry().block_size().bytes(),
             u32::try_from(block_size).unwrap_or(u32::MAX)
         );
         assert_eq!(read, 5);
@@ -94,12 +91,13 @@ fn metadata_csum_seed_is_accepted_with_metadata_csum() {
     put_u32(&mut image, 1024 + 96, INCOMPAT_MODERN | INCOMPAT_CSUM_SEED);
     put_u32(&mut image, 1024 + 624, 0x1234_5678);
     refresh_primary_block_group_descriptor_checksum(&mut image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let superblock = must(Superblock::parse(&image[1024..2048]));
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
 
-    assert_eq!(volume.superblock().checksum_seed().as_u32(), 0x1234_5678);
+    assert_eq!(superblock.checksum_seed().as_u32(), 0x1234_5678);
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 3);
 }
 
@@ -109,13 +107,11 @@ fn write_mount_accepts_metadata_csum_seed() {
     put_u32(&mut image, 1024 + 96, INCOMPAT_MODERN | INCOMPAT_CSUM_SEED);
     put_u32(&mut image, 1024 + 624, 0x1234_5678);
     refresh_primary_block_group_descriptor_checksum(&mut image);
+    let superblock = must(Superblock::parse_read_write(&image[1024..2048]));
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let _volume = must(JournaledVolume::mount(device, test_mount_context()));
 
-    assert_eq!(volume.superblock().checksum_seed().as_u32(), 0x1234_5678);
+    assert_eq!(superblock.checksum_seed().as_u32(), 0x1234_5678);
 }
 
 #[test]
@@ -132,7 +128,7 @@ fn read_only_mount_accepts_quota_and_clean_orphan_file() {
     let mut image = fixture_image();
     put_u32(&mut image, 1024 + 92, COMPAT_ORPHAN_FILE);
     put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | RO_COMPAT_QUOTA);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
@@ -168,16 +164,11 @@ fn read_only_mount_rejects_layout_changing_features() {
 #[test]
 fn write_mount_accepts_modern_baseline() {
     let mut image = modern_fixture_image();
+    let superblock = must(Superblock::parse_read_write(&image[1024..2048]));
     let device = SliceBlockDeviceMut::new(&mut image);
-    let volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let _volume = must(JournaledVolume::mount(device, test_mount_context()));
 
-    assert_eq!(
-        volume.superblock().journal_mode(),
-        JournalMode::Internal(inode(8))
-    );
+    assert_eq!(superblock.journal_mode(), JournalMode::Internal(inode(8)));
 }
 
 #[test]

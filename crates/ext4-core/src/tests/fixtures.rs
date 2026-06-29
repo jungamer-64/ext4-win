@@ -901,7 +901,7 @@ pub(super) fn make_indexed_root_directory(image: &mut [u8]) {
         get_u32(image, root_inode + 100),
     );
     let file_name = must(Ext4Name::new(b"file"));
-    let entries = vec![DirectoryEntry::new(
+    let entries = vec![RawDirectoryEntry::new(
         inode(3),
         &file_name,
         DirectoryEntryKind::File,

@@ -111,7 +111,7 @@ pub(crate) fn enable_verity(
 ) -> DriverResult<DriverCompletion> {
     let payload = read_input(target, stack)
         .and_then(|input| FsverityEnablePayload::parse(input.as_slice()))?;
-    let enable = payload.into_core_enable()?;
+    let enable = payload.into_core_enable();
     let opened_file = OpenedFileObject::decode(stack.file_object())?;
     let NodeId::File(file_id) = opened_file.node() else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
@@ -360,10 +360,6 @@ struct FsverityEnablePayload {
     algorithm: FsverityHashAlgorithm,
     /// Merkle tree block size.
     block_size: FsverityBlockSize,
-    /// Salt pointer and byte length.
-    salt: OptionalUserBuffer,
-    /// Signature pointer and byte length.
-    signature: OptionalUserBuffer,
 }
 
 impl FsverityEnablePayload {
@@ -387,12 +383,12 @@ impl FsverityEnablePayload {
         let block_size = FsverityBlockSize::new(
             fields.read_u32(wire_offset(FSVERITY_ENABLE_BLOCK_SIZE_OFFSET))?,
         )?;
-        let salt = OptionalUserBuffer::new(
+        reject_unsupported_user_buffer(
             fields.read_u64(wire_offset(FSVERITY_ENABLE_SALT_PTR_OFFSET))?,
             fields.read_u32(wire_offset(FSVERITY_ENABLE_SALT_SIZE_OFFSET))?,
             32,
         )?;
-        let signature = OptionalUserBuffer::new(
+        reject_unsupported_user_buffer(
             fields.read_u64(wire_offset(FSVERITY_ENABLE_SIG_PTR_OFFSET))?,
             fields.read_u32(wire_offset(FSVERITY_ENABLE_SIG_SIZE_OFFSET))?,
             FSVERITY_MAX_SIGNATURE_BYTES,
@@ -408,24 +404,17 @@ impl FsverityEnablePayload {
         Ok(Self {
             algorithm,
             block_size,
-            salt,
-            signature,
         })
     }
 
     /// Converts this decoded payload into the ext4-core enable domain.
-    fn into_core_enable(self) -> DriverResult<FsverityEnable> {
-        let salt = self.salt();
-        let signature = self.signature();
-        if salt.length != 0 || signature.length != 0 {
-            return Err(DriverError::NotSupported);
-        }
-        Ok(FsverityEnable::new(
+    fn into_core_enable(self) -> FsverityEnable {
+        FsverityEnable::new(
             self.algorithm(),
             self.block_size(),
             FsveritySalt::empty(),
             FsveritySignature::empty(),
-        ))
+        )
     }
 
     /// Hash algorithm for the Merkle tree.
@@ -437,44 +426,26 @@ impl FsverityEnablePayload {
     const fn block_size(self) -> FsverityBlockSize {
         self.block_size
     }
-
-    /// Salt pointer and size.
-    const fn salt(self) -> OptionalUserBuffer {
-        self.salt
-    }
-
-    /// Signature pointer and size.
-    const fn signature(self) -> OptionalUserBuffer {
-        self.signature
-    }
 }
 
-/// Optional pointer-sized buffer descriptor from Linux ioctl-compatible payloads.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct OptionalUserBuffer {
-    /// User-mode address carried by the Linux layout.
-    address: u64,
-    /// Buffer length in bytes.
-    length: u32,
-}
-
-impl OptionalUserBuffer {
-    /// Creates a validated optional pointer/length pair.
-    fn new(address: u64, length: u32, max_length: u32) -> DriverResult<Self> {
-        if length > max_length {
-            return Err(DriverError::InvalidParameter);
-        }
-        if (length == 0) != (address == 0) {
-            return Err(DriverError::InvalidParameter);
-        }
-        Ok(Self { address, length })
+/// Rejects currently unsupported external fs-verity user buffers at parse time.
+fn reject_unsupported_user_buffer(address: u64, length: u32, max_length: u32) -> DriverResult<()> {
+    if length > max_length {
+        return Err(DriverError::InvalidParameter);
     }
+    if (length == 0) != (address == 0) {
+        return Err(DriverError::InvalidParameter);
+    }
+    if length != 0 {
+        return Err(DriverError::NotSupported);
+    }
+    Ok(())
 }
 
 /// Reads METHOD_BUFFERED input bytes for one user FSCTL.
 fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
     let length = stack.input_buffer_length().as_usize();
-    let input = target.data_buffer(length)?;
+    let input = target.buffered_input(length)?;
     Ok(input.as_slice().to_vec())
 }
 
@@ -488,12 +459,12 @@ fn output_buffer(
     target: DispatchTarget,
     stack: FileSystemControlStack,
     len: usize,
-) -> DriverResult<crate::irp::IrpDataBuffer> {
+) -> DriverResult<crate::irp::BufferedOutput> {
     let output_len = stack.output_buffer_length().as_usize();
     if output_len < len {
         return Err(DriverError::BufferTooSmall);
     }
-    target.data_buffer(len)
+    target.buffered_output(len)
 }
 
 /// Builds an FSCTL output completion byte count.
@@ -699,51 +670,22 @@ mod tests {
     }
 
     #[test]
-    fn fsverity_enable_payload_decodes_linux_layout() {
-        let payload = enable_verity_payload(
-            2,
-            4096,
-            OptionalUserBuffer {
-                address: 0x1000,
-                length: 3,
-            },
-            OptionalUserBuffer {
-                address: 0x2000,
-                length: 16,
-            },
-        );
+    fn fsverity_enable_payload_decodes_supported_linux_layout() {
+        let payload = enable_verity_payload(2, 4096, 0, 0, 0, 0);
         let payload = must!(payload);
 
         let decoded = must!(FsverityEnablePayload::parse(&payload));
 
         assert_eq!(decoded.algorithm(), FsverityHashAlgorithm::Sha512);
         assert_eq!(decoded.block_size().bytes(), 4096);
-        assert_eq!(decoded.salt().address, 0x1000);
-        assert_eq!(decoded.salt().length, 3);
-        assert_eq!(decoded.signature().address, 0x2000);
-        assert_eq!(decoded.signature().length, 16);
     }
 
     #[test]
     fn fsverity_enable_payload_maps_empty_buffers_to_core_domain() {
-        let payload = enable_verity_payload(
-            1,
-            1024,
-            OptionalUserBuffer {
-                address: 0,
-                length: 0,
-            },
-            OptionalUserBuffer {
-                address: 0,
-                length: 0,
-            },
-        );
+        let payload = enable_verity_payload(1, 1024, 0, 0, 0, 0);
         let payload = must!(payload);
 
-        let enable = must!(
-            FsverityEnablePayload::parse(&payload)
-                .and_then(FsverityEnablePayload::into_core_enable)
-        );
+        let enable = must!(FsverityEnablePayload::parse(&payload)).into_core_enable();
 
         assert_eq!(enable.algorithm(), FsverityHashAlgorithm::Sha256);
         assert_eq!(enable.block_size().bytes(), 1024);
@@ -753,41 +695,18 @@ mod tests {
 
     #[test]
     fn fsverity_enable_payload_rejects_external_salt_or_signature_buffers() {
-        let payload = enable_verity_payload(
-            1,
-            1024,
-            OptionalUserBuffer {
-                address: 0x1000,
-                length: 1,
-            },
-            OptionalUserBuffer {
-                address: 0,
-                length: 0,
-            },
-        );
+        let payload = enable_verity_payload(1, 1024, 0x1000, 1, 0, 0);
         let payload = must!(payload);
 
         assert_eq!(
-            FsverityEnablePayload::parse(&payload)
-                .and_then(FsverityEnablePayload::into_core_enable),
+            FsverityEnablePayload::parse(&payload),
             Err(DriverError::NotSupported)
         );
     }
 
     #[test]
     fn fsverity_enable_payload_rejects_reserved_and_bad_pointer_pairs() {
-        let reserved = enable_verity_payload(
-            1,
-            1024,
-            OptionalUserBuffer {
-                address: 0,
-                length: 0,
-            },
-            OptionalUserBuffer {
-                address: 0,
-                length: 0,
-            },
-        );
+        let reserved = enable_verity_payload(1, 1024, 0, 0, 0, 0);
         let mut reserved = must!(reserved);
         {
             let mut output = LittleEndianOutput::new(&mut reserved);
@@ -798,18 +717,7 @@ mod tests {
             Err(DriverError::InvalidParameter)
         );
 
-        let bad_salt = enable_verity_payload(
-            1,
-            1024,
-            OptionalUserBuffer {
-                address: 0,
-                length: 1,
-            },
-            OptionalUserBuffer {
-                address: 0,
-                length: 0,
-            },
-        );
+        let bad_salt = enable_verity_payload(1, 1024, 0, 1, 0, 0);
         let bad_salt = must!(bad_salt);
         assert_eq!(
             FsverityEnablePayload::parse(&bad_salt),
@@ -868,8 +776,10 @@ mod tests {
     fn enable_verity_payload(
         algorithm: u32,
         block_size: u32,
-        salt: OptionalUserBuffer,
-        signature: OptionalUserBuffer,
+        salt_address: u64,
+        salt_length: u32,
+        signature_address: u64,
+        signature_length: u32,
     ) -> DriverResult<Vec<u8>> {
         let mut payload = vec![0_u8; FSVERITY_ENABLE_ARG_BYTES];
         let mut output = LittleEndianOutput::new(&mut payload);
@@ -882,15 +792,15 @@ mod tests {
             algorithm,
         )?;
         output.write_u32(wire_offset(FSVERITY_ENABLE_BLOCK_SIZE_OFFSET), block_size)?;
-        output.write_u32(wire_offset(FSVERITY_ENABLE_SALT_SIZE_OFFSET), salt.length)?;
-        output.write_u64(wire_offset(FSVERITY_ENABLE_SALT_PTR_OFFSET), salt.address)?;
+        output.write_u32(wire_offset(FSVERITY_ENABLE_SALT_SIZE_OFFSET), salt_length)?;
+        output.write_u64(wire_offset(FSVERITY_ENABLE_SALT_PTR_OFFSET), salt_address)?;
         output.write_u32(
             wire_offset(FSVERITY_ENABLE_SIG_SIZE_OFFSET),
-            signature.length,
+            signature_length,
         )?;
         output.write_u64(
             wire_offset(FSVERITY_ENABLE_SIG_PTR_OFFSET),
-            signature.address,
+            signature_address,
         )?;
         Ok(payload)
     }

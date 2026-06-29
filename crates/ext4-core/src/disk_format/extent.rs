@@ -283,25 +283,6 @@ pub struct ExtentTree {
 }
 
 impl ExtentTree {
-    /// Parses a depth-0 inode extent root.
-    ///
-    /// # Errors
-    /// Returns an error when the extent header is malformed, contains a deeper
-    /// tree, or has invalid entry bounds.
-    pub fn parse_inode_root(root: &InodeExtentRoot) -> Result<Self> {
-        let raw = root.bytes();
-        let entries = header_entries(raw)?;
-        let mut extents = Vec::with_capacity(entries);
-        if parse_node(raw, None, &mut extents)? != 0 {
-            return Err(Error::UnsupportedExtentDepth);
-        }
-        normalize_extents(&mut extents)?;
-        Ok(Self {
-            extents,
-            metadata_blocks: Vec::new(),
-        })
-    }
-
     /// Loads an extent tree, following external index blocks up to the ext4 depth limit.
     ///
     /// # Errors
@@ -433,15 +414,6 @@ impl MutableExtentTree {
             physical_block,
         ));
         normalize_extents(&mut self.extents)
-    }
-
-    /// Number of allocated data blocks represented by leaf extents.
-    #[must_use]
-    pub fn allocated_data_blocks(&self) -> u64 {
-        self.extents
-            .iter()
-            .map(|extent| extent.len().as_u64())
-            .sum()
     }
 
     /// External extent metadata blocks currently reserved for this tree.

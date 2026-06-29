@@ -717,18 +717,6 @@ impl Inode {
         self.times
     }
 
-    /// POSIX owner parsed from uid/gid fields.
-    #[must_use]
-    pub const fn owner(&self) -> Ext4Owner {
-        self.security.owner()
-    }
-
-    /// Permission bits parsed from `i_mode` without file-type bits.
-    #[must_use]
-    pub const fn permissions(&self) -> Ext4Permissions {
-        self.security.permissions()
-    }
-
     /// Raw link count.
     #[must_use]
     pub const fn links_count(&self) -> u16 {

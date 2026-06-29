@@ -134,7 +134,7 @@ fn query_ea(request: &QueryEaRequest) -> DriverResult<DriverCompletion> {
     if length < required {
         return Err(DriverError::BufferTooSmall);
     }
-    let mut output = request.target.data_buffer(length)?;
+    let mut output = request.target.data_output(length)?;
     let written = pack_full_ea_entries(entries.as_slice(), output.as_mut_slice())?;
     DriverCompletion::from_usize(written)
 }
@@ -168,7 +168,7 @@ fn collect_query_entries(
 fn load_windows_eas(opened_file: &OpenedFileObject) -> DriverResult<Vec<WindowsEaEntry>> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
-    let xattrs = vcb.volume().read_xattrs(fcb.node().inode())?;
+    let xattrs = vcb.volume().read_xattrs(fcb.node())?;
     let mut entries = Vec::new();
     for (name, value) in xattrs.entries() {
         if name.namespace() != XattrNamespace::User {
@@ -229,7 +229,7 @@ fn parse_set_ea_entries(
     if length == 0 {
         return Ok(Vec::new());
     }
-    let input = target.data_buffer(length)?;
+    let input = target.data_input(length)?;
     parse_full_ea_list(input.as_slice())
 }
 

@@ -8,10 +8,7 @@ fn in_inode_xattr_round_trips_through_inode_body() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, node_id);
@@ -23,12 +20,13 @@ fn in_inode_xattr_round_trips_through_inode_body() {
     assert_eq!(get_u32(&image, inode_offset + 104), 0);
     assert_eq!(get_u32(&image, inode_offset + 160), 0xEA02_0000);
 
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    assert_eq!(must(volume.read_xattr(inode(3), &name)), Some(value));
-    assert_eq!(must(volume.read_xattrs(inode(3))).entries().len(), 1);
+    let file = node_id(&volume, inode(3));
+    assert_eq!(must(volume.read_xattr(file, &name)), Some(value));
+    assert_eq!(must(volume.read_xattrs(file)).entries().len(), 1);
 }
 
 #[test]
@@ -40,10 +38,7 @@ fn external_xattr_block_is_allocated_and_removed() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, node_id);
@@ -60,18 +55,16 @@ fn external_xattr_block_is_allocated_and_removed() {
     assert_eq!(get_u32(&image, xattr_block_offset + 8), 1);
     assert_ne!(get_u32(&image, xattr_block_offset + 16), 0);
 
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    assert_eq!(must(volume.read_xattr(inode(3), &name)), Some(value));
+    let file = node_id(&volume, inode(3));
+    assert_eq!(must(volume.read_xattr(file, &name)), Some(value));
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, node_id);
@@ -83,11 +76,12 @@ fn external_xattr_block_is_allocated_and_removed() {
     }
 
     assert_eq!(get_u32(&image, inode_offset + 104), 0);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    assert_eq!(must(volume.read_xattr(inode(3), &name)), None);
+    let file = node_id(&volume, inode(3));
+    assert_eq!(must(volume.read_xattr(file, &name)), None);
 }
 
 #[test]
@@ -102,10 +96,7 @@ fn posix_acl_uses_typed_acl_boundary() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, node_id);
@@ -113,16 +104,17 @@ fn posix_acl_uses_typed_acl_boundary() {
         must(transaction.commit());
     }
 
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
+    let file = node_id(&volume, inode(3));
     assert_eq!(
-        must(volume.read_posix_acl(inode(3), PosixAclKind::Access)),
+        must(volume.read_posix_acl(file, PosixAclKind::Access)),
         Some(acl)
     );
     assert_eq!(
-        must(volume.read_xattr(inode(3), &must(PosixAcl::access_xattr_name()))),
+        must(volume.read_xattr(file, &must(PosixAcl::access_xattr_name()))),
         Some(acl_value)
     );
 }
@@ -136,10 +128,7 @@ fn windows_overlay_is_stored_in_user_ext4win_xattr() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, node_id);
@@ -147,13 +136,14 @@ fn windows_overlay_is_stored_in_user_ext4win_xattr() {
         must(transaction.commit());
     }
 
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    assert_eq!(must(volume.read_windows_overlay(inode(3))), Some(overlay));
+    let file = node_id(&volume, inode(3));
+    assert_eq!(must(volume.read_windows_overlay(file)), Some(overlay));
     assert_eq!(
-        must(volume.read_xattr(inode(3), &must(WindowsOverlay::attributes_xattr_name()))),
+        must(volume.read_xattr(file, &must(WindowsOverlay::attributes_xattr_name()))),
         Some(must(overlay.to_xattr_value()))
     );
 }
@@ -171,20 +161,15 @@ fn minimal_profile_mounts_without_ext_attr_but_rejects_xattr_mutations() {
     ]));
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+    let file = node_id(&volume, inode(3));
     assert_eq!(
-        must(volume.read_xattr(
-            inode(3),
-            &must(XattrName::new(XattrNamespace::User, b"name"))
-        )),
+        must(volume.read_xattr(file, &must(XattrName::new(XattrNamespace::User, b"name")))),
         None
     );
-    assert_eq!(must(volume.read_windows_overlay(inode(3))), None);
+    assert_eq!(must(volume.read_windows_overlay(file)), None);
 
-    let node_id = node_id(&volume, inode(3));
+    let node_id = file;
     let mut xattr = volume.begin_transaction(NOW);
     let node = transaction_node(&xattr, node_id);
     let result = xattr.set_xattr(

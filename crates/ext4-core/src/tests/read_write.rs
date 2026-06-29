@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn sparse_file_reads_zeroes_for_holes() {
     let image = fixture_image();
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
@@ -20,7 +20,7 @@ fn sparse_file_reads_zeroes_for_holes() {
 fn uninitialized_extent_reads_as_zeroes() {
     let mut image = fixture_image();
     put_u16(&mut image, inode_offset(3) + 56, 0x8001);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
@@ -36,7 +36,12 @@ fn extent_hole_mapping_is_explicit() {
     let mut raw = [0_u8; 60];
     write_extent_root(&mut raw, 0, 1, 1, FILE_DATA_BLOCK);
     let root = crate::disk_format::inode::InodeExtentRoot::from_bytes(raw);
-    let tree = must(ExtentTree::parse_inode_root(&root));
+    let tree = must(ExtentTree::load_inode_tree(
+        &root,
+        must(BlockSize::from_superblock_log(0)),
+        &SliceBlockDevice::new(&[]),
+        ExtentTreeContext::none(),
+    ));
 
     assert_eq!(
         tree.map_logical(LogicalBlock::from_u32(0)),
@@ -48,10 +53,7 @@ fn extent_hole_mapping_is_explicit() {
 fn sparse_hole_write_allocates_block() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
 
     let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
@@ -70,10 +72,7 @@ fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
@@ -112,7 +111,7 @@ fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
     assert_ne!(extent_block, 0);
     assert_eq!(get_u16(&image, block_offset(extent_block)), 0xF30A);
 
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
@@ -170,10 +169,7 @@ fn external_extent_block_checksum_mismatch_is_rejected() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
@@ -196,7 +192,7 @@ fn external_extent_block_checksum_mismatch_is_rejected() {
     let checksum_offset = block_offset(extent_block) + BLOCK_SIZE - 4;
     image[checksum_offset] ^= 0x80;
 
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
@@ -212,10 +208,7 @@ fn uninitialized_extent_write_is_rejected() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     put_u16(&mut image, modern_inode_offset(3) + 56, 0x8001);
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
     let file = transaction_file(&transaction, file_id);
@@ -232,10 +225,7 @@ fn inode_protection_flags_are_typed_before_mutation_policy() {
     let file_flags = get_u32(&image, modern_inode_offset(3) + 32) | EXT4_VERITY_FL;
     put_u32(&mut image, modern_inode_offset(3) + 32, file_flags);
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
 
     let file = file_node(&volume, 3);
     assert_eq!(file.protection(), InodeProtection::EncryptedVerity);
@@ -252,10 +242,7 @@ fn inode_protection_flags_are_typed_before_mutation_policy() {
 fn extend_file_creates_sparse_range() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
 
     let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
@@ -274,10 +261,7 @@ fn extend_file_creates_sparse_range() {
 fn minimal_profile_rejects_file_size_beyond_large_file_boundary() {
     let mut image = minimal_write_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
     let file = transaction_file(&transaction, file_id);
@@ -290,10 +274,7 @@ fn minimal_profile_rejects_file_size_beyond_large_file_boundary() {
 fn truncate_file_releases_blocks() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
 
     let file_id = file_node_id(&volume, 3);
     let mut write = volume.begin_transaction(NOW);
@@ -311,10 +292,7 @@ fn truncate_file_releases_blocks() {
 fn transaction_too_large_is_rejected_before_writes() {
     let mut image = modern_fixture_image_with_journal_blocks(3);
     let device = SliceBlockDeviceMut::new(&mut image);
-    let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-        device,
-        test_mount_context(),
-    ));
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
 
@@ -328,10 +306,7 @@ fn transaction_too_large_is_rejected_before_writes() {
 fn inode_security_is_parsed_from_owner_and_mode() {
     let image = modern_fixture_image();
     let device = SliceBlockDevice::new(&image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(ReadOnlyVolume::mount(device, test_mount_context()));
 
     let file = file_node(&volume, 3);
     assert_eq!(file.security().owner().uid().as_u32(), 0);
@@ -349,10 +324,7 @@ fn inode_times_are_parsed_from_inode_fields() {
     put_u32(&mut image, offset + 144, 44);
 
     let device = SliceBlockDevice::new(&image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
-        device,
-        test_mount_context(),
-    ));
+    let volume = must(ReadOnlyVolume::mount(device, test_mount_context()));
     let file = file_node(&volume, 3);
 
     assert_eq!(
@@ -372,10 +344,7 @@ fn set_posix_security_updates_owner_and_permissions() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let security = Ext4Security::new(
             Ext4Owner::new(
                 Ext4Uid::from_u32(0x0002_0001),
@@ -414,10 +383,7 @@ fn set_times_updates_inode_timestamp_fields() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, node_id);
@@ -444,10 +410,7 @@ fn minimal_profile_does_not_write_extra_inode_timestamp_fields() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
         let node = transaction_node(&transaction, node_id);
@@ -470,10 +433,7 @@ fn volume_label_round_trips_through_superblock() {
 
     {
         let device = SliceBlockDeviceMut::new(&mut image);
-        let mut volume = must(Volume::<_, ReadWrite>::mount_read_write(
-            device,
-            test_mount_context(),
-        ));
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         transaction.set_volume_label(label);
         must(transaction.commit());
@@ -482,7 +442,7 @@ fn volume_label_round_trips_through_superblock() {
     assert_eq!(&image[1024 + 120..1024 + 127], b"EXT4WIN");
     assert_eq!(&image[1024 + 127..1024 + 136], &[0_u8; 9]);
 
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
@@ -509,7 +469,7 @@ fn bad_tag_checksum_transaction_is_rejected() {
     write_jbd2_commit(&mut image, 3, 9);
 
     let device = SliceBlockDeviceMut::new(&mut image);
-    let result = Volume::<_, ReadWrite>::mount_read_write(device, test_mount_context());
+    let result = JournaledVolume::mount(device, test_mount_context());
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
     assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x1C), 1);
@@ -520,7 +480,7 @@ fn bad_tag_checksum_transaction_is_rejected() {
 fn extent_depth_traversal_reads_index_block() {
     let mut image = modern_fixture_image();
     write_indexed_file_inode(&mut image);
-    let volume = must(Volume::<_, ReadOnly>::mount_read_only(
+    let volume = must(ReadOnlyVolume::mount(
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
