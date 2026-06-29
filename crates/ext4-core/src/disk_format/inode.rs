@@ -506,27 +506,6 @@ pub enum DirectoryStorageKind {
     HTree,
 }
 
-/// Write-domain operation requested against an inode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InodeMutation {
-    /// POSIX metadata, timestamps, or xattrs that do not reinterpret file data.
-    Metadata,
-    /// Directory entry insertion.
-    DirectoryEntryCreate,
-    /// Directory entry removal by exact on-disk name.
-    DirectoryEntryDelete,
-    /// Directory entry rename within one directory.
-    DirectoryEntryRename,
-    /// Directory entry target replacement.
-    DirectoryEntryReplace,
-    /// Regular-file or symlink payload bytes.
-    FileData,
-    /// File length or allocated extent shape.
-    FileSize,
-    /// Namespace removal and final inode release.
-    Delete,
-}
-
 /// Contents protection attached to an inode by ext4 flags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InodeProtection {
@@ -756,43 +735,6 @@ impl Inode {
             (false, true) => InodeProtection::Verity,
             (true, true) => InodeProtection::EncryptedVerity,
         }
-    }
-
-    /// Validates one write-domain operation against this inode's flags.
-    ///
-    /// # Errors
-    /// Returns an error when the requested operation is incompatible with the
-    /// inode's on-disk semantics.
-    pub fn require_mutation(&self, mutation: InodeMutation) -> Result<()> {
-        if self.flags & EXT4_IMMUTABLE_FL != 0 {
-            return Err(Error::UnsupportedInodeMutation);
-        }
-        if self.flags & EXT4_INLINE_DATA_FL != 0 {
-            return Err(Error::UnsupportedInodeMutation);
-        }
-        match mutation {
-            InodeMutation::Metadata | InodeMutation::Delete => {}
-            InodeMutation::DirectoryEntryDelete => {
-                if self.flags & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0 {
-                    return Err(Error::UnsupportedInodeMutation);
-                }
-            }
-            InodeMutation::DirectoryEntryCreate
-            | InodeMutation::DirectoryEntryRename
-            | InodeMutation::DirectoryEntryReplace => {
-                if self.flags & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0 {
-                    return Err(Error::UnsupportedInodeMutation);
-                }
-            }
-            InodeMutation::FileData | InodeMutation::FileSize => {
-                if self.flags & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0
-                    || self.protection().is_verity()
-                {
-                    return Err(Error::UnsupportedInodeMutation);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Data storage selected by inode flags and node kind.
