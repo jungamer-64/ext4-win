@@ -1,6 +1,6 @@
 //! Read-only traversal and metadata projection for mounted volumes.
 
-use super::*;
+use super::scope::*;
 
 impl<D, N> ReadOnlyVolume<D, N>
 where

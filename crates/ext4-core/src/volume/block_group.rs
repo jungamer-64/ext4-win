@@ -1,6 +1,6 @@
 //! Block-group allocation bitmaps and mounted cluster-reference accounting.
 
-use super::*;
+use super::scope::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Mounted allocation-cluster ownership index used by write transactions.
