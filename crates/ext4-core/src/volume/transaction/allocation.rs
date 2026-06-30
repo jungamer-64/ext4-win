@@ -248,7 +248,10 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
     }
 
     /// Returns the staged block bitmap index, loading it once when needed.
-    pub(super) fn ensure_block_bitmap_update(&mut self, bitmap_block: BlockAddress) -> Result<usize> {
+    pub(super) fn ensure_block_bitmap_update(
+        &mut self,
+        bitmap_block: BlockAddress,
+    ) -> Result<usize> {
         if let Some(index) = self
             .block_bitmap_updates
             .iter()
@@ -279,7 +282,10 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
     }
 
     /// Returns the staged inode bitmap index, loading it once when needed.
-    pub(super) fn ensure_inode_bitmap_update(&mut self, bitmap_block: BlockAddress) -> Result<usize> {
+    pub(super) fn ensure_inode_bitmap_update(
+        &mut self,
+        bitmap_block: BlockAddress,
+    ) -> Result<usize> {
         if let Some(index) = self
             .inode_bitmap_updates
             .iter()
@@ -326,7 +332,10 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
     }
 
     /// Creates a zeroed inode record at the allocated inode's device offset.
-    pub(super) fn empty_allocated_inode_record(&self, inode_id: InodeId) -> Result<AllocatedInodeRecord> {
+    pub(super) fn empty_allocated_inode_record(
+        &self,
+        inode_id: InodeId,
+    ) -> Result<AllocatedInodeRecord> {
         Ok(RawInodeRecord {
             id: inode_id,
             offset: inode_offset_on_device(&self.volume.device, &self.volume.superblock, inode_id)?,
@@ -363,7 +372,11 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
     }
 
     /// Records a free-inode count delta for one block group and the superblock.
-    pub(super) fn record_group_free_inodes_delta(&mut self, group: BlockGroupId, delta: i64) -> Result<()> {
+    pub(super) fn record_group_free_inodes_delta(
+        &mut self,
+        group: BlockGroupId,
+        delta: i64,
+    ) -> Result<()> {
         let entry = self.group_delta_mut(group)?;
         entry.free_inodes_delta = entry
             .free_inodes_delta
@@ -377,11 +390,16 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
     }
 
     /// Records a used-directory count delta for one block group.
-    pub(super) fn record_group_used_dirs_delta(&mut self, group: BlockGroupId, delta: i64) -> Result<()> {
+    pub(super) fn record_group_used_dirs_delta(
+        &mut self,
+        group: BlockGroupId,
+        delta: i64,
+    ) -> Result<()> {
         let entry = self.group_delta_mut(group)?;
         entry.used_dirs_delta = entry
             .used_dirs_delta
             .checked_add(delta)
             .ok_or(Error::ArithmeticOverflow)?;
         Ok(())
-    }}
+    }
+}
