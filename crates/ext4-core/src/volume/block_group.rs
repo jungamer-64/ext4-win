@@ -15,7 +15,9 @@ pub(super) struct ClusterReferenceIndex {
 
 impl ClusterReferenceIndex {
     /// Builds the mounted reference index from static metadata and live inodes.
-    pub(super) fn load<D: BlockReader, State, N>(volume: &MountedVolume<D, State, N>) -> Result<Self> {
+    pub(super) fn load<D: BlockReader, State, N>(
+        volume: &MountedVolume<D, State, N>,
+    ) -> Result<Self> {
         let mut index = Self {
             refs: Vec::new(),
             exclusive_blocks: Vec::new(),
@@ -384,7 +386,10 @@ pub(super) fn cluster_bitmap_bit_state(
 }
 
 /// Reads one typed inode bitmap bit.
-pub(super) fn inode_bitmap_bit_state(bytes: &[u8], position: InodeBitmapPosition) -> Result<BitmapBitState> {
+pub(super) fn inode_bitmap_bit_state(
+    bytes: &[u8],
+    position: InodeBitmapPosition,
+) -> Result<BitmapBitState> {
     bitmap_bit_state(bytes, position.bit())
 }
 
@@ -466,7 +471,10 @@ pub(super) fn inode_bitmap_state(
 }
 
 /// Returns the first physical block in a block group.
-pub(super) fn group_start_block(superblock: &Superblock, group: BlockGroupId) -> Result<BlockAddress> {
+pub(super) fn group_start_block(
+    superblock: &Superblock,
+    group: BlockGroupId,
+) -> Result<BlockAddress> {
     Ok(BlockAddress::new(
         superblock
             .first_data_block()
