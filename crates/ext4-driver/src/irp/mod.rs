@@ -92,33 +92,42 @@ impl DispatchTarget {
     }
 
     /// Returns METHOD_BUFFERED input bytes from the IRP system buffer.
-    pub(crate) fn buffered_input(self, length: usize) -> Result<BufferedInput, DriverError> {
-        BufferedInput::new(self.associated_system_buffer()?, length)
+    pub(crate) fn buffered_input(
+        self,
+        length: IrpBufferLength,
+    ) -> Result<BufferedInput, DriverError> {
+        BufferedInput::new(self.associated_system_buffer()?, length.as_usize())
     }
 
     /// Returns METHOD_BUFFERED output bytes from the IRP system buffer.
-    pub(crate) fn buffered_output(self, length: usize) -> Result<BufferedOutput, DriverError> {
-        BufferedOutput::new(self.associated_system_buffer()?, length)
+    pub(crate) fn buffered_output(
+        self,
+        length: IrpBufferLength,
+    ) -> Result<BufferedOutput, DriverError> {
+        BufferedOutput::new(self.associated_system_buffer()?, length.as_usize())
     }
 
     /// Returns read-like IRP data bytes as immutable kernel memory.
-    pub(crate) fn data_input(self, length: usize) -> Result<BufferedInput, DriverError> {
-        BufferedInput::new(self.data_buffer_address(length)?, length)
+    pub(crate) fn data_input(self, length: IrpBufferLength) -> Result<BufferedInput, DriverError> {
+        BufferedInput::new(self.data_buffer_address(length)?, length.as_usize())
     }
 
     /// Returns write-like IRP data bytes as mutable kernel memory.
-    pub(crate) fn data_output(self, length: usize) -> Result<BufferedOutput, DriverError> {
-        BufferedOutput::new(self.data_buffer_address(length)?, length)
+    pub(crate) fn data_output(
+        self,
+        length: IrpBufferLength,
+    ) -> Result<BufferedOutput, DriverError> {
+        BufferedOutput::new(self.data_buffer_address(length)?, length.as_usize())
     }
 
     /// Returns the IRP user output buffer as kernel-addressable memory.
-    pub(crate) fn user_output(self, length: usize) -> Result<UserOutput, DriverError> {
+    pub(crate) fn user_output(self, length: IrpBufferLength) -> Result<UserOutput, DriverError> {
         // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
         let irp = unsafe { self.irp.as_ref() };
         let Some(buffer) = NonNull::new(irp.UserBuffer) else {
             return Err(DriverError::InvalidParameter);
         };
-        UserOutput::new(buffer.cast(), length)
+        UserOutput::new(buffer.cast(), length.as_usize())
     }
 
     /// Returns the buffered I/O system buffer address for this IRP.
@@ -136,7 +145,7 @@ impl DispatchTarget {
     }
 
     /// Returns the read/write IRP data buffer address as kernel memory.
-    fn data_buffer_address(self, length: usize) -> Result<NonNull<u8>, DriverError> {
+    fn data_buffer_address(self, length: IrpBufferLength) -> Result<NonNull<u8>, DriverError> {
         if let Ok(system_buffer) = self.associated_system_buffer() {
             return Ok(system_buffer);
         }
@@ -751,7 +760,7 @@ impl UserOutput {
 /// Returns an IRP MDL data buffer address as kernel memory.
 fn mdl_data_buffer_address(
     mdl: NonNull<wdk_sys::MDL>,
-    length: usize,
+    length: IrpBufferLength,
 ) -> Result<NonNull<u8>, DriverError> {
     let mdl_ref = unsafe {
         // SAFETY: The IRP's MdlAddress is non-null and owned by the I/O
@@ -759,7 +768,7 @@ fn mdl_data_buffer_address(
         mdl.as_ref()
     };
     let mdl_len = usize::try_from(mdl_ref.ByteCount).map_err(|_| DriverError::InvalidParameter)?;
-    if length > mdl_len {
+    if length.as_usize() > mdl_len {
         return Err(DriverError::InvalidParameter);
     }
 
@@ -820,7 +829,7 @@ impl IrpBufferLength {
     }
 
     /// Returns whether the request supplied an empty buffer.
-    const fn is_empty(self) -> bool {
+    pub(crate) const fn is_empty(self) -> bool {
         self.0 == 0
     }
 }
@@ -830,6 +839,11 @@ impl IrpBufferLength {
 pub(crate) struct DirectoryEntryIndex(u32);
 
 impl DirectoryEntryIndex {
+    /// Creates a directory entry index from the Windows cursor field.
+    pub(crate) const fn from_u32(value: u32) -> Self {
+        Self(value)
+    }
+
     /// Returns the cursor index.
     pub(crate) const fn as_u32(self) -> u32 {
         self.0
@@ -1815,7 +1829,7 @@ mod tests {
         CurrentIrpStackLocation, DirectoryControlMinorFunction, DirectoryCursorPosition,
         DirectoryEntryEmission, DirectoryInformationClass, DirectoryPatternInput, DispatchTarget,
         EaEntryEmission, EaNameSelection, FILE_OPEN_DISPOSITION, FileSystemControlMinorFunction,
-        FsControlCode, QueryFileInformationClass, QueryVolumeInformationClass,
+        FsControlCode, IrpBufferLength, QueryFileInformationClass, QueryVolumeInformationClass,
         SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
     };
     use crate::state::{KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb};
@@ -1854,6 +1868,16 @@ mod tests {
         assert!(decoded.is_ok());
         if let Ok(target) = decoded {
             assert_eq!(target.device().as_ptr(), device);
+        }
+    }
+
+    #[test]
+    fn irp_buffer_length_preserves_zero_as_typed_empty() {
+        let length = IrpBufferLength::from_ulong(0);
+        assert!(length.is_ok());
+        if let Ok(length) = length {
+            assert!(length.is_empty());
+            assert_eq!(length.as_usize(), 0);
         }
     }
 

@@ -34,7 +34,7 @@ pub(crate) fn get_reparse_point(
     stack: FileSystemControlStack,
 ) -> DriverResult<DriverCompletion> {
     let symlink_target = read_symlink_target(stack)?;
-    let length = stack.output_buffer_length().as_usize();
+    let length = stack.output_buffer_length();
     let mut output = target.buffered_output(length)?;
     let written = pack_symlink_reparse_buffer(symlink_target.as_slice(), output.as_mut_slice())?;
     DriverCompletion::from_usize(written)
@@ -75,7 +75,7 @@ fn parse_symlink_reparse_target(
     target: DispatchTarget,
     stack: FileSystemControlStack,
 ) -> DriverResult<SymlinkTarget> {
-    let length = stack.input_buffer_length().as_usize();
+    let length = stack.input_buffer_length();
     let input = target.buffered_input(length)?;
     parse_symlink_reparse_buffer(input.as_slice())
 }

@@ -194,27 +194,32 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
         return Err(DriverError::InsufficientResources);
     }
 
-    if MountedVolumeDevice::initialize_vpb_identity(request.vpb().as_non_null(), &vcb).is_none() {
+    if let Err(error) =
+        MountedVolumeDevice::initialize_vpb_identity(request.vpb().as_non_null(), &vcb)
+    {
         unsafe {
             // SAFETY: `device` was returned by a successful IoCreateDevice call
             // and has not been published as a mounted volume.
             ffi::IoDeleteDevice(device);
         }
-        return Err(DriverError::InvalidParameter);
+        return Err(error);
     }
 
-    let Some(mounted_device) = MountedVolumeDevice::initialize(
+    let mounted_device = match MountedVolumeDevice::initialize(
         device,
         Box::new(vcb),
         request.vpb().as_non_null(),
         candidate.target_device(),
-    ) else {
-        unsafe {
-            // SAFETY: `device` was returned by a successful IoCreateDevice call
-            // and no initialized extension owns heap state on this path.
-            ffi::IoDeleteDevice(device);
+    ) {
+        Ok(mounted_device) => mounted_device,
+        Err(error) => {
+            unsafe {
+                // SAFETY: `device` was returned by a successful IoCreateDevice call
+                // and no initialized extension owns heap state on this path.
+                ffi::IoDeleteDevice(device);
+            }
+            return Err(error);
         }
-        return Err(DriverError::InvalidParameter);
     };
     let _mounted_device = mounted_device.as_ptr();
     Ok(())

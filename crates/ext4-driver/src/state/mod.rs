@@ -16,7 +16,7 @@ use wdk_sys::{
     SHARE_ACCESS, STATUS_SUCCESS, VPB_MOUNTED,
 };
 
-use crate::irp::{DesiredAccess, ShareAccess};
+use crate::irp::{DesiredAccess, DirectoryEntryIndex, ShareAccess};
 use crate::kernel::cng::CngFscryptNonceGenerator;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::{block_device::KernelBlockDevice, ffi};
@@ -447,13 +447,14 @@ impl MountedVolumeDevice {
         vcb: Box<VolumeControlBlock>,
         vpb: NonNull<wdk_sys::VPB>,
         real_device: KernelDevice,
-    ) -> Option<Self> {
-        let device = KernelDevice::from_raw(device)?;
+    ) -> DriverResult<Self> {
+        let device = KernelDevice::from_raw(device).ok_or(DriverError::InvalidParameter)?;
         let device_object = unsafe {
             // SAFETY: The device was just created by this driver and remains
             // valid during mount initialization.
             device.as_ptr().as_mut()
-        }?;
+        }
+        .ok_or(DriverError::InvalidParameter)?;
         let extension = unsafe {
             // SAFETY: The device was created with a DeviceExtension sized for
             // MountedVolumeDeviceExtension by this driver.
@@ -461,10 +462,11 @@ impl MountedVolumeDevice {
                 .DeviceExtension
                 .cast::<MountedVolumeDeviceExtension>()
                 .as_mut()
-        }?;
+        }
+        .ok_or(DriverError::InvalidParameter)?;
         Self::initialize_device_object(device, vpb, real_device)?;
         extension.vcb = Box::into_raw(vcb);
-        Some(Self { device })
+        Ok(Self { device })
     }
 
     /// Returns the mounted volume device object pointer.
@@ -496,16 +498,21 @@ impl MountedVolumeDevice {
         device: KernelDevice,
         mut vpb: NonNull<wdk_sys::VPB>,
         real_device: KernelDevice,
-    ) -> Option<()> {
+    ) -> DriverResult<()> {
         let device_object = unsafe {
             // SAFETY: The mounted device object was created by this driver and
             // remains valid during mount initialization.
             device.as_ptr().as_mut()
-        }?;
+        }
+        .ok_or(DriverError::InvalidParameter)?;
         device_object.Vpb = vpb.as_ptr();
         device_object.Flags |= DO_DIRECT_IO;
         device_object.Flags &= !DO_DEVICE_INITIALIZING;
-        device_object.StackSize = real_device.stack_size()?.checked_add(1)?;
+        device_object.StackSize = real_device
+            .stack_size()
+            .ok_or(DriverError::InvalidParameter)?
+            .checked_add(1)
+            .ok_or(DriverError::InvalidParameter)?;
 
         let vpb = unsafe {
             // SAFETY: The VPB was supplied by the I/O Manager for this mount
@@ -514,54 +521,66 @@ impl MountedVolumeDevice {
         };
         vpb.DeviceObject = device.as_ptr();
         vpb.RealDevice = real_device.as_ptr();
-        vpb.Flags |= u16::try_from(VPB_MOUNTED).ok()?;
-        Some(())
+        vpb.Flags |= u16::try_from(VPB_MOUNTED).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(())
     }
 
     /// Copies VCB-derived identity fields into the VPB.
     pub(crate) fn initialize_vpb_identity(
         vpb: NonNull<wdk_sys::VPB>,
         vcb: &VolumeControlBlock,
-    ) -> Option<()> {
+    ) -> DriverResult<()> {
         let vpb = unsafe {
             // SAFETY: The VPB belongs to the active mount request and remains
             // writable until the mount IRP is completed.
             vpb.as_ptr().as_mut()
-        }?;
+        }
+        .ok_or(DriverError::InvalidParameter)?;
         vpb.SerialNumber = vcb.serial_number().as_u32();
         write_vpb_label(vpb, vcb.volume_label())
     }
 
     /// Refreshes the VPB volume label after a successful label mutation.
-    pub(crate) fn refresh_vpb_label(device: KernelDevice, vcb: &VolumeControlBlock) -> Option<()> {
+    pub(crate) fn refresh_vpb_label(
+        device: KernelDevice,
+        vcb: &VolumeControlBlock,
+    ) -> DriverResult<()> {
         let device_object = unsafe {
             // SAFETY: `device` is a mounted volume device owned by this driver
             // and is read only for its current VPB pointer.
             device.as_ptr().as_ref()
-        }?;
+        }
+        .ok_or(DriverError::InvalidParameter)?;
         let vpb = unsafe {
             // SAFETY: The VPB pointer belongs to the mounted device and stays
             // valid while the volume remains mounted.
             device_object.Vpb.as_mut()
-        }?;
+        }
+        .ok_or(DriverError::InvalidParameter)?;
         write_vpb_label(vpb, vcb.volume_label())
     }
 }
 
 /// Writes an ext4 label into the UTF-16 VPB label field using one code unit per
 /// ext4 label byte.
-fn write_vpb_label(vpb: &mut wdk_sys::VPB, label: ext4_core::Ext4VolumeLabel) -> Option<()> {
+fn write_vpb_label(vpb: &mut wdk_sys::VPB, label: ext4_core::Ext4VolumeLabel) -> DriverResult<()> {
     vpb.VolumeLabel.fill(0);
     let bytes = label.bytes();
     if bytes.len() > vpb.VolumeLabel.len() {
-        return None;
+        return Err(DriverError::InvalidParameter);
     }
     for (index, byte) in bytes.iter().enumerate() {
-        *vpb.VolumeLabel.get_mut(index)? = u16::from(*byte);
+        *vpb.VolumeLabel
+            .get_mut(index)
+            .ok_or(DriverError::InvalidParameter)? = u16::from(*byte);
     }
-    let wchar_bytes = bytes.len().checked_mul(core::mem::size_of::<u16>())?;
-    vpb.VolumeLabelLength = u16::try_from(wchar_bytes).ok()?;
-    Some(())
+    let wchar_bytes = bytes
+        .len()
+        .checked_mul(core::mem::size_of::<u16>())
+        .ok_or(DriverError::InvalidParameter)?;
+    vpb.VolumeLabelLength =
+        u16::try_from(wchar_bytes).map_err(|_| DriverError::InvalidParameter)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -687,22 +706,24 @@ enum FileControlBlockRelease {
 /// Per-handle directory enumeration state.
 pub(crate) struct DirectoryCursor {
     /// Next directory entry index to emit.
-    next_entry: u32,
+    next_entry: DirectoryEntryIndex,
 }
 
 impl DirectoryCursor {
     /// Creates a cursor at the first directory entry.
     pub(crate) const fn start() -> Self {
-        Self { next_entry: 0 }
+        Self {
+            next_entry: DirectoryEntryIndex::from_u32(0),
+        }
     }
 
     /// Returns the next directory entry index to emit.
-    pub(crate) const fn next_entry(self) -> u32 {
+    pub(crate) const fn next_entry(self) -> DirectoryEntryIndex {
         self.next_entry
     }
 
     /// Moves the cursor to a specific directory entry index.
-    pub(crate) const fn seek(&mut self, next_entry: u32) {
+    pub(crate) const fn seek(&mut self, next_entry: DirectoryEntryIndex) {
         self.next_entry = next_entry;
     }
 }

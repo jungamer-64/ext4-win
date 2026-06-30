@@ -16,8 +16,10 @@ use crate::disk_format::extent::{
 };
 use crate::disk_format::group::BlockGroupDescriptor;
 use crate::disk_format::inode::{
-    DirectoryStorageKind, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
-    FileOffset, FileSize, Inode, InodeId, InodeKind, InodeMutation, InodeProtection, InodeStorage,
+    DirectoryEntryMutationCapability, DirectoryStorageKind, Ext4LinkCount, Ext4Owner,
+    Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset,
+    FilePayloadMutationCapability, FileSize, FileSizeMutationCapability, Inode, InodeFlags,
+    InodeId, InodeKind, InodeMode, InodeProtection, InodeStorage, LinkCountAfterDecrement,
     NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 use crate::disk_format::journal::{Journal, LoadedJournal};
@@ -53,21 +55,23 @@ const fn disk_offset(offset: usize) -> DiskOffset {
 /// Maximum directory size read eagerly for lookup and enumeration.
 const MAX_EAGER_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
 /// `i_mode` type bits for ext4 directories.
+#[cfg(test)]
 const MODE_DIRECTORY: u16 = 0x4000;
 /// `i_mode` type bits for regular files.
+#[cfg(test)]
 const MODE_REGULAR: u16 = 0x8000;
 /// `i_mode` type bits for symbolic links.
+#[cfg(test)]
 const MODE_SYMLINK: u16 = 0xA000;
 /// `i_mode` mask that preserves inode type bits.
+#[cfg(test)]
 const MODE_KIND_MASK: u16 = 0xF000;
 /// `i_flags` bit indicating extent-based block mapping.
+#[cfg(test)]
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 /// `i_flags` bit indicating an HTree-indexed directory.
+#[cfg(test)]
 const EXT4_INDEX_FL: u32 = 0x0000_1000;
-/// `i_flags` bit indicating fscrypt-protected file contents or dirent names.
-const EXT4_ENCRYPT_FL: u32 = 0x0000_0800;
-/// `i_flags` bit indicating fs-verity protected file contents.
-const EXT4_VERITY_FL: u32 = 0x0010_0000;
 /// Offset of `i_mode` in an inode record.
 const INODE_MODE_OFFSET: usize = 0;
 /// Offset of `i_uid_lo` in an inode record.
@@ -821,7 +825,7 @@ impl FileNode {
 
     /// Link count parsed from the file inode.
     #[must_use]
-    pub const fn links_count(&self) -> u16 {
+    pub const fn links_count(&self) -> Ext4LinkCount {
         self.inode.links_count()
     }
 
@@ -871,7 +875,7 @@ impl DirectoryNode {
 
     /// Link count parsed from the directory inode.
     #[must_use]
-    pub const fn links_count(&self) -> u16 {
+    pub const fn links_count(&self) -> Ext4LinkCount {
         self.inode.links_count()
     }
 
@@ -921,7 +925,7 @@ impl SymlinkNode {
 
     /// Link count parsed from the symlink inode.
     #[must_use]
-    pub const fn links_count(&self) -> u16 {
+    pub const fn links_count(&self) -> Ext4LinkCount {
         self.inode.links_count()
     }
 
@@ -2312,7 +2316,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
             ExtentTreeContext::metadata_csum(
                 self.superblock.checksum_seed().as_u32(),
                 inode.id(),
-                inode.generation(),
+                inode.generation().as_u32(),
             )
         } else {
             ExtentTreeContext::none()
@@ -2325,7 +2329,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
             DirectoryChecksum::metadata_csum(
                 self.superblock.checksum_seed(),
                 inode.id(),
-                inode.generation(),
+                inode.generation().as_u32(),
             )
         } else {
             DirectoryChecksum::None
@@ -2476,7 +2480,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
     /// semantics outside the write domain.
     pub fn node(&self, id: NodeId) -> Result<TransactionNode> {
         let inode = self.volume.read_inode_record(id.inode())?;
-        inode.require_mutation(InodeMutation::Metadata)?;
+        let _metadata = inode.metadata_mutation()?;
         match (id, inode.kind()) {
             (NodeId::File(_), InodeKind::File)
             | (NodeId::Directory(_), InodeKind::Directory)
@@ -2536,7 +2540,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         let inode_index = self.ensure_inode_update(node.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
-        inode.require_mutation(InodeMutation::Metadata)?;
+        let _metadata = inode.metadata_mutation()?;
         raw_inode.set_owner(security.owner())?;
         raw_inode.set_permissions(security.permissions())?;
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
@@ -2556,7 +2560,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         metadata: NewFileMetadata,
     ) -> Result<TransactionFile> {
         self.ensure_child_absent(parent.inode(), name)?;
-        self.require_directory_entry_mutation(parent.inode(), InodeMutation::DirectoryEntryCreate)?;
+        self.require_directory_entry_create_mutation(parent.inode())?;
         let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
         let inherited_context = self.inherited_fscrypt_context(&parent_inode)?;
         let allocated_inode = self.allocate_inode()?;
@@ -2589,9 +2593,9 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
-        inode.require_mutation(InodeMutation::Delete)?;
+        let _deletion = inode.deletion_mutation()?;
         match raw_inode.decrement_links_count()? {
-            LinkCountAfterDecrement::StillLinked => {
+            LinkCountAfterDecrement::StillLinked(_) => {
                 raw_inode
                     .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
                 self.replace_live_inode(inode_index, raw_inode)?;
@@ -2628,7 +2632,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         metadata: NewDirectoryMetadata,
     ) -> Result<TransactionDirectory> {
         self.ensure_child_absent(parent.inode(), name)?;
-        self.require_directory_entry_mutation(parent.inode(), InodeMutation::DirectoryEntryCreate)?;
+        self.require_directory_entry_create_mutation(parent.inode())?;
         let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
         let inherited_context = self.inherited_fscrypt_context(&parent_inode)?;
         let block = self.allocate_cluster()?;
@@ -2685,7 +2689,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         metadata: NewSymlinkMetadata,
     ) -> Result<TransactionSymlink> {
         self.ensure_child_absent(parent.inode(), name)?;
-        self.require_directory_entry_mutation(parent.inode(), InodeMutation::DirectoryEntryCreate)?;
+        self.require_directory_entry_create_mutation(parent.inode())?;
         let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
         if parent_inode.protection().is_encrypted() {
             return Err(Error::UnsupportedEncryption);
@@ -2759,7 +2763,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        inode.require_mutation(InodeMutation::Delete)?;
+        let _deletion = inode.deletion_mutation()?;
         if !self.directory_is_empty(&inode)? {
             return Err(Error::DirectoryNotEmpty);
         }
@@ -2807,7 +2811,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         let child_index = self.ensure_inode_update(source.inode())?;
         let mut child_raw = self.staged_live_inode(child_index)?;
         let child_inode = child_raw.parse()?;
-        child_inode.require_mutation(InodeMutation::Metadata)?;
+        let _metadata = child_inode.metadata_mutation()?;
         if child_inode.kind() == InodeKind::Directory && source.inode() == InodeId::ROOT {
             return Err(Error::CannotRemoveRoot);
         }
@@ -2860,7 +2864,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         let inode_index = self.ensure_inode_update(node.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
-        inode.require_mutation(InodeMutation::Metadata)?;
+        let _metadata = inode.metadata_mutation()?;
         raw_inode.set_ext4_times(times, self.volume.superblock.inode_timestamp_encoding())?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
@@ -2956,7 +2960,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         if inode.kind() != InodeKind::Symlink {
             return Err(Error::WrongInodeKind);
         }
-        inode.require_mutation(InodeMutation::Delete)?;
+        let _deletion = inode.deletion_mutation()?;
         if let Ok(tree) = self.mutable_extent_tree(&inode) {
             for extent in tree.extents().iter().copied() {
                 self.free_extent(extent, 0)?;
@@ -3470,7 +3474,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         if inode.protection().is_verity() {
             return Err(Error::UnsupportedInodeMutation);
         }
-        inode.require_mutation(InodeMutation::FileData)?;
+        let _payload = inode.file_payload_mutation()?;
 
         let mut plaintext = vec![0_u8; inode.size().to_usize()?];
         let read =
@@ -3529,62 +3533,76 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
     }
 
     /// Verifies file-data mutation policy with mount-scoped fscrypt keys.
-    fn require_file_data_mutation(&self, inode: &Inode) -> Result<()> {
+    fn require_file_data_mutation(&self, inode: &Inode) -> Result<FilePayloadMutationCapability> {
         if inode.protection().is_encrypted() {
             self.volume.require_encryption_key(inode)?;
             if inode.kind() != InodeKind::File || inode.protection().is_verity() {
                 return Err(Error::UnsupportedEncryption);
             }
         }
-        inode.require_mutation(InodeMutation::FileData)
+        inode.file_payload_mutation()
     }
 
     /// Verifies file-size mutation policy with mount-scoped fscrypt keys.
-    fn require_file_size_mutation(&self, inode: &Inode) -> Result<()> {
+    fn require_file_size_mutation(&self, inode: &Inode) -> Result<FileSizeMutationCapability> {
         if inode.protection().is_encrypted() {
             self.volume.require_encryption_key(inode)?;
             if inode.kind() != InodeKind::File || inode.protection().is_verity() {
                 return Err(Error::UnsupportedEncryption);
             }
         }
-        inode.require_mutation(InodeMutation::FileSize)
+        inode.file_size_mutation()
     }
 
-    /// Verifies directory-entry mutation policy using the latest staged inode.
-    fn require_directory_entry_mutation(
+    /// Verifies directory-entry creation policy using the latest staged inode.
+    fn require_directory_entry_create_mutation(
         &self,
         inode_id: InodeId,
-        mutation: InodeMutation,
-    ) -> Result<()> {
+    ) -> Result<DirectoryEntryMutationCapability> {
         let raw_inode = self.raw_inode_for_policy(inode_id)?;
         let inode = raw_inode.parse()?;
+        self.require_directory_entry_create_mutation_for_inode(&inode)
+    }
+
+    /// Verifies directory-entry creation policy with mount-scoped fscrypt keys.
+    fn require_directory_entry_create_mutation_for_inode(
+        &self,
+        inode: &Inode,
+    ) -> Result<DirectoryEntryMutationCapability> {
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        self.require_directory_entry_mutation_for_inode(&inode, mutation)
+        if inode.protection().is_encrypted() {
+            self.volume.require_encryption_key(inode)?;
+        }
+        inode.directory_entry_mutation()
     }
 
-    /// Verifies directory-entry mutation policy with mount-scoped fscrypt keys.
-    fn require_directory_entry_mutation_for_inode(
+    /// Verifies directory-entry deletion policy with mount-scoped fscrypt keys.
+    fn require_directory_entry_delete_mutation_for_inode(
         &self,
         inode: &Inode,
-        mutation: InodeMutation,
-    ) -> Result<()> {
-        if inode.protection().is_encrypted() {
-            match mutation {
-                InodeMutation::DirectoryEntryDelete => {}
-                InodeMutation::DirectoryEntryCreate
-                | InodeMutation::DirectoryEntryRename
-                | InodeMutation::DirectoryEntryReplace => {
-                    self.volume.require_encryption_key(inode)?;
-                }
-                InodeMutation::Metadata
-                | InodeMutation::FileData
-                | InodeMutation::FileSize
-                | InodeMutation::Delete => {}
-            }
+    ) -> Result<DirectoryEntryMutationCapability> {
+        if inode.kind() != InodeKind::Directory {
+            return Err(Error::WrongInodeKind);
         }
-        inode.require_mutation(mutation)
+        inode.directory_entry_mutation()
+    }
+
+    /// Verifies directory-entry rename policy with mount-scoped fscrypt keys.
+    fn require_directory_entry_rename_mutation_for_inode(
+        &self,
+        inode: &Inode,
+    ) -> Result<DirectoryEntryMutationCapability> {
+        self.require_directory_entry_create_mutation_for_inode(inode)
+    }
+
+    /// Verifies directory-entry replacement policy with mount-scoped fscrypt keys.
+    fn require_directory_entry_replace_mutation_for_inode(
+        &self,
+        inode: &Inode,
+    ) -> Result<DirectoryEntryMutationCapability> {
+        self.require_directory_entry_create_mutation_for_inode(inode)
     }
 
     /// Builds the fscrypt context inherited by a new child of this directory.
@@ -3672,10 +3690,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        self.require_directory_entry_mutation_for_inode(
-            &parent_inode,
-            InodeMutation::DirectoryEntryCreate,
-        )?;
+        self.require_directory_entry_create_mutation_for_inode(&parent_inode)?;
         let disk_name = self
             .volume
             .encrypt_directory_child_name(&parent_inode, name)?;
@@ -3768,10 +3783,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        self.require_directory_entry_mutation_for_inode(
-            &parent_inode,
-            InodeMutation::DirectoryEntryDelete,
-        )?;
+        self.require_directory_entry_delete_mutation_for_inode(&parent_inode)?;
         let disk_name = self.directory_lookup_name(&parent_inode, name)?;
         if matches!(
             parent_inode.directory_storage_kind()?,
@@ -3812,10 +3824,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        self.require_directory_entry_mutation_for_inode(
-            &parent_inode,
-            InodeMutation::DirectoryEntryRename,
-        )?;
+        self.require_directory_entry_rename_mutation_for_inode(&parent_inode)?;
         let old_disk_name = self
             .volume
             .encrypt_directory_child_name(&parent_inode, old_name)?;
@@ -3883,10 +3892,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        self.require_directory_entry_mutation_for_inode(
-            &parent_inode,
-            InodeMutation::DirectoryEntryReplace,
-        )?;
+        self.require_directory_entry_replace_mutation_for_inode(&parent_inode)?;
         let disk_name = self
             .volume
             .encrypt_directory_child_name(&parent_inode, name)?;
@@ -3924,7 +3930,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
     /// Rebuilds and stages one directory as a canonical HTree image.
     fn stage_rebuilt_htree_directory(
         &mut self,
-        inode_index: usize,
+        inode_index: StagedInodeIndex,
         mut raw_parent: LiveInodeRecord,
         parent_inode: &Inode,
         entries: &[RawDirectoryEntry],
@@ -3990,11 +3996,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         raw_parent.set_size(rebuilt_size)?;
         raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
         self.stage_extent_tree(&mut raw_parent, tree)?;
-        *self
-            .inode_updates
-            .get_mut(inode_index)
-            .ok_or(Error::InvalidInode)? = raw_parent.into();
-        Ok(())
+        self.replace_live_inode(inode_index, raw_parent)
     }
 
     /// Stages the latest image for a mutated directory block.
@@ -4068,7 +4070,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         let inode_index = self.ensure_inode_update(node.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
-        inode.require_mutation(InodeMutation::Metadata)?;
+        let _metadata = inode.metadata_mutation()?;
 
         let mut set = self.xattr_set_for_raw_inode(&raw_inode)?;
         update(set.public_mut())?;
@@ -4363,44 +4365,54 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
     pub fn abort(self) {}
 
     /// Returns the staged inode record index, loading it once when needed.
-    fn ensure_inode_update(&mut self, inode_id: InodeId) -> Result<usize> {
+    fn ensure_inode_update(&mut self, inode_id: InodeId) -> Result<StagedInodeIndex> {
         if let Some(index) = self
             .inode_updates
             .iter()
             .position(|inode| inode.id() == inode_id)
         {
-            return Ok(index);
+            return Ok(StagedInodeIndex::new(index));
         }
         let raw_inode = self.volume.read_live_inode_record(inode_id)?;
         self.inode_updates.push(raw_inode.into());
-        self.inode_updates
-            .len()
-            .checked_sub(1)
-            .ok_or(Error::ArithmeticOverflow)
+        Ok(StagedInodeIndex::new(
+            self.inode_updates
+                .len()
+                .checked_sub(1)
+                .ok_or(Error::ArithmeticOverflow)?,
+        ))
     }
 
     /// Returns a staged live inode record by index.
-    fn staged_live_inode(&self, index: usize) -> Result<LiveInodeRecord> {
+    fn staged_live_inode(&self, index: StagedInodeIndex) -> Result<LiveInodeRecord> {
         self.inode_updates
-            .get(index)
+            .get(index.get())
             .ok_or(Error::InvalidInode)?
             .clone_live()
     }
 
     /// Replaces a staged inode with its updated live state.
-    fn replace_live_inode(&mut self, index: usize, record: LiveInodeRecord) -> Result<()> {
+    fn replace_live_inode(
+        &mut self,
+        index: StagedInodeIndex,
+        record: LiveInodeRecord,
+    ) -> Result<()> {
         *self
             .inode_updates
-            .get_mut(index)
+            .get_mut(index.get())
             .ok_or(Error::InvalidInode)? = record.into();
         Ok(())
     }
 
     /// Replaces a staged inode with its deleted state.
-    fn replace_deleted_inode(&mut self, index: usize, record: DeletedInodeRecord) -> Result<()> {
+    fn replace_deleted_inode(
+        &mut self,
+        index: StagedInodeIndex,
+        record: DeletedInodeRecord,
+    ) -> Result<()> {
         *self
             .inode_updates
-            .get_mut(index)
+            .get_mut(index.get())
             .ok_or(Error::InvalidInode)? = record.into();
         Ok(())
     }
@@ -5226,12 +5238,19 @@ enum StagedInodeRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Result of decrementing an inode link count.
-enum LinkCountAfterDecrement {
-    /// At least one directory entry still references the inode.
-    StillLinked,
-    /// No directory entry references the inode anymore.
-    Unlinked,
+/// Index into this transaction's staged inode records.
+struct StagedInodeIndex(usize);
+
+impl StagedInodeIndex {
+    /// Creates a typed staged-inode index from vector position arithmetic.
+    const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    /// Returns the vector index at the local staging boundary.
+    const fn get(self) -> usize {
+        self.0
+    }
 }
 
 impl From<LiveInodeRecord> for StagedInodeRecord {
@@ -5356,19 +5375,19 @@ impl LiveInodeRecord {
     /// Marks this directory inode as HTree indexed.
     fn mark_indexed_directory(&mut self) -> Result<()> {
         let flags = self.raw.flags()?;
-        self.raw.set_flags(flags | EXT4_INDEX_FL)
+        self.raw.set_flags(flags.with_indexed_directory())
     }
 
     /// Marks this regular file inode as fs-verity protected.
     fn mark_verity(&mut self) -> Result<()> {
         let flags = self.raw.flags()?;
-        self.raw.set_flags(flags | EXT4_VERITY_FL)
+        self.raw.set_flags(flags.with_verity())
     }
 
     /// Marks this inode as fscrypt protected.
     fn mark_encrypted(&mut self) -> Result<()> {
         let flags = self.raw.flags()?;
-        self.raw.set_flags(flags | EXT4_ENCRYPT_FL)
+        self.raw.set_flags(flags.with_encryption())
     }
 
     /// Updates owner fields.
@@ -5442,26 +5461,23 @@ impl LiveInodeRecord {
     /// Increments link count.
     fn increment_links_count(&mut self) -> Result<()> {
         let links = self.parse()?.links_count();
-        self.raw
-            .set_links_count(links.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
+        self.raw.set_links_count(links.incremented()?)
     }
 
     /// Decrements link count and returns the resulting live/deletion boundary.
     fn decrement_links_count(&mut self) -> Result<LinkCountAfterDecrement> {
         let links = self.parse()?.links_count();
-        let updated = links.checked_sub(1).ok_or(Error::InvalidInode)?;
-        self.raw.set_links_count(updated)?;
-        if updated == 0 {
-            Ok(LinkCountAfterDecrement::Unlinked)
-        } else {
-            Ok(LinkCountAfterDecrement::StillLinked)
+        let boundary = links.decremented();
+        if let LinkCountAfterDecrement::StillLinked(updated) = boundary {
+            self.raw.set_links_count(updated)?;
         }
+        Ok(boundary)
     }
 
     /// Serializes deletion state after final unlink.
     fn delete(mut self, now: Ext4Timestamp, block_size: BlockSize) -> Result<DeletedInodeRecord> {
         self.raw.set_deletion_time(now.seconds())?;
-        self.raw.set_links_count(0)?;
+        self.raw.set_deleted_links_count()?;
         self.raw.set_size(FileSize::from_bytes(0))?;
         self.raw.set_allocated_blocks(0, 1024)?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
@@ -5478,7 +5494,7 @@ impl LiveInodeRecord {
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<DeletedInodeRecord> {
         self.raw.set_deletion_time(now.seconds())?;
-        self.raw.set_links_count(0)?;
+        self.raw.set_deleted_links_count()?;
         self.raw.set_size(FileSize::from_bytes(0))?;
         self.raw.set_allocated_blocks(0, 1024)?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
@@ -5539,7 +5555,7 @@ impl RawInodeRecord {
 
     /// Returns whether the raw inode advertises an extent tree.
     fn has_extent_tree(&self) -> Result<bool> {
-        Ok(le_u32(&self.bytes, disk_offset(INODE_FLAGS_OFFSET))? & EXT4_EXTENTS_FL != 0)
+        Ok(self.flags()?.has_extent_tree())
     }
 
     /// Parses the raw bytes as a validated inode.
@@ -5556,14 +5572,14 @@ impl RawInodeRecord {
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<()> {
         self.bytes.fill(0);
-        self.set_mode(MODE_REGULAR, metadata.permissions())?;
+        self.set_mode(InodeMode::regular_file(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
         self.set_size(FileSize::from_bytes(0))?;
-        self.set_links_count(1)?;
+        self.set_links_count(Ext4LinkCount::ONE)?;
         self.set_timestamps(now, timestamp_encoding)?;
         self.set_creation_time(now, timestamp_encoding)?;
         self.set_deletion_time(0)?;
-        self.set_flags(EXT4_EXTENTS_FL)?;
+        self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
@@ -5581,14 +5597,14 @@ impl RawInodeRecord {
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<()> {
         self.bytes.fill(0);
-        self.set_mode(MODE_DIRECTORY, metadata.permissions())?;
+        self.set_mode(InodeMode::directory(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
         self.set_size(FileSize::from_bytes(u64::from(block_size.bytes())))?;
-        self.set_links_count(2)?;
+        self.set_links_count(Ext4LinkCount::TWO)?;
         self.set_timestamps(now, timestamp_encoding)?;
         self.set_creation_time(now, timestamp_encoding)?;
         self.set_deletion_time(0)?;
-        self.set_flags(EXT4_EXTENTS_FL)?;
+        self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
         let tree = MutableExtentTree::from_extents(vec![Extent::initialized(
             LogicalBlock::from_u32(0),
             ExtentLength::new(1)?,
@@ -5611,16 +5627,16 @@ impl RawInodeRecord {
             return Err(Error::InvalidWriteRange);
         }
         self.bytes.fill(0);
-        self.set_mode(MODE_SYMLINK, metadata.permissions())?;
+        self.set_mode(InodeMode::symlink(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
         self.set_size(FileSize::from_bytes(
             u64::try_from(target.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
         ))?;
-        self.set_links_count(1)?;
+        self.set_links_count(Ext4LinkCount::ONE)?;
         self.set_timestamps(now, timestamp_encoding)?;
         self.set_creation_time(now, timestamp_encoding)?;
         self.set_deletion_time(0)?;
-        self.set_flags(0)?;
+        self.set_flags(InodeFlags::EMPTY)?;
         self.set_inline_target(target.bytes())?;
         self.set_allocated_blocks(0, 1024)
     }
@@ -5638,16 +5654,16 @@ impl RawInodeRecord {
             return Err(Error::InvalidWriteRange);
         }
         self.bytes.fill(0);
-        self.set_mode(MODE_SYMLINK, metadata.permissions())?;
+        self.set_mode(InodeMode::symlink(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
         self.set_size(FileSize::from_bytes(
             u64::try_from(target.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
         ))?;
-        self.set_links_count(1)?;
+        self.set_links_count(Ext4LinkCount::ONE)?;
         self.set_timestamps(now, timestamp_encoding)?;
         self.set_creation_time(now, timestamp_encoding)?;
         self.set_deletion_time(0)?;
-        self.set_flags(EXT4_EXTENTS_FL)?;
+        self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
@@ -5655,21 +5671,21 @@ impl RawInodeRecord {
     }
 
     /// Writes inode type and permission bits into `i_mode`.
-    fn set_mode(&mut self, file_type: u16, permissions: Ext4Permissions) -> Result<()> {
+    fn set_mode(&mut self, mode: InodeMode) -> Result<()> {
         put_le_u16(
             &mut self.bytes,
             disk_offset(INODE_MODE_OFFSET),
-            file_type | permissions.as_u16(),
+            mode.as_u16(),
         )
     }
 
     /// Updates inode permission bits without changing the inode type.
     fn set_permissions(&mut self, permissions: Ext4Permissions) -> Result<()> {
-        let mode = le_u16(&self.bytes, disk_offset(INODE_MODE_OFFSET))?;
+        let mode = InodeMode::from_disk(le_u16(&self.bytes, disk_offset(INODE_MODE_OFFSET))?)?;
         put_le_u16(
             &mut self.bytes,
             disk_offset(INODE_MODE_OFFSET),
-            (mode & MODE_KIND_MASK) | permissions.as_u16(),
+            InodeMode::new(mode.kind(), permissions).as_u16(),
         )
     }
 
@@ -5703,22 +5719,34 @@ impl RawInodeRecord {
     }
 
     /// Writes the inode link count.
-    fn set_links_count(&mut self, links: u16) -> Result<()> {
+    fn set_links_count(&mut self, links: Ext4LinkCount) -> Result<()> {
         put_le_u16(
             &mut self.bytes,
             disk_offset(INODE_LINKS_COUNT_OFFSET),
-            links,
+            links.get(),
         )
     }
 
+    /// Writes zero link count at the deleted-inode serialization boundary.
+    fn set_deleted_links_count(&mut self) -> Result<()> {
+        put_le_u16(&mut self.bytes, disk_offset(INODE_LINKS_COUNT_OFFSET), 0)
+    }
+
     /// Writes the inode flags field.
-    fn set_flags(&mut self, flags: u32) -> Result<()> {
-        put_le_u32(&mut self.bytes, disk_offset(INODE_FLAGS_OFFSET), flags)
+    fn set_flags(&mut self, flags: InodeFlags) -> Result<()> {
+        put_le_u32(
+            &mut self.bytes,
+            disk_offset(INODE_FLAGS_OFFSET),
+            flags.as_u32(),
+        )
     }
 
     /// Reads the inode flags field.
-    fn flags(&self) -> Result<u32> {
-        le_u32(&self.bytes, disk_offset(INODE_FLAGS_OFFSET))
+    fn flags(&self) -> Result<InodeFlags> {
+        Ok(InodeFlags::from_u32(le_u32(
+            &self.bytes,
+            disk_offset(INODE_FLAGS_OFFSET),
+        )?))
     }
 
     /// Splits a file size across low and high inode size fields.
@@ -6546,7 +6574,7 @@ mod tests {
         assert_eq!(file.increment_links_count(), Ok(()));
         assert_eq!(
             file.decrement_links_count(),
-            Ok(LinkCountAfterDecrement::StillLinked)
+            Ok(LinkCountAfterDecrement::StillLinked(Ext4LinkCount::ONE))
         );
         assert_eq!(links(&file.raw), Ok(1));
 
