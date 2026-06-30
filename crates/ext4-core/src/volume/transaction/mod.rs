@@ -1,6 +1,6 @@
 //! Journaled write transaction domain for mounted ext4 volumes.
 
-use super::*;
+use super::scope::*;
 
 mod allocation;
 mod commit;

@@ -1,6 +1,6 @@
 //! Inode record typestates staged by mounted volume transactions.
 
-use super::*;
+use super::scope::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Raw inode record paired with its inode number and device offset.
@@ -858,7 +858,7 @@ impl RawInodeRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::scope::*;
     use crate::disk_format::inode::{Ext4Gid, Ext4Uid};
 
     fn raw_record(value: u32) -> Result<RawInodeRecord> {

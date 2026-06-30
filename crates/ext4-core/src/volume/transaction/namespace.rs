@@ -787,5 +787,4 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         }
         Ok(blocks)
     }
-
 }

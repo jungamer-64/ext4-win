@@ -1,6 +1,7 @@
 //! Mount typestates and journal backend selection for ext4 volumes.
 
-use super::*;
+use super::scope::*;
+use super::transaction::JournalTransaction;
 
 /// Read-only mounted volume state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
