@@ -212,6 +212,7 @@ pub(super) fn variable_block_fixture_image(block_size: usize) -> Vec<u8> {
 
     let root_inode = variable_inode_offset(inode_table_block, 2, block_size);
     put_u16(&mut image, root_inode, 0x4000 | 0o755);
+    put_u16(&mut image, root_inode + 26, 2);
     put_u32(
         &mut image,
         root_inode + 4,
@@ -222,6 +223,7 @@ pub(super) fn variable_block_fixture_image(block_size: usize) -> Vec<u8> {
 
     let file_inode = variable_inode_offset(inode_table_block, 3, block_size);
     put_u16(&mut image, file_inode, 0x8000 | 0o444);
+    put_u16(&mut image, file_inode + 26, 1);
     put_u32(&mut image, file_inode + 4, 5);
     put_u32(&mut image, file_inode + 32, EXT4_EXTENTS_FL);
     write_extent_root(&mut image, file_inode + 40, 0, 1, file_data_block);
@@ -437,6 +439,7 @@ pub(super) fn write_modern_inode_bitmap(image: &mut [u8]) -> u32 {
 pub(super) fn write_root_inode(image: &mut [u8]) {
     let offset = inode_offset(2);
     put_u16(image, offset, 0x4000 | 0o755);
+    put_u16(image, offset + 26, 2);
     put_u32(
         image,
         offset + 4,
@@ -449,6 +452,7 @@ pub(super) fn write_root_inode(image: &mut [u8]) {
 pub(super) fn write_modern_root_inode(image: &mut [u8]) {
     let offset = modern_inode_offset(2);
     put_u16(image, offset, 0x4000 | 0o755);
+    put_u16(image, offset + 26, 2);
     put_u32(
         image,
         offset + 4,
@@ -462,6 +466,7 @@ pub(super) fn write_modern_root_inode(image: &mut [u8]) {
 pub(super) fn write_file_inode(image: &mut [u8]) {
     let offset = inode_offset(3);
     put_u16(image, offset, 0x8000 | 0o444);
+    put_u16(image, offset + 26, 1);
     put_u32(image, offset + 4, 2048);
     put_u32(image, offset + 32, EXT4_EXTENTS_FL);
     write_extent_root(image, offset + 40, 1, 1, FILE_DATA_BLOCK);
@@ -470,6 +475,7 @@ pub(super) fn write_file_inode(image: &mut [u8]) {
 pub(super) fn write_modern_file_inode(image: &mut [u8]) {
     let offset = modern_inode_offset(3);
     put_u16(image, offset, 0x8000 | 0o444);
+    put_u16(image, offset + 26, 1);
     put_u32(image, offset + 4, 2048);
     put_u32(image, offset + 28, 2);
     put_u32(image, offset + 32, EXT4_EXTENTS_FL);
@@ -479,6 +485,7 @@ pub(super) fn write_modern_file_inode(image: &mut [u8]) {
 pub(super) fn write_indexed_file_inode(image: &mut [u8]) {
     let offset = modern_inode_offset(3);
     put_u16(image, offset, 0x8000 | 0o444);
+    put_u16(image, offset + 26, 1);
     put_u32(image, offset + 4, 1024);
     put_u32(image, offset + 28, 2);
     put_u32(image, offset + 32, EXT4_EXTENTS_FL);
@@ -504,6 +511,7 @@ pub(super) fn write_indexed_file_inode(image: &mut [u8]) {
 pub(super) fn write_modern_journal_inode(image: &mut [u8], journal_blocks: u16) {
     let offset = modern_inode_offset(8);
     put_u16(image, offset, 0x8000 | 0o600);
+    put_u16(image, offset + 26, 1);
     put_u32(
         image,
         offset + 4,
@@ -815,6 +823,7 @@ pub(super) fn make_external_journal_filesystem(image: &mut [u8], uuid: [u8; 16])
 pub(super) fn write_fragmented_journal_inode(image: &mut [u8]) {
     let offset = modern_inode_offset(8);
     put_u16(image, offset, 0x8000 | 0o600);
+    put_u16(image, offset + 26, 1);
     put_u32(
         image,
         offset + 4,
@@ -841,6 +850,7 @@ pub(super) fn move_journal_block(image: &mut [u8], logical: u32, physical_block:
 pub(super) fn write_symlink_inode(image: &mut [u8]) {
     let offset = inode_offset(4);
     put_u16(image, offset, 0xA000 | 0o777);
+    put_u16(image, offset + 26, 1);
     put_u32(image, offset + 4, 4);
     image[offset + 40..offset + 44].copy_from_slice(b"file");
 }

@@ -107,7 +107,7 @@ fn query_volume(request: QueryVolumeRequest) -> DriverResult<DriverCompletion> {
         // this mounted device extension.
         vcb.as_mut()
     };
-    let length = request.stack.length().as_usize();
+    let length = request.stack.length();
     let mut buffer = request.target.buffered_output(length)?;
     let output = buffer.as_mut_slice();
     match request.stack.information_class() {
@@ -129,7 +129,7 @@ fn set_volume(request: SetVolumeRequest) -> DriverResult<DriverCompletion> {
 
 /// Applies `FILE_FS_LABEL_INFORMATION` to the mounted ext4 superblock.
 fn set_volume_label(request: SetVolumeRequest) -> DriverResult<()> {
-    let length = request.stack.length().as_usize();
+    let length = request.stack.length();
     let input = request.target.buffered_input(length)?;
     let label = volume_label_from_file_fs_label(input.as_slice())?;
     let Some(mut vcb) = MountedVolumeDevice::vcb(request.device) else {
@@ -150,7 +150,7 @@ fn set_volume_label(request: SetVolumeRequest) -> DriverResult<()> {
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     transaction.set_volume_label(label);
     transaction.commit()?;
-    MountedVolumeDevice::refresh_vpb_label(request.device, vcb).ok_or(DriverError::InvalidParameter)
+    MountedVolumeDevice::refresh_vpb_label(request.device, vcb)
 }
 
 /// Decodes a Windows label information buffer into an ext4 volume label.

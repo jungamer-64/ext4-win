@@ -444,7 +444,7 @@ fn reject_unsupported_user_buffer(address: u64, length: u32, max_length: u32) ->
 
 /// Reads METHOD_BUFFERED input bytes for one user FSCTL.
 fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
-    let length = stack.input_buffer_length().as_usize();
+    let length = stack.input_buffer_length();
     let input = target.buffered_input(length)?;
     Ok(input.as_slice().to_vec())
 }
@@ -460,11 +460,11 @@ fn output_buffer(
     stack: FileSystemControlStack,
     len: usize,
 ) -> DriverResult<crate::irp::BufferedOutput> {
-    let output_len = stack.output_buffer_length().as_usize();
-    if output_len < len {
+    let output_len = stack.output_buffer_length();
+    if output_len.as_usize() < len {
         return Err(DriverError::BufferTooSmall);
     }
-    target.buffered_output(len)
+    target.buffered_output(output_len)
 }
 
 /// Builds an FSCTL output completion byte count.

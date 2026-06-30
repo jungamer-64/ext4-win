@@ -108,15 +108,105 @@ impl SetEaRequest {
     }
 }
 
+/// Validated Windows EA name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WindowsEaName {
+    /// Windows EA name bytes.
+    bytes: Vec<u8>,
+}
+
+impl WindowsEaName {
+    /// Validates and stores a Windows EA name.
+    fn new(name: &[u8]) -> DriverResult<Self> {
+        if name.is_empty() || name.contains(&0) {
+            return Err(DriverError::InvalidEaName);
+        }
+        if name.starts_with(RESERVED_EA_NAME_PREFIX) {
+            return Err(DriverError::InvalidEaName);
+        }
+        u8::try_from(name.len()).map_err(|_| DriverError::InvalidEaName)?;
+        Ok(Self {
+            bytes: name.to_vec(),
+        })
+    }
+
+    /// Returns name bytes for Windows and xattr encoding.
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the name length.
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+/// Validated Windows EA value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WindowsEaValue {
+    /// Windows EA value bytes.
+    bytes: Vec<u8>,
+}
+
+impl WindowsEaValue {
+    /// Stores a Windows EA value representable by FILE_FULL_EA_INFORMATION.
+    fn new(value: &[u8]) -> DriverResult<Self> {
+        u16::try_from(value.len()).map_err(|_| DriverError::EaTooLarge)?;
+        Ok(Self {
+            bytes: value.to_vec(),
+        })
+    }
+
+    /// Returns value bytes.
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns whether this value removes the EA.
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Returns the value length.
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
 /// Windows EA entry after parsing or before packing.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct WindowsEaEntry {
-    /// EA flags. ext4win currently persists only flagless EAs.
-    flags: u8,
-    /// Windows EA name bytes.
-    name: Vec<u8>,
-    /// Windows EA value bytes.
-    value: Vec<u8>,
+struct WindowsEaRecord {
+    /// Windows EA name.
+    name: WindowsEaName,
+    /// Windows EA value.
+    value: WindowsEaValue,
+}
+
+impl WindowsEaRecord {
+    /// Creates a flagless Windows EA record.
+    fn new(name: WindowsEaName, value: WindowsEaValue) -> Self {
+        Self { name, value }
+    }
+
+    /// Creates a Windows EA record from wire fields.
+    fn from_wire(flags: u8, name: &[u8], value: &[u8]) -> DriverResult<Self> {
+        if flags != 0 {
+            return Err(DriverError::NotSupported);
+        }
+        Ok(Self::new(
+            WindowsEaName::new(name)?,
+            WindowsEaValue::new(value)?,
+        ))
+    }
+}
+
+/// Query-EA name selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WindowsEaSelection {
+    /// Return every persisted EA.
+    All,
+    /// Return only the requested names.
+    Names(Vec<WindowsEaName>),
 }
 
 /// Performs an EA query against mounted ext4 xattrs.
@@ -129,9 +219,9 @@ fn query_ea(request: &QueryEaRequest) -> DriverResult<DriverCompletion> {
         return Err(DriverError::NoEasOnFile);
     }
 
-    let length = request.stack.length().as_usize();
+    let length = request.stack.length();
     let required = packed_full_ea_length(entries.as_slice())?;
-    if length < required {
+    if length.as_usize() < required {
         return Err(DriverError::BufferTooSmall);
     }
     let mut output = request.target.data_output(length)?;
@@ -150,22 +240,24 @@ fn set_ea(request: &SetEaRequest) -> DriverResult<DriverCompletion> {
 fn collect_query_entries(
     opened_file: &OpenedFileObject,
     stack: QueryEaStack,
-) -> DriverResult<Vec<WindowsEaEntry>> {
+) -> DriverResult<Vec<WindowsEaRecord>> {
     let entries = load_windows_eas(opened_file)?;
-    let Some(names) = requested_ea_names(stack)? else {
-        return Ok(entries);
-    };
-    let mut selected = Vec::new();
-    for requested in names {
-        if let Some(entry) = entries.iter().find(|entry| entry.name == requested) {
-            selected.push(entry.clone());
+    match requested_ea_names(stack)? {
+        WindowsEaSelection::All => Ok(entries),
+        WindowsEaSelection::Names(names) => {
+            let mut selected = Vec::new();
+            for requested in names {
+                if let Some(entry) = entries.iter().find(|entry| entry.name == requested) {
+                    selected.push(entry.clone());
+                }
+            }
+            Ok(selected)
         }
     }
-    Ok(selected)
 }
 
 /// Reads all ext4win Windows EA xattrs for the opened node.
-fn load_windows_eas(opened_file: &OpenedFileObject) -> DriverResult<Vec<WindowsEaEntry>> {
+fn load_windows_eas(opened_file: &OpenedFileObject) -> DriverResult<Vec<WindowsEaRecord>> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
     let xattrs = vcb.volume().read_xattrs(fcb.node())?;
@@ -177,12 +269,10 @@ fn load_windows_eas(opened_file: &OpenedFileObject) -> DriverResult<Vec<WindowsE
         let Some(ea_name) = name.local().strip_prefix(EA_XATTR_PREFIX) else {
             continue;
         };
-        validate_ea_name(ea_name)?;
-        entries.push(WindowsEaEntry {
-            flags: 0,
-            name: ea_name.to_vec(),
-            value: value.bytes().to_vec(),
-        });
+        entries.push(WindowsEaRecord::new(
+            WindowsEaName::new(ea_name)?,
+            WindowsEaValue::new(value.bytes())?,
+        ));
     }
     Ok(entries)
 }
@@ -190,7 +280,7 @@ fn load_windows_eas(opened_file: &OpenedFileObject) -> DriverResult<Vec<WindowsE
 /// Applies parsed set-EA records in one journal transaction.
 fn apply_set_ea_entries(
     opened_file: &OpenedFileObject,
-    entries: &[WindowsEaEntry],
+    entries: &[WindowsEaRecord],
 ) -> DriverResult<()> {
     if entries.is_empty() {
         return Ok(());
@@ -209,11 +299,11 @@ fn apply_set_ea_entries(
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let node = transaction.node(node_id)?;
     for entry in entries {
-        let name = xattr_name_from_ea_name(entry.name.as_slice())?;
+        let name = xattr_name_from_ea_name(&entry.name)?;
         if entry.value.is_empty() {
             transaction.remove_xattr(node, &name)?;
         } else {
-            transaction.set_xattr(node, name, XattrValue::new(entry.value.as_slice())?)?;
+            transaction.set_xattr(node, name, XattrValue::new(entry.value.as_bytes())?)?;
         }
     }
     transaction.commit()?;
@@ -224,32 +314,32 @@ fn apply_set_ea_entries(
 fn parse_set_ea_entries(
     target: DispatchTarget,
     stack: SetEaStack,
-) -> DriverResult<Vec<WindowsEaEntry>> {
-    let length = stack.length().as_usize();
-    if length == 0 {
+) -> DriverResult<Vec<WindowsEaRecord>> {
+    let length = stack.length();
+    if length.is_empty() {
         return Ok(Vec::new());
     }
     let input = target.data_input(length)?;
     parse_full_ea_list(input.as_slice())
 }
 
-/// Parses an optional FILE_GET_EA_INFORMATION list from the query stack.
-fn requested_ea_names(stack: QueryEaStack) -> DriverResult<Option<Vec<Vec<u8>>>> {
+/// Parses FILE_GET_EA_INFORMATION selection from the query stack.
+fn requested_ea_names(stack: QueryEaStack) -> DriverResult<WindowsEaSelection> {
     match stack.name_selection() {
-        EaNameSelection::All => Ok(None),
+        EaNameSelection::All => Ok(WindowsEaSelection::All),
         EaNameSelection::Names { address, length } => {
             let bytes = unsafe {
                 // SAFETY: QueryEa supplies EaList/EaListLength as a kernel-addressable
                 // input list for the lifetime of this dispatch callback.
                 core::slice::from_raw_parts(address.as_ptr(), length.as_usize())
             };
-            parse_get_ea_list(bytes).map(Some)
+            parse_get_ea_list(bytes).map(WindowsEaSelection::Names)
         }
     }
 }
 
 /// Parses a FILE_FULL_EA_INFORMATION list.
-fn parse_full_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaEntry>> {
+fn parse_full_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaRecord>> {
     let fields = LittleEndianInput::new(input);
     let mut offset = 0;
     let mut entries = Vec::new();
@@ -262,9 +352,6 @@ fn parse_full_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaEntry>> {
         let flags = fields.read_u8(wire_offset(
             offset.checked_add(4).ok_or(DriverError::InvalidParameter)?,
         ))?;
-        if flags != 0 {
-            return Err(DriverError::NotSupported);
-        }
         let name_len = usize::from(fields.read_u8(wire_offset(
             offset.checked_add(5).ok_or(DriverError::InvalidParameter)?,
         ))?);
@@ -286,18 +373,13 @@ fn parse_full_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaEntry>> {
         let name = input
             .get(name_start..name_end)
             .ok_or(DriverError::EaListInconsistent)?;
-        validate_ea_name(name)?;
         if input.get(name_end).copied() != Some(0) {
             return Err(DriverError::EaListInconsistent);
         }
         let value = input
             .get(value_start..value_end)
             .ok_or(DriverError::EaListInconsistent)?;
-        entries.push(WindowsEaEntry {
-            flags,
-            name: name.to_vec(),
-            value: value.to_vec(),
-        });
+        entries.push(WindowsEaRecord::from_wire(flags, name, value)?);
 
         let raw_len = full_ea_record_length(name.len(), value.len())?;
         if next == 0 {
@@ -313,7 +395,7 @@ fn parse_full_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaEntry>> {
 }
 
 /// Parses a FILE_GET_EA_INFORMATION list.
-fn parse_get_ea_list(input: &[u8]) -> DriverResult<Vec<Vec<u8>>> {
+fn parse_get_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaName>> {
     let fields = LittleEndianInput::new(input);
     let mut offset = 0;
     let mut names = Vec::new();
@@ -335,11 +417,10 @@ fn parse_get_ea_list(input: &[u8]) -> DriverResult<Vec<Vec<u8>>> {
         let name = input
             .get(name_start..name_end)
             .ok_or(DriverError::EaListInconsistent)?;
-        validate_ea_name(name)?;
         if input.get(name_end).copied() != Some(0) {
             return Err(DriverError::EaListInconsistent);
         }
-        names.push(name.to_vec());
+        names.push(WindowsEaName::new(name)?);
 
         let raw_len = get_ea_record_length(name.len())?;
         if next == 0 {
@@ -355,7 +436,7 @@ fn parse_get_ea_list(input: &[u8]) -> DriverResult<Vec<Vec<u8>>> {
 }
 
 /// Packs FILE_FULL_EA_INFORMATION records.
-fn pack_full_ea_entries(entries: &[WindowsEaEntry], output: &mut [u8]) -> DriverResult<usize> {
+fn pack_full_ea_entries(entries: &[WindowsEaRecord], output: &mut [u8]) -> DriverResult<usize> {
     let required = packed_full_ea_length(entries)?;
     if output.len() < required {
         return Err(DriverError::BufferTooSmall);
@@ -389,7 +470,7 @@ fn pack_full_ea_entries(entries: &[WindowsEaEntry], output: &mut [u8]) -> Driver
         output.write_u32(wire_offset(offset), next)?;
         output.write_u8(
             wire_offset(offset.checked_add(4).ok_or(DriverError::InvalidParameter)?),
-            entry.flags,
+            0,
         )?;
         output.write_u8(
             wire_offset(offset.checked_add(5).ok_or(DriverError::InvalidParameter)?),
@@ -402,7 +483,7 @@ fn pack_full_ea_entries(entries: &[WindowsEaEntry], output: &mut [u8]) -> Driver
         let name_start = offset
             .checked_add(FILE_FULL_EA_NAME_OFFSET)
             .ok_or(DriverError::InvalidParameter)?;
-        output.write_bytes(wire_offset(name_start), entry.name.as_slice())?;
+        output.write_bytes(wire_offset(name_start), entry.name.as_bytes())?;
         output.write_u8(
             wire_offset(
                 name_start
@@ -418,7 +499,7 @@ fn pack_full_ea_entries(entries: &[WindowsEaEntry], output: &mut [u8]) -> Driver
                     .and_then(|value_start| value_start.checked_add(1))
                     .ok_or(DriverError::InvalidParameter)?,
             ),
-            entry.value.as_slice(),
+            entry.value.as_bytes(),
         )?;
         offset = offset
             .checked_add(stride)
@@ -428,7 +509,7 @@ fn pack_full_ea_entries(entries: &[WindowsEaEntry], output: &mut [u8]) -> Driver
 }
 
 /// Returns the packed byte count for a full EA list.
-fn packed_full_ea_length(entries: &[WindowsEaEntry]) -> DriverResult<usize> {
+fn packed_full_ea_length(entries: &[WindowsEaRecord]) -> DriverResult<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
@@ -467,28 +548,15 @@ fn get_ea_record_length(name_len: usize) -> DriverResult<usize> {
 }
 
 /// Maps a Windows EA name to the ext4 xattr namespace.
-fn xattr_name_from_ea_name(name: &[u8]) -> DriverResult<XattrName> {
-    validate_ea_name(name)?;
+fn xattr_name_from_ea_name(name: &WindowsEaName) -> DriverResult<XattrName> {
     let local_len = EA_XATTR_PREFIX
         .len()
         .checked_add(name.len())
         .ok_or(DriverError::InvalidEaName)?;
     let mut local = Vec::with_capacity(local_len);
     local.extend_from_slice(EA_XATTR_PREFIX);
-    local.extend_from_slice(name);
+    local.extend_from_slice(name.as_bytes());
     Ok(XattrName::new(XattrNamespace::User, local.as_slice())?)
-}
-
-/// Validates a Windows EA name before mapping it to ext4.
-fn validate_ea_name(name: &[u8]) -> DriverResult<()> {
-    if name.is_empty() || name.contains(&0) {
-        return Err(DriverError::InvalidEaName);
-    }
-    if name.starts_with(RESERVED_EA_NAME_PREFIX) {
-        return Err(DriverError::InvalidEaName);
-    }
-    u8::try_from(name.len()).map_err(|_| DriverError::InvalidEaName)?;
-    Ok(())
 }
 
 /// Returns the mounted VCB referenced by an FCB.
@@ -518,7 +586,7 @@ fn align_to_four(value: usize) -> DriverResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{vec, vec::Vec};
+    use alloc::vec;
 
     use crate::{
         kernel::status::DriverError,
@@ -526,23 +594,26 @@ mod tests {
     };
 
     use super::{
-        WindowsEaEntry, pack_full_ea_entries, parse_full_ea_list, parse_get_ea_list, wire_offset,
-        xattr_name_from_ea_name,
+        WindowsEaName, WindowsEaRecord, WindowsEaValue, pack_full_ea_entries, parse_full_ea_list,
+        parse_get_ea_list, wire_offset, xattr_name_from_ea_name,
     };
 
     #[test]
     fn full_ea_records_round_trip() {
+        let alpha = WindowsEaName::new(b"alpha");
+        let beta = WindowsEaName::new(b"beta");
+        let one = WindowsEaValue::new(b"one");
+        let two = WindowsEaValue::new(b"two");
+        assert!(alpha.is_ok());
+        assert!(beta.is_ok());
+        assert!(one.is_ok());
+        assert!(two.is_ok());
+        let (Ok(alpha), Ok(beta), Ok(one), Ok(two)) = (alpha, beta, one, two) else {
+            return;
+        };
         let entries = vec![
-            WindowsEaEntry {
-                flags: 0,
-                name: Vec::from(&b"alpha"[..]),
-                value: Vec::from(&b"one"[..]),
-            },
-            WindowsEaEntry {
-                flags: 0,
-                name: Vec::from(&b"beta"[..]),
-                value: Vec::from(&b"two"[..]),
-            },
+            WindowsEaRecord::new(alpha, one),
+            WindowsEaRecord::new(beta, two),
         ];
         let mut output = vec![0; 64];
 
@@ -572,16 +643,28 @@ mod tests {
             assert_eq!(output.write_bytes(wire_offset(17), b"beta"), Ok(()));
             assert_eq!(output.write_u8(wire_offset(21), 0), Ok(()));
         }
+        let alpha = WindowsEaName::new(b"alpha");
+        let beta = WindowsEaName::new(b"beta");
+        assert!(alpha.is_ok());
+        assert!(beta.is_ok());
+        let (Ok(alpha), Ok(beta)) = (alpha, beta) else {
+            return;
+        };
 
         assert_eq!(
             parse_get_ea_list(input.get(..22).unwrap_or(&[])),
-            Ok(vec![Vec::from(&b"alpha"[..]), Vec::from(&b"beta"[..])])
+            Ok(vec![alpha, beta])
         );
     }
 
     #[test]
     fn ea_name_maps_to_ext4win_user_xattr() {
-        let name = xattr_name_from_ea_name(b"alpha");
+        let ea_name = WindowsEaName::new(b"alpha");
+        assert!(ea_name.is_ok());
+        let Ok(ea_name) = ea_name else {
+            return;
+        };
+        let name = xattr_name_from_ea_name(&ea_name);
         assert!(name.is_ok());
         if let Ok(name) = name {
             assert_eq!(name.qualified(), b"user.ext4win.ea.alpha");
@@ -590,16 +673,13 @@ mod tests {
 
     #[test]
     fn invalid_ea_names_are_rejected() {
+        assert_eq!(WindowsEaName::new(b""), Err(DriverError::InvalidEaName));
         assert_eq!(
-            xattr_name_from_ea_name(b""),
+            WindowsEaName::new(b"has\0nul"),
             Err(DriverError::InvalidEaName)
         );
         assert_eq!(
-            xattr_name_from_ea_name(b"has\0nul"),
-            Err(DriverError::InvalidEaName)
-        );
-        assert_eq!(
-            xattr_name_from_ea_name(b"ext4win.attributes"),
+            WindowsEaName::new(b"ext4win.attributes"),
             Err(DriverError::InvalidEaName)
         );
     }
@@ -634,6 +714,18 @@ mod tests {
         assert_eq!(
             parse_full_ea_list(input.as_slice()),
             Err(DriverError::NotSupported)
+        );
+    }
+
+    #[test]
+    fn ea_value_rejects_lengths_outside_windows_wire_field() {
+        let Some(length) = usize::from(u16::MAX).checked_add(1) else {
+            return;
+        };
+        let value = vec![0; length];
+        assert_eq!(
+            WindowsEaValue::new(value.as_slice()),
+            Err(DriverError::EaTooLarge)
         );
     }
 }

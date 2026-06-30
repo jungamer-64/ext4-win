@@ -5,16 +5,17 @@ use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4Name, Ext4Security, Ext4Times, Ext4Timestamp,
-    Ext4WindowsAttributes, FileNodeId, FileSize, LoadedNode, NodeId, WindowsName, WindowsOverlay,
+    ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Security, Ext4Times,
+    Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileSize, LoadedNode, NodeId, WindowsName,
+    WindowsOverlay,
 };
 use wdk_sys::{LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::irp::{
     DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
-    DirectoryInformationClass, DirectoryPatternInput, DispatchTarget, DriverCompletion,
-    IrpBufferLength, QueryDirectoryStack, QueryFileInformationClass, QueryFileStack,
-    SetFileInformationClass, SetFileStack,
+    DirectoryEntryIndex, DirectoryInformationClass, DirectoryPatternInput, DispatchTarget,
+    DriverCompletion, IrpBufferLength, QueryDirectoryStack, QueryFileInformationClass,
+    QueryFileStack, SetFileInformationClass, SetFileStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{
@@ -236,7 +237,7 @@ impl QueryDirectoryRequest {
 /// Packs one supported file information class.
 fn query_file_information(request: QueryFileRequest) -> DriverResult<DriverCompletion> {
     let metadata = load_file_metadata(&request.opened_file)?;
-    let length = request.stack.length().as_usize();
+    let length = request.stack.length();
     let mut buffer = request.target.buffered_output(length)?;
     let output = buffer.as_mut_slice();
     match request.stack.information_class() {
@@ -351,7 +352,7 @@ fn set_disposition_information(mut request: SetFileRequest) -> DriverResult<()> 
 
 /// Applies FILE_RENAME_INFORMATION to the opened path.
 fn set_rename_information(mut request: SetFileRequest) -> DriverResult<()> {
-    let rename = RenameInformation::parse(request.target, request.stack.length())?;
+    let rename = RenameTargetPath::parse(request.target, request.stack.length())?;
 
     let OpenedPath::Child {
         parent: source_parent,
@@ -368,7 +369,7 @@ fn set_rename_information(mut request: SetFileRequest) -> DriverResult<()> {
         // transaction boundary for this rename request.
         vcb.as_mut()
     };
-    let (target_parent, target_name) = resolve_rename_target(vcb, &rename.name)?;
+    let (target_parent, target_name) = resolve_rename_target(vcb, &rename)?;
     let mut transaction = vcb
         .volume_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
@@ -420,7 +421,7 @@ fn query_directory(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     let mut request = QueryDirectoryRequest::decode(target)?;
     let class = request.stack.information_class();
     let pattern = DirectoryPattern::from_stack(request.stack)?;
-    let length = request.stack.length().as_usize();
+    let length = request.stack.length();
     let mut buffer = request.target.data_output(length)?;
     let buffer = buffer.as_mut_slice();
 
@@ -621,8 +622,8 @@ fn is_all_directory_pattern(units: &[u16]) -> bool {
 fn initialize_directory_cursor(cursor: &mut DirectoryCursor, stack: QueryDirectoryStack) {
     match stack.cursor_position() {
         DirectoryCursorPosition::Current => {}
-        DirectoryCursorPosition::Restart => cursor.seek(0),
-        DirectoryCursorPosition::Index(index) => cursor.seek(index.as_u32()),
+        DirectoryCursorPosition::Restart => cursor.seek(DirectoryEntryIndex::from_u32(0)),
+        DirectoryCursorPosition::Index(index) => cursor.seek(index),
     }
 }
 
@@ -636,7 +637,8 @@ fn emit_directory_entries(
     entries: &[DirectoryEntry],
     buffer: &mut [u8],
 ) -> DriverResult<usize> {
-    let start = usize::try_from(cursor.next_entry()).map_err(|_| DriverError::InvalidParameter)?;
+    let start =
+        usize::try_from(cursor.next_entry().as_u32()).map_err(|_| DriverError::InvalidParameter)?;
     let mut emitted = 0_usize;
     let mut written = 0_usize;
     let mut information = 0_usize;
@@ -648,11 +650,11 @@ fn emit_directory_entries(
             .checked_add(1)
             .ok_or(DriverError::InvalidParameter)?;
         let Ok(name) = WindowsName::from_ext4(entry.name()) else {
-            cursor.seek(next_entry);
+            cursor.seek(DirectoryEntryIndex::from_u32(next_entry));
             continue;
         };
         if !pattern.matches(&name) {
-            cursor.seek(next_entry);
+            cursor.seek(DirectoryEntryIndex::from_u32(next_entry));
             continue;
         }
 
@@ -688,7 +690,7 @@ fn emit_directory_entries(
         written = written
             .checked_add(layout.padded_size)
             .ok_or(DriverError::InvalidParameter)?;
-        cursor.seek(next_entry);
+        cursor.seek(DirectoryEntryIndex::from_u32(next_entry));
 
         if matches!(stack.entry_emission(), DirectoryEntryEmission::Single) {
             break;
@@ -911,21 +913,19 @@ fn read_file_information_input<T: Copy>(
     target: DispatchTarget,
     length: IrpBufferLength,
 ) -> DriverResult<T> {
-    let length = length.as_usize();
     target.buffered_input(length)?.read_unaligned()
 }
 
-/// Decoded FILE_RENAME_INFORMATION payload.
+/// Decoded FILE_RENAME_INFORMATION target path.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RenameInformation {
-    /// Root-relative target path components.
-    name: Vec<WindowsName>,
+struct RenameTargetPath {
+    /// Root-relative target path.
+    path: NonEmptyWindowsPath,
 }
 
-impl RenameInformation {
+impl RenameTargetPath {
     /// Decodes a FILE_RENAME_INFORMATION variable-length input buffer.
     fn parse(target: DispatchTarget, length: IrpBufferLength) -> DriverResult<Self> {
-        let length = length.as_usize();
         let input = target.buffered_input(length)?;
         let bytes = input.as_slice();
         match bytes
@@ -935,9 +935,7 @@ impl RenameInformation {
             0 => {}
             _ => return Err(DriverError::NotSupported),
         }
-        if root_directory_is_present(bytes)? {
-            return Err(DriverError::NotSupported);
-        }
+        reject_root_directory(bytes)?;
         let name_length = usize::try_from(
             LittleEndianInput::new(bytes).read_u32(wire_offset(FILE_RENAME_NAME_LENGTH_OFFSET))?,
         )
@@ -948,8 +946,59 @@ impl RenameInformation {
         let name_bytes = input_range(bytes, FILE_RENAME_NAME_OFFSET, name_length)?;
         let units = utf16_units_from_le_bytes(name_bytes)?;
         Ok(Self {
-            name: windows_path_components(&units)?,
+            path: NonEmptyWindowsPath::from_utf16_path(&units)?,
         })
+    }
+
+    /// Returns parent components before the target name.
+    fn parents(&self) -> &[WindowsName] {
+        self.path.parents()
+    }
+
+    /// Returns the final target name.
+    fn target_name(&self) -> &WindowsName {
+        self.path.target_name()
+    }
+}
+
+/// Non-empty root-relative Windows path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NonEmptyWindowsPath {
+    /// Parent path components from root to target parent.
+    parents: Vec<WindowsName>,
+    /// Final path component being renamed to.
+    target_name: WindowsName,
+}
+
+impl NonEmptyWindowsPath {
+    /// Splits a root-relative UTF-16 path into validated Windows components.
+    fn from_utf16_path(units: &[u16]) -> DriverResult<Self> {
+        let mut trimmed = units;
+        while let Some(rest) = trimmed.strip_prefix(&[UTF16_BACKSLASH]) {
+            trimmed = rest;
+        }
+        if trimmed.is_empty() {
+            return Err(DriverError::InvalidParameter);
+        }
+        let mut components = Vec::new();
+        for component in trimmed.split(|unit| *unit == UTF16_BACKSLASH) {
+            components.push(WindowsName::from_utf16(component)?);
+        }
+        let target_name = components.pop().ok_or(DriverError::InvalidParameter)?;
+        Ok(Self {
+            parents: components,
+            target_name,
+        })
+    }
+
+    /// Parent path components from root to target parent.
+    fn parents(&self) -> &[WindowsName] {
+        &self.parents
+    }
+
+    /// Final path component.
+    const fn target_name(&self) -> &WindowsName {
+        &self.target_name
     }
 }
 
@@ -964,15 +1013,20 @@ const FILE_RENAME_NAME_OFFSET: usize = 20;
 /// UTF-16 backslash separator.
 const UTF16_BACKSLASH: u16 = 0x005C;
 
-/// Returns true when FILE_RENAME_INFORMATION carries an unsupported root handle.
-fn root_directory_is_present(bytes: &[u8]) -> DriverResult<bool> {
-    Ok(input_range(
+/// Rejects FILE_RENAME_INFORMATION payloads carrying an unsupported root handle.
+fn reject_root_directory(bytes: &[u8]) -> DriverResult<()> {
+    if input_range(
         bytes,
         FILE_RENAME_ROOT_DIRECTORY_OFFSET,
         core::mem::size_of::<wdk_sys::HANDLE>(),
     )?
     .iter()
-    .any(|byte| *byte != 0))
+    .any(|byte| *byte != 0)
+    {
+        Err(DriverError::NotSupported)
+    } else {
+        Ok(())
+    }
 }
 
 /// Decodes little-endian UTF-16 units from a byte buffer.
@@ -992,32 +1046,13 @@ fn utf16_units_from_le_bytes(bytes: &[u8]) -> DriverResult<Vec<u16>> {
     Ok(units)
 }
 
-/// Splits a root-relative UTF-16 path into validated Windows components.
-fn windows_path_components(units: &[u16]) -> DriverResult<Vec<WindowsName>> {
-    let mut trimmed = units;
-    while let Some(rest) = trimmed.strip_prefix(&[UTF16_BACKSLASH]) {
-        trimmed = rest;
-    }
-    if trimmed.is_empty() {
-        return Err(DriverError::InvalidParameter);
-    }
-    let mut components = Vec::new();
-    for component in trimmed.split(|unit| *unit == UTF16_BACKSLASH) {
-        components.push(WindowsName::from_utf16(component)?);
-    }
-    Ok(components)
-}
-
 /// Resolves the target parent directory and final ext4 name for a rename.
 fn resolve_rename_target(
     vcb: &VolumeControlBlock,
-    components: &[WindowsName],
+    target: &RenameTargetPath,
 ) -> DriverResult<(DirectoryNodeId, Ext4Name)> {
-    let (target_name, parents) = components
-        .split_last()
-        .ok_or(DriverError::InvalidParameter)?;
     let mut parent_id = DirectoryNodeId::ROOT;
-    for component in parents {
+    for component in target.parents() {
         let parent = match vcb.volume().load(NodeId::Directory(parent_id))? {
             LoadedNode::Directory(directory) => directory,
             LoadedNode::File(_) | LoadedNode::Symlink(_) => {
@@ -1035,7 +1070,7 @@ fn resolve_rename_target(
             ChildLookup::NotFound => return Err(DriverError::ObjectPathNotFound),
         };
     }
-    Ok((parent_id, target_name.to_ext4()?))
+    Ok((parent_id, target.target_name().to_ext4()?))
 }
 
 /// Returns an immutable checked input byte range.
@@ -1174,7 +1209,7 @@ struct FileMetadata {
     /// ext4 inode timestamps.
     times: Ext4Times,
     /// ext4 inode link count.
-    links_count: u16,
+    links_count: Ext4LinkCount,
     /// Windows-specific overlay attributes.
     overlay_attributes: u32,
     /// Mounted volume block size.
@@ -1292,7 +1327,7 @@ fn pack_standard_information(
         wdk_sys::FILE_STANDARD_INFORMATION {
             AllocationSize: large_integer_from_u64(allocation_size(metadata)?)?,
             EndOfFile: large_integer_from_u64(metadata.size.bytes())?,
-            NumberOfLinks: wdk_sys::ULONG::from(metadata.links_count),
+            NumberOfLinks: wdk_sys::ULONG::from(metadata.links_count.get()),
             DeletePending: boolean(false),
             Directory: boolean(metadata.kind == FileMetadataKind::Directory),
         },
@@ -1440,8 +1475,8 @@ fn boolean(value: bool) -> wdk_sys::BOOLEAN {
 fn read_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     let stack = target.current_stack()?.read()?;
     let opened_file = OpenedFileObject::decode(stack.file_object())?;
-    let length = stack.length().as_usize();
-    if length == 0 {
+    let length = stack.length();
+    if length.is_empty() {
         return Ok(DriverCompletion::EMPTY);
     }
     let mut output = target.data_output(length)?;
@@ -1465,8 +1500,8 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
 fn write_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     let stack = target.current_stack()?.write()?;
     let opened_file = OpenedFileObject::decode(stack.file_object())?;
-    let length = stack.length().as_usize();
-    if length == 0 {
+    let length = stack.length();
+    if length.is_empty() {
         return Ok(DriverCompletion::EMPTY);
     }
     let input = target.data_input(length)?;
@@ -1488,7 +1523,7 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> 
     let file = transaction.file(file_id)?;
     transaction.overwrite_file_range(file, stack.byte_offset(), input.as_slice())?;
     transaction.commit()?;
-    DriverCompletion::from_usize(length)
+    DriverCompletion::from_usize(input.as_slice().len())
 }
 
 /// Returns the mounted VCB referenced by an FCB.
@@ -1534,10 +1569,48 @@ mod tests {
 
     use wdk_sys::STATUS_NOT_SUPPORTED;
 
+    use crate::kernel::status::DriverError;
+
+    #[test]
+    fn rename_target_path_rejects_empty_and_root_only_names() {
+        assert_eq!(
+            super::NonEmptyWindowsPath::from_utf16_path(&[]),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            super::NonEmptyWindowsPath::from_utf16_path(&[super::UTF16_BACKSLASH]),
+            Err(DriverError::InvalidParameter)
+        );
+    }
+
+    #[test]
+    fn rename_root_directory_field_is_not_supported() {
+        let mut input = [0_u8; super::FILE_RENAME_ROOT_DIRECTORY_OFFSET + 8];
+        let Some(root_directory) = input.get_mut(
+            super::FILE_RENAME_ROOT_DIRECTORY_OFFSET
+                ..super::FILE_RENAME_ROOT_DIRECTORY_OFFSET
+                    + core::mem::size_of::<wdk_sys::HANDLE>(),
+        ) else {
+            return;
+        };
+        let Some(first_byte) = root_directory.get_mut(0) else {
+            return;
+        };
+        *first_byte = 1;
+
+        assert_eq!(
+            super::reject_root_directory(&input),
+            Err(DriverError::NotSupported)
+        );
+    }
+
     #[test]
     fn rename_replace_flag_decode_boundary_rejects() {
         let mut input = [0_u8; super::FILE_RENAME_NAME_OFFSET + 2];
-        input[super::FILE_RENAME_REPLACE_IF_EXISTS_OFFSET] = 1;
+        let Some(replace_flag) = input.get_mut(super::FILE_RENAME_REPLACE_IF_EXISTS_OFFSET) else {
+            return;
+        };
+        *replace_flag = 1;
         let name_length = input.get_mut(
             super::FILE_RENAME_NAME_LENGTH_OFFSET
                 ..super::FILE_RENAME_NAME_LENGTH_OFFSET + core::mem::size_of::<u32>(),

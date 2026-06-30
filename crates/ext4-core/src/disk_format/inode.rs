@@ -1,6 +1,7 @@
 //! Inode parsing and domain typing.
 
 use alloc::vec::Vec;
+use core::num::NonZeroU16;
 
 use crate::disk::endian::{DiskOffset, le_u16, le_u32};
 use crate::error::{Error, Result};
@@ -305,6 +306,80 @@ impl Ext4Permissions {
     }
 }
 
+/// ext4 `i_mode` decoded into supported inode kind and permission bits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InodeMode {
+    /// Supported inode kind selected by the file-type bits.
+    kind: InodeKind,
+    /// Permission and special-mode bits without file-type bits.
+    permissions: Ext4Permissions,
+}
+
+impl InodeMode {
+    /// Creates a typed inode mode from supported domain parts.
+    #[must_use]
+    pub const fn new(kind: InodeKind, permissions: Ext4Permissions) -> Self {
+        Self { kind, permissions }
+    }
+
+    /// Creates a regular-file mode.
+    #[must_use]
+    pub const fn regular_file(permissions: Ext4Permissions) -> Self {
+        Self::new(InodeKind::File, permissions)
+    }
+
+    /// Creates a directory mode.
+    #[must_use]
+    pub const fn directory(permissions: Ext4Permissions) -> Self {
+        Self::new(InodeKind::Directory, permissions)
+    }
+
+    /// Creates a symbolic-link mode.
+    #[must_use]
+    pub const fn symlink(permissions: Ext4Permissions) -> Self {
+        Self::new(InodeKind::Symlink, permissions)
+    }
+
+    /// Parses raw on-disk `i_mode` bits into the supported domain.
+    ///
+    /// # Errors
+    /// Returns an error when the mode selects an unsupported inode kind or
+    /// contains permission bits outside ext4's permission mask.
+    pub fn from_disk(value: u16) -> Result<Self> {
+        let permissions = Ext4Permissions::new(value & PERMISSION_BITS)?;
+        let kind = match value & MODE_KIND_MASK {
+            MODE_REGULAR => InodeKind::File,
+            MODE_DIRECTORY => InodeKind::Directory,
+            MODE_SYMLINK => InodeKind::Symlink,
+            _ => return Err(Error::WrongInodeKind),
+        };
+        Ok(Self { kind, permissions })
+    }
+
+    /// Supported inode kind.
+    #[must_use]
+    pub const fn kind(self) -> InodeKind {
+        self.kind
+    }
+
+    /// Permission and special-mode bits without file-type bits.
+    #[must_use]
+    pub const fn permissions(self) -> Ext4Permissions {
+        self.permissions
+    }
+
+    /// Encodes this mode for the on-disk inode boundary.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        let file_type = match self.kind {
+            InodeKind::File => MODE_REGULAR,
+            InodeKind::Directory => MODE_DIRECTORY,
+            InodeKind::Symlink => MODE_SYMLINK,
+        };
+        file_type | self.permissions.as_u16()
+    }
+}
+
 /// POSIX security state representable in ext4 inode owner and mode fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ext4Security {
@@ -486,6 +561,61 @@ impl TryFrom<u32> for InodeId {
     }
 }
 
+/// Nonzero link count of a live ext4 inode.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Ext4LinkCount(NonZeroU16);
+
+impl Ext4LinkCount {
+    /// Link count for a newly linked file or symlink.
+    pub const ONE: Self = Self(NonZeroU16::MIN);
+    /// Link count for a newly created directory with `.` and its parent entry.
+    pub const TWO: Self = Self(match NonZeroU16::new(2) {
+        Some(value) => value,
+        None => NonZeroU16::MIN,
+    });
+
+    /// Creates a live inode link count.
+    ///
+    /// # Errors
+    /// Returns an error when the count is zero, which belongs to deleted inode
+    /// serialization rather than the live inode domain.
+    pub fn new(value: u16) -> Result<Self> {
+        NonZeroU16::new(value).map(Self).ok_or(Error::InvalidInode)
+    }
+
+    /// Returns the raw count for on-disk encoding.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+
+    /// Returns the next representable live link count.
+    ///
+    /// # Errors
+    /// Returns an error when incrementing would overflow the ext4 field.
+    pub fn incremented(self) -> Result<Self> {
+        Self::new(self.get().checked_add(1).ok_or(Error::ArithmeticOverflow)?)
+    }
+
+    /// Decrements this live link count and reports the live/deleted boundary.
+    #[must_use]
+    pub fn decremented(self) -> LinkCountAfterDecrement {
+        match self.get().checked_sub(1).and_then(NonZeroU16::new) {
+            Some(updated) => LinkCountAfterDecrement::StillLinked(Self(updated)),
+            None => LinkCountAfterDecrement::Unlinked,
+        }
+    }
+}
+
+/// Result of decrementing a live inode link count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkCountAfterDecrement {
+    /// At least one directory entry still references the inode.
+    StillLinked(Ext4LinkCount),
+    /// No directory entry references the inode anymore.
+    Unlinked,
+}
+
 /// Inode node kind accepted by the ext4 core domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InodeKind {
@@ -504,6 +634,194 @@ pub enum DirectoryStorageKind {
     Linear,
     /// Directory entries are indexed by an ext4 HTree.
     HTree,
+}
+
+/// Inode generation used by metadata checksums.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InodeGeneration(u32);
+
+impl InodeGeneration {
+    /// Creates an inode generation from the on-disk field.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the generation value for checksum boundaries.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// ext4 inode flags decoded behind a typed capability boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InodeFlags(u32);
+
+impl InodeFlags {
+    /// No inode flags.
+    pub const EMPTY: Self = Self(0);
+
+    /// Creates flags from the on-disk `i_flags` field.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw flags for on-disk encoding.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    /// Returns flags with the extent-tree bit set.
+    #[must_use]
+    pub const fn with_extent_tree(self) -> Self {
+        Self(self.0 | EXT4_EXTENTS_FL)
+    }
+
+    /// Returns flags with the indexed-directory bit set.
+    #[must_use]
+    pub const fn with_indexed_directory(self) -> Self {
+        Self(self.0 | EXT4_INDEX_FL)
+    }
+
+    /// Returns flags with the fscrypt bit set.
+    #[must_use]
+    pub const fn with_encryption(self) -> Self {
+        Self(self.0 | EXT4_ENCRYPT_FL)
+    }
+
+    /// Returns flags with the fs-verity bit set.
+    #[must_use]
+    pub const fn with_verity(self) -> Self {
+        Self(self.0 | EXT4_VERITY_FL)
+    }
+
+    /// Returns whether the inode uses an extent tree.
+    #[must_use]
+    pub const fn has_extent_tree(self) -> bool {
+        self.0 & EXT4_EXTENTS_FL != 0
+    }
+
+    /// Returns whether this directory is indexed by an HTree.
+    #[must_use]
+    pub const fn has_indexed_directory(self) -> bool {
+        self.0 & EXT4_INDEX_FL != 0
+    }
+
+    /// Returns the protection state selected by fscrypt/fs-verity flags.
+    #[must_use]
+    pub const fn protection(self) -> InodeProtection {
+        match (self.0 & EXT4_ENCRYPT_FL != 0, self.0 & EXT4_VERITY_FL != 0) {
+            (false, false) => InodeProtection::Plain,
+            (true, false) => InodeProtection::Encrypted,
+            (false, true) => InodeProtection::Verity,
+            (true, true) => InodeProtection::EncryptedVerity,
+        }
+    }
+
+    /// Creates a metadata mutation capability for these flags.
+    ///
+    /// # Errors
+    /// Returns an error when immutable or inline-data semantics reject writes.
+    pub fn metadata_mutation(self) -> Result<MetadataMutationCapability> {
+        self.require_common_mutation()?;
+        Ok(MetadataMutationCapability { _private: () })
+    }
+
+    /// Creates a directory entry mutation capability for these flags.
+    ///
+    /// # Errors
+    /// Returns an error when flags imply unsupported directory write semantics.
+    pub fn directory_entry_mutation(self) -> Result<DirectoryEntryMutationCapability> {
+        self.require_common_mutation()?;
+        if self.0 & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0 {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        Ok(DirectoryEntryMutationCapability { _private: () })
+    }
+
+    /// Creates a file payload mutation capability for these flags.
+    ///
+    /// # Errors
+    /// Returns an error when flags imply unsupported data write semantics.
+    pub fn file_payload_mutation(self) -> Result<FilePayloadMutationCapability> {
+        self.require_file_mutation()?;
+        Ok(FilePayloadMutationCapability { _private: () })
+    }
+
+    /// Creates a file size mutation capability for these flags.
+    ///
+    /// # Errors
+    /// Returns an error when flags imply unsupported size write semantics.
+    pub fn file_size_mutation(self) -> Result<FileSizeMutationCapability> {
+        self.require_file_mutation()?;
+        Ok(FileSizeMutationCapability { _private: () })
+    }
+
+    /// Creates a final deletion mutation capability for these flags.
+    ///
+    /// # Errors
+    /// Returns an error when immutable or inline-data semantics reject deletion.
+    pub fn deletion_mutation(self) -> Result<DeletionMutationCapability> {
+        self.require_common_mutation()?;
+        Ok(DeletionMutationCapability { _private: () })
+    }
+
+    /// Rejects inode flags that make every mutation unsupported.
+    fn require_common_mutation(self) -> Result<()> {
+        if self.0 & (EXT4_IMMUTABLE_FL | EXT4_INLINE_DATA_FL) != 0 {
+            Err(Error::UnsupportedInodeMutation)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Rejects inode flags that make file payload or size mutation unsupported.
+    fn require_file_mutation(self) -> Result<()> {
+        self.require_common_mutation()?;
+        if self.0 & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL | EXT4_VERITY_FL) != 0 {
+            Err(Error::UnsupportedInodeMutation)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Capability proving metadata mutation is allowed by inode flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetadataMutationCapability {
+    /// Prevents construction outside this module.
+    _private: (),
+}
+
+/// Capability proving directory-entry mutation is allowed by inode flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryEntryMutationCapability {
+    /// Prevents construction outside this module.
+    _private: (),
+}
+
+/// Capability proving file payload mutation is allowed by inode flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilePayloadMutationCapability {
+    /// Prevents construction outside this module.
+    _private: (),
+}
+
+/// Capability proving file size mutation is allowed by inode flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileSizeMutationCapability {
+    /// Prevents construction outside this module.
+    _private: (),
+}
+
+/// Capability proving final deletion is allowed by inode flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeletionMutationCapability {
+    /// Prevents construction outside this module.
+    _private: (),
 }
 
 /// Contents protection attached to an inode by ext4 flags.
@@ -595,20 +913,20 @@ impl InodeInlineBytes {
 pub struct Inode {
     /// Stable inode number used by directory entries and checksum seeds.
     id: InodeId,
-    /// Supported inode kind selected from `i_mode`.
-    kind: InodeKind,
+    /// Supported inode kind and permission bits selected from `i_mode`.
+    mode: InodeMode,
     /// Combined low/high inode size.
     size: FileSize,
-    /// POSIX security state parsed from owner and mode fields.
-    security: Ext4Security,
+    /// POSIX owner parsed from uid/gid fields.
+    owner: Ext4Owner,
     /// Timestamps parsed from ext4 inode time fields.
     times: Ext4Times,
-    /// Raw link count used by directory removal checks.
-    links_count: u16,
-    /// Raw inode flags kept for capability predicates.
-    flags: u32,
+    /// Nonzero link count for this live inode.
+    links_count: Ext4LinkCount,
+    /// Inode flags hidden behind typed predicates and capability constructors.
+    flags: InodeFlags,
     /// Inode generation used by metadata checksums.
-    generation: u32,
+    generation: InodeGeneration,
     /// Typed interpretation of the 60-byte `i_block` field.
     storage: InodeStorage,
 }
@@ -623,41 +941,34 @@ impl Inode {
         if raw.len() < 128 {
             return Err(Error::TruncatedStructure);
         }
-        let mode = le_u16(raw, disk_offset(0))?;
-        let permissions = Ext4Permissions::new(mode & PERMISSION_BITS)?;
+        let mode = InodeMode::from_disk(le_u16(raw, disk_offset(0))?)?;
         let owner = Ext4Owner::new(
             Ext4Uid::from_u32(parse_uid(raw)?),
             Ext4Gid::from_u32(parse_gid(raw)?),
         );
-        let kind = match mode & MODE_KIND_MASK {
-            MODE_REGULAR => InodeKind::File,
-            MODE_DIRECTORY => InodeKind::Directory,
-            MODE_SYMLINK => InodeKind::Symlink,
-            _ => return Err(Error::WrongInodeKind),
-        };
         let size = FileSize::from_bytes(
             u64::from(le_u32(raw, disk_offset(4))?)
                 | (u64::from(le_u32(raw, disk_offset(108))?) << 32),
         );
         let times = parse_times(raw)?;
-        let links_count = le_u16(raw, disk_offset(26))?;
-        let flags = le_u32(raw, disk_offset(32))?;
-        let generation = le_u32(raw, disk_offset(100))?;
+        let links_count = Ext4LinkCount::new(le_u16(raw, disk_offset(26))?)?;
+        let flags = InodeFlags::from_u32(le_u32(raw, disk_offset(32))?);
+        let generation = InodeGeneration::from_u32(le_u32(raw, disk_offset(100))?);
         let block_slice = raw.get(40..100).ok_or(Error::TruncatedStructure)?;
         let mut block = [0_u8; 60];
         block.copy_from_slice(block_slice);
-        let storage = if flags & EXT4_EXTENTS_FL != 0 {
+        let storage = if flags.has_extent_tree() {
             InodeStorage::Extents(InodeExtentRoot::from_bytes(block))
-        } else if kind == InodeKind::Symlink && size.to_usize()? <= block.len() {
+        } else if mode.kind() == InodeKind::Symlink && size.to_usize()? <= block.len() {
             InodeStorage::InlineBytes(InodeInlineBytes::from_bytes(block))
         } else {
             InodeStorage::UnsupportedBlockMap
         };
         Ok(Self {
             id,
-            kind,
+            mode,
             size,
-            security: Ext4Security::new(owner, permissions),
+            owner,
             times,
             links_count,
             flags,
@@ -675,7 +986,7 @@ impl Inode {
     /// Node kind.
     #[must_use]
     pub const fn kind(&self) -> InodeKind {
-        self.kind
+        self.mode.kind()
     }
 
     /// File size in bytes.
@@ -687,7 +998,7 @@ impl Inode {
     /// POSIX security state parsed from owner and mode fields.
     #[must_use]
     pub const fn security(&self) -> Ext4Security {
-        self.security
+        Ext4Security::new(self.owner, self.mode.permissions())
     }
 
     /// ext4 inode timestamps.
@@ -696,15 +1007,15 @@ impl Inode {
         self.times
     }
 
-    /// Raw link count.
+    /// Live link count.
     #[must_use]
-    pub const fn links_count(&self) -> u16 {
+    pub const fn links_count(&self) -> Ext4LinkCount {
         self.links_count
     }
 
     /// Inode generation used by metadata checksums.
     #[must_use]
-    pub const fn generation(&self) -> u32 {
+    pub const fn generation(&self) -> InodeGeneration {
         self.generation
     }
 
@@ -713,10 +1024,10 @@ impl Inode {
     /// # Errors
     /// Returns an error when the inode is not a directory.
     pub fn directory_storage_kind(&self) -> Result<DirectoryStorageKind> {
-        if self.kind != InodeKind::Directory {
+        if self.mode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        if self.flags & EXT4_INDEX_FL != 0 {
+        if self.flags.has_indexed_directory() {
             Ok(DirectoryStorageKind::HTree)
         } else {
             Ok(DirectoryStorageKind::Linear)
@@ -726,15 +1037,47 @@ impl Inode {
     /// Contents protection selected by inode flags.
     #[must_use]
     pub const fn protection(&self) -> InodeProtection {
-        match (
-            self.flags & EXT4_ENCRYPT_FL != 0,
-            self.flags & EXT4_VERITY_FL != 0,
-        ) {
-            (false, false) => InodeProtection::Plain,
-            (true, false) => InodeProtection::Encrypted,
-            (false, true) => InodeProtection::Verity,
-            (true, true) => InodeProtection::EncryptedVerity,
-        }
+        self.flags.protection()
+    }
+
+    /// Builds a metadata mutation capability for this inode.
+    ///
+    /// # Errors
+    /// Returns an error when this inode's flags reject metadata writes.
+    pub fn metadata_mutation(&self) -> Result<MetadataMutationCapability> {
+        self.flags.metadata_mutation()
+    }
+
+    /// Builds a directory-entry mutation capability for this inode.
+    ///
+    /// # Errors
+    /// Returns an error when this inode's flags reject directory entry writes.
+    pub fn directory_entry_mutation(&self) -> Result<DirectoryEntryMutationCapability> {
+        self.flags.directory_entry_mutation()
+    }
+
+    /// Builds a file payload mutation capability for this inode.
+    ///
+    /// # Errors
+    /// Returns an error when this inode's flags reject file data writes.
+    pub fn file_payload_mutation(&self) -> Result<FilePayloadMutationCapability> {
+        self.flags.file_payload_mutation()
+    }
+
+    /// Builds a file-size mutation capability for this inode.
+    ///
+    /// # Errors
+    /// Returns an error when this inode's flags reject file size writes.
+    pub fn file_size_mutation(&self) -> Result<FileSizeMutationCapability> {
+        self.flags.file_size_mutation()
+    }
+
+    /// Builds a deletion mutation capability for this inode.
+    ///
+    /// # Errors
+    /// Returns an error when this inode's flags reject final deletion.
+    pub fn deletion_mutation(&self) -> Result<DeletionMutationCapability> {
+        self.flags.deletion_mutation()
     }
 
     /// Data storage selected by inode flags and node kind.
@@ -821,7 +1164,10 @@ fn parse_times(raw: &[u8]) -> Result<Ext4Times> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectoryStorageKind, Inode, InodeId, MODE_DIRECTORY, MODE_REGULAR};
+    use super::{
+        DirectoryStorageKind, Ext4LinkCount, Ext4Permissions, Inode, InodeFlags, InodeId,
+        InodeMode, MODE_DIRECTORY, MODE_REGULAR,
+    };
     use crate::disk::endian::{put_le_u16, put_le_u32};
     use crate::error::{Error, Result};
 
@@ -874,5 +1220,47 @@ mod tests {
             return;
         };
         assert_eq!(file.directory_storage_kind(), Err(Error::WrongInodeKind));
+    }
+
+    #[test]
+    fn link_count_rejects_deleted_inode_zero() {
+        assert_eq!(Ext4LinkCount::new(0), Err(Error::InvalidInode));
+        assert_eq!(Ext4LinkCount::new(1), Ok(Ext4LinkCount::ONE));
+    }
+
+    #[test]
+    fn inode_mode_and_permissions_reject_mixed_domains() {
+        assert_eq!(InodeMode::from_disk(0o644), Err(Error::WrongInodeKind));
+        assert_eq!(Ext4Permissions::new(MODE_REGULAR), Err(Error::InvalidInode));
+    }
+
+    #[test]
+    fn inode_flags_build_operation_capabilities() {
+        let immutable = InodeFlags::from_u32(super::EXT4_IMMUTABLE_FL);
+        assert_eq!(
+            immutable.metadata_mutation(),
+            Err(Error::UnsupportedInodeMutation)
+        );
+
+        let append_only = InodeFlags::from_u32(super::EXT4_APPEND_FL);
+        assert_eq!(
+            append_only.directory_entry_mutation(),
+            Err(Error::UnsupportedInodeMutation)
+        );
+
+        let casefold = InodeFlags::from_u32(super::EXT4_CASEFOLD_FL);
+        assert_eq!(
+            casefold.file_size_mutation(),
+            Err(Error::UnsupportedInodeMutation)
+        );
+
+        let verity = InodeFlags::from_u32(super::EXT4_VERITY_FL);
+        assert_eq!(
+            verity.file_payload_mutation(),
+            Err(Error::UnsupportedInodeMutation)
+        );
+
+        let encrypted = InodeFlags::from_u32(super::EXT4_ENCRYPT_FL);
+        assert!(encrypted.file_payload_mutation().is_ok());
     }
 }

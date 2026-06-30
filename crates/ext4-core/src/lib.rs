@@ -23,9 +23,11 @@ pub use disk::block::{BlockReader, BlockSize, BlockWriter, ByteOffset, DeviceLen
 pub use disk_format::acl::{PosixAcl, PosixAclEntry, PosixAclKind};
 pub use disk_format::dir::DirectoryEntryKind;
 pub use disk_format::inode::{
-    Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid,
-    FileOffset, FileSize, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, ReadBytes,
-    SymlinkTarget,
+    DeletionMutationCapability, DirectoryEntryMutationCapability, Ext4Gid, Ext4LinkCount,
+    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileOffset,
+    FilePayloadMutationCapability, FileSize, FileSizeMutationCapability, InodeFlags,
+    InodeGeneration, InodeMode, MetadataMutationCapability, NewDirectoryMetadata, NewFileMetadata,
+    NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 pub use disk_format::superblock::{
     ClusterCount, ClusterSize, Ext4VolumeLabel, FilesystemUuid, FreeClusterCount,
