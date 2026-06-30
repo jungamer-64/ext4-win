@@ -281,7 +281,11 @@ impl LiveInodeRecord {
     }
 
     /// Serializes deletion state after final unlink.
-    pub(super) fn delete(mut self, now: Ext4Timestamp, block_size: BlockSize) -> Result<DeletedInodeRecord> {
+    pub(super) fn delete(
+        mut self,
+        now: Ext4Timestamp,
+        block_size: BlockSize,
+    ) -> Result<DeletedInodeRecord> {
         self.raw.set_deletion_time(now.seconds())?;
         self.raw.set_deleted_links_count()?;
         self.raw.set_size(FileSize::from_bytes(0))?;
