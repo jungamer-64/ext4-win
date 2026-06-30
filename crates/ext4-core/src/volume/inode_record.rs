@@ -858,7 +858,7 @@ impl RawInodeRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::scope::*;
+    use super::*;
     use crate::disk_format::inode::{Ext4Gid, Ext4Uid};
 
     fn raw_record(value: u32) -> Result<RawInodeRecord> {
