@@ -116,7 +116,12 @@ where
     ///
     /// # Errors
     /// Returns an error when the file extent mapping cannot be traversed.
-    pub fn read_file(&self, file: &FileNode, offset: FileOffset, out: &mut [u8]) -> Result<ReadBytes> {
+    pub fn read_file(
+        &self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes> {
         self.volume.read_file(file, offset, out)
     }
 
@@ -282,7 +287,12 @@ where
     ///
     /// # Errors
     /// Returns an error when the file extent mapping cannot be traversed.
-    pub fn read_file(&self, file: &FileNode, offset: FileOffset, out: &mut [u8]) -> Result<ReadBytes> {
+    pub fn read_file(
+        &self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes> {
         self.volume.read_file(file, offset, out)
     }
 
@@ -380,7 +390,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
 
     /// Returns this mounted volume's fscrypt key presence for one identifier.
     #[must_use]
-    pub(super) fn fscrypt_key_presence(&self, identifier: FscryptKeyIdentifier) -> FscryptKeyPresence {
+    pub(super) fn fscrypt_key_presence(
+        &self,
+        identifier: FscryptKeyIdentifier,
+    ) -> FscryptKeyPresence {
         self.mount_context.fscrypt_key_presence(identifier)
     }
 
@@ -405,7 +418,11 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
-    pub(super) fn read_inode_xattr(&self, inode_id: InodeId, name: &XattrName) -> Result<Option<XattrValue>> {
+    pub(super) fn read_inode_xattr(
+        &self,
+        inode_id: InodeId,
+        name: &XattrName,
+    ) -> Result<Option<XattrValue>> {
         Ok(self.read_inode_xattrs(inode_id)?.get(name).cloned())
     }
 
@@ -428,7 +445,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the overlay xattr payload is malformed.
-    pub(super) fn read_inode_windows_overlay(&self, inode_id: InodeId) -> Result<Option<WindowsOverlay>> {
+    pub(super) fn read_inode_windows_overlay(
+        &self,
+        inode_id: InodeId,
+    ) -> Result<Option<WindowsOverlay>> {
         let Some(value) =
             self.read_inode_xattr(inode_id, &WindowsOverlay::attributes_xattr_name()?)?
         else {
@@ -442,7 +462,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     /// # Errors
     /// Returns an error when the inode's xattr storage is malformed or the
     /// stored fscrypt context is not in the supported v2 AES profile.
-    pub(super) fn read_inode_fscrypt_context(&self, inode_id: InodeId) -> Result<Option<FscryptContextV2>> {
+    pub(super) fn read_inode_fscrypt_context(
+        &self,
+        inode_id: InodeId,
+    ) -> Result<Option<FscryptContextV2>> {
         let xattrs = self.read_inode_xattrs_from_live(&self.read_live_inode_record(inode_id)?)?;
         let Some(value) = xattrs.encryption_context() else {
             return Ok(None);
@@ -478,7 +501,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Derives the per-file AES-XTS contents key for an encrypted inode.
-    pub(super) fn fscrypt_contents_key_for_inode(&self, inode: &Inode) -> Result<FscryptContentsKey> {
+    pub(super) fn fscrypt_contents_key_for_inode(
+        &self,
+        inode: &Inode,
+    ) -> Result<FscryptContentsKey> {
         let (context, master_key) = self.fscrypt_master_key_for_inode(inode)?;
         master_key.derive_contents_key(context.nonce())
     }
@@ -496,7 +522,11 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Converts a plaintext child name to the on-disk name for a directory.
-    pub(super) fn encrypt_directory_child_name(&self, parent: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
+    pub(super) fn encrypt_directory_child_name(
+        &self,
+        parent: &Inode,
+        name: &Ext4Name,
+    ) -> Result<Ext4Name> {
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
             return Ok(name.clone());
         }
@@ -505,7 +535,11 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Converts an on-disk child name to plaintext for a directory.
-    pub(super) fn decrypt_directory_child_name(&self, parent: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
+    pub(super) fn decrypt_directory_child_name(
+        &self,
+        parent: &Inode,
+        name: &Ext4Name,
+    ) -> Result<Ext4Name> {
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
             return Ok(name.clone());
         }
@@ -742,7 +776,11 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
-    pub(super) fn lookup_child(&self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup> {
+    pub(super) fn lookup_child(
+        &self,
+        parent: &DirectoryNode,
+        name: &Ext4Name,
+    ) -> Result<ChildLookup> {
         if let Some(entry) = self.read_directory_layout(parent.inode())?.find(name) {
             return Ok(ChildLookup::Found(self.directory_child(parent, entry)?));
         }
@@ -880,7 +918,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads directory file blocks through the inode extent tree.
-    pub(super) fn read_directory_block_data(&self, inode: &Inode) -> Result<Vec<DirectoryBlockData>> {
+    pub(super) fn read_directory_block_data(
+        &self,
+        inode: &Inode,
+    ) -> Result<Vec<DirectoryBlockData>> {
         let block_size = self.superblock.block_size();
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
@@ -1147,7 +1188,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads all xattr storage locations referenced by a live inode.
-    pub(super) fn read_inode_xattrs_from_live(&self, raw_inode: &LiveInodeRecord) -> Result<InodeXattrSet> {
+    pub(super) fn read_inode_xattrs_from_live(
+        &self,
+        raw_inode: &LiveInodeRecord,
+    ) -> Result<InodeXattrSet> {
         match self.superblock.xattr_mutation() {
             XattrMutationSupport::Disabled => return Ok(InodeXattrSet::empty()),
             XattrMutationSupport::Enabled => {}

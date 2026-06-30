@@ -71,10 +71,10 @@ pub use node::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
     FileNodeId, LoadedNode, NodeId, SymlinkNode, SymlinkNodeId,
 };
+pub(crate) use transaction::MetadataBlock;
 pub use transaction::{
     JournalTransaction, TransactionDirectory, TransactionFile, TransactionNode, TransactionSymlink,
 };
-pub(crate) use transaction::MetadataBlock;
 
 /// Builds a volume-owned on-disk field offset.
 const fn disk_offset(offset: usize) -> DiskOffset {
@@ -171,4 +171,3 @@ const SUPERBLOCK_FREE_INODES_OFFSET: usize = 16;
 const SUPERBLOCK_FREE_BLOCKS_HI_OFFSET: usize = 344;
 /// Byte offset of the primary ext4 superblock.
 const SUPERBLOCK_OFFSET: u64 = 1024;
-
