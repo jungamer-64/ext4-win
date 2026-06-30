@@ -271,22 +271,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator + Clone>
         &mut self,
         now: Ext4Timestamp,
     ) -> JournalTransaction<'_, D, InternalJournal, N> {
-        JournalTransaction {
-            volume: self,
-            now,
-            inode_updates: Vec::new(),
-            block_bitmap_updates: Vec::new(),
-            inode_bitmap_updates: Vec::new(),
-            directory_updates: Vec::new(),
-            extent_updates: Vec::new(),
-            xattr_updates: Vec::new(),
-            group_deltas: Vec::new(),
-            data_writes: Vec::new(),
-            cluster_deltas: Vec::new(),
-            free_clusters_delta: FreeClusterDelta::ZERO,
-            free_inodes_delta: 0,
-            volume_label_update: None,
-        }
+        JournalTransaction::begin(self, now)
     }
 }
 
@@ -372,22 +357,7 @@ impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
         &mut self,
         now: Ext4Timestamp,
     ) -> JournalTransaction<'_, D, ExternalJournal<J>, N> {
-        JournalTransaction {
-            volume: self,
-            now,
-            inode_updates: Vec::new(),
-            block_bitmap_updates: Vec::new(),
-            inode_bitmap_updates: Vec::new(),
-            directory_updates: Vec::new(),
-            extent_updates: Vec::new(),
-            xattr_updates: Vec::new(),
-            group_deltas: Vec::new(),
-            data_writes: Vec::new(),
-            cluster_deltas: Vec::new(),
-            free_clusters_delta: FreeClusterDelta::ZERO,
-            free_inodes_delta: 0,
-            volume_label_update: None,
-        }
+        JournalTransaction::begin(self, now)
     }
 }
 

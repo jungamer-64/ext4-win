@@ -1194,3 +1194,13 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 }
 
+/// Returns the exclusive byte end of the logical inode stream described by extents.
+fn extent_payload_end_bytes(extent_tree: &ExtentTree, block_size: BlockSize) -> Result<u64> {
+    let mut end_blocks = 0_u64;
+    for extent in extent_tree.extents().iter().copied() {
+        end_blocks = end_blocks.max(u64::from(extent.end_logical()?));
+    }
+    end_blocks
+        .checked_mul(u64::from(block_size.bytes()))
+        .ok_or(Error::ArithmeticOverflow)
+}

@@ -569,3 +569,16 @@ pub(super) fn inode_offset_on_device(
         .ok_or(Error::ArithmeticOverflow)?;
     Ok(ByteOffset::new(offset))
 }
+
+/// Divides with upward rounding and overflow checking.
+pub(super) fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
+    if divisor == 0 {
+        return Err(Error::ArithmeticOverflow);
+    }
+    let adjusted = value
+        .checked_add(divisor.checked_sub(1).ok_or(Error::ArithmeticOverflow)?)
+        .ok_or(Error::ArithmeticOverflow)?;
+    adjusted
+        .checked_div(divisor)
+        .ok_or(Error::ArithmeticOverflow)
+}
