@@ -14,9 +14,8 @@ pub use mount::{
 };
 pub use node::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
-    FileNodeId, LoadedNode, NodeId, SymlinkNode, SymlinkNodeId,
+    FileNodeId, NodeId, SymlinkNode, SymlinkNodeId,
 };
-pub(crate) use transaction::MetadataBlock;
 pub use transaction::{
     JournalTransaction, TransactionDirectory, TransactionFile, TransactionNode, TransactionSymlink,
 };
