@@ -19,8 +19,9 @@ use crate::irp::{
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{
-    CloseDisposition, DirectoryCursor, FileControlBlock, KernelFileObject, OpenedFileObject,
-    OpenedHandle, OpenedPath, VolumeControlBlock, release_file_control_block,
+    CloseDisposition, DirectoryCursor, FileControlBlock, KernelFileObject, OpenedDirectory,
+    OpenedHandle, OpenedObject, OpenedPath, OpenedRegularFile, VolumeControlBlock,
+    release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -140,14 +141,14 @@ struct QueryFileRequest {
     /// Decoded query stack.
     stack: QueryFileStack,
     /// Opened file contexts decoded before handler execution.
-    opened_file: OpenedFileObject,
+    opened_file: OpenedObject,
 }
 
 impl QueryFileRequest {
     /// Decodes a query-file-information request.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.query_file()?;
-        let opened_file = OpenedFileObject::decode(stack.file_object())?;
+        let opened_file = OpenedObject::decode(stack.file_object())?;
         Ok(Self {
             target,
             stack,
@@ -164,14 +165,14 @@ struct SetFileRequest {
     /// Decoded set stack.
     stack: SetFileStack,
     /// Opened file contexts decoded before handler execution.
-    opened_file: OpenedFileObject,
+    opened_file: OpenedObject,
 }
 
 impl SetFileRequest {
     /// Decodes a set-file-information request.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.set_file()?;
-        let opened_file = OpenedFileObject::decode(stack.file_object())?;
+        let opened_file = OpenedObject::decode(stack.file_object())?;
         Ok(Self {
             target,
             stack,
@@ -188,14 +189,14 @@ struct QueryDirectoryRequest {
     /// Decoded query-directory stack.
     stack: QueryDirectoryStack,
     /// Opened directory contexts decoded before handler execution.
-    opened_file: OpenedFileObject,
+    opened_file: OpenedDirectory,
 }
 
 impl QueryDirectoryRequest {
     /// Decodes a query-directory request.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.query_directory()?;
-        let opened_file = OpenedFileObject::decode(stack.file_object())?;
+        let opened_file = OpenedDirectory::decode(stack.file_object())?;
         Ok(Self {
             target,
             stack,
@@ -282,10 +283,8 @@ fn set_end_of_file_information(request: SetFileRequest) -> DriverResult<()> {
         request.target,
         request.stack.length(),
     )?;
-    set_regular_file_size(
-        &request.opened_file,
-        file_size_from_large_integer(info.EndOfFile)?,
-    )
+    let opened_file = OpenedRegularFile::decode(request.stack.file_object())?;
+    set_regular_file_size(&opened_file, file_size_from_large_integer(info.EndOfFile)?)
 }
 
 /// Applies FILE_ALLOCATION_INFORMATION within the ext4 sparse-file model.
@@ -295,20 +294,17 @@ fn set_allocation_information(request: SetFileRequest) -> DriverResult<()> {
         request.stack.length(),
     )?;
     let requested = file_size_from_large_integer(info.AllocationSize)?;
-    let context = opened_file_context(&request.opened_file);
-    let NodeId::File(file_id) = context.node else {
-        return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
-    };
+    let opened_file = OpenedRegularFile::decode(request.stack.file_object())?;
     let vcb = unsafe {
         // SAFETY: FCBs are constructed only from live mounted VCB pointers and
         // remain valid while file objects are open.
-        context.volume.as_ref()
+        opened_file.volume().as_ref()
     };
-    let current = regular_file_size(vcb, file_id)?;
+    let current = regular_file_size(vcb, opened_file.id())?;
     if requested >= current {
         return Ok(());
     }
-    set_regular_file_size(&request.opened_file, requested)
+    set_regular_file_size(&opened_file, requested)
 }
 
 /// Applies FILE_DISPOSITION_INFORMATION to the handle-local close disposition.
@@ -351,11 +347,7 @@ fn set_close_disposition(
     request: &mut SetFileRequest,
     close_disposition: CloseDisposition,
 ) -> DriverResult<()> {
-    let handle = request.opened_file.handle_mut();
-    match close_disposition {
-        CloseDisposition::Keep => handle.keep_on_close(),
-        CloseDisposition::Delete => handle.mark_delete_on_close(),
-    }
+    request.opened_file.set_close_disposition(close_disposition);
     Ok(())
 }
 
@@ -369,7 +361,7 @@ fn set_rename_information(
     let OpenedPath::Child {
         parent: source_parent,
         name: source_name,
-    } = request.opened_file.handle().path().clone()
+    } = request.opened_file.path().clone()
     else {
         return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));
     };
@@ -389,8 +381,7 @@ fn set_rename_information(
     let target_parent = transaction.directory(target_parent)?;
     transaction.rename_child(source_parent, &source_name, target_parent, &target_name)?;
     transaction.commit()?;
-    let handle = request.opened_file.handle_mut();
-    handle.replace_path(OpenedPath::Child {
+    request.opened_file.replace_path(OpenedPath::Child {
         parent: target_parent.id(),
         name: target_name,
     });
@@ -398,12 +389,9 @@ fn set_rename_information(
 }
 
 /// Sets a regular file size by extending sparse or truncating allocated ranges.
-fn set_regular_file_size(opened_file: &OpenedFileObject, new_size: FileSize) -> DriverResult<()> {
-    let context = opened_file_context(opened_file);
-    let NodeId::File(file_id) = context.node else {
-        return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
-    };
-    let mut vcb = context.volume;
+fn set_regular_file_size(opened_file: &OpenedRegularFile, new_size: FileSize) -> DriverResult<()> {
+    let file_id = opened_file.id();
+    let mut vcb = opened_file.volume();
     let vcb = unsafe {
         // SAFETY: FCBs are constructed only from live mounted VCB pointers and
         // remain valid while file objects are open. The mutable borrow is the
@@ -439,20 +427,15 @@ fn query_directory(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 
     let volume = request.opened_file.volume();
     let vcb = unsafe {
-        // SAFETY: OpenedFileObject is decoded from a live FCB whose VCB
+        // SAFETY: OpenedDirectory is decoded from a live FCB whose VCB
         // pointer remains valid for the opened FILE_OBJECT lifetime.
         volume.as_ref()
     };
-    let NodeId::Directory(directory_id) = request.opened_file.node() else {
-        return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
-    };
+    let directory_id = request.opened_file.id();
     let directory = vcb.volume().load_directory(directory_id)?;
     let entries = vcb.volume().read_directory(&directory)?;
 
-    let handle = request.opened_file.handle_mut();
-    let Some(cursor) = handle.directory_cursor_mut() else {
-        return Err(DriverError::InvalidParameter);
-    };
+    let cursor = request.opened_file.cursor_mut();
     initialize_directory_cursor(cursor, request.stack);
 
     let result = emit_directory_entries(
@@ -885,11 +868,11 @@ fn windows_time_quad(timestamp: Ext4Timestamp) -> i64 {
 
 /// Applies cleanup-time namespace mutations requested by this handle.
 fn cleanup_file_object(file_object: KernelFileObject) -> DriverResult<()> {
-    let mut opened_file = OpenedFileObject::decode(file_object)?;
-    if opened_file.handle().close_disposition() == CloseDisposition::Keep {
+    let mut opened_file = OpenedObject::decode(file_object)?;
+    if opened_file.close_disposition() == CloseDisposition::Keep {
         return Ok(());
     }
-    let OpenedPath::Child { parent, name } = opened_file.handle().path().clone() else {
+    let OpenedPath::Child { parent, name } = opened_file.path().clone() else {
         return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));
     };
 
@@ -910,7 +893,7 @@ fn cleanup_file_object(file_object: KernelFileObject) -> DriverResult<()> {
         NodeId::Symlink(_) => transaction.remove_symlink(parent, &name)?,
     }
     transaction.commit()?;
-    opened_file.handle_mut().keep_on_close();
+    opened_file.set_close_disposition(CloseDisposition::Keep);
     Ok(())
 }
 
@@ -924,7 +907,7 @@ struct OpenedFileContext {
 }
 
 /// Returns the opened FCB identity and VCB pointer.
-fn opened_file_context(opened_file: &OpenedFileObject) -> OpenedFileContext {
+fn opened_file_context(opened_file: &OpenedObject) -> OpenedFileContext {
     OpenedFileContext {
         volume: opened_file.volume(),
         node: opened_file.node(),
@@ -1284,7 +1267,7 @@ enum FileMetadataKind {
 }
 
 /// Loads metadata for the opened file currently being queried.
-fn load_file_metadata(opened_file: &OpenedFileObject) -> DriverResult<FileMetadata> {
+fn load_file_metadata(opened_file: &OpenedObject) -> DriverResult<FileMetadata> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
     metadata_from_node(vcb, fcb.node())
@@ -1395,7 +1378,7 @@ fn pack_internal_information(
 /// Packs FILE_POSITION_INFORMATION.
 fn pack_position_information(
     output: &mut [u8],
-    opened_file: &OpenedFileObject,
+    opened_file: &OpenedObject,
 ) -> DriverResult<IrpCompletion> {
     let file_object = opened_file.file_object();
     let file_object = unsafe {
@@ -1437,9 +1420,9 @@ fn pack_network_open_information(
 /// Packs FILE_NAME_INFORMATION.
 fn pack_name_information(
     output: &mut [u8],
-    opened_file: &OpenedFileObject,
+    opened_file: &OpenedObject,
 ) -> DriverResult<IrpCompletion> {
-    let units = opened_path_name_units(opened_file.handle().path())?;
+    let units = opened_path_name_units(opened_file.path())?;
     let name_bytes = utf16_byte_len(&units)?;
     let required = FILE_NAME_INFORMATION_NAME_OFFSET
         .checked_add(name_bytes)
@@ -1574,19 +1557,19 @@ fn boolean(value: bool) -> wdk_sys::BOOLEAN {
 /// Reads a regular file through ext4-core into the IRP output buffer.
 fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.read()?;
-    let opened_file = OpenedFileObject::decode(stack.file_object())?;
+    let opened_file = OpenedRegularFile::decode(stack.file_object())?;
     let length = stack.length();
     if length.is_empty() {
         return Ok(IrpCompletion::EMPTY);
     }
     let mut output = target.data_output(length)?;
-    let fcb = opened_file.file_control_block();
-    let vcb = volume_control_block(fcb);
-    let NodeId::File(file_id) = fcb.node() else {
-        return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
+    let vcb = unsafe {
+        // SAFETY: OpenedRegularFile is decoded from a live FCB whose VCB
+        // pointer remains valid for the opened FILE_OBJECT lifetime.
+        opened_file.volume().as_ref()
     };
 
-    let file = vcb.volume().load_file(file_id)?;
+    let file = vcb.volume().load_file(opened_file.id())?;
     let bytes_read = vcb
         .volume()
         .read_file(&file, stack.byte_offset(), output.as_mut_slice())?;
@@ -1596,28 +1579,24 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// Writes a regular file range through an ext4 journal transaction.
 fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.write()?;
-    let opened_file = OpenedFileObject::decode(stack.file_object())?;
+    let opened_file = OpenedRegularFile::decode(stack.file_object())?;
     let length = stack.length();
     if length.is_empty() {
         return Ok(IrpCompletion::EMPTY);
     }
     let input = target.data_input(length)?;
-    let fcb = opened_file.file_control_block();
-    let mut vcb = fcb.volume();
+    let mut vcb = opened_file.volume();
     let vcb = unsafe {
         // SAFETY: FCBs are constructed only from live mounted VCB pointers and
         // remain valid while file objects are open. The mutable borrow is the
         // transaction boundary for this synchronous write path.
         vcb.as_mut()
     };
-    let NodeId::File(file_id) = fcb.node() else {
-        return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
-    };
 
     let mut transaction = vcb
         .volume_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let file = transaction.file(file_id)?;
+    let file = transaction.file(opened_file.id())?;
     transaction.overwrite_file_range(file, stack.byte_offset(), input.as_slice())?;
     transaction.commit()?;
     IrpCompletion::from_usize(input.as_slice().len())
@@ -1666,7 +1645,7 @@ mod tests {
 
     use ext4_core::{
         BlockSize, DirectoryNodeId, Ext4Gid, Ext4LinkCount, Ext4Name, Ext4Owner, Ext4Permissions,
-        Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileSize, WindowsName,
+        Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileSize, NodeId, WindowsName,
     };
     use wdk_sys::STATUS_NOT_SUPPORTED;
 
@@ -1857,13 +1836,18 @@ mod tests {
         };
         name.copy_from_slice(&u16::from(b'a').to_le_bytes());
 
+        let mut fcb = crate::state::FileControlBlock::new(
+            NonNull::<crate::state::VolumeControlBlock>::dangling(),
+            NodeId::Directory(DirectoryNodeId::ROOT),
+        );
+        let mut handle = crate::state::OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedPath::Root,
+            crate::state::CloseDisposition::Keep,
+        );
         let mut file_object = wdk_sys::FILE_OBJECT {
-            FsContext: NonNull::<crate::state::FileControlBlock>::dangling()
-                .as_ptr()
-                .cast(),
-            FsContext2: NonNull::<crate::state::OpenedHandle>::dangling()
-                .as_ptr()
-                .cast(),
+            FsContext: core::ptr::addr_of_mut!(fcb).cast(),
+            FsContext2: core::ptr::addr_of_mut!(handle).cast(),
             ..wdk_sys::FILE_OBJECT::default()
         };
         let mut stack = wdk_sys::IO_STACK_LOCATION {

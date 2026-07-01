@@ -8,7 +8,7 @@ use crate::irp::{
     DispatchTarget, EaEntryEmission, EaNameSelection, IrpCompletion, QueryEaStack, SetEaStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::state::{FileControlBlock, OpenedFileObject, VolumeControlBlock};
+use crate::state::{FileControlBlock, OpenedObject, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
 /// Local xattr prefix used to store Windows EA records under `user.*`.
@@ -59,14 +59,14 @@ struct QueryEaRequest {
     /// Decoded query-EA stack.
     stack: QueryEaStack,
     /// Opened file contexts decoded before EA handling.
-    opened_file: OpenedFileObject,
+    opened_file: OpenedObject,
 }
 
 impl QueryEaRequest {
     /// Decodes a query-EA request.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.query_ea()?;
-        let opened_file = OpenedFileObject::decode(stack.file_object())?;
+        let opened_file = OpenedObject::decode(stack.file_object())?;
         Ok(Self {
             target,
             stack,
@@ -83,14 +83,14 @@ struct SetEaRequest {
     /// Decoded set-EA stack.
     stack: SetEaStack,
     /// Opened file contexts decoded before EA handling.
-    opened_file: OpenedFileObject,
+    opened_file: OpenedObject,
 }
 
 impl SetEaRequest {
     /// Decodes a set-EA request.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.set_ea()?;
-        let opened_file = OpenedFileObject::decode(stack.file_object())?;
+        let opened_file = OpenedObject::decode(stack.file_object())?;
         Ok(Self {
             target,
             stack,
@@ -229,7 +229,7 @@ fn set_ea(request: &SetEaRequest) -> DriverResult<IrpCompletion> {
 
 /// Collects Windows EA entries selected by a query request.
 fn collect_query_entries(
-    opened_file: &OpenedFileObject,
+    opened_file: &OpenedObject,
     stack: QueryEaStack,
 ) -> DriverResult<Vec<WindowsEaRecord>> {
     let entries = load_windows_eas(opened_file)?;
@@ -248,7 +248,7 @@ fn collect_query_entries(
 }
 
 /// Reads all ext4win Windows EA xattrs for the opened node.
-fn load_windows_eas(opened_file: &OpenedFileObject) -> DriverResult<Vec<WindowsEaRecord>> {
+fn load_windows_eas(opened_file: &OpenedObject) -> DriverResult<Vec<WindowsEaRecord>> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
     let xattrs = vcb.volume().read_xattrs(fcb.node())?;
@@ -270,7 +270,7 @@ fn load_windows_eas(opened_file: &OpenedFileObject) -> DriverResult<Vec<WindowsE
 
 /// Applies parsed set-EA records in one journal transaction.
 fn apply_set_ea_entries(
-    opened_file: &OpenedFileObject,
+    opened_file: &OpenedObject,
     entries: &[WindowsEaRecord],
 ) -> DriverResult<()> {
     if entries.is_empty() {
