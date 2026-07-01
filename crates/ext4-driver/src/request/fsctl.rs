@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 
-use crate::irp::{DispatchTarget, DriverCompletion, FileSystemControlStack};
+use crate::irp::{DispatchTarget, FileSystemControlStack, IrpCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{OpenedFileObject, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
@@ -108,7 +108,7 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 pub(crate) fn enable_verity(
     target: DispatchTarget,
     stack: FileSystemControlStack,
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     let payload = read_input(target, stack)
         .and_then(|input| FsverityEnablePayload::parse(input.as_slice()))?;
     let enable = payload.into_core_enable();
@@ -128,14 +128,14 @@ pub(crate) fn enable_verity(
     let file = transaction.file(file_id)?;
     transaction.enable_verity(file, &enable)?;
     transaction.commit()?;
-    Ok(DriverCompletion::EMPTY)
+    Ok(IrpCompletion::EMPTY)
 }
 
 /// Adds an fscrypt master key to the mounted VCB.
 pub(crate) fn add_encryption_key(
     target: DispatchTarget,
     stack: FileSystemControlStack,
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     let input = read_input(target, stack)?;
     let payload = FscryptAddKeyPayload::parse(input.as_slice())?;
     let mut vcb = mounted_vcb(stack)?;
@@ -145,14 +145,14 @@ pub(crate) fn add_encryption_key(
         vcb.as_mut()
     };
     vcb.add_fscrypt_key(payload.into_master_key())?;
-    Ok(DriverCompletion::EMPTY)
+    Ok(IrpCompletion::EMPTY)
 }
 
 /// Removes an fscrypt master key from the mounted VCB.
 pub(crate) fn remove_encryption_key(
     target: DispatchTarget,
     stack: FileSystemControlStack,
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     let input = read_input(target, stack)?;
     let payload = FscryptRemoveKeyPayload::parse(input.as_slice())?;
     let mut vcb = mounted_vcb(stack)?;
@@ -172,7 +172,7 @@ pub(crate) fn remove_encryption_key(
 pub(crate) fn get_encryption_key_status(
     target: DispatchTarget,
     stack: FileSystemControlStack,
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     let input = read_input(target, stack)?;
     let payload = FscryptKeyStatusPayload::parse(input.as_slice())?;
     let vcb = mounted_vcb(stack)?;
@@ -468,8 +468,8 @@ fn output_buffer(
 }
 
 /// Builds an FSCTL output completion byte count.
-fn completion_for_length(len: usize) -> DriverResult<DriverCompletion> {
-    DriverCompletion::from_usize(len)
+fn completion_for_length(len: usize) -> DriverResult<IrpCompletion> {
+    IrpCompletion::from_usize(len)
 }
 
 /// Parses a Linux fscrypt v2 key identifier specifier.

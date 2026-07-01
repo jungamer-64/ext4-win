@@ -4,8 +4,10 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::FileOffset;
-use wdk_sys::{PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP};
+use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_SUCCESS};
 
+#[cfg(not(test))]
+use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb};
 
@@ -31,6 +33,56 @@ impl InformationLength {
     /// Returns the WDK payload for the IRP boundary.
     const fn as_ulong_ptr(self) -> wdk_sys::ULONG_PTR {
         self.bytes
+    }
+}
+
+/// Complete IRP status block payload at the NTSTATUS dispatch boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IrpCompletion {
+    /// NTSTATUS returned to the I/O Manager.
+    status: NTSTATUS,
+    /// Completed information byte count.
+    information: InformationLength,
+}
+
+impl IrpCompletion {
+    /// Successful completion without output bytes.
+    pub(crate) const EMPTY: Self = Self {
+        status: STATUS_SUCCESS,
+        information: InformationLength::ZERO,
+    };
+
+    /// Builds a successful completion from an information length.
+    pub(crate) const fn with_information(information: InformationLength) -> Self {
+        Self {
+            status: STATUS_SUCCESS,
+            information,
+        }
+    }
+
+    /// Builds a successful completion from a Rust byte count.
+    pub(crate) fn from_usize(bytes: usize) -> DriverResult<Self> {
+        Ok(Self::with_information(InformationLength::from_usize(
+            bytes,
+        )?))
+    }
+
+    /// Converts a driver error into a completed failed IRP payload.
+    pub(crate) fn from_error(error: DriverError) -> Self {
+        Self {
+            status: error.ntstatus(),
+            information: InformationLength::ZERO,
+        }
+    }
+
+    /// Returns the NTSTATUS for the IRP status block and dispatch return.
+    const fn status(self) -> NTSTATUS {
+        self.status
+    }
+
+    /// Returns the typed information length.
+    const fn information(self) -> InformationLength {
+        self.information
     }
 }
 
@@ -127,6 +179,28 @@ impl DispatchTarget {
         mdl_data_buffer_address(mdl, length)
     }
 
+    /// Writes, completes, and returns one coherent IRP completion.
+    pub(crate) fn finish(self, completion: IrpCompletion) -> NTSTATUS {
+        self.irp.complete(completion)
+    }
+
+    /// Completes this IRP from a fallible handler result.
+    pub(crate) fn finish_result(self, result: DriverResult<IrpCompletion>) -> NTSTATUS {
+        self.finish(match result {
+            Ok(completion) => completion,
+            Err(error) => IrpCompletion::from_error(error),
+        })
+    }
+
+    /// Completes a raw IRP when dispatch-target decoding failed.
+    pub(crate) fn finish_decode_error(irp: PIRP, error: DriverError) -> NTSTATUS {
+        let completion = IrpCompletion::from_error(error);
+        if let Some(irp) = KernelIrp::from_raw(irp) {
+            return irp.complete(completion);
+        }
+        completion.status()
+    }
+
     /// Returns the current stack location selected by the I/O Manager.
     pub(crate) fn current_stack(self) -> Result<CurrentIrpStackLocation, DriverError> {
         // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
@@ -171,8 +245,37 @@ impl KernelIrp {
     }
 
     /// Returns the raw IRP pointer for writes to the WDK completion fields.
+    #[cfg(not(test))]
     fn as_mut_ptr(self) -> *mut wdk_sys::IRP {
         self.irp.as_ptr()
+    }
+
+    /// Writes status and byte count to the IRP status block.
+    fn write_status_block(self, completion: IrpCompletion) {
+        let irp = unsafe {
+            // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP
+            // pointer supplied by the active WDK dispatch callback.
+            self.irp.as_ptr().as_mut()
+        };
+        if let Some(irp) = irp {
+            irp.IoStatus.__bindgen_anon_1.Status = completion.status();
+            irp.IoStatus.Information = completion.information().as_ulong_ptr();
+        }
+    }
+
+    /// Completes the IRP through the I/O Manager.
+    fn complete(self, completion: IrpCompletion) -> NTSTATUS {
+        self.write_status_block(completion);
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The IRP pointer belongs to the current dispatch callback
+            // and has had its final status block written immediately above.
+            ffi::IofCompleteRequest(
+                self.as_mut_ptr(),
+                wdk_sys::IO_NO_INCREMENT as wdk_sys::CCHAR,
+            );
+        }
+        completion.status()
     }
 }
 
@@ -1783,8 +1886,9 @@ mod tests {
         CurrentIrpStackLocation, DirectoryControlMinorFunction, DirectoryCursorPosition,
         DirectoryEntryEmission, DirectoryInformationClass, DirectoryPatternInput, DispatchTarget,
         EaEntryEmission, EaNameSelection, FILE_OPEN_DISPOSITION, FileSystemControlMinorFunction,
-        FsControlCode, IrpBufferLength, QueryFileInformationClass, QueryVolumeInformationClass,
-        SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
+        FsControlCode, InformationLength, IrpBufferLength, IrpCompletion, KernelIrp,
+        QueryFileInformationClass, QueryVolumeInformationClass, SecurityComponentSelection,
+        SetFileInformationClass, SetVolumeInformationClass,
     };
     use crate::state::{KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb};
 
@@ -1823,6 +1927,43 @@ mod tests {
         if let Ok(target) = decoded {
             assert_eq!(target.device().as_ptr(), device);
         }
+    }
+
+    #[test]
+    fn irp_completion_writes_status_and_information_together() {
+        let mut irp = wdk_sys::IRP::default();
+        let kernel_irp = KernelIrp::from_raw(core::ptr::addr_of_mut!(irp));
+        assert!(kernel_irp.is_some());
+        if let Some(kernel_irp) = kernel_irp {
+            kernel_irp.write_status_block(IrpCompletion::with_information(
+                InformationLength::from_usize(128).unwrap(),
+            ));
+        }
+
+        assert_eq!(
+            unsafe { irp.IoStatus.__bindgen_anon_1.Status },
+            wdk_sys::STATUS_SUCCESS
+        );
+        assert_eq!(irp.IoStatus.Information, 128);
+    }
+
+    #[test]
+    fn failed_irp_completion_writes_zero_information() {
+        let mut irp = wdk_sys::IRP::default();
+        irp.IoStatus.Information = 128;
+        let kernel_irp = KernelIrp::from_raw(core::ptr::addr_of_mut!(irp));
+        assert!(kernel_irp.is_some());
+        if let Some(kernel_irp) = kernel_irp {
+            kernel_irp.write_status_block(IrpCompletion::from_error(
+                crate::kernel::status::DriverError::InvalidParameter,
+            ));
+        }
+
+        assert_eq!(
+            unsafe { irp.IoStatus.__bindgen_anon_1.Status },
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(irp.IoStatus.Information, 0);
     }
 
     #[test]

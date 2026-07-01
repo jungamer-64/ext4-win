@@ -7,12 +7,12 @@ use wdk_sys::{
     FILE_FS_DEVICE_INFORMATION, FILE_FS_FULL_SIZE_INFORMATION, FILE_FS_LABEL_INFORMATION,
     FILE_FS_SIZE_INFORMATION, FILE_FS_VOLUME_INFORMATION, FILE_SUPPORTS_EXTENDED_ATTRIBUTES,
     FILE_SUPPORTS_REPARSE_POINTS, FILE_UNICODE_ON_DISK, LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT,
-    PIRP, STATUS_SUCCESS,
+    PIRP,
 };
 
 use crate::{
     irp::{
-        DispatchTarget, DriverCompletion, QueryVolumeInformationClass, QueryVolumeStack,
+        DispatchTarget, IrpCompletion, QueryVolumeInformationClass, QueryVolumeStack,
         SetVolumeInformationClass, SetVolumeStack,
     },
     kernel::status::{DriverError, DriverResult},
@@ -27,29 +27,19 @@ const BYTES_PER_SECTOR: u32 = 512;
 
 /// Handles volume information queries.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(QueryVolumeRequest::decode) {
-        Ok(request) => match query_volume(request) {
-            Ok(completion) => {
-                request.target.complete(completion);
-                STATUS_SUCCESS
-            }
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => {
+            target.finish_result(QueryVolumeRequest::decode(target).and_then(query_volume))
+        }
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Handles volume information mutations.
 pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(SetVolumeRequest::decode) {
-        Ok(request) => match set_volume(request) {
-            Ok(completion) => {
-                request.target.complete(completion);
-                STATUS_SUCCESS
-            }
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => target.finish_result(SetVolumeRequest::decode(target).and_then(set_volume)),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
@@ -98,7 +88,7 @@ impl SetVolumeRequest {
 }
 
 /// Executes one volume information query.
-fn query_volume(request: QueryVolumeRequest) -> DriverResult<DriverCompletion> {
+fn query_volume(request: QueryVolumeRequest) -> DriverResult<IrpCompletion> {
     let Some(mut vcb) = MountedVolumeDevice::vcb(request.device) else {
         return Err(DriverError::InvalidDeviceRequest);
     };
@@ -120,11 +110,11 @@ fn query_volume(request: QueryVolumeRequest) -> DriverResult<DriverCompletion> {
 }
 
 /// Executes one volume information mutation.
-fn set_volume(request: SetVolumeRequest) -> DriverResult<DriverCompletion> {
+fn set_volume(request: SetVolumeRequest) -> DriverResult<IrpCompletion> {
     match request.stack.information_class() {
         SetVolumeInformationClass::Label => set_volume_label(request),
     }?;
-    Ok(DriverCompletion::EMPTY)
+    Ok(IrpCompletion::EMPTY)
 }
 
 /// Applies `FILE_FS_LABEL_INFORMATION` to the mounted ext4 superblock.
@@ -185,7 +175,7 @@ fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel
 fn pack_volume_information(
     vcb: &VolumeControlBlock,
     output: &mut [u8],
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     let label = vcb.volume_label();
     let label_bytes = label.bytes();
     let header = core::mem::offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
@@ -250,7 +240,7 @@ fn pack_volume_information(
 fn pack_size_information(
     vcb: &VolumeControlBlock,
     output: &mut [u8],
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     let geometry = vcb.volume().geometry();
     write_fixed(
         output,
@@ -270,7 +260,7 @@ fn pack_size_information(
 }
 
 /// Packs `FILE_FS_DEVICE_INFORMATION`.
-fn pack_device_information(output: &mut [u8]) -> DriverResult<DriverCompletion> {
+fn pack_device_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
     write_fixed(
         output,
         FILE_FS_DEVICE_INFORMATION {
@@ -284,7 +274,7 @@ fn pack_device_information(output: &mut [u8]) -> DriverResult<DriverCompletion> 
 fn pack_full_size_information(
     vcb: &VolumeControlBlock,
     output: &mut [u8],
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     let geometry = vcb.volume().geometry();
     let available = LARGE_INTEGER {
         QuadPart: i64::try_from(geometry.free_cluster_count().as_u64())
@@ -306,7 +296,7 @@ fn pack_full_size_information(
 }
 
 /// Packs `FILE_FS_ATTRIBUTE_INFORMATION`.
-fn pack_attribute_information(output: &mut [u8]) -> DriverResult<DriverCompletion> {
+fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
     let header = core::mem::offset_of!(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
     let name_len = FILE_SYSTEM_NAME
         .len()
@@ -371,12 +361,12 @@ fn sectors_per_allocation_unit(cluster_size: ClusterSize) -> DriverResult<u32> {
 }
 
 /// Converts a byte count to `IO_STATUS_BLOCK::Information`.
-fn information_length(value: usize) -> DriverResult<DriverCompletion> {
-    DriverCompletion::from_usize(value)
+fn information_length(value: usize) -> DriverResult<IrpCompletion> {
+    IrpCompletion::from_usize(value)
 }
 
 /// Writes one fixed-size WDK information structure into an output byte buffer.
-fn write_fixed<T>(output: &mut [u8], value: T) -> DriverResult<DriverCompletion> {
+fn write_fixed<T>(output: &mut [u8], value: T) -> DriverResult<IrpCompletion> {
     let size = core::mem::size_of::<T>();
     if output.len() < size {
         return Err(DriverError::BufferTooSmall);
@@ -395,7 +385,7 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     use crate::{
-        irp::DriverCompletion,
+        irp::IrpCompletion,
         kernel::status::DriverError,
         wire::{LittleEndianInput, WireOffset},
     };
@@ -445,7 +435,7 @@ mod tests {
         let written = pack_device_information(buffer.as_mut_slice());
         assert!(written.is_ok());
         if let Ok(written) = written {
-            assert_eq!(DriverCompletion::from_usize(buffer.len()), Ok(written));
+            assert_eq!(IrpCompletion::from_usize(buffer.len()), Ok(written));
             let output = LittleEndianInput::new(buffer.as_slice());
             assert_eq!(
                 output.read_u32(WireOffset::new(0)),

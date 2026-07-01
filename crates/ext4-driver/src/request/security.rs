@@ -4,10 +4,10 @@ use alloc::{vec, vec::Vec};
 use core::ptr::NonNull;
 
 use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, NodeId};
-use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
+use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP};
 
 use crate::irp::{
-    DispatchTarget, DriverCompletion, QuerySecurityStack, SecurityComponentSelection,
+    DispatchTarget, IrpCompletion, QuerySecurityStack, SecurityComponentSelection,
     SecuritySelection, SetSecurityStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
@@ -45,29 +45,21 @@ const POSIX_RWX_BITS: u16 = 0o777;
 
 /// Handles IRP_MJ_QUERY_SECURITY.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(QuerySecurityRequest::decode) {
-        Ok(request) => match query_security(&request) {
-            Ok(completion) => {
-                request.target.complete(completion);
-                STATUS_SUCCESS
-            }
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => target.finish_result(
+            QuerySecurityRequest::decode(target).and_then(|request| query_security(&request)),
+        ),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Handles IRP_MJ_SET_SECURITY.
 pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(SetSecurityRequest::decode) {
-        Ok(request) => match set_security(&request) {
-            Ok(completion) => {
-                request.target.complete(completion);
-                STATUS_SUCCESS
-            }
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => target.finish_result(
+            SetSecurityRequest::decode(target).and_then(|request| set_security(&request)),
+        ),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
@@ -98,8 +90,6 @@ impl QuerySecurityRequest {
 /// Decoded set-security request.
 #[derive(Debug)]
 struct SetSecurityRequest {
-    /// Dispatch target receiving completion.
-    target: DispatchTarget,
     /// Decoded set-security stack.
     stack: SetSecurityStack,
     /// Opened file contexts decoded before security handling.
@@ -111,11 +101,7 @@ impl SetSecurityRequest {
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.set_security()?;
         let opened_file = OpenedFileObject::decode(stack.file_object())?;
-        Ok(Self {
-            target,
-            stack,
-            opened_file,
-        })
+        Ok(Self { stack, opened_file })
     }
 }
 
@@ -329,7 +315,7 @@ impl DaclPermissionBuilder {
 }
 
 /// Performs a security descriptor query.
-fn query_security(request: &QuerySecurityRequest) -> DriverResult<DriverCompletion> {
+fn query_security(request: &QuerySecurityRequest) -> DriverResult<IrpCompletion> {
     let security = load_ext4_security(&request.opened_file)?;
     let descriptor = security_descriptor(security, request.stack.selection())?;
     let required = descriptor.len();
@@ -340,11 +326,11 @@ fn query_security(request: &QuerySecurityRequest) -> DriverResult<DriverCompleti
     let mut output = request.target.user_output(length)?;
     LittleEndianOutput::new(output.as_mut_slice())
         .write_bytes(wire_offset(0), descriptor.as_slice())?;
-    DriverCompletion::from_usize(required)
+    IrpCompletion::from_usize(required)
 }
 
 /// Performs a POSIX security mutation from a Windows security descriptor.
-fn set_security(request: &SetSecurityRequest) -> DriverResult<DriverCompletion> {
+fn set_security(request: &SetSecurityRequest) -> DriverResult<IrpCompletion> {
     let context = load_ext4_security_context(&request.opened_file)?;
     let descriptor = security_descriptor_bytes(
         request.stack.security_descriptor().as_non_null(),
@@ -356,7 +342,7 @@ fn set_security(request: &SetSecurityRequest) -> DriverResult<DriverCompletion> 
         context.security,
     )?;
     if security == context.security {
-        return Ok(DriverCompletion::EMPTY);
+        return Ok(IrpCompletion::EMPTY);
     }
 
     let mut vcb = context.volume;
@@ -372,7 +358,7 @@ fn set_security(request: &SetSecurityRequest) -> DriverResult<DriverCompletion> 
     let node = transaction.node(context.node)?;
     transaction.set_posix_security(node, security)?;
     transaction.commit()?;
-    Ok(DriverCompletion::EMPTY)
+    Ok(IrpCompletion::EMPTY)
 }
 
 /// Loads ext4 security metadata for an opened node.
