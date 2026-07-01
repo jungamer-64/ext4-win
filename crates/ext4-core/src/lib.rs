@@ -20,14 +20,10 @@ mod protection;
 mod volume;
 
 pub use disk::block::{BlockReader, BlockSize, BlockWriter, ByteOffset, DeviceLength};
-pub use disk_format::acl::{PosixAcl, PosixAclEntry, PosixAclKind};
-pub use disk_format::dir::DirectoryEntryKind;
 pub use disk_format::inode::{
-    DeletionMutationCapability, DirectoryEntryMutationCapability, Ext4Gid, Ext4LinkCount,
-    Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileOffset,
-    FilePayloadMutationCapability, FileSize, FileSizeMutationCapability, InodeFlags,
-    InodeGeneration, InodeMode, MetadataMutationCapability, NewDirectoryMetadata, NewFileMetadata,
-    NewSymlinkMetadata, ReadBytes, SymlinkTarget,
+    Ext4Gid, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
+    Ext4Uid, FileOffset, FileSize, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
+    ReadBytes, SymlinkTarget,
 };
 pub use disk_format::superblock::{
     ClusterCount, ClusterSize, Ext4VolumeLabel, FilesystemUuid, FreeClusterCount,
@@ -37,24 +33,17 @@ pub use error::{Error, Result};
 pub use platform::name::{Ext4Name, WindowsName};
 pub use platform::windows::{Ext4WindowsAttributes, WindowsOverlay};
 pub use protection::fscrypt::{
-    FSCRYPT_CONTEXT_V2_BYTES, FSCRYPT_POLICY_V2_BYTES, FscryptContentsKey, FscryptContentsMode,
-    FscryptContextV2, FscryptDataUnitSize, FscryptFileNonce, FscryptFilenamePadding,
-    FscryptFilenamesKey, FscryptFilenamesMode, FscryptKeyIdentifier, FscryptKeyPresence,
-    FscryptKeySet, FscryptMasterKey, FscryptNoNonceGenerator, FscryptNonceGenerator,
-    FscryptPolicyV2,
+    FscryptFileNonce, FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey,
+    FscryptNonceGenerator,
 };
 pub use protection::verity::{
-    EXT4_VERITY_METADATA_ALIGNMENT_BYTES, Ext4VerityMetadata, Ext4VerityMetadataLayout,
-    FSVERITY_DESCRIPTOR_BYTES, FSVERITY_MAX_BLOCK_BYTES, FSVERITY_MAX_SIGNATURE_BYTES,
-    FSVERITY_MIN_BLOCK_BYTES, FsverityBlockSize, FsverityDescriptor, FsverityDigest,
-    FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsverityRootHash, FsveritySalt,
-    FsveritySignature,
+    FsverityBlockSize, FsverityEnable, FsverityHashAlgorithm, FsveritySalt, FsveritySignature,
 };
 pub use volume::{
-    ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, ExternalJournal,
-    FileNode, FileNodeId, InternalJournal, JournalTransaction, JournaledVolume, MountContext,
-    NodeId, ReadOnlyVolume, SymlinkNode, SymlinkNodeId, TransactionDirectory, TransactionFile,
-    TransactionNode, TransactionSymlink, VolumeGeometry, VolumeIdentity,
+    ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
+    FileNodeId, InternalJournal, JournalTransaction, JournaledVolume, MountContext, NodeId,
+    SymlinkNode, SymlinkNodeId, TransactionDirectory, TransactionFile, TransactionNode,
+    TransactionSymlink, VolumeGeometry, VolumeIdentity,
 };
 
 #[cfg(test)]

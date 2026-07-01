@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N> {
+impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Allocates the first free allocation cluster visible in group bitmaps.
     pub(super) fn allocate_cluster(&mut self) -> Result<BlockAddress> {
         let groups = self.volume.superblock.block_group_count()?;

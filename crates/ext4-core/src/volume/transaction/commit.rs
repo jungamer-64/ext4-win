@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N> {
+impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Serializes all staged metadata mutations into byte-range writes.
     fn metadata_writes(&mut self) -> Result<Vec<RangeWrite>> {
         let mut writes = Vec::new();
@@ -260,7 +260,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
     }
 }
 
-impl<D: BlockWriter, N: FscryptNonceGenerator> JournalTransaction<'_, D, InternalJournal, N> {
+impl<D: BlockWriter, N: FscryptNonceGenerator> JournalTransaction<'_, D, N, InternalJournal> {
     /// Commits staged data and metadata through the internal journal.
     ///
     /// # Errors
@@ -289,8 +289,8 @@ impl<D: BlockWriter, N: FscryptNonceGenerator> JournalTransaction<'_, D, Interna
     }
 }
 
-impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator>
-    JournalTransaction<'_, D, ExternalJournal<J>, N>
+impl<D: BlockWriter, N: FscryptNonceGenerator, J: BlockWriter>
+    JournalTransaction<'_, D, N, ExternalJournal<J>>
 {
     /// Commits staged data and metadata through the external journal device.
     ///

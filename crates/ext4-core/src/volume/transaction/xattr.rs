@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N> {
+impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Sets or replaces one ext4 extended attribute.
     ///
     /// # Errors
@@ -41,7 +41,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
     ///
     /// # Errors
     /// Returns an error when the ACL cannot be serialized or stored.
-    pub fn set_posix_acl(
+    pub(crate) fn set_posix_acl(
         &mut self,
         node: TransactionNode,
         kind: PosixAclKind,

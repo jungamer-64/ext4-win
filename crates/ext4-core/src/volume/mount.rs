@@ -9,7 +9,7 @@ pub(super) struct ReadOnlyMount;
 
 /// Mount-time context that keeps external fscrypt material out of superblock parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MountContext<N = FscryptNoNonceGenerator> {
+pub struct MountContext<N> {
     /// fscrypt master keys available for this mount.
     fscrypt_keys: FscryptKeySet,
     /// Source of fresh nonces for newly-created encrypted inodes.
@@ -89,7 +89,7 @@ pub struct ExternalJournal<J> {
 
 /// Journaled read-write mounted volume state.
 #[derive(Debug)]
-pub(super) struct JournaledMount<J = InternalJournal> {
+pub(super) struct JournaledMount<J> {
     /// Journal backend selected at mount.
     pub(super) journal: J,
     /// Mounted cluster reference counts constructed before any mutation.
@@ -98,7 +98,7 @@ pub(super) struct JournaledMount<J = InternalJournal> {
 
 /// Mounted ext4 volume with typestate-selected mutation capability.
 #[derive(Debug)]
-pub(super) struct MountedVolume<D, State, N = FscryptNoNonceGenerator> {
+pub(super) struct MountedVolume<D, State, N> {
     /// Backing filesystem block device.
     pub(super) device: D,
     /// Validated superblock and mount policy.
@@ -111,14 +111,14 @@ pub(super) struct MountedVolume<D, State, N = FscryptNoNonceGenerator> {
 
 /// Mounted read-only ext4 volume.
 #[derive(Debug)]
-pub struct ReadOnlyVolume<D, N = FscryptNoNonceGenerator> {
+pub(crate) struct ReadOnlyVolume<D, N> {
     /// Private mounted state with read traversal capability only.
     pub(super) volume: MountedVolume<D, ReadOnlyMount, N>,
 }
 
 /// Mounted journaled ext4 volume with mutation capability.
 #[derive(Debug)]
-pub struct JournaledVolume<D, J = InternalJournal, N = FscryptNoNonceGenerator> {
+pub struct JournaledVolume<D, N, J = InternalJournal> {
     /// Private mounted state with journaled mutation capability.
     pub(super) volume: MountedVolume<D, JournaledMount<J>, N>,
 }
@@ -206,7 +206,7 @@ impl<D: BlockReader, N> ReadOnlyVolume<D, N> {
     ///
     /// # Errors
     /// Returns an error when the device does not contain a supported ext4 superblock.
-    pub fn mount(device: D, mount_context: MountContext<N>) -> Result<Self> {
+    pub(crate) fn mount(device: D, mount_context: MountContext<N>) -> Result<Self> {
         Ok(Self {
             volume: MountedVolume::mount(device, mount_context)?,
         })
@@ -274,12 +274,12 @@ impl<D: BlockWriter, N: FscryptNonceGenerator + Clone>
     pub fn begin_transaction(
         &mut self,
         now: Ext4Timestamp,
-    ) -> JournalTransaction<'_, D, InternalJournal, N> {
+    ) -> JournalTransaction<'_, D, N, InternalJournal> {
         JournalTransaction::begin(self, now)
     }
 }
 
-impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> JournaledVolume<D, InternalJournal, N> {
+impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> JournaledVolume<D, N, InternalJournal> {
     /// Replays the internal journal boundary and constructs journaled read-write state.
     ///
     /// # Errors
@@ -295,7 +295,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> JournaledVolume<D, Intern
     pub fn begin_transaction(
         &mut self,
         now: Ext4Timestamp,
-    ) -> JournalTransaction<'_, D, InternalJournal, N> {
+    ) -> JournalTransaction<'_, D, N, InternalJournal> {
         self.volume.begin_transaction(now)
     }
 }
@@ -360,13 +360,13 @@ impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
     pub fn begin_transaction(
         &mut self,
         now: Ext4Timestamp,
-    ) -> JournalTransaction<'_, D, ExternalJournal<J>, N> {
+    ) -> JournalTransaction<'_, D, N, ExternalJournal<J>> {
         JournalTransaction::begin(self, now)
     }
 }
 
 impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
-    JournaledVolume<D, ExternalJournal<J>, N>
+    JournaledVolume<D, N, ExternalJournal<J>>
 {
     /// Replays an external journal and constructs journaled read-write state.
     ///
@@ -387,7 +387,7 @@ impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
     pub fn begin_transaction(
         &mut self,
         now: Ext4Timestamp,
-    ) -> JournalTransaction<'_, D, ExternalJournal<J>, N> {
+    ) -> JournalTransaction<'_, D, N, ExternalJournal<J>> {
         self.volume.begin_transaction(now)
     }
 }

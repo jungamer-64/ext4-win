@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N> {
+impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Overwrites bytes inside an existing regular file range.
     ///
     /// # Errors

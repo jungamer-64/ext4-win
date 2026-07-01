@@ -92,8 +92,7 @@ impl TransactionNode {
 
 /// In-progress ext4 write transaction.
 #[derive(Debug)]
-pub struct JournalTransaction<'a, D: BlockWriter, J = InternalJournal, N = FscryptNoNonceGenerator>
-{
+pub struct JournalTransaction<'a, D: BlockWriter, N, J = InternalJournal> {
     /// Mounted read-write volume being mutated.
     volume: &'a mut MountedVolume<D, JournaledMount<J>, N>,
     /// Timestamp applied consistently to staged inode updates.
@@ -124,7 +123,7 @@ pub struct JournalTransaction<'a, D: BlockWriter, J = InternalJournal, N = Fscry
     volume_label_update: Option<Ext4VolumeLabel>,
 }
 
-impl<'a, D: BlockWriter, J, N> JournalTransaction<'a, D, J, N> {
+impl<'a, D: BlockWriter, N, J> JournalTransaction<'a, D, N, J> {
     /// Starts an empty journal transaction for a mounted read-write volume.
     pub(super) fn begin(
         volume: &'a mut MountedVolume<D, JournaledMount<J>, N>,
@@ -148,7 +147,7 @@ impl<'a, D: BlockWriter, J, N> JournalTransaction<'a, D, J, N> {
         }
     }
 }
-impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N> {
+impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Verifies that the mounted profile admits xattr storage mutation.
     fn require_xattr_mutation(&self) -> Result<()> {
         self.volume.superblock.xattr_mutation().require_supported()
