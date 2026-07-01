@@ -24,7 +24,7 @@ pub(super) use crate::disk_format::inode::{
     InodeId, InodeKind, InodeMode, InodeStorage, LinkCountAfterDecrement, NewDirectoryMetadata,
     NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
-pub(super) use crate::disk_format::journal::{Journal, LoadedJournal};
+pub(super) use crate::disk_format::journal::{Journal, LoadedJournal, MetadataBlock};
 pub(super) use crate::disk_format::superblock::{
     BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel, FreeClusterCount,
     FreeClusterDelta, InodeTimestampEncoding, JournalMode, MetadataChecksum, RecoveryState,
@@ -57,7 +57,7 @@ pub(super) use super::inode_record::{
     StagedInodeRecord,
 };
 pub(super) use super::mount::{
-    ExternalJournal, InternalJournal, JournaledMount, JournaledVolume, MountContext, MountedVolume,
+    ExternalJournal, InternalJournal, JournaledMount, JournaledVolume, MountedVolume,
     ReadOnlyVolume, VolumeGeometry, VolumeIdentity,
 };
 pub(super) use super::node::{

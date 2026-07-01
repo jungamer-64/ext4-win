@@ -446,8 +446,8 @@ fn volume_label_round_trips_through_superblock() {
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    assert_eq!(volume.volume_label(), label);
-    assert_eq!(volume.volume_label().bytes(), b"EXT4WIN");
+    assert_eq!(volume.identity().label(), label);
+    assert_eq!(volume.identity().label().bytes(), b"EXT4WIN");
 }
 
 #[test]

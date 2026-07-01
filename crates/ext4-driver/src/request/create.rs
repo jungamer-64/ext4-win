@@ -6,7 +6,7 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    ChildLookup, DirectoryNodeId, Ext4Name, FileNodeId, FileSize, LoadedNode, NodeId, WindowsName,
+    ChildLookup, DirectoryNodeId, Ext4Name, FileNodeId, FileSize, NodeId, WindowsName,
 };
 use wdk_sys::{FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
@@ -267,9 +267,8 @@ fn resolve_path(
     let mut components = components.iter().peekable();
     while let Some(component) = components.next() {
         let is_final = components.peek().is_none();
-        let parent = match vcb.volume().load(NodeId::Directory(parent_id)) {
-            Ok(LoadedNode::Directory(directory)) => directory,
-            Ok(_) => return Err(DriverError::ObjectPathNotFound),
+        let parent = match vcb.volume().load_directory(parent_id) {
+            Ok(directory) => directory,
             Err(error) => return Err(DriverError::from(error)),
         };
         let child = match vcb.volume().lookup_windows_child(&parent, component) {
@@ -298,9 +297,9 @@ fn resolve_path(
         parent_id = directory_id;
     }
 
-    match vcb.volume().load(NodeId::Directory(parent_id)) {
-        Ok(node) => Ok(PathLookup::Existing {
-            node: node.id(),
+    match vcb.volume().load_directory(parent_id) {
+        Ok(directory) => Ok(PathLookup::Existing {
+            node: NodeId::Directory(directory.id()),
             path: OpenedPath::Root,
         }),
         Err(error) => Err(DriverError::from(error)),

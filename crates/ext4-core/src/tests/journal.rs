@@ -28,7 +28,7 @@ fn bad_metadata_descriptor_checksum_is_rejected() {
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    let result = volume.root_directory();
+    let result = volume.load_directory(DirectoryNodeId::ROOT);
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
@@ -56,7 +56,7 @@ fn bad_gdt_descriptor_checksum_is_rejected() {
         SliceBlockDevice::new(&image),
         test_mount_context(),
     ));
-    let result = volume.root_directory();
+    let result = volume.load_directory(DirectoryNodeId::ROOT);
 
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }

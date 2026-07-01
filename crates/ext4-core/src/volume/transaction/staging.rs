@@ -1,4 +1,4 @@
-//! Staged transaction images and journal commit payload types.
+//! Staged transaction images.
 
 use super::*;
 
@@ -52,25 +52,4 @@ pub(super) struct RangeWrite {
     pub(super) offset: ByteOffset,
     /// Bytes to write at the offset.
     pub(super) bytes: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Full metadata block supplied to the journal commit path.
-pub(crate) struct MetadataBlock {
-    /// Filesystem block address.
-    pub(super) block: BlockAddress,
-    /// Complete metadata block bytes.
-    pub(super) bytes: Vec<u8>,
-}
-
-impl MetadataBlock {
-    /// Returns the filesystem block address.
-    pub(crate) const fn block(&self) -> BlockAddress {
-        self.block
-    }
-
-    /// Returns the full metadata block bytes.
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
 }
