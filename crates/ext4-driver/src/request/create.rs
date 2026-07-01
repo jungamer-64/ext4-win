@@ -8,12 +8,12 @@ use core::ptr::NonNull;
 use ext4_core::{
     ChildLookup, DirectoryNodeId, Ext4Name, FileNodeId, FileSize, NodeId, WindowsName,
 };
-use wdk_sys::{FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
+use wdk_sys::{FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP};
 
 use crate::{
     irp::{
         CreateDisposition, CreateParameters, CreateStack, CreateTargetRequirement, DesiredAccess,
-        DispatchTarget, ShareAccess,
+        DispatchTarget, IrpCompletion, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     request::metadata,
@@ -28,12 +28,13 @@ const UTF16_BACKSLASH: u16 = 0x005C;
 
 /// Handles create/open IRPs.
 pub(crate) fn dispatch(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(CreateRequest::decode) {
-        Ok(request) => match open_or_create(request) {
-            Ok(()) => STATUS_SUCCESS,
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => target.finish_result(
+            CreateRequest::decode(target)
+                .and_then(open_or_create)
+                .map(|()| IrpCompletion::EMPTY),
+        ),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 

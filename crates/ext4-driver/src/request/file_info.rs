@@ -9,13 +9,13 @@ use ext4_core::{
     Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileSize, NodeId, WindowsName,
     WindowsOverlay,
 };
-use wdk_sys::{LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
+use wdk_sys::{LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP};
 
 use crate::irp::{
     DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
     DirectoryEntryIndex, DirectoryInformationClass, DirectoryPatternInput, DispatchTarget,
-    DriverCompletion, IrpBufferLength, QueryDirectoryStack, QueryFileInformationClass,
-    QueryFileStack, SetFileInformationClass, SetFileStack,
+    IrpBufferLength, IrpCompletion, QueryDirectoryStack, QueryFileInformationClass, QueryFileStack,
+    SetFileInformationClass, SetFileStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{
@@ -26,138 +26,108 @@ use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset
 
 /// Handles cleanup IRPs.
 pub(crate) fn cleanup(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(|target| target.current_stack()) {
-        Ok(stack) => match stack.file_object() {
-            Ok(file_object) => match cleanup_file_object(file_object) {
-                Ok(()) => STATUS_SUCCESS,
-                Err(error) => error.ntstatus(),
-            },
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => target.finish_result(
+            target
+                .current_stack()
+                .and_then(|stack| stack.file_object())
+                .and_then(cleanup_file_object)
+                .map(|()| IrpCompletion::EMPTY),
+        ),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Handles close IRPs and releases FILE_OBJECT contexts.
 pub(crate) fn close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(|target| target.current_stack()) {
-        Ok(stack) => match stack.file_object() {
-            Ok(file_object) => {
-                release_file_contexts(file_object);
-                STATUS_SUCCESS
-            }
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => target.finish_result(
+            target
+                .current_stack()
+                .and_then(|stack| stack.file_object())
+                .map(|file_object| {
+                    release_file_contexts(file_object);
+                    IrpCompletion::EMPTY
+                }),
+        ),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Handles regular file data reads.
 pub(crate) fn read(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp) {
-        Ok(target) => match read_regular_file(target) {
-            Ok(completion) => {
-                target.complete(completion);
-                STATUS_SUCCESS
-            }
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+        Ok(target) => target.finish_result(read_regular_file(target)),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Handles regular file data writes.
 pub(crate) fn write(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp) {
-        Ok(target) => match write_regular_file(target) {
-            Ok(completion) => {
-                target.complete(completion);
-                STATUS_SUCCESS
-            }
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+        Ok(target) => target.finish_result(write_regular_file(target)),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Flushes cached or ordered file data.
 pub(crate) fn flush(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp) {
-        Ok(_target) => STATUS_SUCCESS,
-        Err(error) => error.ntstatus(),
+        Ok(target) => target.finish(IrpCompletion::EMPTY),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Handles file information queries.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(QueryFileRequest::decode) {
-        Ok(request) => {
-            let target = request.target;
-            match query_file_information(request) {
-                Ok(completion) => {
-                    target.complete(completion);
-                    STATUS_SUCCESS
-                }
-                Err(error) => error.ntstatus(),
-            }
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => {
+            target.finish_result(QueryFileRequest::decode(target).and_then(query_file_information))
         }
-        Err(error) => error.ntstatus(),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Handles file information mutations.
 pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(SetFileRequest::decode) {
-        Ok(request) => {
-            let target = request.target;
-            match set_file_information(request) {
-                Ok(completion) => {
-                    target.complete(completion);
-                    STATUS_SUCCESS
-                }
-                Err(error) => error.ntstatus(),
-            }
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => {
+            target.finish_result(SetFileRequest::decode(target).and_then(set_file_information))
         }
-        Err(error) => error.ntstatus(),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Handles directory enumeration and notification.
 pub(crate) fn directory_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp) {
-        Ok(target) => match target.current_stack() {
-            Ok(stack) => match stack.directory_control_minor() {
-                DirectoryControlMinorFunction::QueryDirectory => match query_directory(target) {
-                    Ok(completion) => {
-                        target.complete(completion);
-                        STATUS_SUCCESS
-                    }
-                    Err(error) => error.ntstatus(),
-                },
+        Ok(target) => target.finish_result(target.current_stack().and_then(|stack| {
+            match stack.directory_control_minor() {
+                DirectoryControlMinorFunction::QueryDirectory => query_directory(target),
                 DirectoryControlMinorFunction::NotifyChangeDirectory => {
-                    DriverError::NotSupported.ntstatus()
+                    Err(DriverError::NotSupported)
                 }
                 DirectoryControlMinorFunction::Unsupported => {
-                    DriverError::InvalidDeviceRequest.ntstatus()
+                    Err(DriverError::InvalidDeviceRequest)
                 }
-            },
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+            }
+        })),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Handles byte-range lock requests.
 pub(crate) fn lock_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match decoded_not_supported(device, irp) {
-        Ok(()) => DriverError::NotSupported.ntstatus(),
-        Err(error) => error.ntstatus(),
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => {
+            target.finish_result(decoded_not_supported(target).and(Err(DriverError::NotSupported)))
+        }
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Rejects a decoded file-object request until its domain path exists.
-fn decoded_not_supported(device: PDEVICE_OBJECT, irp: PIRP) -> DriverResult<()> {
-    let target = DispatchTarget::decode(device, irp)?;
+fn decoded_not_supported(target: DispatchTarget) -> DriverResult<()> {
     let _device = target.device();
     Ok(())
 }
@@ -235,7 +205,7 @@ impl QueryDirectoryRequest {
 }
 
 /// Packs one supported file information class.
-fn query_file_information(request: QueryFileRequest) -> DriverResult<DriverCompletion> {
+fn query_file_information(request: QueryFileRequest) -> DriverResult<IrpCompletion> {
     let metadata = load_file_metadata(&request.opened_file)?;
     let length = request.stack.length();
     let mut buffer = request.target.buffered_output(length)?;
@@ -252,7 +222,7 @@ fn query_file_information(request: QueryFileRequest) -> DriverResult<DriverCompl
 }
 
 /// Applies one supported set-file-information class.
-fn set_file_information(request: SetFileRequest) -> DriverResult<DriverCompletion> {
+fn set_file_information(request: SetFileRequest) -> DriverResult<IrpCompletion> {
     match request.stack.information_class() {
         SetFileInformationClass::Basic => set_basic_information(request),
         SetFileInformationClass::EndOfFile => set_end_of_file_information(request),
@@ -262,7 +232,7 @@ fn set_file_information(request: SetFileRequest) -> DriverResult<DriverCompletio
         SetFileInformationClass::Rename => set_rename_information(request),
         SetFileInformationClass::RenameEx => Err(DriverError::NotSupported),
     }?;
-    Ok(DriverCompletion::EMPTY)
+    Ok(IrpCompletion::EMPTY)
 }
 
 /// Applies FILE_BASIC_INFORMATION timestamps and overlay attributes.
@@ -417,7 +387,7 @@ fn set_regular_file_size(opened_file: &OpenedFileObject, new_size: FileSize) -> 
 }
 
 /// Packs directory entries into the caller's query-directory buffer.
-fn query_directory(target: DispatchTarget) -> DriverResult<DriverCompletion> {
+fn query_directory(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let mut request = QueryDirectoryRequest::decode(target)?;
     let class = request.stack.information_class();
     let pattern = DirectoryPattern::from_stack(request.stack)?;
@@ -452,7 +422,7 @@ fn query_directory(target: DispatchTarget) -> DriverResult<DriverCompletion> {
         &entries,
         buffer,
     )?;
-    DriverCompletion::from_usize(result)
+    IrpCompletion::from_usize(result)
 }
 
 impl DirectoryInformationClass {
@@ -1278,7 +1248,7 @@ fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult
 fn pack_basic_information(
     output: &mut [u8],
     metadata: FileMetadata,
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     write_fixed(
         output,
         wdk_sys::FILE_BASIC_INFORMATION {
@@ -1295,7 +1265,7 @@ fn pack_basic_information(
 fn pack_standard_information(
     output: &mut [u8],
     metadata: FileMetadata,
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     write_fixed(
         output,
         wdk_sys::FILE_STANDARD_INFORMATION {
@@ -1312,7 +1282,7 @@ fn pack_standard_information(
 fn pack_internal_information(
     output: &mut [u8],
     metadata: FileMetadata,
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     write_fixed(
         output,
         wdk_sys::FILE_INTERNAL_INFORMATION {
@@ -1327,7 +1297,7 @@ fn pack_internal_information(
 fn pack_position_information(
     output: &mut [u8],
     opened_file: &OpenedFileObject,
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     let file_object = opened_file.file_object();
     let file_object = unsafe {
         // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
@@ -1350,7 +1320,7 @@ fn pack_position_information(
 fn pack_network_open_information(
     output: &mut [u8],
     metadata: FileMetadata,
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     write_fixed(
         output,
         wdk_sys::FILE_NETWORK_OPEN_INFORMATION {
@@ -1366,7 +1336,7 @@ fn pack_network_open_information(
 }
 
 /// Writes one fixed-size information structure into the caller's buffer.
-fn write_fixed<T>(output: &mut [u8], value: T) -> DriverResult<DriverCompletion> {
+fn write_fixed<T>(output: &mut [u8], value: T) -> DriverResult<IrpCompletion> {
     let size = core::mem::size_of::<T>();
     if output.len() < size {
         return Err(DriverError::BufferTooSmall);
@@ -1377,7 +1347,7 @@ fn write_fixed<T>(output: &mut [u8], value: T) -> DriverResult<DriverCompletion>
         // imposing an alignment requirement on the system buffer.
         output.as_mut_ptr().cast::<T>().write_unaligned(value);
     }
-    DriverCompletion::from_usize(size)
+    IrpCompletion::from_usize(size)
 }
 
 /// Converts an ext4 timestamp to a Windows system-time LARGE_INTEGER.
@@ -1446,12 +1416,12 @@ fn boolean(value: bool) -> wdk_sys::BOOLEAN {
 }
 
 /// Reads a regular file through ext4-core into the IRP output buffer.
-fn read_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
+fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.read()?;
     let opened_file = OpenedFileObject::decode(stack.file_object())?;
     let length = stack.length();
     if length.is_empty() {
-        return Ok(DriverCompletion::EMPTY);
+        return Ok(IrpCompletion::EMPTY);
     }
     let mut output = target.data_output(length)?;
     let fcb = opened_file.file_control_block();
@@ -1464,16 +1434,16 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     let bytes_read = vcb
         .volume()
         .read_file(&file, stack.byte_offset(), output.as_mut_slice())?;
-    DriverCompletion::from_usize(bytes_read.as_usize())
+    IrpCompletion::from_usize(bytes_read.as_usize())
 }
 
 /// Writes a regular file range through an ext4 journal transaction.
-fn write_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
+fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.write()?;
     let opened_file = OpenedFileObject::decode(stack.file_object())?;
     let length = stack.length();
     if length.is_empty() {
-        return Ok(DriverCompletion::EMPTY);
+        return Ok(IrpCompletion::EMPTY);
     }
     let input = target.data_input(length)?;
     let fcb = opened_file.file_control_block();
@@ -1494,7 +1464,7 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> 
     let file = transaction.file(file_id)?;
     transaction.overwrite_file_range(file, stack.byte_offset(), input.as_slice())?;
     transaction.commit()?;
-    DriverCompletion::from_usize(input.as_slice().len())
+    IrpCompletion::from_usize(input.as_slice().len())
 }
 
 /// Returns the mounted VCB referenced by an FCB.

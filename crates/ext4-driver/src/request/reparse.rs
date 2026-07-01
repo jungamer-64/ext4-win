@@ -3,7 +3,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::irp::{DispatchTarget, DriverCompletion, FileSystemControlStack};
+use crate::irp::{DispatchTarget, FileSystemControlStack, IrpCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::request::metadata;
 use crate::state::{FileControlBlock, OpenedFileObject, OpenedPath, VolumeControlBlock};
@@ -32,22 +32,22 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 pub(crate) fn get_reparse_point(
     target: DispatchTarget,
     stack: FileSystemControlStack,
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     let symlink_target = read_symlink_target(stack)?;
     let length = stack.output_buffer_length();
     let mut output = target.buffered_output(length)?;
     let written = pack_symlink_reparse_buffer(symlink_target.as_slice(), output.as_mut_slice())?;
-    DriverCompletion::from_usize(written)
+    IrpCompletion::from_usize(written)
 }
 
 /// Handles `FSCTL_SET_REPARSE_POINT` by replacing the opened node with an ext4 symlink.
 pub(crate) fn set_reparse_point(
     target: DispatchTarget,
     stack: FileSystemControlStack,
-) -> DriverResult<DriverCompletion> {
+) -> DriverResult<IrpCompletion> {
     let symlink_target = parse_symlink_reparse_target(target, stack)?;
     replace_opened_path_with_symlink(stack, &symlink_target)?;
-    Ok(DriverCompletion::EMPTY)
+    Ok(IrpCompletion::EMPTY)
 }
 
 /// Reads the target bytes for the symlink opened by the FSCTL.

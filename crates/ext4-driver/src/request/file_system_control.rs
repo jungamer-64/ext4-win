@@ -6,8 +6,8 @@ use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::{
     irp::{
-        DispatchTarget, DriverCompletion, FileSystemControlMinorFunction, FileSystemControlStack,
-        FsControlCode, IrpBufferLength, MountVolumeStack,
+        DispatchTarget, FileSystemControlMinorFunction, FileSystemControlStack, FsControlCode,
+        IrpBufferLength, IrpCompletion, MountVolumeStack,
     },
     kernel::{
         block_device::query_device_length,
@@ -23,31 +23,25 @@ use crate::{
 
 /// Handles file-system control requests, including mount and reparse controls.
 pub(crate) fn dispatch(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(FileSystemControlRequest::decode) {
-        Ok(FileSystemControlRequest::MountVolume(request)) => match mount_volume(request) {
-            Ok(()) => STATUS_SUCCESS,
-            Err(error) => error.ntstatus(),
-        },
-        Ok(FileSystemControlRequest::UserFsControl(request)) => match user_fs_control(request) {
-            Ok(completion) => {
-                request.target().complete(completion);
-                STATUS_SUCCESS
-            }
-            Err(error) => error.ntstatus(),
-        },
-        Ok(FileSystemControlRequest::Unsupported) => DriverError::NotSupported.ntstatus(),
-        Err(error) => error.ntstatus(),
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => target.finish_result(FileSystemControlRequest::decode(target).and_then(
+            |request| match request {
+                FileSystemControlRequest::MountVolume(request) => {
+                    mount_volume(request).map(|()| IrpCompletion::EMPTY)
+                }
+                FileSystemControlRequest::UserFsControl(request) => user_fs_control(request),
+                FileSystemControlRequest::Unsupported => Err(DriverError::NotSupported),
+            },
+        )),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Handles device control requests addressed to this FSD.
 pub(crate) fn device_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp) {
-        Ok(target) => {
-            let _device = target.device();
-            crate::kernel::status::DriverError::InvalidDeviceRequest.ntstatus()
-        }
-        Err(error) => error.ntstatus(),
+        Ok(target) => target.finish_result(Err(DriverError::InvalidDeviceRequest)),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
@@ -226,7 +220,7 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
 }
 
 /// Handles path-scoped user FSCTL requests.
-fn user_fs_control(request: UserFsControlRequest) -> DriverResult<DriverCompletion> {
+fn user_fs_control(request: UserFsControlRequest) -> DriverResult<IrpCompletion> {
     match request.fs_control_code() {
         FsControlCode::GetReparsePoint => {
             reparse::get_reparse_point(request.target(), request.stack())

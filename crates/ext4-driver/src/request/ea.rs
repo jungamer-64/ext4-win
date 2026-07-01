@@ -2,10 +2,10 @@
 
 use alloc::vec::Vec;
 use ext4_core::{XattrName, XattrNamespace, XattrValue};
-use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
+use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP};
 
 use crate::irp::{
-    DispatchTarget, DriverCompletion, EaEntryEmission, EaNameSelection, QueryEaStack, SetEaStack,
+    DispatchTarget, EaEntryEmission, EaNameSelection, IrpCompletion, QueryEaStack, SetEaStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{FileControlBlock, OpenedFileObject, VolumeControlBlock};
@@ -34,29 +34,20 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 
 /// Handles IRP_MJ_QUERY_EA.
 pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(QueryEaRequest::decode) {
-        Ok(request) => match query_ea(&request) {
-            Ok(completion) => {
-                request.target.complete(completion);
-                STATUS_SUCCESS
-            }
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => target
+            .finish_result(QueryEaRequest::decode(target).and_then(|request| query_ea(&request))),
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
 /// Handles IRP_MJ_SET_EA.
 pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp).and_then(SetEaRequest::decode) {
-        Ok(request) => match set_ea(&request) {
-            Ok(completion) => {
-                request.target.complete(completion);
-                STATUS_SUCCESS
-            }
-            Err(error) => error.ntstatus(),
-        },
-        Err(error) => error.ntstatus(),
+    match DispatchTarget::decode(device, irp) {
+        Ok(target) => {
+            target.finish_result(SetEaRequest::decode(target).and_then(|request| set_ea(&request)))
+        }
+        Err(error) => DispatchTarget::finish_decode_error(irp, error),
     }
 }
 
@@ -210,7 +201,7 @@ enum WindowsEaSelection {
 }
 
 /// Performs an EA query against mounted ext4 xattrs.
-fn query_ea(request: &QueryEaRequest) -> DriverResult<DriverCompletion> {
+fn query_ea(request: &QueryEaRequest) -> DriverResult<IrpCompletion> {
     let mut entries = collect_query_entries(&request.opened_file, request.stack)?;
     if matches!(request.stack.entry_emission(), EaEntryEmission::Single) && entries.len() > 1 {
         entries.truncate(1);
@@ -226,14 +217,14 @@ fn query_ea(request: &QueryEaRequest) -> DriverResult<DriverCompletion> {
     }
     let mut output = request.target.data_output(length)?;
     let written = pack_full_ea_entries(entries.as_slice(), output.as_mut_slice())?;
-    DriverCompletion::from_usize(written)
+    IrpCompletion::from_usize(written)
 }
 
 /// Applies set-EA records to `user.ext4win.ea.*` xattrs.
-fn set_ea(request: &SetEaRequest) -> DriverResult<DriverCompletion> {
+fn set_ea(request: &SetEaRequest) -> DriverResult<IrpCompletion> {
     let entries = parse_set_ea_entries(request.target, request.stack)?;
     apply_set_ea_entries(&request.opened_file, entries.as_slice())?;
-    Ok(DriverCompletion::EMPTY)
+    Ok(IrpCompletion::EMPTY)
 }
 
 /// Collects Windows EA entries selected by a query request.
