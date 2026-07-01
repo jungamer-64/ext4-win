@@ -5,11 +5,11 @@ use core::ptr::NonNull;
 
 use crate::irp::{DispatchTarget, FileSystemControlStack, IrpCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::state::{OpenedFileObject, VolumeControlBlock};
+use crate::state::{OpenedObject, OpenedRegularFile, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{
     FscryptKeyIdentifier, FscryptKeyPresence, FscryptMasterKey, FsverityBlockSize, FsverityEnable,
-    FsverityHashAlgorithm, FsveritySalt, FsveritySignature, NodeId,
+    FsverityHashAlgorithm, FsveritySalt, FsveritySignature,
 };
 
 /// Linux `FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER`.
@@ -112,10 +112,7 @@ pub(crate) fn enable_verity(
     let payload = read_input(target, stack)
         .and_then(|input| FsverityEnablePayload::parse(input.as_slice()))?;
     let enable = payload.into_core_enable();
-    let opened_file = OpenedFileObject::decode(stack.file_object())?;
-    let NodeId::File(file_id) = opened_file.node() else {
-        return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
-    };
+    let opened_file = OpenedRegularFile::decode(stack.file_object())?;
     let mut vcb = opened_file.volume();
     let vcb = unsafe {
         // SAFETY: FCBs only store live mounted VCB pointers. The mutable borrow
@@ -125,7 +122,7 @@ pub(crate) fn enable_verity(
     let mut transaction = vcb
         .volume_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let file = transaction.file(file_id)?;
+    let file = transaction.file(opened_file.id())?;
     transaction.enable_verity(file, &enable)?;
     transaction.commit()?;
     Ok(IrpCompletion::EMPTY)
@@ -451,7 +448,7 @@ fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> DriverRe
 
 /// Returns a mounted VCB from a path-scoped FSCTL stack.
 fn mounted_vcb(stack: FileSystemControlStack) -> DriverResult<NonNull<VolumeControlBlock>> {
-    Ok(OpenedFileObject::decode(stack.file_object())?.volume())
+    Ok(OpenedObject::decode(stack.file_object())?.volume())
 }
 
 /// Returns a METHOD_BUFFERED output buffer after stack length validation.

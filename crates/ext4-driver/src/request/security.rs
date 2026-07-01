@@ -11,7 +11,7 @@ use crate::irp::{
     SecuritySelection, SetSecurityStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::state::{FileControlBlock, OpenedFileObject, VolumeControlBlock};
+use crate::state::{FileControlBlock, OpenedObject, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
 /// SECURITY_DESCRIPTOR_RELATIVE byte size.
@@ -71,14 +71,14 @@ struct QuerySecurityRequest {
     /// Decoded query-security stack.
     stack: QuerySecurityStack,
     /// Opened file contexts decoded before security handling.
-    opened_file: OpenedFileObject,
+    opened_file: OpenedObject,
 }
 
 impl QuerySecurityRequest {
     /// Decodes a query-security request.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.query_security()?;
-        let opened_file = OpenedFileObject::decode(stack.file_object())?;
+        let opened_file = OpenedObject::decode(stack.file_object())?;
         Ok(Self {
             target,
             stack,
@@ -93,14 +93,14 @@ struct SetSecurityRequest {
     /// Decoded set-security stack.
     stack: SetSecurityStack,
     /// Opened file contexts decoded before security handling.
-    opened_file: OpenedFileObject,
+    opened_file: OpenedObject,
 }
 
 impl SetSecurityRequest {
     /// Decodes a set-security request.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.set_security()?;
-        let opened_file = OpenedFileObject::decode(stack.file_object())?;
+        let opened_file = OpenedObject::decode(stack.file_object())?;
         Ok(Self { stack, opened_file })
     }
 }
@@ -362,14 +362,12 @@ fn set_security(request: &SetSecurityRequest) -> DriverResult<IrpCompletion> {
 }
 
 /// Loads ext4 security metadata for an opened node.
-fn load_ext4_security(opened_file: &OpenedFileObject) -> DriverResult<Ext4Security> {
+fn load_ext4_security(opened_file: &OpenedObject) -> DriverResult<Ext4Security> {
     load_ext4_security_context(opened_file).map(|context| context.security)
 }
 
 /// Loads ext4 security context for an opened node.
-fn load_ext4_security_context(
-    opened_file: &OpenedFileObject,
-) -> DriverResult<OpenedSecurityContext> {
+fn load_ext4_security_context(opened_file: &OpenedObject) -> DriverResult<OpenedSecurityContext> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
     Ok(OpenedSecurityContext {

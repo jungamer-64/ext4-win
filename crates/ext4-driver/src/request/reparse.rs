@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use crate::irp::{DispatchTarget, FileSystemControlStack, IrpCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::request::metadata;
-use crate::state::{FileControlBlock, OpenedFileObject, OpenedPath, VolumeControlBlock};
+use crate::state::{FileControlBlock, OpenedObject, OpenedPath, OpenedSymlink, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{NodeId, SymlinkNodeId, SymlinkTarget};
 
@@ -52,13 +52,10 @@ pub(crate) fn set_reparse_point(
 
 /// Reads the target bytes for the symlink opened by the FSCTL.
 fn read_symlink_target(stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
-    let opened_file = OpenedFileObject::decode(stack.file_object())?;
+    let opened_file = OpenedSymlink::decode(stack.file_object())?;
     let fcb = opened_file.file_control_block();
-    let NodeId::Symlink(symlink_id) = opened_file.node() else {
-        return Err(DriverError::NotAReparsePoint);
-    };
     let vcb = volume_control_block(fcb);
-    read_core_symlink(vcb, symlink_id)
+    read_core_symlink(vcb, opened_file.id())
 }
 
 /// Reads a symlink inode through ext4-core.
@@ -82,8 +79,8 @@ fn replace_opened_path_with_symlink(
     stack: FileSystemControlStack,
     target: &SymlinkTarget,
 ) -> DriverResult<()> {
-    let mut opened_file = OpenedFileObject::decode(stack.file_object())?;
-    let OpenedPath::Child { parent, name } = opened_file.handle().path().clone() else {
+    let mut opened_file = OpenedObject::decode(stack.file_object())?;
+    let OpenedPath::Child { parent, name } = opened_file.path().clone() else {
         return Err(DriverError::NotSupported);
     };
 
@@ -110,9 +107,7 @@ fn replace_opened_path_with_symlink(
         metadata::default_symlink_metadata()?,
     )?;
     transaction.commit()?;
-    let node = NodeId::Symlink(symlink.id());
-    opened_file.file_control_block_mut().replace_node(node);
-    opened_file.handle_mut().replace_node(node);
+    opened_file.replace_with_symlink(symlink.id());
     Ok(())
 }
 

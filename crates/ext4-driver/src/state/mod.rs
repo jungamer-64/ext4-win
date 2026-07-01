@@ -7,8 +7,9 @@ use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    DeviceLength, DirectoryNodeId, Ext4Name, FscryptKeyIdentifier, FscryptKeyPresence,
+    DeviceLength, DirectoryNodeId, Ext4Name, FileNodeId, FscryptKeyIdentifier, FscryptKeyPresence,
     FscryptKeySet, FscryptMasterKey, JournaledVolume, MountContext, NodeId, Result as Ext4Result,
+    SymlinkNodeId,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT,
@@ -746,31 +747,58 @@ pub(crate) enum CloseDisposition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Common per-handle state shared by every opened node kind.
+pub(crate) struct OpenedHandleState {
+    /// Path used for namespace mutations on cleanup.
+    path: OpenedPath,
+    /// Requested close disposition.
+    close_disposition: CloseDisposition,
+}
+
+impl OpenedHandleState {
+    /// Creates shared per-handle state.
+    const fn new(path: OpenedPath, close_disposition: CloseDisposition) -> Self {
+        Self {
+            path,
+            close_disposition,
+        }
+    }
+
+    /// Returns the opened path identity.
+    const fn path(&self) -> &OpenedPath {
+        &self.path
+    }
+
+    /// Replaces the opened path after a successful rename.
+    fn replace_path(&mut self, path: OpenedPath) {
+        self.path = path;
+    }
+
+    /// Returns the requested close disposition.
+    const fn close_disposition(&self) -> CloseDisposition {
+        self.close_disposition
+    }
+
+    /// Replaces the requested close disposition.
+    const fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
+        self.close_disposition = close_disposition;
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 /// Per-handle state stored in `FILE_OBJECT::FsContext2`.
 pub(crate) enum OpenedHandle {
     /// Regular file handle.
-    File {
-        /// Path used for namespace mutations on cleanup.
-        path: OpenedPath,
-        /// Requested close disposition.
-        close_disposition: CloseDisposition,
-    },
+    File(OpenedHandleState),
     /// Directory handle with enumeration cursor.
     Directory {
+        /// Shared per-handle state.
+        state: OpenedHandleState,
         /// Directory enumeration cursor.
         cursor: DirectoryCursor,
-        /// Path used for namespace mutations on cleanup.
-        path: OpenedPath,
-        /// Requested close disposition.
-        close_disposition: CloseDisposition,
     },
     /// Symlink handle.
-    Symlink {
-        /// Path used for namespace mutations on cleanup.
-        path: OpenedPath,
-        /// Requested close disposition.
-        close_disposition: CloseDisposition,
-    },
+    Symlink(OpenedHandleState),
 }
 
 impl OpenedHandle {
@@ -781,65 +809,61 @@ impl OpenedHandle {
 
     /// Creates per-handle state from explicit lifecycle fields.
     fn from_parts(node: NodeId, path: OpenedPath, close_disposition: CloseDisposition) -> Self {
+        let state = OpenedHandleState::new(path, close_disposition);
         match node {
-            NodeId::File(_) => Self::File {
-                path,
-                close_disposition,
-            },
+            NodeId::File(_) => Self::File(state),
             NodeId::Directory(_) => Self::Directory {
+                state,
                 cursor: DirectoryCursor::start(),
-                path,
-                close_disposition,
             },
-            NodeId::Symlink(_) => Self::Symlink {
-                path,
-                close_disposition,
-            },
+            NodeId::Symlink(_) => Self::Symlink(state),
         }
     }
 
     /// Returns the requested close disposition.
-    pub(crate) const fn close_disposition(&self) -> CloseDisposition {
-        match self {
-            Self::File {
-                close_disposition, ..
-            }
-            | Self::Directory {
-                close_disposition, ..
-            }
-            | Self::Symlink {
-                close_disposition, ..
-            } => *close_disposition,
-        }
+    const fn close_disposition(&self) -> CloseDisposition {
+        self.state().close_disposition()
     }
 
     /// Returns the opened path identity.
-    pub(crate) const fn path(&self) -> &OpenedPath {
-        match self {
-            Self::File { path, .. } | Self::Directory { path, .. } | Self::Symlink { path, .. } => {
-                path
-            }
-        }
+    const fn path(&self) -> &OpenedPath {
+        self.state().path()
+    }
+
+    /// Replaces the requested close disposition.
+    const fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
+        self.state_mut().set_close_disposition(close_disposition);
     }
 
     /// Replaces the opened path after a successful rename.
-    pub(crate) fn replace_path(&mut self, path: OpenedPath) {
-        *self.path_mut() = path;
+    fn replace_path(&mut self, path: OpenedPath) {
+        self.state_mut().replace_path(path);
     }
 
-    /// Returns the mutable opened path field for this handle variant.
-    fn path_mut(&mut self) -> &mut OpenedPath {
+    /// Converts the per-handle state to a symlink handle after namespace conversion.
+    fn replace_with_symlink(&mut self) {
+        let state = self.state().clone();
+        *self = Self::Symlink(state);
+    }
+
+    /// Returns shared handle state.
+    const fn state(&self) -> &OpenedHandleState {
         match self {
-            Self::File { path, .. } | Self::Directory { path, .. } | Self::Symlink { path, .. } => {
-                path
-            }
+            Self::File(state) | Self::Symlink(state) | Self::Directory { state, .. } => state,
+        }
+    }
+
+    /// Returns mutable shared handle state.
+    const fn state_mut(&mut self) -> &mut OpenedHandleState {
+        match self {
+            Self::File(state) | Self::Symlink(state) | Self::Directory { state, .. } => state,
         }
     }
 }
 
 /// FILE_OBJECT whose FCB and CCB contexts have both been initialized by create.
 #[derive(Debug)]
-pub(crate) struct OpenedFileObject {
+pub(crate) struct OpenedObject {
     /// Kernel FILE_OBJECT carrying the contexts.
     file_object: KernelFileObject,
     /// Shared file control block stored in FsContext.
@@ -848,8 +872,12 @@ pub(crate) struct OpenedFileObject {
     handle: NonNull<OpenedHandle>,
 }
 
-impl OpenedFileObject {
+impl OpenedObject {
     /// Decodes an initialized FILE_OBJECT context pair.
+    ///
+    /// # Errors
+    /// Returns an error when either filesystem context pointer is absent or
+    /// when the shared FCB node kind does not match the per-handle state kind.
     pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
         let object = unsafe {
             // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack
@@ -860,11 +888,13 @@ impl OpenedFileObject {
             .ok_or(DriverError::InvalidParameter)?;
         let handle = NonNull::new(object.FsContext2.cast::<OpenedHandle>())
             .ok_or(DriverError::InvalidParameter)?;
-        Ok(Self {
+        let opened = Self {
             file_object,
             fcb,
             handle,
-        })
+        };
+        opened.validate_handle_kind()?;
+        Ok(opened)
     }
 
     /// Returns the kernel FILE_OBJECT associated with this opened handle.
@@ -875,6 +905,43 @@ impl OpenedFileObject {
     /// Returns the mounted VCB pointer owning this opened node.
     pub(crate) fn volume(&self) -> NonNull<VolumeControlBlock> {
         self.file_control_block().volume()
+    }
+
+    /// Returns the ext4 node identity owned by the shared FCB.
+    pub(crate) fn node(&self) -> NodeId {
+        self.file_control_block().node()
+    }
+
+    /// Returns the opened path identity.
+    pub(crate) fn path(&self) -> &OpenedPath {
+        self.handle().path()
+    }
+
+    /// Replaces the opened path after a successful rename.
+    pub(crate) fn replace_path(&mut self, path: OpenedPath) {
+        self.mutable_handle().replace_path(path);
+    }
+
+    /// Returns the requested close disposition.
+    pub(crate) fn close_disposition(&self) -> CloseDisposition {
+        self.handle().close_disposition()
+    }
+
+    /// Replaces the requested close disposition.
+    pub(crate) fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
+        self.mutable_handle()
+            .set_close_disposition(close_disposition);
+    }
+
+    /// Converts this opened child state to the symlink produced by reparse SET.
+    pub(crate) fn replace_with_symlink(&mut self, symlink: SymlinkNodeId) {
+        let fcb = unsafe {
+            // SAFETY: This method updates the shared FCB identity and the
+            // per-handle variant together, keeping FILE_OBJECT contexts aligned.
+            self.fcb.as_mut()
+        };
+        fcb.node = NodeId::Symlink(symlink);
+        self.mutable_handle().replace_with_symlink();
     }
 
     /// Returns the decoded file control block.
@@ -888,7 +955,7 @@ impl OpenedFileObject {
     }
 
     /// Returns the decoded per-handle state.
-    pub(crate) fn handle(&self) -> &OpenedHandle {
+    fn handle(&self) -> &OpenedHandle {
         unsafe {
             // SAFETY: `decode` only constructs this type from a non-null
             // FsContext2 written by successful create and used during the
@@ -897,6 +964,146 @@ impl OpenedFileObject {
         }
     }
 
+    /// Returns mutable per-handle state for atomic state transitions.
+    fn mutable_handle(&mut self) -> &mut OpenedHandle {
+        unsafe {
+            // SAFETY: Mutating handle-local state is limited to `OpenedObject`
+            // methods that keep it aligned with the FCB node kind.
+            self.handle.as_mut()
+        }
+    }
+
+    /// Rejects corrupted FILE_OBJECT contexts whose FCB and handle kind disagree.
+    ///
+    /// # Errors
+    /// Returns an error when FCB node identity and handle variant encode
+    /// different node kinds.
+    fn validate_handle_kind(&self) -> DriverResult<()> {
+        match (self.node(), self.handle()) {
+            (NodeId::File(_), OpenedHandle::File(_))
+            | (NodeId::Directory(_), OpenedHandle::Directory { .. })
+            | (NodeId::Symlink(_), OpenedHandle::Symlink(_)) => Ok(()),
+            _ => Err(DriverError::InvalidParameter),
+        }
+    }
+}
+
+#[derive(Debug)]
+/// Opened regular file decoded from a FILE_OBJECT context pair.
+pub(crate) struct OpenedRegularFile {
+    /// Opened object context validated as a regular file.
+    opened: OpenedObject,
+    /// Typed file node identity.
+    id: FileNodeId,
+}
+
+impl OpenedRegularFile {
+    /// Decodes an opened FILE_OBJECT and requires a regular-file node.
+    ///
+    /// # Errors
+    /// Returns an error when the FILE_OBJECT contexts are invalid or when the
+    /// opened node is not a regular file.
+    pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
+        let opened = OpenedObject::decode(file_object)?;
+        let NodeId::File(id) = opened.node() else {
+            return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
+        };
+        Ok(Self { opened, id })
+    }
+
+    /// Returns the typed regular-file identity.
+    pub(crate) const fn id(&self) -> FileNodeId {
+        self.id
+    }
+
+    /// Returns the mounted VCB pointer owning this opened file.
+    pub(crate) fn volume(&self) -> NonNull<VolumeControlBlock> {
+        self.opened.volume()
+    }
+}
+
+#[derive(Debug)]
+/// Opened directory decoded from a FILE_OBJECT context pair.
+pub(crate) struct OpenedDirectory {
+    /// Opened object context validated as a directory.
+    opened: OpenedObject,
+    /// Typed directory node identity.
+    id: DirectoryNodeId,
+    /// Directory cursor stored in the directory handle variant.
+    cursor: NonNull<DirectoryCursor>,
+}
+
+impl OpenedDirectory {
+    /// Decodes an opened FILE_OBJECT and requires a directory node.
+    ///
+    /// # Errors
+    /// Returns an error when the FILE_OBJECT contexts are invalid or when the
+    /// opened node is not a directory.
+    pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
+        let mut opened = OpenedObject::decode(file_object)?;
+        let NodeId::Directory(id) = opened.node() else {
+            return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
+        };
+        let OpenedHandle::Directory { cursor, .. } = opened.mutable_handle() else {
+            return Err(DriverError::InvalidParameter);
+        };
+        let cursor = NonNull::from(cursor);
+        Ok(Self { opened, id, cursor })
+    }
+
+    /// Returns the typed directory identity.
+    pub(crate) const fn id(&self) -> DirectoryNodeId {
+        self.id
+    }
+
+    /// Returns the mounted VCB pointer owning this opened directory.
+    pub(crate) fn volume(&self) -> NonNull<VolumeControlBlock> {
+        self.opened.volume()
+    }
+
+    /// Returns the mutable directory enumeration cursor.
+    pub(crate) fn cursor_mut(&mut self) -> &mut DirectoryCursor {
+        unsafe {
+            // SAFETY: `cursor` points into the live directory handle variant
+            // validated during decode. This type exposes no variant-changing
+            // operation.
+            self.cursor.as_mut()
+        }
+    }
+}
+
+#[derive(Debug)]
+/// Opened symbolic link decoded from a FILE_OBJECT context pair.
+pub(crate) struct OpenedSymlink {
+    /// Opened object context validated as a symlink.
+    opened: OpenedObject,
+    /// Typed symlink node identity.
+    id: SymlinkNodeId,
+}
+
+impl OpenedSymlink {
+    /// Decodes an opened FILE_OBJECT and requires a symbolic-link node.
+    ///
+    /// # Errors
+    /// Returns an error when the FILE_OBJECT contexts are invalid or when the
+    /// opened node is not a symbolic link.
+    pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
+        let opened = OpenedObject::decode(file_object)?;
+        let NodeId::Symlink(id) = opened.node() else {
+            return Err(DriverError::NotAReparsePoint);
+        };
+        Ok(Self { opened, id })
+    }
+
+    /// Returns the typed symlink identity.
+    pub(crate) const fn id(&self) -> SymlinkNodeId {
+        self.id
+    }
+
+    /// Returns the shared file control block.
+    pub(crate) fn file_control_block(&self) -> &FileControlBlock {
+        self.opened.file_control_block()
+    }
 }
 
 /// Releases one FILE_OBJECT reference to a VCB-owned FCB.
@@ -940,11 +1147,13 @@ mod tests {
 
     use ext4_core::{DirectoryNodeId, NodeId};
 
+    use crate::irp::DirectoryEntryIndex;
     use crate::kernel::status::DriverError;
 
     use super::{
-        FileControlBlock, FileControlBlockRelease, KernelFileObject, OpenedFileObject,
-        UninitializedFileObject, VolumeControlBlock,
+        CloseDisposition, FileControlBlock, FileControlBlockRelease, KernelFileObject,
+        OpenedDirectory, OpenedHandle, OpenedHandleState, OpenedObject, OpenedPath,
+        OpenedRegularFile, OpenedSymlink, UninitializedFileObject, VolumeControlBlock,
     };
 
     fn file_object_with_contexts(
@@ -969,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn opened_file_object_requires_both_contexts() {
+    fn opened_object_requires_both_contexts() {
         let mut file = file_object_with_contexts(core::ptr::null_mut(), core::ptr::null_mut());
         let file_object = kernel_file_object(&mut file);
         assert!(file_object.is_some());
@@ -978,7 +1187,7 @@ mod tests {
         };
 
         assert_eq!(
-            OpenedFileObject::decode(file_object).err(),
+            OpenedObject::decode(file_object).err(),
             Some(DriverError::InvalidParameter)
         );
 
@@ -992,7 +1201,7 @@ mod tests {
             return;
         };
         assert_eq!(
-            OpenedFileObject::decode(file_object).err(),
+            OpenedObject::decode(file_object).err(),
             Some(DriverError::InvalidParameter)
         );
 
@@ -1006,9 +1215,168 @@ mod tests {
             return;
         };
         assert_eq!(
-            OpenedFileObject::decode(file_object).err(),
+            OpenedObject::decode(file_object).err(),
             Some(DriverError::InvalidParameter)
         );
+    }
+
+    #[test]
+    fn opened_object_rejects_mismatched_fcb_and_handle_kinds() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::File(OpenedHandleState::new(
+            OpenedPath::Root,
+            CloseDisposition::Keep,
+        ));
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+
+        assert_eq!(
+            OpenedObject::decode(file_object).err(),
+            Some(DriverError::InvalidParameter)
+        );
+    }
+
+    #[test]
+    fn typed_opened_directory_exposes_cursor_without_option() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedPath::Root,
+            CloseDisposition::Keep,
+        );
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        let directory = OpenedDirectory::decode(file_object);
+        assert!(directory.is_ok());
+        let Ok(mut directory) = directory else {
+            return;
+        };
+
+        assert_eq!(directory.id(), DirectoryNodeId::ROOT);
+        assert_eq!(
+            directory.cursor_mut().next_entry(),
+            DirectoryEntryIndex::from_u32(0)
+        );
+        directory
+            .cursor_mut()
+            .seek(DirectoryEntryIndex::from_u32(7));
+        assert_eq!(
+            directory.cursor_mut().next_entry(),
+            DirectoryEntryIndex::from_u32(7)
+        );
+    }
+
+    #[test]
+    fn typed_opened_decoders_reject_wrong_node_kind() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedPath::Root,
+            CloseDisposition::Keep,
+        );
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+
+        assert_eq!(
+            OpenedRegularFile::decode(file_object).err(),
+            Some(DriverError::Core(ext4_core::Error::WrongInodeKind))
+        );
+        assert_eq!(
+            OpenedSymlink::decode(file_object).err(),
+            Some(DriverError::NotAReparsePoint)
+        );
+    }
+
+    #[test]
+    fn opened_object_updates_close_disposition() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedPath::Root,
+            CloseDisposition::Keep,
+        );
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        let opened = OpenedObject::decode(file_object);
+        assert!(opened.is_ok());
+        let Ok(mut opened) = opened else {
+            return;
+        };
+
+        opened.set_close_disposition(CloseDisposition::Delete);
+        assert_eq!(opened.close_disposition(), CloseDisposition::Delete);
+        opened.set_close_disposition(CloseDisposition::Keep);
+        assert_eq!(opened.close_disposition(), CloseDisposition::Keep);
+    }
+
+    #[test]
+    fn opened_object_symlink_conversion_updates_fcb_and_handle_together() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedPath::Root,
+            CloseDisposition::Delete,
+        );
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        let opened = OpenedObject::decode(file_object);
+        assert!(opened.is_ok());
+        let Ok(mut opened) = opened else {
+            return;
+        };
+        let symlink = unsafe {
+            // SAFETY: `SymlinkNodeId` is an opaque integer identity wrapper.
+            // This unit test never sends the fabricated id into ext4-core; it
+            // only verifies that one atomic state method updates both local
+            // FILE_OBJECT contexts to the same supplied identity.
+            core::mem::zeroed()
+        };
+
+        opened.replace_with_symlink(symlink);
+
+        assert_eq!(opened.node(), NodeId::Symlink(symlink));
+        assert_eq!(opened.close_disposition(), CloseDisposition::Delete);
+        assert!(matches!(handle, OpenedHandle::Symlink(_)));
     }
 
     #[test]
