@@ -2,6 +2,7 @@
 
 use super::scope::*;
 
+#[cfg(test)]
 impl<D, N> ReadOnlyVolume<D, N>
 where
     D: BlockReader,
@@ -16,29 +17,6 @@ where
     #[must_use]
     pub(crate) const fn geometry(&self) -> VolumeGeometry {
         self.volume.geometry()
-    }
-
-    /// Adds one fscrypt master key to this mounted volume.
-    ///
-    /// # Errors
-    /// Returns an error when the key identifier is already present.
-    pub(crate) fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> Result<()> {
-        self.volume.add_fscrypt_key(key)
-    }
-
-    /// Removes one fscrypt master key from this mounted volume.
-    #[must_use]
-    pub(crate) fn remove_fscrypt_key(
-        &mut self,
-        identifier: FscryptKeyIdentifier,
-    ) -> Option<FscryptMasterKey> {
-        self.volume.remove_fscrypt_key(identifier)
-    }
-
-    /// Returns this mounted volume's fscrypt key presence for one identifier.
-    #[must_use]
-    pub(crate) fn fscrypt_key_presence(&self, identifier: FscryptKeyIdentifier) -> FscryptKeyPresence {
-        self.volume.fscrypt_key_presence(identifier)
     }
 
     /// Loads a regular file by previously validated file identity.
@@ -77,6 +55,7 @@ where
     ///
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
+    #[cfg(test)]
     pub(crate) fn read_xattr(&self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>> {
         self.volume.read_inode_xattr(node.inode(), name)
     }
@@ -85,6 +64,7 @@ where
     ///
     /// # Errors
     /// Returns an error when the backing xattr or ACL payload is malformed.
+    #[cfg(test)]
     pub(crate) fn read_posix_acl(
         &self,
         node: NodeId,
@@ -105,6 +85,7 @@ where
     ///
     /// # Errors
     /// Returns an error when the inode's xattr storage is malformed or the stored fscrypt context is not in the supported v2 AES profile.
+    #[cfg(test)]
     pub(crate) fn read_fscrypt_context(&self, node: NodeId) -> Result<Option<FscryptContextV2>> {
         self.volume.read_inode_fscrypt_context(node.inode())
     }
@@ -142,6 +123,7 @@ where
     ///
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
+    #[cfg(test)]
     pub(crate) fn lookup_child(
         &self,
         parent: &DirectoryNode,
@@ -162,7 +144,7 @@ where
         self.volume.lookup_windows_child(parent, requested)
     }
 }
-impl<D, J, N> JournaledVolume<D, J, N>
+impl<D, N, J> JournaledVolume<D, N, J>
 where
     D: BlockReader,
 {
@@ -237,20 +219,9 @@ where
     ///
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
+    #[cfg(test)]
     pub(crate) fn read_xattr(&self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>> {
         self.volume.read_inode_xattr(node.inode(), name)
-    }
-
-    /// Reads a POSIX ACL from its ext4 xattr slot.
-    ///
-    /// # Errors
-    /// Returns an error when the backing xattr or ACL payload is malformed.
-    pub(crate) fn read_posix_acl(
-        &self,
-        node: NodeId,
-        kind: PosixAclKind,
-    ) -> Result<Option<PosixAcl>> {
-        self.volume.read_inode_posix_acl(node.inode(), kind)
     }
 
     /// Reads Windows overlay metadata isolated in user.ext4win.* xattrs.
@@ -259,14 +230,6 @@ where
     /// Returns an error when the overlay xattr payload is malformed.
     pub fn read_windows_overlay(&self, node: NodeId) -> Result<Option<WindowsOverlay>> {
         self.volume.read_inode_windows_overlay(node.inode())
-    }
-
-    /// Reads the fscrypt v2 context stored in ext4's private inode xattr slot.
-    ///
-    /// # Errors
-    /// Returns an error when the inode's xattr storage is malformed or the stored fscrypt context is not in the supported v2 AES profile.
-    pub(crate) fn read_fscrypt_context(&self, node: NodeId) -> Result<Option<FscryptContextV2>> {
-        self.volume.read_inode_fscrypt_context(node.inode())
     }
 
     /// Reads file bytes from a typed regular file node.
@@ -302,6 +265,7 @@ where
     ///
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
+    #[cfg(test)]
     pub(crate) fn lookup_child(
         &self,
         parent: &DirectoryNode,
@@ -420,6 +384,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the backing xattr or ACL payload is malformed.
+    #[cfg(test)]
     pub(super) fn read_inode_posix_acl(
         &self,
         inode_id: InodeId,
@@ -766,6 +731,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
+    #[cfg(test)]
     pub(super) fn lookup_child(
         &self,
         parent: &DirectoryNode,
@@ -792,7 +758,6 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
                 parent.id(),
                 entry.name(),
                 *entry.node(),
-                entry.entry_kind(),
             ))),
             None => Ok(ChildLookup::NotFound),
         }
@@ -852,18 +817,14 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Converts a directory entry into a child whose inode kind is validated.
+    #[cfg(test)]
     pub(super) fn directory_child(
         &self,
         parent: &DirectoryNode,
         entry: RawDirectoryEntry,
     ) -> Result<DirectoryChild> {
         let node = self.load_inode_node(entry.inode())?.id();
-        Ok(DirectoryChild::new(
-            parent.id(),
-            entry.name(),
-            node,
-            entry.kind(),
-        ))
+        Ok(DirectoryChild::new(parent.id(), entry.name(), node))
     }
 
     /// Converts raw directory entries into public entries with validated node identity.

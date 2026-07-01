@@ -270,12 +270,6 @@ impl SymlinkNode {
         self.inode.links_count()
     }
 
-    /// Contents protection selected by symlink inode flags.
-    #[must_use]
-    pub(crate) const fn protection(&self) -> InodeProtection {
-        self.inode.protection()
-    }
-
     /// Returns the backing inode for volume-internal operations.
     pub(super) fn inode(&self) -> &Inode {
         &self.inode
@@ -291,23 +285,15 @@ pub struct DirectoryChild {
     name: Ext4Name,
     /// Typed child identity.
     node: NodeId,
-    /// File type recorded in the directory entry.
-    entry_kind: DirectoryEntryKind,
 }
 
 impl DirectoryChild {
     /// Creates a typed directory child after validating the referenced inode.
-    pub(super) fn new(
-        parent: DirectoryNodeId,
-        name: &Ext4Name,
-        node: NodeId,
-        entry_kind: DirectoryEntryKind,
-    ) -> Self {
+    pub(super) fn new(parent: DirectoryNodeId, name: &Ext4Name, node: NodeId) -> Self {
         Self {
             parent,
             name: name.clone(),
             node,
-            entry_kind,
         }
     }
 
@@ -327,12 +313,6 @@ impl DirectoryChild {
     #[must_use]
     pub const fn node(&self) -> &NodeId {
         &self.node
-    }
-
-    /// File type recorded in the directory entry.
-    #[must_use]
-    pub(crate) const fn entry_kind(&self) -> DirectoryEntryKind {
-        self.entry_kind
     }
 }
 
@@ -371,6 +351,7 @@ impl DirectoryEntry {
 
     /// File type recorded in the directory entry.
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn entry_kind(&self) -> DirectoryEntryKind {
         self.entry_kind
     }

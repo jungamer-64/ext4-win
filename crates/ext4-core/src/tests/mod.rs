@@ -17,6 +17,7 @@ use crate::disk::block::{
     BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset, DeviceLength, SliceBlockDevice,
     SliceBlockDeviceMut,
 };
+use crate::disk_format::acl::{PosixAcl, PosixAclEntry, PosixAclKind};
 use crate::disk_format::dir::{DirectoryEntry as RawDirectoryEntry, DirectoryEntryKind};
 use crate::disk_format::extent::{
     BlockMapping, Extent, ExtentLength, ExtentTree, ExtentTreeContext, LogicalBlock,
@@ -25,17 +26,20 @@ use crate::disk_format::extent::{
 use crate::disk_format::inode::{InodeExtentRoot, InodeId, InodeProtection};
 use crate::disk_format::superblock::{BlockGroupId, JournalMode, Superblock};
 use crate::disk_format::xattr::{self as xattr_storage, InodeXattrSet};
+use crate::protection::fscrypt::{FscryptContextV2, FscryptNoNonceGenerator};
+use crate::protection::verity::{
+    Ext4VerityMetadataLayout, FSVERITY_DESCRIPTOR_BYTES, FsverityDescriptor, FsverityMerkleTree,
+};
+use crate::volume::{ExternalJournal, ReadOnlyVolume};
 use crate::{
     DirectoryEntry, DirectoryNode, DirectoryNodeId, Error, Ext4Gid, Ext4Name, Ext4Owner,
-    Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, Ext4VerityMetadataLayout,
-    Ext4VolumeLabel, Ext4WindowsAttributes, ExternalJournal, FSVERITY_DESCRIPTOR_BYTES, FileNode,
-    FileNodeId, FileOffset, FileSize, FscryptContextV2, FscryptFileNonce, FscryptKeySet,
-    FscryptMasterKey, FscryptNoNonceGenerator, FscryptNonceGenerator, FsverityBlockSize,
-    FsverityDescriptor, FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt,
-    FsveritySignature, InternalJournal, JournalTransaction, JournaledVolume, MountContext,
-    NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, NodeId, PosixAcl, PosixAclEntry,
-    PosixAclKind, ReadOnlyVolume, SymlinkNode, SymlinkTarget, TransactionDirectory,
-    TransactionFile, WindowsName, WindowsOverlay, XattrName, XattrNamespace, XattrSet, XattrValue,
+    Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, Ext4VolumeLabel,
+    Ext4WindowsAttributes, FileNode, FileNodeId, FileOffset, FileSize, FscryptFileNonce,
+    FscryptKeySet, FscryptMasterKey, FscryptNonceGenerator, FsverityBlockSize, FsverityEnable,
+    FsverityHashAlgorithm, FsveritySalt, FsveritySignature, JournalTransaction, JournaledVolume,
+    MountContext, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, NodeId, SymlinkNode,
+    SymlinkTarget, TransactionDirectory, TransactionFile, WindowsName, WindowsOverlay, XattrName,
+    XattrNamespace, XattrSet, XattrValue,
 };
 
 const BLOCK_SIZE: usize = 1024;
@@ -193,7 +197,7 @@ impl<D: BlockReader, N> MountedVolumeTestExt for ReadOnlyVolume<D, N> {
     }
 }
 
-impl<D: BlockReader, J, N> MountedVolumeTestExt for JournaledVolume<D, J, N> {
+impl<D: BlockReader, N, J> MountedVolumeTestExt for JournaledVolume<D, N, J> {
     fn load_file(&self, id: FileNodeId) -> crate::Result<FileNode> {
         Self::load_file(self, id)
     }
@@ -368,22 +372,22 @@ fn lookup_windows_inode<V: MountedVolumeTestExt>(
     }
 }
 
-fn transaction_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &JournalTransaction<'_, D, J, N>,
+fn transaction_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
+    transaction: &JournalTransaction<'_, D, N, J>,
     file_id: FileNodeId,
 ) -> TransactionFile {
     must(transaction.file(file_id))
 }
 
-fn transaction_directory<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &JournalTransaction<'_, D, J, N>,
+fn transaction_directory<D: BlockWriter, N: FscryptNonceGenerator, J>(
+    transaction: &JournalTransaction<'_, D, N, J>,
     directory_id: DirectoryNodeId,
 ) -> TransactionDirectory {
     must(transaction.directory(directory_id))
 }
 
-fn transaction_node<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &JournalTransaction<'_, D, J, N>,
+fn transaction_node<D: BlockWriter, N: FscryptNonceGenerator, J>(
+    transaction: &JournalTransaction<'_, D, N, J>,
     id: NodeId,
 ) -> crate::TransactionNode {
     must(transaction.node(id))
@@ -405,11 +409,13 @@ fn test_symlink_metadata() -> NewSymlinkMetadata {
     NewSymlinkMetadata::new(test_owner(), must(Ext4Permissions::new(0o777)))
 }
 
-fn test_mount_context() -> MountContext {
+fn test_mount_context() -> MountContext<FscryptNoNonceGenerator> {
     MountContext::new(FscryptKeySet::empty(), FscryptNoNonceGenerator)
 }
 
-fn test_mount_context_with_key(master_key: FscryptMasterKey) -> MountContext {
+fn test_mount_context_with_key(
+    master_key: FscryptMasterKey,
+) -> MountContext<FscryptNoNonceGenerator> {
     MountContext::new(
         must(FscryptKeySet::from_keys(vec![master_key])),
         FscryptNoNonceGenerator,
@@ -501,8 +507,8 @@ fn encrypt_modern_root_file_name(image: &mut [u8], master_key: &FscryptMasterKey
     );
 }
 
-fn overwrite_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &mut JournalTransaction<'_, D, J, N>,
+fn overwrite_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
+    transaction: &mut JournalTransaction<'_, D, N, J>,
     file_id: FileNodeId,
     offset: u64,
     bytes: &[u8],
@@ -511,8 +517,8 @@ fn overwrite_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
     must(transaction.overwrite_file_range(file, FileOffset::from_bytes(offset), bytes));
 }
 
-fn extend_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &mut JournalTransaction<'_, D, J, N>,
+fn extend_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
+    transaction: &mut JournalTransaction<'_, D, N, J>,
     file_id: FileNodeId,
     new_size: u64,
 ) {
@@ -520,8 +526,8 @@ fn extend_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
     must(transaction.extend_file(file, FileSize::from_bytes(new_size)));
 }
 
-fn truncate_file<D: BlockWriter, J, N: FscryptNonceGenerator>(
-    transaction: &mut JournalTransaction<'_, D, J, N>,
+fn truncate_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
+    transaction: &mut JournalTransaction<'_, D, N, J>,
     file_id: FileNodeId,
     new_size: u64,
 ) {

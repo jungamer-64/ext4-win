@@ -78,6 +78,7 @@ const INCOMPAT_ENCRYPT: u32 = 0x0001_0000;
 /// Incompatible feature bit for casefolded directory lookup.
 const INCOMPAT_CASEFOLD: u32 = 0x0002_0000;
 /// Incompatible feature mask accepted for read-only traversal.
+#[cfg(test)]
 const SUPPORTED_READ_INCOMPAT: u32 = INCOMPAT_FILETYPE
     | INCOMPAT_EXTENTS
     | INCOMPAT_64BIT
@@ -113,6 +114,7 @@ const RO_COMPAT_VERITY: u32 = 0x8000;
 /// Read-only compatible feature bit indicating orphan cleanup is required.
 const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
 /// Read-only compatible feature mask accepted for read-only traversal.
+#[cfg(test)]
 const SUPPORTED_READ_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_LARGE_FILE
     | RO_COMPAT_HUGE_FILE
@@ -1034,6 +1036,7 @@ impl FeatureSet {
     /// # Errors
     /// Returns an error when the advertised feature set is outside the
     /// read-only mount policy.
+    #[cfg(test)]
     pub(crate) fn read_only(compat: u32, incompat: u32, read_only_compat: u32) -> Result<Self> {
         if incompat & !SUPPORTED_READ_INCOMPAT != 0 {
             return Err(Error::UnsupportedIncompatFeature);
@@ -1348,6 +1351,7 @@ impl Superblock {
     /// # Errors
     /// Returns an error when the primary superblock cannot be read or does not
     /// satisfy the clean v1 mount policy.
+    #[cfg(test)]
     pub fn read_from(device: &impl BlockReader) -> Result<Self> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
         device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
@@ -1369,6 +1373,7 @@ impl Superblock {
     /// # Errors
     /// Returns an error when the payload is truncated, has invalid ext4 magic,
     /// is dirty, advertises unsupported features, or contains invalid geometry.
+    #[cfg(test)]
     pub fn parse(raw: &[u8]) -> Result<Self> {
         Self::parse_with_policy(raw, FeatureSet::read_only)
     }

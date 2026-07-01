@@ -33,8 +33,6 @@ const ACL_UNDEFINED_ID: u32 = u32::MAX;
 pub enum PosixAclKind {
     /// `system.posix_acl_access`.
     Access,
-    /// `system.posix_acl_default`.
-    Default,
 }
 
 /// POSIX ACL associated with one inode.
@@ -53,14 +51,6 @@ impl PosixAcl {
         XattrName::new(XattrNamespace::System, b"posix_acl_access")
     }
 
-    /// Returns the xattr name for default directory ACLs.
-    ///
-    /// # Errors
-    /// Returns an error only if the fixed domain name is invalid.
-    pub fn default_xattr_name() -> Result<XattrName> {
-        XattrName::new(XattrNamespace::System, b"posix_acl_default")
-    }
-
     /// Returns the xattr name for the requested POSIX ACL slot.
     ///
     /// # Errors
@@ -68,7 +58,6 @@ impl PosixAcl {
     pub fn xattr_name(kind: PosixAclKind) -> Result<XattrName> {
         match kind {
             PosixAclKind::Access => Self::access_xattr_name(),
-            PosixAclKind::Default => Self::default_xattr_name(),
         }
     }
 
@@ -155,12 +144,6 @@ impl PosixAcl {
                 .ok_or(Error::ArithmeticOverflow)?;
         }
         XattrValue::new(&bytes)
-    }
-
-    /// Entries in canonical order.
-    #[must_use]
-    pub fn entries(&self) -> &[PosixAclEntry] {
-        &self.entries
     }
 }
 
