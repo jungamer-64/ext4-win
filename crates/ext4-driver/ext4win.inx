@@ -4,6 +4,8 @@
 
 [Version]
 Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider    = %ProviderName%
 DriverVer   =
 CatalogFile = ext4win.cat
@@ -25,12 +27,6 @@ CopyFiles  = Ext4Win.DriverFiles
 
 [DefaultInstall.NT$ARCH$.Services]
 AddService = %ServiceName%,,Ext4Win.Service
-
-[DefaultUninstall.NT$ARCH$]
-DelFiles = Ext4Win.DriverFiles
-
-[DefaultUninstall.NT$ARCH$.Services]
-DelService = %ServiceName%,0x200
 
 [Ext4Win.DriverFiles]
 ext4win.sys
