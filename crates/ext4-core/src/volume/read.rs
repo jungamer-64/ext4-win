@@ -41,6 +41,30 @@ where
         self.volume.fscrypt_key_presence(identifier)
     }
 
+    /// Loads a regular file by previously validated file identity.
+    ///
+    /// # Errors
+    /// Returns an error when the inode cannot be read or no longer is a regular file.
+    pub fn load_file(&self, id: FileNodeId) -> Result<FileNode> {
+        self.volume.load_file(id)
+    }
+
+    /// Loads a directory by previously validated directory identity.
+    ///
+    /// # Errors
+    /// Returns an error when the inode cannot be read or no longer is a directory.
+    pub fn load_directory(&self, id: DirectoryNodeId) -> Result<DirectoryNode> {
+        self.volume.load_directory(id)
+    }
+
+    /// Loads a symbolic link by previously validated symlink identity.
+    ///
+    /// # Errors
+    /// Returns an error when the inode cannot be read or no longer is a symbolic link.
+    pub fn load_symlink(&self, id: SymlinkNodeId) -> Result<SymlinkNode> {
+        self.volume.load_symlink(id)
+    }
+
     /// Reads all extended attributes attached to a typed node.
     ///
     /// # Errors
@@ -129,7 +153,6 @@ where
     ) -> Result<ChildLookup> {
         self.volume.lookup_windows_child(parent, requested)
     }
-
 }
 impl<D, J, N> JournaledVolume<D, J, N>
 where
@@ -170,6 +193,30 @@ where
         self.volume.fscrypt_key_presence(identifier)
     }
 
+    /// Loads a regular file by previously validated file identity.
+    ///
+    /// # Errors
+    /// Returns an error when the inode cannot be read or no longer is a regular file.
+    pub fn load_file(&self, id: FileNodeId) -> Result<FileNode> {
+        self.volume.load_file(id)
+    }
+
+    /// Loads a directory by previously validated directory identity.
+    ///
+    /// # Errors
+    /// Returns an error when the inode cannot be read or no longer is a directory.
+    pub fn load_directory(&self, id: DirectoryNodeId) -> Result<DirectoryNode> {
+        self.volume.load_directory(id)
+    }
+
+    /// Loads a symbolic link by previously validated symlink identity.
+    ///
+    /// # Errors
+    /// Returns an error when the inode cannot be read or no longer is a symbolic link.
+    pub fn load_symlink(&self, id: SymlinkNodeId) -> Result<SymlinkNode> {
+        self.volume.load_symlink(id)
+    }
+
     /// Reads all extended attributes attached to a typed node.
     ///
     /// # Errors
@@ -258,7 +305,6 @@ where
     ) -> Result<ChildLookup> {
         self.volume.lookup_windows_child(parent, requested)
     }
-
 }
 impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     /// Stable filesystem identity.
@@ -305,6 +351,30 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         identifier: FscryptKeyIdentifier,
     ) -> FscryptKeyPresence {
         self.mount_context.fscrypt_key_presence(identifier)
+    }
+
+    /// Loads a regular file by previously validated file identity.
+    pub(super) fn load_file(&self, id: FileNodeId) -> Result<FileNode> {
+        match self.load_validated_node(NodeId::File(id))? {
+            LoadedNode::File(file) => Ok(file),
+            LoadedNode::Directory(_) | LoadedNode::Symlink(_) => Err(Error::WrongInodeKind),
+        }
+    }
+
+    /// Loads a directory by previously validated directory identity.
+    pub(super) fn load_directory(&self, id: DirectoryNodeId) -> Result<DirectoryNode> {
+        match self.load_validated_node(NodeId::Directory(id))? {
+            LoadedNode::Directory(directory) => Ok(directory),
+            LoadedNode::File(_) | LoadedNode::Symlink(_) => Err(Error::WrongInodeKind),
+        }
+    }
+
+    /// Loads a symbolic link by previously validated symlink identity.
+    pub(super) fn load_symlink(&self, id: SymlinkNodeId) -> Result<SymlinkNode> {
+        match self.load_validated_node(NodeId::Symlink(id))? {
+            LoadedNode::Symlink(symlink) => Ok(symlink),
+            LoadedNode::File(_) | LoadedNode::Directory(_) => Err(Error::WrongInodeKind),
+        }
     }
 
     /// Reads all extended attributes attached to an inode.

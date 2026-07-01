@@ -159,7 +159,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
 
             let index = if let Some(index) = blocks
                 .iter()
-                .position(|metadata: &MetadataBlock| metadata.block == block)
+                .position(|metadata: &MetadataBlock| metadata.block() == block)
             {
                 index
             } else {
@@ -167,7 +167,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
                 self.volume
                     .device
                     .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
-                blocks.push(MetadataBlock { block, bytes });
+                blocks.push(MetadataBlock::new(block, bytes));
                 blocks
                     .len()
                     .checked_sub(1)
@@ -176,7 +176,7 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
             blocks
                 .get_mut(index)
                 .ok_or(Error::InvalidSuperblock)?
-                .bytes
+                .bytes_mut()
                 .get_mut(in_block..end)
                 .ok_or(Error::DeviceRange)?
                 .copy_from_slice(&write.bytes);

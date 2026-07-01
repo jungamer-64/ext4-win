@@ -32,9 +32,9 @@ use crate::{
     FileNodeId, FileOffset, FileSize, FscryptContextV2, FscryptFileNonce, FscryptKeySet,
     FscryptMasterKey, FscryptNoNonceGenerator, FscryptNonceGenerator, FsverityBlockSize,
     FsverityDescriptor, FsverityEnable, FsverityHashAlgorithm, FsverityMerkleTree, FsveritySalt,
-    FsveritySignature, InternalJournal, JournalTransaction, JournaledVolume, LoadedNode,
-    MountContext, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, NodeId, PosixAcl,
-    PosixAclEntry, PosixAclKind, ReadOnlyVolume, SymlinkNode, SymlinkTarget, TransactionDirectory,
+    FsveritySignature, InternalJournal, JournalTransaction, JournaledVolume, MountContext,
+    NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, NodeId, PosixAcl, PosixAclEntry,
+    PosixAclKind, ReadOnlyVolume, SymlinkNode, SymlinkTarget, TransactionDirectory,
     TransactionFile, WindowsName, WindowsOverlay, XattrName, XattrNamespace, XattrSet, XattrValue,
 };
 
@@ -123,7 +123,9 @@ fn inode(value: u32) -> InodeId {
 }
 
 trait MountedVolumeTestExt {
-    fn load(&self, id: NodeId) -> crate::Result<LoadedNode>;
+    fn load_file(&self, id: FileNodeId) -> crate::Result<FileNode>;
+    fn load_directory(&self, id: DirectoryNodeId) -> crate::Result<DirectoryNode>;
+    fn load_symlink(&self, id: crate::SymlinkNodeId) -> crate::Result<SymlinkNode>;
     fn read_file(
         &self,
         file: &FileNode,
@@ -145,8 +147,16 @@ trait MountedVolumeTestExt {
 }
 
 impl<D: BlockReader, N> MountedVolumeTestExt for ReadOnlyVolume<D, N> {
-    fn load(&self, id: NodeId) -> crate::Result<LoadedNode> {
-        Self::load(self, id)
+    fn load_file(&self, id: FileNodeId) -> crate::Result<FileNode> {
+        Self::load_file(self, id)
+    }
+
+    fn load_directory(&self, id: DirectoryNodeId) -> crate::Result<DirectoryNode> {
+        Self::load_directory(self, id)
+    }
+
+    fn load_symlink(&self, id: crate::SymlinkNodeId) -> crate::Result<SymlinkNode> {
+        Self::load_symlink(self, id)
     }
 
     fn read_file(
@@ -184,8 +194,16 @@ impl<D: BlockReader, N> MountedVolumeTestExt for ReadOnlyVolume<D, N> {
 }
 
 impl<D: BlockReader, J, N> MountedVolumeTestExt for JournaledVolume<D, J, N> {
-    fn load(&self, id: NodeId) -> crate::Result<LoadedNode> {
-        Self::load(self, id)
+    fn load_file(&self, id: FileNodeId) -> crate::Result<FileNode> {
+        Self::load_file(self, id)
+    }
+
+    fn load_directory(&self, id: DirectoryNodeId) -> crate::Result<DirectoryNode> {
+        Self::load_directory(self, id)
+    }
+
+    fn load_symlink(&self, id: crate::SymlinkNodeId) -> crate::Result<SymlinkNode> {
+        Self::load_symlink(self, id)
     }
 
     fn read_file(
@@ -237,10 +255,7 @@ fn node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> NodeId {
             continue;
         }
         visited.push(directory_id.inode());
-        let directory = match must(volume.load(NodeId::Directory(directory_id))) {
-            LoadedNode::Directory(directory) => directory,
-            LoadedNode::File(_) | LoadedNode::Symlink(_) => panic!("expected directory node"),
-        };
+        let directory = must(volume.load_directory(directory_id));
         for entry in must(volume.read_directory(&directory)) {
             if entry.node().inode() == inode_id {
                 return *entry.node();
@@ -257,15 +272,11 @@ fn node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> NodeId {
     panic!("expected reachable node");
 }
 
-fn load_fixture_node<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> LoadedNode {
-    must(volume.load(node_id(volume, inode_id)))
-}
-
 fn file_node<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> FileNode {
-    match load_fixture_node(volume, inode(inode_id)) {
-        LoadedNode::File(file) => file,
-        LoadedNode::Directory(_) | LoadedNode::Symlink(_) => panic!("expected file node"),
-    }
+    let NodeId::File(file_id) = node_id(volume, inode(inode_id)) else {
+        panic!("expected file node");
+    };
+    must(volume.load_file(file_id))
 }
 
 fn file_node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> FileNodeId {
@@ -273,17 +284,17 @@ fn file_node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> FileNodeI
 }
 
 fn directory_node<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> DirectoryNode {
-    match load_fixture_node(volume, inode_id) {
-        LoadedNode::Directory(directory) => directory,
-        LoadedNode::File(_) | LoadedNode::Symlink(_) => panic!("expected directory node"),
-    }
+    let NodeId::Directory(directory_id) = node_id(volume, inode_id) else {
+        panic!("expected directory node");
+    };
+    must(volume.load_directory(directory_id))
 }
 
 fn symlink_node<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> SymlinkNode {
-    match load_fixture_node(volume, inode(inode_id)) {
-        LoadedNode::Symlink(symlink) => symlink,
-        LoadedNode::File(_) | LoadedNode::Directory(_) => panic!("expected symlink node"),
-    }
+    let NodeId::Symlink(symlink_id) = node_id(volume, inode(inode_id)) else {
+        panic!("expected symlink node");
+    };
+    must(volume.load_symlink(symlink_id))
 }
 
 fn read_file<V: MountedVolumeTestExt>(

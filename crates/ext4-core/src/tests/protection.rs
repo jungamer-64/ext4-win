@@ -443,10 +443,10 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
         child_context.nonce(),
         FscryptFileNonce::new([TestFscryptNonceGenerator::FIRST_NONCE_BYTE; 16])
     );
-    assert!(matches!(
-        load_fixture_node(&volume, inode(11)),
-        LoadedNode::File(file) if file.protection() == InodeProtection::Encrypted
-    ));
+    assert_eq!(
+        file_node(&volume, 11).protection(),
+        InodeProtection::Encrypted
+    );
     assert_eq!(
         lookup_windows_inode(
             &volume,
@@ -502,10 +502,10 @@ fn encrypted_directory_create_directory_inherits_child_context_when_key_is_prese
         child_context.nonce(),
         FscryptFileNonce::new([TestFscryptNonceGenerator::FIRST_NONCE_BYTE; 16])
     );
-    assert!(matches!(
-        load_fixture_node(&volume, inode(11)),
-        LoadedNode::Directory(directory) if directory.protection() == InodeProtection::Encrypted
-    ));
+    assert_eq!(
+        directory_node(&volume, inode(11)).protection(),
+        InodeProtection::Encrypted
+    );
     assert_eq!(
         lookup_windows_inode(
             &volume,

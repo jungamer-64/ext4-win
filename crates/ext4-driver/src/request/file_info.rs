@@ -6,7 +6,7 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Security, Ext4Times,
-    Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileSize, LoadedNode, NodeId, WindowsName,
+    Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileSize, NodeId, WindowsName,
     WindowsOverlay,
 };
 use wdk_sys::{LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
@@ -434,12 +434,7 @@ fn query_directory(target: DispatchTarget) -> DriverResult<DriverCompletion> {
     let NodeId::Directory(directory_id) = request.opened_file.node() else {
         return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
     };
-    let directory = match vcb.volume().load(NodeId::Directory(directory_id))? {
-        LoadedNode::Directory(directory) => directory,
-        LoadedNode::File(_) | LoadedNode::Symlink(_) => {
-            return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
-        }
-    };
+    let directory = vcb.volume().load_directory(directory_id)?;
     let entries = vcb.volume().read_directory(&directory)?;
 
     let handle = request.opened_file.handle_mut();
@@ -658,8 +653,7 @@ fn emit_directory_entries(
             continue;
         }
 
-        let node = vcb.volume().load(*entry.node())?;
-        let metadata = metadata_from_node(vcb, *entry.node(), node)?;
+        let metadata = metadata_from_node(vcb, *entry.node())?;
         let layout = DirectoryRecordLayout::new(class, &name)?;
         let required = written
             .checked_add(layout.unpadded_size)
@@ -1053,12 +1047,10 @@ fn resolve_rename_target(
 ) -> DriverResult<(DirectoryNodeId, Ext4Name)> {
     let mut parent_id = DirectoryNodeId::ROOT;
     for component in target.parents() {
-        let parent = match vcb.volume().load(NodeId::Directory(parent_id))? {
-            LoadedNode::Directory(directory) => directory,
-            LoadedNode::File(_) | LoadedNode::Symlink(_) => {
-                return Err(DriverError::ObjectPathNotFound);
-            }
-        };
+        let parent = vcb
+            .volume()
+            .load_directory(parent_id)
+            .map_err(|_| DriverError::ObjectPathNotFound)?;
         let child = vcb.volume().lookup_windows_child(&parent, component)?;
         match child {
             ChildLookup::Found(child) => {
@@ -1178,12 +1170,7 @@ fn file_size_from_large_integer(value: LARGE_INTEGER) -> DriverResult<FileSize> 
 
 /// Returns the current size of a regular file inode.
 fn regular_file_size(vcb: &VolumeControlBlock, file_id: FileNodeId) -> DriverResult<FileSize> {
-    match vcb.volume().load(NodeId::File(file_id))? {
-        LoadedNode::File(file) => Ok(file.size()),
-        LoadedNode::Directory(_) | LoadedNode::Symlink(_) => {
-            Err(DriverError::from(ext4_core::Error::WrongInodeKind))
-        }
-    }
+    Ok(vcb.volume().load_file(file_id)?.size())
 }
 
 /// Returns the signed payload of a LARGE_INTEGER.
@@ -1231,32 +1218,11 @@ enum FileMetadataKind {
 fn load_file_metadata(opened_file: &OpenedFileObject) -> DriverResult<FileMetadata> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
-    let node_id = fcb.node();
-    let node = vcb.volume().load(node_id)?;
-    let metadata = metadata_from_node(vcb, node_id, node)?;
-    if fcb_node_matches_metadata(fcb.node(), metadata.kind) {
-        Ok(metadata)
-    } else {
-        Err(DriverError::Core(ext4_core::Error::WrongInodeKind))
-    }
-}
-
-/// Returns true when an FCB node identity still matches loaded core metadata.
-const fn fcb_node_matches_metadata(node: NodeId, kind: FileMetadataKind) -> bool {
-    matches!(
-        (node, kind),
-        (NodeId::File(_), FileMetadataKind::File)
-            | (NodeId::Directory(_), FileMetadataKind::Directory)
-            | (NodeId::Symlink(_), FileMetadataKind::Symlink)
-    )
+    metadata_from_node(vcb, fcb.node())
 }
 
 /// Builds Windows-facing metadata from a loaded ext4 node.
-fn metadata_from_node(
-    vcb: &VolumeControlBlock,
-    node_id: NodeId,
-    node: LoadedNode,
-) -> DriverResult<FileMetadata> {
+fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult<FileMetadata> {
     let inode = node_id.inode();
     let overlay_attributes = vcb
         .volume()
@@ -1266,37 +1232,46 @@ fn metadata_from_node(
 
     let file_index = inode.as_u32();
     let block_size = vcb.volume().geometry().block_size();
-    match node {
-        LoadedNode::File(file) => Ok(FileMetadata {
-            file_index,
-            kind: FileMetadataKind::File,
-            size: file.size(),
-            security: file.security(),
-            times: file.times(),
-            links_count: file.links_count(),
-            overlay_attributes,
-            block_size,
-        }),
-        LoadedNode::Directory(directory) => Ok(FileMetadata {
-            file_index,
-            kind: FileMetadataKind::Directory,
-            size: directory.size(),
-            security: directory.security(),
-            times: directory.times(),
-            links_count: directory.links_count(),
-            overlay_attributes,
-            block_size,
-        }),
-        LoadedNode::Symlink(symlink) => Ok(FileMetadata {
-            file_index,
-            kind: FileMetadataKind::Symlink,
-            size: symlink.size(),
-            security: symlink.security(),
-            times: symlink.times(),
-            links_count: symlink.links_count(),
-            overlay_attributes,
-            block_size,
-        }),
+    match node_id {
+        NodeId::File(file_id) => {
+            let file = vcb.volume().load_file(file_id)?;
+            Ok(FileMetadata {
+                file_index,
+                kind: FileMetadataKind::File,
+                size: file.size(),
+                security: file.security(),
+                times: file.times(),
+                links_count: file.links_count(),
+                overlay_attributes,
+                block_size,
+            })
+        }
+        NodeId::Directory(directory_id) => {
+            let directory = vcb.volume().load_directory(directory_id)?;
+            Ok(FileMetadata {
+                file_index,
+                kind: FileMetadataKind::Directory,
+                size: directory.size(),
+                security: directory.security(),
+                times: directory.times(),
+                links_count: directory.links_count(),
+                overlay_attributes,
+                block_size,
+            })
+        }
+        NodeId::Symlink(symlink_id) => {
+            let symlink = vcb.volume().load_symlink(symlink_id)?;
+            Ok(FileMetadata {
+                file_index,
+                kind: FileMetadataKind::Symlink,
+                size: symlink.size(),
+                security: symlink.security(),
+                times: symlink.times(),
+                links_count: symlink.links_count(),
+                overlay_attributes,
+                block_size,
+            })
+        }
     }
 }
 
@@ -1486,10 +1461,7 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<DriverCompletion> {
         return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
     };
 
-    let node = vcb.volume().load(NodeId::File(file_id))?;
-    let LoadedNode::File(file) = node else {
-        return Err(DriverError::Core(ext4_core::Error::WrongInodeKind));
-    };
+    let file = vcb.volume().load_file(file_id)?;
     let bytes_read = vcb
         .volume()
         .read_file(&file, stack.byte_offset(), output.as_mut_slice())?;

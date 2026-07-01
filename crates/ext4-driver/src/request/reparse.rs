@@ -8,7 +8,7 @@ use crate::kernel::status::{DriverError, DriverResult};
 use crate::request::metadata;
 use crate::state::{FileControlBlock, OpenedFileObject, OpenedPath, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
-use ext4_core::{LoadedNode, NodeId, SymlinkNodeId, SymlinkTarget};
+use ext4_core::{NodeId, SymlinkNodeId, SymlinkTarget};
 
 /// Reparse buffer header before the tag-specific payload.
 const REPARSE_DATA_BUFFER_HEADER_SIZE: usize = 8;
@@ -63,10 +63,7 @@ fn read_symlink_target(stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
 
 /// Reads a symlink inode through ext4-core.
 fn read_core_symlink(vcb: &VolumeControlBlock, symlink_id: SymlinkNodeId) -> DriverResult<Vec<u8>> {
-    let node = vcb.volume().load(NodeId::Symlink(symlink_id))?;
-    let LoadedNode::Symlink(symlink) = node else {
-        return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
-    };
+    let symlink = vcb.volume().load_symlink(symlink_id)?;
     Ok(vcb.volume().read_symlink(&symlink)?)
 }
 

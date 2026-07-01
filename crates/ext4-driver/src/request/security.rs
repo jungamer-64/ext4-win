@@ -3,7 +3,7 @@
 use alloc::{vec, vec::Vec};
 use core::ptr::NonNull;
 
-use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, LoadedNode, NodeId};
+use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, NodeId};
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::irp::{
@@ -386,21 +386,19 @@ fn load_ext4_security_context(
 ) -> DriverResult<OpenedSecurityContext> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
-    let node = vcb.volume().load(fcb.node())?;
     Ok(OpenedSecurityContext {
         volume: fcb.volume(),
         node: fcb.node(),
-        security: security_from_node(fcb.node(), node)?,
+        security: security_from_node(vcb, fcb.node())?,
     })
 }
 
 /// Extracts security metadata after validating FCB kind against core metadata.
-fn security_from_node(identity: NodeId, node: LoadedNode) -> DriverResult<Ext4Security> {
-    match (identity, node) {
-        (NodeId::File(_), LoadedNode::File(file)) => Ok(file.security()),
-        (NodeId::Directory(_), LoadedNode::Directory(directory)) => Ok(directory.security()),
-        (NodeId::Symlink(_), LoadedNode::Symlink(symlink)) => Ok(symlink.security()),
-        _ => Err(DriverError::from(ext4_core::Error::WrongInodeKind)),
+fn security_from_node(vcb: &VolumeControlBlock, identity: NodeId) -> DriverResult<Ext4Security> {
+    match identity {
+        NodeId::File(file) => Ok(vcb.volume().load_file(file)?.security()),
+        NodeId::Directory(directory) => Ok(vcb.volume().load_directory(directory)?.security()),
+        NodeId::Symlink(symlink) => Ok(vcb.volume().load_symlink(symlink)?.security()),
     }
 }
 

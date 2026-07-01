@@ -16,7 +16,6 @@ use crate::disk_format::extent::{ExtentTree, ExtentTreeContext};
 use crate::disk_format::inode::Inode;
 use crate::disk_format::superblock::RecoveryState;
 use crate::error::{Error, Result};
-use crate::volume::MetadataBlock;
 
 // Common JBD2 block header fields. JBD2 stores its control structures big-endian.
 /// Magic value that prefixes every JBD2 control block.
@@ -78,6 +77,37 @@ const JOURNAL_SUPERBLOCK_BYTES: usize = 1024;
 const JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET: u64 = 2048;
 /// External journal blocks reserved before usable log space.
 const JOURNAL_OVERHEAD_BLOCKS: u32 = 2;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Full filesystem metadata block supplied to the journal commit path.
+pub(crate) struct MetadataBlock {
+    /// Filesystem block address.
+    block: BlockAddress,
+    /// Complete metadata block bytes.
+    bytes: Vec<u8>,
+}
+
+impl MetadataBlock {
+    /// Creates a complete metadata block image for a journal transaction.
+    pub(crate) fn new(block: BlockAddress, bytes: Vec<u8>) -> Self {
+        Self { block, bytes }
+    }
+
+    /// Returns the filesystem block address.
+    pub(crate) const fn block(&self) -> BlockAddress {
+        self.block
+    }
+
+    /// Returns the full metadata block bytes.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the mutable full metadata block bytes before commit encoding.
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// JBD2 journal with typestate-tracked replay and commit phases.

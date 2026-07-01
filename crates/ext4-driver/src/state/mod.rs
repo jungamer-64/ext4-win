@@ -301,7 +301,7 @@ impl VolumeControlBlock {
 
     /// Returns the mounted ext4 volume label.
     pub(crate) fn volume_label(&self) -> ext4_core::Ext4VolumeLabel {
-        self.volume.volume_label()
+        self.volume.identity().label()
     }
 
     /// Adds one fscrypt master key to the mounted volume.
