@@ -256,22 +256,10 @@ impl Ext4VerityMetadata {
         })
     }
 
-    /// ext4 byte layout.
-    #[must_use]
-    pub const fn layout(&self) -> Ext4VerityMetadataLayout {
-        self.layout
-    }
-
     /// Linux fs-verity descriptor.
     #[must_use]
     pub const fn descriptor(&self) -> &FsverityDescriptor {
         &self.descriptor
-    }
-
-    /// Optional builtin signature bytes.
-    #[must_use]
-    pub fn signature(&self) -> &[u8] {
-        &self.signature
     }
 
     /// Stored Merkle tree.
@@ -737,15 +725,6 @@ impl FsverityDescriptor {
         Ok(bytes)
     }
 
-    /// Computes the fs-verity file digest over the serialized descriptor.
-    ///
-    /// # Errors
-    /// Returns an error when serialization fails.
-    pub fn file_digest(&self) -> Result<FsverityDigest> {
-        let bytes = self.to_bytes()?;
-        FsverityDigest::new(self.algorithm, hash_bytes(self.algorithm, &bytes))
-    }
-
     /// Hash algorithm.
     #[must_use]
     pub const fn algorithm(&self) -> FsverityHashAlgorithm {
@@ -899,18 +878,6 @@ impl FsverityMerkleTree {
     #[must_use]
     pub fn blocks(&self) -> &[u8] {
         &self.blocks
-    }
-
-    /// Hash algorithm.
-    #[must_use]
-    pub const fn algorithm(&self) -> FsverityHashAlgorithm {
-        self.algorithm
-    }
-
-    /// Merkle/data block size.
-    #[must_use]
-    pub const fn block_size(&self) -> FsverityBlockSize {
-        self.block_size
     }
 }
 

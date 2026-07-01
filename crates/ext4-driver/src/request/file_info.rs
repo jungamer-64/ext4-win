@@ -1223,14 +1223,13 @@ fn load_file_metadata(opened_file: &OpenedFileObject) -> DriverResult<FileMetada
 
 /// Builds Windows-facing metadata from a loaded ext4 node.
 fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult<FileMetadata> {
-    let inode = node_id.inode();
     let overlay_attributes = vcb
         .volume()
         .read_windows_overlay(node_id)?
         .map(|overlay| overlay.attributes().bits())
         .unwrap_or(0);
 
-    let file_index = inode.as_u32();
+    let file_index = node_id.file_index();
     let block_size = vcb.volume().geometry().block_size();
     match node_id {
         NodeId::File(file_id) => {

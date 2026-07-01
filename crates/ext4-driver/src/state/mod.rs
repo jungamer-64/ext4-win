@@ -8,8 +8,7 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     DeviceLength, DirectoryNodeId, Ext4Name, FscryptKeyIdentifier, FscryptKeyPresence,
-    FscryptKeySet, FscryptMasterKey, InternalJournal, JournaledVolume, MountContext, NodeId,
-    Result as Ext4Result,
+    FscryptKeySet, FscryptMasterKey, JournaledVolume, MountContext, NodeId, Result as Ext4Result,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT,
@@ -256,7 +255,7 @@ impl MountCandidate {
 /// Volume control block stored in a mounted volume device extension.
 pub(crate) struct VolumeControlBlock {
     /// Mounted journaled read-write ext4 volume.
-    volume: JournaledVolume<KernelBlockDevice, InternalJournal, CngFscryptNonceGenerator>,
+    volume: JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator>,
     /// VCB-owned FCBs keyed by ext4 node identity.
     file_control_blocks: Vec<NonNull<FileControlBlock>>,
 }
@@ -268,7 +267,7 @@ impl VolumeControlBlock {
         length: DeviceLength,
     ) -> Ext4Result<Self> {
         let block_device = KernelBlockDevice::new(target_device, length);
-        let volume = JournaledVolume::<_, InternalJournal, _>::mount(
+        let volume = JournaledVolume::<_, CngFscryptNonceGenerator>::mount(
             block_device,
             MountContext::new(FscryptKeySet::empty(), CngFscryptNonceGenerator),
         )?;
@@ -288,14 +287,14 @@ impl VolumeControlBlock {
     /// Returns the mounted ext4 volume.
     pub(crate) const fn volume(
         &self,
-    ) -> &JournaledVolume<KernelBlockDevice, InternalJournal, CngFscryptNonceGenerator> {
+    ) -> &JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator> {
         &self.volume
     }
 
     /// Returns the mounted ext4 volume for journaled mutation.
     pub(crate) const fn volume_mut(
         &mut self,
-    ) -> &mut JournaledVolume<KernelBlockDevice, InternalJournal, CngFscryptNonceGenerator> {
+    ) -> &mut JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator> {
         &mut self.volume
     }
 

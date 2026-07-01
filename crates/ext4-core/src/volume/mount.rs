@@ -111,6 +111,7 @@ pub(super) struct MountedVolume<D, State, N> {
 
 /// Mounted read-only ext4 volume.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct ReadOnlyVolume<D, N> {
     /// Private mounted state with read traversal capability only.
     pub(super) volume: MountedVolume<D, ReadOnlyMount, N>,
@@ -185,6 +186,7 @@ impl VolumeGeometry {
     }
 }
 
+#[cfg(test)]
 impl<D: BlockReader, N> MountedVolume<D, ReadOnlyMount, N> {
     /// Validates an ext4 volume and constructs read-only mounted state.
     ///
@@ -201,6 +203,7 @@ impl<D: BlockReader, N> MountedVolume<D, ReadOnlyMount, N> {
     }
 }
 
+#[cfg(test)]
 impl<D: BlockReader, N> ReadOnlyVolume<D, N> {
     /// Validates an ext4 volume and constructs read-only mounted state.
     ///

@@ -17,4 +17,5 @@ pub use transaction::{
     JournalTransaction, TransactionDirectory, TransactionFile, TransactionNode, TransactionSymlink,
 };
 
+#[cfg(test)]
 pub(crate) use mount::{ExternalJournal, ReadOnlyVolume};

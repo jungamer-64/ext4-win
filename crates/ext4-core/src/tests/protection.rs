@@ -407,7 +407,7 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
     {
-        let mut volume = must(JournaledVolume::<_, InternalJournal, _>::mount(
+        let mut volume = must(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
             SliceBlockDeviceMut::new(&mut image),
             test_mount_context_with_key_and_nonce_source(master_key.clone()),
         ));
@@ -474,7 +474,7 @@ fn encrypted_directory_create_directory_inherits_child_context_when_key_is_prese
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
     {
-        let mut volume = must(JournaledVolume::<_, InternalJournal, _>::mount(
+        let mut volume = must(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
             SliceBlockDeviceMut::new(&mut image),
             test_mount_context_with_key_and_nonce_source(master_key.clone()),
         ));
@@ -532,7 +532,7 @@ fn encrypted_directory_create_symlink_rejects_plaintext_target() {
     let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
     install_inline_fscrypt_context(&mut image, 2, &context_bytes);
 
-    let mut volume = must(JournaledVolume::<_, InternalJournal, _>::mount(
+    let mut volume = must(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
         SliceBlockDeviceMut::new(&mut image),
         test_mount_context_with_key_and_nonce_source(master_key),
     ));

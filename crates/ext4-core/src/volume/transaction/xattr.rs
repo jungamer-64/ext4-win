@@ -41,6 +41,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     ///
     /// # Errors
     /// Returns an error when the ACL cannot be serialized or stored.
+    #[cfg(test)]
     pub(crate) fn set_posix_acl(
         &mut self,
         node: TransactionNode,

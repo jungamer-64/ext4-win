@@ -7,6 +7,7 @@ pub(super) use crate::disk::block::{
 };
 pub(super) use crate::disk::checksum::crc32c;
 pub(super) use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+#[cfg(test)]
 pub(super) use crate::disk_format::acl::{PosixAcl, PosixAclKind};
 pub(super) use crate::disk_format::dir::{
     DirectoryBlock, DirectoryBlockData, DirectoryChecksum, DirectoryEntry as RawDirectoryEntry,
@@ -56,9 +57,11 @@ pub(super) use super::inode_record::{
     AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord, StagedInodeIndex,
     StagedInodeRecord,
 };
+#[cfg(test)]
+pub(super) use super::mount::ReadOnlyVolume;
 pub(super) use super::mount::{
     ExternalJournal, InternalJournal, JournaledMount, JournaledVolume, MountedVolume,
-    ReadOnlyVolume, VolumeGeometry, VolumeIdentity,
+    VolumeGeometry, VolumeIdentity,
 };
 pub(super) use super::node::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,

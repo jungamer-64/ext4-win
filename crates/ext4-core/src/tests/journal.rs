@@ -264,7 +264,7 @@ fn external_journal_uuid_mismatch_is_rejected() {
         default_journal_incompat(),
     );
 
-    let result: crate::Result<JournaledVolume<_, ExternalJournal<_>>> =
+    let result: crate::Result<JournaledVolume<_, FscryptNoNonceGenerator, ExternalJournal<_>>> =
         JournaledVolume::mount_with_external_journal(
             SliceBlockDeviceMut::new(&mut image),
             SliceBlockDeviceMut::new(&mut journal),
@@ -833,7 +833,7 @@ fn external_journal_short_device_is_rejected() {
         default_journal_incompat(),
     );
 
-    let result: crate::Result<JournaledVolume<_, ExternalJournal<_>>> =
+    let result: crate::Result<JournaledVolume<_, FscryptNoNonceGenerator, ExternalJournal<_>>> =
         JournaledVolume::mount_with_external_journal(
             SliceBlockDeviceMut::new(&mut image),
             SliceBlockDeviceMut::new(&mut journal),

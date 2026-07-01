@@ -14,6 +14,7 @@ use zeroize::Zeroize;
 use crate::error::{Error, Result};
 
 /// Serialized fscrypt v2 policy size.
+#[cfg(test)]
 pub const FSCRYPT_POLICY_V2_BYTES: usize = 24;
 /// Serialized fscrypt v2 context size.
 pub const FSCRYPT_CONTEXT_V2_BYTES: usize = 40;
@@ -21,6 +22,7 @@ pub const FSCRYPT_CONTEXT_V2_BYTES: usize = 40;
 /// Prefix used for reversible no-key filename display names.
 const FSCRYPT_NOKEY_NAME_PREFIX: &[u8] = b"_fscrypt_";
 /// fscrypt v2 policy version byte.
+#[cfg(test)]
 const FSCRYPT_POLICY_V2: u8 = 2;
 /// fscrypt v2 context version byte.
 const FSCRYPT_CONTEXT_V2: u8 = 2;
@@ -275,6 +277,7 @@ impl FscryptPolicyV2 {
     /// # Errors
     /// Returns an error when the image is not exactly v2 AES-256-XTS plus
     /// AES-256-CBC-CTS with only supported flags.
+    #[cfg(test)]
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         require_exact_len(bytes, FSCRYPT_POLICY_V2_BYTES)?;
         parse_policy_fields(bytes, FSCRYPT_POLICY_V2)
@@ -282,6 +285,7 @@ impl FscryptPolicyV2 {
 
     /// Serializes this policy as Linux `struct fscrypt_policy_v2` bytes.
     #[must_use]
+    #[cfg(test)]
     pub fn to_bytes(self) -> [u8; FSCRYPT_POLICY_V2_BYTES] {
         let mut bytes = [0_u8; FSCRYPT_POLICY_V2_BYTES];
         write_policy_fields(&mut bytes, FSCRYPT_POLICY_V2, self);
@@ -433,8 +437,10 @@ pub trait FscryptNonceGenerator {
 
 /// Mount nonce source used when encrypted inode creation is unavailable.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 pub struct FscryptNoNonceGenerator;
 
+#[cfg(test)]
 impl FscryptNonceGenerator for FscryptNoNonceGenerator {
     fn next_file_nonce(&mut self) -> Result<FscryptFileNonce> {
         Err(Error::UnsupportedEncryption)
