@@ -624,11 +624,6 @@ impl FileControlBlock {
         self.node
     }
 
-    /// Replaces the ext4 node identity after an in-place namespace conversion.
-    pub(crate) fn replace_node(&mut self, node: NodeId) {
-        self.node = node;
-    }
-
     /// Checks and records one FILE_OBJECT's share-access claim.
     pub(crate) fn check_share_access(
         &mut self,
@@ -803,24 +798,6 @@ impl OpenedHandle {
         }
     }
 
-    /// Returns the mutable directory cursor when this handle opened a directory.
-    pub(crate) fn directory_cursor_mut(&mut self) -> Option<&mut DirectoryCursor> {
-        match self {
-            Self::Directory { cursor, .. } => Some(cursor),
-            Self::File { .. } | Self::Symlink { .. } => None,
-        }
-    }
-
-    /// Marks the handle for delete-on-close cleanup.
-    pub(crate) fn mark_delete_on_close(&mut self) {
-        *self.close_disposition_mut() = CloseDisposition::Delete;
-    }
-
-    /// Clears a delete-on-close request for this handle.
-    pub(crate) fn keep_on_close(&mut self) {
-        *self.close_disposition_mut() = CloseDisposition::Keep;
-    }
-
     /// Returns the requested close disposition.
     pub(crate) const fn close_disposition(&self) -> CloseDisposition {
         match self {
@@ -848,28 +825,6 @@ impl OpenedHandle {
     /// Replaces the opened path after a successful rename.
     pub(crate) fn replace_path(&mut self, path: OpenedPath) {
         *self.path_mut() = path;
-    }
-
-    /// Replaces handle-local node state after an in-place namespace conversion.
-    pub(crate) fn replace_node(&mut self, node: NodeId) {
-        let path = self.path().clone();
-        let close_disposition = self.close_disposition();
-        *self = Self::from_parts(node, path, close_disposition);
-    }
-
-    /// Returns the mutable close disposition field for this handle variant.
-    fn close_disposition_mut(&mut self) -> &mut CloseDisposition {
-        match self {
-            Self::File {
-                close_disposition, ..
-            }
-            | Self::Directory {
-                close_disposition, ..
-            }
-            | Self::Symlink {
-                close_disposition, ..
-            } => close_disposition,
-        }
     }
 
     /// Returns the mutable opened path field for this handle variant.
@@ -922,11 +877,6 @@ impl OpenedFileObject {
         self.file_control_block().volume()
     }
 
-    /// Returns the ext4 node identity opened by this FILE_OBJECT.
-    pub(crate) fn node(&self) -> NodeId {
-        self.file_control_block().node()
-    }
-
     /// Returns the decoded file control block.
     pub(crate) fn file_control_block(&self) -> &FileControlBlock {
         unsafe {
@@ -934,15 +884,6 @@ impl OpenedFileObject {
             // FsContext written by successful create and used during the
             // active FILE_OBJECT lifetime.
             self.fcb.as_ref()
-        }
-    }
-
-    /// Returns mutable decoded file control block state for the active dispatch.
-    pub(crate) fn file_control_block_mut(&mut self) -> &mut FileControlBlock {
-        unsafe {
-            // SAFETY: Mutating FCB-local identity is limited to the active
-            // synchronous dispatch path that owns `&mut self`.
-            self.fcb.as_mut()
         }
     }
 
@@ -956,14 +897,6 @@ impl OpenedFileObject {
         }
     }
 
-    /// Returns mutable per-handle state for the active dispatch.
-    pub(crate) fn handle_mut(&mut self) -> &mut OpenedHandle {
-        unsafe {
-            // SAFETY: Mutating handle-local state is serialized by the active
-            // synchronous dispatch path that owns `&mut self`.
-            self.handle.as_mut()
-        }
-    }
 }
 
 /// Releases one FILE_OBJECT reference to a VCB-owned FCB.
