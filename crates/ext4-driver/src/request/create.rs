@@ -18,8 +18,9 @@ use crate::{
     kernel::status::{DriverError, DriverResult},
     request::metadata,
     state::{
-        FileControlBlock, KernelDevice, KernelFileObject, MountedVolumeDevice, OpenedHandle,
-        OpenedPath, UninitializedFileObject, VolumeControlBlock, release_file_control_block,
+        CloseDisposition, FileControlBlock, KernelDevice, KernelFileObject, MountedVolumeDevice,
+        OpenedHandle, OpenedPath, UninitializedFileObject, VolumeControlBlock,
+        release_file_control_block,
     },
 };
 
@@ -135,6 +136,7 @@ fn open_existing_node(
                 path,
                 parameters.desired_access(),
                 parameters.share_access(),
+                parameters.close_disposition(),
             )
         }
         CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
@@ -150,7 +152,13 @@ fn open_existing_node(
                 parameters.share_access(),
             )?;
             match truncate_existing_file(vcb, inode) {
-                Ok(()) => attach_file_object(request.file_object(), fcb, node, path),
+                Ok(()) => attach_file_object(
+                    request.file_object(),
+                    fcb,
+                    node,
+                    path,
+                    parameters.close_disposition(),
+                ),
                 Err(error) => {
                     abandon_file_control_block(request.file_object().kernel_file_object(), fcb);
                     Err(error)
@@ -204,6 +212,7 @@ fn create_missing_node(
         },
         request.parameters().desired_access(),
         request.parameters().share_access(),
+        request.parameters().close_disposition(),
     )
 }
 
@@ -378,9 +387,10 @@ fn initialize_file_object(
     path: OpenedPath,
     desired_access: DesiredAccess,
     share_access: ShareAccess,
+    close_disposition: CloseDisposition,
 ) -> DriverResult<()> {
     let fcb = open_shared_file_control_block(file_object, vcb, node, desired_access, share_access)?;
-    attach_file_object(file_object, fcb, node, path)
+    attach_file_object(file_object, fcb, node, path, close_disposition)
 }
 
 /// Opens the shared FCB for a node and records the create share-access claim.
@@ -415,13 +425,14 @@ fn attach_file_object(
     fcb: NonNull<FileControlBlock>,
     node: NodeId,
     path: OpenedPath,
+    close_disposition: CloseDisposition,
 ) -> DriverResult<()> {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is
         // writable during successful create processing.
         file_object.as_mut()
     };
-    let handle = Box::new(OpenedHandle::new(node, path));
+    let handle = Box::new(OpenedHandle::new(node, path, close_disposition));
     file_object.FsContext = fcb.as_ptr().cast::<c_void>();
     file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
     Ok(())

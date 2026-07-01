@@ -780,8 +780,8 @@ pub(crate) enum OpenedHandle {
 
 impl OpenedHandle {
     /// Creates per-handle state for an opened node.
-    pub(crate) fn new(node: NodeId, path: OpenedPath) -> Self {
-        Self::from_parts(node, path, CloseDisposition::Keep)
+    pub(crate) fn new(node: NodeId, path: OpenedPath, close_disposition: CloseDisposition) -> Self {
+        Self::from_parts(node, path, close_disposition)
     }
 
     /// Creates per-handle state from explicit lifecycle fields.
