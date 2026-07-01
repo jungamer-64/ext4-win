@@ -28,7 +28,7 @@ impl<N> MountContext<N> {
 
     /// fscrypt master keys available to this mount.
     #[must_use]
-    pub const fn fscrypt_keys(&self) -> &FscryptKeySet {
+    pub(super) const fn fscrypt_keys(&self) -> &FscryptKeySet {
         &self.fscrypt_keys
     }
 
@@ -44,13 +44,13 @@ impl<N> MountContext<N> {
     ///
     /// # Errors
     /// Returns an error when the key identifier is already present.
-    pub fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> Result<()> {
+    pub(super) fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> Result<()> {
         self.fscrypt_keys.insert(key)
     }
 
     /// Removes one fscrypt master key from this mount context.
     #[must_use]
-    pub fn remove_fscrypt_key(
+    pub(super) fn remove_fscrypt_key(
         &mut self,
         identifier: FscryptKeyIdentifier,
     ) -> Option<FscryptMasterKey> {
@@ -59,7 +59,10 @@ impl<N> MountContext<N> {
 
     /// Returns this mount context's fscrypt key presence for one identifier.
     #[must_use]
-    pub fn fscrypt_key_presence(&self, identifier: FscryptKeyIdentifier) -> FscryptKeyPresence {
+    pub(super) fn fscrypt_key_presence(
+        &self,
+        identifier: FscryptKeyIdentifier,
+    ) -> FscryptKeyPresence {
         if self.fscrypt_keys.contains(identifier) {
             FscryptKeyPresence::Present
         } else {

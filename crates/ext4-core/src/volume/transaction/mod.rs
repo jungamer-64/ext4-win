@@ -13,7 +13,6 @@ use commit::{
     descriptor_byte_count, directory_entry_kind, map_extents, reject_reserved_directory_name,
     verity_metadata_image,
 };
-pub(crate) use staging::MetadataBlock;
 use staging::{BlockImage, EncryptedBlockBase, GroupDelta, RangeWrite};
 
 /// Regular file selected for mutation inside a write transaction.
@@ -468,9 +467,6 @@ impl<D: BlockWriter, J, N: FscryptNonceGenerator> JournalTransaction<'_, D, J, N
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
-
-    /// Aborts the transaction without writing staged data or metadata.
-    pub fn abort(self) {}
 
     /// Returns the staged inode record index, loading it once when needed.
     fn ensure_inode_update(&mut self, inode_id: InodeId) -> Result<StagedInodeIndex> {

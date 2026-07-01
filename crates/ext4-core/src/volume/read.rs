@@ -18,12 +18,6 @@ where
         self.volume.geometry()
     }
 
-    /// Mount context used by this volume.
-    #[must_use]
-    pub const fn mount_context(&self) -> &MountContext<N> {
-        self.volume.mount_context()
-    }
-
     /// Adds one fscrypt master key to this mounted volume.
     ///
     /// # Errors
@@ -45,31 +39,6 @@ where
     #[must_use]
     pub fn fscrypt_key_presence(&self, identifier: FscryptKeyIdentifier) -> FscryptKeyPresence {
         self.volume.fscrypt_key_presence(identifier)
-    }
-
-    /// Filesystem volume label parsed from the mounted superblock.
-    #[must_use]
-    pub const fn volume_label(&self) -> Ext4VolumeLabel {
-        self.volume.volume_label()
-    }
-
-    /// Loads the root directory.
-    ///
-    /// # Errors
-    /// Returns an error when the root inode cannot be read as a directory.
-    pub fn root_directory(&self) -> Result<DirectoryNode> {
-        match self.volume.load_inode_node(DirectoryNodeId::ROOT.inode())? {
-            LoadedNode::Directory(directory) => Ok(directory),
-            _ => Err(Error::InvalidInode),
-        }
-    }
-
-    /// Loads a node by previously validated identity.
-    ///
-    /// # Errors
-    /// Returns an error when the inode cannot be read or no longer has the recorded kind.
-    pub fn load(&self, id: NodeId) -> Result<LoadedNode> {
-        self.volume.load_validated_node(id)
     }
 
     /// Reads all extended attributes attached to a typed node.
@@ -161,17 +130,6 @@ where
         self.volume.lookup_windows_child(parent, requested)
     }
 
-    /// Looks up a Windows-visible child name and returns the matched directory entry.
-    ///
-    /// # Errors
-    /// Returns an error when the parent cannot be enumerated or the case-insensitive Windows projection is ambiguous.
-    pub fn lookup_windows_child_entry(
-        &self,
-        parent: &DirectoryNode,
-        requested: &WindowsName,
-    ) -> Result<Option<DirectoryEntry>> {
-        self.volume.lookup_windows_child_entry(parent, requested)
-    }
 }
 impl<D, J, N> JournaledVolume<D, J, N>
 where
@@ -189,12 +147,6 @@ where
         self.volume.geometry()
     }
 
-    /// Mount context used by this volume.
-    #[must_use]
-    pub const fn mount_context(&self) -> &MountContext<N> {
-        self.volume.mount_context()
-    }
-
     /// Adds one fscrypt master key to this mounted volume.
     ///
     /// # Errors
@@ -216,31 +168,6 @@ where
     #[must_use]
     pub fn fscrypt_key_presence(&self, identifier: FscryptKeyIdentifier) -> FscryptKeyPresence {
         self.volume.fscrypt_key_presence(identifier)
-    }
-
-    /// Filesystem volume label parsed from the mounted superblock.
-    #[must_use]
-    pub const fn volume_label(&self) -> Ext4VolumeLabel {
-        self.volume.volume_label()
-    }
-
-    /// Loads the root directory.
-    ///
-    /// # Errors
-    /// Returns an error when the root inode cannot be read as a directory.
-    pub fn root_directory(&self) -> Result<DirectoryNode> {
-        match self.volume.load_inode_node(DirectoryNodeId::ROOT.inode())? {
-            LoadedNode::Directory(directory) => Ok(directory),
-            _ => Err(Error::InvalidInode),
-        }
-    }
-
-    /// Loads a node by previously validated identity.
-    ///
-    /// # Errors
-    /// Returns an error when the inode cannot be read or no longer has the recorded kind.
-    pub fn load(&self, id: NodeId) -> Result<LoadedNode> {
-        self.volume.load_validated_node(id)
     }
 
     /// Reads all extended attributes attached to a typed node.
@@ -332,17 +259,6 @@ where
         self.volume.lookup_windows_child(parent, requested)
     }
 
-    /// Looks up a Windows-visible child name and returns the matched directory entry.
-    ///
-    /// # Errors
-    /// Returns an error when the parent cannot be enumerated or the case-insensitive Windows projection is ambiguous.
-    pub fn lookup_windows_child_entry(
-        &self,
-        parent: &DirectoryNode,
-        requested: &WindowsName,
-    ) -> Result<Option<DirectoryEntry>> {
-        self.volume.lookup_windows_child_entry(parent, requested)
-    }
 }
 impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     /// Stable filesystem identity.
@@ -363,12 +279,6 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
             cluster_count: self.superblock.cluster_count(),
             free_cluster_count: self.superblock.free_cluster_count(),
         }
-    }
-
-    /// Mount context used by this volume.
-    #[must_use]
-    pub(super) const fn mount_context(&self) -> &MountContext<N> {
-        &self.mount_context
     }
 
     /// Adds one fscrypt master key to this mounted volume.
@@ -395,12 +305,6 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         identifier: FscryptKeyIdentifier,
     ) -> FscryptKeyPresence {
         self.mount_context.fscrypt_key_presence(identifier)
-    }
-
-    /// Filesystem volume label parsed from the mounted superblock.
-    #[must_use]
-    pub(super) const fn volume_label(&self) -> Ext4VolumeLabel {
-        self.superblock.volume_label()
     }
 
     /// Reads all extended attributes attached to an inode.

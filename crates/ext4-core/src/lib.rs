@@ -52,9 +52,9 @@ pub use protection::verity::{
 };
 pub use volume::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, ExternalJournal,
-    FileNode, FileNodeId, InternalJournal, JournalTransaction, JournaledVolume, LoadedNode,
-    MountContext, NodeId, ReadOnlyVolume, SymlinkNode, SymlinkNodeId, TransactionDirectory,
-    TransactionFile, TransactionNode, TransactionSymlink, VolumeGeometry, VolumeIdentity,
+    FileNode, FileNodeId, InternalJournal, JournalTransaction, JournaledVolume, MountContext,
+    NodeId, ReadOnlyVolume, SymlinkNode, SymlinkNodeId, TransactionDirectory, TransactionFile,
+    TransactionNode, TransactionSymlink, VolumeGeometry, VolumeIdentity,
 };
 
 #[cfg(test)]

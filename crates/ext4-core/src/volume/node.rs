@@ -96,7 +96,7 @@ impl NodeId {
 
 /// Typed node loaded from an inode.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LoadedNode {
+pub(super) enum LoadedNode {
     /// Regular file node.
     File(FileNode),
     /// Directory node.
@@ -117,7 +117,7 @@ impl LoadedNode {
 
     /// Returns this loaded node's typed identity.
     #[must_use]
-    pub const fn id(&self) -> NodeId {
+    pub(super) const fn id(&self) -> NodeId {
         match self {
             Self::File(file) => NodeId::File(file.id()),
             Self::Directory(directory) => NodeId::Directory(directory.id()),
