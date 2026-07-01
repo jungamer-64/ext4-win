@@ -21,7 +21,7 @@ impl FileNodeId {
 
     /// Returns the raw inode for on-disk and external boundary encoding.
     #[must_use]
-    pub const fn inode(self) -> InodeId {
+    pub(crate) const fn inode(self) -> InodeId {
         self.inode
     }
 }
@@ -46,7 +46,7 @@ impl DirectoryNodeId {
 
     /// Returns the raw inode for on-disk and external boundary encoding.
     #[must_use]
-    pub const fn inode(self) -> InodeId {
+    pub(crate) const fn inode(self) -> InodeId {
         self.inode
     }
 }
@@ -66,7 +66,7 @@ impl SymlinkNodeId {
 
     /// Returns the raw inode for on-disk and external boundary encoding.
     #[must_use]
-    pub const fn inode(self) -> InodeId {
+    pub(crate) const fn inode(self) -> InodeId {
         self.inode
     }
 }
@@ -85,12 +85,18 @@ pub enum NodeId {
 impl NodeId {
     /// Returns the raw inode for on-disk and external boundary encoding.
     #[must_use]
-    pub const fn inode(&self) -> InodeId {
+    pub(crate) const fn inode(&self) -> InodeId {
         match self {
             Self::File(file) => file.inode(),
             Self::Directory(directory) => directory.inode(),
             Self::Symlink(symlink) => symlink.inode(),
         }
+    }
+
+    /// Stable file index exposed to the Windows file-information boundary.
+    #[must_use]
+    pub const fn file_index(self) -> u32 {
+        self.inode().as_u32()
     }
 }
 
@@ -166,7 +172,7 @@ impl FileNode {
 
     /// Contents protection selected by file inode flags.
     #[must_use]
-    pub const fn protection(&self) -> InodeProtection {
+    pub(crate) const fn protection(&self) -> InodeProtection {
         self.inode.protection()
     }
 
@@ -216,7 +222,7 @@ impl DirectoryNode {
 
     /// Contents protection selected by directory inode flags.
     #[must_use]
-    pub const fn protection(&self) -> InodeProtection {
+    pub(crate) const fn protection(&self) -> InodeProtection {
         self.inode.protection()
     }
 
@@ -266,7 +272,7 @@ impl SymlinkNode {
 
     /// Contents protection selected by symlink inode flags.
     #[must_use]
-    pub const fn protection(&self) -> InodeProtection {
+    pub(crate) const fn protection(&self) -> InodeProtection {
         self.inode.protection()
     }
 
@@ -325,7 +331,7 @@ impl DirectoryChild {
 
     /// File type recorded in the directory entry.
     #[must_use]
-    pub const fn entry_kind(&self) -> DirectoryEntryKind {
+    pub(crate) const fn entry_kind(&self) -> DirectoryEntryKind {
         self.entry_kind
     }
 }
@@ -365,7 +371,7 @@ impl DirectoryEntry {
 
     /// File type recorded in the directory entry.
     #[must_use]
-    pub const fn entry_kind(&self) -> DirectoryEntryKind {
+    pub(crate) const fn entry_kind(&self) -> DirectoryEntryKind {
         self.entry_kind
     }
 }

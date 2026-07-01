@@ -8,10 +8,7 @@ mod read;
 mod scope;
 mod transaction;
 
-pub use mount::{
-    ExternalJournal, InternalJournal, JournaledVolume, MountContext, ReadOnlyVolume,
-    VolumeGeometry, VolumeIdentity,
-};
+pub use mount::{InternalJournal, JournaledVolume, MountContext, VolumeGeometry, VolumeIdentity};
 pub use node::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
     FileNodeId, NodeId, SymlinkNode, SymlinkNodeId,
@@ -19,3 +16,5 @@ pub use node::{
 pub use transaction::{
     JournalTransaction, TransactionDirectory, TransactionFile, TransactionNode, TransactionSymlink,
 };
+
+pub(crate) use mount::{ExternalJournal, ReadOnlyVolume};

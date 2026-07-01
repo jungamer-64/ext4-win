@@ -40,7 +40,7 @@ pub(super) use crate::platform::windows::WindowsOverlay;
 pub(super) use crate::protection::fscrypt::{
     FscryptContentsKey, FscryptContextV2, FscryptFileNonce, FscryptFilenamePadding,
     FscryptFilenamesKey, FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey,
-    FscryptNoKeyName, FscryptNoNonceGenerator, FscryptNonceGenerator,
+    FscryptNoKeyName, FscryptNonceGenerator,
 };
 pub(super) use crate::protection::verity::{
     Ext4VerityMetadata, Ext4VerityMetadataLayout, FSVERITY_DESCRIPTOR_BYTES, FsverityDescriptor,
