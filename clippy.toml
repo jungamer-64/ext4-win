@@ -1,0 +1,15 @@
+avoid-breaking-exported-api = false
+
+allow-panic-in-tests = false
+allow-unwrap-in-tests = false
+allow-expect-in-tests = false
+allow-indexing-slicing-in-tests = false
+allow-dbg-in-tests = false
+allow-print-in-tests = false
+allow-useless-vec-in-tests = false
+allow-large-stack-frames-in-tests = false
+
+allow-unwrap-in-consts = false
+allow-expect-in-consts = false
+
+check-private-items = true
