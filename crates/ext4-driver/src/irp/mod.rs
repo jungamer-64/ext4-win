@@ -34,37 +34,6 @@ impl InformationLength {
     }
 }
 
-/// Successful driver completion before the NTSTATUS dispatch boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DriverCompletion {
-    /// Completed information byte count.
-    information: InformationLength,
-}
-
-impl DriverCompletion {
-    /// Successful completion without output bytes.
-    pub(crate) const EMPTY: Self = Self {
-        information: InformationLength::ZERO,
-    };
-
-    /// Builds a successful completion from an information length.
-    pub(crate) const fn with_information(information: InformationLength) -> Self {
-        Self { information }
-    }
-
-    /// Builds a successful completion from a Rust byte count.
-    pub(crate) fn from_usize(bytes: usize) -> DriverResult<Self> {
-        Ok(Self::with_information(InformationLength::from_usize(
-            bytes,
-        )?))
-    }
-
-    /// Returns the typed information length.
-    const fn information(self) -> InformationLength {
-        self.information
-    }
-}
-
 /// Non-null dispatch target decoded from raw WDK callback inputs.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DispatchTarget {
@@ -156,21 +125,6 @@ impl DispatchTarget {
             return Err(DriverError::InvalidParameter);
         };
         mdl_data_buffer_address(mdl, length)
-    }
-
-    /// Stores the byte count returned by this IRP.
-    pub(crate) fn set_information(self, information: InformationLength) {
-        // SAFETY: `KernelIrp` owns a non-null IRP pointer, and completion writes
-        // only the IRP status block for the active dispatch.
-        let irp = unsafe { self.irp.as_mut_ptr().as_mut() };
-        if let Some(irp) = irp {
-            irp.IoStatus.Information = information.as_ulong_ptr();
-        }
-    }
-
-    /// Applies a successful completion payload to this IRP.
-    pub(crate) fn complete(self, completion: DriverCompletion) {
-        self.set_information(completion.information());
     }
 
     /// Returns the current stack location selected by the I/O Manager.
