@@ -9,7 +9,9 @@ use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_SUCCESS
 #[cfg(not(test))]
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::state::{KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb};
+use crate::state::{
+    CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
+};
 
 /// Byte count completed in `IO_STATUS_BLOCK::Information`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1212,6 +1214,10 @@ pub(crate) enum QueryFileInformationClass {
     Position,
     /// Windows `FileNetworkOpenInformation`.
     NetworkOpen,
+    /// Windows `FileNameInformation`.
+    Name,
+    /// Windows `FileAttributeTagInformation`.
+    AttributeTag,
 }
 
 impl QueryFileInformationClass {
@@ -1223,6 +1229,8 @@ impl QueryFileInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileInternalInformation => Ok(Self::Internal),
             wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => Ok(Self::Position),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNetworkOpenInformation => Ok(Self::NetworkOpen),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileNameInformation => Ok(Self::Name),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileAttributeTagInformation => Ok(Self::AttributeTag),
             _ => Err(DriverError::InvalidInfoClass),
         }
     }
@@ -1274,6 +1282,8 @@ pub(crate) enum DirectoryInformationClass {
     Full,
     /// Windows `FileBothDirectoryInformation`.
     Both,
+    /// Windows `FileNamesInformation`.
+    Names,
 }
 
 impl DirectoryInformationClass {
@@ -1283,6 +1293,7 @@ impl DirectoryInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileDirectoryInformation => Ok(Self::Directory),
             wdk_sys::_FILE_INFORMATION_CLASS::FileFullDirectoryInformation => Ok(Self::Full),
             wdk_sys::_FILE_INFORMATION_CLASS::FileBothDirectoryInformation => Ok(Self::Both),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileNamesInformation => Ok(Self::Names),
             _ => Err(DriverError::InvalidInfoClass),
         }
     }
@@ -1299,6 +1310,8 @@ pub(crate) struct CreateParameters {
     disposition: CreateDisposition,
     /// File-vs-directory create/open requirement.
     target_requirement: CreateTargetRequirement,
+    /// Cleanup-time lifecycle requested by create options.
+    close_disposition: CloseDisposition,
     /// Extended-attribute input length supplied with create.
     ea_length: IrpBufferLength,
 }
@@ -1311,11 +1324,13 @@ impl CreateParameters {
         share_access: wdk_sys::USHORT,
         ea_length: IrpBufferLength,
     ) -> Result<Self, DriverError> {
+        let create_options = CreateOptions::decode(options)?;
         Ok(Self {
             desired_access: DesiredAccess::from_raw(desired_access),
             share_access: ShareAccess::from_raw(share_access)?,
             disposition: CreateDisposition::from_options(options)?,
-            target_requirement: CreateTargetRequirement::from_options(options)?,
+            target_requirement: create_options.target_requirement(),
+            close_disposition: create_options.close_disposition(),
             ea_length,
         })
     }
@@ -1338,6 +1353,11 @@ impl CreateParameters {
     /// Returns the target kind requirement.
     pub(crate) const fn target_requirement(self) -> CreateTargetRequirement {
         self.target_requirement
+    }
+
+    /// Returns the cleanup-time lifecycle requested at create/open.
+    pub(crate) const fn close_disposition(self) -> CloseDisposition {
+        self.close_disposition
     }
 
     /// Returns the input EA length.
@@ -1433,14 +1453,10 @@ pub(crate) enum CreateTargetRequirement {
 }
 
 impl CreateTargetRequirement {
-    /// Decodes file-vs-directory create options and rejects unsupported options.
+    /// Decodes file-vs-directory create options.
     fn from_options(options: wdk_sys::ULONG) -> Result<Self, DriverError> {
-        let raw_options = options & CREATE_OPTIONS_MASK;
-        if raw_options & !SUPPORTED_CREATE_OPTIONS != 0 {
-            return Err(DriverError::NotSupported);
-        }
-        let directory = raw_options & FILE_DIRECTORY_FILE_OPTION != 0;
-        let non_directory = raw_options & FILE_NON_DIRECTORY_FILE_OPTION != 0;
+        let directory = create_option_selected(options, wdk_sys::FILE_DIRECTORY_FILE);
+        let non_directory = create_option_selected(options, wdk_sys::FILE_NON_DIRECTORY_FILE);
         match (directory, non_directory) {
             (true, true) => Err(DriverError::InvalidParameter),
             (true, false) => Ok(Self::Directory),
@@ -1448,6 +1464,49 @@ impl CreateTargetRequirement {
             (false, false) => Ok(Self::Any),
         }
     }
+}
+
+/// Create options that survive raw Windows boundary decoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CreateOptions {
+    /// File-vs-directory requirement.
+    target_requirement: CreateTargetRequirement,
+    /// Requested cleanup-time lifecycle.
+    close_disposition: CloseDisposition,
+}
+
+impl CreateOptions {
+    /// Decodes and normalizes raw `Create.Options`.
+    fn decode(options: wdk_sys::ULONG) -> DriverResult<Self> {
+        let raw_options = options & CREATE_OPTIONS_MASK;
+        if raw_options & !ACCEPTED_CREATE_OPTIONS != 0 {
+            return Err(DriverError::NotSupported);
+        }
+        let close_disposition = if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
+            CloseDisposition::Delete
+        } else {
+            CloseDisposition::Keep
+        };
+        Ok(Self {
+            target_requirement: CreateTargetRequirement::from_options(options)?,
+            close_disposition,
+        })
+    }
+
+    /// Returns the decoded file-vs-directory requirement.
+    const fn target_requirement(self) -> CreateTargetRequirement {
+        self.target_requirement
+    }
+
+    /// Returns the decoded cleanup-time lifecycle.
+    const fn close_disposition(self) -> CloseDisposition {
+        self.close_disposition
+    }
+}
+
+/// Returns true when a create option bit is present.
+const fn create_option_selected(options: wdk_sys::ULONG, option: wdk_sys::ULONG) -> bool {
+    options & option != 0
 }
 
 /// `FILE_SUPERSEDE` create disposition.
@@ -1466,13 +1525,26 @@ const FILE_OVERWRITE_IF_DISPOSITION: wdk_sys::ULONG = 5;
 const CREATE_DISPOSITION_SHIFT: u32 = 24;
 /// Mask for option bits below the create disposition.
 const CREATE_OPTIONS_MASK: wdk_sys::ULONG = 0x00FF_FFFF;
-/// `FILE_DIRECTORY_FILE` create option.
-const FILE_DIRECTORY_FILE_OPTION: wdk_sys::ULONG = 0x0000_0001;
-/// `FILE_NON_DIRECTORY_FILE` create option.
-const FILE_NON_DIRECTORY_FILE_OPTION: wdk_sys::ULONG = 0x0000_0040;
-/// Create options implemented by this FSD.
-const SUPPORTED_CREATE_OPTIONS: wdk_sys::ULONG =
-    FILE_DIRECTORY_FILE_OPTION | FILE_NON_DIRECTORY_FILE_OPTION;
+/// Create options with an ext4win-internal domain meaning.
+const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG =
+    wdk_sys::FILE_DIRECTORY_FILE | wdk_sys::FILE_NON_DIRECTORY_FILE | wdk_sys::FILE_DELETE_ON_CLOSE;
+/// Create options consumed as Windows boundary hints.
+const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_WRITE_THROUGH
+    | wdk_sys::FILE_SEQUENTIAL_ONLY
+    | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING
+    | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT
+    | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT
+    | wdk_sys::FILE_COMPLETE_IF_OPLOCKED
+    | wdk_sys::FILE_NO_EA_KNOWLEDGE
+    | wdk_sys::FILE_RANDOM_ACCESS
+    | wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT
+    | wdk_sys::FILE_NO_COMPRESSION
+    | wdk_sys::FILE_DISALLOW_EXCLUSIVE
+    | wdk_sys::FILE_OPEN_REPARSE_POINT
+    | wdk_sys::FILE_OPEN_NO_RECALL
+    | wdk_sys::FILE_OPEN_FOR_FREE_SPACE_QUERY;
+/// Create options accepted by this FSD boundary.
+const ACCEPTED_CREATE_OPTIONS: wdk_sys::ULONG = DOMAIN_CREATE_OPTIONS | IGNORED_CREATE_HINT_OPTIONS;
 /// WDK share-access bits accepted by create/open.
 const FILE_SHARE_ACCESS_MASK: wdk_sys::USHORT = 0x0007;
 
@@ -1885,12 +1957,14 @@ mod tests {
         CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateTargetRequirement,
         CurrentIrpStackLocation, DirectoryControlMinorFunction, DirectoryCursorPosition,
         DirectoryEntryEmission, DirectoryInformationClass, DirectoryPatternInput, DispatchTarget,
-        EaEntryEmission, EaNameSelection, FILE_OPEN_DISPOSITION, FileSystemControlMinorFunction,
-        FsControlCode, InformationLength, IrpBufferLength, IrpCompletion, KernelIrp,
-        QueryFileInformationClass, QueryVolumeInformationClass, SecurityComponentSelection,
-        SetFileInformationClass, SetVolumeInformationClass,
+        EaEntryEmission, EaNameSelection, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
+        FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
+        IrpCompletion, KernelIrp, QueryFileInformationClass, QueryVolumeInformationClass,
+        SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
     };
-    use crate::state::{KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb};
+    use crate::state::{
+        CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
+    };
 
     /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
     const MOUNT_VOLUME_MINOR: wdk_sys::UCHAR = 1;
@@ -2143,7 +2217,10 @@ mod tests {
         };
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::addr_of_mut!(security_context),
-            Options: 0x0300_0040,
+            Options: (FILE_OPEN_IF_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_NON_DIRECTORY_FILE
+                | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT
+                | wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT,
             __bindgen_padding_0: [0; 2],
             FileAttributes: 0x20,
             ShareAccess: u16::try_from(wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE)
@@ -2169,6 +2246,7 @@ mod tests {
                     parameters.target_requirement(),
                     CreateTargetRequirement::NonDirectory
                 );
+                assert_eq!(parameters.close_disposition(), CloseDisposition::Keep);
                 assert_eq!(
                     parameters.share_access().as_ulong(),
                     wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE
@@ -2179,15 +2257,47 @@ mod tests {
     }
 
     #[test]
-    fn create_stack_rejects_unsupported_options_before_handler() {
-        const FILE_SEQUENTIAL_ONLY: wdk_sys::ULONG = 0x0000_0004;
-
+    fn create_stack_decodes_delete_on_close_as_close_disposition() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
         stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::addr_of_mut!(security_context),
-            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT) | FILE_SEQUENTIAL_ONLY,
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_DIRECTORY_FILE
+                | wdk_sys::FILE_DELETE_ON_CLOSE,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let create = current.create();
+            assert!(create.is_ok());
+            if let Ok(create) = create {
+                let parameters = create.parameters();
+                assert_eq!(
+                    parameters.target_requirement(),
+                    CreateTargetRequirement::Directory
+                );
+                assert_eq!(parameters.close_disposition(), CloseDisposition::Delete);
+            }
+        }
+    }
+
+    #[test]
+    fn create_stack_rejects_unsupported_options_before_handler() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_OPEN_BY_FILE_ID,
             __bindgen_padding_0: [0; 2],
             FileAttributes: 0,
             ShareAccess: 0,
@@ -2632,6 +2742,39 @@ mod tests {
     }
 
     #[test]
+    fn query_file_stack_decodes_name_and_attribute_tag_classes() {
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        for (raw_class, expected) in [
+            (
+                wdk_sys::_FILE_INFORMATION_CLASS::FileNameInformation,
+                QueryFileInformationClass::Name,
+            ),
+            (
+                wdk_sys::_FILE_INFORMATION_CLASS::FileAttributeTagInformation,
+                QueryFileInformationClass::AttributeTag,
+            ),
+        ] {
+            let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+            stack.FileObject = file_object.as_ptr();
+            stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
+                Length: 64,
+                __bindgen_padding_0: 0,
+                FileInformationClass: raw_class,
+            };
+
+            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            assert!(current.is_ok());
+            if let Ok(current) = current {
+                let query = current.query_file();
+                assert!(query.is_ok());
+                if let Ok(query) = query {
+                    assert_eq!(query.information_class(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn set_file_stack_preserves_file_object_length_and_class() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
@@ -2719,6 +2862,30 @@ mod tests {
                     query.information_class(),
                     DirectoryInformationClass::Directory
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn query_directory_stack_decodes_names_class() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        stack.FileObject = file_object.as_ptr();
+        stack.Parameters.QueryDirectory = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_6 {
+            Length: 128,
+            FileName: core::ptr::null_mut(),
+            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileNamesInformation,
+            __bindgen_padding_0: 0,
+            FileIndex: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let query = current.query_directory();
+            assert!(query.is_ok());
+            if let Ok(query) = query {
+                assert_eq!(query.information_class(), DirectoryInformationClass::Names);
             }
         }
     }

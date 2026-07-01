@@ -218,6 +218,8 @@ fn query_file_information(request: QueryFileRequest) -> DriverResult<IrpCompleti
             pack_position_information(output, &request.opened_file)
         }
         QueryFileInformationClass::NetworkOpen => pack_network_open_information(output, metadata),
+        QueryFileInformationClass::Name => pack_name_information(output, &request.opened_file),
+        QueryFileInformationClass::AttributeTag => pack_attribute_tag_information(output, metadata),
     }
 }
 
@@ -228,9 +230,13 @@ fn set_file_information(request: SetFileRequest) -> DriverResult<IrpCompletion> 
         SetFileInformationClass::EndOfFile => set_end_of_file_information(request),
         SetFileInformationClass::Allocation => set_allocation_information(request),
         SetFileInformationClass::Disposition => set_disposition_information(request),
-        SetFileInformationClass::DispositionEx => Err(DriverError::NotSupported),
-        SetFileInformationClass::Rename => set_rename_information(request),
-        SetFileInformationClass::RenameEx => Err(DriverError::NotSupported),
+        SetFileInformationClass::DispositionEx => set_disposition_information_ex(request),
+        SetFileInformationClass::Rename => {
+            set_rename_information(request, RenameInformationFormat::ReplaceIfExistsByte)
+        }
+        SetFileInformationClass::RenameEx => {
+            set_rename_information(request, RenameInformationFormat::Flags)
+        }
     }?;
     Ok(IrpCompletion::EMPTY)
 }
@@ -311,18 +317,54 @@ fn set_disposition_information(mut request: SetFileRequest) -> DriverResult<()> 
         request.target,
         request.stack.length(),
     )?;
-    let handle = request.opened_file.handle_mut();
-    if info.DeleteFile == 0 {
-        handle.keep_on_close();
+    let close_disposition = if info.DeleteFile == 0 {
+        CloseDisposition::Keep
     } else {
-        handle.mark_delete_on_close();
+        CloseDisposition::Delete
+    };
+    set_close_disposition(&mut request, close_disposition)
+}
+
+/// Applies FILE_DISPOSITION_INFORMATION_EX to the handle-local close disposition.
+fn set_disposition_information_ex(mut request: SetFileRequest) -> DriverResult<()> {
+    let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION_EX>(
+        request.target,
+        request.stack.length(),
+    )?;
+    set_close_disposition(&mut request, disposition_ex_close_disposition(info.Flags)?)
+}
+
+/// Decodes FILE_DISPOSITION_INFORMATION_EX flags into handle lifecycle state.
+fn disposition_ex_close_disposition(flags: wdk_sys::ULONG) -> DriverResult<CloseDisposition> {
+    if flags & !SUPPORTED_DISPOSITION_EX_FLAGS != 0 {
+        return Err(DriverError::NotSupported);
+    }
+    if flags & wdk_sys::FILE_DISPOSITION_DELETE != 0 {
+        Ok(CloseDisposition::Delete)
+    } else {
+        Ok(CloseDisposition::Keep)
+    }
+}
+
+/// Stores the decoded delete-on-close request on the opened handle.
+fn set_close_disposition(
+    request: &mut SetFileRequest,
+    close_disposition: CloseDisposition,
+) -> DriverResult<()> {
+    let handle = request.opened_file.handle_mut();
+    match close_disposition {
+        CloseDisposition::Keep => handle.keep_on_close(),
+        CloseDisposition::Delete => handle.mark_delete_on_close(),
     }
     Ok(())
 }
 
 /// Applies FILE_RENAME_INFORMATION to the opened path.
-fn set_rename_information(mut request: SetFileRequest) -> DriverResult<()> {
-    let rename = RenameTargetPath::parse(request.target, request.stack.length())?;
+fn set_rename_information(
+    mut request: SetFileRequest,
+    format: RenameInformationFormat,
+) -> DriverResult<()> {
+    let rename = RenameTargetPath::parse(request.target, request.stack.length(), format)?;
 
     let OpenedPath::Child {
         parent: source_parent,
@@ -432,6 +474,7 @@ impl DirectoryInformationClass {
             Self::Directory => DIRECTORY_INFORMATION_NAME_OFFSET,
             Self::Full => FULL_DIRECTORY_INFORMATION_NAME_OFFSET,
             Self::Both => BOTH_DIRECTORY_INFORMATION_NAME_OFFSET,
+            Self::Names => NAMES_INFORMATION_NAME_OFFSET,
         }
     }
 }
@@ -521,6 +564,8 @@ const DIRECTORY_INFORMATION_NAME_OFFSET: usize = 64;
 const FULL_DIRECTORY_INFORMATION_NAME_OFFSET: usize = 68;
 /// Bytes before FileName in FILE_BOTH_DIR_INFORMATION.
 const BOTH_DIRECTORY_INFORMATION_NAME_OFFSET: usize = 94;
+/// Bytes before FileName in FILE_NAMES_INFORMATION.
+const NAMES_INFORMATION_NAME_OFFSET: usize = 12;
 /// Offset of the common NextEntryOffset field.
 const DIRECTORY_NEXT_ENTRY_OFFSET: usize = 0;
 /// Offset of the common FileIndex field.
@@ -541,6 +586,8 @@ const DIRECTORY_ALLOCATION_SIZE_OFFSET: usize = 48;
 const DIRECTORY_FILE_ATTRIBUTES_OFFSET: usize = 56;
 /// Offset of the common FileNameLength field.
 const DIRECTORY_FILE_NAME_LENGTH_OFFSET: usize = 60;
+/// Offset of FileNameLength in FILE_NAMES_INFORMATION.
+const NAMES_INFORMATION_FILE_NAME_LENGTH_OFFSET: usize = 8;
 /// Offset of EaSize in FILE_FULL_DIR_INFORMATION and FILE_BOTH_DIR_INFORMATION.
 const DIRECTORY_EA_SIZE_OFFSET: usize = 64;
 /// Offset of ShortNameLength in FILE_BOTH_DIR_INFORMATION.
@@ -685,6 +732,18 @@ fn pack_directory_record(
         record_field_offset(start, DIRECTORY_FILE_INDEX_OFFSET)?,
         file_index,
     )?;
+    if matches!(class, DirectoryInformationClass::Names) {
+        LittleEndianOutput::new(buffer).write_u32(
+            record_field_offset(start, NAMES_INFORMATION_FILE_NAME_LENGTH_OFFSET)?,
+            u32::try_from(utf16_byte_len(name.utf16())?)
+                .map_err(|_| DriverError::InvalidParameter)?,
+        )?;
+        return write_utf16(
+            buffer,
+            field_offset(start, layout.name_offset)?,
+            name.utf16(),
+        );
+    }
     LittleEndianOutput::new(buffer).write_bytes(
         record_field_offset(start, DIRECTORY_CREATION_TIME_OFFSET)?,
         &windows_time_quad(metadata.times.created()).to_le_bytes(),
@@ -718,7 +777,7 @@ fn pack_directory_record(
         u32::try_from(utf16_byte_len(name.utf16())?).map_err(|_| DriverError::InvalidParameter)?,
     )?;
     match class {
-        DirectoryInformationClass::Directory => {}
+        DirectoryInformationClass::Directory | DirectoryInformationClass::Names => {}
         DirectoryInformationClass::Full => {
             LittleEndianOutput::new(buffer)
                 .write_u32(record_field_offset(start, DIRECTORY_EA_SIZE_OFFSET)?, 0)?;
@@ -889,16 +948,14 @@ struct RenameTargetPath {
 
 impl RenameTargetPath {
     /// Decodes a FILE_RENAME_INFORMATION variable-length input buffer.
-    fn parse(target: DispatchTarget, length: IrpBufferLength) -> DriverResult<Self> {
+    fn parse(
+        target: DispatchTarget,
+        length: IrpBufferLength,
+        format: RenameInformationFormat,
+    ) -> DriverResult<Self> {
         let input = target.buffered_input(length)?;
         let bytes = input.as_slice();
-        match bytes
-            .get(FILE_RENAME_REPLACE_IF_EXISTS_OFFSET)
-            .ok_or(DriverError::BufferTooSmall)?
-        {
-            0 => {}
-            _ => return Err(DriverError::NotSupported),
-        }
+        format.validate(bytes)?;
         reject_root_directory(bytes)?;
         let name_length = usize::try_from(
             LittleEndianInput::new(bytes).read_u32(wire_offset(FILE_RENAME_NAME_LENGTH_OFFSET))?,
@@ -922,6 +979,40 @@ impl RenameTargetPath {
     /// Returns the final target name.
     fn target_name(&self) -> &WindowsName {
         self.path.target_name()
+    }
+}
+
+/// FILE_RENAME_INFORMATION union arm selected by the information class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenameInformationFormat {
+    /// `FileRenameInformation` exposes a BOOLEAN ReplaceIfExists field.
+    ReplaceIfExistsByte,
+    /// `FileRenameInformationEx` exposes a ULONG Flags field.
+    Flags,
+}
+
+impl RenameInformationFormat {
+    /// Rejects rename semantics that ext4win does not implement.
+    fn validate(self, bytes: &[u8]) -> DriverResult<()> {
+        match self {
+            Self::ReplaceIfExistsByte => {
+                match bytes
+                    .get(FILE_RENAME_REPLACE_IF_EXISTS_OFFSET)
+                    .ok_or(DriverError::BufferTooSmall)?
+                {
+                    0 => Ok(()),
+                    _ => Err(DriverError::NotSupported),
+                }
+            }
+            Self::Flags => {
+                let flags = LittleEndianInput::new(bytes)
+                    .read_u32(wire_offset(FILE_RENAME_FLAGS_OFFSET))?;
+                if flags & !SUPPORTED_RENAME_EX_FLAGS != 0 {
+                    return Err(DriverError::NotSupported);
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -968,12 +1059,20 @@ impl NonEmptyWindowsPath {
 
 /// Offset of FILE_RENAME_INFORMATION ReplaceIfExists.
 const FILE_RENAME_REPLACE_IF_EXISTS_OFFSET: usize = 0;
+/// Offset of FILE_RENAME_INFORMATION_EX Flags.
+const FILE_RENAME_FLAGS_OFFSET: usize = 0;
 /// Offset of FILE_RENAME_INFORMATION RootDirectory.
 const FILE_RENAME_ROOT_DIRECTORY_OFFSET: usize = 8;
 /// Offset of FILE_RENAME_INFORMATION FileNameLength.
 const FILE_RENAME_NAME_LENGTH_OFFSET: usize = 16;
 /// Offset of FILE_RENAME_INFORMATION FileName.
 const FILE_RENAME_NAME_OFFSET: usize = 20;
+/// FILE_DISPOSITION_INFORMATION_EX flags handled by this driver.
+const SUPPORTED_DISPOSITION_EX_FLAGS: wdk_sys::ULONG = wdk_sys::FILE_DISPOSITION_DELETE
+    | wdk_sys::FILE_DISPOSITION_ON_CLOSE
+    | wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
+/// FILE_RENAME_INFORMATION_EX flags that do not change ext4win rename semantics.
+const SUPPORTED_RENAME_EX_FLAGS: wdk_sys::ULONG = wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE;
 /// UTF-16 backslash separator.
 const UTF16_BACKSLASH: u16 = 0x005C;
 
@@ -1335,6 +1434,63 @@ fn pack_network_open_information(
     )
 }
 
+/// Packs FILE_NAME_INFORMATION.
+fn pack_name_information(
+    output: &mut [u8],
+    opened_file: &OpenedFileObject,
+) -> DriverResult<IrpCompletion> {
+    let units = opened_path_name_units(opened_file.handle().path())?;
+    let name_bytes = utf16_byte_len(&units)?;
+    let required = FILE_NAME_INFORMATION_NAME_OFFSET
+        .checked_add(name_bytes)
+        .ok_or(DriverError::InvalidParameter)?;
+    if output.len() < required {
+        return Err(DriverError::BufferOverflow);
+    }
+    clear_record(output, 0, required)?;
+    LittleEndianOutput::new(output).write_u32(
+        WireOffset::new(FILE_NAME_INFORMATION_NAME_LENGTH_OFFSET),
+        u32::try_from(name_bytes).map_err(|_| DriverError::InvalidParameter)?,
+    )?;
+    write_utf16(output, FILE_NAME_INFORMATION_NAME_OFFSET, &units)?;
+    IrpCompletion::from_usize(required)
+}
+
+/// Packs FILE_ATTRIBUTE_TAG_INFORMATION.
+fn pack_attribute_tag_information(
+    output: &mut [u8],
+    metadata: FileMetadata,
+) -> DriverResult<IrpCompletion> {
+    write_fixed(
+        output,
+        wdk_sys::FILE_ATTRIBUTE_TAG_INFORMATION {
+            FileAttributes: file_attributes(metadata),
+            ReparseTag: reparse_tag(metadata.kind),
+        },
+    )
+}
+
+/// Projects an opened path to the name payload returned to Windows.
+fn opened_path_name_units(path: &OpenedPath) -> DriverResult<Vec<u16>> {
+    match path {
+        OpenedPath::Root => Ok(Vec::from([UTF16_BACKSLASH])),
+        OpenedPath::Child { name, .. } => Ok(WindowsName::from_ext4(name)?.utf16().to_vec()),
+    }
+}
+
+/// Returns the reparse tag associated with file attributes.
+const fn reparse_tag(kind: FileMetadataKind) -> wdk_sys::ULONG {
+    match kind {
+        FileMetadataKind::File | FileMetadataKind::Directory => 0,
+        FileMetadataKind::Symlink => wdk_sys::IO_REPARSE_TAG_SYMLINK,
+    }
+}
+
+/// Offset of FileNameLength in FILE_NAME_INFORMATION.
+const FILE_NAME_INFORMATION_NAME_LENGTH_OFFSET: usize = 0;
+/// Offset of FileName in FILE_NAME_INFORMATION.
+const FILE_NAME_INFORMATION_NAME_OFFSET: usize = 4;
+
 /// Writes one fixed-size information structure into the caller's buffer.
 fn write_fixed<T>(output: &mut [u8], value: T) -> DriverResult<IrpCompletion> {
     let size = core::mem::size_of::<T>();
@@ -1508,9 +1664,37 @@ fn release_file_contexts(file_object: KernelFileObject) {
 mod tests {
     use core::ptr::NonNull;
 
+    use ext4_core::{
+        BlockSize, DirectoryNodeId, Ext4Gid, Ext4LinkCount, Ext4Name, Ext4Owner, Ext4Permissions,
+        Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileSize, WindowsName,
+    };
     use wdk_sys::STATUS_NOT_SUPPORTED;
 
+    use crate::irp::DirectoryInformationClass;
     use crate::kernel::status::DriverError;
+    use crate::state::OpenedPath;
+
+    fn test_metadata(kind: super::FileMetadataKind) -> super::FileMetadata {
+        let timestamp = Ext4Timestamp::from_unix_seconds(1);
+        super::FileMetadata {
+            file_index: 1,
+            kind,
+            size: FileSize::from_bytes(0),
+            security: Ext4Security::new(
+                Ext4Owner::new(Ext4Uid::from_u32(0), Ext4Gid::from_u32(0)),
+                Ext4Permissions::new(0o644).unwrap(),
+            ),
+            times: Ext4Times::new(timestamp, timestamp, timestamp, timestamp),
+            links_count: Ext4LinkCount::ONE,
+            overlay_attributes: 0,
+            block_size: BlockSize::from_superblock_log(0).unwrap(),
+        }
+    }
+
+    fn le_u32(buffer: &[u8], offset: usize) -> u32 {
+        let bytes: [u8; 4] = buffer[offset..offset + 4].try_into().unwrap();
+        u32::from_le_bytes(bytes)
+    }
 
     #[test]
     fn rename_target_path_rejects_empty_and_root_only_names() {
@@ -1521,6 +1705,104 @@ mod tests {
         assert_eq!(
             super::NonEmptyWindowsPath::from_utf16_path(&[super::UTF16_BACKSLASH]),
             Err(DriverError::InvalidParameter)
+        );
+    }
+
+    #[test]
+    fn opened_path_name_units_project_root_and_child_names() {
+        assert_eq!(
+            super::opened_path_name_units(&OpenedPath::Root).unwrap(),
+            [super::UTF16_BACKSLASH]
+        );
+
+        let name = Ext4Name::new(b"file").unwrap();
+        let path = OpenedPath::Child {
+            parent: DirectoryNodeId::ROOT,
+            name,
+        };
+        assert_eq!(
+            super::opened_path_name_units(&path).unwrap(),
+            [
+                u16::from(b'f'),
+                u16::from(b'i'),
+                u16::from(b'l'),
+                u16::from(b'e')
+            ]
+        );
+    }
+
+    #[test]
+    fn file_names_information_record_uses_name_only_layout() {
+        let name = WindowsName::from_utf16(&[u16::from(b'a')]).unwrap();
+        let layout =
+            super::DirectoryRecordLayout::new(DirectoryInformationClass::Names, &name).unwrap();
+        let mut buffer = [0_u8; 24];
+
+        super::pack_directory_record(
+            &mut buffer,
+            0,
+            DirectoryInformationClass::Names,
+            7,
+            &name,
+            test_metadata(super::FileMetadataKind::File),
+            layout,
+        )
+        .unwrap();
+
+        assert_eq!(le_u32(&buffer, super::DIRECTORY_NEXT_ENTRY_OFFSET), 0);
+        assert_eq!(le_u32(&buffer, super::DIRECTORY_FILE_INDEX_OFFSET), 7);
+        assert_eq!(
+            le_u32(&buffer, super::NAMES_INFORMATION_FILE_NAME_LENGTH_OFFSET),
+            2
+        );
+        assert_eq!(
+            &buffer[super::NAMES_INFORMATION_NAME_OFFSET..][..2],
+            &[b'a', 0]
+        );
+    }
+
+    #[test]
+    fn symlink_attribute_tag_information_uses_symlink_reparse_tag() {
+        assert_eq!(super::reparse_tag(super::FileMetadataKind::File), 0);
+        assert_eq!(
+            super::reparse_tag(super::FileMetadataKind::Symlink),
+            wdk_sys::IO_REPARSE_TAG_SYMLINK
+        );
+    }
+
+    #[test]
+    fn disposition_ex_flags_decode_close_disposition_and_reject_posix_semantics() {
+        assert_eq!(
+            super::disposition_ex_close_disposition(0),
+            Ok(crate::state::CloseDisposition::Keep)
+        );
+        assert_eq!(
+            super::disposition_ex_close_disposition(
+                wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_ON_CLOSE
+            ),
+            Ok(crate::state::CloseDisposition::Delete)
+        );
+        assert_eq!(
+            super::disposition_ex_close_disposition(wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS),
+            Err(DriverError::NotSupported)
+        );
+    }
+
+    #[test]
+    fn rename_ex_flags_reject_replace_semantics() {
+        let mut input = [0_u8; super::FILE_RENAME_NAME_OFFSET + 2];
+        input[super::FILE_RENAME_FLAGS_OFFSET..][..4]
+            .copy_from_slice(&wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE.to_le_bytes());
+        assert_eq!(
+            super::RenameInformationFormat::Flags.validate(&input),
+            Ok(())
+        );
+
+        input[super::FILE_RENAME_FLAGS_OFFSET..][..4]
+            .copy_from_slice(&wdk_sys::FILE_RENAME_REPLACE_IF_EXISTS.to_le_bytes());
+        assert_eq!(
+            super::RenameInformationFormat::Flags.validate(&input),
+            Err(DriverError::NotSupported)
         );
     }
 
