@@ -351,7 +351,6 @@ dependencies = [
  "ext4-core",
  "wdk-alloc",
  "wdk-build",
- "wdk-panic",
  "wdk-sys",
 ]
 
@@ -849,18 +848,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "wdk"
-version = "0.4.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
-dependencies = [
- "cfg-if",
- "tracing",
- "tracing-subscriber",
- "wdk-build",
- "wdk-sys",
-]
-
-[[package]]
 name = "wdk-alloc"
 version = "0.4.1"
 source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
@@ -908,17 +895,6 @@ dependencies = [
  "serde",
  "serde_json",
  "syn",
-]
-
-[[package]]
-name = "wdk-panic"
-version = "0.4.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
-dependencies = [
- "tracing",
- "tracing-subscriber",
- "wdk",
- "wdk-build",
 ]
 
 [[package]]

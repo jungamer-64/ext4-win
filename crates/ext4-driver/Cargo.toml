@@ -16,7 +16,6 @@ wdk-build.workspace = true
 [dependencies]
 ext4-core = { path = "../ext4-core" }
 wdk-alloc.workspace = true
-wdk-panic.workspace = true
 wdk-sys.workspace = true
 
 [features]
