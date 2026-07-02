@@ -206,7 +206,7 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
         return Err(error);
     }
 
-    let vcb = memory::boxed(vcb)?;
+    let vcb = memory::boxed_with(|| vcb)?;
     let mounted_device = match MountedVolumeDevice::initialize(
         device,
         vcb,

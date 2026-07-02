@@ -6,6 +6,7 @@ use alloc::{
     collections::{TryReserveError, TryReserveErrorKind},
     vec::Vec,
 };
+use core::fmt;
 
 use crate::kernel::status::{DriverError, DriverResult};
 
@@ -64,8 +65,8 @@ impl<T> PushError<T> {
 /// Kernel-bound vector wrapper.
 ///
 /// This intentionally does not implement `Deref<Target = [T]>` and does not expose `into_inner`.
-/// Production paths should not fall back to raw `Vec::push`, `Vec::resize`, `Vec::extend`, or
-/// `vec![]` after crossing this boundary.
+/// Production paths should not fall back to raw `Vec::push`, `Vec::resize`, `Vec::extend`, or the
+/// vector macro after crossing this boundary.
 #[repr(transparent)]
 pub(crate) struct KernelVec<T, A: Allocator = Global> {
     /// Owned vector guarded by this module's fallible growth API.
@@ -74,6 +75,33 @@ pub(crate) struct KernelVec<T, A: Allocator = Global> {
 
 /// Default driver vector using the crate-global allocator.
 pub(crate) type DriverVec<T> = KernelVec<T, Global>;
+
+impl<T, A> fmt::Debug for KernelVec<T, A>
+where
+    T: fmt::Debug,
+    A: Allocator,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_slice().fmt(formatter)
+    }
+}
+
+impl<T, A> PartialEq for KernelVec<T, A>
+where
+    T: PartialEq,
+    A: Allocator,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T, A> Eq for KernelVec<T, A>
+where
+    T: Eq,
+    A: Allocator,
+{
+}
 
 impl<T> KernelVec<T, Global> {
     /// Creates an empty vector using the global allocator.
@@ -122,13 +150,6 @@ impl<T, A> KernelVec<T, A>
 where
     A: Allocator,
 {
-    /// Creates an empty vector using the provided allocator.
-    pub(crate) fn new_in(allocator: A) -> Self {
-        Self {
-            inner: Vec::new_in(allocator),
-        }
-    }
-
     /// Creates an empty vector with fallibly reserved exact capacity.
     /// # Errors
     ///
@@ -149,14 +170,14 @@ where
         self.inner.is_empty()
     }
 
-    /// Returns the current allocated capacity reported by `Vec`.
-    pub(crate) fn capacity(&self) -> usize {
-        self.inner.capacity()
-    }
-
     /// Returns the contents as a slice.
     pub(crate) fn as_slice(&self) -> &[T] {
         self.inner.as_slice()
+    }
+
+    /// Iterates over the vector contents without exposing growth operations.
+    pub(crate) fn iter(&self) -> core::slice::Iter<'_, T> {
+        self.inner.iter()
     }
 
     /// Returns the contents as a mutable slice.
@@ -164,26 +185,6 @@ where
     /// This does not expose allocation-changing vector operations.
     pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         self.inner.as_mut_slice()
-    }
-
-    /// Returns an element by index without panicking.
-    pub(crate) fn get(&self, index: usize) -> Option<&T> {
-        self.inner.get(index)
-    }
-
-    /// Returns a mutable element by index without panicking.
-    pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        self.inner.get_mut(index)
-    }
-
-    /// Returns the raw pointer for FFI/kernel boundary calls.
-    pub(crate) fn as_ptr(&self) -> *const T {
-        self.inner.as_ptr()
-    }
-
-    /// Returns the mutable raw pointer for FFI/kernel boundary calls.
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
-        self.inner.as_mut_ptr()
     }
 
     /// Fallibly reserves exact additional capacity.
@@ -214,7 +215,7 @@ where
         }
 
         match self.inner.push_within_capacity(value) {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(value) => Err(PushError::CapacityInvariant { value }),
         }
     }
@@ -274,7 +275,9 @@ where
             return Ok(());
         }
 
-        let additional = new_len - old_len;
+        let additional = new_len
+            .checked_sub(old_len)
+            .ok_or(DriverError::InternalInvariantViolation)?;
         self.try_reserve_exact(additional)?;
 
         while self.inner.len() < new_len {
@@ -284,25 +287,20 @@ where
         Ok(())
     }
 
-    /// Truncates a `Copy` vector without allocation or destructor execution.
-    pub(crate) fn truncate_copy(&mut self, new_len: usize)
-    where
-        T: Copy,
-    {
-        self.inner.truncate(new_len);
-    }
-
-    /// Clears a `Copy` vector without allocation or destructor execution.
-    pub(crate) fn clear_copy(&mut self)
-    where
-        T: Copy,
-    {
-        self.inner.clear();
-    }
-
     /// Removes the last element without panicking.
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.inner.pop()
+    }
+
+    /// Removes one element by swapping in the last element.
+    ///
+    /// Returns `None` instead of panicking when `index` is outside the current length.
+    pub(crate) fn swap_remove(&mut self, index: usize) -> Option<T> {
+        if index < self.inner.len() {
+            Some(self.inner.swap_remove(index))
+        } else {
+            None
+        }
     }
 
     /// Copies a slice into a newly allocated vector using the provided allocator.
@@ -343,7 +341,7 @@ where
         T: Copy,
     {
         match self.inner.push_within_capacity(value) {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(_) => Err(DriverError::InternalInvariantViolation),
         }
     }
@@ -378,32 +376,6 @@ where
     boxed_try_with_in(allocator, || Ok(build()))
 }
 
-/// Boxes a `Copy` value using the provided allocator.
-///
-/// This convenience function is restricted to `Copy` so allocation failure cannot cause a
-/// destructor to run for the input value.
-/// # Errors
-///
-/// Returns an error when box allocation fails.
-pub(crate) fn boxed_copy_in<T, A>(value: T, allocator: A) -> DriverResult<Box<T, A>>
-where
-    T: Copy,
-    A: Allocator,
-{
-    boxed_with_in(allocator, || value)
-}
-
-/// Global-allocator version of [`boxed_try_with_in`].
-/// # Errors
-///
-/// Returns an error when box allocation fails or `build` returns an error.
-pub(crate) fn boxed_try_with<T, F>(build: F) -> DriverResult<Box<T>>
-where
-    F: FnOnce() -> DriverResult<T>,
-{
-    boxed_try_with_in(Global, build)
-}
-
 /// Global-allocator version of [`boxed_with_in`].
 /// # Errors
 ///
@@ -413,15 +385,4 @@ where
     F: FnOnce() -> T,
 {
     boxed_with_in(Global, build)
-}
-
-/// Global-allocator version of [`boxed_copy_in`].
-/// # Errors
-///
-/// Returns an error when box allocation fails.
-pub(crate) fn boxed_copy<T>(value: T) -> DriverResult<Box<T>>
-where
-    T: Copy,
-{
-    boxed_copy_in(value, Global)
 }

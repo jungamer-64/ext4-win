@@ -1,6 +1,5 @@
 //! Windows security descriptor boundary for ext4 owner and mode bits.
 
-use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, NodeId};
@@ -11,7 +10,7 @@ use crate::irp::{
     SecuritySelection, SetSecurityStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::{self, FallibleVec};
+use crate::memory::DriverVec;
 use crate::state::{FileControlBlock, OpenedObject, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -115,14 +114,14 @@ impl SetSecurityRequest {
 }
 
 /// Binary SID used while building a self-relative descriptor.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct BinarySid {
     /// Serialized SID bytes.
-    bytes: Vec<u8>,
+    bytes: DriverVec<u8>,
 }
 
 /// One allow ACE projected from a POSIX permission class.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct AllowAce {
     /// Windows access mask.
     mask: WindowsAccessMask,
@@ -308,10 +307,10 @@ impl PosixRwxBits {
 }
 
 /// Duplicate-checking builder for POSIX permission bits parsed from a DACL.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 struct DaclPermissionBuilder {
     /// Permission classes observed in DACL order.
-    classes: Vec<PermissionClassBits>,
+    classes: DriverVec<PermissionClassBits>,
 }
 
 impl DaclPermissionBuilder {
@@ -330,7 +329,7 @@ impl DaclPermissionBuilder {
     /// Converts parsed classes into POSIX rwx mode bits.
     fn mode_bits(&self) -> u16 {
         let mut mode = 0_u16;
-        for entry in &self.classes {
+        for entry in self.classes.iter() {
             match entry.class {
                 PermissionClass::Owner => mode |= entry.bits.as_u16() << 6,
                 PermissionClass::Group => mode |= entry.bits.as_u16() << 3,
@@ -439,8 +438,8 @@ fn security_from_node(vcb: &VolumeControlBlock, identity: NodeId) -> DriverResul
 fn security_descriptor(
     security: Ext4Security,
     selection: SecuritySelection,
-) -> DriverResult<Vec<u8>> {
-    let mut descriptor = memory::repeated_vec(0_u8, SECURITY_DESCRIPTOR_RELATIVE_BYTES)?;
+) -> DriverResult<DriverVec<u8>> {
+    let mut descriptor = DriverVec::try_repeated_copy(0_u8, SECURITY_DESCRIPTOR_RELATIVE_BYTES)?;
     LittleEndianOutput::new(descriptor.as_mut_slice()).write_u8(
         wire_offset(0),
         u8::try_from(wdk_sys::SECURITY_DESCRIPTOR_REVISION)
@@ -483,7 +482,7 @@ fn security_descriptor(
 fn security_descriptor_bytes(
     security_descriptor: NonNull<core::ffi::c_void>,
     selection: SecuritySelection,
-) -> DriverResult<Vec<u8>> {
+) -> DriverResult<DriverVec<u8>> {
     let pointer = security_descriptor.cast::<u8>();
     let mut length = SECURITY_DESCRIPTOR_RELATIVE_BYTES;
     let header = unsafe {
@@ -509,7 +508,7 @@ fn security_descriptor_bytes(
         // and ACL size fields. Windows owns the descriptor for this dispatch.
         core::slice::from_raw_parts(pointer.as_ptr(), length)
     };
-    memory::copied_slice(bytes)
+    DriverVec::try_copied_from_slice(bytes)
 }
 
 /// Builds new ext4 security metadata from a Windows security descriptor.
@@ -881,32 +880,35 @@ fn sid_sub_authority(bytes: &[u8], index: usize) -> DriverResult<u32> {
 /// # Errors
 ///
 /// Returns an error when a generated SID or ACE cannot be represented in the ACL byte image.
-fn dacl_from_permissions(security: Ext4Security) -> DriverResult<Vec<u8>> {
+fn dacl_from_permissions(security: Ext4Security) -> DriverResult<DriverVec<u8>> {
     let permissions = security.permissions().as_u16();
     let owner = permission_class_mask((permissions >> 6) & 0o7);
     let group = permission_class_mask((permissions >> 3) & 0o7);
     let other = permission_class_mask(permissions & 0o7);
-    let mut aces = Vec::new();
+    let mut aces = DriverVec::new();
     if !owner.is_empty() {
-        aces.try_push(AllowAce {
+        aces.try_push_owned(AllowAce {
             mask: owner,
             sid: uid_sid(security.owner().uid().as_u32())?,
-        })?;
+        })
+        .map_err(|error| error.into_parts().0)?;
     }
     if !group.is_empty() {
-        aces.try_push(AllowAce {
+        aces.try_push_owned(AllowAce {
             mask: group,
             sid: gid_sid(security.owner().gid().as_u32())?,
-        })?;
+        })
+        .map_err(|error| error.into_parts().0)?;
     }
     if !other.is_empty() {
-        aces.try_push(AllowAce {
+        aces.try_push_owned(AllowAce {
             mask: other,
             sid: everyone_sid()?,
-        })?;
+        })
+        .map_err(|error| error.into_parts().0)?;
     }
 
-    let mut acl = memory::repeated_vec(0_u8, ACL_HEADER_BYTES)?;
+    let mut acl = DriverVec::try_repeated_copy(0_u8, ACL_HEADER_BYTES)?;
     LittleEndianOutput::new(acl.as_mut_slice()).write_u8(
         wire_offset(0),
         u8::try_from(wdk_sys::ACL_REVISION).map_err(|_| DriverError::InvalidParameter)?,
@@ -915,7 +917,7 @@ fn dacl_from_permissions(security: Ext4Security) -> DriverResult<Vec<u8>> {
         wire_offset(4),
         u16::try_from(aces.len()).map_err(|_| DriverError::InvalidParameter)?,
     )?;
-    for ace in &aces {
+    for ace in aces.iter() {
         append_allow_ace(&mut acl, ace)?;
     }
     let acl_len = u16::try_from(acl.len()).map_err(|_| DriverError::InvalidParameter)?;
@@ -944,11 +946,11 @@ fn permission_class_mask(bits: u16) -> WindowsAccessMask {
 /// Returns an error when the descriptor's current length cannot be represented as a 32-bit
 /// self-relative offset.
 fn append_component(
-    descriptor: &mut Vec<u8>,
+    descriptor: &mut DriverVec<u8>,
     component: &[u8],
 ) -> DriverResult<SecurityDescriptorOffset> {
     let offset = u32::try_from(descriptor.len()).map_err(|_| DriverError::InvalidParameter)?;
-    descriptor.try_extend_from_slice(component)?;
+    descriptor.try_extend_from_copy_slice(component)?;
     Ok(SecurityDescriptorOffset::from_u32(offset))
 }
 
@@ -956,12 +958,12 @@ fn append_component(
 /// # Errors
 ///
 /// Returns an error when ACE size arithmetic overflows or the ACE header fields cannot be encoded.
-fn append_allow_ace(acl: &mut Vec<u8>, ace: &AllowAce) -> DriverResult<()> {
+fn append_allow_ace(acl: &mut DriverVec<u8>, ace: &AllowAce) -> DriverResult<()> {
     let ace_size = ACCESS_ALLOWED_ACE_PREFIX_BYTES
         .checked_add(ace.sid.bytes.len())
         .ok_or(DriverError::InvalidParameter)?;
     let start = acl.len();
-    acl.try_resize(
+    acl.try_resize_copy(
         start
             .checked_add(ace_size)
             .ok_or(DriverError::InvalidParameter)?,
@@ -1030,10 +1032,7 @@ fn sid(authority: u64, sub_authorities: &[u32]) -> DriverResult<BinarySid> {
                 .ok_or(DriverError::InvalidParameter)?,
         )
         .ok_or(DriverError::InvalidParameter)?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(capacity)
-        .map_err(|_| DriverError::InsufficientResources)?;
+    let mut bytes = DriverVec::try_with_capacity(capacity)?;
     bytes.try_push(
         u8::try_from(wdk_sys::SID_REVISION).map_err(|_| DriverError::InvalidParameter)?,
     )?;
@@ -1042,9 +1041,9 @@ fn sid(authority: u64, sub_authorities: &[u32]) -> DriverResult<BinarySid> {
     let Some(authority) = authority.get(2..) else {
         return Err(DriverError::InvalidParameter);
     };
-    bytes.try_extend_from_slice(authority)?;
+    bytes.try_extend_from_copy_slice(authority)?;
     for sub_authority in sub_authorities {
-        bytes.try_extend_from_slice(sub_authority.to_le_bytes().as_slice())?;
+        bytes.try_extend_from_copy_slice(sub_authority.to_le_bytes().as_slice())?;
     }
     Ok(BinarySid { bytes })
 }
@@ -1092,8 +1091,6 @@ fn security_range(bytes: &[u8], offset: usize, length: usize) -> DriverResult<&[
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-
     use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid};
 
     use crate::{
@@ -1130,14 +1127,22 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn uid_and_gid_sids_use_linux_sid_authority() {
-        assert_eq!(
-            uid_sid(1000).map(|sid| sid.bytes),
-            Ok(vec![1, 2, 0, 0, 0, 0, 0, 22, 1, 0, 0, 0, 232, 3, 0, 0])
-        );
-        assert_eq!(
-            gid_sid(100).map(|sid| sid.bytes),
-            Ok(vec![1, 2, 0, 0, 0, 0, 0, 22, 2, 0, 0, 0, 100, 0, 0, 0])
-        );
+        let uid = uid_sid(1000);
+        assert!(uid.is_ok());
+        if let Ok(uid) = uid {
+            assert_eq!(
+                uid.bytes.as_slice(),
+                &[1, 2, 0, 0, 0, 0, 0, 22, 1, 0, 0, 0, 232, 3, 0, 0]
+            );
+        }
+        let gid = gid_sid(100);
+        assert!(gid.is_ok());
+        if let Ok(gid) = gid {
+            assert_eq!(
+                gid.bytes.as_slice(),
+                &[1, 2, 0, 0, 0, 0, 0, 22, 2, 0, 0, 0, 100, 0, 0, 0]
+            );
+        }
     }
 
     /// # Panics
@@ -1305,9 +1310,10 @@ mod tests {
                     if let Some(ace_type_offset) = ace_type_offset {
                         let deny_type = u8::try_from(wdk_sys::ACCESS_DENIED_ACE_TYPE);
                         assert!(deny_type.is_ok());
-                        if let (Some(byte), Ok(deny_type)) =
-                            (descriptor.get_mut(ace_type_offset), deny_type)
-                        {
+                        if let (Some(byte), Ok(deny_type)) = (
+                            descriptor.as_mut_slice().get_mut(ace_type_offset),
+                            deny_type,
+                        ) {
                             *byte = deny_type;
                         }
                         assert_eq!(

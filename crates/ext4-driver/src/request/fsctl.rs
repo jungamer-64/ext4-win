@@ -1,11 +1,10 @@
 //! ext4win-private FSCTL payload decoding for fscrypt and fs-verity.
 
-use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use crate::irp::{DispatchTarget, FileSystemControlStack, IrpCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory;
+use crate::memory::DriverVec;
 use crate::state::{OpenedObject, OpenedRegularFile, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{
@@ -488,10 +487,13 @@ fn reject_unsupported_user_buffer(address: u64, length: u32, max_length: u32) ->
 /// # Errors
 ///
 /// Returns an error when the FSCTL input buffer is unavailable.
-fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
+fn read_input(
+    target: DispatchTarget,
+    stack: FileSystemControlStack,
+) -> DriverResult<DriverVec<u8>> {
     let length = stack.input_buffer_length();
     let input = target.buffered_input(length)?;
-    memory::copied_slice(input.as_slice())
+    DriverVec::try_copied_from_slice(input.as_slice())
 }
 
 /// Returns a mounted VCB from a path-scoped FSCTL stack.
@@ -565,7 +567,7 @@ fn parse_key_identifier(input: &[u8]) -> DriverResult<FscryptKeyIdentifier> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
 
     use super::*;
 

@@ -1,6 +1,8 @@
 //! Native Windows kernel entry point for the ext4 file system driver.
 
 #![feature(allocator_api)]
+#![feature(try_reserve_kind)]
+#![feature(vec_push_within_capacity)]
 #![no_std]
 
 extern crate alloc;
