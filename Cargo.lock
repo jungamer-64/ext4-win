@@ -851,7 +851,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "wdk"
 version = "0.4.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=0e3499d68daee51a22dabf2965b7a25159621234#0e3499d68daee51a22dabf2965b7a25159621234"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
 dependencies = [
  "cfg-if",
  "tracing",
@@ -863,7 +863,7 @@ dependencies = [
 [[package]]
 name = "wdk-alloc"
 version = "0.4.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=0e3499d68daee51a22dabf2965b7a25159621234#0e3499d68daee51a22dabf2965b7a25159621234"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -874,7 +874,7 @@ dependencies = [
 [[package]]
 name = "wdk-build"
 version = "0.5.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=0e3499d68daee51a22dabf2965b7a25159621234#0e3499d68daee51a22dabf2965b7a25159621234"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -897,7 +897,7 @@ dependencies = [
 [[package]]
 name = "wdk-macros"
 version = "0.5.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=0e3499d68daee51a22dabf2965b7a25159621234#0e3499d68daee51a22dabf2965b7a25159621234"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
 dependencies = [
  "cfg-if",
  "fs4",
@@ -913,7 +913,7 @@ dependencies = [
 [[package]]
 name = "wdk-panic"
 version = "0.4.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=0e3499d68daee51a22dabf2965b7a25159621234#0e3499d68daee51a22dabf2965b7a25159621234"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -924,7 +924,7 @@ dependencies = [
 [[package]]
 name = "wdk-sys"
 version = "0.5.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=0e3499d68daee51a22dabf2965b7a25159621234#0e3499d68daee51a22dabf2965b7a25159621234"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
 dependencies = [
  "anyhow",
  "bindgen",

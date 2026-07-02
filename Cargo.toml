@@ -6,10 +6,10 @@ members = [
 resolver = "3"
 
 [workspace.dependencies]
-wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "0e3499d68daee51a22dabf2965b7a25159621234" }
-wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "0e3499d68daee51a22dabf2965b7a25159621234" }
-wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "0e3499d68daee51a22dabf2965b7a25159621234" }
-wdk-panic = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "0e3499d68daee51a22dabf2965b7a25159621234" }
+wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "21ec8f86ea16766ec5cebc33341de744f3119bbf" }
+wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "21ec8f86ea16766ec5cebc33341de744f3119bbf" }
+wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "21ec8f86ea16766ec5cebc33341de744f3119bbf" }
+wdk-panic = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "21ec8f86ea16766ec5cebc33341de744f3119bbf" }
 
 [profile.dev]
 panic = "abort"
