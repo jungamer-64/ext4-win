@@ -14,6 +14,7 @@ use crate::disk_format::superblock::{
     BlockGroupId, FreeClusterDelta, Superblock,
 };
 use crate::error::{Error, Result};
+use crate::memory;
 
 // Low 32-bit descriptor fields are present in both 32-byte and 64-byte layouts.
 /// Offset of `bg_block_bitmap_lo` in a block group descriptor.
@@ -102,7 +103,8 @@ impl BlockGroupDescriptor {
         }
         let offset =
             descriptor_offset(superblock.block_size(), superblock.descriptor_size(), group)?;
-        let mut bytes = alloc::vec![0_u8; usize::from(superblock.descriptor_size().as_u16())];
+        let mut bytes =
+            memory::repeated_vec(0_u8, usize::from(superblock.descriptor_size().as_u16()))?;
         reader.read_exact_at(offset, &mut bytes)?;
         verify_block_group_descriptor_checksum(superblock, group, &bytes)?;
         let block_bitmap = descriptor_block_address(

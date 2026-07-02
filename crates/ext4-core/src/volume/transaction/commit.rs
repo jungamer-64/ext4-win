@@ -11,50 +11,50 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     fn metadata_writes(&mut self) -> Result<Vec<RangeWrite>> {
         let mut writes = Vec::new();
         for bitmap in &self.block_bitmap_updates {
-            writes.push(RangeWrite {
+            writes.try_push(RangeWrite {
                 offset: self
                     .volume
                     .superblock
                     .block_size()
                     .offset_of(bitmap.block)?,
-                bytes: bitmap.bytes.clone(),
-            });
+                bytes: memory::copied_slice(&bitmap.bytes)?,
+            })?;
         }
         for bitmap in &self.inode_bitmap_updates {
-            writes.push(RangeWrite {
+            writes.try_push(RangeWrite {
                 offset: self
                     .volume
                     .superblock
                     .block_size()
                     .offset_of(bitmap.block)?,
-                bytes: bitmap.bytes.clone(),
-            });
+                bytes: memory::copied_slice(&bitmap.bytes)?,
+            })?;
         }
         for directory in &self.directory_updates {
-            writes.push(RangeWrite {
+            writes.try_push(RangeWrite {
                 offset: self
                     .volume
                     .superblock
                     .block_size()
                     .offset_of(directory.block)?,
-                bytes: directory.bytes.clone(),
-            });
+                bytes: memory::copied_slice(&directory.bytes)?,
+            })?;
         }
         for extent in &self.extent_updates {
-            writes.push(RangeWrite {
+            writes.try_push(RangeWrite {
                 offset: self
                     .volume
                     .superblock
                     .block_size()
                     .offset_of(extent.block)?,
-                bytes: extent.bytes.clone(),
-            });
+                bytes: memory::copied_slice(&extent.bytes)?,
+            })?;
         }
         for xattr in &self.xattr_updates {
-            writes.push(RangeWrite {
+            writes.try_push(RangeWrite {
                 offset: self.volume.superblock.block_size().offset_of(xattr.block)?,
-                bytes: xattr.bytes.clone(),
-            });
+                bytes: memory::copied_slice(&xattr.bytes)?,
+            })?;
         }
         for delta in &self.group_deltas {
             let mut descriptor = BlockGroupDescriptor::read_from(
@@ -105,27 +105,27 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                     bitmap.bytes.as_slice(),
                 )?;
             }
-            writes.push(RangeWrite {
+            writes.try_push(RangeWrite {
                 offset: descriptor.offset(),
-                bytes: descriptor.bytes().to_vec(),
-            });
+                bytes: memory::copied_slice(descriptor.bytes())?,
+            })?;
         }
         if !self.free_clusters_delta.is_zero()
             || self.free_inodes_delta != 0
             || self.volume_label_update.is_some()
         {
-            writes.push(RangeWrite {
+            writes.try_push(RangeWrite {
                 offset: ByteOffset::new(SUPERBLOCK_OFFSET),
                 bytes: self.updated_superblock_bytes()?,
-            });
+            })?;
         }
         for inode in &self.inode_updates {
-            let mut inode = inode.clone();
+            let mut inode = inode.try_clone()?;
             inode.refresh_checksum(&self.volume.superblock)?;
-            writes.push(RangeWrite {
+            writes.try_push(RangeWrite {
                 offset: inode.offset(),
-                bytes: inode.bytes().to_vec(),
-            });
+                bytes: memory::copied_slice(inode.bytes())?,
+            })?;
         }
         Ok(writes)
     }
@@ -171,11 +171,11 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             {
                 index
             } else {
-                let mut bytes = vec![0_u8; block_bytes];
+                let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
                 self.volume
                     .device
                     .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
-                blocks.push(MetadataBlock::new(block, bytes));
+                blocks.try_push(MetadataBlock::new(block, bytes))?;
                 blocks
                     .len()
                     .checked_sub(1)
@@ -212,7 +212,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     /// Returns an error when the primary superblock cannot be read, free counters underflow or
     /// overflow, the label cannot be written, or the checksum cannot be refreshed.
     fn updated_superblock_bytes(&self) -> Result<Vec<u8>> {
-        let mut bytes = vec![0_u8; 1024];
+        let mut bytes = memory::repeated_vec(0_u8, 1024)?;
         self.volume
             .device
             .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut bytes)?;
@@ -380,7 +380,7 @@ pub(super) fn verity_metadata_image(
             .ok_or(Error::InvalidVerityMetadata)?,
     )
     .map_err(|_| Error::ArithmeticOverflow)?;
-    let mut image = vec![0_u8; metadata_bytes];
+    let mut image = memory::repeated_vec(0_u8, metadata_bytes)?;
     let tree_end = merkle_tree.len();
     image
         .get_mut(..tree_end)

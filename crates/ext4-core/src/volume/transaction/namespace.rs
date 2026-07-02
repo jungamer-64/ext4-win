@@ -28,7 +28,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         self.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
         let inode_id = raw_inode.id();
         self.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::File)?;
-        self.inode_updates.push(raw_inode.into());
+        self.inode_updates.try_push(raw_inode.into())?;
         Ok(TransactionFile {
             id: FileNodeId::new(inode_id),
         })
@@ -112,9 +112,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
 
         let mut directory = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
-        );
+        )?;
         directory.initialize_dot_entries(inode_id, parent.inode())?;
-        self.stage_directory_block(block, directory.into_bytes());
+        self.stage_directory_block(block, directory.into_bytes())?;
 
         self.add_directory_entry(
             parent.inode(),
@@ -125,7 +125,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         self.increment_directory_links(parent.inode())?;
         let group = InodeBitmapPosition::from_inode(&self.volume.superblock, inode_id)?.group();
         self.record_group_used_dirs_delta(group, 1)?;
-        self.inode_updates.push(raw_inode.into());
+        self.inode_updates.try_push(raw_inode.into())?;
         Ok(TransactionDirectory {
             id: DirectoryNodeId::new(inode_id),
         })
@@ -171,15 +171,15 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             let mut tree = MutableExtentTree::from_extents(Vec::new())?;
             for (logical, chunk) in target.bytes().chunks(block_bytes).enumerate() {
                 let block = self.allocate_cluster()?;
-                let mut bytes = vec![0_u8; block_bytes];
+                let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
                 bytes
                     .get_mut(..chunk.len())
                     .ok_or(Error::DeviceRange)?
                     .copy_from_slice(chunk);
-                self.data_writes.push(RangeWrite {
+                self.data_writes.try_push(RangeWrite {
                     offset: block_size.offset_of(block)?,
                     bytes,
-                });
+                })?;
                 tree.insert_or_extend_initialized(
                     LogicalBlock::try_from(
                         u64::try_from(logical).map_err(|_| Error::ArithmeticOverflow)?,
@@ -192,7 +192,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         };
         let inode_id = raw_inode.id();
         self.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::Symlink)?;
-        self.inode_updates.push(raw_inode.into());
+        self.inode_updates.try_push(raw_inode.into())?;
         Ok(TransactionSymlink {
             id: SymlinkNodeId::new(inode_id),
         })
@@ -362,7 +362,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             return Err(Error::WrongInodeKind);
         }
         let lookup_name = self.directory_lookup_name(&inode, name)?;
-        if let Some(entry) = self.directory_layout(&inode)?.find(&lookup_name) {
+        if let Some(entry) = self.directory_layout(&inode)?.find(&lookup_name)? {
             return Ok(entry);
         }
         Err(Error::DirectoryEntryNotFound)
@@ -375,10 +375,17 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     /// ciphertext fallback can represent `name`.
     fn directory_lookup_name(&self, directory: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
         match self.volume.encrypt_directory_child_name(directory, name) {
-            Err(Error::MissingEncryptionKey) => Ok(
-                MountedVolume::<D, JournaledMount<J>, N>::locked_directory_ciphertext_name(name)?
-                    .unwrap_or_else(|| name.clone()),
-            ),
+            Err(Error::MissingEncryptionKey) => {
+                if let Some(ciphertext) =
+                    MountedVolume::<D, JournaledMount<J>, N>::locked_directory_ciphertext_name(
+                        name,
+                    )?
+                {
+                    Ok(ciphertext)
+                } else {
+                    Ext4Name::new(name.bytes())
+                }
+            }
             result => result,
         }
     }
@@ -407,7 +414,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             .encrypt_directory_child_name(&parent_inode, name)?;
         if self
             .directory_layout(&parent_inode)?
-            .find(&disk_name)
+            .find(&disk_name)?
             .is_some()
         {
             return Err(Error::NameAlreadyExists);
@@ -416,15 +423,15 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries();
-            entries.push(RawDirectoryEntry::new(child, &disk_name, kind));
+            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
+            entries.try_push(RawDirectoryEntry::new(child, &disk_name, kind)?)?;
             self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
             return Ok(());
         }
 
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if block.insert(child, &disk_name, kind)? {
-                self.stage_directory_block(physical, block.into_bytes());
+                self.stage_directory_block(physical, block.into_bytes())?;
                 raw_parent
                     .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
                 self.replace_live_inode(inode_index, raw_parent)?;
@@ -434,8 +441,8 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
 
         match self.volume.superblock.directory_indexing() {
             DirectoryIndexing::Enabled => {
-                let mut entries = self.directory_layout(&parent_inode)?.entries();
-                entries.push(RawDirectoryEntry::new(child, &disk_name, kind));
+                let mut entries = self.directory_layout(&parent_inode)?.entries()?;
+                entries.try_push(RawDirectoryEntry::new(child, &disk_name, kind)?)?;
                 self.stage_rebuilt_htree_directory(
                     inode_index,
                     raw_parent,
@@ -460,13 +467,13 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
 
         let mut block = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
-        );
+        )?;
         block.initialize_free_space()?;
         let inserted = block.insert(child, &disk_name, kind)?;
         if !inserted {
             return Err(Error::InvalidDirectoryEntry);
         }
-        self.stage_directory_block(new_physical, block.into_bytes());
+        self.stage_directory_block(new_physical, block.into_bytes())?;
         let new_parent_size = FileSize::from_bytes(
             parent_inode
                 .size()
@@ -504,7 +511,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries();
+            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
             let Some(position) = entries.iter().position(|entry| entry.name() == &disk_name) else {
                 return Err(Error::DirectoryEntryNotFound);
             };
@@ -514,7 +521,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         }
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(removed) = block.remove(&disk_name)? {
-                self.stage_directory_block(physical, block.into_bytes());
+                self.stage_directory_block(physical, block.into_bytes())?;
                 raw_parent
                     .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
                 self.replace_live_inode(inode_index, raw_parent)?;
@@ -554,7 +561,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries();
+            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
             if entries.iter().any(|entry| entry.name() == &new_disk_name) {
                 return Err(Error::NameAlreadyExists);
             }
@@ -567,14 +574,14 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             let renamed = entries
                 .get(position)
                 .ok_or(Error::InvalidDirectoryEntry)?
-                .clone();
+                .try_clone()?;
             if renamed.inode() != child {
                 return Err(Error::InvalidDirectoryEntry);
             }
             *entries
                 .get_mut(position)
                 .ok_or(Error::InvalidDirectoryEntry)? =
-                RawDirectoryEntry::new(child, &new_disk_name, kind);
+                RawDirectoryEntry::new(child, &new_disk_name, kind)?;
             self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
             return Ok(renamed);
         }
@@ -587,7 +594,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                 if replacement.is_none() {
                     return Err(Error::InvalidDirectoryEntry);
                 }
-                self.stage_directory_block(physical, block.into_bytes());
+                self.stage_directory_block(physical, block.into_bytes())?;
                 raw_parent
                     .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
                 self.replace_live_inode(inode_index, raw_parent)?;
@@ -623,24 +630,24 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries();
+            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
             let Some(position) = entries.iter().position(|entry| entry.name() == &disk_name) else {
                 return Err(Error::DirectoryEntryNotFound);
             };
             let replaced = entries
                 .get(position)
                 .ok_or(Error::InvalidDirectoryEntry)?
-                .clone();
+                .try_clone()?;
             *entries
                 .get_mut(position)
                 .ok_or(Error::InvalidDirectoryEntry)? =
-                RawDirectoryEntry::new(child, &disk_name, kind);
+                RawDirectoryEntry::new(child, &disk_name, kind)?;
             self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
             return Ok(replaced);
         }
         for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
             if let Some(replaced) = block.replace(&disk_name, child, kind)? {
-                self.stage_directory_block(physical, block.into_bytes());
+                self.stage_directory_block(physical, block.into_bytes())?;
                 raw_parent
                     .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
                 self.replace_live_inode(inode_index, raw_parent)?;
@@ -709,9 +716,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             let image_block = image
                 .blocks()
                 .get(usize::try_from(logical).map_err(|_| Error::ArithmeticOverflow)?)
-                .ok_or(Error::InvalidDirectoryEntry)?
-                .clone();
-            self.stage_directory_block(physical, image_block);
+                .ok_or(Error::InvalidDirectoryEntry)?;
+            let image_block = memory::copied_slice(image_block)?;
+            self.stage_directory_block(physical, image_block)?;
         }
         raw_parent.mark_indexed_directory()?;
         let rebuilt_size = FileSize::from_bytes(
@@ -727,7 +734,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Stages the latest image for a mutated directory block.
-    fn stage_directory_block(&mut self, block: BlockAddress, bytes: Vec<u8>) {
+    /// # Errors
+    ///
+    /// Returns an error when recording a new staged block image cannot allocate.
+    fn stage_directory_block(&mut self, block: BlockAddress, bytes: Vec<u8>) -> Result<()> {
         if let Some(image) = self
             .directory_updates
             .iter_mut()
@@ -735,8 +745,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         {
             image.bytes = bytes;
         } else {
-            self.directory_updates.push(BlockImage { block, bytes });
+            self.directory_updates
+                .try_push(BlockImage { block, bytes })?;
         }
+        Ok(())
     }
 
     /// Returns whether a directory contains only `.` and `..`.
@@ -744,7 +756,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     ///
     /// Returns an error when the directory layout cannot be loaded or parsed.
     fn directory_is_empty(&self, inode: &Inode) -> Result<bool> {
-        for entry in self.directory_layout(inode)?.entries() {
+        for entry in self.directory_layout(inode)?.entries()? {
             let name = entry.name().bytes();
             if name != b"." && name != b".." {
                 return Ok(false);
@@ -768,10 +780,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         }
         let mut blocks = Vec::new();
         for (logical, _physical, block) in self.directory_blocks(inode)? {
-            blocks.push(DirectoryBlockData::new(
+            blocks.try_push(DirectoryBlockData::new(
                 logical.as_u32(),
                 block.into_bytes(),
-            ));
+            ))?;
         }
         DirectoryLayout::from_storage_kind(
             storage,
@@ -818,15 +830,15 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                 if staged.bytes.len() != block_bytes {
                     return Err(Error::InvalidDirectoryEntry);
                 }
-                staged.bytes.clone()
+                memory::copied_slice(&staged.bytes)?
             } else {
-                let mut bytes = vec![0_u8; block_bytes];
+                let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
                 self.volume
                     .device
                     .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
                 bytes
             };
-            blocks.push((logical, physical, DirectoryBlock::new(bytes)));
+            blocks.try_push((logical, physical, DirectoryBlock::new(bytes)))?;
         }
         Ok(blocks)
     }

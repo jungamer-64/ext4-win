@@ -1,12 +1,13 @@
 //! Extent tree parsing, mapping, and mutation serialization.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::disk::block::{BlockAddress, BlockReader, BlockSize};
 use crate::disk::checksum::crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::disk_format::inode::{InodeExtentRoot, InodeId};
 use crate::error::{Error, Result};
+use crate::memory::{self, FallibleVec};
 
 /// Magic value stored at the start of every ext4 extent header.
 const EXTENT_MAGIC: u16 = 0xF30A;
@@ -411,11 +412,11 @@ impl MutableExtentTree {
         logical_block: LogicalBlock,
         physical_block: BlockAddress,
     ) -> Result<()> {
-        self.extents.push(Extent::initialized(
+        self.extents.try_push(Extent::initialized(
             logical_block,
             ExtentLength::new(1)?,
             physical_block,
-        ));
+        ))?;
         normalize_extents(&mut self.extents)
     }
 
@@ -473,11 +474,12 @@ impl MutableExtentTree {
                 .checked_add(1)
                 .ok_or(Error::ArithmeticOverflow)?;
             let bytes = serialize_external_extent_node(block_size, 0, chunk, context)?;
-            external_blocks.push(SerializedExtentBlock {
+            let block_bytes = memory::copied_slice(&bytes)?;
+            external_blocks.try_push(SerializedExtentBlock {
                 block,
-                bytes: bytes.clone(),
-            });
-            nodes.push(SerializedNode {
+                bytes: block_bytes,
+            })?;
+            nodes.try_push(SerializedNode {
                 first_logical: chunk
                     .first()
                     .ok_or(Error::InvalidExtentTree)?
@@ -485,7 +487,7 @@ impl MutableExtentTree {
                 depth: 0,
                 block,
                 bytes,
-            });
+            })?;
         }
 
         while nodes.len() > INODE_ROOT_ENTRY_CAPACITY {
@@ -507,16 +509,17 @@ impl MutableExtentTree {
                     .ok_or(Error::ArithmeticOverflow)?;
                 let bytes =
                     serialize_external_index_node(block_size, parent_depth, chunk, context)?;
-                external_blocks.push(SerializedExtentBlock {
+                let block_bytes = memory::copied_slice(&bytes)?;
+                external_blocks.try_push(SerializedExtentBlock {
                     block,
-                    bytes: bytes.clone(),
-                });
-                parents.push(SerializedNode {
+                    bytes: block_bytes,
+                })?;
+                parents.try_push(SerializedNode {
                     first_logical: chunk.first().ok_or(Error::InvalidExtentTree)?.first_logical,
                     depth: parent_depth,
                     block,
                     bytes,
-                });
+                })?;
             }
             nodes = parents;
         }
@@ -657,10 +660,12 @@ fn parse_index_node(
         if metadata_blocks.contains(&leaf) {
             return Err(Error::InvalidExtentTree);
         }
-        metadata_blocks.push(leaf);
+        metadata_blocks.try_push(leaf)?;
 
-        let mut child =
-            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        let mut child = memory::repeated_vec(
+            0_u8,
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
         reader.read_exact_at(block_size.offset_of(leaf)?, &mut child)?;
         verify_external_extent_block_checksum(context, child.as_slice())?;
         let child_depth = parse_node(
@@ -717,7 +722,7 @@ fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>
         if end > raw.len() {
             return Err(Error::InvalidExtentTree);
         }
-        extents.push(parse_extent(raw, offset)?);
+        extents.try_push(parse_extent(raw, offset)?)?;
     }
     Ok(depth)
 }
@@ -834,7 +839,7 @@ fn normalize_extents(extents: &mut Vec<Extent>) -> Result<()> {
                 continue;
             }
         }
-        normalized.push(extent);
+        normalized.try_push(extent)?;
     }
     *extents = normalized;
     Ok(())
@@ -945,8 +950,10 @@ fn serialize_external_extent_node(
     context: ExtentTreeContext,
 ) -> Result<Vec<u8>> {
     let capacity = external_entry_capacity(block_size)?;
-    let mut raw =
-        vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+    let mut raw = memory::repeated_vec(
+        0_u8,
+        usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
     write_header(raw.as_mut_slice(), extents.len(), capacity, depth)?;
     for (entry_index, extent) in extents.iter().copied().enumerate() {
         write_extent_entry(raw.as_mut_slice(), entry_offset(entry_index)?, extent)?;
@@ -967,8 +974,10 @@ fn serialize_external_index_node(
     context: ExtentTreeContext,
 ) -> Result<Vec<u8>> {
     let capacity = external_entry_capacity(block_size)?;
-    let mut raw =
-        vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+    let mut raw = memory::repeated_vec(
+        0_u8,
+        usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
     write_header(raw.as_mut_slice(), nodes.len(), capacity, depth)?;
     for (entry_index, node) in nodes.iter().enumerate() {
         write_index_entry(raw.as_mut_slice(), entry_offset(entry_index)?, node)?;

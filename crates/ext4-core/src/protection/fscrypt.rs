@@ -1,6 +1,6 @@
 //! fscrypt v2 policy, context, and mount-key domain.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::fmt;
 
 use aes::Aes256;
@@ -12,6 +12,7 @@ use xts_mode::{Xts128, get_tweak_default};
 use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
+use crate::memory::{self, FallibleVec};
 
 /// Serialized fscrypt v2 policy size.
 #[cfg(test)]
@@ -402,7 +403,7 @@ impl FscryptNoKeyName {
     pub(crate) fn from_ciphertext(ciphertext: &[u8]) -> Result<Self> {
         validate_ciphertext_filename_len(ciphertext.len())?;
         let name = Self {
-            ciphertext: ciphertext.to_vec(),
+            ciphertext: memory::copied_slice(ciphertext)?,
         };
         let _display = name.display_bytes()?;
         Ok(name)
@@ -438,8 +439,11 @@ impl FscryptNoKeyName {
         if display_len > 255 {
             return Err(Error::InvalidName);
         }
-        let mut display = Vec::with_capacity(display_len);
-        display.extend_from_slice(FSCRYPT_NOKEY_NAME_PREFIX);
+        let mut display = Vec::new();
+        display
+            .try_reserve_exact(display_len)
+            .map_err(|_| Error::OutOfMemory)?;
+        display.try_extend_from_slice(FSCRYPT_NOKEY_NAME_PREFIX)?;
         base64url_encode_nopad(&self.ciphertext, &mut display)?;
         Ok(display)
     }
@@ -490,7 +494,7 @@ impl FscryptMasterKey {
         let identifier = FscryptKeyIdentifier::for_raw_master_key(bytes)?;
         Ok(Self {
             identifier,
-            bytes: bytes.to_vec(),
+            bytes: memory::copied_slice(bytes)?,
         })
     }
 
@@ -709,7 +713,7 @@ impl FscryptFilenamesKey {
         padding: FscryptFilenamePadding,
     ) -> Result<Vec<u8>> {
         let padded_len = padded_filename_len(plaintext.len(), padding)?;
-        let mut ciphertext = vec![0_u8; padded_len];
+        let mut ciphertext = memory::repeated_vec(0_u8, padded_len)?;
         ciphertext
             .get_mut(..plaintext.len())
             .ok_or(Error::InvalidName)?
@@ -729,7 +733,7 @@ impl FscryptFilenamesKey {
         if ciphertext.len() < 16 || ciphertext.len() > 255 {
             return Err(Error::InvalidName);
         }
-        let mut plaintext = ciphertext.to_vec();
+        let mut plaintext = memory::copied_slice(ciphertext)?;
         aes_256_cbc_cts(self.bytes)
             .decrypt(&mut plaintext)
             .map_err(|_| Error::InvalidName)?;
@@ -860,7 +864,7 @@ fn base64url_encode_nopad(bytes: &[u8], output: &mut Vec<u8>) -> Result<()> {
 ///
 /// Returns an error when `value` is outside the six-bit base64url alphabet range.
 fn push_base64url(output: &mut Vec<u8>, value: u8) -> Result<()> {
-    output.push(base64url_alphabet_byte(value)?);
+    output.try_push(base64url_alphabet_byte(value)?)?;
     Ok(())
 }
 
@@ -885,7 +889,10 @@ fn base64url_decode_nopad(encoded: &[u8]) -> Result<Vec<u8>> {
         return Err(Error::InvalidName);
     }
     let capacity = base64url_decoded_len(encoded.len())?;
-    let mut output = Vec::with_capacity(capacity);
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::OutOfMemory)?;
     let mut remaining = encoded;
     while remaining.len() >= 4 {
         let chunk = remaining.get(..4).ok_or(Error::InvalidName)?;
@@ -893,9 +900,9 @@ fn base64url_decode_nopad(encoded: &[u8]) -> Result<Vec<u8>> {
         let c1 = base64url_value(*chunk.get(1).ok_or(Error::InvalidName)?)?;
         let c2 = base64url_value(*chunk.get(2).ok_or(Error::InvalidName)?)?;
         let c3 = base64url_value(*chunk.get(3).ok_or(Error::InvalidName)?)?;
-        output.push((c0 << 2) | (c1 >> 4));
-        output.push((c1 << 4) | (c2 >> 2));
-        output.push((c2 << 6) | c3);
+        output.try_push((c0 << 2) | (c1 >> 4))?;
+        output.try_push((c1 << 4) | (c2 >> 2))?;
+        output.try_push((c2 << 6) | c3)?;
         remaining = remaining.get(4..).ok_or(Error::InvalidName)?;
     }
 
@@ -907,7 +914,7 @@ fn base64url_decode_nopad(encoded: &[u8]) -> Result<Vec<u8>> {
             if c1 & 0x0f != 0 {
                 return Err(Error::InvalidName);
             }
-            output.push((c0 << 2) | (c1 >> 4));
+            output.try_push((c0 << 2) | (c1 >> 4))?;
             Ok(output)
         }
         3 => {
@@ -917,8 +924,8 @@ fn base64url_decode_nopad(encoded: &[u8]) -> Result<Vec<u8>> {
             if c2 & 0x03 != 0 {
                 return Err(Error::InvalidName);
             }
-            output.push((c0 << 2) | (c1 >> 4));
-            output.push((c1 << 4) | (c2 >> 2));
+            output.try_push((c0 << 2) | (c1 >> 4))?;
+            output.try_push((c1 << 4) | (c2 >> 2))?;
             Ok(output)
         }
         _ => Err(Error::InvalidName),
@@ -1051,16 +1058,18 @@ fn fscrypt_hkdf_expand(
     info: &[u8],
     output: &mut [u8],
 ) -> Result<()> {
-    let mut prefixed_info = Vec::with_capacity(
-        FSCRYPT_HKDF_INFO_PREFIX
-            .len()
-            .checked_add(1)
-            .and_then(|len| len.checked_add(info.len()))
-            .ok_or(Error::ArithmeticOverflow)?,
-    );
-    prefixed_info.extend_from_slice(FSCRYPT_HKDF_INFO_PREFIX);
-    prefixed_info.push(context.value());
-    prefixed_info.extend_from_slice(info);
+    let info_len = FSCRYPT_HKDF_INFO_PREFIX
+        .len()
+        .checked_add(1)
+        .and_then(|len| len.checked_add(info.len()))
+        .ok_or(Error::ArithmeticOverflow)?;
+    let mut prefixed_info = Vec::new();
+    prefixed_info
+        .try_reserve_exact(info_len)
+        .map_err(|_| Error::OutOfMemory)?;
+    prefixed_info.try_extend_from_slice(FSCRYPT_HKDF_INFO_PREFIX)?;
+    prefixed_info.try_push(context.value())?;
+    prefixed_info.try_extend_from_slice(info)?;
 
     Hkdf::<Sha512>::new(None, master_key)
         .expand(&prefixed_info, output)

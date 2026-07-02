@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use core::{char, str};
 
 use crate::error::{Error, Result};
+use crate::memory::{self, FallibleVec};
 
 /// Raw ext4 directory entry name.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,7 +27,7 @@ impl Ext4Name {
             return Err(Error::InvalidName);
         }
         Ok(Self {
-            bytes: bytes.to_vec(),
+            bytes: memory::copied_slice(bytes)?,
         })
     }
 
@@ -43,7 +44,7 @@ impl Ext4Name {
             return Err(Error::InvalidName);
         }
         Ok(Self {
-            bytes: bytes.to_vec(),
+            bytes: memory::copied_slice(bytes)?,
         })
     }
 
@@ -88,7 +89,7 @@ impl WindowsName {
             return Err(Error::InvalidName);
         }
         Ok(Self {
-            utf16: utf16.to_vec(),
+            utf16: memory::copied_slice(utf16)?,
         })
     }
 
@@ -107,9 +108,14 @@ impl WindowsName {
         }) {
             return Err(Error::InvalidName);
         }
-        Ok(Self {
-            utf16: text.encode_utf16().collect(),
-        })
+        let mut utf16 = Vec::new();
+        utf16
+            .try_reserve(text.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for unit in text.encode_utf16() {
+            utf16.try_push(unit)?;
+        }
+        Ok(Self { utf16 })
     }
 
     /// Converts this Windows name to the ext4 UTF-8 name stored on disk.
@@ -123,7 +129,7 @@ impl WindowsName {
             let ch = item.map_err(|_| Error::InvalidName)?;
             let mut encoded = [0_u8; 4];
             let text = ch.encode_utf8(&mut encoded);
-            bytes.extend_from_slice(text.as_bytes());
+            bytes.try_extend_from_slice(text.as_bytes())?;
         }
         Ext4Name::new(&bytes)
     }

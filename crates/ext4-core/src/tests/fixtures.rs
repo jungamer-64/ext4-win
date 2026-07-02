@@ -911,11 +911,11 @@ pub(super) fn make_indexed_root_directory(image: &mut [u8]) {
         get_u32(image, root_inode + 100),
     );
     let file_name = must(Ext4Name::new(b"file"));
-    let entries = vec![RawDirectoryEntry::new(
+    let entries = vec![must(RawDirectoryEntry::new(
         inode(3),
         &file_name,
         DirectoryEntryKind::File,
-    )];
+    ))];
     let htree = must(crate::disk_format::dir::build_htree_directory(
         inode(2),
         inode(2),

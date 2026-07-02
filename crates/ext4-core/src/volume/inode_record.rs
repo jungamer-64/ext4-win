@@ -72,6 +72,18 @@ impl From<DeletedInodeRecord> for StagedInodeRecord {
 }
 
 impl RawInodeRecord {
+    /// Copies this raw inode image without infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the raw inode bytes cannot allocate.
+    fn try_clone_record(&self) -> Result<Self> {
+        Ok(Self {
+            id: self.id,
+            offset: self.offset,
+            bytes: memory::copied_slice(&self.bytes)?,
+        })
+    }
+
     /// Returns this inode record's id.
     pub(super) const fn id(&self) -> InodeId {
         self.id
@@ -409,6 +421,21 @@ impl LiveInodeRecord {
 }
 
 impl StagedInodeRecord {
+    /// Copies this staged inode image without infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the staged raw inode bytes cannot allocate.
+    pub(super) fn try_clone(&self) -> Result<Self> {
+        Ok(match self {
+            Self::Live(record) => Self::Live(LiveInodeRecord {
+                raw: record.raw.try_clone_record()?,
+            }),
+            Self::Deleted(record) => Self::Deleted(DeletedInodeRecord {
+                raw: record.raw.try_clone_record()?,
+            }),
+        })
+    }
+
     /// Returns the staged inode id regardless of state.
     pub(super) const fn id(&self) -> InodeId {
         match self {
@@ -423,7 +450,9 @@ impl StagedInodeRecord {
     /// Returns an error when the staged record has already crossed into deleted state.
     pub(super) fn clone_live(&self) -> Result<LiveInodeRecord> {
         match self {
-            Self::Live(record) => Ok(record.clone()),
+            Self::Live(record) => Ok(LiveInodeRecord {
+                raw: record.raw.try_clone_record()?,
+            }),
             Self::Deleted(_) => Err(Error::InvalidInode),
         }
     }
@@ -532,11 +561,13 @@ impl RawInodeRecord {
         self.set_creation_time(now, timestamp_encoding)?;
         self.set_deletion_time(0)?;
         self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
-        let tree = MutableExtentTree::from_extents(vec![Extent::initialized(
+        let mut extents = Vec::new();
+        extents.try_push(Extent::initialized(
             LogicalBlock::from_u32(0),
             ExtentLength::new(1)?,
             first_block,
-        )])?;
+        ))?;
+        let tree = MutableExtentTree::from_extents(extents)?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
         self.set_allocated_blocks(allocated_blocks, u64::from(block_size.bytes()))

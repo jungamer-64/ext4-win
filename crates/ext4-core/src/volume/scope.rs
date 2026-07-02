@@ -1,6 +1,8 @@
 //! Private volume module scope shared by implementation submodules.
 
-pub(super) use alloc::{vec, vec::Vec};
+#[cfg(test)]
+pub(super) use alloc::vec;
+pub(super) use alloc::vec::Vec;
 
 pub(super) use crate::disk::block::{
     BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset,
@@ -35,6 +37,7 @@ pub(super) use crate::disk_format::xattr::{
     self as xattr_storage, InodeXattrSet, XattrName, XattrSet, XattrValue,
 };
 pub(super) use crate::error::{Error, Result};
+pub(super) use crate::memory::{self, FallibleVec};
 pub(super) use crate::platform::name::Ext4Name;
 pub(super) use crate::platform::name::WindowsName;
 pub(super) use crate::platform::windows::WindowsOverlay;

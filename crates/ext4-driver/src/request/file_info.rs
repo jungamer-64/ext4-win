@@ -18,6 +18,7 @@ use crate::irp::{
     SetFileInformationClass, SetFileStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
+use crate::memory::{self, FallibleVec};
 use crate::state::{
     CloseDisposition, DirectoryCursor, FileControlBlock, KernelFileObject, OpenedDirectory,
     OpenedHandle, OpenedObject, OpenedPath, OpenedRegularFile, VolumeControlBlock,
@@ -1146,7 +1147,7 @@ impl NonEmptyWindowsPath {
         }
         let mut components = Vec::new();
         for component in trimmed.split(|unit| *unit == UTF16_BACKSLASH) {
-            components.push(WindowsName::from_utf16(component)?);
+            components.try_push(WindowsName::from_utf16(component)?)?;
         }
         let target_name = components.pop().ok_or(DriverError::InvalidParameter)?;
         Ok(Self {
@@ -1213,13 +1214,13 @@ fn utf16_units_from_le_bytes(bytes: &[u8]) -> DriverResult<Vec<u16>> {
         return Err(DriverError::InvalidParameter);
     }
     let mut units = Vec::new();
-    for chunk in bytes.chunks_exact(core::mem::size_of::<u16>()) {
-        let unit = u16::from_le_bytes(
-            chunk
-                .try_into()
-                .map_err(|_| DriverError::InvalidParameter)?,
-        );
-        units.push(unit);
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(DriverError::InvalidParameter);
+    }
+    for chunk in chunks {
+        let unit = u16::from_le_bytes(*chunk);
+        units.try_push(unit)?;
     }
     Ok(units)
 }
@@ -1650,8 +1651,10 @@ fn pack_attribute_tag_information(
 /// Returns an error when a child ext4 name cannot be represented as a Windows UTF-16 name.
 fn opened_path_name_units(path: &OpenedPath) -> DriverResult<Vec<u16>> {
     match path {
-        OpenedPath::Root => Ok(Vec::from([UTF16_BACKSLASH])),
-        OpenedPath::Child { name, .. } => Ok(WindowsName::from_ext4(name)?.utf16().to_vec()),
+        OpenedPath::Root => memory::copied_slice(&[UTF16_BACKSLASH]),
+        OpenedPath::Child { name, .. } => {
+            memory::copied_slice(WindowsName::from_ext4(name)?.utf16())
+        }
     }
 }
 

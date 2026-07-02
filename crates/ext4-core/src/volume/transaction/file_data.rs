@@ -91,13 +91,12 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                             .get()
                             .checked_add(in_block)
                             .ok_or(Error::ArithmeticOverflow)?;
-                        self.data_writes.push(RangeWrite {
+                        self.data_writes.try_push(RangeWrite {
                             offset: ByteOffset::new(write_offset),
-                            bytes: bytes
-                                .get(completed..end)
-                                .ok_or(Error::DeviceRange)?
-                                .to_vec(),
-                        });
+                            bytes: memory::copied_slice(
+                                bytes.get(completed..end).ok_or(Error::DeviceRange)?,
+                            )?,
+                        })?;
                     }
                 }
                 BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
@@ -114,7 +113,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                             EncryptedBlockBase::ZeroedPlaintext,
                         )?;
                     } else {
-                        let mut block = vec![0_u8; block_size];
+                        let mut block = memory::repeated_vec(0_u8, block_size)?;
                         let start =
                             usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
                         let block_end =
@@ -123,10 +122,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                             .get_mut(start..block_end)
                             .ok_or(Error::DeviceRange)?
                             .copy_from_slice(bytes.get(completed..end).ok_or(Error::DeviceRange)?);
-                        self.data_writes.push(RangeWrite {
+                        self.data_writes.try_push(RangeWrite {
                             offset: self.volume.superblock.block_size().offset_of(physical)?,
                             bytes: block,
-                        });
+                        })?;
                     }
                 }
             }
@@ -199,13 +198,11 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             EncryptedBlockBase::ExistingPlaintext => {
                 self.plaintext_file_block_for_update(contents_key, logical_block, physical)?
             }
-            EncryptedBlockBase::ZeroedPlaintext => {
-                vec![
-                    0_u8;
-                    usize::try_from(self.volume.superblock.block_size().bytes())
-                        .map_err(|_| Error::ArithmeticOverflow)?
-                ]
-            }
+            EncryptedBlockBase::ZeroedPlaintext => memory::repeated_vec(
+                0_u8,
+                usize::try_from(self.volume.superblock.block_size().bytes())
+                    .map_err(|_| Error::ArithmeticOverflow)?,
+            )?,
         };
         let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
         let end = start
@@ -216,10 +213,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             .ok_or(Error::DeviceRange)?
             .copy_from_slice(bytes);
         contents_key.encrypt_block(logical_block.as_u64(), &mut block)?;
-        self.data_writes.push(RangeWrite {
+        self.data_writes.try_push(RangeWrite {
             offset: self.volume.superblock.block_size().offset_of(physical)?,
             bytes: block,
-        });
+        })?;
         Ok(())
     }
 
@@ -244,9 +241,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             .rev()
             .find(|write| write.offset == block_offset && write.bytes.len() == block_bytes)
         {
-            staged.bytes.clone()
+            memory::copied_slice(&staged.bytes)?
         } else {
-            let mut bytes = vec![0_u8; block_bytes];
+            let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
             self.volume.device.read_exact_at(block_offset, &mut bytes)?;
             bytes
         };
@@ -337,13 +334,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                 .get()
                 .checked_add(in_block)
                 .ok_or(Error::ArithmeticOverflow)?;
-            self.data_writes.push(RangeWrite {
+            self.data_writes.try_push(RangeWrite {
                 offset: ByteOffset::new(write_offset),
-                bytes: bytes
-                    .get(completed..end)
-                    .ok_or(Error::DeviceRange)?
-                    .to_vec(),
-            });
+                bytes: memory::copied_slice(bytes.get(completed..end).ok_or(Error::DeviceRange)?)?,
+            })?;
             completed = end;
         }
         Ok(())
@@ -456,7 +450,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
-        let extents = tree.extents().to_vec();
+        let extents = memory::copied_slice(tree.extents())?;
         let keep_blocks = round_up_div(new_size.bytes(), block_size_u64)?;
         let mut updated = Vec::new();
         for extent in extents {
@@ -472,13 +466,13 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                 )
                 .map_err(|_| Error::ArithmeticOverflow)?;
                 self.free_extent(extent, keep_len)?;
-                updated.push(Extent::initialized(
+                updated.try_push(Extent::initialized(
                     extent.logical_start(),
                     ExtentLength::new(keep_len)?,
                     extent.physical_start(),
-                ));
+                ))?;
             } else {
-                updated.push(extent);
+                updated.try_push(extent)?;
             }
         }
         if new_size
@@ -528,7 +522,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         }
         let _payload = inode.file_payload_mutation()?;
 
-        let mut plaintext = vec![0_u8; inode.size().to_usize()?];
+        let mut plaintext = memory::repeated_vec(0_u8, inode.size().to_usize()?)?;
         let read =
             self.volume
                 .read_inode_plaintext_data(&inode, FileOffset::ZERO, &mut plaintext)?;
@@ -546,7 +540,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             enable.block_size(),
             inode.size().bytes(),
             merkle_tree.root_hash(),
-            enable.salt().clone(),
+            enable.salt().try_clone()?,
         )?;
         let descriptor_fixed = descriptor.to_bytes()?;
         let descriptor_bytes = descriptor_byte_count(enable.signature().bytes())?;
@@ -655,10 +649,13 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             .get()
             .checked_add(in_block)
             .ok_or(Error::ArithmeticOverflow)?;
-        self.data_writes.push(RangeWrite {
+        self.data_writes.try_push(RangeWrite {
             offset: ByteOffset::new(offset),
-            bytes: vec![0_u8; usize::try_from(zero_len).map_err(|_| Error::ArithmeticOverflow)?],
-        });
+            bytes: memory::repeated_vec(
+                0_u8,
+                usize::try_from(zero_len).map_err(|_| Error::ArithmeticOverflow)?,
+            )?,
+        })?;
         Ok(())
     }
 
@@ -694,7 +691,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                 .ok_or(Error::ArithmeticOverflow)?,
         )
         .map_err(|_| Error::ArithmeticOverflow)?;
-        let zeroes = vec![0_u8; zero_len];
+        let zeroes = memory::repeated_vec(0_u8, zero_len)?;
         self.stage_encrypted_file_block_update(
             &contents_key,
             LogicalBlock::try_from(logical_block)?,

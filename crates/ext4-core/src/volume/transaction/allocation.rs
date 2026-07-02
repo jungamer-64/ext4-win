@@ -83,10 +83,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                 .ok_or(Error::ArithmeticOverflow)?,
         )
         .map_err(|_| Error::ArithmeticOverflow)?;
-        self.data_writes.push(RangeWrite {
+        self.data_writes.try_push(RangeWrite {
             offset: self.volume.superblock.block_size().offset_of(first_block)?,
-            bytes: vec![0_u8; bytes],
-        });
+            bytes: memory::repeated_vec(0_u8, bytes)?,
+        })?;
         Ok(())
     }
 
@@ -117,7 +117,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                 .ok_or(Error::ArithmeticOverflow)?;
         } else {
             self.cluster_deltas
-                .push(ClusterReferenceDelta { cluster, delta });
+                .try_push(ClusterReferenceDelta { cluster, delta })?;
         }
         Ok(())
     }
@@ -297,11 +297,11 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         {
             return Ok(index);
         }
-        let mut bytes = vec![
-            0_u8;
+        let mut bytes = memory::repeated_vec(
+            0_u8,
             usize::try_from(self.volume.superblock.block_size().bytes())
-                .map_err(|_| Error::ArithmeticOverflow)?
-        ];
+                .map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
         self.volume.device.read_exact_at(
             self.volume
                 .superblock
@@ -309,10 +309,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                 .offset_of(bitmap_block)?,
             &mut bytes,
         )?;
-        self.block_bitmap_updates.push(BlockImage {
+        self.block_bitmap_updates.try_push(BlockImage {
             block: bitmap_block,
             bytes,
-        });
+        })?;
         self.block_bitmap_updates
             .len()
             .checked_sub(1)
@@ -335,11 +335,11 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         {
             return Ok(index);
         }
-        let mut bytes = vec![
-            0_u8;
+        let mut bytes = memory::repeated_vec(
+            0_u8,
             usize::try_from(self.volume.superblock.block_size().bytes())
-                .map_err(|_| Error::ArithmeticOverflow)?
-        ];
+                .map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
         self.volume.device.read_exact_at(
             self.volume
                 .superblock
@@ -347,10 +347,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                 .offset_of(bitmap_block)?,
             &mut bytes,
         )?;
-        self.inode_bitmap_updates.push(BlockImage {
+        self.inode_bitmap_updates.try_push(BlockImage {
             block: bitmap_block,
             bytes,
-        });
+        })?;
         self.inode_bitmap_updates
             .len()
             .checked_sub(1)
@@ -388,7 +388,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         Ok(RawInodeRecord {
             id: inode_id,
             offset: inode_offset_on_device(&self.volume.device, &self.volume.superblock, inode_id)?,
-            bytes: vec![0_u8; usize::from(self.volume.superblock.inode_size().as_u16())],
+            bytes: memory::repeated_vec(
+                0_u8,
+                usize::from(self.volume.superblock.inode_size().as_u16()),
+            )?,
         }
         .into_allocated())
     }
@@ -409,7 +412,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                 .get_mut(index)
                 .ok_or(Error::InvalidSuperblock);
         }
-        self.group_deltas.push(GroupDelta::new(group));
+        self.group_deltas.try_push(GroupDelta::new(group))?;
         self.group_deltas.last_mut().ok_or(Error::InvalidSuperblock)
     }
 

@@ -5,6 +5,7 @@ use core::num::NonZeroU16;
 
 use crate::disk::endian::{DiskOffset, le_u16, le_u32};
 use crate::error::{Error, Result};
+use crate::memory;
 
 /// Mask selecting file-type bits from `i_mode`.
 const MODE_KIND_MASK: u16 = 0xF000;
@@ -517,7 +518,7 @@ impl SymlinkTarget {
             return Err(Error::InvalidName);
         }
         Ok(Self {
-            bytes: bytes.to_vec(),
+            bytes: memory::copied_slice(bytes)?,
         })
     }
 

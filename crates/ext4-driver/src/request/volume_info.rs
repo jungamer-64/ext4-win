@@ -16,6 +16,7 @@ use crate::{
         SetVolumeInformationClass, SetVolumeStack,
     },
     kernel::status::{DriverError, DriverResult},
+    memory::FallibleVec,
     state::{KernelDevice, MountedVolumeDevice, VolumeControlBlock},
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
@@ -187,10 +188,13 @@ fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel
         WireOffset::new(end),
     )?)?;
     let mut label = Vec::new();
-    for unit in label_input.chunks_exact(core::mem::size_of::<u16>()) {
-        let array: [u8; 2] = unit.try_into().map_err(|_| DriverError::InvalidParameter)?;
-        let unit = u16::from_le_bytes(array);
-        label.push(u8::try_from(unit).map_err(|_| DriverError::NotSupported)?);
+    let (chunks, remainder) = label_input.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(DriverError::InvalidParameter);
+    }
+    for unit in chunks {
+        let unit = u16::from_le_bytes(*unit);
+        label.try_push(u8::try_from(unit).map_err(|_| DriverError::NotSupported)?)?;
     }
     Ext4VolumeLabel::new(label.as_slice()).map_err(|_| DriverError::InvalidParameter)
 }
@@ -254,10 +258,11 @@ fn pack_volume_information(
         WireOffset::new(header),
         WireOffset::new(required),
     )?)?;
-    for (chunk, byte) in label_output
-        .chunks_exact_mut(2)
-        .zip(label_bytes.iter().copied())
-    {
+    let (chunks, remainder) = label_output.as_chunks_mut::<2>();
+    if !remainder.is_empty() {
+        return Err(DriverError::InvalidParameter);
+    }
+    for (chunk, byte) in chunks.iter_mut().zip(label_bytes.iter().copied()) {
         chunk.copy_from_slice(&u16::from(byte).to_le_bytes());
     }
     information_length(required)
@@ -384,10 +389,11 @@ fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> 
         WireOffset::new(header),
         WireOffset::new(required),
     )?)?;
-    for (chunk, unit) in name_output
-        .chunks_exact_mut(2)
-        .zip(FILE_SYSTEM_NAME.iter().copied())
-    {
+    let (chunks, remainder) = name_output.as_chunks_mut::<2>();
+    if !remainder.is_empty() {
+        return Err(DriverError::InvalidParameter);
+    }
+    for (chunk, unit) in chunks.iter_mut().zip(FILE_SYSTEM_NAME.iter().copied()) {
         chunk.copy_from_slice(&unit.to_le_bytes());
     }
     information_length(required)

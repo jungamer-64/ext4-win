@@ -1,7 +1,5 @@
 //! File-system control, mount, reparse, and device-control dispatch boundary.
 
-use alloc::boxed::Box;
-
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
 
 use crate::{
@@ -14,6 +12,7 @@ use crate::{
         ffi,
         status::{DriverError, DriverResult},
     },
+    memory,
     request::{fsctl, reparse},
     state::{
         KernelDevice, KernelVpb, MountCandidate, MountedVolumeDevice, MountedVolumeDeviceExtension,
@@ -207,9 +206,10 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
         return Err(error);
     }
 
+    let vcb = memory::boxed(vcb)?;
     let mounted_device = match MountedVolumeDevice::initialize(
         device,
-        Box::new(vcb),
+        vcb,
         request.vpb().as_non_null(),
         candidate.target_device(),
     ) {

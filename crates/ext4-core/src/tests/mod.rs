@@ -10,6 +10,10 @@
     clippy::panic,
     reason = "unit tests fail through panic on unexpected errors"
 )]
+#![expect(
+    clippy::disallowed_macros,
+    reason = "unit test helpers intentionally fail tests with panic on impossible fixture states"
+)]
 
 use alloc::{vec, vec::Vec};
 
