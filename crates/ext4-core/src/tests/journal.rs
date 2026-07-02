@@ -1,5 +1,8 @@
 use super::*;
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn dirty_volume_is_rejected() {
     let mut image = fixture_image();
@@ -9,6 +12,9 @@ fn dirty_volume_is_rejected() {
     assert!(matches!(result, Err(Error::DirtyVolume)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn metadata_descriptor_checksum_is_verified() {
     let image = modern_fixture_image();
@@ -20,6 +26,9 @@ fn metadata_descriptor_checksum_is_verified() {
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 3);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bad_metadata_descriptor_checksum_is_rejected() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -33,6 +42,9 @@ fn bad_metadata_descriptor_checksum_is_rejected() {
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn gdt_descriptor_checksum_is_verified() {
     let mut image = fixture_image();
@@ -46,6 +58,9 @@ fn gdt_descriptor_checksum_is_verified() {
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 4);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bad_gdt_descriptor_checksum_is_rejected() {
     let mut image = fixture_image();
@@ -61,6 +76,9 @@ fn bad_gdt_descriptor_checksum_is_rejected() {
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn jbd2_header_is_big_endian() {
     let mut block = [0_u8; 12];
@@ -71,6 +89,9 @@ fn jbd2_header_is_big_endian() {
     assert_eq!(header.sequence(), 7);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn write_mount_accepts_minimal_journaled_profile() {
     let mut image = minimal_write_fixture_image();
@@ -84,6 +105,9 @@ fn write_mount_accepts_minimal_journaled_profile() {
     assert_eq!(&output, b"hello");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn gdt_csum_minimal_profile_refreshes_descriptor_checksum_after_write() {
     let mut image = minimal_write_fixture_image_with_gdt_csum();
@@ -110,6 +134,9 @@ fn gdt_csum_minimal_profile_refreshes_descriptor_checksum_after_write() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn overwrite_existing_file_range_commits() {
     let mut image = modern_fixture_image();
@@ -127,6 +154,9 @@ fn overwrite_existing_file_range_commits() {
     assert_eq!(&output, b"HELLO");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn committed_dirty_journal_transaction_is_replayed() {
     let mut image = modern_fixture_image();
@@ -149,6 +179,9 @@ fn committed_dirty_journal_transaction_is_replayed() {
     assert_eq!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn descriptor_without_commit_is_ignored() {
     let mut image = modern_fixture_image();
@@ -166,6 +199,9 @@ fn descriptor_without_commit_is_ignored() {
     assert_eq!(&output, b"hello");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn later_revoke_prevents_stale_metadata_replay() {
     let mut image = modern_fixture_image();
@@ -186,6 +222,9 @@ fn later_revoke_prevents_stale_metadata_replay() {
     assert_eq!(&output, b"hello");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn circular_journal_wraparound_is_replayed() {
     let mut image = modern_fixture_image();
@@ -204,6 +243,9 @@ fn circular_journal_wraparound_is_replayed() {
     assert_eq!(&output, b"WRAP!");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn escaped_journal_data_block_is_unescaped_on_replay() {
     let mut image = modern_fixture_image();
@@ -229,6 +271,9 @@ fn escaped_journal_data_block_is_unescaped_on_replay() {
     assert_eq!(output[4], b'E');
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn checkpointed_dirty_journal_replay_is_idempotent() {
     let mut image = modern_fixture_image();
@@ -249,6 +294,9 @@ fn checkpointed_dirty_journal_replay_is_idempotent() {
     assert_eq!(&output, b"DONE!");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn external_journal_uuid_mismatch_is_rejected() {
     let mut image = modern_fixture_image();
@@ -274,6 +322,9 @@ fn external_journal_uuid_mismatch_is_rejected() {
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn fast_commit_journal_feature_is_rejected() {
     let mut image = modern_fixture_image();
@@ -292,6 +343,9 @@ fn fast_commit_journal_feature_is_rejected() {
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn write_transaction_emits_descriptor_data_and_commit_records() {
     let mut image = modern_fixture_image();
@@ -316,6 +370,9 @@ fn write_transaction_emits_descriptor_data_and_commit_records() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn emitted_committed_records_are_replayable_after_checkpoint_loss() {
     let mut image = modern_fixture_image();
@@ -339,6 +396,9 @@ fn emitted_committed_records_are_replayable_after_checkpoint_loss() {
     assert_eq!(file.size().bytes(), 3072);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn legacy_32bit_descriptor_tag_is_replayed() {
     let mut image = modern_fixture_image();
@@ -357,6 +417,9 @@ fn legacy_32bit_descriptor_tag_is_replayed() {
     assert_eq!(&output, b"32BIT");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn csum_v2_descriptor_tail_and_commit_checksum_are_verified() {
     let mut image = modern_fixture_image();
@@ -384,6 +447,9 @@ fn csum_v2_descriptor_tail_and_commit_checksum_are_verified() {
     assert_eq!(&output, b"V2OK!");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn zero_tag_checksum_is_rejected() {
     let mut image = modern_fixture_image();
@@ -398,6 +464,9 @@ fn zero_tag_checksum_is_rejected() {
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn zero_descriptor_tail_checksum_is_rejected() {
     let mut image = modern_fixture_image();
@@ -413,6 +482,9 @@ fn zero_descriptor_tail_checksum_is_rejected() {
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn invalid_commit_checksum_is_rejected() {
     let mut image = modern_fixture_image();
@@ -428,6 +500,9 @@ fn invalid_commit_checksum_is_rejected() {
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn invalid_revoke_tail_checksum_is_rejected() {
     let mut image = modern_fixture_image();
@@ -446,6 +521,9 @@ fn invalid_revoke_tail_checksum_is_rejected() {
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn journal_superblock_fields_and_checksum_are_preserved_when_cleaned() {
     let mut image = modern_fixture_image();
@@ -470,6 +548,9 @@ fn journal_superblock_fields_and_checksum_are_preserved_when_cleaned() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn journal_sequence_wraps_after_max_transaction() {
     let mut image = modern_fixture_image();
@@ -486,6 +567,9 @@ fn journal_sequence_wraps_after_max_transaction() {
     assert_eq!(get_be_u32(&image, journal_log_offset(0) + 0x1C), 0);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn nonzero_journal_ro_compat_is_rejected() {
     let mut image = modern_fixture_image();
@@ -496,6 +580,9 @@ fn nonzero_journal_ro_compat_is_rejected() {
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn recovery_required_with_zero_journal_start_is_rejected() {
     let mut image = modern_fixture_image();
@@ -507,6 +594,9 @@ fn recovery_required_with_zero_journal_start_is_rejected() {
     assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn replay_target_outside_filesystem_is_rejected() {
     let mut image = modern_fixture_image();
@@ -527,6 +617,9 @@ fn replay_target_outside_filesystem_is_rejected() {
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn replay_target_inside_internal_journal_is_rejected() {
     let mut image = modern_fixture_image();
@@ -541,6 +634,9 @@ fn replay_target_inside_internal_journal_is_rejected() {
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn emitted_journal_data_escapes_jbd2_magic_prefix() {
     let mut image = modern_fixture_image();
@@ -580,6 +676,9 @@ fn emitted_journal_data_escapes_jbd2_magic_prefix() {
     assert!(found);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn descriptor_tag_uuid_mismatch_is_rejected() {
     let mut image = modern_fixture_image();
@@ -610,6 +709,9 @@ fn descriptor_tag_uuid_mismatch_is_rejected() {
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn descriptor_tag_uuid_match_is_replayed() {
     let mut image = modern_fixture_image();
@@ -644,6 +746,9 @@ fn descriptor_tag_uuid_match_is_replayed() {
     assert_eq!(&output, b"UUID?");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn descriptor_without_last_tag_is_rejected() {
     let mut image = modern_fixture_image();
@@ -664,6 +769,9 @@ fn descriptor_without_last_tag_is_rejected() {
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn empty_descriptor_commit_is_rejected() {
     let mut image = modern_fixture_image();
@@ -680,6 +788,9 @@ fn empty_descriptor_commit_is_rejected() {
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn duplicate_home_block_in_transaction_is_rejected() {
     let mut image = modern_fixture_image();
@@ -702,6 +813,9 @@ fn duplicate_home_block_in_transaction_is_rejected() {
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn second_descriptor_block_is_rejected() {
     let mut image = modern_fixture_image();
@@ -718,6 +832,9 @@ fn second_descriptor_block_is_rejected() {
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn commit_sequence_mismatch_is_rejected() {
     let mut image = modern_fixture_image();
@@ -733,6 +850,9 @@ fn commit_sequence_mismatch_is_rejected() {
     assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn same_transaction_later_revoke_prevents_replay() {
     let mut image = modern_fixture_image();
@@ -752,6 +872,9 @@ fn same_transaction_later_revoke_prevents_replay() {
     assert_eq!(&output, b"hello");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn malformed_revoke_remainder_is_rejected() {
     let mut image = modern_fixture_image();
@@ -767,6 +890,9 @@ fn malformed_revoke_remainder_is_rejected() {
     assert!(matches!(result, Err(Error::JournalCorrupt)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn wrapped_later_revoke_prevents_old_sequence_replay() {
     let mut image = modern_fixture_image();
@@ -787,6 +913,9 @@ fn wrapped_later_revoke_prevents_old_sequence_replay() {
     assert_eq!(&output, b"hello");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn nonzero_journal_compat_is_rejected() {
     let mut image = modern_fixture_image();
@@ -797,6 +926,9 @@ fn nonzero_journal_compat_is_rejected() {
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn journal_first_block_must_be_one() {
     let mut image = modern_fixture_image();
@@ -807,6 +939,9 @@ fn journal_first_block_must_be_one() {
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn journal_maxlen_beyond_inode_capacity_is_rejected() {
     let mut image = modern_fixture_image();
@@ -817,6 +952,9 @@ fn journal_maxlen_beyond_inode_capacity_is_rejected() {
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn external_journal_short_device_is_rejected() {
     let mut image = modern_fixture_image();
@@ -843,6 +981,9 @@ fn external_journal_short_device_is_rejected() {
     assert!(matches!(result, Err(Error::UnsupportedJournal)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn fragmented_internal_journal_is_mapped_on_demand() {
     let mut image = modern_fixture_image();
@@ -875,6 +1016,9 @@ fn fragmented_internal_journal_is_mapped_on_demand() {
     assert_eq!(&committed, b"hole");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn checkpoint_failure_leaves_replayable_dirty_journal() {
     let mut image = modern_fixture_image();

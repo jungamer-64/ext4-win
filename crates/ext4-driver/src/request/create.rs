@@ -52,6 +52,10 @@ struct CreateRequest {
 
 impl CreateRequest {
     /// Decodes the create request from the current IRP stack.
+    /// # Errors
+    ///
+    /// Returns an error when the current stack is not create/open or the FILE_OBJECT is already
+    /// initialized.
     fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
         let stack = target.current_stack()?.create()?;
         let file_object = UninitializedFileObject::decode(stack.file_object())?;
@@ -79,6 +83,10 @@ impl CreateRequest {
 }
 
 /// Opens or creates a root-relative ext4 object.
+/// # Errors
+///
+/// Returns an error when EA create input is supplied, the device is not mounted, path resolution
+/// fails, or the selected open/create disposition cannot be satisfied.
 fn open_or_create(request: CreateRequest) -> DriverResult<()> {
     if request.parameters().ea_length().as_usize() != 0 {
         return Err(DriverError::NotSupported);
@@ -118,6 +126,10 @@ enum PathLookup {
 }
 
 /// Opens an existing path according to the requested disposition and options.
+/// # Errors
+///
+/// Returns an error when existing-node options conflict, create-only disposition collides, share
+/// access fails, or overwrite truncation fails.
 fn open_existing_node(
     request: CreateRequest,
     vcb: NonNull<crate::state::VolumeControlBlock>,
@@ -169,6 +181,10 @@ fn open_existing_node(
 }
 
 /// Resolves an existing regular file inode for overwrite-style dispositions.
+/// # Errors
+///
+/// Returns an error when overwrite is requested for a directory-required open or for an existing
+/// non-file node.
 fn overwrite_file_inode(
     node: NodeId,
     requirement: CreateTargetRequirement,
@@ -186,6 +202,10 @@ fn overwrite_file_inode(
 }
 
 /// Creates a missing final path component.
+/// # Errors
+///
+/// Returns an error when the disposition requires an existing name, child creation fails, or the new
+/// file object cannot be initialized.
 fn create_missing_node(
     request: CreateRequest,
     vcb: NonNull<crate::state::VolumeControlBlock>,
@@ -217,6 +237,9 @@ fn create_missing_node(
 }
 
 /// Validates file-vs-directory options for an existing node.
+/// # Errors
+///
+/// Returns an error when directory-only or non-directory-only create options contradict `node`.
 fn validate_existing_node_options(
     node: NodeId,
     requirement: CreateTargetRequirement,
@@ -235,6 +258,9 @@ fn validate_existing_node_options(
 }
 
 /// Truncates an existing regular file for overwrite-style create dispositions.
+/// # Errors
+///
+/// Returns an error when the file cannot be selected for mutation or the truncate transaction fails.
 fn truncate_existing_file(
     mut vcb: NonNull<crate::state::VolumeControlBlock>,
     file_id: FileNodeId,
@@ -255,6 +281,10 @@ fn truncate_existing_file(
 }
 
 /// Resolves a root-relative Windows path to an existing node or missing leaf.
+/// # Errors
+///
+/// Returns an error when relative FILE_OBJECT opens are requested, a path component is invalid, an
+/// intermediate component is missing or not a directory, or lookup fails.
 fn resolve_path(
     file_object: UninitializedFileObject,
     vcb: NonNull<crate::state::VolumeControlBlock>,
@@ -317,6 +347,10 @@ fn resolve_path(
 }
 
 /// Creates a file or directory under an existing parent directory.
+/// # Errors
+///
+/// Returns an error when default metadata cannot be built, the parent cannot be selected, creation
+/// fails, or the transaction cannot commit.
 fn create_child(
     mut vcb: NonNull<crate::state::VolumeControlBlock>,
     parent: DirectoryNodeId,
@@ -352,6 +386,10 @@ fn create_child(
 }
 
 /// Splits the FILE_OBJECT name into validated root-relative Windows components.
+/// # Errors
+///
+/// Returns an error when the UNICODE_STRING has odd byte length, a null non-empty buffer, or an
+/// invalid Windows path component.
 fn path_components(file_object: &FILE_OBJECT) -> DriverResult<Vec<WindowsName>> {
     let name = file_object.FileName;
     if name.Length == 0 {
@@ -380,6 +418,9 @@ fn path_components(file_object: &FILE_OBJECT) -> DriverResult<Vec<WindowsName>> 
 }
 
 /// Stores FCB/CCB context pointers in the FILE_OBJECT.
+/// # Errors
+///
+/// Returns an error when the shared FCB cannot be opened or the handle context cannot be attached.
 fn initialize_file_object(
     file_object: UninitializedFileObject,
     vcb: NonNull<crate::state::VolumeControlBlock>,
@@ -394,6 +435,10 @@ fn initialize_file_object(
 }
 
 /// Opens the shared FCB for a node and records the create share-access claim.
+/// # Errors
+///
+/// Returns an error when the VCB cannot open an FCB for `node` or Windows share-access checking
+/// rejects the new handle.
 fn open_shared_file_control_block(
     file_object: UninitializedFileObject,
     vcb: NonNull<crate::state::VolumeControlBlock>,
@@ -420,6 +465,9 @@ fn open_shared_file_control_block(
 }
 
 /// Stores already-opened FCB and new CCB context pointers in the FILE_OBJECT.
+/// # Errors
+///
+/// Returns an error when FILE_OBJECT context pointers cannot be attached.
 fn attach_file_object(
     file_object: UninitializedFileObject,
     fcb: NonNull<FileControlBlock>,

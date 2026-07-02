@@ -244,6 +244,9 @@ pub(crate) enum DirectoryLayout {
 
 impl DirectoryLayout {
     /// Parses a directory file into the storage shape selected by the inode.
+    /// # Errors
+    ///
+    /// Returns an error when the selected storage shape cannot parse the supplied directory blocks.
     pub(crate) fn from_storage_kind(
         storage: DirectoryStorageKind,
         blocks: Vec<DirectoryBlockData>,
@@ -288,6 +291,9 @@ pub(crate) struct LinearDirectory {
 
 impl LinearDirectory {
     /// Parses all logical blocks as linear directory blocks.
+    /// # Errors
+    ///
+    /// Returns an error when any block contains a malformed linear dirent stream.
     fn parse(blocks: Vec<DirectoryBlockData>) -> Result<Self> {
         let mut entries = Vec::new();
         for block in blocks {
@@ -349,6 +355,10 @@ impl DirectoryChecksum {
     }
 
     /// Writes and checksums a leaf checksum tail when enabled.
+    /// # Errors
+    ///
+    /// Returns an error when the tail offset is outside the block or the tail fields cannot be
+    /// encoded.
     fn write_dirent_tail(self, bytes: &mut [u8], tail_offset: usize) -> Result<()> {
         let Self::Crc32c { inode_seed } = self else {
             return Ok(());
@@ -386,6 +396,10 @@ impl DirectoryChecksum {
     }
 
     /// Verifies a leaf checksum tail when enabled.
+    /// # Errors
+    ///
+    /// Returns an error when the block is too small, the tail fields are invalid, or the CRC32C
+    /// value does not match the live dirent bytes.
     fn verify_dirent_tail(self, bytes: &[u8]) -> Result<()> {
         let Self::Crc32c { inode_seed } = self else {
             return Ok(());
@@ -432,6 +446,10 @@ impl DirectoryChecksum {
     }
 
     /// Writes and checksums an HTree dx tail when enabled.
+    /// # Errors
+    ///
+    /// Returns an error when the dx table geometry overflows or the checksum tail would fall outside
+    /// the block.
     fn write_dx_tail(
         self,
         bytes: &mut [u8],
@@ -483,6 +501,10 @@ impl DirectoryChecksum {
     }
 
     /// Verifies an HTree dx tail when enabled.
+    /// # Errors
+    ///
+    /// Returns an error when the dx tail is outside the block, the reserved field is nonzero, or the
+    /// stored CRC32C does not match the index bytes.
     fn verify_dx_tail(
         self,
         bytes: &[u8],
@@ -560,6 +582,10 @@ impl HtreeDirectoryImage {
 }
 
 /// Builds a canonical HTree directory image from child entries.
+/// # Errors
+///
+/// Returns an error when the block size cannot hold an HTree root, leaf packing exceeds supported
+/// limits, logical block planning overflows, or block serialization fails.
 pub(crate) fn build_htree_directory(
     self_inode: InodeId,
     parent_inode: InodeId,
@@ -644,6 +670,10 @@ struct PackedLeaf {
 }
 
 /// Packs sorted entries into leaf blocks.
+/// # Errors
+///
+/// Returns an error when the usable leaf area is too small, an entry cannot fit in one leaf, or leaf
+/// size accounting overflows.
 fn pack_htree_leaves(
     hashed: Vec<HashedDirectoryEntry>,
     block_size: usize,
@@ -735,6 +765,10 @@ struct HtreeBuildPlan {
 
 impl HtreeBuildPlan {
     /// Selects the shallowest HTree that can route all leaves.
+    /// # Errors
+    ///
+    /// Returns an error when the root or node fan-out is zero, arithmetic overflows, or more than two
+    /// indirect levels would be required.
     fn new(leaves: &[PackedLeaf], root_limit: usize, node_limit: usize) -> Result<Self> {
         if root_limit == 0 || node_limit == 0 {
             return Err(Error::InvalidDirectoryEntry);
@@ -776,11 +810,18 @@ impl HtreeBuildPlan {
     }
 
     /// Total generated directory logical blocks.
+    /// # Errors
+    ///
+    /// Returns an error when summing the root, index, and leaf block counts overflows.
     fn block_count(&self) -> Result<usize> {
         checked_sum_usize(&[1, self.upper_nodes, self.lower_nodes, self.leaf_count])
     }
 
     /// Returns the logical block number for one leaf index.
+    /// # Errors
+    ///
+    /// Returns an error when the leaf index is outside the plan or the logical block number cannot
+    /// be represented on disk.
     fn leaf_logical(&self, index: usize) -> Result<u32> {
         if index >= self.leaf_count {
             return Err(Error::InvalidDirectoryEntry);
@@ -794,16 +835,26 @@ impl HtreeBuildPlan {
     }
 
     /// Returns the logical block number for a lower index node.
+    /// # Errors
+    ///
+    /// Returns an error when the lower-node logical block number overflows `u32`.
     fn lower_node_logical(&self, lower: usize) -> Result<u32> {
         usize_to_u32(checked_sum_usize(&[1, self.upper_nodes, lower])?)
     }
 
     /// Returns the logical block number for an upper index node.
+    /// # Errors
+    ///
+    /// Returns an error when the upper-node logical block number overflows `u32`.
     fn upper_node_logical(&self, upper: usize) -> Result<u32> {
         usize_to_u32(checked_sum_usize(&[1, upper])?)
     }
 
     /// Returns all index nodes that must be serialized.
+    /// # Errors
+    ///
+    /// Returns an error when node fan-out arithmetic overflows or a planned node cannot be tied to a
+    /// leaf start hash.
     fn nodes(&self, leaves: &[PackedLeaf]) -> Result<Vec<PlannedIndexNode>> {
         let mut nodes = Vec::new();
         if self.depth == 0 {
@@ -861,6 +912,10 @@ impl HtreeBuildPlan {
     }
 
     /// Returns root index entries.
+    /// # Errors
+    ///
+    /// Returns an error when root routing arithmetic overflows, a planned leaf is missing, or the
+    /// stored depth exceeds the supported HTree profile.
     fn root_entries(&self, leaves: &[PackedLeaf]) -> Result<Vec<DxEntry>> {
         let mut entries = Vec::new();
         match self.depth {
@@ -919,6 +974,9 @@ struct PlannedIndexNode {
 }
 
 /// Calculates how many dx entries fit in one root or node block.
+/// # Errors
+///
+/// Returns an error when the block cannot hold the count/limit field and at least one dx entry.
 fn dx_capacity(
     block_size: usize,
     count_offset: usize,
@@ -933,6 +991,10 @@ fn dx_capacity(
 }
 
 /// Serializes an HTree leaf block.
+/// # Errors
+///
+/// Returns an error when the leaf's dirent area is invalid, record lengths overflow, an entry cannot
+/// be written, or the checksum tail cannot be serialized.
 fn write_leaf_block(
     bytes: &mut [u8],
     entries: &[DirectoryEntry],
@@ -976,6 +1038,9 @@ fn write_leaf_block(
 }
 
 /// Serializes an HTree interior node.
+/// # Errors
+///
+/// Returns an error when the block length or dx table cannot be represented in ext4 fields.
 fn write_index_node(
     bytes: &mut [u8],
     entries: &[DxEntry],
@@ -987,6 +1052,10 @@ fn write_index_node(
 }
 
 /// Serializes the HTree root block.
+/// # Errors
+///
+/// Returns an error when dot entries, root metadata fields, or the root dx table cannot be written
+/// into the supplied block.
 fn write_htree_root(
     bytes: &mut [u8],
     self_inode: InodeId,
@@ -1035,6 +1104,10 @@ fn write_htree_root(
 }
 
 /// Serializes a dx_countlimit/dx_entry table.
+/// # Errors
+///
+/// Returns an error when the table capacity is invalid, the entry count is zero or exceeds capacity,
+/// an offset overflows, or the checksum tail cannot be written.
 fn write_dx_table(
     bytes: &mut [u8],
     count_offset: usize,
@@ -1072,6 +1145,9 @@ fn write_dx_table(
 }
 
 /// Integer ceil division for HTree fan-out planning.
+/// # Errors
+///
+/// Returns an error when the divisor is zero or the rounded addition overflows.
 fn round_up_div_usize(value: usize, divisor: usize) -> Result<usize> {
     if divisor == 0 {
         return Err(Error::ArithmeticOverflow);
@@ -1084,6 +1160,9 @@ fn round_up_div_usize(value: usize, divisor: usize) -> Result<usize> {
 }
 
 /// Sums usize values with overflow checking.
+/// # Errors
+///
+/// Returns an error when the accumulated sum exceeds `usize`.
 fn checked_sum_usize(values: &[usize]) -> Result<usize> {
     let mut sum = 0_usize;
     for value in values {
@@ -1093,6 +1172,9 @@ fn checked_sum_usize(values: &[usize]) -> Result<usize> {
 }
 
 /// Converts a usize logical block value into the on-disk u32 range.
+/// # Errors
+///
+/// Returns an error when the logical block number exceeds the on-disk `u32` field.
 fn usize_to_u32(value: usize) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::ArithmeticOverflow)
 }
@@ -1110,6 +1192,10 @@ pub(crate) struct HtreeDirectory {
 
 impl HtreeDirectory {
     /// Parses an HTree directory from logical directory blocks.
+    /// # Errors
+    ///
+    /// Returns an error when the root block is missing or any referenced index or leaf block is
+    /// malformed.
     fn parse(
         blocks: &[DirectoryBlockData],
         hash_seed: DirectoryHashSeed,
@@ -1196,6 +1282,10 @@ struct HtreeLeaf {
 
 impl HtreeLeaf {
     /// Parses one leaf block as dirents.
+    /// # Errors
+    ///
+    /// Returns an error when the leaf checksum tail is invalid or the leaf dirent stream is
+    /// malformed.
     fn parse(start_hash: u32, bytes: &[u8], checksum: DirectoryChecksum) -> Result<Self> {
         checksum.verify_dirent_tail(bytes)?;
         Ok(Self {
@@ -1228,6 +1318,10 @@ struct HtreeRoot {
 
 impl HtreeRoot {
     /// Parses and validates an HTree root block.
+    /// # Errors
+    ///
+    /// Returns an error when the root is too small, lacks valid `.`/`..` entries, carries
+    /// unsupported hash metadata, or has an invalid root index.
     fn parse(
         bytes: &[u8],
         hash_seed: DirectoryHashSeed,
@@ -1274,6 +1368,9 @@ impl HtreeRoot {
     }
 
     /// Resolves all leaf logical blocks in index traversal order.
+    /// # Errors
+    ///
+    /// Returns an error when any root entry points at a missing, cyclic, or malformed index block.
     fn leaf_blocks(
         &self,
         blocks: &[DirectoryBlockData],
@@ -1314,6 +1411,10 @@ struct DxIndex {
 
 impl DxIndex {
     /// Parses a root or interior HTree index table.
+    /// # Errors
+    ///
+    /// Returns an error when count/limit fields are inconsistent, the table extends outside the
+    /// block, a child pointer is zero, or the dx tail checksum is invalid.
     fn parse(bytes: &[u8], count_offset: usize, checksum: DirectoryChecksum) -> Result<Self> {
         let limit = usize::from(le_u16(bytes, disk_offset(count_offset))?);
         let count = usize::from(le_u16(
@@ -1370,6 +1471,10 @@ struct DxEntry {
 }
 
 /// Recursively resolves index nodes into leaf logical blocks.
+/// # Errors
+///
+/// Returns an error when traversal detects a cycle, an index node is missing, or a nested dx table
+/// is malformed.
 fn collect_leaf_blocks(
     blocks: &[DirectoryBlockData],
     logical: u32,
@@ -1407,6 +1512,9 @@ fn collect_leaf_blocks(
 }
 
 /// Finds one supplied logical directory block.
+/// # Errors
+///
+/// Returns an error when no supplied block has the requested logical block number.
 fn find_directory_block(
     blocks: &[DirectoryBlockData],
     logical: u32,
@@ -1443,6 +1551,10 @@ impl DirectoryBlock {
     }
 
     /// Initializes `.` and `..`, leaving the second entry to own remaining space.
+    /// # Errors
+    ///
+    /// Returns an error when the block cannot hold both dot entries or either entry cannot be
+    /// encoded in the available record space.
     pub(crate) fn initialize_dot_entries(
         &mut self,
         self_inode: InodeId,
@@ -1480,6 +1592,9 @@ impl DirectoryBlock {
     }
 
     /// Initializes the block as one free dirent slot.
+    /// # Errors
+    ///
+    /// Returns an error when the block length cannot be represented as an ext4 `rec_len`.
     pub(crate) fn initialize_free_space(&mut self) -> Result<()> {
         let rec_len = checked_u16(self.bytes.len())?;
         self.bytes.fill(0);
@@ -1487,11 +1602,17 @@ impl DirectoryBlock {
     }
 
     /// Parses live entries from the current block image.
+    /// # Errors
+    ///
+    /// Returns an error when the current block image is not a valid ext4 dirent stream.
     pub(crate) fn entries(&self) -> Result<Vec<DirectoryEntry>> {
         DirectoryEntry::parse_all(&self.bytes)
     }
 
     /// Checks whether a live entry already owns `name`.
+    /// # Errors
+    ///
+    /// Returns an error when the current block cannot be parsed before the lookup.
     pub(crate) fn contains_name(&self, name: &Ext4Name) -> Result<bool> {
         for entry in self.entries()? {
             if entry.name() == name {
@@ -1502,6 +1623,10 @@ impl DirectoryBlock {
     }
 
     /// Inserts a live entry by reusing free space or splitting an oversized record.
+    /// # Errors
+    ///
+    /// Returns an error when the name already exists, record accounting overflows, an existing
+    /// dirent is malformed, or the new entry cannot be encoded.
     pub(crate) fn insert(
         &mut self,
         inode: InodeId,
@@ -1581,6 +1706,10 @@ impl DirectoryBlock {
     }
 
     /// Removes a live entry by clearing its inode while preserving record length.
+    /// # Errors
+    ///
+    /// Returns an error when a scanned dirent is malformed or the removed entry's inode/name cannot
+    /// be converted back into domain types.
     pub(crate) fn remove(&mut self, name: &Ext4Name) -> Result<Option<DirectoryEntry>> {
         let mut offset = 0_usize;
         while offset < self.bytes.len() {
@@ -1638,6 +1767,10 @@ impl DirectoryBlock {
     }
 
     /// Renames a live entry inside this directory block.
+    /// # Errors
+    ///
+    /// Returns an error when the target name already exists, the source block is malformed, or the
+    /// renamed entry no longer fits after removal.
     pub(crate) fn rename(
         &mut self,
         old_name: &Ext4Name,
@@ -1661,6 +1794,10 @@ impl DirectoryBlock {
     }
 
     /// Replaces the inode and kind of an existing entry without changing its name.
+    /// # Errors
+    ///
+    /// Returns an error when a scanned dirent is malformed, the previous entry cannot be decoded, or
+    /// the replacement entry cannot be written in place.
     pub(crate) fn replace(
         &mut self,
         name: &Ext4Name,
@@ -1807,6 +1944,10 @@ impl DirectoryHashContext {
 }
 
 /// Parses one live directory entry at a fixed offset.
+/// # Errors
+///
+/// Returns an error when the record length, inode, name length, name bytes, or file-type byte is not
+/// a valid live ext4 dirent at `offset`.
 fn parse_live_entry_at(bytes: &[u8], offset: usize) -> Result<DirectoryEntry> {
     let rec_len = usize::from(le_u16(bytes, disk_offset(offset).checked_add_bytes(4)?)?);
     if rec_len < DIRENT_HEADER_SIZE
@@ -2018,6 +2159,10 @@ fn md4_h(x: u32, y: u32, z: u32) -> u32 {
 }
 
 /// Writes one ext4 directory record into a checked block slice.
+/// # Errors
+///
+/// Returns an error when `rec_len` cannot hold the name payload, the record would exceed the block,
+/// the name length is not representable, or any field write is out of range.
 fn write_entry(
     bytes: &mut [u8],
     offset: usize,
@@ -2075,6 +2220,10 @@ fn write_entry(
 }
 
 /// Returns the aligned record length required for a name payload.
+/// # Errors
+///
+/// Returns an error when adding the dirent header to the name length overflows or the aligned length
+/// cannot be represented by ext4.
 fn required_name_rec_len(name_len: usize) -> Result<usize> {
     checked_rec_len(
         DIRENT_HEADER_SIZE
@@ -2084,6 +2233,9 @@ fn required_name_rec_len(name_len: usize) -> Result<usize> {
 }
 
 /// Rounds a directory record length up to the ext4 alignment and `u16` range.
+/// # Errors
+///
+/// Returns an error when alignment arithmetic overflows or the aligned value exceeds `u16::MAX`.
 fn checked_rec_len(value: usize) -> Result<usize> {
     let adjusted = value
         .checked_add(
@@ -2104,6 +2256,9 @@ fn checked_rec_len(value: usize) -> Result<usize> {
 }
 
 /// Converts a checked record length into the on-disk `rec_len` field.
+/// # Errors
+///
+/// Returns an error when the record length cannot be represented as an ext4 `u16` field.
 fn checked_u16(value: usize) -> Result<u16> {
     u16::try_from(value).map_err(|_| Error::InvalidDirectoryEntry)
 }
@@ -2118,10 +2273,19 @@ mod tests {
     use crate::disk_format::inode::{DirectoryStorageKind, InodeId};
     use crate::platform::name::Ext4Name;
 
+    /// Builds a test inode id.
+    /// # Errors
+    ///
+    /// Returns an error when `value` is outside the inode-id domain.
     fn inode(value: u32) -> Result<InodeId> {
         InodeId::try_from(value)
     }
 
+    /// Builds a deterministic test ext4 name.
+    /// # Errors
+    ///
+    /// Returns an error when suffix arithmetic overflows or the generated bytes are not a valid
+    /// ext4 name.
     fn name(index: usize, len: usize) -> Result<Ext4Name> {
         let mut bytes = alloc::vec![b'x'; len];
         let mut value = index;
@@ -2135,6 +2299,10 @@ mod tests {
         Ext4Name::new(&bytes)
     }
 
+    /// Builds deterministic directory entries for HTree tests.
+    /// # Errors
+    ///
+    /// Returns an error when inode numbering, name generation, or entry construction fails.
     fn entries(count: usize, name_len: usize) -> Result<alloc::vec::Vec<DirectoryEntry>> {
         let mut entries = alloc::vec::Vec::new();
         for index in 0..count {
@@ -2151,6 +2319,9 @@ mod tests {
     }
 
     #[test]
+    /// # Errors
+    ///
+    /// Returns an error when HTree serialization or validation of the generated image fails.
     fn htree_builder_serializes_depth_one_index_nodes() -> Result<()> {
         let children = entries(600, 255)?;
         let image = build_htree_directory(
@@ -2198,6 +2369,9 @@ mod tests {
     }
 
     #[test]
+    /// # Errors
+    ///
+    /// Returns an error when the depth-two HTree plan cannot be built or has unexpected geometry.
     fn htree_build_plan_grows_root_to_depth_two() -> Result<()> {
         let leaves = alloc::vec![
             super::PackedLeaf {

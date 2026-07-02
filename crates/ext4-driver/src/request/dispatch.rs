@@ -84,6 +84,9 @@ impl<'driver> DispatchTable<'driver> {
     }
 
     /// Installs one major-function dispatch routine.
+    /// # Errors
+    ///
+    /// Returns an error when `major_function` indexes outside `DRIVER_OBJECT::MajorFunction`.
     fn set(
         &mut self,
         major_function: MajorFunction,
@@ -99,6 +102,10 @@ impl<'driver> DispatchTable<'driver> {
 }
 
 /// Installs the ext4 file-system dispatch table.
+/// # Errors
+///
+/// Returns an error when the WDK dispatch table cannot hold one of ext4win's required IRP major
+/// function slots.
 pub(crate) fn install(driver: &mut DRIVER_OBJECT) -> Result<(), DispatchInstallError> {
     let mut table = DispatchTable::new(driver);
     table.unload(crate::state::driver_unload);
@@ -133,76 +140,122 @@ pub(crate) fn install(driver: &mut DRIVER_OBJECT) -> Result<(), DispatchInstallE
 }
 
 /// Handles create/open IRPs.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active create/open dispatch call.
 unsafe extern "C" fn create(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::create::dispatch(device, irp)
 }
 
 /// Handles close IRPs.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active close dispatch call.
 unsafe extern "C" fn close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::file_info::close(device, irp)
 }
 
 /// Handles cleanup IRPs.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active cleanup dispatch call.
 unsafe extern "C" fn cleanup(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::file_info::cleanup(device, irp)
 }
 
 /// Handles read IRPs.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active read dispatch call.
 unsafe extern "C" fn read(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::file_info::read(device, irp)
 }
 
 /// Handles write IRPs.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active write dispatch call.
 unsafe extern "C" fn write(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::file_info::write(device, irp)
 }
 
 /// Handles file information queries.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active file-information query.
 unsafe extern "C" fn query_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::file_info::query(device, irp)
 }
 
 /// Handles file information mutations.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active file-information mutation.
 unsafe extern "C" fn set_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::file_info::set(device, irp)
 }
 
 /// Handles volume information queries.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active volume-information query.
 unsafe extern "C" fn query_volume_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::volume_info::query(device, irp)
 }
 
 /// Handles volume information mutations.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active volume-information mutation.
 unsafe extern "C" fn set_volume_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::volume_info::set(device, irp)
 }
 
 /// Handles directory enumeration and change notification.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active directory-control dispatch.
 unsafe extern "C" fn directory_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::file_info::directory_control(device, irp)
 }
 
 /// Handles file-system control requests.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active filesystem-control dispatch.
 unsafe extern "C" fn file_system_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::file_system_control::dispatch(device, irp)
 }
 
 /// Rejects unsupported device-control requests.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active device-control dispatch.
 unsafe extern "C" fn device_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::file_system_control::device_control(device, irp)
 }
 
 /// Handles security descriptor queries.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active security query.
 unsafe extern "C" fn query_security(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::security::query(device, irp)
 }
 
 /// Handles security descriptor mutations.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active security mutation.
 unsafe extern "C" fn set_security(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::security::set(device, irp)
 }
 
 /// Completes IRPs whose current minimal behavior is successful no-op.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for an active dispatch slot owned by this
+/// driver.
 unsafe extern "C" fn success(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     match DispatchTarget::decode(device, irp) {
         Ok(target) => target.finish(IrpCompletion::EMPTY),
@@ -211,21 +264,33 @@ unsafe extern "C" fn success(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 }
 
 /// Handles flush requests.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active flush dispatch call.
 unsafe extern "C" fn flush_buffers(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::file_info::flush(device, irp)
 }
 
 /// Handles extended-attribute queries.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active EA query.
 unsafe extern "C" fn query_ea(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::ea::query(device, irp)
 }
 
 /// Handles extended-attribute mutations.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active EA mutation.
 unsafe extern "C" fn set_ea(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::ea::set(device, irp)
 }
 
 /// Handles byte-range lock requests.
+///
+/// # Safety
+/// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active lock-control dispatch.
 unsafe extern "C" fn lock_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     crate::request::file_info::lock_control(device, irp)
 }

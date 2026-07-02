@@ -770,6 +770,10 @@ impl InodeFlags {
     }
 
     /// Rejects inode flags that make every mutation unsupported.
+    /// # Errors
+    ///
+    /// Returns an error when immutable or inline-data flags make the inode outside the mutable
+    /// write domain.
     fn require_common_mutation(self) -> Result<()> {
         if self.0 & (EXT4_IMMUTABLE_FL | EXT4_INLINE_DATA_FL) != 0 {
             Err(Error::UnsupportedInodeMutation)
@@ -779,6 +783,10 @@ impl InodeFlags {
     }
 
     /// Rejects inode flags that make file payload or size mutation unsupported.
+    /// # Errors
+    ///
+    /// Returns an error when common mutation is unsupported or append-only, casefold, or fs-verity
+    /// flags reject file data changes.
     fn require_file_mutation(self) -> Result<()> {
         self.require_common_mutation()?;
         if self.0 & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL | EXT4_VERITY_FL) != 0 {
@@ -1114,6 +1122,9 @@ impl Inode {
 }
 
 /// Combines the low and optional high inode UID fields.
+/// # Errors
+///
+/// Returns an error when the low UID field or present high UID field is outside the raw inode bytes.
 fn parse_uid(raw: &[u8]) -> Result<u32> {
     let low = u32::from(le_u16(raw, disk_offset(INODE_UID_LO_OFFSET))?);
     let high_offset_end = INODE_UID_HI_OFFSET
@@ -1128,6 +1139,9 @@ fn parse_uid(raw: &[u8]) -> Result<u32> {
 }
 
 /// Combines the low and optional high inode GID fields.
+/// # Errors
+///
+/// Returns an error when the low GID field or present high GID field is outside the raw inode bytes.
 fn parse_gid(raw: &[u8]) -> Result<u32> {
     let low = u32::from(le_u16(raw, disk_offset(INODE_GID_LO_OFFSET))?);
     let high_offset_end = INODE_GID_HI_OFFSET
@@ -1142,6 +1156,9 @@ fn parse_gid(raw: &[u8]) -> Result<u32> {
 }
 
 /// Parses ext4 inode timestamps.
+/// # Errors
+///
+/// Returns an error when any required inode timestamp field is outside the raw inode bytes.
 fn parse_times(raw: &[u8]) -> Result<Ext4Times> {
     let accessed = Ext4Timestamp::from_unix_seconds(le_u32(raw, disk_offset(INODE_ATIME_OFFSET))?);
     let changed = Ext4Timestamp::from_unix_seconds(le_u32(raw, disk_offset(INODE_CTIME_OFFSET))?);
@@ -1171,10 +1188,18 @@ mod tests {
     use crate::disk::endian::{put_le_u16, put_le_u32};
     use crate::error::{Error, Result};
 
+    /// Builds the fixed inode id used by inode parser tests.
+    /// # Errors
+    ///
+    /// Returns an error if the fixed test inode number leaves the inode-id domain.
     fn inode_id() -> Result<InodeId> {
         InodeId::try_from(11)
     }
 
+    /// Builds a raw 128-byte inode image for parser tests.
+    /// # Errors
+    ///
+    /// Returns an error when a required inode field cannot be written into the fixed image.
     fn inode_bytes(mode: u16, flags: u32) -> Result<[u8; 128]> {
         let mut raw = [0_u8; 128];
         put_le_u16(&mut raw, super::disk_offset(0), mode)?;
@@ -1183,6 +1208,9 @@ mod tests {
         Ok(raw)
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn directory_storage_kind_decodes_linear_and_htree() {
         let linear = inode_id().and_then(|id| {
@@ -1211,6 +1239,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn directory_storage_kind_rejects_non_directory_inode() {
         let file = inode_id()
@@ -1222,18 +1253,27 @@ mod tests {
         assert_eq!(file.directory_storage_kind(), Err(Error::WrongInodeKind));
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn link_count_rejects_deleted_inode_zero() {
         assert_eq!(Ext4LinkCount::new(0), Err(Error::InvalidInode));
         assert_eq!(Ext4LinkCount::new(1), Ok(Ext4LinkCount::ONE));
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn inode_mode_and_permissions_reject_mixed_domains() {
         assert_eq!(InodeMode::from_disk(0o644), Err(Error::WrongInodeKind));
         assert_eq!(Ext4Permissions::new(MODE_REGULAR), Err(Error::InvalidInode));
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn inode_flags_build_operation_capabilities() {
         let immutable = InodeFlags::from_u32(super::EXT4_IMMUTABLE_FL);

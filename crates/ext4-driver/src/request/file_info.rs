@@ -128,6 +128,10 @@ pub(crate) fn lock_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 }
 
 /// Rejects a decoded file-object request until its domain path exists.
+/// # Errors
+///
+/// Returns an error when the decoded request is intentionally outside the implemented file-object
+/// operation set.
 fn decoded_not_supported(target: DispatchTarget) -> DriverResult<()> {
     let _device = target.device();
     Ok(())
@@ -146,6 +150,10 @@ struct QueryFileRequest {
 
 impl QueryFileRequest {
     /// Decodes a query-file-information request.
+    /// # Errors
+    ///
+    /// Returns an error when the current IRP stack is not a query-file stack or its FILE_OBJECT has
+    /// no opened ext4 context.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.query_file()?;
         let opened_file = OpenedObject::decode(stack.file_object())?;
@@ -170,6 +178,10 @@ struct SetFileRequest {
 
 impl SetFileRequest {
     /// Decodes a set-file-information request.
+    /// # Errors
+    ///
+    /// Returns an error when the current IRP stack is not a set-file stack or its FILE_OBJECT has no
+    /// opened ext4 context.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.set_file()?;
         let opened_file = OpenedObject::decode(stack.file_object())?;
@@ -194,6 +206,10 @@ struct QueryDirectoryRequest {
 
 impl QueryDirectoryRequest {
     /// Decodes a query-directory request.
+    /// # Errors
+    ///
+    /// Returns an error when the current IRP stack is not a query-directory stack or the FILE_OBJECT
+    /// is not an opened directory.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.query_directory()?;
         let opened_file = OpenedDirectory::decode(stack.file_object())?;
@@ -206,6 +222,10 @@ impl QueryDirectoryRequest {
 }
 
 /// Packs one supported file information class.
+/// # Errors
+///
+/// Returns an error when metadata cannot be loaded, the output buffer is too small, or the requested
+/// information class cannot be packed into its Windows layout.
 fn query_file_information(request: QueryFileRequest) -> DriverResult<IrpCompletion> {
     let metadata = load_file_metadata(&request.opened_file)?;
     let length = request.stack.length();
@@ -225,6 +245,10 @@ fn query_file_information(request: QueryFileRequest) -> DriverResult<IrpCompleti
 }
 
 /// Applies one supported set-file-information class.
+/// # Errors
+///
+/// Returns an error when the selected set-information class has invalid input or its ext4 metadata
+/// mutation cannot be committed.
 fn set_file_information(request: SetFileRequest) -> DriverResult<IrpCompletion> {
     match request.stack.information_class() {
         SetFileInformationClass::Basic => set_basic_information(request),
@@ -243,6 +267,10 @@ fn set_file_information(request: SetFileRequest) -> DriverResult<IrpCompletion> 
 }
 
 /// Applies FILE_BASIC_INFORMATION timestamps and overlay attributes.
+/// # Errors
+///
+/// Returns an error when the input structure is truncated, timestamps or attributes are invalid, or
+/// the resulting ext4 metadata transaction fails.
 fn set_basic_information(request: SetFileRequest) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_BASIC_INFORMATION>(
         request.target,
@@ -278,6 +306,10 @@ fn set_basic_information(request: SetFileRequest) -> DriverResult<()> {
 }
 
 /// Applies FILE_END_OF_FILE_INFORMATION to a regular file.
+/// # Errors
+///
+/// Returns an error when the input is truncated, the handle is not a regular file, the size is
+/// negative, or the file resize transaction fails.
 fn set_end_of_file_information(request: SetFileRequest) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_END_OF_FILE_INFORMATION>(
         request.target,
@@ -288,6 +320,10 @@ fn set_end_of_file_information(request: SetFileRequest) -> DriverResult<()> {
 }
 
 /// Applies FILE_ALLOCATION_INFORMATION within the ext4 sparse-file model.
+/// # Errors
+///
+/// Returns an error when the input is truncated, the handle is not a regular file, the requested
+/// allocation size is negative, or shrinking to that size fails.
 fn set_allocation_information(request: SetFileRequest) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_ALLOCATION_INFORMATION>(
         request.target,
@@ -308,6 +344,9 @@ fn set_allocation_information(request: SetFileRequest) -> DriverResult<()> {
 }
 
 /// Applies FILE_DISPOSITION_INFORMATION to the handle-local close disposition.
+/// # Errors
+///
+/// Returns an error when the disposition input buffer is too small.
 fn set_disposition_information(mut request: SetFileRequest) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION>(
         request.target,
@@ -322,6 +361,9 @@ fn set_disposition_information(mut request: SetFileRequest) -> DriverResult<()> 
 }
 
 /// Applies FILE_DISPOSITION_INFORMATION_EX to the handle-local close disposition.
+/// # Errors
+///
+/// Returns an error when the extended disposition input is truncated or carries unsupported flags.
 fn set_disposition_information_ex(mut request: SetFileRequest) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION_EX>(
         request.target,
@@ -331,6 +373,10 @@ fn set_disposition_information_ex(mut request: SetFileRequest) -> DriverResult<(
 }
 
 /// Decodes FILE_DISPOSITION_INFORMATION_EX flags into handle lifecycle state.
+/// # Errors
+///
+/// Returns an error when `flags` contains disposition bits outside the supported delete-on-close
+/// subset.
 fn disposition_ex_close_disposition(flags: wdk_sys::ULONG) -> DriverResult<CloseDisposition> {
     if flags & !SUPPORTED_DISPOSITION_EX_FLAGS != 0 {
         return Err(DriverError::NotSupported);
@@ -343,6 +389,9 @@ fn disposition_ex_close_disposition(flags: wdk_sys::ULONG) -> DriverResult<Close
 }
 
 /// Stores the decoded delete-on-close request on the opened handle.
+/// # Errors
+///
+/// Returns an error when the handle-local close disposition cannot be recorded.
 fn set_close_disposition(
     request: &mut SetFileRequest,
     close_disposition: CloseDisposition,
@@ -352,6 +401,10 @@ fn set_close_disposition(
 }
 
 /// Applies FILE_RENAME_INFORMATION to the opened path.
+/// # Errors
+///
+/// Returns an error when the rename buffer is malformed, the opened path is the root, the target
+/// parent cannot be resolved, or the ext4 rename transaction fails.
 fn set_rename_information(
     mut request: SetFileRequest,
     format: RenameInformationFormat,
@@ -389,6 +442,10 @@ fn set_rename_information(
 }
 
 /// Sets a regular file size by extending sparse or truncating allocated ranges.
+/// # Errors
+///
+/// Returns an error when the current file size cannot be loaded or the ext4 resize transaction
+/// fails.
 fn set_regular_file_size(opened_file: &OpenedRegularFile, new_size: FileSize) -> DriverResult<()> {
     let file_id = opened_file.id();
     let mut vcb = opened_file.volume();
@@ -417,6 +474,10 @@ fn set_regular_file_size(opened_file: &OpenedRegularFile, new_size: FileSize) ->
 }
 
 /// Packs directory entries into the caller's query-directory buffer.
+/// # Errors
+///
+/// Returns an error when the directory query stack, pattern, output buffer, opened directory, or
+/// emitted directory record layout is invalid.
 fn query_directory(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let mut request = QueryDirectoryRequest::decode(target)?;
     let class = request.stack.information_class();
@@ -473,6 +534,10 @@ enum DirectoryPattern {
 
 impl DirectoryPattern {
     /// Decodes the optional QueryDirectory filename pattern.
+    /// # Errors
+    ///
+    /// Returns an error when the pattern UNICODE_STRING is malformed, contains unsupported
+    /// wildcards, or is not a valid Windows name.
     fn from_stack(stack: QueryDirectoryStack) -> DriverResult<Self> {
         let DirectoryPatternInput::Name(name) = stack.pattern() else {
             return Ok(Self::All);
@@ -527,6 +592,9 @@ struct DirectoryRecordLayout {
 
 impl DirectoryRecordLayout {
     /// Computes the class-specific layout for the supplied Windows name.
+    /// # Errors
+    ///
+    /// Returns an error when the UTF-16 file-name byte length or padded record size overflows.
     fn new(class: DirectoryInformationClass, name: &WindowsName) -> DriverResult<Self> {
         let name_offset = class.name_offset();
         let name_bytes = utf16_byte_len(name.utf16())?;
@@ -585,6 +653,10 @@ const UTF16_DOT: u16 = 0x002E;
 const UTF16_QUESTION_MARK: u16 = 0x003F;
 
 /// Returns the UTF-16 units described by a WDK UNICODE_STRING.
+/// # Errors
+///
+/// Returns an error when the UNICODE_STRING has an odd byte length or a null buffer with nonzero
+/// length.
 fn unicode_string_units(name: &wdk_sys::UNICODE_STRING) -> DriverResult<&[u16]> {
     if name.Length & 1 != 0 {
         return Err(DriverError::InvalidParameter);
@@ -623,6 +695,10 @@ fn initialize_directory_cursor(cursor: &mut DirectoryCursor, stack: QueryDirecto
 }
 
 /// Emits directory entries into a caller buffer.
+/// # Errors
+///
+/// Returns an error when cursor arithmetic overflows, a matching entry cannot fit in an empty
+/// output buffer, metadata loading fails, or a directory record cannot be packed.
 fn emit_directory_entries(
     vcb: &VolumeControlBlock,
     cursor: &mut DirectoryCursor,
@@ -699,6 +775,9 @@ fn emit_directory_entries(
 }
 
 /// Packs one variable-length directory information record.
+/// # Errors
+///
+/// Returns an error when any fixed field or UTF-16 name range falls outside the output buffer.
 fn pack_directory_record(
     buffer: &mut [u8],
     start: usize,
@@ -782,6 +861,9 @@ fn pack_directory_record(
 }
 
 /// Clears a record before individual fields are written.
+/// # Errors
+///
+/// Returns an error when the target record range falls outside `buffer`.
 fn clear_record(buffer: &mut [u8], start: usize, length: usize) -> DriverResult<()> {
     let record = mutable_bytes(buffer, start, length)?;
     record.fill(0);
@@ -789,6 +871,9 @@ fn clear_record(buffer: &mut [u8], start: usize, length: usize) -> DriverResult<
 }
 
 /// Writes UTF-16 code units as Windows little-endian bytes.
+/// # Errors
+///
+/// Returns an error when the UTF-16 output range overflows or extends beyond `buffer`.
 fn write_utf16(buffer: &mut [u8], offset: usize, units: &[u16]) -> DriverResult<()> {
     let mut cursor = offset;
     for unit in units {
@@ -799,6 +884,9 @@ fn write_utf16(buffer: &mut [u8], offset: usize, units: &[u16]) -> DriverResult<
 }
 
 /// Returns a checked mutable byte range.
+/// # Errors
+///
+/// Returns an error when `offset..offset + length` overflows or is outside `buffer`.
 fn mutable_bytes(buffer: &mut [u8], offset: usize, length: usize) -> DriverResult<&mut [u8]> {
     wire_range(offset, length)?
         .write_to(buffer)
@@ -811,11 +899,18 @@ const fn wire_offset(offset: usize) -> WireOffset {
 }
 
 /// Builds a checked wire byte range from raw FILE_INFORMATION_CLASS fields.
+/// # Errors
+///
+/// Returns an error when a file-information `offset + length` cannot be represented as a wire
+/// range.
 fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
     WireRange::new(wire_offset(offset), WireByteLen::new(length))
 }
 
 /// Computes an absolute field offset from a record start.
+/// # Errors
+///
+/// Returns an error when the raw directory-record `start + offset` overflows.
 fn field_offset(start: usize, offset: usize) -> DriverResult<usize> {
     start
         .checked_add(offset)
@@ -823,11 +918,18 @@ fn field_offset(start: usize, offset: usize) -> DriverResult<usize> {
 }
 
 /// Computes an absolute directory record field offset for wire output.
+/// # Errors
+///
+/// Returns an error when the directory-record field offset cannot be represented as a wire offset.
 fn record_field_offset(start: usize, offset: usize) -> DriverResult<WireOffset> {
     field_offset(start, offset).map(wire_offset)
 }
 
 /// Returns the byte count for UTF-16 code units.
+/// # Errors
+///
+/// Returns an error when a file-information UTF-16 code-unit count cannot be doubled without
+/// overflow.
 fn utf16_byte_len(units: &[u16]) -> DriverResult<usize> {
     units
         .len()
@@ -836,6 +938,9 @@ fn utf16_byte_len(units: &[u16]) -> DriverResult<usize> {
 }
 
 /// Aligns a directory record size to an eight-byte boundary.
+/// # Errors
+///
+/// Returns an error when the padding addition or aligned-size multiplication overflows.
 fn align_to_eight(value: usize) -> DriverResult<usize> {
     let adjustment = DIRECTORY_ENTRY_ALIGNMENT
         .checked_sub(1)
@@ -852,6 +957,9 @@ fn align_to_eight(value: usize) -> DriverResult<usize> {
 }
 
 /// Converts an unsigned byte count to a signed Windows large-integer payload.
+/// # Errors
+///
+/// Returns an error when a file-information byte count exceeds the signed LARGE_INTEGER range.
 fn signed_i64(value: u64) -> DriverResult<i64> {
     i64::try_from(value).map_err(|_| DriverError::InvalidParameter)
 }
@@ -867,6 +975,10 @@ fn windows_time_quad(timestamp: Ext4Timestamp) -> i64 {
 }
 
 /// Applies cleanup-time namespace mutations requested by this handle.
+/// # Errors
+///
+/// Returns an error when the FILE_OBJECT has no opened context, the root is marked for deletion, or
+/// the cleanup-time namespace transaction fails.
 fn cleanup_file_object(file_object: KernelFileObject) -> DriverResult<()> {
     let mut opened_file = OpenedObject::decode(file_object)?;
     if opened_file.close_disposition() == CloseDisposition::Keep {
@@ -915,6 +1027,9 @@ fn opened_file_context(opened_file: &OpenedObject) -> OpenedFileContext {
 }
 
 /// Reads a fixed-size set-information input structure.
+/// # Errors
+///
+/// Returns an error when the buffered input is smaller than `T`.
 fn read_file_information_input<T: Copy>(
     target: DispatchTarget,
     length: IrpBufferLength,
@@ -931,6 +1046,10 @@ struct RenameTargetPath {
 
 impl RenameTargetPath {
     /// Decodes a FILE_RENAME_INFORMATION variable-length input buffer.
+    /// # Errors
+    ///
+    /// Returns an error when the rename input buffer is truncated, uses unsupported flags or root
+    /// handles, has an invalid name length, or encodes an invalid target path.
     fn parse(
         target: DispatchTarget,
         length: IrpBufferLength,
@@ -976,6 +1095,9 @@ enum RenameInformationFormat {
 
 impl RenameInformationFormat {
     /// Rejects rename semantics that ext4win does not implement.
+    /// # Errors
+    ///
+    /// Returns an error when replace-if-exists is requested or unsupported rename-ex flags are set.
     fn validate(self, bytes: &[u8]) -> DriverResult<()> {
         match self {
             Self::ReplaceIfExistsByte => {
@@ -1010,6 +1132,10 @@ struct NonEmptyWindowsPath {
 
 impl NonEmptyWindowsPath {
     /// Splits a root-relative UTF-16 path into validated Windows components.
+    /// # Errors
+    ///
+    /// Returns an error when the path is empty after root separators are removed or any component is
+    /// not a valid Windows name.
     fn from_utf16_path(units: &[u16]) -> DriverResult<Self> {
         let mut trimmed = units;
         while let Some(rest) = trimmed.strip_prefix(&[UTF16_BACKSLASH]) {
@@ -1060,6 +1186,9 @@ const SUPPORTED_RENAME_EX_FLAGS: wdk_sys::ULONG = wdk_sys::FILE_RENAME_IGNORE_RE
 const UTF16_BACKSLASH: u16 = 0x005C;
 
 /// Rejects FILE_RENAME_INFORMATION payloads carrying an unsupported root handle.
+/// # Errors
+///
+/// Returns an error when the root-directory handle field is present and nonzero.
 fn reject_root_directory(bytes: &[u8]) -> DriverResult<()> {
     if input_range(
         bytes,
@@ -1076,6 +1205,9 @@ fn reject_root_directory(bytes: &[u8]) -> DriverResult<()> {
 }
 
 /// Decodes little-endian UTF-16 units from a byte buffer.
+/// # Errors
+///
+/// Returns an error when `bytes` has an odd length or cannot be split into two-byte units.
 fn utf16_units_from_le_bytes(bytes: &[u8]) -> DriverResult<Vec<u16>> {
     if bytes.len() & 1 != 0 {
         return Err(DriverError::InvalidParameter);
@@ -1093,6 +1225,10 @@ fn utf16_units_from_le_bytes(bytes: &[u8]) -> DriverResult<Vec<u16>> {
 }
 
 /// Resolves the target parent directory and final ext4 name for a rename.
+/// # Errors
+///
+/// Returns an error when any parent component is absent or not a directory, or the target Windows
+/// name cannot be converted to an ext4 name.
 fn resolve_rename_target(
     vcb: &VolumeControlBlock,
     target: &RenameTargetPath,
@@ -1118,11 +1254,18 @@ fn resolve_rename_target(
 }
 
 /// Returns an immutable checked input byte range.
+/// # Errors
+///
+/// Returns an error when `offset..offset + length` overflows or is outside `bytes`.
 fn input_range(bytes: &[u8], offset: usize, length: usize) -> DriverResult<&[u8]> {
     wire_range(offset, length)?.read_from(bytes)
 }
 
 /// Builds a complete ext4 timestamp set from FILE_BASIC_INFORMATION.
+/// # Errors
+///
+/// Returns an error when any supplied Windows timestamp is negative, unsupported, or cannot be
+/// converted to Unix seconds.
 fn set_basic_times(
     current: Ext4Times,
     info: wdk_sys::FILE_BASIC_INFORMATION,
@@ -1136,6 +1279,10 @@ fn set_basic_times(
 }
 
 /// Selects one timestamp field, preserving the current value for sentinel inputs.
+/// # Errors
+///
+/// Returns an error when `value` is a negative non-sentinel timestamp or Windows cannot convert it
+/// to Unix seconds.
 fn windows_time_field(value: LARGE_INTEGER, current: Ext4Timestamp) -> DriverResult<Ext4Timestamp> {
     let quad = large_integer_quad(value);
     if quad == WINDOWS_TIME_UNCHANGED || quad == WINDOWS_TIME_PRESERVE {
@@ -1166,6 +1313,10 @@ const WINDOWS_TIME_UNCHANGED: i64 = 0;
 const WINDOWS_TIME_PRESERVE: i64 = -1;
 
 /// Builds overlay metadata from FILE_BASIC_INFORMATION attributes.
+/// # Errors
+///
+/// Returns an error when requested attributes contradict the node kind, attempt to change readonly
+/// permission state, or include unsupported bits.
 fn set_basic_overlay(
     metadata: FileMetadata,
     attributes: wdk_sys::ULONG,
@@ -1198,6 +1349,9 @@ fn set_basic_overlay(
 }
 
 /// Rejects node-kind attributes that contradict the opened ext4 node.
+/// # Errors
+///
+/// Returns an error when directory or reparse-point attributes do not match the opened node kind.
 fn validate_kind_attribute(kind: FileMetadataKind, attributes: wdk_sys::ULONG) -> DriverResult<()> {
     if attributes & wdk_sys::FILE_ATTRIBUTE_DIRECTORY != 0 && kind != FileMetadataKind::Directory {
         return Err(DriverError::InvalidParameter);
@@ -1210,6 +1364,9 @@ fn validate_kind_attribute(kind: FileMetadataKind, attributes: wdk_sys::ULONG) -
 }
 
 /// Returns a non-negative file size from a Windows LARGE_INTEGER.
+/// # Errors
+///
+/// Returns an error when the LARGE_INTEGER contains a negative size.
 fn file_size_from_large_integer(value: LARGE_INTEGER) -> DriverResult<FileSize> {
     let value = large_integer_quad(value);
     if value < 0 {
@@ -1221,6 +1378,9 @@ fn file_size_from_large_integer(value: LARGE_INTEGER) -> DriverResult<FileSize> 
 }
 
 /// Returns the current size of a regular file inode.
+/// # Errors
+///
+/// Returns an error when `file_id` cannot be loaded as a regular file.
 fn regular_file_size(vcb: &VolumeControlBlock, file_id: FileNodeId) -> DriverResult<FileSize> {
     Ok(vcb.volume().load_file(file_id)?.size())
 }
@@ -1267,6 +1427,9 @@ enum FileMetadataKind {
 }
 
 /// Loads metadata for the opened file currently being queried.
+/// # Errors
+///
+/// Returns an error when the opened node metadata or Windows overlay xattr cannot be loaded.
 fn load_file_metadata(opened_file: &OpenedObject) -> DriverResult<FileMetadata> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
@@ -1274,6 +1437,10 @@ fn load_file_metadata(opened_file: &OpenedObject) -> DriverResult<FileMetadata> 
 }
 
 /// Builds Windows-facing metadata from a loaded ext4 node.
+/// # Errors
+///
+/// Returns an error when `node_id` cannot be loaded as its typed ext4 node or its Windows overlay
+/// xattr is malformed.
 fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult<FileMetadata> {
     let overlay_attributes = vcb
         .volume()
@@ -1327,6 +1494,9 @@ fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult
 }
 
 /// Packs FILE_BASIC_INFORMATION.
+/// # Errors
+///
+/// Returns an error when the output buffer is too small for `FILE_BASIC_INFORMATION`.
 fn pack_basic_information(
     output: &mut [u8],
     metadata: FileMetadata,
@@ -1344,6 +1514,10 @@ fn pack_basic_information(
 }
 
 /// Packs FILE_STANDARD_INFORMATION.
+/// # Errors
+///
+/// Returns an error when allocation or EOF sizes cannot be represented, or the output buffer is too
+/// small for `FILE_STANDARD_INFORMATION`.
 fn pack_standard_information(
     output: &mut [u8],
     metadata: FileMetadata,
@@ -1361,6 +1535,9 @@ fn pack_standard_information(
 }
 
 /// Packs FILE_INTERNAL_INFORMATION.
+/// # Errors
+///
+/// Returns an error when the output buffer is too small for `FILE_INTERNAL_INFORMATION`.
 fn pack_internal_information(
     output: &mut [u8],
     metadata: FileMetadata,
@@ -1376,6 +1553,9 @@ fn pack_internal_information(
 }
 
 /// Packs FILE_POSITION_INFORMATION.
+/// # Errors
+///
+/// Returns an error when the output buffer is too small for `FILE_POSITION_INFORMATION`.
 fn pack_position_information(
     output: &mut [u8],
     opened_file: &OpenedObject,
@@ -1399,6 +1579,10 @@ fn pack_position_information(
 }
 
 /// Packs FILE_NETWORK_OPEN_INFORMATION.
+/// # Errors
+///
+/// Returns an error when sizes cannot be represented as signed Windows values or the output buffer
+/// is too small for `FILE_NETWORK_OPEN_INFORMATION`.
 fn pack_network_open_information(
     output: &mut [u8],
     metadata: FileMetadata,
@@ -1418,6 +1602,10 @@ fn pack_network_open_information(
 }
 
 /// Packs FILE_NAME_INFORMATION.
+/// # Errors
+///
+/// Returns an error when the opened path cannot be projected to UTF-16, the name length overflows,
+/// or the output buffer is too small.
 fn pack_name_information(
     output: &mut [u8],
     opened_file: &OpenedObject,
@@ -1440,6 +1628,9 @@ fn pack_name_information(
 }
 
 /// Packs FILE_ATTRIBUTE_TAG_INFORMATION.
+/// # Errors
+///
+/// Returns an error when the output buffer is too small for `FILE_ATTRIBUTE_TAG_INFORMATION`.
 fn pack_attribute_tag_information(
     output: &mut [u8],
     metadata: FileMetadata,
@@ -1454,6 +1645,9 @@ fn pack_attribute_tag_information(
 }
 
 /// Projects an opened path to the name payload returned to Windows.
+/// # Errors
+///
+/// Returns an error when a child ext4 name cannot be represented as a Windows UTF-16 name.
 fn opened_path_name_units(path: &OpenedPath) -> DriverResult<Vec<u16>> {
     match path {
         OpenedPath::Root => Ok(Vec::from([UTF16_BACKSLASH])),
@@ -1475,6 +1669,9 @@ const FILE_NAME_INFORMATION_NAME_LENGTH_OFFSET: usize = 0;
 const FILE_NAME_INFORMATION_NAME_OFFSET: usize = 4;
 
 /// Writes one fixed-size information structure into the caller's buffer.
+/// # Errors
+///
+/// Returns an error when `output` is smaller than `T`.
 fn write_fixed<T>(output: &mut [u8], value: T) -> DriverResult<IrpCompletion> {
     let size = core::mem::size_of::<T>();
     if output.len() < size {
@@ -1522,6 +1719,9 @@ fn file_attributes(metadata: FileMetadata) -> wdk_sys::ULONG {
 }
 
 /// Returns allocation size rounded to a volume allocation unit.
+/// # Errors
+///
+/// Returns an error when block-size rounding arithmetic overflows.
 fn allocation_size(metadata: FileMetadata) -> DriverResult<u64> {
     let size = metadata.size.bytes();
     if size == 0 {
@@ -1543,6 +1743,9 @@ fn allocation_size(metadata: FileMetadata) -> DriverResult<u64> {
 }
 
 /// Creates a signed LARGE_INTEGER from an unsigned byte count.
+/// # Errors
+///
+/// Returns an error when `value` exceeds the signed LARGE_INTEGER range.
 fn large_integer_from_u64(value: u64) -> DriverResult<LARGE_INTEGER> {
     Ok(LARGE_INTEGER {
         QuadPart: i64::try_from(value).map_err(|_| DriverError::InvalidParameter)?,
@@ -1555,6 +1758,10 @@ fn boolean(value: bool) -> wdk_sys::BOOLEAN {
 }
 
 /// Reads a regular file through ext4-core into the IRP output buffer.
+/// # Errors
+///
+/// Returns an error when the read stack or output buffer is invalid, the FILE_OBJECT is not a
+/// regular file, or ext4 data read fails.
 fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.read()?;
     let opened_file = OpenedRegularFile::decode(stack.file_object())?;
@@ -1577,6 +1784,10 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 }
 
 /// Writes a regular file range through an ext4 journal transaction.
+/// # Errors
+///
+/// Returns an error when the write stack or input buffer is invalid, the FILE_OBJECT is not a
+/// regular file, or the ext4 overwrite transaction fails.
 fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.write()?;
     let opened_file = OpenedRegularFile::decode(stack.file_object())?;
@@ -1653,28 +1864,46 @@ mod tests {
     use crate::kernel::status::DriverError;
     use crate::state::OpenedPath;
 
-    fn test_metadata(kind: super::FileMetadataKind) -> super::FileMetadata {
+    fn test_metadata(kind: super::FileMetadataKind) -> Option<super::FileMetadata> {
         let timestamp = Ext4Timestamp::from_unix_seconds(1);
-        super::FileMetadata {
+        Some(super::FileMetadata {
             file_index: 1,
             kind,
             size: FileSize::from_bytes(0),
             security: Ext4Security::new(
                 Ext4Owner::new(Ext4Uid::from_u32(0), Ext4Gid::from_u32(0)),
-                Ext4Permissions::new(0o644).unwrap(),
+                Ext4Permissions::new(0o644).ok()?,
             ),
             times: Ext4Times::new(timestamp, timestamp, timestamp, timestamp),
             links_count: Ext4LinkCount::ONE,
             overlay_attributes: 0,
-            block_size: BlockSize::from_superblock_log(0).unwrap(),
-        }
+            block_size: BlockSize::from_superblock_log(0).ok()?,
+        })
     }
 
-    fn le_u32(buffer: &[u8], offset: usize) -> u32 {
-        let bytes: [u8; 4] = buffer[offset..offset + 4].try_into().unwrap();
-        u32::from_le_bytes(bytes)
+    /// Reads one little-endian u32 from a test output buffer.
+    fn le_u32(buffer: &[u8], offset: usize) -> Option<u32> {
+        let end = offset.checked_add(core::mem::size_of::<u32>())?;
+        let bytes = buffer.get(offset..end)?;
+        let bytes = <[u8; 4]>::try_from(bytes).ok()?;
+        Some(u32::from_le_bytes(bytes))
     }
 
+    /// Writes one little-endian u32 into a test input buffer.
+    fn put_le_u32(buffer: &mut [u8], offset: usize, value: u32) -> bool {
+        let Some(end) = offset.checked_add(core::mem::size_of::<u32>()) else {
+            return false;
+        };
+        let Some(target) = buffer.get_mut(offset..end) else {
+            return false;
+        };
+        target.copy_from_slice(&value.to_le_bytes());
+        true
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn rename_target_path_rejects_empty_and_root_only_names() {
         assert_eq!(
@@ -1687,59 +1916,89 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn opened_path_name_units_project_root_and_child_names() {
+        let root_units: &[u16] = &[super::UTF16_BACKSLASH];
         assert_eq!(
-            super::opened_path_name_units(&OpenedPath::Root).unwrap(),
-            [super::UTF16_BACKSLASH]
+            super::opened_path_name_units(&OpenedPath::Root).as_deref(),
+            Ok(root_units)
         );
 
-        let name = Ext4Name::new(b"file").unwrap();
+        let name = Ext4Name::new(b"file");
+        assert!(name.is_ok());
+        let Ok(name) = name else {
+            return;
+        };
         let path = OpenedPath::Child {
             parent: DirectoryNodeId::ROOT,
             name,
         };
+        let child_units: &[u16] = &[
+            u16::from(b'f'),
+            u16::from(b'i'),
+            u16::from(b'l'),
+            u16::from(b'e'),
+        ];
         assert_eq!(
-            super::opened_path_name_units(&path).unwrap(),
-            [
-                u16::from(b'f'),
-                u16::from(b'i'),
-                u16::from(b'l'),
-                u16::from(b'e')
-            ]
+            super::opened_path_name_units(&path).as_deref(),
+            Ok(child_units)
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_names_information_record_uses_name_only_layout() {
-        let name = WindowsName::from_utf16(&[u16::from(b'a')]).unwrap();
-        let layout =
-            super::DirectoryRecordLayout::new(DirectoryInformationClass::Names, &name).unwrap();
+        let name = WindowsName::from_utf16(&[u16::from(b'a')]);
+        assert!(name.is_ok());
+        let Ok(name) = name else {
+            return;
+        };
+        let layout = super::DirectoryRecordLayout::new(DirectoryInformationClass::Names, &name);
+        assert!(layout.is_ok());
+        let Ok(layout) = layout else {
+            return;
+        };
         let mut buffer = [0_u8; 24];
+        let metadata = test_metadata(super::FileMetadataKind::File);
+        assert!(metadata.is_some());
+        let Some(metadata) = metadata else {
+            return;
+        };
 
-        super::pack_directory_record(
+        let packed = super::pack_directory_record(
             &mut buffer,
             0,
             DirectoryInformationClass::Names,
             7,
             &name,
-            test_metadata(super::FileMetadataKind::File),
+            metadata,
             layout,
-        )
-        .unwrap();
+        );
+        assert!(packed.is_ok());
 
-        assert_eq!(le_u32(&buffer, super::DIRECTORY_NEXT_ENTRY_OFFSET), 0);
-        assert_eq!(le_u32(&buffer, super::DIRECTORY_FILE_INDEX_OFFSET), 7);
+        assert_eq!(le_u32(&buffer, super::DIRECTORY_NEXT_ENTRY_OFFSET), Some(0));
+        assert_eq!(le_u32(&buffer, super::DIRECTORY_FILE_INDEX_OFFSET), Some(7));
         assert_eq!(
             le_u32(&buffer, super::NAMES_INFORMATION_FILE_NAME_LENGTH_OFFSET),
-            2
+            Some(2)
         );
-        assert_eq!(
-            &buffer[super::NAMES_INFORMATION_NAME_OFFSET..][..2],
-            &[b'a', 0]
-        );
+        let name_bytes = buffer.get(super::NAMES_INFORMATION_NAME_OFFSET..24);
+        assert!(name_bytes.is_some());
+        let Some(name_bytes) = name_bytes else {
+            return;
+        };
+        let expected_name: &[u8] = &[b'a', 0];
+        assert_eq!(name_bytes.get(..2), Some(expected_name));
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn symlink_attribute_tag_information_uses_symlink_reparse_tag() {
         assert_eq!(super::reparse_tag(super::FileMetadataKind::File), 0);
@@ -1749,6 +2008,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn disposition_ex_flags_decode_close_disposition_and_reject_posix_semantics() {
         assert_eq!(
@@ -1767,24 +2029,36 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn rename_ex_flags_reject_replace_semantics() {
         let mut input = [0_u8; super::FILE_RENAME_NAME_OFFSET + 2];
-        input[super::FILE_RENAME_FLAGS_OFFSET..][..4]
-            .copy_from_slice(&wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE.to_le_bytes());
+        assert!(put_le_u32(
+            &mut input,
+            super::FILE_RENAME_FLAGS_OFFSET,
+            wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE,
+        ));
         assert_eq!(
             super::RenameInformationFormat::Flags.validate(&input),
             Ok(())
         );
 
-        input[super::FILE_RENAME_FLAGS_OFFSET..][..4]
-            .copy_from_slice(&wdk_sys::FILE_RENAME_REPLACE_IF_EXISTS.to_le_bytes());
+        assert!(put_le_u32(
+            &mut input,
+            super::FILE_RENAME_FLAGS_OFFSET,
+            wdk_sys::FILE_RENAME_REPLACE_IF_EXISTS,
+        ));
         assert_eq!(
             super::RenameInformationFormat::Flags.validate(&input),
             Err(DriverError::NotSupported)
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn rename_root_directory_field_is_not_supported() {
         let mut input = [0_u8; super::FILE_RENAME_ROOT_DIRECTORY_OFFSET + 8];
@@ -1805,7 +2079,9 @@ mod tests {
             Err(DriverError::NotSupported)
         );
     }
-
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn rename_replace_flag_decode_boundary_rejects() {
         let mut input = [0_u8; super::FILE_RENAME_NAME_OFFSET + 2];

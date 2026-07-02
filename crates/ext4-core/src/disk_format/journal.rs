@@ -180,6 +180,10 @@ impl<State> Journal<State> {
     }
 
     /// Loads an internal journal stored in the filesystem journal inode.
+    /// # Errors
+    ///
+    /// Returns an error when the inode is not a supported extent-backed journal, the journal
+    /// superblock cannot be read or parsed, or the ring layout is inconsistent with the inode size.
     pub(crate) fn from_inode(
         inode: &Inode,
         block_size: BlockSize,
@@ -225,6 +229,10 @@ impl<State> Journal<State> {
     }
 
     /// Loads an external journal device and validates its filesystem UUID.
+    /// # Errors
+    ///
+    /// Returns an error when the external superblock cannot be read or parsed, its UUID does not
+    /// match the filesystem, or the external ring geometry is unsupported.
     pub(crate) fn from_external_device(
         journal: &impl BlockReader,
         block_size: BlockSize,
@@ -254,6 +262,10 @@ impl<State> Journal<State> {
     }
 
     /// Verifies that one metadata transaction can fit in the usable log window.
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor tag count or required overhead exceeds the usable
+    /// journal ring.
     pub(crate) fn ensure_transaction_capacity(&self, metadata_blocks: usize) -> Result<()> {
         if metadata_blocks > self.descriptor_tag_capacity()? {
             return Err(Error::TransactionTooLarge);
@@ -270,6 +282,10 @@ impl<State> Journal<State> {
     }
 
     /// Replays and checkpoints an internal journal through the filesystem device.
+    /// # Errors
+    ///
+    /// Returns an error when replay scanning, checkpoint writes, flushes, or clean-superblock writes
+    /// fail on the filesystem device.
     pub(crate) fn replay_and_checkpoint_internal(
         mut self,
         filesystem: &mut impl BlockWriter,
@@ -281,6 +297,10 @@ impl<State> Journal<State> {
     }
 
     /// Replays and checkpoints an external journal through separate I/O targets.
+    /// # Errors
+    ///
+    /// Returns an error when journal scanning, home-block checkpoint writes, journal writes, or
+    /// flushes fail across the filesystem and external journal devices.
     pub(crate) fn replay_and_checkpoint_external(
         mut self,
         filesystem: &mut impl BlockWriter,
@@ -296,6 +316,10 @@ impl<State> Journal<State> {
     }
 
     /// Commits metadata blocks through an internal journal.
+    /// # Errors
+    ///
+    /// Returns an error when transaction preparation, journal writes, checkpoint writes, or flushes
+    /// fail on the filesystem device.
     pub(crate) fn commit_internal(
         &mut self,
         filesystem: &mut impl BlockWriter,
@@ -307,6 +331,10 @@ impl<State> Journal<State> {
     }
 
     /// Commits metadata blocks through an external journal.
+    /// # Errors
+    ///
+    /// Returns an error when transaction preparation, external journal writes, filesystem
+    /// checkpoint writes, or flushes fail.
     pub(crate) fn commit_external(
         &mut self,
         filesystem: &mut impl BlockWriter,
@@ -322,6 +350,10 @@ impl<State> Journal<State> {
     }
 
     /// Replays committed transactions and advances the journal to a clean state.
+    /// # Errors
+    ///
+    /// Returns an error when the superblock recovery state is inconsistent, transaction scanning
+    /// fails, checkpoint I/O fails, or the clean superblock cannot be written.
     fn replay_and_checkpoint(
         &mut self,
         io: &mut impl JournalIo,
@@ -371,6 +403,10 @@ impl<State> Journal<State> {
     }
 
     /// Writes, checkpoints, and cleans one metadata transaction.
+    /// # Errors
+    ///
+    /// Returns an error when the journal is already dirty, the transaction cannot be prepared, or any
+    /// durable write, checkpoint, or clean step fails.
     fn commit_metadata_transaction(
         &mut self,
         io: &mut impl JournalIo,
@@ -388,6 +424,10 @@ impl<State> Journal<State> {
     }
 
     /// Persists descriptor, data, and commit blocks in crash-safe order.
+    /// # Errors
+    ///
+    /// Returns an error when dirty-superblock encoding, ring advancement, journal writes, or flushes
+    /// fail.
     fn write_prepared_transaction(
         &mut self,
         io: &mut impl JournalIo,
@@ -421,6 +461,10 @@ impl<State> Journal<State> {
     }
 
     /// Copies durable journal payloads back to their home filesystem blocks.
+    /// # Errors
+    ///
+    /// Returns an error when any metadata block cannot be written to its home location or the
+    /// checkpoint flush fails.
     fn checkpoint_durable_transaction(
         &mut self,
         io: &mut impl JournalIo,
@@ -439,6 +483,9 @@ impl<State> Journal<State> {
     }
 
     /// Marks a checkpointed transaction clean in the journal superblock.
+    /// # Errors
+    ///
+    /// Returns an error when the clean journal superblock cannot be encoded, written, or flushed.
     fn clean_checkpointed_transaction(
         &mut self,
         io: &mut impl JournalIo,
@@ -450,6 +497,10 @@ impl<State> Journal<State> {
     }
 
     /// Builds descriptor, escaped data blocks, and commit block for a transaction.
+    /// # Errors
+    ///
+    /// Returns an error when the transaction is too large, a metadata block has the wrong size, data
+    /// escaping fails, or descriptor/commit serialization fails.
     fn prepare_metadata_transaction(
         &self,
         block_size: BlockSize,
@@ -488,6 +539,10 @@ impl<State> Journal<State> {
     }
 
     /// Scans the journal ring for complete committed transactions.
+    /// # Errors
+    ///
+    /// Returns an error when usable ring bounds cannot be computed or a transaction block cannot be
+    /// read and parsed.
     fn committed_transactions(
         &self,
         io: &mut impl JournalIo,
@@ -542,6 +597,10 @@ impl<State> Journal<State> {
     }
 
     /// Parses one transaction starting at the supplied logical journal block.
+    /// # Errors
+    ///
+    /// Returns an error when a transaction has inconsistent sequence numbers, duplicate descriptor
+    /// blocks, corrupt escaped data, duplicate home blocks, invalid revokes, or a bad commit block.
     fn parse_transaction(
         &self,
         io: &mut impl JournalIo,
@@ -639,6 +698,10 @@ impl<State> Journal<State> {
     }
 
     /// Reads one logical journal block into an owned buffer.
+    /// # Errors
+    ///
+    /// Returns an error when the journal block size cannot be allocated or the logical block cannot
+    /// be read from the journal location.
     fn read_journal_block(
         &self,
         io: &mut impl JournalIo,
@@ -652,6 +715,10 @@ impl<State> Journal<State> {
     }
 
     /// Rejects replay targets outside the filesystem or inside the internal journal.
+    /// # Errors
+    ///
+    /// Returns an error when the replay target is beyond the filesystem or overlaps the internal
+    /// journal's home blocks.
     fn validate_replay_target(&self, block: BlockAddress) -> Result<()> {
         if block.get() >= self.filesystem_blocks {
             return Err(Error::JournalCorrupt);
@@ -663,6 +730,10 @@ impl<State> Journal<State> {
     }
 
     /// Parses descriptor tags from a JBD2 descriptor block.
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor tail checksum is invalid, no last tag is present, or any
+    /// tag is malformed.
     fn parse_descriptor_block(&self, block: &[u8]) -> Result<JournalDescriptor> {
         self.verify_block_tail_checksum(block)?;
         let mut offset = JOURNAL_HEADER_BYTES;
@@ -692,6 +763,10 @@ impl<State> Journal<State> {
     }
 
     /// Parses one descriptor tag and returns the next tag offset.
+    /// # Errors
+    ///
+    /// Returns an error when tag fields exceed the descriptor payload, tag flags are unsupported, or
+    /// an embedded UUID does not match the journal superblock.
     fn parse_tag(
         &self,
         block: &[u8],
@@ -806,6 +881,10 @@ impl<State> Journal<State> {
     }
 
     /// Parses a revoke block into the home blocks it cancels.
+    /// # Errors
+    ///
+    /// Returns an error when the revoke block checksum is invalid, its used length is inconsistent,
+    /// or its block-address entries are not exactly aligned.
     fn parse_revoke_block(&self, block: &[u8]) -> Result<JournalRevoke> {
         self.verify_block_tail_checksum(block)?;
         let used = usize::try_from(be_u32(block, disk_offset(JOURNAL_HEADER_BYTES))?)
@@ -844,6 +923,10 @@ impl<State> Journal<State> {
     }
 
     /// Validates a commit block for the expected transaction sequence.
+    /// # Errors
+    ///
+    /// Returns an error when the block is not a commit block for `expected_sequence`, checksum
+    /// metadata fields are invalid, or the commit checksum fails.
     fn parse_commit_block(
         &self,
         block: &[u8],
@@ -872,6 +955,10 @@ impl<State> Journal<State> {
     }
 
     /// Encodes descriptor tags for the metadata blocks in a new transaction.
+    /// # Errors
+    ///
+    /// Returns an error when the block size cannot be allocated, a data block is missing, a tag does
+    /// not fit, or the descriptor tail checksum cannot be written.
     fn encode_descriptor_block(
         &self,
         sequence: JournalSequence,
@@ -901,6 +988,10 @@ impl<State> Journal<State> {
     }
 
     /// Encodes one descriptor tag using the active JBD2 tag format.
+    /// # Errors
+    ///
+    /// Returns an error when the tag would exceed the descriptor payload or its block address,
+    /// checksum, or flags cannot be represented in the active tag format.
     fn encode_tag(
         &self,
         block: &mut [u8],
@@ -969,6 +1060,10 @@ impl<State> Journal<State> {
     }
 
     /// Encodes the commit block that makes a transaction durable.
+    /// # Errors
+    ///
+    /// Returns an error when the block size cannot be allocated, the header cannot be written, or
+    /// commit checksum fields are outside the block.
     fn encode_commit_block(
         &self,
         sequence: JournalSequence,
@@ -987,6 +1082,9 @@ impl<State> Journal<State> {
     }
 
     /// Writes a clean journal superblock with the next transaction sequence.
+    /// # Errors
+    ///
+    /// Returns an error when clean superblock encoding, journal superblock write, or flush fails.
     fn mark_clean(
         &mut self,
         io: &mut impl JournalIo,
@@ -1001,11 +1099,18 @@ impl<State> Journal<State> {
     }
 
     /// Returns the number of usable blocks in the journal ring.
+    /// # Errors
+    ///
+    /// Returns an error when ring geometry leaves no usable journal blocks.
     fn usable_log_blocks(&self) -> Result<u32> {
         self.ring.usable_blocks()
     }
 
     /// Returns how many tags fit in one descriptor block.
+    /// # Errors
+    ///
+    /// Returns an error when the journal block cannot hold the descriptor header, optional tail, and
+    /// at least one tag.
     fn descriptor_tag_capacity(&self) -> Result<usize> {
         let block_bytes =
             usize::try_from(self.superblock.block_size()).map_err(|_| Error::ArithmeticOverflow)?;
@@ -1035,6 +1140,9 @@ impl<State> Journal<State> {
     }
 
     /// Returns the descriptor payload limit before an optional checksum tail.
+    /// # Errors
+    ///
+    /// Returns an error when metadata checksums are enabled but the block is smaller than its tail.
     fn descriptor_payload_limit(&self, block_len: usize) -> Result<usize> {
         if self.superblock.has_metadata_checksums() {
             block_len.checked_sub(4).ok_or(Error::InvalidSuperblock)
@@ -1044,11 +1152,17 @@ impl<State> Journal<State> {
     }
 
     /// Advances a logical journal block with ring wraparound.
+    /// # Errors
+    ///
+    /// Returns an error when the logical block is outside the validated journal ring.
     fn next_logical(&self, logical: u32) -> Result<u32> {
         self.ring.next(logical)
     }
 
     /// Verifies a descriptor tag checksum against its data block.
+    /// # Errors
+    ///
+    /// Returns an error when the computed data checksum does not match the tag checksum.
     fn verify_tag_checksum(
         &self,
         sequence: JournalSequence,
@@ -1077,6 +1191,9 @@ impl<State> Journal<State> {
     }
 
     /// Computes the JBD2 checksum for one journal data block.
+    /// # Errors
+    ///
+    /// Returns an error when the sequence number cannot be written into the checksum seed buffer.
     fn tag_checksum(&self, sequence: JournalSequence, data: &[u8]) -> Result<u32> {
         let mut sequence_bytes = [0_u8; 4];
         put_be_u32(&mut sequence_bytes, disk_offset(0), sequence.get())?;
@@ -1086,6 +1203,10 @@ impl<State> Journal<State> {
     }
 
     /// Verifies the optional checksum stored at the end of a control block.
+    /// # Errors
+    ///
+    /// Returns an error when the control block is too short for a tail checksum or the computed
+    /// checksum differs from the stored value.
     fn verify_block_tail_checksum(&self, block: &[u8]) -> Result<()> {
         if !self.superblock.has_metadata_checksums() {
             return Ok(());
@@ -1101,6 +1222,10 @@ impl<State> Journal<State> {
     }
 
     /// Writes the optional checksum stored at the end of a control block.
+    /// # Errors
+    ///
+    /// Returns an error when the control block is too short for a tail checksum or the checksum
+    /// field cannot be written.
     fn write_block_tail_checksum(&self, block: &mut [u8]) -> Result<()> {
         if !self.superblock.has_metadata_checksums() {
             return Ok(());
@@ -1111,6 +1236,10 @@ impl<State> Journal<State> {
     }
 
     /// Verifies the checksum field embedded in a commit block.
+    /// # Errors
+    ///
+    /// Returns an error when the commit checksum field is truncated or does not match the block
+    /// checksum with that field zeroed.
     fn verify_commit_checksum(&self, block: &[u8]) -> Result<()> {
         let expected = be_u32(block, disk_offset(0x10))?;
         let actual = self.block_checksum_with_zeroed(block, 0x10)?;
@@ -1122,6 +1251,9 @@ impl<State> Journal<State> {
     }
 
     /// Computes a control-block checksum with its checksum field zeroed.
+    /// # Errors
+    ///
+    /// Returns an error when the checksum field range overflows or is outside the control block.
     fn block_checksum_with_zeroed(&self, block: &[u8], checksum_offset: usize) -> Result<u32> {
         let end = checksum_offset
             .checked_add(4)
@@ -1146,6 +1278,10 @@ struct JournalRing {
 
 impl JournalRing {
     /// Validates ring geometry from a parsed journal superblock.
+    /// # Errors
+    ///
+    /// Returns an error when `first`, `maxlen`, or `start` falls outside the supported ring shape or
+    /// physical journal capacity.
     fn new(superblock: &JournalSuperblock, capacity_blocks: u32) -> Result<Self> {
         let first = superblock.first();
         let maxlen = superblock.maxlen();
@@ -1162,6 +1298,9 @@ impl JournalRing {
     }
 
     /// Returns usable block count after the reserved superblock region.
+    /// # Errors
+    ///
+    /// Returns an error when `maxlen` does not leave any blocks after `first`.
     fn usable_blocks(self) -> Result<u32> {
         self.maxlen
             .checked_sub(self.first)
@@ -1169,6 +1308,9 @@ impl JournalRing {
     }
 
     /// Returns the next logical block, wrapping at the ring end.
+    /// # Errors
+    ///
+    /// Returns an error when `logical` is outside the ring or advancing it overflows.
     fn next(self, logical: u32) -> Result<u32> {
         if logical < self.first || logical >= self.maxlen {
             return Err(Error::JournalCorrupt);
@@ -1193,6 +1335,10 @@ enum JournalLocation {
 
 impl JournalLocation {
     /// Maps a logical journal block to a byte offset on its backing device.
+    /// # Errors
+    ///
+    /// Returns an error when the logical block is not backed by the internal layout or exceeds the
+    /// external journal capacity.
     fn offset_of(&self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
         match self {
             Self::Internal(layout) => block_size.offset_of(layout.map_logical(logical)?),
@@ -1201,6 +1347,9 @@ impl JournalLocation {
     }
 
     /// Verifies that the journal ring is backed by the selected location.
+    /// # Errors
+    ///
+    /// Returns an error when the selected physical location does not cover the validated ring.
     fn validate_ring(&self, ring: &JournalRing) -> Result<()> {
         match self {
             Self::Internal(layout) => layout.validate_ring(ring),
@@ -1209,6 +1358,9 @@ impl JournalLocation {
     }
 
     /// Returns whether a filesystem home block overlaps the internal journal.
+    /// # Errors
+    ///
+    /// Returns an error when the internal journal extent mapping cannot be evaluated.
     fn contains_home_block(&self, block: BlockAddress) -> Result<bool> {
         match self {
             Self::Internal(layout) => layout.contains_physical(block),
@@ -1236,6 +1388,10 @@ struct InternalJournalLayout {
 
 impl InternalJournalLayout {
     /// Converts inode extents into a contiguous logical journal layout.
+    /// # Errors
+    ///
+    /// Returns an error when an inode extent exceeds journal capacity or its logical/physical bounds
+    /// overflow.
     fn new(extents: &[crate::disk_format::extent::Extent], capacity_blocks: u32) -> Result<Self> {
         let mut mapped = Vec::with_capacity(extents.len());
         for extent in extents {
@@ -1262,6 +1418,10 @@ impl InternalJournalLayout {
     }
 
     /// Verifies that extents cover the journal ring from logical block zero.
+    /// # Errors
+    ///
+    /// Returns an error when journal inode extents are not contiguous from block zero through the
+    /// ring end.
     fn validate_ring(&self, ring: &JournalRing) -> Result<()> {
         let mut expected = 0_u32;
         for extent in &self.extents {
@@ -1277,6 +1437,10 @@ impl InternalJournalLayout {
     }
 
     /// Maps a logical journal block through the journal inode extents.
+    /// # Errors
+    ///
+    /// Returns an error when no journal inode extent covers `logical` or the physical mapping
+    /// overflows.
     fn map_logical(&self, logical: u32) -> Result<BlockAddress> {
         for extent in &self.extents {
             if let Some(block) = extent.map_logical(logical)? {
@@ -1287,6 +1451,9 @@ impl InternalJournalLayout {
     }
 
     /// Returns whether a physical filesystem block belongs to the journal inode.
+    /// # Errors
+    ///
+    /// Returns an error when an extent's physical range cannot be evaluated.
     fn contains_physical(&self, block: BlockAddress) -> Result<bool> {
         for extent in &self.extents {
             if extent.contains_physical(block) {
@@ -1317,6 +1484,9 @@ struct JournalExtent {
 
 impl JournalExtent {
     /// Builds a checked journal extent from logical and physical bounds.
+    /// # Errors
+    ///
+    /// Returns an error when `physical_start + len` overflows.
     fn new(
         logical_start: u32,
         logical_end: u32,
@@ -1336,6 +1506,9 @@ impl JournalExtent {
     }
 
     /// Maps a logical journal block when it falls inside this extent.
+    /// # Errors
+    ///
+    /// Returns an error when subtracting the extent start or adding the physical offset overflows.
     fn map_logical(self, logical: u32) -> Result<Option<BlockAddress>> {
         if logical < self.logical_start || logical >= self.logical_end {
             return Ok(None);
@@ -1368,6 +1541,10 @@ struct ExternalJournalLayout {
 
 impl ExternalJournalLayout {
     /// Derives external journal capacity from the journal device length.
+    /// # Errors
+    ///
+    /// Returns an error when the device is too small after the external superblock offset or its
+    /// block capacity is outside the supported range.
     fn new(journal: &impl BlockReader, block_size: BlockSize) -> Result<Self> {
         let base = ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET);
         let remaining = journal
@@ -1390,6 +1567,9 @@ impl ExternalJournalLayout {
     }
 
     /// Verifies that the journal ring fits on the external device.
+    /// # Errors
+    ///
+    /// Returns an error when the ring max length exceeds external journal capacity.
     fn validate_ring(self, ring: &JournalRing) -> Result<()> {
         if ring.maxlen <= self.capacity_blocks {
             Ok(())
@@ -1399,6 +1579,9 @@ impl ExternalJournalLayout {
     }
 
     /// Maps a logical journal block to an external journal byte offset.
+    /// # Errors
+    ///
+    /// Returns an error when `logical` exceeds capacity or byte-offset arithmetic overflows.
     fn offset_of(self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
         if logical >= self.capacity_blocks {
             return Err(Error::UnsupportedJournal);
@@ -1450,6 +1633,10 @@ pub(crate) struct JournalSuperblock {
 
 impl JournalSuperblock {
     /// Parses and verifies a JBD2 superblock image.
+    /// # Errors
+    ///
+    /// Returns an error when the image is truncated, lacks a JBD2 superblock header, has an invalid
+    /// superblock checksum, or required fields are missing.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < JOURNAL_SUPERBLOCK_BYTES {
             return Err(Error::TruncatedStructure);
@@ -1479,6 +1666,10 @@ impl JournalSuperblock {
     }
 
     /// Validates JBD2 features and ring geometry for mounting.
+    /// # Errors
+    ///
+    /// Returns an error when block size, feature bits, checksum type, or ring geometry are outside
+    /// the supported JBD2 profile.
     fn validate_for_mount(
         &self,
         block_size: BlockSize,
@@ -1508,6 +1699,10 @@ impl JournalSuperblock {
     }
 
     /// Encodes a superblock image with updated sequence and start fields.
+    /// # Errors
+    ///
+    /// Returns an error when the retained raw superblock length does not match `block_size` or the
+    /// sequence/start/checksum fields cannot be rewritten.
     fn encode_with_state(
         &self,
         block_size: BlockSize,
@@ -1529,11 +1724,19 @@ impl JournalSuperblock {
     }
 
     /// Encodes a clean journal superblock with no pending transaction tail.
+    /// # Errors
+    ///
+    /// Returns an error when the clean sequence/start state cannot be encoded into a valid
+    /// superblock image.
     fn encode_clean(&self, block_size: BlockSize, sequence: JournalSequence) -> Result<Vec<u8>> {
         self.encode_with_state(block_size, sequence, 0)
     }
 
     /// Encodes a dirty journal superblock pointing at a transaction descriptor.
+    /// # Errors
+    ///
+    /// Returns an error when the dirty sequence/start state cannot be encoded into a valid
+    /// superblock image.
     fn encode_dirty(
         &self,
         block_size: BlockSize,
@@ -1603,6 +1806,9 @@ impl JournalSuperblock {
     }
 
     /// Returns whether the journal superblock checksum field is populated.
+    /// # Errors
+    ///
+    /// Returns an error when the checksum field is outside the retained raw superblock image.
     fn has_superblock_checksum(&self) -> Result<bool> {
         Ok(be_u32(&self.raw, disk_offset(0xFC))? != 0)
     }
@@ -1619,6 +1825,9 @@ pub(crate) struct Jbd2Header {
 
 impl Jbd2Header {
     /// Parses the common JBD2 control block header.
+    /// # Errors
+    ///
+    /// Returns an error when the header is truncated or the JBD2 magic does not match.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < JOURNAL_HEADER_BYTES {
             return Err(Error::TruncatedStructure);
@@ -1649,6 +1858,9 @@ impl Jbd2Header {
     }
 
     /// Writes the common JBD2 header fields into a block image.
+    /// # Errors
+    ///
+    /// Returns an error when the destination block is too small for a JBD2 header.
     pub(crate) fn encode(self, bytes: &mut [u8]) -> Result<()> {
         if bytes.len() < JOURNAL_HEADER_BYTES {
             return Err(Error::TruncatedStructure);
@@ -1815,6 +2027,9 @@ struct RevokedBlock {
 /// I/O boundary shared by internal and external journal backends.
 trait JournalIo {
     /// Reads one logical journal block from the journal device.
+    /// # Errors
+    ///
+    /// Returns an error when the logical journal block cannot be mapped or read.
     fn read_journal_block<S>(
         &mut self,
         journal: &Journal<S>,
@@ -1824,6 +2039,9 @@ trait JournalIo {
     ) -> Result<()>;
 
     /// Writes one logical journal block to the journal device.
+    /// # Errors
+    ///
+    /// Returns an error when the logical journal block cannot be mapped or written.
     fn write_journal_block<S>(
         &mut self,
         journal: &Journal<S>,
@@ -1833,6 +2051,9 @@ trait JournalIo {
     ) -> Result<()>;
 
     /// Writes one filesystem home block.
+    /// # Errors
+    ///
+    /// Returns an error when the filesystem block offset cannot be computed or the write fails.
     fn write_home_block(
         &mut self,
         block_size: BlockSize,
@@ -1841,6 +2062,9 @@ trait JournalIo {
     ) -> Result<()>;
 
     /// Flushes all devices touched by this journal operation.
+    /// # Errors
+    ///
+    /// Returns an error when any touched device fails to flush.
     fn flush_all(&mut self) -> Result<()>;
 }
 
@@ -1937,12 +2161,18 @@ impl<F: BlockWriter, J: BlockWriter> JournalIo for ExternalJournalIo<'_, F, J> {
 
 impl<State> Journal<State> {
     /// Maps a logical journal block to a byte offset for this journal.
+    /// # Errors
+    ///
+    /// Returns an error when the journal location cannot map `logical` to a device offset.
     fn offset_of(&self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
         self.location.offset_of(logical, block_size)
     }
 }
 
 /// Reads a logical journal block from an arbitrary journal location.
+/// # Errors
+///
+/// Returns an error when the location cannot map `logical` or the backing reader fails.
 fn read_journal_block(
     reader: &impl BlockReader,
     location: &JournalLocation,
@@ -1962,6 +2192,10 @@ fn starts_with_jbd2_magic(bytes: &[u8]) -> bool {
 }
 
 /// Rejects descriptor tag flags this journal implementation cannot interpret.
+/// # Errors
+///
+/// Returns an error when any tag flag outside the supported escape, same-UUID, deleted, and last-tag
+/// set is present.
 fn validate_tag_flags(flags: u32) -> Result<()> {
     const SUPPORTED_TAG_FLAGS: u32 = JBD2_TAG_FLAG_ESCAPE
         | JBD2_TAG_FLAG_SAME_UUID
@@ -1984,6 +2218,10 @@ fn transaction_tail(consumed: u32) -> JournalTransactionScan {
 }
 
 /// Verifies the checksum stored in a journal superblock.
+/// # Errors
+///
+/// Returns an error when the checksum field is truncated or the computed checksum differs from the
+/// stored value.
 fn verify_journal_superblock_checksum(block: &[u8]) -> Result<()> {
     let expected = be_u32(block, disk_offset(0xFC))?;
     let actual = journal_superblock_checksum(block)?;
@@ -1995,6 +2233,9 @@ fn verify_journal_superblock_checksum(block: &[u8]) -> Result<()> {
 }
 
 /// Recomputes and writes the journal superblock checksum.
+/// # Errors
+///
+/// Returns an error when the journal superblock checksum field cannot be zeroed or rewritten.
 fn refresh_journal_superblock_checksum(block: &mut [u8]) -> Result<()> {
     put_be_u32(block, disk_offset(0xFC), 0)?;
     let checksum = journal_superblock_checksum(block)?;
@@ -2002,6 +2243,9 @@ fn refresh_journal_superblock_checksum(block: &mut [u8]) -> Result<()> {
 }
 
 /// Computes a journal superblock checksum with its checksum field zeroed.
+/// # Errors
+///
+/// Returns an error when the superblock body or checksum field is truncated.
 fn journal_superblock_checksum(block: &[u8]) -> Result<u32> {
     let mut checked = block
         .get(..JOURNAL_SUPERBLOCK_BYTES)

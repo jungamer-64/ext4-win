@@ -323,6 +323,9 @@ struct XattrEntry {
 }
 
 /// Parses in-inode xattrs from the inode body region after `i_extra_isize`.
+/// # Errors
+///
+/// Returns an error when a non-empty inline region has the wrong magic or malformed xattr entries.
 pub(crate) fn parse_inline_xattrs(region: &[u8]) -> Result<InodeXattrSet> {
     if region.len() < EXT4_XATTR_INODE_HEADER_BYTES || region.iter().all(|byte| *byte == 0) {
         return Ok(InodeXattrSet::empty());
@@ -339,6 +342,10 @@ pub(crate) fn parse_inline_xattrs(region: &[u8]) -> Result<InodeXattrSet> {
 }
 
 /// Serializes a complete xattr set into an in-inode xattr region.
+/// # Errors
+///
+/// Returns an error when the region cannot hold the inline xattr header or the serialized entries
+/// and values.
 pub(crate) fn serialize_inline_xattrs(set: &InodeXattrSet, capacity: usize) -> Result<Vec<u8>> {
     let mut bytes = vec![0_u8; capacity];
     if set.is_empty() {
@@ -360,6 +367,10 @@ pub(crate) fn serialize_inline_xattrs(set: &InodeXattrSet, capacity: usize) -> R
 
 /// Parses an external xattr block and verifies its checksum when metadata
 /// checksums are active.
+/// # Errors
+///
+/// Returns an error when the block header or checksum is invalid, or the contained xattr entries are
+/// malformed.
 pub(crate) fn parse_external_xattr_block(
     bytes: &[u8],
     block: BlockAddress,
@@ -375,6 +386,10 @@ pub(crate) fn parse_external_xattr_block(
 }
 
 /// Serializes a complete xattr set into one external xattr block.
+/// # Errors
+///
+/// Returns an error when the set is empty, entries cannot fit in the block, or checksum refresh
+/// cannot write the external block checksum field.
 pub(crate) fn serialize_external_xattr_block(
     set: &InodeXattrSet,
     block_size: usize,
@@ -400,6 +415,9 @@ pub(crate) fn serialize_external_xattr_block(
 }
 
 /// Verifies that a set fits in one external xattr block.
+/// # Errors
+///
+/// Returns an error when serializing the set would exceed the supplied block size.
 pub(crate) fn ensure_external_xattrs_fit(set: &InodeXattrSet, block_size: usize) -> Result<()> {
     let mut bytes = vec![0_u8; block_size];
     serialize_xattr_entries(
@@ -412,6 +430,10 @@ pub(crate) fn ensure_external_xattrs_fit(set: &InodeXattrSet, block_size: usize)
 }
 
 /// Reads the external xattr block reference count.
+/// # Errors
+///
+/// Returns an error when the block magic is invalid, the reference-count field is truncated, or the
+/// reference count is zero.
 pub(crate) fn external_xattr_refcount(bytes: &[u8]) -> Result<u32> {
     if le_u32(bytes, disk_offset(0))? != EXT4_XATTR_MAGIC {
         return Err(Error::InvalidXattr);
@@ -424,6 +446,10 @@ pub(crate) fn external_xattr_refcount(bytes: &[u8]) -> Result<u32> {
 }
 
 /// Rewrites the external xattr block reference count and checksum.
+/// # Errors
+///
+/// Returns an error when `refcount` is zero, the block magic is invalid, or the refcount/checksum
+/// fields cannot be written.
 pub(crate) fn set_external_xattr_refcount(
     bytes: &mut [u8],
     block: BlockAddress,
@@ -442,6 +468,9 @@ pub(crate) fn set_external_xattr_refcount(
 
 /// Merges inline and external xattr sets while rejecting duplicate logical and
 /// private slots.
+/// # Errors
+///
+/// Returns an error when public xattr names collide or both sets contain a private fscrypt context.
 pub(crate) fn merge_xattr_sets(left: InodeXattrSet, right: InodeXattrSet) -> Result<InodeXattrSet> {
     let mut entries = left.public.into_entries();
     entries.extend(right.public.into_entries());
@@ -512,6 +541,10 @@ impl DiskXattrKey {
 }
 
 /// Parses xattr entries from a complete in-inode region or external block.
+/// # Errors
+///
+/// Returns an error when entry headers are truncated, disk keys are unsorted or unsupported, value
+/// ranges overlap entries or leave storage, or logical slots collide.
 fn parse_xattr_entries(
     storage: &[u8],
     entry_offset: usize,
@@ -623,6 +656,10 @@ fn parse_xattr_entries(
 }
 
 /// Serializes xattr entries into a pre-zeroed storage image.
+/// # Errors
+///
+/// Returns an error when entry metadata or value payloads cannot fit in `storage`, or an encoded
+/// name, value size, or value offset exceeds the ext4 field width.
 fn serialize_xattr_entries(
     set: &InodeXattrSet,
     storage: &mut [u8],
@@ -726,6 +763,9 @@ fn serialize_xattr_entries(
 }
 
 /// Returns the end of the serialized entry table including terminator padding.
+/// # Errors
+///
+/// Returns an error when entry-header, name-length, terminator, or alignment arithmetic overflows.
 fn serialized_entries_end(entry_offset: usize, entries: &[SerializedDiskXattr]) -> Result<usize> {
     let mut cursor = entry_offset;
     for entry in entries {
@@ -744,6 +784,9 @@ fn serialized_entries_end(entry_offset: usize, entries: &[SerializedDiskXattr]) 
 }
 
 /// Converts a logical xattr name to its on-disk key.
+/// # Errors
+///
+/// Returns an error when the logical name cannot be represented by an ext4 xattr disk key.
 fn disk_key(name: &XattrName) -> Result<DiskXattrKey> {
     let (index, local) = match name.namespace() {
         XattrNamespace::User => (EXT4_XATTR_INDEX_USER, name.local()),
@@ -764,6 +807,10 @@ fn disk_key(name: &XattrName) -> Result<DiskXattrKey> {
 }
 
 /// Converts an on-disk xattr key to the logical inode xattr slot.
+/// # Errors
+///
+/// Returns an error when the namespace/local-name pair is not part of the supported public or
+/// private xattr slots.
 fn logical_slot(index: u8, local: &[u8]) -> Result<ParsedDiskXattrSlot> {
     match index {
         EXT4_XATTR_INDEX_USER => Ok(ParsedDiskXattrSlot::Public(XattrName::new(
@@ -796,6 +843,10 @@ fn logical_slot(index: u8, local: &[u8]) -> Result<ParsedDiskXattrSlot> {
 }
 
 /// Validates the external xattr block header and checksum.
+/// # Errors
+///
+/// Returns an error when the header is too small, magic/refcount/block-count fields are invalid, or
+/// the metadata checksum does not match.
 fn validate_external_xattr_block(
     bytes: &[u8],
     block: BlockAddress,
@@ -824,6 +875,9 @@ fn validate_external_xattr_block(
 }
 
 /// Refreshes the external xattr block checksum.
+/// # Errors
+///
+/// Returns an error when the external xattr checksum field cannot be zeroed or rewritten.
 fn refresh_external_xattr_checksum(
     bytes: &mut [u8],
     block: BlockAddress,
@@ -842,6 +896,9 @@ fn refresh_external_xattr_checksum(
 }
 
 /// Aligns a byte offset upward to an ext4 xattr 4-byte boundary.
+/// # Errors
+///
+/// Returns an error when adding the alignment padding would overflow `usize`.
 fn align_up(value: usize) -> Result<usize> {
     value
         .checked_add(3)
@@ -863,6 +920,9 @@ mod tests {
         parse_inline_xattrs, serialize_inline_xattrs,
     };
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn xattr_name_is_split_from_namespace() {
         let name = XattrName::new(XattrNamespace::User, b"ext4win").ok();
@@ -872,6 +932,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn xattr_set_rejects_duplicate_names() {
         let name = XattrName::new(XattrNamespace::System, b"posix_acl_access");
@@ -884,6 +947,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_context_is_private_inode_xattr() {
         let name = XattrName::new(XattrNamespace::User, b"visible");
@@ -923,6 +989,9 @@ mod tests {
         assert_eq!(parsed.encryption_context(), Some(&context));
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn duplicate_private_fscrypt_context_is_rejected() {
         let left_context = XattrValue::new(b"a");

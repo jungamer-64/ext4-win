@@ -33,6 +33,9 @@ impl<N> MountContext<N> {
     }
 
     /// Returns the next fscrypt nonce for a new encrypted inode.
+    /// # Errors
+    ///
+    /// Returns an error when the mounted fscrypt nonce source cannot produce a valid file nonce.
     pub(super) fn next_fscrypt_file_nonce(&mut self) -> Result<FscryptFileNonce>
     where
         N: FscryptNonceGenerator,

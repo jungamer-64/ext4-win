@@ -279,6 +279,9 @@ pub enum FsverityHashAlgorithm {
 
 impl FsverityHashAlgorithm {
     /// Parses a Linux fs-verity hash algorithm id.
+    /// # Errors
+    ///
+    /// Returns an error when the algorithm id is not SHA-256 or SHA-512.
     pub(crate) const fn parse_u8(value: u8) -> Result<Self> {
         match value {
             FSVERITY_HASH_ALG_SHA256 => Ok(Self::Sha256),
@@ -584,6 +587,9 @@ impl FsverityRootHash {
     }
 
     /// Parses and validates the fixed descriptor root-hash field.
+    /// # Errors
+    ///
+    /// Returns an error when bytes beyond the selected algorithm digest length are nonzero.
     fn parse(
         algorithm: FsverityHashAlgorithm,
         bytes: [u8; FSVERITY_MAX_DIGEST_BYTES],
@@ -882,6 +888,9 @@ impl FsverityMerkleTree {
 }
 
 /// Computes the serialized Merkle tree byte count for one file.
+/// # Errors
+///
+/// Returns an error when Merkle level sizing or accumulated tree byte counts overflow.
 fn stored_tree_bytes_for_data_size(
     algorithm: FsverityHashAlgorithm,
     block_size: FsverityBlockSize,
@@ -913,6 +922,10 @@ fn stored_tree_bytes_for_data_size(
 }
 
 /// Parses salt and requires unused descriptor salt bytes to be zero.
+/// # Errors
+///
+/// Returns an error when the salt field range is truncated, size arithmetic overflows, or unused
+/// salt bytes are nonzero.
 fn parse_salt(bytes: &[u8], salt_size: usize) -> Result<FsveritySalt> {
     let salt_end = DESCRIPTOR_SALT_OFFSET
         .checked_add(salt_size)
@@ -935,6 +948,9 @@ fn parse_salt(bytes: &[u8], salt_size: usize) -> Result<FsveritySalt> {
 }
 
 /// Aligns an offset upward to a positive byte boundary.
+/// # Errors
+///
+/// Returns an error when `alignment` is zero or rounding `value` up overflows.
 fn align_up_u64(value: u64, alignment: u64) -> Result<u64> {
     if alignment == 0 {
         return Err(Error::ArithmeticOverflow);
@@ -952,6 +968,9 @@ fn align_up_u64(value: u64, alignment: u64) -> Result<u64> {
 }
 
 /// Divides and rounds up without accepting a zero divisor.
+/// # Errors
+///
+/// Returns an error when `divisor` is zero or rounded addition overflows.
 fn round_up_div_u64(value: u64, divisor: u64) -> Result<u64> {
     if divisor == 0 {
         return Err(Error::ArithmeticOverflow);
@@ -964,6 +983,9 @@ fn round_up_div_u64(value: u64, divisor: u64) -> Result<u64> {
 }
 
 /// Hashes every data block, padding the final block with zeroes.
+/// # Errors
+///
+/// Returns an error when a data chunk cannot be copied into its zero-padded Merkle block.
 fn hash_data_blocks(
     data: &[u8],
     algorithm: FsverityHashAlgorithm,
@@ -983,6 +1005,10 @@ fn hash_data_blocks(
 }
 
 /// Hashes one Merkle level into parent hashes.
+/// # Errors
+///
+/// Returns an error when the block cannot hold at least one digest, a child digest uses the wrong
+/// algorithm, or digest placement arithmetic overflows.
 fn hash_level(
     hashes: &[FsverityDigest],
     algorithm: FsverityHashAlgorithm,
@@ -1016,6 +1042,10 @@ fn hash_level(
 }
 
 /// Hashes one fs-verity data or Merkle block with padded salt.
+/// # Errors
+///
+/// Returns an error when the salt does not fit in the algorithm's padded salt block or the produced
+/// digest length is invalid.
 fn hash_block(
     algorithm: FsverityHashAlgorithm,
     salt: &FsveritySalt,
@@ -1043,6 +1073,10 @@ fn hash_bytes(algorithm: FsverityHashAlgorithm, bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Requires an exact serialized structure length.
+/// # Errors
+///
+/// Returns an error when `bytes` is shorter or longer than the expected serialized fs-verity
+/// structure.
 fn require_exact_len(bytes: &[u8], expected: usize) -> Result<()> {
     match bytes.len().cmp(&expected) {
         core::cmp::Ordering::Less => Err(Error::TruncatedStructure),
@@ -1052,26 +1086,41 @@ fn require_exact_len(bytes: &[u8], expected: usize) -> Result<()> {
 }
 
 /// Reads one byte from a checked offset.
+/// # Errors
+///
+/// Returns an error when `offset` is outside the serialized fs-verity structure.
 fn byte(bytes: &[u8], offset: usize) -> Result<u8> {
     bytes.get(offset).copied().ok_or(Error::TruncatedStructure)
 }
 
 /// Reads a little-endian `u32` at a checked offset.
+/// # Errors
+///
+/// Returns an error when the four-byte fs-verity field is not fully present at `offset`.
 fn le_u32(bytes: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(fixed(bytes, offset)?))
 }
 
 /// Reads a little-endian `u64` at a checked offset.
+/// # Errors
+///
+/// Returns an error when the eight-byte fs-verity field is not fully present at `offset`.
 fn le_u64(bytes: &[u8], offset: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(fixed(bytes, offset)?))
 }
 
 /// Writes a little-endian `u64` at a checked offset.
+/// # Errors
+///
+/// Returns an error when the eight-byte field cannot be written at `offset`.
 fn put_le_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result<()> {
     copy_into(bytes, offset, &value.to_le_bytes())
 }
 
 /// Writes one byte at a checked offset.
+/// # Errors
+///
+/// Returns an error when `offset` is outside the destination structure.
 fn set_byte(bytes: &mut [u8], offset: usize, value: u8) -> Result<()> {
     let target = bytes.get_mut(offset).ok_or(Error::TruncatedStructure)?;
     *target = value;
@@ -1079,6 +1128,9 @@ fn set_byte(bytes: &mut [u8], offset: usize, value: u8) -> Result<()> {
 }
 
 /// Copies a fixed byte array from a checked offset.
+/// # Errors
+///
+/// Returns an error when the fixed-width field overflows or is outside the source structure.
 fn fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
     let end = offset.checked_add(N).ok_or(Error::ArithmeticOverflow)?;
     let slice = bytes.get(offset..end).ok_or(Error::TruncatedStructure)?;
@@ -1088,6 +1140,9 @@ fn fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
 }
 
 /// Copies source bytes into a checked destination offset.
+/// # Errors
+///
+/// Returns an error when the destination range overflows or is outside the target structure.
 fn copy_into(target: &mut [u8], offset: usize, source: &[u8]) -> Result<()> {
     let end = offset
         .checked_add(source.len())
@@ -1155,6 +1210,9 @@ mod tests {
         };
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn ext4_verity_metadata_layout_places_descriptor_size_tail() {
         let layout = must!(Ext4VerityMetadataLayout::new(
@@ -1175,6 +1233,9 @@ mod tests {
         assert_eq!(layout.metadata_end(), 77_824);
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn ext4_verity_metadata_layout_rejects_bad_descriptor_and_overflow() {
         assert_eq!(
@@ -1202,6 +1263,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_descriptor_round_trips_supported_layout() {
         let descriptor = must!(small_descriptor());
@@ -1210,6 +1274,9 @@ mod tests {
         assert_eq!(FsverityDescriptor::parse(&bytes), Ok(descriptor));
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_descriptor_rejects_reserved_and_unused_salt_bytes() {
         let mut reserved_word = must!(must!(small_descriptor()).to_bytes());
@@ -1246,6 +1313,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_descriptor_rejects_unsupported_algorithm_and_block_size() {
         let mut algorithm = must!(must!(small_descriptor()).to_bytes());
@@ -1271,6 +1341,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_merkle_tree_matches_sha256_single_block_vector() {
         let block_size = must!(FsverityBlockSize::new(1024));
@@ -1289,6 +1362,9 @@ mod tests {
         assert!(tree.blocks().is_empty());
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_merkle_tree_matches_sha256_multi_block_vector() {
         let block_size = must!(FsverityBlockSize::new(1024));
@@ -1312,6 +1388,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_merkle_tree_verify_rejects_data_and_tree_corruption() {
         let block_size = must!(FsverityBlockSize::new(1024));
@@ -1348,6 +1427,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_empty_file_has_zero_root_and_no_tree_blocks() {
         let block_size = must!(FsverityBlockSize::new(1024));
@@ -1364,6 +1446,10 @@ mod tests {
     }
 
     /// Builds the single-block vector descriptor.
+    /// # Errors
+    ///
+    /// Returns an error when the fixed digest, block size, root hash, salt, or descriptor fields are
+    /// rejected by their domain constructors.
     fn small_descriptor() -> Result<FsverityDescriptor> {
         let digest =
             FsverityDigest::new(FsverityHashAlgorithm::Sha256, SMALL_SHA256_ROOT.to_vec())?;
@@ -1377,6 +1463,9 @@ mod tests {
     }
 
     /// Builds deterministic multi-block test data.
+    /// # Errors
+    ///
+    /// Returns an error when a generated byte index cannot be represented as `u8`.
     fn repeating_data(len: usize) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         for index in 0..len {

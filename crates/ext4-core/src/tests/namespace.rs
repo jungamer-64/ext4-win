@@ -1,5 +1,8 @@
 use super::*;
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn directory_entries_are_parsed_from_root_inode() {
     let image = fixture_image();
@@ -16,6 +19,9 @@ fn directory_entries_are_parsed_from_root_inode() {
     assert_eq!(entries[3].entry_kind(), DirectoryEntryKind::Symlink);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn symlink_inline_target_is_read_without_extents() {
     let image = fixture_image();
@@ -28,6 +34,9 @@ fn symlink_inline_target_is_read_without_extents() {
     assert_eq!(target, b"file");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn exact_ext4_lookup_uses_raw_bytes() {
     let image = fixture_image();
@@ -44,6 +53,9 @@ fn exact_ext4_lookup_uses_raw_bytes() {
     assert_eq!(child.node().inode(), inode(3));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn windows_name_projection_rejects_reserved_separator() {
     let ext4_name = must(crate::Ext4Name::new(b"a:b"));
@@ -52,6 +64,9 @@ fn windows_name_projection_rejects_reserved_separator() {
     assert!(matches!(result, Err(Error::InvalidName)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn windows_lookup_accepts_unique_ascii_case_fold() {
     let image = fixture_image();
@@ -68,6 +83,9 @@ fn windows_lookup_accepts_unique_ascii_case_fold() {
     assert_eq!(child.node().inode(), inode(3));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn lookup_reports_not_found_without_option() {
     let image = fixture_image();
@@ -79,6 +97,9 @@ fn lookup_reports_not_found_without_option() {
     assert_eq!(lookup_ext4_inode(&volume, InodeId::ROOT, b"missing"), None);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn windows_lookup_rejects_ambiguous_case_fold() {
     let mut image = fixture_image();
@@ -101,6 +122,9 @@ fn windows_lookup_rejects_ambiguous_case_fold() {
     assert_eq!(result, Err(Error::AmbiguousWindowsName));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn write_mount_rejects_layout_and_namespace_feature_profiles() {
     for incompat in [
@@ -123,6 +147,9 @@ fn write_mount_rejects_layout_and_namespace_feature_profiles() {
     }
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn minimal_profile_supports_file_and_namespace_mutations() {
     let mut image = minimal_write_fixture_image();
@@ -174,6 +201,9 @@ fn minimal_profile_supports_file_and_namespace_mutations() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn create_file_adds_directory_entry_and_inode() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -199,6 +229,9 @@ fn create_file_adds_directory_entry_and_inode() {
     assert_eq!(get_u32(&image, 1024 + 16), 5);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn create_file_rejects_duplicate_name() {
     let mut image = modern_fixture_image();
@@ -212,6 +245,9 @@ fn create_file_rejects_duplicate_name() {
     assert_eq!(result, Err(Error::NameAlreadyExists));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn unlink_file_removes_directory_entry_and_frees_inode() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -237,6 +273,9 @@ fn unlink_file_removes_directory_entry_and_frees_inode() {
     assert_eq!(get_u32(&image, 1024 + 16), 6);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn unlink_file_reports_missing_entry() {
     let mut image = modern_fixture_image();
@@ -250,6 +289,9 @@ fn unlink_file_reports_missing_entry() {
     assert_eq!(result, Err(Error::DirectoryEntryNotFound));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn rename_file_updates_staged_directory_entry() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -276,6 +318,9 @@ fn rename_file_updates_staged_directory_entry() {
     assert_eq!(get_u32(&image, 1024 + 16), 5);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn rename_rejects_existing_target() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -291,6 +336,9 @@ fn rename_rejects_existing_target() {
     assert_eq!(result, Err(Error::NameAlreadyExists));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn create_and_remove_empty_directory_updates_namespace() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -322,6 +370,9 @@ fn create_and_remove_empty_directory_updates_namespace() {
     assert_eq!(get_u32(&image, 1024 + 16), 6);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn create_inline_symlink_adds_directory_entry_and_inode() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -347,6 +398,9 @@ fn create_inline_symlink_adds_directory_entry_and_inode() {
     }
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn create_extent_symlink_writes_target_blocks() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -369,6 +423,9 @@ fn create_extent_symlink_writes_target_blocks() {
     }
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn remove_symlink_removes_directory_entry_and_frees_inode() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -396,6 +453,9 @@ fn remove_symlink_removes_directory_entry_and_frees_inode() {
     }
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn rename_directory_across_parents_updates_dotdot() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -449,6 +509,9 @@ fn rename_directory_across_parents_updates_dotdot() {
     assert_eq!(get_u32(&image, 1024 + 16), 4);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn remove_directory_rejects_non_empty_child() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -474,6 +537,9 @@ fn remove_directory_rejects_non_empty_child() {
     assert_eq!(result, Err(Error::DirectoryNotEmpty));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn remove_directory_rejects_root_entry() {
     let mut image = modern_fixture_image();
@@ -487,6 +553,9 @@ fn remove_directory_rejects_root_entry() {
     assert_eq!(result, Err(Error::CannotRemoveRoot));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn indexed_directory_create_rebuilds_real_htree() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -517,6 +586,9 @@ fn indexed_directory_create_rebuilds_real_htree() {
     assert_eq!(get_u32(&image, block_offset(MODERN_EXTENT_INDEX_BLOCK)), 3);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn htree_directory_read_lookup_and_windows_lookup_use_real_index() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -548,6 +620,9 @@ fn htree_directory_read_lookup_and_windows_lookup_use_real_index() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn htree_dx_tail_checksum_mismatch_is_rejected() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -560,6 +635,9 @@ fn htree_dx_tail_checksum_mismatch_is_rejected() {
     assert_eq!(volume.read_directory(&root), Err(Error::ChecksumMismatch));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn htree_leaf_tail_checksum_mismatch_is_rejected() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -572,6 +650,9 @@ fn htree_leaf_tail_checksum_mismatch_is_rejected() {
     assert_eq!(volume.read_directory(&root), Err(Error::ChecksumMismatch));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn linear_directory_converts_to_htree_when_full() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -603,6 +684,9 @@ fn linear_directory_converts_to_htree_when_full() {
     assert!(get_u32(&image, root_inode + 4) >= u32::try_from(BLOCK_SIZE * 2).unwrap_or(u32::MAX));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn indexed_directory_rename_and_unlink_rebuild_htree_consistently() {
     let mut image = modern_fixture_image_with_journal_blocks(16);

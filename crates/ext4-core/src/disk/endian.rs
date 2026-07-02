@@ -25,6 +25,9 @@ impl DiskOffset {
     }
 
     /// Adds a checked on-disk byte length to this offset.
+    /// # Errors
+    ///
+    /// Returns an error when the resulting byte offset exceeds `usize`.
     pub(crate) fn checked_add(self, length: DiskByteLen) -> Result<Self> {
         Ok(Self {
             bytes: self
@@ -35,6 +38,10 @@ impl DiskOffset {
     }
 
     /// Adds a checked raw byte count at the endian boundary.
+    /// # Errors
+    ///
+    /// Returns an error when the raw byte count cannot be represented as a checked disk length or
+    /// the resulting offset overflows.
     pub(crate) fn checked_add_bytes(self, bytes: usize) -> Result<Self> {
         self.checked_add(DiskByteLen::new(bytes))
     }
@@ -71,6 +78,9 @@ pub struct DiskRange {
 
 impl DiskRange {
     /// Builds a checked disk byte range from an offset and length.
+    /// # Errors
+    ///
+    /// Returns an error when adding the length to the start offset overflows.
     pub fn new(offset: DiskOffset, length: DiskByteLen) -> Result<Self> {
         let end = offset.checked_add(length)?;
         Ok(Self {
@@ -80,6 +90,9 @@ impl DiskRange {
     }
 
     /// Builds a checked disk byte range from start and end offsets.
+    /// # Errors
+    ///
+    /// Returns an error when the end offset precedes the start offset.
     pub fn span(start: DiskOffset, end: DiskOffset) -> Result<Self> {
         if end.as_usize() < start.as_usize() {
             return Err(Error::TruncatedStructure);
@@ -91,6 +104,9 @@ impl DiskRange {
     }
 
     /// Borrows this range from an on-disk input structure.
+    /// # Errors
+    ///
+    /// Returns an error when this range is outside the supplied input bytes.
     pub fn read_from(self, bytes: &[u8]) -> Result<&[u8]> {
         bytes
             .get(self.start..self.end)
@@ -98,6 +114,9 @@ impl DiskRange {
     }
 
     /// Borrows this range from an on-disk output structure.
+    /// # Errors
+    ///
+    /// Returns an error when this range is outside the supplied output bytes.
     pub fn write_to(self, bytes: &mut [u8]) -> Result<&mut [u8]> {
         bytes
             .get_mut(self.start..self.end)
@@ -106,56 +125,86 @@ impl DiskRange {
 }
 
 /// Reads a little-endian `u16` at `offset`.
+/// # Errors
+///
+/// Returns an error when the two-byte little-endian field is not fully present at `offset`.
 pub fn le_u16(bytes: &[u8], offset: DiskOffset) -> Result<u16> {
     let raw = fixed::<2>(bytes, offset)?;
     Ok(u16::from_le_bytes(raw))
 }
 
 /// Reads a little-endian `u32` at `offset`.
+/// # Errors
+///
+/// Returns an error when the four-byte little-endian field is not fully present at `offset`.
 pub fn le_u32(bytes: &[u8], offset: DiskOffset) -> Result<u32> {
     let raw = fixed::<4>(bytes, offset)?;
     Ok(u32::from_le_bytes(raw))
 }
 
 /// Reads a big-endian `u32` at `offset`.
+/// # Errors
+///
+/// Returns an error when the four-byte big-endian field is not fully present at `offset`.
 pub fn be_u32(bytes: &[u8], offset: DiskOffset) -> Result<u32> {
     let raw = fixed::<4>(bytes, offset)?;
     Ok(u32::from_be_bytes(raw))
 }
 
 /// Reads a big-endian `u16` at `offset`.
+/// # Errors
+///
+/// Returns an error when the two-byte big-endian field is not fully present at `offset`.
 pub fn be_u16(bytes: &[u8], offset: DiskOffset) -> Result<u16> {
     let raw = fixed::<2>(bytes, offset)?;
     Ok(u16::from_be_bytes(raw))
 }
 
 /// Reads a big-endian `u64` at `offset`.
+/// # Errors
+///
+/// Returns an error when the eight-byte big-endian field is not fully present at `offset`.
 pub fn be_u64(bytes: &[u8], offset: DiskOffset) -> Result<u64> {
     let raw = fixed::<8>(bytes, offset)?;
     Ok(u64::from_be_bytes(raw))
 }
 
 /// Writes a little-endian `u16` at `offset`.
+/// # Errors
+///
+/// Returns an error when the two-byte little-endian field cannot be written at `offset`.
 pub fn put_le_u16(bytes: &mut [u8], offset: DiskOffset, value: u16) -> Result<()> {
     put_fixed(bytes, offset, &value.to_le_bytes())
 }
 
 /// Writes a little-endian `u32` at `offset`.
+/// # Errors
+///
+/// Returns an error when the four-byte little-endian field cannot be written at `offset`.
 pub fn put_le_u32(bytes: &mut [u8], offset: DiskOffset, value: u32) -> Result<()> {
     put_fixed(bytes, offset, &value.to_le_bytes())
 }
 
 /// Writes a big-endian `u32` at `offset`.
+/// # Errors
+///
+/// Returns an error when the four-byte big-endian field cannot be written at `offset`.
 pub fn put_be_u32(bytes: &mut [u8], offset: DiskOffset, value: u32) -> Result<()> {
     put_fixed(bytes, offset, &value.to_be_bytes())
 }
 
 /// Writes a big-endian `u16` at `offset`.
+/// # Errors
+///
+/// Returns an error when the two-byte big-endian field cannot be written at `offset`.
 pub fn put_be_u16(bytes: &mut [u8], offset: DiskOffset, value: u16) -> Result<()> {
     put_fixed(bytes, offset, &value.to_be_bytes())
 }
 
 /// Copies an exact-width byte array out of a checked range.
+/// # Errors
+///
+/// Returns an error when the fixed-width range overflows or is outside the input bytes.
 fn fixed<const N: usize>(bytes: &[u8], offset: DiskOffset) -> Result<[u8; N]> {
     let range = DiskRange::new(offset, DiskByteLen::new(N))?;
     let slice = range.read_from(bytes)?;
@@ -165,6 +214,9 @@ fn fixed<const N: usize>(bytes: &[u8], offset: DiskOffset) -> Result<[u8; N]> {
 }
 
 /// Copies an exact-width byte array into a checked mutable range.
+/// # Errors
+///
+/// Returns an error when the source-width range overflows or is outside the output bytes.
 fn put_fixed(bytes: &mut [u8], offset: DiskOffset, source: &[u8]) -> Result<()> {
     let target = DiskRange::new(offset, DiskByteLen::new(source.len()))?.write_to(bytes)?;
     target.copy_from_slice(source);
@@ -176,6 +228,9 @@ mod tests {
     use super::{DiskByteLen, DiskOffset, DiskRange};
     use crate::error::Error;
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn disk_range_rejects_overflowing_end() {
         assert_eq!(
@@ -184,6 +239,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn disk_range_rejects_end_before_start() {
         assert_eq!(
@@ -192,6 +250,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn disk_range_rejects_short_buffers() {
         let range = DiskRange::new(DiskOffset::new(2), DiskByteLen::new(4));

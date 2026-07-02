@@ -39,6 +39,10 @@ pub(crate) fn crc16(seed: u16, bytes: &[u8]) -> u16 {
 }
 
 /// Verifies a little-endian CRC32C field after zeroing the checksum bytes.
+/// # Errors
+///
+/// Returns an error when the checksum field cannot be read, the checksum range cannot be zeroed, or
+/// the computed CRC32C does not match the stored value.
 pub(crate) fn verify_crc32c(seed: u32, bytes: &[u8], checksum_offset: DiskOffset) -> Result<()> {
     let expected = le_u32(bytes, checksum_offset)?;
     let mut checked = bytes.to_vec();

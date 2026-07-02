@@ -4,6 +4,10 @@ use super::*;
 
 impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Serializes all staged metadata mutations into byte-range writes.
+    /// # Errors
+    ///
+    /// Returns an error when staged bitmap, directory, extent, xattr, group, superblock, or inode
+    /// metadata cannot be serialized to device byte ranges.
     fn metadata_writes(&mut self) -> Result<Vec<RangeWrite>> {
         let mut writes = Vec::new();
         for bitmap in &self.block_bitmap_updates {
@@ -127,6 +131,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Coalesces metadata byte ranges into full blocks for journaling.
+    /// # Errors
+    ///
+    /// Returns an error when a metadata write does not fit within one block or an original metadata
+    /// block cannot be read before patching.
     fn metadata_blocks(&mut self) -> Result<Vec<MetadataBlock>> {
         let block_size = self.volume.superblock.block_size();
         let block_bytes =
@@ -186,6 +194,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Writes ordered file data before the metadata transaction is committed.
+    /// # Errors
+    ///
+    /// Returns an error when any ordered data write or the following device flush fails.
     fn write_ordered_data(&mut self) -> Result<()> {
         for write in &self.data_writes {
             self.volume
@@ -196,6 +207,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Applies accumulated free-count deltas to a superblock image.
+    /// # Errors
+    ///
+    /// Returns an error when the primary superblock cannot be read, free counters underflow or
+    /// overflow, the label cannot be written, or the checksum cannot be refreshed.
     fn updated_superblock_bytes(&self) -> Result<Vec<u8>> {
         let mut bytes = vec![0_u8; 1024];
         self.volume
@@ -335,6 +350,9 @@ pub(super) fn map_extents(extents: &[Extent], logical_block: LogicalBlock) -> Bl
 }
 
 /// Returns descriptor plus signature byte count.
+/// # Errors
+///
+/// Returns an error when descriptor and signature lengths exceed the `u32` fs-verity field.
 pub(super) fn descriptor_byte_count(signature: &[u8]) -> Result<u32> {
     u32::try_from(
         FSVERITY_DESCRIPTOR_BYTES
@@ -345,6 +363,10 @@ pub(super) fn descriptor_byte_count(signature: &[u8]) -> Result<u32> {
 }
 
 /// Builds the ext4 post-EOF verity metadata byte image.
+/// # Errors
+///
+/// Returns an error when the verity layout offsets are inconsistent or any metadata slice falls
+/// outside the allocated image.
 pub(super) fn verity_metadata_image(
     layout: Ext4VerityMetadataLayout,
     merkle_tree: &[u8],
@@ -410,6 +432,9 @@ pub(super) const fn directory_entry_kind(kind: InodeKind) -> DirectoryEntryKind 
 }
 
 /// Rejects `.` and `..` as caller-supplied child names.
+/// # Errors
+///
+/// Returns an error when `name` is `.` or `..`.
 pub(super) fn reject_reserved_directory_name(name: &Ext4Name) -> Result<()> {
     if matches!(name.bytes(), b"." | b"..") {
         Err(Error::InvalidName)

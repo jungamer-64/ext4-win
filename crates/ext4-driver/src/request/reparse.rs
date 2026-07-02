@@ -24,11 +24,18 @@ const fn wire_offset(offset: usize) -> WireOffset {
 }
 
 /// Creates a checked reparse-buffer range.
+/// # Errors
+///
+/// Returns an error when `offset + length` cannot be represented as a reparse-buffer wire range.
 fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
     WireRange::new(wire_offset(offset), WireByteLen::new(length))
 }
 
 /// Handles `FSCTL_GET_REPARSE_POINT` for an opened ext4 symlink.
+/// # Errors
+///
+/// Returns an error when the opened object is not a symlink, the symlink target cannot be read, or
+/// the output buffer cannot hold the reparse data.
 pub(crate) fn get_reparse_point(
     target: DispatchTarget,
     stack: FileSystemControlStack,
@@ -41,6 +48,10 @@ pub(crate) fn get_reparse_point(
 }
 
 /// Handles `FSCTL_SET_REPARSE_POINT` by replacing the opened node with an ext4 symlink.
+/// # Errors
+///
+/// Returns an error when the reparse input is malformed or the opened path cannot be replaced by a
+/// symlink in an ext4 transaction.
 pub(crate) fn set_reparse_point(
     target: DispatchTarget,
     stack: FileSystemControlStack,
@@ -51,6 +62,10 @@ pub(crate) fn set_reparse_point(
 }
 
 /// Reads the target bytes for the symlink opened by the FSCTL.
+/// # Errors
+///
+/// Returns an error when the FSCTL FILE_OBJECT is not an opened symlink or the symlink target cannot
+/// be read.
 fn read_symlink_target(stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
     let opened_file = OpenedSymlink::decode(stack.file_object())?;
     let fcb = opened_file.file_control_block();
@@ -59,12 +74,19 @@ fn read_symlink_target(stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
 }
 
 /// Reads a symlink inode through ext4-core.
+/// # Errors
+///
+/// Returns an error when `symlink_id` cannot be loaded or its target bytes cannot be read.
 fn read_core_symlink(vcb: &VolumeControlBlock, symlink_id: SymlinkNodeId) -> DriverResult<Vec<u8>> {
     let symlink = vcb.volume().load_symlink(symlink_id)?;
     Ok(vcb.volume().read_symlink(&symlink)?)
 }
 
 /// Parses a Windows symbolic-link reparse input buffer into an ext4 symlink target.
+/// # Errors
+///
+/// Returns an error when the FSCTL input buffer is unavailable or the symbolic-link reparse buffer
+/// is malformed.
 fn parse_symlink_reparse_target(
     target: DispatchTarget,
     stack: FileSystemControlStack,
@@ -75,6 +97,10 @@ fn parse_symlink_reparse_target(
 }
 
 /// Replaces the opened child entry with a newly-created symlink inode.
+/// # Errors
+///
+/// Returns an error when the opened object is the root, its current node cannot be removed, or the
+/// replacement symlink cannot be created and committed.
 fn replace_opened_path_with_symlink(
     stack: FileSystemControlStack,
     target: &SymlinkTarget,
@@ -121,6 +147,10 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
 }
 
 /// Packs ext4 symlink bytes into a Windows symbolic-link reparse buffer.
+/// # Errors
+///
+/// Returns an error when the ext4 target is not UTF-8, path length fields overflow, or the output
+/// buffer is too small.
 fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> DriverResult<usize> {
     let target = core::str::from_utf8(target).map_err(|_| DriverError::NotSupported)?;
     let path: Vec<u16> = target.encode_utf16().collect();
@@ -168,6 +198,10 @@ fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> DriverResult
 }
 
 /// Parses a Windows symbolic-link reparse buffer.
+/// # Errors
+///
+/// Returns an error when the tag is not symbolic-link, lengths are inconsistent, flags are
+/// unsupported, UTF-16 is invalid, or the target is not a valid ext4 symlink.
 fn parse_symlink_reparse_buffer(input: &[u8]) -> DriverResult<SymlinkTarget> {
     let input_len = input.len();
     let input = LittleEndianInput::new(input);
@@ -207,6 +241,10 @@ fn parse_symlink_reparse_buffer(input: &[u8]) -> DriverResult<SymlinkTarget> {
 }
 
 /// Reads a UTF-16 path slice from a symbolic-link reparse path buffer.
+/// # Errors
+///
+/// Returns an error when path offsets are not UTF-16 aligned, overflow, or point outside the reparse
+/// path buffer.
 fn reparse_path_units(
     input: LittleEndianInput<'_>,
     path_buffer_length: usize,
@@ -244,6 +282,9 @@ fn reparse_path_units(
 }
 
 /// Returns the byte count for UTF-16 code units.
+/// # Errors
+///
+/// Returns an error when the code-unit count cannot be doubled without overflow.
 fn utf16_byte_len(units: &[u16]) -> DriverResult<usize> {
     units
         .len()
@@ -263,6 +304,9 @@ fn is_relative_symlink_target(target: &[u8]) -> bool {
 }
 
 /// Writes UTF-16 code units into the reparse path buffer.
+/// # Errors
+///
+/// Returns an error when a UTF-16 code-unit offset overflows or falls outside the output buffer.
 fn write_utf16(
     output: &mut LittleEndianOutput<'_>,
     offset: usize,
@@ -291,6 +335,9 @@ mod tests {
         wire_offset,
     };
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn packs_relative_symlink_reparse_buffer() {
         let mut output = vec![0; 128];
@@ -321,6 +368,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn packs_absolute_symlink_without_relative_flag() {
         let mut output = vec![0; 128];
@@ -336,6 +386,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn rejects_too_small_reparse_buffer() {
         const TOO_SMALL_BUFFER_LENGTH: usize = 19;
@@ -347,6 +400,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn parses_symlink_reparse_buffer_target() {
         let mut input = vec![0; 128];
@@ -362,6 +418,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn rejects_unhandled_reparse_tag_on_set() {
         let mut input = vec![0; 128];
@@ -380,6 +439,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn rejects_unsupported_symlink_reparse_flags() {
         let mut input = vec![0; 128];

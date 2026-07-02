@@ -15,6 +15,10 @@ pub(super) struct ClusterReferenceIndex {
 
 impl ClusterReferenceIndex {
     /// Builds the mounted reference index from static metadata and live inodes.
+    /// # Errors
+    ///
+    /// Returns an error when static metadata or live inode block references cannot be validated
+    /// against allocation bitmaps.
     pub(super) fn load<D: BlockReader, State, N>(
         volume: &MountedVolume<D, State, N>,
     ) -> Result<Self> {
@@ -37,6 +41,10 @@ impl ClusterReferenceIndex {
     }
 
     /// Applies committed staged reference deltas.
+    /// # Errors
+    ///
+    /// Returns an error when a staged delta would drive a mounted cluster reference count below
+    /// zero or overflow its signed representation.
     pub(super) fn apply_deltas(&mut self, deltas: &[ClusterReferenceDelta]) -> Result<()> {
         for delta in deltas {
             let updated = self.apply_delta(delta.cluster, delta.delta)?;
@@ -48,6 +56,10 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds one exclusive mounted reference after validating bitmap allocation.
+    /// # Errors
+    ///
+    /// Returns an error when `block` is already known through another owner or is not marked
+    /// allocated in the mounted cluster bitmap.
     pub(super) fn add_exclusive_reference<D: BlockReader, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
@@ -61,6 +73,10 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds one external-xattr mounted reference after validating bitmap allocation.
+    /// # Errors
+    ///
+    /// Returns an error when `block` conflicts with an exclusive owner or is not allocated in the
+    /// mounted cluster bitmap.
     pub(super) fn add_xattr_reference<D: BlockReader, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
@@ -76,6 +92,10 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds one mounted cluster reference after validating bitmap allocation.
+    /// # Errors
+    ///
+    /// Returns an error when `block` cannot be translated to a mounted cluster, the bitmap cannot
+    /// be read, or the cluster is marked free.
     pub(super) fn add_cluster_reference<D: BlockReader, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
@@ -92,6 +112,10 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds all static metadata ranges that must keep their clusters allocated.
+    /// # Errors
+    ///
+    /// Returns an error when descriptor-table, bitmap, or inode-table blocks cannot be enumerated
+    /// or are not exclusively allocated.
     pub(super) fn add_static_metadata<D: BlockReader, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
@@ -139,6 +163,10 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds data and dynamic metadata references from allocated inode records.
+    /// # Errors
+    ///
+    /// Returns an error when inode bitmaps, raw inode records, external xattr blocks, or extent tree
+    /// blocks cannot be read or validated as allocated.
     pub(super) fn add_live_inodes<D: BlockReader, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
@@ -185,6 +213,10 @@ impl ClusterReferenceIndex {
     }
 
     /// Adds references for every physical block represented by an extent.
+    /// # Errors
+    ///
+    /// Returns an error when the extent block range overflows or any represented block is not an
+    /// exclusively allocated cluster.
     pub(super) fn add_extent_references<D: BlockReader, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
@@ -206,6 +238,10 @@ impl ClusterReferenceIndex {
     }
 
     /// Applies one signed delta and returns the resulting signed count.
+    /// # Errors
+    ///
+    /// Returns an error when reference-count arithmetic overflows or an existing reference slot
+    /// cannot be found after lookup.
     pub(super) fn apply_delta(&mut self, cluster: ClusterAddress, delta: i32) -> Result<i32> {
         if let Some(index) = self
             .refs
@@ -277,6 +313,10 @@ impl ClusterBitmapPosition {
     }
 
     /// Computes the cluster bitmap position for an absolute cluster address.
+    /// # Errors
+    ///
+    /// Returns an error when `cluster` is outside the filesystem or its group-local bit cannot be
+    /// derived.
     pub(super) fn from_cluster(superblock: &Superblock, cluster: ClusterAddress) -> Result<Self> {
         let group = superblock.cluster_group_of(cluster)?;
         Ok(Self {
@@ -312,6 +352,10 @@ impl InodeBitmapPosition {
     }
 
     /// Computes the inode bitmap position for an absolute inode id.
+    /// # Errors
+    ///
+    /// Returns an error when `inode_id` is outside the filesystem inode range or group arithmetic is
+    /// invalid.
     pub(super) fn from_inode(superblock: &Superblock, inode_id: InodeId) -> Result<Self> {
         if inode_id.as_u32() > superblock.inode_count().as_u32() {
             return Err(Error::InvalidInode);
@@ -333,6 +377,9 @@ impl InodeBitmapPosition {
     }
 
     /// Converts this bitmap position into its absolute inode id.
+    /// # Errors
+    ///
+    /// Returns an error when group-local inode arithmetic overflows or produces inode number zero.
     pub(super) fn inode_id(self, superblock: &Superblock) -> Result<InodeId> {
         let zero_based = self
             .group
@@ -365,6 +412,9 @@ pub(super) enum BitmapBitState {
 }
 
 /// Reads one allocation bitmap bit.
+/// # Errors
+///
+/// Returns an error when `bit` points beyond `bytes` or bit-index arithmetic fails.
 pub(super) fn bitmap_bit_state(bytes: &[u8], bit: u32) -> Result<BitmapBitState> {
     let byte_index = usize::try_from(bit.checked_div(8).ok_or(Error::ArithmeticOverflow)?)
         .map_err(|_| Error::ArithmeticOverflow)?;
@@ -378,6 +428,9 @@ pub(super) fn bitmap_bit_state(bytes: &[u8], bit: u32) -> Result<BitmapBitState>
 }
 
 /// Reads one typed allocation-cluster bitmap bit.
+/// # Errors
+///
+/// Returns an error when the cluster bitmap position falls outside `bytes`.
 pub(super) fn cluster_bitmap_bit_state(
     bytes: &[u8],
     position: ClusterBitmapPosition,
@@ -386,6 +439,9 @@ pub(super) fn cluster_bitmap_bit_state(
 }
 
 /// Reads one typed inode bitmap bit.
+/// # Errors
+///
+/// Returns an error when the inode bitmap position falls outside `bytes`.
 pub(super) fn inode_bitmap_bit_state(
     bytes: &[u8],
     position: InodeBitmapPosition,
@@ -394,6 +450,9 @@ pub(super) fn inode_bitmap_bit_state(
 }
 
 /// Writes one allocation bitmap bit.
+/// # Errors
+///
+/// Returns an error when `bit` points beyond `bytes` or bit-index arithmetic fails.
 pub(super) fn set_bitmap_bit(bytes: &mut [u8], bit: u32, state: BitmapBitState) -> Result<()> {
     let byte_index = usize::try_from(bit.checked_div(8).ok_or(Error::ArithmeticOverflow)?)
         .map_err(|_| Error::ArithmeticOverflow)?;
@@ -407,6 +466,9 @@ pub(super) fn set_bitmap_bit(bytes: &mut [u8], bit: u32, state: BitmapBitState) 
 }
 
 /// Writes one typed allocation-cluster bitmap bit.
+/// # Errors
+///
+/// Returns an error when the cluster bitmap position falls outside `bytes`.
 pub(super) fn set_cluster_bitmap_bit(
     bytes: &mut [u8],
     position: ClusterBitmapPosition,
@@ -416,6 +478,9 @@ pub(super) fn set_cluster_bitmap_bit(
 }
 
 /// Writes one typed inode bitmap bit.
+/// # Errors
+///
+/// Returns an error when the inode bitmap position falls outside `bytes`.
 pub(super) fn set_inode_bitmap_bit(
     bytes: &mut [u8],
     position: InodeBitmapPosition,
@@ -425,6 +490,10 @@ pub(super) fn set_inode_bitmap_bit(
 }
 
 /// Reads the allocation bitmap bit for one cluster.
+/// # Errors
+///
+/// Returns an error when `cluster` is outside the mounted geometry, its group descriptor cannot be
+/// read, or the bitmap block cannot be loaded.
 pub(super) fn cluster_bitmap_state(
     reader: &impl BlockReader,
     superblock: &Superblock,
@@ -448,6 +517,10 @@ pub(super) fn cluster_bitmap_state(
 }
 
 /// Reads the inode bitmap bit for one inode.
+/// # Errors
+///
+/// Returns an error when `inode_id` is outside the mounted inode range, its group descriptor cannot
+/// be read, or the bitmap block cannot be loaded.
 pub(super) fn inode_bitmap_state(
     reader: &impl BlockReader,
     superblock: &Superblock,
@@ -471,6 +544,10 @@ pub(super) fn inode_bitmap_state(
 }
 
 /// Returns the first physical block in a block group.
+/// # Errors
+///
+/// Returns an error when multiplying `group` by blocks-per-group or adding the first data block
+/// overflows.
 pub(super) fn group_start_block(
     superblock: &Superblock,
     group: BlockGroupId,
@@ -518,6 +595,9 @@ pub(super) fn is_power_of(mut value: u32, base: u32) -> bool {
 }
 
 /// Returns the number of blocks occupied by one descriptor-table copy.
+/// # Errors
+///
+/// Returns an error when descriptor byte count multiplication or rounded block division overflows.
 pub(super) fn descriptor_table_blocks(superblock: &Superblock) -> Result<u64> {
     let descriptor_bytes = u64::from(superblock.block_group_count()?.as_u32())
         .checked_mul(u64::from(superblock.descriptor_size().as_u16()))
@@ -526,6 +606,10 @@ pub(super) fn descriptor_table_blocks(superblock: &Superblock) -> Result<u64> {
 }
 
 /// Returns the inode count actually present in a possibly partial group.
+/// # Errors
+///
+/// Returns an error when the group start is past the inode count or group inode arithmetic
+/// overflows.
 pub(super) fn inode_count_in_group(superblock: &Superblock, group: BlockGroupId) -> Result<u32> {
     let group_start = u64::from(group.as_u32())
         .checked_mul(u64::from(superblock.inodes_per_group().as_u32()))
@@ -540,6 +624,9 @@ pub(super) fn inode_count_in_group(superblock: &Superblock, group: BlockGroupId)
 }
 
 /// Returns the number of blocks occupied by a group's inode table.
+/// # Errors
+///
+/// Returns an error when inode count, inode size, or rounded block division arithmetic fails.
 pub(super) fn inode_table_blocks(superblock: &Superblock, group: BlockGroupId) -> Result<u64> {
     let inode_bytes = u64::from(inode_count_in_group(superblock, group)?)
         .checked_mul(u64::from(superblock.inode_size().as_u16()))
@@ -548,6 +635,10 @@ pub(super) fn inode_table_blocks(superblock: &Superblock, group: BlockGroupId) -
 }
 
 /// Computes the absolute device offset of an inode record.
+/// # Errors
+///
+/// Returns an error when `inode_id` cannot be mapped to a group, the descriptor cannot be read, or
+/// inode-table offset arithmetic overflows.
 pub(super) fn inode_offset_on_device(
     reader: &impl BlockReader,
     superblock: &Superblock,
@@ -571,6 +662,9 @@ pub(super) fn inode_offset_on_device(
 }
 
 /// Divides with upward rounding and overflow checking.
+/// # Errors
+///
+/// Returns an error when `divisor` is zero or the rounded numerator overflows.
 pub(super) fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
     if divisor == 0 {
         return Err(Error::ArithmeticOverflow);

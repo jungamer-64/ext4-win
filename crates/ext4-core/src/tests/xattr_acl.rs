@@ -1,5 +1,8 @@
 use super::*;
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn in_inode_xattr_round_trips_through_inode_body() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -29,6 +32,9 @@ fn in_inode_xattr_round_trips_through_inode_body() {
     assert_eq!(must(volume.read_xattrs(file)).entries().len(), 1);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn external_xattr_block_is_allocated_and_removed() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -84,6 +90,9 @@ fn external_xattr_block_is_allocated_and_removed() {
     assert_eq!(must(volume.read_xattr(file, &name)), None);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn posix_acl_uses_typed_acl_boundary() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -119,6 +128,9 @@ fn posix_acl_uses_typed_acl_boundary() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn windows_overlay_is_stored_in_user_ext4win_xattr() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -148,6 +160,9 @@ fn windows_overlay_is_stored_in_user_ext4win_xattr() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn minimal_profile_mounts_without_ext_attr_but_rejects_xattr_mutations() {
     let mut image = minimal_write_fixture_image();

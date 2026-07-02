@@ -35,6 +35,9 @@ impl Ext4Name {
     /// Encrypted ext4 directories can contain ciphertext bytes that are not
     /// valid plaintext path components. External callers must continue to use
     /// [`Self::new`] for user-provided names.
+    /// # Errors
+    ///
+    /// Returns an error when the on-disk name is empty or exceeds the ext4 component length limit.
     pub(crate) fn from_disk(bytes: &[u8]) -> Result<Self> {
         if bytes.is_empty() || bytes.len() > 255 {
             return Err(Error::InvalidName);
@@ -161,6 +164,9 @@ fn fold_ascii_u16(value: u16) -> u16 {
 mod tests {
     use super::WindowsName;
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn windows_name_converts_to_ext4_utf8_name() {
         let name = WindowsName::from_utf16(&[0x0063, 0x0061, 0x0066, 0x00E9]);
@@ -174,6 +180,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn windows_name_rejects_unpaired_surrogate_for_ext4_creation() {
         let name = WindowsName::from_utf16(&[0xD800]);

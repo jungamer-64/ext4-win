@@ -100,11 +100,18 @@ const fn wire_offset(offset: usize) -> WireOffset {
 }
 
 /// Creates a checked FSCTL payload range.
+/// # Errors
+///
+/// Returns an error when `offset + length` cannot be represented as an FSCTL wire range.
 fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
     WireRange::new(wire_offset(offset), WireByteLen::new(length))
 }
 
 /// Enables fs-verity on the opened regular file.
+/// # Errors
+///
+/// Returns an error when the enable payload is malformed, the FILE_OBJECT is not a regular file, or
+/// the fs-verity transaction fails.
 pub(crate) fn enable_verity(
     target: DispatchTarget,
     stack: FileSystemControlStack,
@@ -129,6 +136,10 @@ pub(crate) fn enable_verity(
 }
 
 /// Adds an fscrypt master key to the mounted VCB.
+/// # Errors
+///
+/// Returns an error when the add-key payload is malformed or the key cannot be added to the mounted
+/// VCB.
 pub(crate) fn add_encryption_key(
     target: DispatchTarget,
     stack: FileSystemControlStack,
@@ -146,6 +157,10 @@ pub(crate) fn add_encryption_key(
 }
 
 /// Removes an fscrypt master key from the mounted VCB.
+/// # Errors
+///
+/// Returns an error when the remove-key payload is malformed, the mounted VCB cannot be resolved, or
+/// the Linux-compatible output buffer is too small.
 pub(crate) fn remove_encryption_key(
     target: DispatchTarget,
     stack: FileSystemControlStack,
@@ -166,6 +181,10 @@ pub(crate) fn remove_encryption_key(
 }
 
 /// Writes fscrypt key presence into Linux-compatible status output fields.
+/// # Errors
+///
+/// Returns an error when the key-status input is malformed, the mounted VCB cannot be resolved, or
+/// the status output buffer is too small.
 pub(crate) fn get_encryption_key_status(
     target: DispatchTarget,
     stack: FileSystemControlStack,
@@ -186,12 +205,18 @@ pub(crate) fn get_encryption_key_status(
 }
 
 /// Writes Linux-compatible remove-key output fields.
+/// # Errors
+///
+/// Returns an error when the remove-key status field cannot be written.
 fn write_remove_key_output(output: &mut [u8]) -> DriverResult<()> {
     LittleEndianOutput::new(output)
         .write_u32(wire_offset(FSCRYPT_REMOVE_KEY_STATUS_FLAGS_OFFSET), 0)
 }
 
 /// Writes Linux-compatible key-status output fields.
+/// # Errors
+///
+/// Returns an error when reserved output bytes or status fields cannot be written.
 fn write_key_status_output(output: &mut [u8], presence: FscryptKeyPresence) -> DriverResult<()> {
     let mut output = LittleEndianOutput::new(output);
     output
@@ -247,6 +272,10 @@ struct FscryptAddKeyPayload {
 
 impl FscryptAddKeyPayload {
     /// Parses Linux `struct fscrypt_add_key_arg`.
+    /// # Errors
+    ///
+    /// Returns an error when the add-key buffer is truncated, has unsupported flags/reserved fields,
+    /// has inconsistent raw-key length, or the raw key identifier does not match the specifier.
     fn parse(input: &[u8]) -> DriverResult<Self> {
         if input.len() < FSCRYPT_ADD_KEY_FIXED_BYTES {
             return Err(DriverError::BufferTooSmall);
@@ -294,6 +323,10 @@ struct FscryptRemoveKeyPayload {
 
 impl FscryptRemoveKeyPayload {
     /// Parses Linux `struct fscrypt_remove_key_arg`.
+    /// # Errors
+    ///
+    /// Returns an error when the remove-key buffer length is wrong or status/reserved fields are
+    /// nonzero.
     fn parse(input: &[u8]) -> DriverResult<Self> {
         if input.len() != FSCRYPT_REMOVE_KEY_BYTES {
             return Err(if input.len() < FSCRYPT_REMOVE_KEY_BYTES {
@@ -330,6 +363,9 @@ struct FscryptKeyStatusPayload {
 
 impl FscryptKeyStatusPayload {
     /// Parses the input fields of Linux `struct fscrypt_get_key_status_arg`.
+    /// # Errors
+    ///
+    /// Returns an error when the key-status input is truncated or reserved fields are nonzero.
     fn parse(input: &[u8]) -> DriverResult<Self> {
         if input.len() < FSCRYPT_GET_KEY_STATUS_INPUT_BYTES {
             return Err(DriverError::BufferTooSmall);
@@ -361,6 +397,10 @@ struct FsverityEnablePayload {
 
 impl FsverityEnablePayload {
     /// Parses Linux `struct fsverity_enable_arg`.
+    /// # Errors
+    ///
+    /// Returns an error when the enable buffer length, version, algorithm, block size, salt/signature
+    /// pointers, or reserved fields are invalid.
     fn parse(input: &[u8]) -> DriverResult<Self> {
         if input.len() != FSVERITY_ENABLE_ARG_BYTES {
             return Err(if input.len() < FSVERITY_ENABLE_ARG_BYTES {
@@ -426,6 +466,10 @@ impl FsverityEnablePayload {
 }
 
 /// Rejects currently unsupported external fs-verity user buffers at parse time.
+/// # Errors
+///
+/// Returns an error when `length` exceeds `max_length`, pointer and length presence disagree, or a
+/// non-empty external user buffer is requested.
 fn reject_unsupported_user_buffer(address: u64, length: u32, max_length: u32) -> DriverResult<()> {
     if length > max_length {
         return Err(DriverError::InvalidParameter);
@@ -440,6 +484,9 @@ fn reject_unsupported_user_buffer(address: u64, length: u32, max_length: u32) ->
 }
 
 /// Reads METHOD_BUFFERED input bytes for one user FSCTL.
+/// # Errors
+///
+/// Returns an error when the FSCTL input buffer is unavailable.
 fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
     let length = stack.input_buffer_length();
     let input = target.buffered_input(length)?;
@@ -447,11 +494,17 @@ fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> DriverRe
 }
 
 /// Returns a mounted VCB from a path-scoped FSCTL stack.
+/// # Errors
+///
+/// Returns an error when the FSCTL FILE_OBJECT has no opened ext4 context.
 fn mounted_vcb(stack: FileSystemControlStack) -> DriverResult<NonNull<VolumeControlBlock>> {
     Ok(OpenedObject::decode(stack.file_object())?.volume())
 }
 
 /// Returns a METHOD_BUFFERED output buffer after stack length validation.
+/// # Errors
+///
+/// Returns an error when the FSCTL output buffer is shorter than `len` or unavailable.
 fn output_buffer(
     target: DispatchTarget,
     stack: FileSystemControlStack,
@@ -465,11 +518,18 @@ fn output_buffer(
 }
 
 /// Builds an FSCTL output completion byte count.
+/// # Errors
+///
+/// Returns an error when `len` cannot be represented in the IRP information field.
 fn completion_for_length(len: usize) -> DriverResult<IrpCompletion> {
     IrpCompletion::from_usize(len)
 }
 
 /// Parses a Linux fscrypt v2 key identifier specifier.
+/// # Errors
+///
+/// Returns an error when the key specifier is truncated, not identifier-based, has nonzero reserved
+/// bytes, or has nonzero trailing union bytes.
 fn parse_key_identifier(input: &[u8]) -> DriverResult<FscryptKeyIdentifier> {
     if input.len() < FSCRYPT_KEY_SPECIFIER_BYTES {
         return Err(DriverError::BufferTooSmall);
@@ -540,6 +600,9 @@ mod tests {
         };
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_add_key_payload_decodes_linux_layout() {
         let payload = must!(add_key_payload(&RAW_KEY));
@@ -552,6 +615,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_add_key_payload_rejects_mismatched_identifier() {
         let mut payload = must!(add_key_payload(&RAW_KEY));
@@ -566,6 +632,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_add_key_payload_rejects_v1_descriptor_and_hw_wrapped_keys() {
         let mut descriptor = must!(add_key_payload(&RAW_KEY));
@@ -589,6 +658,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_remove_and_status_payloads_decode_identifier() {
         let identifier = must!(FscryptMasterKey::from_raw(&RAW_KEY)).identifier();
@@ -605,6 +677,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_status_outputs_linux_layout() {
         let mut present = vec![0xFF; FSCRYPT_GET_KEY_STATUS_BYTES];
@@ -653,6 +728,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_remove_output_clears_status_flags() {
         let mut output = vec![0xFF; FSCRYPT_REMOVE_KEY_BYTES];
@@ -666,6 +744,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_enable_payload_decodes_supported_linux_layout() {
         let payload = enable_verity_payload(2, 4096, 0, 0, 0, 0);
@@ -677,6 +758,9 @@ mod tests {
         assert_eq!(decoded.block_size().bytes(), 4096);
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_enable_payload_maps_empty_buffers_to_core_domain() {
         let payload = enable_verity_payload(1, 1024, 0, 0, 0, 0);
@@ -690,6 +774,9 @@ mod tests {
         assert!(enable.signature().bytes().is_empty());
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_enable_payload_rejects_external_salt_or_signature_buffers() {
         let payload = enable_verity_payload(1, 1024, 0x1000, 1, 0, 0);
@@ -701,6 +788,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_enable_payload_rejects_reserved_and_bad_pointer_pairs() {
         let reserved = enable_verity_payload(1, 1024, 0, 0, 0, 0);
@@ -723,6 +813,10 @@ mod tests {
     }
 
     /// Builds a Linux fscrypt add-key payload.
+    /// # Errors
+    ///
+    /// Returns an error when `raw_key` is not a valid fscrypt master key or the serialized payload
+    /// cannot hold its identifier or length.
     fn add_key_payload(raw_key: &[u8]) -> DriverResult<Vec<u8>> {
         let identifier = FscryptMasterKey::from_raw(raw_key)?.identifier();
         let mut payload = vec![0_u8; FSCRYPT_ADD_KEY_FIXED_BYTES];
@@ -739,6 +833,9 @@ mod tests {
     }
 
     /// Builds a Linux fscrypt remove-key payload.
+    /// # Errors
+    ///
+    /// Returns an error when the serialized remove-key payload cannot hold `identifier`.
     fn remove_key_payload(identifier: FscryptKeyIdentifier) -> DriverResult<Vec<u8>> {
         let mut payload = vec![0_u8; FSCRYPT_REMOVE_KEY_BYTES];
         write_key_identifier(&mut payload, identifier)?;
@@ -746,6 +843,9 @@ mod tests {
     }
 
     /// Builds a Linux fscrypt key-status payload.
+    /// # Errors
+    ///
+    /// Returns an error when the serialized key-status payload cannot hold `identifier`.
     fn key_status_payload(identifier: FscryptKeyIdentifier) -> DriverResult<Vec<u8>> {
         let mut payload = vec![0_u8; FSCRYPT_GET_KEY_STATUS_INPUT_BYTES];
         write_key_identifier(&mut payload, identifier)?;
@@ -753,6 +853,9 @@ mod tests {
     }
 
     /// Writes a Linux fscrypt v2 key identifier specifier.
+    /// # Errors
+    ///
+    /// Returns an error when `payload` is too small for the key specifier type or identifier bytes.
     fn write_key_identifier(
         payload: &mut [u8],
         identifier: FscryptKeyIdentifier,
@@ -770,6 +873,10 @@ mod tests {
     }
 
     /// Builds a Linux fs-verity enable payload.
+    /// # Errors
+    ///
+    /// Returns an error when the serialized fs-verity enable buffer cannot hold one of the fixed
+    /// argument fields.
     fn enable_verity_payload(
         algorithm: u32,
         block_size: u32,

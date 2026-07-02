@@ -21,6 +21,9 @@ impl WireOffset {
     }
 
     /// Adds a checked wire length to this offset.
+    /// # Errors
+    ///
+    /// Returns an error when adding `length` to this offset overflows.
     fn checked_add(self, length: WireByteLen) -> DriverResult<Self> {
         Ok(Self {
             bytes: self
@@ -61,6 +64,9 @@ pub(crate) struct WireRange {
 
 impl WireRange {
     /// Builds a checked wire byte range from an offset and length.
+    /// # Errors
+    ///
+    /// Returns an error when `offset + length` overflows.
     pub(crate) fn new(offset: WireOffset, length: WireByteLen) -> DriverResult<Self> {
         let end = offset.checked_add(length)?;
         Ok(Self {
@@ -70,6 +76,9 @@ impl WireRange {
     }
 
     /// Builds a checked wire byte range from start and end offsets.
+    /// # Errors
+    ///
+    /// Returns an error when `end` is before `start`.
     pub(crate) fn span(start: WireOffset, end: WireOffset) -> DriverResult<Self> {
         if end.as_usize() < start.as_usize() {
             return Err(DriverError::InvalidParameter);
@@ -81,6 +90,9 @@ impl WireRange {
     }
 
     /// Borrows this range from an input payload.
+    /// # Errors
+    ///
+    /// Returns an error when this input range is not fully present in `bytes`.
     pub(crate) fn read_from(self, bytes: &[u8]) -> DriverResult<&[u8]> {
         bytes
             .get(self.start..self.end)
@@ -88,6 +100,9 @@ impl WireRange {
     }
 
     /// Borrows this range from an output payload.
+    /// # Errors
+    ///
+    /// Returns an error when this output range is not fully present in `bytes`.
     pub(crate) fn write_to(self, bytes: &mut [u8]) -> DriverResult<&mut [u8]> {
         bytes
             .get_mut(self.start..self.end)
@@ -109,16 +124,25 @@ impl<'a> LittleEndianInput<'a> {
     }
 
     /// Borrows a checked range from the payload.
+    /// # Errors
+    ///
+    /// Returns an error when `range` is not fully present in this little-endian input payload.
     pub(crate) fn range(self, range: WireRange) -> DriverResult<&'a [u8]> {
         range.read_from(self.bytes)
     }
 
     /// Returns whether a checked range contains only zero bytes.
+    /// # Errors
+    ///
+    /// Returns an error when `range` is not fully present before the zero scan.
     pub(crate) fn all_zero(self, range: WireRange) -> DriverResult<bool> {
         Ok(self.range(range)?.iter().all(|byte| *byte == 0))
     }
 
     /// Copies a fixed-size byte array from a checked range.
+    /// # Errors
+    ///
+    /// Returns an error when the `N`-byte range starting at `offset` is not present.
     pub(crate) fn fixed<const N: usize>(self, offset: WireOffset) -> DriverResult<[u8; N]> {
         let mut bytes = [0_u8; N];
         bytes.copy_from_slice(self.range(WireRange::new(offset, WireByteLen::new(N))?)?);
@@ -126,11 +150,18 @@ impl<'a> LittleEndianInput<'a> {
     }
 
     /// Reads a little-endian `u16` from the payload.
+    /// # Errors
+    ///
+    /// Returns an error when the two-byte little-endian wire field is not fully present at
+    /// `offset`.
     pub(crate) fn read_u16(self, offset: WireOffset) -> DriverResult<u16> {
         Ok(u16::from_le_bytes(self.fixed(offset)?))
     }
 
     /// Reads one byte from the payload.
+    /// # Errors
+    ///
+    /// Returns an error when `offset` is outside this input payload.
     pub(crate) fn read_u8(self, offset: WireOffset) -> DriverResult<u8> {
         self.bytes
             .get(offset.as_usize())
@@ -139,11 +170,18 @@ impl<'a> LittleEndianInput<'a> {
     }
 
     /// Reads a little-endian `u32` from the payload.
+    /// # Errors
+    ///
+    /// Returns an error when the four-byte little-endian wire field is not fully present at
+    /// `offset`.
     pub(crate) fn read_u32(self, offset: WireOffset) -> DriverResult<u32> {
         Ok(u32::from_le_bytes(self.fixed(offset)?))
     }
 
     /// Reads a little-endian `u64` from the payload.
+    /// # Errors
+    ///
+    /// Returns an error when the eight-byte little-endian field is not fully present at `offset`.
     pub(crate) fn read_u64(self, offset: WireOffset) -> DriverResult<u64> {
         Ok(u64::from_le_bytes(self.fixed(offset)?))
     }
@@ -163,11 +201,17 @@ impl<'a> LittleEndianOutput<'a> {
     }
 
     /// Borrows a checked mutable range from the payload.
+    /// # Errors
+    ///
+    /// Returns an error when `range` is not fully present in this output payload.
     pub(crate) fn range_mut(&mut self, range: WireRange) -> DriverResult<&mut [u8]> {
         range.write_to(self.bytes)
     }
 
     /// Writes raw bytes into a checked range.
+    /// # Errors
+    ///
+    /// Returns an error when the destination range for `bytes` is not fully present.
     pub(crate) fn write_bytes(&mut self, offset: WireOffset, bytes: &[u8]) -> DriverResult<()> {
         self.range_mut(WireRange::new(offset, WireByteLen::new(bytes.len()))?)?
             .copy_from_slice(bytes);
@@ -175,11 +219,17 @@ impl<'a> LittleEndianOutput<'a> {
     }
 
     /// Writes a little-endian `u16` into the payload.
+    /// # Errors
+    ///
+    /// Returns an error when the two-byte little-endian wire field cannot be written at `offset`.
     pub(crate) fn write_u16(&mut self, offset: WireOffset, value: u16) -> DriverResult<()> {
         self.write_bytes(offset, value.to_le_bytes().as_slice())
     }
 
     /// Writes one byte into the payload.
+    /// # Errors
+    ///
+    /// Returns an error when `offset` is outside this output payload.
     pub(crate) fn write_u8(&mut self, offset: WireOffset, value: u8) -> DriverResult<()> {
         *self
             .bytes
@@ -189,11 +239,17 @@ impl<'a> LittleEndianOutput<'a> {
     }
 
     /// Writes a little-endian `u32` into the payload.
+    /// # Errors
+    ///
+    /// Returns an error when the four-byte little-endian wire field cannot be written at `offset`.
     pub(crate) fn write_u32(&mut self, offset: WireOffset, value: u32) -> DriverResult<()> {
         self.write_bytes(offset, value.to_le_bytes().as_slice())
     }
 
     /// Writes a little-endian `u64` into the payload.
+    /// # Errors
+    ///
+    /// Returns an error when the eight-byte little-endian wire field cannot be written at `offset`.
     #[cfg(test)]
     pub(crate) fn write_u64(&mut self, offset: WireOffset, value: u64) -> DriverResult<()> {
         self.write_bytes(offset, value.to_le_bytes().as_slice())
@@ -205,6 +261,9 @@ mod tests {
     use super::{WireByteLen, WireOffset, WireRange};
     use crate::kernel::status::DriverError;
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn wire_range_rejects_overflowing_end() {
         assert_eq!(
@@ -213,6 +272,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn wire_range_rejects_end_before_start() {
         assert_eq!(
@@ -221,6 +283,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn wire_range_rejects_short_buffers() {
         let range = WireRange::new(WireOffset::new(2), WireByteLen::new(4));

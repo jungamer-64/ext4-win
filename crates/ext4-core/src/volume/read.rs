@@ -84,7 +84,8 @@ where
     /// Reads the fscrypt v2 context stored in ext4's private inode xattr slot.
     ///
     /// # Errors
-    /// Returns an error when the inode's xattr storage is malformed or the stored fscrypt context is not in the supported v2 AES profile.
+    /// Returns an error when the inode's xattr storage is malformed or the stored fscrypt context
+    /// is not in the supported v2 AES profile.
     #[cfg(test)]
     pub(crate) fn read_fscrypt_context(&self, node: NodeId) -> Result<Option<FscryptContextV2>> {
         self.volume.read_inode_fscrypt_context(node.inode())
@@ -114,7 +115,8 @@ where
     /// Enumerates directory entries as validated node identities.
     ///
     /// # Errors
-    /// Returns an error when the directory is too large for eager enumeration, contains malformed entries, or references an invalid inode.
+    /// Returns an error when the directory is too large for eager enumeration, contains malformed
+    /// entries, or references an invalid inode.
     pub(crate) fn read_directory(&self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
         self.volume.read_directory(directory)
     }
@@ -135,7 +137,8 @@ where
     /// Looks up a Windows-visible child name, accepting case-insensitive matches only when unique.
     ///
     /// # Errors
-    /// Returns an error when the parent cannot be enumerated or the case-insensitive Windows projection is ambiguous.
+    /// Returns an error when the parent cannot be enumerated or the case-insensitive Windows
+    /// projection is ambiguous.
     pub(crate) fn lookup_windows_child(
         &self,
         parent: &DirectoryNode,
@@ -256,7 +259,8 @@ where
     /// Enumerates directory entries as validated node identities.
     ///
     /// # Errors
-    /// Returns an error when the directory is too large for eager enumeration, contains malformed entries, or references an invalid inode.
+    /// Returns an error when the directory is too large for eager enumeration, contains malformed
+    /// entries, or references an invalid inode.
     pub fn read_directory(&self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
         self.volume.read_directory(directory)
     }
@@ -277,7 +281,8 @@ where
     /// Looks up a Windows-visible child name, accepting case-insensitive matches only when unique.
     ///
     /// # Errors
-    /// Returns an error when the parent cannot be enumerated or the case-insensitive Windows projection is ambiguous.
+    /// Returns an error when the parent cannot be enumerated or the case-insensitive Windows
+    /// projection is ambiguous.
     pub fn lookup_windows_child(
         &self,
         parent: &DirectoryNode,
@@ -334,6 +339,9 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Loads a regular file by previously validated file identity.
+    /// # Errors
+    ///
+    /// Returns an error when the identity's inode cannot be loaded or is no longer a regular file.
     pub(super) fn load_file(&self, id: FileNodeId) -> Result<FileNode> {
         match self.load_validated_node(NodeId::File(id))? {
             LoadedNode::File(file) => Ok(file),
@@ -342,6 +350,9 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Loads a directory by previously validated directory identity.
+    /// # Errors
+    ///
+    /// Returns an error when the identity's inode cannot be loaded or is no longer a directory.
     pub(super) fn load_directory(&self, id: DirectoryNodeId) -> Result<DirectoryNode> {
         match self.load_validated_node(NodeId::Directory(id))? {
             LoadedNode::Directory(directory) => Ok(directory),
@@ -350,6 +361,9 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Loads a symbolic link by previously validated symlink identity.
+    /// # Errors
+    ///
+    /// Returns an error when the identity's inode cannot be loaded or is no longer a symbolic link.
     pub(super) fn load_symlink(&self, id: SymlinkNodeId) -> Result<SymlinkNode> {
         match self.load_validated_node(NodeId::Symlink(id))? {
             LoadedNode::Symlink(symlink) => Ok(symlink),
@@ -429,6 +443,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Verifies that an encrypted inode has an available fscrypt master key.
+    /// # Errors
+    ///
+    /// Returns an error when the inode is encrypted but its fscrypt context is malformed or no
+    /// matching mounted master key exists.
     pub(super) fn require_encryption_key(&self, inode: &Inode) -> Result<()> {
         if !inode.protection().is_encrypted() {
             return Ok(());
@@ -438,6 +456,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Returns the mount key matching an encrypted inode's fscrypt context.
+    /// # Errors
+    ///
+    /// Returns an error when the inode has no valid fscrypt context or the matching master key is
+    /// absent from the mount context.
     pub(super) fn fscrypt_master_key_for_inode(
         &self,
         inode: &Inode,
@@ -456,6 +478,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Derives the per-file AES-XTS contents key for an encrypted inode.
+    /// # Errors
+    ///
+    /// Returns an error when the inode's master key cannot be resolved or contents-key derivation
+    /// rejects the policy parameters.
     pub(super) fn fscrypt_contents_key_for_inode(
         &self,
         inode: &Inode,
@@ -465,6 +491,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Derives the per-directory filename key and padding policy.
+    /// # Errors
+    ///
+    /// Returns an error when the inode's master key cannot be resolved or filename-key derivation
+    /// rejects the policy parameters.
     pub(super) fn fscrypt_filenames_key_for_inode(
         &self,
         inode: &Inode,
@@ -477,6 +507,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Converts a plaintext child name to the on-disk name for a directory.
+    /// # Errors
+    ///
+    /// Returns an error when an encrypted parent lacks a filename key or the encrypted name is not a
+    /// valid ext4 component.
     pub(super) fn encrypt_directory_child_name(
         &self,
         parent: &Inode,
@@ -490,6 +524,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Converts an on-disk child name to plaintext for a directory.
+    /// # Errors
+    ///
+    /// Returns an error when an encrypted parent lacks a filename key or the decrypted name is not a
+    /// valid ext4 component.
     pub(super) fn decrypt_directory_child_name(
         &self,
         parent: &Inode,
@@ -503,6 +541,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Rejects protected plaintext data access until crypto and verification paths exist.
+    /// # Errors
+    ///
+    /// Returns an error when the inode is encrypted or verity-protected, including the missing-key
+    /// case for encrypted payloads.
     pub(super) fn reject_unsupported_protected_payload_access(&self, inode: &Inode) -> Result<()> {
         if inode.protection().is_encrypted() {
             self.require_encryption_key(inode)?;
@@ -524,6 +566,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Loads an inode through a previously validated public identity.
+    /// # Errors
+    ///
+    /// Returns an error when the inode cannot be loaded or its actual typed identity no longer
+    /// matches `id`.
     pub(super) fn load_validated_node(&self, id: NodeId) -> Result<LoadedNode> {
         let node = self.load_inode_node(id.inode())?;
         if node.id() == id {
@@ -565,6 +611,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads a verity-protected regular file after verifying its full plaintext.
+    /// # Errors
+    ///
+    /// Returns an error when verity metadata cannot be read, full-file plaintext cannot be read, the
+    /// Merkle tree verification fails, or the requested output slice is out of range.
     pub(super) fn read_verified_file(
         &self,
         file: &FileNode,
@@ -599,6 +649,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads ext4 post-EOF fs-verity metadata from a regular file's extent stream.
+    /// # Errors
+    ///
+    /// Returns an error when post-EOF metadata is absent, layout offsets are invalid, descriptor
+    /// bytes are malformed, or metadata extents cannot be read.
     pub(super) fn read_verity_metadata(&self, file: &FileNode) -> Result<Ext4VerityMetadata> {
         let block_size = self.superblock.block_size();
         let extent_tree = ExtentTree::load_inode_tree(
@@ -685,6 +739,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Decrypts directory-entry names for an unlocked encrypted directory.
+    /// # Errors
+    ///
+    /// Returns an error when the directory filename key is unavailable or any decrypted entry name
+    /// is not a valid ext4 component.
     pub(super) fn decrypt_directory_entries(
         &self,
         directory: &Inode,
@@ -699,6 +757,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Projects encrypted on-disk dirent names into reversible no-key names.
+    /// # Errors
+    ///
+    /// Returns an error when an encrypted directory entry name cannot be encoded as a no-key display
+    /// name.
     pub(super) fn project_locked_directory_entries(
         entries: Vec<RawDirectoryEntry>,
     ) -> Result<Vec<RawDirectoryEntry>> {
@@ -711,6 +773,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Projects one encrypted on-disk dirent name into a no-key display name.
+    /// # Errors
+    ///
+    /// Returns an error when the ciphertext name cannot be represented as an ext4 no-key display
+    /// name.
     pub(super) fn project_locked_directory_name(name: &Ext4Name) -> Result<Ext4Name> {
         if matches!(name.bytes(), b"." | b"..") {
             return Ok(name.clone());
@@ -720,6 +786,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Decodes a no-key display name back into its encrypted on-disk name.
+    /// # Errors
+    ///
+    /// Returns an error when `name` looks like a no-key display name but decodes to an invalid ext4
+    /// ciphertext component.
     pub(super) fn locked_directory_ciphertext_name(name: &Ext4Name) -> Result<Option<Ext4Name>> {
         let Some(no_key_name) = FscryptNoKeyName::from_display(name.bytes())? else {
             return Ok(None);
@@ -817,6 +887,9 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Converts a directory entry into a child whose inode kind is validated.
+    /// # Errors
+    ///
+    /// Returns an error when the entry inode cannot be loaded and classified.
     #[cfg(test)]
     pub(super) fn directory_child(
         &self,
@@ -828,6 +901,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Converts raw directory entries into public entries with validated node identity.
+    /// # Errors
+    ///
+    /// Returns an error when any directory entry references an inode that cannot be loaded and
+    /// classified.
     pub(super) fn validate_directory_entries(
         &self,
         entries: Vec<RawDirectoryEntry>,
@@ -841,6 +918,9 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Converts one raw directory entry into a public entry using an explicit visible name.
+    /// # Errors
+    ///
+    /// Returns an error when `entry` references an inode that cannot be loaded and classified.
     pub(super) fn validate_directory_entry(
         &self,
         entry: RawDirectoryEntry,
@@ -851,6 +931,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Loads and validates the directory layout selected by an inode.
+    /// # Errors
+    ///
+    /// Returns an error when the directory exceeds eager-read limits, uses unsupported indexed
+    /// storage, or its blocks cannot be parsed as the selected layout.
     pub(super) fn read_directory_layout(&self, inode: &Inode) -> Result<DirectoryLayout> {
         if inode.size().bytes() > MAX_EAGER_DIRECTORY_BYTES {
             return Err(Error::DirectoryTooLarge);
@@ -869,6 +953,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads directory file blocks through the inode extent tree.
+    /// # Errors
+    ///
+    /// Returns an error when the directory extent tree contains holes or uninitialized extents,
+    /// range arithmetic fails, or a directory block cannot be read.
     pub(super) fn read_directory_block_data(
         &self,
         inode: &Inode,
@@ -901,6 +989,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads plaintext file data, decrypting fscrypt contents when needed.
+    /// # Errors
+    ///
+    /// Returns an error when extent traversal fails, encrypted contents cannot be decrypted, or the
+    /// requested output range cannot be represented.
     pub(super) fn read_inode_plaintext_data(
         &self,
         inode: &Inode,
@@ -935,6 +1027,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads file data through the inode extent tree, zero-filling sparse ranges.
+    /// # Errors
+    ///
+    /// Returns an error when the extent tree cannot be loaded, read range arithmetic fails, or a
+    /// mapped physical block cannot be read.
     pub(super) fn read_inode_data(
         &self,
         inode: &Inode,
@@ -965,6 +1061,9 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads plaintext bytes from an inode extent stream without applying `i_size` limits.
+    /// # Errors
+    ///
+    /// Returns an error when encrypted stream key lookup or the selected stream reader fails.
     pub(super) fn read_inode_plaintext_stream_range(
         &self,
         inode: &Inode,
@@ -981,6 +1080,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads and decrypts bytes from an fscrypt inode stream.
+    /// # Errors
+    ///
+    /// Returns an error when stream range arithmetic fails, a mapped block cannot be read, or block
+    /// decryption fails.
     pub(super) fn read_encrypted_inode_stream_range(
         &self,
         contents_key: &FscryptContentsKey,
@@ -1048,6 +1151,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads bytes from an inode extent stream without applying `i_size` limits.
+    /// # Errors
+    ///
+    /// Returns an error when stream range arithmetic fails or a mapped physical block cannot be
+    /// read.
     pub(super) fn read_inode_stream_range(
         &self,
         extent_tree: &ExtentTree,
@@ -1112,6 +1219,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads an inode record together with its on-device offset.
+    /// # Errors
+    ///
+    /// Returns an error when `inode_id` is outside the filesystem inode range, its table offset
+    /// cannot be computed, or the record cannot be read.
     pub(super) fn read_raw_inode_record(&self, inode_id: InodeId) -> Result<RawInodeRecord> {
         if inode_id.as_u32() > self.superblock.inode_count().as_u32() {
             return Err(Error::InvalidInode);
@@ -1129,16 +1240,27 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     }
 
     /// Reads and parses a typed inode record.
+    /// # Errors
+    ///
+    /// Returns an error when the live inode record cannot be read or parsed as a supported inode.
     pub(super) fn read_inode_record(&self, inode_id: InodeId) -> Result<Inode> {
         self.read_live_inode_record(inode_id)?.parse()
     }
 
     /// Reads a live inode record for mutation or metadata interpretation.
+    /// # Errors
+    ///
+    /// Returns an error when the raw inode record cannot be read or does not satisfy live-inode
+    /// invariants.
     pub(super) fn read_live_inode_record(&self, inode_id: InodeId) -> Result<LiveInodeRecord> {
         self.read_raw_inode_record(inode_id)?.into_live()
     }
 
     /// Reads all xattr storage locations referenced by a live inode.
+    /// # Errors
+    ///
+    /// Returns an error when inline xattrs, the external xattr pointer, external block I/O, or
+    /// merged xattr namespaces are malformed.
     pub(super) fn read_inode_xattrs_from_live(
         &self,
         raw_inode: &LiveInodeRecord,
@@ -1190,6 +1312,9 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
 }
 
 /// Returns the exclusive byte end of the logical inode stream described by extents.
+/// # Errors
+///
+/// Returns an error when extent end calculation or final block-to-byte multiplication overflows.
 fn extent_payload_end_bytes(extent_tree: &ExtentTree, block_size: BlockSize) -> Result<u64> {
     let mut end_blocks = 0_u64;
     for extent in extent_tree.extents().iter().copied() {

@@ -1,5 +1,8 @@
 use super::*;
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn write_mount_accepts_bigalloc() {
     let mut image = bigalloc_fixture_image();
@@ -14,6 +17,9 @@ fn write_mount_accepts_bigalloc() {
     assert_eq!(volume.geometry().free_cluster_count().as_u64(), 9);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_geometry_rejections_are_targeted() {
     let mut image = bigalloc_fixture_image();
@@ -45,6 +51,9 @@ fn bigalloc_geometry_rejections_are_targeted() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_hole_write_reuses_logical_cluster() {
     let mut image = bigalloc_fixture_image();
@@ -77,6 +86,9 @@ fn bigalloc_hole_write_reuses_logical_cluster() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_sparse_extension_allocates_one_cluster() {
     let mut image = bigalloc_fixture_image();
@@ -120,6 +132,9 @@ fn bigalloc_sparse_extension_allocates_one_cluster() {
     assert_eq!(get_u32(&image, 1024 + 12), initial_free - 1);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_partial_truncate_preserves_referenced_cluster() {
     let mut image = bigalloc_fixture_image();
@@ -152,6 +167,9 @@ fn bigalloc_partial_truncate_preserves_referenced_cluster() {
     assert!(bigalloc_cluster_is_used(&image, file_cluster));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_full_truncate_frees_last_cluster_reference() {
     let mut image = bigalloc_fixture_image();
@@ -176,6 +194,9 @@ fn bigalloc_full_truncate_frees_last_cluster_reference() {
     assert!(!bigalloc_cluster_is_used(&image, file_cluster));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_unlink_file_frees_last_cluster_reference() {
     let mut image = bigalloc_fixture_image_with_journal_blocks(16);
@@ -201,6 +222,9 @@ fn bigalloc_unlink_file_frees_last_cluster_reference() {
     assert!(!bigalloc_cluster_is_used(&image, file_cluster));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_two_extents_in_same_physical_cluster_are_indexed() {
     let mut image = bigalloc_fixture_image();
@@ -244,6 +268,9 @@ fn bigalloc_two_extents_in_same_physical_cluster_are_indexed() {
     assert!(bigalloc_cluster_is_used(&image, file_cluster));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_duplicate_physical_block_reference_is_rejected() {
     let mut image = bigalloc_fixture_image();
@@ -269,6 +296,9 @@ fn bigalloc_duplicate_physical_block_reference_is_rejected() {
     assert_eq!(result.map(|_| ()), Err(Error::ClusterReferenceConflict));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_mount_rejects_references_into_free_clusters() {
     let mut image = bigalloc_fixture_image();
@@ -283,6 +313,9 @@ fn bigalloc_mount_rejects_references_into_free_clusters() {
     assert_eq!(result.map(|_| ()), Err(Error::ClusterReferenceConflict));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_allocated_unreferenced_cluster_remains_unavailable() {
     let mut image = bigalloc_fixture_image();
@@ -318,6 +351,9 @@ fn bigalloc_allocated_unreferenced_cluster_remains_unavailable() {
     assert_eq!(&image[block_offset(33)..block_offset(33) + 4], b"next");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_directory_create_remove_returns_cluster_count() {
     let mut image = bigalloc_fixture_image_with_journal_blocks(16);
@@ -346,6 +382,9 @@ fn bigalloc_directory_create_remove_returns_cluster_count() {
     assert_eq!(get_u32(&image, 1024 + 12), initial_free);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
     let mut image = bigalloc_fixture_image_with_journal_blocks(16);
@@ -388,6 +427,9 @@ fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
     assert_eq!(get_u16(&image, block_offset(extent_block)), 0xF30A);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bigalloc_external_xattr_allocation_uses_cluster_accounting() {
     let mut image = bigalloc_fixture_image_with_journal_blocks(16);

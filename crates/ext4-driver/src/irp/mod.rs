@@ -13,6 +13,10 @@ use crate::state::{
     CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
 };
 
+/// Completion priority boost for IRPs that should not adjust thread priority.
+#[cfg(not(test))]
+const IO_NO_INCREMENT_PRIORITY: wdk_sys::CCHAR = 0;
+
 /// Byte count completed in `IO_STATUS_BLOCK::Information`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InformationLength {
@@ -25,6 +29,9 @@ impl InformationLength {
     pub(crate) const ZERO: Self = Self { bytes: 0 };
 
     /// Builds an information length from a Rust byte count.
+    /// # Errors
+    ///
+    /// Returns an error when `bytes` cannot be represented in `IO_STATUS_BLOCK::Information`.
     pub(crate) fn from_usize(bytes: usize) -> DriverResult<Self> {
         Ok(Self {
             bytes: wdk_sys::ULONG_PTR::try_from(bytes)
@@ -63,6 +70,9 @@ impl IrpCompletion {
     }
 
     /// Builds a successful completion from a Rust byte count.
+    /// # Errors
+    ///
+    /// Returns an error when `bytes` cannot be represented in the IRP information field.
     pub(crate) fn from_usize(bytes: usize) -> DriverResult<Self> {
         Ok(Self::with_information(InformationLength::from_usize(
             bytes,
@@ -99,6 +109,9 @@ pub(crate) struct DispatchTarget {
 
 impl DispatchTarget {
     /// Decodes raw WDK dispatch pointers.
+    /// # Errors
+    ///
+    /// Returns an error when either the device object or IRP pointer is null.
     pub(crate) fn decode(device: PDEVICE_OBJECT, irp: PIRP) -> Result<Self, DriverError> {
         let Some(device) = KernelDevice::from_raw(device) else {
             return Err(DriverError::InvalidParameter);
@@ -115,6 +128,10 @@ impl DispatchTarget {
     }
 
     /// Returns METHOD_BUFFERED input bytes from the IRP system buffer.
+    /// # Errors
+    ///
+    /// Returns an error when the associated system buffer is null or `length` exceeds the slice
+    /// domain.
     pub(crate) fn buffered_input(
         self,
         length: IrpBufferLength,
@@ -123,6 +140,10 @@ impl DispatchTarget {
     }
 
     /// Returns METHOD_BUFFERED output bytes from the IRP system buffer.
+    /// # Errors
+    ///
+    /// Returns an error when the associated system buffer is null or `length` exceeds the slice
+    /// domain.
     pub(crate) fn buffered_output(
         self,
         length: IrpBufferLength,
@@ -131,11 +152,19 @@ impl DispatchTarget {
     }
 
     /// Returns read-like IRP data bytes as immutable kernel memory.
+    /// # Errors
+    ///
+    /// Returns an error when neither a system buffer nor a mapped MDL can provide `length` input
+    /// bytes.
     pub(crate) fn data_input(self, length: IrpBufferLength) -> Result<BufferedInput, DriverError> {
         BufferedInput::new(self.data_buffer_address(length)?, length.as_usize())
     }
 
     /// Returns write-like IRP data bytes as mutable kernel memory.
+    /// # Errors
+    ///
+    /// Returns an error when neither a system buffer nor a mapped MDL can provide `length` output
+    /// bytes.
     pub(crate) fn data_output(
         self,
         length: IrpBufferLength,
@@ -144,6 +173,9 @@ impl DispatchTarget {
     }
 
     /// Returns the IRP user output buffer as kernel-addressable memory.
+    /// # Errors
+    ///
+    /// Returns an error when `UserBuffer` is null or `length` exceeds the slice domain.
     pub(crate) fn user_output(self, length: IrpBufferLength) -> Result<UserOutput, DriverError> {
         // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
         let irp = unsafe { self.irp.as_ref() };
@@ -154,6 +186,9 @@ impl DispatchTarget {
     }
 
     /// Returns the buffered I/O system buffer address for this IRP.
+    /// # Errors
+    ///
+    /// Returns an error when `AssociatedIrp.SystemBuffer` is null.
     fn associated_system_buffer(self) -> Result<NonNull<u8>, DriverError> {
         // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
         let irp = unsafe { self.irp.as_ref() };
@@ -168,6 +203,9 @@ impl DispatchTarget {
     }
 
     /// Returns the read/write IRP data buffer address as kernel memory.
+    /// # Errors
+    ///
+    /// Returns an error when the system buffer is unavailable and the IRP has no usable MDL mapping.
     fn data_buffer_address(self, length: IrpBufferLength) -> Result<NonNull<u8>, DriverError> {
         if let Ok(system_buffer) = self.associated_system_buffer() {
             return Ok(system_buffer);
@@ -204,6 +242,9 @@ impl DispatchTarget {
     }
 
     /// Returns the current stack location selected by the I/O Manager.
+    /// # Errors
+    ///
+    /// Returns an error when the IRP current stack location pointer is null.
     pub(crate) fn current_stack(self) -> Result<CurrentIrpStackLocation, DriverError> {
         // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
         let irp = unsafe { self.irp.as_ref() };
@@ -238,6 +279,10 @@ impl KernelIrp {
     }
 
     /// Returns an immutable IRP reference for active dispatch decoding.
+    ///
+    /// # Safety
+    /// The returned reference must not outlive the WDK dispatch callback that supplied this IRP, and
+    /// the caller must not mutate the same IRP through another alias for that lifetime.
     unsafe fn as_ref<'a>(self) -> &'a wdk_sys::IRP {
         unsafe {
             // SAFETY: The caller ties the returned reference to the current WDK
@@ -272,10 +317,7 @@ impl KernelIrp {
         unsafe {
             // SAFETY: The IRP pointer belongs to the current dispatch callback
             // and has had its final status block written immediately above.
-            ffi::IofCompleteRequest(
-                self.as_mut_ptr(),
-                wdk_sys::IO_NO_INCREMENT as wdk_sys::CCHAR,
-            );
+            ffi::IofCompleteRequest(self.as_mut_ptr(), IO_NO_INCREMENT_PRIORITY);
         }
         completion.status()
     }
@@ -290,6 +332,9 @@ pub(crate) struct CurrentIrpStackLocation {
 
 impl CurrentIrpStackLocation {
     /// Decodes a raw stack location pointer.
+    /// # Errors
+    ///
+    /// Returns an error when `stack` is null.
     fn from_raw(stack: PIO_STACK_LOCATION) -> Result<Self, DriverError> {
         let Some(stack) = NonNull::new(stack) else {
             return Err(DriverError::InvalidParameter);
@@ -335,11 +380,17 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes the FILE_OBJECT carried by the current stack location.
+    /// # Errors
+    ///
+    /// Returns an error when the public IRP stack view cannot produce a kernel FILE_OBJECT.
     pub(crate) fn file_object(self) -> Result<KernelFileObject, DriverError> {
         self.kernel_file_object()
     }
 
     /// Decodes the FILE_OBJECT carried by the current stack location.
+    /// # Errors
+    ///
+    /// Returns an error when the raw `FileObject` pointer in the current stack location is null.
     fn kernel_file_object(self) -> Result<KernelFileObject, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -350,6 +401,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes mount-volume parameters from the current stack location.
+    /// # Errors
+    ///
+    /// Returns an error when the VPB or target device object is null, or the output length is not
+    /// representable.
     pub(crate) fn mount_volume(self) -> Result<MountVolumeStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -377,6 +432,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes user file-system-control parameters from the current stack location.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT is absent, buffer lengths are invalid, or the FSCTL
+    /// code is unsupported.
     pub(crate) fn file_system_control(self) -> Result<FileSystemControlStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -397,6 +456,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes create/open parameters from the current stack location.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT or security context is absent, EA length is invalid, or
+    /// create parameters are unsupported.
     pub(crate) fn create(self) -> Result<CreateStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -429,6 +492,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes query-volume-information parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the output length is not representable or the volume information class
+    /// is unsupported.
     pub(crate) fn query_volume(self) -> Result<QueryVolumeStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -447,6 +514,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes set-volume-information parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the input length is not representable or the volume information class
+    /// is unsupported.
     pub(crate) fn set_volume(self) -> Result<SetVolumeStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -465,6 +536,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes query-file-information parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT is absent, the output length is invalid, or the file
+    /// information class is unsupported.
     pub(crate) fn query_file(self) -> Result<QueryFileStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -484,6 +559,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes set-file-information parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT is absent, the input length is invalid, or the file
+    /// information class is unsupported.
     pub(crate) fn set_file(self) -> Result<SetFileStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -503,6 +582,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes query-directory parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT is absent, the output length is invalid, or the
+    /// directory information class is unsupported.
     pub(crate) fn query_directory(self) -> Result<QueryDirectoryStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -543,6 +626,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes query-EA parameters.
+    /// # Errors
+    ///
+    /// Returns an error when indexed EA queries are requested, an EA name list pointer is missing,
+    /// the FILE_OBJECT is absent, or buffer lengths are invalid.
     pub(crate) fn query_ea(self) -> Result<QueryEaStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -583,6 +670,9 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes set-EA parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT is absent or the set-EA input length is invalid.
     pub(crate) fn set_ea(self) -> Result<SetEaStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -601,6 +691,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes query-security parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT is absent, requested security bits are unsupported, or
+    /// the output length is invalid.
     pub(crate) fn query_security(self) -> Result<QuerySecurityStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -620,6 +714,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes set-security parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT or security descriptor is absent, or requested security
+    /// bits are unsupported.
     pub(crate) fn set_security(self) -> Result<SetSecurityStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -643,6 +741,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes read parameters from the current stack location.
+    /// # Errors
+    ///
+    /// Returns an error when the read stack has no FILE_OBJECT, an invalid byte count, or a negative
+    /// read offset.
     pub(crate) fn read(self) -> Result<ReadStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -670,6 +772,10 @@ impl CurrentIrpStackLocation {
     }
 
     /// Decodes write parameters from the current stack location.
+    /// # Errors
+    ///
+    /// Returns an error when the write stack has no FILE_OBJECT, an invalid byte count, or a
+    /// negative write offset.
     pub(crate) fn write(self) -> Result<WriteStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -708,6 +814,9 @@ struct IrpByteBuffer {
 
 impl IrpByteBuffer {
     /// Creates byte buffer after length validation.
+    /// # Errors
+    ///
+    /// Returns an error when `length` cannot safely back a Rust slice.
     fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
         let max_slice_len =
             usize::try_from(isize::MAX).map_err(|_| DriverError::InvalidParameter)?;
@@ -736,6 +845,9 @@ impl IrpByteBuffer {
     }
 
     /// Copies an unaligned fixed-size payload out of the buffer.
+    /// # Errors
+    ///
+    /// Returns an error when the raw IRP byte buffer is smaller than `T`.
     fn read_unaligned<T: Copy>(&self) -> DriverResult<T> {
         if self.length < core::mem::size_of::<T>() {
             return Err(DriverError::BufferTooSmall);
@@ -757,6 +869,9 @@ pub(crate) struct BufferedInput {
 
 impl BufferedInput {
     /// Creates an immutable buffer view after length validation.
+    /// # Errors
+    ///
+    /// Returns an error when the input buffer length cannot safely back a Rust slice.
     fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
         Ok(Self {
             bytes: IrpByteBuffer::new(address, length)?,
@@ -769,6 +884,9 @@ impl BufferedInput {
     }
 
     /// Copies an unaligned fixed-size input payload.
+    /// # Errors
+    ///
+    /// Returns an error when the buffered input payload is smaller than `T`.
     pub(crate) fn read_unaligned<T: Copy>(&self) -> DriverResult<T> {
         self.bytes.read_unaligned()
     }
@@ -783,6 +901,9 @@ pub(crate) struct BufferedOutput {
 
 impl BufferedOutput {
     /// Creates a mutable buffer view after length validation.
+    /// # Errors
+    ///
+    /// Returns an error when the output buffer length cannot safely back a mutable Rust slice.
     fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
         Ok(Self {
             bytes: IrpByteBuffer::new(address, length)?,
@@ -804,6 +925,9 @@ pub(crate) struct UserOutput {
 
 impl UserOutput {
     /// Creates a mutable user output view after length validation.
+    /// # Errors
+    ///
+    /// Returns an error when the user-output length cannot safely back a mutable Rust slice.
     fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
         Ok(Self {
             bytes: IrpByteBuffer::new(address, length)?,
@@ -817,6 +941,10 @@ impl UserOutput {
 }
 
 /// Returns an IRP MDL data buffer address as kernel memory.
+/// # Errors
+///
+/// Returns an error when `length` exceeds the MDL byte count or the MDL cannot be mapped to system
+/// address space.
 fn mdl_data_buffer_address(
     mdl: NonNull<wdk_sys::MDL>,
     length: IrpBufferLength,
@@ -836,6 +964,9 @@ fn mdl_data_buffer_address(
 }
 
 /// Implements the address-selection behavior of `MmGetSystemAddressForMdlSafe`.
+/// # Errors
+///
+/// Returns an error when an already-mapped MDL has no mapped address or mapping locked pages fails.
 fn mapped_mdl_address(
     mdl: NonNull<wdk_sys::MDL>,
     mdl_ref: &wdk_sys::MDL,
@@ -872,6 +1003,9 @@ pub(crate) struct IrpBufferLength(usize);
 
 impl IrpBufferLength {
     /// Decodes a WDK `ULONG` byte count into the driver length domain.
+    /// # Errors
+    ///
+    /// Returns an error when `value` exceeds the maximum Rust slice length.
     fn from_ulong(value: wdk_sys::ULONG) -> Result<Self, DriverError> {
         let length = usize::try_from(value).map_err(|_| DriverError::InvalidParameter)?;
         let max_slice_len =
@@ -992,6 +1126,10 @@ impl SecuritySelection {
     }
 
     /// Converts raw `SECURITY_INFORMATION` bits into supported component state.
+    /// # Errors
+    ///
+    /// Returns an error when SACL access is requested or unsupported security-information bits are
+    /// present.
     fn from_raw(value: wdk_sys::SECURITY_INFORMATION) -> Result<Self, DriverError> {
         let supported = wdk_sys::OWNER_SECURITY_INFORMATION
             | wdk_sys::GROUP_SECURITY_INFORMATION
@@ -1089,6 +1227,9 @@ pub(crate) enum FsControlCode {
 
 impl FsControlCode {
     /// Decodes the raw WDK control code at the IRP boundary.
+    /// # Errors
+    ///
+    /// Returns an error when `value` is not one of the supported Windows or ext4win FSCTL codes.
     fn from_raw(value: wdk_sys::ULONG) -> Result<Self, DriverError> {
         match value {
             FSCTL_GET_REPARSE_POINT => Ok(Self::GetReparsePoint),
@@ -1159,6 +1300,9 @@ pub(crate) enum QueryVolumeInformationClass {
 
 impl QueryVolumeInformationClass {
     /// Decodes a raw WDK filesystem information class for volume queries.
+    /// # Errors
+    ///
+    /// Returns an error when the filesystem information class is not supported for volume queries.
     fn from_raw(value: wdk_sys::FS_INFORMATION_CLASS) -> Result<Self, DriverError> {
         match value {
             FILE_FS_VOLUME_INFORMATION_CLASS => Ok(Self::Volume),
@@ -1180,6 +1324,9 @@ pub(crate) enum SetVolumeInformationClass {
 
 impl SetVolumeInformationClass {
     /// Decodes a raw WDK filesystem information class for volume mutations.
+    /// # Errors
+    ///
+    /// Returns an error when the filesystem information class is not `FileFsLabelInformation`.
     fn from_raw(value: wdk_sys::FS_INFORMATION_CLASS) -> Result<Self, DriverError> {
         match value {
             FILE_FS_LABEL_INFORMATION_CLASS => Ok(Self::Label),
@@ -1222,6 +1369,9 @@ pub(crate) enum QueryFileInformationClass {
 
 impl QueryFileInformationClass {
     /// Decodes a raw WDK file information class for fixed file queries.
+    /// # Errors
+    ///
+    /// Returns an error when the file information class is not implemented for fixed file queries.
     fn from_raw(value: wdk_sys::FILE_INFORMATION_CLASS) -> Result<Self, DriverError> {
         match value {
             wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => Ok(Self::Basic),
@@ -1257,6 +1407,9 @@ pub(crate) enum SetFileInformationClass {
 
 impl SetFileInformationClass {
     /// Decodes a raw WDK file information class for file mutations.
+    /// # Errors
+    ///
+    /// Returns an error when the file information class is not implemented for file mutations.
     fn from_raw(value: wdk_sys::FILE_INFORMATION_CLASS) -> Result<Self, DriverError> {
         match value {
             wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => Ok(Self::Basic),
@@ -1288,6 +1441,10 @@ pub(crate) enum DirectoryInformationClass {
 
 impl DirectoryInformationClass {
     /// Decodes a raw WDK file information class for directory enumeration.
+    /// # Errors
+    ///
+    /// Returns an error when the file information class is not a supported directory enumeration
+    /// class.
     fn from_raw(value: wdk_sys::FILE_INFORMATION_CLASS) -> Result<Self, DriverError> {
         match value {
             wdk_sys::_FILE_INFORMATION_CLASS::FileDirectoryInformation => Ok(Self::Directory),
@@ -1318,6 +1475,10 @@ pub(crate) struct CreateParameters {
 
 impl CreateParameters {
     /// Decodes raw WDK create parameters at the IRP boundary.
+    /// # Errors
+    ///
+    /// Returns an error when share access, create disposition, or create options contain unsupported
+    /// values.
     fn decode(
         desired_access: wdk_sys::ACCESS_MASK,
         options: wdk_sys::ULONG,
@@ -1394,6 +1555,9 @@ pub(crate) struct ShareAccess {
 
 impl ShareAccess {
     /// Decodes the raw WDK share mask.
+    /// # Errors
+    ///
+    /// Returns an error when `raw` contains bits outside the Windows file-share mask.
     fn from_raw(raw: wdk_sys::USHORT) -> Result<Self, DriverError> {
         if raw & !FILE_SHARE_ACCESS_MASK != 0 {
             return Err(DriverError::InvalidParameter);
@@ -1428,6 +1592,10 @@ pub(crate) enum CreateDisposition {
 
 impl CreateDisposition {
     /// Decodes the disposition stored in Create.Options.
+    /// # Errors
+    ///
+    /// Returns an error when the disposition bits do not name a supported Windows create
+    /// disposition.
     fn from_options(options: wdk_sys::ULONG) -> Result<Self, DriverError> {
         match options >> CREATE_DISPOSITION_SHIFT {
             FILE_OPEN_DISPOSITION => Ok(Self::Open),
@@ -1454,6 +1622,9 @@ pub(crate) enum CreateTargetRequirement {
 
 impl CreateTargetRequirement {
     /// Decodes file-vs-directory create options.
+    /// # Errors
+    ///
+    /// Returns an error when both directory-only and non-directory-only options are set.
     fn from_options(options: wdk_sys::ULONG) -> Result<Self, DriverError> {
         let directory = create_option_selected(options, wdk_sys::FILE_DIRECTORY_FILE);
         let non_directory = create_option_selected(options, wdk_sys::FILE_NON_DIRECTORY_FILE);
@@ -1477,6 +1648,9 @@ struct CreateOptions {
 
 impl CreateOptions {
     /// Decodes and normalizes raw `Create.Options`.
+    /// # Errors
+    ///
+    /// Returns an error when create options include bits outside the accepted ext4win boundary.
     fn decode(options: wdk_sys::ULONG) -> DriverResult<Self> {
         let raw_options = options & CREATE_OPTIONS_MASK;
         if raw_options & !ACCEPTED_CREATE_OPTIONS != 0 {
@@ -1976,6 +2150,9 @@ mod tests {
 
     use core::ptr::NonNull;
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn null_dispatch_target_is_invalid_parameter() {
         assert_eq!(
@@ -1992,6 +2169,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn decoded_dispatch_target_preserves_pointers() {
         let device = opaque::<wdk_sys::DEVICE_OBJECT>();
@@ -2003,24 +2183,33 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn irp_completion_writes_status_and_information_together() {
         let mut irp = wdk_sys::IRP::default();
         let kernel_irp = KernelIrp::from_raw(core::ptr::addr_of_mut!(irp));
         assert!(kernel_irp.is_some());
-        if let Some(kernel_irp) = kernel_irp {
-            kernel_irp.write_status_block(IrpCompletion::with_information(
-                InformationLength::from_usize(128).unwrap(),
-            ));
+        let information = InformationLength::from_usize(128);
+        assert!(information.is_ok());
+        if let (Some(kernel_irp), Ok(information)) = (kernel_irp, information) {
+            kernel_irp.write_status_block(IrpCompletion::with_information(information));
         }
 
         assert_eq!(
-            unsafe { irp.IoStatus.__bindgen_anon_1.Status },
+            unsafe {
+                // SAFETY: `write_status_block` just wrote the active Status union arm.
+                irp.IoStatus.__bindgen_anon_1.Status
+            },
             wdk_sys::STATUS_SUCCESS
         );
         assert_eq!(irp.IoStatus.Information, 128);
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn failed_irp_completion_writes_zero_information() {
         let mut irp = wdk_sys::IRP::default();
@@ -2034,12 +2223,18 @@ mod tests {
         }
 
         assert_eq!(
-            unsafe { irp.IoStatus.__bindgen_anon_1.Status },
+            unsafe {
+                // SAFETY: `write_status_block` just wrote the active Status union arm.
+                irp.IoStatus.__bindgen_anon_1.Status
+            },
             STATUS_INVALID_PARAMETER
         );
         assert_eq!(irp.IoStatus.Information, 0);
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn irp_buffer_length_preserves_zero_as_typed_empty() {
         let length = IrpBufferLength::from_ulong(0);
@@ -2050,6 +2245,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn current_stack_location_rejects_null_pointer() {
         assert_eq!(
@@ -2060,6 +2258,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn unsupported_filesystem_control_minor_decodes_as_unsupported() {
         let mut stack = wdk_sys::IO_STACK_LOCATION {
@@ -2074,6 +2275,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn unsupported_directory_control_minor_decodes_as_unsupported() {
         let mut stack = wdk_sys::IO_STACK_LOCATION {
@@ -2088,6 +2292,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn mount_volume_stack_preserves_vpb_and_target() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2120,6 +2327,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_system_control_stack_decodes_supported_user_control() {
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
@@ -2154,6 +2364,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_system_control_stack_rejects_unsupported_control_before_handler() {
         let mut stack = wdk_sys::IO_STACK_LOCATION {
@@ -2183,6 +2396,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn ext4win_private_fsctl_codes_decode_to_domain_variants() {
         assert_eq!(
@@ -2203,6 +2419,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn create_stack_preserves_access_share_options_and_ea_length() {
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
@@ -2256,6 +2475,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn create_stack_decodes_delete_on_close_as_close_disposition() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2289,6 +2511,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn create_stack_rejects_unsupported_options_before_handler() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2318,6 +2543,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_ea_stack_decodes_name_selection_length_and_emission() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2356,6 +2584,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_ea_stack_rejects_index_selection_at_decode() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2383,6 +2614,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn set_ea_stack_preserves_file_object_and_length() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2406,6 +2640,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_security_stack_preserves_file_object_information_and_length() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2445,6 +2682,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_security_stack_rejects_sacl_at_decode() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2469,6 +2709,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_security_stack_rejects_unsupported_bits_at_decode() {
         const LABEL_SECURITY_INFORMATION: wdk_sys::SECURITY_INFORMATION = 0x10;
@@ -2495,6 +2738,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn set_volume_stack_preserves_length_and_class() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2516,6 +2762,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_volume_stack_decodes_supported_information_class() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2540,6 +2789,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn volume_information_stack_rejects_unsupported_class_before_handler() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2562,6 +2814,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn set_security_stack_preserves_file_object_information_and_descriptor() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2601,6 +2856,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn read_stack_preserves_file_object_length_and_offset() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2630,6 +2888,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn read_stack_rejects_negative_offset_at_decode() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2656,6 +2917,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn write_stack_preserves_file_object_length_and_offset() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2685,6 +2949,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn write_stack_rejects_negative_offset_at_decode() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2711,6 +2978,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_file_stack_preserves_file_object_length_and_class() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2741,6 +3011,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_file_stack_decodes_name_and_attribute_tag_classes() {
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
@@ -2754,12 +3027,16 @@ mod tests {
                 QueryFileInformationClass::AttributeTag,
             ),
         ] {
-            let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-            stack.FileObject = file_object.as_ptr();
-            stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
-                Length: 64,
-                __bindgen_padding_0: 0,
-                FileInformationClass: raw_class,
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                FileObject: file_object.as_ptr(),
+                Parameters: wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1 {
+                    QueryFile: wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
+                        Length: 64,
+                        __bindgen_padding_0: 0,
+                        FileInformationClass: raw_class,
+                    },
+                },
+                ..wdk_sys::IO_STACK_LOCATION::default()
             };
 
             let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
@@ -2774,6 +3051,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn set_file_stack_preserves_file_object_length_and_class() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2804,6 +3084,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_information_stack_rejects_unsupported_class_before_handler() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2828,6 +3111,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_directory_stack_decodes_restart_pattern_length_class_and_emission() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2866,6 +3152,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_directory_stack_decodes_names_class() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -2890,6 +3179,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_directory_stack_decodes_index_cursor() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();

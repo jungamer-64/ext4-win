@@ -149,11 +149,17 @@ impl<'a, D: BlockWriter, N, J> JournalTransaction<'a, D, N, J> {
 }
 impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Verifies that the mounted profile admits xattr storage mutation.
+    /// # Errors
+    ///
+    /// Returns an error when mounted xattr feature flags do not permit xattr storage mutation.
     fn require_xattr_mutation(&self) -> Result<()> {
         self.volume.superblock.xattr_mutation().require_supported()
     }
 
     /// Verifies that an inode size is representable by the mounted profile.
+    /// # Errors
+    ///
+    /// Returns an error when `size` exceeds the active inode file-size encoding.
     fn require_inode_size_supported(&self, size: FileSize) -> Result<()> {
         self.volume
             .superblock
@@ -162,6 +168,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Verifies that an inode block charge is representable by the mounted profile.
+    /// # Errors
+    ///
+    /// Returns an error when `blocks` cannot be converted to sectors or exceeds the active
+    /// `i_blocks` encoding.
     fn require_allocated_blocks_supported(&self, blocks: u64) -> Result<()> {
         let sectors = blocks
             .checked_mul(u64::from(self.volume.superblock.block_size().bytes()))
@@ -270,6 +280,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Computes mounted cluster state after a successful commit.
+    /// # Errors
+    ///
+    /// Returns an error when staged cluster deltas conflict or the superblock free-cluster delta
+    /// cannot be applied.
     fn committed_cluster_state(&self) -> Result<(ClusterReferenceIndex, Superblock)> {
         let mut clusters = self.volume.state.clusters.clone();
         clusters.apply_deltas(self.cluster_deltas.as_slice())?;
@@ -279,6 +293,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Verifies directory-entry creation policy using the latest staged inode.
+    /// # Errors
+    ///
+    /// Returns an error when the parent inode cannot be loaded from staged/device state or does not
+    /// permit directory-entry creation.
     fn require_directory_entry_create_mutation(
         &self,
         inode_id: InodeId,
@@ -289,6 +307,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Verifies directory-entry creation policy with mount-scoped fscrypt keys.
+    /// # Errors
+    ///
+    /// Returns an error when `inode` is not a directory, lacks a required fscrypt key, or its
+    /// storage policy rejects entry creation.
     fn require_directory_entry_create_mutation_for_inode(
         &self,
         inode: &Inode,
@@ -303,6 +325,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Verifies directory-entry deletion policy with mount-scoped fscrypt keys.
+    /// # Errors
+    ///
+    /// Returns an error when `inode` is not a directory or its storage policy rejects entry
+    /// deletion.
     fn require_directory_entry_delete_mutation_for_inode(
         &self,
         inode: &Inode,
@@ -314,6 +340,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Verifies directory-entry rename policy with mount-scoped fscrypt keys.
+    /// # Errors
+    ///
+    /// Returns an error when the source directory cannot satisfy entry creation-style mutation
+    /// requirements for rename staging.
     fn require_directory_entry_rename_mutation_for_inode(
         &self,
         inode: &Inode,
@@ -322,6 +352,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Verifies directory-entry replacement policy with mount-scoped fscrypt keys.
+    /// # Errors
+    ///
+    /// Returns an error when the target directory cannot satisfy entry creation-style mutation
+    /// requirements for replacement staging.
     fn require_directory_entry_replace_mutation_for_inode(
         &self,
         inode: &Inode,
@@ -330,6 +364,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Builds the fscrypt context inherited by a new child of this directory.
+    /// # Errors
+    ///
+    /// Returns an error when the encrypted parent has no mounted master key or a new file nonce
+    /// cannot be generated.
     fn inherited_fscrypt_context(&mut self, parent: &Inode) -> Result<Option<FscryptContextV2>> {
         if !parent.protection().is_encrypted() {
             return Ok(None);
@@ -340,6 +378,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Stores an inherited fscrypt context on a newly-initialized live inode.
+    /// # Errors
+    ///
+    /// Returns an error when xattr mutation is unsupported, the encryption flag cannot be written,
+    /// or the context cannot be stored in inode xattr storage.
     fn apply_fscrypt_context(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
@@ -356,6 +398,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns the staged inode record when present, otherwise the device image.
+    /// # Errors
+    ///
+    /// Returns an error when an existing staged record is deleted or the live inode cannot be read
+    /// from the mounted device.
     fn raw_inode_for_policy(&self, inode_id: InodeId) -> Result<LiveInodeRecord> {
         if let Some(raw_inode) = self
             .inode_updates
@@ -368,6 +414,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Loads a mutable extent tree for an inode selected by this transaction.
+    /// # Errors
+    ///
+    /// Returns an error when the inode does not expose a supported extent root or its extent tree
+    /// cannot be loaded.
     fn mutable_extent_tree(&self, inode: &Inode) -> Result<MutableExtentTree> {
         MutableExtentTree::load_inode_tree(
             inode.extent_root()?,
@@ -378,6 +428,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Stages an updated extent tree and adjusts its metadata block ownership.
+    /// # Errors
+    ///
+    /// Returns an error when metadata block allocation or release fails, extent serialization fails,
+    /// or the updated inode block charge cannot be represented.
     fn stage_extent_tree(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
@@ -404,6 +458,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Counts physical blocks charged to an inode through allocation clusters.
+    /// # Errors
+    ///
+    /// Returns an error when extent block arithmetic overflows or a physical block cannot be mapped
+    /// to mounted cluster geometry.
     fn allocated_data_blocks(&self, tree: &MutableExtentTree) -> Result<u64> {
         let mut clusters = Vec::new();
         for extent in tree.extents().iter().copied() {
@@ -432,6 +490,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Copies a serialized extent tree into the inode and metadata block staging areas.
+    /// # Errors
+    ///
+    /// Returns an error when the serialized inode-root extent payload cannot be written.
     fn stage_serialized_extent_tree(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
@@ -448,6 +509,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Increments a directory inode link count and updates timestamps.
+    /// # Errors
+    ///
+    /// Returns an error when the directory inode cannot be staged, its link count is saturated, or
+    /// timestamps cannot be written.
     fn increment_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
         let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
@@ -458,6 +523,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Decrements a directory inode link count and updates timestamps.
+    /// # Errors
+    ///
+    /// Returns an error when the directory inode cannot be staged or the decremented link count and
+    /// timestamps cannot be written.
     fn decrement_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
         let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
@@ -468,6 +537,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns the staged inode record index, loading it once when needed.
+    /// # Errors
+    ///
+    /// Returns an error when `inode_id` cannot be read as a live inode or the staged index cannot be
+    /// represented.
     fn ensure_inode_update(&mut self, inode_id: InodeId) -> Result<StagedInodeIndex> {
         if let Some(index) = self
             .inode_updates
@@ -487,6 +560,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns a staged live inode record by index.
+    /// # Errors
+    ///
+    /// Returns an error when `index` is outside the staging vector or refers to a deleted inode.
     fn staged_live_inode(&self, index: StagedInodeIndex) -> Result<LiveInodeRecord> {
         self.inode_updates
             .get(index.get())
@@ -495,6 +571,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Replaces a staged inode with its updated live state.
+    /// # Errors
+    ///
+    /// Returns an error when `index` is outside the staged inode vector.
     fn replace_live_inode(
         &mut self,
         index: StagedInodeIndex,
@@ -508,6 +587,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Replaces a staged inode with its deleted state.
+    /// # Errors
+    ///
+    /// Returns an error when `index` is outside the staged inode vector.
     fn replace_deleted_inode(
         &mut self,
         index: StagedInodeIndex,

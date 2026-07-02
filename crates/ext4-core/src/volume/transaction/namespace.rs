@@ -339,6 +339,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Verifies that a directory does not already contain `name`.
+    /// # Errors
+    ///
+    /// Returns an error when `name` already exists in `parent` or the parent directory cannot be
+    /// searched.
     fn ensure_child_absent(&self, parent: InodeId, name: &Ext4Name) -> Result<()> {
         match self.find_child_entry(parent, name) {
             Ok(_) => Err(Error::NameAlreadyExists),
@@ -348,6 +352,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Finds a live directory entry by exact ext4 name.
+    /// # Errors
+    ///
+    /// Returns an error when `parent` is not a directory, its lookup name cannot be derived, or the
+    /// requested entry is absent.
     fn find_child_entry(&self, parent: InodeId, name: &Ext4Name) -> Result<RawDirectoryEntry> {
         let inode = self.volume.read_inode_record(parent)?;
         if inode.kind() != InodeKind::Directory {
@@ -361,6 +369,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns the on-disk name to use for a directory lookup inside this transaction.
+    /// # Errors
+    ///
+    /// Returns an error when the encrypted lookup name cannot be derived and no locked-directory
+    /// ciphertext fallback can represent `name`.
     fn directory_lookup_name(&self, directory: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
         match self.volume.encrypt_directory_child_name(directory, name) {
             Err(Error::MissingEncryptionKey) => Ok(
@@ -372,6 +384,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Adds a child entry to a mutable directory, extending it when supported.
+    /// # Errors
+    ///
+    /// Returns an error when `parent` is not mutable, `name` already exists, encryption or HTree
+    /// rebuild fails, or a new directory block cannot be allocated and staged.
     fn add_directory_entry(
         &mut self,
         parent: InodeId,
@@ -467,6 +483,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Removes a child entry from a mutable directory.
+    /// # Errors
+    ///
+    /// Returns an error when `parent` is not mutable, `name` is absent, or the linear/HTree
+    /// directory image cannot be rewritten.
     fn remove_directory_entry(
         &mut self,
         parent: InodeId,
@@ -505,6 +525,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Renames a child entry while preserving the expected child inode and kind.
+    /// # Errors
+    ///
+    /// Returns an error when the old entry is absent, the new name already exists, the existing
+    /// entry does not match `child`, or the directory image cannot be rewritten.
     fn rename_directory_entry(
         &mut self,
         parent: InodeId,
@@ -574,6 +598,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Replaces the inode and kind stored for an existing directory name.
+    /// # Errors
+    ///
+    /// Returns an error when `name` is absent, `parent` is not mutable, or the replacement cannot be
+    /// staged in the directory image.
     fn replace_directory_entry(
         &mut self,
         parent: InodeId,
@@ -623,6 +651,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Rebuilds and stages one directory as a canonical HTree image.
+    /// # Errors
+    ///
+    /// Returns an error when dot entries are invalid, HTree construction fails, required blocks
+    /// cannot be allocated, or the rebuilt extent tree/size cannot be staged.
     fn stage_rebuilt_htree_directory(
         &mut self,
         inode_index: StagedInodeIndex,
@@ -708,6 +740,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns whether a directory contains only `.` and `..`.
+    /// # Errors
+    ///
+    /// Returns an error when the directory layout cannot be loaded or parsed.
     fn directory_is_empty(&self, inode: &Inode) -> Result<bool> {
         for entry in self.directory_layout(inode)?.entries() {
             let name = entry.name().bytes();
@@ -719,6 +754,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Loads the staged-aware directory layout for mutation-time lookups.
+    /// # Errors
+    ///
+    /// Returns an error when directory storage is unsupported, indexed layout is disabled, or staged
+    /// directory blocks cannot be parsed into a layout.
     fn directory_layout(&self, inode: &Inode) -> Result<DirectoryLayout> {
         let storage = inode.directory_storage_kind()?;
         if matches!(storage, DirectoryStorageKind::HTree) {
@@ -744,6 +783,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Loads directory blocks, preferring staged images over device bytes.
+    /// # Errors
+    ///
+    /// Returns an error when the directory extent tree contains holes, a staged block has the wrong
+    /// size, a device block cannot be read, or block-count arithmetic fails.
     fn directory_blocks(
         &self,
         inode: &Inode,

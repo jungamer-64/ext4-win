@@ -240,6 +240,9 @@ impl Extent {
     }
 
     /// Returns the exclusive logical end of this extent.
+    /// # Errors
+    ///
+    /// Returns an error when `logical_start + len` overflows the on-disk logical block range.
     pub(crate) fn end_logical(self) -> Result<u32> {
         self.logical_start
             .as_u32()
@@ -592,6 +595,10 @@ struct SerializedNode {
 }
 
 /// Walks an extent node and all index children, collecting leaf extents.
+/// # Errors
+///
+/// Returns an error when the current node is malformed, an index child cannot be read, a child
+/// checksum fails, or recursive parsing rejects a child node.
 fn parse_node_recursive(
     raw: &[u8],
     block_size: BlockSize,
@@ -616,6 +623,10 @@ fn parse_node_recursive(
 }
 
 /// Parses an extent index node and validates each referenced child block.
+/// # Errors
+///
+/// Returns an error when an index entry is truncated, points at a repeated metadata block, cannot be
+/// read from the device, has a bad checksum, or has an unexpected child depth.
 fn parse_index_node(
     raw: &[u8],
     depth: u16,
@@ -673,6 +684,10 @@ fn parse_index_node(
 }
 
 /// Parses one extent tree node and appends leaf extents when the node is a leaf.
+/// # Errors
+///
+/// Returns an error when the header magic is wrong, the depth or entry count is unsupported, the
+/// expected depth does not match, or a leaf entry is truncated or invalid.
 fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>) -> Result<u16> {
     if le_u16(raw, disk_offset(0))? != EXTENT_MAGIC {
         return Err(Error::InvalidExtentTree);
@@ -708,6 +723,9 @@ fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>
 }
 
 /// Parses one leaf extent entry from `raw`.
+/// # Errors
+///
+/// Returns an error when any extent field is outside `raw` or the encoded extent length is zero.
 fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
     let logical_start = LogicalBlock::from_u32(le_u32(raw, disk_offset(offset))?);
     let raw_len = le_u16(
@@ -740,6 +758,9 @@ fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
 }
 
 /// Reads the extent-header entry count after validating header size.
+/// # Errors
+///
+/// Returns an error when the node is smaller than an ext4 extent header.
 fn header_entries(raw: &[u8]) -> Result<usize> {
     if raw.len() < EXTENT_HEADER_SIZE {
         return Err(Error::InvalidExtentTree);
@@ -748,6 +769,9 @@ fn header_entries(raw: &[u8]) -> Result<usize> {
 }
 
 /// Computes the byte offset of one extent or index entry.
+/// # Errors
+///
+/// Returns an error when multiplying the entry index by the on-disk entry size overflows.
 fn entry_offset(entry_index: usize) -> Result<usize> {
     EXTENT_HEADER_SIZE
         .checked_add(
@@ -771,6 +795,10 @@ fn map_extents(extents: &[Extent], logical_block: LogicalBlock) -> BlockMapping 
 }
 
 /// Restores logical order, merges adjacent compatible extents, and rejects overlaps.
+/// # Errors
+///
+/// Returns an error when extents overlap, adjacency calculations overflow, or a merged length cannot
+/// be represented as an ext4 extent length.
 fn normalize_extents(extents: &mut Vec<Extent>) -> Result<()> {
     extents.sort_by_key(|extent| extent.logical_start());
     let mut normalized: Vec<Extent> = Vec::new();
@@ -813,6 +841,10 @@ fn normalize_extents(extents: &mut Vec<Extent>) -> Result<()> {
 }
 
 /// Computes external extent metadata block count for a normalized leaf count.
+/// # Errors
+///
+/// Returns an error when node fan-out arithmetic overflows or the serialized tree would exceed the
+/// supported ext4 depth.
 fn required_metadata_blocks(extent_count: usize, block_size: BlockSize) -> Result<usize> {
     if extent_count <= INODE_ROOT_ENTRY_CAPACITY {
         return Ok(0);
@@ -837,6 +869,10 @@ fn required_metadata_blocks(extent_count: usize, block_size: BlockSize) -> Resul
 }
 
 /// Number of extent/index entries that fit in one external extent block.
+/// # Errors
+///
+/// Returns an error when the block size cannot hold an extent header, checksum tail, and at least
+/// one entry.
 fn external_entry_capacity(block_size: BlockSize) -> Result<usize> {
     let bytes = usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
     let payload = bytes
@@ -854,6 +890,9 @@ fn external_entry_capacity(block_size: BlockSize) -> Result<usize> {
 }
 
 /// Integer ceiling division for tree packing.
+/// # Errors
+///
+/// Returns an error when the divisor is zero or rounded addition overflows.
 fn round_up_div_usize(value: usize, divisor: usize) -> Result<usize> {
     if divisor == 0 {
         return Err(Error::ArithmeticOverflow);
@@ -867,6 +906,10 @@ fn round_up_div_usize(value: usize, divisor: usize) -> Result<usize> {
 }
 
 /// Serializes a root containing leaf extent entries.
+/// # Errors
+///
+/// Returns an error when the root header cannot represent the entry count or an extent entry would
+/// exceed the fixed inode root bytes.
 fn serialize_extent_root(extents: &[Extent]) -> Result<[u8; INODE_ROOT_BYTES]> {
     let mut raw = [0_u8; INODE_ROOT_BYTES];
     write_header(&mut raw, extents.len(), INODE_ROOT_ENTRY_CAPACITY, 0)?;
@@ -877,6 +920,10 @@ fn serialize_extent_root(extents: &[Extent]) -> Result<[u8; INODE_ROOT_BYTES]> {
 }
 
 /// Serializes a root containing index entries.
+/// # Errors
+///
+/// Returns an error when the root header cannot represent the index count or an index entry would
+/// exceed the fixed inode root bytes.
 fn serialize_index_root(depth: u16, nodes: &[SerializedNode]) -> Result<[u8; INODE_ROOT_BYTES]> {
     let mut raw = [0_u8; INODE_ROOT_BYTES];
     write_header(&mut raw, nodes.len(), INODE_ROOT_ENTRY_CAPACITY, depth)?;
@@ -887,6 +934,10 @@ fn serialize_index_root(depth: u16, nodes: &[SerializedNode]) -> Result<[u8; INO
 }
 
 /// Serializes an external leaf extent node.
+/// # Errors
+///
+/// Returns an error when the block cannot hold the leaf entries, a field write exceeds the block, or
+/// checksum refresh fails.
 fn serialize_external_extent_node(
     block_size: BlockSize,
     depth: u16,
@@ -905,6 +956,10 @@ fn serialize_external_extent_node(
 }
 
 /// Serializes an external index node.
+/// # Errors
+///
+/// Returns an error when the block cannot hold the child index entries, a field write exceeds the
+/// block, or checksum refresh fails.
 fn serialize_external_index_node(
     block_size: BlockSize,
     depth: u16,
@@ -923,6 +978,10 @@ fn serialize_external_index_node(
 }
 
 /// Writes a common extent header.
+/// # Errors
+///
+/// Returns an error when `entries` exceeds `max_entries` or either count cannot be encoded as an
+/// ext4 header field.
 fn write_header(raw: &mut [u8], entries: usize, max_entries: usize, depth: u16) -> Result<()> {
     if entries > max_entries {
         return Err(Error::InvalidExtentTree);
@@ -943,6 +1002,10 @@ fn write_header(raw: &mut [u8], entries: usize, max_entries: usize, depth: u16) 
 }
 
 /// Writes one leaf extent entry.
+/// # Errors
+///
+/// Returns an error when the entry would exceed `raw` or the physical block address cannot be split
+/// into ext4 low/high fields.
 fn write_extent_entry(raw: &mut [u8], offset: usize, extent: Extent) -> Result<()> {
     let end = offset
         .checked_add(EXTENT_ENTRY_SIZE)
@@ -975,6 +1038,10 @@ fn write_extent_entry(raw: &mut [u8], offset: usize, extent: Extent) -> Result<(
 }
 
 /// Writes one index entry.
+/// # Errors
+///
+/// Returns an error when the entry would exceed `raw` or the child block address cannot be split
+/// into ext4 low/high fields.
 fn write_index_entry(raw: &mut [u8], offset: usize, node: &SerializedNode) -> Result<()> {
     let end = offset
         .checked_add(EXTENT_ENTRY_SIZE)
@@ -1002,6 +1069,10 @@ fn write_index_entry(raw: &mut [u8], offset: usize, node: &SerializedNode) -> Re
 }
 
 /// Verifies an external extent block checksum when metadata checksums are enabled.
+/// # Errors
+///
+/// Returns an error when the block is too small for a checksum tail or the stored checksum differs
+/// from the computed CRC32C.
 fn verify_external_extent_block_checksum(context: ExtentTreeContext, raw: &[u8]) -> Result<()> {
     let Some(checksum) = context.checksum else {
         return Ok(());
@@ -1019,6 +1090,10 @@ fn verify_external_extent_block_checksum(context: ExtentTreeContext, raw: &[u8])
 }
 
 /// Refreshes an external extent block checksum when metadata checksums are enabled.
+/// # Errors
+///
+/// Returns an error when the block is too small for a checksum tail or the checksum field cannot be
+/// zeroed and rewritten.
 fn refresh_external_extent_block_checksum(
     context: ExtentTreeContext,
     raw: &mut [u8],
@@ -1036,6 +1111,10 @@ fn refresh_external_extent_block_checksum(
 }
 
 /// Computes the crc32c checksum for one external extent block.
+/// # Errors
+///
+/// Returns an error when the pre-tail or post-tail ranges cannot be sliced from `raw`, or the tail
+/// offset arithmetic overflows.
 fn extent_block_checksum(
     checksum: ExtentBlockChecksum,
     raw: &[u8],

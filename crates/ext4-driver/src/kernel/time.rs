@@ -5,6 +5,9 @@ use ext4_core::Ext4Timestamp;
 use crate::kernel::status::DriverError;
 
 /// Returns the current system time as an ext4 inode timestamp.
+/// # Errors
+///
+/// Returns an error when the system time cannot be represented as an ext4 timestamp.
 pub(crate) fn current_ext4_timestamp() -> Result<Ext4Timestamp, DriverError> {
     let mut time = wdk_sys::LARGE_INTEGER { QuadPart: 0 };
     unsafe {

@@ -28,6 +28,9 @@ const fn wire_offset(offset: usize) -> WireOffset {
 }
 
 /// Creates a checked wire range from an EA record-relative byte position.
+/// # Errors
+///
+/// Returns an error when `offset + length` cannot be represented as an EA wire range.
 fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
     WireRange::new(wire_offset(offset), WireByteLen::new(length))
 }
@@ -64,6 +67,10 @@ struct QueryEaRequest {
 
 impl QueryEaRequest {
     /// Decodes a query-EA request.
+    /// # Errors
+    ///
+    /// Returns an error when the current stack is not a query-EA stack or its FILE_OBJECT has no
+    /// opened ext4 context.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.query_ea()?;
         let opened_file = OpenedObject::decode(stack.file_object())?;
@@ -88,6 +95,10 @@ struct SetEaRequest {
 
 impl SetEaRequest {
     /// Decodes a set-EA request.
+    /// # Errors
+    ///
+    /// Returns an error when the current stack is not a set-EA stack or its FILE_OBJECT has no
+    /// opened ext4 context.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.set_ea()?;
         let opened_file = OpenedObject::decode(stack.file_object())?;
@@ -108,6 +119,10 @@ struct WindowsEaName {
 
 impl WindowsEaName {
     /// Validates and stores a Windows EA name.
+    /// # Errors
+    ///
+    /// Returns an error when the EA name is empty, contains NUL, uses the reserved ext4win prefix,
+    /// or exceeds the one-byte FILE_FULL_EA_INFORMATION name length.
     fn new(name: &[u8]) -> DriverResult<Self> {
         if name.is_empty() || name.contains(&0) {
             return Err(DriverError::InvalidEaName);
@@ -141,6 +156,9 @@ struct WindowsEaValue {
 
 impl WindowsEaValue {
     /// Stores a Windows EA value representable by FILE_FULL_EA_INFORMATION.
+    /// # Errors
+    ///
+    /// Returns an error when the value exceeds the two-byte FILE_FULL_EA_INFORMATION value length.
     fn new(value: &[u8]) -> DriverResult<Self> {
         u16::try_from(value.len()).map_err(|_| DriverError::EaTooLarge)?;
         Ok(Self {
@@ -180,6 +198,9 @@ impl WindowsEaRecord {
     }
 
     /// Creates a Windows EA record from wire fields.
+    /// # Errors
+    ///
+    /// Returns an error when the record has unsupported flags or invalid EA name/value fields.
     fn from_wire(flags: u8, name: &[u8], value: &[u8]) -> DriverResult<Self> {
         if flags != 0 {
             return Err(DriverError::NotSupported);
@@ -201,6 +222,10 @@ enum WindowsEaSelection {
 }
 
 /// Performs an EA query against mounted ext4 xattrs.
+/// # Errors
+///
+/// Returns an error when selected EAs cannot be loaded, no EAs match, the output buffer is too
+/// small, or packed EA records cannot be emitted.
 fn query_ea(request: &QueryEaRequest) -> DriverResult<IrpCompletion> {
     let mut entries = collect_query_entries(&request.opened_file, request.stack)?;
     if matches!(request.stack.entry_emission(), EaEntryEmission::Single) && entries.len() > 1 {
@@ -221,6 +246,9 @@ fn query_ea(request: &QueryEaRequest) -> DriverResult<IrpCompletion> {
 }
 
 /// Applies set-EA records to `user.ext4win.ea.*` xattrs.
+/// # Errors
+///
+/// Returns an error when the set-EA input list is malformed or the xattr update transaction fails.
 fn set_ea(request: &SetEaRequest) -> DriverResult<IrpCompletion> {
     let entries = parse_set_ea_entries(request.target, request.stack)?;
     apply_set_ea_entries(&request.opened_file, entries.as_slice())?;
@@ -228,6 +256,9 @@ fn set_ea(request: &SetEaRequest) -> DriverResult<IrpCompletion> {
 }
 
 /// Collects Windows EA entries selected by a query request.
+/// # Errors
+///
+/// Returns an error when persisted EAs or the caller's requested EA-name list cannot be parsed.
 fn collect_query_entries(
     opened_file: &OpenedObject,
     stack: QueryEaStack,
@@ -248,6 +279,10 @@ fn collect_query_entries(
 }
 
 /// Reads all ext4win Windows EA xattrs for the opened node.
+/// # Errors
+///
+/// Returns an error when node xattrs cannot be read or any stored ext4win EA name/value no longer
+/// fits the Windows EA record domain.
 fn load_windows_eas(opened_file: &OpenedObject) -> DriverResult<Vec<WindowsEaRecord>> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
@@ -269,6 +304,10 @@ fn load_windows_eas(opened_file: &OpenedObject) -> DriverResult<Vec<WindowsEaRec
 }
 
 /// Applies parsed set-EA records in one journal transaction.
+/// # Errors
+///
+/// Returns an error when EA names cannot be mapped to xattrs or the journaled xattr set/remove
+/// operation fails.
 fn apply_set_ea_entries(
     opened_file: &OpenedObject,
     entries: &[WindowsEaRecord],
@@ -302,6 +341,10 @@ fn apply_set_ea_entries(
 }
 
 /// Parses the set-EA input buffer.
+/// # Errors
+///
+/// Returns an error when the IRP input buffer is unavailable or the FILE_FULL_EA_INFORMATION list is
+/// malformed.
 fn parse_set_ea_entries(
     target: DispatchTarget,
     stack: SetEaStack,
@@ -315,6 +358,9 @@ fn parse_set_ea_entries(
 }
 
 /// Parses FILE_GET_EA_INFORMATION selection from the query stack.
+/// # Errors
+///
+/// Returns an error when the caller's EA-name selection buffer is malformed.
 fn requested_ea_names(stack: QueryEaStack) -> DriverResult<WindowsEaSelection> {
     match stack.name_selection() {
         EaNameSelection::All => Ok(WindowsEaSelection::All),
@@ -330,6 +376,10 @@ fn requested_ea_names(stack: QueryEaStack) -> DriverResult<WindowsEaSelection> {
 }
 
 /// Parses a FILE_FULL_EA_INFORMATION list.
+/// # Errors
+///
+/// Returns an error when record offsets, name terminators, name/value ranges, flags, or alignment
+/// are inconsistent.
 fn parse_full_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaRecord>> {
     let fields = LittleEndianInput::new(input);
     let mut offset = 0;
@@ -386,6 +436,10 @@ fn parse_full_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaRecord>> {
 }
 
 /// Parses a FILE_GET_EA_INFORMATION list.
+/// # Errors
+///
+/// Returns an error when record offsets, name terminators, name ranges, or alignment are
+/// inconsistent.
 fn parse_get_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaName>> {
     let fields = LittleEndianInput::new(input);
     let mut offset = 0;
@@ -427,6 +481,10 @@ fn parse_get_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaName>> {
 }
 
 /// Packs FILE_FULL_EA_INFORMATION records.
+/// # Errors
+///
+/// Returns an error when the output buffer is too small or any packed record field cannot be
+/// represented.
 fn pack_full_ea_entries(entries: &[WindowsEaRecord], output: &mut [u8]) -> DriverResult<usize> {
     let required = packed_full_ea_length(entries)?;
     if output.len() < required {
@@ -500,6 +558,10 @@ fn pack_full_ea_entries(entries: &[WindowsEaRecord], output: &mut [u8]) -> Drive
 }
 
 /// Returns the packed byte count for a full EA list.
+/// # Errors
+///
+/// Returns an error when a record length or total packed list length exceeds the Windows EA size
+/// domain.
 fn packed_full_ea_length(entries: &[WindowsEaRecord]) -> DriverResult<usize> {
     if entries.is_empty() {
         return Ok(0);
@@ -522,6 +584,9 @@ fn packed_full_ea_length(entries: &[WindowsEaRecord]) -> DriverResult<usize> {
 }
 
 /// Returns the unaligned FILE_FULL_EA_INFORMATION record length.
+/// # Errors
+///
+/// Returns an error when name/value lengths overflow the full-EA record size.
 fn full_ea_record_length(name_len: usize, value_len: usize) -> DriverResult<usize> {
     FILE_FULL_EA_NAME_OFFSET
         .checked_add(name_len)
@@ -531,6 +596,9 @@ fn full_ea_record_length(name_len: usize, value_len: usize) -> DriverResult<usiz
 }
 
 /// Returns the unaligned FILE_GET_EA_INFORMATION record length.
+/// # Errors
+///
+/// Returns an error when the name length overflows the get-EA record size.
 fn get_ea_record_length(name_len: usize) -> DriverResult<usize> {
     FILE_GET_EA_NAME_OFFSET
         .checked_add(name_len)
@@ -539,6 +607,9 @@ fn get_ea_record_length(name_len: usize) -> DriverResult<usize> {
 }
 
 /// Maps a Windows EA name to the ext4 xattr namespace.
+/// # Errors
+///
+/// Returns an error when the reserved prefix plus EA name cannot form a valid `user.*` xattr name.
 fn xattr_name_from_ea_name(name: &WindowsEaName) -> DriverResult<XattrName> {
     let local_len = EA_XATTR_PREFIX
         .len()
@@ -560,6 +631,9 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
 }
 
 /// Aligns a byte count to a four-byte boundary.
+/// # Errors
+///
+/// Returns an error when padding arithmetic overflows.
 fn align_to_four(value: usize) -> DriverResult<usize> {
     let adjustment = EA_RECORD_ALIGNMENT
         .checked_sub(1)
@@ -589,6 +663,9 @@ mod tests {
         parse_get_ea_list, wire_offset, xattr_name_from_ea_name,
     };
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn full_ea_records_round_trip() {
         let alpha = WindowsEaName::new(b"alpha");
@@ -621,6 +698,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn get_ea_records_parse_names() {
         let mut input = vec![0; 32];
@@ -648,6 +728,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn ea_name_maps_to_ext4win_user_xattr() {
         let ea_name = WindowsEaName::new(b"alpha");
@@ -662,6 +745,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn invalid_ea_names_are_rejected() {
         assert_eq!(WindowsEaName::new(b""), Err(DriverError::InvalidEaName));
@@ -675,6 +761,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn inconsistent_full_ea_list_is_rejected() {
         let mut input = vec![0; 16];
@@ -691,6 +780,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn nonzero_ea_flags_are_rejected() {
         let mut input = vec![0; 16];
@@ -708,6 +800,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn ea_value_rejects_lengths_outside_windows_wire_field() {
         let Some(length) = usize::from(u16::MAX).checked_add(1) else {

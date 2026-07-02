@@ -141,6 +141,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Selects a physical block for a sparse logical block using logical-cluster placement.
+    /// # Errors
+    ///
+    /// Returns an error when cluster geometry is invalid, a matching physical cluster cannot be
+    /// referenced, or a new cluster cannot be allocated.
     fn physical_block_for_hole(
         &mut self,
         tree: &MutableExtentTree,
@@ -178,6 +182,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Merges plaintext bytes into one encrypted file block and stages ciphertext.
+    /// # Errors
+    ///
+    /// Returns an error when the plaintext base block cannot be obtained, `bytes` do not fit at
+    /// `in_block`, encryption fails, or the physical write offset overflows.
     fn stage_encrypted_file_block_update(
         &mut self,
         contents_key: &FscryptContentsKey,
@@ -216,6 +224,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns the latest plaintext image of one file block for encrypted updates.
+    /// # Errors
+    ///
+    /// Returns an error when the block cannot be read from staged/device data or fscrypt decryption
+    /// fails.
     fn plaintext_file_block_for_update(
         &self,
         contents_key: &FscryptContentsKey,
@@ -243,6 +255,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns a block at `cluster_offset` inside a fully present physical cluster.
+    /// # Errors
+    ///
+    /// Returns an error when `cluster_offset` is outside the cluster or physical block arithmetic
+    /// overflows.
     fn physical_block_in_cluster(
         &self,
         cluster: ClusterAddress,
@@ -262,6 +278,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Stages a write into an inode extent stream without applying EOF limits.
+    /// # Errors
+    ///
+    /// Returns an error when logical range arithmetic fails, the stream contains uninitialized
+    /// extents, allocation fails, or a staged write slice cannot be represented.
     fn stage_inode_stream_write(
         &mut self,
         tree: &mut MutableExtentTree,
@@ -330,6 +350,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Stages a plaintext write into an encrypted inode stream without EOF limits.
+    /// # Errors
+    ///
+    /// Returns an error when the inode has no mounted contents key, range arithmetic fails, the
+    /// stream contains uninitialized extents, allocation fails, or encryption fails.
     fn stage_encrypted_inode_stream_write(
         &mut self,
         inode: &Inode,
@@ -561,6 +585,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Verifies file-data mutation policy with mount-scoped fscrypt keys.
+    /// # Errors
+    ///
+    /// Returns an error when an encrypted inode lacks a mounted key, encrypted mutation is not
+    /// supported for the inode kind, or the inode storage policy rejects payload mutation.
     pub(super) fn require_file_data_mutation(
         &self,
         inode: &Inode,
@@ -575,6 +603,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Verifies file-size mutation policy with mount-scoped fscrypt keys.
+    /// # Errors
+    ///
+    /// Returns an error when an encrypted inode lacks a mounted key, encrypted size mutation is not
+    /// supported for the inode kind, or the inode storage policy rejects size mutation.
     pub(super) fn require_file_size_mutation(
         &self,
         inode: &Inode,
@@ -589,6 +621,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Stages zeroes for the remainder of a partially truncated data block.
+    /// # Errors
+    ///
+    /// Returns an error when tail offset arithmetic fails or the zero-filled write length cannot be
+    /// represented.
     fn zero_truncated_tail(
         &mut self,
         extents: &[Extent],
@@ -627,6 +663,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Stages encrypted zeroes for the plaintext suffix of a truncated block.
+    /// # Errors
+    ///
+    /// Returns an error when the inode has no mounted contents key, tail length arithmetic fails, or
+    /// the encrypted block update cannot be staged.
     fn zero_encrypted_truncated_tail(
         &mut self,
         inode: &Inode,
