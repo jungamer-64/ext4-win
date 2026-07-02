@@ -345,40 +345,6 @@ fn resolve_path(
 ///
 /// Returns an error when default metadata cannot be built, the parent cannot be selected, creation
 /// fails, or the transaction cannot commit.
-fn create_child(
-    mut vcb: NonNull<crate::state::VolumeControlBlock>,
-    parent: DirectoryNodeId,
-    name: &Ext4Name,
-    requirement: CreateTargetRequirement,
-) -> DriverResult<NodeId> {
-    let vcb = unsafe {
-        // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
-        // in the mounted device extension. The mutable borrow is the
-        // transaction boundary for this create request.
-        vcb.as_mut()
-    };
-    let mut transaction = vcb
-        .volume_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let parent = transaction.directory(parent)?;
-    let node = match requirement {
-        CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
-            let file = transaction.create_file(parent, name, metadata::default_file_metadata()?)?;
-            NodeId::File(file.id())
-        }
-        CreateTargetRequirement::Directory => {
-            let directory = transaction.create_directory(
-                parent,
-                name,
-                metadata::default_directory_metadata()?,
-            )?;
-            NodeId::Directory(directory.id())
-        }
-    };
-    transaction.commit()?;
-    Ok(node)
-}
-
 /// Splits the FILE_OBJECT name into validated root-relative Windows components.
 /// # Errors
 ///
