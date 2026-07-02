@@ -127,22 +127,62 @@ fn inode(value: u32) -> InodeId {
 }
 
 trait MountedVolumeTestExt {
+    /// Loads a typed file node through the mounted-volume variant under test.
+    /// # Errors
+    ///
+    /// Returns an error when the inode cannot be loaded as a regular file.
     fn load_file(&self, id: FileNodeId) -> crate::Result<FileNode>;
+
+    /// Loads a typed directory node through the mounted-volume variant under test.
+    /// # Errors
+    ///
+    /// Returns an error when the inode cannot be loaded as a directory.
     fn load_directory(&self, id: DirectoryNodeId) -> crate::Result<DirectoryNode>;
+
+    /// Loads a typed symlink node through the mounted-volume variant under test.
+    /// # Errors
+    ///
+    /// Returns an error when the inode cannot be loaded as a symlink.
     fn load_symlink(&self, id: crate::SymlinkNodeId) -> crate::Result<SymlinkNode>;
+
+    /// Reads file bytes through the mounted-volume variant under test.
+    /// # Errors
+    ///
+    /// Returns an error when file extent traversal or backing-device reads fail.
     fn read_file(
         &self,
         file: &FileNode,
         offset: FileOffset,
         out: &mut [u8],
     ) -> crate::Result<crate::ReadBytes>;
+
+    /// Reads directory entries through the mounted-volume variant under test.
+    /// # Errors
+    ///
+    /// Returns an error when directory traversal or entry validation fails.
     fn read_directory(&self, directory: &DirectoryNode) -> crate::Result<Vec<DirectoryEntry>>;
+
+    /// Reads a symlink target through the mounted-volume variant under test.
+    /// # Errors
+    ///
+    /// Returns an error when symlink target bytes cannot be read.
     fn read_symlink(&self, symlink: &SymlinkNode) -> crate::Result<Vec<u8>>;
+
+    /// Performs exact child lookup through the mounted-volume variant under test.
+    /// # Errors
+    ///
+    /// Returns an error when the parent cannot be enumerated.
     fn lookup_child(
         &self,
         parent: &DirectoryNode,
         name: &Ext4Name,
     ) -> crate::Result<crate::ChildLookup>;
+
+    /// Performs Windows-visible child lookup through the mounted-volume variant under test.
+    /// # Errors
+    ///
+    /// Returns an error when the parent cannot be enumerated or the Windows projection is
+    /// ambiguous.
     fn lookup_windows_child(
         &self,
         parent: &DirectoryNode,
@@ -244,6 +284,9 @@ impl<D: BlockReader, N, J> MountedVolumeTestExt for JournaledVolume<D, N, J> {
     }
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 fn node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> NodeId {
     if inode_id == InodeId::ROOT {
         return NodeId::Directory(DirectoryNodeId::ROOT);
@@ -276,6 +319,9 @@ fn node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> NodeId {
     panic!("expected reachable node");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 fn file_node<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> FileNode {
     let NodeId::File(file_id) = node_id(volume, inode(inode_id)) else {
         panic!("expected file node");
@@ -287,6 +333,9 @@ fn file_node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> FileNodeI
     file_node(volume, inode_id).id()
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 fn directory_node<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> DirectoryNode {
     let NodeId::Directory(directory_id) = node_id(volume, inode_id) else {
         panic!("expected directory node");
@@ -294,6 +343,9 @@ fn directory_node<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> Dir
     must(volume.load_directory(directory_id))
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 fn symlink_node<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> SymlinkNode {
     let NodeId::Symlink(symlink_id) = node_id(volume, inode(inode_id)) else {
         panic!("expected symlink node");
@@ -316,6 +368,9 @@ fn read_directory<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> Vec
     must(volume.read_directory(&directory))
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 fn directory_entry_name(entries: &[DirectoryEntry], inode_id: InodeId) -> Ext4Name {
     for entry in entries {
         if entry.node().inode() == inode_id {

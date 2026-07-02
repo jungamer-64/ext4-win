@@ -56,6 +56,10 @@ struct QueryVolumeRequest {
 
 impl QueryVolumeRequest {
     /// Decodes query-volume parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the current stack is not a query-volume stack or the requested class is
+    /// unsupported.
     fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
         Ok(Self {
             device: target.device(),
@@ -78,6 +82,10 @@ struct SetVolumeRequest {
 
 impl SetVolumeRequest {
     /// Decodes set-volume parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the current stack is not a set-volume stack or the requested class is
+    /// unsupported.
     fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
         Ok(Self {
             device: target.device(),
@@ -88,6 +96,10 @@ impl SetVolumeRequest {
 }
 
 /// Executes one volume information query.
+/// # Errors
+///
+/// Returns an error when the dispatch target is not a mounted volume or the selected class cannot be
+/// packed into the caller buffer.
 fn query_volume(request: QueryVolumeRequest) -> DriverResult<IrpCompletion> {
     let Some(mut vcb) = MountedVolumeDevice::vcb(request.device) else {
         return Err(DriverError::InvalidDeviceRequest);
@@ -110,6 +122,10 @@ fn query_volume(request: QueryVolumeRequest) -> DriverResult<IrpCompletion> {
 }
 
 /// Executes one volume information mutation.
+/// # Errors
+///
+/// Returns an error when the selected volume-information mutation input is invalid or cannot be
+/// committed.
 fn set_volume(request: SetVolumeRequest) -> DriverResult<IrpCompletion> {
     match request.stack.information_class() {
         SetVolumeInformationClass::Label => set_volume_label(request),
@@ -118,6 +134,10 @@ fn set_volume(request: SetVolumeRequest) -> DriverResult<IrpCompletion> {
 }
 
 /// Applies `FILE_FS_LABEL_INFORMATION` to the mounted ext4 superblock.
+/// # Errors
+///
+/// Returns an error when the label input buffer is malformed, the device is not mounted, the
+/// superblock label transaction fails, or the VPB label cannot be refreshed.
 fn set_volume_label(request: SetVolumeRequest) -> DriverResult<()> {
     let length = request.stack.length();
     let input = request.target.buffered_input(length)?;
@@ -144,6 +164,10 @@ fn set_volume_label(request: SetVolumeRequest) -> DriverResult<()> {
 }
 
 /// Decodes a Windows label information buffer into an ext4 volume label.
+/// # Errors
+///
+/// Returns an error when the label buffer is truncated, has odd UTF-16 byte length, contains
+/// non-byte-representable UTF-16 units, or is not a valid ext4 label.
 fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel> {
     let header = core::mem::offset_of!(FILE_FS_LABEL_INFORMATION, VolumeLabel);
     if input.len() < header {
@@ -172,6 +196,9 @@ fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel
 }
 
 /// Packs `FILE_FS_VOLUME_INFORMATION`.
+/// # Errors
+///
+/// Returns an error when the UTF-16 label byte count overflows or the output buffer is too small.
 fn pack_volume_information(
     vcb: &VolumeControlBlock,
     output: &mut [u8],
@@ -237,6 +264,10 @@ fn pack_volume_information(
 }
 
 /// Packs `FILE_FS_SIZE_INFORMATION`.
+/// # Errors
+///
+/// Returns an error when ext4 cluster geometry cannot be represented in `FILE_FS_SIZE_INFORMATION`
+/// or the output buffer is too small.
 fn pack_size_information(
     vcb: &VolumeControlBlock,
     output: &mut [u8],
@@ -260,6 +291,9 @@ fn pack_size_information(
 }
 
 /// Packs `FILE_FS_DEVICE_INFORMATION`.
+/// # Errors
+///
+/// Returns an error when the output buffer is too small for `FILE_FS_DEVICE_INFORMATION`.
 fn pack_device_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
     write_fixed(
         output,
@@ -271,6 +305,10 @@ fn pack_device_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
 }
 
 /// Packs `FILE_FS_FULL_SIZE_INFORMATION`.
+/// # Errors
+///
+/// Returns an error when ext4 cluster geometry cannot be represented in
+/// `FILE_FS_FULL_SIZE_INFORMATION` or the output buffer is too small.
 fn pack_full_size_information(
     vcb: &VolumeControlBlock,
     output: &mut [u8],
@@ -296,6 +334,10 @@ fn pack_full_size_information(
 }
 
 /// Packs `FILE_FS_ATTRIBUTE_INFORMATION`.
+/// # Errors
+///
+/// Returns an error when the filesystem name byte count overflows or the output buffer is too
+/// small.
 fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
     let header = core::mem::offset_of!(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
     let name_len = FILE_SYSTEM_NAME
@@ -352,6 +394,9 @@ fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> 
 }
 
 /// Returns sectors per ext4 allocation cluster for Windows allocation units.
+/// # Errors
+///
+/// Returns an error when the cluster size is smaller than one sector.
 fn sectors_per_allocation_unit(cluster_size: ClusterSize) -> DriverResult<u32> {
     cluster_size
         .bytes()
@@ -361,11 +406,17 @@ fn sectors_per_allocation_unit(cluster_size: ClusterSize) -> DriverResult<u32> {
 }
 
 /// Converts a byte count to `IO_STATUS_BLOCK::Information`.
+/// # Errors
+///
+/// Returns an error when `value` cannot be represented in the IRP information field.
 fn information_length(value: usize) -> DriverResult<IrpCompletion> {
     IrpCompletion::from_usize(value)
 }
 
 /// Writes one fixed-size WDK information structure into an output byte buffer.
+/// # Errors
+///
+/// Returns an error when `output` is smaller than `T`.
 fn write_fixed<T>(output: &mut [u8], value: T) -> DriverResult<IrpCompletion> {
     let size = core::mem::size_of::<T>();
     if output.len() < size {
@@ -392,6 +443,9 @@ mod tests {
 
     use super::{pack_device_information, volume_label_from_file_fs_label};
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_fs_label_information_decodes_byte_representable_utf16() {
         let input = label_information_bytes(b"EXT4");
@@ -402,6 +456,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_fs_label_information_rejects_odd_label_byte_length() {
         let input = vec![1, 0, 0, 0, b'E'];
@@ -411,6 +468,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_fs_label_information_rejects_unrepresentable_utf16() {
         let input = vec![2, 0, 0, 0, 0x00, 0x01];
@@ -420,6 +480,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_fs_label_information_rejects_ext4_invalid_label() {
         let input = label_information_bytes(&[0]);
@@ -429,6 +492,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn device_information_reports_disk_file_system_without_device_flags() {
         let mut buffer = vec![0; core::mem::size_of::<wdk_sys::FILE_FS_DEVICE_INFORMATION>()];
@@ -446,6 +512,9 @@ mod tests {
     }
 
     /// Builds a FILE_FS_LABEL_INFORMATION byte image from label bytes.
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     fn label_information_bytes(label: &[u8]) -> alloc::vec::Vec<u8> {
         let label_bytes = label.len().checked_mul(2);
         assert!(label_bytes.is_some());

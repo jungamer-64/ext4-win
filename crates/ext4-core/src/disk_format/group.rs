@@ -88,6 +88,10 @@ pub(crate) struct BlockGroupDescriptor {
 
 impl BlockGroupDescriptor {
     /// Reads, verifies, and decodes a descriptor for one block group.
+    /// # Errors
+    ///
+    /// Returns an error when the group is outside the mounted geometry, descriptor I/O fails, the
+    /// descriptor checksum is invalid, or any descriptor field is truncated.
     pub(crate) fn read_from(
         reader: &impl BlockReader,
         superblock: &Superblock,
@@ -187,6 +191,10 @@ impl BlockGroupDescriptor {
     }
 
     /// Applies a free-cluster accounting delta and refreshes the descriptor checksum.
+    /// # Errors
+    ///
+    /// Returns an error when the delta underflows or overflows the free-cluster count, the count
+    /// fields cannot be written, or checksum refresh fails.
     pub(crate) fn apply_free_clusters_delta(
         &mut self,
         delta: FreeClusterDelta,
@@ -221,6 +229,10 @@ impl BlockGroupDescriptor {
     }
 
     /// Applies a free-inode accounting delta and refreshes the descriptor checksum.
+    /// # Errors
+    ///
+    /// Returns an error when the delta underflows or overflows the free-inode count, the count fields
+    /// cannot be written, or checksum refresh fails.
     pub(crate) fn apply_free_inodes_delta(
         &mut self,
         delta: i64,
@@ -239,6 +251,10 @@ impl BlockGroupDescriptor {
     }
 
     /// Applies a directory-count delta and refreshes the descriptor checksum.
+    /// # Errors
+    ///
+    /// Returns an error when the delta underflows or overflows the used-directory count, the count
+    /// fields cannot be written, or checksum refresh fails.
     pub(crate) fn apply_used_dirs_delta(
         &mut self,
         delta: i64,
@@ -257,6 +273,10 @@ impl BlockGroupDescriptor {
     }
 
     /// Recomputes the block bitmap checksum fields for this group.
+    /// # Errors
+    ///
+    /// Returns an error when the block bitmap checksum fields or descriptor checksum cannot be
+    /// rewritten.
     pub(crate) fn refresh_block_bitmap_checksum(
         &mut self,
         superblock: &Superblock,
@@ -273,6 +293,10 @@ impl BlockGroupDescriptor {
     }
 
     /// Recomputes the inode bitmap checksum fields for this group.
+    /// # Errors
+    ///
+    /// Returns an error when the inode bitmap checksum fields or descriptor checksum cannot be
+    /// rewritten.
     pub(crate) fn refresh_inode_bitmap_checksum(
         &mut self,
         superblock: &Superblock,
@@ -289,6 +313,10 @@ impl BlockGroupDescriptor {
     }
 
     /// Writes a metadata CRC32C bitmap checksum and refreshes the descriptor checksum.
+    /// # Errors
+    ///
+    /// Returns an error when the checksum cannot be split into descriptor fields or the descriptor
+    /// checksum cannot be refreshed.
     fn refresh_bitmap_checksum(
         &mut self,
         superblock: &Superblock,
@@ -318,6 +346,10 @@ impl BlockGroupDescriptor {
 }
 
 /// Writes the active block group descriptor checksum into the raw descriptor.
+/// # Errors
+///
+/// Returns an error when the descriptor checksum cannot be computed or written to the checksum
+/// field.
 pub(crate) fn write_block_group_descriptor_checksum(
     superblock: &Superblock,
     group: BlockGroupId,
@@ -331,6 +363,10 @@ pub(crate) fn write_block_group_descriptor_checksum(
 }
 
 /// Verifies the block group descriptor checksum selected by the superblock.
+/// # Errors
+///
+/// Returns an error when the stored checksum field cannot be read or the computed checksum does not
+/// match it.
 fn verify_block_group_descriptor_checksum(
     superblock: &Superblock,
     group: BlockGroupId,
@@ -348,6 +384,10 @@ fn verify_block_group_descriptor_checksum(
 }
 
 /// Computes the descriptor checksum using the validated checksum mode.
+/// # Errors
+///
+/// Returns an error when the selected checksum algorithm cannot slice the descriptor around the
+/// checksum field.
 fn block_group_descriptor_checksum(
     superblock: &Superblock,
     group: BlockGroupId,
@@ -361,6 +401,10 @@ fn block_group_descriptor_checksum(
 }
 
 /// Computes the legacy GDT CRC16 descriptor checksum.
+/// # Errors
+///
+/// Returns an error when checksum-field offset arithmetic overflows or the descriptor cannot be
+/// sliced around the checksum field.
 fn gdt_checksum(superblock: &Superblock, group: BlockGroupId, bytes: &[u8]) -> Result<u16> {
     let checksum_end = BG_CHECKSUM_OFFSET
         .checked_add(BG_CHECKSUM_SIZE)
@@ -385,6 +429,10 @@ fn gdt_checksum(superblock: &Superblock, group: BlockGroupId, bytes: &[u8]) -> R
 }
 
 /// Computes the metadata_csum CRC32C descriptor checksum.
+/// # Errors
+///
+/// Returns an error when checksum-field offset arithmetic overflows or the descriptor cannot be
+/// sliced around the checksum field.
 fn metadata_checksum(superblock: &Superblock, group: BlockGroupId, bytes: &[u8]) -> Result<u16> {
     let checksum_end = BG_CHECKSUM_OFFSET
         .checked_add(BG_CHECKSUM_SIZE)
@@ -409,6 +457,9 @@ fn metadata_checksum(superblock: &Superblock, group: BlockGroupId, bytes: &[u8])
 }
 
 /// Computes the absolute byte offset of one descriptor table entry.
+/// # Errors
+///
+/// Returns an error when the descriptor table byte offset overflows the device offset range.
 fn descriptor_offset(
     block_size: BlockSize,
     descriptor_size: BlockGroupDescriptorSize,
@@ -433,6 +484,9 @@ fn descriptor_offset(
 }
 
 /// Combines low and optional high descriptor fields into a block address.
+/// # Errors
+///
+/// Returns an error when either block-address field is outside the supplied descriptor bytes.
 fn descriptor_block_address(
     bytes: &[u8],
     lo_offset: usize,
@@ -449,6 +503,9 @@ fn descriptor_block_address(
 }
 
 /// Combines low and optional high descriptor fields into a 32-bit count.
+/// # Errors
+///
+/// Returns an error when either count field is outside the supplied descriptor bytes.
 fn descriptor_count(
     bytes: &[u8],
     lo_offset: usize,
@@ -465,6 +522,9 @@ fn descriptor_count(
 }
 
 /// Splits a 32-bit count across the low and optional high descriptor fields.
+/// # Errors
+///
+/// Returns an error when either count field cannot be written to the supplied descriptor bytes.
 fn write_descriptor_count(
     bytes: &mut [u8],
     lo_offset: usize,
@@ -488,6 +548,10 @@ fn write_descriptor_count(
 }
 
 /// Applies a signed accounting delta without underflowing the descriptor count.
+/// # Errors
+///
+/// Returns an error when `delta` is outside `u32` bounds or applying it would underflow or overflow
+/// the descriptor count.
 fn apply_u32_delta(current: u32, delta: i64) -> Result<u32> {
     if delta.is_negative() {
         current

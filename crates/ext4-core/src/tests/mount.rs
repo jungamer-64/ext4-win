@@ -1,5 +1,8 @@
 use super::*;
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn clean_superblock_mounts() {
     let image = fixture_image();
@@ -11,6 +14,9 @@ fn clean_superblock_mounts() {
     assert_eq!(superblock.inode_count().as_u32(), 16);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn invalid_magic_is_rejected() {
     let mut image = fixture_image();
@@ -20,6 +26,9 @@ fn invalid_magic_is_rejected() {
     assert_eq!(result, Err(Error::InvalidMagic));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn unsupported_incompat_feature_is_rejected() {
     let mut image = fixture_image();
@@ -29,11 +38,17 @@ fn unsupported_incompat_feature_is_rejected() {
     assert!(matches!(result, Err(Error::UnsupportedIncompatFeature)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn inode_zero_is_not_constructible() {
     assert_eq!(InodeId::try_from(0), Err(Error::InvalidInode));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn file_offset_addition_rejects_overflow() {
     let result = FileOffset::from_bytes(u64::MAX).checked_add_len(1);
@@ -41,11 +56,17 @@ fn file_offset_addition_rejects_overflow() {
     assert_eq!(result, Err(Error::ArithmeticOverflow));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn crc32c_known_vector_matches_castagnoli() {
     assert_eq!(crate::disk::checksum::crc32c(0, b"123456789"), 0xE306_9283);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn metadata_checksum_mismatch_is_rejected() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -55,6 +76,9 @@ fn metadata_checksum_mismatch_is_rejected() {
     assert!(matches!(result, Err(Error::ChecksumMismatch)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn larger_block_sizes_mount_and_read_file() {
     for block_size in [8192_usize, 16_384, 65_536] {
@@ -75,6 +99,9 @@ fn larger_block_sizes_mount_and_read_file() {
     }
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn block_count_uses_64bit_superblock_high_field() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -85,6 +112,9 @@ fn block_count_uses_64bit_superblock_high_field() {
     assert_eq!(superblock.block_count().as_u64(), 0x1_0000_0001);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn metadata_csum_seed_is_accepted_with_metadata_csum() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -101,6 +131,9 @@ fn metadata_csum_seed_is_accepted_with_metadata_csum() {
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 3);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn write_mount_accepts_metadata_csum_seed() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -114,6 +147,9 @@ fn write_mount_accepts_metadata_csum_seed() {
     assert_eq!(superblock.checksum_seed().as_u32(), 0x1234_5678);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn metadata_csum_seed_without_metadata_csum_is_rejected() {
     let mut image = fixture_image();
@@ -123,6 +159,9 @@ fn metadata_csum_seed_without_metadata_csum_is_rejected() {
     assert!(matches!(result, Err(Error::UnsupportedIncompatFeature)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn read_only_mount_accepts_quota_and_clean_orphan_file() {
     let mut image = fixture_image();
@@ -136,6 +175,9 @@ fn read_only_mount_accepts_quota_and_clean_orphan_file() {
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 4);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn read_only_mount_rejects_layout_changing_features() {
     for incompat in [
@@ -161,6 +203,9 @@ fn read_only_mount_rejects_layout_changing_features() {
     }
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn write_mount_accepts_modern_baseline() {
     let mut image = modern_fixture_image();
@@ -171,6 +216,9 @@ fn write_mount_accepts_modern_baseline() {
     assert_eq!(superblock.journal_mode(), JournalMode::Internal(inode(8)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn write_mount_rejects_recovery_accounting_feature_profiles() {
     for compat in [COMPAT_FAST_COMMIT, COMPAT_ORPHAN_FILE] {

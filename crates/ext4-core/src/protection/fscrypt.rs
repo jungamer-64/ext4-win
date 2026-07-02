@@ -139,6 +139,9 @@ pub enum FscryptContentsMode {
 
 impl FscryptContentsMode {
     /// Parses a serialized fscrypt contents-mode byte.
+    /// # Errors
+    ///
+    /// Returns an error when the contents mode is not the supported AES-256-XTS profile.
     fn parse(value: u8) -> Result<Self> {
         match value {
             FSCRYPT_MODE_AES_256_XTS => Ok(Self::Aes256Xts),
@@ -164,6 +167,9 @@ pub enum FscryptFilenamesMode {
 
 impl FscryptFilenamesMode {
     /// Parses a serialized fscrypt filenames-mode byte.
+    /// # Errors
+    ///
+    /// Returns an error when the filenames mode is not the supported AES-256-CBC-CTS profile.
     fn parse(value: u8) -> Result<Self> {
         match value {
             FSCRYPT_MODE_AES_256_CTS => Ok(Self::Aes256CbcCts),
@@ -195,6 +201,9 @@ pub enum FscryptFilenamePadding {
 
 impl FscryptFilenamePadding {
     /// Parses a supported v2 policy flags byte.
+    /// # Errors
+    ///
+    /// Returns an error when unsupported policy flag bits are set.
     fn parse(flags: u8) -> Result<Self> {
         if flags & !FSCRYPT_SUPPORTED_POLICY_FLAGS != 0 {
             return Err(Error::InvalidEncryptionContext);
@@ -240,6 +249,9 @@ pub enum FscryptDataUnitSize {
 
 impl FscryptDataUnitSize {
     /// Parses the v2 policy data-unit-size byte.
+    /// # Errors
+    ///
+    /// Returns an error when the data-unit size is not the filesystem-block default.
     fn parse(value: u8) -> Result<Self> {
         match value {
             0 => Ok(Self::FilesystemBlock),
@@ -383,6 +395,10 @@ pub(crate) struct FscryptNoKeyName {
 
 impl FscryptNoKeyName {
     /// Builds a displayable no-key name from on-disk ciphertext bytes.
+    /// # Errors
+    ///
+    /// Returns an error when the ciphertext length is invalid or its Windows-safe display encoding
+    /// would exceed the ext4 name limit.
     pub(crate) fn from_ciphertext(ciphertext: &[u8]) -> Result<Self> {
         validate_ciphertext_filename_len(ciphertext.len())?;
         let name = Self {
@@ -393,6 +409,10 @@ impl FscryptNoKeyName {
     }
 
     /// Decodes a display name created by [`Self::display_bytes`].
+    /// # Errors
+    ///
+    /// Returns an error when a prefixed no-key display name is not canonical base64url or decodes to
+    /// an invalid ciphertext length.
     pub(crate) fn from_display(display: &[u8]) -> Result<Option<Self>> {
         if !display.starts_with(FSCRYPT_NOKEY_NAME_PREFIX) {
             return Ok(None);
@@ -405,6 +425,10 @@ impl FscryptNoKeyName {
     }
 
     /// Returns the Windows-safe encoded display name.
+    /// # Errors
+    ///
+    /// Returns an error when encoded-length arithmetic overflows or the display name would exceed
+    /// the ext4 component length limit.
     pub(crate) fn display_bytes(&self) -> Result<Vec<u8>> {
         let encoded_len = base64url_nopad_len(self.ciphertext.len())?;
         let display_len = FSCRYPT_NOKEY_NAME_PREFIX
@@ -755,6 +779,10 @@ impl FscryptHkdfContext {
 }
 
 /// Validates the supported raw master-key size range.
+/// # Errors
+///
+/// Returns an error when the raw key is shorter than the AES-256 minimum or longer than fscrypt
+/// accepts.
 fn validate_raw_master_key(bytes: &[u8]) -> Result<()> {
     if bytes.len() < FSCRYPT_AES_256_MIN_MASTER_KEY_BYTES || bytes.len() > FSCRYPT_MAX_RAW_KEY_BYTES
     {
@@ -764,6 +792,9 @@ fn validate_raw_master_key(bytes: &[u8]) -> Result<()> {
 }
 
 /// Validates the on-disk ciphertext filename length.
+/// # Errors
+///
+/// Returns an error when the ciphertext name is empty or longer than one ext4 component.
 fn validate_ciphertext_filename_len(len: usize) -> Result<()> {
     if len == 0 || len > 255 {
         return Err(Error::InvalidName);
@@ -772,6 +803,9 @@ fn validate_ciphertext_filename_len(len: usize) -> Result<()> {
 }
 
 /// Returns the unpadded base64url length for `len` source bytes.
+/// # Errors
+///
+/// Returns an error when base64 output-length arithmetic overflows.
 fn base64url_nopad_len(len: usize) -> Result<usize> {
     let full_groups = len.checked_div(3).ok_or(Error::ArithmeticOverflow)?;
     let full_chars = full_groups
@@ -786,6 +820,9 @@ fn base64url_nopad_len(len: usize) -> Result<usize> {
 }
 
 /// Encodes bytes with URL-safe base64 and no padding.
+/// # Errors
+///
+/// Returns an error when chunk slicing fails or a six-bit value is outside the base64url alphabet.
 fn base64url_encode_nopad(bytes: &[u8], output: &mut Vec<u8>) -> Result<()> {
     let mut remaining = bytes;
     while remaining.len() >= 3 {
@@ -819,12 +856,18 @@ fn base64url_encode_nopad(bytes: &[u8], output: &mut Vec<u8>) -> Result<()> {
 }
 
 /// Appends one base64url alphabet byte.
+/// # Errors
+///
+/// Returns an error when `value` is outside the six-bit base64url alphabet range.
 fn push_base64url(output: &mut Vec<u8>, value: u8) -> Result<()> {
     output.push(base64url_alphabet_byte(value)?);
     Ok(())
 }
 
 /// Returns one base64url alphabet byte by six-bit value.
+/// # Errors
+///
+/// Returns an error when `value` is greater than 63.
 fn base64url_alphabet_byte(value: u8) -> Result<u8> {
     BASE64URL_ALPHABET
         .get(usize::from(value))
@@ -833,6 +876,10 @@ fn base64url_alphabet_byte(value: u8) -> Result<u8> {
 }
 
 /// Decodes URL-safe base64 without padding.
+/// # Errors
+///
+/// Returns an error when the input length is not valid for unpadded base64url, contains a non
+/// alphabet byte, or has nonzero canonical pad bits.
 fn base64url_decode_nopad(encoded: &[u8]) -> Result<Vec<u8>> {
     if encoded.is_empty() || encoded.len() % 4 == 1 {
         return Err(Error::InvalidName);
@@ -879,6 +926,10 @@ fn base64url_decode_nopad(encoded: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Returns decoded byte capacity for an unpadded base64url string.
+/// # Errors
+///
+/// Returns an error when decoded-length arithmetic overflows or the encoded length has a remainder
+/// impossible for unpadded base64url.
 fn base64url_decoded_len(len: usize) -> Result<usize> {
     let full_groups = len.checked_div(4).ok_or(Error::ArithmeticOverflow)?;
     let full_bytes = full_groups
@@ -893,6 +944,9 @@ fn base64url_decoded_len(len: usize) -> Result<usize> {
 }
 
 /// Decodes one base64url alphabet byte.
+/// # Errors
+///
+/// Returns an error when `byte` is not in the URL-safe base64 alphabet.
 fn base64url_value(byte: u8) -> Result<u8> {
     match byte {
         b'A'..=b'Z' => byte.checked_sub(b'A').ok_or(Error::ArithmeticOverflow),
@@ -911,6 +965,10 @@ fn base64url_value(byte: u8) -> Result<u8> {
 }
 
 /// Parses policy fields shared by v2 policies and contexts.
+/// # Errors
+///
+/// Returns an error when the version, modes, flags, data-unit size, reserved bytes, or key
+/// identifier fields are not a supported fscrypt v2 AES profile.
 fn parse_policy_fields(bytes: &[u8], version: u8) -> Result<FscryptPolicyV2> {
     if byte(bytes, FSCRYPT_VERSION_OFFSET)? != version {
         return Err(Error::InvalidEncryptionContext);
@@ -983,6 +1041,10 @@ fn put_bytes(bytes: &mut [u8], offset: usize, value: &[u8]) {
 }
 
 /// Expands an fscrypt v2 HKDF output for one namespace and info value.
+/// # Errors
+///
+/// Returns an error when HKDF info construction overflows or the requested output length is invalid
+/// for HKDF-SHA512.
 fn fscrypt_hkdf_expand(
     master_key: &[u8],
     context: FscryptHkdfContext,
@@ -1018,6 +1080,10 @@ fn aes_256_cbc_cts(key: [u8; FSCRYPT_AES_256_CBC_CTS_KEY_BYTES]) -> CbcCs3<Aes25
 }
 
 /// Returns the padded filename length accepted by fscrypt AES-CBC-CTS.
+/// # Errors
+///
+/// Returns an error when the plaintext name length is outside ext4 bounds or padding arithmetic
+/// overflows.
 fn padded_filename_len(len: usize, padding: FscryptFilenamePadding) -> Result<usize> {
     if len == 0 || len > 255 {
         return Err(Error::InvalidName);
@@ -1036,6 +1102,10 @@ fn padded_filename_len(len: usize, padding: FscryptFilenamePadding) -> Result<us
 }
 
 /// Requires an exact serialized structure length.
+/// # Errors
+///
+/// Returns an error when `bytes` is shorter or longer than the expected serialized fscrypt
+/// structure.
 fn require_exact_len(bytes: &[u8], expected: usize) -> Result<()> {
     match bytes.len().cmp(&expected) {
         core::cmp::Ordering::Less => Err(Error::TruncatedStructure),
@@ -1045,11 +1115,18 @@ fn require_exact_len(bytes: &[u8], expected: usize) -> Result<()> {
 }
 
 /// Reads one byte from a checked offset.
+/// # Errors
+///
+/// Returns an error when `offset` is outside the serialized fscrypt structure.
 fn byte(bytes: &[u8], offset: usize) -> Result<u8> {
     bytes.get(offset).copied().ok_or(Error::TruncatedStructure)
 }
 
 /// Copies a fixed byte array from a checked offset.
+/// # Errors
+///
+/// Returns an error when the fixed-width field overflows or is outside the serialized fscrypt
+/// structure.
 fn fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
     let end = offset.checked_add(N).ok_or(Error::ArithmeticOverflow)?;
     let slice = bytes.get(offset..end).ok_or(Error::TruncatedStructure)?;
@@ -1124,6 +1201,9 @@ mod tests {
         };
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_v2_policy_parses_supported_aes_profile() {
         let policy = valid_policy_bytes();
@@ -1142,6 +1222,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_v2_context_parses_nonce_and_policy() {
         let mut context = [0_u8; FSCRYPT_CONTEXT_V2_BYTES];
@@ -1157,6 +1240,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_v2_context_serializes_linux_layout() {
         let parsed = must!(FscryptContextV2::parse(&valid_context_bytes()));
@@ -1169,6 +1255,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_v2_context_rejects_unsupported_features() {
         let mut unsupported_contents = valid_context_bytes();
@@ -1200,6 +1289,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_v2_context_rejects_wrong_size_and_reserved_bytes() {
         let context = valid_context_bytes();
@@ -1223,6 +1315,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_master_key_derives_identifier_and_per_file_keys() {
         let master_key = must!(FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY));
@@ -1239,6 +1334,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_master_key_rejects_invalid_raw_key_sizes() {
         assert_eq!(
@@ -1251,6 +1349,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_key_set_is_sorted_unique_by_identifier() {
         let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
@@ -1268,6 +1369,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_key_set_rejects_duplicate_identifiers() {
         let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
@@ -1279,6 +1383,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_key_set_insert_and_remove_update_mount_state() {
         let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
@@ -1295,6 +1402,9 @@ mod tests {
         assert!(set.remove(identifier).is_none());
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_filename_key_encrypts_and_decrypts_padded_name() {
         let master_key = must!(FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY));
@@ -1307,6 +1417,9 @@ mod tests {
         assert_eq!(must!(key.decrypt_filename(&ciphertext)), b"secret.txt");
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_nokey_name_roundtrips_ciphertext_with_windows_safe_bytes() {
         let ciphertext = b"\x00\xff/opaque encrypted name";
@@ -1326,6 +1439,9 @@ mod tests {
         assert_eq!(FscryptNoKeyName::from_display(b"plain"), Ok(None));
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_nokey_name_rejects_noncanonical_display() {
         assert_eq!(

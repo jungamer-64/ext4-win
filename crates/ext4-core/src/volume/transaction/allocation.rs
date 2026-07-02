@@ -4,6 +4,10 @@ use super::*;
 
 impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Allocates the first free allocation cluster visible in group bitmaps.
+    /// # Errors
+    ///
+    /// Returns an error when no full free cluster is available, bitmap state conflicts with staged
+    /// references, or cluster/group accounting cannot be updated.
     pub(super) fn allocate_cluster(&mut self) -> Result<BlockAddress> {
         let groups = self.volume.superblock.block_group_count()?;
         for group in 0..groups.as_u32() {
@@ -67,6 +71,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Stages zeroes for every block covered by a newly allocated cluster.
+    /// # Errors
+    ///
+    /// Returns an error when the cluster range or zero-fill byte count cannot be represented.
     pub(super) fn stage_cluster_zeroes(&mut self, cluster: ClusterAddress) -> Result<()> {
         let first_block = self.volume.superblock.first_block_of_cluster(cluster)?;
         let blocks = self.volume.superblock.blocks_in_cluster(cluster)?;
@@ -84,6 +91,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Records one staged cluster-reference delta after checking underflow.
+    /// # Errors
+    ///
+    /// Returns an error when the delta overflows or would make the staged reference count negative.
     pub(super) fn record_cluster_reference_delta(
         &mut self,
         cluster: ClusterAddress,
@@ -113,6 +123,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns mounted plus staged references for one cluster.
+    /// # Errors
+    ///
+    /// Returns an error when mounted or staged reference counts cannot be represented as signed
+    /// arithmetic.
     pub(super) fn staged_cluster_reference_count(&self, cluster: ClusterAddress) -> Result<i32> {
         let mut count = i32::try_from(self.volume.state.clusters.count(cluster))
             .map_err(|_| Error::ArithmeticOverflow)?;
@@ -129,6 +143,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Releases a block-owned cluster reference and frees the cluster if no references remain.
+    /// # Errors
+    ///
+    /// Returns an error when `block` cannot be mapped to a cluster or releasing it would underflow
+    /// the staged reference count.
     pub(super) fn release_cluster_reference(&mut self, block: BlockAddress) -> Result<()> {
         let cluster = self.volume.superblock.cluster_of_block(block)?;
         self.record_cluster_reference_delta(cluster, -1)?;
@@ -139,6 +157,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Clears one cluster bitmap bit and records the affected accounting deltas.
+    /// # Errors
+    ///
+    /// Returns an error when the cluster is not currently allocated, its bitmap cannot be staged, or
+    /// free-cluster counters overflow.
     pub(super) fn free_cluster(&mut self, cluster: ClusterAddress) -> Result<()> {
         let position = ClusterBitmapPosition::from_cluster(&self.volume.superblock, cluster)?;
         let group = position.group();
@@ -160,6 +182,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Frees the suffix of an extent after `keep_len` blocks.
+    /// # Errors
+    ///
+    /// Returns an error when the suffix block range overflows or any released cluster reference is
+    /// inconsistent.
     pub(super) fn free_extent(&mut self, extent: Extent, keep_len: u16) -> Result<()> {
         let start = u64::from(keep_len);
         let len = extent.len().as_u64();
@@ -186,6 +212,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Allocates the first non-reserved inode visible in inode bitmaps.
+    /// # Errors
+    ///
+    /// Returns an error when no free non-reserved inode exists, inode bitmap staging fails, or free
+    /// inode counters cannot be updated.
     pub(super) fn allocate_inode(&mut self) -> Result<AllocatedInodeRecord> {
         let groups = self.volume.superblock.block_group_count()?;
         for group in 0..groups.as_u32() {
@@ -227,6 +257,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Marks an inode free and records its group allocation delta.
+    /// # Errors
+    ///
+    /// Returns an error when `inode_id` is the root inode, cannot be mapped to a bitmap bit, or the
+    /// free-inode delta overflows.
     pub(super) fn free_inode(&mut self, inode_id: InodeId) -> Result<()> {
         if inode_id == InodeId::ROOT {
             return Err(Error::CannotRemoveRoot);
@@ -248,6 +282,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns the staged block bitmap index, loading it once when needed.
+    /// # Errors
+    ///
+    /// Returns an error when the bitmap block cannot be read or its staged vector index cannot be
+    /// represented.
     pub(super) fn ensure_block_bitmap_update(
         &mut self,
         bitmap_block: BlockAddress,
@@ -282,6 +320,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns the staged inode bitmap index, loading it once when needed.
+    /// # Errors
+    ///
+    /// Returns an error when the inode bitmap block cannot be read or its staged vector index cannot
+    /// be represented.
     pub(super) fn ensure_inode_bitmap_update(
         &mut self,
         bitmap_block: BlockAddress,
@@ -316,6 +358,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns the inode count actually present in a possibly partial group.
+    /// # Errors
+    ///
+    /// Returns an error when group inode arithmetic overflows or the group starts past the inode
+    /// count.
     pub(super) fn inodes_in_group(&self, group: BlockGroupId) -> Result<u32> {
         let group_start = u64::from(group.as_u32())
             .checked_mul(u64::from(
@@ -332,6 +378,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Creates a zeroed inode record at the allocated inode's device offset.
+    /// # Errors
+    ///
+    /// Returns an error when `inode_id` cannot be mapped to an inode-table offset.
     pub(super) fn empty_allocated_inode_record(
         &self,
         inode_id: InodeId,
@@ -345,6 +394,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Returns the mutable delta accumulator for a block group.
+    /// # Errors
+    ///
+    /// Returns an error when the newly inserted group delta cannot be recovered from the staging
+    /// vector.
     pub(super) fn group_delta_mut(&mut self, group: BlockGroupId) -> Result<&mut GroupDelta> {
         if let Some(index) = self
             .group_deltas
@@ -361,6 +414,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Records a free-cluster count delta for one block group.
+    /// # Errors
+    ///
+    /// Returns an error when the group free-cluster delta exceeds the checked counter range.
     pub(super) fn record_group_free_clusters_delta(
         &mut self,
         group: BlockGroupId,
@@ -372,6 +428,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Records a free-inode count delta for one block group and the superblock.
+    /// # Errors
+    ///
+    /// Returns an error when the group or superblock free-inode delta exceeds the checked counter
+    /// range.
     pub(super) fn record_group_free_inodes_delta(
         &mut self,
         group: BlockGroupId,
@@ -390,6 +450,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Records a used-directory count delta for one block group.
+    /// # Errors
+    ///
+    /// Returns an error when the used-directory delta exceeds the checked group counter range.
     pub(super) fn record_group_used_dirs_delta(
         &mut self,
         group: BlockGroupId,

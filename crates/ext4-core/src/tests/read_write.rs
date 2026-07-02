@@ -1,5 +1,8 @@
 use super::*;
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn sparse_file_reads_zeroes_for_holes() {
     let image = fixture_image();
@@ -16,6 +19,9 @@ fn sparse_file_reads_zeroes_for_holes() {
     assert_eq!(output[1029], 0);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn uninitialized_extent_reads_as_zeroes() {
     let mut image = fixture_image();
@@ -31,6 +37,9 @@ fn uninitialized_extent_reads_as_zeroes() {
     assert_eq!(output, [0, 0, 0, 0, 0]);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn extent_hole_mapping_is_explicit() {
     let mut raw = [0_u8; 60];
@@ -49,6 +58,9 @@ fn extent_hole_mapping_is_explicit() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn sparse_hole_write_allocates_block() {
     let mut image = modern_fixture_image();
@@ -66,6 +78,9 @@ fn sparse_hole_write_allocates_block() {
     assert_eq!(&output, b"hole");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -128,6 +143,9 @@ fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
     assert_eq!(output, [b'x']);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn mutable_extent_tree_serializes_depth_two_indexes() {
     let block_size = must(BlockSize::from_superblock_log(0));
@@ -163,6 +181,9 @@ fn mutable_extent_tree_serializes_depth_two_indexes() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn external_extent_block_checksum_mismatch_is_rejected() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -203,6 +224,9 @@ fn external_extent_block_checksum_mismatch_is_rejected() {
     assert_eq!(result, Err(Error::ChecksumMismatch));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn uninitialized_extent_write_is_rejected() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -217,6 +241,9 @@ fn uninitialized_extent_write_is_rejected() {
     assert_eq!(result, Err(Error::UnsupportedInodeMutation));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn inode_protection_flags_are_typed_before_mutation_policy() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -238,6 +265,9 @@ fn inode_protection_flags_are_typed_before_mutation_policy() {
     assert_eq!(result, Err(Error::MissingEncryptionKey));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn extend_file_creates_sparse_range() {
     let mut image = modern_fixture_image();
@@ -257,6 +287,9 @@ fn extend_file_creates_sparse_range() {
     assert_eq!(output, [0, 0, 0, 0]);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn minimal_profile_rejects_file_size_beyond_large_file_boundary() {
     let mut image = minimal_write_fixture_image();
@@ -270,6 +303,9 @@ fn minimal_profile_rejects_file_size_beyond_large_file_boundary() {
     assert_eq!(result, Err(Error::UnsupportedInodeMutation));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn truncate_file_releases_blocks() {
     let mut image = modern_fixture_image();
@@ -288,6 +324,9 @@ fn truncate_file_releases_blocks() {
     assert_eq!(file.size().bytes(), 0);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn transaction_too_large_is_rejected_before_writes() {
     let mut image = modern_fixture_image_with_journal_blocks(3);
@@ -302,6 +341,9 @@ fn transaction_too_large_is_rejected_before_writes() {
     assert!(matches!(result, Err(Error::TransactionTooLarge)));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn inode_security_is_parsed_from_owner_and_mode() {
     let image = modern_fixture_image();
@@ -314,6 +356,9 @@ fn inode_security_is_parsed_from_owner_and_mode() {
     assert_eq!(file.security().permissions().as_u16(), 0o444);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn inode_times_are_parsed_from_inode_fields() {
     let mut image = modern_fixture_image();
@@ -338,6 +383,9 @@ fn inode_times_are_parsed_from_inode_fields() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn set_posix_security_updates_owner_and_permissions() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -371,6 +419,9 @@ fn set_posix_security_updates_owner_and_permissions() {
     assert_eq!(get_u16(&image, inode_offset + 122), 4);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn set_times_updates_inode_timestamp_fields() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -398,6 +449,9 @@ fn set_times_updates_inode_timestamp_fields() {
     assert_eq!(get_u32(&image, inode_offset + 144), 44);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn minimal_profile_does_not_write_extra_inode_timestamp_fields() {
     let mut image = minimal_write_fixture_image();
@@ -426,6 +480,9 @@ fn minimal_profile_does_not_write_extra_inode_timestamp_fields() {
     assert_eq!(get_u32(&image, inode_offset + 144), 0);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn volume_label_round_trips_through_superblock() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -450,6 +507,9 @@ fn volume_label_round_trips_through_superblock() {
     assert_eq!(volume.identity().label().bytes(), b"EXT4WIN");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn volume_label_rejects_unrepresentable_bytes() {
     assert_eq!(
@@ -459,6 +519,9 @@ fn volume_label_rejects_unrepresentable_bytes() {
     assert_eq!(Ext4VolumeLabel::new(b"bad\0label"), Err(Error::InvalidName));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn bad_tag_checksum_transaction_is_rejected() {
     let mut image = modern_fixture_image();
@@ -476,6 +539,9 @@ fn bad_tag_checksum_transaction_is_rejected() {
     assert_ne!(get_u32(&image, 1024 + 96) & INCOMPAT_RECOVER, 0);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn extent_depth_traversal_reads_index_block() {
     let mut image = modern_fixture_image();

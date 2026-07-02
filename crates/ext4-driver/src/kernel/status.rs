@@ -169,6 +169,9 @@ mod tests {
 
     use super::DriverError;
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn core_namespace_errors_map_to_name_statuses() {
         assert_eq!(
@@ -185,6 +188,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn core_space_and_mount_errors_map_to_fsd_statuses() {
         assert_eq!(
@@ -205,6 +211,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn corrupt_and_bad_request_errors_remain_separate() {
         assert_eq!(

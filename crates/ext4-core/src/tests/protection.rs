@@ -1,5 +1,8 @@
 use super::*;
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn read_only_mount_accepts_encryption_and_verity_feature_bits() {
     let mut image = fixture_image();
@@ -13,6 +16,9 @@ fn read_only_mount_accepts_encryption_and_verity_feature_bits() {
     assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 4);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn private_fscrypt_context_is_not_public_xattr() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -32,6 +38,9 @@ fn private_fscrypt_context_is_not_public_xattr() {
     assert_eq!(must(volume.read_xattrs(file)).entries().len(), 0);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn public_xattr_update_preserves_private_fscrypt_context() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -63,6 +72,9 @@ fn public_xattr_update_preserves_private_fscrypt_context() {
     assert_eq!(must(volume.read_xattrs(file)).entries().len(), 1);
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_file_read_requires_mount_key() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -82,6 +94,9 @@ fn encrypted_file_read_requires_mount_key() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_file_read_with_key_decrypts_plaintext() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -104,6 +119,9 @@ fn encrypted_file_read_with_key_decrypts_plaintext() {
     assert_eq!(&output, b"hello");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_file_overwrite_roundtrips_ciphertext() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -135,6 +153,9 @@ fn encrypted_file_overwrite_roundtrips_ciphertext() {
     assert_eq!(&output, b"hELlo");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_truncate_zeroes_plaintext_tail() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -169,6 +190,9 @@ fn encrypted_truncate_zeroes_plaintext_tail() {
     assert_eq!(&output, b"hel\0\0");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn verity_file_read_verifies_post_eof_metadata() {
     let image = verity_fixture_image();
@@ -187,6 +211,9 @@ fn verity_file_read_verifies_post_eof_metadata() {
     assert_eq!(&output, b"hello");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn verity_file_read_rejects_corruption() {
     let mut corrupt_data = verity_fixture_image();
@@ -215,6 +242,9 @@ fn verity_file_read_rejects_corruption() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn enable_verity_commits_metadata_and_remount_verifies() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -255,6 +285,9 @@ fn enable_verity_commits_metadata_and_remount_verifies() {
     assert_eq!(&output, b"hello");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_enable_verity_remount_verifies_after_decrypt() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -301,6 +334,9 @@ fn encrypted_enable_verity_remount_verifies_after_decrypt() {
     assert_eq!(&output, b"hello");
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_directory_create_requires_mount_key() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -319,6 +355,9 @@ fn encrypted_directory_create_requires_mount_key() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_directory_read_projects_names_when_key_is_present() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -349,6 +388,9 @@ fn encrypted_directory_read_projects_names_when_key_is_present() {
     assert!(entries.iter().any(|entry| entry.name().bytes() == b"file"));
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_directory_windows_lookup_encrypts_requested_name() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -377,6 +419,9 @@ fn encrypted_directory_windows_lookup_encrypts_requested_name() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_directory_encoded_lookup_does_not_require_mount_key() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -398,6 +443,9 @@ fn encrypted_directory_encoded_lookup_does_not_require_mount_key() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -465,6 +513,9 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_directory_create_directory_inherits_child_context_when_key_is_present() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -525,6 +576,9 @@ fn encrypted_directory_create_directory_inherits_child_context_when_key_is_prese
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_directory_create_symlink_rejects_plaintext_target() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -547,6 +601,9 @@ fn encrypted_directory_create_symlink_rejects_plaintext_target() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
@@ -598,6 +655,9 @@ fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
     );
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn encrypted_directory_encoded_delete_does_not_require_mount_key() {
     let mut image = modern_fixture_image_with_journal_blocks(16);

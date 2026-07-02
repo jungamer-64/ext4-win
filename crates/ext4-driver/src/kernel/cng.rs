@@ -31,6 +31,9 @@ impl FscryptNonceGenerator for CngFscryptNonceGenerator {
 }
 
 /// Fills a kernel buffer from CNG's system-preferred RNG.
+/// # Errors
+///
+/// Returns an error when `out.len()` exceeds CNG's `u32` buffer length or `BCryptGenRandom` fails.
 fn fill_random(out: &mut [u8]) -> Ext4Result<()> {
     let buffer_len = u32::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?;
     let status = unsafe {
@@ -48,6 +51,9 @@ fn fill_random(out: &mut [u8]) -> Ext4Result<()> {
 }
 
 /// Converts CNG NTSTATUS values into the ext4-core failure domain.
+/// # Errors
+///
+/// Returns an error when `status` is not a successful CNG NTSTATUS value.
 fn cng_status_to_core(status: NTSTATUS) -> Ext4Result<()> {
     if NT_SUCCESS(status) {
         Ok(())
@@ -63,6 +69,9 @@ mod tests {
 
     use super::cng_status_to_core;
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn cng_status_mapping_preserves_success_and_io_failure() {
         assert_eq!(cng_status_to_core(STATUS_SUCCESS), Ok(()));

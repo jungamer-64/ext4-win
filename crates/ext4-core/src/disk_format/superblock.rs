@@ -138,7 +138,7 @@ impl InodeCount {
     /// Creates an inode count.
     ///
     /// # Errors
-    /// Returns an error when the count is zero.
+    /// Returns an error when the filesystem inode count is zero.
     pub fn new(value: u32) -> Result<Self> {
         if value == 0 {
             Err(Error::InvalidSuperblock)
@@ -162,7 +162,7 @@ impl BlockCount {
     /// Creates a block count.
     ///
     /// # Errors
-    /// Returns an error when the count is zero.
+    /// Returns an error when the filesystem block count is zero.
     pub fn new(value: u64) -> Result<Self> {
         if value == 0 {
             Err(Error::InvalidSuperblock)
@@ -204,7 +204,7 @@ impl ClusterCount {
     /// Creates a cluster count.
     ///
     /// # Errors
-    /// Returns an error when the count is zero.
+    /// Returns an error when the allocation cluster count is zero.
     pub fn new(value: u64) -> Result<Self> {
         if value == 0 {
             Err(Error::InvalidClusterGeometry)
@@ -228,7 +228,7 @@ impl ClusterSize {
     /// Creates a cluster size from validated superblock geometry.
     ///
     /// # Errors
-    /// Returns an error when the size is zero.
+    /// Returns an error when the allocation cluster size is zero.
     pub fn new(value: u32) -> Result<Self> {
         if value == 0 {
             Err(Error::InvalidClusterGeometry)
@@ -252,7 +252,7 @@ impl BlocksPerCluster {
     /// Creates a blocks-per-cluster value.
     ///
     /// # Errors
-    /// Returns an error when the value is zero.
+    /// Returns an error when the block-to-cluster ratio is zero.
     pub fn new(value: u32) -> Result<Self> {
         if value == 0 {
             Err(Error::InvalidClusterGeometry)
@@ -276,7 +276,7 @@ impl ClustersPerGroup {
     /// Creates a clusters-per-group value.
     ///
     /// # Errors
-    /// Returns an error when the value is zero.
+    /// Returns an error when the allocation clusters-per-group value is zero.
     pub fn new(value: u32) -> Result<Self> {
         if value == 0 {
             Err(Error::InvalidClusterGeometry)
@@ -367,7 +367,7 @@ impl BlocksPerGroup {
     /// Creates a blocks-per-group value.
     ///
     /// # Errors
-    /// Returns an error when the value is zero.
+    /// Returns an error when the block group block count is zero.
     pub fn new(value: u32) -> Result<Self> {
         if value == 0 {
             Err(Error::InvalidSuperblock)
@@ -391,7 +391,7 @@ impl InodesPerGroup {
     /// Creates an inodes-per-group value.
     ///
     /// # Errors
-    /// Returns an error when the value is zero.
+    /// Returns an error when the block group inode count is zero.
     pub fn new(value: u32) -> Result<Self> {
         if value == 0 {
             Err(Error::InvalidSuperblock)
@@ -559,6 +559,10 @@ impl Ext4VolumeLabel {
     }
 
     /// Parses the fixed superblock label field.
+    /// # Errors
+    ///
+    /// Returns an error when the fixed label field is truncated or the decoded bytes violate volume
+    /// label rules.
     pub(crate) fn parse(raw: &[u8]) -> Result<Self> {
         let field = raw
             .get(VOLUME_LABEL_OFFSET..VOLUME_LABEL_OFFSET + VOLUME_LABEL_BYTES)
@@ -571,6 +575,10 @@ impl Ext4VolumeLabel {
     }
 
     /// Writes this label to the fixed superblock label field.
+    /// # Errors
+    ///
+    /// Returns an error when the fixed label field is truncated or this label's stored length is
+    /// inconsistent with its bytes.
     pub(crate) fn write_to(self, raw: &mut [u8]) -> Result<()> {
         let field = raw
             .get_mut(VOLUME_LABEL_OFFSET..VOLUME_LABEL_OFFSET + VOLUME_LABEL_BYTES)
@@ -656,6 +664,10 @@ pub(crate) enum DirectoryHashByteInterpretation {
 
 impl DirectoryHashVersion {
     /// Converts the on-disk version byte to a supported hash version.
+    /// # Errors
+    ///
+    /// Returns an error when the version byte is not one of the ext4 hash algorithms supported by
+    /// this mount profile.
     pub(crate) fn from_raw(raw: u8) -> Result<Self> {
         match raw {
             0 => Ok(Self::Legacy),
@@ -785,6 +797,10 @@ struct RawClusterGeometry {
 
 impl ClusterGeometry {
     /// Validates cluster fields against feature flags and block geometry.
+    /// # Errors
+    ///
+    /// Returns an error when block and cluster feature bits disagree, cluster ratios are invalid, or
+    /// derived cluster counts overflow.
     fn new(raw: RawClusterGeometry) -> Result<Self> {
         match raw.allocation_bitmap_domain {
             AllocationBitmapDomain::Blocks => {
@@ -882,6 +898,9 @@ pub(crate) enum DirectoryIndexing {
 
 impl DirectoryIndexing {
     /// Verifies that an indexed directory can be interpreted.
+    /// # Errors
+    ///
+    /// Returns an error when the mounted feature policy disables HTree directory indexing.
     pub(crate) const fn require_supported(self) -> Result<()> {
         match self {
             Self::Enabled => Ok(()),
@@ -912,6 +931,9 @@ pub(crate) enum ChecksumSeedSource {
 
 impl ChecksumSeedSource {
     /// Reads or derives the checksum seed selected by this source.
+    /// # Errors
+    ///
+    /// Returns an error when the explicit checksum seed field is selected but truncated.
     fn seed(self, raw: &[u8], uuid: &[u8; 16]) -> Result<ChecksumSeed> {
         match self {
             Self::Zero => Ok(ChecksumSeed::from_u32(0)),
@@ -932,6 +954,9 @@ pub(crate) enum XattrMutationSupport {
 
 impl XattrMutationSupport {
     /// Verifies that xattr mutation is supported.
+    /// # Errors
+    ///
+    /// Returns an error when the mounted feature policy disables public xattr mutation.
     pub(crate) const fn require_supported(self) -> Result<()> {
         match self {
             Self::Enabled => Ok(()),
@@ -951,6 +976,9 @@ pub(crate) enum FileSizeEncoding {
 
 impl FileSizeEncoding {
     /// Verifies that `bytes` can be encoded by this profile.
+    /// # Errors
+    ///
+    /// Returns an error when the legacy inode size profile is active and `bytes` exceeds its limit.
     pub(crate) const fn require_supported(self, bytes: u64, legacy_limit: u64) -> Result<()> {
         match self {
             Self::LargeFile => Ok(()),
@@ -976,6 +1004,10 @@ pub(crate) enum InodeBlockCountEncoding {
 
 impl InodeBlockCountEncoding {
     /// Verifies that `sectors` can be encoded by this profile.
+    /// # Errors
+    ///
+    /// Returns an error when the legacy inode block-count profile is active and `sectors` exceeds
+    /// its limit.
     pub(crate) const fn require_supported(self, sectors: u64, legacy_limit: u64) -> Result<()> {
         match self {
             Self::HugeFile => Ok(()),
@@ -1387,6 +1419,10 @@ impl Superblock {
     }
 
     /// Parses a raw superblock with the supplied feature validation policy.
+    /// # Errors
+    ///
+    /// Returns an error when the payload is truncated, has invalid magic or dirty state, fails the
+    /// feature policy, contains invalid geometry, or carries an invalid checksum/journal/hash field.
     fn parse_with_policy(
         raw: &[u8],
         validate_features: fn(u32, u32, u32) -> Result<FeatureSet>,
@@ -1717,6 +1753,9 @@ impl Superblock {
     }
 
     /// Recomputes the primary superblock checksum when the on-disk checksum is present.
+    /// # Errors
+    ///
+    /// Returns an error when the checksum field cannot be read, zeroed, or rewritten.
     pub(crate) fn refresh_checksum(raw: &mut [u8]) -> Result<()> {
         if le_u32(raw, disk_offset(1020))? == 0 {
             return Ok(());
@@ -1742,6 +1781,10 @@ impl Superblock {
     }
 
     /// Returns the allocation cluster containing a physical block.
+    /// # Errors
+    ///
+    /// Returns an error when `block` is outside the filesystem data range or division by the
+    /// validated blocks-per-cluster value fails.
     pub(crate) fn cluster_of_block(self, block: BlockAddress) -> Result<ClusterAddress> {
         if block.get() >= self.block_count.as_u64() {
             return Err(Error::InvalidClusterGeometry);
@@ -1760,6 +1803,10 @@ impl Superblock {
     }
 
     /// Returns the first block covered by an allocation cluster.
+    /// # Errors
+    ///
+    /// Returns an error when `cluster` is outside the filesystem or translating it to a block number
+    /// overflows.
     pub(crate) fn first_block_of_cluster(self, cluster: ClusterAddress) -> Result<BlockAddress> {
         if cluster.get() >= self.cluster_count.as_u64() {
             return Err(Error::InvalidClusterGeometry);
@@ -1778,6 +1825,9 @@ impl Superblock {
     }
 
     /// Returns the number of physical blocks present in a cluster.
+    /// # Errors
+    ///
+    /// Returns an error when the cluster start is invalid or lies beyond the validated block count.
     pub(crate) fn blocks_in_cluster(self, cluster: ClusterAddress) -> Result<u32> {
         let start = self.first_block_of_cluster(cluster)?.get();
         let remaining = self
@@ -1792,6 +1842,10 @@ impl Superblock {
     }
 
     /// Returns the block group containing an allocation cluster.
+    /// # Errors
+    ///
+    /// Returns an error when `cluster` is outside the filesystem or the derived group number exceeds
+    /// the on-disk `u32` range.
     pub(crate) fn cluster_group_of(self, cluster: ClusterAddress) -> Result<BlockGroupId> {
         if cluster.get() >= self.cluster_count.as_u64() {
             return Err(Error::InvalidClusterGeometry);
@@ -1806,6 +1860,10 @@ impl Superblock {
     }
 
     /// Returns the group-local bitmap bit for an allocation cluster.
+    /// # Errors
+    ///
+    /// Returns an error when the group start overflows, `cluster` precedes the group, or the derived
+    /// bit is outside the group's bitmap domain.
     pub(crate) fn cluster_bit_in_group(
         self,
         cluster: ClusterAddress,
@@ -1825,6 +1883,10 @@ impl Superblock {
     }
 
     /// Returns the allocation cluster count present in a possibly partial group.
+    /// # Errors
+    ///
+    /// Returns an error when the group start overflows or the group begins beyond the validated
+    /// cluster count.
     pub(crate) fn clusters_in_group(self, group: BlockGroupId) -> Result<u32> {
         let group_start = u64::from(group.as_u32())
             .checked_mul(u64::from(self.clusters_per_group.as_u32()))
@@ -1841,6 +1903,10 @@ impl Superblock {
     }
 
     /// Applies a committed free-cluster delta to the mounted superblock image.
+    /// # Errors
+    ///
+    /// Returns an error when the delta underflows or overflows the free-cluster count, or the result
+    /// exceeds the mounted cluster count.
     pub(crate) fn apply_free_cluster_delta(&mut self, delta: FreeClusterDelta) -> Result<()> {
         let raw_delta = delta.as_i64();
         let updated = if raw_delta.is_negative() {
@@ -1863,6 +1929,9 @@ impl Superblock {
 }
 
 /// Divides with upward rounding and overflow checking.
+/// # Errors
+///
+/// Returns an error when the divisor is zero or the rounded addition overflows.
 fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
     if divisor == 0 {
         return Err(Error::InvalidClusterGeometry);

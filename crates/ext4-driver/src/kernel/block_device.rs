@@ -26,6 +26,10 @@ struct DiskLengthInformation {
 }
 
 /// Queries the byte length of a lower storage device.
+/// # Errors
+///
+/// Returns an error when the length-query IRP cannot be built or completed, reports the wrong
+/// output size, or returns a non-positive device length.
 pub(crate) fn query_device_length(device: KernelDevice) -> Result<DeviceLength> {
     let mut event = KEVENT::default();
     let mut io_status = IO_STATUS_BLOCK::default();
@@ -56,6 +60,10 @@ pub(crate) fn query_device_length(device: KernelDevice) -> Result<DeviceLength> 
 }
 
 /// Converts disk length query output into the core device-length domain.
+/// # Errors
+///
+/// Returns an error when the reported disk length is negative, zero, or outside the core length
+/// domain.
 fn device_length_from_information(length: DiskLengthInformation) -> Result<DeviceLength> {
     let bytes = u64::try_from(length.length).map_err(|_| Error::DeviceRange)?;
     if bytes == 0 {
@@ -80,6 +88,10 @@ impl KernelBlockDevice {
     }
 
     /// Validates a byte range before it crosses into the I/O Manager.
+    /// # Errors
+    ///
+    /// Returns an error when the request length is not representable or `offset + len` exceeds the
+    /// mounted device length.
     fn validate_range(self, offset: ByteOffset, len: usize) -> Result<()> {
         let request_len = u64::try_from(len).map_err(|_| Error::DeviceRange)?;
         let end = offset
@@ -93,6 +105,10 @@ impl KernelBlockDevice {
     }
 
     /// Sends a synchronous read or write IRP to the lower storage device.
+    /// # Errors
+    ///
+    /// Returns an error when the byte range, transfer length, starting offset, or lower-device IRP
+    /// completion is invalid.
     fn transfer(
         self,
         major_function: wdk_sys::ULONG,
@@ -121,6 +137,9 @@ impl KernelBlockDevice {
     }
 
     /// Sends a synchronous flush IRP to the lower storage device.
+    /// # Errors
+    ///
+    /// Returns an error when the lower-device flush IRP cannot be built or completed successfully.
     fn flush_lower_device(self) -> Result<()> {
         self.send_synchronous_request(
             IRP_MJ_FLUSH_BUFFERS,
@@ -131,6 +150,10 @@ impl KernelBlockDevice {
     }
 
     /// Builds, submits, waits for, and validates a synchronous lower-device IRP.
+    /// # Errors
+    ///
+    /// Returns an error when IRP allocation fails, submission or completion reports a failing
+    /// NTSTATUS, or the completed byte count differs from `request_length`.
     fn send_synchronous_request(
         self,
         major_function: wdk_sys::ULONG,
@@ -209,6 +232,10 @@ fn initialize_notification_event(event: &mut KEVENT) {
 }
 
 /// Submits an already-built synchronous IRP and waits for completion.
+/// # Errors
+///
+/// Returns an error when the IRP pointer is null, dispatch or wait returns a failing NTSTATUS, or
+/// the IOSB completion status is failing.
 fn submit_synchronous_irp(
     device: KernelDevice,
     irp: PIRP,
@@ -248,6 +275,9 @@ fn submit_synchronous_irp(
 }
 
 /// Requires a lower-device request to report the expected transfer size.
+/// # Errors
+///
+/// Returns an error when `IO_STATUS_BLOCK::Information` does not equal the expected byte count.
 fn ensure_expected_information(
     information: wdk_sys::ULONG_PTR,
     expected: wdk_sys::ULONG,
@@ -259,6 +289,9 @@ fn ensure_expected_information(
 }
 
 /// Rejects failing NTSTATUS values.
+/// # Errors
+///
+/// Returns an error when `status` is below `STATUS_SUCCESS`.
 fn ensure_nt_success(status: NTSTATUS) -> Result<()> {
     if status < STATUS_SUCCESS {
         return Err(Error::DeviceIo);
@@ -285,6 +318,9 @@ mod tests {
     use super::{DiskLengthInformation, KernelBlockDevice, device_length_from_information};
     use crate::state::KernelDevice;
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn kernel_block_device_preserves_device_and_length() {
         let raw = NonNull::<c_void>::dangling().as_ptr().cast();
@@ -300,6 +336,9 @@ mod tests {
         assert_eq!(block_device.device.as_ptr(), raw);
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn kernel_block_device_rejects_out_of_range_request_before_ffi() {
         let raw = NonNull::<c_void>::dangling().as_ptr().cast();
@@ -317,6 +356,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn disk_length_information_rejects_non_positive_lengths() {
         assert_eq!(
@@ -329,6 +371,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn disk_length_information_preserves_positive_length() {
         let length = device_length_from_information(DiskLengthInformation { length: 4096 });

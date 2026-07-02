@@ -11,6 +11,9 @@ fn default_owner() -> Ext4Owner {
 }
 
 /// Default metadata for Windows-created regular files.
+/// # Errors
+///
+/// Returns an error when the default `0644` mode cannot be represented as ext4 permissions.
 pub(crate) fn default_file_metadata() -> Result<NewFileMetadata> {
     Ok(NewFileMetadata::new(
         default_owner(),
@@ -19,6 +22,9 @@ pub(crate) fn default_file_metadata() -> Result<NewFileMetadata> {
 }
 
 /// Default metadata for Windows-created directories.
+/// # Errors
+///
+/// Returns an error when the default `0755` mode cannot be represented as ext4 permissions.
 pub(crate) fn default_directory_metadata() -> Result<NewDirectoryMetadata> {
     Ok(NewDirectoryMetadata::new(
         default_owner(),
@@ -27,6 +33,9 @@ pub(crate) fn default_directory_metadata() -> Result<NewDirectoryMetadata> {
 }
 
 /// Default metadata for Windows-created symbolic links.
+/// # Errors
+///
+/// Returns an error when the default `0777` mode cannot be represented as ext4 permissions.
 pub(crate) fn default_symlink_metadata() -> Result<NewSymlinkMetadata> {
     Ok(NewSymlinkMetadata::new(
         default_owner(),

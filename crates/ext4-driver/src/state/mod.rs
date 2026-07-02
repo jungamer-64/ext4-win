@@ -77,6 +77,11 @@ impl KernelFileObject {
     }
 
     /// Returns an immutable WDK file object reference.
+    ///
+    /// # Safety
+    /// The returned reference must not outlive the active WDK callback that supplied this
+    /// FILE_OBJECT, and the caller must not mutate the object through another alias for that
+    /// lifetime.
     pub(crate) unsafe fn as_ref<'a>(self) -> &'a FILE_OBJECT {
         unsafe {
             // SAFETY: The caller ties the returned reference to the active WDK
@@ -86,6 +91,10 @@ impl KernelFileObject {
     }
 
     /// Returns a mutable WDK file object reference.
+    ///
+    /// # Safety
+    /// The caller must own the current mutation point for this FILE_OBJECT and ensure no other
+    /// FILE_OBJECT reference aliases the returned mutable reference.
     pub(crate) unsafe fn as_mut<'a>(mut self) -> &'a mut FILE_OBJECT {
         unsafe {
             // SAFETY: The caller owns the active mutation point for this
@@ -109,6 +118,9 @@ pub(crate) struct UninitializedFileObject {
 
 impl UninitializedFileObject {
     /// Decodes a create target whose FCB and CCB slots are both empty.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT already has filesystem-owned FCB or CCB context.
     pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
         let object = unsafe {
             // SAFETY: The FILE_OBJECT pointer comes from the active create
@@ -127,6 +139,10 @@ impl UninitializedFileObject {
     }
 
     /// Returns an immutable WDK FILE_OBJECT reference.
+    ///
+    /// # Safety
+    /// The returned reference must stay within the active create dispatch lifetime and must not
+    /// alias any concurrent mutable access to the FILE_OBJECT.
     pub(crate) unsafe fn as_ref<'a>(self) -> &'a FILE_OBJECT {
         unsafe {
             // SAFETY: The caller ties the returned reference to the active
@@ -136,6 +152,10 @@ impl UninitializedFileObject {
     }
 
     /// Returns a mutable WDK FILE_OBJECT reference.
+    ///
+    /// # Safety
+    /// The caller must hold the unique create attach point for this uninitialized FILE_OBJECT while
+    /// the returned mutable reference is alive.
     pub(crate) unsafe fn as_mut<'a>(self) -> &'a mut FILE_OBJECT {
         unsafe {
             // SAFETY: The caller owns the successful create attach point for
@@ -263,6 +283,9 @@ pub(crate) struct VolumeControlBlock {
 
 impl VolumeControlBlock {
     /// Mounts a journaled read-write ext4 VCB.
+    /// # Errors
+    ///
+    /// Returns an error when the lower device cannot be mounted as a journaled ext4 volume.
     pub(crate) fn mount_journaled(
         target_device: KernelDevice,
         length: DeviceLength,
@@ -305,6 +328,9 @@ impl VolumeControlBlock {
     }
 
     /// Adds one fscrypt master key to the mounted volume.
+    /// # Errors
+    ///
+    /// Returns an error when the mounted volume rejects the fscrypt master key.
     pub(crate) fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> Ext4Result<()> {
         self.volume.add_fscrypt_key(key)
     }
@@ -326,6 +352,9 @@ impl VolumeControlBlock {
     }
 
     /// Opens or reuses the VCB-owned FCB for a node.
+    /// # Errors
+    ///
+    /// Returns an error when an existing FCB's open-reference counter would overflow.
     pub(crate) fn open_file_control_block(
         mut volume: NonNull<Self>,
         node: NodeId,
@@ -442,6 +471,10 @@ pub(crate) struct MountedVolumeDevice {
 impl MountedVolumeDevice {
     /// Initializes an IoCreateDevice-created mounted device and takes ownership
     /// of the VCB.
+    /// # Errors
+    ///
+    /// Returns an error when the mounted DEVICE_OBJECT, device extension, or VPB initialization
+    /// target is absent or invalid.
     pub(crate) fn initialize(
         device: PDEVICE_OBJECT,
         vcb: Box<VolumeControlBlock>,
@@ -494,6 +527,10 @@ impl MountedVolumeDevice {
     }
 
     /// Initializes DEVICE_OBJECT and VPB fields after a successful core mount.
+    /// # Errors
+    ///
+    /// Returns an error when the mounted device object, lower-device stack size, or VPB mounted flag
+    /// cannot be represented.
     fn initialize_device_object(
         device: KernelDevice,
         mut vpb: NonNull<wdk_sys::VPB>,
@@ -526,6 +563,10 @@ impl MountedVolumeDevice {
     }
 
     /// Copies VCB-derived identity fields into the VPB.
+    /// # Errors
+    ///
+    /// Returns an error when the VPB pointer is no longer writable or the volume label does not fit
+    /// in the VPB label field.
     pub(crate) fn initialize_vpb_identity(
         vpb: NonNull<wdk_sys::VPB>,
         vcb: &VolumeControlBlock,
@@ -541,6 +582,10 @@ impl MountedVolumeDevice {
     }
 
     /// Refreshes the VPB volume label after a successful label mutation.
+    /// # Errors
+    ///
+    /// Returns an error when the mounted device or its VPB pointer is absent, or the ext4 label does
+    /// not fit in the VPB label field.
     pub(crate) fn refresh_vpb_label(
         device: KernelDevice,
         vcb: &VolumeControlBlock,
@@ -563,6 +608,10 @@ impl MountedVolumeDevice {
 
 /// Writes an ext4 label into the UTF-16 VPB label field using one code unit per
 /// ext4 label byte.
+/// # Errors
+///
+/// Returns an error when the ext4 label exceeds the VPB label capacity or the UTF-16 byte length
+/// cannot be represented by the VPB.
 fn write_vpb_label(vpb: &mut wdk_sys::VPB, label: ext4_core::Ext4VolumeLabel) -> DriverResult<()> {
     vpb.VolumeLabel.fill(0);
     let bytes = label.bytes();
@@ -626,6 +675,9 @@ impl FileControlBlock {
     }
 
     /// Checks and records one FILE_OBJECT's share-access claim.
+    /// # Errors
+    ///
+    /// Returns an error when the I/O Manager rejects the requested share-access claim.
     pub(crate) fn check_share_access(
         &mut self,
         file_object: KernelFileObject,
@@ -662,6 +714,9 @@ impl FileControlBlock {
     }
 
     /// Adds one FILE_OBJECT reference to an already-open FCB.
+    /// # Errors
+    ///
+    /// Returns an error when the FCB open-reference counter cannot be incremented.
     fn add_open_reference(&mut self) -> DriverResult<()> {
         let count = self
             .open_count
@@ -1120,6 +1175,10 @@ pub(crate) fn release_file_control_block(fcb: NonNull<FileControlBlock>) {
 }
 
 /// Driver unload callback registered in the driver object.
+///
+/// # Safety
+/// The I/O Manager must call this only as the registered unload routine for this driver object,
+/// after no dispatch callbacks can still use the control device being unregistered.
 pub(crate) unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {
     let control_device = core::ptr::addr_of_mut!(CONTROL_DEVICE);
     let device = unsafe {
@@ -1172,11 +1231,17 @@ mod tests {
         KernelFileObject::from_raw(core::ptr::addr_of_mut!(*file))
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn kernel_file_object_rejects_null_raw_pointer() {
         assert_eq!(KernelFileObject::from_raw(core::ptr::null_mut()), None);
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn opened_object_requires_both_contexts() {
         let mut file = file_object_with_contexts(core::ptr::null_mut(), core::ptr::null_mut());
@@ -1220,6 +1285,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn opened_object_rejects_mismatched_fcb_and_handle_kinds() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
@@ -1244,6 +1312,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn typed_opened_directory_exposes_cursor_without_option() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
@@ -1282,6 +1353,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn typed_opened_decoders_reject_wrong_node_kind() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
@@ -1311,6 +1385,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn opened_object_updates_close_disposition() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
@@ -1341,6 +1418,9 @@ mod tests {
         assert_eq!(opened.close_disposition(), CloseDisposition::Keep);
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn opened_object_symlink_conversion_updates_fcb_and_handle_together() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
@@ -1379,6 +1459,9 @@ mod tests {
         assert!(matches!(handle, OpenedHandle::Symlink(_)));
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn uninitialized_file_object_rejects_existing_contexts() {
         let mut file = file_object_with_contexts(core::ptr::null_mut(), core::ptr::null_mut());
@@ -1419,6 +1502,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_control_block_open_count_cannot_represent_zero() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
@@ -1438,6 +1524,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_control_block_open_count_overflow_is_typed() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
@@ -1451,6 +1540,9 @@ mod tests {
         assert_eq!(fcb.open_count, NonZeroU32::MAX);
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_control_block_starts_with_empty_share_access() {
         let volume = NonNull::<VolumeControlBlock>::dangling();

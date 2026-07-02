@@ -81,6 +81,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Reads an external xattr block, preferring this transaction's staged image.
+    /// # Errors
+    ///
+    /// Returns an error when `block` cannot be read from the mounted device or block-size arithmetic
+    /// cannot be represented.
     fn xattr_block_bytes(&self, block: BlockAddress) -> Result<Vec<u8>> {
         if let Some(staged) = self
             .xattr_updates
@@ -100,6 +104,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Reads all xattrs referenced by a staged live inode.
+    /// # Errors
+    ///
+    /// Returns an error when inline xattrs, the external block pointer, the external xattr block, or
+    /// merged xattr namespaces are malformed.
     pub(super) fn xattr_set_for_raw_inode(
         &self,
         raw_inode: &LiveInodeRecord,
@@ -119,6 +127,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Applies a mutation to an inode's complete xattr set.
+    /// # Errors
+    ///
+    /// Returns an error when xattr mutation is disabled, the inode cannot be staged, the existing
+    /// set is malformed, `update` fails, or the updated set cannot be stored.
     fn update_xattrs(
         &mut self,
         node: TransactionNode,
@@ -140,6 +152,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
 
     /// Stores a complete xattr set using inline storage when possible and one
     /// external xattr block otherwise.
+    /// # Errors
+    ///
+    /// Returns an error when inline storage cannot be cleared or written, external xattr references
+    /// cannot be released, or the set cannot fit supported xattr storage.
     pub(super) fn store_xattr_set(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
@@ -172,6 +188,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Stores a complete xattr set in a single external block.
+    /// # Errors
+    ///
+    /// Returns an error when the set exceeds one external block, shared-block refcounts cannot be
+    /// adjusted, a replacement block cannot be allocated, or serialization fails.
     fn store_external_xattr_set(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
@@ -209,6 +229,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Releases one inode reference to an external xattr block.
+    /// # Errors
+    ///
+    /// Returns an error when the block image or refcount is malformed, or the backing cluster
+    /// reference cannot be released.
     fn release_xattr_block_ref(&mut self, block: BlockAddress) -> Result<()> {
         let bytes = self.xattr_block_bytes(block)?;
         let refcount = xattr_storage::external_xattr_refcount(&bytes)?;
@@ -221,6 +245,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Decrements a shared external xattr block refcount.
+    /// # Errors
+    ///
+    /// Returns an error when the current refcount is zero or the updated refcount checksum cannot be
+    /// written.
     fn decrement_xattr_block_ref(
         &mut self,
         block: BlockAddress,

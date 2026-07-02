@@ -170,6 +170,9 @@ const fn disk_offset(offset: usize) -> DiskOffset {
 }
 
 /// Parses one serialized ACL entry.
+/// # Errors
+///
+/// Returns an error when `tag` and `id` do not form one supported POSIX ACL entry kind.
 fn parse_entry(tag: u16, permissions: Ext4Permissions, id: u32) -> Result<PosixAclEntry> {
     match tag {
         ACL_USER_OBJ if id == ACL_UNDEFINED_ID => Ok(PosixAclEntry::UserObj(permissions)),
@@ -199,6 +202,10 @@ const fn entry_fields(entry: &PosixAclEntry) -> (u16, Ext4Permissions, u32) {
 }
 
 /// Validates ACL required entries, uniqueness, and canonical order.
+/// # Errors
+///
+/// Returns an error when required entries are absent, duplicate-only entries repeat, entries are out
+/// of canonical order, or named entries appear without a mask.
 fn validate_acl(entries: &[PosixAclEntry]) -> Result<()> {
     let mut seen_user_obj = false;
     let mut seen_group_obj = false;
@@ -232,6 +239,9 @@ fn validate_acl(entries: &[PosixAclEntry]) -> Result<()> {
 }
 
 /// Converts a duplicate flag into its updated value.
+/// # Errors
+///
+/// Returns an error when the caller has already seen the entry kind being validated.
 fn unique(seen: bool) -> Result<bool> {
     if seen {
         Err(Error::InvalidAcl)
@@ -263,6 +273,9 @@ mod tests {
         Ext4Permissions::new(bits).ok()
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn posix_acl_round_trips_xattr_payload() {
         if let (Some(user_obj), Some(user), Some(group_obj), Some(group), Some(mask), Some(other)) = (
@@ -292,6 +305,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn named_acl_requires_mask() {
         if let (Some(user_obj), Some(user), Some(group_obj), Some(other)) = (

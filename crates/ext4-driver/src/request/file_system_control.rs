@@ -58,6 +58,10 @@ enum FileSystemControlRequest {
 
 impl FileSystemControlRequest {
     /// Decodes the current FSCTL stack location.
+    /// # Errors
+    ///
+    /// Returns an error when the current IRP stack is absent or its mount/user-FSCTL parameters are
+    /// malformed.
     fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
         let stack = target.current_stack()?;
         match stack.file_system_control_minor() {
@@ -149,6 +153,10 @@ impl MountVolumeRequest {
 }
 
 /// Handles a decoded mount request.
+/// # Errors
+///
+/// Returns an error when the target device cannot be queried or mounted, the filesystem device has
+/// no driver object, or mounted-device/VPB initialization fails.
 fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
     let length = query_device_length(request.target_device())?;
     let candidate = MountCandidate::new(request.target_device(), length);
@@ -220,6 +228,10 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
 }
 
 /// Handles path-scoped user FSCTL requests.
+/// # Errors
+///
+/// Returns an error when the requested reparse, encryption-key, or verity operation rejects its
+/// buffers, file object, or mounted-volume state.
 fn user_fs_control(request: UserFsControlRequest) -> DriverResult<IrpCompletion> {
     match request.fs_control_code() {
         FsControlCode::GetReparsePoint => {

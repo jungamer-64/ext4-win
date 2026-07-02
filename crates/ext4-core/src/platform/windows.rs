@@ -118,6 +118,9 @@ impl WindowsOverlay {
 mod tests {
     use super::{Ext4WindowsAttributes, WindowsOverlay};
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn windows_overlay_round_trips_supported_attributes() {
         let attributes = Ext4WindowsAttributes::new(
@@ -132,6 +135,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn windows_overlay_rejects_readonly_attribute() {
         assert!(Ext4WindowsAttributes::new(0x0000_0001).is_err());

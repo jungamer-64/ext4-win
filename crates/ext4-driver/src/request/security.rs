@@ -76,6 +76,10 @@ struct QuerySecurityRequest {
 
 impl QuerySecurityRequest {
     /// Decodes a query-security request.
+    /// # Errors
+    ///
+    /// Returns an error when the current stack is not a query-security stack or its FILE_OBJECT has
+    /// no opened ext4 context.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.query_security()?;
         let opened_file = OpenedObject::decode(stack.file_object())?;
@@ -98,6 +102,10 @@ struct SetSecurityRequest {
 
 impl SetSecurityRequest {
     /// Decodes a set-security request.
+    /// # Errors
+    ///
+    /// Returns an error when the current stack is not a set-security stack or its FILE_OBJECT has no
+    /// opened ext4 context.
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.set_security()?;
         let opened_file = OpenedObject::decode(stack.file_object())?;
@@ -208,6 +216,9 @@ struct SecurityDescriptorControl(u16);
 
 impl SecurityDescriptorControl {
     /// Parses and validates descriptor control flags.
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor is not self-relative or requests a SACL.
     fn parse(value: u16) -> DriverResult<Self> {
         let self_relative =
             u16::try_from(wdk_sys::SE_SELF_RELATIVE).map_err(|_| DriverError::InvalidParameter)?;
@@ -223,6 +234,9 @@ impl SecurityDescriptorControl {
     }
 
     /// Returns whether a DACL is present.
+    /// # Errors
+    ///
+    /// Returns an error when the WDK DACL-present control bit cannot be represented.
     fn has_dacl(self) -> DriverResult<bool> {
         let dacl_present =
             u16::try_from(wdk_sys::SE_DACL_PRESENT).map_err(|_| DriverError::InvalidParameter)?;
@@ -251,6 +265,9 @@ impl SecurityDescriptorOffset {
     }
 
     /// Converts a present component offset to a host index.
+    /// # Errors
+    ///
+    /// Returns an error when the component offset is zero or cannot be represented as `usize`.
     fn as_present_usize(self) -> DriverResult<usize> {
         if self.is_absent() {
             return Err(DriverError::InvalidParameter);
@@ -259,6 +276,9 @@ impl SecurityDescriptorOffset {
     }
 
     /// Converts an optional component offset to a host index.
+    /// # Errors
+    ///
+    /// Returns an error when the component offset cannot be represented as `usize`.
     fn as_usize(self) -> DriverResult<usize> {
         usize::try_from(self.0).map_err(|_| DriverError::InvalidParameter)
     }
@@ -270,6 +290,9 @@ struct PosixRwxBits(u16);
 
 impl PosixRwxBits {
     /// Creates POSIX rwx bits.
+    /// # Errors
+    ///
+    /// Returns an error when `value` contains bits outside one POSIX rwx class.
     fn new(value: u16) -> DriverResult<Self> {
         if value & !0o7 != 0 {
             return Err(DriverError::InvalidParameter);
@@ -292,6 +315,9 @@ struct DaclPermissionBuilder {
 
 impl DaclPermissionBuilder {
     /// Stores one parsed permission class.
+    /// # Errors
+    ///
+    /// Returns an error when the DACL contains duplicate ACEs for the same POSIX permission class.
     fn set(&mut self, class: PermissionClass, bits: PosixRwxBits) -> DriverResult<()> {
         if self.classes.iter().any(|entry| entry.class == class) {
             return Err(DriverError::NotSupported);
@@ -315,6 +341,10 @@ impl DaclPermissionBuilder {
 }
 
 /// Performs a security descriptor query.
+/// # Errors
+///
+/// Returns an error when ext4 security metadata cannot be loaded, the requested descriptor cannot
+/// be built, or the user output buffer is too small.
 fn query_security(request: &QuerySecurityRequest) -> DriverResult<IrpCompletion> {
     let security = load_ext4_security(&request.opened_file)?;
     let descriptor = security_descriptor(security, request.stack.selection())?;
@@ -330,6 +360,10 @@ fn query_security(request: &QuerySecurityRequest) -> DriverResult<IrpCompletion>
 }
 
 /// Performs a POSIX security mutation from a Windows security descriptor.
+/// # Errors
+///
+/// Returns an error when the input descriptor cannot be copied or mapped to ext4 owner/permissions,
+/// or the journaled security update fails.
 fn set_security(request: &SetSecurityRequest) -> DriverResult<IrpCompletion> {
     let context = load_ext4_security_context(&request.opened_file)?;
     let descriptor = security_descriptor_bytes(
@@ -362,11 +396,18 @@ fn set_security(request: &SetSecurityRequest) -> DriverResult<IrpCompletion> {
 }
 
 /// Loads ext4 security metadata for an opened node.
+/// # Errors
+///
+/// Returns an error when the opened node cannot be loaded from ext4 metadata.
 fn load_ext4_security(opened_file: &OpenedObject) -> DriverResult<Ext4Security> {
     load_ext4_security_context(opened_file).map(|context| context.security)
 }
 
 /// Loads ext4 security context for an opened node.
+/// # Errors
+///
+/// Returns an error when the opened node cannot be loaded or its security metadata is inconsistent
+/// with the FCB identity.
 fn load_ext4_security_context(opened_file: &OpenedObject) -> DriverResult<OpenedSecurityContext> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
@@ -378,6 +419,9 @@ fn load_ext4_security_context(opened_file: &OpenedObject) -> DriverResult<Opened
 }
 
 /// Extracts security metadata after validating FCB kind against core metadata.
+/// # Errors
+///
+/// Returns an error when `identity` cannot be loaded as its typed ext4 node.
 fn security_from_node(vcb: &VolumeControlBlock, identity: NodeId) -> DriverResult<Ext4Security> {
     match identity {
         NodeId::File(file) => Ok(vcb.volume().load_file(file)?.security()),
@@ -387,6 +431,10 @@ fn security_from_node(vcb: &VolumeControlBlock, identity: NodeId) -> DriverResul
 }
 
 /// Builds a self-relative security descriptor for requested fields.
+/// # Errors
+///
+/// Returns an error when requested SIDs or DACL bytes cannot be encoded into a self-relative
+/// security descriptor.
 fn security_descriptor(
     security: Ext4Security,
     selection: SecuritySelection,
@@ -427,6 +475,10 @@ fn security_descriptor(
 }
 
 /// Copies the raw SetSecurity descriptor into a bounded byte image.
+/// # Errors
+///
+/// Returns an error when selected owner, group, or DACL offsets are invalid or their raw component
+/// lengths cannot be bounded.
 fn security_descriptor_bytes(
     security_descriptor: NonNull<core::ffi::c_void>,
     selection: SecuritySelection,
@@ -460,6 +512,10 @@ fn security_descriptor_bytes(
 }
 
 /// Builds new ext4 security metadata from a Windows security descriptor.
+/// # Errors
+///
+/// Returns an error when the selected owner/group SIDs or DACL cannot be converted to ext4 owner and
+/// POSIX mode bits.
 fn security_from_descriptor(
     descriptor: &[u8],
     selection: SecuritySelection,
@@ -487,6 +543,10 @@ fn security_from_descriptor(
 
 impl<'a> ParsedSecurityDescriptor<'a> {
     /// Parses a self-relative Windows security descriptor.
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor header is truncated, has an unsupported revision, or has
+    /// unsupported control flags.
     fn parse(bytes: &'a [u8]) -> DriverResult<Self> {
         if bytes.len() < SECURITY_DESCRIPTOR_RELATIVE_BYTES {
             return Err(DriverError::InvalidParameter);
@@ -515,6 +575,9 @@ impl<'a> ParsedSecurityDescriptor<'a> {
     }
 
     /// Returns the owner UID represented by the owner SID.
+    /// # Errors
+    ///
+    /// Returns an error when the owner SID is absent or is not a Linux UID SID.
     fn owner_uid(self) -> DriverResult<u32> {
         match sid_identity(self.sid_at(self.owner_offset)?)? {
             SidIdentity::LinuxUid(uid) => Ok(uid),
@@ -523,6 +586,9 @@ impl<'a> ParsedSecurityDescriptor<'a> {
     }
 
     /// Returns the group GID represented by the group SID.
+    /// # Errors
+    ///
+    /// Returns an error when the group SID is absent or is not a Linux GID SID.
     fn group_gid(self) -> DriverResult<u32> {
         match sid_identity(self.sid_at(self.group_offset)?)? {
             SidIdentity::LinuxGid(gid) => Ok(gid),
@@ -531,6 +597,10 @@ impl<'a> ParsedSecurityDescriptor<'a> {
     }
 
     /// Returns low POSIX rwx bits represented by the descriptor DACL.
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor has no DACL or the DACL cannot be mapped to POSIX rwx
+    /// classes.
     fn dacl_permissions(self, owner: Ext4Owner) -> DriverResult<u16> {
         if !self.control.has_dacl()? || self.dacl_offset.is_absent() {
             return Err(DriverError::NotSupported);
@@ -540,6 +610,10 @@ impl<'a> ParsedSecurityDescriptor<'a> {
     }
 
     /// Returns a SID component at a self-relative descriptor offset.
+    /// # Errors
+    ///
+    /// Returns an error when the SID offset is absent, the SID header is truncated, or the SID
+    /// length exceeds the descriptor.
     fn sid_at(self, offset: SecurityDescriptorOffset) -> DriverResult<&'a [u8]> {
         let start = offset.as_present_usize()?;
         let header = security_range(self.bytes, start, SID_PREFIX_BYTES)?;
@@ -554,6 +628,10 @@ impl<'a> ParsedSecurityDescriptor<'a> {
     }
 
     /// Returns an ACL component at a self-relative descriptor offset.
+    /// # Errors
+    ///
+    /// Returns an error when the ACL offset is absent, the ACL header is truncated, or the ACL size
+    /// exceeds the descriptor.
     fn acl_at(self, offset: SecurityDescriptorOffset) -> DriverResult<&'a [u8]> {
         let start = offset.as_present_usize()?;
         let header = security_range(self.bytes, start, ACL_HEADER_BYTES)?;
@@ -568,6 +646,9 @@ impl<'a> ParsedSecurityDescriptor<'a> {
 }
 
 /// Returns the byte end of a raw SID component.
+/// # Errors
+///
+/// Returns an error when the SID offset is absent or the computed SID length overflows.
 fn raw_sid_end(pointer: NonNull<u8>, offset: SecurityDescriptorOffset) -> DriverResult<usize> {
     let start = offset.as_present_usize()?;
     let count_offset = start.checked_add(1).ok_or(DriverError::InvalidParameter)?;
@@ -588,6 +669,10 @@ fn raw_sid_end(pointer: NonNull<u8>, offset: SecurityDescriptorOffset) -> Driver
 }
 
 /// Returns the byte end of a raw ACL component.
+/// # Errors
+///
+/// Returns an error when the ACL offset is absent or its size field cannot be used to bound the raw
+/// descriptor copy.
 fn raw_acl_end(pointer: NonNull<u8>, offset: SecurityDescriptorOffset) -> DriverResult<usize> {
     if offset.is_absent() {
         return Err(DriverError::NotSupported);
@@ -615,6 +700,9 @@ fn raw_acl_end(pointer: NonNull<u8>, offset: SecurityDescriptorOffset) -> Driver
 }
 
 /// Returns the serialized SID length for a sub-authority count.
+/// # Errors
+///
+/// Returns an error when the sub-authority byte count overflows.
 fn sid_length_from_sub_authorities(count: usize) -> DriverResult<usize> {
     SID_PREFIX_BYTES
         .checked_add(
@@ -626,6 +714,10 @@ fn sid_length_from_sub_authorities(count: usize) -> DriverResult<usize> {
 }
 
 /// Parses a DACL into POSIX rwx permission bits.
+/// # Errors
+///
+/// Returns an error when the ACL header is malformed, ACE sizes are inconsistent, or an ACE cannot
+/// be mapped to a POSIX permission class.
 fn parse_dacl_permissions(acl: &[u8], owner: Ext4Owner) -> DriverResult<u16> {
     if acl.len() < ACL_HEADER_BYTES {
         return Err(DriverError::InvalidParameter);
@@ -669,6 +761,10 @@ fn parse_dacl_permissions(acl: &[u8], owner: Ext4Owner) -> DriverResult<u16> {
 }
 
 /// Parses one allow ACE into a POSIX permission class.
+/// # Errors
+///
+/// Returns an error when the ACE is not a plain allow ACE, its mask is unsupported, or its SID does
+/// not identify the owner, group, or everyone class.
 fn parse_allow_ace(
     ace_type: u8,
     ace_flags: u8,
@@ -696,6 +792,10 @@ fn parse_allow_ace(
 }
 
 /// Maps one accepted Windows access mask back to POSIX rwx bits.
+/// # Errors
+///
+/// Returns an error when `mask` is not one of the Windows generic-access combinations generated for
+/// POSIX rwx bits.
 fn permission_bits_from_mask(mask: WindowsAccessMask) -> DriverResult<PosixRwxBits> {
     for bits in 0..=0o7 {
         if permission_class_mask(bits) == mask {
@@ -706,6 +806,9 @@ fn permission_bits_from_mask(mask: WindowsAccessMask) -> DriverResult<PosixRwxBi
 }
 
 /// Classifies a SID for DACL permission projection.
+/// # Errors
+///
+/// Returns an error when the SID names a Linux UID/GID other than the inode owner/group.
 fn permission_class_from_sid(sid: SidIdentity, owner: Ext4Owner) -> DriverResult<PermissionClass> {
     match sid {
         SidIdentity::LinuxUid(uid) if uid == owner.uid().as_u32() => Ok(PermissionClass::Owner),
@@ -716,6 +819,9 @@ fn permission_class_from_sid(sid: SidIdentity, owner: Ext4Owner) -> DriverResult
 }
 
 /// Parses a SID into the identities accepted by this driver.
+/// # Errors
+///
+/// Returns an error when the SID is malformed or is not Everyone, Linux UID, or Linux GID.
 fn sid_identity(bytes: &[u8]) -> DriverResult<SidIdentity> {
     if bytes.len() < SID_PREFIX_BYTES {
         return Err(DriverError::InvalidParameter);
@@ -744,6 +850,9 @@ fn sid_identity(bytes: &[u8]) -> DriverResult<SidIdentity> {
 }
 
 /// Reads the big-endian SID authority.
+/// # Errors
+///
+/// Returns an error when the six-byte SID authority field is truncated.
 fn sid_authority(bytes: &[u8]) -> DriverResult<u64> {
     let authority: [u8; 6] = security_range(bytes, 2, 6)?
         .try_into()
@@ -753,6 +862,9 @@ fn sid_authority(bytes: &[u8]) -> DriverResult<u64> {
 }
 
 /// Reads a little-endian SID sub-authority by index.
+/// # Errors
+///
+/// Returns an error when `index` overflows the SID sub-authority offset or the field is truncated.
 fn sid_sub_authority(bytes: &[u8], index: usize) -> DriverResult<u32> {
     let start = SID_PREFIX_BYTES
         .checked_add(
@@ -765,6 +877,9 @@ fn sid_sub_authority(bytes: &[u8], index: usize) -> DriverResult<u32> {
 }
 
 /// Builds a DACL with owner, group, and everyone allow ACEs from POSIX mode bits.
+/// # Errors
+///
+/// Returns an error when a generated SID or ACE cannot be represented in the ACL byte image.
 fn dacl_from_permissions(security: Ext4Security) -> DriverResult<Vec<u8>> {
     let permissions = security.permissions().as_u16();
     let owner = permission_class_mask((permissions >> 6) & 0o7);
@@ -823,6 +938,10 @@ fn permission_class_mask(bits: u16) -> WindowsAccessMask {
 }
 
 /// Appends one component to the self-relative descriptor.
+/// # Errors
+///
+/// Returns an error when the descriptor's current length cannot be represented as a 32-bit
+/// self-relative offset.
 fn append_component(
     descriptor: &mut Vec<u8>,
     component: &[u8],
@@ -833,6 +952,9 @@ fn append_component(
 }
 
 /// Appends one ACCESS_ALLOWED_ACE to an ACL image.
+/// # Errors
+///
+/// Returns an error when ACE size arithmetic overflows or the ACE header fields cannot be encoded.
 fn append_allow_ace(acl: &mut Vec<u8>, ace: &AllowAce) -> DriverResult<()> {
     let ace_size = ACCESS_ALLOWED_ACE_PREFIX_BYTES
         .checked_add(ace.sid.bytes.len())
@@ -869,21 +991,33 @@ fn append_allow_ace(acl: &mut Vec<u8>, ace: &AllowAce) -> DriverResult<()> {
 }
 
 /// Builds `S-1-22-1-uid`.
+/// # Errors
+///
+/// Returns an error when the Linux UID SID cannot be encoded.
 fn uid_sid(uid: u32) -> DriverResult<BinarySid> {
     sid(SECURITY_NT_NON_UNIQUE_AUTHORITY, &[1, uid])
 }
 
 /// Builds `S-1-22-2-gid`.
+/// # Errors
+///
+/// Returns an error when the Linux GID SID cannot be encoded.
 fn gid_sid(gid: u32) -> DriverResult<BinarySid> {
     sid(SECURITY_NT_NON_UNIQUE_AUTHORITY, &[2, gid])
 }
 
 /// Builds Everyone, `S-1-1-0`.
+/// # Errors
+///
+/// Returns an error when the Everyone SID cannot be encoded.
 fn everyone_sid() -> DriverResult<BinarySid> {
     sid(SECURITY_WORLD_AUTHORITY, &[0])
 }
 
 /// Builds a binary SID from an authority and sub-authorities.
+/// # Errors
+///
+/// Returns an error when the sub-authority count or serialized SID capacity cannot be represented.
 fn sid(authority: u64, sub_authorities: &[u32]) -> DriverResult<BinarySid> {
     let sub_authority_count =
         u8::try_from(sub_authorities.len()).map_err(|_| DriverError::InvalidParameter)?;
@@ -919,6 +1053,9 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
 }
 
 /// Normalizes malformed security descriptor field access to the Windows set-security error.
+/// # Errors
+///
+/// Returns an error when `result` failed; the error is normalized to invalid-parameter semantics.
 fn malformed_security<T>(result: DriverResult<T>) -> DriverResult<T> {
     result.map_err(|_| DriverError::InvalidParameter)
 }
@@ -929,11 +1066,18 @@ const fn wire_offset(offset: usize) -> WireOffset {
 }
 
 /// Builds a checked security-descriptor wire range.
+/// # Errors
+///
+/// Returns an error when a security-descriptor `offset + length` cannot be represented as a wire
+/// range.
 fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
     WireRange::new(wire_offset(offset), WireByteLen::new(length))
 }
 
 /// Borrows a checked security descriptor range with malformed-input error semantics.
+/// # Errors
+///
+/// Returns an error when `offset..offset + length` falls outside `bytes`.
 fn security_range(bytes: &[u8], offset: usize, length: usize) -> DriverResult<&[u8]> {
     wire_range(offset, length)?
         .read_from(bytes)
@@ -975,6 +1119,9 @@ mod tests {
         )
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn uid_and_gid_sids_use_linux_sid_authority() {
         assert_eq!(
@@ -987,6 +1134,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn permission_classes_project_to_file_generic_masks() {
         assert_eq!(permission_class_mask(0o0), WindowsAccessMask::EMPTY);
@@ -1004,6 +1154,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn dacl_contains_owner_group_and_everyone_aces() {
         let permissions = Ext4Permissions::new(0o754);
@@ -1026,6 +1179,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn security_descriptor_packs_requested_owner_group_and_dacl() {
         let permissions = Ext4Permissions::new(0o754);
@@ -1047,6 +1203,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn security_descriptor_set_round_trips_posix_owner_group_and_dacl() {
         let current_permissions = Ext4Permissions::new(0o600);
@@ -1079,6 +1238,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn set_dacl_rejects_owner_sid_that_does_not_match_inode_owner() {
         let current_permissions = Ext4Permissions::new(0o600);
@@ -1111,6 +1273,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn set_dacl_rejects_deny_aces() {
         let permissions = Ext4Permissions::new(0o700);
@@ -1153,6 +1318,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn accepted_sid_identities_are_strictly_classified() {
         assert_eq!(
@@ -1169,6 +1337,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_generic_masks_are_the_only_accepted_permission_masks() {
         assert_eq!(
@@ -1187,6 +1358,9 @@ mod tests {
         );
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn security_descriptor_control_rejects_unsupported_forms() {
         assert_eq!(
@@ -1203,6 +1377,9 @@ mod tests {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn security_descriptor_offset_rejects_absent_required_component() {
         assert_eq!(

@@ -1177,6 +1177,9 @@ impl BlockWriter for FailOneWriteAt<'_> {
     }
 }
 
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
 pub(super) fn must<T>(result: crate::Result<T>) -> T {
     match result {
         Ok(value) => value,
