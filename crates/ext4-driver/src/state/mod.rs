@@ -279,7 +279,7 @@ pub(crate) struct VolumeControlBlock {
     /// Mounted journaled read-write ext4 volume.
     volume: JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator>,
     /// VCB-owned FCBs keyed by ext4 node identity.
-    file_control_blocks: DriverVec<NonNull<FileControlBlock>>,
+    file_control_blocks: DriverVec<Box<FileControlBlock>>,
 }
 
 impl VolumeControlBlock {
@@ -376,10 +376,12 @@ impl VolumeControlBlock {
             return Ok(fcb);
         }
 
-        let fcb = memory::boxed_with(|| FileControlBlock::new(volume, node))?;
-        let fcb = NonNull::from(Box::leak(fcb));
-        vcb.file_control_blocks.try_push(fcb)?;
-        Ok(fcb)
+        let mut fcb = memory::boxed_with(|| FileControlBlock::new(volume, node))?;
+        let fcb_ptr = NonNull::from(fcb.as_mut());
+        vcb.file_control_blocks
+            .try_push_owned(fcb)
+            .map_err(|error| error.into_parts().0)?;
+        Ok(fcb_ptr)
     }
 
     /// Releases one open reference to a VCB-owned FCB.
