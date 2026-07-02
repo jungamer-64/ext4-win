@@ -53,6 +53,16 @@ impl Ext4Name {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// Copies this ext4 name without using infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the name bytes cannot allocate.
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            bytes: memory::copied_slice(&self.bytes)?,
+        })
+    }
 }
 
 /// Name that can be losslessly exposed through the Windows UTF-16 namespace.

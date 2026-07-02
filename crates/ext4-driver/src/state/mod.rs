@@ -389,7 +389,7 @@ impl VolumeControlBlock {
         let Some(index) = self
             .file_control_blocks
             .iter()
-            .position(|candidate| *candidate == fcb)
+            .position(|candidate| NonNull::from(candidate.as_ref()) == fcb)
         else {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
         };
@@ -404,25 +404,17 @@ impl VolumeControlBlock {
                 let Some(removed) = self.file_control_blocks.swap_remove(index) else {
                     KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
                 };
-                unsafe {
-                    // SAFETY: The pointer was removed from the ownership table
-                    // exactly once and no open FILE_OBJECT should reference it
-                    // after the last close.
-                    drop(Box::from_raw(removed.as_ptr()));
-                }
+                drop(removed);
             }
         }
     }
 
     /// Finds a VCB-owned FCB by node identity.
     fn find_file_control_block(&mut self, node: NodeId) -> Option<NonNull<FileControlBlock>> {
-        self.file_control_blocks.iter().copied().find(|fcb| {
-            let fcb = unsafe {
-                // SAFETY: FCB pointers in this table are owned by the VCB.
-                fcb.as_ref()
-            };
-            fcb.node() == node
-        })
+        self.file_control_blocks
+            .iter()
+            .find(|fcb| fcb.node() == node)
+            .map(|fcb| NonNull::from(fcb.as_ref()))
     }
 }
 
@@ -444,18 +436,6 @@ impl VolumeSerialNumber {
     /// Returns the WDK serial number payload.
     pub(crate) const fn as_u32(self) -> u32 {
         self.value
-    }
-}
-
-impl Drop for VolumeControlBlock {
-    fn drop(&mut self) {
-        while let Some(fcb) = self.file_control_blocks.pop() {
-            unsafe {
-                // SAFETY: Remaining FCB pointers are still owned by this VCB
-                // during volume teardown.
-                drop(Box::from_raw(fcb.as_ptr()));
-            }
-        }
     }
 }
 
@@ -783,7 +763,7 @@ impl DirectoryCursor {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 /// Opened path identity stored with a handle.
 pub(crate) enum OpenedPath {
     /// Mounted volume root.
@@ -797,6 +777,19 @@ pub(crate) enum OpenedPath {
     },
 }
 
+impl OpenedPath {
+    /// Builds a child path by fallibly copying the ext4 child name.
+    /// # Errors
+    ///
+    /// Returns an error when copying the child name cannot allocate.
+    pub(crate) fn try_child(parent: DirectoryNodeId, name: &Ext4Name) -> DriverResult<Self> {
+        Ok(Self::Child {
+            parent,
+            name: name.try_clone()?,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Action requested when the last handle cleanup occurs.
 pub(crate) enum CloseDisposition {
@@ -806,7 +799,7 @@ pub(crate) enum CloseDisposition {
     Delete,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 /// Common per-handle state shared by every opened node kind.
 pub(crate) struct OpenedHandleState {
     /// Path used for namespace mutations on cleanup.
@@ -845,20 +838,27 @@ impl OpenedHandleState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 /// Per-handle state stored in `FILE_OBJECT::FsContext2`.
-pub(crate) enum OpenedHandle {
+pub(crate) struct OpenedHandle {
+    /// Common handle state independent of node kind.
+    state: OpenedHandleState,
+    /// Kind-specific handle state.
+    kind: OpenedHandleKind,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+/// Kind-specific per-handle state.
+enum OpenedHandleKind {
     /// Regular file handle.
-    File(OpenedHandleState),
+    File,
     /// Directory handle with enumeration cursor.
     Directory {
-        /// Shared per-handle state.
-        state: OpenedHandleState,
         /// Directory enumeration cursor.
         cursor: DirectoryCursor,
     },
     /// Symlink handle.
-    Symlink(OpenedHandleState),
+    Symlink,
 }
 
 impl OpenedHandle {
@@ -870,53 +870,51 @@ impl OpenedHandle {
     /// Creates per-handle state from explicit lifecycle fields.
     fn from_parts(node: NodeId, path: OpenedPath, close_disposition: CloseDisposition) -> Self {
         let state = OpenedHandleState::new(path, close_disposition);
-        match node {
-            NodeId::File(_) => Self::File(state),
-            NodeId::Directory(_) => Self::Directory {
-                state,
+        let kind = match node {
+            NodeId::File(_) => OpenedHandleKind::File,
+            NodeId::Directory(_) => OpenedHandleKind::Directory {
                 cursor: DirectoryCursor::start(),
             },
-            NodeId::Symlink(_) => Self::Symlink(state),
-        }
+            NodeId::Symlink(_) => OpenedHandleKind::Symlink,
+        };
+        Self { state, kind }
     }
 
     /// Returns the requested close disposition.
     const fn close_disposition(&self) -> CloseDisposition {
-        self.state().close_disposition()
+        self.state.close_disposition()
     }
 
     /// Returns the opened path identity.
     const fn path(&self) -> &OpenedPath {
-        self.state().path()
+        self.state.path()
     }
 
     /// Replaces the requested close disposition.
     const fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
-        self.state_mut().set_close_disposition(close_disposition);
+        self.state.set_close_disposition(close_disposition);
     }
 
     /// Replaces the opened path after a successful rename.
     fn replace_path(&mut self, path: OpenedPath) {
-        self.state_mut().replace_path(path);
+        self.state.replace_path(path);
     }
 
     /// Converts the per-handle state to a symlink handle after namespace conversion.
     fn replace_with_symlink(&mut self) {
-        let state = self.state().clone();
-        *self = Self::Symlink(state);
+        self.kind = OpenedHandleKind::Symlink;
     }
 
-    /// Returns shared handle state.
-    const fn state(&self) -> &OpenedHandleState {
-        match self {
-            Self::File(state) | Self::Symlink(state) | Self::Directory { state, .. } => state,
-        }
+    /// Returns the kind-specific handle state.
+    const fn kind(&self) -> &OpenedHandleKind {
+        &self.kind
     }
 
-    /// Returns mutable shared handle state.
-    const fn state_mut(&mut self) -> &mut OpenedHandleState {
-        match self {
-            Self::File(state) | Self::Symlink(state) | Self::Directory { state, .. } => state,
+    /// Returns the mutable directory cursor for directory handles.
+    fn directory_cursor_mut(&mut self) -> Option<&mut DirectoryCursor> {
+        match &mut self.kind {
+            OpenedHandleKind::Directory { cursor } => Some(cursor),
+            OpenedHandleKind::File | OpenedHandleKind::Symlink => None,
         }
     }
 }
@@ -1044,10 +1042,10 @@ impl OpenedObject {
     /// Returns an error when FCB node identity and handle variant encode
     /// different node kinds.
     fn validate_handle_kind(&self) -> DriverResult<()> {
-        match (self.node(), self.handle()) {
-            (NodeId::File(_), OpenedHandle::File(_))
-            | (NodeId::Directory(_), OpenedHandle::Directory { .. })
-            | (NodeId::Symlink(_), OpenedHandle::Symlink(_)) => Ok(()),
+        match (self.node(), self.handle().kind()) {
+            (NodeId::File(_), OpenedHandleKind::File)
+            | (NodeId::Directory(_), OpenedHandleKind::Directory { .. })
+            | (NodeId::Symlink(_), OpenedHandleKind::Symlink) => Ok(()),
             _ => KernelWideInconsistency::file_object_context_corruption().bugcheck(),
         }
     }
@@ -1109,7 +1107,7 @@ impl OpenedDirectory {
         let NodeId::Directory(id) = opened.node() else {
             return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
         };
-        let OpenedHandle::Directory { cursor, .. } = opened.mutable_handle() else {
+        let Some(cursor) = opened.mutable_handle().directory_cursor_mut() else {
             return Err(DriverError::InvalidParameter);
         };
         let cursor = NonNull::from(cursor);
@@ -1221,8 +1219,8 @@ mod tests {
 
     use super::{
         CloseDisposition, FileControlBlock, FileControlBlockRelease, KernelFileObject,
-        OpenedDirectory, OpenedHandle, OpenedObject, OpenedPath, OpenedRegularFile, OpenedSymlink,
-        UninitializedFileObject, VolumeControlBlock,
+        OpenedDirectory, OpenedHandle, OpenedHandleKind, OpenedObject, OpenedPath,
+        OpenedRegularFile, OpenedSymlink, UninitializedFileObject, VolumeControlBlock,
     };
 
     fn file_object_with_contexts(
@@ -1411,7 +1409,7 @@ mod tests {
 
         assert_eq!(opened.node(), NodeId::Symlink(symlink));
         assert_eq!(opened.close_disposition(), CloseDisposition::Delete);
-        assert!(matches!(handle, OpenedHandle::Symlink(_)));
+        assert!(matches!(handle.kind, OpenedHandleKind::Symlink));
     }
 
     /// # Panics

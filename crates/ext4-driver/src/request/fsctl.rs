@@ -264,7 +264,7 @@ const fn key_presence_user_count(presence: FscryptKeyPresence) -> u32 {
 }
 
 /// Parsed fscrypt add-key payload.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct FscryptAddKeyPayload {
     /// Mount-scoped master key validated against its v2 identifier.
     master_key: FscryptMasterKey,
