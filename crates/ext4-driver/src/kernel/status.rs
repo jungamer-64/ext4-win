@@ -5,8 +5,9 @@ use wdk_sys::{
     NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
     STATUS_CANNOT_DELETE, STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL,
     STATUS_EA_LIST_INCONSISTENT, STATUS_EA_TOO_LARGE, STATUS_FILE_CORRUPT_ERROR,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_EA_NAME,
-    STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR,
+    STATUS_INSUFFICIENT_RESOURCES, STATUS_INTERNAL_ERROR, STATUS_INVALID_BUFFER_SIZE,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_EA_NAME, STATUS_INVALID_INFO_CLASS,
+    STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR,
     STATUS_NO_EAS_ON_FILE, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_NOT_SUPPORTED,
     STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
     STATUS_OBJECT_TYPE_MISMATCH, STATUS_UNRECOGNIZED_VOLUME, STATUS_VOLUME_DIRTY,
@@ -22,6 +23,10 @@ pub(crate) enum DriverError {
     InvalidDeviceRequest,
     /// Caller supplied parameters outside the accepted FSD boundary.
     InvalidParameter,
+    /// Driver attempted to build a collection larger than `Vec` can represent.
+    InvalidBufferSize,
+    /// A local invariant inside driver-only helper code was violated.
+    InternalInvariantViolation,
     /// Kernel memory could not be mapped for the current IRP.
     InsufficientResources,
     /// Access is denied by the current FSD policy.
@@ -74,6 +79,8 @@ impl DriverError {
         match self {
             Self::InvalidDeviceRequest => STATUS_INVALID_DEVICE_REQUEST,
             Self::InvalidParameter => STATUS_INVALID_PARAMETER,
+            Self::InvalidBufferSize => STATUS_INVALID_BUFFER_SIZE,
+            Self::InternalInvariantViolation => STATUS_INTERNAL_ERROR,
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,
             Self::BufferTooSmall => STATUS_BUFFER_TOO_SMALL,
