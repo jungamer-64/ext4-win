@@ -9,7 +9,6 @@ resolver = "3"
 wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "21ec8f86ea16766ec5cebc33341de744f3119bbf" }
 wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "21ec8f86ea16766ec5cebc33341de744f3119bbf" }
 wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "21ec8f86ea16766ec5cebc33341de744f3119bbf" }
-wdk-panic = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "21ec8f86ea16766ec5cebc33341de744f3119bbf" }
 
 [profile.dev]
 panic = "abort"

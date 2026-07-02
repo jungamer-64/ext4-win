@@ -11,9 +11,6 @@ mod state;
 mod wire;
 
 #[cfg(not(test))]
-extern crate wdk_panic;
-
-#[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_SUCCESS};
 
