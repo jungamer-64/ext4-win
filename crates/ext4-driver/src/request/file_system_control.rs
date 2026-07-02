@@ -171,6 +171,7 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
     let Some(driver_object) = request.file_system_device().driver_object() else {
         return Err(DriverError::InvalidParameter);
     };
+    let vcb = memory::boxed_with(move || vcb)?;
 
     let mut device = core::ptr::null_mut();
     let extension_size =
@@ -196,7 +197,7 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
     }
 
     if let Err(error) =
-        MountedVolumeDevice::initialize_vpb_identity(request.vpb().as_non_null(), &vcb)
+        MountedVolumeDevice::initialize_vpb_identity(request.vpb().as_non_null(), vcb.as_ref())
     {
         unsafe {
             // SAFETY: `device` was returned by a successful IoCreateDevice call
@@ -206,7 +207,6 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
         return Err(error);
     }
 
-    let vcb = memory::boxed_with(|| vcb)?;
     let mounted_device = match MountedVolumeDevice::initialize(
         device,
         vcb,

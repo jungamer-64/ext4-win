@@ -107,7 +107,7 @@ fn open_or_create(request: CreateRequest) -> DriverResult<()> {
 }
 
 /// Result of resolving a Windows path against the mounted volume.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum PathLookup {
     /// The requested path already exists.
     Existing {
@@ -156,6 +156,9 @@ fn open_existing_node(
         | CreateDisposition::OverwriteIf
         | CreateDisposition::Supersede => {
             let inode = overwrite_file_inode(node, parameters.target_requirement())?;
+            let handle = memory::boxed_with(|| {
+                OpenedHandle::new(node, path, parameters.close_disposition())
+            })?;
             let fcb = open_shared_file_control_block(
                 request.file_object(),
                 vcb,
@@ -164,13 +167,10 @@ fn open_existing_node(
                 parameters.share_access(),
             )?;
             match truncate_existing_file(vcb, inode) {
-                Ok(()) => attach_file_object(
-                    request.file_object(),
-                    fcb,
-                    node,
-                    path,
-                    parameters.close_disposition(),
-                ),
+                Ok(()) => {
+                    attach_preallocated_file_object(request.file_object(), fcb, handle);
+                    Ok(())
+                }
                 Err(error) => {
                     abandon_file_control_block(request.file_object().kernel_file_object(), fcb);
                     Err(error)
@@ -226,10 +226,7 @@ fn create_missing_node(
         request.file_object(),
         vcb,
         node,
-        OpenedPath::Child {
-            parent,
-            name: name.clone(),
-        },
+        OpenedPath::try_child(parent, name)?,
         request.parameters().desired_access(),
         request.parameters().share_access(),
         request.parameters().close_disposition(),
@@ -325,10 +322,7 @@ fn resolve_path(
         if is_final {
             return Ok(PathLookup::Existing {
                 node: *child.node(),
-                path: OpenedPath::Child {
-                    parent: child.parent(),
-                    name: child.name().clone(),
-                },
+                path: OpenedPath::try_child(child.parent(), child.name())?,
             });
         }
         let NodeId::Directory(directory_id) = *child.node() else {
@@ -432,8 +426,10 @@ fn initialize_file_object(
     share_access: ShareAccess,
     close_disposition: CloseDisposition,
 ) -> DriverResult<()> {
+    let handle = memory::boxed_with(|| OpenedHandle::new(node, path, close_disposition))?;
     let fcb = open_shared_file_control_block(file_object, vcb, node, desired_access, share_access)?;
-    attach_file_object(file_object, fcb, node, path, close_disposition)
+    attach_preallocated_file_object(file_object, fcb, handle);
+    Ok(())
 }
 
 /// Opens the shared FCB for a node and records the create share-access claim.
@@ -466,26 +462,19 @@ fn open_shared_file_control_block(
     Ok(fcb)
 }
 
-/// Stores already-opened FCB and new CCB context pointers in the FILE_OBJECT.
-/// # Errors
-///
-/// Returns an error when FILE_OBJECT context pointers cannot be attached.
-fn attach_file_object(
+/// Stores already-opened FCB and preallocated CCB context pointers in the FILE_OBJECT.
+fn attach_preallocated_file_object(
     file_object: UninitializedFileObject,
     fcb: NonNull<FileControlBlock>,
-    node: NodeId,
-    path: OpenedPath,
-    close_disposition: CloseDisposition,
-) -> DriverResult<()> {
+    handle: Box<OpenedHandle>,
+) {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is
         // writable during successful create processing.
         file_object.as_mut()
     };
-    let handle = memory::boxed_with(|| OpenedHandle::new(node, path, close_disposition))?;
     file_object.FsContext = fcb.as_ptr().cast::<c_void>();
     file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
-    Ok(())
 }
 
 /// Rolls back an FCB open whose FILE_OBJECT was not attached.

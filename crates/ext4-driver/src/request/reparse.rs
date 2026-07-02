@@ -106,8 +106,9 @@ fn replace_opened_path_with_symlink(
     target: &SymlinkTarget,
 ) -> DriverResult<()> {
     let mut opened_file = OpenedObject::decode(stack.file_object())?;
-    let OpenedPath::Child { parent, name } = opened_file.path().clone() else {
-        return Err(DriverError::NotSupported);
+    let (parent, name) = match opened_file.path() {
+        OpenedPath::Child { parent, name } => (*parent, name.try_clone()?),
+        OpenedPath::Root => return Err(DriverError::NotSupported),
     };
 
     let mut vcb = opened_file.volume();

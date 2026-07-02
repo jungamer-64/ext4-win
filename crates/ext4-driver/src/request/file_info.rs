@@ -411,12 +411,9 @@ fn set_rename_information(
 ) -> DriverResult<()> {
     let rename = RenameTargetPath::parse(request.target, request.stack.length(), format)?;
 
-    let OpenedPath::Child {
-        parent: source_parent,
-        name: source_name,
-    } = request.opened_file.path().clone()
-    else {
-        return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));
+    let (source_parent, source_name) = match request.opened_file.path() {
+        OpenedPath::Child { parent, name } => (*parent, name.try_clone()?),
+        OpenedPath::Root => return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot)),
     };
 
     let mut vcb = request.opened_file.volume();
@@ -524,7 +521,7 @@ impl DirectoryInformationClass {
 }
 
 /// Caller-supplied directory filename pattern.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum DirectoryPattern {
     /// Enumerate every Windows-representable ext4 entry.
     All,
@@ -984,8 +981,9 @@ fn cleanup_file_object(file_object: KernelFileObject) -> DriverResult<()> {
     if opened_file.close_disposition() == CloseDisposition::Keep {
         return Ok(());
     }
-    let OpenedPath::Child { parent, name } = opened_file.path().clone() else {
-        return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));
+    let (parent, name) = match opened_file.path() {
+        OpenedPath::Child { parent, name } => (*parent, name.try_clone()?),
+        OpenedPath::Root => return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot)),
     };
 
     let mut vcb = opened_file.volume();
