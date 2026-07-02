@@ -1,12 +1,13 @@
 //! fs-verity descriptor and Merkle tree domain.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::disk::block::BlockSize;
 use crate::disk_format::inode::FileSize;
 use crate::error::{Error, Result};
+use crate::memory::{self, FallibleVec};
 
 /// Serialized Linux `struct fsverity_descriptor` size without signature bytes.
 pub const FSVERITY_DESCRIPTOR_BYTES: usize = 256;
@@ -405,7 +406,7 @@ impl FsveritySalt {
             return Err(Error::InvalidVerityMetadata);
         }
         Ok(Self {
-            bytes: bytes.to_vec(),
+            bytes: memory::copied_slice(bytes)?,
         })
     }
 
@@ -426,6 +427,16 @@ impl FsveritySalt {
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
+
+    /// Copies this salt without using infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the salt bytes cannot allocate.
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            bytes: memory::copied_slice(&self.bytes)?,
+        })
+    }
 }
 
 /// Optional builtin fs-verity signature bytes stored after the descriptor.
@@ -445,7 +456,7 @@ impl FsveritySignature {
             return Err(Error::InvalidVerityMetadata);
         }
         Ok(Self {
-            bytes: bytes.to_vec(),
+            bytes: memory::copied_slice(bytes)?,
         })
     }
 
@@ -800,14 +811,14 @@ impl FsverityMerkleTree {
         let mut levels = Vec::new();
         while hashes.len() > 1 {
             let (level_blocks, parent_hashes) = hash_level(&hashes, algorithm, block_bytes, salt)?;
-            levels.push(level_blocks);
+            levels.try_push(level_blocks)?;
             hashes = parent_hashes;
         }
         let root_digest = hashes.pop().ok_or(Error::InvalidVerityMetadata)?;
         levels.reverse();
         let mut blocks = Vec::new();
         for level in levels {
-            blocks.extend_from_slice(&level);
+            blocks.try_extend_from_slice(&level)?;
         }
         Ok(Self {
             algorithm,
@@ -994,12 +1005,12 @@ fn hash_data_blocks(
 ) -> Result<Vec<FsverityDigest>> {
     let mut hashes = Vec::new();
     for chunk in data.chunks(block_bytes) {
-        let mut block = vec![0_u8; block_bytes];
+        let mut block = memory::repeated_vec(0_u8, block_bytes)?;
         block
             .get_mut(..chunk.len())
             .ok_or(Error::InvalidVerityMetadata)?
             .copy_from_slice(chunk);
-        hashes.push(hash_block(algorithm, salt, &block)?);
+        hashes.try_push(hash_block(algorithm, salt, &block)?)?;
     }
     Ok(hashes)
 }
@@ -1025,7 +1036,7 @@ fn hash_level(
     let mut level_blocks = Vec::new();
     let mut parent_hashes = Vec::new();
     for hash_group in hashes.chunks(hashes_per_block) {
-        let mut block = vec![0_u8; block_bytes];
+        let mut block = memory::repeated_vec(0_u8, block_bytes)?;
         for (index, hash) in hash_group.iter().enumerate() {
             if hash.algorithm() != algorithm {
                 return Err(Error::InvalidVerityMetadata);
@@ -1035,8 +1046,8 @@ fn hash_level(
                 .ok_or(Error::ArithmeticOverflow)?;
             copy_into(&mut block, offset, hash.bytes())?;
         }
-        parent_hashes.push(hash_block(algorithm, salt, &block)?);
-        level_blocks.extend_from_slice(&block);
+        parent_hashes.try_push(hash_block(algorithm, salt, &block)?)?;
+        level_blocks.try_extend_from_slice(&block)?;
     }
     Ok((level_blocks, parent_hashes))
 }
@@ -1054,21 +1065,24 @@ fn hash_block(
     let mut input = Vec::new();
     if !salt.is_empty() {
         let padded_salt_bytes = algorithm.compression_input_bytes();
-        input.resize(padded_salt_bytes, 0);
+        input = memory::repeated_vec(0_u8, padded_salt_bytes)?;
         input
             .get_mut(..salt.bytes().len())
             .ok_or(Error::InvalidVerityMetadata)?
             .copy_from_slice(salt.bytes());
     }
-    input.extend_from_slice(block);
-    FsverityDigest::new(algorithm, hash_bytes(algorithm, &input))
+    input.try_extend_from_slice(block)?;
+    FsverityDigest::new(algorithm, hash_bytes(algorithm, &input)?)
 }
 
 /// Hashes an arbitrary byte slice with the selected algorithm.
-fn hash_bytes(algorithm: FsverityHashAlgorithm, bytes: &[u8]) -> Vec<u8> {
+/// # Errors
+///
+/// Returns an error when allocating the owned digest bytes fails.
+fn hash_bytes(algorithm: FsverityHashAlgorithm, bytes: &[u8]) -> Result<Vec<u8>> {
     match algorithm {
-        FsverityHashAlgorithm::Sha256 => Sha256::digest(bytes).to_vec(),
-        FsverityHashAlgorithm::Sha512 => Sha512::digest(bytes).to_vec(),
+        FsverityHashAlgorithm::Sha256 => memory::copied_slice(&Sha256::digest(bytes)),
+        FsverityHashAlgorithm::Sha512 => memory::copied_slice(&Sha512::digest(bytes)),
     }
 }
 

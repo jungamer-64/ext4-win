@@ -14,10 +14,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         name: XattrName,
         value: XattrValue,
     ) -> Result<()> {
-        self.update_xattrs(node, |set| {
-            set.insert(name, value);
-            Ok(())
-        })
+        self.update_xattrs(node, |set| set.insert(name, value))
     }
 
     /// Removes one ext4 extended attribute.
@@ -68,7 +65,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 
     /// Stages the latest image for a mutated external xattr block.
-    fn stage_xattr_block(&mut self, block: BlockAddress, bytes: Vec<u8>) {
+    /// # Errors
+    ///
+    /// Returns an error when recording a new staged block image cannot allocate.
+    fn stage_xattr_block(&mut self, block: BlockAddress, bytes: Vec<u8>) -> Result<()> {
         if let Some(image) = self
             .xattr_updates
             .iter_mut()
@@ -76,8 +76,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         {
             image.bytes = bytes;
         } else {
-            self.xattr_updates.push(BlockImage { block, bytes });
+            self.xattr_updates.try_push(BlockImage { block, bytes })?;
         }
+        Ok(())
     }
 
     /// Reads an external xattr block, preferring this transaction's staged image.
@@ -92,11 +93,13 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             .rev()
             .find(|image| image.block == block)
         {
-            return Ok(staged.bytes.clone());
+            return memory::copied_slice(&staged.bytes);
         }
         let block_size = self.volume.superblock.block_size();
-        let mut bytes =
-            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        let mut bytes = memory::repeated_vec(
+            0_u8,
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
         self.volume
             .device
             .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
@@ -223,7 +226,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             block,
             &self.volume.superblock,
         )?;
-        self.stage_xattr_block(block, bytes);
+        self.stage_xattr_block(block, bytes)?;
         raw_inode.clear_inline_xattr_region()?;
         raw_inode.set_xattr_block(Some(block))
     }
@@ -262,7 +265,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             &self.volume.superblock,
             updated,
         )?;
-        self.stage_xattr_block(block, bytes);
+        self.stage_xattr_block(block, bytes)?;
         Ok(())
     }
 }

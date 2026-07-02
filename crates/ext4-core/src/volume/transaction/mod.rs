@@ -285,7 +285,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     /// Returns an error when staged cluster deltas conflict or the superblock free-cluster delta
     /// cannot be applied.
     fn committed_cluster_state(&self) -> Result<(ClusterReferenceIndex, Superblock)> {
-        let mut clusters = self.volume.state.clusters.clone();
+        let mut clusters = self.volume.state.clusters.try_clone()?;
         clusters.apply_deltas(self.cluster_deltas.as_slice())?;
         let mut superblock = self.volume.superblock;
         superblock.apply_free_cluster_delta(self.free_clusters_delta)?;
@@ -439,9 +439,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     ) -> Result<()> {
         let block_size = self.volume.superblock.block_size();
         let required = tree.required_metadata_blocks(block_size)?;
-        let mut metadata_blocks = tree.metadata_blocks().to_vec();
+        let mut metadata_blocks = memory::copied_slice(tree.metadata_blocks())?;
         while metadata_blocks.len() < required {
-            metadata_blocks.push(self.allocate_cluster()?);
+            metadata_blocks.try_push(self.allocate_cluster()?)?;
         }
         while metadata_blocks.len() > required {
             let block = metadata_blocks.pop().ok_or(Error::InvalidExtentTree)?;
@@ -474,7 +474,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
                         .ok_or(Error::ArithmeticOverflow)?,
                 ))?;
                 if !clusters.contains(&cluster) {
-                    clusters.push(cluster);
+                    clusters.try_push(cluster)?;
                 }
             }
         }
@@ -500,10 +500,10 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     ) -> Result<()> {
         raw_inode.set_extent_root_bytes(serialized.inode_root())?;
         for block in serialized.external_blocks() {
-            self.extent_updates.push(BlockImage {
+            self.extent_updates.try_push(BlockImage {
                 block: block.block(),
-                bytes: block.bytes().to_vec(),
-            });
+                bytes: memory::copied_slice(block.bytes())?,
+            })?;
         }
         Ok(())
     }
@@ -550,7 +550,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             return Ok(StagedInodeIndex::new(index));
         }
         let raw_inode = self.volume.read_live_inode_record(inode_id)?;
-        self.inode_updates.push(raw_inode.into());
+        self.inode_updates.try_push(raw_inode.into())?;
         Ok(StagedInodeIndex::new(
             self.inode_updates
                 .len()

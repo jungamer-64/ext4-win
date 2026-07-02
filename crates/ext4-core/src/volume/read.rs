@@ -376,10 +376,9 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
     pub(super) fn read_inode_xattrs(&self, inode_id: InodeId) -> Result<XattrSet> {
-        Ok(self
-            .read_inode_xattrs_from_live(&self.read_live_inode_record(inode_id)?)?
+        self.read_inode_xattrs_from_live(&self.read_live_inode_record(inode_id)?)?
             .public()
-            .clone())
+            .try_clone()
     }
 
     /// Reads one extended attribute value by name.
@@ -391,7 +390,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         inode_id: InodeId,
         name: &XattrName,
     ) -> Result<Option<XattrValue>> {
-        Ok(self.read_inode_xattrs(inode_id)?.get(name).cloned())
+        self.read_inode_xattrs(inode_id)?
+            .get(name)
+            .map(XattrValue::try_clone)
+            .transpose()
     }
 
     /// Reads a POSIX ACL from its ext4 xattr slot.
@@ -517,7 +519,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         name: &Ext4Name,
     ) -> Result<Ext4Name> {
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
-            return Ok(name.clone());
+            return Ext4Name::new(name.bytes());
         }
         let (key, padding) = self.fscrypt_filenames_key_for_inode(parent)?;
         Ext4Name::from_disk(&key.encrypt_filename(name.bytes(), padding)?)
@@ -534,7 +536,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         name: &Ext4Name,
     ) -> Result<Ext4Name> {
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
-            return Ok(name.clone());
+            return Ext4Name::new(name.bytes());
         }
         let (key, _padding) = self.fscrypt_filenames_key_for_inode(parent)?;
         Ext4Name::new(&key.decrypt_filename(name.bytes())?)
@@ -603,9 +605,9 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         self.reject_unsupported_protected_payload_access(symlink.inode())?;
         let len = symlink.size().to_usize()?;
         if let Ok(inline) = symlink.inode().inline_bytes() {
-            return Ok(inline.prefix(symlink.size())?.to_vec());
+            return memory::copied_slice(inline.prefix(symlink.size())?);
         }
-        let mut target = vec![0_u8; len];
+        let mut target = memory::repeated_vec(0_u8, len)?;
         let _bytes_read = self.read_inode_data(symlink.inode(), FileOffset::ZERO, &mut target)?;
         Ok(target)
     }
@@ -625,7 +627,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
             return Ok(ReadBytes::from_usize(0));
         }
         let metadata = self.read_verity_metadata(file)?;
-        let mut plaintext = vec![0_u8; file.size().to_usize()?];
+        let mut plaintext = memory::repeated_vec(0_u8, file.size().to_usize()?)?;
         let read =
             self.read_inode_plaintext_data(file.inode(), FileOffset::ZERO, &mut plaintext)?;
         if read.as_usize() != plaintext.len() {
@@ -683,7 +685,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         )?;
         let descriptor_len =
             usize::try_from(descriptor_bytes).map_err(|_| Error::ArithmeticOverflow)?;
-        let mut descriptor_image = vec![0_u8; descriptor_len];
+        let mut descriptor_image = memory::repeated_vec(0_u8, descriptor_len)?;
         self.read_inode_plaintext_stream_range(
             file.inode(),
             &extent_tree,
@@ -704,17 +706,18 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         )?;
         let merkle_tree_len =
             usize::try_from(layout.merkle_tree_bytes()).map_err(|_| Error::ArithmeticOverflow)?;
-        let mut merkle_tree = vec![0_u8; merkle_tree_len];
+        let mut merkle_tree = memory::repeated_vec(0_u8, merkle_tree_len)?;
         self.read_inode_plaintext_stream_range(
             file.inode(),
             &extent_tree,
             layout.merkle_tree_offset(),
             &mut merkle_tree,
         )?;
-        let signature = descriptor_image
-            .get(FSVERITY_DESCRIPTOR_BYTES..)
-            .ok_or(Error::TruncatedStructure)?
-            .to_vec();
+        let signature = memory::copied_slice(
+            descriptor_image
+                .get(FSVERITY_DESCRIPTOR_BYTES..)
+                .ok_or(Error::TruncatedStructure)?,
+        )?;
         Ext4VerityMetadata::new(layout, descriptor, signature, merkle_tree)
     }
 
@@ -724,7 +727,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     /// Returns an error when the directory is too large for eager
     /// enumeration, or contains malformed entries.
     pub(super) fn read_directory(&self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
-        let entries = self.read_directory_layout(directory.inode())?.entries();
+        let entries = self.read_directory_layout(directory.inode())?.entries()?;
         let entries = if directory.protection().is_encrypted() {
             match self.decrypt_directory_entries(directory.inode(), &entries) {
                 Err(Error::MissingEncryptionKey) => {
@@ -748,10 +751,13 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         directory: &Inode,
         entries: &[RawDirectoryEntry],
     ) -> Result<Vec<RawDirectoryEntry>> {
-        let mut decrypted = Vec::with_capacity(entries.len());
+        let mut decrypted = Vec::new();
+        decrypted
+            .try_reserve_exact(entries.len())
+            .map_err(|_| Error::OutOfMemory)?;
         for entry in entries {
             let name = self.decrypt_directory_child_name(directory, entry.name())?;
-            decrypted.push(RawDirectoryEntry::new(entry.inode(), &name, entry.kind()));
+            decrypted.try_push(RawDirectoryEntry::new(entry.inode(), &name, entry.kind())?)?;
         }
         Ok(decrypted)
     }
@@ -764,10 +770,13 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     pub(super) fn project_locked_directory_entries(
         entries: Vec<RawDirectoryEntry>,
     ) -> Result<Vec<RawDirectoryEntry>> {
-        let mut projected = Vec::with_capacity(entries.len());
+        let mut projected = Vec::new();
+        projected
+            .try_reserve_exact(entries.len())
+            .map_err(|_| Error::OutOfMemory)?;
         for entry in entries {
             let name = Self::project_locked_directory_name(entry.name())?;
-            projected.push(RawDirectoryEntry::new(entry.inode(), &name, entry.kind()));
+            projected.try_push(RawDirectoryEntry::new(entry.inode(), &name, entry.kind())?)?;
         }
         Ok(projected)
     }
@@ -779,7 +788,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     /// name.
     pub(super) fn project_locked_directory_name(name: &Ext4Name) -> Result<Ext4Name> {
         if matches!(name.bytes(), b"." | b"..") {
-            return Ok(name.clone());
+            return Ext4Name::new(name.bytes());
         }
         let display = FscryptNoKeyName::from_ciphertext(name.bytes())?.display_bytes()?;
         Ext4Name::new(&display)
@@ -807,7 +816,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         parent: &DirectoryNode,
         name: &Ext4Name,
     ) -> Result<ChildLookup> {
-        if let Some(entry) = self.read_directory_layout(parent.inode())?.find(name) {
+        if let Some(entry) = self.read_directory_layout(parent.inode())?.find(name)? {
             return Ok(ChildLookup::Found(self.directory_child(parent, entry)?));
         }
         Ok(ChildLookup::NotFound)
@@ -859,7 +868,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
             };
             return self
                 .read_directory_layout(parent.inode())?
-                .find(&ciphertext)
+                .find(&ciphertext)?
                 .map(|entry| self.validate_directory_entry(entry, &visible_name))
                 .transpose();
         }
@@ -909,10 +918,13 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         &self,
         entries: Vec<RawDirectoryEntry>,
     ) -> Result<Vec<DirectoryEntry>> {
-        let mut validated = Vec::with_capacity(entries.len());
+        let mut validated = Vec::new();
+        validated
+            .try_reserve_exact(entries.len())
+            .map_err(|_| Error::OutOfMemory)?;
         for entry in entries {
             let node = self.load_inode_node(entry.inode())?.id();
-            validated.push(DirectoryEntry::new(entry.name(), node, entry.kind()));
+            validated.try_push(DirectoryEntry::new(entry.name(), node, entry.kind()))?;
         }
         Ok(validated)
     }
@@ -980,10 +992,10 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
                     return Err(Error::InvalidDirectoryEntry);
                 }
             };
-            let mut bytes = vec![0_u8; block_bytes];
+            let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
             self.device
                 .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
-            blocks.push(DirectoryBlockData::new(logical_block.as_u32(), bytes));
+            blocks.try_push(DirectoryBlockData::new(logical_block.as_u32(), bytes))?;
         }
         Ok(blocks)
     }
@@ -1126,7 +1138,7 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
 
             match extent_tree.map_logical(LogicalBlock::try_from(logical_block)?) {
                 BlockMapping::Physical(physical_block) => {
-                    let mut block = vec![0_u8; block_bytes];
+                    let mut block = memory::repeated_vec(0_u8, block_bytes)?;
                     self.device.read_exact_at(
                         self.superblock.block_size().offset_of(physical_block)?,
                         &mut block,
@@ -1230,7 +1242,8 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
 
         let inode_offset = inode_offset_on_device(&self.device, &self.superblock, inode_id)?;
 
-        let mut bytes = vec![0_u8; usize::from(self.superblock.inode_size().as_u16())];
+        let mut bytes =
+            memory::repeated_vec(0_u8, usize::from(self.superblock.inode_size().as_u16()))?;
         self.device.read_exact_at(inode_offset, &mut bytes)?;
         Ok(RawInodeRecord {
             id: inode_id,
@@ -1273,11 +1286,11 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
         let Some(block) = raw_inode.xattr_block()? else {
             return Ok(inline);
         };
-        let mut bytes = vec![
-            0_u8;
+        let mut bytes = memory::repeated_vec(
+            0_u8,
             usize::try_from(self.superblock.block_size().bytes())
-                .map_err(|_| Error::ArithmeticOverflow)?
-        ];
+                .map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
         self.device
             .read_exact_at(self.superblock.block_size().offset_of(block)?, &mut bytes)?;
         let external = xattr_storage::parse_external_xattr_block(&bytes, block, &self.superblock)?;

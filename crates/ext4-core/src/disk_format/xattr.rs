@@ -1,6 +1,6 @@
 //! Extended-attribute domain and ext4 xattr block encoding.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use crate::disk::block::BlockAddress;
@@ -8,6 +8,7 @@ use crate::disk::checksum::crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::disk_format::superblock::{MetadataChecksum, Superblock};
 use crate::error::{Error, Result};
+use crate::memory::{self, FallibleVec};
 
 /// ext4 xattr header magic.
 const EXT4_XATTR_MAGIC: u32 = 0xEA02_0000;
@@ -98,7 +99,7 @@ impl XattrName {
         }
         Ok(Self {
             namespace,
-            local: local.to_vec(),
+            local: memory::copied_slice(local)?,
         })
     }
 
@@ -115,20 +116,36 @@ impl XattrName {
     }
 
     /// Fully qualified xattr name with namespace prefix.
-    #[must_use]
-    pub fn qualified(&self) -> Vec<u8> {
-        let mut qualified = Vec::with_capacity(
-            self.namespace
-                .prefix()
-                .len()
-                .checked_add(1)
-                .and_then(|len| len.checked_add(self.local.len()))
-                .unwrap_or(0),
-        );
-        qualified.extend_from_slice(self.namespace.prefix());
-        qualified.push(b'.');
-        qualified.extend_from_slice(&self.local);
+    /// # Errors
+    ///
+    /// Returns an error when the qualified name allocation fails.
+    pub fn qualified(&self) -> Result<Vec<u8>> {
+        let full_len = self
+            .namespace
+            .prefix()
+            .len()
+            .checked_add(1)
+            .and_then(|len| len.checked_add(self.local.len()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let mut qualified = Vec::new();
         qualified
+            .try_reserve_exact(full_len)
+            .map_err(|_| Error::OutOfMemory)?;
+        qualified.try_extend_from_slice(self.namespace.prefix())?;
+        qualified.try_push(b'.')?;
+        qualified.try_extend_from_slice(&self.local)?;
+        Ok(qualified)
+    }
+
+    /// Copies this xattr name without using infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the local xattr name bytes cannot allocate.
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            namespace: self.namespace,
+            local: memory::copied_slice(&self.local)?,
+        })
     }
 }
 
@@ -152,7 +169,7 @@ impl XattrValue {
             return Err(Error::InvalidXattr);
         }
         Ok(Self {
-            bytes: bytes.to_vec(),
+            bytes: memory::copied_slice(bytes)?,
         })
     }
 
@@ -160,6 +177,16 @@ impl XattrValue {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Copies this xattr value without using infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the xattr value bytes cannot allocate.
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            bytes: memory::copied_slice(&self.bytes)?,
+        })
     }
 }
 
@@ -176,10 +203,14 @@ impl XattrSet {
     /// # Errors
     /// Returns an error when duplicate names are present.
     pub fn from_entries(entries: Vec<(XattrName, XattrValue)>) -> Result<Self> {
-        let mut entries: Vec<_> = entries
-            .into_iter()
-            .map(|(name, value)| XattrEntry { name, value })
-            .collect();
+        let mut converted = Vec::new();
+        converted
+            .try_reserve_exact(entries.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for (name, value) in entries {
+            converted.try_push(XattrEntry { name, value })?;
+        }
+        let mut entries = converted;
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         if entries
             .windows(2)
@@ -196,6 +227,24 @@ impl XattrSet {
         Self {
             entries: Vec::new(),
         }
+    }
+
+    /// Copies this xattr set without using infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying an entry name/value or reserving the set storage fails.
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for entry in &self.entries {
+            entries.try_push(XattrEntry {
+                name: entry.name.try_clone()?,
+                value: entry.value.try_clone()?,
+            })?;
+        }
+        Ok(Self { entries })
     }
 
     /// Returns true when this set has no entries.
@@ -215,15 +264,24 @@ impl XattrSet {
     }
 
     /// Inserts or replaces one value.
-    pub fn insert(&mut self, name: XattrName, value: XattrValue) {
+    /// # Errors
+    ///
+    /// Returns an error when inserting a new xattr requires allocation and that allocation fails.
+    pub fn insert(&mut self, name: XattrName, value: XattrValue) -> Result<()> {
         match self.entries.binary_search_by(|entry| entry.name.cmp(&name)) {
             Ok(index) => {
                 if let Some(entry) = self.entries.get_mut(index) {
                     entry.value = value;
                 }
             }
-            Err(index) => self.entries.insert(index, XattrEntry { name, value }),
+            Err(index) => {
+                self.entries
+                    .try_reserve(1)
+                    .map_err(|_| Error::OutOfMemory)?;
+                self.entries.insert(index, XattrEntry { name, value });
+            }
         }
+        Ok(())
     }
 
     /// Removes one value.
@@ -242,11 +300,18 @@ impl XattrSet {
     }
 
     /// Consumes the set into owned entries.
-    pub(crate) fn into_entries(self) -> Vec<(XattrName, XattrValue)> {
-        self.entries
-            .into_iter()
-            .map(|entry| (entry.name, entry.value))
-            .collect()
+    /// # Errors
+    ///
+    /// Returns an error when reserving the output entry vector fails.
+    pub(crate) fn into_entries(self) -> Result<Vec<(XattrName, XattrValue)>> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for entry in self.entries {
+            entries.try_push((entry.name, entry.value))?;
+        }
+        Ok(entries)
     }
 }
 
@@ -347,7 +412,7 @@ pub(crate) fn parse_inline_xattrs(region: &[u8]) -> Result<InodeXattrSet> {
 /// Returns an error when the region cannot hold the inline xattr header or the serialized entries
 /// and values.
 pub(crate) fn serialize_inline_xattrs(set: &InodeXattrSet, capacity: usize) -> Result<Vec<u8>> {
-    let mut bytes = vec![0_u8; capacity];
+    let mut bytes = memory::repeated_vec(0_u8, capacity)?;
     if set.is_empty() {
         return Ok(bytes);
     }
@@ -399,7 +464,7 @@ pub(crate) fn serialize_external_xattr_block(
     if set.is_empty() {
         return Err(Error::InvalidXattr);
     }
-    let mut bytes = vec![0_u8; block_size];
+    let mut bytes = memory::repeated_vec(0_u8, block_size)?;
     put_le_u32(&mut bytes, disk_offset(0), EXT4_XATTR_MAGIC)?;
     put_le_u32(&mut bytes, disk_offset(4), 1)?;
     put_le_u32(&mut bytes, disk_offset(8), 1)?;
@@ -419,7 +484,7 @@ pub(crate) fn serialize_external_xattr_block(
 ///
 /// Returns an error when serializing the set would exceed the supplied block size.
 pub(crate) fn ensure_external_xattrs_fit(set: &InodeXattrSet, block_size: usize) -> Result<()> {
-    let mut bytes = vec![0_u8; block_size];
+    let mut bytes = memory::repeated_vec(0_u8, block_size)?;
     serialize_xattr_entries(
         set,
         &mut bytes,
@@ -472,8 +537,14 @@ pub(crate) fn set_external_xattr_refcount(
 ///
 /// Returns an error when public xattr names collide or both sets contain a private fscrypt context.
 pub(crate) fn merge_xattr_sets(left: InodeXattrSet, right: InodeXattrSet) -> Result<InodeXattrSet> {
-    let mut entries = left.public.into_entries();
-    entries.extend(right.public.into_entries());
+    let mut entries = left.public.into_entries()?;
+    let right_entries = right.public.into_entries()?;
+    entries
+        .try_reserve_exact(right_entries.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    for entry in right_entries {
+        entries.try_push(entry)?;
+    }
     let public = XattrSet::from_entries(entries)?;
     let encryption_context = match (left.encryption_context, right.encryption_context) {
         (None, None) => None,
@@ -602,7 +673,7 @@ fn parse_xattr_entries(
             .ok_or(Error::InvalidXattr)?;
         let key = DiskXattrKey {
             index,
-            local: local.to_vec(),
+            local: memory::copied_slice(local)?,
         };
         if let Some(previous) = &previous_key
             && previous.cmp_disk(&key) != Ordering::Less
@@ -611,11 +682,11 @@ fn parse_xattr_entries(
         }
         previous_key = Some(key);
 
-        parsed.push(ParsedDiskXattr {
+        parsed.try_push(ParsedDiskXattr {
             slot: logical_slot(index, local)?,
             value_offset,
             value_size,
-        });
+        })?;
         cursor = align_up(name_end)?;
     }
 
@@ -641,7 +712,7 @@ fn parse_xattr_entries(
             )?
         };
         match entry.slot {
-            ParsedDiskXattrSlot::Public(name) => public_entries.push((name, value)),
+            ParsedDiskXattrSlot::Public(name) => public_entries.try_push((name, value))?,
             ParsedDiskXattrSlot::EncryptionContext => {
                 if encryption_context.replace(value).is_some() {
                     return Err(Error::InvalidXattr);
@@ -669,19 +740,19 @@ fn serialize_xattr_entries(
 ) -> Result<()> {
     let mut entries = Vec::new();
     for entry in &set.public.entries {
-        entries.push(SerializedDiskXattr {
+        entries.try_push(SerializedDiskXattr {
             key: disk_key(&entry.name)?,
-            value: entry.value.clone(),
-        });
+            value: entry.value.try_clone()?,
+        })?;
     }
     if let Some(value) = &set.encryption_context {
-        entries.push(SerializedDiskXattr {
+        entries.try_push(SerializedDiskXattr {
             key: DiskXattrKey {
                 index: EXT4_XATTR_INDEX_ENCRYPTION,
-                local: ENCRYPTION_CONTEXT_NAME.to_vec(),
+                local: memory::copied_slice(ENCRYPTION_CONTEXT_NAME)?,
             },
-            value: value.clone(),
-        });
+            value: value.try_clone()?,
+        })?;
     }
     entries.sort_by(|left, right| left.key.cmp_disk(&right.key));
 
@@ -690,7 +761,7 @@ fn serialize_xattr_entries(
         return Err(Error::NoSpace);
     }
 
-    let mut value_offsets = vec![0_usize; entries.len()];
+    let mut value_offsets = memory::repeated_vec(0_usize, entries.len())?;
     let mut value_cursor = storage.len();
     for (index, entry) in entries.iter().enumerate().rev() {
         let value = entry.value.bytes();
@@ -802,7 +873,7 @@ fn disk_key(name: &XattrName) -> Result<DiskXattrKey> {
     };
     Ok(DiskXattrKey {
         index,
-        local: local.to_vec(),
+        local: memory::copied_slice(local)?,
     })
 }
 
@@ -861,7 +932,7 @@ fn validate_external_xattr_block(
     }
     if superblock.metadata_checksum() == MetadataChecksum::Crc32c {
         let expected = le_u32(bytes, disk_offset(16))?;
-        let mut checksum_bytes = bytes.to_vec();
+        let mut checksum_bytes = memory::copied_slice(bytes)?;
         put_le_u32(&mut checksum_bytes, disk_offset(16), 0)?;
         let seed = crc32c(
             superblock.checksum_seed().as_u32(),
@@ -927,7 +998,11 @@ mod tests {
     fn xattr_name_is_split_from_namespace() {
         let name = XattrName::new(XattrNamespace::User, b"ext4win").ok();
         assert_eq!(
-            name.as_ref().map(XattrName::qualified),
+            name.as_ref()
+                .map(XattrName::qualified)
+                .transpose()
+                .ok()
+                .flatten(),
             Some(b"user.ext4win".to_vec())
         );
     }

@@ -1,11 +1,12 @@
 //! POSIX ACL xattr domain.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::disk_format::inode::{Ext4Gid, Ext4Permissions, Ext4Uid};
 use crate::disk_format::xattr::{XattrName, XattrNamespace, XattrValue};
 use crate::error::{Error, Result};
+use crate::memory::{self, FallibleVec};
 
 /// POSIX ACL xattr payload version.
 const POSIX_ACL_XATTR_VERSION: u32 = 0x0002;
@@ -102,7 +103,7 @@ impl PosixAcl {
                 bytes,
                 disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
             )?;
-            entries.push(parse_entry(tag, permissions, id)?);
+            entries.try_push(parse_entry(tag, permissions, id)?)?;
             offset = offset
                 .checked_add(ACL_ENTRY_BYTES)
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -123,7 +124,7 @@ impl PosixAcl {
                     .ok_or(Error::ArithmeticOverflow)?,
             )
             .ok_or(Error::ArithmeticOverflow)?;
-        let mut bytes = vec![0_u8; len];
+        let mut bytes = memory::repeated_vec(0_u8, len)?;
         put_le_u32(&mut bytes, disk_offset(0), POSIX_ACL_XATTR_VERSION)?;
         let mut offset = ACL_HEADER_BYTES;
         for entry in &self.entries {

@@ -13,3 +13,19 @@ allow-unwrap-in-consts = false
 allow-expect-in-consts = false
 
 check-private-items = true
+
+disallowed-methods = [
+    { path = "alloc::boxed::Box::new", reason = "kernel allocations must cross an explicit fallible allocation boundary" },
+    { path = "alloc::vec::Vec::with_capacity", reason = "kernel allocations must reserve through try_reserve and return OutOfMemory" },
+]
+
+disallowed-macros = [
+    { path = "std::panic", reason = "production kernel paths must return errors or use the explicit fatal boundary" },
+    { path = "core::panic", reason = "production kernel paths must return errors or use the explicit fatal boundary" },
+    { path = "std::todo", reason = "incomplete control flow must not enter kernel paths" },
+    { path = "core::todo", reason = "incomplete control flow must not enter kernel paths" },
+    { path = "std::unimplemented", reason = "incomplete control flow must not enter kernel paths" },
+    { path = "core::unimplemented", reason = "incomplete control flow must not enter kernel paths" },
+    { path = "std::unreachable", reason = "kernel impossibility must be represented by types or explicit fatal state" },
+    { path = "core::unreachable", reason = "kernel impossibility must be represented by types or explicit fatal state" },
+]

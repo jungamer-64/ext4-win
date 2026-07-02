@@ -1,10 +1,10 @@
 //! Reparse-point FSCTL packing for ext4 symbolic links.
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::irp::{DispatchTarget, FileSystemControlStack, IrpCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
+use crate::memory::FallibleVec;
 use crate::request::metadata;
 use crate::state::{FileControlBlock, OpenedObject, OpenedPath, OpenedSymlink, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
@@ -153,7 +153,12 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
 /// buffer is too small.
 fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> DriverResult<usize> {
     let target = core::str::from_utf8(target).map_err(|_| DriverError::NotSupported)?;
-    let path: Vec<u16> = target.encode_utf16().collect();
+    let mut path = Vec::new();
+    path.try_reserve(target.len())
+        .map_err(|_| DriverError::InsufficientResources)?;
+    for unit in target.encode_utf16() {
+        path.try_push(unit)?;
+    }
     let path_bytes = utf16_byte_len(path.as_slice())?;
     let print_name_offset = u16::try_from(path_bytes).map_err(|_| DriverError::NotSupported)?;
     let path_buffer_bytes = path_bytes
@@ -236,8 +241,8 @@ fn parse_symlink_reparse_buffer(input: &[u8]) -> DriverResult<SymlinkTarget> {
         substitute_name_offset,
         substitute_name_length,
     )?;
-    let target = String::from_utf16(units.as_slice()).map_err(|_| DriverError::InvalidParameter)?;
-    Ok(SymlinkTarget::new(target.as_bytes())?)
+    let target = utf16_to_utf8_bytes(units.as_slice())?;
+    Ok(SymlinkTarget::new(target.as_slice())?)
 }
 
 /// Reads a UTF-16 path slice from a symbolic-link reparse path buffer.
@@ -267,18 +272,36 @@ fn reparse_path_units(
         return Err(DriverError::InvalidParameter);
     }
     let bytes = input.range(wire_range(start, length)?)?;
-    let mut chunks = bytes.chunks_exact(core::mem::size_of::<u16>());
     let mut units = Vec::new();
-    for chunk in &mut chunks {
-        let unit: [u8; 2] = chunk
-            .try_into()
-            .map_err(|_| DriverError::InvalidParameter)?;
-        units.push(u16::from_le_bytes(unit));
-    }
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
         return Err(DriverError::InvalidParameter);
     }
+    for chunk in chunks {
+        units.try_push(u16::from_le_bytes(*chunk))?;
+    }
     Ok(units)
+}
+
+/// Converts UTF-16 units into UTF-8 bytes without using infallible string allocation.
+/// # Errors
+///
+/// Returns an error when the UTF-16 input is malformed or allocation fails.
+fn utf16_to_utf8_bytes(units: &[u16]) -> DriverResult<Vec<u8>> {
+    let capacity = units
+        .len()
+        .checked_mul(3)
+        .ok_or(DriverError::InvalidParameter)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve(capacity)
+        .map_err(|_| DriverError::InsufficientResources)?;
+    for decoded in char::decode_utf16(units.iter().copied()) {
+        let character = decoded.map_err(|_| DriverError::InvalidParameter)?;
+        let mut encoded = [0_u8; 4];
+        bytes.try_extend_from_slice(character.encode_utf8(&mut encoded).as_bytes())?;
+    }
+    Ok(bytes)
 }
 
 /// Returns the byte count for UTF-16 code units.

@@ -94,6 +94,8 @@ pub enum Error {
     InvalidVerityMetadata,
     /// fs-verity data verification failed.
     VerityMismatch,
+    /// Memory allocation failed before the requested operation could complete.
+    OutOfMemory,
 }
 
 impl fmt::Display for Error {
@@ -144,6 +146,7 @@ impl fmt::Display for Error {
             Self::InvalidEncryptionContext => "invalid ext4 encryption context",
             Self::InvalidVerityMetadata => "invalid ext4 verity metadata",
             Self::VerityMismatch => "ext4 verity verification failed",
+            Self::OutOfMemory => "memory allocation failed",
         })
     }
 }

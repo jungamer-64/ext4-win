@@ -6,7 +6,7 @@
 //! advance the superblock tail. This keeps crash-ordering rules out of ad hoc
 //! booleans in the volume layer.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use crate::disk::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
@@ -16,6 +16,7 @@ use crate::disk_format::extent::{ExtentTree, ExtentTreeContext};
 use crate::disk_format::inode::Inode;
 use crate::disk_format::superblock::RecoveryState;
 use crate::error::{Error, Result};
+use crate::memory::{self, FallibleVec};
 
 // Common JBD2 block header fields. JBD2 stores its control structures big-endian.
 /// Magic value that prefixes every JBD2 control block.
@@ -169,14 +170,17 @@ impl JournalSequence {
 
 impl<State> Journal<State> {
     /// Rebuilds the same journal data with a different typestate marker.
-    fn clone_without_state<Next>(&self) -> Journal<Next> {
-        Journal {
-            location: self.location.clone(),
-            superblock: self.superblock.clone(),
+    /// # Errors
+    ///
+    /// Returns an error when copying the typestate-independent journal data cannot allocate.
+    fn copy_without_state<Next>(&self) -> Result<Journal<Next>> {
+        Ok(Journal {
+            location: self.location.try_clone()?,
+            superblock: self.superblock.try_clone()?,
             ring: self.ring,
             filesystem_blocks: self.filesystem_blocks,
             state: PhantomData,
-        }
+        })
     }
 
     /// Loads an internal journal stored in the filesystem journal inode.
@@ -212,8 +216,10 @@ impl<State> Journal<State> {
         )?;
         let location =
             JournalLocation::Internal(InternalJournalLayout::new(tree.extents(), capacity_blocks)?);
-        let mut raw =
-            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        let mut raw = memory::repeated_vec(
+            0_u8,
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
         read_journal_block(reader, &location, block_size, 0, &mut raw)?;
         let superblock = JournalSuperblock::parse(&raw)?;
         let ring = superblock.validate_for_mount(block_size, capacity_blocks)?;
@@ -239,8 +245,10 @@ impl<State> Journal<State> {
         expected_uuid: [u8; 16],
         filesystem_blocks: u64,
     ) -> Result<Journal<LoadedJournal>> {
-        let mut raw =
-            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        let mut raw = memory::repeated_vec(
+            0_u8,
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
         journal.read_exact_at(
             ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET),
             &mut raw,
@@ -365,22 +373,22 @@ impl<State> Journal<State> {
         }
         let scan = self.committed_transactions(io, block_size)?;
         if scan.tail == JournalScanTail::CleanSuperblock {
-            return Ok(self.clone_without_state());
+            return self.copy_without_state();
         }
         if scan.transactions.is_empty() {
             self.mark_clean(io, block_size, self.superblock.sequence())?;
-            return Ok(self.clone_without_state());
+            return self.copy_without_state();
         }
 
         let mut revokes = Vec::new();
         for transaction in &scan.transactions {
             for (order, event) in transaction.events.iter().enumerate() {
                 if let JournalTransactionEvent::Revoke(block) = event {
-                    revokes.push(RevokedBlock {
+                    revokes.try_push(RevokedBlock {
                         sequence: transaction.sequence,
                         order,
                         block: *block,
-                    });
+                    })?;
                 }
             }
         }
@@ -399,7 +407,7 @@ impl<State> Journal<State> {
         }
         io.flush_all()?;
         self.mark_clean(io, block_size, next_sequence)?;
-        Ok(self.clone_without_state())
+        self.copy_without_state()
     }
 
     /// Writes, checkpoints, and cleans one metadata transaction.
@@ -509,16 +517,19 @@ impl<State> Journal<State> {
         self.ensure_transaction_capacity(metadata_blocks.len())?;
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
-        let mut data_blocks = Vec::with_capacity(metadata_blocks.len());
+        let mut data_blocks = Vec::new();
+        data_blocks
+            .try_reserve_exact(metadata_blocks.len())
+            .map_err(|_| Error::OutOfMemory)?;
         for metadata in metadata_blocks {
             if metadata.bytes().len() != block_bytes {
                 return Err(Error::InvalidWriteRange);
             }
-            let mut data = metadata.bytes().to_vec();
+            let mut data = memory::copied_slice(metadata.bytes())?;
             if starts_with_jbd2_magic(&data) {
                 put_be_u32(&mut data, disk_offset(0), 0)?;
             }
-            data_blocks.push(data);
+            data_blocks.try_push(data)?;
         }
 
         let sequence = self.superblock.sequence();
@@ -566,7 +577,7 @@ impl<State> Journal<State> {
                     next_cursor,
                     consumed: transaction_blocks,
                 } => {
-                    transactions.push(transaction);
+                    transactions.try_push(transaction)?;
                     cursor = next_cursor;
                     sequence = sequence.next();
                     consumed = consumed
@@ -653,12 +664,12 @@ impl<State> Journal<State> {
                             }) {
                                 return Err(Error::JournalCorrupt);
                             }
-                            transaction
-                                .events
-                                .push(JournalTransactionEvent::Entry(JournalEntry {
+                            transaction.events.try_push(JournalTransactionEvent::Entry(
+                                JournalEntry {
                                     home: tag.block,
                                     bytes: data,
-                                }));
+                                },
+                            ))?;
                         }
                         cursor = self.next_logical(cursor)?;
                         consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
@@ -669,7 +680,7 @@ impl<State> Journal<State> {
                     for block in revoke.blocks {
                         transaction
                             .events
-                            .push(JournalTransactionEvent::Revoke(block));
+                            .try_push(JournalTransactionEvent::Revoke(block))?;
                     }
                     cursor = self.next_logical(cursor)?;
                     consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
@@ -708,8 +719,10 @@ impl<State> Journal<State> {
         block_size: BlockSize,
         logical: u32,
     ) -> Result<Vec<u8>> {
-        let mut block =
-            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        let mut block = memory::repeated_vec(
+            0_u8,
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
         io.read_journal_block(self, block_size, logical, &mut block)?;
         Ok(block)
     }
@@ -749,7 +762,7 @@ impl<State> Journal<State> {
                 return Err(Error::JournalCorrupt);
             };
             let last = tag.flags & JBD2_TAG_FLAG_LAST_TAG != 0;
-            tags.push(tag);
+            tags.try_push(tag)?;
             offset = next_offset;
             if last {
                 saw_last = true;
@@ -911,7 +924,7 @@ impl<State> Journal<State> {
             } else {
                 u64::from(be_u32(block, disk_offset(offset))?)
             };
-            blocks.push(BlockAddress::new(block));
+            blocks.try_push(BlockAddress::new(block))?;
             offset = offset
                 .checked_add(entry_size)
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -966,8 +979,10 @@ impl<State> Journal<State> {
         data_blocks: &[Vec<u8>],
         block_size: BlockSize,
     ) -> Result<Vec<u8>> {
-        let mut block =
-            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        let mut block = memory::repeated_vec(
+            0_u8,
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
         Jbd2Header::descriptor(sequence.get()).encode(&mut block)?;
         let mut offset = JOURNAL_HEADER_BYTES;
         for (index, metadata) in metadata_blocks.iter().enumerate() {
@@ -1069,8 +1084,10 @@ impl<State> Journal<State> {
         sequence: JournalSequence,
         block_size: BlockSize,
     ) -> Result<Vec<u8>> {
-        let mut block =
-            vec![0_u8; usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?];
+        let mut block = memory::repeated_vec(
+            0_u8,
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
         Jbd2Header::commit(sequence.get()).encode(&mut block)?;
         if self.superblock.has_metadata_checksums() {
             *block.get_mut(0x0C).ok_or(Error::TruncatedStructure)? = JBD2_CHECKSUM_CRC32C;
@@ -1258,7 +1275,7 @@ impl<State> Journal<State> {
         let end = checksum_offset
             .checked_add(4)
             .ok_or(Error::ArithmeticOverflow)?;
-        let mut checked = block.to_vec();
+        let mut checked = memory::copied_slice(block)?;
         checked
             .get_mut(checksum_offset..end)
             .ok_or(Error::TruncatedStructure)?
@@ -1334,6 +1351,17 @@ enum JournalLocation {
 }
 
 impl JournalLocation {
+    /// Copies this journal location without infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the internal journal layout cannot allocate.
+    fn try_clone(&self) -> Result<Self> {
+        match self {
+            Self::Internal(layout) => Ok(Self::Internal(layout.try_clone()?)),
+            Self::External(layout) => Ok(Self::External(*layout)),
+        }
+    }
+
     /// Maps a logical journal block to a byte offset on its backing device.
     /// # Errors
     ///
@@ -1387,13 +1415,27 @@ struct InternalJournalLayout {
 }
 
 impl InternalJournalLayout {
+    /// Copies this internal journal layout without infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the extent list cannot allocate.
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            extents: memory::copied_slice(&self.extents)?,
+            capacity_blocks: self.capacity_blocks,
+        })
+    }
+
     /// Converts inode extents into a contiguous logical journal layout.
     /// # Errors
     ///
     /// Returns an error when an inode extent exceeds journal capacity or its logical/physical bounds
     /// overflow.
     fn new(extents: &[crate::disk_format::extent::Extent], capacity_blocks: u32) -> Result<Self> {
-        let mut mapped = Vec::with_capacity(extents.len());
+        let mut mapped = Vec::new();
+        mapped
+            .try_reserve_exact(extents.len())
+            .map_err(|_| Error::OutOfMemory)?;
         for extent in extents {
             let len = extent.len().as_u32();
             let logical_start = extent.logical_start().as_u32();
@@ -1403,12 +1445,12 @@ impl InternalJournalLayout {
             if logical_end > capacity_blocks {
                 return Err(Error::UnsupportedJournal);
             }
-            mapped.push(JournalExtent::new(
+            mapped.try_push(JournalExtent::new(
                 logical_start,
                 logical_end,
                 extent.physical_start(),
                 len,
-            )?);
+            )?)?;
         }
         mapped.sort_by_key(|extent| extent.logical_start);
         Ok(Self {
@@ -1632,6 +1674,26 @@ pub(crate) struct JournalSuperblock {
 }
 
 impl JournalSuperblock {
+    /// Copies this parsed superblock without infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the raw superblock image cannot allocate.
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            raw: memory::copied_slice(&self.raw)?,
+            block_size: self.block_size,
+            maxlen: self.maxlen,
+            first: self.first,
+            sequence: self.sequence,
+            start: self.start,
+            compat: self.compat,
+            incompat: self.incompat,
+            ro_compat: self.ro_compat,
+            uuid: self.uuid,
+            checksum_type: self.checksum_type,
+        })
+    }
+
     /// Parses and verifies a JBD2 superblock image.
     /// # Errors
     ///
@@ -1651,7 +1713,7 @@ impl JournalSuperblock {
             verify_journal_superblock_checksum(bytes)?;
         }
         Ok(Self {
-            raw: bytes.to_vec(),
+            raw: memory::copied_slice(bytes)?,
             block_size: be_u32(bytes, disk_offset(0x0C))?,
             maxlen: be_u32(bytes, disk_offset(0x10))?,
             first: be_u32(bytes, disk_offset(0x14))?,
@@ -1714,7 +1776,7 @@ impl JournalSuperblock {
         if self.raw.len() != block_len {
             return Err(Error::JournalCorrupt);
         }
-        let mut block = self.raw.clone();
+        let mut block = memory::copied_slice(&self.raw)?;
         put_be_u32(&mut block, disk_offset(0x18), sequence.get())?;
         put_be_u32(&mut block, disk_offset(0x1C), start)?;
         if self.has_superblock_checksum()? {
@@ -2247,10 +2309,11 @@ fn refresh_journal_superblock_checksum(block: &mut [u8]) -> Result<()> {
 ///
 /// Returns an error when the superblock body or checksum field is truncated.
 fn journal_superblock_checksum(block: &[u8]) -> Result<u32> {
-    let mut checked = block
-        .get(..JOURNAL_SUPERBLOCK_BYTES)
-        .ok_or(Error::TruncatedStructure)?
-        .to_vec();
+    let mut checked = memory::copied_slice(
+        block
+            .get(..JOURNAL_SUPERBLOCK_BYTES)
+            .ok_or(Error::TruncatedStructure)?,
+    )?;
     checked
         .get_mut(0xFC..0x100)
         .ok_or(Error::TruncatedStructure)?

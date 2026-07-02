@@ -122,6 +122,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::CannotRemoveRoot => STATUS_CANNOT_DELETE,
         Error::MissingEncryptionKey => STATUS_ACCESS_DENIED,
         Error::DirtyVolume => STATUS_VOLUME_DIRTY,
+        Error::OutOfMemory => STATUS_INSUFFICIENT_RESOURCES,
         Error::DeviceIo => STATUS_IO_DEVICE_ERROR,
         Error::VerityMismatch => STATUS_IO_DEVICE_ERROR,
         Error::UnsupportedBlockSize
@@ -200,6 +201,10 @@ mod tests {
         assert_eq!(
             DriverError::from(Error::DirtyVolume).ntstatus(),
             STATUS_VOLUME_DIRTY
+        );
+        assert_eq!(
+            DriverError::from(Error::OutOfMemory).ntstatus(),
+            wdk_sys::STATUS_INSUFFICIENT_RESOURCES
         );
         assert_eq!(
             DriverError::from(Error::UnsupportedDirectoryHash).ntstatus(),

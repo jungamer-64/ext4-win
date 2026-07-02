@@ -18,8 +18,10 @@ use wdk_sys::{
 
 use crate::irp::{DesiredAccess, DirectoryEntryIndex, ShareAccess};
 use crate::kernel::cng::CngFscryptNonceGenerator;
+use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::{block_device::KernelBlockDevice, ffi};
+use crate::memory::{self, FallibleVec};
 
 /// Registered control device observed by the unload callback.
 static mut CONTROL_DEVICE: Option<ControlDevice> = None;
@@ -375,9 +377,9 @@ impl VolumeControlBlock {
             return Ok(fcb);
         }
 
-        let fcb = Box::new(FileControlBlock::new(volume, node));
+        let fcb = memory::boxed(FileControlBlock::new(volume, node))?;
         let fcb = NonNull::from(Box::leak(fcb));
-        vcb.file_control_blocks.push(fcb);
+        vcb.file_control_blocks.try_push(fcb)?;
         Ok(fcb)
     }
 
@@ -388,7 +390,7 @@ impl VolumeControlBlock {
             .iter()
             .position(|candidate| *candidate == fcb)
         else {
-            return;
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
         };
         let mut fcb = fcb;
         let fcb_ref = unsafe {
@@ -939,10 +941,15 @@ impl OpenedObject {
             // and is read only for filesystem-owned context pointers.
             file_object.as_ref()
         };
-        let fcb = NonNull::new(object.FsContext.cast::<FileControlBlock>())
-            .ok_or(DriverError::InvalidParameter)?;
-        let handle = NonNull::new(object.FsContext2.cast::<OpenedHandle>())
-            .ok_or(DriverError::InvalidParameter)?;
+        let fcb = NonNull::new(object.FsContext.cast::<FileControlBlock>());
+        let handle = NonNull::new(object.FsContext2.cast::<OpenedHandle>());
+        let (fcb, handle) = match (fcb, handle) {
+            (Some(fcb), Some(handle)) => (fcb, handle),
+            (None, None) => return Err(DriverError::InvalidParameter),
+            (Some(_), None) | (None, Some(_)) => {
+                KernelWideInconsistency::file_object_context_corruption().bugcheck();
+            }
+        };
         let opened = Self {
             file_object,
             fcb,
@@ -1038,7 +1045,7 @@ impl OpenedObject {
             (NodeId::File(_), OpenedHandle::File(_))
             | (NodeId::Directory(_), OpenedHandle::Directory { .. })
             | (NodeId::Symlink(_), OpenedHandle::Symlink(_)) => Ok(()),
-            _ => Err(DriverError::InvalidParameter),
+            _ => KernelWideInconsistency::file_object_context_corruption().bugcheck(),
         }
     }
 }
@@ -1211,8 +1218,8 @@ mod tests {
 
     use super::{
         CloseDisposition, FileControlBlock, FileControlBlockRelease, KernelFileObject,
-        OpenedDirectory, OpenedHandle, OpenedHandleState, OpenedObject, OpenedPath,
-        OpenedRegularFile, OpenedSymlink, UninitializedFileObject, VolumeControlBlock,
+        OpenedDirectory, OpenedHandle, OpenedObject, OpenedPath, OpenedRegularFile, OpenedSymlink,
+        UninitializedFileObject, VolumeControlBlock,
     };
 
     fn file_object_with_contexts(
@@ -1243,63 +1250,8 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn opened_object_requires_both_contexts() {
+    fn unopened_object_without_contexts_is_invalid_parameter() {
         let mut file = file_object_with_contexts(core::ptr::null_mut(), core::ptr::null_mut());
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-
-        assert_eq!(
-            OpenedObject::decode(file_object).err(),
-            Some(DriverError::InvalidParameter)
-        );
-
-        let mut file = file_object_with_contexts(
-            NonNull::<FileControlBlock>::dangling().as_ptr().cast(),
-            core::ptr::null_mut(),
-        );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        assert_eq!(
-            OpenedObject::decode(file_object).err(),
-            Some(DriverError::InvalidParameter)
-        );
-
-        let mut file = file_object_with_contexts(
-            core::ptr::null_mut(),
-            NonNull::<super::OpenedHandle>::dangling().as_ptr().cast(),
-        );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        assert_eq!(
-            OpenedObject::decode(file_object).err(),
-            Some(DriverError::InvalidParameter)
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn opened_object_rejects_mismatched_fcb_and_handle_kinds() {
-        let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::File(OpenedHandleState::new(
-            OpenedPath::Root,
-            CloseDisposition::Keep,
-        ));
-        let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
-            core::ptr::addr_of_mut!(handle).cast(),
-        );
         let file_object = kernel_file_object(&mut file);
         assert!(file_object.is_some());
         let Some(file_object) = file_object else {

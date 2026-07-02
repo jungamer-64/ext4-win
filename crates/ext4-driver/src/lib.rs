@@ -1,11 +1,13 @@
 //! Native Windows kernel entry point for the ext4 file system driver.
 
+#![feature(allocator_api)]
 #![no_std]
 
 extern crate alloc;
 
 mod irp;
 mod kernel;
+mod memory;
 mod request;
 mod state;
 mod wire;

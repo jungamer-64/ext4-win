@@ -9,6 +9,7 @@ use crate::disk_format::superblock::{
     ChecksumSeed, DirectoryHashByteInterpretation, DirectoryHashSeed, DirectoryHashVersion,
 };
 use crate::error::{Error, Result};
+use crate::memory::{self, FallibleVec};
 use crate::platform::name::Ext4Name;
 
 /// Bytes occupied by the fixed header of an ext4 directory record.
@@ -113,12 +114,23 @@ pub struct DirectoryEntry {
 
 impl DirectoryEntry {
     /// Creates a live directory entry from validated domain values.
-    pub(crate) fn new(inode: InodeId, name: &Ext4Name, kind: DirectoryEntryKind) -> Self {
-        Self {
+    /// # Errors
+    ///
+    /// Returns an error when copying the raw directory name bytes cannot allocate.
+    pub(crate) fn new(inode: InodeId, name: &Ext4Name, kind: DirectoryEntryKind) -> Result<Self> {
+        Ok(Self {
             inode,
-            name: name.clone(),
+            name: Ext4Name::from_disk(name.bytes())?,
             kind,
-        }
+        })
+    }
+
+    /// Copies this directory entry without infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the raw directory name bytes cannot allocate.
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Self::new(self.inode, &self.name, self.kind)
     }
 
     /// Parses a directory file payload into live directory entries.
@@ -167,7 +179,7 @@ impl DirectoryEntry {
                 let name_end = name_start
                     .checked_add(name_len)
                     .ok_or(Error::ArithmeticOverflow)?;
-                entries.push(Self {
+                entries.try_push(Self {
                     inode: InodeId::try_from(inode)?,
                     name: Ext4Name::from_disk(
                         bytes
@@ -175,7 +187,7 @@ impl DirectoryEntry {
                             .ok_or(Error::InvalidDirectoryEntry)?,
                     )?,
                     kind: DirectoryEntryKind::from_raw(file_type),
-                });
+                })?;
             }
 
             offset = offset
@@ -266,15 +278,21 @@ impl DirectoryLayout {
     }
 
     /// Returns all live entries in directory traversal order.
-    pub(crate) fn entries(&self) -> Vec<DirectoryEntry> {
+    /// # Errors
+    ///
+    /// Returns an error when cloning the live entries cannot allocate.
+    pub(crate) fn entries(&self) -> Result<Vec<DirectoryEntry>> {
         match self {
-            Self::Linear(directory) => directory.entries.clone(),
+            Self::Linear(directory) => directory.entries(),
             Self::HTree(directory) => directory.entries(),
         }
     }
 
     /// Finds one exact ext4 child name.
-    pub(crate) fn find(&self, name: &Ext4Name) -> Option<DirectoryEntry> {
+    /// # Errors
+    ///
+    /// Returns an error when cloning the matched directory entry cannot allocate.
+    pub(crate) fn find(&self, name: &Ext4Name) -> Result<Option<DirectoryEntry>> {
         match self {
             Self::Linear(directory) => directory.find(name),
             Self::HTree(directory) => directory.find(name),
@@ -297,17 +315,42 @@ impl LinearDirectory {
     fn parse(blocks: Vec<DirectoryBlockData>) -> Result<Self> {
         let mut entries = Vec::new();
         for block in blocks {
-            entries.extend(DirectoryEntry::parse_all(block.bytes())?);
+            let block_entries = DirectoryEntry::parse_all(block.bytes())?;
+            entries
+                .try_reserve_exact(block_entries.len())
+                .map_err(|_| Error::OutOfMemory)?;
+            for entry in block_entries {
+                entries.try_push(entry)?;
+            }
         }
         Ok(Self { entries })
     }
 
+    /// Returns all live entries in physical order.
+    /// # Errors
+    ///
+    /// Returns an error when cloning the live entries cannot allocate.
+    fn entries(&self) -> Result<Vec<DirectoryEntry>> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for entry in &self.entries {
+            entries.try_push(entry.try_clone()?)?;
+        }
+        Ok(entries)
+    }
+
     /// Finds one exact ext4 name.
-    fn find(&self, name: &Ext4Name) -> Option<DirectoryEntry> {
+    /// # Errors
+    ///
+    /// Returns an error when cloning the matched directory entry cannot allocate.
+    fn find(&self, name: &Ext4Name) -> Result<Option<DirectoryEntry>> {
         self.entries
             .iter()
             .find(|entry| entry.name() == name)
-            .cloned()
+            .map(DirectoryEntry::try_clone)
+            .transpose()
     }
 }
 
@@ -605,10 +648,10 @@ pub(crate) fn build_htree_directory(
         if name == b"." || name == b".." {
             continue;
         }
-        hashed.push(HashedDirectoryEntry {
+        hashed.try_push(HashedDirectoryEntry {
             hash: hash.hash_name(entry.name()),
-            entry: entry.clone(),
-        });
+            entry: entry.try_clone()?,
+        })?;
     }
     hashed.sort_by(|left, right| {
         left.hash
@@ -622,7 +665,14 @@ pub(crate) fn build_htree_directory(
     let root_limit = dx_capacity(block_size, DX_ROOT_COUNT_OFFSET, checksum)?;
     let node_limit = dx_capacity(block_size, DX_NODE_COUNT_OFFSET, checksum)?;
     let plan = HtreeBuildPlan::new(&leaves, root_limit, node_limit)?;
-    let mut blocks = alloc::vec![alloc::vec![0_u8; block_size]; plan.block_count()?];
+    let block_count = plan.block_count()?;
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(block_count)
+        .map_err(|_| Error::OutOfMemory)?;
+    for _ in 0..block_count {
+        blocks.try_push(memory::repeated_vec(0_u8, block_size)?)?;
+    }
 
     for (index, leaf) in leaves.iter().enumerate() {
         let logical = plan.leaf_logical(index)?;
@@ -702,11 +752,11 @@ fn pack_htree_leaves(
                 .ok_or(Error::ArithmeticOverflow)?
                 > live_limit
         {
-            leaves.push(PackedLeaf {
+            leaves.try_push(PackedLeaf {
                 start_hash: current_start,
                 last_hash: current_last,
                 entries: current,
-            });
+            })?;
             current = Vec::new();
             current_len = 0;
         }
@@ -727,21 +777,21 @@ fn pack_htree_leaves(
             .checked_add(needed)
             .ok_or(Error::ArithmeticOverflow)?;
         current_last = item.hash.major;
-        current.push(item.entry);
+        current.try_push(item.entry)?;
     }
 
     if current.is_empty() {
-        leaves.push(PackedLeaf {
+        leaves.try_push(PackedLeaf {
             start_hash: 0,
             last_hash: 0,
             entries: Vec::new(),
-        });
+        })?;
     } else {
-        leaves.push(PackedLeaf {
+        leaves.try_push(PackedLeaf {
             start_hash: current_start,
             last_hash: current_last,
             entries: current,
-        });
+        })?;
     }
     Ok(leaves)
 }
@@ -871,13 +921,13 @@ impl HtreeBuildPlan {
             );
             let mut entries = Vec::new();
             for (leaf_index, leaf) in leaves.iter().enumerate().take(last_leaf).skip(first_leaf) {
-                entries.push(DxEntry {
+                entries.try_push(DxEntry {
                     hash: leaf.start_hash,
                     block: self.leaf_logical(leaf_index)?,
-                });
+                })?;
             }
             let logical = self.lower_node_logical(lower)?;
-            nodes.push(PlannedIndexNode { logical, entries });
+            nodes.try_push(PlannedIndexNode { logical, entries })?;
         }
         if self.depth == 2 {
             for upper in 0..self.upper_nodes {
@@ -894,18 +944,18 @@ impl HtreeBuildPlan {
                     let first_leaf = lower
                         .checked_mul(self.node_limit)
                         .ok_or(Error::ArithmeticOverflow)?;
-                    entries.push(DxEntry {
+                    entries.try_push(DxEntry {
                         hash: leaves
                             .get(first_leaf)
                             .ok_or(Error::InvalidDirectoryEntry)?
                             .start_hash,
                         block: self.lower_node_logical(lower)?,
-                    });
+                    })?;
                 }
-                nodes.push(PlannedIndexNode {
+                nodes.try_push(PlannedIndexNode {
                     logical: self.upper_node_logical(upper)?,
                     entries,
-                });
+                })?;
             }
         }
         Ok(nodes)
@@ -921,10 +971,10 @@ impl HtreeBuildPlan {
         match self.depth {
             0 => {
                 for (index, leaf) in leaves.iter().enumerate().take(self.root_count) {
-                    entries.push(DxEntry {
+                    entries.try_push(DxEntry {
                         hash: leaf.start_hash,
                         block: self.leaf_logical(index)?,
-                    });
+                    })?;
                 }
             }
             1 => {
@@ -932,13 +982,13 @@ impl HtreeBuildPlan {
                     let first_leaf = lower
                         .checked_mul(self.node_limit)
                         .ok_or(Error::ArithmeticOverflow)?;
-                    entries.push(DxEntry {
+                    entries.try_push(DxEntry {
                         hash: leaves
                             .get(first_leaf)
                             .ok_or(Error::InvalidDirectoryEntry)?
                             .start_hash,
                         block: usize_to_u32(checked_sum_usize(&[1, lower])?)?,
-                    });
+                    })?;
                 }
             }
             2 => {
@@ -949,13 +999,13 @@ impl HtreeBuildPlan {
                     let first_leaf = first_lower
                         .checked_mul(self.node_limit)
                         .ok_or(Error::ArithmeticOverflow)?;
-                    entries.push(DxEntry {
+                    entries.try_push(DxEntry {
                         hash: leaves
                             .get(first_leaf)
                             .ok_or(Error::InvalidDirectoryEntry)?
                             .start_hash,
                         block: self.upper_node_logical(upper)?,
-                    });
+                    })?;
                 }
             }
             _ => return Err(Error::DirectoryTooLarge),
@@ -1213,11 +1263,11 @@ impl HtreeDirectory {
         let mut leaves = Vec::new();
         for indexed_leaf in leaf_blocks {
             let block = find_directory_block(blocks, indexed_leaf.logical)?;
-            leaves.push(HtreeLeaf::parse(
+            leaves.try_push(HtreeLeaf::parse(
                 indexed_leaf.start_hash,
                 block.bytes(),
                 checksum,
-            )?);
+            )?)?;
         }
         Ok(Self {
             hash: root.hash,
@@ -1227,16 +1277,33 @@ impl HtreeDirectory {
     }
 
     /// Returns all live entries in HTree traversal order.
-    fn entries(&self) -> Vec<DirectoryEntry> {
-        let mut entries = self.dot_entries.clone();
-        for leaf in &self.leaves {
-            entries.extend(leaf.entries.iter().cloned());
-        }
+    /// # Errors
+    ///
+    /// Returns an error when cloning the live entries cannot allocate.
+    fn entries(&self) -> Result<Vec<DirectoryEntry>> {
+        let mut entries = Vec::new();
         entries
+            .try_reserve_exact(self.dot_entries.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for entry in &self.dot_entries {
+            entries.try_push(entry.try_clone()?)?;
+        }
+        for leaf in &self.leaves {
+            entries
+                .try_reserve_exact(leaf.entries.len())
+                .map_err(|_| Error::OutOfMemory)?;
+            for entry in &leaf.entries {
+                entries.try_push(entry.try_clone()?)?;
+            }
+        }
+        Ok(entries)
     }
 
     /// Finds an exact ext4 name through the hash-selected leaf chain.
-    fn find(&self, name: &Ext4Name) -> Option<DirectoryEntry> {
+    /// # Errors
+    ///
+    /// Returns an error when cloning the matched directory entry cannot allocate.
+    fn find(&self, name: &Ext4Name) -> Result<Option<DirectoryEntry>> {
         let hash = self.hash.hash_name(name).major;
         let start = self
             .leaves
@@ -1255,11 +1322,11 @@ impl HtreeDirectory {
             if leaf_hash > hash {
                 break;
             }
-            if let Some(entry) = leaf.find(name) {
-                return Some(entry);
+            if let Some(entry) = leaf.find(name)? {
+                return Ok(Some(entry));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Returns whether two adjacent leaves belong to the same collision chain.
@@ -1295,11 +1362,15 @@ impl HtreeLeaf {
     }
 
     /// Finds one exact ext4 name in this leaf.
-    fn find(&self, name: &Ext4Name) -> Option<DirectoryEntry> {
+    /// # Errors
+    ///
+    /// Returns an error when cloning the matched directory entry cannot allocate.
+    fn find(&self, name: &Ext4Name) -> Result<Option<DirectoryEntry>> {
         self.entries
             .iter()
             .find(|entry| entry.name() == name)
-            .cloned()
+            .map(DirectoryEntry::try_clone)
+            .transpose()
     }
 }
 
@@ -1361,7 +1432,12 @@ impl HtreeRoot {
         let index = DxIndex::parse(bytes, DX_ROOT_COUNT_OFFSET, checksum)?;
         Ok(Self {
             hash: DirectoryHashContext::new(hash_seed, hash_version),
-            dot_entries: alloc::vec![dot, dotdot],
+            dot_entries: {
+                let mut dot_entries = Vec::new();
+                dot_entries.try_push(dot)?;
+                dot_entries.try_push(dotdot)?;
+                dot_entries
+            },
             indirect_levels,
             index,
         })
@@ -1455,7 +1531,7 @@ impl DxIndex {
             if block == 0 {
                 return Err(Error::InvalidDirectoryEntry);
             }
-            entries.push(DxEntry { hash, block });
+            entries.try_push(DxEntry { hash, block })?;
         }
         Ok(Self { entries })
     }
@@ -1487,12 +1563,12 @@ fn collect_leaf_blocks(
     if visited.contains(&logical) {
         return Err(Error::InvalidDirectoryEntry);
     }
-    visited.push(logical);
+    visited.try_push(logical)?;
     if depth == 0 {
-        leaves.push(IndexedLeafBlock {
+        leaves.try_push(IndexedLeafBlock {
             start_hash,
             logical,
-        });
+        })?;
         return Ok(());
     }
     let block = find_directory_block(blocks, logical)?;
@@ -1539,10 +1615,13 @@ impl DirectoryBlock {
     }
 
     /// Creates a zero-filled directory block with the filesystem block size.
-    pub(crate) fn empty(block_size: usize) -> Self {
-        Self {
-            bytes: alloc::vec![0_u8; block_size],
-        }
+    /// # Errors
+    ///
+    /// Returns an error when allocating the block-sized byte buffer fails.
+    pub(crate) fn empty(block_size: usize) -> Result<Self> {
+        Ok(Self {
+            bytes: memory::repeated_vec(0_u8, block_size)?,
+        })
     }
 
     /// Returns the mutated directory block bytes.
@@ -1780,7 +1859,7 @@ impl DirectoryBlock {
             return Err(Error::NameAlreadyExists);
         }
 
-        let original = self.bytes.clone();
+        let original = memory::copied_slice(&self.bytes)?;
         let Some(entry) = self.remove(old_name)? else {
             return Ok(None);
         };
@@ -2313,7 +2392,7 @@ mod tests {
                 inode(inode_number)?,
                 &name(index, name_len)?,
                 DirectoryEntryKind::File,
-            ));
+            )?);
         }
         Ok(entries)
     }
@@ -2357,7 +2436,7 @@ mod tests {
         {
             return Err(Error::InvalidDirectoryEntry);
         }
-        if layout.entries().len()
+        if layout.entries()?.len()
             != children
                 .len()
                 .checked_add(2)

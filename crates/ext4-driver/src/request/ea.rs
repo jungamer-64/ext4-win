@@ -8,6 +8,7 @@ use crate::irp::{
     DispatchTarget, EaEntryEmission, EaNameSelection, IrpCompletion, QueryEaStack, SetEaStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
+use crate::memory::{self, FallibleVec};
 use crate::state::{FileControlBlock, OpenedObject, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -132,7 +133,7 @@ impl WindowsEaName {
         }
         u8::try_from(name.len()).map_err(|_| DriverError::InvalidEaName)?;
         Ok(Self {
-            bytes: name.to_vec(),
+            bytes: memory::copied_slice(name)?,
         })
     }
 
@@ -144,6 +145,16 @@ impl WindowsEaName {
     /// Returns the name length.
     fn len(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// Copies this EA name without using infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the EA name bytes cannot allocate.
+    fn try_clone(&self) -> DriverResult<Self> {
+        Ok(Self {
+            bytes: memory::copied_slice(self.as_bytes())?,
+        })
     }
 }
 
@@ -162,7 +173,7 @@ impl WindowsEaValue {
     fn new(value: &[u8]) -> DriverResult<Self> {
         u16::try_from(value.len()).map_err(|_| DriverError::EaTooLarge)?;
         Ok(Self {
-            bytes: value.to_vec(),
+            bytes: memory::copied_slice(value)?,
         })
     }
 
@@ -179,6 +190,16 @@ impl WindowsEaValue {
     /// Returns the value length.
     fn len(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// Copies this EA value without using infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the EA value bytes cannot allocate.
+    fn try_clone(&self) -> DriverResult<Self> {
+        Ok(Self {
+            bytes: memory::copied_slice(self.as_bytes())?,
+        })
     }
 }
 
@@ -209,6 +230,14 @@ impl WindowsEaRecord {
             WindowsEaName::new(name)?,
             WindowsEaValue::new(value)?,
         ))
+    }
+
+    /// Copies this EA record without using infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying the record name or value cannot allocate.
+    fn try_clone(&self) -> DriverResult<Self> {
+        Ok(Self::new(self.name.try_clone()?, self.value.try_clone()?))
     }
 }
 
@@ -270,7 +299,7 @@ fn collect_query_entries(
             let mut selected = Vec::new();
             for requested in names {
                 if let Some(entry) = entries.iter().find(|entry| entry.name == requested) {
-                    selected.push(entry.clone());
+                    selected.try_push(entry.try_clone()?)?;
                 }
             }
             Ok(selected)
@@ -295,10 +324,10 @@ fn load_windows_eas(opened_file: &OpenedObject) -> DriverResult<Vec<WindowsEaRec
         let Some(ea_name) = name.local().strip_prefix(EA_XATTR_PREFIX) else {
             continue;
         };
-        entries.push(WindowsEaRecord::new(
+        entries.try_push(WindowsEaRecord::new(
             WindowsEaName::new(ea_name)?,
             WindowsEaValue::new(value.bytes())?,
-        ));
+        ))?;
     }
     Ok(entries)
 }
@@ -420,7 +449,7 @@ fn parse_full_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaRecord>> {
         let value = input
             .get(value_start..value_end)
             .ok_or(DriverError::EaListInconsistent)?;
-        entries.push(WindowsEaRecord::from_wire(flags, name, value)?);
+        entries.try_push(WindowsEaRecord::from_wire(flags, name, value)?)?;
 
         let raw_len = full_ea_record_length(name.len(), value.len())?;
         if next == 0 {
@@ -465,7 +494,7 @@ fn parse_get_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaName>> {
         if input.get(name_end).copied() != Some(0) {
             return Err(DriverError::EaListInconsistent);
         }
-        names.push(WindowsEaName::new(name)?);
+        names.try_push(WindowsEaName::new(name)?)?;
 
         let raw_len = get_ea_record_length(name.len())?;
         if next == 0 {
@@ -615,9 +644,12 @@ fn xattr_name_from_ea_name(name: &WindowsEaName) -> DriverResult<XattrName> {
         .len()
         .checked_add(name.len())
         .ok_or(DriverError::InvalidEaName)?;
-    let mut local = Vec::with_capacity(local_len);
-    local.extend_from_slice(EA_XATTR_PREFIX);
-    local.extend_from_slice(name.as_bytes());
+    let mut local = Vec::new();
+    local
+        .try_reserve_exact(local_len)
+        .map_err(|_| DriverError::InsufficientResources)?;
+    local.try_extend_from_slice(EA_XATTR_PREFIX)?;
+    local.try_extend_from_slice(name.as_bytes())?;
     Ok(XattrName::new(XattrNamespace::User, local.as_slice())?)
 }
 
@@ -741,7 +773,7 @@ mod tests {
         let name = xattr_name_from_ea_name(&ea_name);
         assert!(name.is_ok());
         if let Ok(name) = name {
-            assert_eq!(name.qualified(), b"user.ext4win.ea.alpha");
+            assert_eq!(name.qualified(), Ok(b"user.ext4win.ea.alpha".to_vec()));
         }
     }
 

@@ -14,6 +14,18 @@ pub(super) struct ClusterReferenceIndex {
 }
 
 impl ClusterReferenceIndex {
+    /// Copies the mounted cluster-reference index without infallible allocation.
+    /// # Errors
+    ///
+    /// Returns an error when copying any reference-index vector cannot allocate.
+    pub(super) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            refs: memory::copied_slice(&self.refs)?,
+            exclusive_blocks: memory::copied_slice(&self.exclusive_blocks)?,
+            xattr_blocks: memory::copied_slice(&self.xattr_blocks)?,
+        })
+    }
+
     /// Builds the mounted reference index from static metadata and live inodes.
     /// # Errors
     ///
@@ -68,7 +80,7 @@ impl ClusterReferenceIndex {
         if self.exclusive_blocks.contains(&block) || self.xattr_blocks.contains(&block) {
             return Err(Error::ClusterReferenceConflict);
         }
-        self.exclusive_blocks.push(block);
+        self.exclusive_blocks.try_push(block)?;
         self.add_cluster_reference(volume, block)
     }
 
@@ -86,7 +98,7 @@ impl ClusterReferenceIndex {
             return Err(Error::ClusterReferenceConflict);
         }
         if !self.xattr_blocks.contains(&block) {
-            self.xattr_blocks.push(block);
+            self.xattr_blocks.try_push(block)?;
         }
         self.add_cluster_reference(volume, block)
     }
@@ -268,10 +280,10 @@ impl ClusterReferenceIndex {
             }
             Ok(updated)
         } else if delta > 0 {
-            self.refs.push(ClusterReference {
+            self.refs.try_push(ClusterReference {
                 cluster,
                 count: u32::try_from(delta).map_err(|_| Error::ArithmeticOverflow)?,
-            });
+            })?;
             Ok(delta)
         } else {
             Ok(delta)
@@ -502,11 +514,10 @@ pub(super) fn cluster_bitmap_state(
     let position = ClusterBitmapPosition::from_cluster(superblock, cluster)?;
     let group = position.group();
     let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
-    let mut bytes = vec![
-        0_u8;
-        usize::try_from(superblock.block_size().bytes())
-            .map_err(|_| Error::ArithmeticOverflow)?
-    ];
+    let mut bytes = memory::repeated_vec(
+        0_u8,
+        usize::try_from(superblock.block_size().bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
     reader.read_exact_at(
         superblock
             .block_size()
@@ -529,11 +540,10 @@ pub(super) fn inode_bitmap_state(
     let position = InodeBitmapPosition::from_inode(superblock, inode_id)?;
     let group = position.group();
     let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
-    let mut bytes = vec![
-        0_u8;
-        usize::try_from(superblock.block_size().bytes())
-            .map_err(|_| Error::ArithmeticOverflow)?
-    ];
+    let mut bytes = memory::repeated_vec(
+        0_u8,
+        usize::try_from(superblock.block_size().bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
     reader.read_exact_at(
         superblock
             .block_size()

@@ -1,6 +1,6 @@
 //! Windows security descriptor boundary for ext4 owner and mode bits.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, NodeId};
@@ -11,6 +11,7 @@ use crate::irp::{
     SecuritySelection, SetSecurityStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
+use crate::memory::{self, FallibleVec};
 use crate::state::{FileControlBlock, OpenedObject, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -322,7 +323,7 @@ impl DaclPermissionBuilder {
         if self.classes.iter().any(|entry| entry.class == class) {
             return Err(DriverError::NotSupported);
         }
-        self.classes.push(PermissionClassBits { class, bits });
+        self.classes.try_push(PermissionClassBits { class, bits })?;
         Ok(())
     }
 
@@ -439,7 +440,7 @@ fn security_descriptor(
     security: Ext4Security,
     selection: SecuritySelection,
 ) -> DriverResult<Vec<u8>> {
-    let mut descriptor = vec![0; SECURITY_DESCRIPTOR_RELATIVE_BYTES];
+    let mut descriptor = memory::repeated_vec(0_u8, SECURITY_DESCRIPTOR_RELATIVE_BYTES)?;
     LittleEndianOutput::new(descriptor.as_mut_slice()).write_u8(
         wire_offset(0),
         u8::try_from(wdk_sys::SECURITY_DESCRIPTOR_REVISION)
@@ -508,7 +509,7 @@ fn security_descriptor_bytes(
         // and ACL size fields. Windows owns the descriptor for this dispatch.
         core::slice::from_raw_parts(pointer.as_ptr(), length)
     };
-    Ok(bytes.to_vec())
+    memory::copied_slice(bytes)
 }
 
 /// Builds new ext4 security metadata from a Windows security descriptor.
@@ -887,25 +888,25 @@ fn dacl_from_permissions(security: Ext4Security) -> DriverResult<Vec<u8>> {
     let other = permission_class_mask(permissions & 0o7);
     let mut aces = Vec::new();
     if !owner.is_empty() {
-        aces.push(AllowAce {
+        aces.try_push(AllowAce {
             mask: owner,
             sid: uid_sid(security.owner().uid().as_u32())?,
-        });
+        })?;
     }
     if !group.is_empty() {
-        aces.push(AllowAce {
+        aces.try_push(AllowAce {
             mask: group,
             sid: gid_sid(security.owner().gid().as_u32())?,
-        });
+        })?;
     }
     if !other.is_empty() {
-        aces.push(AllowAce {
+        aces.try_push(AllowAce {
             mask: other,
             sid: everyone_sid()?,
-        });
+        })?;
     }
 
-    let mut acl = vec![0; ACL_HEADER_BYTES];
+    let mut acl = memory::repeated_vec(0_u8, ACL_HEADER_BYTES)?;
     LittleEndianOutput::new(acl.as_mut_slice()).write_u8(
         wire_offset(0),
         u8::try_from(wdk_sys::ACL_REVISION).map_err(|_| DriverError::InvalidParameter)?,
@@ -947,7 +948,7 @@ fn append_component(
     component: &[u8],
 ) -> DriverResult<SecurityDescriptorOffset> {
     let offset = u32::try_from(descriptor.len()).map_err(|_| DriverError::InvalidParameter)?;
-    descriptor.extend_from_slice(component);
+    descriptor.try_extend_from_slice(component)?;
     Ok(SecurityDescriptorOffset::from_u32(offset))
 }
 
@@ -960,12 +961,12 @@ fn append_allow_ace(acl: &mut Vec<u8>, ace: &AllowAce) -> DriverResult<()> {
         .checked_add(ace.sid.bytes.len())
         .ok_or(DriverError::InvalidParameter)?;
     let start = acl.len();
-    acl.resize(
+    acl.try_resize(
         start
             .checked_add(ace_size)
             .ok_or(DriverError::InvalidParameter)?,
         0,
-    );
+    )?;
     let mut output = LittleEndianOutput::new(acl.as_mut_slice());
     output.write_u8(
         wire_offset(start),
@@ -1029,16 +1030,21 @@ fn sid(authority: u64, sub_authorities: &[u32]) -> DriverResult<BinarySid> {
                 .ok_or(DriverError::InvalidParameter)?,
         )
         .ok_or(DriverError::InvalidParameter)?;
-    let mut bytes = Vec::with_capacity(capacity);
-    bytes.push(u8::try_from(wdk_sys::SID_REVISION).map_err(|_| DriverError::InvalidParameter)?);
-    bytes.push(sub_authority_count);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| DriverError::InsufficientResources)?;
+    bytes.try_push(
+        u8::try_from(wdk_sys::SID_REVISION).map_err(|_| DriverError::InvalidParameter)?,
+    )?;
+    bytes.try_push(sub_authority_count)?;
     let authority = authority.to_be_bytes();
     let Some(authority) = authority.get(2..) else {
         return Err(DriverError::InvalidParameter);
     };
-    bytes.extend_from_slice(authority);
+    bytes.try_extend_from_slice(authority)?;
     for sub_authority in sub_authorities {
-        bytes.extend_from_slice(sub_authority.to_le_bytes().as_slice());
+        bytes.try_extend_from_slice(sub_authority.to_le_bytes().as_slice())?;
     }
     Ok(BinarySid { bytes })
 }

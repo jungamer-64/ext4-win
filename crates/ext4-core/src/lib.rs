@@ -15,6 +15,7 @@ extern crate std;
 mod disk;
 mod disk_format;
 mod error;
+mod memory;
 mod platform;
 mod protection;
 mod volume;

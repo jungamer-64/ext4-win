@@ -5,6 +5,7 @@ use core::ptr::NonNull;
 
 use crate::irp::{DispatchTarget, FileSystemControlStack, IrpCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
+use crate::memory;
 use crate::state::{OpenedObject, OpenedRegularFile, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{
@@ -490,7 +491,7 @@ fn reject_unsupported_user_buffer(address: u64, length: u32, max_length: u32) ->
 fn read_input(target: DispatchTarget, stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
     let length = stack.input_buffer_length();
     let input = target.buffered_input(length)?;
-    Ok(input.as_slice().to_vec())
+    memory::copied_slice(input.as_slice())
 }
 
 /// Returns a mounted VCB from a path-scoped FSCTL stack.

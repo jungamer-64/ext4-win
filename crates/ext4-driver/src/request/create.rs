@@ -16,6 +16,7 @@ use crate::{
         DispatchTarget, IrpCompletion, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
+    memory::{self, FallibleVec},
     request::metadata,
     state::{
         CloseDisposition, FileControlBlock, KernelDevice, KernelFileObject, MountedVolumeDevice,
@@ -412,7 +413,7 @@ fn path_components(file_object: &FILE_OBJECT) -> DriverResult<Vec<WindowsName>> 
     }
     let mut components = Vec::new();
     for component in trimmed.split(|unit| *unit == UTF16_BACKSLASH) {
-        components.push(WindowsName::from_utf16(component)?);
+        components.try_push(WindowsName::from_utf16(component)?)?;
     }
     Ok(components)
 }
@@ -480,7 +481,7 @@ fn attach_file_object(
         // writable during successful create processing.
         file_object.as_mut()
     };
-    let handle = Box::new(OpenedHandle::new(node, path, close_disposition));
+    let handle = memory::boxed(OpenedHandle::new(node, path, close_disposition))?;
     file_object.FsContext = fcb.as_ptr().cast::<c_void>();
     file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
     Ok(())
