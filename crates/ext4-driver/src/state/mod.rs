@@ -1,7 +1,6 @@
 //! Driver-local lifecycle and open-object state.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
@@ -21,7 +20,7 @@ use crate::kernel::cng::CngFscryptNonceGenerator;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::{block_device::KernelBlockDevice, ffi};
-use crate::memory::{self, FallibleVec};
+use crate::memory::{self, DriverVec};
 
 /// Registered control device observed by the unload callback.
 static mut CONTROL_DEVICE: Option<ControlDevice> = None;
@@ -280,7 +279,7 @@ pub(crate) struct VolumeControlBlock {
     /// Mounted journaled read-write ext4 volume.
     volume: JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator>,
     /// VCB-owned FCBs keyed by ext4 node identity.
-    file_control_blocks: Vec<NonNull<FileControlBlock>>,
+    file_control_blocks: DriverVec<NonNull<FileControlBlock>>,
 }
 
 impl VolumeControlBlock {
@@ -299,7 +298,7 @@ impl VolumeControlBlock {
         )?;
         Ok(Self {
             volume,
-            file_control_blocks: Vec::new(),
+            file_control_blocks: DriverVec::new(),
         })
     }
 
@@ -377,7 +376,7 @@ impl VolumeControlBlock {
             return Ok(fcb);
         }
 
-        let fcb = memory::boxed(FileControlBlock::new(volume, node))?;
+        let fcb = memory::boxed_with(|| FileControlBlock::new(volume, node))?;
         let fcb = NonNull::from(Box::leak(fcb));
         vcb.file_control_blocks.try_push(fcb)?;
         Ok(fcb)
@@ -400,7 +399,9 @@ impl VolumeControlBlock {
         match fcb_ref.release_open_reference() {
             FileControlBlockRelease::StillOpen => {}
             FileControlBlockRelease::LastReference => {
-                let removed = self.file_control_blocks.swap_remove(index);
+                let Some(removed) = self.file_control_blocks.swap_remove(index) else {
+                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+                };
                 unsafe {
                     // SAFETY: The pointer was removed from the ownership table
                     // exactly once and no open FILE_OBJECT should reference it
@@ -446,7 +447,7 @@ impl VolumeSerialNumber {
 
 impl Drop for VolumeControlBlock {
     fn drop(&mut self) {
-        for fcb in self.file_control_blocks.drain(..) {
+        while let Some(fcb) = self.file_control_blocks.pop() {
             unsafe {
                 // SAFETY: Remaining FCB pointers are still owned by this VCB
                 // during volume teardown.

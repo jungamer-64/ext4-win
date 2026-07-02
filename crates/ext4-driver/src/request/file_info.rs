@@ -1,7 +1,6 @@
 //! File object IRP handlers and file information packing boundary.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use ext4_core::{
@@ -18,7 +17,7 @@ use crate::irp::{
     SetFileInformationClass, SetFileStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::{self, FallibleVec};
+use crate::memory::DriverVec;
 use crate::state::{
     CloseDisposition, DirectoryCursor, FileControlBlock, KernelFileObject, OpenedDirectory,
     OpenedHandle, OpenedObject, OpenedPath, OpenedRegularFile, VolumeControlBlock,
@@ -1039,7 +1038,7 @@ fn read_file_information_input<T: Copy>(
 }
 
 /// Decoded FILE_RENAME_INFORMATION target path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct RenameTargetPath {
     /// Root-relative target path.
     path: NonEmptyWindowsPath,
@@ -1070,7 +1069,7 @@ impl RenameTargetPath {
         let name_bytes = input_range(bytes, FILE_RENAME_NAME_OFFSET, name_length)?;
         let units = utf16_units_from_le_bytes(name_bytes)?;
         Ok(Self {
-            path: NonEmptyWindowsPath::from_utf16_path(&units)?,
+            path: NonEmptyWindowsPath::from_utf16_path(units.as_slice())?,
         })
     }
 
@@ -1123,10 +1122,10 @@ impl RenameInformationFormat {
 }
 
 /// Non-empty root-relative Windows path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct NonEmptyWindowsPath {
     /// Parent path components from root to target parent.
-    parents: Vec<WindowsName>,
+    parents: DriverVec<WindowsName>,
     /// Final path component being renamed to.
     target_name: WindowsName,
 }
@@ -1145,9 +1144,11 @@ impl NonEmptyWindowsPath {
         if trimmed.is_empty() {
             return Err(DriverError::InvalidParameter);
         }
-        let mut components = Vec::new();
+        let mut components = DriverVec::new();
         for component in trimmed.split(|unit| *unit == UTF16_BACKSLASH) {
-            components.try_push(WindowsName::from_utf16(component)?)?;
+            components
+                .try_push_owned(WindowsName::from_utf16(component)?)
+                .map_err(|error| error.into_parts().0)?;
         }
         let target_name = components.pop().ok_or(DriverError::InvalidParameter)?;
         Ok(Self {
@@ -1158,7 +1159,7 @@ impl NonEmptyWindowsPath {
 
     /// Parent path components from root to target parent.
     fn parents(&self) -> &[WindowsName] {
-        &self.parents
+        self.parents.as_slice()
     }
 
     /// Final path component.
@@ -1209,11 +1210,11 @@ fn reject_root_directory(bytes: &[u8]) -> DriverResult<()> {
 /// # Errors
 ///
 /// Returns an error when `bytes` has an odd length or cannot be split into two-byte units.
-fn utf16_units_from_le_bytes(bytes: &[u8]) -> DriverResult<Vec<u16>> {
+fn utf16_units_from_le_bytes(bytes: &[u8]) -> DriverResult<DriverVec<u16>> {
     if bytes.len() & 1 != 0 {
         return Err(DriverError::InvalidParameter);
     }
-    let mut units = Vec::new();
+    let mut units = DriverVec::new();
     let (chunks, remainder) = bytes.as_chunks::<2>();
     if !remainder.is_empty() {
         return Err(DriverError::InvalidParameter);
@@ -1612,7 +1613,7 @@ fn pack_name_information(
     opened_file: &OpenedObject,
 ) -> DriverResult<IrpCompletion> {
     let units = opened_path_name_units(opened_file.path())?;
-    let name_bytes = utf16_byte_len(&units)?;
+    let name_bytes = utf16_byte_len(units.as_slice())?;
     let required = FILE_NAME_INFORMATION_NAME_OFFSET
         .checked_add(name_bytes)
         .ok_or(DriverError::InvalidParameter)?;
@@ -1624,7 +1625,7 @@ fn pack_name_information(
         WireOffset::new(FILE_NAME_INFORMATION_NAME_LENGTH_OFFSET),
         u32::try_from(name_bytes).map_err(|_| DriverError::InvalidParameter)?,
     )?;
-    write_utf16(output, FILE_NAME_INFORMATION_NAME_OFFSET, &units)?;
+    write_utf16(output, FILE_NAME_INFORMATION_NAME_OFFSET, units.as_slice())?;
     IrpCompletion::from_usize(required)
 }
 
@@ -1649,11 +1650,11 @@ fn pack_attribute_tag_information(
 /// # Errors
 ///
 /// Returns an error when a child ext4 name cannot be represented as a Windows UTF-16 name.
-fn opened_path_name_units(path: &OpenedPath) -> DriverResult<Vec<u16>> {
+fn opened_path_name_units(path: &OpenedPath) -> DriverResult<DriverVec<u16>> {
     match path {
-        OpenedPath::Root => memory::copied_slice(&[UTF16_BACKSLASH]),
+        OpenedPath::Root => DriverVec::try_copied_from_slice(&[UTF16_BACKSLASH]),
         OpenedPath::Child { name, .. } => {
-            memory::copied_slice(WindowsName::from_ext4(name)?.utf16())
+            DriverVec::try_copied_from_slice(WindowsName::from_ext4(name)?.utf16())
         }
     }
 }
@@ -1925,10 +1926,11 @@ mod tests {
     #[test]
     fn opened_path_name_units_project_root_and_child_names() {
         let root_units: &[u16] = &[super::UTF16_BACKSLASH];
-        assert_eq!(
-            super::opened_path_name_units(&OpenedPath::Root).as_deref(),
-            Ok(root_units)
-        );
+        let projected_root = super::opened_path_name_units(&OpenedPath::Root);
+        assert!(projected_root.is_ok());
+        if let Ok(projected_root) = projected_root {
+            assert_eq!(projected_root.as_slice(), root_units);
+        }
 
         let name = Ext4Name::new(b"file");
         assert!(name.is_ok());
@@ -1945,10 +1947,11 @@ mod tests {
             u16::from(b'l'),
             u16::from(b'e'),
         ];
-        assert_eq!(
-            super::opened_path_name_units(&path).as_deref(),
-            Ok(child_units)
-        );
+        let projected_child = super::opened_path_name_units(&path);
+        assert!(projected_child.is_ok());
+        if let Ok(projected_child) = projected_child {
+            assert_eq!(projected_child.as_slice(), child_units);
+        }
     }
 
     /// # Panics

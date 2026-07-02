@@ -1,7 +1,6 @@
 //! Create/open dispatch and FILE_OBJECT context initialization.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
@@ -16,7 +15,7 @@ use crate::{
         DispatchTarget, IrpCompletion, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
-    memory::{self, FallibleVec},
+    memory::{self, DriverVec},
     request::metadata,
     state::{
         CloseDisposition, FileControlBlock, KernelDevice, KernelFileObject, MountedVolumeDevice,
@@ -391,10 +390,10 @@ fn create_child(
 ///
 /// Returns an error when the UNICODE_STRING has odd byte length, a null non-empty buffer, or an
 /// invalid Windows path component.
-fn path_components(file_object: &FILE_OBJECT) -> DriverResult<Vec<WindowsName>> {
+fn path_components(file_object: &FILE_OBJECT) -> DriverResult<DriverVec<WindowsName>> {
     let name = file_object.FileName;
     if name.Length == 0 {
-        return Ok(Vec::new());
+        return Ok(DriverVec::new());
     }
     if !name.Length.is_multiple_of(2) || name.Buffer.is_null() {
         return Err(DriverError::InvalidParameter);
@@ -409,11 +408,13 @@ fn path_components(file_object: &FILE_OBJECT) -> DriverResult<Vec<WindowsName>> 
         trimmed = rest;
     }
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(DriverVec::new());
     }
-    let mut components = Vec::new();
+    let mut components = DriverVec::new();
     for component in trimmed.split(|unit| *unit == UTF16_BACKSLASH) {
-        components.try_push(WindowsName::from_utf16(component)?)?;
+        components
+            .try_push_owned(WindowsName::from_utf16(component)?)
+            .map_err(|error| error.into_parts().0)?;
     }
     Ok(components)
 }
@@ -481,7 +482,7 @@ fn attach_file_object(
         // writable during successful create processing.
         file_object.as_mut()
     };
-    let handle = memory::boxed(OpenedHandle::new(node, path, close_disposition))?;
+    let handle = memory::boxed_with(|| OpenedHandle::new(node, path, close_disposition))?;
     file_object.FsContext = fcb.as_ptr().cast::<c_void>();
     file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
     Ok(())

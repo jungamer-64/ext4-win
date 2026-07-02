@@ -1,6 +1,5 @@
 //! Volume information query and mutation boundary.
 
-use alloc::vec::Vec;
 use ext4_core::{ClusterSize, Ext4VolumeLabel};
 use wdk_sys::{
     FILE_CASE_PRESERVED_NAMES, FILE_CASE_SENSITIVE_SEARCH, FILE_FS_ATTRIBUTE_INFORMATION,
@@ -16,7 +15,7 @@ use crate::{
         SetVolumeInformationClass, SetVolumeStack,
     },
     kernel::status::{DriverError, DriverResult},
-    memory::FallibleVec,
+    memory::DriverVec,
     state::{KernelDevice, MountedVolumeDevice, VolumeControlBlock},
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
@@ -187,7 +186,7 @@ fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel
         WireOffset::new(header),
         WireOffset::new(end),
     )?)?;
-    let mut label = Vec::new();
+    let mut label = DriverVec::new();
     let (chunks, remainder) = label_input.as_chunks::<2>();
     if !remainder.is_empty() {
         return Err(DriverError::InvalidParameter);

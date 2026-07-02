@@ -1,6 +1,5 @@
 //! Windows extended-attribute IRP handling.
 
-use alloc::vec::Vec;
 use ext4_core::{XattrName, XattrNamespace, XattrValue};
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP};
 
@@ -8,7 +7,7 @@ use crate::irp::{
     DispatchTarget, EaEntryEmission, EaNameSelection, IrpCompletion, QueryEaStack, SetEaStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::{self, FallibleVec};
+use crate::memory::DriverVec;
 use crate::state::{FileControlBlock, OpenedObject, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -112,10 +111,10 @@ impl SetEaRequest {
 }
 
 /// Validated Windows EA name.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct WindowsEaName {
     /// Windows EA name bytes.
-    bytes: Vec<u8>,
+    bytes: DriverVec<u8>,
 }
 
 impl WindowsEaName {
@@ -133,13 +132,13 @@ impl WindowsEaName {
         }
         u8::try_from(name.len()).map_err(|_| DriverError::InvalidEaName)?;
         Ok(Self {
-            bytes: memory::copied_slice(name)?,
+            bytes: DriverVec::try_copied_from_slice(name)?,
         })
     }
 
     /// Returns name bytes for Windows and xattr encoding.
     fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
     }
 
     /// Returns the name length.
@@ -153,16 +152,16 @@ impl WindowsEaName {
     /// Returns an error when copying the EA name bytes cannot allocate.
     fn try_clone(&self) -> DriverResult<Self> {
         Ok(Self {
-            bytes: memory::copied_slice(self.as_bytes())?,
+            bytes: DriverVec::try_copied_from_slice(self.as_bytes())?,
         })
     }
 }
 
 /// Validated Windows EA value.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct WindowsEaValue {
     /// Windows EA value bytes.
-    bytes: Vec<u8>,
+    bytes: DriverVec<u8>,
 }
 
 impl WindowsEaValue {
@@ -173,13 +172,13 @@ impl WindowsEaValue {
     fn new(value: &[u8]) -> DriverResult<Self> {
         u16::try_from(value.len()).map_err(|_| DriverError::EaTooLarge)?;
         Ok(Self {
-            bytes: memory::copied_slice(value)?,
+            bytes: DriverVec::try_copied_from_slice(value)?,
         })
     }
 
     /// Returns value bytes.
     fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
     }
 
     /// Returns whether this value removes the EA.
@@ -198,13 +197,13 @@ impl WindowsEaValue {
     /// Returns an error when copying the EA value bytes cannot allocate.
     fn try_clone(&self) -> DriverResult<Self> {
         Ok(Self {
-            bytes: memory::copied_slice(self.as_bytes())?,
+            bytes: DriverVec::try_copied_from_slice(self.as_bytes())?,
         })
     }
 }
 
 /// Windows EA entry after parsing or before packing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct WindowsEaRecord {
     /// Windows EA name.
     name: WindowsEaName,
@@ -242,12 +241,12 @@ impl WindowsEaRecord {
 }
 
 /// Query-EA name selection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum WindowsEaSelection {
     /// Return every persisted EA.
     All,
     /// Return only the requested names.
-    Names(Vec<WindowsEaName>),
+    Names(DriverVec<WindowsEaName>),
 }
 
 /// Performs an EA query against mounted ext4 xattrs.
@@ -256,21 +255,24 @@ enum WindowsEaSelection {
 /// Returns an error when selected EAs cannot be loaded, no EAs match, the output buffer is too
 /// small, or packed EA records cannot be emitted.
 fn query_ea(request: &QueryEaRequest) -> DriverResult<IrpCompletion> {
-    let mut entries = collect_query_entries(&request.opened_file, request.stack)?;
-    if matches!(request.stack.entry_emission(), EaEntryEmission::Single) && entries.len() > 1 {
-        entries.truncate(1);
+    let entries = collect_query_entries(&request.opened_file, request.stack)?;
+    let entries = if matches!(request.stack.entry_emission(), EaEntryEmission::Single) {
+        entries.as_slice().get(..entries.len().min(1))
+    } else {
+        Some(entries.as_slice())
     }
+    .ok_or(DriverError::InvalidParameter)?;
     if entries.is_empty() {
         return Err(DriverError::NoEasOnFile);
     }
 
     let length = request.stack.length();
-    let required = packed_full_ea_length(entries.as_slice())?;
+    let required = packed_full_ea_length(entries)?;
     if length.as_usize() < required {
         return Err(DriverError::BufferTooSmall);
     }
     let mut output = request.target.data_output(length)?;
-    let written = pack_full_ea_entries(entries.as_slice(), output.as_mut_slice())?;
+    let written = pack_full_ea_entries(entries, output.as_mut_slice())?;
     IrpCompletion::from_usize(written)
 }
 
@@ -291,15 +293,17 @@ fn set_ea(request: &SetEaRequest) -> DriverResult<IrpCompletion> {
 fn collect_query_entries(
     opened_file: &OpenedObject,
     stack: QueryEaStack,
-) -> DriverResult<Vec<WindowsEaRecord>> {
+) -> DriverResult<DriverVec<WindowsEaRecord>> {
     let entries = load_windows_eas(opened_file)?;
     match requested_ea_names(stack)? {
         WindowsEaSelection::All => Ok(entries),
         WindowsEaSelection::Names(names) => {
-            let mut selected = Vec::new();
-            for requested in names {
-                if let Some(entry) = entries.iter().find(|entry| entry.name == requested) {
-                    selected.try_push(entry.try_clone()?)?;
+            let mut selected = DriverVec::new();
+            for requested in names.iter() {
+                if let Some(entry) = entries.iter().find(|entry| entry.name == *requested) {
+                    selected
+                        .try_push_owned(entry.try_clone()?)
+                        .map_err(|error| error.into_parts().0)?;
                 }
             }
             Ok(selected)
@@ -312,11 +316,11 @@ fn collect_query_entries(
 ///
 /// Returns an error when node xattrs cannot be read or any stored ext4win EA name/value no longer
 /// fits the Windows EA record domain.
-fn load_windows_eas(opened_file: &OpenedObject) -> DriverResult<Vec<WindowsEaRecord>> {
+fn load_windows_eas(opened_file: &OpenedObject) -> DriverResult<DriverVec<WindowsEaRecord>> {
     let fcb = opened_file.file_control_block();
     let vcb = volume_control_block(fcb);
     let xattrs = vcb.volume().read_xattrs(fcb.node())?;
-    let mut entries = Vec::new();
+    let mut entries = DriverVec::new();
     for (name, value) in xattrs.entries() {
         if name.namespace() != XattrNamespace::User {
             continue;
@@ -324,10 +328,12 @@ fn load_windows_eas(opened_file: &OpenedObject) -> DriverResult<Vec<WindowsEaRec
         let Some(ea_name) = name.local().strip_prefix(EA_XATTR_PREFIX) else {
             continue;
         };
-        entries.try_push(WindowsEaRecord::new(
-            WindowsEaName::new(ea_name)?,
-            WindowsEaValue::new(value.bytes())?,
-        ))?;
+        entries
+            .try_push_owned(WindowsEaRecord::new(
+                WindowsEaName::new(ea_name)?,
+                WindowsEaValue::new(value.bytes())?,
+            ))
+            .map_err(|error| error.into_parts().0)?;
     }
     Ok(entries)
 }
@@ -377,10 +383,10 @@ fn apply_set_ea_entries(
 fn parse_set_ea_entries(
     target: DispatchTarget,
     stack: SetEaStack,
-) -> DriverResult<Vec<WindowsEaRecord>> {
+) -> DriverResult<DriverVec<WindowsEaRecord>> {
     let length = stack.length();
     if length.is_empty() {
-        return Ok(Vec::new());
+        return Ok(DriverVec::new());
     }
     let input = target.data_input(length)?;
     parse_full_ea_list(input.as_slice())
@@ -409,10 +415,10 @@ fn requested_ea_names(stack: QueryEaStack) -> DriverResult<WindowsEaSelection> {
 ///
 /// Returns an error when record offsets, name terminators, name/value ranges, flags, or alignment
 /// are inconsistent.
-fn parse_full_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaRecord>> {
+fn parse_full_ea_list(input: &[u8]) -> DriverResult<DriverVec<WindowsEaRecord>> {
     let fields = LittleEndianInput::new(input);
     let mut offset = 0;
-    let mut entries = Vec::new();
+    let mut entries = DriverVec::new();
     loop {
         if offset >= input.len() {
             return Err(DriverError::EaListInconsistent);
@@ -449,7 +455,9 @@ fn parse_full_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaRecord>> {
         let value = input
             .get(value_start..value_end)
             .ok_or(DriverError::EaListInconsistent)?;
-        entries.try_push(WindowsEaRecord::from_wire(flags, name, value)?)?;
+        entries
+            .try_push_owned(WindowsEaRecord::from_wire(flags, name, value)?)
+            .map_err(|error| error.into_parts().0)?;
 
         let raw_len = full_ea_record_length(name.len(), value.len())?;
         if next == 0 {
@@ -469,10 +477,10 @@ fn parse_full_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaRecord>> {
 ///
 /// Returns an error when record offsets, name terminators, name ranges, or alignment are
 /// inconsistent.
-fn parse_get_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaName>> {
+fn parse_get_ea_list(input: &[u8]) -> DriverResult<DriverVec<WindowsEaName>> {
     let fields = LittleEndianInput::new(input);
     let mut offset = 0;
-    let mut names = Vec::new();
+    let mut names = DriverVec::new();
     loop {
         if offset >= input.len() {
             return Err(DriverError::EaListInconsistent);
@@ -494,7 +502,9 @@ fn parse_get_ea_list(input: &[u8]) -> DriverResult<Vec<WindowsEaName>> {
         if input.get(name_end).copied() != Some(0) {
             return Err(DriverError::EaListInconsistent);
         }
-        names.try_push(WindowsEaName::new(name)?)?;
+        names
+            .try_push_owned(WindowsEaName::new(name)?)
+            .map_err(|error| error.into_parts().0)?;
 
         let raw_len = get_ea_record_length(name.len())?;
         if next == 0 {
@@ -644,12 +654,9 @@ fn xattr_name_from_ea_name(name: &WindowsEaName) -> DriverResult<XattrName> {
         .len()
         .checked_add(name.len())
         .ok_or(DriverError::InvalidEaName)?;
-    let mut local = Vec::new();
-    local
-        .try_reserve_exact(local_len)
-        .map_err(|_| DriverError::InsufficientResources)?;
-    local.try_extend_from_slice(EA_XATTR_PREFIX)?;
-    local.try_extend_from_slice(name.as_bytes())?;
+    let mut local = DriverVec::try_with_capacity(local_len)?;
+    local.try_extend_from_copy_slice(EA_XATTR_PREFIX)?;
+    local.try_extend_from_copy_slice(name.as_bytes())?;
     Ok(XattrName::new(XattrNamespace::User, local.as_slice())?)
 }
 
@@ -724,10 +731,11 @@ mod tests {
         let fields = LittleEndianInput::new(output.as_slice());
         assert_eq!(fields.read_u32(wire_offset(0)), Ok(20));
         assert_eq!(fields.read_u16(wire_offset(6)), Ok(3));
-        assert_eq!(
-            parse_full_ea_list(output.get(..36).unwrap_or(&[])),
-            Ok(entries)
-        );
+        let parsed = parse_full_ea_list(output.get(..36).unwrap_or(&[]));
+        assert!(parsed.is_ok());
+        if let Ok(parsed) = parsed {
+            assert_eq!(parsed.as_slice(), entries.as_slice());
+        }
     }
 
     /// # Panics
@@ -754,10 +762,12 @@ mod tests {
             return;
         };
 
-        assert_eq!(
-            parse_get_ea_list(input.get(..22).unwrap_or(&[])),
-            Ok(vec![alpha, beta])
-        );
+        let parsed = parse_get_ea_list(input.get(..22).unwrap_or(&[]));
+        assert!(parsed.is_ok());
+        if let Ok(parsed) = parsed {
+            let expected = [alpha, beta];
+            assert_eq!(parsed.as_slice(), expected.as_slice());
+        }
     }
 
     /// # Panics

@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use crate::irp::{DispatchTarget, FileSystemControlStack, IrpCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::FallibleVec;
+use crate::memory::DriverVec;
 use crate::request::metadata;
 use crate::state::{FileControlBlock, OpenedObject, OpenedPath, OpenedSymlink, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
@@ -153,9 +153,7 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
 /// buffer is too small.
 fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> DriverResult<usize> {
     let target = core::str::from_utf8(target).map_err(|_| DriverError::NotSupported)?;
-    let mut path = Vec::new();
-    path.try_reserve(target.len())
-        .map_err(|_| DriverError::InsufficientResources)?;
+    let mut path = DriverVec::try_with_capacity(target.len())?;
     for unit in target.encode_utf16() {
         path.try_push(unit)?;
     }
@@ -255,7 +253,7 @@ fn reparse_path_units(
     path_buffer_length: usize,
     offset: usize,
     length: usize,
-) -> DriverResult<Vec<u16>> {
+) -> DriverResult<DriverVec<u16>> {
     if !offset.is_multiple_of(2) || !length.is_multiple_of(2) {
         return Err(DriverError::InvalidParameter);
     }
@@ -272,7 +270,7 @@ fn reparse_path_units(
         return Err(DriverError::InvalidParameter);
     }
     let bytes = input.range(wire_range(start, length)?)?;
-    let mut units = Vec::new();
+    let mut units = DriverVec::new();
     let (chunks, remainder) = bytes.as_chunks::<2>();
     if !remainder.is_empty() {
         return Err(DriverError::InvalidParameter);
@@ -287,19 +285,16 @@ fn reparse_path_units(
 /// # Errors
 ///
 /// Returns an error when the UTF-16 input is malformed or allocation fails.
-fn utf16_to_utf8_bytes(units: &[u16]) -> DriverResult<Vec<u8>> {
+fn utf16_to_utf8_bytes(units: &[u16]) -> DriverResult<DriverVec<u8>> {
     let capacity = units
         .len()
         .checked_mul(3)
         .ok_or(DriverError::InvalidParameter)?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve(capacity)
-        .map_err(|_| DriverError::InsufficientResources)?;
+    let mut bytes = DriverVec::try_with_capacity(capacity)?;
     for decoded in char::decode_utf16(units.iter().copied()) {
         let character = decoded.map_err(|_| DriverError::InvalidParameter)?;
         let mut encoded = [0_u8; 4];
-        bytes.try_extend_from_slice(character.encode_utf8(&mut encoded).as_bytes())?;
+        bytes.try_extend_from_copy_slice(character.encode_utf8(&mut encoded).as_bytes())?;
     }
     Ok(bytes)
 }
