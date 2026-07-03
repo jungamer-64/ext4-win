@@ -341,16 +341,15 @@ fn resolve_path(
         // only for immutable path fields.
         file_object.as_ref()
     };
-    if !file_object.RelatedFileObject.is_null() {
-        return Err(DriverError::NotSupported);
-    }
+    let name = CreatePathName::decode(file_object)?;
+    let anchor = CreatePathAnchor::decode(file_object, vcb)?;
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
         // in the mounted device extension and is read only for path lookup.
         vcb.as_ref()
     };
-    let mut parent_id = DirectoryNodeId::ROOT;
-    let components = path_components(file_object)?;
+    let mut parent_id = anchor.directory();
+    let components = name.components();
     let mut components = components.iter().peekable();
     while let Some(component) = components.next() {
         let is_final = components.peek().is_none();
@@ -381,13 +380,7 @@ fn resolve_path(
         parent_id = directory_id;
     }
 
-    match vcb.volume().load_directory(parent_id) {
-        Ok(directory) => Ok(PathLookup::Existing {
-            node: NodeId::Directory(directory.id()),
-            path: OpenedPath::Root,
-        }),
-        Err(error) => Err(DriverError::from(error)),
-    }
+    anchor.existing_directory(parent_id)
 }
 
 /// Splits the FILE_OBJECT name into validated root-relative Windows components.
