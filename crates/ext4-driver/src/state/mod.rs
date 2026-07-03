@@ -968,6 +968,17 @@ impl OpenedPath {
             name: name.try_to_owned_name()?,
         })
     }
+
+    /// Copies this opened path into a separately owned handle path.
+    /// # Errors
+    ///
+    /// Returns an error when copying a child name cannot allocate.
+    pub(crate) fn try_to_owned_path(&self) -> DriverResult<Self> {
+        match self {
+            Self::Root => Ok(Self::Root),
+            Self::Child { parent, name } => Self::try_child(*parent, name),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
