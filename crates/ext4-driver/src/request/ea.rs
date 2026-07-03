@@ -1,8 +1,5 @@
 //! Windows extended-attribute IRP handling.
 
-use ext4_core::{XattrName, XattrNamespace, XattrValue};
-use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP};
-
 use crate::irp::{
     DispatchTarget, EaEntryEmission, EaNameSelection, IrpCompletion, QueryEaStack, SetEaStack,
 };
@@ -10,6 +7,7 @@ use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{FileControlBlock, OpenedObject, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
+use ext4_core::{XattrName, XattrNamespace, XattrValue};
 
 /// Local xattr prefix used to store Windows EA records under `user.*`.
 const EA_XATTR_PREFIX: &[u8] = b"ext4win.ea.";
@@ -35,23 +33,20 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
     WireRange::new(wire_offset(offset), WireByteLen::new(length))
 }
 
-/// Handles IRP_MJ_QUERY_EA.
-pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target
-            .finish_result(QueryEaRequest::decode(target).and_then(|request| query_ea(&request))),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes IRP_MJ_QUERY_EA.
+/// # Errors
+///
+/// Returns an error when query-EA stack decoding, EA selection, or output packing fails.
+pub(crate) fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    QueryEaRequest::decode(target).and_then(|request| query_ea(&request))
 }
 
-/// Handles IRP_MJ_SET_EA.
-pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => {
-            target.finish_result(SetEaRequest::decode(target).and_then(|request| set_ea(&request)))
-        }
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes IRP_MJ_SET_EA.
+/// # Errors
+///
+/// Returns an error when set-EA stack decoding or ext4 EA mutation fails.
+pub(crate) fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    SetEaRequest::decode(target).and_then(|request| set_ea(&request))
 }
 
 /// Decoded query-EA request.

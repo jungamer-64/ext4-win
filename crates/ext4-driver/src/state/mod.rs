@@ -16,7 +16,7 @@ use wdk_sys::{
     SHARE_ACCESS, STATUS_SUCCESS, VPB_MOUNTED,
 };
 
-use crate::irp::{DesiredAccess, DirectoryEntryIndex, ShareAccess};
+use crate::irp::{DesiredAccess, DeviceIrpQueue, DirectoryEntryIndex, ShareAccess};
 use crate::kernel::cng::CngFscryptNonceGenerator;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
@@ -106,7 +106,7 @@ impl KernelFileObject {
     }
 
     /// Returns the raw WDK pointer for FFI calls that require FILE_OBJECT.
-    fn as_ptr(self) -> *mut FILE_OBJECT {
+    pub(crate) fn as_ptr(self) -> *mut FILE_OBJECT {
         self.file_object.as_ptr()
     }
 }
@@ -205,6 +205,66 @@ impl KernelSecurityDescriptor {
     }
 }
 
+/// Device extension stored in the file-system control device.
+#[repr(C)]
+pub(crate) struct ControlDeviceExtension {
+    /// Device-owned queue for pended control-device IRPs.
+    queue: DeviceIrpQueue,
+}
+
+impl ControlDeviceExtension {
+    /// Initializes the extension attached to the control device.
+    /// # Errors
+    ///
+    /// Returns an error when the device has no extension or its IRP queue cannot be initialized.
+    fn initialize(device: KernelDevice) -> DriverResult<()> {
+        let device_object = unsafe {
+            // SAFETY: `device` is the newly created control device object.
+            device.as_ptr().as_mut()
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        let extension = unsafe {
+            // SAFETY: DriverEntry creates the control device with a
+            // ControlDeviceExtension-sized extension.
+            device_object
+                .DeviceExtension
+                .cast::<ControlDeviceExtension>()
+                .as_mut()
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        unsafe {
+            // SAFETY: The extension is stable device-owned storage.
+            DeviceIrpQueue::initialize_at(core::ptr::addr_of_mut!(extension.queue), device)
+        }
+    }
+
+    /// Releases resources stored in the extension.
+    /// # Safety
+    ///
+    /// No dispatch callback or queue worker may still access the control device.
+    unsafe fn release(device: KernelDevice) {
+        let Some(device_object) = (unsafe {
+            // SAFETY: The caller owns teardown of the control device.
+            device.as_ptr().as_mut()
+        }) else {
+            return;
+        };
+        let Some(extension) = (unsafe {
+            // SAFETY: The control device was created with this extension type.
+            device_object
+                .DeviceExtension
+                .cast::<ControlDeviceExtension>()
+                .as_mut()
+        }) else {
+            return;
+        };
+        unsafe {
+            // SAFETY: Teardown has exclusive access to the extension.
+            DeviceIrpQueue::release_at(core::ptr::addr_of_mut!(extension.queue));
+        }
+    }
+}
+
 /// Registered file system control device owned by the driver.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ControlDevice {
@@ -214,13 +274,29 @@ pub(crate) struct ControlDevice {
 
 impl ControlDevice {
     /// Creates registered control-device state.
-    pub(crate) fn registered(device: PDEVICE_OBJECT) -> Option<Self> {
-        KernelDevice::from_raw(device).map(|device| Self { device })
+    /// # Errors
+    ///
+    /// Returns an error when the device pointer is null or its extension cannot be initialized.
+    pub(crate) fn registered(device: PDEVICE_OBJECT) -> DriverResult<Self> {
+        let device = KernelDevice::from_raw(device).ok_or(DriverError::InvalidParameter)?;
+        ControlDeviceExtension::initialize(device)?;
+        Ok(Self { device })
     }
 
     /// Returns the raw WDK device pointer for FFI calls.
     pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
         self.device.as_ptr()
+    }
+
+    /// Releases resources stored in the control device extension.
+    /// # Safety
+    ///
+    /// No dispatch callback or queue worker may still access the control device.
+    pub(crate) unsafe fn release(self) {
+        unsafe {
+            // SAFETY: The caller owns control-device teardown.
+            ControlDeviceExtension::release(self.device);
+        }
     }
 }
 
@@ -552,6 +628,8 @@ impl VolumeSerialNumber {
 /// Device extension stored in mounted volume device objects.
 #[repr(C)]
 pub(crate) struct MountedVolumeDeviceExtension {
+    /// Device-owned queue for pended volume IRPs.
+    queue: DeviceIrpQueue,
     /// Heap-owned VCB for this mounted volume device.
     vcb: *mut VolumeControlBlock,
 }
@@ -606,6 +684,12 @@ impl MountedVolumeDevice {
             vpb.as_ptr().as_mut()
         }
         .ok_or(DriverError::InvalidParameter)?;
+
+        unsafe {
+            // SAFETY: The extension is stable device-owned storage for this
+            // just-created mounted volume device.
+            DeviceIrpQueue::initialize_at(core::ptr::addr_of_mut!(extension.queue), device)?;
+        }
 
         device_object.Vpb = vpb;
         device_object.Flags |= DO_DIRECT_IO;
@@ -1290,11 +1374,16 @@ pub(crate) unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {
         // Replacement takes ownership of the registered device for teardown.
         core::ptr::replace(control_device, None)
     };
-    if let Some(device) = device {
-        let device = device.as_ptr();
+    if let Some(control_device) = device {
+        let device = control_device.as_ptr();
         unsafe {
             // SAFETY: The device was created and registered by DriverEntry.
             ffi::IoUnregisterFileSystem(device);
+        }
+        unsafe {
+            // SAFETY: The control device is no longer registered and no
+            // dispatch callbacks can access its queue.
+            control_device.release();
         }
         unsafe {
             // SAFETY: The device is no longer registered and is owned by this driver.

@@ -8,7 +8,7 @@ use ext4_core::{
     Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileSize, NodeId, WindowsName,
     WindowsOverlay,
 };
-use wdk_sys::{LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT, PIRP};
+use wdk_sys::LARGE_INTEGER;
 
 use crate::irp::{
     DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
@@ -25,106 +25,93 @@ use crate::state::{
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
-/// Handles cleanup IRPs.
-pub(crate) fn cleanup(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish_result(
-            target
-                .current_stack()
-                .and_then(|stack| stack.file_object())
-                .and_then(cleanup_file_object)
-                .map(|()| IrpCompletion::EMPTY),
-        ),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes cleanup IRPs.
+/// # Errors
+///
+/// Returns an error when the IRP stack has no opened FILE_OBJECT or cleanup state is invalid.
+pub(crate) fn cleanup(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    target
+        .current_stack()
+        .and_then(|stack| stack.file_object())
+        .and_then(cleanup_file_object)
+        .map(|()| IrpCompletion::EMPTY)
 }
 
-/// Handles close IRPs and releases FILE_OBJECT contexts.
-pub(crate) fn close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish_result(
-            target
-                .current_stack()
-                .and_then(|stack| stack.file_object())
-                .map(|file_object| {
-                    release_file_contexts(file_object);
-                    IrpCompletion::EMPTY
-                }),
-        ),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes close IRPs and releases FILE_OBJECT contexts.
+/// # Errors
+///
+/// Returns an error when the close stack has no FILE_OBJECT.
+pub(crate) fn close(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    target
+        .current_stack()
+        .and_then(|stack| stack.file_object())
+        .map(|file_object| {
+            release_file_contexts(file_object);
+            IrpCompletion::EMPTY
+        })
 }
 
-/// Handles regular file data reads.
-pub(crate) fn read(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish_result(read_regular_file(target)),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes regular file data reads.
+/// # Errors
+///
+/// Returns an error when read stack decoding, output buffer mapping, or ext4 file reading fails.
+pub(crate) fn read(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    read_regular_file(target)
 }
 
-/// Handles regular file data writes.
-pub(crate) fn write(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish_result(write_regular_file(target)),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes regular file data writes.
+/// # Errors
+///
+/// Returns an error when write stack decoding, input buffer mapping, or ext4 file mutation fails.
+pub(crate) fn write(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    write_regular_file(target)
 }
 
 /// Flushes cached or ordered file data.
-pub(crate) fn flush(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish(IrpCompletion::EMPTY),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// # Errors
+///
+/// This currently returns success for decoded flush IRPs.
+pub(crate) fn flush(_target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    Ok(IrpCompletion::EMPTY)
 }
 
-/// Handles file information queries.
-pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => {
-            target.finish_result(QueryFileRequest::decode(target).and_then(query_file_information))
-        }
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes file information queries.
+/// # Errors
+///
+/// Returns an error when query stack decoding or information packing fails.
+pub(crate) fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    QueryFileRequest::decode(target).and_then(query_file_information)
 }
 
-/// Handles file information mutations.
-pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => {
-            target.finish_result(SetFileRequest::decode(target).and_then(set_file_information))
-        }
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes file information mutations.
+/// # Errors
+///
+/// Returns an error when set stack decoding or the requested file mutation fails.
+pub(crate) fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    SetFileRequest::decode(target).and_then(set_file_information)
 }
 
-/// Handles directory enumeration and notification.
-pub(crate) fn directory_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish_result(target.current_stack().and_then(|stack| {
-            match stack.directory_control_minor() {
-                DirectoryControlMinorFunction::QueryDirectory => query_directory(target),
-                DirectoryControlMinorFunction::NotifyChangeDirectory => {
-                    Err(DriverError::NotSupported)
-                }
-                DirectoryControlMinorFunction::Unsupported => {
-                    Err(DriverError::InvalidDeviceRequest)
-                }
-            }
-        })),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes directory enumeration and notification.
+/// # Errors
+///
+/// Returns an error when directory-control decoding, enumeration, or unsupported notification
+/// handling rejects the request.
+pub(crate) fn directory_control(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    target
+        .current_stack()
+        .and_then(|stack| match stack.directory_control_minor() {
+            DirectoryControlMinorFunction::QueryDirectory => query_directory(target),
+            DirectoryControlMinorFunction::NotifyChangeDirectory => Err(DriverError::NotSupported),
+            DirectoryControlMinorFunction::Unsupported => Err(DriverError::InvalidDeviceRequest),
+        })
 }
 
-/// Handles byte-range lock requests.
-pub(crate) fn lock_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => {
-            target.finish_result(decoded_not_supported(target).and(Err(DriverError::NotSupported)))
-        }
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes byte-range lock requests.
+/// # Errors
+///
+/// Always returns an unsupported-operation error after validating the decoded target.
+pub(crate) fn lock_control(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    decoded_not_supported(target).and(Err(DriverError::NotSupported))
 }
 
 /// Rejects a decoded file-object request until its domain path exists.
@@ -1856,15 +1843,13 @@ fn release_file_contexts(file_object: KernelFileObject) {
 mod tests {
     use core::ptr::NonNull;
 
+    use crate::irp::{DirectoryInformationClass, DispatchTarget};
+    use crate::kernel::status::DriverError;
+    use crate::state::OpenedPath;
     use ext4_core::{
         BlockSize, DirectoryNodeId, Ext4Gid, Ext4LinkCount, Ext4Name, Ext4Owner, Ext4Permissions,
         Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileSize, NodeId, WindowsName,
     };
-    use wdk_sys::STATUS_NOT_SUPPORTED;
-
-    use crate::irp::DirectoryInformationClass;
-    use crate::kernel::status::DriverError;
-    use crate::state::OpenedPath;
 
     fn test_metadata(kind: super::FileMetadataKind) -> Option<super::FileMetadata> {
         let timestamp = Ext4Timestamp::from_unix_seconds(1);
@@ -2152,12 +2137,13 @@ mod tests {
             .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
 
         let mut device = wdk_sys::DEVICE_OBJECT::default();
-        assert_eq!(
-            super::set(
-                core::ptr::addr_of_mut!(device),
-                core::ptr::addr_of_mut!(irp)
-            ),
-            STATUS_NOT_SUPPORTED
+        let target = DispatchTarget::decode(
+            core::ptr::addr_of_mut!(device),
+            core::ptr::addr_of_mut!(irp),
         );
+        assert!(target.is_ok());
+        if let Ok(target) = target {
+            assert_eq!(super::set(target), Err(DriverError::NotSupported));
+        }
     }
 }
