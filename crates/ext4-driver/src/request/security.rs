@@ -2,9 +2,6 @@
 
 use core::ptr::NonNull;
 
-use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, NodeId};
-use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP};
-
 use crate::irp::{
     DispatchTarget, IrpCompletion, QuerySecurityStack, SecurityComponentSelection,
     SecuritySelection, SetSecurityStack,
@@ -13,6 +10,7 @@ use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{FileControlBlock, OpenedObject, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
+use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, NodeId};
 
 /// SECURITY_DESCRIPTOR_RELATIVE byte size.
 const SECURITY_DESCRIPTOR_RELATIVE_BYTES: usize = 20;
@@ -43,24 +41,20 @@ const SECURITY_WORLD_AUTHORITY: u64 = 1;
 /// POSIX permission bits stored in ext4 mode.
 const POSIX_RWX_BITS: u16 = 0o777;
 
-/// Handles IRP_MJ_QUERY_SECURITY.
-pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish_result(
-            QuerySecurityRequest::decode(target).and_then(|request| query_security(&request)),
-        ),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes IRP_MJ_QUERY_SECURITY.
+/// # Errors
+///
+/// Returns an error when security stack decoding or descriptor packing fails.
+pub(crate) fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    QuerySecurityRequest::decode(target).and_then(|request| query_security(&request))
 }
 
-/// Handles IRP_MJ_SET_SECURITY.
-pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish_result(
-            SetSecurityRequest::decode(target).and_then(|request| set_security(&request)),
-        ),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes IRP_MJ_SET_SECURITY.
+/// # Errors
+///
+/// Returns an error when security stack decoding or descriptor mutation fails.
+pub(crate) fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    SetSecurityRequest::decode(target).and_then(|request| set_security(&request))
 }
 
 /// Decoded query-security request.

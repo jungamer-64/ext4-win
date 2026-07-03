@@ -4,7 +4,10 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::FileOffset;
-use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_SUCCESS};
+use wdk_sys::{
+    LIST_ENTRY, NTSTATUS, PDEVICE_OBJECT, PIO_CSQ, PIO_STACK_LOCATION, PIO_WORKITEM, PIRP,
+    PLIST_ENTRY, PVOID, STATUS_PENDING, STATUS_SUCCESS,
+};
 
 #[cfg(not(test))]
 use crate::kernel::ffi;
@@ -16,6 +19,9 @@ use crate::state::{
 /// Completion priority boost for IRPs that should not adjust thread priority.
 #[cfg(not(test))]
 const IO_NO_INCREMENT_PRIORITY: wdk_sys::CCHAR = 0;
+
+/// `STATUS_CANCELLED` is not emitted by the current `wdk-sys` bindings.
+const STATUS_CANCELLED: NTSTATUS = i32::from_ne_bytes(0xC000_0120_u32.to_ne_bytes());
 
 /// Byte count completed in `IO_STATUS_BLOCK::Information`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +93,14 @@ impl IrpCompletion {
         }
     }
 
+    /// Builds a canceled IRP completion payload.
+    const fn cancelled() -> Self {
+        Self {
+            status: STATUS_CANCELLED,
+            information: InformationLength::ZERO,
+        }
+    }
+
     /// Returns the NTSTATUS for the IRP status block and dispatch return.
     const fn status(self) -> NTSTATUS {
         self.status
@@ -95,6 +109,116 @@ impl IrpCompletion {
     /// Returns the typed information length.
     const fn information(self) -> InformationLength {
         self.information
+    }
+}
+
+/// IRP major-function slot owned by the ext4win dispatch boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DispatchMajor {
+    /// Create/open request.
+    Create,
+    /// Close request.
+    Close,
+    /// Cleanup request.
+    Cleanup,
+    /// Read request.
+    Read,
+    /// Write request.
+    Write,
+    /// File information query.
+    QueryInformation,
+    /// File information mutation.
+    SetInformation,
+    /// Volume information query.
+    QueryVolumeInformation,
+    /// Volume information mutation.
+    SetVolumeInformation,
+    /// Directory enumeration or notification request.
+    DirectoryControl,
+    /// File-system control request.
+    FileSystemControl,
+    /// Device control request.
+    DeviceControl,
+    /// Flush request.
+    FlushBuffers,
+    /// Extended-attribute query.
+    QueryEa,
+    /// Extended-attribute mutation.
+    SetEa,
+    /// Byte-range lock request.
+    LockControl,
+    /// Shutdown notification.
+    Shutdown,
+    /// Security descriptor query.
+    QuerySecurity,
+    /// Security descriptor mutation.
+    SetSecurity,
+}
+
+impl DispatchMajor {
+    /// Decodes the raw major function stored in the current IRP stack location.
+    /// # Errors
+    ///
+    /// Returns an error when `value` does not name a dispatch slot owned by this driver.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "queued worker dispatch is compiled out in unit tests"
+        )
+    )]
+    pub(crate) fn from_stack_major(value: wdk_sys::UCHAR) -> DriverResult<Self> {
+        match u32::from(value) {
+            value if value == wdk_sys::IRP_MJ_CREATE => Ok(Self::Create),
+            value if value == wdk_sys::IRP_MJ_CLOSE => Ok(Self::Close),
+            value if value == wdk_sys::IRP_MJ_CLEANUP => Ok(Self::Cleanup),
+            value if value == wdk_sys::IRP_MJ_READ => Ok(Self::Read),
+            value if value == wdk_sys::IRP_MJ_WRITE => Ok(Self::Write),
+            value if value == wdk_sys::IRP_MJ_QUERY_INFORMATION => Ok(Self::QueryInformation),
+            value if value == wdk_sys::IRP_MJ_SET_INFORMATION => Ok(Self::SetInformation),
+            value if value == wdk_sys::IRP_MJ_QUERY_VOLUME_INFORMATION => {
+                Ok(Self::QueryVolumeInformation)
+            }
+            value if value == wdk_sys::IRP_MJ_SET_VOLUME_INFORMATION => {
+                Ok(Self::SetVolumeInformation)
+            }
+            value if value == wdk_sys::IRP_MJ_DIRECTORY_CONTROL => Ok(Self::DirectoryControl),
+            value if value == wdk_sys::IRP_MJ_FILE_SYSTEM_CONTROL => Ok(Self::FileSystemControl),
+            value if value == wdk_sys::IRP_MJ_DEVICE_CONTROL => Ok(Self::DeviceControl),
+            value if value == wdk_sys::IRP_MJ_FLUSH_BUFFERS => Ok(Self::FlushBuffers),
+            value if value == wdk_sys::IRP_MJ_QUERY_EA => Ok(Self::QueryEa),
+            value if value == wdk_sys::IRP_MJ_SET_EA => Ok(Self::SetEa),
+            value if value == wdk_sys::IRP_MJ_LOCK_CONTROL => Ok(Self::LockControl),
+            value if value == wdk_sys::IRP_MJ_SHUTDOWN => Ok(Self::Shutdown),
+            value if value == wdk_sys::IRP_MJ_QUERY_SECURITY => Ok(Self::QuerySecurity),
+            value if value == wdk_sys::IRP_MJ_SET_SECURITY => Ok(Self::SetSecurity),
+            _ => Err(DriverError::InvalidDeviceRequest),
+        }
+    }
+
+    /// Returns the index into `DRIVER_OBJECT::MajorFunction`.
+    pub(crate) const fn table_index(self) -> usize {
+        match self {
+            Self::Create => 0x00,
+            Self::Close => 0x02,
+            Self::Read => 0x03,
+            Self::Write => 0x04,
+            Self::QueryInformation => 0x05,
+            Self::SetInformation => 0x06,
+            Self::QueryEa => 0x07,
+            Self::SetEa => 0x08,
+            Self::FlushBuffers => 0x09,
+            Self::QueryVolumeInformation => 0x0A,
+            Self::SetVolumeInformation => 0x0B,
+            Self::DirectoryControl => 0x0C,
+            Self::FileSystemControl => 0x0D,
+            Self::DeviceControl => 0x0E,
+            Self::Shutdown => 0x10,
+            Self::LockControl => 0x11,
+            Self::Cleanup => 0x12,
+            Self::QuerySecurity => 0x14,
+            Self::SetSecurity => 0x15,
+        }
     }
 }
 
@@ -224,23 +348,782 @@ impl DispatchTarget {
     ///
     /// Returns an error when the IRP current stack location pointer is null.
     pub(crate) fn current_stack(self) -> Result<CurrentIrpStackLocation, DriverError> {
-        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
-        let irp = unsafe { self.irp.as_ref() };
-        let tail_overlay = unsafe {
-            // SAFETY: CurrentStackLocation is stored through the IRP tail
-            // overlay for active IRPs delivered to driver dispatch routines.
-            irp.Tail.Overlay
-        };
-        let current_stack = unsafe {
-            // SAFETY: The list overlay contains the current stack pointer in
-            // active dispatch IRPs.
-            tail_overlay
-                .__bindgen_anon_2
-                .__bindgen_anon_1
-                .CurrentStackLocation
-        };
-        CurrentIrpStackLocation::from_raw(current_stack)
+        self.irp.current_stack()
     }
+}
+
+/// IRP received by a dispatch callback before its completion policy is selected.
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct ReceivedIrp {
+    /// Target decoded from the raw dispatch ABI.
+    target: DispatchTarget,
+}
+
+impl ReceivedIrp {
+    /// Decodes raw WDK dispatch pointers into a received IRP.
+    /// # Errors
+    ///
+    /// Returns an error when either the device object or IRP pointer is null.
+    pub(crate) fn decode(device: PDEVICE_OBJECT, irp: PIRP) -> DriverResult<Self> {
+        Ok(Self {
+            target: DispatchTarget::decode(device, irp)?,
+        })
+    }
+
+    /// Returns the dispatch target for stack and buffer decoding.
+    pub(crate) const fn target(&self) -> DispatchTarget {
+        self.target
+    }
+
+    /// Returns the target device that received this IRP.
+    pub(crate) const fn device(&self) -> KernelDevice {
+        self.target.device
+    }
+
+    /// Marks this IRP pending before it enters a driver-owned queue.
+    /// # Errors
+    ///
+    /// Returns an error when the current IRP stack location is absent or cannot hold the pending
+    /// marker.
+    pub(crate) fn mark_pending(&self) -> DriverResult<()> {
+        self.target.irp.mark_pending()
+    }
+
+    /// Transfers a marked received IRP into the queued pending state.
+    pub(crate) fn into_pending(self) -> PendingIrp {
+        PendingIrp {
+            target: self.target,
+        }
+    }
+
+    /// Completes this received IRP immediately.
+    pub(crate) fn complete(self, completion: IrpCompletion) -> NTSTATUS {
+        OwnedIrp {
+            target: self.target,
+        }
+        .complete(completion)
+    }
+
+    /// Completes this received IRP from a fallible request result.
+    pub(crate) fn complete_result(self, result: DriverResult<IrpCompletion>) -> NTSTATUS {
+        self.complete(match result {
+            Ok(completion) => completion,
+            Err(error) => IrpCompletion::from_error(error),
+        })
+    }
+
+    /// Completes a raw IRP when dispatch-target decoding failed.
+    pub(crate) fn complete_decode_error(irp: PIRP, error: DriverError) -> NTSTATUS {
+        let completion = IrpCompletion::from_error(error);
+        if let Some(irp) = KernelIrp::from_raw(irp) {
+            return irp.complete(completion);
+        }
+        completion.status()
+    }
+}
+
+/// IRP marked pending and ready to be inserted into a device queue.
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct PendingIrp {
+    /// Pending dispatch target.
+    target: DispatchTarget,
+}
+
+impl PendingIrp {
+    /// Returns the raw pending IRP pointer for queue insertion.
+    fn as_raw_irp(&self) -> PIRP {
+        self.target.irp.as_ptr()
+    }
+
+    /// Returns the status dispatch must return after this IRP has been pended.
+    const fn dispatch_status(&self) -> NTSTATUS {
+        STATUS_PENDING
+    }
+}
+
+/// Unique IRP completion authority held by queue, worker, and immediate paths.
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct OwnedIrp {
+    /// Target whose IRP can be completed exactly once by this owner.
+    target: DispatchTarget,
+}
+
+impl OwnedIrp {
+    /// Builds owned completion authority from a raw queued IRP.
+    fn from_raw(device: KernelDevice, irp: PIRP) -> Option<Self> {
+        KernelIrp::from_raw(irp).map(|irp| Self {
+            target: DispatchTarget { device, irp },
+        })
+    }
+
+    /// Returns the dispatch target for request execution.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "queued worker completion is compiled out in unit tests"
+        )
+    )]
+    pub(crate) const fn target(&self) -> DispatchTarget {
+        self.target
+    }
+
+    /// Completes the IRP through the I/O Manager.
+    pub(crate) fn complete(self, completion: IrpCompletion) -> NTSTATUS {
+        self.target.irp.complete(completion)
+    }
+
+    /// Completes the IRP from a fallible request result.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "queued worker completion is compiled out in unit tests"
+        )
+    )]
+    pub(crate) fn complete_result(self, result: DriverResult<IrpCompletion>) -> NTSTATUS {
+        self.complete(match result {
+            Ok(completion) => completion,
+            Err(error) => IrpCompletion::from_error(error),
+        })
+    }
+
+    /// Completes the IRP as canceled.
+    fn complete_cancelled(self) -> NTSTATUS {
+        self.complete(IrpCompletion::cancelled())
+    }
+}
+
+/// Worker scheduling state protected by the device IRP queue lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueWorkerState {
+    /// No worker owns queue draining.
+    Idle,
+    /// A worker has been queued and owns queue draining.
+    Scheduled,
+}
+
+/// Result of checking whether a draining worker can exit.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "queued worker drain is compiled out in unit tests"
+    )
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueDrainState {
+    /// The queue is empty and the worker moved back to idle.
+    Finished,
+    /// New IRPs arrived before the worker could move back to idle.
+    HasQueuedIrps,
+}
+
+/// Device-owned cancel-safe queue for pended IRPs.
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct DeviceIrpQueue {
+    /// Cancel-safe queue callback table. This must remain the first field.
+    csq: wdk_sys::IO_CSQ,
+    /// Queue lock used by the CSQ callbacks and worker scheduling state.
+    lock: wdk_sys::KSPIN_LOCK,
+    /// FIFO head using `IRP.Tail.Overlay.ListEntry` links.
+    list_head: LIST_ENTRY,
+    /// System worker item allocated for this device.
+    work_item: PIO_WORKITEM,
+    /// Worker ownership state guarded by `lock`.
+    worker_state: QueueWorkerState,
+    /// Device object that owns this queue.
+    device: KernelDevice,
+}
+
+impl DeviceIrpQueue {
+    /// Initializes a queue directly inside device-extension storage.
+    /// # Safety
+    ///
+    /// `queue` must point to writable device-extension memory that will not be moved after
+    /// initialization. The memory must be released through `release_at` before the device object is
+    /// deleted.
+    /// # Errors
+    ///
+    /// Returns an error when CSQ initialization or work-item allocation fails.
+    pub(crate) unsafe fn initialize_at(queue: *mut Self, device: KernelDevice) -> DriverResult<()> {
+        unsafe {
+            // SAFETY: The caller supplied writable device-extension storage for
+            // the queue object, and this write establishes its initial value.
+            core::ptr::write(
+                queue,
+                Self {
+                    csq: wdk_sys::IO_CSQ::default(),
+                    lock: 0,
+                    list_head: LIST_ENTRY::default(),
+                    work_item: core::ptr::null_mut(),
+                    worker_state: QueueWorkerState::Idle,
+                    device,
+                },
+            );
+        }
+
+        let queue = unsafe {
+            // SAFETY: The object was initialized immediately above and remains
+            // in the caller-provided device extension.
+            queue.as_mut()
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        initialize_list_head(core::ptr::addr_of_mut!(queue.list_head));
+
+        #[cfg(not(test))]
+        {
+            unsafe {
+                // SAFETY: `lock` is writable queue-owned storage.
+                ffi::KeInitializeSpinLock(core::ptr::addr_of_mut!(queue.lock));
+            }
+            let status = unsafe {
+                // SAFETY: `csq` is writable queue-owned storage, and all
+                // callbacks use the containing `DeviceIrpQueue`.
+                ffi::IoCsqInitialize(
+                    core::ptr::addr_of_mut!(queue.csq),
+                    Some(csq_insert_irp),
+                    Some(csq_remove_irp),
+                    Some(csq_peek_next_irp),
+                    Some(csq_acquire_lock),
+                    Some(csq_release_lock),
+                    Some(csq_complete_canceled_irp),
+                )
+            };
+            if status < STATUS_SUCCESS {
+                return Err(DriverError::InsufficientResources);
+            }
+            let work_item = unsafe {
+                // SAFETY: The device object owns this device-extension queue
+                // and remains alive until queue release.
+                ffi::IoAllocateWorkItem(device.as_ptr())
+            };
+            let Some(work_item) = NonNull::new(work_item) else {
+                return Err(DriverError::InsufficientResources);
+            };
+            queue.work_item = work_item.as_ptr();
+        }
+
+        Ok(())
+    }
+
+    /// Releases resources allocated for a queue in device-extension storage.
+    /// # Safety
+    ///
+    /// No worker or dispatch path may still access `queue`.
+    pub(crate) unsafe fn release_at(queue: *mut Self) {
+        let Some(queue) = (unsafe {
+            // SAFETY: The caller guarantees exclusive teardown access.
+            queue.as_mut()
+        }) else {
+            return;
+        };
+        #[cfg(not(test))]
+        if let Some(work_item) = NonNull::new(queue.work_item) {
+            unsafe {
+                // SAFETY: The work item was allocated by `initialize_at` for
+                // this queue and is released once during device teardown.
+                ffi::IoFreeWorkItem(work_item.as_ptr());
+            }
+            queue.work_item = core::ptr::null_mut();
+        }
+        #[cfg(test)]
+        let _: &mut Self = queue;
+    }
+
+    /// Returns the device-owned queue embedded as the first extension field.
+    /// # Errors
+    ///
+    /// Returns an error when the device has no extension.
+    pub(crate) fn from_device(device: KernelDevice) -> DriverResult<NonNull<Self>> {
+        let device_object = unsafe {
+            // SAFETY: `device` is a non-null DEVICE_OBJECT decoded at the
+            // dispatch boundary and read only for its extension pointer.
+            device.as_ptr().as_ref()
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        NonNull::new(device_object.DeviceExtension.cast::<Self>())
+            .ok_or(DriverError::InvalidParameter)
+    }
+
+    /// Inserts a pending IRP into this queue and schedules the worker.
+    pub(crate) fn enqueue(mut queue: NonNull<Self>, pending: PendingIrp) -> NTSTATUS {
+        let status = pending.dispatch_status();
+        let irp = pending.as_raw_irp();
+        let queue = unsafe {
+            // SAFETY: The queue pointer comes from a live device extension.
+            queue.as_mut()
+        };
+        #[cfg(not(test))]
+        {
+            let csq = queue.csq_ptr();
+            unsafe {
+                // SAFETY: `pending` was marked pending by this driver, and CSQ
+                // now owns cancellation-safe insertion.
+                ffi::IoCsqInsertIrp(
+                    csq,
+                    irp,
+                    core::ptr::null_mut::<wdk_sys::IO_CSQ_IRP_CONTEXT>(),
+                );
+            }
+        }
+        #[cfg(test)]
+        {
+            queue.insert_irp(irp);
+        }
+        queue.request_worker();
+        status
+    }
+
+    /// Cancels all queued IRPs that target `file_object`.
+    pub(crate) fn cancel_file_object(mut queue: NonNull<Self>, file_object: KernelFileObject) {
+        let peek_context = file_object.as_ptr().cast::<c_void>();
+        let queue = unsafe {
+            // SAFETY: The queue pointer comes from a live device extension.
+            queue.as_mut()
+        };
+        loop {
+            let irp = queue.remove_next_irp(peek_context);
+            if irp.is_null() {
+                break;
+            }
+            if let Some(owned) = OwnedIrp::from_raw(queue.device, irp) {
+                let _status = owned.complete_cancelled();
+            }
+        }
+    }
+
+    /// Returns a pointer to the embedded CSQ table.
+    #[cfg_attr(
+        test,
+        expect(dead_code, reason = "kernel CSQ calls are compiled out in unit tests")
+    )]
+    fn csq_ptr(&mut self) -> PIO_CSQ {
+        core::ptr::addr_of_mut!(self.csq)
+    }
+
+    /// Requests worker execution when no worker is already scheduled.
+    fn request_worker(&mut self) {
+        #[cfg(not(test))]
+        {
+            let should_queue = {
+                let old_irql = unsafe {
+                    // SAFETY: The spin lock belongs to this queue.
+                    ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of_mut!(self.lock))
+                };
+                let should_queue = self.worker_state == QueueWorkerState::Idle;
+                if should_queue {
+                    self.worker_state = QueueWorkerState::Scheduled;
+                }
+                unsafe {
+                    // SAFETY: Releases the lock acquired above with its previous IRQL.
+                    ffi::KeReleaseSpinLock(core::ptr::addr_of_mut!(self.lock), old_irql);
+                }
+                should_queue
+            };
+
+            if should_queue {
+                unsafe {
+                    // SAFETY: `work_item` is allocated for this device queue, and
+                    // the context is the queue's stable device-extension address.
+                    ffi::IoQueueWorkItem(
+                        self.work_item,
+                        Some(device_irp_queue_worker),
+                        wdk_sys::_WORK_QUEUE_TYPE::DelayedWorkQueue,
+                        core::ptr::from_mut(self).cast::<c_void>(),
+                    );
+                }
+            }
+        }
+
+        #[cfg(test)]
+        if self.worker_state == QueueWorkerState::Idle {
+            self.worker_state = QueueWorkerState::Scheduled;
+        }
+    }
+
+    /// Removes the next queued IRP matching `peek_context`.
+    fn remove_next_irp(&mut self, peek_context: PVOID) -> PIRP {
+        #[cfg(not(test))]
+        {
+            let csq = self.csq_ptr();
+            unsafe {
+                // SAFETY: The CSQ owns synchronization and returns an IRP only
+                // after removing it from this queue.
+                ffi::IoCsqRemoveNextIrp(csq, peek_context)
+            }
+        }
+        #[cfg(test)]
+        {
+            let irp = self.peek_next_irp(core::ptr::null_mut(), peek_context);
+            if !irp.is_null() {
+                self.remove_irp(irp);
+            }
+            irp
+        }
+    }
+
+    /// Moves the worker back to idle only when the queue is still empty.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "queued worker drain is compiled out in unit tests"
+        )
+    )]
+    fn finish_drain_if_empty(&mut self) -> QueueDrainState {
+        #[cfg(not(test))]
+        {
+            let old_irql = unsafe {
+                // SAFETY: The spin lock belongs to this queue.
+                ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of_mut!(self.lock))
+            };
+            let state = if self.is_empty() {
+                self.worker_state = QueueWorkerState::Idle;
+                QueueDrainState::Finished
+            } else {
+                QueueDrainState::HasQueuedIrps
+            };
+            unsafe {
+                // SAFETY: Releases the lock acquired above with its previous IRQL.
+                ffi::KeReleaseSpinLock(core::ptr::addr_of_mut!(self.lock), old_irql);
+            }
+            state
+        }
+        #[cfg(test)]
+        {
+            if self.is_empty() {
+                self.worker_state = QueueWorkerState::Idle;
+                QueueDrainState::Finished
+            } else {
+                QueueDrainState::HasQueuedIrps
+            }
+        }
+    }
+
+    /// Inserts `irp` at the FIFO tail. The caller must hold the CSQ lock.
+    fn insert_irp(&mut self, irp: PIRP) {
+        let Some(entry) = irp_list_entry(irp) else {
+            return;
+        };
+        insert_tail_list(core::ptr::addr_of_mut!(self.list_head), entry);
+    }
+
+    /// Removes `irp` from the FIFO. The caller must hold the CSQ lock.
+    fn remove_irp(&mut self, irp: PIRP) {
+        let Some(entry) = irp_list_entry(irp) else {
+            return;
+        };
+        remove_entry_list(entry);
+    }
+
+    /// Returns the next queued IRP after `irp` that matches `peek_context`.
+    fn peek_next_irp(&self, irp: PIRP, peek_context: PVOID) -> PIRP {
+        let head = core::ptr::addr_of!(self.list_head).cast_mut();
+        let mut entry = if irp.is_null() {
+            unsafe {
+                // SAFETY: `head` points to this initialized list head.
+                (*head).Flink
+            }
+        } else {
+            let Some(irp_entry) = irp_list_entry(irp) else {
+                return core::ptr::null_mut();
+            };
+            unsafe {
+                // SAFETY: `irp_entry` belongs to an IRP currently linked in
+                // this queue by the CSQ framework.
+                (*irp_entry).Flink
+            }
+        };
+
+        while entry != head {
+            let candidate = irp_from_list_entry(entry);
+            if irp_matches_peek_context(candidate, peek_context) {
+                return candidate;
+            }
+            entry = unsafe {
+                // SAFETY: `entry` is a linked list node in this initialized
+                // intrusive list.
+                (*entry).Flink
+            };
+        }
+        core::ptr::null_mut()
+    }
+
+    /// Returns whether the intrusive list is empty.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "queued worker drain is compiled out in unit tests"
+        )
+    )]
+    fn is_empty(&self) -> bool {
+        let head = core::ptr::addr_of!(self.list_head).cast_mut();
+        unsafe {
+            // SAFETY: `head` points to this initialized list head.
+            (*head).Flink == head
+        }
+    }
+}
+
+#[cfg(not(test))]
+/// System worker entry point that drains queued IRPs.
+/// # Safety
+///
+/// The I/O Manager must call this with `context` equal to a live `DeviceIrpQueue` pointer that was
+/// supplied to `IoQueueWorkItem`.
+unsafe extern "C" fn device_irp_queue_worker(_device_object: PDEVICE_OBJECT, context: PVOID) {
+    let Some(mut queue) = NonNull::new(context.cast::<DeviceIrpQueue>()) else {
+        return;
+    };
+    let queue = unsafe {
+        // SAFETY: The work item context is the queue's stable device-extension pointer.
+        queue.as_mut()
+    };
+    loop {
+        let irp = queue.remove_next_irp(core::ptr::null_mut());
+        if irp.is_null() {
+            let drain_state = queue.finish_drain_if_empty();
+            match drain_state {
+                QueueDrainState::Finished => return,
+                QueueDrainState::HasQueuedIrps => continue,
+            }
+        }
+
+        if let Some(owned) = OwnedIrp::from_raw(queue.device, irp) {
+            let target = owned.target();
+            let result = crate::request::dispatch::execute_queued(target);
+            let _status = owned.complete_result(result);
+        }
+    }
+}
+
+#[cfg(not(test))]
+/// CSQ callback that inserts an IRP into the device FIFO.
+/// # Safety
+///
+/// The CSQ framework must pass the embedded `IO_CSQ` pointer for a live `DeviceIrpQueue`.
+unsafe extern "C" fn csq_insert_irp(csq: PIO_CSQ, irp: PIRP) {
+    let Some(queue) = (unsafe {
+        // SAFETY: CSQ callbacks receive the embedded first field of
+        // `DeviceIrpQueue`.
+        queue_from_csq(csq)
+    }) else {
+        return;
+    };
+    queue.insert_irp(irp);
+}
+
+#[cfg(not(test))]
+/// CSQ callback that removes an IRP from the device FIFO.
+/// # Safety
+///
+/// The CSQ framework must pass the embedded `IO_CSQ` pointer for a live `DeviceIrpQueue`.
+unsafe extern "C" fn csq_remove_irp(csq: PIO_CSQ, irp: PIRP) {
+    let Some(queue) = (unsafe {
+        // SAFETY: CSQ callbacks receive the embedded first field of
+        // `DeviceIrpQueue`.
+        queue_from_csq(csq)
+    }) else {
+        return;
+    };
+    queue.remove_irp(irp);
+}
+
+#[cfg(not(test))]
+/// CSQ callback that finds the next matching IRP in FIFO order.
+/// # Safety
+///
+/// The CSQ framework must pass the embedded `IO_CSQ` pointer for a live `DeviceIrpQueue`.
+unsafe extern "C" fn csq_peek_next_irp(csq: PIO_CSQ, irp: PIRP, peek_context: PVOID) -> PIRP {
+    let Some(queue) = (unsafe {
+        // SAFETY: CSQ callbacks receive the embedded first field of
+        // `DeviceIrpQueue`.
+        queue_from_csq(csq)
+    }) else {
+        return core::ptr::null_mut();
+    };
+    queue.peek_next_irp(irp, peek_context)
+}
+
+#[cfg(not(test))]
+/// CSQ callback that acquires the queue spin lock.
+/// # Safety
+///
+/// The CSQ framework must pass the embedded `IO_CSQ` pointer and writable IRQL storage.
+unsafe extern "C" fn csq_acquire_lock(csq: PIO_CSQ, irql: wdk_sys::PKIRQL) {
+    let Some(queue) = (unsafe {
+        // SAFETY: CSQ callbacks receive the embedded first field of
+        // `DeviceIrpQueue`.
+        queue_from_csq(csq)
+    }) else {
+        return;
+    };
+    let Some(irql) = (unsafe {
+        // SAFETY: The CSQ framework passes writable IRQL storage.
+        irql.as_mut()
+    }) else {
+        return;
+    };
+    *irql = unsafe {
+        // SAFETY: The spin lock belongs to this queue.
+        ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of_mut!(queue.lock))
+    };
+}
+
+#[cfg(not(test))]
+/// CSQ callback that releases the queue spin lock.
+/// # Safety
+///
+/// The CSQ framework must pass the embedded `IO_CSQ` pointer and the IRQL returned by
+/// `csq_acquire_lock`.
+unsafe extern "C" fn csq_release_lock(csq: PIO_CSQ, irql: wdk_sys::KIRQL) {
+    let Some(queue) = (unsafe {
+        // SAFETY: CSQ callbacks receive the embedded first field of
+        // `DeviceIrpQueue`.
+        queue_from_csq(csq)
+    }) else {
+        return;
+    };
+    unsafe {
+        // SAFETY: Releases the lock acquired by `csq_acquire_lock`.
+        ffi::KeReleaseSpinLock(core::ptr::addr_of_mut!(queue.lock), irql);
+    }
+}
+
+#[cfg(not(test))]
+/// CSQ callback that completes an IRP canceled while queued.
+/// # Safety
+///
+/// The CSQ framework must pass the embedded `IO_CSQ` pointer and an IRP removed from this queue.
+unsafe extern "C" fn csq_complete_canceled_irp(csq: PIO_CSQ, irp: PIRP) {
+    let Some(queue) = (unsafe {
+        // SAFETY: CSQ callbacks receive the embedded first field of
+        // `DeviceIrpQueue`.
+        queue_from_csq(csq)
+    }) else {
+        return;
+    };
+    if let Some(owned) = OwnedIrp::from_raw(queue.device, irp) {
+        let _status = owned.complete_cancelled();
+    }
+}
+
+#[cfg(not(test))]
+/// Returns the containing queue from its first-field CSQ pointer.
+/// # Safety
+///
+/// `csq` must be the address of the first field in a live `DeviceIrpQueue`.
+unsafe fn queue_from_csq<'a>(csq: PIO_CSQ) -> Option<&'a mut DeviceIrpQueue> {
+    let mut queue = NonNull::new(csq.cast::<DeviceIrpQueue>())?;
+    Some(unsafe {
+        // SAFETY: `csq` is the first field of `DeviceIrpQueue`.
+        queue.as_mut()
+    })
+}
+
+/// Initializes a doubly-linked list head.
+fn initialize_list_head(head: PLIST_ENTRY) {
+    let head_ref = unsafe {
+        // SAFETY: `head` points to writable list-head storage.
+        &mut *head
+    };
+    head_ref.Flink = head;
+    head_ref.Blink = head;
+}
+
+/// Inserts `entry` before `head`.
+fn insert_tail_list(head: PLIST_ENTRY, entry: PLIST_ENTRY) {
+    let head_ref = unsafe {
+        // SAFETY: `head` is an initialized list head.
+        &mut *head
+    };
+    let previous = head_ref.Blink;
+    let entry_ref = unsafe {
+        // SAFETY: `entry` is not linked in another list while it is being inserted.
+        &mut *entry
+    };
+    entry_ref.Flink = head;
+    entry_ref.Blink = previous;
+    let previous_ref = unsafe {
+        // SAFETY: `previous` is the current tail in the initialized list.
+        &mut *previous
+    };
+    previous_ref.Flink = entry;
+    head_ref.Blink = entry;
+}
+
+/// Removes `entry` from its current list.
+fn remove_entry_list(entry: PLIST_ENTRY) {
+    let entry_ref = unsafe {
+        // SAFETY: `entry` is currently linked in an initialized list.
+        &mut *entry
+    };
+    let previous = entry_ref.Blink;
+    let next = entry_ref.Flink;
+    let previous_ref = unsafe {
+        // SAFETY: `previous` is adjacent to `entry` in the initialized list.
+        &mut *previous
+    };
+    previous_ref.Flink = next;
+    let next_ref = unsafe {
+        // SAFETY: `next` is adjacent to `entry` in the initialized list.
+        &mut *next
+    };
+    next_ref.Blink = previous;
+    initialize_list_head(entry);
+}
+
+/// Returns the intrusive list entry embedded in an IRP.
+fn irp_list_entry(irp: PIRP) -> Option<PLIST_ENTRY> {
+    let mut irp = NonNull::new(irp)?;
+    let entry = unsafe {
+        // SAFETY: `irp` is a live IRP owned by the I/O Manager while queued.
+        core::ptr::addr_of_mut!(irp.as_mut().Tail.Overlay.__bindgen_anon_2.ListEntry)
+    };
+    Some(entry)
+}
+
+/// Offset of `IRP.Tail.Overlay.ListEntry` from the start of an IRP.
+const IRP_TAIL_OVERLAY_LIST_ENTRY_OFFSET: usize = core::mem::offset_of!(wdk_sys::IRP, Tail)
+    + core::mem::offset_of!(wdk_sys::_IRP__bindgen_ty_4__bindgen_ty_1, __bindgen_anon_2)
+    + core::mem::offset_of!(
+        wdk_sys::_IRP__bindgen_ty_4__bindgen_ty_1__bindgen_ty_2,
+        ListEntry
+    );
+
+/// Returns the containing IRP for an intrusive list entry.
+fn irp_from_list_entry(entry: PLIST_ENTRY) -> PIRP {
+    entry
+        .cast::<u8>()
+        .wrapping_sub(IRP_TAIL_OVERLAY_LIST_ENTRY_OFFSET)
+        .cast::<wdk_sys::IRP>()
+}
+
+/// Returns whether an IRP matches a CSQ peek context.
+fn irp_matches_peek_context(irp: PIRP, peek_context: PVOID) -> bool {
+    if peek_context.is_null() {
+        return true;
+    }
+    irp_current_file_object(irp)
+        .is_some_and(|file_object| file_object.cast::<c_void>() == peek_context)
+}
+
+/// Returns the current stack FILE_OBJECT for a queued IRP.
+fn irp_current_file_object(irp: PIRP) -> Option<*mut wdk_sys::FILE_OBJECT> {
+    let irp = KernelIrp::from_raw(irp)?;
+    let stack = irp.current_stack().ok()?;
+    let stack = unsafe {
+        // SAFETY: The current stack location remains valid while the IRP is
+        // queued and owned by the I/O Manager.
+        stack.stack.as_ref()
+    };
+    NonNull::new(stack.FileObject).map(NonNull::as_ptr)
 }
 
 /// Non-null IRP pointer kept private to the typed dispatch boundary.
@@ -256,6 +1139,11 @@ impl KernelIrp {
         NonNull::new(irp).map(|irp| Self { irp })
     }
 
+    /// Returns the raw IRP pointer.
+    fn as_ptr(self) -> PIRP {
+        self.irp.as_ptr()
+    }
+
     /// Returns an immutable IRP reference for active dispatch decoding.
     ///
     /// # Safety
@@ -267,6 +1155,47 @@ impl KernelIrp {
             // dispatch callback that supplied this IRP.
             self.irp.as_ref()
         }
+    }
+
+    /// Returns the current stack location selected by the I/O Manager.
+    /// # Errors
+    ///
+    /// Returns an error when the IRP current stack location pointer is null.
+    fn current_stack(self) -> Result<CurrentIrpStackLocation, DriverError> {
+        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
+        let irp = unsafe { self.as_ref() };
+        let tail_overlay = unsafe {
+            // SAFETY: CurrentStackLocation is stored through the IRP tail
+            // overlay for active IRPs delivered to driver dispatch routines.
+            irp.Tail.Overlay
+        };
+        let current_stack = unsafe {
+            // SAFETY: The list overlay contains the current stack pointer in
+            // active dispatch IRPs.
+            tail_overlay
+                .__bindgen_anon_2
+                .__bindgen_anon_1
+                .CurrentStackLocation
+        };
+        CurrentIrpStackLocation::from_raw(current_stack)
+    }
+
+    /// Marks the current stack as pending before this IRP enters a driver-owned queue.
+    /// # Errors
+    ///
+    /// Returns an error when the current stack location is absent or the WDK pending bit cannot be
+    /// represented by the stack control byte.
+    fn mark_pending(self) -> DriverResult<()> {
+        let pending_bit = u8::try_from(wdk_sys::SL_PENDING_RETURNED)
+            .map_err(|_| DriverError::InvalidParameter)?;
+        let mut stack = self.current_stack()?;
+        let stack = unsafe {
+            // SAFETY: The current stack location belongs to this active IRP and
+            // the dispatch path owns the pending transition before queuing it.
+            stack.stack.as_mut()
+        };
+        stack.Control |= pending_bit;
+        Ok(())
     }
 
     /// Returns the raw IRP pointer for writes to the WDK completion fields.
@@ -318,6 +1247,26 @@ impl CurrentIrpStackLocation {
             return Err(DriverError::InvalidParameter);
         };
         Ok(Self { stack })
+    }
+
+    /// Decodes this stack location's major function.
+    /// # Errors
+    ///
+    /// Returns an error when the raw major function is not owned by this driver.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "queued worker dispatch is compiled out in unit tests"
+        )
+    )]
+    pub(crate) fn major(self) -> DriverResult<DispatchMajor> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for a dispatch callback or queued IRP still owned by the I/O Manager.
+            self.stack.as_ref()
+        };
+        DispatchMajor::from_stack_major(stack.MajorFunction)
     }
 
     /// Decodes this stack location's filesystem-control minor function.
@@ -2107,12 +3056,14 @@ mod tests {
 
     use super::{
         CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateTargetRequirement,
-        CurrentIrpStackLocation, DirectoryControlMinorFunction, DirectoryCursorPosition,
-        DirectoryEntryEmission, DirectoryInformationClass, DirectoryPatternInput, DispatchTarget,
-        EaEntryEmission, EaNameSelection, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
-        FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
-        IrpCompletion, KernelIrp, QueryFileInformationClass, QueryVolumeInformationClass,
-        SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
+        CurrentIrpStackLocation, DeviceIrpQueue, DirectoryControlMinorFunction,
+        DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
+        DirectoryPatternInput, DispatchTarget, EaEntryEmission, EaNameSelection,
+        FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION, FileSystemControlMinorFunction,
+        FsControlCode, InformationLength, IrpBufferLength, IrpCompletion, KernelIrp,
+        QueryFileInformationClass, QueryVolumeInformationClass, QueueWorkerState, ReceivedIrp,
+        STATUS_CANCELLED, SecurityComponentSelection, SetFileInformationClass,
+        SetVolumeInformationClass,
     };
     use crate::state::{
         CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
@@ -2127,6 +3078,15 @@ mod tests {
     }
 
     use core::ptr::NonNull;
+
+    /// Reads the active IRP status union arm.
+    fn irp_status(irp: &wdk_sys::IRP) -> wdk_sys::NTSTATUS {
+        unsafe {
+            // SAFETY: Tests read the status arm after initializing or writing
+            // it through IRP completion helpers.
+            irp.IoStatus.__bindgen_anon_1.Status
+        }
+    }
 
     /// # Panics
     ///
@@ -2208,6 +3168,204 @@ mod tests {
             STATUS_INVALID_PARAMETER
         );
         assert_eq!(irp.IoStatus.Information, 0);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn received_irp_pending_mark_sets_current_stack_control() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut irp = wdk_sys::IRP::default();
+        irp.Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+
+        let received = ReceivedIrp::decode(
+            core::ptr::addr_of_mut!(device),
+            core::ptr::addr_of_mut!(irp),
+        );
+        assert!(received.is_ok());
+        if let Ok(received) = received {
+            assert!(received.mark_pending().is_ok());
+            assert_eq!(
+                u32::from(stack.Control) & wdk_sys::SL_PENDING_RETURNED,
+                wdk_sys::SL_PENDING_RETURNED
+            );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn device_irp_queue_removes_irps_in_fifo_order() {
+        let device = KernelDevice::from_raw(opaque::<wdk_sys::DEVICE_OBJECT>());
+        assert!(device.is_some());
+        let Some(device) = device else {
+            return;
+        };
+        let mut queue = DeviceIrpQueue {
+            csq: wdk_sys::IO_CSQ::default(),
+            lock: 0,
+            list_head: wdk_sys::LIST_ENTRY::default(),
+            work_item: core::ptr::null_mut(),
+            worker_state: QueueWorkerState::Idle,
+            device,
+        };
+        super::initialize_list_head(core::ptr::addr_of_mut!(queue.list_head));
+
+        let mut stack_a = wdk_sys::IO_STACK_LOCATION::default();
+        let mut stack_b = wdk_sys::IO_STACK_LOCATION::default();
+        let mut stack_c = wdk_sys::IO_STACK_LOCATION::default();
+        let mut irp_a = wdk_sys::IRP::default();
+        let mut irp_b = wdk_sys::IRP::default();
+        let mut irp_c = wdk_sys::IRP::default();
+        irp_a
+            .Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_a);
+        irp_b
+            .Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_b);
+        irp_c
+            .Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_c);
+
+        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
+        for irp in [
+            core::ptr::addr_of_mut!(irp_a),
+            core::ptr::addr_of_mut!(irp_b),
+            core::ptr::addr_of_mut!(irp_c),
+        ] {
+            let received = ReceivedIrp::decode(core::ptr::addr_of_mut!(kernel_device), irp);
+            assert!(received.is_ok());
+            if let Ok(received) = received {
+                assert!(received.mark_pending().is_ok());
+                assert_eq!(
+                    DeviceIrpQueue::enqueue(NonNull::from(&mut queue), received.into_pending()),
+                    wdk_sys::STATUS_PENDING
+                );
+            }
+        }
+
+        assert_eq!(
+            queue.remove_next_irp(core::ptr::null_mut()),
+            core::ptr::addr_of_mut!(irp_a)
+        );
+        assert_eq!(
+            queue.remove_next_irp(core::ptr::null_mut()),
+            core::ptr::addr_of_mut!(irp_b)
+        );
+        assert_eq!(
+            queue.remove_next_irp(core::ptr::null_mut()),
+            core::ptr::addr_of_mut!(irp_c)
+        );
+        assert!(queue.remove_next_irp(core::ptr::null_mut()).is_null());
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn device_irp_queue_cancels_only_matching_file_object() {
+        let device = KernelDevice::from_raw(opaque::<wdk_sys::DEVICE_OBJECT>());
+        assert!(device.is_some());
+        let Some(device) = device else {
+            return;
+        };
+        let mut queue = DeviceIrpQueue {
+            csq: wdk_sys::IO_CSQ::default(),
+            lock: 0,
+            list_head: wdk_sys::LIST_ENTRY::default(),
+            work_item: core::ptr::null_mut(),
+            worker_state: QueueWorkerState::Idle,
+            device,
+        };
+        super::initialize_list_head(core::ptr::addr_of_mut!(queue.list_head));
+
+        let mut file_a = wdk_sys::FILE_OBJECT::default();
+        let mut file_b = wdk_sys::FILE_OBJECT::default();
+        let mut stack_a1 = wdk_sys::IO_STACK_LOCATION {
+            FileObject: core::ptr::addr_of_mut!(file_a),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        let mut stack_b = wdk_sys::IO_STACK_LOCATION {
+            FileObject: core::ptr::addr_of_mut!(file_b),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        let mut stack_a2 = wdk_sys::IO_STACK_LOCATION {
+            FileObject: core::ptr::addr_of_mut!(file_a),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        let mut irp_a1 = wdk_sys::IRP::default();
+        let mut irp_b = wdk_sys::IRP::default();
+        let mut irp_a2 = wdk_sys::IRP::default();
+        irp_a1.IoStatus.Information = 99;
+        irp_b.IoStatus.Information = 99;
+        irp_a2.IoStatus.Information = 99;
+        irp_a1
+            .Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_a1);
+        irp_b
+            .Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_b);
+        irp_a2
+            .Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_a2);
+
+        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
+        for irp in [
+            core::ptr::addr_of_mut!(irp_a1),
+            core::ptr::addr_of_mut!(irp_b),
+            core::ptr::addr_of_mut!(irp_a2),
+        ] {
+            let received = ReceivedIrp::decode(core::ptr::addr_of_mut!(kernel_device), irp);
+            assert!(received.is_ok());
+            if let Ok(received) = received {
+                assert!(received.mark_pending().is_ok());
+                let _status =
+                    DeviceIrpQueue::enqueue(NonNull::from(&mut queue), received.into_pending());
+            }
+        }
+
+        let file_object = KernelFileObject::from_raw(core::ptr::addr_of_mut!(file_a));
+        assert!(file_object.is_some());
+        if let Some(file_object) = file_object {
+            DeviceIrpQueue::cancel_file_object(NonNull::from(&mut queue), file_object);
+        }
+
+        assert_eq!(irp_status(&irp_a1), STATUS_CANCELLED);
+        assert_eq!(irp_a1.IoStatus.Information, 0);
+        assert_eq!(irp_status(&irp_a2), STATUS_CANCELLED);
+        assert_eq!(irp_a2.IoStatus.Information, 0);
+        assert_eq!(irp_status(&irp_b), wdk_sys::STATUS_SUCCESS);
+        assert_eq!(irp_b.IoStatus.Information, 99);
+        assert_eq!(
+            queue.remove_next_irp(core::ptr::null_mut()),
+            core::ptr::addr_of_mut!(irp_b)
+        );
+        assert!(queue.remove_next_irp(core::ptr::null_mut()).is_null());
     }
 
     /// # Panics

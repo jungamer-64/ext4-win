@@ -7,7 +7,7 @@ use core::ptr::NonNull;
 use ext4_core::{
     ChildLookup, DirectoryNodeId, Ext4Name, FileNodeId, FileSize, NodeId, WindowsName,
 };
-use wdk_sys::{FILE_OBJECT, NTSTATUS, PDEVICE_OBJECT, PIRP};
+use wdk_sys::FILE_OBJECT;
 
 use crate::{
     irp::{
@@ -27,16 +27,14 @@ use crate::{
 /// UTF-16 backslash separator.
 const UTF16_BACKSLASH: u16 = 0x005C;
 
-/// Handles create/open IRPs.
-pub(crate) fn dispatch(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish_result(
-            CreateRequest::decode(target)
-                .and_then(open_or_create)
-                .map(|()| IrpCompletion::EMPTY),
-        ),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes a decoded create/open IRP.
+/// # Errors
+///
+/// Returns an error when create stack decoding or ext4 open/create handling rejects the request.
+pub(crate) fn execute(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    CreateRequest::decode(target)
+        .and_then(open_or_create)
+        .map(|()| IrpCompletion::EMPTY)
 }
 
 /// Decoded create request at the filesystem boundary.

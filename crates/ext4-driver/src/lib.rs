@@ -45,12 +45,17 @@ pub unsafe extern "system" fn driver_entry(
     }
 
     let mut device = core::ptr::null_mut();
+    let extension_size =
+        match wdk_sys::ULONG::try_from(core::mem::size_of::<state::ControlDeviceExtension>()) {
+            Ok(size) => size,
+            Err(_) => return kernel::status::DriverError::InvalidParameter.ntstatus(),
+        };
     let status = unsafe {
         // SAFETY: The driver object is valid for DriverEntry, the device name
         // is intentionally unnamed, and `device` points to writable storage.
         kernel::ffi::IoCreateDevice(
             driver,
-            0,
+            extension_size,
             core::ptr::null_mut(),
             kernel::ffi::FILE_DEVICE_DISK_FILE_SYSTEM,
             0,
@@ -62,8 +67,16 @@ pub unsafe extern "system" fn driver_entry(
         return kernel::status::DriverError::InsufficientResources.ntstatus();
     }
 
-    let Some(control_device) = state::ControlDevice::registered(device) else {
-        return kernel::status::DriverError::InvalidParameter.ntstatus();
+    let control_device = match state::ControlDevice::registered(device) {
+        Ok(control_device) => control_device,
+        Err(error) => {
+            unsafe {
+                // SAFETY: `device` was returned by IoCreateDevice and has not
+                // been registered with the I/O Manager.
+                kernel::ffi::IoDeleteDevice(device);
+            }
+            return error.ntstatus();
+        }
     };
 
     unsafe {

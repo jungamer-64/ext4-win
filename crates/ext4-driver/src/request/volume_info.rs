@@ -5,8 +5,7 @@ use wdk_sys::{
     FILE_CASE_PRESERVED_NAMES, FILE_CASE_SENSITIVE_SEARCH, FILE_FS_ATTRIBUTE_INFORMATION,
     FILE_FS_DEVICE_INFORMATION, FILE_FS_FULL_SIZE_INFORMATION, FILE_FS_LABEL_INFORMATION,
     FILE_FS_SIZE_INFORMATION, FILE_FS_VOLUME_INFORMATION, FILE_SUPPORTS_EXTENDED_ATTRIBUTES,
-    FILE_SUPPORTS_REPARSE_POINTS, FILE_UNICODE_ON_DISK, LARGE_INTEGER, NTSTATUS, PDEVICE_OBJECT,
-    PIRP,
+    FILE_SUPPORTS_REPARSE_POINTS, FILE_UNICODE_ON_DISK, LARGE_INTEGER,
 };
 
 use crate::{
@@ -25,22 +24,20 @@ const FILE_SYSTEM_NAME: &[u16] = &[0x0045, 0x0058, 0x0054, 0x0034, 0x0057, 0x004
 /// Sector size reported to Windows.
 const BYTES_PER_SECTOR: u32 = 512;
 
-/// Handles volume information queries.
-pub(crate) fn query(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => {
-            target.finish_result(QueryVolumeRequest::decode(target).and_then(query_volume))
-        }
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes volume information queries.
+/// # Errors
+///
+/// Returns an error when volume stack decoding or information packing fails.
+pub(crate) fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    QueryVolumeRequest::decode(target).and_then(query_volume)
 }
 
-/// Handles volume information mutations.
-pub(crate) fn set(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish_result(SetVolumeRequest::decode(target).and_then(set_volume)),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes volume information mutations.
+/// # Errors
+///
+/// Returns an error when volume stack decoding or label mutation fails.
+pub(crate) fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    SetVolumeRequest::decode(target).and_then(set_volume)
 }
 
 /// Decoded query-volume request.

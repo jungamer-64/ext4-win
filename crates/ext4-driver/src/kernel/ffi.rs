@@ -10,3 +10,9 @@ pub(crate) use wdk_sys::ntddk::{
     KeWaitForSingleObject, MmMapLockedPagesSpecifyCache, RtlSecondsSince1970ToTime,
     RtlTimeToSecondsSince1970,
 };
+
+#[cfg(not(test))]
+pub(crate) use wdk_sys::ntddk::{
+    IoAllocateWorkItem, IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeWorkItem,
+    IoQueueWorkItem, KeAcquireSpinLockRaiseToDpc, KeInitializeSpinLock, KeReleaseSpinLock,
+};

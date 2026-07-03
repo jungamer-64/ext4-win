@@ -1,6 +1,6 @@
 //! File-system control, mount, reparse, and device-control dispatch boundary.
 
-use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIRP, STATUS_SUCCESS};
+use wdk_sys::STATUS_SUCCESS;
 
 use crate::{
     irp::{
@@ -20,28 +20,27 @@ use crate::{
     },
 };
 
-/// Handles file-system control requests, including mount and reparse controls.
-pub(crate) fn dispatch(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish_result(FileSystemControlRequest::decode(target).and_then(
-            |request| match request {
-                FileSystemControlRequest::MountVolume(request) => {
-                    mount_volume(request).map(|()| IrpCompletion::EMPTY)
-                }
-                FileSystemControlRequest::UserFsControl(request) => user_fs_control(request),
-                FileSystemControlRequest::Unsupported => Err(DriverError::NotSupported),
-            },
-        )),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes file-system control requests, including mount and reparse controls.
+/// # Errors
+///
+/// Returns an error when FSCTL stack decoding, mount, reparse, encryption-key, or verity handling
+/// rejects the request.
+pub(crate) fn execute(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    FileSystemControlRequest::decode(target).and_then(|request| match request {
+        FileSystemControlRequest::MountVolume(request) => {
+            mount_volume(request).map(|()| IrpCompletion::EMPTY)
+        }
+        FileSystemControlRequest::UserFsControl(request) => user_fs_control(request),
+        FileSystemControlRequest::Unsupported => Err(DriverError::NotSupported),
+    })
 }
 
-/// Handles device control requests addressed to this FSD.
-pub(crate) fn device_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    match DispatchTarget::decode(device, irp) {
-        Ok(target) => target.finish_result(Err(DriverError::InvalidDeviceRequest)),
-        Err(error) => DispatchTarget::finish_decode_error(irp, error),
-    }
+/// Executes device control requests addressed to this FSD.
+/// # Errors
+///
+/// Always returns `InvalidDeviceRequest`; device controls are not owned by this FSD path.
+pub(crate) fn device_control(_target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    Err(DriverError::InvalidDeviceRequest)
 }
 
 /// File-system-control request understood at the dispatch boundary.
