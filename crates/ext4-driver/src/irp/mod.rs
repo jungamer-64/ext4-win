@@ -219,28 +219,6 @@ impl DispatchTarget {
         mdl_data_buffer_address(mdl, length)
     }
 
-    /// Writes, completes, and returns one coherent IRP completion.
-    pub(crate) fn finish(self, completion: IrpCompletion) -> NTSTATUS {
-        self.irp.complete(completion)
-    }
-
-    /// Completes this IRP from a fallible handler result.
-    pub(crate) fn finish_result(self, result: DriverResult<IrpCompletion>) -> NTSTATUS {
-        self.finish(match result {
-            Ok(completion) => completion,
-            Err(error) => IrpCompletion::from_error(error),
-        })
-    }
-
-    /// Completes a raw IRP when dispatch-target decoding failed.
-    pub(crate) fn finish_decode_error(irp: PIRP, error: DriverError) -> NTSTATUS {
-        let completion = IrpCompletion::from_error(error);
-        if let Some(irp) = KernelIrp::from_raw(irp) {
-            return irp.complete(completion);
-        }
-        completion.status()
-    }
-
     /// Returns the current stack location selected by the I/O Manager.
     /// # Errors
     ///
