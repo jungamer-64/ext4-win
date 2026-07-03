@@ -40,6 +40,8 @@ pub(crate) fn execute(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// Decoded create request at the filesystem boundary.
 #[derive(Clone, Copy, Debug)]
 struct CreateRequest {
+    /// Dispatch target carrying create-time auxiliary buffers.
+    target: DispatchTarget,
     /// Mounted device receiving the create.
     device: KernelDevice,
     /// Create stack parameters.
@@ -58,10 +60,16 @@ impl CreateRequest {
         let stack = target.current_stack()?.create()?;
         let file_object = UninitializedFileObject::decode(stack.file_object())?;
         Ok(Self {
+            target,
             device: target.device(),
             stack,
             file_object,
         })
+    }
+
+    /// Returns the dispatch target carrying create-time auxiliary buffers.
+    const fn target(self) -> DispatchTarget {
+        self.target
     }
 
     /// Returns the mounted device receiving the create.
@@ -86,9 +94,7 @@ impl CreateRequest {
 /// Returns an error when EA create input is supplied, the device is not mounted, path resolution
 /// fails, or the selected open/create disposition cannot be satisfied.
 fn open_or_create(request: CreateRequest) -> DriverResult<()> {
-    if request.parameters().ea_length().as_usize() != 0 {
-        return Err(DriverError::NotSupported);
-    }
+    let create_ea = CreateEa::decode(request.target(), request.parameters().ea_length())?;
     let Some(vcb) = MountedVolumeDevice::vcb(request.device()) else {
         return Err(DriverError::InvalidDeviceRequest);
     };
@@ -98,7 +104,7 @@ fn open_or_create(request: CreateRequest) -> DriverResult<()> {
             open_existing_node(request, vcb, disposition, node, path)
         }
         Ok(PathLookup::Missing { parent, name }) => {
-            create_missing_node(request, vcb, disposition, parent, &name)
+            create_missing_node(request, create_ea, vcb, disposition, parent, &name)
         }
         Err(error) => Err(error),
     }
@@ -346,6 +352,7 @@ fn overwrite_file_inode(
 /// be staged or committed, or the new file object cannot be initialized.
 fn create_missing_node(
     request: CreateRequest,
+    create_ea: CreateEa,
     mut vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
     parent: DirectoryNodeId,
@@ -389,6 +396,7 @@ fn create_missing_node(
         parameters.desired_access(),
         parameters.share_access(),
     )?;
+    create_ea.apply_to_pending_child(&mut creation)?;
 
     match creation.commit() {
         Ok(()) => {
