@@ -5,8 +5,8 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Security, Ext4Times,
-    Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileSize, NodeId, WindowsName,
-    WindowsOverlay,
+    Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileSize, NodeId, RenameTargetCollision,
+    WindowsName, WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
@@ -454,7 +454,13 @@ fn set_rename_information(
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let source_parent = transaction.directory(source_parent)?;
     let target_parent = transaction.directory(target_parent)?;
-    transaction.rename_child(source_parent, &source_name, target_parent, &target_name)?;
+    transaction.rename_child(
+        source_parent,
+        &source_name,
+        target_parent,
+        &target_name,
+        rename.target_collision(),
+    )?;
     transaction.commit()?;
     request.opened_file.replace_path(OpenedPath::Child {
         parent: target_parent.id(),
@@ -1206,6 +1212,8 @@ fn read_file_information_input<T: Copy>(
 struct RenameTargetPath {
     /// Root-relative target path.
     path: NonEmptyWindowsPath,
+    /// Target collision behavior requested by the Windows rename input.
+    target_collision: RenameTargetCollision,
 }
 
 impl RenameTargetPath {
@@ -1221,7 +1229,7 @@ impl RenameTargetPath {
     ) -> DriverResult<Self> {
         let input = target.buffered_input(length)?;
         let bytes = input.as_slice();
-        format.validate(bytes)?;
+        let target_collision = format.target_collision(bytes)?;
         reject_root_directory(bytes)?;
         let name_length = usize::try_from(
             LittleEndianInput::new(bytes).read_u32(wire_offset(FILE_RENAME_NAME_LENGTH_OFFSET))?,
@@ -1234,6 +1242,7 @@ impl RenameTargetPath {
         let units = utf16_units_from_le_bytes(name_bytes)?;
         Ok(Self {
             path: NonEmptyWindowsPath::from_utf16_path(units.as_slice())?,
+            target_collision,
         })
     }
 
@@ -1245,6 +1254,11 @@ impl RenameTargetPath {
     /// Returns the final target name.
     fn target_name(&self) -> &WindowsName {
         self.path.target_name()
+    }
+
+    /// Returns the collision behavior selected at the Windows boundary.
+    const fn target_collision(&self) -> RenameTargetCollision {
+        self.target_collision
     }
 }
 
@@ -1258,28 +1272,30 @@ enum RenameInformationFormat {
 }
 
 impl RenameInformationFormat {
-    /// Rejects rename semantics that ext4win does not implement.
+    /// Decodes target-collision semantics from the selected rename input format.
     /// # Errors
     ///
-    /// Returns an error when replace-if-exists is requested or unsupported rename-ex flags are set.
-    fn validate(self, bytes: &[u8]) -> DriverResult<()> {
+    /// Returns an error when unsupported rename-ex flags are set.
+    fn target_collision(self, bytes: &[u8]) -> DriverResult<RenameTargetCollision> {
         match self {
-            Self::ReplaceIfExistsByte => {
-                match bytes
-                    .get(FILE_RENAME_REPLACE_IF_EXISTS_OFFSET)
-                    .ok_or(DriverError::BufferTooSmall)?
-                {
-                    0 => Ok(()),
-                    _ => Err(DriverError::NotSupported),
-                }
-            }
+            Self::ReplaceIfExistsByte => match bytes
+                .get(FILE_RENAME_REPLACE_IF_EXISTS_OFFSET)
+                .ok_or(DriverError::BufferTooSmall)?
+            {
+                0 => Ok(RenameTargetCollision::Reject),
+                _ => Ok(RenameTargetCollision::Replace),
+            },
             Self::Flags => {
                 let flags = LittleEndianInput::new(bytes)
                     .read_u32(wire_offset(FILE_RENAME_FLAGS_OFFSET))?;
                 if flags & !SUPPORTED_RENAME_EX_FLAGS != 0 {
                     return Err(DriverError::NotSupported);
                 }
-                Ok(())
+                if flags & wdk_sys::FILE_RENAME_REPLACE_IF_EXISTS != 0 {
+                    Ok(RenameTargetCollision::Replace)
+                } else {
+                    Ok(RenameTargetCollision::Reject)
+                }
             }
         }
     }
@@ -1346,8 +1362,9 @@ const FILE_RENAME_NAME_OFFSET: usize = 20;
 const SUPPORTED_DISPOSITION_EX_FLAGS: wdk_sys::ULONG = wdk_sys::FILE_DISPOSITION_DELETE
     | wdk_sys::FILE_DISPOSITION_ON_CLOSE
     | wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
-/// FILE_RENAME_INFORMATION_EX flags that do not change ext4win rename semantics.
-const SUPPORTED_RENAME_EX_FLAGS: wdk_sys::ULONG = wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE;
+/// FILE_RENAME_INFORMATION_EX flags handled by this driver.
+const SUPPORTED_RENAME_EX_FLAGS: wdk_sys::ULONG =
+    wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE | wdk_sys::FILE_RENAME_REPLACE_IF_EXISTS;
 /// UTF-16 backslash separator.
 const UTF16_BACKSLASH: u16 = 0x005C;
 
@@ -2344,7 +2361,7 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn rename_ex_flags_reject_replace_semantics() {
+    fn rename_ex_flags_decode_collision_and_reject_unsupported_semantics() {
         let mut input = [0_u8; super::FILE_RENAME_NAME_OFFSET + 2];
         assert!(put_le_u32(
             &mut input,
@@ -2352,8 +2369,8 @@ mod tests {
             wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE,
         ));
         assert_eq!(
-            super::RenameInformationFormat::Flags.validate(&input),
-            Ok(())
+            super::RenameInformationFormat::Flags.target_collision(&input),
+            Ok(ext4_core::RenameTargetCollision::Reject)
         );
 
         assert!(put_le_u32(
@@ -2362,7 +2379,17 @@ mod tests {
             wdk_sys::FILE_RENAME_REPLACE_IF_EXISTS,
         ));
         assert_eq!(
-            super::RenameInformationFormat::Flags.validate(&input),
+            super::RenameInformationFormat::Flags.target_collision(&input),
+            Ok(ext4_core::RenameTargetCollision::Replace)
+        );
+
+        assert!(put_le_u32(
+            &mut input,
+            super::FILE_RENAME_FLAGS_OFFSET,
+            wdk_sys::FILE_RENAME_POSIX_SEMANTICS,
+        ));
+        assert_eq!(
+            super::RenameInformationFormat::Flags.target_collision(&input),
             Err(DriverError::NotSupported)
         );
     }
@@ -2394,7 +2421,7 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn rename_replace_flag_decode_boundary_rejects() {
+    fn rename_replace_flag_decode_boundary_selects_replace_collision() {
         let mut input = [0_u8; super::FILE_RENAME_NAME_OFFSET + 2];
         let Some(replace_flag) = input.get_mut(super::FILE_RENAME_REPLACE_IF_EXISTS_OFFSET) else {
             return;
@@ -2465,7 +2492,23 @@ mod tests {
         );
         assert!(target.is_ok());
         if let Ok(target) = target {
-            assert_eq!(super::set(target), Err(DriverError::NotSupported));
+            let stack = target.current_stack().and_then(|stack| stack.set_file());
+            assert!(stack.is_ok());
+            let Ok(stack) = stack else {
+                return;
+            };
+            let parsed = super::RenameTargetPath::parse(
+                target,
+                stack.length(),
+                super::RenameInformationFormat::ReplaceIfExistsByte,
+            );
+            assert!(parsed.is_ok());
+            if let Ok(parsed) = parsed {
+                assert_eq!(
+                    parsed.target_collision(),
+                    ext4_core::RenameTargetCollision::Replace
+                );
+            }
         }
     }
 }

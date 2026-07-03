@@ -43,8 +43,8 @@ pub use protection::verity::{
 pub use volume::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
     FileNodeId, InternalJournal, JournalTransaction, JournaledVolume, MountContext, NodeId,
-    SymlinkNode, SymlinkNodeId, TransactionDirectory, TransactionFile, TransactionNode,
-    TransactionSymlink, VolumeGeometry, VolumeIdentity,
+    RenameTargetCollision, SymlinkNode, SymlinkNodeId, TransactionDirectory, TransactionFile,
+    TransactionNode, TransactionSymlink, VolumeGeometry, VolumeIdentity,
 };
 
 #[cfg(test)]
