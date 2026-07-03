@@ -19,7 +19,7 @@ use crate::{
     request::metadata,
     state::{
         ChildCreationTarget, CloseDisposition, FileControlBlock, KernelDevice, KernelFileObject,
-        MountedVolumeDevice, OpenedHandle, OpenedPath, PendingChildCreation,
+        MountedVolumeDevice, OpenedHandle, OpenedObject, OpenedPath, PendingChildCreation,
         UninitializedFileObject, VolumeControlBlock, release_file_control_block,
     },
 };
@@ -80,7 +80,7 @@ impl CreateRequest {
     }
 }
 
-/// Opens or creates a root-relative ext4 object.
+/// Opens or creates an ext4 object from a volume-root or opened-directory path.
 /// # Errors
 ///
 /// Returns an error when EA create input is supplied, the device is not mounted, path resolution
@@ -121,6 +121,142 @@ enum PathLookup {
         /// New ext4 child name.
         name: Ext4Name,
     },
+}
+
+/// FILE_OBJECT name rooting after the raw UTF-16 boundary has been decoded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreateNameRooting {
+    /// Name starts at the mounted volume root.
+    Absolute,
+    /// Name starts at the related directory when one exists, otherwise the mounted volume root.
+    Relative,
+}
+
+/// Decoded create path name supplied by the I/O Manager.
+#[derive(Debug, Eq, PartialEq)]
+struct CreatePathName {
+    /// Rooting syntax encoded by the raw FILE_OBJECT name.
+    rooting: CreateNameRooting,
+    /// Validated Windows path components after removing the syntactic root prefix.
+    components: DriverVec<WindowsName>,
+}
+
+impl CreatePathName {
+    /// Decodes the FILE_OBJECT name into a rooted component sequence.
+    /// # Errors
+    ///
+    /// Returns an error when the raw UNICODE_STRING is malformed, contains an empty path component,
+    /// or contains a component not representable in the Windows namespace domain.
+    fn decode(file_object: &FILE_OBJECT) -> DriverResult<Self> {
+        let name = file_object.FileName;
+        if name.Length == 0 {
+            return Ok(Self {
+                rooting: CreateNameRooting::Relative,
+                components: DriverVec::new(),
+            });
+        }
+        if !name.Length.is_multiple_of(2) || name.Buffer.is_null() {
+            return Err(DriverError::InvalidParameter);
+        }
+        let units = unsafe {
+            // SAFETY: UNICODE_STRING Length is byte length; the odd-length and null
+            // buffer cases were rejected above.
+            core::slice::from_raw_parts(name.Buffer, usize::from(name.Length / 2))
+        };
+        let (rooting, components) = Self::split_rooting(units);
+        Ok(Self {
+            rooting,
+            components: path_components(components)?,
+        })
+    }
+
+    /// Returns the decoded rooting syntax.
+    const fn rooting(&self) -> CreateNameRooting {
+        self.rooting
+    }
+
+    /// Returns validated path components.
+    fn components(&self) -> &[WindowsName] {
+        self.components.as_slice()
+    }
+
+    /// Splits the syntactic root prefix from the component payload.
+    fn split_rooting(mut units: &[u16]) -> (CreateNameRooting, &[u16]) {
+        if !units.starts_with(&[UTF16_BACKSLASH]) {
+            return (CreateNameRooting::Relative, units);
+        }
+        while let Some(rest) = units.strip_prefix(&[UTF16_BACKSLASH]) {
+            units = rest;
+        }
+        (CreateNameRooting::Absolute, units)
+    }
+}
+
+/// Create path starting directory after RelatedFileObject has been decoded.
+#[derive(Debug, Eq, PartialEq)]
+enum CreatePathAnchor {
+    /// Mounted volume root directory.
+    VolumeRoot,
+    /// Existing opened directory supplied through FILE_OBJECT::RelatedFileObject.
+    OpenedDirectory {
+        /// Related directory inode.
+        id: DirectoryNodeId,
+        /// Related directory path identity.
+        path: OpenedPath,
+    },
+}
+
+impl CreatePathAnchor {
+    /// Decodes the path anchor for a create request.
+    /// # Errors
+    ///
+    /// Returns an error when an absolute path also supplies a related object, or when the related
+    /// object is not an opened directory on the mounted volume receiving this create.
+    fn decode(
+        file_object: &FILE_OBJECT,
+        vcb: NonNull<VolumeControlBlock>,
+        rooting: CreateNameRooting,
+    ) -> DriverResult<Self> {
+        let Some(related_file) = KernelFileObject::from_raw(file_object.RelatedFileObject) else {
+            return Ok(Self::VolumeRoot);
+        };
+        if rooting == CreateNameRooting::Absolute {
+            return Err(DriverError::InvalidParameter);
+        }
+        let opened = OpenedObject::decode(related_file)?;
+        if opened.volume() != vcb {
+            return Err(DriverError::InvalidDeviceRequest);
+        }
+        let NodeId::Directory(id) = opened.node() else {
+            return Err(DriverError::ObjectTypeMismatch);
+        };
+        Ok(Self::OpenedDirectory {
+            id,
+            path: opened.path().try_to_owned_path()?,
+        })
+    }
+
+    /// Returns the directory where component lookup starts.
+    const fn directory(&self) -> DirectoryNodeId {
+        match self {
+            Self::VolumeRoot => DirectoryNodeId::ROOT,
+            Self::OpenedDirectory { id, .. } => *id,
+        }
+    }
+
+    /// Converts an empty create name into the already-opened anchor directory.
+    fn existing_directory(self) -> PathLookup {
+        match self {
+            Self::VolumeRoot => PathLookup::Existing {
+                node: NodeId::Directory(DirectoryNodeId::ROOT),
+                path: OpenedPath::Root,
+            },
+            Self::OpenedDirectory { id, path } => PathLookup::Existing {
+                node: NodeId::Directory(id),
+                path,
+            },
+        }
+    }
 }
 
 /// Opens an existing path according to the requested disposition and options.
@@ -334,7 +470,7 @@ fn truncate_existing_file(
 /// intermediate component is missing or not a directory, or lookup fails.
 fn resolve_path(
     file_object: UninitializedFileObject,
-    vcb: NonNull<crate::state::VolumeControlBlock>,
+    vcb: NonNull<VolumeControlBlock>,
 ) -> DriverResult<PathLookup> {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is read
@@ -342,7 +478,7 @@ fn resolve_path(
         file_object.as_ref()
     };
     let name = CreatePathName::decode(file_object)?;
-    let anchor = CreatePathAnchor::decode(file_object, vcb)?;
+    let anchor = CreatePathAnchor::decode(file_object, vcb, name.rooting())?;
     let vcb = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
         // in the mounted device extension and is read only for path lookup.
@@ -380,36 +516,20 @@ fn resolve_path(
         parent_id = directory_id;
     }
 
-    anchor.existing_directory(parent_id)
+    Ok(anchor.existing_directory())
 }
 
-/// Splits the FILE_OBJECT name into validated root-relative Windows components.
+/// Splits non-root path units into validated Windows components.
 /// # Errors
 ///
-/// Returns an error when the UNICODE_STRING has odd byte length, a null non-empty buffer, or an
-/// invalid Windows path component.
-fn path_components(file_object: &FILE_OBJECT) -> DriverResult<DriverVec<WindowsName>> {
-    let name = file_object.FileName;
-    if name.Length == 0 {
-        return Ok(DriverVec::new());
-    }
-    if !name.Length.is_multiple_of(2) || name.Buffer.is_null() {
-        return Err(DriverError::InvalidParameter);
-    }
-    let units = unsafe {
-        // SAFETY: UNICODE_STRING Length is byte length; the odd-length and null
-        // buffer cases were rejected above.
-        core::slice::from_raw_parts(name.Buffer, usize::from(name.Length / 2))
-    };
-    let mut trimmed = units;
-    while let Some(rest) = trimmed.strip_prefix(&[UTF16_BACKSLASH]) {
-        trimmed = rest;
-    }
-    if trimmed.is_empty() {
+/// Returns an error when any component is empty or not representable in the Windows namespace
+/// domain.
+fn path_components(units: &[u16]) -> DriverResult<DriverVec<WindowsName>> {
+    if units.is_empty() {
         return Ok(DriverVec::new());
     }
     let mut components = DriverVec::new();
-    for component in trimmed.split(|unit| *unit == UTF16_BACKSLASH) {
+    for component in units.split(|unit| *unit == UTF16_BACKSLASH) {
         components
             .try_push_owned(WindowsName::from_utf16(component)?)
             .map_err(|error| error.into_parts().0)?;
@@ -518,4 +638,155 @@ fn abandon_file_control_block(file_object: KernelFileObject, mut fcb: NonNull<Fi
     };
     fcb_ref.remove_share_access(file_object);
     release_file_control_block(fcb);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_object_with_name(units: &mut [u16]) -> FILE_OBJECT {
+        let Ok(byte_len) = u16::try_from(core::mem::size_of_val(units)) else {
+            return FILE_OBJECT::default();
+        };
+        FILE_OBJECT {
+            FileName: wdk_sys::UNICODE_STRING {
+                Length: byte_len,
+                MaximumLength: byte_len,
+                Buffer: units.as_mut_ptr(),
+            },
+            ..FILE_OBJECT::default()
+        }
+    }
+
+    fn attach_opened_contexts(
+        file_object: &mut FILE_OBJECT,
+        fcb: &mut FileControlBlock,
+        handle: &mut OpenedHandle,
+    ) {
+        file_object.FsContext = core::ptr::addr_of_mut!(*fcb).cast();
+        file_object.FsContext2 = core::ptr::addr_of_mut!(*handle).cast();
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_path_name_decodes_absolute_relative_and_empty_names() {
+        let mut absolute_units = [
+            UTF16_BACKSLASH,
+            UTF16_BACKSLASH,
+            u16::from(b'd'),
+            u16::from(b'i'),
+            u16::from(b'r'),
+            UTF16_BACKSLASH,
+            u16::from(b'f'),
+        ];
+        let absolute_file = file_object_with_name(&mut absolute_units);
+        let absolute = CreatePathName::decode(&absolute_file);
+        assert!(absolute.is_ok());
+        if let Ok(absolute) = absolute {
+            assert_eq!(absolute.rooting(), CreateNameRooting::Absolute);
+            assert_eq!(absolute.components().len(), 2);
+            assert_eq!(
+                absolute.components().first().map(WindowsName::utf16),
+                Some([u16::from(b'd'), u16::from(b'i'), u16::from(b'r')].as_slice())
+            );
+            assert_eq!(
+                absolute.components().get(1).map(WindowsName::utf16),
+                Some([u16::from(b'f')].as_slice())
+            );
+        }
+
+        let mut relative_units = [u16::from(b'c'), u16::from(b'h'), u16::from(b'i')];
+        let relative_file = file_object_with_name(&mut relative_units);
+        let relative = CreatePathName::decode(&relative_file);
+        assert!(relative.is_ok());
+        if let Ok(relative) = relative {
+            assert_eq!(relative.rooting(), CreateNameRooting::Relative);
+            assert_eq!(relative.components().len(), 1);
+            assert_eq!(
+                relative.components().first().map(WindowsName::utf16),
+                Some([u16::from(b'c'), u16::from(b'h'), u16::from(b'i')].as_slice())
+            );
+        }
+
+        let empty_file = FILE_OBJECT::default();
+        let empty = CreatePathName::decode(&empty_file);
+        assert!(empty.is_ok());
+        if let Ok(empty) = empty {
+            assert_eq!(empty.rooting(), CreateNameRooting::Relative);
+            assert!(empty.components().is_empty());
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_path_name_rejects_empty_inner_components() {
+        let mut units = [
+            u16::from(b'd'),
+            UTF16_BACKSLASH,
+            UTF16_BACKSLASH,
+            u16::from(b'f'),
+        ];
+        let file_object = file_object_with_name(&mut units);
+        assert_eq!(
+            CreatePathName::decode(&file_object),
+            Err(DriverError::from(ext4_core::Error::InvalidName))
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_path_anchor_accepts_opened_relative_directory() {
+        let vcb = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(vcb, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedPath::Root,
+            CloseDisposition::Keep,
+        );
+        let mut related = FILE_OBJECT::default();
+        attach_opened_contexts(&mut related, &mut fcb, &mut handle);
+        let create = FILE_OBJECT {
+            RelatedFileObject: core::ptr::addr_of_mut!(related),
+            ..FILE_OBJECT::default()
+        };
+
+        assert_eq!(
+            CreatePathAnchor::decode(&create, vcb, CreateNameRooting::Relative),
+            Ok(CreatePathAnchor::OpenedDirectory {
+                id: DirectoryNodeId::ROOT,
+                path: OpenedPath::Root,
+            })
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_path_anchor_rejects_conflicting_absolute_related_object() {
+        let vcb = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(vcb, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedPath::Root,
+            CloseDisposition::Keep,
+        );
+        let mut related = FILE_OBJECT::default();
+        attach_opened_contexts(&mut related, &mut fcb, &mut handle);
+        let create = FILE_OBJECT {
+            RelatedFileObject: core::ptr::addr_of_mut!(related),
+            ..FILE_OBJECT::default()
+        };
+
+        assert_eq!(
+            CreatePathAnchor::decode(&create, vcb, CreateNameRooting::Absolute),
+            Err(DriverError::InvalidParameter)
+        );
+    }
 }
