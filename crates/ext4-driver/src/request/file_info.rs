@@ -604,6 +604,144 @@ impl DirectoryPattern {
     }
 }
 
+/// Caller-supplied wildcard pattern for Windows-visible long names.
+#[derive(Debug, Eq, PartialEq)]
+struct DirectoryWildcardPattern {
+    /// Parsed pattern tokens.
+    tokens: DriverVec<DirectoryWildcardToken>,
+}
+
+impl DirectoryWildcardPattern {
+    /// Decodes a wildcard pattern for directory enumeration.
+    /// # Errors
+    ///
+    /// Returns an error when the pattern contains a non-wildcard character outside the Windows name
+    /// component domain or malformed UTF-16.
+    fn from_utf16(units: &[u16]) -> DriverResult<Self> {
+        validate_directory_pattern_units(units)?;
+        let mut tokens = DriverVec::new();
+        for unit in units {
+            let token = match *unit {
+                UTF16_ASTERISK => DirectoryWildcardToken::AnySequence,
+                UTF16_QUESTION_MARK => DirectoryWildcardToken::AnyOne,
+                unit => DirectoryWildcardToken::Literal(unit),
+            };
+            tokens
+                .try_push_owned(token)
+                .map_err(|error| error.into_parts().0)?;
+        }
+        Ok(Self { tokens })
+    }
+
+    /// Returns true when this pattern matches a Windows-visible long name.
+    fn matches(&self, name: &WindowsName) -> bool {
+        wildcard_tokens_match(self.tokens.as_slice(), name.utf16())
+    }
+}
+
+/// One token in a directory wildcard expression.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectoryWildcardToken {
+    /// Exact UTF-16 code unit match.
+    Literal(u16),
+    /// Match exactly one UTF-16 code unit.
+    AnyOne,
+    /// Match zero or more UTF-16 code units.
+    AnySequence,
+}
+
+/// Validates wildcard pattern units while keeping wildcard syntax out of `WindowsName`.
+/// # Errors
+///
+/// Returns an error when a non-wildcard unit is not valid inside a Windows component or the pattern
+/// is malformed UTF-16.
+fn validate_directory_pattern_units(units: &[u16]) -> DriverResult<()> {
+    if units.iter().any(|unit| {
+        matches!(
+            *unit,
+            0x0000 | 0x0022 | 0x002F | 0x003A | 0x003C | 0x003E | 0x005C | 0x007C
+        )
+    }) {
+        return Err(DriverError::from(ext4_core::Error::InvalidName));
+    }
+    if core::char::decode_utf16(units.iter().copied()).any(|item| item.is_err()) {
+        return Err(DriverError::from(ext4_core::Error::InvalidName));
+    }
+    Ok(())
+}
+
+/// Matches `*` and `?` wildcard tokens against UTF-16 name units.
+fn wildcard_tokens_match(pattern: &[DirectoryWildcardToken], name: &[u16]) -> bool {
+    let mut pattern_index = 0_usize;
+    let mut name_index = 0_usize;
+    let mut sequence_restart = None;
+
+    while name_index < name.len() {
+        if let Some(token) = pattern.get(pattern_index) {
+            match token {
+                DirectoryWildcardToken::Literal(unit)
+                    if name.get(name_index).copied() == Some(*unit) =>
+                {
+                    let Some(next_pattern) = pattern_index.checked_add(1) else {
+                        return false;
+                    };
+                    let Some(next_name) = name_index.checked_add(1) else {
+                        return false;
+                    };
+                    pattern_index = next_pattern;
+                    name_index = next_name;
+                    continue;
+                }
+                DirectoryWildcardToken::AnyOne => {
+                    let Some(next_pattern) = pattern_index.checked_add(1) else {
+                        return false;
+                    };
+                    let Some(next_name) = name_index.checked_add(1) else {
+                        return false;
+                    };
+                    pattern_index = next_pattern;
+                    name_index = next_name;
+                    continue;
+                }
+                DirectoryWildcardToken::AnySequence => {
+                    let Some(next_pattern) = pattern_index.checked_add(1) else {
+                        return false;
+                    };
+                    sequence_restart = Some((pattern_index, name_index));
+                    pattern_index = next_pattern;
+                    continue;
+                }
+                DirectoryWildcardToken::Literal(_) => {}
+            }
+        }
+
+        let Some((sequence_index, restart_name)) = sequence_restart else {
+            return false;
+        };
+        let Some(next_restart_name) = restart_name.checked_add(1) else {
+            return false;
+        };
+        let Some(next_pattern) = sequence_index.checked_add(1) else {
+            return false;
+        };
+        sequence_restart = Some((sequence_index, next_restart_name));
+        pattern_index = next_pattern;
+        name_index = next_restart_name;
+    }
+
+    while matches!(
+        pattern.get(pattern_index),
+        Some(DirectoryWildcardToken::AnySequence)
+    ) {
+        let Some(next_pattern) = pattern_index.checked_add(1) else {
+            return false;
+        };
+        pattern_index = next_pattern;
+    }
+
+    pattern_index == pattern.len()
+}
+
 /// Variable directory record layout for one emitted entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DirectoryRecordLayout {
@@ -2002,6 +2140,74 @@ mod tests {
                 Some(DriverError::InvalidDeviceRequest)
             );
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn directory_wildcard_pattern_matches_long_windows_names() {
+        let pattern = super::DirectoryWildcardPattern::from_utf16(&[
+            u16::from(b'f'),
+            super::UTF16_ASTERISK,
+            u16::from(b'.'),
+            u16::from(b't'),
+            u16::from(b'?'),
+            u16::from(b't'),
+        ]);
+        assert!(pattern.is_ok());
+        let Ok(pattern) = pattern else {
+            return;
+        };
+        let matched = WindowsName::from_utf16(&[
+            u16::from(b'f'),
+            u16::from(b'i'),
+            u16::from(b'l'),
+            u16::from(b'e'),
+            u16::from(b'.'),
+            u16::from(b't'),
+            u16::from(b'x'),
+            u16::from(b't'),
+        ]);
+        assert!(matched.is_ok());
+        let Ok(matched) = matched else {
+            return;
+        };
+        let rejected = WindowsName::from_utf16(&[
+            u16::from(b'f'),
+            u16::from(b'i'),
+            u16::from(b'l'),
+            u16::from(b'e'),
+            u16::from(b'.'),
+            u16::from(b't'),
+            u16::from(b'x'),
+        ]);
+        assert!(rejected.is_ok());
+        let Ok(rejected) = rejected else {
+            return;
+        };
+
+        assert!(pattern.matches(&matched));
+        assert!(!pattern.matches(&rejected));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn directory_wildcard_pattern_rejects_non_name_units() {
+        assert_eq!(
+            super::DirectoryWildcardPattern::from_utf16(&[
+                u16::from(b'a'),
+                super::UTF16_BACKSLASH,
+                super::UTF16_ASTERISK,
+            ]),
+            Err(DriverError::from(ext4_core::Error::InvalidName))
+        );
+        assert_eq!(
+            super::DirectoryWildcardPattern::from_utf16(&[0xD800, super::UTF16_ASTERISK]),
+            Err(DriverError::from(ext4_core::Error::InvalidName))
+        );
     }
 
     /// # Panics
