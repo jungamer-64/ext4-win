@@ -205,11 +205,35 @@ impl KernelSecurityDescriptor {
     }
 }
 
+/// Driver-owned device extension kind stored after the queue common prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+struct DeviceExtensionKind {
+    /// Stable discriminant written during device initialization.
+    value: u8,
+}
+
+impl DeviceExtensionKind {
+    /// Registered filesystem control device.
+    const CONTROL: Self = Self { value: 1 };
+    /// Mounted ext4 volume device.
+    const MOUNTED_VOLUME: Self = Self { value: 2 };
+}
+
+/// Common prefix shared by all driver-owned device extensions.
+#[repr(C)]
+struct DeviceExtensionHeader {
+    /// Device-owned queue for pended IRPs.
+    queue: DeviceIrpQueue,
+    /// Concrete extension kind following the queue prefix.
+    kind: DeviceExtensionKind,
+}
+
 /// Device extension stored in the file-system control device.
 #[repr(C)]
 pub(crate) struct ControlDeviceExtension {
-    /// Device-owned queue for pended control-device IRPs.
-    queue: DeviceIrpQueue,
+    /// Common driver-owned device extension header.
+    header: DeviceExtensionHeader,
 }
 
 impl ControlDeviceExtension {
@@ -232,9 +256,10 @@ impl ControlDeviceExtension {
                 .as_mut()
         }
         .ok_or(DriverError::InvalidParameter)?;
+        extension.header.kind = DeviceExtensionKind::CONTROL;
         unsafe {
             // SAFETY: The extension is stable device-owned storage.
-            DeviceIrpQueue::initialize_at(core::ptr::addr_of_mut!(extension.queue), device)
+            DeviceIrpQueue::initialize_at(core::ptr::addr_of_mut!(extension.header.queue), device)
         }
     }
 
@@ -260,7 +285,7 @@ impl ControlDeviceExtension {
         };
         unsafe {
             // SAFETY: Teardown has exclusive access to the extension.
-            DeviceIrpQueue::release_at(core::ptr::addr_of_mut!(extension.queue));
+            DeviceIrpQueue::release_at(core::ptr::addr_of_mut!(extension.header.queue));
         }
     }
 }
@@ -407,6 +432,14 @@ impl VolumeControlBlock {
         &mut self,
     ) -> &mut JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator> {
         &mut self.volume
+    }
+
+    /// Persists writes issued through the mounted ext4 volume.
+    /// # Errors
+    ///
+    /// Returns an error when the lower storage device cannot guarantee persistence.
+    pub(crate) fn flush(&mut self) -> Ext4Result<()> {
+        self.volume.flush()
     }
 
     /// Returns the mounted ext4 volume label.
@@ -628,8 +661,8 @@ impl VolumeSerialNumber {
 /// Device extension stored in mounted volume device objects.
 #[repr(C)]
 pub(crate) struct MountedVolumeDeviceExtension {
-    /// Device-owned queue for pended volume IRPs.
-    queue: DeviceIrpQueue,
+    /// Common driver-owned device extension header.
+    header: DeviceExtensionHeader,
     /// Heap-owned VCB for this mounted volume device.
     vcb: *mut VolumeControlBlock,
 }
@@ -685,10 +718,11 @@ impl MountedVolumeDevice {
         }
         .ok_or(DriverError::InvalidParameter)?;
 
+        extension.header.kind = DeviceExtensionKind::MOUNTED_VOLUME;
         unsafe {
             // SAFETY: The extension is stable device-owned storage for this
             // just-created mounted volume device.
-            DeviceIrpQueue::initialize_at(core::ptr::addr_of_mut!(extension.queue), device)?;
+            DeviceIrpQueue::initialize_at(core::ptr::addr_of_mut!(extension.header.queue), device)?;
         }
 
         device_object.Vpb = vpb;
@@ -718,10 +752,21 @@ impl MountedVolumeDevice {
             // dispatch boundary and is read for its extension pointer only.
             device.as_ptr().as_ref()
         }?;
+        let header = unsafe {
+            // SAFETY: Driver-owned device extensions share `DeviceExtensionHeader`
+            // as their first field, so the kind can be checked before reading
+            // any mounted-volume-only fields.
+            device_object
+                .DeviceExtension
+                .cast::<DeviceExtensionHeader>()
+                .as_ref()
+        }?;
+        if header.kind != DeviceExtensionKind::MOUNTED_VOLUME {
+            return None;
+        }
         let extension = unsafe {
-            // SAFETY: Mounted volume devices created by this driver store a
-            // MountedVolumeDeviceExtension in DeviceExtension. Null or foreign
-            // extensions are rejected by the following pointer checks.
+            // SAFETY: The common header identified this driver-owned extension
+            // as a mounted volume before the full mounted layout is read.
             device_object
                 .DeviceExtension
                 .cast::<MountedVolumeDeviceExtension>()
@@ -1414,9 +1459,10 @@ mod tests {
     use crate::kernel::status::DriverError;
 
     use super::{
-        CloseDisposition, FileControlBlock, FileControlBlockRelease, KernelFileObject,
-        OpenedDirectory, OpenedHandle, OpenedHandleKind, OpenedObject, OpenedPath,
-        OpenedRegularFile, OpenedSymlink, UninitializedFileObject, VolumeControlBlock,
+        CloseDisposition, ControlDeviceExtension, FileControlBlock, FileControlBlockRelease,
+        KernelDevice, KernelFileObject, MountedVolumeDevice, OpenedDirectory, OpenedHandle,
+        OpenedHandleKind, OpenedObject, OpenedPath, OpenedRegularFile, OpenedSymlink,
+        UninitializedFileObject, VolumeControlBlock,
     };
 
     fn file_object_with_contexts(
@@ -1433,6 +1479,29 @@ mod tests {
     /// Builds the typed FILE_OBJECT boundary from a local non-null test object.
     fn kernel_file_object(file: &mut wdk_sys::FILE_OBJECT) -> Option<KernelFileObject> {
         KernelFileObject::from_raw(core::ptr::addr_of_mut!(*file))
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn mounted_volume_vcb_rejects_control_device_extension() {
+        let mut extension = core::mem::MaybeUninit::<ControlDeviceExtension>::zeroed();
+        let mut device = wdk_sys::DEVICE_OBJECT {
+            DeviceExtension: extension.as_mut_ptr().cast(),
+            ..wdk_sys::DEVICE_OBJECT::default()
+        };
+        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device));
+        assert!(device.is_some());
+        if let Some(device) = device {
+            assert_eq!(ControlDeviceExtension::initialize(device), Ok(()));
+            assert_eq!(MountedVolumeDevice::vcb(device), None);
+            unsafe {
+                // SAFETY: The test initialized the control extension above and
+                // no queue user exists after the local assertions.
+                ControlDeviceExtension::release(device);
+            }
+        }
     }
 
     /// # Panics

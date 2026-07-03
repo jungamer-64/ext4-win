@@ -306,6 +306,16 @@ impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> JournaledVolume<D, N, Int
     }
 }
 
+impl<D: BlockWriter, N> JournaledVolume<D, N, InternalJournal> {
+    /// Persists all filesystem-device writes issued through this mounted volume.
+    ///
+    /// # Errors
+    /// Returns an error when the filesystem backing device cannot guarantee persistence.
+    pub fn flush(&mut self) -> Result<()> {
+        self.volume.device.flush()
+    }
+}
+
 impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
     MountedVolume<D, JournaledMount<ExternalJournal<J>>, N>
 {
@@ -395,5 +405,16 @@ impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
         now: Ext4Timestamp,
     ) -> JournalTransaction<'_, D, N, ExternalJournal<J>> {
         self.volume.begin_transaction(now)
+    }
+}
+
+impl<D: BlockWriter, J: BlockWriter, N> JournaledVolume<D, N, ExternalJournal<J>> {
+    /// Persists all journal and filesystem-device writes issued through this mounted volume.
+    ///
+    /// # Errors
+    /// Returns an error when either backing device cannot guarantee persistence.
+    pub fn flush(&mut self) -> Result<()> {
+        self.volume.state.journal.device.flush()?;
+        self.volume.device.flush()
     }
 }

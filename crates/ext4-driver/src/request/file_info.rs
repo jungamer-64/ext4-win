@@ -19,8 +19,8 @@ use crate::irp::{
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{
-    CloseDisposition, DirectoryCursor, FileControlBlock, KernelFileObject, OpenedDirectory,
-    OpenedHandle, OpenedObject, OpenedPath, OpenedRegularFile, VolumeControlBlock,
+    CloseDisposition, DirectoryCursor, FileControlBlock, KernelFileObject, MountedVolumeDevice,
+    OpenedDirectory, OpenedHandle, OpenedObject, OpenedPath, OpenedRegularFile, VolumeControlBlock,
     release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
@@ -130,6 +130,36 @@ pub(crate) fn lock_control(target: DispatchTarget) -> DriverResult<IrpCompletion
 fn decoded_not_supported(target: DispatchTarget) -> DriverResult<()> {
     let _device = target.device();
     Ok(())
+}
+
+/// Decoded mounted volume selected by a flush IRP.
+#[derive(Clone, Copy, Debug)]
+struct FlushVolume {
+    /// Mounted VCB whose backing device must be flushed.
+    volume: NonNull<VolumeControlBlock>,
+}
+
+impl FlushVolume {
+    /// Decodes the mounted volume affected by a flush IRP.
+    /// # Errors
+    ///
+    /// Returns an error when the current stack is absent, the opened FILE_OBJECT context is invalid,
+    /// or a device-level flush is not directed at a mounted volume device.
+    fn decode(target: DispatchTarget) -> DriverResult<Self> {
+        let stack = target.current_stack()?;
+        let volume = match stack.file_object() {
+            Ok(file_object) => OpenedObject::decode(file_object)?.volume(),
+            Err(DriverError::InvalidParameter) => MountedVolumeDevice::vcb(target.device())
+                .ok_or(DriverError::InvalidDeviceRequest)?,
+            Err(error) => return Err(error),
+        };
+        Ok(Self { volume })
+    }
+
+    /// Returns the mounted VCB pointer selected by the flush request.
+    const fn volume(self) -> NonNull<VolumeControlBlock> {
+        self.volume
+    }
 }
 
 /// Decoded query-file-information request.
@@ -1894,6 +1924,81 @@ mod tests {
         };
         target.copy_from_slice(&value.to_le_bytes());
         true
+    }
+
+    /// Builds a dispatch target whose IRP points at the supplied current stack.
+    /// # Errors
+    ///
+    /// Returns an error when the local test device or IRP pointer cannot be decoded.
+    fn target_from_stack(
+        stack: &mut wdk_sys::IO_STACK_LOCATION,
+        irp: &mut wdk_sys::IRP,
+        device: &mut wdk_sys::DEVICE_OBJECT,
+    ) -> Result<DispatchTarget, DriverError> {
+        irp.Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(*stack);
+        DispatchTarget::decode(
+            core::ptr::addr_of_mut!(*device),
+            core::ptr::addr_of_mut!(*irp),
+        )
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn flush_volume_decodes_opened_file_object_volume() {
+        let volume = NonNull::<crate::state::VolumeControlBlock>::dangling();
+        let mut fcb =
+            crate::state::FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = crate::state::OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedPath::Root,
+            crate::state::CloseDisposition::Keep,
+        );
+        let mut file_object = wdk_sys::FILE_OBJECT {
+            FsContext: core::ptr::addr_of_mut!(fcb).cast(),
+            FsContext2: core::ptr::addr_of_mut!(handle).cast(),
+            ..wdk_sys::FILE_OBJECT::default()
+        };
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: core::ptr::addr_of_mut!(file_object),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        let mut irp = wdk_sys::IRP::default();
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let target = target_from_stack(&mut stack, &mut irp, &mut device);
+        assert!(target.is_ok());
+
+        if let Ok(target) = target {
+            let decoded = super::FlushVolume::decode(target);
+            assert!(decoded.is_ok());
+            if let Ok(decoded) = decoded {
+                assert_eq!(decoded.volume(), volume);
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn flush_volume_rejects_unmounted_device_without_file_object() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut irp = wdk_sys::IRP::default();
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let target = target_from_stack(&mut stack, &mut irp, &mut device);
+        assert!(target.is_ok());
+
+        if let Ok(target) = target {
+            assert_eq!(
+                super::FlushVolume::decode(target).err(),
+                Some(DriverError::InvalidDeviceRequest)
+            );
+        }
     }
 
     /// # Panics

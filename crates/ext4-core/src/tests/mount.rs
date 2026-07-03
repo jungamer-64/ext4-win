@@ -1,5 +1,63 @@
 use super::*;
 
+#[derive(Debug)]
+struct ObservedFlushDevice<'a> {
+    bytes: &'a mut [u8],
+    flushes: &'a core::cell::Cell<u32>,
+    fail_next_flush: &'a core::cell::Cell<bool>,
+}
+
+impl<'a> ObservedFlushDevice<'a> {
+    const fn new(
+        bytes: &'a mut [u8],
+        flushes: &'a core::cell::Cell<u32>,
+        fail_next_flush: &'a core::cell::Cell<bool>,
+    ) -> Self {
+        Self {
+            bytes,
+            flushes,
+            fail_next_flush,
+        }
+    }
+}
+
+impl BlockReader for ObservedFlushDevice<'_> {
+    fn len(&self) -> DeviceLength {
+        DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
+    }
+
+    fn read_exact_at(&self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(out.len()).ok_or(Error::DeviceRange)?;
+        let source = self.bytes.get(start..end).ok_or(Error::DeviceRange)?;
+        out.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+impl BlockWriter for ObservedFlushDevice<'_> {
+    fn write_exact_at(&mut self, offset: ByteOffset, bytes: &[u8]) -> crate::Result<()> {
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(bytes.len()).ok_or(Error::DeviceRange)?;
+        let target = self.bytes.get_mut(start..end).ok_or(Error::DeviceRange)?;
+        target.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> crate::Result<()> {
+        let flushes = self
+            .flushes
+            .get()
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        self.flushes.set(flushes);
+        if self.fail_next_flush.replace(false) {
+            return Err(Error::DeviceIo);
+        }
+        Ok(())
+    }
+}
+
 /// # Panics
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
@@ -12,6 +70,47 @@ fn clean_superblock_mounts() {
 
     assert_eq!(volume.geometry().block_size().bytes(), 1024);
     assert_eq!(superblock.inode_count().as_u32(), 16);
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn journaled_volume_flush_reaches_filesystem_device() {
+    let mut image = modern_fixture_image();
+    let flushes = core::cell::Cell::new(0);
+    let fail_next_flush = core::cell::Cell::new(false);
+    let device = ObservedFlushDevice::new(&mut image, &flushes, &fail_next_flush);
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+    let before = flushes.get();
+
+    assert_eq!(volume.flush(), Ok(()));
+    let expected = before.checked_add(1);
+    assert!(expected.is_some());
+    if let Some(expected) = expected {
+        assert_eq!(flushes.get(), expected);
+    }
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn journaled_volume_flush_returns_device_error() {
+    let mut image = modern_fixture_image();
+    let flushes = core::cell::Cell::new(0);
+    let fail_next_flush = core::cell::Cell::new(false);
+    let device = ObservedFlushDevice::new(&mut image, &flushes, &fail_next_flush);
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+    let before = flushes.get();
+    fail_next_flush.set(true);
+
+    assert_eq!(volume.flush(), Err(Error::DeviceIo));
+    let expected = before.checked_add(1);
+    assert!(expected.is_some());
+    if let Some(expected) = expected {
+        assert_eq!(flushes.get(), expected);
+    }
 }
 
 /// # Panics
