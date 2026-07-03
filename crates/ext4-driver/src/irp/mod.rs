@@ -407,15 +407,47 @@ impl ReceivedIrp {
     }
 }
 
+/// Failed transition from a received IRP into the pending queue state.
+#[derive(Debug)]
+#[must_use]
+struct PendingIrpError {
+    /// IRP that must still be completed synchronously.
+    received: ReceivedIrp,
+    /// Failure reported while marking the IRP pending.
+    error: DriverError,
+}
+
+impl PendingIrpError {
+    /// Completes the still-owned received IRP with the transition failure.
+    fn complete(self) -> NTSTATUS {
+        self.received
+            .complete(IrpCompletion::from_error(self.error))
+    }
+}
+
 /// IRP marked pending and ready to be inserted into a device queue.
 #[derive(Debug)]
 #[must_use]
-pub(crate) struct PendingIrp {
+struct PendingIrp {
     /// Pending dispatch target.
     target: DispatchTarget,
 }
 
 impl PendingIrp {
+    /// Marks a received IRP pending and builds the queue-owned typestate.
+    /// # Errors
+    ///
+    /// Returns the original received IRP with the failure when the active stack location is absent
+    /// or cannot represent the WDK pending bit.
+    fn from_received(received: ReceivedIrp) -> Result<Self, PendingIrpError> {
+        if let Err(error) = received.target.irp.mark_pending() {
+            return Err(PendingIrpError { received, error });
+        }
+        Ok(Self {
+            target: received.target,
+        })
+    }
+
     /// Returns the raw pending IRP pointer for queue insertion.
     fn as_raw_irp(&self) -> PIRP {
         self.target.irp.as_ptr()
@@ -634,8 +666,22 @@ impl DeviceIrpQueue {
             .ok_or(DriverError::InvalidParameter)
     }
 
+    /// Receives an async-capable IRP, marks it pending, inserts it into the device queue, and
+    /// returns the dispatch status.
+    pub(crate) fn receive_async(received: ReceivedIrp) -> NTSTATUS {
+        let queue = match Self::from_device(received.device()) {
+            Ok(queue) => queue,
+            Err(error) => return received.complete(IrpCompletion::from_error(error)),
+        };
+        let pending = match PendingIrp::from_received(received) {
+            Ok(pending) => pending,
+            Err(error) => return error.complete(),
+        };
+        Self::enqueue(queue, pending)
+    }
+
     /// Inserts a pending IRP into this queue and schedules the worker.
-    pub(crate) fn enqueue(mut queue: NonNull<Self>, pending: PendingIrp) -> NTSTATUS {
+    fn enqueue(mut queue: NonNull<Self>, pending: PendingIrp) -> NTSTATUS {
         let status = pending.dispatch_status();
         let irp = pending.as_raw_irp();
         let queue = unsafe {
@@ -3072,6 +3118,33 @@ mod tests {
         }
     }
 
+    /// Builds unlinked queue storage for a device-owned extension.
+    fn queue_storage(device: KernelDevice) -> DeviceIrpQueue {
+        DeviceIrpQueue {
+            csq: wdk_sys::IO_CSQ::default(),
+            lock: 0,
+            list_head: wdk_sys::LIST_ENTRY::default(),
+            work_item: core::ptr::null_mut(),
+            worker_state: QueueWorkerState::Idle,
+            device,
+        }
+    }
+
+    /// Initializes queue links after the queue has reached its stable stack address.
+    fn initialize_queue_links(queue: &mut DeviceIrpQueue) {
+        super::initialize_list_head(core::ptr::addr_of_mut!(queue.list_head));
+    }
+
+    /// Publishes queue storage as the device extension used by queue lookup.
+    fn attach_queue_extension(device: &mut wdk_sys::DEVICE_OBJECT, queue: &mut DeviceIrpQueue) {
+        device.DeviceExtension = core::ptr::from_mut(queue).cast::<c_void>();
+    }
+
+    /// Returns whether the current stack control byte contains the pending-returned bit.
+    fn stack_has_pending_returned(stack: &wdk_sys::IO_STACK_LOCATION) -> bool {
+        u32::from(stack.Control) & wdk_sys::SL_PENDING_RETURNED == wdk_sys::SL_PENDING_RETURNED
+    }
+
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
@@ -3158,8 +3231,17 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn received_irp_pending_mark_sets_current_stack_control() {
-        let mut device = wdk_sys::DEVICE_OBJECT::default();
+    fn device_irp_queue_receive_async_marks_current_stack_pending() {
+        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
+        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
+        assert!(device.is_some());
+        let Some(device) = device else {
+            return;
+        };
+        let mut queue = queue_storage(device);
+        initialize_queue_links(&mut queue);
+        attach_queue_extension(&mut kernel_device, &mut queue);
+
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let mut irp = wdk_sys::IRP::default();
         irp.Tail
@@ -3169,15 +3251,20 @@ mod tests {
             .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
 
         let received = ReceivedIrp::decode(
-            core::ptr::addr_of_mut!(device),
+            core::ptr::addr_of_mut!(kernel_device),
             core::ptr::addr_of_mut!(irp),
         );
         assert!(received.is_ok());
         if let Ok(received) = received {
-            assert!(received.mark_pending().is_ok());
             assert_eq!(
-                u32::from(stack.Control) & wdk_sys::SL_PENDING_RETURNED,
-                wdk_sys::SL_PENDING_RETURNED
+                DeviceIrpQueue::receive_async(received),
+                wdk_sys::STATUS_PENDING
+            );
+            assert!(stack_has_pending_returned(&stack));
+            assert_eq!(queue.worker_state, QueueWorkerState::Scheduled);
+            assert_eq!(
+                queue.remove_next_irp(core::ptr::null_mut()),
+                core::ptr::addr_of_mut!(irp)
             );
         }
     }
@@ -3186,21 +3273,83 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn device_irp_queue_removes_irps_in_fifo_order() {
-        let device = KernelDevice::from_raw(opaque::<wdk_sys::DEVICE_OBJECT>());
+    fn device_irp_queue_receive_async_completes_without_pending_when_extension_is_absent() {
+        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut irp = wdk_sys::IRP::default();
+        irp.IoStatus.Information = 99;
+        irp.Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+
+        let received = ReceivedIrp::decode(
+            core::ptr::addr_of_mut!(kernel_device),
+            core::ptr::addr_of_mut!(irp),
+        );
+        assert!(received.is_ok());
+        if let Ok(received) = received {
+            assert_eq!(
+                DeviceIrpQueue::receive_async(received),
+                STATUS_INVALID_PARAMETER
+            );
+        }
+
+        assert!(!stack_has_pending_returned(&stack));
+        assert_eq!(irp_status(&irp), STATUS_INVALID_PARAMETER);
+        assert_eq!(irp.IoStatus.Information, 0);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn device_irp_queue_receive_async_completes_when_pending_mark_fails() {
+        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
+        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
         assert!(device.is_some());
         let Some(device) = device else {
             return;
         };
-        let mut queue = DeviceIrpQueue {
-            csq: wdk_sys::IO_CSQ::default(),
-            lock: 0,
-            list_head: wdk_sys::LIST_ENTRY::default(),
-            work_item: core::ptr::null_mut(),
-            worker_state: QueueWorkerState::Idle,
-            device,
+        let mut queue = queue_storage(device);
+        initialize_queue_links(&mut queue);
+        attach_queue_extension(&mut kernel_device, &mut queue);
+
+        let mut irp = wdk_sys::IRP::default();
+        irp.IoStatus.Information = 99;
+        let received = ReceivedIrp::decode(
+            core::ptr::addr_of_mut!(kernel_device),
+            core::ptr::addr_of_mut!(irp),
+        );
+        assert!(received.is_ok());
+        if let Ok(received) = received {
+            assert_eq!(
+                DeviceIrpQueue::receive_async(received),
+                STATUS_INVALID_PARAMETER
+            );
+        }
+
+        assert_eq!(irp_status(&irp), STATUS_INVALID_PARAMETER);
+        assert_eq!(irp.IoStatus.Information, 0);
+        assert_eq!(queue.worker_state, QueueWorkerState::Idle);
+        assert!(queue.remove_next_irp(core::ptr::null_mut()).is_null());
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn device_irp_queue_removes_irps_in_fifo_order() {
+        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
+        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
+        assert!(device.is_some());
+        let Some(device) = device else {
+            return;
         };
-        super::initialize_list_head(core::ptr::addr_of_mut!(queue.list_head));
+        let mut queue = queue_storage(device);
+        initialize_queue_links(&mut queue);
+        attach_queue_extension(&mut kernel_device, &mut queue);
 
         let mut stack_a = wdk_sys::IO_STACK_LOCATION::default();
         let mut stack_b = wdk_sys::IO_STACK_LOCATION::default();
@@ -3227,7 +3376,6 @@ mod tests {
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::addr_of_mut!(stack_c);
 
-        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
         for irp in [
             core::ptr::addr_of_mut!(irp_a),
             core::ptr::addr_of_mut!(irp_b),
@@ -3236,9 +3384,8 @@ mod tests {
             let received = ReceivedIrp::decode(core::ptr::addr_of_mut!(kernel_device), irp);
             assert!(received.is_ok());
             if let Ok(received) = received {
-                assert!(received.mark_pending().is_ok());
                 assert_eq!(
-                    DeviceIrpQueue::enqueue(NonNull::from(&mut queue), received.into_pending()),
+                    DeviceIrpQueue::receive_async(received),
                     wdk_sys::STATUS_PENDING
                 );
             }
@@ -3264,20 +3411,15 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn device_irp_queue_cancels_only_matching_file_object() {
-        let device = KernelDevice::from_raw(opaque::<wdk_sys::DEVICE_OBJECT>());
+        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
+        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
         assert!(device.is_some());
         let Some(device) = device else {
             return;
         };
-        let mut queue = DeviceIrpQueue {
-            csq: wdk_sys::IO_CSQ::default(),
-            lock: 0,
-            list_head: wdk_sys::LIST_ENTRY::default(),
-            work_item: core::ptr::null_mut(),
-            worker_state: QueueWorkerState::Idle,
-            device,
-        };
-        super::initialize_list_head(core::ptr::addr_of_mut!(queue.list_head));
+        let mut queue = queue_storage(device);
+        initialize_queue_links(&mut queue);
+        attach_queue_extension(&mut kernel_device, &mut queue);
 
         let mut file_a = wdk_sys::FILE_OBJECT::default();
         let mut file_b = wdk_sys::FILE_OBJECT::default();
@@ -3318,7 +3460,6 @@ mod tests {
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::addr_of_mut!(stack_a2);
 
-        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
         for irp in [
             core::ptr::addr_of_mut!(irp_a1),
             core::ptr::addr_of_mut!(irp_b),
@@ -3327,9 +3468,10 @@ mod tests {
             let received = ReceivedIrp::decode(core::ptr::addr_of_mut!(kernel_device), irp);
             assert!(received.is_ok());
             if let Ok(received) = received {
-                assert!(received.mark_pending().is_ok());
-                let _status =
-                    DeviceIrpQueue::enqueue(NonNull::from(&mut queue), received.into_pending());
+                assert_eq!(
+                    DeviceIrpQueue::receive_async(received),
+                    wdk_sys::STATUS_PENDING
+                );
             }
         }
 

@@ -254,7 +254,7 @@ fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS
             let target = received.target();
             received.complete_result(execute_immediate(major, target))
         }
-        DispatchPolicy::Queued => queue_received_irp(received),
+        DispatchPolicy::Queued => DeviceIrpQueue::receive_async(received),
     }
 }
 
@@ -290,18 +290,6 @@ const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
         | DispatchMajor::QuerySecurity
         | DispatchMajor::SetSecurity => DispatchPolicy::Queued,
     }
-}
-
-/// Queues a received IRP for worker execution.
-fn queue_received_irp(received: ReceivedIrp) -> NTSTATUS {
-    let queue = match DeviceIrpQueue::from_device(received.device()) {
-        Ok(queue) => queue,
-        Err(error) => return received.complete(IrpCompletion::from_error(error)),
-    };
-    if let Err(error) = received.mark_pending() {
-        return received.complete(IrpCompletion::from_error(error));
-    }
-    DeviceIrpQueue::enqueue(queue, received.into_pending())
 }
 
 /// Executes a queued IRP after a worker removes it from the device queue.
