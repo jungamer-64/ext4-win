@@ -1585,8 +1585,8 @@ impl CurrentIrpStackLocation {
     /// Decodes query-EA parameters.
     /// # Errors
     ///
-    /// Returns an error when indexed EA queries are requested, an EA name list pointer is missing,
-    /// the FILE_OBJECT is absent, or buffer lengths are invalid.
+    /// Returns an error when an EA name list pointer is missing, the FILE_OBJECT is absent, or
+    /// buffer lengths are invalid.
     pub(crate) fn query_ea(self) -> Result<QueryEaStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1598,20 +1598,19 @@ impl CurrentIrpStackLocation {
             // where QueryEa is active.
             stack.Parameters.QueryEa
         };
-        if stack_flag(stack.Flags, wdk_sys::SL_INDEX_SPECIFIED) || query.EaIndex != 0 {
-            return Err(DriverError::NotSupported);
-        }
         let ea_list_length = IrpBufferLength::from_ulong(query.EaListLength)?;
-        let name_selection = if ea_list_length.is_empty() {
-            EaNameSelection::All
-        } else {
+        let selection = if !ea_list_length.is_empty() {
             let Some(address) = NonNull::new(query.EaList.cast::<u8>()) else {
                 return Err(DriverError::InvalidParameter);
             };
-            EaNameSelection::Names {
+            EaSelection::Names {
                 address,
                 length: ea_list_length,
             }
+        } else if stack_flag(stack.Flags, wdk_sys::SL_INDEX_SPECIFIED) {
+            EaSelection::Index(EaEntryIndex::from_u32(query.EaIndex))
+        } else {
+            EaSelection::All
         };
         let entry_emission = if stack_flag(stack.Flags, wdk_sys::SL_RETURN_SINGLE_ENTRY) {
             EaEntryEmission::Single
@@ -1620,7 +1619,7 @@ impl CurrentIrpStackLocation {
         };
         Ok(QueryEaStack {
             file_object: self.kernel_file_object()?,
-            name_selection,
+            selection,
             entry_emission,
             length: IrpBufferLength::from_ulong(query.Length)?,
         })
@@ -2029,9 +2028,25 @@ pub(crate) enum DirectoryEntryEmission {
     Single,
 }
 
-/// Query-EA name selection supplied by the caller.
+/// EA entry index selected by a query-EA request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EaNameSelection {
+pub(crate) struct EaEntryIndex(u32);
+
+impl EaEntryIndex {
+    /// Creates an EA entry index from the Windows one-based index field.
+    pub(crate) const fn from_u32(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the caller-supplied one-based EA entry index.
+    pub(crate) const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Query-EA selection supplied by the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EaSelection {
     /// Return every EA associated with the opened file.
     All,
     /// Return only names listed in the caller's `FILE_GET_EA_INFORMATION` buffer.
@@ -2041,6 +2056,8 @@ pub(crate) enum EaNameSelection {
         /// Byte length of the caller's name list.
         length: IrpBufferLength,
     },
+    /// Return the entry at a caller-supplied one-based index, then continue scanning.
+    Index(EaEntryIndex),
 }
 
 /// EA entry emission cardinality requested by the caller.
@@ -2825,8 +2842,8 @@ pub(crate) struct QueryDirectoryStack {
 pub(crate) struct QueryEaStack {
     /// FILE_OBJECT carrying the FCB/CCB.
     file_object: KernelFileObject,
-    /// EA name selection requested by the caller.
-    name_selection: EaNameSelection,
+    /// EA selection requested by the caller.
+    selection: EaSelection,
     /// EA entry emission cardinality.
     entry_emission: EaEntryEmission,
     /// Output buffer length.
@@ -3016,9 +3033,9 @@ impl QueryEaStack {
         self.file_object
     }
 
-    /// Returns the EA name selection.
-    pub(crate) const fn name_selection(self) -> EaNameSelection {
-        self.name_selection
+    /// Returns the EA selection.
+    pub(crate) const fn selection(self) -> EaSelection {
+        self.selection
     }
 
     /// Returns EA entry emission cardinality.
