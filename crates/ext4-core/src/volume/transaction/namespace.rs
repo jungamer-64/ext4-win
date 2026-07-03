@@ -239,18 +239,19 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         self.record_group_used_dirs_delta(group, -1)
     }
 
-    /// Renames or moves a child entry without replacing an existing target.
+    /// Renames or moves a child entry.
     ///
     /// # Errors
-    /// Returns an error when the source entry is absent, the target name exists,
-    /// either parent is outside the mutable directory domain, or a moved
-    /// directory cannot have its parent link updated.
+    /// Returns an error when the source entry is absent, the target collision mode rejects an
+    /// existing target, either parent is outside the mutable directory domain, or a moved directory
+    /// cannot have its parent link updated.
     pub fn rename_child(
         &mut self,
         source_parent: TransactionDirectory,
         source_name: &Ext4Name,
         target_parent: TransactionDirectory,
         target_name: &Ext4Name,
+        target_collision: RenameTargetCollision,
     ) -> Result<()> {
         reject_reserved_directory_name(source_name)?;
         reject_reserved_directory_name(target_name)?;
@@ -261,7 +262,9 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         if source_parent == target_parent && source_name == target_name {
             return Ok(());
         }
-        self.ensure_child_absent(target_parent, target_name)?;
+        if matches!(target_collision, RenameTargetCollision::Reject) {
+            self.ensure_child_absent(target_parent, target_name)?;
+        }
 
         let child_index = self.ensure_inode_update(source.inode())?;
         let mut child_raw = self.staged_live_inode(child_index)?;
