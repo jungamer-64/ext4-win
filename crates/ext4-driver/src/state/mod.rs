@@ -9,7 +9,7 @@ use ext4_core::{
     DeviceLength, DirectoryNodeId, Ext4Name, Ext4Timestamp, FileNodeId, FscryptKeyIdentifier,
     FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, InternalJournal, JournalTransaction,
     JournaledVolume, MountContext, NewDirectoryMetadata, NewFileMetadata, NodeId,
-    Result as Ext4Result, SymlinkNodeId,
+    Result as Ext4Result, SymlinkNodeId, XattrName, XattrValue,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT,
@@ -559,6 +559,26 @@ impl PendingChildCreation<'_> {
     /// Releases one open reference to a VCB-owned FCB while the create is still pending.
     pub(crate) fn release_file_control_block(&mut self, fcb: NonNull<FileControlBlock>) {
         close_file_control_block_in_table(self.file_control_blocks, fcb);
+    }
+
+    /// Sets or replaces one xattr on the staged child in this create transaction.
+    /// # Errors
+    ///
+    /// Returns an error when the staged node rejects xattr mutation.
+    pub(crate) fn set_xattr(&mut self, name: XattrName, value: XattrValue) -> DriverResult<()> {
+        let node = self.transaction.node(self.node)?;
+        self.transaction.set_xattr(node, name, value)?;
+        Ok(())
+    }
+
+    /// Removes one xattr from the staged child in this create transaction.
+    /// # Errors
+    ///
+    /// Returns an error when the staged node rejects xattr mutation.
+    pub(crate) fn remove_xattr(&mut self, name: &XattrName) -> DriverResult<()> {
+        let node = self.transaction.node(self.node)?;
+        self.transaction.remove_xattr(node, name)?;
+        Ok(())
     }
 
     /// Commits the staged namespace mutation to the mounted ext4 volume.

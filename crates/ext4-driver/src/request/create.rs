@@ -16,7 +16,7 @@ use crate::{
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
-    request::metadata,
+    request::{ea::CreateEa, metadata},
     state::{
         ChildCreationTarget, CloseDisposition, FileControlBlock, KernelDevice, KernelFileObject,
         MountedVolumeDevice, OpenedHandle, OpenedObject, OpenedPath, PendingChildCreation,
@@ -390,13 +390,13 @@ fn create_missing_node(
             parameters.close_disposition(),
         ))
     })?;
+    create_ea.apply_to_pending_child(&mut creation)?;
     let fcb = open_pending_child_file_control_block(
         &mut creation,
         request.file_object(),
         parameters.desired_access(),
         parameters.share_access(),
     )?;
-    create_ea.apply_to_pending_child(&mut creation)?;
 
     match creation.commit() {
         Ok(()) => {

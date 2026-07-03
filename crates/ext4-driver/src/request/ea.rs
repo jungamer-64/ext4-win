@@ -1,11 +1,12 @@
 //! Windows extended-attribute IRP handling.
 
 use crate::irp::{
-    DispatchTarget, EaEntryEmission, EaNameSelection, IrpCompletion, QueryEaStack, SetEaStack,
+    DispatchTarget, EaEntryEmission, EaNameSelection, IrpBufferLength, IrpCompletion, QueryEaStack,
+    SetEaStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
-use crate::state::{FileControlBlock, OpenedObject, VolumeControlBlock};
+use crate::state::{FileControlBlock, OpenedObject, PendingChildCreation, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{XattrName, XattrNamespace, XattrValue};
 
@@ -102,6 +103,46 @@ impl SetEaRequest {
             stack,
             opened_file,
         })
+    }
+}
+
+/// Parsed create-time EA list.
+#[derive(Debug)]
+pub(crate) struct CreateEa {
+    /// Parsed FILE_FULL_EA_INFORMATION records.
+    entries: DriverVec<WindowsEaRecord>,
+}
+
+impl CreateEa {
+    /// Decodes the create-time EA buffer.
+    /// # Errors
+    ///
+    /// Returns an error when the create EA buffer is unavailable or malformed.
+    pub(crate) fn decode(target: DispatchTarget, length: IrpBufferLength) -> DriverResult<Self> {
+        if length.is_empty() {
+            return Ok(Self {
+                entries: DriverVec::new(),
+            });
+        }
+        let input = target.buffered_input(length)?;
+        Ok(Self {
+            entries: parse_full_ea_list(input.as_slice())?,
+        })
+    }
+
+    /// Applies this create-time EA list to a pending child before the create transaction commits.
+    /// # Errors
+    ///
+    /// Returns an error when any EA name cannot be mapped to an ext4 xattr or the pending child
+    /// rejects the xattr mutation.
+    pub(crate) fn apply_to_pending_child(
+        &self,
+        creation: &mut PendingChildCreation,
+    ) -> DriverResult<()> {
+        for entry in self.entries.iter() {
+            apply_ea_record_to_pending_child(creation, entry)?;
+        }
+        Ok(())
     }
 }
 
@@ -368,6 +409,23 @@ fn apply_set_ea_entries(
     }
     transaction.commit()?;
     Ok(())
+}
+
+/// Applies one EA record to a pending create transaction.
+/// # Errors
+///
+/// Returns an error when the EA name cannot be mapped to an xattr or the pending child rejects the
+/// xattr mutation.
+fn apply_ea_record_to_pending_child(
+    creation: &mut PendingChildCreation,
+    entry: &WindowsEaRecord,
+) -> DriverResult<()> {
+    let name = xattr_name_from_ea_name(&entry.name)?;
+    if entry.value.is_empty() {
+        creation.remove_xattr(&name)
+    } else {
+        creation.set_xattr(name, XattrValue::new(entry.value.as_bytes())?)
+    }
 }
 
 /// Parses the set-EA input buffer.
@@ -686,16 +744,54 @@ fn align_to_four(value: usize) -> DriverResult<usize> {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use core::ffi::c_void;
 
     use crate::{
+        irp::DispatchTarget,
         kernel::status::DriverError,
         wire::{LittleEndianInput, LittleEndianOutput},
     };
 
     use super::{
-        WindowsEaName, WindowsEaRecord, WindowsEaValue, pack_full_ea_entries, parse_full_ea_list,
-        parse_get_ea_list, wire_offset, xattr_name_from_ea_name,
+        CreateEa, WindowsEaName, WindowsEaRecord, WindowsEaValue, pack_full_ea_entries,
+        parse_full_ea_list, parse_get_ea_list, wire_offset, xattr_name_from_ea_name,
     };
+
+    /// Builds a create dispatch target carrying one EA system buffer.
+    /// # Errors
+    ///
+    /// Returns an error when the local target pointers cannot be decoded.
+    fn create_target_with_ea(
+        system_buffer: *mut c_void,
+        ea_length: wdk_sys::ULONG,
+        file_object: &mut wdk_sys::FILE_OBJECT,
+        security_context: &mut wdk_sys::IO_SECURITY_CONTEXT,
+        stack: &mut wdk_sys::IO_STACK_LOCATION,
+        irp: &mut wdk_sys::IRP,
+        device: &mut wdk_sys::DEVICE_OBJECT,
+    ) -> Result<DispatchTarget, DriverError> {
+        stack.FileObject = core::ptr::addr_of_mut!(*file_object);
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(*security_context),
+            Options: 1 << 24,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: ea_length,
+        };
+        irp.AssociatedIrp.SystemBuffer = system_buffer;
+        irp.Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(*stack);
+
+        DispatchTarget::decode(
+            core::ptr::addr_of_mut!(*device),
+            core::ptr::addr_of_mut!(*irp),
+        )
+    }
 
     /// # Panics
     ///
@@ -730,6 +826,94 @@ mod tests {
         assert!(parsed.is_ok());
         if let Ok(parsed) = parsed {
             assert_eq!(parsed.as_slice(), entries.as_slice());
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_ea_decodes_buffered_full_ea_list() {
+        let alpha = WindowsEaName::new(b"alpha");
+        let one = WindowsEaValue::new(b"one");
+        assert!(alpha.is_ok());
+        assert!(one.is_ok());
+        let (Ok(alpha), Ok(one)) = (alpha, one) else {
+            return;
+        };
+        let expected = [WindowsEaRecord::new(alpha, one)];
+        let mut input = vec![0; 24];
+        let written = pack_full_ea_entries(expected.as_slice(), input.as_mut_slice());
+        assert!(written.is_ok());
+        let Ok(written) = written else {
+            return;
+        };
+        let ea_length = wdk_sys::ULONG::try_from(written).unwrap_or(wdk_sys::ULONG::MAX);
+
+        let mut file_object = wdk_sys::FILE_OBJECT::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut irp = wdk_sys::IRP::default();
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let target = create_target_with_ea(
+            input.as_mut_ptr().cast::<c_void>(),
+            ea_length,
+            &mut file_object,
+            &mut security_context,
+            &mut stack,
+            &mut irp,
+            &mut device,
+        );
+        assert!(target.is_ok());
+        let Ok(target) = target else {
+            return;
+        };
+        let create = target.current_stack().and_then(|stack| stack.create());
+        assert!(create.is_ok());
+        let Ok(create) = create else {
+            return;
+        };
+
+        let parsed = CreateEa::decode(target, create.parameters().ea_length());
+        assert!(parsed.is_ok());
+        if let Ok(parsed) = parsed {
+            assert_eq!(parsed.entries.as_slice(), expected.as_slice());
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_ea_empty_length_does_not_require_system_buffer() {
+        let mut file_object = wdk_sys::FILE_OBJECT::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut irp = wdk_sys::IRP::default();
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let target = create_target_with_ea(
+            core::ptr::null_mut(),
+            0,
+            &mut file_object,
+            &mut security_context,
+            &mut stack,
+            &mut irp,
+            &mut device,
+        );
+        assert!(target.is_ok());
+        let Ok(target) = target else {
+            return;
+        };
+        let create = target.current_stack().and_then(|stack| stack.create());
+        assert!(create.is_ok());
+        let Ok(create) = create else {
+            return;
+        };
+
+        let parsed = CreateEa::decode(target, create.parameters().ea_length());
+        assert!(parsed.is_ok());
+        if let Ok(parsed) = parsed {
+            assert!(parsed.entries.is_empty());
         }
     }
 
