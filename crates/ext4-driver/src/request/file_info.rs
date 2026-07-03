@@ -70,8 +70,16 @@ pub(crate) fn write(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// Flushes cached or ordered file data.
 /// # Errors
 ///
-/// This currently returns success for decoded flush IRPs.
-pub(crate) fn flush(_target: DispatchTarget) -> DriverResult<IrpCompletion> {
+/// Returns an error when the flush target cannot be resolved to a mounted ext4 volume or the
+/// lower storage flush fails.
+pub(crate) fn flush(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let mut volume = FlushVolume::decode(target)?.volume();
+    let vcb = unsafe {
+        // SAFETY: The decoded flush volume is owned by the mounted device or the opened
+        // FILE_OBJECT context for the duration of this dispatch.
+        volume.as_mut()
+    };
+    vcb.flush()?;
     Ok(IrpCompletion::EMPTY)
 }
 
