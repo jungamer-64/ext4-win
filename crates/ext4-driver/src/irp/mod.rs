@@ -381,22 +381,6 @@ impl ReceivedIrp {
         self.target.device
     }
 
-    /// Marks this IRP pending before it enters a driver-owned queue.
-    /// # Errors
-    ///
-    /// Returns an error when the current IRP stack location is absent or cannot hold the pending
-    /// marker.
-    pub(crate) fn mark_pending(&self) -> DriverResult<()> {
-        self.target.irp.mark_pending()
-    }
-
-    /// Transfers a marked received IRP into the queued pending state.
-    pub(crate) fn into_pending(self) -> PendingIrp {
-        PendingIrp {
-            target: self.target,
-        }
-    }
-
     /// Completes this received IRP immediately.
     pub(crate) fn complete(self, completion: IrpCompletion) -> NTSTATUS {
         OwnedIrp {
