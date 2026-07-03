@@ -552,6 +552,8 @@ enum DirectoryPattern {
     All,
     /// Return the entry with this exact Windows name.
     Exact(WindowsName),
+    /// Return entries matched by a caller-supplied wildcard expression.
+    Wildcard(DirectoryWildcardPattern),
 }
 
 impl DirectoryPattern {
@@ -577,7 +579,7 @@ impl DirectoryPattern {
             .iter()
             .any(|unit| matches!(*unit, UTF16_ASTERISK | UTF16_QUESTION_MARK))
         {
-            return Err(DriverError::NotSupported);
+            return DirectoryWildcardPattern::from_utf16(units).map(Self::Wildcard);
         }
         WindowsName::from_utf16(units)
             .map(Self::Exact)
@@ -589,6 +591,7 @@ impl DirectoryPattern {
         match self {
             Self::All => true,
             Self::Exact(requested) => name.equals(requested),
+            Self::Wildcard(pattern) => pattern.matches(name),
         }
     }
 
@@ -596,7 +599,7 @@ impl DirectoryPattern {
     const fn exhausted_error(&self) -> DriverError {
         match self {
             Self::All => DriverError::NoMoreFiles,
-            Self::Exact(_) => DriverError::NoSuchFile,
+            Self::Exact(_) | Self::Wildcard(_) => DriverError::NoSuchFile,
         }
     }
 }
