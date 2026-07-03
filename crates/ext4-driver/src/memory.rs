@@ -30,8 +30,9 @@ fn reserve_failed(error: TryReserveError) -> DriverError {
 
 /// Error returned by owned push operations.
 ///
-/// This keeps ownership of the value on failure. A generic `T` may have a destructor, and dropping
-/// it inside an allocation helper would make allocation failure execute arbitrary destructor code.
+/// This preserves ownership of the value on failure. The helper itself does not drop the value on
+/// allocation failure. The caller must either recover it or intentionally drop the returned
+/// [`PushError`].
 #[must_use]
 pub(crate) enum PushError<T> {
     /// The capacity reservation failed. The value was not inserted.
@@ -73,7 +74,10 @@ pub(crate) struct KernelVec<T, A: Allocator = Global> {
     inner: Vec<T, A>,
 }
 
-/// Default driver vector using the crate-global allocator.
+/// Driver vector using the crate-global allocator.
+///
+/// In driver builds, `Global` is backed by `wdk_alloc::WdkAllocator`, which allocates from
+/// `POOL_FLAG_NON_PAGED`.
 pub(crate) type DriverVec<T> = KernelVec<T, Global>;
 
 impl<T, A> fmt::Debug for KernelVec<T, A>
@@ -275,9 +279,7 @@ where
             return Ok(());
         }
 
-        let additional = new_len
-            .checked_sub(old_len)
-            .ok_or(DriverError::InternalInvariantViolation)?;
+        let additional = new_len.saturating_sub(old_len);
         self.try_reserve_exact(additional)?;
 
         while self.inner.len() < new_len {
@@ -347,10 +349,10 @@ where
     }
 }
 
-/// Allocates one boxed value after allocation has already succeeded.
+/// Allocates one boxed value after the heap slot has already been reserved.
 ///
-/// Prefer this over `boxed_copy` for large values, because the value is constructed only after the
-/// heap slot exists.
+/// `build` is still arbitrary code. This function converts allocation failure and explicit builder
+/// failure into [`DriverError`]; it does not make `build` panic-free.
 /// # Errors
 ///
 /// Returns an error when box allocation fails or `build` returns an error.
@@ -362,4 +364,15 @@ where
     let slot = Box::<T, A>::try_new_uninit_in(allocator).map_err(alloc_failed)?;
     let value = build()?;
     Ok(Box::write(slot, value))
+}
+
+/// Global-allocator version of [`boxed_try_with_in`].
+/// # Errors
+///
+/// Returns an error when box allocation fails or `build` returns an error.
+pub(crate) fn boxed_try_with<T, F>(build: F) -> DriverResult<Box<T>>
+where
+    F: FnOnce() -> DriverResult<T>,
+{
+    boxed_try_with_in(Global, build)
 }

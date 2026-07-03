@@ -171,7 +171,7 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
     let Some(driver_object) = request.file_system_device().driver_object() else {
         return Err(DriverError::InvalidParameter);
     };
-    let vcb = memory::boxed_with(move || vcb)?;
+    let vcb = memory::boxed_try_with(move || Ok(vcb))?;
 
     let mut device = core::ptr::null_mut();
     let extension_size =
