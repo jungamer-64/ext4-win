@@ -62,6 +62,15 @@ pub struct TransactionSymlink {
     id: SymlinkNodeId,
 }
 
+/// How a rename handles an already existing target name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenameTargetCollision {
+    /// The target name must be absent.
+    Reject,
+    /// The target name may be replaced by the source entry.
+    Replace,
+}
+
 impl TransactionSymlink {
     /// Typed inode identifier backing this transaction symlink.
     #[must_use]
