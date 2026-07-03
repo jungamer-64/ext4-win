@@ -196,17 +196,6 @@ fn mount_volume(request: MountVolumeRequest) -> DriverResult<()> {
         return Err(DriverError::InsufficientResources);
     }
 
-    if let Err(error) =
-        MountedVolumeDevice::initialize_vpb_identity(request.vpb().as_non_null(), vcb.as_ref())
-    {
-        unsafe {
-            // SAFETY: `device` was returned by a successful IoCreateDevice call
-            // and has not been published as a mounted volume.
-            ffi::IoDeleteDevice(device);
-        }
-        return Err(error);
-    }
-
     let mounted_device = match MountedVolumeDevice::initialize(
         device,
         vcb,

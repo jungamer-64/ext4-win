@@ -412,7 +412,7 @@ fn set_rename_information(
     let rename = RenameTargetPath::parse(request.target, request.stack.length(), format)?;
 
     let (source_parent, source_name) = match request.opened_file.path() {
-        OpenedPath::Child { parent, name } => (*parent, name.try_clone()?),
+        OpenedPath::Child { parent, name } => (*parent, name.try_to_owned_name()?),
         OpenedPath::Root => return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot)),
     };
 
@@ -982,7 +982,7 @@ fn cleanup_file_object(file_object: KernelFileObject) -> DriverResult<()> {
         return Ok(());
     }
     let (parent, name) = match opened_file.path() {
-        OpenedPath::Child { parent, name } => (*parent, name.try_clone()?),
+        OpenedPath::Child { parent, name } => (*parent, name.try_to_owned_name()?),
         OpenedPath::Root => return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot)),
     };
 
