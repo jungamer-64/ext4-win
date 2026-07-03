@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// Existing target outcome for a replace-capable rename.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingRenameTarget {
+    /// No target entry exists.
+    Absent,
+    /// A distinct target entry was removed from the namespace.
+    Removed,
+    /// The target entry already names the source inode.
+    SameInode,
+}
+
 impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Creates an empty regular file under a directory.
     ///
@@ -274,6 +285,17 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             return Err(Error::CannotRemoveRoot);
         }
         let kind = directory_entry_kind(child_inode.kind());
+        if matches!(target_collision, RenameTargetCollision::Replace) {
+            let existing_target = self.remove_existing_rename_target(
+                target_parent,
+                target_name,
+                source.inode(),
+                child_inode.kind(),
+            )?;
+            if matches!(existing_target, ExistingRenameTarget::SameInode) {
+                return Ok(());
+            }
+        }
 
         if source_parent == target_parent {
             let renamed = self.rename_directory_entry(
@@ -311,6 +333,49 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
         child_raw.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
         self.replace_live_inode(child_index, child_raw)?;
         Ok(())
+    }
+
+    /// Removes the existing target entry for a replace-capable rename.
+    /// # Errors
+    ///
+    /// Returns an error when the target exists with a kind that cannot be replaced by the source
+    /// kind or when the target's deletion policy rejects removal.
+    fn remove_existing_rename_target(
+        &mut self,
+        target_parent: InodeId,
+        target_name: &Ext4Name,
+        source: InodeId,
+        source_kind: InodeKind,
+    ) -> Result<ExistingRenameTarget> {
+        let target = match self.find_child_entry(target_parent, target_name) {
+            Ok(target) => target,
+            Err(Error::DirectoryEntryNotFound) => return Ok(ExistingRenameTarget::Absent),
+            Err(error) => return Err(error),
+        };
+        if target.inode() == source {
+            return Ok(ExistingRenameTarget::SameInode);
+        }
+
+        let target_kind = self.raw_inode_for_policy(target.inode())?.parse()?.kind();
+        let target_parent = TransactionDirectory {
+            id: DirectoryNodeId::new(target_parent),
+        };
+        match (source_kind, target_kind) {
+            (InodeKind::Directory, InodeKind::Directory) => {
+                self.remove_empty_directory(target_parent, target_name)?;
+            }
+            (InodeKind::Directory, InodeKind::File | InodeKind::Symlink)
+            | (InodeKind::File | InodeKind::Symlink, InodeKind::Directory) => {
+                return Err(Error::WrongInodeKind);
+            }
+            (InodeKind::File | InodeKind::Symlink, InodeKind::File) => {
+                self.unlink_file(target_parent, target_name)?;
+            }
+            (InodeKind::File | InodeKind::Symlink, InodeKind::Symlink) => {
+                self.remove_symlink(target_parent, target_name)?;
+            }
+        }
+        Ok(ExistingRenameTarget::Removed)
     }
 
     /// Removes a symbolic link directory entry and releases its inode.

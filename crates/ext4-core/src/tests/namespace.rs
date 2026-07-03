@@ -184,7 +184,13 @@ fn minimal_profile_supports_file_and_namespace_mutations() {
 
         let mut rename = volume.begin_transaction(NOW);
         let root_directory = transaction_directory(&rename, root_id);
-        must(rename.rename_child(root_directory, &old_name, root_directory, &new_name));
+        must(rename.rename_child(
+            root_directory,
+            &old_name,
+            root_directory,
+            &new_name,
+            RenameTargetCollision::Reject,
+        ));
         must(rename.commit());
 
         let mut unlink = volume.begin_transaction(NOW);
@@ -304,7 +310,13 @@ fn rename_file_updates_staged_directory_entry() {
         let old_name = must(Ext4Name::new(b"old"));
         let new_name = must(Ext4Name::new(b"new"));
         let file = must(transaction.create_file(root, &old_name, test_file_metadata()));
-        must(transaction.rename_child(root, &old_name, root, &new_name));
+        must(transaction.rename_child(
+            root,
+            &old_name,
+            root,
+            &new_name,
+            RenameTargetCollision::Reject,
+        ));
         assert_eq!(file.id().inode(), inode(11));
         must(transaction.commit());
 
@@ -331,9 +343,127 @@ fn rename_rejects_existing_target() {
     let source = must(Ext4Name::new(b"file"));
     let target = must(Ext4Name::new(b"target"));
     let _target_file = must(transaction.create_file(root, &target, test_file_metadata()));
-    let result = transaction.rename_child(root, &source, root, &target);
+    let result =
+        transaction.rename_child(root, &source, root, &target, RenameTargetCollision::Reject);
 
     assert_eq!(result, Err(Error::NameAlreadyExists));
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn rename_file_replaces_existing_file_target() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+        let source_name = must(Ext4Name::new(b"source"));
+        let target_name = must(Ext4Name::new(b"target"));
+
+        let mut create = volume.begin_transaction(NOW);
+        let root = transaction_directory(&create, crate::DirectoryNodeId::ROOT);
+        let source = must(create.create_file(root, &source_name, test_file_metadata()));
+        let target = must(create.create_file(root, &target_name, test_file_metadata()));
+        must(create.commit());
+
+        let mut rename = volume.begin_transaction(NOW);
+        let root = transaction_directory(&rename, crate::DirectoryNodeId::ROOT);
+        must(rename.rename_child(
+            root,
+            &source_name,
+            root,
+            &target_name,
+            RenameTargetCollision::Replace,
+        ));
+        must(rename.commit());
+
+        assert_eq!(lookup_ext4_inode(&volume, InodeId::ROOT, b"source"), None);
+        assert_eq!(
+            lookup_ext4_inode(&volume, InodeId::ROOT, b"target"),
+            Some(source.id().inode())
+        );
+        assert_ne!(
+            lookup_ext4_inode(&volume, InodeId::ROOT, b"target"),
+            Some(target.id().inode())
+        );
+    }
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn rename_directory_replaces_empty_directory_target() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+        let source_name = must(Ext4Name::new(b"source-dir"));
+        let target_name = must(Ext4Name::new(b"target-dir"));
+
+        let mut create = volume.begin_transaction(NOW);
+        let root = transaction_directory(&create, crate::DirectoryNodeId::ROOT);
+        let source = must(create.create_directory(root, &source_name, test_directory_metadata()));
+        let target = must(create.create_directory(root, &target_name, test_directory_metadata()));
+        must(create.commit());
+
+        let mut rename = volume.begin_transaction(NOW);
+        let root = transaction_directory(&rename, crate::DirectoryNodeId::ROOT);
+        must(rename.rename_child(
+            root,
+            &source_name,
+            root,
+            &target_name,
+            RenameTargetCollision::Replace,
+        ));
+        must(rename.commit());
+
+        assert_eq!(
+            lookup_ext4_inode(&volume, InodeId::ROOT, b"source-dir"),
+            None
+        );
+        assert_eq!(
+            lookup_ext4_inode(&volume, InodeId::ROOT, b"target-dir"),
+            Some(source.id().inode())
+        );
+        assert_ne!(
+            lookup_ext4_inode(&volume, InodeId::ROOT, b"target-dir"),
+            Some(target.id().inode())
+        );
+    }
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn rename_file_replace_rejects_directory_target() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+    let source_name = must(Ext4Name::new(b"source"));
+    let target_name = must(Ext4Name::new(b"target-dir"));
+
+    let mut create = volume.begin_transaction(NOW);
+    let root = transaction_directory(&create, crate::DirectoryNodeId::ROOT);
+    let _source = must(create.create_file(root, &source_name, test_file_metadata()));
+    let _target = must(create.create_directory(root, &target_name, test_directory_metadata()));
+    must(create.commit());
+
+    let mut rename = volume.begin_transaction(NOW);
+    let root = transaction_directory(&rename, crate::DirectoryNodeId::ROOT);
+    let result = rename.rename_child(
+        root,
+        &source_name,
+        root,
+        &target_name,
+        RenameTargetCollision::Replace,
+    );
+
+    assert_eq!(result, Err(Error::WrongInodeKind));
 }
 
 /// # Panics
@@ -488,7 +618,13 @@ fn rename_directory_across_parents_updates_dotdot() {
         let mut rename = volume.begin_transaction(NOW);
         let root = transaction_directory(&rename, crate::DirectoryNodeId::ROOT);
         let target_parent = transaction_directory(&rename, target_parent_id);
-        must(rename.rename_child(root, &source_name, target_parent, &moved_name));
+        must(rename.rename_child(
+            root,
+            &source_name,
+            target_parent,
+            &moved_name,
+            RenameTargetCollision::Reject,
+        ));
         must(rename.commit());
 
         assert_eq!(lookup_ext4_inode(&volume, InodeId::ROOT, b"a"), None);
@@ -705,7 +841,13 @@ fn indexed_directory_rename_and_unlink_rebuild_htree_consistently() {
 
         let mut rename = volume.begin_transaction(NOW);
         let root = transaction_directory(&rename, crate::DirectoryNodeId::ROOT);
-        must(rename.rename_child(root, &old_name, root, &renamed_name));
+        must(rename.rename_child(
+            root,
+            &old_name,
+            root,
+            &renamed_name,
+            RenameTargetCollision::Reject,
+        ));
         must(rename.commit());
 
         assert_eq!(lookup_ext4_inode(&volume, InodeId::ROOT, b"temp"), None);

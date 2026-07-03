@@ -621,7 +621,13 @@ fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
         let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
         let old_name = must(Ext4Name::new(b"file"));
         let new_name = must(Ext4Name::new(b"renamed"));
-        must(transaction.rename_child(root, &old_name, root, &new_name));
+        must(transaction.rename_child(
+            root,
+            &old_name,
+            root,
+            &new_name,
+            RenameTargetCollision::Reject,
+        ));
         must(transaction.commit());
     }
 
