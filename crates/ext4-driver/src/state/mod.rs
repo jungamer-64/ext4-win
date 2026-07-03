@@ -482,7 +482,7 @@ fn open_file_control_block_in_table(
         return Ok(fcb);
     }
 
-    let mut fcb = memory::boxed_with(|| FileControlBlock::new(volume, node))?;
+    let mut fcb = memory::boxed_try_with(|| Ok(FileControlBlock::new(volume, node)))?;
     let fcb_ptr = NonNull::from(fcb.as_mut());
     table
         .try_push_owned(fcb)

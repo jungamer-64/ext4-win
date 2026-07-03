@@ -156,8 +156,12 @@ fn open_existing_node(
         | CreateDisposition::OverwriteIf
         | CreateDisposition::Supersede => {
             let inode = overwrite_file_inode(node, parameters.target_requirement())?;
-            let handle = memory::boxed_with(|| {
-                OpenedHandle::new(node, path, parameters.close_disposition())
+            let handle = memory::boxed_try_with(|| {
+                Ok(OpenedHandle::new(
+                    node,
+                    path,
+                    parameters.close_disposition(),
+                ))
             })?;
             let fcb = open_shared_file_control_block(
                 request.file_object(),
@@ -238,8 +242,13 @@ fn create_missing_node(
         crate::kernel::time::current_ext4_timestamp()?,
     )?;
     let node = creation.node();
-    let handle =
-        memory::boxed_with(|| OpenedHandle::new(node, path, parameters.close_disposition()))?;
+    let handle = memory::boxed_try_with(|| {
+        Ok(OpenedHandle::new(
+            node,
+            path,
+            parameters.close_disposition(),
+        ))
+    })?;
     let fcb = open_pending_child_file_control_block(
         &mut creation,
         request.file_object(),
@@ -430,7 +439,7 @@ fn initialize_file_object(
     share_access: ShareAccess,
     close_disposition: CloseDisposition,
 ) -> DriverResult<()> {
-    let handle = memory::boxed_with(|| OpenedHandle::new(node, path, close_disposition))?;
+    let handle = memory::boxed_try_with(|| Ok(OpenedHandle::new(node, path, close_disposition)))?;
     let fcb = open_shared_file_control_block(file_object, vcb, node, desired_access, share_access)?;
     attach_preallocated_file_object(file_object, fcb, handle);
     Ok(())
