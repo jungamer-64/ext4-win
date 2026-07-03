@@ -363,26 +363,3 @@ where
     let value = build()?;
     Ok(Box::write(slot, value))
 }
-
-/// Allocates one boxed value after allocation has already succeeded.
-/// # Errors
-///
-/// Returns an error when box allocation fails.
-pub(crate) fn boxed_with_in<T, A, F>(allocator: A, build: F) -> DriverResult<Box<T, A>>
-where
-    A: Allocator,
-    F: FnOnce() -> T,
-{
-    boxed_try_with_in(allocator, || Ok(build()))
-}
-
-/// Global-allocator version of [`boxed_with_in`].
-/// # Errors
-///
-/// Returns an error when box allocation fails.
-pub(crate) fn boxed_with<T, F>(build: F) -> DriverResult<Box<T>>
-where
-    F: FnOnce() -> T,
-{
-    boxed_with_in(Global, build)
-}
