@@ -54,11 +54,11 @@ impl Ext4Name {
         &self.bytes
     }
 
-    /// Copies this ext4 name without using infallible allocation.
+    /// Copies this ext4 name into a new owned name without using infallible allocation.
     /// # Errors
     ///
     /// Returns an error when copying the name bytes cannot allocate.
-    pub fn try_clone(&self) -> Result<Self> {
+    pub fn try_to_owned_name(&self) -> Result<Self> {
         Ok(Self {
             bytes: memory::copied_slice(&self.bytes)?,
         })

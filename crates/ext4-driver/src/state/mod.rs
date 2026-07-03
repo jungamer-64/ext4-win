@@ -6,9 +6,10 @@ use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    DeviceLength, DirectoryNodeId, Ext4Name, FileNodeId, FscryptKeyIdentifier, FscryptKeyPresence,
-    FscryptKeySet, FscryptMasterKey, JournaledVolume, MountContext, NodeId, Result as Ext4Result,
-    SymlinkNodeId,
+    DeviceLength, DirectoryNodeId, Ext4Name, Ext4Timestamp, FileNodeId, FscryptKeyIdentifier,
+    FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, InternalJournal, JournalTransaction,
+    JournaledVolume, MountContext, NewDirectoryMetadata, NewFileMetadata, NodeId,
+    Result as Ext4Result, SymlinkNodeId,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT,
@@ -282,6 +283,15 @@ pub(crate) struct VolumeControlBlock {
     file_control_blocks: DriverVec<Box<FileControlBlock>>,
 }
 
+#[derive(Debug)]
+/// Missing-child node kind selected before an ext4 namespace create transaction starts.
+pub(crate) enum ChildCreationTarget {
+    /// Create a regular file with prebuilt metadata.
+    File(NewFileMetadata),
+    /// Create a directory with prebuilt metadata.
+    Directory(NewDirectoryMetadata),
+}
+
 impl VolumeControlBlock {
     /// Mounts a journaled read-write ext4 VCB.
     /// # Errors
@@ -365,57 +375,157 @@ impl VolumeControlBlock {
             // mounted device extension while processing create/open.
             volume.as_mut()
         };
-        if let Some(mut fcb) = vcb.find_file_control_block(node) {
-            let fcb_ref = unsafe {
-                // SAFETY: FCB pointers in the table are Box allocations owned
-                // by this VCB and remain valid until their open count reaches
-                // zero in `close_file_control_block`.
-                fcb.as_mut()
-            };
-            fcb_ref.add_open_reference()?;
-            return Ok(fcb);
-        }
+        open_file_control_block_in_table(&mut vcb.file_control_blocks, volume, node)
+    }
 
-        let mut fcb = memory::boxed_with(|| FileControlBlock::new(volume, node))?;
-        let fcb_ptr = NonNull::from(fcb.as_mut());
-        vcb.file_control_blocks
-            .try_push_owned(fcb)
-            .map_err(|error| error.into_parts().0)?;
-        Ok(fcb_ptr)
+    /// Starts a missing-child create transaction without committing filesystem state.
+    /// # Errors
+    ///
+    /// Returns an error when the parent cannot be selected, child creation cannot be staged, or
+    /// default metadata is rejected by the mounted ext4 profile.
+    pub(crate) fn begin_child_creation(
+        &mut self,
+        parent: DirectoryNodeId,
+        name: &Ext4Name,
+        target: ChildCreationTarget,
+        now: Ext4Timestamp,
+    ) -> DriverResult<PendingChildCreation<'_>> {
+        let volume = NonNull::from(&mut *self);
+        let Self {
+            volume: mounted_volume,
+            file_control_blocks,
+        } = self;
+        let mut transaction = mounted_volume.begin_transaction(now);
+        let parent = transaction.directory(parent)?;
+        let node = match target {
+            ChildCreationTarget::File(metadata) => {
+                NodeId::File(transaction.create_file(parent, name, metadata)?.id())
+            }
+            ChildCreationTarget::Directory(metadata) => {
+                NodeId::Directory(transaction.create_directory(parent, name, metadata)?.id())
+            }
+        };
+        Ok(PendingChildCreation {
+            transaction,
+            file_control_blocks,
+            volume,
+            node,
+        })
     }
 
     /// Releases one open reference to a VCB-owned FCB.
     fn close_file_control_block(&mut self, fcb: NonNull<FileControlBlock>) {
-        let Some(index) = self
-            .file_control_blocks
-            .iter()
-            .position(|candidate| NonNull::from(candidate.as_ref()) == fcb)
-        else {
-            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-        };
-        let mut fcb = fcb;
-        let fcb_ref = unsafe {
-            // SAFETY: The FCB was found in this VCB's ownership table.
-            fcb.as_mut()
-        };
-        match fcb_ref.release_open_reference() {
-            FileControlBlockRelease::StillOpen => {}
-            FileControlBlockRelease::LastReference => {
-                let Some(removed) = self.file_control_blocks.swap_remove(index) else {
-                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-                };
-                drop(removed);
-            }
-        }
+        close_file_control_block_in_table(&mut self.file_control_blocks, fcb);
+    }
+}
+
+/// In-progress missing-child create transaction that has not reached durable ext4 state.
+#[derive(Debug)]
+pub(crate) struct PendingChildCreation<'a> {
+    /// Staged ext4 namespace mutation.
+    transaction:
+        JournalTransaction<'a, KernelBlockDevice, CngFscryptNonceGenerator, InternalJournal>,
+    /// VCB-owned FCB table, borrowed independently from the mounted ext4 volume.
+    file_control_blocks: &'a mut DriverVec<Box<FileControlBlock>>,
+    /// VCB that owns any FCB opened for the staged node.
+    volume: NonNull<VolumeControlBlock>,
+    /// Node identity allocated by the staged transaction.
+    node: NodeId,
+}
+
+impl PendingChildCreation<'_> {
+    /// Returns the node identity allocated by the staged create transaction.
+    pub(crate) const fn node(&self) -> NodeId {
+        self.node
     }
 
-    /// Finds a VCB-owned FCB by node identity.
-    fn find_file_control_block(&mut self, node: NodeId) -> Option<NonNull<FileControlBlock>> {
-        self.file_control_blocks
-            .iter()
-            .find(|fcb| fcb.node() == node)
-            .map(|fcb| NonNull::from(fcb.as_ref()))
+    /// Opens or reuses the VCB-owned FCB for the staged node.
+    /// # Errors
+    ///
+    /// Returns an error when FCB allocation fails or an existing FCB open count overflows.
+    pub(crate) fn open_file_control_block(&mut self) -> DriverResult<NonNull<FileControlBlock>> {
+        open_file_control_block_in_table(self.file_control_blocks, self.volume, self.node)
     }
+
+    /// Releases one open reference to a VCB-owned FCB while the create is still pending.
+    pub(crate) fn release_file_control_block(&mut self, fcb: NonNull<FileControlBlock>) {
+        close_file_control_block_in_table(self.file_control_blocks, fcb);
+    }
+
+    /// Commits the staged namespace mutation to the mounted ext4 volume.
+    /// # Errors
+    ///
+    /// Returns an error when the journal cannot durably commit the staged mutation.
+    pub(crate) fn commit(self) -> DriverResult<()> {
+        self.transaction.commit()?;
+        Ok(())
+    }
+}
+
+/// Opens or reuses an FCB in a VCB-owned table.
+/// # Errors
+///
+/// Returns an error when FCB allocation fails or an existing FCB open count overflows.
+fn open_file_control_block_in_table(
+    table: &mut DriverVec<Box<FileControlBlock>>,
+    volume: NonNull<VolumeControlBlock>,
+    node: NodeId,
+) -> DriverResult<NonNull<FileControlBlock>> {
+    if let Some(mut fcb) = find_file_control_block_in_table(table, node) {
+        let fcb_ref = unsafe {
+            // SAFETY: FCB pointers in the table are Box allocations owned
+            // by this VCB and remain valid until their open count reaches
+            // zero in `close_file_control_block_in_table`.
+            fcb.as_mut()
+        };
+        fcb_ref.add_open_reference()?;
+        return Ok(fcb);
+    }
+
+    let mut fcb = memory::boxed_with(|| FileControlBlock::new(volume, node))?;
+    let fcb_ptr = NonNull::from(fcb.as_mut());
+    table
+        .try_push_owned(fcb)
+        .map_err(|error| error.into_parts().0)?;
+    Ok(fcb_ptr)
+}
+
+/// Releases one open reference to an FCB in a VCB-owned table.
+fn close_file_control_block_in_table(
+    table: &mut DriverVec<Box<FileControlBlock>>,
+    fcb: NonNull<FileControlBlock>,
+) {
+    let Some(index) = table
+        .iter()
+        .position(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+    else {
+        KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+    };
+    let mut fcb = fcb;
+    let fcb_ref = unsafe {
+        // SAFETY: The FCB was found in this VCB's ownership table.
+        fcb.as_mut()
+    };
+    match fcb_ref.release_open_reference() {
+        FileControlBlockRelease::StillOpen => {}
+        FileControlBlockRelease::LastReference => {
+            let Some(removed) = table.swap_remove(index) else {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+            };
+            drop(removed);
+        }
+    }
+}
+
+/// Finds a VCB-owned FCB by node identity.
+fn find_file_control_block_in_table(
+    table: &mut DriverVec<Box<FileControlBlock>>,
+    node: NodeId,
+) -> Option<NonNull<FileControlBlock>> {
+    table
+        .iter()
+        .find(|fcb| fcb.node() == node)
+        .map(|fcb| NonNull::from(fcb.as_ref()))
 }
 
 /// Windows volume serial number derived from the ext4 filesystem UUID.
@@ -467,6 +577,14 @@ impl MountedVolumeDevice {
         real_device: KernelDevice,
     ) -> DriverResult<Self> {
         let device = KernelDevice::from_raw(device).ok_or(DriverError::InvalidParameter)?;
+        let stack_size = real_device
+            .stack_size()
+            .ok_or(DriverError::InvalidParameter)?
+            .checked_add(1)
+            .ok_or(DriverError::InvalidParameter)?;
+        let mounted_flag = u16::try_from(VPB_MOUNTED).map_err(|_| DriverError::InvalidParameter)?;
+        let serial_number = vcb.serial_number().as_u32();
+        let volume_label = VpbLabel::encode(vcb.volume_label())?;
         let device_object = unsafe {
             // SAFETY: The device was just created by this driver and remains
             // valid during mount initialization.
@@ -482,8 +600,25 @@ impl MountedVolumeDevice {
                 .as_mut()
         }
         .ok_or(DriverError::InvalidParameter)?;
-        Self::initialize_device_object(device, vpb, real_device)?;
+        let vpb = unsafe {
+            // SAFETY: The VPB was supplied by the I/O Manager for this mount
+            // request and is writable during successful mount completion.
+            vpb.as_ptr().as_mut()
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+
+        device_object.Vpb = vpb;
+        device_object.Flags |= DO_DIRECT_IO;
+        device_object.StackSize = stack_size;
+
+        vpb.SerialNumber = serial_number;
+        volume_label.write_to(vpb);
+        vpb.DeviceObject = device.as_ptr();
+        vpb.RealDevice = real_device.as_ptr();
+        vpb.Flags |= mounted_flag;
+
         extension.vcb = Box::into_raw(vcb);
+        device_object.Flags &= !DO_DEVICE_INITIALIZING;
         Ok(Self { device })
     }
 
@@ -511,61 +646,6 @@ impl MountedVolumeDevice {
         NonNull::new(extension.vcb)
     }
 
-    /// Initializes DEVICE_OBJECT and VPB fields after a successful core mount.
-    /// # Errors
-    ///
-    /// Returns an error when the mounted device object, lower-device stack size, or VPB mounted flag
-    /// cannot be represented.
-    fn initialize_device_object(
-        device: KernelDevice,
-        mut vpb: NonNull<wdk_sys::VPB>,
-        real_device: KernelDevice,
-    ) -> DriverResult<()> {
-        let device_object = unsafe {
-            // SAFETY: The mounted device object was created by this driver and
-            // remains valid during mount initialization.
-            device.as_ptr().as_mut()
-        }
-        .ok_or(DriverError::InvalidParameter)?;
-        device_object.Vpb = vpb.as_ptr();
-        device_object.Flags |= DO_DIRECT_IO;
-        device_object.Flags &= !DO_DEVICE_INITIALIZING;
-        device_object.StackSize = real_device
-            .stack_size()
-            .ok_or(DriverError::InvalidParameter)?
-            .checked_add(1)
-            .ok_or(DriverError::InvalidParameter)?;
-
-        let vpb = unsafe {
-            // SAFETY: The VPB was supplied by the I/O Manager for this mount
-            // request and is writable during successful mount completion.
-            vpb.as_mut()
-        };
-        vpb.DeviceObject = device.as_ptr();
-        vpb.RealDevice = real_device.as_ptr();
-        vpb.Flags |= u16::try_from(VPB_MOUNTED).map_err(|_| DriverError::InvalidParameter)?;
-        Ok(())
-    }
-
-    /// Copies VCB-derived identity fields into the VPB.
-    /// # Errors
-    ///
-    /// Returns an error when the VPB pointer is no longer writable or the volume label does not fit
-    /// in the VPB label field.
-    pub(crate) fn initialize_vpb_identity(
-        vpb: NonNull<wdk_sys::VPB>,
-        vcb: &VolumeControlBlock,
-    ) -> DriverResult<()> {
-        let vpb = unsafe {
-            // SAFETY: The VPB belongs to the active mount request and remains
-            // writable until the mount IRP is completed.
-            vpb.as_ptr().as_mut()
-        }
-        .ok_or(DriverError::InvalidParameter)?;
-        vpb.SerialNumber = vcb.serial_number().as_u32();
-        write_vpb_label(vpb, vcb.volume_label())
-    }
-
     /// Refreshes the VPB volume label after a successful label mutation.
     /// # Errors
     ///
@@ -587,34 +667,50 @@ impl MountedVolumeDevice {
             device_object.Vpb.as_mut()
         }
         .ok_or(DriverError::InvalidParameter)?;
-        write_vpb_label(vpb, vcb.volume_label())
+        VpbLabel::encode(vcb.volume_label()).map(|label| label.write_to(vpb))
     }
 }
 
-/// Writes an ext4 label into the UTF-16 VPB label field using one code unit per
-/// ext4 label byte.
-/// # Errors
-///
-/// Returns an error when the ext4 label exceeds the VPB label capacity or the UTF-16 byte length
-/// cannot be represented by the VPB.
-fn write_vpb_label(vpb: &mut wdk_sys::VPB, label: ext4_core::Ext4VolumeLabel) -> DriverResult<()> {
-    vpb.VolumeLabel.fill(0);
-    let bytes = label.bytes();
-    if bytes.len() > vpb.VolumeLabel.len() {
-        return Err(DriverError::InvalidParameter);
+/// Count of UTF-16 code units exposed by WDK VPB::VolumeLabel.
+const VPB_VOLUME_LABEL_UNITS: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// VPB label payload prevalidated before mount publish mutates kernel-visible state.
+struct VpbLabel {
+    /// UTF-16 code units to copy into VPB::VolumeLabel.
+    units: [u16; VPB_VOLUME_LABEL_UNITS],
+    /// Byte length stored in VPB::VolumeLabelLength.
+    byte_len: u16,
+}
+
+impl VpbLabel {
+    /// Encodes an ext4 label into the VPB label layout.
+    /// # Errors
+    ///
+    /// Returns an error when the ext4 label exceeds the VPB label capacity or the UTF-16 byte
+    /// length cannot be represented by the VPB.
+    fn encode(label: ext4_core::Ext4VolumeLabel) -> DriverResult<Self> {
+        let bytes = label.bytes();
+        if bytes.len() > VPB_VOLUME_LABEL_UNITS {
+            return Err(DriverError::InvalidParameter);
+        }
+        let mut units = [0_u16; VPB_VOLUME_LABEL_UNITS];
+        for (target, byte) in units.iter_mut().zip(bytes.iter().copied()) {
+            *target = u16::from(byte);
+        }
+        let wchar_bytes = bytes
+            .len()
+            .checked_mul(core::mem::size_of::<u16>())
+            .ok_or(DriverError::InvalidParameter)?;
+        let byte_len = u16::try_from(wchar_bytes).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(Self { units, byte_len })
     }
-    for (index, byte) in bytes.iter().enumerate() {
-        *vpb.VolumeLabel
-            .get_mut(index)
-            .ok_or(DriverError::InvalidParameter)? = u16::from(*byte);
+
+    /// Writes a prevalidated label into a VPB.
+    fn write_to(self, vpb: &mut wdk_sys::VPB) {
+        vpb.VolumeLabel = self.units;
+        vpb.VolumeLabelLength = self.byte_len;
     }
-    let wchar_bytes = bytes
-        .len()
-        .checked_mul(core::mem::size_of::<u16>())
-        .ok_or(DriverError::InvalidParameter)?;
-    vpb.VolumeLabelLength =
-        u16::try_from(wchar_bytes).map_err(|_| DriverError::InvalidParameter)?;
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -785,7 +881,7 @@ impl OpenedPath {
     pub(crate) fn try_child(parent: DirectoryNodeId, name: &Ext4Name) -> DriverResult<Self> {
         Ok(Self::Child {
             parent,
-            name: name.try_clone()?,
+            name: name.try_to_owned_name()?,
         })
     }
 }

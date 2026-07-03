@@ -18,9 +18,9 @@ use crate::{
     memory::{self, DriverVec},
     request::metadata,
     state::{
-        CloseDisposition, FileControlBlock, KernelDevice, KernelFileObject, MountedVolumeDevice,
-        OpenedHandle, OpenedPath, UninitializedFileObject, VolumeControlBlock,
-        release_file_control_block,
+        ChildCreationTarget, CloseDisposition, FileControlBlock, KernelDevice, KernelFileObject,
+        MountedVolumeDevice, OpenedHandle, OpenedPath, PendingChildCreation,
+        UninitializedFileObject, VolumeControlBlock, release_file_control_block,
     },
 };
 
@@ -204,15 +204,16 @@ fn overwrite_file_inode(
 /// Creates a missing final path component.
 /// # Errors
 ///
-/// Returns an error when the disposition requires an existing name, child creation fails, or the new
-/// file object cannot be initialized.
+/// Returns an error when the disposition requires an existing name, missing-child creation cannot
+/// be staged or committed, or the new file object cannot be initialized.
 fn create_missing_node(
     request: CreateRequest,
-    vcb: NonNull<crate::state::VolumeControlBlock>,
+    mut vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
     parent: DirectoryNodeId,
     name: &Ext4Name,
 ) -> DriverResult<()> {
+    let parameters = request.parameters();
     match disposition {
         CreateDisposition::Create
         | CreateDisposition::OpenIf
@@ -221,16 +222,58 @@ fn create_missing_node(
         CreateDisposition::Open => return Err(DriverError::ObjectNameNotFound),
         CreateDisposition::Overwrite => return Err(DriverError::ObjectNameNotFound),
     }
-    let node = create_child(vcb, parent, name, request.parameters().target_requirement())?;
-    initialize_file_object(
+
+    let path = OpenedPath::try_child(parent, name)?;
+    let target = child_creation_target(parameters.target_requirement())?;
+    let mut creation = unsafe {
+        // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
+        // in the mounted device extension. The pending creation keeps the
+        // mutable borrow until its staged transaction is committed or dropped.
+        vcb.as_mut()
+    }
+    .begin_child_creation(
+        parent,
+        name,
+        target,
+        crate::kernel::time::current_ext4_timestamp()?,
+    )?;
+    let node = creation.node();
+    let handle =
+        memory::boxed_with(|| OpenedHandle::new(node, path, parameters.close_disposition()))?;
+    let fcb = open_pending_child_file_control_block(
+        &mut creation,
         request.file_object(),
-        vcb,
-        node,
-        OpenedPath::try_child(parent, name)?,
-        request.parameters().desired_access(),
-        request.parameters().share_access(),
-        request.parameters().close_disposition(),
-    )
+        parameters.desired_access(),
+        parameters.share_access(),
+    )?;
+
+    match creation.commit() {
+        Ok(()) => {
+            attach_preallocated_file_object(request.file_object(), fcb, handle);
+            Ok(())
+        }
+        Err(error) => {
+            abandon_file_control_block(request.file_object().kernel_file_object(), fcb);
+            Err(error)
+        }
+    }
+}
+
+/// Maps create options to the concrete child kind used for missing-name creation.
+/// # Errors
+///
+/// Returns an error when default metadata cannot be built.
+fn child_creation_target(
+    requirement: CreateTargetRequirement,
+) -> DriverResult<ChildCreationTarget> {
+    match requirement {
+        CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
+            Ok(ChildCreationTarget::File(metadata::default_file_metadata()?))
+        }
+        CreateTargetRequirement::Directory => Ok(ChildCreationTarget::Directory(
+            metadata::default_directory_metadata()?,
+        )),
+    }
 }
 
 /// Validates file-vs-directory options for an existing node.
@@ -340,11 +383,6 @@ fn resolve_path(
     }
 }
 
-/// Creates a file or directory under an existing parent directory.
-/// # Errors
-///
-/// Returns an error when default metadata cannot be built, the parent cannot be selected, creation
-/// fails, or the transaction cannot commit.
 /// Splits the FILE_OBJECT name into validated root-relative Windows components.
 /// # Errors
 ///
@@ -422,6 +460,34 @@ fn open_shared_file_control_block(
         share_access,
     ) {
         release_file_control_block(fcb);
+        return Err(error);
+    }
+
+    Ok(fcb)
+}
+
+/// Opens the staged child FCB and records the create share-access claim before commit.
+/// # Errors
+///
+/// Returns an error when FCB creation fails or Windows share-access checking rejects the new handle.
+fn open_pending_child_file_control_block(
+    creation: &mut PendingChildCreation<'_>,
+    file_object: UninitializedFileObject,
+    desired_access: DesiredAccess,
+    share_access: ShareAccess,
+) -> DriverResult<NonNull<FileControlBlock>> {
+    let mut fcb = creation.open_file_control_block()?;
+    let fcb_ref = unsafe {
+        // SAFETY: The pending creation returned a live owned FCB pointer with
+        // an open reference for this create request.
+        fcb.as_mut()
+    };
+    if let Err(error) = fcb_ref.check_share_access(
+        file_object.kernel_file_object(),
+        desired_access,
+        share_access,
+    ) {
+        creation.release_file_control_block(fcb);
         return Err(error);
     }
 
