@@ -21,7 +21,7 @@ use crate::memory::DriverVec;
 use crate::state::{
     CloseDisposition, DirectoryCursor, FileControlBlock, KernelFileObject, MountedVolumeDevice,
     OpenedDirectory, OpenedHandle, OpenedObject, OpenedPath, OpenedRegularFile, VolumeControlBlock,
-    release_file_control_block,
+    WriteCommitment, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -2062,6 +2062,12 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let file = transaction.file(opened_file.id())?;
     transaction.overwrite_file_range(file, stack.byte_offset(), input.as_slice())?;
     transaction.commit()?;
+    if matches!(
+        opened_file.write_commitment(),
+        WriteCommitment::FlushThrough
+    ) {
+        vcb.flush()?;
+    }
     IrpCompletion::from_usize(input.as_slice().len())
 }
 
@@ -2257,6 +2263,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedPath::Root,
             crate::state::CloseDisposition::Keep,
+            crate::state::WriteCommitment::CommitOnly,
         );
         let mut file_object = wdk_sys::FILE_OBJECT {
             FsContext: core::ptr::addr_of_mut!(fcb).cast(),
@@ -2599,6 +2606,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedPath::Root,
             crate::state::CloseDisposition::Keep,
+            crate::state::WriteCommitment::CommitOnly,
         );
         let mut file_object = wdk_sys::FILE_OBJECT {
             FsContext: core::ptr::addr_of_mut!(fcb).cast(),

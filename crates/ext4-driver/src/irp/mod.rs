@@ -14,6 +14,7 @@ use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{
     CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
+    WriteCommitment,
 };
 
 /// Completion priority boost for IRPs that should not adjust thread priority.
@@ -2443,6 +2444,8 @@ pub(crate) struct CreateParameters {
     target_requirement: CreateTargetRequirement,
     /// Cleanup-time lifecycle requested by create options.
     close_disposition: CloseDisposition,
+    /// Write completion durability requested by create options.
+    write_commitment: WriteCommitment,
     /// Extended-attribute input length supplied with create.
     ea_length: IrpBufferLength,
 }
@@ -2466,6 +2469,7 @@ impl CreateParameters {
             disposition: CreateDisposition::from_options(options)?,
             target_requirement: create_options.target_requirement(),
             close_disposition: create_options.close_disposition(),
+            write_commitment: create_options.write_commitment(),
             ea_length,
         })
     }
@@ -2493,6 +2497,11 @@ impl CreateParameters {
     /// Returns the cleanup-time lifecycle requested at create/open.
     pub(crate) const fn close_disposition(self) -> CloseDisposition {
         self.close_disposition
+    }
+
+    /// Returns write completion durability requested by create options.
+    pub(crate) const fn write_commitment(self) -> WriteCommitment {
+        self.write_commitment
     }
 
     /// Returns the input EA length.
@@ -2618,6 +2627,8 @@ struct CreateOptions {
     target_requirement: CreateTargetRequirement,
     /// Requested cleanup-time lifecycle.
     close_disposition: CloseDisposition,
+    /// Requested write completion durability.
+    write_commitment: WriteCommitment,
 }
 
 impl CreateOptions {
@@ -2635,9 +2646,15 @@ impl CreateOptions {
         } else {
             CloseDisposition::Keep
         };
+        let write_commitment = if create_option_selected(options, wdk_sys::FILE_WRITE_THROUGH) {
+            WriteCommitment::FlushThrough
+        } else {
+            WriteCommitment::CommitOnly
+        };
         Ok(Self {
             target_requirement: CreateTargetRequirement::from_options(options)?,
             close_disposition,
+            write_commitment,
         })
     }
 
@@ -2649,6 +2666,11 @@ impl CreateOptions {
     /// Returns the decoded cleanup-time lifecycle.
     const fn close_disposition(self) -> CloseDisposition {
         self.close_disposition
+    }
+
+    /// Returns decoded write completion durability.
+    const fn write_commitment(self) -> WriteCommitment {
+        self.write_commitment
     }
 }
 
@@ -2674,8 +2696,10 @@ const CREATE_DISPOSITION_SHIFT: u32 = 24;
 /// Mask for option bits below the create disposition.
 const CREATE_OPTIONS_MASK: wdk_sys::ULONG = 0x00FF_FFFF;
 /// Create options with an ext4win-internal domain meaning.
-const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG =
-    wdk_sys::FILE_DIRECTORY_FILE | wdk_sys::FILE_NON_DIRECTORY_FILE | wdk_sys::FILE_DELETE_ON_CLOSE;
+const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_DIRECTORY_FILE
+    | wdk_sys::FILE_NON_DIRECTORY_FILE
+    | wdk_sys::FILE_DELETE_ON_CLOSE
+    | wdk_sys::FILE_WRITE_THROUGH;
 /// Create options consumed as Windows boundary hints.
 const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONLY
     | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING
@@ -3113,6 +3137,7 @@ mod tests {
     };
     use crate::state::{
         CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
+        WriteCommitment,
     };
 
     /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
@@ -3716,6 +3741,7 @@ mod tests {
             SecurityContext: core::ptr::addr_of_mut!(security_context),
             Options: (FILE_OPEN_IF_DISPOSITION << CREATE_DISPOSITION_SHIFT)
                 | wdk_sys::FILE_NON_DIRECTORY_FILE
+                | wdk_sys::FILE_WRITE_THROUGH
                 | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT
                 | wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT,
             __bindgen_padding_0: [0; 2],
@@ -3744,6 +3770,7 @@ mod tests {
                     CreateTargetRequirement::NonDirectory
                 );
                 assert_eq!(parameters.close_disposition(), CloseDisposition::Keep);
+                assert_eq!(parameters.write_commitment(), WriteCommitment::FlushThrough);
                 assert_eq!(
                     parameters.share_access().as_ulong(),
                     wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE
@@ -3785,6 +3812,7 @@ mod tests {
                     CreateTargetRequirement::Directory
                 );
                 assert_eq!(parameters.close_disposition(), CloseDisposition::Delete);
+                assert_eq!(parameters.write_commitment(), WriteCommitment::CommitOnly);
             }
         }
     }
