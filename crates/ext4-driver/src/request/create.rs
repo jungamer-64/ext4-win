@@ -11,8 +11,9 @@ use wdk_sys::FILE_OBJECT;
 
 use crate::{
     irp::{
-        CreateDisposition, CreateParameters, CreateStack, CreateTargetRequirement,
-        CreateTransferBuffering, DesiredAccess, DispatchTarget, IrpCompletion, ShareAccess,
+        CreateDisposition, CreateParameters, CreateStack, CreateSynchronizationMode,
+        CreateTargetRequirement, CreateTransferBuffering, DesiredAccess, DispatchTarget,
+        IrpCompletion, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
@@ -143,6 +144,8 @@ struct CreateHandlePolicy {
     write_commitment: WriteCommitment,
     /// Data transfer buffering policy stored on the opened handle.
     data_transfer_mode: DataTransferMode,
+    /// FILE_OBJECT flags projected from create options.
+    file_object_flags: CreateFileObjectFlags,
 }
 
 impl CreateHandlePolicy {
@@ -151,6 +154,7 @@ impl CreateHandlePolicy {
     ///
     /// Returns an error when requested transfer buffering cannot be satisfied by the mounted device.
     fn from_parameters(parameters: CreateParameters, device: KernelDevice) -> DriverResult<Self> {
+        let file_object_flags = CreateFileObjectFlags::from_parameters(parameters);
         Ok(Self {
             desired_access: parameters.desired_access(),
             share_access: parameters.share_access(),
@@ -164,6 +168,7 @@ impl CreateHandlePolicy {
                     DataTransferMode::NoIntermediate(NoIntermediateTransfer::from_device(device)?)
                 }
             },
+            file_object_flags,
         })
     }
 
@@ -190,6 +195,49 @@ impl CreateHandlePolicy {
     /// Returns data transfer buffering policy.
     const fn data_transfer_mode(self) -> DataTransferMode {
         self.data_transfer_mode
+    }
+
+    /// Returns FILE_OBJECT flags projected from create options.
+    const fn file_object_flags(self) -> CreateFileObjectFlags {
+        self.file_object_flags
+    }
+}
+
+/// FILE_OBJECT flags selected by create options.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CreateFileObjectFlags {
+    /// Raw WDK `FILE_OBJECT::Flags` bits.
+    raw: wdk_sys::ULONG,
+}
+
+impl CreateFileObjectFlags {
+    /// Projects FILE_OBJECT flags from decoded create parameters.
+    const fn from_parameters(parameters: CreateParameters) -> Self {
+        let mut raw = 0;
+        if matches!(parameters.write_commitment(), WriteCommitment::FlushThrough) {
+            raw |= wdk_sys::FO_WRITE_THROUGH;
+        }
+        if matches!(
+            parameters.transfer_buffering(),
+            CreateTransferBuffering::NoIntermediate
+        ) {
+            raw |= wdk_sys::FO_NO_INTERMEDIATE_BUFFERING;
+        }
+        match parameters.synchronization_mode() {
+            CreateSynchronizationMode::Asynchronous => {}
+            CreateSynchronizationMode::SynchronousAlert => {
+                raw |= wdk_sys::FO_SYNCHRONOUS_IO | wdk_sys::FO_ALERTABLE_IO;
+            }
+            CreateSynchronizationMode::SynchronousNonAlert => {
+                raw |= wdk_sys::FO_SYNCHRONOUS_IO;
+            }
+        }
+        Self { raw }
+    }
+
+    /// Applies the selected flags to the FILE_OBJECT being opened.
+    fn apply_to(self, file_object: &mut FILE_OBJECT) {
+        file_object.Flags |= self.raw;
     }
 }
 
@@ -371,7 +419,12 @@ fn open_existing_node(
             )?;
             match truncate_existing_file(vcb, inode) {
                 Ok(()) => {
-                    attach_preallocated_file_object(request.file_object(), fcb, handle);
+                    attach_preallocated_file_object(
+                        request.file_object(),
+                        fcb,
+                        handle,
+                        policy.file_object_flags(),
+                    );
                     Ok(())
                 }
                 Err(error) => {
@@ -462,7 +515,12 @@ fn create_missing_node(
 
     match creation.commit() {
         Ok(()) => {
-            attach_preallocated_file_object(request.file_object(), fcb, handle);
+            attach_preallocated_file_object(
+                request.file_object(),
+                fcb,
+                handle,
+                policy.file_object_flags(),
+            );
             Ok(())
         }
         Err(error) => {
@@ -634,7 +692,7 @@ fn initialize_file_object(
         policy.desired_access(),
         policy.share_access(),
     )?;
-    attach_preallocated_file_object(file_object, fcb, handle);
+    attach_preallocated_file_object(file_object, fcb, handle, policy.file_object_flags());
     Ok(())
 }
 
@@ -701,12 +759,14 @@ fn attach_preallocated_file_object(
     file_object: UninitializedFileObject,
     fcb: NonNull<FileControlBlock>,
     handle: Box<OpenedHandle>,
+    file_object_flags: CreateFileObjectFlags,
 ) {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is
         // writable during successful create processing.
         file_object.as_mut()
     };
+    file_object_flags.apply_to(file_object);
     file_object.FsContext = fcb.as_ptr().cast::<c_void>();
     file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
 }
@@ -725,6 +785,50 @@ fn abandon_file_control_block(file_object: KernelFileObject, mut fcb: NonNull<Fi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_FILE_OPEN_DISPOSITION_OPTIONS: wdk_sys::ULONG = 1 << 24;
+
+    /// Decodes create parameters through the dispatch boundary.
+    /// # Errors
+    ///
+    /// Returns an error when the fixed test stack cannot be decoded as a create/open request.
+    fn decoded_create_parameters(
+        options: wdk_sys::ULONG,
+        desired_access: wdk_sys::ACCESS_MASK,
+    ) -> DriverResult<CreateParameters> {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        let mut irp = wdk_sys::IRP::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
+            DesiredAccess: desired_access,
+            ..wdk_sys::IO_SECURITY_CONTEXT::default()
+        };
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: TEST_FILE_OPEN_DISPOSITION_OPTIONS | options,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+        irp.Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+
+        Ok(DispatchTarget::decode(
+            core::ptr::addr_of_mut!(device),
+            core::ptr::addr_of_mut!(irp),
+        )?
+        .current_stack()?
+        .create()?
+        .parameters())
+    }
 
     fn file_object_with_name(units: &mut [u16]) -> FILE_OBJECT {
         let Ok(byte_len) = u16::try_from(core::mem::size_of_val(units)) else {
@@ -747,6 +851,65 @@ mod tests {
     ) {
         file_object.FsContext = core::ptr::addr_of_mut!(*fcb).cast();
         file_object.FsContext2 = core::ptr::addr_of_mut!(*handle).cast();
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_file_object_flags_project_write_transfer_and_synchronization_modes() {
+        let parameters = decoded_create_parameters(
+            wdk_sys::FILE_WRITE_THROUGH
+                | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING
+                | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT,
+            wdk_sys::FILE_READ_DATA | wdk_sys::SYNCHRONIZE,
+        );
+        assert!(parameters.is_ok());
+        if let Ok(parameters) = parameters {
+            let flags = CreateFileObjectFlags::from_parameters(parameters);
+
+            assert_eq!(
+                flags.raw,
+                wdk_sys::FO_WRITE_THROUGH
+                    | wdk_sys::FO_NO_INTERMEDIATE_BUFFERING
+                    | wdk_sys::FO_SYNCHRONOUS_IO
+                    | wdk_sys::FO_ALERTABLE_IO
+            );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_file_object_flags_project_nonalert_synchronous_io() {
+        let parameters =
+            decoded_create_parameters(wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT, wdk_sys::SYNCHRONIZE);
+        assert!(parameters.is_ok());
+        if let Ok(parameters) = parameters {
+            let flags = CreateFileObjectFlags::from_parameters(parameters);
+
+            assert_eq!(flags.raw, wdk_sys::FO_SYNCHRONOUS_IO);
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_file_object_flags_apply_preserves_existing_flags() {
+        let existing = wdk_sys::FO_HANDLE_CREATED;
+        let mut file_object = FILE_OBJECT {
+            Flags: existing,
+            ..FILE_OBJECT::default()
+        };
+
+        CreateFileObjectFlags {
+            raw: wdk_sys::FO_SYNCHRONOUS_IO,
+        }
+        .apply_to(&mut file_object);
+
+        assert_eq!(file_object.Flags, existing | wdk_sys::FO_SYNCHRONOUS_IO);
     }
 
     /// # Panics

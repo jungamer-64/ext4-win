@@ -2463,6 +2463,8 @@ pub(crate) struct CreateParameters {
     write_commitment: WriteCommitment,
     /// Data transfer buffering requested by create options.
     transfer_buffering: CreateTransferBuffering,
+    /// Per-handle synchronous I/O mode requested by create options.
+    synchronization_mode: CreateSynchronizationMode,
     /// Extended-attribute input length supplied with create.
     ea_length: IrpBufferLength,
 }
@@ -2489,6 +2491,7 @@ impl CreateParameters {
             close_disposition: create_options.close_disposition(),
             write_commitment: create_options.write_commitment(),
             transfer_buffering: create_options.transfer_buffering(),
+            synchronization_mode: create_options.synchronization_mode(),
             ea_length,
         })
     }
@@ -2526,6 +2529,11 @@ impl CreateParameters {
     /// Returns data transfer buffering requested at create/open.
     pub(crate) const fn transfer_buffering(self) -> CreateTransferBuffering {
         self.transfer_buffering
+    }
+
+    /// Returns synchronous I/O mode requested at create/open.
+    pub(crate) const fn synchronization_mode(self) -> CreateSynchronizationMode {
+        self.synchronization_mode
     }
 
     /// Returns the input EA length.
@@ -2641,6 +2649,45 @@ pub(crate) enum CreateTransferBuffering {
     NoIntermediate,
 }
 
+/// Requested per-handle synchronous I/O mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateSynchronizationMode {
+    /// No synchronous file-position context was requested.
+    Asynchronous,
+    /// Synchronous I/O with alertable waits.
+    SynchronousAlert,
+    /// Synchronous I/O with non-alertable waits.
+    SynchronousNonAlert,
+}
+
+impl CreateSynchronizationMode {
+    /// Decodes synchronous I/O create options.
+    /// # Errors
+    ///
+    /// Returns an error when both synchronous modes are set or `SYNCHRONIZE` access is absent.
+    fn from_options(options: wdk_sys::ULONG, desired_access: DesiredAccess) -> DriverResult<Self> {
+        let alert = create_option_selected(options, wdk_sys::FILE_SYNCHRONOUS_IO_ALERT);
+        let nonalert = create_option_selected(options, wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT);
+        match (alert, nonalert) {
+            (true, true) => Err(DriverError::InvalidParameter),
+            (true, false) => Self::synchronized(desired_access, Self::SynchronousAlert),
+            (false, true) => Self::synchronized(desired_access, Self::SynchronousNonAlert),
+            (false, false) => Ok(Self::Asynchronous),
+        }
+    }
+
+    /// Returns a synchronous mode after validating the access mask.
+    /// # Errors
+    ///
+    /// Returns an error when the caller omitted `SYNCHRONIZE`.
+    fn synchronized(desired_access: DesiredAccess, mode: Self) -> DriverResult<Self> {
+        if !desired_access.contains(wdk_sys::SYNCHRONIZE) {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(mode)
+    }
+}
+
 impl CreateTargetRequirement {
     /// Decodes file-vs-directory create options.
     /// # Errors
@@ -2669,6 +2716,8 @@ struct CreateOptions {
     write_commitment: WriteCommitment,
     /// Requested data transfer buffering.
     transfer_buffering: CreateTransferBuffering,
+    /// Requested synchronous I/O mode.
+    synchronization_mode: CreateSynchronizationMode,
 }
 
 impl CreateOptions {
@@ -2690,6 +2739,8 @@ impl CreateOptions {
             } else {
                 CreateTransferBuffering::IntermediateAllowed
             };
+        let synchronization_mode =
+            CreateSynchronizationMode::from_options(options, desired_access)?;
         let close_disposition = if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
             CloseDisposition::Delete
         } else {
@@ -2707,6 +2758,7 @@ impl CreateOptions {
             close_disposition,
             write_commitment,
             transfer_buffering,
+            synchronization_mode,
         })
     }
 
@@ -2728,6 +2780,11 @@ impl CreateOptions {
     /// Returns decoded data transfer buffering.
     const fn transfer_buffering(self) -> CreateTransferBuffering {
         self.transfer_buffering
+    }
+
+    /// Returns decoded synchronous I/O mode.
+    const fn synchronization_mode(self) -> CreateSynchronizationMode {
+        self.synchronization_mode
     }
 }
 
@@ -2757,7 +2814,9 @@ const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_DIRECTORY_FILE
     | wdk_sys::FILE_NON_DIRECTORY_FILE
     | wdk_sys::FILE_DELETE_ON_CLOSE
     | wdk_sys::FILE_WRITE_THROUGH
-    | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING;
+    | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING
+    | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT
+    | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT;
 /// Create options consumed as Windows boundary hints.
 const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONLY
     | wdk_sys::FILE_COMPLETE_IF_OPLOCKED
@@ -3180,8 +3239,8 @@ mod tests {
     use wdk_sys::{STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
 
     use super::{
-        CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateTargetRequirement,
-        CreateTransferBuffering, CurrentIrpStackLocation, DeviceIrpQueue,
+        CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateSynchronizationMode,
+        CreateTargetRequirement, CreateTransferBuffering, CurrentIrpStackLocation, DeviceIrpQueue,
         DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
         DirectoryInformationClass, DirectoryPatternInput, DispatchTarget, EaEntryEmission,
         EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
@@ -3783,7 +3842,8 @@ mod tests {
     #[test]
     fn create_stack_preserves_access_share_options_and_ea_length() {
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
-        let desired_access = wdk_sys::FILE_READ_DATA | wdk_sys::FILE_WRITE_DATA;
+        let desired_access =
+            wdk_sys::FILE_READ_DATA | wdk_sys::FILE_WRITE_DATA | wdk_sys::SYNCHRONIZE;
         let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
             DesiredAccess: desired_access,
             ..wdk_sys::IO_SECURITY_CONTEXT::default()
@@ -3831,6 +3891,10 @@ mod tests {
                     CreateTransferBuffering::IntermediateAllowed
                 );
                 assert_eq!(
+                    parameters.synchronization_mode(),
+                    CreateSynchronizationMode::SynchronousNonAlert
+                );
+                assert_eq!(
                     parameters.share_access().as_ulong(),
                     wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE
                 );
@@ -3876,6 +3940,10 @@ mod tests {
                     parameters.transfer_buffering(),
                     CreateTransferBuffering::IntermediateAllowed
                 );
+                assert_eq!(
+                    parameters.synchronization_mode(),
+                    CreateSynchronizationMode::Asynchronous
+                );
             }
         }
     }
@@ -3914,7 +3982,118 @@ mod tests {
                     CreateTransferBuffering::NoIntermediate
                 );
                 assert_eq!(parameters.write_commitment(), WriteCommitment::FlushThrough);
+                assert_eq!(
+                    parameters.synchronization_mode(),
+                    CreateSynchronizationMode::Asynchronous
+                );
             }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_stack_decodes_alertable_synchronous_io() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
+            DesiredAccess: wdk_sys::SYNCHRONIZE,
+            ..wdk_sys::IO_SECURITY_CONTEXT::default()
+        };
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let create = current.create();
+            assert!(create.is_ok());
+            if let Ok(create) = create {
+                assert_eq!(
+                    create.parameters().synchronization_mode(),
+                    CreateSynchronizationMode::SynchronousAlert
+                );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_stack_rejects_synchronous_io_without_synchronize_access() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
+            DesiredAccess: wdk_sys::FILE_READ_DATA,
+            ..wdk_sys::IO_SECURITY_CONTEXT::default()
+        };
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            assert_eq!(
+                current
+                    .create()
+                    .err()
+                    .map(crate::kernel::status::DriverError::ntstatus),
+                Some(STATUS_INVALID_PARAMETER)
+            );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_stack_rejects_conflicting_synchronous_io_modes() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
+            DesiredAccess: wdk_sys::SYNCHRONIZE,
+            ..wdk_sys::IO_SECURITY_CONTEXT::default()
+        };
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT
+                | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            assert_eq!(
+                current
+                    .create()
+                    .err()
+                    .map(crate::kernel::status::DriverError::ntstatus),
+                Some(STATUS_INVALID_PARAMETER)
+            );
         }
     }
 
