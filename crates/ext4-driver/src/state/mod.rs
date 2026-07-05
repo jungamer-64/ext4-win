@@ -63,6 +63,162 @@ impl KernelDevice {
         }?;
         Some(device.StackSize)
     }
+
+    /// Returns the device transfer buffer alignment advertised by the I/O Manager.
+    /// # Errors
+    ///
+    /// Returns an error when the device object is invalid or its alignment mask is malformed.
+    pub(crate) fn transfer_buffer_alignment(self) -> DriverResult<TransferBufferAlignment> {
+        let device = unsafe {
+            // SAFETY: `self` is a non-null DEVICE_OBJECT pointer decoded at the
+            // driver boundary and is only read for AlignmentRequirement propagation.
+            self.as_ptr().as_ref()
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        TransferBufferAlignment::from_requirement_mask(device.AlignmentRequirement)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Required alignment for direct transfer buffers.
+pub(crate) struct TransferBufferAlignment {
+    /// WDK alignment mask, where `0` means byte-aligned and `511` means 512-byte aligned.
+    mask: usize,
+    /// Original WDK alignment mask.
+    raw_mask: wdk_sys::ULONG,
+}
+
+impl TransferBufferAlignment {
+    /// Decodes a WDK `DEVICE_OBJECT::AlignmentRequirement` mask.
+    /// # Errors
+    ///
+    /// Returns an error when the mask cannot represent a power-of-two byte alignment.
+    fn from_requirement_mask(raw_mask: wdk_sys::ULONG) -> DriverResult<Self> {
+        let mask = usize::try_from(raw_mask).map_err(|_| DriverError::InvalidParameter)?;
+        let alignment = mask.checked_add(1).ok_or(DriverError::InvalidParameter)?;
+        if !alignment.is_power_of_two() {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(Self { mask, raw_mask })
+    }
+
+    /// Returns whether `address` satisfies this transfer-buffer alignment.
+    fn accepts(self, address: NonNull<u8>) -> bool {
+        address.as_ptr().cast_const().addr() & self.mask == 0
+    }
+
+    /// Returns the raw WDK alignment mask.
+    const fn as_mask(self) -> wdk_sys::ULONG {
+        self.raw_mask
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Byte multiple required for no-intermediate file ranges.
+pub(crate) struct TransferSectorSize {
+    /// Sector byte count exposed by this filesystem.
+    bytes: u32,
+}
+
+impl TransferSectorSize {
+    /// Sector size currently reported through `FileFs*SizeInformation`.
+    pub(crate) const WINDOWS_REPORTED: Self = Self { bytes: 512 };
+
+    /// Returns the sector size in bytes.
+    pub(crate) const fn as_u32(self) -> u32 {
+        self.bytes
+    }
+
+    /// Returns whether `value` is an integral sector multiple.
+    /// # Errors
+    ///
+    /// Returns an error when the sector byte count cannot be represented as a native `usize`.
+    fn divides(self, value: usize) -> DriverResult<bool> {
+        let bytes = usize::try_from(self.bytes).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(value.is_multiple_of(bytes))
+    }
+
+    /// Returns whether `value` is an integral sector multiple.
+    fn divides_u64(self, value: u64) -> bool {
+        value.is_multiple_of(u64::from(self.bytes))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Concrete constraints for a handle opened without intermediate buffering.
+pub(crate) struct NoIntermediateTransfer {
+    /// Sector multiple required for read/write ranges.
+    sector_size: TransferSectorSize,
+    /// Buffer alignment required by the mounted storage stack.
+    buffer_alignment: TransferBufferAlignment,
+}
+
+impl NoIntermediateTransfer {
+    /// Builds no-intermediate transfer constraints from the mounted device boundary.
+    /// # Errors
+    ///
+    /// Returns an error when the mounted device cannot expose a valid transfer alignment.
+    pub(crate) fn from_device(device: KernelDevice) -> DriverResult<Self> {
+        Ok(Self {
+            sector_size: TransferSectorSize::WINDOWS_REPORTED,
+            buffer_alignment: device.transfer_buffer_alignment()?,
+        })
+    }
+
+    /// Validates one read/write byte range.
+    /// # Errors
+    ///
+    /// Returns an error when the offset or length is not sector-aligned.
+    fn validate_range(self, byte_offset: u64, byte_count: usize) -> DriverResult<()> {
+        if !self.sector_size.divides_u64(byte_offset) || !self.sector_size.divides(byte_count)? {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(())
+    }
+
+    /// Validates one transfer buffer address.
+    /// # Errors
+    ///
+    /// Returns an error when the buffer does not satisfy the device alignment.
+    fn validate_buffer(self, address: NonNull<u8>) -> DriverResult<()> {
+        if !self.buffer_alignment.accepts(address) {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Per-handle data transfer buffering policy.
+pub(crate) enum DataTransferMode {
+    /// The filesystem may use ordinary intermediate buffering behavior.
+    IntermediateAllowed,
+    /// Every non-empty transfer must satisfy no-intermediate-buffering constraints.
+    NoIntermediate(NoIntermediateTransfer),
+}
+
+impl DataTransferMode {
+    /// Validates one read/write byte range for this handle.
+    /// # Errors
+    ///
+    /// Returns an error when no-intermediate buffering requires stricter alignment.
+    pub(crate) fn validate_range(self, byte_offset: u64, byte_count: usize) -> DriverResult<()> {
+        match self {
+            Self::IntermediateAllowed => Ok(()),
+            Self::NoIntermediate(transfer) => transfer.validate_range(byte_offset, byte_count),
+        }
+    }
+
+    /// Validates a non-empty transfer buffer for this handle.
+    /// # Errors
+    ///
+    /// Returns an error when no-intermediate buffering requires stricter alignment.
+    pub(crate) fn validate_buffer(self, address: NonNull<u8>) -> DriverResult<()> {
+        match self {
+            Self::IntermediateAllowed => Ok(()),
+            Self::NoIntermediate(transfer) => transfer.validate_buffer(address),
+        }
+    }
 }
 
 /// Non-null kernel file object pointer at the WDK boundary.
@@ -713,6 +869,7 @@ impl MountedVolumeDevice {
             .ok_or(DriverError::InvalidParameter)?
             .checked_add(1)
             .ok_or(DriverError::InvalidParameter)?;
+        let transfer_alignment = real_device.transfer_buffer_alignment()?;
         let mounted_flag = u16::try_from(VPB_MOUNTED).map_err(|_| DriverError::InvalidParameter)?;
         let serial_number = vcb.serial_number().as_u32();
         let volume_label = VpbLabel::encode(vcb.volume_label())?;
@@ -748,6 +905,7 @@ impl MountedVolumeDevice {
         device_object.Vpb = vpb;
         device_object.Flags |= DO_DIRECT_IO;
         device_object.StackSize = stack_size;
+        device_object.AlignmentRequirement = transfer_alignment.as_mask();
 
         vpb.SerialNumber = serial_number;
         volume_label.write_to(vpb);
@@ -1073,6 +1231,8 @@ pub(crate) struct OpenedHandleState {
     close_disposition: CloseDisposition,
     /// Write completion durability requested for this handle.
     write_commitment: WriteCommitment,
+    /// Data transfer buffering policy requested for this handle.
+    data_transfer_mode: DataTransferMode,
 }
 
 impl OpenedHandleState {
@@ -1081,11 +1241,13 @@ impl OpenedHandleState {
         path: OpenedPath,
         close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
+        data_transfer_mode: DataTransferMode,
     ) -> Self {
         Self {
             path,
             close_disposition,
             write_commitment,
+            data_transfer_mode,
         }
     }
 
@@ -1107,6 +1269,11 @@ impl OpenedHandleState {
     /// Returns write completion durability requested for this handle.
     const fn write_commitment(&self) -> WriteCommitment {
         self.write_commitment
+    }
+
+    /// Returns data transfer buffering policy requested at create/open.
+    const fn data_transfer_mode(&self) -> DataTransferMode {
+        self.data_transfer_mode
     }
 
     /// Replaces the requested close disposition.
@@ -1145,8 +1312,15 @@ impl OpenedHandle {
         path: OpenedPath,
         close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
+        data_transfer_mode: DataTransferMode,
     ) -> Self {
-        Self::from_parts(node, path, close_disposition, write_commitment)
+        Self::from_parts(
+            node,
+            path,
+            close_disposition,
+            write_commitment,
+            data_transfer_mode,
+        )
     }
 
     /// Creates per-handle state from explicit lifecycle fields.
@@ -1155,8 +1329,14 @@ impl OpenedHandle {
         path: OpenedPath,
         close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
+        data_transfer_mode: DataTransferMode,
     ) -> Self {
-        let state = OpenedHandleState::new(path, close_disposition, write_commitment);
+        let state = OpenedHandleState::new(
+            path,
+            close_disposition,
+            write_commitment,
+            data_transfer_mode,
+        );
         let kind = match node {
             NodeId::File(_) => OpenedHandleKind::File,
             NodeId::Directory(_) => OpenedHandleKind::Directory {
@@ -1175,6 +1355,11 @@ impl OpenedHandle {
     /// Returns write completion durability requested for this handle.
     const fn write_commitment(&self) -> WriteCommitment {
         self.state.write_commitment()
+    }
+
+    /// Returns data transfer buffering policy requested for this handle.
+    const fn data_transfer_mode(&self) -> DataTransferMode {
+        self.state.data_transfer_mode()
     }
 
     /// Returns the opened path identity.
@@ -1287,6 +1472,11 @@ impl OpenedObject {
         self.handle().write_commitment()
     }
 
+    /// Returns data transfer buffering policy requested for this opened handle.
+    pub(crate) fn data_transfer_mode(&self) -> DataTransferMode {
+        self.handle().data_transfer_mode()
+    }
+
     /// Replaces the requested close disposition.
     pub(crate) fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
         self.mutable_handle()
@@ -1384,6 +1574,11 @@ impl OpenedRegularFile {
     /// Returns write completion durability requested for this regular-file handle.
     pub(crate) fn write_commitment(&self) -> WriteCommitment {
         self.opened.write_commitment()
+    }
+
+    /// Returns data transfer buffering policy requested for this regular-file handle.
+    pub(crate) fn data_transfer_mode(&self) -> DataTransferMode {
+        self.opened.data_transfer_mode()
     }
 }
 
@@ -1525,9 +1720,10 @@ mod tests {
     use crate::kernel::status::DriverError;
 
     use super::{
-        CloseDisposition, ControlDeviceExtension, FileControlBlock, FileControlBlockRelease,
-        KernelDevice, KernelFileObject, MountedVolumeDevice, OpenedDirectory, OpenedHandle,
-        OpenedHandleKind, OpenedObject, OpenedPath, OpenedRegularFile, OpenedSymlink,
+        CloseDisposition, ControlDeviceExtension, DataTransferMode, FileControlBlock,
+        FileControlBlockRelease, KernelDevice, KernelFileObject, MountedVolumeDevice,
+        NoIntermediateTransfer, OpenedDirectory, OpenedHandle, OpenedHandleKind, OpenedObject,
+        OpenedPath, OpenedRegularFile, OpenedSymlink, TransferBufferAlignment, TransferSectorSize,
         UninitializedFileObject, VolumeControlBlock, WriteCommitment,
     };
 
@@ -1574,6 +1770,83 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    fn kernel_device_decodes_transfer_alignment_requirement() {
+        let mut device = wdk_sys::DEVICE_OBJECT {
+            AlignmentRequirement: wdk_sys::FILE_512_BYTE_ALIGNMENT,
+            ..wdk_sys::DEVICE_OBJECT::default()
+        };
+        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device));
+        assert!(device.is_some());
+        let Some(device) = device else {
+            return;
+        };
+
+        let alignment = device.transfer_buffer_alignment();
+        assert!(alignment.is_ok());
+        if let Ok(alignment) = alignment {
+            assert_eq!(alignment.as_mask(), wdk_sys::FILE_512_BYTE_ALIGNMENT);
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn no_intermediate_transfer_validates_range_and_buffer_alignment() {
+        let buffer_alignment =
+            TransferBufferAlignment::from_requirement_mask(wdk_sys::FILE_QUAD_ALIGNMENT);
+        assert!(buffer_alignment.is_ok());
+        let Ok(buffer_alignment) = buffer_alignment else {
+            return;
+        };
+        let mode = DataTransferMode::NoIntermediate(NoIntermediateTransfer {
+            sector_size: TransferSectorSize::WINDOWS_REPORTED,
+            buffer_alignment,
+        });
+
+        assert_eq!(mode.validate_range(512, 1024), Ok(()));
+        assert_eq!(
+            mode.validate_range(1, 1024),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            mode.validate_range(512, 1),
+            Err(DriverError::InvalidParameter)
+        );
+
+        let mut bytes = [0_u8; 32];
+        let base = bytes.as_mut_ptr().addr();
+        let aligned_delta = (8 - (base & 7)) & 7;
+        let aligned_ptr = unsafe {
+            // SAFETY: `aligned_delta` is at most 7 and the local buffer has 32 bytes.
+            bytes.as_mut_ptr().add(aligned_delta)
+        };
+        let aligned = NonNull::new(aligned_ptr);
+        assert!(aligned.is_some());
+        let Some(aligned) = aligned else {
+            return;
+        };
+        let misaligned_ptr = unsafe {
+            // SAFETY: `aligned_delta + 1` is at most 8 and the local buffer has 32 bytes.
+            bytes.as_mut_ptr().add(aligned_delta + 1)
+        };
+        let misaligned = NonNull::new(misaligned_ptr);
+        assert!(misaligned.is_some());
+        let Some(misaligned) = misaligned else {
+            return;
+        };
+
+        assert_eq!(mode.validate_buffer(aligned), Ok(()));
+        assert_eq!(
+            mode.validate_buffer(misaligned),
+            Err(DriverError::InvalidParameter)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
     fn kernel_file_object_rejects_null_raw_pointer() {
         assert_eq!(KernelFileObject::from_raw(core::ptr::null_mut()), None);
     }
@@ -1608,6 +1881,7 @@ mod tests {
             OpenedPath::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -1650,6 +1924,7 @@ mod tests {
             OpenedPath::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -1683,6 +1958,7 @@ mod tests {
             OpenedPath::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -1717,6 +1993,7 @@ mod tests {
             OpenedPath::Root,
             CloseDisposition::Keep,
             WriteCommitment::FlushThrough,
+            DataTransferMode::IntermediateAllowed,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -1738,6 +2015,49 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    fn opened_object_preserves_data_transfer_mode() {
+        let buffer_alignment =
+            TransferBufferAlignment::from_requirement_mask(wdk_sys::FILE_QUAD_ALIGNMENT);
+        assert!(buffer_alignment.is_ok());
+        let Ok(buffer_alignment) = buffer_alignment else {
+            return;
+        };
+        let transfer = NoIntermediateTransfer {
+            sector_size: TransferSectorSize::WINDOWS_REPORTED,
+            buffer_alignment,
+        };
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedPath::Root,
+            CloseDisposition::Keep,
+            WriteCommitment::CommitOnly,
+            DataTransferMode::NoIntermediate(transfer),
+        );
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        let opened = OpenedObject::decode(file_object);
+        assert!(opened.is_ok());
+        if let Ok(opened) = opened {
+            assert_eq!(
+                opened.data_transfer_mode(),
+                DataTransferMode::NoIntermediate(transfer)
+            );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
     fn opened_object_symlink_conversion_updates_fcb_and_handle_together() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
@@ -1746,6 +2066,7 @@ mod tests {
             OpenedPath::Root,
             CloseDisposition::Delete,
             WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
