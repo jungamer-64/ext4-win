@@ -2677,8 +2677,7 @@ const CREATE_OPTIONS_MASK: wdk_sys::ULONG = 0x00FF_FFFF;
 const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG =
     wdk_sys::FILE_DIRECTORY_FILE | wdk_sys::FILE_NON_DIRECTORY_FILE | wdk_sys::FILE_DELETE_ON_CLOSE;
 /// Create options consumed as Windows boundary hints.
-const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_WRITE_THROUGH
-    | wdk_sys::FILE_SEQUENTIAL_ONLY
+const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONLY
     | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING
     | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT
     | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT
