@@ -11,9 +11,9 @@ use wdk_sys::FILE_OBJECT;
 
 use crate::{
     irp::{
-        CreateDisposition, CreateParameters, CreateStack, CreateSynchronizationMode,
-        CreateTargetRequirement, CreateTransferBuffering, DesiredAccess, DispatchTarget,
-        IrpCompletion, ShareAccess,
+        CreateDisposition, CreateParameters, CreateReparsePointMode, CreateStack,
+        CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering, DesiredAccess,
+        DispatchTarget, IrpCompletion, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
@@ -390,6 +390,7 @@ fn open_existing_node(
     path: OpenedPath,
 ) -> DriverResult<()> {
     let parameters = request.parameters();
+    validate_existing_reparse_point_mode(node, parameters.reparse_point_mode())?;
     let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
@@ -564,6 +565,27 @@ fn validate_existing_node_options(
             return Err(DriverError::ObjectTypeMismatch);
         }
         CreateTargetRequirement::Directory | CreateTargetRequirement::NonDirectory => {}
+    }
+    Ok(())
+}
+
+/// Validates reparse-point open semantics for an existing final path component.
+/// # Errors
+///
+/// Returns an error when the caller requested normal target resolution for a symlink, which this
+/// FSD does not yet complete as a reparse redirect.
+fn validate_existing_reparse_point_mode(
+    node: NodeId,
+    mode: CreateReparsePointMode,
+) -> DriverResult<()> {
+    if matches!(
+        (node, mode),
+        (
+            NodeId::Symlink(_),
+            CreateReparsePointMode::ResolveFinalTarget
+        )
+    ) {
+        return Err(DriverError::NotSupported);
     }
     Ok(())
 }
@@ -853,6 +875,16 @@ mod tests {
         file_object.FsContext2 = core::ptr::addr_of_mut!(*handle).cast();
     }
 
+    fn fabricated_symlink_node() -> NodeId {
+        let symlink = unsafe {
+            // SAFETY: `SymlinkNodeId` is an opaque identity wrapper. These
+            // tests never send the fabricated id into ext4-core; they only
+            // exercise create-option branching over the already-typed node kind.
+            core::mem::zeroed()
+        };
+        NodeId::Symlink(symlink)
+    }
+
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
@@ -910,6 +942,41 @@ mod tests {
         .apply_to(&mut file_object);
 
         assert_eq!(file_object.Flags, existing | wdk_sys::FO_SYNCHRONOUS_IO);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn existing_reparse_point_mode_rejects_unresolved_symlink() {
+        assert_eq!(
+            validate_existing_reparse_point_mode(
+                fabricated_symlink_node(),
+                CreateReparsePointMode::ResolveFinalTarget
+            ),
+            Err(DriverError::NotSupported)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn existing_reparse_point_mode_accepts_opened_symlink_and_normal_directory() {
+        assert_eq!(
+            validate_existing_reparse_point_mode(
+                fabricated_symlink_node(),
+                CreateReparsePointMode::OpenFinalReparsePoint
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_existing_reparse_point_mode(
+                NodeId::Directory(DirectoryNodeId::ROOT),
+                CreateReparsePointMode::ResolveFinalTarget
+            ),
+            Ok(())
+        );
     }
 
     /// # Panics

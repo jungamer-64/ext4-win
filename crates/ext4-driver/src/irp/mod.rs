@@ -2465,6 +2465,8 @@ pub(crate) struct CreateParameters {
     transfer_buffering: CreateTransferBuffering,
     /// Per-handle synchronous I/O mode requested by create options.
     synchronization_mode: CreateSynchronizationMode,
+    /// Reparse-point opening mode requested by create options.
+    reparse_point_mode: CreateReparsePointMode,
     /// Extended-attribute input length supplied with create.
     ea_length: IrpBufferLength,
 }
@@ -2492,6 +2494,7 @@ impl CreateParameters {
             write_commitment: create_options.write_commitment(),
             transfer_buffering: create_options.transfer_buffering(),
             synchronization_mode: create_options.synchronization_mode(),
+            reparse_point_mode: create_options.reparse_point_mode(),
             ea_length,
         })
     }
@@ -2534,6 +2537,11 @@ impl CreateParameters {
     /// Returns synchronous I/O mode requested at create/open.
     pub(crate) const fn synchronization_mode(self) -> CreateSynchronizationMode {
         self.synchronization_mode
+    }
+
+    /// Returns reparse-point opening mode requested at create/open.
+    pub(crate) const fn reparse_point_mode(self) -> CreateReparsePointMode {
+        self.reparse_point_mode
     }
 
     /// Returns the input EA length.
@@ -2688,6 +2696,26 @@ impl CreateSynchronizationMode {
     }
 }
 
+/// Requested reparse-point handling for an existing final path component.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateReparsePointMode {
+    /// Use normal reparse processing for final reparse points.
+    ResolveFinalTarget,
+    /// Open the final reparse point itself.
+    OpenFinalReparsePoint,
+}
+
+impl CreateReparsePointMode {
+    /// Decodes reparse-point create options.
+    const fn from_options(options: wdk_sys::ULONG) -> Self {
+        if create_option_selected(options, wdk_sys::FILE_OPEN_REPARSE_POINT) {
+            Self::OpenFinalReparsePoint
+        } else {
+            Self::ResolveFinalTarget
+        }
+    }
+}
+
 impl CreateTargetRequirement {
     /// Decodes file-vs-directory create options.
     /// # Errors
@@ -2718,6 +2746,8 @@ struct CreateOptions {
     transfer_buffering: CreateTransferBuffering,
     /// Requested synchronous I/O mode.
     synchronization_mode: CreateSynchronizationMode,
+    /// Requested reparse-point handling.
+    reparse_point_mode: CreateReparsePointMode,
 }
 
 impl CreateOptions {
@@ -2741,6 +2771,7 @@ impl CreateOptions {
             };
         let synchronization_mode =
             CreateSynchronizationMode::from_options(options, desired_access)?;
+        let reparse_point_mode = CreateReparsePointMode::from_options(options);
         let close_disposition = if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
             CloseDisposition::Delete
         } else {
@@ -2759,6 +2790,7 @@ impl CreateOptions {
             write_commitment,
             transfer_buffering,
             synchronization_mode,
+            reparse_point_mode,
         })
     }
 
@@ -2785,6 +2817,11 @@ impl CreateOptions {
     /// Returns decoded synchronous I/O mode.
     const fn synchronization_mode(self) -> CreateSynchronizationMode {
         self.synchronization_mode
+    }
+
+    /// Returns decoded reparse-point handling.
+    const fn reparse_point_mode(self) -> CreateReparsePointMode {
+        self.reparse_point_mode
     }
 }
 
@@ -2816,7 +2853,8 @@ const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_DIRECTORY_FILE
     | wdk_sys::FILE_WRITE_THROUGH
     | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING
     | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT
-    | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT;
+    | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT
+    | wdk_sys::FILE_OPEN_REPARSE_POINT;
 /// Create options consumed as Windows boundary hints.
 const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONLY
     | wdk_sys::FILE_COMPLETE_IF_OPLOCKED
@@ -3238,15 +3276,16 @@ mod tests {
     use wdk_sys::{STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
 
     use super::{
-        CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateSynchronizationMode,
-        CreateTargetRequirement, CreateTransferBuffering, CurrentIrpStackLocation, DeviceIrpQueue,
-        DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
-        DirectoryInformationClass, DirectoryPatternInput, DispatchTarget, EaEntryEmission,
-        EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
-        FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
-        IrpCompletion, KernelIrp, QueryFileInformationClass, QueryVolumeInformationClass,
-        QueueWorkerState, ReceivedIrp, STATUS_CANCELLED, SecurityComponentSelection,
-        SetFileInformationClass, SetVolumeInformationClass,
+        CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateReparsePointMode,
+        CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering,
+        CurrentIrpStackLocation, DeviceIrpQueue, DirectoryControlMinorFunction,
+        DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
+        DirectoryPatternInput, DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection,
+        FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION, FileSystemControlMinorFunction,
+        FsControlCode, InformationLength, IrpBufferLength, IrpCompletion, KernelIrp,
+        QueryFileInformationClass, QueryVolumeInformationClass, QueueWorkerState, ReceivedIrp,
+        STATUS_CANCELLED, SecurityComponentSelection, SetFileInformationClass,
+        SetVolumeInformationClass,
     };
     use crate::state::{
         CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
@@ -3894,6 +3933,10 @@ mod tests {
                     CreateSynchronizationMode::SynchronousNonAlert
                 );
                 assert_eq!(
+                    parameters.reparse_point_mode(),
+                    CreateReparsePointMode::ResolveFinalTarget
+                );
+                assert_eq!(
                     parameters.share_access().as_ulong(),
                     wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE
                 );
@@ -3943,6 +3986,10 @@ mod tests {
                     parameters.synchronization_mode(),
                     CreateSynchronizationMode::Asynchronous
                 );
+                assert_eq!(
+                    parameters.reparse_point_mode(),
+                    CreateReparsePointMode::ResolveFinalTarget
+                );
             }
         }
     }
@@ -3984,6 +4031,43 @@ mod tests {
                 assert_eq!(
                     parameters.synchronization_mode(),
                     CreateSynchronizationMode::Asynchronous
+                );
+                assert_eq!(
+                    parameters.reparse_point_mode(),
+                    CreateReparsePointMode::ResolveFinalTarget
+                );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_stack_decodes_open_reparse_point() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_OPEN_REPARSE_POINT,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let create = current.create();
+            assert!(create.is_ok());
+            if let Ok(create) = create {
+                assert_eq!(
+                    create.parameters().reparse_point_mode(),
+                    CreateReparsePointMode::OpenFinalReparsePoint
                 );
             }
         }
