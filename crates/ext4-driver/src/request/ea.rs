@@ -1,8 +1,8 @@
 //! Windows extended-attribute IRP handling.
 
 use crate::irp::{
-    DispatchTarget, EaEntryEmission, EaNameSelection, IrpBufferLength, IrpCompletion, QueryEaStack,
-    SetEaStack,
+    DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection, IrpBufferLength, IrpCompletion,
+    QueryEaStack, SetEaStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
@@ -283,6 +283,8 @@ enum WindowsEaSelection {
     All,
     /// Return only the requested names.
     Names(DriverVec<WindowsEaName>),
+    /// Return persisted EAs starting at a one-based EA index.
+    Index(EaEntryIndex),
 }
 
 /// Performs an EA query against mounted ext4 xattrs.
@@ -331,7 +333,7 @@ fn collect_query_entries(
     stack: QueryEaStack,
 ) -> DriverResult<DriverVec<WindowsEaRecord>> {
     let entries = load_windows_eas(opened_file)?;
-    match requested_ea_names(stack)? {
+    match requested_eas(stack)? {
         WindowsEaSelection::All => Ok(entries),
         WindowsEaSelection::Names(names) => {
             let mut selected = DriverVec::new();
@@ -344,6 +346,7 @@ fn collect_query_entries(
             }
             Ok(selected)
         }
+        WindowsEaSelection::Index(index) => indexed_ea_entries(entries, index),
     }
 }
 
@@ -449,10 +452,10 @@ fn parse_set_ea_entries(
 /// # Errors
 ///
 /// Returns an error when the caller's EA-name selection buffer is malformed.
-fn requested_ea_names(stack: QueryEaStack) -> DriverResult<WindowsEaSelection> {
-    match stack.name_selection() {
-        EaNameSelection::All => Ok(WindowsEaSelection::All),
-        EaNameSelection::Names { address, length } => {
+fn requested_eas(stack: QueryEaStack) -> DriverResult<WindowsEaSelection> {
+    match stack.selection() {
+        EaSelection::All => Ok(WindowsEaSelection::All),
+        EaSelection::Names { address, length } => {
             let bytes = unsafe {
                 // SAFETY: QueryEa supplies EaList/EaListLength as a kernel-addressable
                 // input list for the lifetime of this dispatch callback.
@@ -460,7 +463,44 @@ fn requested_ea_names(stack: QueryEaStack) -> DriverResult<WindowsEaSelection> {
             };
             parse_get_ea_list(bytes).map(WindowsEaSelection::Names)
         }
+        EaSelection::Index(index) => Ok(WindowsEaSelection::Index(index)),
     }
+}
+
+/// Selects EA entries starting at a caller-supplied one-based index.
+/// # Errors
+///
+/// Returns an error when the requested index is zero, beyond the enumerating end, or does not
+/// identify an existing EA entry.
+fn indexed_ea_entries(
+    entries: DriverVec<WindowsEaRecord>,
+    index: EaEntryIndex,
+) -> DriverResult<DriverVec<WindowsEaRecord>> {
+    let requested = usize::try_from(index.as_u32()).map_err(|_| DriverError::InvalidParameter)?;
+    if requested == 0 || entries.is_empty() {
+        return Err(DriverError::NonexistentEaEntry);
+    }
+    let start = requested
+        .checked_sub(1)
+        .ok_or(DriverError::InvalidParameter)?;
+    if start == entries.len() {
+        return Err(DriverError::NoMoreEas);
+    }
+    if start > entries.len() {
+        return Err(DriverError::NonexistentEaEntry);
+    }
+
+    let mut selected = DriverVec::new();
+    for entry in entries
+        .as_slice()
+        .get(start..)
+        .ok_or(DriverError::InvalidParameter)?
+    {
+        selected
+            .try_push_owned(entry.try_clone()?)
+            .map_err(|error| error.into_parts().0)?;
+    }
+    Ok(selected)
 }
 
 /// Parses a FILE_FULL_EA_INFORMATION list.
@@ -747,14 +787,16 @@ mod tests {
     use core::ffi::c_void;
 
     use crate::{
-        irp::DispatchTarget,
+        irp::{DispatchTarget, EaEntryIndex},
         kernel::status::DriverError,
+        memory::DriverVec,
         wire::{LittleEndianInput, LittleEndianOutput},
     };
 
     use super::{
-        CreateEa, WindowsEaName, WindowsEaRecord, WindowsEaValue, pack_full_ea_entries,
-        parse_full_ea_list, parse_get_ea_list, wire_offset, xattr_name_from_ea_name,
+        CreateEa, WindowsEaName, WindowsEaRecord, WindowsEaValue, indexed_ea_entries,
+        pack_full_ea_entries, parse_full_ea_list, parse_get_ea_list, wire_offset,
+        xattr_name_from_ea_name,
     };
 
     /// Builds a create dispatch target carrying one EA system buffer.
@@ -793,6 +835,47 @@ mod tests {
         )
     }
 
+    /// Builds a DriverVec of sample EA records.
+    /// # Panics
+    ///
+    /// Panics when fixed test fixture values cannot be represented.
+    fn sample_ea_records() -> DriverVec<WindowsEaRecord> {
+        let alpha = WindowsEaName::new(b"alpha");
+        let beta = WindowsEaName::new(b"beta");
+        let gamma = WindowsEaName::new(b"gamma");
+        let one = WindowsEaValue::new(b"one");
+        let two = WindowsEaValue::new(b"two");
+        let three = WindowsEaValue::new(b"three");
+        assert!(alpha.is_ok());
+        assert!(beta.is_ok());
+        assert!(gamma.is_ok());
+        assert!(one.is_ok());
+        assert!(two.is_ok());
+        assert!(three.is_ok());
+        let (Ok(alpha), Ok(beta), Ok(gamma), Ok(one), Ok(two), Ok(three)) =
+            (alpha, beta, gamma, one, two, three)
+        else {
+            return DriverVec::new();
+        };
+        let mut entries = DriverVec::new();
+        assert!(
+            entries
+                .try_push_owned(WindowsEaRecord::new(alpha, one))
+                .is_ok()
+        );
+        assert!(
+            entries
+                .try_push_owned(WindowsEaRecord::new(beta, two))
+                .is_ok()
+        );
+        assert!(
+            entries
+                .try_push_owned(WindowsEaRecord::new(gamma, three))
+                .is_ok()
+        );
+        entries
+    }
+
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
@@ -827,6 +910,42 @@ mod tests {
         if let Ok(parsed) = parsed {
             assert_eq!(parsed.as_slice(), entries.as_slice());
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn indexed_ea_entries_selects_one_based_suffix() {
+        let entries = sample_ea_records();
+        let selected = indexed_ea_entries(entries, EaEntryIndex::from_u32(2));
+        assert!(selected.is_ok());
+        if let Ok(selected) = selected {
+            let expected = sample_ea_records();
+            assert_eq!(
+                selected.as_slice(),
+                expected.as_slice().get(1..).unwrap_or(&[])
+            );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn indexed_ea_entries_rejects_non_entry_indexes() {
+        assert_eq!(
+            indexed_ea_entries(sample_ea_records(), EaEntryIndex::from_u32(0)),
+            Err(DriverError::NonexistentEaEntry)
+        );
+        assert_eq!(
+            indexed_ea_entries(sample_ea_records(), EaEntryIndex::from_u32(4)),
+            Err(DriverError::NoMoreEas)
+        );
+        assert_eq!(
+            indexed_ea_entries(sample_ea_records(), EaEntryIndex::from_u32(5)),
+            Err(DriverError::NonexistentEaEntry)
+        );
     }
 
     /// # Panics
