@@ -2702,7 +2702,6 @@ const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_DIRECTORY_FILE
     | wdk_sys::FILE_WRITE_THROUGH;
 /// Create options consumed as Windows boundary hints.
 const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONLY
-    | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING
     | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT
     | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT
     | wdk_sys::FILE_COMPLETE_IF_OPLOCKED
