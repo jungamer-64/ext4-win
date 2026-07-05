@@ -308,16 +308,12 @@ struct DaclPermissionBuilder {
 }
 
 impl DaclPermissionBuilder {
-    /// Stores one parsed permission class.
+    /// Stores or merges one parsed permission class.
     /// # Errors
     ///
-    /// Returns an error when the DACL contains duplicate ACEs for the same POSIX permission class.
+    /// Returns an error when the permission class cannot be stored.
     fn set(&mut self, class: PermissionClass, bits: PosixRwxBits) -> DriverResult<()> {
-        if self.classes.iter().any(|entry| entry.class == class) {
-            return Err(DriverError::NotSupported);
-        }
-        self.classes.try_push(PermissionClassBits { class, bits })?;
-        Ok(())
+        self.merge_or_insert(class, bits)
     }
 
     /// Converts parsed classes into POSIX rwx mode bits.
