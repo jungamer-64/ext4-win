@@ -2825,7 +2825,6 @@ const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONL
     | wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT
     | wdk_sys::FILE_NO_COMPRESSION
     | wdk_sys::FILE_DISALLOW_EXCLUSIVE
-    | wdk_sys::FILE_OPEN_REPARSE_POINT
     | wdk_sys::FILE_OPEN_NO_RECALL
     | wdk_sys::FILE_OPEN_FOR_FREE_SPACE_QUERY;
 /// Create options accepted by this FSD boundary.
