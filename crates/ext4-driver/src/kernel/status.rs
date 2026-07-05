@@ -47,6 +47,10 @@ pub(crate) enum DriverError {
     EaListInconsistent,
     /// Opened node has no extended attributes.
     NoEasOnFile,
+    /// EA enumeration reached the end of the EA list.
+    NoMoreEas,
+    /// Caller supplied an EA index that does not identify an EA entry.
+    NonexistentEaEntry,
     /// EA payload is too large for the Windows EA boundary.
     EaTooLarge,
     /// Create target already exists where creation requires absence.
@@ -91,6 +95,8 @@ impl DriverError {
             Self::InvalidEaName => STATUS_INVALID_EA_NAME,
             Self::EaListInconsistent => STATUS_EA_LIST_INCONSISTENT,
             Self::NoEasOnFile => STATUS_NO_EAS_ON_FILE,
+            Self::NoMoreEas => ntstatus(0x8000_0012),
+            Self::NonexistentEaEntry => ntstatus(0xC000_0051),
             Self::EaTooLarge => STATUS_EA_TOO_LARGE,
             Self::ObjectNameCollision => STATUS_OBJECT_NAME_COLLISION,
             Self::ObjectNameNotFound => STATUS_OBJECT_NAME_NOT_FOUND,
@@ -220,6 +226,21 @@ mod tests {
         assert_eq!(
             DriverError::from(Error::UnsupportedVerity).ntstatus(),
             STATUS_NOT_SUPPORTED
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when EA status mappings drift.
+    #[test]
+    fn ea_query_errors_map_to_ea_statuses() {
+        assert_eq!(
+            DriverError::NoMoreEas.ntstatus(),
+            super::ntstatus(0x8000_0012)
+        );
+        assert_eq!(
+            DriverError::NonexistentEaEntry.ntstatus(),
+            super::ntstatus(0xC000_0051)
         );
     }
 

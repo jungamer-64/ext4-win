@@ -3105,7 +3105,7 @@ mod tests {
         CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateTargetRequirement,
         CurrentIrpStackLocation, DeviceIrpQueue, DirectoryControlMinorFunction,
         DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
-        DirectoryPatternInput, DispatchTarget, EaEntryEmission, EaNameSelection,
+        DirectoryPatternInput, DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection,
         FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION, FileSystemControlMinorFunction,
         FsControlCode, InformationLength, IrpBufferLength, IrpCompletion, KernelIrp,
         QueryFileInformationClass, QueryVolumeInformationClass, QueueWorkerState, ReceivedIrp,
@@ -3831,13 +3831,14 @@ mod tests {
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
         let ea_list = NonNull::<u8>::dangling();
         stack.FileObject = file_object.as_ptr();
-        stack.Flags = u8::try_from(wdk_sys::SL_RETURN_SINGLE_ENTRY).unwrap_or(u8::MAX);
+        stack.Flags = u8::try_from(wdk_sys::SL_RETURN_SINGLE_ENTRY | wdk_sys::SL_INDEX_SPECIFIED)
+            .unwrap_or(u8::MAX);
         stack.Parameters.QueryEa = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_11 {
             Length: 128,
             EaList: ea_list.as_ptr().cast(),
             EaListLength: 24,
             __bindgen_padding_0: 0,
-            EaIndex: 0,
+            EaIndex: 3,
         };
 
         let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
@@ -3853,8 +3854,8 @@ mod tests {
                 assert_eq!(query.entry_emission(), EaEntryEmission::Single);
                 assert_eq!(query.length().as_usize(), 128);
                 assert_eq!(
-                    query.name_selection(),
-                    EaNameSelection::Names {
+                    query.selection(),
+                    EaSelection::Names {
                         address: ea_list,
                         length: super::IrpBufferLength(24),
                     }
@@ -3867,7 +3868,7 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn query_ea_stack_rejects_index_selection_at_decode() {
+    fn query_ea_stack_decodes_index_selection() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
         stack.FileObject = file_object.as_ptr();
@@ -3877,19 +3878,17 @@ mod tests {
             EaList: core::ptr::null_mut(),
             EaListLength: 0,
             __bindgen_padding_0: 0,
-            EaIndex: 0,
+            EaIndex: 3,
         };
 
         let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
         assert!(current.is_ok());
         if let Ok(current) = current {
-            assert_eq!(
-                current
-                    .query_ea()
-                    .err()
-                    .map(crate::kernel::status::DriverError::ntstatus),
-                Some(STATUS_NOT_SUPPORTED)
-            );
+            let query = current.query_ea();
+            assert!(query.is_ok());
+            if let Ok(query) = query {
+                assert_eq!(query.selection(), EaSelection::Index(EaEntryIndex(3)));
+            }
         }
     }
 
