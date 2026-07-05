@@ -298,6 +298,11 @@ impl PosixRwxBits {
     const fn as_u16(self) -> u16 {
         self.0
     }
+
+    /// Returns the union of two rwx bit sets.
+    const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 /// Duplicate-checking builder for POSIX permission bits parsed from a DACL.
@@ -314,6 +319,21 @@ impl DaclPermissionBuilder {
     /// Returns an error when the permission class cannot be stored.
     fn set(&mut self, class: PermissionClass, bits: PosixRwxBits) -> DriverResult<()> {
         self.merge_or_insert(class, bits)
+    }
+
+    /// Merges `bits` into an existing class or appends a new class entry.
+    /// # Errors
+    ///
+    /// Returns an error when appending a new class cannot allocate.
+    fn merge_or_insert(&mut self, class: PermissionClass, bits: PosixRwxBits) -> DriverResult<()> {
+        for entry in self.classes.as_mut_slice() {
+            if entry.class == class {
+                entry.bits = entry.bits.union(bits);
+                return Ok(());
+            }
+        }
+        self.classes.try_push(PermissionClassBits { class, bits })?;
+        Ok(())
     }
 
     /// Converts parsed classes into POSIX rwx mode bits.
@@ -1086,14 +1106,15 @@ mod tests {
     use crate::{
         irp::{SecurityComponentSelection, SecuritySelection},
         kernel::status::DriverError,
-        wire::LittleEndianInput,
+        memory::DriverVec,
+        wire::{LittleEndianInput, LittleEndianOutput},
     };
 
     use super::{
-        PosixRwxBits, SecurityDescriptorControl, SecurityDescriptorOffset, SidIdentity,
-        WindowsAccessMask, dacl_from_permissions, gid_sid, permission_bits_from_mask,
-        permission_class_mask, security_descriptor, security_from_descriptor, sid_identity,
-        uid_sid, wire_offset,
+        AllowAce, PosixRwxBits, SecurityDescriptorControl, SecurityDescriptorOffset, SidIdentity,
+        WindowsAccessMask, append_allow_ace, dacl_from_permissions, everyone_sid, gid_sid,
+        parse_dacl_permissions, permission_bits_from_mask, permission_class_mask,
+        security_descriptor, security_from_descriptor, sid_identity, uid_sid, wire_offset,
     };
 
     fn all_security_components() -> SecuritySelection {
@@ -1110,6 +1131,51 @@ mod tests {
             SecurityComponentSelection::Omitted,
             SecurityComponentSelection::Selected,
         )
+    }
+
+    /// Builds a DACL where the owner permissions are split across two allow ACEs.
+    /// # Errors
+    ///
+    /// Returns an error when fixed fixture ACL fields cannot be encoded.
+    fn split_owner_dacl() -> Result<DriverVec<u8>, DriverError> {
+        let mut acl = DriverVec::try_repeated_copy(0, super::ACL_HEADER_BYTES)?;
+        append_allow_ace(
+            &mut acl,
+            &AllowAce {
+                mask: permission_class_mask(0o4),
+                sid: uid_sid(1000)?,
+            },
+        )?;
+        append_allow_ace(
+            &mut acl,
+            &AllowAce {
+                mask: permission_class_mask(0o2),
+                sid: uid_sid(1000)?,
+            },
+        )?;
+        append_allow_ace(
+            &mut acl,
+            &AllowAce {
+                mask: permission_class_mask(0o5),
+                sid: gid_sid(100)?,
+            },
+        )?;
+        append_allow_ace(
+            &mut acl,
+            &AllowAce {
+                mask: permission_class_mask(0o1),
+                sid: everyone_sid()?,
+            },
+        )?;
+        let acl_len = u16::try_from(acl.len()).map_err(|_| DriverError::InvalidParameter)?;
+        let mut output = LittleEndianOutput::new(acl.as_mut_slice());
+        output.write_u8(
+            wire_offset(0),
+            u8::try_from(wdk_sys::ACL_REVISION).map_err(|_| DriverError::InvalidParameter)?,
+        )?;
+        output.write_u16(wire_offset(super::ACL_SIZE_OFFSET), acl_len)?;
+        output.write_u16(wire_offset(super::ACL_ACE_COUNT_OFFSET), 4)?;
+        Ok(acl)
     }
 
     /// # Panics
@@ -1177,6 +1243,19 @@ mod tests {
                 assert_eq!(fields.read_u16(wire_offset(34)), Ok(24));
                 assert_eq!(fields.read_u16(wire_offset(58)), Ok(20));
             }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn split_allow_aces_for_one_class_are_merged() {
+        let owner = Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(100));
+        let dacl = split_owner_dacl();
+        assert!(dacl.is_ok());
+        if let Ok(dacl) = dacl {
+            assert_eq!(parse_dacl_permissions(dacl.as_slice(), owner), Ok(0o651));
         }
     }
 
