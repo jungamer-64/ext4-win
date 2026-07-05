@@ -2695,7 +2695,9 @@ impl CreateOptions {
         } else {
             CloseDisposition::Keep
         };
-        let write_commitment = if create_option_selected(options, wdk_sys::FILE_WRITE_THROUGH) {
+        let write_commitment = if create_option_selected(options, wdk_sys::FILE_WRITE_THROUGH)
+            || matches!(transfer_buffering, CreateTransferBuffering::NoIntermediate)
+        {
             WriteCommitment::FlushThrough
         } else {
             WriteCommitment::CommitOnly
@@ -3908,10 +3910,12 @@ mod tests {
             let create = current.create();
             assert!(create.is_ok());
             if let Ok(create) = create {
+                let parameters = create.parameters();
                 assert_eq!(
-                    create.parameters().transfer_buffering(),
+                    parameters.transfer_buffering(),
                     CreateTransferBuffering::NoIntermediate
                 );
+                assert_eq!(parameters.write_commitment(), WriteCommitment::FlushThrough);
             }
         }
     }
