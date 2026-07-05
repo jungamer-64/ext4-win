@@ -11,16 +11,17 @@ use wdk_sys::FILE_OBJECT;
 
 use crate::{
     irp::{
-        CreateDisposition, CreateParameters, CreateStack, CreateTargetRequirement, DesiredAccess,
-        DispatchTarget, IrpCompletion, ShareAccess,
+        CreateDisposition, CreateParameters, CreateStack, CreateTargetRequirement,
+        CreateTransferBuffering, DesiredAccess, DispatchTarget, IrpCompletion, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
     request::{ea::CreateEa, metadata},
     state::{
-        ChildCreationTarget, CloseDisposition, FileControlBlock, KernelDevice, KernelFileObject,
-        MountedVolumeDevice, OpenedHandle, OpenedObject, OpenedPath, PendingChildCreation,
-        UninitializedFileObject, VolumeControlBlock, WriteCommitment, release_file_control_block,
+        ChildCreationTarget, CloseDisposition, DataTransferMode, FileControlBlock, KernelDevice,
+        KernelFileObject, MountedVolumeDevice, NoIntermediateTransfer, OpenedHandle, OpenedObject,
+        OpenedPath, PendingChildCreation, UninitializedFileObject, VolumeControlBlock,
+        WriteCommitment, release_file_control_block,
     },
 };
 
@@ -140,17 +141,30 @@ struct CreateHandlePolicy {
     close_disposition: CloseDisposition,
     /// Write completion durability requested by create options.
     write_commitment: WriteCommitment,
+    /// Data transfer buffering policy stored on the opened handle.
+    data_transfer_mode: DataTransferMode,
 }
 
 impl CreateHandlePolicy {
     /// Projects handle policy fields from decoded create parameters.
-    const fn from_parameters(parameters: CreateParameters) -> Self {
-        Self {
+    /// # Errors
+    ///
+    /// Returns an error when requested transfer buffering cannot be satisfied by the mounted device.
+    fn from_parameters(parameters: CreateParameters, device: KernelDevice) -> DriverResult<Self> {
+        Ok(Self {
             desired_access: parameters.desired_access(),
             share_access: parameters.share_access(),
             close_disposition: parameters.close_disposition(),
             write_commitment: parameters.write_commitment(),
-        }
+            data_transfer_mode: match parameters.transfer_buffering() {
+                CreateTransferBuffering::IntermediateAllowed => {
+                    DataTransferMode::IntermediateAllowed
+                }
+                CreateTransferBuffering::NoIntermediate => {
+                    DataTransferMode::NoIntermediate(NoIntermediateTransfer::from_device(device)?)
+                }
+            },
+        })
     }
 
     /// Returns the desired access mask.
@@ -171,6 +185,11 @@ impl CreateHandlePolicy {
     /// Returns write completion durability.
     const fn write_commitment(self) -> WriteCommitment {
         self.write_commitment
+    }
+
+    /// Returns data transfer buffering policy.
+    const fn data_transfer_mode(self) -> DataTransferMode {
+        self.data_transfer_mode
     }
 }
 
@@ -323,7 +342,7 @@ fn open_existing_node(
     path: OpenedPath,
 ) -> DriverResult<()> {
     let parameters = request.parameters();
-    let policy = CreateHandlePolicy::from_parameters(parameters);
+    let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
@@ -340,6 +359,7 @@ fn open_existing_node(
                     path,
                     policy.close_disposition(),
                     policy.write_commitment(),
+                    policy.data_transfer_mode(),
                 ))
             })?;
             let fcb = open_shared_file_control_block(
@@ -398,7 +418,7 @@ fn create_missing_node(
     name: &Ext4Name,
 ) -> DriverResult<()> {
     let parameters = request.parameters();
-    let policy = CreateHandlePolicy::from_parameters(parameters);
+    let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
     match disposition {
         CreateDisposition::Create
         | CreateDisposition::OpenIf
@@ -429,6 +449,7 @@ fn create_missing_node(
             path,
             policy.close_disposition(),
             policy.write_commitment(),
+            policy.data_transfer_mode(),
         ))
     })?;
     create_ea.apply_to_pending_child(&mut creation)?;
@@ -603,6 +624,7 @@ fn initialize_file_object(
             path,
             policy.close_disposition(),
             policy.write_commitment(),
+            policy.data_transfer_mode(),
         ))
     })?;
     let fcb = open_shared_file_control_block(
@@ -809,6 +831,7 @@ mod tests {
             OpenedPath::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
         );
         let mut related = FILE_OBJECT::default();
         attach_opened_contexts(&mut related, &mut fcb, &mut handle);
@@ -838,6 +861,7 @@ mod tests {
             OpenedPath::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
         );
         let mut related = FILE_OBJECT::default();
         attach_opened_contexts(&mut related, &mut fcb, &mut handle);

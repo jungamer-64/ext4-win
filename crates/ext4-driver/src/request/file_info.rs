@@ -2018,10 +2018,13 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.read()?;
     let opened_file = OpenedRegularFile::decode(stack.file_object())?;
     let length = stack.length();
+    let data_transfer_mode = opened_file.data_transfer_mode();
+    data_transfer_mode.validate_range(stack.byte_offset().bytes(), length.as_usize())?;
     if length.is_empty() {
         return Ok(IrpCompletion::EMPTY);
     }
     let mut output = target.data_output(length)?;
+    data_transfer_mode.validate_buffer(output.address())?;
     let vcb = unsafe {
         // SAFETY: OpenedRegularFile is decoded from a live FCB whose VCB
         // pointer remains valid for the opened FILE_OBJECT lifetime.
@@ -2044,10 +2047,13 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.write()?;
     let opened_file = OpenedRegularFile::decode(stack.file_object())?;
     let length = stack.length();
+    let data_transfer_mode = opened_file.data_transfer_mode();
+    data_transfer_mode.validate_range(stack.byte_offset().bytes(), length.as_usize())?;
     if length.is_empty() {
         return Ok(IrpCompletion::EMPTY);
     }
     let input = target.data_input(length)?;
+    data_transfer_mode.validate_buffer(input.address())?;
     let mut vcb = opened_file.volume();
     let vcb = unsafe {
         // SAFETY: FCBs are constructed only from live mounted VCB pointers and
@@ -2264,6 +2270,7 @@ mod tests {
             OpenedPath::Root,
             crate::state::CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,
+            crate::state::DataTransferMode::IntermediateAllowed,
         );
         let mut file_object = wdk_sys::FILE_OBJECT {
             FsContext: core::ptr::addr_of_mut!(fcb).cast(),
@@ -2607,6 +2614,7 @@ mod tests {
             OpenedPath::Root,
             crate::state::CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,
+            crate::state::DataTransferMode::IntermediateAllowed,
         );
         let mut file_object = wdk_sys::FILE_OBJECT {
             FsContext: core::ptr::addr_of_mut!(fcb).cast(),

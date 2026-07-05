@@ -15,14 +15,12 @@ use crate::{
     },
     kernel::status::{DriverError, DriverResult},
     memory::DriverVec,
-    state::{KernelDevice, MountedVolumeDevice, VolumeControlBlock},
+    state::{KernelDevice, MountedVolumeDevice, TransferSectorSize, VolumeControlBlock},
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
 
 /// Filesystem name exposed through `FileFsAttributeInformation`.
 const FILE_SYSTEM_NAME: &[u16] = &[0x0045, 0x0058, 0x0054, 0x0034, 0x0057, 0x0049, 0x004E];
-/// Sector size reported to Windows.
-const BYTES_PER_SECTOR: u32 = 512;
 
 /// Executes volume information queries.
 /// # Errors
@@ -286,7 +284,7 @@ fn pack_size_information(
                     .map_err(|_| DriverError::InvalidParameter)?,
             },
             SectorsPerAllocationUnit: sectors_per_allocation_unit(geometry.cluster_size())?,
-            BytesPerSector: BYTES_PER_SECTOR,
+            BytesPerSector: TransferSectorSize::WINDOWS_REPORTED.as_u32(),
         },
     )
 }
@@ -329,7 +327,7 @@ fn pack_full_size_information(
             CallerAvailableAllocationUnits: available,
             ActualAvailableAllocationUnits: available,
             SectorsPerAllocationUnit: sectors_per_allocation_unit(geometry.cluster_size())?,
-            BytesPerSector: BYTES_PER_SECTOR,
+            BytesPerSector: TransferSectorSize::WINDOWS_REPORTED.as_u32(),
         },
     )
 }
@@ -402,7 +400,7 @@ fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> 
 fn sectors_per_allocation_unit(cluster_size: ClusterSize) -> DriverResult<u32> {
     cluster_size
         .bytes()
-        .checked_div(BYTES_PER_SECTOR)
+        .checked_div(TransferSectorSize::WINDOWS_REPORTED.as_u32())
         .filter(|sectors| *sectors != 0)
         .ok_or(DriverError::InvalidParameter)
 }

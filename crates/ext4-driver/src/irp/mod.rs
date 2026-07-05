@@ -1783,6 +1783,11 @@ impl IrpByteBuffer {
         Ok(Self { address, length })
     }
 
+    /// Returns the first byte address.
+    const fn address(&self) -> NonNull<u8> {
+        self.address
+    }
+
     /// Returns the buffer as a byte slice.
     fn as_slice(&self) -> &[u8] {
         unsafe {
@@ -1840,6 +1845,11 @@ impl BufferedInput {
         self.bytes.as_slice()
     }
 
+    /// Returns the first input byte address.
+    pub(crate) const fn address(&self) -> NonNull<u8> {
+        self.bytes.address()
+    }
+
     /// Copies an unaligned fixed-size input payload.
     /// # Errors
     ///
@@ -1870,6 +1880,11 @@ impl BufferedOutput {
     /// Returns output bytes.
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         self.bytes.as_mut_slice()
+    }
+
+    /// Returns the first output byte address.
+    pub(crate) const fn address(&self) -> NonNull<u8> {
+        self.bytes.address()
     }
 }
 
@@ -2446,6 +2461,8 @@ pub(crate) struct CreateParameters {
     close_disposition: CloseDisposition,
     /// Write completion durability requested by create options.
     write_commitment: WriteCommitment,
+    /// Data transfer buffering requested by create options.
+    transfer_buffering: CreateTransferBuffering,
     /// Extended-attribute input length supplied with create.
     ea_length: IrpBufferLength,
 }
@@ -2462,14 +2479,16 @@ impl CreateParameters {
         share_access: wdk_sys::USHORT,
         ea_length: IrpBufferLength,
     ) -> Result<Self, DriverError> {
-        let create_options = CreateOptions::decode(options)?;
+        let desired_access = DesiredAccess::from_raw(desired_access);
+        let create_options = CreateOptions::decode(options, desired_access)?;
         Ok(Self {
-            desired_access: DesiredAccess::from_raw(desired_access),
+            desired_access,
             share_access: ShareAccess::from_raw(share_access)?,
             disposition: CreateDisposition::from_options(options)?,
             target_requirement: create_options.target_requirement(),
             close_disposition: create_options.close_disposition(),
             write_commitment: create_options.write_commitment(),
+            transfer_buffering: create_options.transfer_buffering(),
             ea_length,
         })
     }
@@ -2504,6 +2523,11 @@ impl CreateParameters {
         self.write_commitment
     }
 
+    /// Returns data transfer buffering requested at create/open.
+    pub(crate) const fn transfer_buffering(self) -> CreateTransferBuffering {
+        self.transfer_buffering
+    }
+
     /// Returns the input EA length.
     pub(crate) const fn ea_length(self) -> IrpBufferLength {
         self.ea_length
@@ -2526,6 +2550,11 @@ impl DesiredAccess {
     /// Returns the WDK access mask for `IoCheckShareAccess`.
     pub(crate) const fn as_raw(self) -> wdk_sys::ACCESS_MASK {
         self.raw
+    }
+
+    /// Returns whether all selected access bits are present.
+    const fn contains(self, mask: wdk_sys::ACCESS_MASK) -> bool {
+        self.raw & mask == mask
     }
 }
 
@@ -2603,6 +2632,15 @@ pub(crate) enum CreateTargetRequirement {
     NonDirectory,
 }
 
+/// Requested file data transfer buffering for a newly opened handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateTransferBuffering {
+    /// No direct-transfer constraints were requested.
+    IntermediateAllowed,
+    /// Caller requested `FILE_NO_INTERMEDIATE_BUFFERING`.
+    NoIntermediate,
+}
+
 impl CreateTargetRequirement {
     /// Decodes file-vs-directory create options.
     /// # Errors
@@ -2629,6 +2667,8 @@ struct CreateOptions {
     close_disposition: CloseDisposition,
     /// Requested write completion durability.
     write_commitment: WriteCommitment,
+    /// Requested data transfer buffering.
+    transfer_buffering: CreateTransferBuffering,
 }
 
 impl CreateOptions {
@@ -2636,11 +2676,20 @@ impl CreateOptions {
     /// # Errors
     ///
     /// Returns an error when create options include bits outside the accepted ext4win boundary.
-    fn decode(options: wdk_sys::ULONG) -> DriverResult<Self> {
+    fn decode(options: wdk_sys::ULONG, desired_access: DesiredAccess) -> DriverResult<Self> {
         let raw_options = options & CREATE_OPTIONS_MASK;
         if raw_options & !ACCEPTED_CREATE_OPTIONS != 0 {
             return Err(DriverError::NotSupported);
         }
+        let transfer_buffering =
+            if create_option_selected(options, wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING) {
+                if desired_access.contains(wdk_sys::FILE_APPEND_DATA) {
+                    return Err(DriverError::InvalidParameter);
+                }
+                CreateTransferBuffering::NoIntermediate
+            } else {
+                CreateTransferBuffering::IntermediateAllowed
+            };
         let close_disposition = if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
             CloseDisposition::Delete
         } else {
@@ -2655,6 +2704,7 @@ impl CreateOptions {
             target_requirement: CreateTargetRequirement::from_options(options)?,
             close_disposition,
             write_commitment,
+            transfer_buffering,
         })
     }
 
@@ -2671,6 +2721,11 @@ impl CreateOptions {
     /// Returns decoded write completion durability.
     const fn write_commitment(self) -> WriteCommitment {
         self.write_commitment
+    }
+
+    /// Returns decoded data transfer buffering.
+    const fn transfer_buffering(self) -> CreateTransferBuffering {
+        self.transfer_buffering
     }
 }
 
@@ -2699,7 +2754,8 @@ const CREATE_OPTIONS_MASK: wdk_sys::ULONG = 0x00FF_FFFF;
 const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_DIRECTORY_FILE
     | wdk_sys::FILE_NON_DIRECTORY_FILE
     | wdk_sys::FILE_DELETE_ON_CLOSE
-    | wdk_sys::FILE_WRITE_THROUGH;
+    | wdk_sys::FILE_WRITE_THROUGH
+    | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING;
 /// Create options consumed as Windows boundary hints.
 const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONLY
     | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT
@@ -3125,14 +3181,14 @@ mod tests {
 
     use super::{
         CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateTargetRequirement,
-        CurrentIrpStackLocation, DeviceIrpQueue, DirectoryControlMinorFunction,
-        DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
-        DirectoryPatternInput, DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection,
-        FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION, FileSystemControlMinorFunction,
-        FsControlCode, InformationLength, IrpBufferLength, IrpCompletion, KernelIrp,
-        QueryFileInformationClass, QueryVolumeInformationClass, QueueWorkerState, ReceivedIrp,
-        STATUS_CANCELLED, SecurityComponentSelection, SetFileInformationClass,
-        SetVolumeInformationClass,
+        CreateTransferBuffering, CurrentIrpStackLocation, DeviceIrpQueue,
+        DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
+        DirectoryInformationClass, DirectoryPatternInput, DispatchTarget, EaEntryEmission,
+        EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
+        FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
+        IrpCompletion, KernelIrp, QueryFileInformationClass, QueryVolumeInformationClass,
+        QueueWorkerState, ReceivedIrp, STATUS_CANCELLED, SecurityComponentSelection,
+        SetFileInformationClass, SetVolumeInformationClass,
     };
     use crate::state::{
         CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
@@ -3771,6 +3827,10 @@ mod tests {
                 assert_eq!(parameters.close_disposition(), CloseDisposition::Keep);
                 assert_eq!(parameters.write_commitment(), WriteCommitment::FlushThrough);
                 assert_eq!(
+                    parameters.transfer_buffering(),
+                    CreateTransferBuffering::IntermediateAllowed
+                );
+                assert_eq!(
                     parameters.share_access().as_ulong(),
                     wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE
                 );
@@ -3812,7 +3872,82 @@ mod tests {
                 );
                 assert_eq!(parameters.close_disposition(), CloseDisposition::Delete);
                 assert_eq!(parameters.write_commitment(), WriteCommitment::CommitOnly);
+                assert_eq!(
+                    parameters.transfer_buffering(),
+                    CreateTransferBuffering::IntermediateAllowed
+                );
             }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_stack_decodes_no_intermediate_buffering() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
+            DesiredAccess: wdk_sys::FILE_READ_DATA,
+            ..wdk_sys::IO_SECURITY_CONTEXT::default()
+        };
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let create = current.create();
+            assert!(create.is_ok());
+            if let Ok(create) = create {
+                assert_eq!(
+                    create.parameters().transfer_buffering(),
+                    CreateTransferBuffering::NoIntermediate
+                );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_stack_rejects_no_intermediate_append_access() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
+            DesiredAccess: wdk_sys::FILE_APPEND_DATA,
+            ..wdk_sys::IO_SECURITY_CONTEXT::default()
+        };
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            assert_eq!(
+                current
+                    .create()
+                    .err()
+                    .map(crate::kernel::status::DriverError::ntstatus),
+                Some(STATUS_INVALID_PARAMETER)
+            );
         }
     }
 
