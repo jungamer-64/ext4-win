@@ -1055,6 +1055,15 @@ pub(crate) enum CloseDisposition {
     Delete,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Per-handle write completion durability requested at create/open.
+pub(crate) enum WriteCommitment {
+    /// Complete writes after the ext4 journal transaction is committed.
+    CommitOnly,
+    /// Flush the mounted volume before completing each non-empty write.
+    FlushThrough,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 /// Common per-handle state shared by every opened node kind.
 pub(crate) struct OpenedHandleState {
@@ -1062,14 +1071,21 @@ pub(crate) struct OpenedHandleState {
     path: OpenedPath,
     /// Requested close disposition.
     close_disposition: CloseDisposition,
+    /// Write completion durability requested for this handle.
+    write_commitment: WriteCommitment,
 }
 
 impl OpenedHandleState {
     /// Creates shared per-handle state.
-    const fn new(path: OpenedPath, close_disposition: CloseDisposition) -> Self {
+    const fn new(
+        path: OpenedPath,
+        close_disposition: CloseDisposition,
+        write_commitment: WriteCommitment,
+    ) -> Self {
         Self {
             path,
             close_disposition,
+            write_commitment,
         }
     }
 
@@ -1086,6 +1102,11 @@ impl OpenedHandleState {
     /// Returns the requested close disposition.
     const fn close_disposition(&self) -> CloseDisposition {
         self.close_disposition
+    }
+
+    /// Returns write completion durability requested for this handle.
+    const fn write_commitment(&self) -> WriteCommitment {
+        self.write_commitment
     }
 
     /// Replaces the requested close disposition.
@@ -1119,13 +1140,23 @@ enum OpenedHandleKind {
 
 impl OpenedHandle {
     /// Creates per-handle state for an opened node.
-    pub(crate) fn new(node: NodeId, path: OpenedPath, close_disposition: CloseDisposition) -> Self {
-        Self::from_parts(node, path, close_disposition)
+    pub(crate) fn new(
+        node: NodeId,
+        path: OpenedPath,
+        close_disposition: CloseDisposition,
+        write_commitment: WriteCommitment,
+    ) -> Self {
+        Self::from_parts(node, path, close_disposition, write_commitment)
     }
 
     /// Creates per-handle state from explicit lifecycle fields.
-    fn from_parts(node: NodeId, path: OpenedPath, close_disposition: CloseDisposition) -> Self {
-        let state = OpenedHandleState::new(path, close_disposition);
+    fn from_parts(
+        node: NodeId,
+        path: OpenedPath,
+        close_disposition: CloseDisposition,
+        write_commitment: WriteCommitment,
+    ) -> Self {
+        let state = OpenedHandleState::new(path, close_disposition, write_commitment);
         let kind = match node {
             NodeId::File(_) => OpenedHandleKind::File,
             NodeId::Directory(_) => OpenedHandleKind::Directory {
@@ -1139,6 +1170,11 @@ impl OpenedHandle {
     /// Returns the requested close disposition.
     const fn close_disposition(&self) -> CloseDisposition {
         self.state.close_disposition()
+    }
+
+    /// Returns write completion durability requested for this handle.
+    const fn write_commitment(&self) -> WriteCommitment {
+        self.state.write_commitment()
     }
 
     /// Returns the opened path identity.
@@ -1246,6 +1282,11 @@ impl OpenedObject {
         self.handle().close_disposition()
     }
 
+    /// Returns write completion durability requested for this opened handle.
+    pub(crate) fn write_commitment(&self) -> WriteCommitment {
+        self.handle().write_commitment()
+    }
+
     /// Replaces the requested close disposition.
     pub(crate) fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
         self.mutable_handle()
@@ -1338,6 +1379,11 @@ impl OpenedRegularFile {
     /// Returns the mounted VCB pointer owning this opened file.
     pub(crate) fn volume(&self) -> NonNull<VolumeControlBlock> {
         self.opened.volume()
+    }
+
+    /// Returns write completion durability requested for this regular-file handle.
+    pub(crate) fn write_commitment(&self) -> WriteCommitment {
+        self.opened.write_commitment()
     }
 }
 
@@ -1482,7 +1528,7 @@ mod tests {
         CloseDisposition, ControlDeviceExtension, FileControlBlock, FileControlBlockRelease,
         KernelDevice, KernelFileObject, MountedVolumeDevice, OpenedDirectory, OpenedHandle,
         OpenedHandleKind, OpenedObject, OpenedPath, OpenedRegularFile, OpenedSymlink,
-        UninitializedFileObject, VolumeControlBlock,
+        UninitializedFileObject, VolumeControlBlock, WriteCommitment,
     };
 
     fn file_object_with_contexts(
@@ -1561,6 +1607,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedPath::Root,
             CloseDisposition::Keep,
+            WriteCommitment::CommitOnly,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -1602,6 +1649,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedPath::Root,
             CloseDisposition::Keep,
+            WriteCommitment::CommitOnly,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -1634,6 +1682,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedPath::Root,
             CloseDisposition::Keep,
+            WriteCommitment::CommitOnly,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -1660,6 +1709,35 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    fn opened_object_preserves_write_commitment() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedPath::Root,
+            CloseDisposition::Keep,
+            WriteCommitment::FlushThrough,
+        );
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        let opened = OpenedObject::decode(file_object);
+        assert!(opened.is_ok());
+        if let Ok(opened) = opened {
+            assert_eq!(opened.write_commitment(), WriteCommitment::FlushThrough);
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
     fn opened_object_symlink_conversion_updates_fcb_and_handle_together() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
@@ -1667,6 +1745,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedPath::Root,
             CloseDisposition::Delete,
+            WriteCommitment::CommitOnly,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),

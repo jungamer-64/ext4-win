@@ -20,7 +20,7 @@ use crate::{
     state::{
         ChildCreationTarget, CloseDisposition, FileControlBlock, KernelDevice, KernelFileObject,
         MountedVolumeDevice, OpenedHandle, OpenedObject, OpenedPath, PendingChildCreation,
-        UninitializedFileObject, VolumeControlBlock, release_file_control_block,
+        UninitializedFileObject, VolumeControlBlock, WriteCommitment, release_file_control_block,
     },
 };
 
@@ -127,6 +127,51 @@ enum PathLookup {
         /// New ext4 child name.
         name: Ext4Name,
     },
+}
+
+/// Per-handle policy decoded from one create/open request.
+#[derive(Clone, Copy, Debug)]
+struct CreateHandlePolicy {
+    /// Access mask used for Windows share-access accounting.
+    desired_access: DesiredAccess,
+    /// Share mask used for Windows share-access accounting.
+    share_access: ShareAccess,
+    /// Cleanup-time lifecycle requested by create options.
+    close_disposition: CloseDisposition,
+    /// Write completion durability requested by create options.
+    write_commitment: WriteCommitment,
+}
+
+impl CreateHandlePolicy {
+    /// Projects handle policy fields from decoded create parameters.
+    const fn from_parameters(parameters: CreateParameters) -> Self {
+        Self {
+            desired_access: parameters.desired_access(),
+            share_access: parameters.share_access(),
+            close_disposition: parameters.close_disposition(),
+            write_commitment: parameters.write_commitment(),
+        }
+    }
+
+    /// Returns the desired access mask.
+    const fn desired_access(self) -> DesiredAccess {
+        self.desired_access
+    }
+
+    /// Returns the share access mask.
+    const fn share_access(self) -> ShareAccess {
+        self.share_access
+    }
+
+    /// Returns the cleanup-time lifecycle.
+    const fn close_disposition(self) -> CloseDisposition {
+        self.close_disposition
+    }
+
+    /// Returns write completion durability.
+    const fn write_commitment(self) -> WriteCommitment {
+        self.write_commitment
+    }
 }
 
 /// FILE_OBJECT name rooting after the raw UTF-16 boundary has been decoded.
@@ -278,18 +323,11 @@ fn open_existing_node(
     path: OpenedPath,
 ) -> DriverResult<()> {
     let parameters = request.parameters();
+    let policy = CreateHandlePolicy::from_parameters(parameters);
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
-            initialize_file_object(
-                request.file_object(),
-                vcb,
-                node,
-                path,
-                parameters.desired_access(),
-                parameters.share_access(),
-                parameters.close_disposition(),
-            )
+            initialize_file_object(request.file_object(), vcb, node, path, policy)
         }
         CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
         CreateDisposition::Overwrite
@@ -300,15 +338,16 @@ fn open_existing_node(
                 Ok(OpenedHandle::new(
                     node,
                     path,
-                    parameters.close_disposition(),
+                    policy.close_disposition(),
+                    policy.write_commitment(),
                 ))
             })?;
             let fcb = open_shared_file_control_block(
                 request.file_object(),
                 vcb,
                 node,
-                parameters.desired_access(),
-                parameters.share_access(),
+                policy.desired_access(),
+                policy.share_access(),
             )?;
             match truncate_existing_file(vcb, inode) {
                 Ok(()) => {
@@ -359,6 +398,7 @@ fn create_missing_node(
     name: &Ext4Name,
 ) -> DriverResult<()> {
     let parameters = request.parameters();
+    let policy = CreateHandlePolicy::from_parameters(parameters);
     match disposition {
         CreateDisposition::Create
         | CreateDisposition::OpenIf
@@ -387,15 +427,16 @@ fn create_missing_node(
         Ok(OpenedHandle::new(
             node,
             path,
-            parameters.close_disposition(),
+            policy.close_disposition(),
+            policy.write_commitment(),
         ))
     })?;
     create_ea.apply_to_pending_child(&mut creation)?;
     let fcb = open_pending_child_file_control_block(
         &mut creation,
         request.file_object(),
-        parameters.desired_access(),
-        parameters.share_access(),
+        policy.desired_access(),
+        policy.share_access(),
     )?;
 
     match creation.commit() {
@@ -554,12 +595,23 @@ fn initialize_file_object(
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: NodeId,
     path: OpenedPath,
-    desired_access: DesiredAccess,
-    share_access: ShareAccess,
-    close_disposition: CloseDisposition,
+    policy: CreateHandlePolicy,
 ) -> DriverResult<()> {
-    let handle = memory::boxed_try_with(|| Ok(OpenedHandle::new(node, path, close_disposition)))?;
-    let fcb = open_shared_file_control_block(file_object, vcb, node, desired_access, share_access)?;
+    let handle = memory::boxed_try_with(|| {
+        Ok(OpenedHandle::new(
+            node,
+            path,
+            policy.close_disposition(),
+            policy.write_commitment(),
+        ))
+    })?;
+    let fcb = open_shared_file_control_block(
+        file_object,
+        vcb,
+        node,
+        policy.desired_access(),
+        policy.share_access(),
+    )?;
     attach_preallocated_file_object(file_object, fcb, handle);
     Ok(())
 }
@@ -756,6 +808,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedPath::Root,
             CloseDisposition::Keep,
+            WriteCommitment::CommitOnly,
         );
         let mut related = FILE_OBJECT::default();
         attach_opened_contexts(&mut related, &mut fcb, &mut handle);
@@ -784,6 +837,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedPath::Root,
             CloseDisposition::Keep,
+            WriteCommitment::CommitOnly,
         );
         let mut related = FILE_OBJECT::default();
         attach_opened_contexts(&mut related, &mut fcb, &mut handle);
