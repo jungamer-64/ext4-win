@@ -303,8 +303,8 @@ fn set_basic_information(request: SetFileRequest) -> DriverResult<()> {
     )?;
     let metadata = load_file_metadata(&request.opened_file)?;
     let times = set_basic_times(metadata.times, info)?;
-    let overlay = set_basic_overlay(metadata, info.FileAttributes)?;
-    if times == metadata.times && overlay.is_none() {
+    let attributes = set_basic_attributes(metadata, info.FileAttributes)?;
+    if times == metadata.times && attributes.is_empty() {
         return Ok(());
     }
 
@@ -323,9 +323,7 @@ fn set_basic_information(request: SetFileRequest) -> DriverResult<()> {
     if times != metadata.times {
         transaction.set_times(node, times)?;
     }
-    if let Some(overlay) = overlay {
-        transaction.set_windows_overlay(node, overlay)?;
-    }
+    attributes.apply(&mut transaction, node)?;
     transaction.commit()?;
     Ok(())
 }
@@ -1500,10 +1498,10 @@ const WINDOWS_TIME_PRESERVE: i64 = -1;
 ///
 /// Returns an error when requested attributes contradict the node kind, attempt to change readonly
 /// permission state, or include unsupported bits.
-fn set_basic_overlay(
+fn set_basic_attributes(
     metadata: FileMetadata,
     attributes: wdk_sys::ULONG,
-) -> DriverResult<Option<WindowsOverlay>> {
+) -> DriverResult<BasicAttributeUpdate> {
     if attributes == 0 {
         return Ok(None);
     }
