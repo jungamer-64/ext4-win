@@ -4,9 +4,9 @@ use alloc::boxed::Box;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Security, Ext4Times,
-    Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileSize, NodeId, RenameTargetCollision,
-    WindowsName, WindowsOverlay,
+    ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Permissions,
+    Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileSize, NodeId,
+    RenameTargetCollision, WindowsName, WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
@@ -323,7 +323,12 @@ fn set_basic_information(request: SetFileRequest) -> DriverResult<()> {
     if times != metadata.times {
         transaction.set_times(node, times)?;
     }
-    attributes.apply(&mut transaction, node)?;
+    if let Some(security) = attributes.security() {
+        transaction.set_posix_security(node, security)?;
+    }
+    if let Some(overlay) = attributes.overlay() {
+        transaction.set_windows_overlay(node, overlay)?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -1492,25 +1497,62 @@ fn windows_time_field(value: LARGE_INTEGER, current: Ext4Timestamp) -> DriverRes
 const WINDOWS_TIME_UNCHANGED: i64 = 0;
 /// Additional Windows sentinel used by callers to preserve timestamp state.
 const WINDOWS_TIME_PRESERVE: i64 = -1;
+/// POSIX write bits that make Windows READONLY false.
+const POSIX_WRITE_BITS: u16 = 0o222;
+/// Owner write bit restored when Windows READONLY is cleared.
+const POSIX_OWNER_WRITE_BIT: u16 = 0o200;
+
+/// Domain updates derived from FILE_BASIC_INFORMATION attributes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BasicAttributeUpdate {
+    /// POSIX security update needed to reflect FILE_ATTRIBUTE_READONLY.
+    security: Option<Ext4Security>,
+    /// Windows overlay xattr update for attributes not owned by POSIX mode or node kind.
+    overlay: Option<WindowsOverlay>,
+}
+
+impl BasicAttributeUpdate {
+    /// Creates an empty attribute update.
+    const fn empty() -> Self {
+        Self {
+            security: None,
+            overlay: None,
+        }
+    }
+
+    /// Creates an attribute update from independent domain mutations.
+    const fn new(security: Option<Ext4Security>, overlay: Option<WindowsOverlay>) -> Self {
+        Self { security, overlay }
+    }
+
+    /// Returns whether this update has no domain mutations.
+    const fn is_empty(self) -> bool {
+        self.security.is_none() && self.overlay.is_none()
+    }
+
+    /// POSIX security update.
+    const fn security(self) -> Option<Ext4Security> {
+        self.security
+    }
+
+    /// Windows overlay update.
+    const fn overlay(self) -> Option<WindowsOverlay> {
+        self.overlay
+    }
+}
 
 /// Builds overlay metadata from FILE_BASIC_INFORMATION attributes.
 /// # Errors
 ///
-/// Returns an error when requested attributes contradict the node kind, attempt to change readonly
-/// permission state, or include unsupported bits.
+/// Returns an error when requested attributes contradict the node kind or include unsupported bits.
 fn set_basic_attributes(
     metadata: FileMetadata,
     attributes: wdk_sys::ULONG,
 ) -> DriverResult<BasicAttributeUpdate> {
     if attributes == 0 {
-        return Ok(None);
+        return Ok(BasicAttributeUpdate::empty());
     }
     validate_kind_attribute(metadata.kind, attributes)?;
-    let current_readonly = metadata.security.permissions().as_u16() & 0o222 == 0;
-    let requested_readonly = attributes & wdk_sys::FILE_ATTRIBUTE_READONLY != 0;
-    if requested_readonly != current_readonly {
-        return Err(DriverError::NotSupported);
-    }
 
     let accepted = Ext4WindowsAttributes::SUPPORTED_MASK
         | wdk_sys::FILE_ATTRIBUTE_READONLY
@@ -1521,12 +1563,39 @@ fn set_basic_attributes(
         return Err(DriverError::NotSupported);
     }
 
+    let security = readonly_security_update(metadata.security, attributes)?;
     let overlay_bits = attributes & Ext4WindowsAttributes::SUPPORTED_MASK;
-    if overlay_bits == metadata.overlay_attributes {
+    let overlay = if overlay_bits == metadata.overlay_attributes {
+        None
+    } else {
+        Some(WindowsOverlay::new(Ext4WindowsAttributes::new(
+            overlay_bits,
+        )?))
+    };
+    Ok(BasicAttributeUpdate::new(security, overlay))
+}
+
+/// Builds a POSIX security update for FILE_ATTRIBUTE_READONLY.
+/// # Errors
+///
+/// Returns an error when the adjusted permissions cannot be represented.
+fn readonly_security_update(
+    security: Ext4Security,
+    attributes: wdk_sys::ULONG,
+) -> DriverResult<Option<Ext4Security>> {
+    let current_permissions = security.permissions().as_u16();
+    let requested_permissions = if attributes & wdk_sys::FILE_ATTRIBUTE_READONLY != 0 {
+        current_permissions & !POSIX_WRITE_BITS
+    } else {
+        current_permissions | POSIX_OWNER_WRITE_BIT
+    };
+    if requested_permissions == current_permissions {
         return Ok(None);
     }
-    let attributes = Ext4WindowsAttributes::new(overlay_bits)?;
-    Ok(Some(WindowsOverlay::new(attributes)))
+    Ok(Some(Ext4Security::new(
+        security.owner(),
+        Ext4Permissions::new(requested_permissions)?,
+    )))
 }
 
 /// Rejects node-kind attributes that contradict the opened ext4 node.
@@ -2046,6 +2115,14 @@ mod tests {
     };
 
     fn test_metadata(kind: super::FileMetadataKind) -> Option<super::FileMetadata> {
+        test_metadata_with_permissions(kind, 0o644, 0)
+    }
+
+    fn test_metadata_with_permissions(
+        kind: super::FileMetadataKind,
+        permissions: u16,
+        overlay_attributes: u32,
+    ) -> Option<super::FileMetadata> {
         let timestamp = Ext4Timestamp::from_unix_seconds(1);
         Some(super::FileMetadata {
             file_index: 1,
@@ -2053,11 +2130,11 @@ mod tests {
             size: FileSize::from_bytes(0),
             security: Ext4Security::new(
                 Ext4Owner::new(Ext4Uid::from_u32(0), Ext4Gid::from_u32(0)),
-                Ext4Permissions::new(0o644).ok()?,
+                Ext4Permissions::new(permissions).ok()?,
             ),
             times: Ext4Times::new(timestamp, timestamp, timestamp, timestamp),
             links_count: Ext4LinkCount::ONE,
-            overlay_attributes: 0,
+            overlay_attributes,
             block_size: BlockSize::from_superblock_log(0).ok()?,
         })
     }
@@ -2080,6 +2157,72 @@ mod tests {
         };
         target.copy_from_slice(&value.to_le_bytes());
         true
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn basic_attributes_set_readonly_updates_posix_permissions() {
+        let metadata = test_metadata_with_permissions(super::FileMetadataKind::File, 0o664, 0);
+        assert!(metadata.is_some());
+        let Some(metadata) = metadata else {
+            return;
+        };
+
+        let update = super::set_basic_attributes(metadata, wdk_sys::FILE_ATTRIBUTE_READONLY);
+        assert!(update.is_ok());
+        if let Ok(update) = update {
+            assert_eq!(
+                update
+                    .security()
+                    .map(|security| security.permissions().as_u16()),
+                Some(0o444)
+            );
+            assert_eq!(update.overlay(), None);
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn basic_attributes_clear_readonly_restores_owner_write() {
+        let metadata = test_metadata_with_permissions(super::FileMetadataKind::File, 0o444, 0);
+        assert!(metadata.is_some());
+        let Some(metadata) = metadata else {
+            return;
+        };
+
+        let update = super::set_basic_attributes(metadata, wdk_sys::FILE_ATTRIBUTE_NORMAL);
+        assert!(update.is_ok());
+        if let Ok(update) = update {
+            assert_eq!(
+                update
+                    .security()
+                    .map(|security| security.permissions().as_u16()),
+                Some(0o644)
+            );
+            assert_eq!(update.overlay(), None);
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn basic_attributes_zero_preserves_existing_attributes() {
+        let metadata = test_metadata_with_permissions(super::FileMetadataKind::File, 0o444, 0);
+        assert!(metadata.is_some());
+        let Some(metadata) = metadata else {
+            return;
+        };
+
+        let update = super::set_basic_attributes(metadata, 0);
+        assert!(update.is_ok());
+        if let Ok(update) = update {
+            assert!(update.is_empty());
+        }
     }
 
     /// Builds a dispatch target whose IRP points at the supplied current stack.
