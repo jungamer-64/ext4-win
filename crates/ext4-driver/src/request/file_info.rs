@@ -117,19 +117,10 @@ pub(crate) fn directory_control(target: DispatchTarget) -> DriverResult<IrpCompl
 /// Executes byte-range lock requests.
 /// # Errors
 ///
-/// Always returns an unsupported-operation error after validating the decoded target.
+/// Always returns an unsupported-operation error after decoding the lock-control stack.
 pub(crate) fn lock_control(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    decoded_not_supported(target).and(Err(DriverError::NotSupported))
-}
-
-/// Rejects a decoded file-object request until its domain path exists.
-/// # Errors
-///
-/// Returns an error when the decoded request is intentionally outside the implemented file-object
-/// operation set.
-fn decoded_not_supported(target: DispatchTarget) -> DriverResult<()> {
-    let _device = target.device();
-    Ok(())
+    let _stack = target.current_stack()?.lock_control()?;
+    Err(DriverError::NotSupported)
 }
 
 /// Decoded mounted volume selected by a flush IRP.
