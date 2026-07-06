@@ -11,18 +11,18 @@ use wdk_sys::FILE_OBJECT;
 
 use crate::{
     irp::{
-        CreateDisposition, CreateParameters, CreateReparsePointMode, CreateStack,
-        CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering, DesiredAccess,
-        DispatchTarget, IrpCompletion, ShareAccess,
+        CreateDisposition, CreateNameInterpretation, CreateParameters, CreateReparsePointMode,
+        CreateStack, CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering,
+        DesiredAccess, DispatchTarget, IrpCompletion, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
     request::{ea::CreateEa, metadata},
     state::{
         ChildCreationTarget, CloseDisposition, DataTransferMode, FileControlBlock, KernelDevice,
-        KernelFileObject, MountedVolumeDevice, NoIntermediateTransfer, OpenedHandle, OpenedObject,
-        OpenedPath, PendingChildCreation, UninitializedFileObject, VolumeControlBlock,
-        WriteCommitment, release_file_control_block,
+        KernelFileObject, MountedVolumeDevice, NoIntermediateTransfer, OpenedHandle,
+        OpenedLocation, OpenedObject, PendingChildCreation, UninitializedFileObject,
+        VolumeControlBlock, WriteCommitment, release_file_control_block,
     },
 };
 
@@ -101,26 +101,32 @@ fn open_or_create(request: CreateRequest) -> DriverResult<()> {
         return Err(DriverError::InvalidDeviceRequest);
     };
     let disposition = request.parameters().disposition();
-    match resolve_path(request.file_object(), vcb) {
-        Ok(PathLookup::Existing { node, path }) => {
-            open_existing_node(request, vcb, disposition, node, path)
+    match resolve_target(
+        request.file_object(),
+        vcb,
+        request.parameters().name_interpretation(),
+        disposition,
+        request.parameters().close_disposition(),
+    ) {
+        Ok(CreateTargetLookup::Existing { node, location }) => {
+            open_existing_node(request, vcb, disposition, node, location)
         }
-        Ok(PathLookup::Missing { parent, name }) => {
+        Ok(CreateTargetLookup::Missing { parent, name }) => {
             create_missing_node(request, create_ea, vcb, disposition, parent, &name)
         }
         Err(error) => Err(error),
     }
 }
 
-/// Result of resolving a Windows path against the mounted volume.
+/// Result of resolving a create target against the mounted volume.
 #[derive(Debug, Eq, PartialEq)]
-enum PathLookup {
-    /// The requested path already exists.
+enum CreateTargetLookup {
+    /// The requested target already exists.
     Existing {
         /// Opened ext4 node.
         node: NodeId,
-        /// Exact path identity.
-        path: OpenedPath,
+        /// Opened location identity.
+        location: OpenedLocation,
     },
     /// The final path component is absent under an existing parent directory.
     Missing {
@@ -241,6 +247,58 @@ impl CreateFileObjectFlags {
     }
 }
 
+/// File reference decoded from FILE_OPEN_BY_FILE_ID input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CreateFileReference {
+    /// Windows-facing stable file index.
+    file_index: u32,
+}
+
+impl CreateFileReference {
+    /// Decodes an 8-byte Windows file reference from FILE_OBJECT::FileName.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT name is absent, malformed, or uses an unsupported
+    /// object-id/prefixed file-reference form.
+    fn decode(file_object: &FILE_OBJECT) -> DriverResult<Self> {
+        let name = file_object.FileName;
+        let byte_len = usize::from(name.Length);
+        if byte_len == 0 || name.Buffer.is_null() {
+            return Err(DriverError::InvalidParameter);
+        }
+        let bytes = unsafe {
+            // SAFETY: UNICODE_STRING Length is a byte length and Buffer is non-null for the
+            // requested binary file-reference payload.
+            core::slice::from_raw_parts(name.Buffer.cast::<u8>(), byte_len)
+        };
+        match byte_len {
+            8 => Self::from_wire_file_reference(
+                <[u8; 8]>::try_from(bytes).map_err(|_| DriverError::InvalidParameter)?,
+            ),
+            16 => Err(DriverError::NotSupported),
+            _ => Err(DriverError::NotSupported),
+        }
+    }
+
+    /// Builds a file reference from the Windows wire file reference.
+    /// # Errors
+    ///
+    /// Returns an error when the file reference cannot fit the ext4win file-index domain.
+    fn from_wire_file_reference(reference: [u8; 8]) -> DriverResult<Self> {
+        let file_index = u32::try_from(u64::from_le_bytes(reference))
+            .map_err(|_| DriverError::InvalidParameter)?;
+        if file_index == 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(Self { file_index })
+    }
+
+    /// Returns the referenced file index.
+    const fn file_index(self) -> u32 {
+        self.file_index
+    }
+}
+
 /// FILE_OBJECT name rooting after the raw UTF-16 boundary has been decoded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CreateNameRooting {
@@ -319,8 +377,8 @@ enum CreatePathAnchor {
     OpenedDirectory {
         /// Related directory inode.
         id: DirectoryNodeId,
-        /// Related directory path identity.
-        path: OpenedPath,
+        /// Related directory location identity.
+        location: OpenedLocation,
     },
 }
 
@@ -350,7 +408,7 @@ impl CreatePathAnchor {
         };
         Ok(Self::OpenedDirectory {
             id,
-            path: opened.path().try_to_owned_path()?,
+            location: opened.location().try_to_owned_location()?,
         })
     }
 
@@ -363,15 +421,15 @@ impl CreatePathAnchor {
     }
 
     /// Converts an empty create name into the already-opened anchor directory.
-    fn existing_directory(self) -> PathLookup {
+    fn existing_directory(self) -> CreateTargetLookup {
         match self {
-            Self::VolumeRoot => PathLookup::Existing {
+            Self::VolumeRoot => CreateTargetLookup::Existing {
                 node: NodeId::Directory(DirectoryNodeId::ROOT),
-                path: OpenedPath::Root,
+                location: OpenedLocation::Root,
             },
-            Self::OpenedDirectory { id, path } => PathLookup::Existing {
+            Self::OpenedDirectory { id, location } => CreateTargetLookup::Existing {
                 node: NodeId::Directory(id),
-                path,
+                location,
             },
         }
     }
@@ -387,7 +445,7 @@ fn open_existing_node(
     vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
     node: NodeId,
-    path: OpenedPath,
+    location: OpenedLocation,
 ) -> DriverResult<()> {
     let parameters = request.parameters();
     validate_existing_reparse_point_mode(node, parameters.reparse_point_mode())?;
@@ -395,7 +453,7 @@ fn open_existing_node(
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
-            initialize_file_object(request.file_object(), vcb, node, path, policy)
+            initialize_file_object(request.file_object(), vcb, node, location, policy)
         }
         CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
         CreateDisposition::Overwrite
@@ -405,7 +463,7 @@ fn open_existing_node(
             let handle = memory::boxed_try_with(|| {
                 Ok(OpenedHandle::new(
                     node,
-                    path,
+                    location,
                     policy.close_disposition(),
                     policy.write_commitment(),
                     policy.data_transfer_mode(),
@@ -482,7 +540,7 @@ fn create_missing_node(
         CreateDisposition::Overwrite => return Err(DriverError::ObjectNameNotFound),
     }
 
-    let path = OpenedPath::try_child(parent, name)?;
+    let location = OpenedLocation::try_directory_entry(parent, name)?;
     let target = child_creation_target(parameters.target_requirement())?;
     let mut creation = unsafe {
         // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
@@ -500,7 +558,7 @@ fn create_missing_node(
     let handle = memory::boxed_try_with(|| {
         Ok(OpenedHandle::new(
             node,
-            path,
+            location,
             policy.close_disposition(),
             policy.write_commitment(),
             policy.data_transfer_mode(),
@@ -613,6 +671,86 @@ fn truncate_existing_file(
     Ok(())
 }
 
+/// Resolves a create target to an existing node or missing path leaf.
+/// # Errors
+///
+/// Returns an error when path or file-reference resolution fails.
+fn resolve_target(
+    file_object: UninitializedFileObject,
+    vcb: NonNull<VolumeControlBlock>,
+    name_interpretation: CreateNameInterpretation,
+    disposition: CreateDisposition,
+    close_disposition: CloseDisposition,
+) -> DriverResult<CreateTargetLookup> {
+    match name_interpretation {
+        CreateNameInterpretation::Path => resolve_path(file_object, vcb),
+        CreateNameInterpretation::FileReference => {
+            validate_file_reference_create(disposition, close_disposition)?;
+            resolve_file_reference(file_object, vcb)
+        }
+    }
+}
+
+/// Validates create semantics for FILE_OPEN_BY_FILE_ID.
+/// # Errors
+///
+/// Returns an error when the request needs a parent/name namespace target that file-reference opens
+/// do not provide.
+fn validate_file_reference_create(
+    disposition: CreateDisposition,
+    close_disposition: CloseDisposition,
+) -> DriverResult<()> {
+    match disposition {
+        CreateDisposition::Open => {}
+        CreateDisposition::Create
+        | CreateDisposition::OpenIf
+        | CreateDisposition::Overwrite
+        | CreateDisposition::OverwriteIf
+        | CreateDisposition::Supersede => return Err(DriverError::InvalidParameter),
+    }
+    if close_disposition == CloseDisposition::Delete {
+        return Err(DriverError::NotSupported);
+    }
+    Ok(())
+}
+
+/// Resolves an 8-byte file reference to an existing typed node.
+/// # Errors
+///
+/// Returns an error when the file-reference name is malformed or no live inode exists for it.
+fn resolve_file_reference(
+    file_object: UninitializedFileObject,
+    vcb: NonNull<VolumeControlBlock>,
+) -> DriverResult<CreateTargetLookup> {
+    let file_object = unsafe {
+        // SAFETY: `file_object` comes from the active create stack and is read
+        // only for immutable name fields.
+        file_object.as_ref()
+    };
+    let reference = CreateFileReference::decode(file_object)?;
+    let vcb = unsafe {
+        // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
+        // in the mounted device extension and is read only for file-id lookup.
+        vcb.as_ref()
+    };
+    let node = vcb
+        .volume()
+        .load_node_by_file_index(reference.file_index())
+        .map_err(file_reference_lookup_error)?;
+    Ok(CreateTargetLookup::Existing {
+        node,
+        location: OpenedLocation::FileReference,
+    })
+}
+
+/// Maps file-reference lookup failures to create/open status.
+fn file_reference_lookup_error(error: ext4_core::Error) -> DriverError {
+    match error {
+        ext4_core::Error::InvalidInode => DriverError::ObjectNameNotFound,
+        _ => DriverError::from(error),
+    }
+}
+
 /// Resolves a root-relative Windows path to an existing node or missing leaf.
 /// # Errors
 ///
@@ -621,7 +759,7 @@ fn truncate_existing_file(
 fn resolve_path(
     file_object: UninitializedFileObject,
     vcb: NonNull<VolumeControlBlock>,
-) -> DriverResult<PathLookup> {
+) -> DriverResult<CreateTargetLookup> {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is read
         // only for immutable path fields.
@@ -646,7 +784,7 @@ fn resolve_path(
         let child = match vcb.volume().lookup_windows_child(&parent, component) {
             Ok(ChildLookup::Found(child)) => child,
             Ok(ChildLookup::NotFound) if is_final => {
-                return Ok(PathLookup::Missing {
+                return Ok(CreateTargetLookup::Missing {
                     parent: parent_id,
                     name: component.to_ext4()?,
                 });
@@ -655,9 +793,9 @@ fn resolve_path(
             Err(error) => return Err(DriverError::from(error)),
         };
         if is_final {
-            return Ok(PathLookup::Existing {
+            return Ok(CreateTargetLookup::Existing {
                 node: *child.node(),
-                path: OpenedPath::try_child(child.parent(), child.name())?,
+                location: OpenedLocation::try_directory_entry(child.parent(), child.name())?,
             });
         }
         let NodeId::Directory(directory_id) = *child.node() else {
@@ -695,13 +833,13 @@ fn initialize_file_object(
     file_object: UninitializedFileObject,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: NodeId,
-    path: OpenedPath,
+    location: OpenedLocation,
     policy: CreateHandlePolicy,
 ) -> DriverResult<()> {
     let handle = memory::boxed_try_with(|| {
         Ok(OpenedHandle::new(
             node,
-            path,
+            location,
             policy.close_disposition(),
             policy.write_commitment(),
             policy.data_transfer_mode(),
@@ -866,6 +1004,20 @@ mod tests {
         }
     }
 
+    fn file_object_with_name_bytes(bytes: &mut [u8]) -> FILE_OBJECT {
+        let Ok(byte_len) = u16::try_from(bytes.len()) else {
+            return FILE_OBJECT::default();
+        };
+        FILE_OBJECT {
+            FileName: wdk_sys::UNICODE_STRING {
+                Length: byte_len,
+                MaximumLength: byte_len,
+                Buffer: bytes.as_mut_ptr().cast::<u16>(),
+            },
+            ..FILE_OBJECT::default()
+        }
+    }
+
     fn attach_opened_contexts(
         file_object: &mut FILE_OBJECT,
         fcb: &mut FileControlBlock,
@@ -942,6 +1094,70 @@ mod tests {
         .apply_to(&mut file_object);
 
         assert_eq!(file_object.Flags, existing | wdk_sys::FO_SYNCHRONOUS_IO);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_file_reference_decodes_eight_byte_file_index() {
+        let mut reference = u64::from(3_u32).to_le_bytes();
+        let file_object = file_object_with_name_bytes(&mut reference);
+
+        assert_eq!(
+            CreateFileReference::decode(&file_object).map(CreateFileReference::file_index),
+            Ok(3)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_file_reference_rejects_invalid_or_unsupported_wire_forms() {
+        let mut zero = 0_u64.to_le_bytes();
+        let zero_file_object = file_object_with_name_bytes(&mut zero);
+        assert_eq!(
+            CreateFileReference::decode(&zero_file_object),
+            Err(DriverError::InvalidParameter)
+        );
+
+        let mut too_large = (u64::from(u32::MAX) + 1).to_le_bytes();
+        let too_large_file_object = file_object_with_name_bytes(&mut too_large);
+        assert_eq!(
+            CreateFileReference::decode(&too_large_file_object),
+            Err(DriverError::InvalidParameter)
+        );
+
+        let mut object_id = [0_u8; 16];
+        let object_id_file_object = file_object_with_name_bytes(&mut object_id);
+        assert_eq!(
+            CreateFileReference::decode(&object_id_file_object),
+            Err(DriverError::NotSupported)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn file_reference_create_accepts_only_existing_keep_opens() {
+        assert_eq!(
+            validate_file_reference_create(CreateDisposition::Open, CloseDisposition::Keep),
+            Ok(())
+        );
+        assert_eq!(
+            validate_file_reference_create(CreateDisposition::Create, CloseDisposition::Keep),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            validate_file_reference_create(CreateDisposition::OpenIf, CloseDisposition::Keep),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            validate_file_reference_create(CreateDisposition::Open, CloseDisposition::Delete),
+            Err(DriverError::NotSupported)
+        );
     }
 
     /// # Panics
@@ -1058,7 +1274,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(vcb, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedPath::Root,
+            OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
@@ -1074,7 +1290,7 @@ mod tests {
             CreatePathAnchor::decode(&create, vcb, CreateNameRooting::Relative),
             Ok(CreatePathAnchor::OpenedDirectory {
                 id: DirectoryNodeId::ROOT,
-                path: OpenedPath::Root,
+                location: OpenedLocation::Root,
             })
         );
     }
@@ -1088,7 +1304,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(vcb, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedPath::Root,
+            OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,

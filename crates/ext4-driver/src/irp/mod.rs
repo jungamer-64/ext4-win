@@ -2467,6 +2467,8 @@ pub(crate) struct CreateParameters {
     synchronization_mode: CreateSynchronizationMode,
     /// Reparse-point opening mode requested by create options.
     reparse_point_mode: CreateReparsePointMode,
+    /// Interpretation of `FILE_OBJECT::FileName`.
+    name_interpretation: CreateNameInterpretation,
     /// Extended-attribute input length supplied with create.
     ea_length: IrpBufferLength,
 }
@@ -2495,6 +2497,7 @@ impl CreateParameters {
             transfer_buffering: create_options.transfer_buffering(),
             synchronization_mode: create_options.synchronization_mode(),
             reparse_point_mode: create_options.reparse_point_mode(),
+            name_interpretation: create_options.name_interpretation(),
             ea_length,
         })
     }
@@ -2542,6 +2545,11 @@ impl CreateParameters {
     /// Returns reparse-point opening mode requested at create/open.
     pub(crate) const fn reparse_point_mode(self) -> CreateReparsePointMode {
         self.reparse_point_mode
+    }
+
+    /// Returns how the create FILE_OBJECT name must be interpreted.
+    pub(crate) const fn name_interpretation(self) -> CreateNameInterpretation {
+        self.name_interpretation
     }
 
     /// Returns the input EA length.
@@ -2716,6 +2724,26 @@ impl CreateReparsePointMode {
     }
 }
 
+/// Requested interpretation for `FILE_OBJECT::FileName`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateNameInterpretation {
+    /// Interpret the FILE_OBJECT name as a Windows path.
+    Path,
+    /// Interpret the FILE_OBJECT name as a binary file reference.
+    FileReference,
+}
+
+impl CreateNameInterpretation {
+    /// Decodes create-name interpretation options.
+    const fn from_options(options: wdk_sys::ULONG) -> Self {
+        if create_option_selected(options, wdk_sys::FILE_OPEN_BY_FILE_ID) {
+            Self::FileReference
+        } else {
+            Self::Path
+        }
+    }
+}
+
 impl CreateTargetRequirement {
     /// Decodes file-vs-directory create options.
     /// # Errors
@@ -2748,6 +2776,8 @@ struct CreateOptions {
     synchronization_mode: CreateSynchronizationMode,
     /// Requested reparse-point handling.
     reparse_point_mode: CreateReparsePointMode,
+    /// Requested name interpretation.
+    name_interpretation: CreateNameInterpretation,
 }
 
 impl CreateOptions {
@@ -2772,6 +2802,7 @@ impl CreateOptions {
         let synchronization_mode =
             CreateSynchronizationMode::from_options(options, desired_access)?;
         let reparse_point_mode = CreateReparsePointMode::from_options(options);
+        let name_interpretation = CreateNameInterpretation::from_options(options);
         let close_disposition = if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
             CloseDisposition::Delete
         } else {
@@ -2791,6 +2822,7 @@ impl CreateOptions {
             transfer_buffering,
             synchronization_mode,
             reparse_point_mode,
+            name_interpretation,
         })
     }
 
@@ -2822,6 +2854,11 @@ impl CreateOptions {
     /// Returns decoded reparse-point handling.
     const fn reparse_point_mode(self) -> CreateReparsePointMode {
         self.reparse_point_mode
+    }
+
+    /// Returns decoded name interpretation.
+    const fn name_interpretation(self) -> CreateNameInterpretation {
+        self.name_interpretation
     }
 }
 
@@ -3277,16 +3314,16 @@ mod tests {
     use wdk_sys::{STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
 
     use super::{
-        CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateReparsePointMode,
-        CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering,
-        CurrentIrpStackLocation, DeviceIrpQueue, DirectoryControlMinorFunction,
-        DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
-        DirectoryPatternInput, DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection,
-        FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION, FileSystemControlMinorFunction,
-        FsControlCode, InformationLength, IrpBufferLength, IrpCompletion, KernelIrp,
-        QueryFileInformationClass, QueryVolumeInformationClass, QueueWorkerState, ReceivedIrp,
-        STATUS_CANCELLED, SecurityComponentSelection, SetFileInformationClass,
-        SetVolumeInformationClass,
+        CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateNameInterpretation,
+        CreateReparsePointMode, CreateSynchronizationMode, CreateTargetRequirement,
+        CreateTransferBuffering, CurrentIrpStackLocation, DeviceIrpQueue,
+        DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
+        DirectoryInformationClass, DirectoryPatternInput, DispatchTarget, EaEntryEmission,
+        EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
+        FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
+        IrpCompletion, KernelIrp, QueryFileInformationClass, QueryVolumeInformationClass,
+        QueueWorkerState, ReceivedIrp, STATUS_CANCELLED, SecurityComponentSelection,
+        SetFileInformationClass, SetVolumeInformationClass,
     };
     use crate::state::{
         CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
@@ -3938,6 +3975,10 @@ mod tests {
                     CreateReparsePointMode::ResolveFinalTarget
                 );
                 assert_eq!(
+                    parameters.name_interpretation(),
+                    CreateNameInterpretation::Path
+                );
+                assert_eq!(
                     parameters.share_access().as_ulong(),
                     wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE
                 );
@@ -3991,6 +4032,10 @@ mod tests {
                     parameters.reparse_point_mode(),
                     CreateReparsePointMode::ResolveFinalTarget
                 );
+                assert_eq!(
+                    parameters.name_interpretation(),
+                    CreateNameInterpretation::Path
+                );
             }
         }
     }
@@ -4037,6 +4082,10 @@ mod tests {
                     parameters.reparse_point_mode(),
                     CreateReparsePointMode::ResolveFinalTarget
                 );
+                assert_eq!(
+                    parameters.name_interpretation(),
+                    CreateNameInterpretation::Path
+                );
             }
         }
     }
@@ -4069,6 +4118,39 @@ mod tests {
                 assert_eq!(
                     create.parameters().reparse_point_mode(),
                     CreateReparsePointMode::OpenFinalReparsePoint
+                );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_stack_decodes_file_reference_name_interpretation() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_OPEN_BY_FILE_ID,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let create = current.create();
+            assert!(create.is_ok());
+            if let Ok(create) = create {
+                assert_eq!(
+                    create.parameters().name_interpretation(),
+                    CreateNameInterpretation::FileReference
                 );
             }
         }
@@ -4227,7 +4309,7 @@ mod tests {
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::addr_of_mut!(security_context),
             Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
-                | wdk_sys::FILE_OPEN_BY_FILE_ID,
+                | wdk_sys::FILE_OPEN_REQUIRING_OPLOCK,
             __bindgen_padding_0: [0; 2],
             FileAttributes: 0,
             ShareAccess: 0,
