@@ -11,10 +11,10 @@ use ext4_core::{
 use wdk_sys::LARGE_INTEGER;
 
 use crate::irp::{
-    DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
-    DirectoryEntryIndex, DirectoryInformationClass, DirectoryPatternInput, DispatchTarget,
-    IrpBufferLength, IrpCompletion, QueryDirectoryStack, QueryFileInformationClass, QueryFileStack,
-    SetFileInformationClass, SetFileStack,
+    ByteRangeLockOperation, DirectoryControlMinorFunction, DirectoryCursorPosition,
+    DirectoryEntryEmission, DirectoryEntryIndex, DirectoryInformationClass, DirectoryPatternInput,
+    DispatchTarget, IrpBufferLength, IrpCompletion, QueryDirectoryStack, QueryFileInformationClass,
+    QueryFileStack, SetFileInformationClass, SetFileStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
@@ -119,7 +119,27 @@ pub(crate) fn directory_control(target: DispatchTarget) -> DriverResult<IrpCompl
 ///
 /// Always returns an unsupported-operation error after decoding the lock-control stack.
 pub(crate) fn lock_control(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let _stack = target.current_stack()?.lock_control()?;
+    let stack = target.current_stack()?.lock_control()?;
+    let _file_object = stack.file_object();
+    match stack.operation() {
+        ByteRangeLockOperation::Lock(request) => {
+            let range = request.range();
+            let _decoded = (
+                range.offset(),
+                range.length().bytes(),
+                range.key().value(),
+                request.access(),
+                request.conflict_policy(),
+            );
+        }
+        ByteRangeLockOperation::UnlockSingle(range) => {
+            let _decoded = (range.offset(), range.length().bytes(), range.key().value());
+        }
+        ByteRangeLockOperation::UnlockAll => {}
+        ByteRangeLockOperation::UnlockAllByKey(key) => {
+            let _decoded = key.value();
+        }
+    }
     Err(DriverError::NotSupported)
 }
 
