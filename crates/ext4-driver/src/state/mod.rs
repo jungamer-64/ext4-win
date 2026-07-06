@@ -1167,39 +1167,45 @@ impl DirectoryCursor {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-/// Opened path identity stored with a handle.
-pub(crate) enum OpenedPath {
+/// Opened location identity stored with a handle.
+pub(crate) enum OpenedLocation {
     /// Mounted volume root.
     Root,
     /// Child entry under a parent directory.
-    Child {
+    DirectoryEntry {
         /// Parent directory inode.
         parent: DirectoryNodeId,
         /// Exact ext4 directory entry name.
         name: Ext4Name,
     },
+    /// Opened by stable file reference without a directory-entry location.
+    FileReference,
 }
 
-impl OpenedPath {
-    /// Builds a child path by fallibly copying the ext4 child name.
+impl OpenedLocation {
+    /// Builds a child directory-entry location by fallibly copying the ext4 child name.
     /// # Errors
     ///
     /// Returns an error when copying the child name cannot allocate.
-    pub(crate) fn try_child(parent: DirectoryNodeId, name: &Ext4Name) -> DriverResult<Self> {
-        Ok(Self::Child {
+    pub(crate) fn try_directory_entry(
+        parent: DirectoryNodeId,
+        name: &Ext4Name,
+    ) -> DriverResult<Self> {
+        Ok(Self::DirectoryEntry {
             parent,
             name: name.try_to_owned_name()?,
         })
     }
 
-    /// Copies this opened path into a separately owned handle path.
+    /// Copies this opened location into a separately owned handle location.
     /// # Errors
     ///
     /// Returns an error when copying a child name cannot allocate.
-    pub(crate) fn try_to_owned_path(&self) -> DriverResult<Self> {
+    pub(crate) fn try_to_owned_location(&self) -> DriverResult<Self> {
         match self {
             Self::Root => Ok(Self::Root),
-            Self::Child { parent, name } => Self::try_child(*parent, name),
+            Self::DirectoryEntry { parent, name } => Self::try_directory_entry(*parent, name),
+            Self::FileReference => Ok(Self::FileReference),
         }
     }
 }
@@ -1225,8 +1231,8 @@ pub(crate) enum WriteCommitment {
 #[derive(Debug, Eq, PartialEq)]
 /// Common per-handle state shared by every opened node kind.
 pub(crate) struct OpenedHandleState {
-    /// Path used for namespace mutations on cleanup.
-    path: OpenedPath,
+    /// Location used for namespace mutations on cleanup when available.
+    location: OpenedLocation,
     /// Requested close disposition.
     close_disposition: CloseDisposition,
     /// Write completion durability requested for this handle.
@@ -1238,27 +1244,27 @@ pub(crate) struct OpenedHandleState {
 impl OpenedHandleState {
     /// Creates shared per-handle state.
     const fn new(
-        path: OpenedPath,
+        location: OpenedLocation,
         close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
     ) -> Self {
         Self {
-            path,
+            location,
             close_disposition,
             write_commitment,
             data_transfer_mode,
         }
     }
 
-    /// Returns the opened path identity.
-    const fn path(&self) -> &OpenedPath {
-        &self.path
+    /// Returns the opened location identity.
+    const fn location(&self) -> &OpenedLocation {
+        &self.location
     }
 
-    /// Replaces the opened path after a successful rename.
-    fn replace_path(&mut self, path: OpenedPath) {
-        self.path = path;
+    /// Replaces the opened location after a successful rename.
+    fn replace_location(&mut self, location: OpenedLocation) {
+        self.location = location;
     }
 
     /// Returns the requested close disposition.
@@ -1309,14 +1315,14 @@ impl OpenedHandle {
     /// Creates per-handle state for an opened node.
     pub(crate) fn new(
         node: NodeId,
-        path: OpenedPath,
+        location: OpenedLocation,
         close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
     ) -> Self {
         Self::from_parts(
             node,
-            path,
+            location,
             close_disposition,
             write_commitment,
             data_transfer_mode,
@@ -1326,13 +1332,13 @@ impl OpenedHandle {
     /// Creates per-handle state from explicit lifecycle fields.
     fn from_parts(
         node: NodeId,
-        path: OpenedPath,
+        location: OpenedLocation,
         close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
     ) -> Self {
         let state = OpenedHandleState::new(
-            path,
+            location,
             close_disposition,
             write_commitment,
             data_transfer_mode,
@@ -1362,9 +1368,9 @@ impl OpenedHandle {
         self.state.data_transfer_mode()
     }
 
-    /// Returns the opened path identity.
-    const fn path(&self) -> &OpenedPath {
-        self.state.path()
+    /// Returns the opened location identity.
+    const fn location(&self) -> &OpenedLocation {
+        self.state.location()
     }
 
     /// Replaces the requested close disposition.
@@ -1372,9 +1378,9 @@ impl OpenedHandle {
         self.state.set_close_disposition(close_disposition);
     }
 
-    /// Replaces the opened path after a successful rename.
-    fn replace_path(&mut self, path: OpenedPath) {
-        self.state.replace_path(path);
+    /// Replaces the opened location after a successful rename.
+    fn replace_location(&mut self, location: OpenedLocation) {
+        self.state.replace_location(location);
     }
 
     /// Converts the per-handle state to a symlink handle after namespace conversion.
@@ -1452,14 +1458,14 @@ impl OpenedObject {
         self.file_control_block().node()
     }
 
-    /// Returns the opened path identity.
-    pub(crate) fn path(&self) -> &OpenedPath {
-        self.handle().path()
+    /// Returns the opened location identity.
+    pub(crate) fn location(&self) -> &OpenedLocation {
+        self.handle().location()
     }
 
-    /// Replaces the opened path after a successful rename.
-    pub(crate) fn replace_path(&mut self, path: OpenedPath) {
-        self.mutable_handle().replace_path(path);
+    /// Replaces the opened location after a successful rename.
+    pub(crate) fn replace_location(&mut self, location: OpenedLocation) {
+        self.mutable_handle().replace_location(location);
     }
 
     /// Returns the requested close disposition.
@@ -1722,9 +1728,9 @@ mod tests {
     use super::{
         CloseDisposition, ControlDeviceExtension, DataTransferMode, FileControlBlock,
         FileControlBlockRelease, KernelDevice, KernelFileObject, MountedVolumeDevice,
-        NoIntermediateTransfer, OpenedDirectory, OpenedHandle, OpenedHandleKind, OpenedObject,
-        OpenedPath, OpenedRegularFile, OpenedSymlink, TransferBufferAlignment, TransferSectorSize,
-        UninitializedFileObject, VolumeControlBlock, WriteCommitment,
+        NoIntermediateTransfer, OpenedDirectory, OpenedHandle, OpenedHandleKind, OpenedLocation,
+        OpenedObject, OpenedRegularFile, OpenedSymlink, TransferBufferAlignment,
+        TransferSectorSize, UninitializedFileObject, VolumeControlBlock, WriteCommitment,
     };
 
     fn file_object_with_contexts(
@@ -1878,7 +1884,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedPath::Root,
+            OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
@@ -1921,7 +1927,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedPath::Root,
+            OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
@@ -1955,7 +1961,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedPath::Root,
+            OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
@@ -1990,7 +1996,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedPath::Root,
+            OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::FlushThrough,
             DataTransferMode::IntermediateAllowed,
@@ -2030,7 +2036,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedPath::Root,
+            OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::NoIntermediate(transfer),
@@ -2063,7 +2069,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedPath::Root,
+            OpenedLocation::Root,
             CloseDisposition::Delete,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,

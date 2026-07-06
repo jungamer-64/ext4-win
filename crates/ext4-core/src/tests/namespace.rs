@@ -57,6 +57,21 @@ fn exact_ext4_lookup_uses_raw_bytes() {
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
+fn file_index_lookup_classifies_live_inode() {
+    let mut image = minimal_write_fixture_image();
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let volume = must(JournaledVolume::mount(device, test_mount_context()));
+
+    let node = must(volume.load_node_by_file_index(3));
+    assert!(matches!(node, NodeId::File(_)));
+    assert_eq!(node.file_index(), 3);
+    assert_eq!(volume.load_node_by_file_index(0), Err(Error::InvalidInode));
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
 fn windows_name_projection_rejects_reserved_separator() {
     let ext4_name = must(crate::Ext4Name::new(b"a:b"));
     let result = WindowsName::from_ext4(&ext4_name);

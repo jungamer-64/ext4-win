@@ -20,8 +20,8 @@ use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{
     CloseDisposition, DirectoryCursor, FileControlBlock, KernelFileObject, MountedVolumeDevice,
-    OpenedDirectory, OpenedHandle, OpenedObject, OpenedPath, OpenedRegularFile, VolumeControlBlock,
-    WriteCommitment, release_file_control_block,
+    OpenedDirectory, OpenedHandle, OpenedLocation, OpenedObject, OpenedRegularFile,
+    VolumeControlBlock, WriteCommitment, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -428,20 +428,21 @@ fn set_close_disposition(
     Ok(())
 }
 
-/// Applies FILE_RENAME_INFORMATION to the opened path.
+/// Applies FILE_RENAME_INFORMATION to the opened directory-entry location.
 /// # Errors
 ///
-/// Returns an error when the rename buffer is malformed, the opened path is the root, the target
-/// parent cannot be resolved, or the ext4 rename transaction fails.
+/// Returns an error when the rename buffer is malformed, the opened location cannot be renamed,
+/// the target parent cannot be resolved, or the ext4 rename transaction fails.
 fn set_rename_information(
     mut request: SetFileRequest,
     format: RenameInformationFormat,
 ) -> DriverResult<()> {
     let rename = RenameTargetPath::parse(request.target, request.stack.length(), format)?;
 
-    let (source_parent, source_name) = match request.opened_file.path() {
-        OpenedPath::Child { parent, name } => (*parent, name.try_to_owned_name()?),
-        OpenedPath::Root => return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot)),
+    let (source_parent, source_name) = match request.opened_file.location() {
+        OpenedLocation::DirectoryEntry { parent, name } => (*parent, name.try_to_owned_name()?),
+        OpenedLocation::Root => return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot)),
+        OpenedLocation::FileReference => return Err(DriverError::NotSupported),
     };
 
     let mut vcb = request.opened_file.volume();
@@ -465,10 +466,12 @@ fn set_rename_information(
         rename.target_collision(),
     )?;
     transaction.commit()?;
-    request.opened_file.replace_path(OpenedPath::Child {
-        parent: target_parent.id(),
-        name: target_name,
-    });
+    request
+        .opened_file
+        .replace_location(OpenedLocation::DirectoryEntry {
+            parent: target_parent.id(),
+            name: target_name,
+        });
     Ok(())
 }
 
@@ -1156,9 +1159,10 @@ fn cleanup_file_object(file_object: KernelFileObject) -> DriverResult<()> {
     if opened_file.close_disposition() == CloseDisposition::Keep {
         return Ok(());
     }
-    let (parent, name) = match opened_file.path() {
-        OpenedPath::Child { parent, name } => (*parent, name.try_to_owned_name()?),
-        OpenedPath::Root => return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot)),
+    let (parent, name) = match opened_file.location() {
+        OpenedLocation::DirectoryEntry { parent, name } => (*parent, name.try_to_owned_name()?),
+        OpenedLocation::Root => return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot)),
+        OpenedLocation::FileReference => return Err(DriverError::NotSupported),
     };
 
     let mut vcb = opened_file.volume();
@@ -1854,13 +1858,13 @@ fn pack_network_open_information(
 /// Packs FILE_NAME_INFORMATION.
 /// # Errors
 ///
-/// Returns an error when the opened path cannot be projected to UTF-16, the name length overflows,
-/// or the output buffer is too small.
+/// Returns an error when the opened location cannot be projected to UTF-16, the name length
+/// overflows, or the output buffer is too small.
 fn pack_name_information(
     output: &mut [u8],
     opened_file: &OpenedObject,
 ) -> DriverResult<IrpCompletion> {
-    let units = opened_path_name_units(opened_file.path())?;
+    let units = opened_location_name_units(opened_file.location())?;
     let name_bytes = utf16_byte_len(units.as_slice())?;
     let required = FILE_NAME_INFORMATION_NAME_OFFSET
         .checked_add(name_bytes)
@@ -1894,16 +1898,18 @@ fn pack_attribute_tag_information(
     )
 }
 
-/// Projects an opened path to the name payload returned to Windows.
+/// Projects an opened location to the name payload returned to Windows.
 /// # Errors
 ///
-/// Returns an error when a child ext4 name cannot be represented as a Windows UTF-16 name.
-fn opened_path_name_units(path: &OpenedPath) -> DriverResult<DriverVec<u16>> {
-    match path {
-        OpenedPath::Root => DriverVec::try_copied_from_slice(&[UTF16_BACKSLASH]),
-        OpenedPath::Child { name, .. } => {
+/// Returns an error when the location has no path name or a child ext4 name cannot be represented
+/// as a Windows UTF-16 name.
+fn opened_location_name_units(location: &OpenedLocation) -> DriverResult<DriverVec<u16>> {
+    match location {
+        OpenedLocation::Root => DriverVec::try_copied_from_slice(&[UTF16_BACKSLASH]),
+        OpenedLocation::DirectoryEntry { name, .. } => {
             DriverVec::try_copied_from_slice(WindowsName::from_ext4(name)?.utf16())
         }
+        OpenedLocation::FileReference => Err(DriverError::NotSupported),
     }
 }
 
@@ -2120,7 +2126,7 @@ mod tests {
 
     use crate::irp::{DirectoryInformationClass, DispatchTarget};
     use crate::kernel::status::DriverError;
-    use crate::state::OpenedPath;
+    use crate::state::OpenedLocation;
     use ext4_core::{
         BlockSize, DirectoryNodeId, Ext4Gid, Ext4LinkCount, Ext4Name, Ext4Owner, Ext4Permissions,
         Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileSize, NodeId, WindowsName,
@@ -2267,7 +2273,7 @@ mod tests {
             crate::state::FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = crate::state::OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedPath::Root,
+            OpenedLocation::Root,
             crate::state::CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,
             crate::state::DataTransferMode::IntermediateAllowed,
@@ -2401,9 +2407,9 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn opened_path_name_units_project_root_and_child_names() {
+    fn opened_location_name_units_project_root_and_child_names() {
         let root_units: &[u16] = &[super::UTF16_BACKSLASH];
-        let projected_root = super::opened_path_name_units(&OpenedPath::Root);
+        let projected_root = super::opened_location_name_units(&OpenedLocation::Root);
         assert!(projected_root.is_ok());
         if let Ok(projected_root) = projected_root {
             assert_eq!(projected_root.as_slice(), root_units);
@@ -2414,7 +2420,7 @@ mod tests {
         let Ok(name) = name else {
             return;
         };
-        let path = OpenedPath::Child {
+        let location = OpenedLocation::DirectoryEntry {
             parent: DirectoryNodeId::ROOT,
             name,
         };
@@ -2424,11 +2430,22 @@ mod tests {
             u16::from(b'l'),
             u16::from(b'e'),
         ];
-        let projected_child = super::opened_path_name_units(&path);
+        let projected_child = super::opened_location_name_units(&location);
         assert!(projected_child.is_ok());
         if let Ok(projected_child) = projected_child {
             assert_eq!(projected_child.as_slice(), child_units);
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn opened_location_name_units_rejects_file_reference_location() {
+        assert_eq!(
+            super::opened_location_name_units(&OpenedLocation::FileReference),
+            Err(DriverError::NotSupported)
+        );
     }
 
     /// # Panics
@@ -2611,7 +2628,7 @@ mod tests {
         );
         let mut handle = crate::state::OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedPath::Root,
+            OpenedLocation::Root,
             crate::state::CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,
             crate::state::DataTransferMode::IntermediateAllowed,

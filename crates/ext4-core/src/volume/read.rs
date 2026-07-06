@@ -210,6 +210,14 @@ where
         self.volume.load_symlink(id)
     }
 
+    /// Loads and classifies one Windows-facing file index as a typed node identity.
+    ///
+    /// # Errors
+    /// Returns an error when the file index cannot be mapped to a live inode.
+    pub fn load_node_by_file_index(&self, file_index: u32) -> Result<NodeId> {
+        self.volume.load_node_by_file_index(file_index)
+    }
+
     /// Reads all extended attributes attached to a typed node.
     ///
     /// # Errors
@@ -565,6 +573,15 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
     /// table cannot be read and parsed.
     pub(super) fn load_inode_node(&self, inode_id: InodeId) -> Result<LoadedNode> {
         Ok(LoadedNode::from_inode(self.read_inode_record(inode_id)?))
+    }
+
+    /// Loads and classifies one Windows-facing file index as a typed node identity.
+    ///
+    /// # Errors
+    /// Returns an error when the file index cannot represent a live ext4 inode.
+    pub(super) fn load_node_by_file_index(&self, file_index: u32) -> Result<NodeId> {
+        let inode_id = InodeId::try_from(file_index)?;
+        Ok(self.load_inode_node(inode_id)?.id())
     }
 
     /// Loads an inode through a previously validated public identity.

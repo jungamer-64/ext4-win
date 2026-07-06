@@ -6,7 +6,9 @@ use crate::irp::{DispatchTarget, FileSystemControlStack, IrpCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::request::metadata;
-use crate::state::{FileControlBlock, OpenedObject, OpenedPath, OpenedSymlink, VolumeControlBlock};
+use crate::state::{
+    FileControlBlock, OpenedLocation, OpenedObject, OpenedSymlink, VolumeControlBlock,
+};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{NodeId, SymlinkNodeId, SymlinkTarget};
 
@@ -50,14 +52,14 @@ pub(crate) fn get_reparse_point(
 /// Handles `FSCTL_SET_REPARSE_POINT` by replacing the opened node with an ext4 symlink.
 /// # Errors
 ///
-/// Returns an error when the reparse input is malformed or the opened path cannot be replaced by a
-/// symlink in an ext4 transaction.
+/// Returns an error when the reparse input is malformed or the opened location cannot be replaced
+/// by a symlink in an ext4 transaction.
 pub(crate) fn set_reparse_point(
     target: DispatchTarget,
     stack: FileSystemControlStack,
 ) -> DriverResult<IrpCompletion> {
     let symlink_target = parse_symlink_reparse_target(target, stack)?;
-    replace_opened_path_with_symlink(stack, &symlink_target)?;
+    replace_opened_location_with_symlink(stack, &symlink_target)?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -96,19 +98,20 @@ fn parse_symlink_reparse_target(
     parse_symlink_reparse_buffer(input.as_slice())
 }
 
-/// Replaces the opened child entry with a newly-created symlink inode.
+/// Replaces the opened directory entry with a newly-created symlink inode.
 /// # Errors
 ///
 /// Returns an error when the opened object is the root, its current node cannot be removed, or the
 /// replacement symlink cannot be created and committed.
-fn replace_opened_path_with_symlink(
+fn replace_opened_location_with_symlink(
     stack: FileSystemControlStack,
     target: &SymlinkTarget,
 ) -> DriverResult<()> {
     let mut opened_file = OpenedObject::decode(stack.file_object())?;
-    let (parent, name) = match opened_file.path() {
-        OpenedPath::Child { parent, name } => (*parent, name.try_to_owned_name()?),
-        OpenedPath::Root => return Err(DriverError::NotSupported),
+    let (parent, name) = match opened_file.location() {
+        OpenedLocation::DirectoryEntry { parent, name } => (*parent, name.try_to_owned_name()?),
+        OpenedLocation::Root => return Err(DriverError::NotSupported),
+        OpenedLocation::FileReference => return Err(DriverError::NotSupported),
     };
 
     let mut vcb = opened_file.volume();
