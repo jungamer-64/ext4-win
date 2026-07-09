@@ -901,6 +901,14 @@ impl MountedVolumeDevice {
             // just-created mounted volume device.
             DeviceIrpQueue::initialize_at(core::ptr::addr_of_mut!(extension.header.queue), device)?;
         }
+        if let Err(error) = register_shutdown_notification(device) {
+            unsafe {
+                // SAFETY: Shutdown registration failed before this device was
+                // published, so no queue worker can still own the queue.
+                DeviceIrpQueue::release_at(core::ptr::addr_of_mut!(extension.header.queue));
+            }
+            return Err(error);
+        }
 
         device_object.Vpb = vpb;
         device_object.Flags |= DO_DIRECT_IO;
@@ -976,6 +984,39 @@ impl MountedVolumeDevice {
         .ok_or(DriverError::InvalidParameter)?;
         VpbLabel::encode(vcb.volume_label()).map(|label| label.write_to(vpb))
     }
+}
+
+/// Registers a mounted filesystem device for shutdown delivery.
+/// # Errors
+///
+/// Returns an error when the I/O Manager cannot register the mounted device for
+/// `IRP_MJ_SHUTDOWN` delivery.
+fn register_shutdown_notification(device: KernelDevice) -> DriverResult<()> {
+    #[cfg(not(test))]
+    {
+        let status = unsafe {
+            // SAFETY: `device` is a live mounted filesystem device whose
+            // dispatch table owns IRP_MJ_SHUTDOWN before it is published.
+            ffi::IoRegisterShutdownNotification(device.as_ptr())
+        };
+        shutdown_registration_status(status)
+    }
+    #[cfg(test)]
+    {
+        let _device = device;
+        Ok(())
+    }
+}
+
+/// Converts shutdown-registration status into the driver error domain.
+/// # Errors
+///
+/// Returns an error when the I/O Manager rejected shutdown-notification registration.
+fn shutdown_registration_status(status: wdk_sys::NTSTATUS) -> DriverResult<()> {
+    if status < STATUS_SUCCESS {
+        return Err(DriverError::InsufficientResources);
+    }
+    Ok(())
 }
 
 /// Count of UTF-16 code units exposed by WDK VPB::VolumeLabel.
@@ -1726,11 +1767,12 @@ mod tests {
     use crate::kernel::status::DriverError;
 
     use super::{
-        CloseDisposition, ControlDeviceExtension, DataTransferMode, FileControlBlock,
-        FileControlBlockRelease, KernelDevice, KernelFileObject, MountedVolumeDevice,
-        NoIntermediateTransfer, OpenedDirectory, OpenedHandle, OpenedHandleKind, OpenedLocation,
-        OpenedObject, OpenedRegularFile, OpenedSymlink, TransferBufferAlignment,
-        TransferSectorSize, UninitializedFileObject, VolumeControlBlock, WriteCommitment,
+        CloseDisposition, ControlDeviceExtension, DataTransferMode, DeviceExtensionKind,
+        FileControlBlock, FileControlBlockRelease, KernelDevice, KernelFileObject,
+        MountedVolumeDevice, MountedVolumeDeviceExtension, NoIntermediateTransfer, OpenedDirectory,
+        OpenedHandle, OpenedHandleKind, OpenedLocation, OpenedObject, OpenedRegularFile,
+        OpenedSymlink, TransferBufferAlignment, TransferSectorSize, UninitializedFileObject,
+        VolumeControlBlock, WriteCommitment, shutdown_registration_status,
     };
 
     fn file_object_with_contexts(
@@ -1770,6 +1812,43 @@ mod tests {
                 ControlDeviceExtension::release(device);
             }
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the mounted extension no longer exposes its live VCB pointer.
+    #[test]
+    fn mounted_volume_vcb_decodes_mounted_device_extension() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut extension = core::mem::MaybeUninit::<MountedVolumeDeviceExtension>::zeroed();
+        let extension = unsafe {
+            // SAFETY: The test initializes every field read by
+            // MountedVolumeDevice::vcb before exposing this extension.
+            extension.assume_init_mut()
+        };
+        extension.header.kind = DeviceExtensionKind::MOUNTED_VOLUME;
+        extension.vcb = volume.as_ptr();
+        let mut device = wdk_sys::DEVICE_OBJECT {
+            DeviceExtension: core::ptr::from_mut(extension).cast(),
+            ..wdk_sys::DEVICE_OBJECT::default()
+        };
+        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device));
+        assert_eq!(device.and_then(MountedVolumeDevice::vcb), Some(volume));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when shutdown-registration failure stops surfacing as an allocation failure.
+    #[test]
+    fn shutdown_registration_status_maps_success_and_failure() {
+        assert_eq!(
+            shutdown_registration_status(wdk_sys::STATUS_SUCCESS),
+            Ok(())
+        );
+        assert_eq!(
+            shutdown_registration_status(wdk_sys::STATUS_INSUFFICIENT_RESOURCES),
+            Err(DriverError::InsufficientResources)
+        );
     }
 
     /// # Panics

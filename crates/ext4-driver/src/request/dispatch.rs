@@ -273,8 +273,7 @@ const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
         DispatchMajor::Close
         | DispatchMajor::Cleanup
         | DispatchMajor::DeviceControl
-        | DispatchMajor::LockControl
-        | DispatchMajor::Shutdown => DispatchPolicy::Immediate,
+        | DispatchMajor::LockControl => DispatchPolicy::Immediate,
         DispatchMajor::Create
         | DispatchMajor::Read
         | DispatchMajor::Write
@@ -288,7 +287,8 @@ const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
         | DispatchMajor::QueryEa
         | DispatchMajor::SetEa
         | DispatchMajor::QuerySecurity
-        | DispatchMajor::SetSecurity => DispatchPolicy::Queued,
+        | DispatchMajor::SetSecurity
+        | DispatchMajor::Shutdown => DispatchPolicy::Queued,
     }
 }
 
@@ -316,10 +316,9 @@ pub(crate) fn execute_queued(target: DispatchTarget) -> DriverResult<IrpCompleti
 fn execute_immediate(major: DispatchMajor, target: DispatchTarget) -> DriverResult<IrpCompletion> {
     match major {
         DispatchMajor::Cleanup => cleanup_immediate(target),
-        DispatchMajor::Close
-        | DispatchMajor::DeviceControl
-        | DispatchMajor::LockControl
-        | DispatchMajor::Shutdown => execute_major(major, target),
+        DispatchMajor::Close | DispatchMajor::DeviceControl | DispatchMajor::LockControl => {
+            execute_major(major, target)
+        }
         DispatchMajor::Create
         | DispatchMajor::Read
         | DispatchMajor::Write
@@ -333,7 +332,8 @@ fn execute_immediate(major: DispatchMajor, target: DispatchTarget) -> DriverResu
         | DispatchMajor::QueryEa
         | DispatchMajor::SetEa
         | DispatchMajor::QuerySecurity
-        | DispatchMajor::SetSecurity => Err(DriverError::InvalidDeviceRequest),
+        | DispatchMajor::SetSecurity
+        | DispatchMajor::Shutdown => Err(DriverError::InvalidDeviceRequest),
     }
 }
 
@@ -373,5 +373,23 @@ fn execute_major(major: DispatchMajor, target: DispatchTarget) -> DriverResult<I
         DispatchMajor::Shutdown => crate::request::file_info::shutdown(target),
         DispatchMajor::QuerySecurity => crate::request::security::query(target),
         DispatchMajor::SetSecurity => crate::request::security::set(target),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::irp::DispatchMajor;
+
+    use super::{DispatchPolicy, dispatch_policy};
+
+    /// # Panics
+    ///
+    /// Panics when the shutdown request stops using the passive-level queue.
+    #[test]
+    fn shutdown_is_queued_for_passive_level_flush() {
+        assert_eq!(
+            dispatch_policy(DispatchMajor::Shutdown),
+            DispatchPolicy::Queued
+        );
     }
 }
