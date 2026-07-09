@@ -102,8 +102,8 @@ pub(crate) fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// Executes directory enumeration and notification.
 /// # Errors
 ///
-/// Returns an error when directory-control decoding, enumeration, or unsupported notification
-/// handling rejects the request.
+/// Returns an error when directory-control decoding, enumeration, or notification request
+/// validation rejects the request.
 pub(crate) fn directory_control(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     target
         .current_stack()
@@ -112,6 +112,22 @@ pub(crate) fn directory_control(target: DispatchTarget) -> DriverResult<IrpCompl
             DirectoryControlMinorFunction::NotifyChangeDirectory => notify_change_directory(target),
             DirectoryControlMinorFunction::Unsupported => Err(DriverError::InvalidDeviceRequest),
         })
+}
+
+/// Validates a directory-change notification request before notification storage is introduced.
+/// # Errors
+///
+/// Returns an error when the stack is malformed, the FILE_OBJECT is not an opened directory, or
+/// directory-change notification is not implemented yet.
+fn notify_change_directory(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let stack = target.current_stack()?.notify_directory()?;
+    let _opened_directory = OpenedDirectory::decode(stack.file_object())?;
+    let _notification_parameters = (
+        stack.length(),
+        stack.completion_filter(),
+        stack.watch_scope(),
+    );
+    Err(DriverError::NotSupported)
 }
 
 /// Executes byte-range lock requests.

@@ -1583,6 +1583,30 @@ impl CurrentIrpStackLocation {
         })
     }
 
+    /// Decodes directory-change-notification parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT is absent, the output length is invalid, or the
+    /// notification filter is empty or contains unsupported bits.
+    pub(crate) fn notify_directory(self) -> Result<NotifyDirectoryStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack
+            // for the current dispatch callback.
+            self.stack.as_ref()
+        };
+        let notify = unsafe {
+            // SAFETY: The caller selects this accessor only for
+            // IRP_MN_NOTIFY_CHANGE_DIRECTORY, where NotifyDirectory is active.
+            stack.Parameters.NotifyDirectory
+        };
+        Ok(NotifyDirectoryStack {
+            file_object: self.kernel_file_object()?,
+            length: IrpBufferLength::from_ulong(notify.Length)?,
+            completion_filter: DirectoryChangeFilter::from_raw(notify.CompletionFilter)?,
+            watch_scope: DirectoryWatchScope::from_stack_flags(stack.Flags),
+        })
+    }
+
     /// Decodes query-EA parameters.
     /// # Errors
     ///
@@ -2068,6 +2092,44 @@ pub(crate) enum DirectoryEntryEmission {
     Multiple,
     /// Emit at most one matching entry.
     Single,
+}
+
+/// Scope selected for a directory-change notification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryWatchScope {
+    /// Observe changes directly below the opened directory.
+    DirectChildren,
+    /// Observe changes below the opened directory and every descendant.
+    Subtree,
+}
+
+impl DirectoryWatchScope {
+    /// Decodes the directory-control watch-tree stack flag.
+    fn from_stack_flags(flags: wdk_sys::UCHAR) -> Self {
+        if stack_flag(flags, wdk_sys::SL_WATCH_TREE) {
+            Self::Subtree
+        } else {
+            Self::DirectChildren
+        }
+    }
+}
+
+/// Validated set of file-system changes requested by a directory notification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DirectoryChangeFilter(wdk_sys::ULONG);
+
+impl DirectoryChangeFilter {
+    /// Decodes a Windows completion-filter bit set.
+    /// # Errors
+    ///
+    /// Returns an error when no notification kind is selected or the bit set contains a kind that
+    /// Windows does not define for directory notifications.
+    fn from_raw(value: wdk_sys::ULONG) -> Result<Self, DriverError> {
+        if value == 0 || value & !wdk_sys::FILE_NOTIFY_VALID_MASK != 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(Self(value))
+    }
 }
 
 /// EA entry index selected by a query-EA request.
@@ -3075,6 +3137,19 @@ pub(crate) struct QueryDirectoryStack {
     information_class: DirectoryInformationClass,
 }
 
+/// Decoded directory-change-notification stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NotifyDirectoryStack {
+    /// FILE_OBJECT carrying the directory CCB.
+    file_object: KernelFileObject,
+    /// Output notification buffer length.
+    length: IrpBufferLength,
+    /// Changes that complete this notification request.
+    completion_filter: DirectoryChangeFilter,
+    /// Directory depth covered by the notification request.
+    watch_scope: DirectoryWatchScope,
+}
+
 /// Decoded query-EA stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryEaStack {
@@ -3478,6 +3553,28 @@ impl QueryDirectoryStack {
     }
 }
 
+impl NotifyDirectoryStack {
+    /// Returns the FILE_OBJECT carrying this notification request.
+    pub(crate) const fn file_object(self) -> KernelFileObject {
+        self.file_object
+    }
+
+    /// Returns the output notification buffer length.
+    pub(crate) const fn length(self) -> IrpBufferLength {
+        self.length
+    }
+
+    /// Returns the validated completion-filter set.
+    pub(crate) const fn completion_filter(self) -> DirectoryChangeFilter {
+        self.completion_filter
+    }
+
+    /// Returns the directory depth covered by this request.
+    pub(crate) const fn watch_scope(self) -> DirectoryWatchScope {
+        self.watch_scope
+    }
+}
+
 impl QueryEaStack {
     /// Returns the FILE_OBJECT carrying this query.
     pub(crate) const fn file_object(self) -> KernelFileObject {
@@ -3559,14 +3656,14 @@ mod tests {
         ByteRangeLockAccess, ByteRangeLockConflictPolicy, ByteRangeLockOperation,
         CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateNameInterpretation,
         CreateReparsePointMode, CreateSynchronizationMode, CreateTargetRequirement,
-        CreateTransferBuffering, CurrentIrpStackLocation, DeviceIrpQueue,
+        CreateTransferBuffering, CurrentIrpStackLocation, DeviceIrpQueue, DirectoryChangeFilter,
         DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
-        DirectoryInformationClass, DirectoryPatternInput, DispatchTarget, EaEntryEmission,
-        EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
-        FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
-        IrpCompletion, KernelIrp, QueryFileInformationClass, QueryVolumeInformationClass,
-        QueueWorkerState, ReceivedIrp, STATUS_CANCELLED, SecurityComponentSelection,
-        SetFileInformationClass, SetVolumeInformationClass,
+        DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope, DispatchTarget,
+        EaEntryEmission, EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION,
+        FILE_OPEN_IF_DISPOSITION, FileSystemControlMinorFunction, FsControlCode, InformationLength,
+        IrpBufferLength, IrpCompletion, KernelIrp, QueryFileInformationClass,
+        QueryVolumeInformationClass, QueueWorkerState, ReceivedIrp, STATUS_CANCELLED,
+        SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
     };
     use crate::state::{
         CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
@@ -5491,6 +5588,95 @@ mod tests {
                 );
                 assert_eq!(query.pattern(), DirectoryPatternInput::All);
                 assert_eq!(query.entry_emission(), DirectoryEntryEmission::Multiple);
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn notify_directory_stack_decodes_length_filter_and_scope() {
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let completion_filter = wdk_sys::FILE_NOTIFY_CHANGE_FILE_NAME
+            | wdk_sys::FILE_NOTIFY_CHANGE_ATTRIBUTES
+            | wdk_sys::FILE_NOTIFY_CHANGE_SECURITY;
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            MinorFunction: u8::try_from(wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY).unwrap_or(u8::MAX),
+            Flags: u8::try_from(wdk_sys::SL_WATCH_TREE).unwrap_or(u8::MAX),
+            FileObject: file_object.as_ptr(),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        stack.Parameters.NotifyDirectory =
+            wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_7 {
+                Length: 512,
+                __bindgen_padding_0: 0,
+                CompletionFilter: completion_filter,
+            };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let notification = current.notify_directory();
+            assert!(notification.is_ok());
+            if let Ok(notification) = notification {
+                assert_eq!(
+                    Some(notification.file_object()),
+                    KernelFileObject::from_raw(file_object.as_ptr())
+                );
+                assert_eq!(notification.length().as_usize(), 512);
+                assert_eq!(
+                    notification.completion_filter(),
+                    DirectoryChangeFilter(completion_filter)
+                );
+                assert_eq!(notification.watch_scope(), DirectoryWatchScope::Subtree);
+            }
+        }
+
+        stack.Flags = 0;
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let notification = current.notify_directory();
+            assert!(notification.is_ok());
+            if let Ok(notification) = notification {
+                assert_eq!(
+                    notification.watch_scope(),
+                    DirectoryWatchScope::DirectChildren
+                );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn notify_directory_stack_rejects_empty_and_unknown_filters() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            MinorFunction: u8::try_from(wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY).unwrap_or(u8::MAX),
+            FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+
+        for completion_filter in [0, 1_u32 << 31] {
+            stack.Parameters.NotifyDirectory =
+                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_7 {
+                    Length: 0,
+                    __bindgen_padding_0: 0,
+                    CompletionFilter: completion_filter,
+                };
+
+            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            assert!(current.is_ok());
+            if let Ok(current) = current {
+                assert_eq!(
+                    current
+                        .notify_directory()
+                        .err()
+                        .map(crate::kernel::status::DriverError::ntstatus),
+                    Some(STATUS_INVALID_PARAMETER)
+                );
             }
         }
     }
