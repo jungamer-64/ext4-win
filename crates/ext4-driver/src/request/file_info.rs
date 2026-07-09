@@ -109,7 +109,7 @@ pub(crate) fn directory_control(target: DispatchTarget) -> DriverResult<IrpCompl
         .current_stack()
         .and_then(|stack| match stack.directory_control_minor() {
             DirectoryControlMinorFunction::QueryDirectory => query_directory(target),
-            DirectoryControlMinorFunction::NotifyChangeDirectory => Err(DriverError::NotSupported),
+            DirectoryControlMinorFunction::NotifyChangeDirectory => notify_change_directory(target),
             DirectoryControlMinorFunction::Unsupported => Err(DriverError::InvalidDeviceRequest),
         })
 }
