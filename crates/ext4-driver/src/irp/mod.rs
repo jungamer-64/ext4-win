@@ -13,8 +13,8 @@ use wdk_sys::{
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{
-    CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
-    WriteCommitment,
+    CloseDisposition, FileControlBlock, KernelDevice, KernelFileObject, KernelSecurityDescriptor,
+    KernelVpb, WriteCommitment,
 };
 
 /// Completion priority boost for IRPs that should not adjust thread priority.
@@ -252,6 +252,12 @@ impl DispatchTarget {
         self.device
     }
 
+    /// Returns the live raw IRP pointer for a kernel helper that owns this request's semantics.
+    #[cfg(not(test))]
+    pub(crate) fn as_raw_irp(self) -> PIRP {
+        self.irp.as_ptr()
+    }
+
     /// Returns METHOD_BUFFERED input bytes from the IRP system buffer.
     /// # Errors
     ///
@@ -396,6 +402,18 @@ impl ReceivedIrp {
             Ok(completion) => completion,
             Err(error) => IrpCompletion::from_error(error),
         })
+    }
+
+    /// Transfers this lock-control IRP's terminal completion authority to FsRtl.
+    ///
+    /// FsRtl completes lock requests itself, including requests that wait for a conflicting range.
+    /// This consuming transition prevents the normal driver completion path from completing the
+    /// same IRP again.
+    pub(crate) fn delegate_byte_range_lock(
+        self,
+        file_control_block: &FileControlBlock,
+    ) -> NTSTATUS {
+        file_control_block.process_byte_range_lock(self.target)
     }
 
     /// Completes a raw IRP when dispatch-target decoding failed.
@@ -1780,32 +1798,6 @@ impl CurrentIrpStackLocation {
             file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(write.Length)?,
             byte_offset,
-        })
-    }
-
-    /// Decodes byte-range lock parameters from the current stack location.
-    /// # Errors
-    ///
-    /// Returns an error when the stack has no FILE_OBJECT, the minor function is unsupported, or a
-    /// range-bearing lock operation carries an invalid range.
-    pub(crate) fn lock_control(self) -> Result<LockControlStack, DriverError> {
-        let stack = unsafe {
-            // SAFETY: `stack` is non-null and belongs to the active IRP stack
-            // for the current dispatch callback.
-            self.stack.as_ref()
-        };
-        let lock_control = unsafe {
-            // SAFETY: The caller selects this accessor only for
-            // IRP_MJ_LOCK_CONTROL, where LockControl is active.
-            stack.Parameters.LockControl
-        };
-        Ok(LockControlStack {
-            file_object: self.kernel_file_object()?,
-            operation: ByteRangeLockOperation::decode(
-                stack.MinorFunction,
-                stack.Flags,
-                lock_control,
-            )?,
         })
     }
 }
@@ -3250,219 +3242,6 @@ impl WriteStack {
     }
 }
 
-/// Decoded byte-range lock stack parameters.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct LockControlStack {
-    /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: KernelFileObject,
-    /// Requested byte-range lock operation.
-    operation: ByteRangeLockOperation,
-}
-
-impl LockControlStack {
-    /// Returns the FILE_OBJECT carrying this lock request.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
-    /// Returns the decoded lock operation.
-    pub(crate) const fn operation(self) -> ByteRangeLockOperation {
-        self.operation
-    }
-}
-
-/// Byte-range lock operation selected by the IRP minor function.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ByteRangeLockOperation {
-    /// Acquires a byte-range lock.
-    Lock(ByteRangeLockRequest),
-    /// Releases one byte-range lock.
-    UnlockSingle(ByteRangeLockRange),
-    /// Releases every lock associated with the FILE_OBJECT.
-    UnlockAll,
-    /// Releases every lock associated with a caller key.
-    UnlockAllByKey(ByteRangeLockKey),
-}
-
-impl ByteRangeLockOperation {
-    /// Decodes a lock-control minor function and its active parameter subset.
-    /// # Errors
-    ///
-    /// Returns an error when the minor function is unsupported or the selected operation carries an
-    /// invalid range.
-    fn decode(
-        minor_function: wdk_sys::UCHAR,
-        stack_flags: wdk_sys::UCHAR,
-        lock_control: wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_16,
-    ) -> DriverResult<Self> {
-        match u32::from(minor_function) {
-            value if value == wdk_sys::IRP_MN_LOCK => {
-                let access = if stack_flag(stack_flags, wdk_sys::SL_EXCLUSIVE_LOCK) {
-                    ByteRangeLockAccess::Exclusive
-                } else {
-                    ByteRangeLockAccess::Shared
-                };
-                let conflict_policy = if stack_flag(stack_flags, wdk_sys::SL_FAIL_IMMEDIATELY) {
-                    ByteRangeLockConflictPolicy::FailImmediately
-                } else {
-                    ByteRangeLockConflictPolicy::Wait
-                };
-                Ok(Self::Lock(ByteRangeLockRequest {
-                    range: ByteRangeLockRange::decode(lock_control)?,
-                    access,
-                    conflict_policy,
-                }))
-            }
-            value if value == wdk_sys::IRP_MN_UNLOCK_SINGLE => Ok(Self::UnlockSingle(
-                ByteRangeLockRange::decode(lock_control)?,
-            )),
-            value if value == wdk_sys::IRP_MN_UNLOCK_ALL => Ok(Self::UnlockAll),
-            value if value == wdk_sys::IRP_MN_UNLOCK_ALL_BY_KEY => Ok(Self::UnlockAllByKey(
-                ByteRangeLockKey::from_raw(lock_control.Key),
-            )),
-            _ => Err(DriverError::InvalidDeviceRequest),
-        }
-    }
-}
-
-/// Complete byte range named by a lock or single-unlock operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ByteRangeLockRange {
-    /// First byte covered by the range.
-    offset: FileOffset,
-    /// Number of bytes covered by the range.
-    length: ByteRangeLockLength,
-    /// Caller key identifying lock ownership within a FILE_OBJECT.
-    key: ByteRangeLockKey,
-}
-
-impl ByteRangeLockRange {
-    /// Decodes the range-bearing lock-control fields.
-    /// # Errors
-    ///
-    /// Returns an error when the range length pointer is null, or when the byte offset or length is
-    /// negative.
-    fn decode(
-        lock_control: wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_16,
-    ) -> DriverResult<Self> {
-        let Some(length) = NonNull::new(lock_control.Length) else {
-            return Err(DriverError::InvalidParameter);
-        };
-        let length = unsafe {
-            // SAFETY: The I/O manager supplies LockControl.Length for range-bearing
-            // IRP_MJ_LOCK_CONTROL minor functions while this stack location is active.
-            length.as_ref().QuadPart
-        };
-        let byte_offset = unsafe {
-            // SAFETY: ByteOffset is represented by the QuadPart arm for
-            // lock-control stack locations.
-            lock_control.ByteOffset.QuadPart
-        };
-        Ok(Self {
-            offset: FileOffset::from_bytes(
-                u64::try_from(byte_offset).map_err(|_| DriverError::InvalidParameter)?,
-            ),
-            length: ByteRangeLockLength::from_bytes(
-                u64::try_from(length).map_err(|_| DriverError::InvalidParameter)?,
-            ),
-            key: ByteRangeLockKey::from_raw(lock_control.Key),
-        })
-    }
-
-    /// Returns the first byte covered by the range.
-    pub(crate) const fn offset(self) -> FileOffset {
-        self.offset
-    }
-
-    /// Returns the number of bytes covered by the range.
-    pub(crate) const fn length(self) -> ByteRangeLockLength {
-        self.length
-    }
-
-    /// Returns the caller key for the range.
-    pub(crate) const fn key(self) -> ByteRangeLockKey {
-        self.key
-    }
-}
-
-/// Caller-visible lock request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ByteRangeLockRequest {
-    /// Range to lock.
-    range: ByteRangeLockRange,
-    /// Shared or exclusive access mode.
-    access: ByteRangeLockAccess,
-    /// Conflict behavior requested by the caller.
-    conflict_policy: ByteRangeLockConflictPolicy,
-}
-
-impl ByteRangeLockRequest {
-    /// Returns the requested byte range.
-    pub(crate) const fn range(self) -> ByteRangeLockRange {
-        self.range
-    }
-
-    /// Returns the requested access mode.
-    pub(crate) const fn access(self) -> ByteRangeLockAccess {
-        self.access
-    }
-
-    /// Returns the requested conflict behavior.
-    pub(crate) const fn conflict_policy(self) -> ByteRangeLockConflictPolicy {
-        self.conflict_policy
-    }
-}
-
-/// Lock access mode selected by `SL_EXCLUSIVE_LOCK`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ByteRangeLockAccess {
-    /// Multiple compatible shared locks may overlap.
-    Shared,
-    /// The lock excludes every overlapping lock.
-    Exclusive,
-}
-
-/// Lock conflict behavior selected by `SL_FAIL_IMMEDIATELY`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ByteRangeLockConflictPolicy {
-    /// Wait for the conflicting range to become available.
-    Wait,
-    /// Fail instead of waiting for a conflicting range.
-    FailImmediately,
-}
-
-/// Caller-supplied lock key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ByteRangeLockKey(u32);
-
-impl ByteRangeLockKey {
-    /// Builds a lock key from the WDK stack field.
-    const fn from_raw(value: wdk_sys::ULONG) -> Self {
-        Self(value)
-    }
-
-    /// Returns the numeric key value.
-    pub(crate) const fn value(self) -> u32 {
-        self.0
-    }
-}
-
-/// Non-negative lock range length.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ByteRangeLockLength(u64);
-
-impl ByteRangeLockLength {
-    /// Builds a range length from a non-negative byte count.
-    const fn from_bytes(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the byte count.
-    pub(crate) const fn bytes(self) -> u64 {
-        self.0
-    }
-}
-
 impl QueryVolumeStack {
     /// Returns the output buffer length.
     pub(crate) const fn length(self) -> IrpBufferLength {
@@ -3647,13 +3426,9 @@ impl SetSecurityStack {
 mod tests {
     use core::ffi::c_void;
 
-    use wdk_sys::{
-        STATUS_ACCESS_DENIED, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
-        STATUS_NOT_SUPPORTED,
-    };
+    use wdk_sys::{STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
 
     use super::{
-        ByteRangeLockAccess, ByteRangeLockConflictPolicy, ByteRangeLockOperation,
         CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateNameInterpretation,
         CreateReparsePointMode, CreateSynchronizationMode, CreateTargetRequirement,
         CreateTransferBuffering, CurrentIrpStackLocation, DeviceIrpQueue, DirectoryChangeFilter,
@@ -5100,260 +4875,6 @@ mod tests {
                     .err()
                     .map(crate::kernel::status::DriverError::ntstatus),
                 Some(STATUS_INVALID_PARAMETER)
-            );
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn lock_control_stack_decodes_exclusive_immediate_lock() {
-        let mut length = wdk_sys::LARGE_INTEGER { QuadPart: 512 };
-        let mut stack = wdk_sys::IO_STACK_LOCATION {
-            MinorFunction: u8::try_from(wdk_sys::IRP_MN_LOCK).unwrap_or(u8::MAX),
-            Flags: u8::try_from(wdk_sys::SL_EXCLUSIVE_LOCK | wdk_sys::SL_FAIL_IMMEDIATELY)
-                .unwrap_or(u8::MAX),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
-        stack.FileObject = file_object.as_ptr();
-        stack.Parameters.LockControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_16 {
-            Length: core::ptr::addr_of_mut!(length),
-            Key: 7,
-            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 4096 },
-        };
-
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            let lock = current.lock_control();
-            assert!(lock.is_ok());
-            if let Ok(lock) = lock {
-                assert_eq!(
-                    Some(lock.file_object()),
-                    KernelFileObject::from_raw(file_object.as_ptr())
-                );
-                let operation = lock.operation();
-                assert!(matches!(operation, ByteRangeLockOperation::Lock(_)));
-                if let ByteRangeLockOperation::Lock(request) = operation {
-                    assert_eq!(request.access(), ByteRangeLockAccess::Exclusive);
-                    assert_eq!(
-                        request.conflict_policy(),
-                        ByteRangeLockConflictPolicy::FailImmediately
-                    );
-                    let range = request.range();
-                    assert_eq!(range.offset().bytes(), 4096);
-                    assert_eq!(range.length().bytes(), 512);
-                    assert_eq!(range.key().value(), 7);
-                }
-            }
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn lock_control_stack_decodes_shared_wait_lock() {
-        let mut length = wdk_sys::LARGE_INTEGER { QuadPart: 128 };
-        let mut stack = wdk_sys::IO_STACK_LOCATION {
-            MinorFunction: u8::try_from(wdk_sys::IRP_MN_LOCK).unwrap_or(u8::MAX),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
-        stack.Parameters.LockControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_16 {
-            Length: core::ptr::addr_of_mut!(length),
-            Key: 11,
-            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 64 },
-        };
-
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            let lock = current.lock_control();
-            assert!(lock.is_ok());
-            if let Ok(lock) = lock {
-                let operation = lock.operation();
-                assert!(matches!(operation, ByteRangeLockOperation::Lock(_)));
-                if let ByteRangeLockOperation::Lock(request) = operation {
-                    assert_eq!(request.access(), ByteRangeLockAccess::Shared);
-                    assert_eq!(request.conflict_policy(), ByteRangeLockConflictPolicy::Wait);
-                    assert_eq!(request.range().offset().bytes(), 64);
-                }
-            }
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn lock_control_stack_decodes_unlock_single_range() {
-        let mut length = wdk_sys::LARGE_INTEGER { QuadPart: 256 };
-        let mut stack = wdk_sys::IO_STACK_LOCATION {
-            MinorFunction: u8::try_from(wdk_sys::IRP_MN_UNLOCK_SINGLE).unwrap_or(u8::MAX),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
-        stack.Parameters.LockControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_16 {
-            Length: core::ptr::addr_of_mut!(length),
-            Key: 19,
-            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 1024 },
-        };
-
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            let lock = current.lock_control();
-            assert!(lock.is_ok());
-            if let Ok(lock) = lock {
-                let operation = lock.operation();
-                assert!(matches!(operation, ByteRangeLockOperation::UnlockSingle(_)));
-                if let ByteRangeLockOperation::UnlockSingle(range) = operation {
-                    assert_eq!(range.offset().bytes(), 1024);
-                    assert_eq!(range.length().bytes(), 256);
-                    assert_eq!(range.key().value(), 19);
-                }
-            }
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn lock_control_stack_decodes_unlock_all_by_key_without_range() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION {
-            MinorFunction: u8::try_from(wdk_sys::IRP_MN_UNLOCK_ALL_BY_KEY).unwrap_or(u8::MAX),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
-        stack.Parameters.LockControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_16 {
-            Length: core::ptr::null_mut(),
-            Key: 23,
-            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: -1 },
-        };
-
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            let lock = current.lock_control();
-            assert!(lock.is_ok());
-            if let Ok(lock) = lock {
-                let operation = lock.operation();
-                assert!(matches!(
-                    operation,
-                    ByteRangeLockOperation::UnlockAllByKey(_)
-                ));
-                if let ByteRangeLockOperation::UnlockAllByKey(key) = operation {
-                    assert_eq!(key.value(), 23);
-                }
-            }
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn lock_control_stack_rejects_missing_range_length() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION {
-            MinorFunction: u8::try_from(wdk_sys::IRP_MN_LOCK).unwrap_or(u8::MAX),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
-        stack.Parameters.LockControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_16 {
-            Length: core::ptr::null_mut(),
-            Key: 0,
-            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
-        };
-
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            assert_eq!(
-                current
-                    .lock_control()
-                    .err()
-                    .map(crate::kernel::status::DriverError::ntstatus),
-                Some(STATUS_INVALID_PARAMETER)
-            );
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn lock_control_stack_rejects_negative_range_bounds() {
-        let mut negative_length = wdk_sys::LARGE_INTEGER { QuadPart: -1 };
-        let mut negative_offset_stack = wdk_sys::IO_STACK_LOCATION {
-            MinorFunction: u8::try_from(wdk_sys::IRP_MN_UNLOCK_SINGLE).unwrap_or(u8::MAX),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        negative_offset_stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
-        negative_offset_stack.Parameters.LockControl =
-            wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_16 {
-                Length: core::ptr::addr_of_mut!(negative_length),
-                Key: 0,
-                ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
-            };
-
-        let current =
-            CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(negative_offset_stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            assert_eq!(
-                current
-                    .lock_control()
-                    .err()
-                    .map(crate::kernel::status::DriverError::ntstatus),
-                Some(STATUS_INVALID_PARAMETER)
-            );
-        }
-
-        let mut positive_length = wdk_sys::LARGE_INTEGER { QuadPart: 1 };
-        negative_offset_stack.Parameters.LockControl =
-            wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_16 {
-                Length: core::ptr::addr_of_mut!(positive_length),
-                Key: 0,
-                ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: -1 },
-            };
-        let current =
-            CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(negative_offset_stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            assert_eq!(
-                current
-                    .lock_control()
-                    .err()
-                    .map(crate::kernel::status::DriverError::ntstatus),
-                Some(STATUS_INVALID_PARAMETER)
-            );
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn lock_control_stack_rejects_unsupported_minor_before_handler() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION {
-            MinorFunction: u8::MAX,
-            FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            assert_eq!(
-                current
-                    .lock_control()
-                    .err()
-                    .map(crate::kernel::status::DriverError::ntstatus),
-                Some(STATUS_INVALID_DEVICE_REQUEST)
             );
         }
     }

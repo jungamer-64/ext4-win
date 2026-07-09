@@ -63,6 +63,8 @@ pub(crate) enum DriverError {
     ObjectTypeMismatch,
     /// WDK share-access validation rejected this open.
     ShareAccessConflict,
+    /// A byte-range lock held by another requestor blocks this I/O range.
+    FileLockConflict,
     /// FCB open reference count reached the representable boundary.
     TooManyOpenReferences,
     /// Directory enumeration has no more entries for this cursor.
@@ -103,6 +105,7 @@ impl DriverError {
             Self::ObjectPathNotFound => STATUS_OBJECT_PATH_NOT_FOUND,
             Self::ObjectTypeMismatch => STATUS_OBJECT_TYPE_MISMATCH,
             Self::ShareAccessConflict => ntstatus(0xC000_0043),
+            Self::FileLockConflict => ntstatus(0xC000_0054),
             Self::TooManyOpenReferences => STATUS_INSUFFICIENT_RESOURCES,
             Self::NoMoreFiles => STATUS_NO_MORE_FILES,
             Self::NoSuchFile => STATUS_NO_SUCH_FILE,
@@ -241,6 +244,17 @@ mod tests {
         assert_eq!(
             DriverError::NonexistentEaEntry.ntstatus(),
             super::ntstatus(0xC000_0051)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the byte-range lock conflict status changes.
+    #[test]
+    fn byte_range_lock_conflict_uses_file_lock_conflict_status() {
+        assert_eq!(
+            DriverError::FileLockConflict.ntstatus(),
+            super::ntstatus(0xC000_0054)
         );
     }
 
