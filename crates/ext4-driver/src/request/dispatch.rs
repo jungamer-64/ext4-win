@@ -255,6 +255,7 @@ fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS
             received.complete_result(execute_immediate(major, target))
         }
         DispatchPolicy::Queued => DeviceIrpQueue::receive_async(received),
+        DispatchPolicy::FsRtlFileLock => dispatch_file_lock(received),
     }
 }
 
@@ -265,15 +266,17 @@ enum DispatchPolicy {
     Immediate,
     /// Mark pending and execute from the device queue worker.
     Queued,
+    /// Transfer terminal completion to the FsRtl byte-range lock package.
+    FsRtlFileLock,
 }
 
 /// Returns the queue policy for a major function.
 const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
     match major {
-        DispatchMajor::Close
-        | DispatchMajor::Cleanup
-        | DispatchMajor::DeviceControl
-        | DispatchMajor::LockControl => DispatchPolicy::Immediate,
+        DispatchMajor::Close | DispatchMajor::Cleanup | DispatchMajor::DeviceControl => {
+            DispatchPolicy::Immediate
+        }
+        DispatchMajor::LockControl => DispatchPolicy::FsRtlFileLock,
         DispatchMajor::Create
         | DispatchMajor::Read
         | DispatchMajor::Write
@@ -289,6 +292,15 @@ const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
         | DispatchMajor::QuerySecurity
         | DispatchMajor::SetSecurity
         | DispatchMajor::Shutdown => DispatchPolicy::Queued,
+    }
+}
+
+/// Decodes a lock target, then lets FsRtl own and complete the lock-control IRP.
+fn dispatch_file_lock(received: ReceivedIrp) -> NTSTATUS {
+    let target = received.target();
+    match crate::request::file_info::lock_control(target) {
+        Ok(opened_file) => received.delegate_byte_range_lock(opened_file.file_control_block()),
+        Err(error) => received.complete_result(Err(error)),
     }
 }
 
@@ -316,9 +328,7 @@ pub(crate) fn execute_queued(target: DispatchTarget) -> DriverResult<IrpCompleti
 fn execute_immediate(major: DispatchMajor, target: DispatchTarget) -> DriverResult<IrpCompletion> {
     match major {
         DispatchMajor::Cleanup => cleanup_immediate(target),
-        DispatchMajor::Close | DispatchMajor::DeviceControl | DispatchMajor::LockControl => {
-            execute_major(major, target)
-        }
+        DispatchMajor::Close | DispatchMajor::DeviceControl => execute_major(major, target),
         DispatchMajor::Create
         | DispatchMajor::Read
         | DispatchMajor::Write
@@ -331,6 +341,7 @@ fn execute_immediate(major: DispatchMajor, target: DispatchTarget) -> DriverResu
         | DispatchMajor::FlushBuffers
         | DispatchMajor::QueryEa
         | DispatchMajor::SetEa
+        | DispatchMajor::LockControl
         | DispatchMajor::QuerySecurity
         | DispatchMajor::SetSecurity
         | DispatchMajor::Shutdown => Err(DriverError::InvalidDeviceRequest),
@@ -369,7 +380,8 @@ fn execute_major(major: DispatchMajor, target: DispatchTarget) -> DriverResult<I
         DispatchMajor::FlushBuffers => crate::request::file_info::flush(target),
         DispatchMajor::QueryEa => crate::request::ea::query(target),
         DispatchMajor::SetEa => crate::request::ea::set(target),
-        DispatchMajor::LockControl => crate::request::file_info::lock_control(target),
+        // Lock control is terminally delegated to FsRtl before generic execution.
+        DispatchMajor::LockControl => Err(DriverError::InvalidDeviceRequest),
         DispatchMajor::Shutdown => crate::request::file_info::shutdown(target),
         DispatchMajor::QuerySecurity => crate::request::security::query(target),
         DispatchMajor::SetSecurity => crate::request::security::set(target),
@@ -390,6 +402,17 @@ mod tests {
         assert_eq!(
             dispatch_policy(DispatchMajor::Shutdown),
             DispatchPolicy::Queued
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when lock-control IRPs stop being completed by FsRtl.
+    #[test]
+    fn lock_control_is_delegated_to_fsrtl() {
+        assert_eq!(
+            dispatch_policy(DispatchMajor::LockControl),
+            DispatchPolicy::FsRtlFileLock
         );
     }
 }

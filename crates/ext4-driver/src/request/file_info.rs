@@ -30,11 +30,9 @@ use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset
 ///
 /// Returns an error when the IRP stack has no opened FILE_OBJECT or cleanup state is invalid.
 pub(crate) fn cleanup(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    target
-        .current_stack()
-        .and_then(|stack| stack.file_object())
-        .and_then(cleanup_file_object)
-        .map(|()| IrpCompletion::EMPTY)
+    let file_object = target.current_stack()?.file_object()?;
+    cleanup_file_object(target, file_object)?;
+    Ok(IrpCompletion::EMPTY)
 }
 
 /// Executes close IRPs and releases FILE_OBJECT contexts.
@@ -152,8 +150,8 @@ fn notify_change_directory(target: DispatchTarget) -> DriverResult<IrpCompletion
 ///
 /// Returns an error when the lock stack is malformed or the target is not an opened regular file.
 pub(crate) fn lock_control(target: DispatchTarget) -> DriverResult<OpenedRegularFile> {
-    let stack = target.current_stack()?.lock_control()?;
-    OpenedRegularFile::decode(stack.file_object())
+    let file_object = target.current_stack()?.file_object()?;
+    OpenedRegularFile::decode(file_object)
 }
 
 /// Decoded mounted volume selected by a flush IRP.
@@ -1188,8 +1186,11 @@ fn windows_time_quad(timestamp: Ext4Timestamp) -> i64 {
 ///
 /// Returns an error when the FILE_OBJECT has no opened context, the root is marked for deletion, or
 /// the cleanup-time namespace transaction fails.
-fn cleanup_file_object(file_object: KernelFileObject) -> DriverResult<()> {
+fn cleanup_file_object(target: DispatchTarget, file_object: KernelFileObject) -> DriverResult<()> {
     let mut opened_file = OpenedObject::decode(file_object)?;
+    opened_file
+        .file_control_block()
+        .release_handle_byte_range_locks(target, file_object);
     if opened_file.close_disposition() == CloseDisposition::Keep {
         return Ok(());
     }
@@ -2063,6 +2064,12 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     if length.is_empty() {
         return Ok(IrpCompletion::EMPTY);
     }
+    if !opened_file
+        .file_control_block()
+        .permits_byte_range_read(target)
+    {
+        return Err(DriverError::FileLockConflict);
+    }
     let mut output = target.data_output(length)?;
     data_transfer_mode.validate_buffer(output.address())?;
     let vcb = unsafe {
@@ -2091,6 +2098,12 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     data_transfer_mode.validate_range(stack.byte_offset().bytes(), length.as_usize())?;
     if length.is_empty() {
         return Ok(IrpCompletion::EMPTY);
+    }
+    if !opened_file
+        .file_control_block()
+        .permits_byte_range_write(target)
+    {
+        return Err(DriverError::FileLockConflict);
     }
     let input = target.data_input(length)?;
     data_transfer_mode.validate_buffer(input.address())?;

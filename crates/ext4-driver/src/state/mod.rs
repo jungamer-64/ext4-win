@@ -1,7 +1,10 @@
 //! Driver-local lifecycle and open-object state.
 
 use alloc::boxed::Box;
+#[cfg(not(test))]
+use core::cell::UnsafeCell;
 use core::ffi::c_void;
+use core::fmt;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
@@ -16,7 +19,7 @@ use wdk_sys::{
     SHARE_ACCESS, STATUS_SUCCESS, VPB_MOUNTED,
 };
 
-use crate::irp::{DesiredAccess, DeviceIrpQueue, DirectoryEntryIndex, ShareAccess};
+use crate::irp::{DesiredAccess, DeviceIrpQueue, DirectoryEntryIndex, DispatchTarget, ShareAccess};
 use crate::kernel::cng::CngFscryptNonceGenerator;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
@@ -1070,13 +1073,15 @@ pub(crate) struct FileControlBlock {
     node: NodeId,
     /// I/O manager share-access accounting for this inode identity.
     share_access: SHARE_ACCESS,
+    /// FsRtl-owned byte-range lock state for this opened inode identity.
+    byte_range_locks: FileByteRangeLocks,
     /// Number of open FILE_OBJECTs currently referencing this FCB.
     open_count: NonZeroU32,
 }
 
 impl FileControlBlock {
     /// Creates an FCB boundary value for a mounted node with one open reference.
-    pub(crate) const fn new(volume: NonNull<VolumeControlBlock>, node: NodeId) -> Self {
+    pub(crate) fn new(volume: NonNull<VolumeControlBlock>, node: NodeId) -> Self {
         Self {
             volume,
             node,
@@ -1089,6 +1094,7 @@ impl FileControlBlock {
                 SharedWrite: 0,
                 SharedDelete: 0,
             },
+            byte_range_locks: FileByteRangeLocks::new(),
             open_count: NonZeroU32::MIN,
         }
     }
@@ -1101,6 +1107,31 @@ impl FileControlBlock {
     /// Returns the ext4 node identity opened by this FCB.
     pub(crate) const fn node(&self) -> NodeId {
         self.node
+    }
+
+    /// Transfers one validated lock-control IRP to the FsRtl lock package.
+    pub(crate) fn process_byte_range_lock(&self, target: DispatchTarget) -> wdk_sys::NTSTATUS {
+        self.byte_range_locks.process(target)
+    }
+
+    /// Returns whether the original read requestor may read the IRP's byte range.
+    pub(crate) fn permits_byte_range_read(&self, target: DispatchTarget) -> bool {
+        self.byte_range_locks.permits_read(target)
+    }
+
+    /// Returns whether the original write requestor may write the IRP's byte range.
+    pub(crate) fn permits_byte_range_write(&self, target: DispatchTarget) -> bool {
+        self.byte_range_locks.permits_write(target)
+    }
+
+    /// Releases all byte-range locks held by this FILE_OBJECT's requestor during cleanup.
+    pub(crate) fn release_handle_byte_range_locks(
+        &self,
+        target: DispatchTarget,
+        file_object: KernelFileObject,
+    ) {
+        self.byte_range_locks
+            .release_for_cleanup(target, file_object);
     }
 
     /// Checks and records one FILE_OBJECT's share-access claim.
@@ -1169,6 +1200,138 @@ impl FileControlBlock {
         };
         self.open_count = remaining;
         FileControlBlockRelease::StillOpen
+    }
+}
+
+/// Opaque FsRtl byte-range lock state owned by one FCB.
+///
+/// FsRtl synchronizes concurrent access to this state internally. `UnsafeCell` only permits the
+/// native routines to mutate their opaque storage through the FCB's shared reference; it does not
+/// expose Rust-side mutable access.
+struct FileByteRangeLocks {
+    /// Native lock package storage, initialized exactly once for this FCB.
+    #[cfg(not(test))]
+    native: UnsafeCell<wdk_sys::FILE_LOCK>,
+}
+
+impl FileByteRangeLocks {
+    /// Initializes FsRtl state for a newly allocated FCB.
+    fn new() -> Self {
+        #[cfg(not(test))]
+        {
+            let locks = Self {
+                native: UnsafeCell::new(wdk_sys::FILE_LOCK::default()),
+            };
+            unsafe {
+                // SAFETY: `native` points to uninitialized FILE_LOCK storage
+                // owned exclusively by this newly created FCB.
+                ffi::FsRtlInitializeFileLock(locks.native.get(), None, None);
+            }
+            locks
+        }
+        #[cfg(test)]
+        {
+            Self {}
+        }
+    }
+
+    /// Lets FsRtl process and complete one byte-range lock IRP.
+    fn process(&self, target: DispatchTarget) -> wdk_sys::NTSTATUS {
+        #[cfg(not(test))]
+        {
+            unsafe {
+                // SAFETY: FsRtl owns this FCB's initialized FILE_LOCK state
+                // and takes over completion of the live lock-control IRP.
+                ffi::FsRtlProcessFileLock(
+                    self.native.get(),
+                    target.as_raw_irp(),
+                    core::ptr::null_mut(),
+                )
+            }
+        }
+        #[cfg(test)]
+        {
+            let _target = target;
+            wdk_sys::STATUS_SUCCESS
+        }
+    }
+
+    /// Checks one IRP_MJ_READ range against this FCB's byte-range locks.
+    fn permits_read(&self, target: DispatchTarget) -> bool {
+        #[cfg(not(test))]
+        {
+            unsafe {
+                // SAFETY: FsRtl reads its initialized lock state and the live
+                // IRP's original requestor context without taking ownership.
+                ffi::FsRtlCheckLockForReadAccess(self.native.get(), target.as_raw_irp()) != 0
+            }
+        }
+        #[cfg(test)]
+        {
+            let _target = target;
+            true
+        }
+    }
+
+    /// Checks one IRP_MJ_WRITE range against this FCB's byte-range locks.
+    fn permits_write(&self, target: DispatchTarget) -> bool {
+        #[cfg(not(test))]
+        {
+            unsafe {
+                // SAFETY: FsRtl reads its initialized lock state and the live
+                // IRP's original requestor context without taking ownership.
+                ffi::FsRtlCheckLockForWriteAccess(self.native.get(), target.as_raw_irp()) != 0
+            }
+        }
+        #[cfg(test)]
+        {
+            let _target = target;
+            true
+        }
+    }
+
+    /// Releases all locks associated with this cleanup IRP's FILE_OBJECT and requestor.
+    fn release_for_cleanup(&self, target: DispatchTarget, file_object: KernelFileObject) {
+        #[cfg(not(test))]
+        let requestor_process = unsafe {
+            // SAFETY: `target` retains the live cleanup IRP until this
+            // immediate dispatch handler returns.
+            ffi::IoGetRequestorProcess(target.as_raw_irp())
+        };
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Cleanup runs for this live FILE_OBJECT. Passing the
+            // requestor captured in its IRP matches FsRtl's lock ownership
+            // identity and releases only that process's locks.
+            let _status = ffi::FsRtlFastUnlockAll(
+                self.native.get(),
+                file_object.as_ptr(),
+                requestor_process,
+                core::ptr::null_mut(),
+            );
+        }
+        #[cfg(test)]
+        {
+            let _target = target;
+            let _file_object = file_object;
+        }
+    }
+}
+
+impl Drop for FileByteRangeLocks {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: This FCB initialized `native` once and cannot be
+            // dropped until its final FILE_OBJECT reference is released.
+            ffi::FsRtlUninitializeFileLock(self.native.get());
+        }
+    }
+}
+
+impl fmt::Debug for FileByteRangeLocks {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FileByteRangeLocks(..)")
     }
 }
 
@@ -1616,6 +1779,11 @@ impl OpenedRegularFile {
     /// Returns the mounted VCB pointer owning this opened file.
     pub(crate) fn volume(&self) -> NonNull<VolumeControlBlock> {
         self.opened.volume()
+    }
+
+    /// Returns the shared FCB that owns this regular file's byte-range locks.
+    pub(crate) fn file_control_block(&self) -> &FileControlBlock {
+        self.opened.file_control_block()
     }
 
     /// Returns write completion durability requested for this regular-file handle.
