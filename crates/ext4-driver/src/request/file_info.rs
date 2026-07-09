@@ -73,10 +73,27 @@ pub(crate) fn write(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// Returns an error when the flush target cannot be resolved to a mounted ext4 volume or the
 /// lower storage flush fails.
 pub(crate) fn flush(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let mut volume = FlushVolume::decode(target)?.volume();
+    flush_volume(FlushVolume::decode(target)?)
+}
+
+/// Flushes one mounted volume during `IRP_MJ_SHUTDOWN`.
+/// # Errors
+///
+/// Returns an error when shutdown was not addressed to a mounted ext4 volume or the lower storage
+/// flush fails.
+pub(crate) fn shutdown(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    flush_volume(FlushVolume::from_mounted_device(target.device())?)
+}
+
+/// Flushes the VCB selected by a flush or shutdown request.
+/// # Errors
+///
+/// Returns an error when the mounted ext4 volume cannot persist its filesystem-device writes.
+fn flush_volume(volume: FlushVolume) -> DriverResult<IrpCompletion> {
+    let mut volume = volume.volume();
     let vcb = unsafe {
-        // SAFETY: The decoded flush volume is owned by the mounted device or the opened
-        // FILE_OBJECT context for the duration of this dispatch.
+        // SAFETY: The decoded flush volume is owned by the mounted device or
+        // an opened FILE_OBJECT context for the duration of this dispatch.
         volume.as_mut()
     };
     vcb.flush()?;
@@ -167,6 +184,15 @@ struct FlushVolume {
 }
 
 impl FlushVolume {
+    /// Decodes a mounted volume device without consulting a FILE_OBJECT.
+    /// # Errors
+    ///
+    /// Returns an error when `device` is not a mounted ext4 volume device.
+    fn from_mounted_device(device: crate::state::KernelDevice) -> DriverResult<Self> {
+        let volume = MountedVolumeDevice::vcb(device).ok_or(DriverError::InvalidDeviceRequest)?;
+        Ok(Self { volume })
+    }
+
     /// Decodes the mounted volume affected by a flush IRP.
     /// # Errors
     ///
@@ -176,8 +202,9 @@ impl FlushVolume {
         let stack = target.current_stack()?;
         let volume = match stack.file_object() {
             Ok(file_object) => OpenedObject::decode(file_object)?.volume(),
-            Err(DriverError::InvalidParameter) => MountedVolumeDevice::vcb(target.device())
-                .ok_or(DriverError::InvalidDeviceRequest)?,
+            Err(DriverError::InvalidParameter) => {
+                Self::from_mounted_device(target.device())?.volume
+            }
             Err(error) => return Err(error),
         };
         Ok(Self { volume })

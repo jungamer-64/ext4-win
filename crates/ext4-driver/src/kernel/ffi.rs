@@ -14,5 +14,6 @@ pub(crate) use wdk_sys::ntddk::{
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{
     IoAllocateWorkItem, IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeWorkItem,
-    IoQueueWorkItem, KeAcquireSpinLockRaiseToDpc, KeInitializeSpinLock, KeReleaseSpinLock,
+    IoQueueWorkItem, IoRegisterShutdownNotification, KeAcquireSpinLockRaiseToDpc,
+    KeInitializeSpinLock, KeReleaseSpinLock,
 };
