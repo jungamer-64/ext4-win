@@ -370,7 +370,7 @@ fn execute_major(major: DispatchMajor, target: DispatchTarget) -> DriverResult<I
         DispatchMajor::QueryEa => crate::request::ea::query(target),
         DispatchMajor::SetEa => crate::request::ea::set(target),
         DispatchMajor::LockControl => crate::request::file_info::lock_control(target),
-        DispatchMajor::Shutdown => Ok(IrpCompletion::EMPTY),
+        DispatchMajor::Shutdown => crate::request::file_info::shutdown(target),
         DispatchMajor::QuerySecurity => crate::request::security::query(target),
         DispatchMajor::SetSecurity => crate::request::security::set(target),
     }
