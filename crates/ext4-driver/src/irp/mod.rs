@@ -3,7 +3,6 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::FileOffset;
 use wdk_sys::{
     LIST_ENTRY, NTSTATUS, PDEVICE_OBJECT, PIO_CSQ, PIO_STACK_LOCATION, PIO_WORKITEM, PIRP,
     PLIST_ENTRY, PVOID, STATUS_PENDING, STATUS_SUCCESS,
@@ -1751,8 +1750,7 @@ impl CurrentIrpStackLocation {
     /// Decodes read parameters from the current stack location.
     /// # Errors
     ///
-    /// Returns an error when the read stack has no FILE_OBJECT, an invalid byte count, or a negative
-    /// read offset.
+    /// Returns an error when the read stack has no FILE_OBJECT or an invalid byte count.
     pub(crate) fn read(self) -> Result<ReadStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1764,26 +1762,16 @@ impl CurrentIrpStackLocation {
             // where Read is active.
             stack.Parameters.Read
         };
-        let byte_offset = unsafe {
-            // SAFETY: ByteOffset is represented by the QuadPart arm for IRP
-            // read/write stack locations.
-            read.ByteOffset.QuadPart
-        };
-        let byte_offset = FileOffset::from_bytes(
-            u64::try_from(byte_offset).map_err(|_| DriverError::InvalidParameter)?,
-        );
         Ok(ReadStack {
             file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(read.Length)?,
-            byte_offset,
         })
     }
 
     /// Decodes write parameters from the current stack location.
     /// # Errors
     ///
-    /// Returns an error when the write stack has no FILE_OBJECT, an invalid byte count, or a
-    /// negative write offset.
+    /// Returns an error when the write stack has no FILE_OBJECT or an invalid byte count.
     pub(crate) fn write(self) -> Result<WriteStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1795,18 +1783,9 @@ impl CurrentIrpStackLocation {
             // where Write is active.
             stack.Parameters.Write
         };
-        let byte_offset = unsafe {
-            // SAFETY: ByteOffset is represented by the QuadPart arm for IRP
-            // read/write stack locations.
-            write.ByteOffset.QuadPart
-        };
-        let byte_offset = FileOffset::from_bytes(
-            u64::try_from(byte_offset).map_err(|_| DriverError::InvalidParameter)?,
-        );
         Ok(WriteStack {
             file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(write.Length)?,
-            byte_offset,
         })
     }
 }
@@ -2898,9 +2877,6 @@ impl CreateOptions {
         }
         let transfer_buffering =
             if create_option_selected(options, wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING) {
-                if desired_access.contains(wdk_sys::FILE_APPEND_DATA) {
-                    return Err(DriverError::InvalidParameter);
-                }
                 CreateTransferBuffering::NoIntermediate
             } else {
                 CreateTransferBuffering::IntermediateAllowed
@@ -3217,8 +3193,6 @@ pub(crate) struct ReadStack {
     file_object: KernelFileObject,
     /// Requested byte count.
     length: IrpBufferLength,
-    /// Requested byte offset.
-    byte_offset: FileOffset,
 }
 
 impl ReadStack {
@@ -3232,10 +3206,6 @@ impl ReadStack {
         self.length
     }
 
-    /// Returns the requested byte offset.
-    pub(crate) const fn byte_offset(self) -> FileOffset {
-        self.byte_offset
-    }
 }
 
 /// Decoded write stack parameters.
@@ -3245,8 +3215,6 @@ pub(crate) struct WriteStack {
     file_object: KernelFileObject,
     /// Requested byte count.
     length: IrpBufferLength,
-    /// Requested byte offset.
-    byte_offset: FileOffset,
 }
 
 impl WriteStack {
@@ -3260,10 +3228,6 @@ impl WriteStack {
         self.length
     }
 
-    /// Returns the requested byte offset.
-    pub(crate) const fn byte_offset(self) -> FileOffset {
-        self.byte_offset
-    }
 }
 
 impl QueryVolumeStack {
@@ -4401,41 +4365,6 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn create_stack_rejects_no_intermediate_append_access() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
-            DesiredAccess: wdk_sys::FILE_APPEND_DATA,
-            ..wdk_sys::IO_SECURITY_CONTEXT::default()
-        };
-        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
-        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
-            SecurityContext: core::ptr::addr_of_mut!(security_context),
-            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
-                | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING,
-            __bindgen_padding_0: [0; 2],
-            FileAttributes: 0,
-            ShareAccess: 0,
-            __bindgen_padding_1: 0,
-            EaLength: 0,
-        };
-
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            assert_eq!(
-                current
-                    .create()
-                    .err()
-                    .map(crate::kernel::status::DriverError::ntstatus),
-                Some(STATUS_INVALID_PARAMETER)
-            );
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
     fn create_stack_rejects_unsupported_options_before_handler() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
@@ -4779,125 +4708,6 @@ mod tests {
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn read_stack_preserves_file_object_length_and_offset() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
-        stack.FileObject = file_object.as_ptr();
-        stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
-            Length: 4096,
-            __bindgen_padding_0: 0,
-            Key: 0,
-            Flags: 0,
-            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 8192 },
-        };
-
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            let read = current.read();
-            assert!(read.is_ok());
-            if let Ok(read) = read {
-                assert_eq!(
-                    Some(read.file_object()),
-                    KernelFileObject::from_raw(file_object.as_ptr())
-                );
-                assert_eq!(read.length().as_usize(), 4096);
-                assert_eq!(read.byte_offset().bytes(), 8192);
-            }
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn read_stack_rejects_negative_offset_at_decode() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
-        stack.FileObject = file_object.as_ptr();
-        stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
-            Length: 4096,
-            __bindgen_padding_0: 0,
-            Key: 0,
-            Flags: 0,
-            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: -1 },
-        };
-
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            assert_eq!(
-                current
-                    .read()
-                    .err()
-                    .map(crate::kernel::status::DriverError::ntstatus),
-                Some(STATUS_INVALID_PARAMETER)
-            );
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn write_stack_preserves_file_object_length_and_offset() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
-        stack.FileObject = file_object.as_ptr();
-        stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
-            Length: 2048,
-            __bindgen_padding_0: 0,
-            Key: 0,
-            Flags: 0,
-            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 4096 },
-        };
-
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            let write = current.write();
-            assert!(write.is_ok());
-            if let Ok(write) = write {
-                assert_eq!(
-                    Some(write.file_object()),
-                    KernelFileObject::from_raw(file_object.as_ptr())
-                );
-                assert_eq!(write.length().as_usize(), 2048);
-                assert_eq!(write.byte_offset().bytes(), 4096);
-            }
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn write_stack_rejects_negative_offset_at_decode() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
-        stack.FileObject = file_object.as_ptr();
-        stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
-            Length: 2048,
-            __bindgen_padding_0: 0,
-            Key: 0,
-            Flags: 0,
-            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: -1 },
-        };
-
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
-        assert!(current.is_ok());
-        if let Ok(current) = current {
-            assert_eq!(
-                current
-                    .write()
-                    .err()
-                    .map(crate::kernel::status::DriverError::ntstatus),
-                Some(STATUS_INVALID_PARAMETER)
-            );
-        }
-    }
-
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.

@@ -1630,16 +1630,6 @@ impl FileControlBlock {
         self.byte_range_locks.process(target)
     }
 
-    /// Returns whether the original read requestor may read the IRP's byte range.
-    pub(crate) fn permits_byte_range_read(&self, target: DispatchTarget) -> bool {
-        self.byte_range_locks.permits_read(target)
-    }
-
-    /// Returns whether the original write requestor may write the IRP's byte range.
-    pub(crate) fn permits_byte_range_write(&self, target: DispatchTarget) -> bool {
-        self.byte_range_locks.permits_write(target)
-    }
-
     /// Releases all byte-range locks held by this FILE_OBJECT's requestor during cleanup.
     pub(crate) fn release_handle_byte_range_locks(
         &self,
@@ -1769,40 +1759,6 @@ impl FileByteRangeLocks {
         {
             let _target = target;
             wdk_sys::STATUS_SUCCESS
-        }
-    }
-
-    /// Checks one IRP_MJ_READ range against this FCB's byte-range locks.
-    fn permits_read(&self, target: DispatchTarget) -> bool {
-        #[cfg(not(test))]
-        {
-            unsafe {
-                // SAFETY: FsRtl reads its initialized lock state and the live
-                // IRP's original requestor context without taking ownership.
-                ffi::FsRtlCheckLockForReadAccess(self.native.get(), target.as_raw_irp()) != 0
-            }
-        }
-        #[cfg(test)]
-        {
-            let _target = target;
-            true
-        }
-    }
-
-    /// Checks one IRP_MJ_WRITE range against this FCB's byte-range locks.
-    fn permits_write(&self, target: DispatchTarget) -> bool {
-        #[cfg(not(test))]
-        {
-            unsafe {
-                // SAFETY: FsRtl reads its initialized lock state and the live
-                // IRP's original requestor context without taking ownership.
-                ffi::FsRtlCheckLockForWriteAccess(self.native.get(), target.as_raw_irp()) != 0
-            }
-        }
-        #[cfg(test)]
-        {
-            let _target = target;
-            true
         }
     }
 
