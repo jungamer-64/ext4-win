@@ -11,10 +11,10 @@ use ext4_core::{
 use wdk_sys::LARGE_INTEGER;
 
 use crate::irp::{
-    DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
-    DirectoryEntryIndex, DirectoryInformationClass, DirectoryPatternInput, DispatchTarget,
-    IrpBufferLength, IrpCompletion, QueryDirectoryStack, QueryFileInformationClass, QueryFileStack,
-    SetFileInformationClass, SetFileStack,
+    DirectoryChangeFilter, DirectoryControlMinorFunction, DirectoryCursorPosition,
+    DirectoryEntryEmission, DirectoryEntryIndex, DirectoryInformationClass, DirectoryPatternInput,
+    DirectoryWatchScope, DispatchTarget, IrpBufferLength, IrpCompletion, QueryDirectoryStack,
+    QueryFileInformationClass, QueryFileStack, SetFileInformationClass, SetFileStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
@@ -136,13 +136,39 @@ pub(crate) fn directory_control(target: DispatchTarget) -> DriverResult<IrpCompl
 /// directory-change notification is not implemented yet.
 fn notify_change_directory(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.notify_directory()?;
-    let _opened_directory = OpenedDirectory::decode(stack.file_object())?;
-    let _notification_parameters = (
-        stack.length(),
-        stack.completion_filter(),
-        stack.watch_scope(),
-    );
-    Err(DriverError::NotSupported)
+    Ok(DirectoryNotificationRequest {
+        opened_directory: OpenedDirectory::decode(stack.file_object())?,
+        completion_filter: stack.completion_filter(),
+        watch_scope: stack.watch_scope(),
+    })
+}
+
+/// Directory notification selected from a valid notify-change IRP.
+#[derive(Debug)]
+pub(crate) struct DirectoryNotificationRequest {
+    /// Opened directory whose FILE_OBJECT owns this notification.
+    opened_directory: OpenedDirectory,
+    /// Change kinds that may complete this request.
+    completion_filter: DirectoryChangeFilter,
+    /// Direct-child or descendant directory scope.
+    watch_scope: DirectoryWatchScope,
+}
+
+impl DirectoryNotificationRequest {
+    /// Returns the directory that owns this notification request.
+    pub(crate) fn opened_directory(&self) -> &OpenedDirectory {
+        &self.opened_directory
+    }
+
+    /// Returns the selected completion filters.
+    pub(crate) const fn completion_filter(&self) -> DirectoryChangeFilter {
+        self.completion_filter
+    }
+
+    /// Returns the selected directory scope.
+    pub(crate) const fn watch_scope(&self) -> DirectoryWatchScope {
+        self.watch_scope
+    }
 }
 
 /// Executes byte-range lock requests.
