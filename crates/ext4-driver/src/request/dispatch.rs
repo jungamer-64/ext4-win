@@ -3,7 +3,10 @@
 use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP};
 
 use crate::{
-    irp::{DeviceIrpQueue, DispatchMajor, DispatchTarget, IrpCompletion, ReceivedIrp},
+    irp::{
+        DeviceIrpQueue, DirectoryControlMinorFunction, DispatchMajor, DispatchTarget,
+        IrpCompletion, OwnedIrp, ReceivedIrp,
+    },
     kernel::status::{DriverError, DriverResult},
 };
 
@@ -255,6 +258,7 @@ fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS
             received.complete_result(execute_immediate(major, target))
         }
         DispatchPolicy::Queued => DeviceIrpQueue::receive_async(received),
+        DispatchPolicy::QueuedCleanup => dispatch_cleanup(received),
         DispatchPolicy::FsRtlFileLock => dispatch_file_lock(received),
     }
 }
@@ -266,6 +270,8 @@ enum DispatchPolicy {
     Immediate,
     /// Mark pending and execute from the device queue worker.
     Queued,
+    /// Cancel pending IRPs for the FILE_OBJECT, then execute cleanup from the device queue worker.
+    QueuedCleanup,
     /// Transfer terminal completion to the FsRtl byte-range lock package.
     FsRtlFileLock,
 }
@@ -273,9 +279,8 @@ enum DispatchPolicy {
 /// Returns the queue policy for a major function.
 const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
     match major {
-        DispatchMajor::Close | DispatchMajor::Cleanup | DispatchMajor::DeviceControl => {
-            DispatchPolicy::Immediate
-        }
+        DispatchMajor::Close | DispatchMajor::DeviceControl => DispatchPolicy::Immediate,
+        DispatchMajor::Cleanup => DispatchPolicy::QueuedCleanup,
         DispatchMajor::LockControl => DispatchPolicy::FsRtlFileLock,
         DispatchMajor::Create
         | DispatchMajor::Read
@@ -295,6 +300,21 @@ const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
     }
 }
 
+/// Cancels queued IRPs for a FILE_OBJECT, then executes its cleanup at PASSIVE_LEVEL.
+fn dispatch_cleanup(received: ReceivedIrp) -> NTSTATUS {
+    let target = received.target();
+    let file_object = match target.current_stack().and_then(|stack| stack.file_object()) {
+        Ok(file_object) => file_object,
+        Err(error) => return received.complete_result(Err(error)),
+    };
+    let queue = match DeviceIrpQueue::from_device(target.device()) {
+        Ok(queue) => queue,
+        Err(error) => return received.complete_result(Err(error)),
+    };
+    DeviceIrpQueue::cancel_file_object(queue, file_object);
+    DeviceIrpQueue::receive_async(received)
+}
+
 /// Decodes a lock target, then lets FsRtl own and complete the lock-control IRP.
 fn dispatch_file_lock(received: ReceivedIrp) -> NTSTATUS {
     let target = received.target();
@@ -304,11 +324,7 @@ fn dispatch_file_lock(received: ReceivedIrp) -> NTSTATUS {
     }
 }
 
-/// Executes a queued IRP after a worker removes it from the device queue.
-/// # Errors
-///
-/// Returns an error when the queued IRP stack cannot be decoded or the selected request handler
-/// rejects the request.
+/// Executes and terminally completes or delegates one IRP removed from the device queue.
 #[cfg_attr(
     test,
     expect(
@@ -316,8 +332,30 @@ fn dispatch_file_lock(received: ReceivedIrp) -> NTSTATUS {
         reason = "kernel work-item worker is compiled out in unit tests"
     )
 )]
-pub(crate) fn execute_queued(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    execute_major(target.current_stack()?.major()?, target)
+pub(crate) fn execute_queued(owned: OwnedIrp) -> NTSTATUS {
+    let target = owned.target();
+    let major = match target.current_stack().and_then(|stack| stack.major()) {
+        Ok(major) => major,
+        Err(error) => return owned.complete_result(Err(error)),
+    };
+    if major == DispatchMajor::DirectoryControl {
+        let minor = match target.current_stack() {
+            Ok(stack) => stack.directory_control_minor(),
+            Err(error) => return owned.complete_result(Err(error)),
+        };
+        return match minor {
+            DirectoryControlMinorFunction::QueryDirectory => {
+                owned.complete_result(crate::request::file_info::query_directory(target))
+            }
+            DirectoryControlMinorFunction::NotifyChangeDirectory => {
+                crate::request::file_info::notify_change_directory(owned)
+            }
+            DirectoryControlMinorFunction::Unsupported => {
+                owned.complete_result(Err(DriverError::InvalidDeviceRequest))
+            }
+        };
+    }
+    owned.complete_result(execute_major(major, target))
 }
 
 /// Executes an immediate IRP during the dispatch callback.
@@ -327,9 +365,9 @@ pub(crate) fn execute_queued(target: DispatchTarget) -> DriverResult<IrpCompleti
 /// execution.
 fn execute_immediate(major: DispatchMajor, target: DispatchTarget) -> DriverResult<IrpCompletion> {
     match major {
-        DispatchMajor::Cleanup => cleanup_immediate(target),
         DispatchMajor::Close | DispatchMajor::DeviceControl => execute_major(major, target),
         DispatchMajor::Create
+        | DispatchMajor::Cleanup
         | DispatchMajor::Read
         | DispatchMajor::Write
         | DispatchMajor::QueryInformation
@@ -348,17 +386,6 @@ fn execute_immediate(major: DispatchMajor, target: DispatchTarget) -> DriverResu
     }
 }
 
-/// Cancels queued IRPs for the same file object, then runs normal cleanup.
-/// # Errors
-///
-/// Returns an error when cleanup stack decoding, queue lookup, or file cleanup handling fails.
-fn cleanup_immediate(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let file_object = target.current_stack()?.file_object()?;
-    let queue = DeviceIrpQueue::from_device(target.device())?;
-    DeviceIrpQueue::cancel_file_object(queue, file_object);
-    crate::request::file_info::cleanup(target)
-}
-
 /// Executes the request implementation for a typed major function.
 /// # Errors
 ///
@@ -374,7 +401,8 @@ fn execute_major(major: DispatchMajor, target: DispatchTarget) -> DriverResult<I
         DispatchMajor::SetInformation => crate::request::file_info::set(target),
         DispatchMajor::QueryVolumeInformation => crate::request::volume_info::query(target),
         DispatchMajor::SetVolumeInformation => crate::request::volume_info::set(target),
-        DispatchMajor::DirectoryControl => crate::request::file_info::directory_control(target),
+        // Directory control selects either normal completion or FsRtl ownership in execute_queued.
+        DispatchMajor::DirectoryControl => Err(DriverError::InvalidDeviceRequest),
         DispatchMajor::FileSystemControl => crate::request::file_system_control::execute(target),
         DispatchMajor::DeviceControl => crate::request::file_system_control::device_control(target),
         DispatchMajor::FlushBuffers => crate::request::file_info::flush(target),
@@ -413,6 +441,17 @@ mod tests {
         assert_eq!(
             dispatch_policy(DispatchMajor::LockControl),
             DispatchPolicy::FsRtlFileLock
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when cleanup can run above PASSIVE_LEVEL after cancelling its pending IRPs.
+    #[test]
+    fn cleanup_is_queued_after_pending_irps_are_cancelled() {
+        assert_eq!(
+            dispatch_policy(DispatchMajor::Cleanup),
+            DispatchPolicy::QueuedCleanup
         );
     }
 }

@@ -19,10 +19,11 @@ use crate::{
     memory::{self, DriverVec},
     request::{ea::CreateEa, metadata},
     state::{
-        ChildCreationTarget, CloseDisposition, DataTransferMode, FileControlBlock, KernelDevice,
-        KernelFileObject, MountedVolumeDevice, NoIntermediateTransfer, OpenedHandle,
-        OpenedLocation, OpenedObject, PendingChildCreation, UninitializedFileObject,
-        VolumeControlBlock, WriteCommitment, release_file_control_block,
+        ChildCreationTarget, CloseDisposition, DataTransferMode, DirectoryNameChange,
+        DirectoryNameChangeAction, FileControlBlock, KernelDevice, KernelFileObject,
+        MountedVolumeDevice, NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedObject,
+        PendingChildCreation, UninitializedFileObject, VolumeControlBlock, WriteCommitment,
+        release_file_control_block,
     },
 };
 
@@ -555,6 +556,8 @@ fn create_missing_node(
         crate::kernel::time::current_ext4_timestamp()?,
     )?;
     let node = creation.node();
+    let notification =
+        DirectoryNameChange::new(parent, name, node, DirectoryNameChangeAction::Added)?;
     let handle = memory::boxed_try_with(|| {
         Ok(OpenedHandle::new(
             node,
@@ -574,12 +577,18 @@ fn create_missing_node(
 
     match creation.commit() {
         Ok(()) => {
+            let vcb = unsafe {
+                // SAFETY: The committed create kept the mounted VCB alive;
+                // reporting only reads its stable FsRtl notifier state.
+                vcb.as_ref()
+            };
             attach_preallocated_file_object(
                 request.file_object(),
                 fcb,
                 handle,
                 policy.file_object_flags(),
             );
+            vcb.report_directory_name_change(notification);
             Ok(())
         }
         Err(error) => {

@@ -11,15 +11,16 @@ use ext4_core::{
 use wdk_sys::LARGE_INTEGER;
 
 use crate::irp::{
-    DirectoryChangeFilter, DirectoryControlMinorFunction, DirectoryCursorPosition,
-    DirectoryEntryEmission, DirectoryEntryIndex, DirectoryInformationClass, DirectoryPatternInput,
-    DirectoryWatchScope, DispatchTarget, IrpBufferLength, IrpCompletion, QueryDirectoryStack,
-    QueryFileInformationClass, QueryFileStack, SetFileInformationClass, SetFileStack,
+    DirectoryChangeFilter, DirectoryCursorPosition, DirectoryEntryEmission, DirectoryEntryIndex,
+    DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope, DispatchTarget,
+    IrpBufferLength, IrpCompletion, OwnedIrp, QueryDirectoryStack, QueryFileInformationClass,
+    QueryFileStack, SetFileInformationClass, SetFileStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{
-    CloseDisposition, DirectoryCursor, FileControlBlock, KernelFileObject, MountedVolumeDevice,
+    CloseDisposition, DirectoryCursor, DirectoryNameChange, DirectoryNameChangeAction,
+    DirectoryNotificationRegistration, FileControlBlock, KernelFileObject, MountedVolumeDevice,
     OpenedDirectory, OpenedHandle, OpenedLocation, OpenedObject, OpenedRegularFile,
     VolumeControlBlock, WriteCommitment, release_file_control_block,
 };
@@ -114,33 +115,25 @@ pub(crate) fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     SetFileRequest::decode(target).and_then(set_file_information)
 }
 
-/// Executes directory enumeration and notification.
-/// # Errors
-///
-/// Returns an error when directory-control decoding, enumeration, or notification request
-/// validation rejects the request.
-pub(crate) fn directory_control(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    target
-        .current_stack()
-        .and_then(|stack| match stack.directory_control_minor() {
-            DirectoryControlMinorFunction::QueryDirectory => query_directory(target),
-            DirectoryControlMinorFunction::NotifyChangeDirectory => notify_change_directory(target),
-            DirectoryControlMinorFunction::Unsupported => Err(DriverError::InvalidDeviceRequest),
-        })
-}
-
-/// Validates a directory-change notification request before notification storage is introduced.
-/// # Errors
-///
-/// Returns an error when the stack is malformed, the FILE_OBJECT is not an opened directory, or
-/// directory-change notification is not implemented yet.
-fn notify_change_directory(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let stack = target.current_stack()?.notify_directory()?;
-    Ok(DirectoryNotificationRequest {
-        opened_directory: OpenedDirectory::decode(stack.file_object())?,
-        completion_filter: stack.completion_filter(),
-        watch_scope: stack.watch_scope(),
-    })
+/// Transfers one queued directory-change IRP to the VCB's FsRtl notification list.
+pub(crate) fn notify_change_directory(owned: OwnedIrp) -> wdk_sys::NTSTATUS {
+    let target = owned.target();
+    let registration = DirectoryNotificationRequest::decode(target).and_then(|mut request| {
+        let registration = request.registration()?;
+        let volume = request.opened_directory().volume();
+        let vcb = unsafe {
+            // SAFETY: OpenedDirectory was decoded from the live FILE_OBJECT
+            // that owns this pending notification IRP.
+            volume.as_ref()
+        };
+        Ok((vcb.directory_change_notifier(), registration))
+    });
+    match registration {
+        Ok((notifier, registration)) => {
+            owned.delegate_directory_notification(notifier, registration)
+        }
+        Err(error) => owned.complete_result(Err(error)),
+    }
 }
 
 /// Directory notification selected from a valid notify-change IRP.
@@ -155,19 +148,38 @@ pub(crate) struct DirectoryNotificationRequest {
 }
 
 impl DirectoryNotificationRequest {
+    /// Decodes the active directory-change stack location.
+    /// # Errors
+    ///
+    /// Returns an error when the stack is malformed or its FILE_OBJECT is not an opened directory.
+    fn decode(target: DispatchTarget) -> DriverResult<Self> {
+        let stack = target.current_stack()?.notify_directory()?;
+        Ok(Self {
+            opened_directory: OpenedDirectory::decode(stack.file_object())?,
+            completion_filter: stack.completion_filter(),
+            watch_scope: stack.watch_scope(),
+        })
+    }
+
     /// Returns the directory that owns this notification request.
     pub(crate) fn opened_directory(&self) -> &OpenedDirectory {
         &self.opened_directory
     }
 
-    /// Returns the selected completion filters.
-    pub(crate) const fn completion_filter(&self) -> DirectoryChangeFilter {
-        self.completion_filter
-    }
-
-    /// Returns the selected directory scope.
-    pub(crate) const fn watch_scope(&self) -> DirectoryWatchScope {
-        self.watch_scope
+    /// Converts this request into the exact FsRtl registration semantics this driver supports.
+    /// # Errors
+    ///
+    /// Returns an error when recursive watching or non-name completion filters are requested.
+    fn registration(&mut self) -> DriverResult<DirectoryNotificationRegistration> {
+        if self.watch_scope.watches_subtree() {
+            return Err(DriverError::NotSupported);
+        }
+        let full_directory_name = self.opened_directory.notification_directory_name()?;
+        Ok(DirectoryNotificationRegistration::new(
+            full_directory_name,
+            self.opened_directory.notification_context(),
+            self.completion_filter.namespace_name_filter()?,
+        ))
     }
 }
 
@@ -511,6 +523,15 @@ fn set_rename_information(
         vcb.as_mut()
     };
     let (target_parent, target_name) = resolve_rename_target(vcb, &rename)?;
+    let notifications = RenameDirectoryNameChanges::prepare(
+        vcb,
+        source_parent,
+        &source_name,
+        request.opened_file.node(),
+        target_parent,
+        &target_name,
+        &rename,
+    )?;
     let mut transaction = vcb
         .volume_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
@@ -524,13 +545,93 @@ fn set_rename_information(
         rename.target_collision(),
     )?;
     transaction.commit()?;
-    request
-        .opened_file
-        .replace_location(OpenedLocation::DirectoryEntry {
-            parent: target_parent.id(),
-            name: target_name,
-        });
+    if let Some(notifications) = notifications {
+        request
+            .opened_file
+            .replace_location(OpenedLocation::DirectoryEntry {
+                parent: target_parent.id(),
+                name: target_name,
+            });
+        notifications.report(vcb);
+    }
     Ok(())
+}
+
+/// Committed directory-name changes caused by one non-no-op rename operation.
+#[derive(Clone, Copy, Debug)]
+struct RenameDirectoryNameChanges {
+    /// Existing target entry removed by a replace-capable rename.
+    replaced_target: Option<DirectoryNameChange>,
+    /// Source entry under its former name.
+    old_source_name: DirectoryNameChange,
+    /// Source entry under its new name.
+    new_source_name: DirectoryNameChange,
+}
+
+impl RenameDirectoryNameChanges {
+    /// Prepares the exact name-change events that a successful rename will publish.
+    /// # Errors
+    ///
+    /// Returns an error when a replace-capable target cannot be read or a visible child name
+    /// cannot be represented in the Windows notification namespace.
+    fn prepare(
+        vcb: &VolumeControlBlock,
+        source_parent: DirectoryNodeId,
+        source_name: &Ext4Name,
+        source_node: NodeId,
+        target_parent: DirectoryNodeId,
+        target_name: &Ext4Name,
+        target: &RenameTargetPath,
+    ) -> DriverResult<Option<Self>> {
+        if source_parent == target_parent && source_name == target_name {
+            return Ok(None);
+        }
+
+        let replaced_target = match target.target_collision() {
+            RenameTargetCollision::Reject => None,
+            RenameTargetCollision::Replace => {
+                let parent = vcb.volume().load_directory(target_parent)?;
+                match vcb
+                    .volume()
+                    .lookup_windows_child(&parent, target.target_name())?
+                {
+                    ChildLookup::Found(child) if *child.node() == source_node => return Ok(None),
+                    ChildLookup::Found(child) => Some(DirectoryNameChange::new(
+                        target_parent,
+                        child.name(),
+                        *child.node(),
+                        DirectoryNameChangeAction::Removed,
+                    )?),
+                    ChildLookup::NotFound => None,
+                }
+            }
+        };
+
+        Ok(Some(Self {
+            replaced_target,
+            old_source_name: DirectoryNameChange::new(
+                source_parent,
+                source_name,
+                source_node,
+                DirectoryNameChangeAction::RenamedOldName,
+            )?,
+            new_source_name: DirectoryNameChange::new(
+                target_parent,
+                target_name,
+                source_node,
+                DirectoryNameChangeAction::RenamedNewName,
+            )?,
+        }))
+    }
+
+    /// Reports every name transition after the corresponding ext4 transaction commits.
+    fn report(self, vcb: &VolumeControlBlock) {
+        if let Some(replaced_target) = self.replaced_target {
+            vcb.report_directory_name_change(replaced_target);
+        }
+        vcb.report_directory_name_change(self.old_source_name);
+        vcb.report_directory_name_change(self.new_source_name);
+    }
 }
 
 /// Sets a regular file size by extending sparse or truncating allocated ranges.
@@ -570,7 +671,7 @@ fn set_regular_file_size(opened_file: &OpenedRegularFile, new_size: FileSize) ->
 ///
 /// Returns an error when the directory query stack, pattern, output buffer, opened directory, or
 /// emitted directory record layout is invalid.
-fn query_directory(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+pub(crate) fn query_directory(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let mut request = QueryDirectoryRequest::decode(target)?;
     let class = request.stack.information_class();
     let pattern = DirectoryPattern::from_stack(request.stack)?;
@@ -1217,6 +1318,7 @@ fn cleanup_file_object(target: DispatchTarget, file_object: KernelFileObject) ->
     opened_file
         .file_control_block()
         .release_handle_byte_range_locks(target, file_object);
+    cleanup_directory_notification(&opened_file);
     if opened_file.close_disposition() == CloseDisposition::Keep {
         return Ok(());
     }
@@ -1225,6 +1327,12 @@ fn cleanup_file_object(target: DispatchTarget, file_object: KernelFileObject) ->
         OpenedLocation::Root => return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot)),
         OpenedLocation::FileReference => return Err(DriverError::NotSupported),
     };
+    let notification = DirectoryNameChange::new(
+        parent,
+        &name,
+        opened_file.node(),
+        DirectoryNameChangeAction::Removed,
+    )?;
 
     let mut vcb = opened_file.volume();
     let vcb = unsafe {
@@ -1243,8 +1351,21 @@ fn cleanup_file_object(target: DispatchTarget, file_object: KernelFileObject) ->
         NodeId::Symlink(_) => transaction.remove_symlink(parent, &name)?,
     }
     transaction.commit()?;
+    vcb.report_directory_name_change(notification);
     opened_file.set_close_disposition(CloseDisposition::Keep);
     Ok(())
+}
+
+/// Releases FsRtl notification records owned by a FILE_OBJECT during its cleanup transition.
+fn cleanup_directory_notification(opened_file: &OpenedObject) {
+    let volume = opened_file.volume();
+    let vcb = unsafe {
+        // SAFETY: The opened FILE_OBJECT keeps its FCB and mounted VCB alive
+        // throughout cleanup, before the CCB context is released at close.
+        volume.as_ref()
+    };
+    vcb.directory_change_notifier()
+        .cleanup(opened_file.notification_context());
 }
 
 /// Open file state needed for journaled metadata mutations.
