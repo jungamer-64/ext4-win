@@ -5,12 +5,9 @@ use alloc::vec::Vec;
 use crate::irp::{DispatchTarget, FileSystemControlStack, IrpCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
-use crate::request::metadata;
-use crate::state::{
-    FileControlBlock, OpenedLocation, OpenedObject, OpenedSymlink, VolumeControlBlock,
-};
-use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
-use ext4_core::{NodeId, SymlinkNodeId, SymlinkTarget};
+use crate::state::{FileControlBlock, OpenedSymlink, VolumeControlBlock};
+use crate::wire::{LittleEndianOutput, WireOffset};
+use ext4_core::SymlinkNodeId;
 
 /// Reparse buffer header before the tag-specific payload.
 const REPARSE_DATA_BUFFER_HEADER_SIZE: usize = 8;
@@ -23,14 +20,6 @@ const SYMLINK_PATH_BUFFER_OFFSET: usize =
 /// Creates a wire offset from a reparse-buffer byte position.
 const fn wire_offset(offset: usize) -> WireOffset {
     WireOffset::new(offset)
-}
-
-/// Creates a checked reparse-buffer range.
-/// # Errors
-///
-/// Returns an error when `offset + length` cannot be represented as a reparse-buffer wire range.
-fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
-    WireRange::new(wire_offset(offset), WireByteLen::new(length))
 }
 
 /// Handles `FSCTL_GET_REPARSE_POINT` for an opened ext4 symlink.
@@ -54,15 +43,6 @@ pub(crate) fn get_reparse_point(
 ///
 /// Returns an error when the reparse input is malformed or the opened location cannot be replaced
 /// by a symlink in an ext4 transaction.
-pub(crate) fn set_reparse_point(
-    target: DispatchTarget,
-    stack: FileSystemControlStack,
-) -> DriverResult<IrpCompletion> {
-    let symlink_target = parse_symlink_reparse_target(target, stack)?;
-    replace_opened_location_with_symlink(stack, &symlink_target)?;
-    Ok(IrpCompletion::EMPTY)
-}
-
 /// Reads the target bytes for the symlink opened by the FSCTL.
 /// # Errors
 ///
@@ -82,63 +62,6 @@ fn read_symlink_target(stack: FileSystemControlStack) -> DriverResult<Vec<u8>> {
 fn read_core_symlink(vcb: &VolumeControlBlock, symlink_id: SymlinkNodeId) -> DriverResult<Vec<u8>> {
     let symlink = vcb.volume().load_symlink(symlink_id)?;
     Ok(vcb.volume().read_symlink(&symlink)?)
-}
-
-/// Parses a Windows symbolic-link reparse input buffer into an ext4 symlink target.
-/// # Errors
-///
-/// Returns an error when the FSCTL input buffer is unavailable or the symbolic-link reparse buffer
-/// is malformed.
-fn parse_symlink_reparse_target(
-    target: DispatchTarget,
-    stack: FileSystemControlStack,
-) -> DriverResult<SymlinkTarget> {
-    let length = stack.input_buffer_length();
-    let input = target.buffered_input(length)?;
-    parse_symlink_reparse_buffer(input.as_slice())
-}
-
-/// Replaces the opened directory entry with a newly-created symlink inode.
-/// # Errors
-///
-/// Returns an error when the opened object is the root, its current node cannot be removed, or the
-/// replacement symlink cannot be created and committed.
-fn replace_opened_location_with_symlink(
-    stack: FileSystemControlStack,
-    target: &SymlinkTarget,
-) -> DriverResult<()> {
-    let mut opened_file = OpenedObject::decode(stack.file_object())?;
-    let (parent, name) = match opened_file.location() {
-        OpenedLocation::DirectoryEntry { parent, name } => (*parent, name.try_to_owned_name()?),
-        OpenedLocation::Root => return Err(DriverError::NotSupported),
-        OpenedLocation::FileReference => return Err(DriverError::NotSupported),
-    };
-
-    let mut vcb = opened_file.volume();
-    let vcb = unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
-        // remain valid while file objects are open. The mutable borrow is the
-        // transaction boundary for this namespace conversion.
-        vcb.as_mut()
-    };
-    let mut transaction = vcb
-        .volume_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let parent_directory = transaction.directory(parent)?;
-    match opened_file.node() {
-        NodeId::File(_) => transaction.unlink_file(parent_directory, &name)?,
-        NodeId::Directory(_) => transaction.remove_empty_directory(parent_directory, &name)?,
-        NodeId::Symlink(_) => transaction.remove_symlink(parent_directory, &name)?,
-    }
-    let symlink = transaction.create_symlink(
-        parent_directory,
-        &name,
-        target,
-        metadata::default_symlink_metadata()?,
-    )?;
-    transaction.commit()?;
-    opened_file.replace_with_symlink(symlink.id());
-    Ok(())
 }
 
 /// Returns the mounted VCB referenced by an FCB.
@@ -204,105 +127,6 @@ fn pack_symlink_reparse_buffer(target: &[u8], output: &mut [u8]) -> DriverResult
     Ok(total_length)
 }
 
-/// Parses a Windows symbolic-link reparse buffer.
-/// # Errors
-///
-/// Returns an error when the tag is not symbolic-link, lengths are inconsistent, flags are
-/// unsupported, UTF-16 is invalid, or the target is not a valid ext4 symlink.
-fn parse_symlink_reparse_buffer(input: &[u8]) -> DriverResult<SymlinkTarget> {
-    let input_len = input.len();
-    let input = LittleEndianInput::new(input);
-    let tag = input.read_u32(wire_offset(0))?;
-    if tag != wdk_sys::IO_REPARSE_TAG_SYMLINK {
-        return Err(DriverError::ReparseTagNotHandled);
-    }
-    let reparse_data_length = usize::from(input.read_u16(wire_offset(4))?);
-    let total_length = REPARSE_DATA_BUFFER_HEADER_SIZE
-        .checked_add(reparse_data_length)
-        .ok_or(DriverError::InvalidParameter)?;
-    if input_len < total_length {
-        return Err(DriverError::BufferTooSmall);
-    }
-    if reparse_data_length < SYMLINK_REPARSE_BUFFER_HEADER_SIZE {
-        return Err(DriverError::InvalidParameter);
-    }
-
-    let substitute_name_offset = usize::from(input.read_u16(wire_offset(8))?);
-    let substitute_name_length = usize::from(input.read_u16(wire_offset(10))?);
-    let flags = input.read_u32(wire_offset(16))?;
-    if flags & !wdk_sys::SYMLINK_FLAG_RELATIVE != 0 {
-        return Err(DriverError::NotSupported);
-    }
-
-    let path_buffer_length = reparse_data_length
-        .checked_sub(SYMLINK_REPARSE_BUFFER_HEADER_SIZE)
-        .ok_or(DriverError::InvalidParameter)?;
-    let units = reparse_path_units(
-        input,
-        path_buffer_length,
-        substitute_name_offset,
-        substitute_name_length,
-    )?;
-    let target = utf16_to_utf8_bytes(units.as_slice())?;
-    Ok(SymlinkTarget::new(target.as_slice())?)
-}
-
-/// Reads a UTF-16 path slice from a symbolic-link reparse path buffer.
-/// # Errors
-///
-/// Returns an error when path offsets are not UTF-16 aligned, overflow, or point outside the reparse
-/// path buffer.
-fn reparse_path_units(
-    input: LittleEndianInput<'_>,
-    path_buffer_length: usize,
-    offset: usize,
-    length: usize,
-) -> DriverResult<DriverVec<u16>> {
-    if !offset.is_multiple_of(2) || !length.is_multiple_of(2) {
-        return Err(DriverError::InvalidParameter);
-    }
-    let path_buffer_end = SYMLINK_PATH_BUFFER_OFFSET
-        .checked_add(path_buffer_length)
-        .ok_or(DriverError::InvalidParameter)?;
-    let start = SYMLINK_PATH_BUFFER_OFFSET
-        .checked_add(offset)
-        .ok_or(DriverError::InvalidParameter)?;
-    let end = start
-        .checked_add(length)
-        .ok_or(DriverError::InvalidParameter)?;
-    if end > path_buffer_end {
-        return Err(DriverError::InvalidParameter);
-    }
-    let bytes = input.range(wire_range(start, length)?)?;
-    let mut units = DriverVec::new();
-    let (chunks, remainder) = bytes.as_chunks::<2>();
-    if !remainder.is_empty() {
-        return Err(DriverError::InvalidParameter);
-    }
-    for chunk in chunks {
-        units.try_push(u16::from_le_bytes(*chunk))?;
-    }
-    Ok(units)
-}
-
-/// Converts UTF-16 units into UTF-8 bytes without using infallible string allocation.
-/// # Errors
-///
-/// Returns an error when the UTF-16 input is malformed or allocation fails.
-fn utf16_to_utf8_bytes(units: &[u16]) -> DriverResult<DriverVec<u8>> {
-    let capacity = units
-        .len()
-        .checked_mul(3)
-        .ok_or(DriverError::InvalidParameter)?;
-    let mut bytes = DriverVec::try_with_capacity(capacity)?;
-    for decoded in char::decode_utf16(units.iter().copied()) {
-        let character = decoded.map_err(|_| DriverError::InvalidParameter)?;
-        let mut encoded = [0_u8; 4];
-        bytes.try_extend_from_copy_slice(character.encode_utf8(&mut encoded).as_bytes())?;
-    }
-    Ok(bytes)
-}
-
 /// Returns the byte count for UTF-16 code units.
 /// # Errors
 ///
@@ -350,12 +174,9 @@ mod tests {
     use alloc::vec::Vec;
 
     use crate::kernel::status::DriverError;
-    use crate::wire::{LittleEndianInput, LittleEndianOutput};
+    use crate::wire::LittleEndianInput;
 
-    use super::{
-        SYMLINK_PATH_BUFFER_OFFSET, pack_symlink_reparse_buffer, parse_symlink_reparse_buffer,
-        wire_offset,
-    };
+    use super::{SYMLINK_PATH_BUFFER_OFFSET, pack_symlink_reparse_buffer, wire_offset};
 
     /// # Panics
     ///
@@ -422,63 +243,4 @@ mod tests {
         );
     }
 
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn parses_symlink_reparse_buffer_target() {
-        let mut input = vec![0; 128];
-        let expected = Vec::from(&b"dir/file"[..]);
-        assert_eq!(
-            pack_symlink_reparse_buffer(expected.as_slice(), input.as_mut_slice()),
-            Ok(52)
-        );
-
-        assert_eq!(
-            parse_symlink_reparse_buffer(input.as_slice()).map(|target| target.bytes().to_vec()),
-            Ok(expected)
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn rejects_unhandled_reparse_tag_on_set() {
-        let mut input = vec![0; 128];
-        assert_eq!(
-            pack_symlink_reparse_buffer(b"target", input.as_mut_slice()),
-            Ok(44)
-        );
-        assert_eq!(
-            LittleEndianOutput::new(input.as_mut_slice()).write_u32(wire_offset(0), 0),
-            Ok(())
-        );
-
-        assert_eq!(
-            parse_symlink_reparse_buffer(input.as_slice()),
-            Err(DriverError::ReparseTagNotHandled)
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn rejects_unsupported_symlink_reparse_flags() {
-        let mut input = vec![0; 128];
-        assert_eq!(
-            pack_symlink_reparse_buffer(b"target", input.as_mut_slice()),
-            Ok(44)
-        );
-        assert_eq!(
-            LittleEndianOutput::new(input.as_mut_slice()).write_u32(wire_offset(16), 2),
-            Ok(())
-        );
-
-        assert_eq!(
-            parse_symlink_reparse_buffer(input.as_slice()),
-            Err(DriverError::NotSupported)
-        );
-    }
 }

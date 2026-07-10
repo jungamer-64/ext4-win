@@ -2,7 +2,7 @@
 
 use ext4_core::{
     Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Uid, NewDirectoryMetadata, NewFileMetadata,
-    NewSymlinkMetadata, Result,
+    Result,
 };
 
 /// Default POSIX owner for Windows-created inodes before security mapping lands.
@@ -29,16 +29,5 @@ pub(crate) fn default_directory_metadata() -> Result<NewDirectoryMetadata> {
     Ok(NewDirectoryMetadata::new(
         default_owner(),
         Ext4Permissions::new(0o755)?,
-    ))
-}
-
-/// Default metadata for Windows-created symbolic links.
-/// # Errors
-///
-/// Returns an error when the default `0777` mode cannot be represented as ext4 permissions.
-pub(crate) fn default_symlink_metadata() -> Result<NewSymlinkMetadata> {
-    Ok(NewSymlinkMetadata::new(
-        default_owner(),
-        Ext4Permissions::new(0o777)?,
     ))
 }
