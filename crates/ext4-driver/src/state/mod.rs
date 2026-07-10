@@ -2143,11 +2143,6 @@ impl OpenedHandle {
         self.state.ensure_directory_notification_name(directory)
     }
 
-    /// Converts the per-handle state to a symlink handle after namespace conversion.
-    fn replace_with_symlink(&mut self) {
-        self.kind = OpenedHandleKind::Symlink;
-    }
-
     /// Returns the kind-specific handle state.
     const fn kind(&self) -> &OpenedHandleKind {
         &self.kind
@@ -2247,17 +2242,6 @@ impl OpenedObject {
     pub(crate) fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
         self.mutable_handle()
             .set_close_disposition(close_disposition);
-    }
-
-    /// Converts this opened child state to the symlink produced by reparse SET.
-    pub(crate) fn replace_with_symlink(&mut self, symlink: SymlinkNodeId) {
-        let fcb = unsafe {
-            // SAFETY: This method updates the shared FCB identity and the
-            // per-handle variant together, keeping FILE_OBJECT contexts aligned.
-            self.fcb.as_mut()
-        };
-        fcb.node = NodeId::Symlink(symlink);
-        self.mutable_handle().replace_with_symlink();
     }
 
     /// Returns the decoded file control block.
@@ -2979,49 +2963,6 @@ mod tests {
                 DataTransferMode::NoIntermediate(transfer)
             );
         }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn opened_object_symlink_conversion_updates_fcb_and_handle_together() {
-        let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedLocation::Root,
-            CloseDisposition::Delete,
-            WriteCommitment::CommitOnly,
-            DataTransferMode::IntermediateAllowed,
-        );
-        let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
-            core::ptr::addr_of_mut!(handle).cast(),
-        );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        let opened = OpenedObject::decode(file_object);
-        assert!(opened.is_ok());
-        let Ok(mut opened) = opened else {
-            return;
-        };
-        let symlink = unsafe {
-            // SAFETY: `SymlinkNodeId` is an opaque integer identity wrapper.
-            // This unit test never sends the fabricated id into ext4-core; it
-            // only verifies that one atomic state method updates both local
-            // FILE_OBJECT contexts to the same supplied identity.
-            core::mem::zeroed()
-        };
-
-        opened.replace_with_symlink(symlink);
-
-        assert_eq!(opened.node(), NodeId::Symlink(symlink));
-        assert_eq!(opened.close_disposition(), CloseDisposition::Delete);
-        assert!(matches!(handle.kind, OpenedHandleKind::Symlink));
     }
 
     /// # Panics

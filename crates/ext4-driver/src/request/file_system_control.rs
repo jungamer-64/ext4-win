@@ -226,10 +226,6 @@ fn user_fs_control(request: UserFsControlRequest) -> DriverResult<IrpCompletion>
         FsControlCode::GetReparsePoint => {
             reparse::get_reparse_point(request.target(), request.stack())
         }
-        FsControlCode::SetReparsePoint => {
-            reparse::set_reparse_point(request.target(), request.stack())
-        }
-        FsControlCode::DeleteReparsePoint => Err(DriverError::NotSupported),
         FsControlCode::AddEncryptionKey => {
             fsctl::add_encryption_key(request.target(), request.stack())
         }
