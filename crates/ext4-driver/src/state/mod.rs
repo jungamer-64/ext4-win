@@ -12,12 +12,14 @@ use ext4_core::{
     DeviceLength, DirectoryNodeId, Ext4Name, Ext4Timestamp, FileNodeId, FscryptKeyIdentifier,
     FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, InternalJournal, JournalTransaction,
     JournaledVolume, MountContext, NewDirectoryMetadata, NewFileMetadata, NodeId,
-    Result as Ext4Result, SymlinkNodeId, XattrName, XattrValue,
+    Result as Ext4Result, SymlinkNodeId, WindowsName, XattrName, XattrValue,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT,
-    SHARE_ACCESS, STATUS_SUCCESS, VPB_MOUNTED,
+    SHARE_ACCESS, STATUS_SUCCESS, UNICODE_STRING, VPB_MOUNTED,
 };
+#[cfg(not(test))]
+use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 
 use crate::irp::{DesiredAccess, DeviceIrpQueue, DirectoryEntryIndex, DispatchTarget, ShareAccess};
 use crate::kernel::cng::CngFscryptNonceGenerator;
@@ -537,6 +539,9 @@ impl MountCandidate {
 #[derive(Debug)]
 /// Volume control block stored in a mounted volume device extension.
 pub(crate) struct VolumeControlBlock {
+    /// Volume-wide opaque FsRtl notification state. This field drops before filesystem state so
+    /// pending notify IRPs cannot outlive the mounted namespace they observe.
+    directory_change_notifier: DirectoryChangeNotifier,
     /// Mounted journaled read-write ext4 volume.
     volume: JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator>,
     /// VCB-owned FCBs keyed by ext4 node identity.
@@ -567,9 +572,28 @@ impl VolumeControlBlock {
             MountContext::new(FscryptKeySet::empty(), CngFscryptNonceGenerator),
         )?;
         Ok(Self {
+            directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
             volume,
             file_control_blocks: DriverVec::new(),
         })
+    }
+
+    /// Initializes the volume-wide FsRtl notification state after this VCB reaches stable storage.
+    /// # Errors
+    ///
+    /// Returns an error when FsRtl cannot allocate the notifier synchronization state.
+    pub(crate) fn initialize_directory_change_notifier(&mut self) -> DriverResult<()> {
+        self.directory_change_notifier.initialize()
+    }
+
+    /// Returns the volume-wide directory notification state.
+    pub(crate) const fn directory_change_notifier(&self) -> &DirectoryChangeNotifier {
+        &self.directory_change_notifier
+    }
+
+    /// Reports one committed namespace name change to pending directory watchers.
+    pub(crate) fn report_directory_name_change(&self, change: DirectoryNameChange) {
+        self.directory_change_notifier.report(change);
     }
 
     /// Returns a stable serial number derived from the ext4 filesystem UUID.
@@ -659,10 +683,8 @@ impl VolumeControlBlock {
         now: Ext4Timestamp,
     ) -> DriverResult<PendingChildCreation<'_>> {
         let volume = NonNull::from(&mut *self);
-        let Self {
-            volume: mounted_volume,
-            file_control_blocks,
-        } = self;
+        let (mounted_volume, file_control_blocks) =
+            (&mut self.volume, &mut self.file_control_blocks);
         let mut transaction = mounted_volume.begin_transaction(now);
         let parent = transaction.directory(parent)?;
         let node = match target {
@@ -686,6 +708,500 @@ impl VolumeControlBlock {
         close_file_control_block_in_table(&mut self.file_control_blocks, fcb);
     }
 }
+
+/// One validated directory-notification registration owned by a FILE_OBJECT.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirectoryNotificationRegistration {
+    /// Stable CCB-owned `UNICODE_STRING` retained by FsRtl until cleanup.
+    full_directory_name: NonNull<UNICODE_STRING>,
+    /// Stable unique CCB address that identifies the owning FILE_OBJECT to FsRtl.
+    context: NonNull<c_void>,
+    /// Supported Windows completion-filter bits.
+    completion_filter: wdk_sys::ULONG,
+}
+
+impl DirectoryNotificationRegistration {
+    /// Builds one registration after the request boundary has rejected unsupported semantics.
+    pub(crate) const fn new(
+        full_directory_name: NonNull<UNICODE_STRING>,
+        context: NonNull<c_void>,
+        completion_filter: wdk_sys::ULONG,
+    ) -> Self {
+        Self {
+            full_directory_name,
+            context,
+            completion_filter,
+        }
+    }
+}
+
+/// Namespace name-change action exposed through directory notifications.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryNameChangeAction {
+    /// A child was created.
+    Added,
+    /// A child was removed.
+    Removed,
+    /// A child is being reported under its former name.
+    RenamedOldName,
+    /// A child is being reported under its replacement name.
+    RenamedNewName,
+}
+
+impl DirectoryNameChangeAction {
+    /// Returns the WDK FILE_ACTION payload for this namespace mutation.
+    const fn as_ulong(self) -> wdk_sys::ULONG {
+        match self {
+            Self::Added => wdk_sys::FILE_ACTION_ADDED,
+            Self::Removed => wdk_sys::FILE_ACTION_REMOVED,
+            Self::RenamedOldName => wdk_sys::FILE_ACTION_RENAMED_OLD_NAME,
+            Self::RenamedNewName => wdk_sys::FILE_ACTION_RENAMED_NEW_NAME,
+        }
+    }
+}
+
+/// Committed namespace mutation prepared before its ext4 transaction is published.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirectoryNameChange {
+    /// Full synthetic target name used only by the FsRtl notifier package.
+    target: DirectoryNotificationTarget,
+    /// FILE_NOTIFY_CHANGE_FILE_NAME or FILE_NOTIFY_CHANGE_DIR_NAME.
+    completion_filter: wdk_sys::ULONG,
+    /// FILE_ACTION_* payload written to matching watcher buffers.
+    action: DirectoryNameChangeAction,
+}
+
+impl DirectoryNameChange {
+    /// Builds a namespace change event for one parent/name/node tuple.
+    /// # Errors
+    ///
+    /// Returns an error when the ext4 child name cannot be represented in the Windows notification
+    /// namespace.
+    pub(crate) fn new(
+        parent: DirectoryNodeId,
+        name: &Ext4Name,
+        node: NodeId,
+        action: DirectoryNameChangeAction,
+    ) -> DriverResult<Self> {
+        let completion_filter = if matches!(node, NodeId::Directory(_)) {
+            wdk_sys::FILE_NOTIFY_CHANGE_DIR_NAME
+        } else {
+            wdk_sys::FILE_NOTIFY_CHANGE_FILE_NAME
+        };
+        Ok(Self {
+            target: DirectoryNotificationTarget::new(parent, name)?,
+            completion_filter,
+            action,
+        })
+    }
+}
+
+/// Opaque FsRtl notification list owned by one mounted VCB.
+pub(crate) struct DirectoryChangeNotifier {
+    /// Native list and synchronization object, initialized only after the VCB has a stable Box
+    /// allocation. FsRtl synchronizes access to the opaque list internally.
+    #[cfg(not(test))]
+    native: UnsafeCell<NativeDirectoryChangeNotifier>,
+    /// Whether `native` has been initialized and can be passed to FsRtl.
+    #[cfg(not(test))]
+    initialized: bool,
+}
+
+/// Native FsRtl notification storage whose list links must point at its final address.
+#[cfg(not(test))]
+struct NativeDirectoryChangeNotifier {
+    /// Opaque volume-wide synchronization state allocated by FsRtl.
+    sync: PNOTIFY_SYNC,
+    /// Head of the FsRtl-owned notification list.
+    list_head: LIST_ENTRY,
+}
+
+impl DirectoryChangeNotifier {
+    /// Creates uninitialized notifier storage before the VCB reaches a stable heap address.
+    const fn uninitialized() -> Self {
+        #[cfg(not(test))]
+        {
+            Self {
+                native: UnsafeCell::new(NativeDirectoryChangeNotifier {
+                    sync: core::ptr::null_mut(),
+                    list_head: LIST_ENTRY {
+                        Flink: core::ptr::null_mut(),
+                        Blink: core::ptr::null_mut(),
+                    },
+                }),
+                initialized: false,
+            }
+        }
+        #[cfg(test)]
+        {
+            Self {}
+        }
+    }
+
+    /// Initializes FsRtl notification state at the VCB's final address.
+    /// # Errors
+    ///
+    /// Returns an error when FsRtl cannot allocate the volume synchronization object or this
+    /// lifecycle transition is attempted twice.
+    fn initialize(&mut self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            if self.initialized {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+            let native = self.native.get();
+            let list_head = unsafe {
+                // SAFETY: `self` is the VCB's final Box allocation, so this
+                // embedded LIST_ENTRY has a stable address for its lifetime.
+                core::ptr::addr_of_mut!((*native).list_head)
+            };
+            unsafe {
+                // SAFETY: The head points to its own empty-list links before
+                // FsRtl receives the list for the first time.
+                (*list_head).Flink = list_head;
+            }
+            unsafe {
+                // SAFETY: The same initialized list head owns both links.
+                (*list_head).Blink = list_head;
+            }
+            let sync = unsafe {
+                // SAFETY: `sync` is writable VCB-owned storage that has not
+                // yet been initialized by FsRtl.
+                core::ptr::addr_of_mut!((*native).sync)
+            };
+            unsafe {
+                // SAFETY: FsRtl initializes the one opaque synchronization
+                // pointer stored in this mounted VCB.
+                ffi::FsRtlNotifyInitializeSync(sync);
+            }
+            if unsafe {
+                // SAFETY: FsRtl initialized the out pointer above; this only
+                // reads the pointer value before publication.
+                (*native).sync.is_null()
+            } {
+                return Err(DriverError::InsufficientResources);
+            }
+            self.initialized = true;
+            Ok(())
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
+    /// Gives one queued directory-change IRP to FsRtl for pending completion.
+    /// # Errors
+    ///
+    /// Returns an error when the mounted VCB notifier was not initialized.
+    pub(crate) fn register(
+        &self,
+        target: DispatchTarget,
+        registration: DirectoryNotificationRegistration,
+    ) -> DriverResult<wdk_sys::NTSTATUS> {
+        #[cfg(not(test))]
+        {
+            if !self.initialized {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+            let native = self.native.get();
+            let sync = unsafe {
+                // SAFETY: `initialized` guarantees FsRtl populated this
+                // mounted VCB's synchronization pointer.
+                (*native).sync
+            };
+            let list_head = unsafe {
+                // SAFETY: The native storage stays pinned inside the mounted
+                // VCB and FsRtl synchronizes access to the list links.
+                core::ptr::addr_of_mut!((*native).list_head)
+            };
+            unsafe {
+                // SAFETY: The IRP was removed from the driver queue and its
+                // unique completion owner is intentionally transferring it to
+                // FsRtl. The registration context is a live CCB pointer.
+                ffi::FsRtlNotifyFullChangeDirectory(
+                    sync,
+                    list_head,
+                    registration.context.as_ptr(),
+                    registration.full_directory_name.as_ptr().cast(),
+                    0,
+                    0,
+                    registration.completion_filter,
+                    target.as_raw_irp(),
+                    None,
+                    core::ptr::null_mut(),
+                );
+            }
+            Ok(STATUS_PENDING)
+        }
+        #[cfg(test)]
+        {
+            let DirectoryNotificationRegistration {
+                full_directory_name,
+                context,
+                completion_filter,
+            } = registration;
+            core::hint::black_box((target, full_directory_name, context, completion_filter));
+            Ok(STATUS_SUCCESS)
+        }
+    }
+
+    /// Reports one committed namespace name change to matching watcher IRPs.
+    fn report(&self, change: DirectoryNameChange) {
+        #[cfg(not(test))]
+        {
+            if !self.initialized {
+                return;
+            }
+            let mut full_target_name = change.target.unicode_string();
+            let native = self.native.get();
+            let sync = unsafe {
+                // SAFETY: `initialized` guarantees FsRtl populated this
+                // mounted VCB's synchronization pointer.
+                (*native).sync
+            };
+            let list_head = unsafe {
+                // SAFETY: The native storage stays pinned inside the mounted
+                // VCB and FsRtl synchronizes access to the list links.
+                core::ptr::addr_of_mut!((*native).list_head)
+            };
+            unsafe {
+                // SAFETY: This runs after the namespace transaction commits
+                // at PASSIVE_LEVEL. FsRtl consumes the event synchronously.
+                ffi::FsRtlNotifyFullReportChange(
+                    sync,
+                    list_head,
+                    core::ptr::from_mut(&mut full_target_name).cast(),
+                    change.target.name_offset_bytes,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    change.completion_filter,
+                    change.action.as_ulong(),
+                    core::ptr::null_mut(),
+                );
+            }
+        }
+        #[cfg(test)]
+        {
+            let _change = change;
+        }
+    }
+
+    /// Cancels and releases notification state owned by one cleaned-up FILE_OBJECT.
+    pub(crate) fn cleanup(&self, context: NonNull<c_void>) {
+        #[cfg(not(test))]
+        {
+            if !self.initialized {
+                return;
+            }
+            let native = self.native.get();
+            let sync = unsafe {
+                // SAFETY: `initialized` guarantees FsRtl populated this
+                // mounted VCB's synchronization pointer.
+                (*native).sync
+            };
+            let list_head = unsafe {
+                // SAFETY: The native storage stays pinned inside the mounted
+                // VCB and FsRtl synchronizes access to the list links.
+                core::ptr::addr_of_mut!((*native).list_head)
+            };
+            unsafe {
+                // SAFETY: The CCB pointer uniquely identifies the FILE_OBJECT
+                // being cleaned up and stays alive until its later close IRP.
+                ffi::FsRtlNotifyCleanup(sync, list_head, context.as_ptr());
+            }
+        }
+        #[cfg(test)]
+        {
+            let _context = context;
+        }
+    }
+}
+
+impl Drop for DirectoryChangeNotifier {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        {
+            if !self.initialized {
+                return;
+            }
+            let native = self.native.get();
+            let sync = unsafe {
+                // SAFETY: `initialized` guarantees FsRtl populated this
+                // mounted VCB's synchronization pointer.
+                (*native).sync
+            };
+            let list_head = unsafe {
+                // SAFETY: This final VCB teardown still owns the stable list
+                // head and no new request can be accepted during destruction.
+                core::ptr::addr_of_mut!((*native).list_head)
+            };
+            unsafe {
+                // SAFETY: FsRtl completes and frees every remaining opaque
+                // notification record before its synchronization object dies.
+                ffi::FsRtlNotifyCleanupAll(sync, list_head);
+            }
+            let sync_slot = unsafe {
+                // SAFETY: The initialized sync pointer is stored in this
+                // unique mutable VCB teardown path.
+                core::ptr::addr_of_mut!((*native).sync)
+            };
+            unsafe {
+                // SAFETY: The list has been cleaned up and this is the unique
+                // FsRtl uninitialization for the mounted VCB.
+                ffi::FsRtlNotifyUninitializeSync(sync_slot);
+            }
+            self.initialized = false;
+        }
+    }
+}
+
+impl fmt::Debug for DirectoryChangeNotifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DirectoryChangeNotifier(..)")
+    }
+}
+
+/// Stable synthetic directory name used only for FsRtl's lexical watcher matching.
+#[derive(Debug)]
+struct DirectoryNotificationDirectoryName {
+    /// UTF-16 `\\` followed by four private inode-identity code units.
+    units: [u16; DIRECTORY_NOTIFICATION_DIRECTORY_UNITS],
+    /// FsRtl retains this descriptor pointer until the CCB cleanup transition.
+    string: UNICODE_STRING,
+}
+
+impl DirectoryNotificationDirectoryName {
+    /// Allocates one stable synthetic name for a directory CCB.
+    /// # Errors
+    ///
+    /// Returns an error when the stable descriptor allocation fails.
+    fn try_new(directory: DirectoryNodeId) -> DriverResult<Box<Self>> {
+        let units = Self::encode(directory);
+        let byte_length = u16::try_from(core::mem::size_of_val(&units))
+            .map_err(|_| DriverError::InvalidBufferSize)?;
+        let mut name = memory::boxed_try_with(|| {
+            Ok(Self {
+                units,
+                string: UNICODE_STRING {
+                    Length: byte_length,
+                    MaximumLength: byte_length,
+                    Buffer: core::ptr::null_mut(),
+                },
+            })
+        })?;
+        name.string.Buffer = name.units.as_mut_ptr();
+        Ok(name)
+    }
+
+    /// Encodes one directory identity without allocating storage.
+    fn encode(directory: DirectoryNodeId) -> [u16; DIRECTORY_NOTIFICATION_DIRECTORY_UNITS] {
+        let mut units = [0_u16; DIRECTORY_NOTIFICATION_DIRECTORY_UNITS];
+        let mut slots = units.iter_mut();
+        if let Some(first) = slots.next() {
+            *first = DIRECTORY_NOTIFICATION_SEPARATOR;
+        }
+        for (slot, byte) in slots.zip(NodeId::Directory(directory).file_index().to_be_bytes()) {
+            *slot = DIRECTORY_NOTIFICATION_INODE_MARKER | u16::from(byte);
+        }
+        units
+    }
+
+    /// Returns the stable descriptor address retained by FsRtl.
+    fn descriptor(&self) -> NonNull<UNICODE_STRING> {
+        NonNull::from(&self.string)
+    }
+}
+
+impl PartialEq for DirectoryNotificationDirectoryName {
+    fn eq(&self, other: &Self) -> bool {
+        self.units == other.units
+    }
+}
+
+impl Eq for DirectoryNotificationDirectoryName {}
+
+/// Full synthetic target path reported to the FsRtl notification package.
+#[derive(Clone, Copy, Debug)]
+struct DirectoryNotificationTarget {
+    /// UTF-16 `\\<opaque parent id>\\<child name>` target path.
+    units: [u16; DIRECTORY_NOTIFICATION_TARGET_UNITS],
+    /// UTF-16 byte count of the populated target path.
+    byte_length: u16,
+    /// Byte offset of the final child component inside `units`.
+    name_offset_bytes: u16,
+}
+
+impl DirectoryNotificationTarget {
+    /// Builds one complete target path from a directory entry identity.
+    /// # Errors
+    ///
+    /// Returns an error when the ext4 child name cannot be represented by Windows.
+    fn new(parent: DirectoryNodeId, name: &Ext4Name) -> DriverResult<Self> {
+        let directory_units = DirectoryNotificationDirectoryName::encode(parent);
+        let name = WindowsName::from_ext4(name)?;
+        let prefix_length = DIRECTORY_NOTIFICATION_DIRECTORY_UNITS
+            .checked_add(1)
+            .ok_or(DriverError::InvalidBufferSize)?;
+        let length = prefix_length
+            .checked_add(name.utf16().len())
+            .ok_or(DriverError::InvalidBufferSize)?;
+        if length > DIRECTORY_NOTIFICATION_TARGET_UNITS {
+            return Err(DriverError::InvalidBufferSize);
+        }
+        let mut units = [0_u16; DIRECTORY_NOTIFICATION_TARGET_UNITS];
+        let directory_destination = units
+            .get_mut(..DIRECTORY_NOTIFICATION_DIRECTORY_UNITS)
+            .ok_or(DriverError::InvalidBufferSize)?;
+        let directory_source = directory_units
+            .get(..DIRECTORY_NOTIFICATION_DIRECTORY_UNITS)
+            .ok_or(DriverError::InvalidBufferSize)?;
+        directory_destination.copy_from_slice(directory_source);
+        let separator = units
+            .get_mut(DIRECTORY_NOTIFICATION_DIRECTORY_UNITS)
+            .ok_or(DriverError::InvalidBufferSize)?;
+        *separator = DIRECTORY_NOTIFICATION_SEPARATOR;
+        let child_destination = units
+            .get_mut(prefix_length..length)
+            .ok_or(DriverError::InvalidBufferSize)?;
+        child_destination.copy_from_slice(name.utf16());
+        let byte_length = u16::try_from(
+            length
+                .checked_mul(core::mem::size_of::<u16>())
+                .ok_or(DriverError::InvalidBufferSize)?,
+        )
+        .map_err(|_| DriverError::InvalidBufferSize)?;
+        let name_offset_bytes = u16::try_from(
+            prefix_length
+                .checked_mul(core::mem::size_of::<u16>())
+                .ok_or(DriverError::InvalidBufferSize)?,
+        )
+        .map_err(|_| DriverError::InvalidBufferSize)?;
+        Ok(Self {
+            units,
+            byte_length,
+            name_offset_bytes,
+        })
+    }
+
+    /// Views this complete target as the layout accepted by FsRtl's PSTRING ABI.
+    fn unicode_string(&self) -> UNICODE_STRING {
+        UNICODE_STRING {
+            Length: self.byte_length,
+            MaximumLength: self.byte_length,
+            Buffer: self.units.as_ptr().cast_mut(),
+        }
+    }
+}
+
+/// UTF-16 backslash separator used in FsRtl synthetic paths.
+const DIRECTORY_NOTIFICATION_SEPARATOR: u16 = 0x005C;
+/// High-byte marker separating encoded inode bytes from Windows path separators.
+const DIRECTORY_NOTIFICATION_INODE_MARKER: u16 = 0x0100;
+/// `\\` plus four lossless inode-identity units.
+const DIRECTORY_NOTIFICATION_DIRECTORY_UNITS: usize = 5;
+/// Synthetic parent path, one separator, and the largest ext4 name in UTF-16 units.
+const DIRECTORY_NOTIFICATION_TARGET_UNITS: usize = 261;
 
 /// In-progress missing-child create transaction that has not reached durable ext4 state.
 #[derive(Debug)]
@@ -1295,7 +1811,7 @@ impl FileByteRangeLocks {
         #[cfg(not(test))]
         let requestor_process = unsafe {
             // SAFETY: `target` retains the live cleanup IRP until this
-            // immediate dispatch handler returns.
+            // queued cleanup handler returns.
             ffi::IoGetRequestorProcess(target.as_raw_irp())
         };
         #[cfg(not(test))]
@@ -1433,6 +1949,15 @@ pub(crate) enum WriteCommitment {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+/// FsRtl directory-name descriptor lifecycle for one opened handle.
+enum DirectoryNotificationName {
+    /// No directory notification IRP has required a stable name yet.
+    Unregistered,
+    /// FsRtl may retain this descriptor until the FILE_OBJECT cleanup transition.
+    Registered(Box<DirectoryNotificationDirectoryName>),
+}
+
+#[derive(Debug, Eq, PartialEq)]
 /// Common per-handle state shared by every opened node kind.
 pub(crate) struct OpenedHandleState {
     /// Location used for namespace mutations on cleanup when available.
@@ -1443,6 +1968,8 @@ pub(crate) struct OpenedHandleState {
     write_commitment: WriteCommitment,
     /// Data transfer buffering policy requested for this handle.
     data_transfer_mode: DataTransferMode,
+    /// Stable FsRtl directory-name descriptor, retained even if the opened node changes kind.
+    directory_notification_name: DirectoryNotificationName,
 }
 
 impl OpenedHandleState {
@@ -1458,6 +1985,7 @@ impl OpenedHandleState {
             close_disposition,
             write_commitment,
             data_transfer_mode,
+            directory_notification_name: DirectoryNotificationName::Unregistered,
         }
     }
 
@@ -1489,6 +2017,23 @@ impl OpenedHandleState {
     /// Replaces the requested close disposition.
     const fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
         self.close_disposition = close_disposition;
+    }
+
+    /// Allocates the stable directory-name descriptor retained by FsRtl after registration.
+    /// # Errors
+    ///
+    /// Returns an error when allocation of the CCB-owned descriptor fails.
+    fn ensure_directory_notification_name(
+        &mut self,
+        directory: DirectoryNodeId,
+    ) -> DriverResult<NonNull<UNICODE_STRING>> {
+        if let DirectoryNotificationName::Registered(name) = &self.directory_notification_name {
+            return Ok(name.descriptor());
+        }
+        let name = DirectoryNotificationDirectoryName::try_new(directory)?;
+        let descriptor = name.descriptor();
+        self.directory_notification_name = DirectoryNotificationName::Registered(name);
+        Ok(descriptor)
     }
 }
 
@@ -1585,6 +2130,17 @@ impl OpenedHandle {
     /// Replaces the opened location after a successful rename.
     fn replace_location(&mut self, location: OpenedLocation) {
         self.state.replace_location(location);
+    }
+
+    /// Returns the stable CCB-owned descriptor needed by FsRtl directory notifications.
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor allocation fails on its first registration.
+    fn ensure_directory_notification_name(
+        &mut self,
+        directory: DirectoryNodeId,
+    ) -> DriverResult<NonNull<UNICODE_STRING>> {
+        self.state.ensure_directory_notification_name(directory)
     }
 
     /// Converts the per-handle state to a symlink handle after namespace conversion.
@@ -1714,6 +2270,23 @@ impl OpenedObject {
         }
     }
 
+    /// Returns the unique CCB address used as the FsRtl notification owner context.
+    pub(crate) const fn notification_context(&self) -> NonNull<c_void> {
+        self.handle.cast()
+    }
+
+    /// Returns the stable CCB-owned directory name retained by FsRtl after registration.
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor allocation fails on its first registration.
+    fn ensure_directory_notification_name(
+        &mut self,
+        directory: DirectoryNodeId,
+    ) -> DriverResult<NonNull<UNICODE_STRING>> {
+        self.mutable_handle()
+            .ensure_directory_notification_name(directory)
+    }
+
     /// Returns the decoded per-handle state.
     fn handle(&self) -> &OpenedHandle {
         unsafe {
@@ -1831,9 +2404,22 @@ impl OpenedDirectory {
         self.id
     }
 
+    /// Returns the stable CCB-owned name descriptor retained by FsRtl notification records.
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor allocation fails on its first registration.
+    pub(crate) fn notification_directory_name(&mut self) -> DriverResult<NonNull<UNICODE_STRING>> {
+        self.opened.ensure_directory_notification_name(self.id)
+    }
+
     /// Returns the mounted VCB pointer owning this opened directory.
     pub(crate) fn volume(&self) -> NonNull<VolumeControlBlock> {
         self.opened.volume()
+    }
+
+    /// Returns the unique CCB address used as the FsRtl notification owner context.
+    pub(crate) const fn notification_context(&self) -> NonNull<c_void> {
+        self.opened.notification_context()
     }
 
     /// Returns the mutable directory enumeration cursor.
@@ -1929,13 +2515,14 @@ mod tests {
     use core::num::NonZeroU32;
     use core::ptr::NonNull;
 
-    use ext4_core::{DirectoryNodeId, NodeId};
+    use ext4_core::{DirectoryNodeId, Ext4Name, NodeId};
 
     use crate::irp::DirectoryEntryIndex;
     use crate::kernel::status::DriverError;
 
     use super::{
-        CloseDisposition, ControlDeviceExtension, DataTransferMode, DeviceExtensionKind,
+        CloseDisposition, ControlDeviceExtension, DIRECTORY_NOTIFICATION_DIRECTORY_UNITS,
+        DataTransferMode, DeviceExtensionKind, DirectoryNameChange, DirectoryNameChangeAction,
         FileControlBlock, FileControlBlockRelease, KernelDevice, KernelFileObject,
         MountedVolumeDevice, MountedVolumeDeviceExtension, NoIntermediateTransfer, OpenedDirectory,
         OpenedHandle, OpenedHandleKind, OpenedLocation, OpenedObject, OpenedRegularFile,
@@ -2163,6 +2750,93 @@ mod tests {
             directory.cursor_mut().next_entry(),
             DirectoryEntryIndex::from_u32(7)
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when FsRtl directory-name storage is recreated or relocated between registrations.
+    #[test]
+    fn opened_directory_reuses_a_stable_notification_name_descriptor() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedLocation::Root,
+            CloseDisposition::Keep,
+            WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
+        );
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        let directory = OpenedDirectory::decode(file_object);
+        assert!(directory.is_ok());
+        let Ok(mut directory) = directory else {
+            return;
+        };
+
+        let first = directory.notification_directory_name();
+        assert!(first.is_ok());
+        let Ok(first) = first else {
+            return;
+        };
+        let second = directory.notification_directory_name();
+        assert_eq!(second, Ok(first));
+        let descriptor = unsafe {
+            // SAFETY: The descriptor is owned by the live CCB and the test
+            // has not executed its cleanup or close transition.
+            first.as_ref()
+        };
+        assert_eq!(descriptor.Length, descriptor.MaximumLength);
+        assert!(!descriptor.Buffer.is_null());
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a namespace change does not preserve its synthetic parent/name boundary.
+    #[test]
+    fn directory_name_change_encodes_the_child_boundary_and_action() {
+        let name = Ext4Name::new(b"child");
+        assert!(name.is_ok());
+        let Ok(name) = name else {
+            return;
+        };
+        let change = DirectoryNameChange::new(
+            DirectoryNodeId::ROOT,
+            &name,
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            DirectoryNameChangeAction::Added,
+        );
+        assert!(change.is_ok());
+        let Ok(change) = change else {
+            return;
+        };
+
+        assert_eq!(
+            change.completion_filter,
+            wdk_sys::FILE_NOTIFY_CHANGE_DIR_NAME
+        );
+        assert_eq!(change.action.as_ulong(), wdk_sys::FILE_ACTION_ADDED);
+        let prefix_units = DIRECTORY_NOTIFICATION_DIRECTORY_UNITS.checked_add(1);
+        assert!(prefix_units.is_some());
+        let Some(prefix_units) = prefix_units else {
+            return;
+        };
+        let prefix_bytes = prefix_units.checked_mul(core::mem::size_of::<u16>());
+        assert!(prefix_bytes.is_some());
+        let Some(prefix_bytes) = prefix_bytes else {
+            return;
+        };
+        assert_eq!(usize::from(change.target.name_offset_bytes), prefix_bytes);
+        let target_name = change.target.unicode_string();
+        assert_eq!(target_name.Buffer, change.target.units.as_ptr().cast_mut());
+        assert_eq!(target_name.Length, change.target.byte_length);
     }
 
     /// # Panics

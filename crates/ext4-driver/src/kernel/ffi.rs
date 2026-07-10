@@ -14,8 +14,10 @@ pub(crate) use wdk_sys::ntddk::{
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{
     FsRtlCheckLockForReadAccess, FsRtlCheckLockForWriteAccess, FsRtlFastUnlockAll,
-    FsRtlInitializeFileLock, FsRtlProcessFileLock, FsRtlUninitializeFileLock, IoAllocateWorkItem,
-    IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeWorkItem, IoGetRequestorProcess,
-    IoQueueWorkItem, IoRegisterShutdownNotification, KeAcquireSpinLockRaiseToDpc,
-    KeInitializeSpinLock, KeReleaseSpinLock,
+    FsRtlInitializeFileLock, FsRtlNotifyCleanup, FsRtlNotifyCleanupAll,
+    FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange, FsRtlNotifyInitializeSync,
+    FsRtlNotifyUninitializeSync, FsRtlProcessFileLock, FsRtlUninitializeFileLock,
+    IoAllocateWorkItem, IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeWorkItem,
+    IoGetRequestorProcess, IoQueueWorkItem, IoRegisterShutdownNotification,
+    KeAcquireSpinLockRaiseToDpc, KeInitializeSpinLock, KeReleaseSpinLock,
 };

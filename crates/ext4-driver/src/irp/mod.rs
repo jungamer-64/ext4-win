@@ -13,8 +13,8 @@ use wdk_sys::{
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{
-    CloseDisposition, FileControlBlock, KernelDevice, KernelFileObject, KernelSecurityDescriptor,
-    KernelVpb, WriteCommitment,
+    CloseDisposition, DirectoryChangeNotifier, DirectoryNotificationRegistration, FileControlBlock,
+    KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb, WriteCommitment,
 };
 
 /// Completion priority boost for IRPs that should not adjust thread priority.
@@ -526,6 +526,18 @@ impl OwnedIrp {
         })
     }
 
+    /// Transfers this queued directory-change IRP's terminal completion authority to FsRtl.
+    pub(crate) fn delegate_directory_notification(
+        self,
+        notifier: &DirectoryChangeNotifier,
+        registration: DirectoryNotificationRegistration,
+    ) -> NTSTATUS {
+        match notifier.register(self.target, registration) {
+            Ok(status) => status,
+            Err(error) => self.complete_result(Err(error)),
+        }
+    }
+
     /// Completes the IRP as canceled.
     fn complete_cancelled(self) -> NTSTATUS {
         self.complete(IrpCompletion::cancelled())
@@ -945,9 +957,7 @@ unsafe extern "C" fn device_irp_queue_worker(_device_object: PDEVICE_OBJECT, con
         }
 
         if let Some(owned) = OwnedIrp::from_raw(queue.device, irp) {
-            let target = owned.target();
-            let result = crate::request::dispatch::execute_queued(target);
-            let _status = owned.complete_result(result);
+            let _status = crate::request::dispatch::execute_queued(owned);
         }
     }
 }
@@ -1604,8 +1614,8 @@ impl CurrentIrpStackLocation {
     /// Decodes directory-change-notification parameters.
     /// # Errors
     ///
-    /// Returns an error when the FILE_OBJECT is absent, the output length is invalid, or the
-    /// notification filter is empty or contains unsupported bits.
+    /// Returns an error when the FILE_OBJECT is absent or the notification filter is empty or
+    /// contains unsupported bits.
     pub(crate) fn notify_directory(self) -> Result<NotifyDirectoryStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1619,7 +1629,6 @@ impl CurrentIrpStackLocation {
         };
         Ok(NotifyDirectoryStack {
             file_object: self.kernel_file_object()?,
-            length: IrpBufferLength::from_ulong(notify.Length)?,
             completion_filter: DirectoryChangeFilter::from_raw(notify.CompletionFilter)?,
             watch_scope: DirectoryWatchScope::from_stack_flags(stack.Flags),
         })
@@ -2104,6 +2113,11 @@ impl DirectoryWatchScope {
             Self::DirectChildren
         }
     }
+
+    /// Returns whether this request asks to observe every descendant directory.
+    pub(crate) const fn watches_subtree(self) -> bool {
+        matches!(self, Self::Subtree)
+    }
 }
 
 /// Validated set of file-system changes requested by a directory notification.
@@ -2121,6 +2135,18 @@ impl DirectoryChangeFilter {
             return Err(DriverError::InvalidParameter);
         }
         Ok(Self(value))
+    }
+
+    /// Returns the filter bits supported by the driver's namespace-only notifier.
+    /// # Errors
+    ///
+    /// Returns an error when the request asks for attribute, data, security, stream, or other
+    /// change kinds that the current notifier cannot report precisely.
+    pub(crate) fn namespace_name_filter(self) -> DriverResult<wdk_sys::ULONG> {
+        if self.0 & !wdk_sys::FILE_NOTIFY_CHANGE_NAME != 0 {
+            return Err(DriverError::NotSupported);
+        }
+        Ok(self.0)
     }
 }
 
@@ -3134,8 +3160,6 @@ pub(crate) struct QueryDirectoryStack {
 pub(crate) struct NotifyDirectoryStack {
     /// FILE_OBJECT carrying the directory CCB.
     file_object: KernelFileObject,
-    /// Output notification buffer length.
-    length: IrpBufferLength,
     /// Changes that complete this notification request.
     completion_filter: DirectoryChangeFilter,
     /// Directory depth covered by the notification request.
@@ -3336,11 +3360,6 @@ impl NotifyDirectoryStack {
     /// Returns the FILE_OBJECT carrying this notification request.
     pub(crate) const fn file_object(self) -> KernelFileObject {
         self.file_object
-    }
-
-    /// Returns the output notification buffer length.
-    pub(crate) const fn length(self) -> IrpBufferLength {
-        self.length
     }
 
     /// Returns the validated completion-filter set.
@@ -5117,7 +5136,7 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn notify_directory_stack_decodes_length_filter_and_scope() {
+    fn notify_directory_stack_decodes_filter_and_scope() {
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
         let completion_filter = wdk_sys::FILE_NOTIFY_CHANGE_FILE_NAME
             | wdk_sys::FILE_NOTIFY_CHANGE_ATTRIBUTES
@@ -5145,7 +5164,6 @@ mod tests {
                     Some(notification.file_object()),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
-                assert_eq!(notification.length().as_usize(), 512);
                 assert_eq!(
                     notification.completion_filter(),
                     DirectoryChangeFilter(completion_filter)
@@ -5153,6 +5171,15 @@ mod tests {
                 assert_eq!(notification.watch_scope(), DirectoryWatchScope::Subtree);
             }
         }
+
+        assert_eq!(
+            DirectoryChangeFilter(wdk_sys::FILE_NOTIFY_CHANGE_NAME).namespace_name_filter(),
+            Ok(wdk_sys::FILE_NOTIFY_CHANGE_NAME)
+        );
+        assert_eq!(
+            DirectoryChangeFilter(completion_filter).namespace_name_filter(),
+            Err(crate::kernel::status::DriverError::NotSupported)
+        );
 
         stack.Flags = 0;
         let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
