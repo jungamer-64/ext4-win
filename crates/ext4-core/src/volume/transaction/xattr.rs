@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// Rejects xattr reparse storage on a native ext4 symbolic link.
+/// # Errors
+///
+/// Returns an error when the typed node is a symbolic link instead of a file or directory.
+fn require_windows_reparse_storage_node(node: TransactionNode) -> Result<()> {
+    match node.id() {
+        NodeId::File(_) | NodeId::Directory(_) => Ok(()),
+        NodeId::Symlink(_) => Err(Error::WrongInodeKind),
+    }
+}
+
 impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Sets or replaces one ext4 extended attribute.
     ///
@@ -62,6 +73,41 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
             WindowsOverlay::attributes_xattr_name()?,
             overlay.to_xattr_value()?,
         )
+    }
+
+    /// Sets Windows symbolic-link reparse metadata on a regular file or directory.
+    ///
+    /// # Errors
+    /// Returns an error when the node is a native symbolic link or the reparse
+    /// xattr cannot be serialized or stored.
+    pub fn set_windows_symlink_reparse_point(
+        &mut self,
+        node: TransactionNode,
+        reparse_point: WindowsSymlinkReparsePoint,
+    ) -> Result<()> {
+        require_windows_reparse_storage_node(node)?;
+        self.set_xattr(
+            node,
+            WindowsSymlinkReparsePoint::xattr_name()?,
+            reparse_point.to_xattr_value()?,
+        )
+    }
+
+    /// Removes Windows symbolic-link reparse metadata from a regular file or directory.
+    ///
+    /// # Errors
+    /// Returns an error when the node is a native symbolic link or the stored
+    /// xattr payload is malformed.
+    pub fn remove_windows_symlink_reparse_point(
+        &mut self,
+        node: TransactionNode,
+    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
+        require_windows_reparse_storage_node(node)?;
+        let Some(value) = self.remove_xattr(node, &WindowsSymlinkReparsePoint::xattr_name()?)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(WindowsSymlinkReparsePoint::parse(&value)?))
     }
 
     /// Stages the latest image for a mutated external xattr block.

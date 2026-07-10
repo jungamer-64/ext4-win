@@ -21,7 +21,7 @@ use crate::memory::DriverVec;
 use crate::state::{
     CloseDisposition, DirectoryCursor, DirectoryNameChange, DirectoryNameChangeAction,
     DirectoryNotificationRegistration, FileControlBlock, KernelFileObject, MountedVolumeDevice,
-    OpenedDirectory, OpenedHandle, OpenedLocation, OpenedObject, OpenedRegularFile,
+    OpenedDirectory, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
     VolumeControlBlock, WriteCommitment, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
@@ -494,6 +494,11 @@ fn set_close_disposition(
     request: &mut SetFileRequest,
     close_disposition: CloseDisposition,
 ) -> DriverResult<()> {
+    if close_disposition == CloseDisposition::Delete
+        && request.opened_file.node_mode() == OpenedNodeMode::ReparsePoint
+    {
+        return Err(DriverError::NotSupported);
+    }
     request.opened_file.set_close_disposition(close_disposition);
     Ok(())
 }
@@ -1617,6 +1622,13 @@ fn resolve_rename_target(
                 let NodeId::Directory(directory_id) = *child.node() else {
                     return Err(DriverError::ObjectPathNotFound);
                 };
+                if vcb
+                    .volume()
+                    .read_windows_symlink_reparse_point(NodeId::Directory(directory_id))?
+                    .is_some()
+                {
+                    return Err(DriverError::NotSupported);
+                }
                 parent_id = directory_id;
             }
             ChildLookup::NotFound => return Err(DriverError::ObjectPathNotFound),
@@ -1738,7 +1750,7 @@ fn set_basic_attributes(
     if attributes == 0 {
         return Ok(BasicAttributeUpdate::empty());
     }
-    validate_kind_attribute(metadata.kind, attributes)?;
+    validate_kind_attribute(metadata, attributes)?;
 
     let accepted = Ext4WindowsAttributes::SUPPORTED_MASK
         | wdk_sys::FILE_ATTRIBUTE_READONLY
@@ -1784,15 +1796,18 @@ fn readonly_security_update(
     )))
 }
 
-/// Rejects node-kind attributes that contradict the opened ext4 node.
+/// Rejects node-kind attributes that contradict the opened ext4 node or reparse state.
 /// # Errors
 ///
-/// Returns an error when directory or reparse-point attributes do not match the opened node kind.
-fn validate_kind_attribute(kind: FileMetadataKind, attributes: wdk_sys::ULONG) -> DriverResult<()> {
-    if attributes & wdk_sys::FILE_ATTRIBUTE_DIRECTORY != 0 && kind != FileMetadataKind::Directory {
+/// Returns an error when directory or reparse-point attributes do not match opened metadata.
+fn validate_kind_attribute(metadata: FileMetadata, attributes: wdk_sys::ULONG) -> DriverResult<()> {
+    if attributes & wdk_sys::FILE_ATTRIBUTE_DIRECTORY != 0
+        && metadata.kind != FileMetadataKind::Directory
+    {
         return Err(DriverError::InvalidParameter);
     }
-    if attributes & wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT != 0 && kind != FileMetadataKind::Symlink
+    if attributes & wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && metadata.reparse_point == FileMetadataReparsePoint::None
     {
         return Err(DriverError::InvalidParameter);
     }
@@ -1847,6 +1862,8 @@ struct FileMetadata {
     links_count: Ext4LinkCount,
     /// Windows-specific overlay attributes.
     overlay_attributes: u32,
+    /// Windows reparse metadata projected from a native symlink or private xattr.
+    reparse_point: FileMetadataReparsePoint,
     /// Mounted volume block size.
     block_size: ext4_core::BlockSize,
 }
@@ -1860,6 +1877,15 @@ enum FileMetadataKind {
     Directory,
     /// Symbolic link.
     Symlink,
+}
+
+/// Reparse metadata projected to Windows file-information records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileMetadataReparsePoint {
+    /// The node has no Windows reparse metadata.
+    None,
+    /// The node represents a symbolic-link reparse point.
+    SymbolicLink,
 }
 
 /// Loads metadata for the opened file currently being queried.
@@ -1883,6 +1909,20 @@ fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult
         .read_windows_overlay(node_id)?
         .map(|overlay| overlay.attributes().bits())
         .unwrap_or(0);
+    let reparse_point = match node_id {
+        NodeId::Symlink(_) => FileMetadataReparsePoint::SymbolicLink,
+        NodeId::File(_) | NodeId::Directory(_) => {
+            if vcb
+                .volume()
+                .read_windows_symlink_reparse_point(node_id)?
+                .is_some()
+            {
+                FileMetadataReparsePoint::SymbolicLink
+            } else {
+                FileMetadataReparsePoint::None
+            }
+        }
+    };
 
     let file_index = node_id.file_index();
     let block_size = vcb.volume().geometry().block_size();
@@ -1897,6 +1937,7 @@ fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult
                 times: file.times(),
                 links_count: file.links_count(),
                 overlay_attributes,
+                reparse_point,
                 block_size,
             })
         }
@@ -1910,6 +1951,7 @@ fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult
                 times: directory.times(),
                 links_count: directory.links_count(),
                 overlay_attributes,
+                reparse_point,
                 block_size,
             })
         }
@@ -1923,6 +1965,7 @@ fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult
                 times: symlink.times(),
                 links_count: symlink.links_count(),
                 overlay_attributes,
+                reparse_point,
                 block_size,
             })
         }
@@ -2075,7 +2118,7 @@ fn pack_attribute_tag_information(
         output,
         wdk_sys::FILE_ATTRIBUTE_TAG_INFORMATION {
             FileAttributes: file_attributes(metadata),
-            ReparseTag: reparse_tag(metadata.kind),
+            ReparseTag: reparse_tag(metadata.reparse_point),
         },
     )
 }
@@ -2095,11 +2138,11 @@ fn opened_location_name_units(location: &OpenedLocation) -> DriverResult<DriverV
     }
 }
 
-/// Returns the reparse tag associated with file attributes.
-const fn reparse_tag(kind: FileMetadataKind) -> wdk_sys::ULONG {
-    match kind {
-        FileMetadataKind::File | FileMetadataKind::Directory => 0,
-        FileMetadataKind::Symlink => wdk_sys::IO_REPARSE_TAG_SYMLINK,
+/// Returns the reparse tag associated with file metadata.
+const fn reparse_tag(reparse_point: FileMetadataReparsePoint) -> wdk_sys::ULONG {
+    match reparse_point {
+        FileMetadataReparsePoint::None => 0,
+        FileMetadataReparsePoint::SymbolicLink => wdk_sys::IO_REPARSE_TAG_SYMLINK,
     }
 }
 
@@ -2149,7 +2192,10 @@ fn file_attributes(metadata: FileMetadata) -> wdk_sys::ULONG {
     match metadata.kind {
         FileMetadataKind::File => {}
         FileMetadataKind::Directory => attributes |= wdk_sys::FILE_ATTRIBUTE_DIRECTORY,
-        FileMetadataKind::Symlink => attributes |= wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT,
+        FileMetadataKind::Symlink => {}
+    }
+    if metadata.reparse_point == FileMetadataReparsePoint::SymbolicLink {
+        attributes |= wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT;
     }
     if attributes == 0 {
         wdk_sys::FILE_ATTRIBUTE_NORMAL
@@ -2347,6 +2393,12 @@ mod tests {
             times: Ext4Times::new(timestamp, timestamp, timestamp, timestamp),
             links_count: Ext4LinkCount::ONE,
             overlay_attributes,
+            reparse_point: match kind {
+                super::FileMetadataKind::File | super::FileMetadataKind::Directory => {
+                    super::FileMetadataReparsePoint::None
+                }
+                super::FileMetadataKind::Symlink => super::FileMetadataReparsePoint::SymbolicLink,
+            },
             block_size: BlockSize::from_superblock_log(0).ok()?,
         })
     }
@@ -2467,6 +2519,7 @@ mod tests {
             crate::state::FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = crate::state::OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
+            crate::state::OpenedNodeMode::Direct,
             OpenedLocation::Root,
             crate::state::CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,
@@ -2694,11 +2747,22 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn symlink_attribute_tag_information_uses_symlink_reparse_tag() {
-        assert_eq!(super::reparse_tag(super::FileMetadataKind::File), 0);
+    fn reparse_metadata_controls_attribute_tag_and_file_attributes() {
+        assert_eq!(super::reparse_tag(super::FileMetadataReparsePoint::None), 0);
         assert_eq!(
-            super::reparse_tag(super::FileMetadataKind::Symlink),
+            super::reparse_tag(super::FileMetadataReparsePoint::SymbolicLink),
             wdk_sys::IO_REPARSE_TAG_SYMLINK
+        );
+
+        let metadata = test_metadata(super::FileMetadataKind::File);
+        assert!(metadata.is_some());
+        let Some(mut metadata) = metadata else {
+            return;
+        };
+        metadata.reparse_point = super::FileMetadataReparsePoint::SymbolicLink;
+        assert_ne!(
+            super::file_attributes(metadata) & wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT,
+            0
         );
     }
 
@@ -2822,6 +2886,7 @@ mod tests {
         );
         let mut handle = crate::state::OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
+            crate::state::OpenedNodeMode::Direct,
             OpenedLocation::Root,
             crate::state::CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,

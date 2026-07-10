@@ -21,9 +21,9 @@ use crate::{
     state::{
         ChildCreationTarget, CloseDisposition, DataTransferMode, DirectoryNameChange,
         DirectoryNameChangeAction, FileControlBlock, KernelDevice, KernelFileObject,
-        MountedVolumeDevice, NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedObject,
-        PendingChildCreation, UninitializedFileObject, VolumeControlBlock, WriteCommitment,
-        release_file_control_block,
+        MountedVolumeDevice, NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode,
+        OpenedObject, PendingChildCreation, UninitializedFileObject, VolumeControlBlock,
+        WriteCommitment, release_file_control_block,
     },
 };
 
@@ -404,6 +404,9 @@ impl CreatePathAnchor {
         if opened.volume() != vcb {
             return Err(DriverError::InvalidDeviceRequest);
         }
+        if opened.node_mode() == OpenedNodeMode::ReparsePoint {
+            return Err(DriverError::NotSupported);
+        }
         let NodeId::Directory(id) = opened.node() else {
             return Err(DriverError::ObjectTypeMismatch);
         };
@@ -449,21 +452,37 @@ fn open_existing_node(
     location: OpenedLocation,
 ) -> DriverResult<()> {
     let parameters = request.parameters();
-    validate_existing_reparse_point_mode(node, parameters.reparse_point_mode())?;
+    let node_mode = existing_node_open_mode(vcb, node, parameters.reparse_point_mode())?;
     let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
-            initialize_file_object(request.file_object(), vcb, node, location, policy)
+            if node_mode == OpenedNodeMode::ReparsePoint
+                && policy.close_disposition() == CloseDisposition::Delete
+            {
+                return Err(DriverError::NotSupported);
+            }
+            initialize_file_object(
+                request.file_object(),
+                vcb,
+                node,
+                node_mode,
+                location,
+                policy,
+            )
         }
         CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
         CreateDisposition::Overwrite
         | CreateDisposition::OverwriteIf
         | CreateDisposition::Supersede => {
+            if node_mode == OpenedNodeMode::ReparsePoint {
+                return Err(DriverError::NotSupported);
+            }
             let inode = overwrite_file_inode(node, parameters.target_requirement())?;
             let handle = memory::boxed_try_with(|| {
                 Ok(OpenedHandle::new(
                     node,
+                    node_mode,
                     location,
                     policy.close_disposition(),
                     policy.write_commitment(),
@@ -561,6 +580,7 @@ fn create_missing_node(
     let handle = memory::boxed_try_with(|| {
         Ok(OpenedHandle::new(
             node,
+            OpenedNodeMode::Direct,
             location,
             policy.close_disposition(),
             policy.write_commitment(),
@@ -636,25 +656,65 @@ fn validate_existing_node_options(
     Ok(())
 }
 
-/// Validates reparse-point open semantics for an existing final path component.
+/// Presence of a reparse point on an existing final create target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingNodeReparsePoint {
+    /// The target is a normal ext4 node.
+    Absent,
+    /// The target must be opened through reparse-point semantics.
+    Present,
+}
+
+/// Determines the handle mode for an existing target's reparse state and create option.
 /// # Errors
 ///
-/// Returns an error when the caller requested normal target resolution for a symlink, which this
-/// FSD does not yet complete as a reparse redirect.
-fn validate_existing_reparse_point_mode(
+/// Returns an error when the caller requested normal target resolution for a reparse point, which
+/// this FSD does not yet complete as a reparse redirect.
+fn opened_node_mode(
+    reparse_point: ExistingNodeReparsePoint,
+    mode: CreateReparsePointMode,
+) -> DriverResult<OpenedNodeMode> {
+    match (reparse_point, mode) {
+        (ExistingNodeReparsePoint::Present, CreateReparsePointMode::ResolveFinalTarget) => {
+            Err(DriverError::NotSupported)
+        }
+        (ExistingNodeReparsePoint::Present, CreateReparsePointMode::OpenFinalReparsePoint) => {
+            Ok(OpenedNodeMode::ReparsePoint)
+        }
+        (ExistingNodeReparsePoint::Absent, _) => Ok(OpenedNodeMode::Direct),
+    }
+}
+
+/// Loads reparse-point state and determines the resulting existing-handle mode.
+/// # Errors
+///
+/// Returns an error when the Windows reparse xattr is malformed or normal target resolution was
+/// requested for a reparse point.
+fn existing_node_open_mode(
+    vcb: NonNull<VolumeControlBlock>,
     node: NodeId,
     mode: CreateReparsePointMode,
-) -> DriverResult<()> {
-    if matches!(
-        (node, mode),
-        (
-            NodeId::Symlink(_),
-            CreateReparsePointMode::ResolveFinalTarget
-        )
-    ) {
-        return Err(DriverError::NotSupported);
-    }
-    Ok(())
+) -> DriverResult<OpenedNodeMode> {
+    let reparse_point = match node {
+        NodeId::Symlink(_) => ExistingNodeReparsePoint::Present,
+        NodeId::File(_) | NodeId::Directory(_) => {
+            let vcb = unsafe {
+                // SAFETY: The mounted-device VCB pointer remains valid for this synchronous
+                // create request and is read only while classifying reparse metadata.
+                vcb.as_ref()
+            };
+            if vcb
+                .volume()
+                .read_windows_symlink_reparse_point(node)?
+                .is_some()
+            {
+                ExistingNodeReparsePoint::Present
+            } else {
+                ExistingNodeReparsePoint::Absent
+            }
+        }
+    };
+    opened_node_mode(reparse_point, mode)
 }
 
 /// Truncates an existing regular file for overwrite-style create dispositions.
@@ -810,6 +870,13 @@ fn resolve_path(
         let NodeId::Directory(directory_id) = *child.node() else {
             return Err(DriverError::ObjectPathNotFound);
         };
+        if vcb
+            .volume()
+            .read_windows_symlink_reparse_point(NodeId::Directory(directory_id))?
+            .is_some()
+        {
+            return Err(DriverError::NotSupported);
+        }
         parent_id = directory_id;
     }
 
@@ -842,12 +909,14 @@ fn initialize_file_object(
     file_object: UninitializedFileObject,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: NodeId,
+    node_mode: OpenedNodeMode,
     location: OpenedLocation,
     policy: CreateHandlePolicy,
 ) -> DriverResult<()> {
     let handle = memory::boxed_try_with(|| {
         Ok(OpenedHandle::new(
             node,
+            node_mode,
             location,
             policy.close_disposition(),
             policy.write_commitment(),
@@ -1036,16 +1105,6 @@ mod tests {
         file_object.FsContext2 = core::ptr::addr_of_mut!(*handle).cast();
     }
 
-    fn fabricated_symlink_node() -> NodeId {
-        let symlink = unsafe {
-            // SAFETY: `SymlinkNodeId` is an opaque identity wrapper. These
-            // tests never send the fabricated id into ext4-core; they only
-            // exercise create-option branching over the already-typed node kind.
-            core::mem::zeroed()
-        };
-        NodeId::Symlink(symlink)
-    }
-
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
@@ -1173,10 +1232,10 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn existing_reparse_point_mode_rejects_unresolved_symlink() {
+    fn reparse_point_open_mode_rejects_unresolved_target() {
         assert_eq!(
-            validate_existing_reparse_point_mode(
-                fabricated_symlink_node(),
+            opened_node_mode(
+                ExistingNodeReparsePoint::Present,
                 CreateReparsePointMode::ResolveFinalTarget
             ),
             Err(DriverError::NotSupported)
@@ -1187,20 +1246,20 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn existing_reparse_point_mode_accepts_opened_symlink_and_normal_directory() {
+    fn reparse_point_open_mode_separates_reparse_and_direct_handles() {
         assert_eq!(
-            validate_existing_reparse_point_mode(
-                fabricated_symlink_node(),
+            opened_node_mode(
+                ExistingNodeReparsePoint::Present,
                 CreateReparsePointMode::OpenFinalReparsePoint
             ),
-            Ok(())
+            Ok(OpenedNodeMode::ReparsePoint)
         );
         assert_eq!(
-            validate_existing_reparse_point_mode(
-                NodeId::Directory(DirectoryNodeId::ROOT),
+            opened_node_mode(
+                ExistingNodeReparsePoint::Absent,
                 CreateReparsePointMode::ResolveFinalTarget
             ),
-            Ok(())
+            Ok(OpenedNodeMode::Direct)
         );
     }
 
@@ -1283,6 +1342,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(vcb, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
             OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
@@ -1313,6 +1373,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(vcb, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
             OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,

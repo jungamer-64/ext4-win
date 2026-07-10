@@ -12,7 +12,7 @@ use ext4_core::{
     DeviceLength, DirectoryNodeId, Ext4Name, Ext4Timestamp, FileNodeId, FscryptKeyIdentifier,
     FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, InternalJournal, JournalTransaction,
     JournaledVolume, MountContext, NewDirectoryMetadata, NewFileMetadata, NodeId,
-    Result as Ext4Result, SymlinkNodeId, WindowsName, XattrName, XattrValue,
+    Result as Ext4Result, WindowsName, XattrName, XattrValue,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT,
@@ -1948,6 +1948,15 @@ pub(crate) enum WriteCommitment {
     FlushThrough,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Namespace interpretation selected for one opened handle.
+pub(crate) enum OpenedNodeMode {
+    /// The handle accesses the underlying ext4 node directly.
+    Direct,
+    /// The handle accesses a reparse point without resolving its target.
+    ReparsePoint,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 /// FsRtl directory-name descriptor lifecycle for one opened handle.
 enum DirectoryNotificationName {
@@ -1960,6 +1969,8 @@ enum DirectoryNotificationName {
 #[derive(Debug, Eq, PartialEq)]
 /// Common per-handle state shared by every opened node kind.
 pub(crate) struct OpenedHandleState {
+    /// Namespace interpretation selected when this handle was opened.
+    node_mode: OpenedNodeMode,
     /// Location used for namespace mutations on cleanup when available.
     location: OpenedLocation,
     /// Requested close disposition.
@@ -1975,12 +1986,14 @@ pub(crate) struct OpenedHandleState {
 impl OpenedHandleState {
     /// Creates shared per-handle state.
     const fn new(
+        node_mode: OpenedNodeMode,
         location: OpenedLocation,
         close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
     ) -> Self {
         Self {
+            node_mode,
             location,
             close_disposition,
             write_commitment,
@@ -1992,6 +2005,11 @@ impl OpenedHandleState {
     /// Returns the opened location identity.
     const fn location(&self) -> &OpenedLocation {
         &self.location
+    }
+
+    /// Returns the namespace interpretation selected for this handle.
+    const fn node_mode(&self) -> OpenedNodeMode {
+        self.node_mode
     }
 
     /// Replaces the opened location after a successful rename.
@@ -2064,6 +2082,7 @@ impl OpenedHandle {
     /// Creates per-handle state for an opened node.
     pub(crate) fn new(
         node: NodeId,
+        node_mode: OpenedNodeMode,
         location: OpenedLocation,
         close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
@@ -2071,6 +2090,7 @@ impl OpenedHandle {
     ) -> Self {
         Self::from_parts(
             node,
+            node_mode,
             location,
             close_disposition,
             write_commitment,
@@ -2081,12 +2101,14 @@ impl OpenedHandle {
     /// Creates per-handle state from explicit lifecycle fields.
     fn from_parts(
         node: NodeId,
+        node_mode: OpenedNodeMode,
         location: OpenedLocation,
         close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
     ) -> Self {
         let state = OpenedHandleState::new(
+            node_mode,
             location,
             close_disposition,
             write_commitment,
@@ -2120,6 +2142,11 @@ impl OpenedHandle {
     /// Returns the opened location identity.
     const fn location(&self) -> &OpenedLocation {
         self.state.location()
+    }
+
+    /// Returns the namespace interpretation selected for this handle.
+    const fn node_mode(&self) -> OpenedNodeMode {
+        self.state.node_mode()
     }
 
     /// Replaces the requested close disposition.
@@ -2216,6 +2243,11 @@ impl OpenedObject {
     /// Returns the opened location identity.
     pub(crate) fn location(&self) -> &OpenedLocation {
         self.handle().location()
+    }
+
+    /// Returns the namespace interpretation selected for this handle.
+    pub(crate) fn node_mode(&self) -> OpenedNodeMode {
+        self.handle().node_mode()
     }
 
     /// Replaces the opened location after a successful rename.
@@ -2325,6 +2357,9 @@ impl OpenedRegularFile {
         let NodeId::File(id) = opened.node() else {
             return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
         };
+        if opened.node_mode() == OpenedNodeMode::ReparsePoint {
+            return Err(DriverError::NotSupported);
+        }
         Ok(Self { opened, id })
     }
 
@@ -2376,6 +2411,9 @@ impl OpenedDirectory {
         let NodeId::Directory(id) = opened.node() else {
             return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
         };
+        if opened.node_mode() == OpenedNodeMode::ReparsePoint {
+            return Err(DriverError::NotSupported);
+        }
         let Some(cursor) = opened.mutable_handle().directory_cursor_mut() else {
             return Err(DriverError::InvalidParameter);
         };
@@ -2414,40 +2452,6 @@ impl OpenedDirectory {
             // operation.
             self.cursor.as_mut()
         }
-    }
-}
-
-#[derive(Debug)]
-/// Opened symbolic link decoded from a FILE_OBJECT context pair.
-pub(crate) struct OpenedSymlink {
-    /// Opened object context validated as a symlink.
-    opened: OpenedObject,
-    /// Typed symlink node identity.
-    id: SymlinkNodeId,
-}
-
-impl OpenedSymlink {
-    /// Decodes an opened FILE_OBJECT and requires a symbolic-link node.
-    ///
-    /// # Errors
-    /// Returns an error when the FILE_OBJECT contexts are invalid or when the
-    /// opened node is not a symbolic link.
-    pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
-        let opened = OpenedObject::decode(file_object)?;
-        let NodeId::Symlink(id) = opened.node() else {
-            return Err(DriverError::NotAReparsePoint);
-        };
-        Ok(Self { opened, id })
-    }
-
-    /// Returns the typed symlink identity.
-    pub(crate) const fn id(&self) -> SymlinkNodeId {
-        self.id
-    }
-
-    /// Returns the shared file control block.
-    pub(crate) fn file_control_block(&self) -> &FileControlBlock {
-        self.opened.file_control_block()
     }
 }
 
@@ -2509,9 +2513,9 @@ mod tests {
         DataTransferMode, DeviceExtensionKind, DirectoryNameChange, DirectoryNameChangeAction,
         FileControlBlock, FileControlBlockRelease, KernelDevice, KernelFileObject,
         MountedVolumeDevice, MountedVolumeDeviceExtension, NoIntermediateTransfer, OpenedDirectory,
-        OpenedHandle, OpenedHandleKind, OpenedLocation, OpenedObject, OpenedRegularFile,
-        OpenedSymlink, TransferBufferAlignment, TransferSectorSize, UninitializedFileObject,
-        VolumeControlBlock, WriteCommitment, shutdown_registration_status,
+        OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
+        TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
+        WriteCommitment, shutdown_registration_status,
     };
 
     fn file_object_with_contexts(
@@ -2702,6 +2706,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
             OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
@@ -2745,6 +2750,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
             OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
@@ -2832,6 +2838,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
             OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
@@ -2851,9 +2858,36 @@ mod tests {
             OpenedRegularFile::decode(file_object).err(),
             Some(DriverError::Core(ext4_core::Error::WrongInodeKind))
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn reparse_point_directory_handle_rejects_directory_operations() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::ReparsePoint,
+            OpenedLocation::Root,
+            CloseDisposition::Keep,
+            WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
+        );
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+
         assert_eq!(
-            OpenedSymlink::decode(file_object).err(),
-            Some(DriverError::NotAReparsePoint)
+            OpenedDirectory::decode(file_object).err(),
+            Some(DriverError::NotSupported)
         );
     }
 
@@ -2866,6 +2900,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
             OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
@@ -2901,6 +2936,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
             OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::FlushThrough,
@@ -2941,6 +2977,7 @@ mod tests {
         let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
             OpenedLocation::Root,
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,

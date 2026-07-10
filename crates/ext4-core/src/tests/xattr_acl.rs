@@ -164,11 +164,67 @@ fn windows_overlay_is_stored_in_user_ext4win_xattr() {
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
+fn windows_symlink_reparse_point_is_stored_and_removed_in_user_ext4win_xattr() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let point =
+        WindowsSymlinkReparsePoint::new(must(SymlinkTarget::new(b"relative\\target")), true);
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&volume, inode(3));
+        let mut transaction = volume.begin_transaction(NOW);
+        let node = transaction_node(&transaction, node_id);
+        must(transaction.set_windows_symlink_reparse_point(node, point.clone()));
+        must(transaction.commit());
+    }
+
+    let volume = must(ReadOnlyVolume::mount(
+        SliceBlockDevice::new(&image),
+        test_mount_context(),
+    ));
+    let file = node_id(&volume, inode(3));
+    assert_eq!(
+        must(volume.read_windows_symlink_reparse_point(file)),
+        Some(point.clone())
+    );
+    assert_eq!(
+        must(volume.read_xattr(file, &must(WindowsSymlinkReparsePoint::xattr_name()))),
+        Some(must(point.to_xattr_value()))
+    );
+
+    {
+        let device = SliceBlockDeviceMut::new(&mut image);
+        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&volume, inode(3));
+        let mut transaction = volume.begin_transaction(NOW);
+        let node = transaction_node(&transaction, node_id);
+        assert_eq!(
+            must(transaction.remove_windows_symlink_reparse_point(node)),
+            Some(point)
+        );
+        must(transaction.commit());
+    }
+
+    let volume = must(ReadOnlyVolume::mount(
+        SliceBlockDevice::new(&image),
+        test_mount_context(),
+    ));
+    let file = node_id(&volume, inode(3));
+    assert_eq!(must(volume.read_windows_symlink_reparse_point(file)), None);
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
 fn minimal_profile_mounts_without_ext_attr_but_rejects_xattr_mutations() {
     let mut image = minimal_write_fixture_image();
     let overlay = WindowsOverlay::new(must(Ext4WindowsAttributes::new(
         Ext4WindowsAttributes::HIDDEN | Ext4WindowsAttributes::ARCHIVE,
     )));
+    let reparse_point =
+        WindowsSymlinkReparsePoint::new(must(SymlinkTarget::new(b"relative\\target")), true);
     let acl = must(PosixAcl::new(vec![
         PosixAclEntry::UserObj(must(Ext4Permissions::new(0o700))),
         PosixAclEntry::GroupObj(must(Ext4Permissions::new(0o500))),
@@ -183,6 +239,7 @@ fn minimal_profile_mounts_without_ext_attr_but_rejects_xattr_mutations() {
         None
     );
     assert_eq!(must(volume.read_windows_overlay(file)), None);
+    assert_eq!(must(volume.read_windows_symlink_reparse_point(file)), None);
 
     let node_id = file;
     let mut xattr = volume.begin_transaction(NOW);
@@ -202,5 +259,10 @@ fn minimal_profile_mounts_without_ext_attr_but_rejects_xattr_mutations() {
     let mut windows = volume.begin_transaction(NOW);
     let node = transaction_node(&windows, node_id);
     let result = windows.set_windows_overlay(node, overlay);
+    assert_eq!(result, Err(Error::UnsupportedWriteFeature));
+
+    let mut reparse = volume.begin_transaction(NOW);
+    let node = transaction_node(&reparse, node_id);
+    let result = reparse.set_windows_symlink_reparse_point(node, reparse_point);
     assert_eq!(result, Err(Error::UnsupportedWriteFeature));
 }
