@@ -69,7 +69,7 @@ fn sparse_hole_write_allocates_block() {
 
     let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
-    overwrite_file(&mut transaction, file_id, 1024, b"hole");
+    write_file(&mut transaction, file_id, 1024, b"hole");
     must(transaction.commit());
 
     let mut output = [0_u8; 4];
@@ -82,7 +82,60 @@ fn sparse_hole_write_allocates_block() {
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
-fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
+fn write_extends_created_empty_file() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+
+    let mut transaction = volume.begin_transaction(NOW);
+    let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
+    let name = must(Ext4Name::new(b"written"));
+    let file = must(transaction.create_file(root, &name, test_file_metadata()));
+    must(transaction.write_file_range(file, FileOffset::ZERO, b"created"));
+    must(transaction.commit());
+
+    assert_eq!(
+        lookup_ext4_inode(&volume, InodeId::ROOT, b"written"),
+        Some(inode(11))
+    );
+    let file = file_node(&volume, 11);
+    assert_eq!(file.size().bytes(), 7);
+    let mut output = [0_u8; 7];
+    assert_eq!(read_file(&volume, 11, 0, &mut output), 7);
+    assert_eq!(&output, b"created");
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn extending_write_zeroes_visible_gap_inside_allocated_block() {
+    let mut image = modern_fixture_image();
+    put_u32(&mut image, modern_inode_offset(3) + 4, 5);
+    let data_offset = block_offset(MODERN_FILE_DATA_BLOCK);
+    image[data_offset + 5..data_offset + 9].fill(0xA5);
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+
+    let file_id = file_node_id(&volume, 3);
+    let mut transaction = volume.begin_transaction(NOW);
+    write_file(&mut transaction, file_id, 9, b"tail");
+    must(transaction.commit());
+
+    let file = file_node(&volume, 3);
+    assert_eq!(file.size().bytes(), 13);
+    let mut output = [0xAA; 13];
+    assert_eq!(read_file(&volume, 3, 0, &mut output), 13);
+    assert_eq!(&output[..5], b"hello");
+    assert_eq!(&output[5..9], &[0, 0, 0, 0]);
+    assert_eq!(&output[9..13], b"tail");
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn write_allocates_external_extent_leaf_after_root_capacity() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
     {
@@ -96,7 +149,7 @@ fn overwrite_allocates_external_extent_leaf_after_root_capacity() {
             u64::try_from(BLOCK_SIZE * 10).unwrap_or(u64::MAX),
         );
         for logical in [0_u64, 2, 4, 6, 8] {
-            overwrite_file(
+            write_file(
                 &mut transaction,
                 file_id,
                 logical.saturating_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX)),
@@ -199,7 +252,7 @@ fn external_extent_block_checksum_mismatch_is_rejected() {
             u64::try_from(BLOCK_SIZE * 10).unwrap_or(u64::MAX),
         );
         for logical in [0_u64, 2, 4, 6, 8] {
-            overwrite_file(
+            write_file(
                 &mut transaction,
                 file_id,
                 logical.saturating_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX)),
@@ -236,7 +289,7 @@ fn uninitialized_extent_write_is_rejected() {
     let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
     let file = transaction_file(&transaction, file_id);
-    let result = transaction.overwrite_file_range(file, FileOffset::ZERO, b"x");
+    let result = transaction.write_file_range(file, FileOffset::ZERO, b"x");
 
     assert_eq!(result, Err(Error::UnsupportedInodeMutation));
 }
@@ -260,7 +313,7 @@ fn inode_protection_flags_are_typed_before_mutation_policy() {
 
     let mut transaction = volume.begin_transaction(NOW);
     let file = transaction_file(&transaction, file_id);
-    let result = transaction.overwrite_file_range(file, FileOffset::ZERO, b"x");
+    let result = transaction.write_file_range(file, FileOffset::ZERO, b"x");
 
     assert_eq!(result, Err(Error::MissingEncryptionKey));
 }
@@ -307,6 +360,22 @@ fn minimal_profile_rejects_file_size_beyond_large_file_boundary() {
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
+fn minimal_profile_rejects_extending_write_beyond_large_file_boundary() {
+    let mut image = minimal_write_fixture_image();
+    let device = SliceBlockDeviceMut::new(&mut image);
+    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+    let file_id = file_node_id(&volume, 3);
+    let mut transaction = volume.begin_transaction(NOW);
+    let file = transaction_file(&transaction, file_id);
+    let result = transaction.write_file_range(file, FileOffset::from_bytes(0x7FFF_FFFF), b"x");
+
+    assert_eq!(result, Err(Error::UnsupportedInodeMutation));
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
 fn truncate_file_releases_blocks() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
@@ -314,7 +383,7 @@ fn truncate_file_releases_blocks() {
 
     let file_id = file_node_id(&volume, 3);
     let mut write = volume.begin_transaction(NOW);
-    overwrite_file(&mut write, file_id, 1024, b"hole");
+    write_file(&mut write, file_id, 1024, b"hole");
     must(write.commit());
     let mut truncate = volume.begin_transaction(NOW);
     truncate_file(&mut truncate, file_id, 0);
@@ -335,7 +404,7 @@ fn transaction_too_large_is_rejected_before_writes() {
     let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
 
-    overwrite_file(&mut transaction, file_id, 1024, b"hole");
+    write_file(&mut transaction, file_id, 1024, b"hole");
     let result = transaction.commit();
 
     assert!(matches!(result, Err(Error::TransactionTooLarge)));

@@ -123,7 +123,7 @@ fn encrypted_file_read_with_key_decrypts_plaintext() {
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
-fn encrypted_file_overwrite_roundtrips_ciphertext() {
+fn encrypted_file_write_roundtrips_ciphertext() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
     let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
@@ -137,7 +137,7 @@ fn encrypted_file_overwrite_roundtrips_ciphertext() {
         ));
         let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        overwrite_file(&mut transaction, file_id, 1, b"EL");
+        write_file(&mut transaction, file_id, 1, b"EL");
         must(transaction.commit());
     }
 
@@ -151,6 +151,42 @@ fn encrypted_file_overwrite_roundtrips_ciphertext() {
     let mut output = [0_u8; 5];
     assert_eq!(read_file(&volume, 3, 0, &mut output), 5);
     assert_eq!(&output, b"hELlo");
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn encrypted_extending_write_zeroes_visible_gap() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
+    let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
+    install_inline_fscrypt_context(&mut image, 3, &context_bytes);
+    put_u32(&mut image, modern_inode_offset(3) + 4, 5);
+    let raw_offset = block_offset(MODERN_FILE_DATA_BLOCK);
+    image[raw_offset + 5..raw_offset + 7].fill(0xA5);
+    encrypt_modern_file_data_block(&mut image, &master_key, &context_bytes);
+
+    {
+        let mut volume = must(JournaledVolume::mount(
+            SliceBlockDeviceMut::new(&mut image),
+            test_mount_context_with_key(master_key.clone()),
+        ));
+        let file_id = file_node_id(&volume, 3);
+        let mut transaction = volume.begin_transaction(NOW);
+        write_file(&mut transaction, file_id, 7, b"!");
+        must(transaction.commit());
+    }
+
+    let volume = must(ReadOnlyVolume::mount(
+        SliceBlockDevice::new(&image),
+        test_mount_context_with_key(master_key),
+    ));
+    let file = file_node(&volume, 3);
+    assert_eq!(file.size().bytes(), 8);
+    let mut output = [0_u8; 8];
+    assert_eq!(read_file(&volume, 3, 0, &mut output), 8);
+    assert_eq!(&output, b"hello\0\0!");
 }
 
 /// # Panics

@@ -138,14 +138,14 @@ fn gdt_csum_minimal_profile_refreshes_descriptor_checksum_after_write() {
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
-fn overwrite_existing_file_range_commits() {
+fn write_existing_file_range_commits() {
     let mut image = modern_fixture_image();
     let device = SliceBlockDeviceMut::new(&mut image);
     let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
 
     let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
-    overwrite_file(&mut transaction, file_id, 0, b"HELLO");
+    write_file(&mut transaction, file_id, 0, b"HELLO");
     must(transaction.commit());
 
     let mut output = [0_u8; 5];
@@ -354,7 +354,7 @@ fn write_transaction_emits_descriptor_data_and_commit_records() {
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        overwrite_file(&mut transaction, file_id, 0, b"HELLO");
+        write_file(&mut transaction, file_id, 0, b"HELLO");
         must(transaction.commit());
     }
 
@@ -650,7 +650,7 @@ fn emitted_journal_data_escapes_jbd2_magic_prefix() {
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        overwrite_file(&mut transaction, file_id, 0, b"MAGIC");
+        write_file(&mut transaction, file_id, 0, b"MAGIC");
         must(transaction.commit());
     }
 
@@ -1007,7 +1007,7 @@ fn fragmented_internal_journal_is_mapped_on_demand() {
 
     let file_id = file_node_id(&volume, 3);
     let mut transaction = volume.begin_transaction(NOW);
-    overwrite_file(&mut transaction, file_id, 1024, b"hole");
+    write_file(&mut transaction, file_id, 1024, b"hole");
     must(transaction.commit());
     let mut committed = [0_u8; 4];
     let read = read_file(&volume, 3, 1024, &mut committed);

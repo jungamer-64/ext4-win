@@ -65,7 +65,7 @@ fn bigalloc_hole_write_reuses_logical_cluster() {
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        overwrite_file(&mut transaction, file_id, 1024, b"hole");
+        write_file(&mut transaction, file_id, 1024, b"hole");
         must(transaction.commit());
 
         assert_eq!(
@@ -104,7 +104,7 @@ fn bigalloc_sparse_extension_allocates_one_cluster() {
             file_id,
             u64::try_from(BLOCK_SIZE * 5).unwrap_or(u64::MAX),
         );
-        overwrite_file(
+        write_file(
             &mut transaction,
             file_id,
             u64::try_from(BLOCK_SIZE * 4).unwrap_or(u64::MAX),
@@ -337,7 +337,7 @@ fn bigalloc_allocated_unreferenced_cluster_remains_unavailable() {
             file_id,
             u64::try_from(BLOCK_SIZE * 5).unwrap_or(u64::MAX),
         );
-        overwrite_file(
+        write_file(
             &mut transaction,
             file_id,
             u64::try_from(BLOCK_SIZE * 4).unwrap_or(u64::MAX),
@@ -401,7 +401,7 @@ fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
             u64::try_from(BLOCK_SIZE * 10).unwrap_or(u64::MAX),
         );
         for logical in [0_u64, 2, 4, 6, 8] {
-            overwrite_file(
+            write_file(
                 &mut transaction,
                 file_id,
                 logical.saturating_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX)),
