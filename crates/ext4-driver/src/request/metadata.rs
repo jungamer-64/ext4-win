@@ -1,8 +1,7 @@
 //! Driver defaults for Windows-created ext4 inodes.
 
 use ext4_core::{
-    Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Uid, NewDirectoryMetadata, NewFileMetadata,
-    Result,
+    Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Uid, NewDirectoryMetadata, NewFileMetadata, Result,
 };
 
 /// Default POSIX owner for Windows-created inodes before security mapping lands.

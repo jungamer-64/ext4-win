@@ -32,7 +32,7 @@ pub use disk_format::superblock::{
 pub use disk_format::xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 pub use error::{Error, Result};
 pub use platform::name::{Ext4Name, WindowsName};
-pub use platform::windows::{Ext4WindowsAttributes, WindowsOverlay};
+pub use platform::windows::{Ext4WindowsAttributes, WindowsOverlay, WindowsSymlinkReparsePoint};
 pub use protection::fscrypt::{
     FscryptFileNonce, FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey,
     FscryptNonceGenerator,

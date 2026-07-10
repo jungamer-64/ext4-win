@@ -43,7 +43,8 @@ use crate::{
     FsverityHashAlgorithm, FsveritySalt, FsveritySignature, JournalTransaction, JournaledVolume,
     MountContext, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, NodeId,
     RenameTargetCollision, SymlinkNode, SymlinkTarget, TransactionDirectory, TransactionFile,
-    WindowsName, WindowsOverlay, XattrName, XattrNamespace, XattrSet, XattrValue,
+    WindowsName, WindowsOverlay, WindowsSymlinkReparsePoint, XattrName, XattrNamespace, XattrSet,
+    XattrValue,
 };
 
 const BLOCK_SIZE: usize = 1024;

@@ -81,6 +81,18 @@ where
         self.volume.read_inode_windows_overlay(node.inode())
     }
 
+    /// Reads Windows symbolic-link reparse metadata isolated in user.ext4win.* xattrs.
+    ///
+    /// # Errors
+    /// Returns an error when the reparse xattr payload is malformed.
+    pub(crate) fn read_windows_symlink_reparse_point(
+        &self,
+        node: NodeId,
+    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
+        self.volume
+            .read_inode_windows_symlink_reparse_point(node.inode())
+    }
+
     /// Reads the fscrypt v2 context stored in ext4's private inode xattr slot.
     ///
     /// # Errors
@@ -241,6 +253,18 @@ where
     /// Returns an error when the overlay xattr payload is malformed.
     pub fn read_windows_overlay(&self, node: NodeId) -> Result<Option<WindowsOverlay>> {
         self.volume.read_inode_windows_overlay(node.inode())
+    }
+
+    /// Reads Windows symbolic-link reparse metadata isolated in user.ext4win.* xattrs.
+    ///
+    /// # Errors
+    /// Returns an error when the reparse xattr payload is malformed.
+    pub fn read_windows_symlink_reparse_point(
+        &self,
+        node: NodeId,
+    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
+        self.volume
+            .read_inode_windows_symlink_reparse_point(node.inode())
     }
 
     /// Reads file bytes from a typed regular file node.
@@ -434,6 +458,22 @@ impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
             return Ok(None);
         };
         Ok(Some(WindowsOverlay::parse(&value)?))
+    }
+
+    /// Reads Windows symbolic-link reparse metadata from its private xattr.
+    ///
+    /// # Errors
+    /// Returns an error when the backing xattr or its payload is malformed.
+    pub(super) fn read_inode_windows_symlink_reparse_point(
+        &self,
+        inode_id: InodeId,
+    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
+        let Some(value) =
+            self.read_inode_xattr(inode_id, &WindowsSymlinkReparsePoint::xattr_name()?)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(WindowsSymlinkReparsePoint::parse(&value)?))
     }
 
     /// Reads the fscrypt v2 context stored in ext4's private inode xattr slot.
