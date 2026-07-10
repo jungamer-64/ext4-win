@@ -567,14 +567,14 @@ fn encrypt_modern_root_file_name(image: &mut [u8], master_key: &FscryptMasterKey
     );
 }
 
-fn overwrite_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
+fn write_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
     transaction: &mut JournalTransaction<'_, D, N, J>,
     file_id: FileNodeId,
     offset: u64,
     bytes: &[u8],
 ) {
     let file = transaction_file(transaction, file_id);
-    must(transaction.overwrite_file_range(file, FileOffset::from_bytes(offset), bytes));
+    must(transaction.write_file_range(file, FileOffset::from_bytes(offset), bytes));
 }
 
 fn extend_file<D: BlockWriter, N: FscryptNonceGenerator, J>(

@@ -2282,7 +2282,7 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// # Errors
 ///
 /// Returns an error when the write stack or input buffer is invalid, the FILE_OBJECT is not a
-/// regular file, or the ext4 overwrite transaction fails.
+/// regular file, or the ext4 write transaction fails.
 fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.write()?;
     let opened_file = OpenedRegularFile::decode(stack.file_object())?;
@@ -2312,7 +2312,7 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
         .volume_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let file = transaction.file(opened_file.id())?;
-    transaction.overwrite_file_range(file, stack.byte_offset(), input.as_slice())?;
+    transaction.write_file_range(file, stack.byte_offset(), input.as_slice())?;
     transaction.commit()?;
     if matches!(
         opened_file.write_commitment(),

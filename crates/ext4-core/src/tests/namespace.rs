@@ -174,12 +174,12 @@ fn minimal_profile_supports_file_and_namespace_mutations() {
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let file_id = file_node_id(&volume, 3);
 
-        let mut overwrite = volume.begin_transaction(NOW);
-        overwrite_file(&mut overwrite, file_id, 0, b"HELLO");
-        extend_file(&mut overwrite, file_id, 3072);
-        overwrite_file(&mut overwrite, file_id, 2048, b"tail");
-        truncate_file(&mut overwrite, file_id, 1024);
-        must(overwrite.commit());
+        let mut write = volume.begin_transaction(NOW);
+        write_file(&mut write, file_id, 0, b"HELLO");
+        extend_file(&mut write, file_id, 3072);
+        write_file(&mut write, file_id, 2048, b"tail");
+        truncate_file(&mut write, file_id, 1024);
+        must(write.commit());
 
         let mut output = [0_u8; 5];
         assert_eq!(read_file(&volume, 3, 0, &mut output), 5);
