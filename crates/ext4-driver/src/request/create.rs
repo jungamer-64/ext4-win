@@ -666,67 +666,6 @@ fn validate_existing_node_options(
     Ok(())
 }
 
-/// Presence of a reparse point on an existing final create target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExistingNodeReparsePoint {
-    /// The target is a normal ext4 node.
-    Absent,
-    /// The target must be opened through reparse-point semantics.
-    Present,
-}
-
-/// Determines the handle mode for an existing target's reparse state and create option.
-/// # Errors
-///
-/// Returns an error when the caller requested normal target resolution for a reparse point, which
-/// this FSD does not yet complete as a reparse redirect.
-fn opened_node_mode(
-    reparse_point: ExistingNodeReparsePoint,
-    mode: CreateReparsePointMode,
-) -> DriverResult<OpenedNodeMode> {
-    match (reparse_point, mode) {
-        (ExistingNodeReparsePoint::Present, CreateReparsePointMode::ResolveFinalTarget) => {
-            Err(DriverError::NotSupported)
-        }
-        (ExistingNodeReparsePoint::Present, CreateReparsePointMode::OpenFinalReparsePoint) => {
-            Ok(OpenedNodeMode::ReparsePoint)
-        }
-        (ExistingNodeReparsePoint::Absent, _) => Ok(OpenedNodeMode::Direct),
-    }
-}
-
-/// Loads reparse-point state and determines the resulting existing-handle mode.
-/// # Errors
-///
-/// Returns an error when the Windows reparse xattr is malformed or normal target resolution was
-/// requested for a reparse point.
-fn existing_node_open_mode(
-    vcb: NonNull<VolumeControlBlock>,
-    node: NodeId,
-    mode: CreateReparsePointMode,
-) -> DriverResult<OpenedNodeMode> {
-    let reparse_point = match node {
-        NodeId::Symlink(_) => ExistingNodeReparsePoint::Present,
-        NodeId::File(_) | NodeId::Directory(_) => {
-            let vcb = unsafe {
-                // SAFETY: The mounted-device VCB pointer remains valid for this synchronous
-                // create request and is read only while classifying reparse metadata.
-                vcb.as_ref()
-            };
-            if vcb
-                .volume()
-                .read_windows_symlink_reparse_point(node)?
-                .is_some()
-            {
-                ExistingNodeReparsePoint::Present
-            } else {
-                ExistingNodeReparsePoint::Absent
-            }
-        }
-    };
-    opened_node_mode(reparse_point, mode)
-}
-
 /// Truncates an existing regular file for overwrite-style create dispositions.
 /// # Errors
 ///
@@ -1236,41 +1175,6 @@ mod tests {
         assert_eq!(
             validate_file_reference_create(CreateDisposition::Open, CloseDisposition::Delete),
             Err(DriverError::NotSupported)
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn reparse_point_open_mode_rejects_unresolved_target() {
-        assert_eq!(
-            opened_node_mode(
-                ExistingNodeReparsePoint::Present,
-                CreateReparsePointMode::ResolveFinalTarget
-            ),
-            Err(DriverError::NotSupported)
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn reparse_point_open_mode_separates_reparse_and_direct_handles() {
-        assert_eq!(
-            opened_node_mode(
-                ExistingNodeReparsePoint::Present,
-                CreateReparsePointMode::OpenFinalReparsePoint
-            ),
-            Ok(OpenedNodeMode::ReparsePoint)
-        );
-        assert_eq!(
-            opened_node_mode(
-                ExistingNodeReparsePoint::Absent,
-                CreateReparsePointMode::ResolveFinalTarget
-            ),
-            Ok(OpenedNodeMode::Direct)
         );
     }
 
