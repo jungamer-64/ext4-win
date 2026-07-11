@@ -9,10 +9,10 @@ use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    DeviceLength, DirectoryNodeId, Ext4Name, Ext4Timestamp, FileNodeId, FscryptKeyIdentifier,
-    FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, InternalJournal, JournalTransaction,
-    JournaledVolume, MountContext, NewDirectoryMetadata, NewFileMetadata, NodeId, FileOffset,
-    Result as Ext4Result, WindowsName, XattrName, XattrValue,
+    DeviceLength, DirectoryNodeId, Ext4Name, Ext4Timestamp, FileNodeId, FileOffset,
+    FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, InternalJournal,
+    JournalTransaction, JournaledVolume, MountContext, NewDirectoryMetadata, NewFileMetadata,
+    NodeId, Result as Ext4Result, WindowsName, XattrName, XattrValue,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, LARGE_INTEGER, PDEVICE_OBJECT,
@@ -1855,6 +1855,9 @@ impl FileByteRangeLocks {
     }
 
     /// Checks one resolved read range against this FCB's byte-range locks.
+    /// # Errors
+    ///
+    /// Returns an error when the resolved range cannot be represented by FsRtl.
     fn permits_read(
         &self,
         target: DispatchTarget,
@@ -1895,6 +1898,9 @@ impl FileByteRangeLocks {
     }
 
     /// Checks one resolved write range against this FCB's byte-range locks.
+    /// # Errors
+    ///
+    /// Returns an error when the resolved range cannot be represented by FsRtl.
     fn permits_write(
         &self,
         target: DispatchTarget,
@@ -2474,8 +2480,12 @@ impl OpenedObject {
     }
 
     /// Writes a preselected position after signed-range validation.
+    /// # Errors
+    ///
+    /// Returns an error when the position exceeds signed Windows range.
     fn write_current_file_position(&mut self, position: FileOffset) -> DriverResult<()> {
-        let position = i64::try_from(position.bytes()).map_err(|_| DriverError::InvalidParameter)?;
+        let position =
+            i64::try_from(position.bytes()).map_err(|_| DriverError::InvalidParameter)?;
         let file_object = unsafe {
             // SAFETY: Queued file operations serialize ext4win mutations of
             // this live FILE_OBJECT's current-position field.
@@ -2603,9 +2613,7 @@ impl OpenedRegularFile {
         self.opened
             .handle()
             .regular_file_write_access()
-            .unwrap_or_else(|| {
-                KernelWideInconsistency::file_object_context_corruption().bugcheck()
-            })
+            .unwrap_or_else(|| KernelWideInconsistency::file_object_context_corruption().bugcheck())
     }
 
     /// Returns the synchronous per-handle file position.
@@ -2755,19 +2763,19 @@ mod tests {
     use core::num::NonZeroU32;
     use core::ptr::NonNull;
 
-    use ext4_core::{DirectoryNodeId, Ext4Name, NodeId};
+    use ext4_core::{DirectoryNodeId, Ext4Name, FileOffset, NodeId};
 
-    use crate::irp::{DirectoryEntryIndex, RegularFileWriteAccess};
+    use crate::irp::{DataIoKind, DirectoryEntryIndex, RegularFileWriteAccess};
     use crate::kernel::status::DriverError;
 
     use super::{
         CloseDisposition, ControlDeviceExtension, DIRECTORY_NOTIFICATION_DIRECTORY_UNITS,
         DataTransferMode, DeviceExtensionKind, DirectoryNameChange, DirectoryNameChangeAction,
         FileControlBlock, FileControlBlockRelease, KernelDevice, KernelFileObject,
-        MountedVolumeDevice, MountedVolumeDeviceExtension, NoIntermediateTransfer, OpenedDirectory,
-        OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
-        TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
-        WriteCommitment, shutdown_registration_status,
+        MountedVolumeDevice, MountedVolumeDeviceExtension, NativeFileByteRange,
+        NoIntermediateTransfer, OpenedDirectory, OpenedHandle, OpenedLocation, OpenedNodeMode,
+        OpenedObject, OpenedRegularFile, TransferBufferAlignment, TransferSectorSize,
+        UninitializedFileObject, VolumeControlBlock, WriteCommitment, shutdown_registration_status,
     };
 
     fn file_object_with_contexts(
@@ -2885,8 +2893,13 @@ mod tests {
         });
 
         assert_eq!(mode.validate_range(512, 1024), Ok(()));
+        assert_eq!(mode.validate_position(1024), Ok(()));
         assert_eq!(
             mode.validate_range(1, 1024),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            mode.validate_position(1),
             Err(DriverError::InvalidParameter)
         );
         assert_eq!(
@@ -3259,6 +3272,206 @@ mod tests {
                 DataTransferMode::NoIntermediate(transfer)
             );
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when synchronous FILE_OBJECT position transitions are inconsistent.
+    #[test]
+    fn synchronous_opened_object_reads_sets_and_advances_position() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
+            OpenedLocation::Root,
+            CloseDisposition::Keep,
+            WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
+        );
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        file.Flags = wdk_sys::FO_SYNCHRONOUS_IO;
+        file.CurrentByteOffset = wdk_sys::LARGE_INTEGER { QuadPart: 11 };
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        let opened = OpenedObject::decode(file_object);
+        assert!(opened.is_ok());
+        let Ok(mut opened) = opened else {
+            return;
+        };
+
+        assert_eq!(
+            opened.current_file_position(),
+            Ok(FileOffset::from_bytes(11))
+        );
+        assert_eq!(
+            opened.set_current_file_position(FileOffset::from_bytes(32)),
+            Ok(())
+        );
+        assert_eq!(
+            opened
+                .update_current_file_position(DataIoKind::Handle, FileOffset::from_bytes(100), 0,),
+            Ok(())
+        );
+        assert_eq!(
+            opened.current_file_position(),
+            Ok(FileOffset::from_bytes(100))
+        );
+        assert_eq!(
+            opened.update_current_file_position(
+                DataIoKind::Handle,
+                FileOffset::from_bytes(100),
+                23,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            opened.current_file_position(),
+            Ok(FileOffset::from_bytes(123))
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the regular-file CCB variant loses its create-time write authority.
+    #[test]
+    fn regular_file_handle_retains_write_authority() {
+        for write_access in [
+            RegularFileWriteAccess::Denied,
+            RegularFileWriteAccess::AppendOnly,
+            RegularFileWriteAccess::Positional,
+        ] {
+            let handle = OpenedHandle {
+                state: super::OpenedHandleState::new(
+                    OpenedNodeMode::Direct,
+                    OpenedLocation::Root,
+                    CloseDisposition::Keep,
+                    WriteCommitment::CommitOnly,
+                    DataTransferMode::IntermediateAllowed,
+                ),
+                kind: super::OpenedHandleKind::File { write_access },
+            };
+            assert_eq!(handle.regular_file_write_access(), Some(write_access));
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when asynchronous or paging I/O changes the current-position field.
+    #[test]
+    fn asynchronous_and_paging_io_do_not_advance_position() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
+            OpenedLocation::Root,
+            CloseDisposition::Keep,
+            WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
+        );
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        file.CurrentByteOffset = wdk_sys::LARGE_INTEGER { QuadPart: 7 };
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        let opened = OpenedObject::decode(file_object);
+        assert!(opened.is_ok());
+        let Ok(mut opened) = opened else {
+            return;
+        };
+
+        assert_eq!(
+            opened.current_file_position(),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            opened.set_current_file_position(FileOffset::from_bytes(9)),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            opened.update_current_file_position(
+                DataIoKind::Handle,
+                FileOffset::from_bytes(100),
+                23,
+            ),
+            Ok(())
+        );
+        file.Flags = wdk_sys::FO_SYNCHRONOUS_IO;
+        assert_eq!(
+            opened.update_current_file_position(
+                DataIoKind::Paging,
+                FileOffset::from_bytes(100),
+                23,
+            ),
+            Ok(())
+        );
+        let position = unsafe {
+            // SAFETY: Tests consistently use the QuadPart LARGE_INTEGER arm.
+            file.CurrentByteOffset.QuadPart
+        };
+        assert_eq!(position, 7);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when invalid current positions or lock ranges enter the signed Windows domain.
+    #[test]
+    fn file_position_and_native_lock_range_reject_signed_overflow() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
+            OpenedLocation::Root,
+            CloseDisposition::Keep,
+            WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
+        );
+        let mut file = file_object_with_contexts(
+            core::ptr::addr_of_mut!(fcb).cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        file.Flags = wdk_sys::FO_SYNCHRONOUS_IO;
+        file.CurrentByteOffset = wdk_sys::LARGE_INTEGER { QuadPart: -1 };
+        let file_object = kernel_file_object(&mut file);
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        let opened = OpenedObject::decode(file_object);
+        assert!(opened.is_ok());
+        let Ok(mut opened) = opened else {
+            return;
+        };
+
+        assert_eq!(
+            opened.current_file_position(),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            opened.set_current_file_position(FileOffset::from_bytes(u64::MAX)),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            NativeFileByteRange::new(FileOffset::from_bytes(i64::MAX.unsigned_abs()), 1).err(),
+            Some(DriverError::InvalidParameter)
+        );
+        assert!(NativeFileByteRange::new(FileOffset::from_bytes(4096), 512).is_ok());
     }
 
     /// # Panics
