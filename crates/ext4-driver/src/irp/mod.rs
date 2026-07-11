@@ -3,6 +3,7 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
+use ext4_core::FileOffset;
 use wdk_sys::{
     LIST_ENTRY, NTSTATUS, PDEVICE_OBJECT, PIO_CSQ, PIO_STACK_LOCATION, PIO_WORKITEM, PIRP,
     PLIST_ENTRY, PVOID, STATUS_PENDING, STATUS_SUCCESS,
@@ -222,6 +223,15 @@ impl DispatchMajor {
     }
 }
 
+/// Origin of a read or write IRP after raw IRP flags are decoded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DataIoKind {
+    /// Normal file-handle I/O participates in per-handle file-position semantics.
+    Handle,
+    /// Paging I/O uses only its explicit byte range and never changes the handle position.
+    Paging,
+}
+
 /// Non-null dispatch target decoded from raw WDK callback inputs.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DispatchTarget {
@@ -249,6 +259,20 @@ impl DispatchTarget {
     /// Returns the typed device object boundary.
     pub(crate) const fn device(self) -> KernelDevice {
         self.device
+    }
+
+    /// Returns whether this request is normal handle I/O or paging I/O.
+    pub(crate) fn data_io_kind(self) -> DataIoKind {
+        let irp = unsafe {
+            // SAFETY: The dispatch target retains the live IRP for the active
+            // callback or queue-owned request lifetime.
+            self.irp.as_ref()
+        };
+        if irp.Flags & wdk_sys::IRP_PAGING_IO == 0 {
+            DataIoKind::Handle
+        } else {
+            DataIoKind::Paging
+        }
     }
 
     /// Returns the live raw IRP pointer for a kernel helper that owns this request's semantics.
@@ -1762,9 +1786,15 @@ impl CurrentIrpStackLocation {
             // where Read is active.
             stack.Parameters.Read
         };
+        let byte_offset = unsafe {
+            // SAFETY: ByteOffset uses the QuadPart arm for read/write stack locations.
+            read.ByteOffset.QuadPart
+        };
         Ok(ReadStack {
             file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(read.Length)?,
+            starting_point: ReadStartingPoint::from_quad(byte_offset)?,
+            key: ByteRangeLockKey::from_ulong(read.Key),
         })
     }
 
@@ -1783,9 +1813,15 @@ impl CurrentIrpStackLocation {
             // where Write is active.
             stack.Parameters.Write
         };
+        let byte_offset = unsafe {
+            // SAFETY: ByteOffset uses the QuadPart arm for read/write stack locations.
+            write.ByteOffset.QuadPart
+        };
         Ok(WriteStack {
             file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(write.Length)?,
+            starting_point: WriteStartingPoint::from_quad(byte_offset)?,
+            key: ByteRangeLockKey::from_ulong(write.Key),
         })
     }
 }
@@ -2466,6 +2502,8 @@ impl QueryFileInformationClass {
 pub(crate) enum SetFileInformationClass {
     /// Windows `FileBasicInformation`.
     Basic,
+    /// Windows `FilePositionInformation`.
+    Position,
     /// Windows `FileEndOfFileInformation`.
     EndOfFile,
     /// Windows `FileAllocationInformation`.
@@ -2488,6 +2526,7 @@ impl SetFileInformationClass {
     fn from_raw(value: wdk_sys::FILE_INFORMATION_CLASS) -> Result<Self, DriverError> {
         match value {
             wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => Ok(Self::Basic),
+            wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => Ok(Self::Position),
             wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation => Ok(Self::EndOfFile),
             wdk_sys::_FILE_INFORMATION_CLASS::FileAllocationInformation => Ok(Self::Allocation),
             wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformation => Ok(Self::Disposition),
@@ -2650,6 +2689,17 @@ pub(crate) struct DesiredAccess {
     raw: wdk_sys::ACCESS_MASK,
 }
 
+/// Write authority retained for one opened regular-file handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegularFileWriteAccess {
+    /// The handle was not opened for regular-file data writes.
+    Denied,
+    /// The handle may write only at the current end of file.
+    AppendOnly,
+    /// The handle may select an absolute, current, or end-of-file starting point.
+    Positional,
+}
+
 impl DesiredAccess {
     /// Wraps the raw WDK access mask.
     const fn from_raw(raw: wdk_sys::ACCESS_MASK) -> Self {
@@ -2659,6 +2709,17 @@ impl DesiredAccess {
     /// Returns the WDK access mask for `IoCheckShareAccess`.
     pub(crate) const fn as_raw(self) -> wdk_sys::ACCESS_MASK {
         self.raw
+    }
+
+    /// Projects Windows desired-access bits into regular-file write authority.
+    pub(crate) const fn regular_file_write_access(self) -> RegularFileWriteAccess {
+        if self.contains(wdk_sys::FILE_WRITE_DATA) {
+            RegularFileWriteAccess::Positional
+        } else if self.contains(wdk_sys::FILE_APPEND_DATA) {
+            RegularFileWriteAccess::AppendOnly
+        } else {
+            RegularFileWriteAccess::Denied
+        }
     }
 
     /// Returns whether all selected access bits are present.
@@ -3186,6 +3247,78 @@ pub(crate) struct SetSecurityStack {
     security_descriptor: KernelSecurityDescriptor,
 }
 
+/// Starting point selected by a Windows read request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadStartingPoint {
+    /// Read from an explicit non-negative file offset.
+    Absolute(FileOffset),
+    /// Read from the synchronous FILE_OBJECT's current position.
+    CurrentFilePosition,
+}
+
+impl ReadStartingPoint {
+    /// Decodes a signed Windows read offset into its semantic form.
+    /// # Errors
+    ///
+    /// Returns an error for end-of-file or unknown negative sentinel values.
+    fn from_quad(value: i64) -> DriverResult<Self> {
+        if value == signed_special_offset(wdk_sys::FILE_USE_FILE_POINTER_POSITION) {
+            return Ok(Self::CurrentFilePosition);
+        }
+        let offset = u64::try_from(value).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(Self::Absolute(FileOffset::from_bytes(offset)))
+    }
+}
+
+/// Starting point selected by a Windows write request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriteStartingPoint {
+    /// Write from an explicit non-negative file offset.
+    Absolute(FileOffset),
+    /// Write from the synchronous FILE_OBJECT's current position.
+    CurrentFilePosition,
+    /// Resolve the starting point from the latest committed end of file.
+    EndOfFile,
+}
+
+impl WriteStartingPoint {
+    /// Decodes a signed Windows write offset into its semantic form.
+    /// # Errors
+    ///
+    /// Returns an error for unknown negative sentinel values.
+    fn from_quad(value: i64) -> DriverResult<Self> {
+        if value == signed_special_offset(wdk_sys::FILE_USE_FILE_POINTER_POSITION) {
+            return Ok(Self::CurrentFilePosition);
+        }
+        if value == signed_special_offset(wdk_sys::FILE_WRITE_TO_END_OF_FILE) {
+            return Ok(Self::EndOfFile);
+        }
+        let offset = u64::try_from(value).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(Self::Absolute(FileOffset::from_bytes(offset)))
+    }
+}
+
+/// Byte-range lock key carried by one read or write request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ByteRangeLockKey(wdk_sys::ULONG);
+
+impl ByteRangeLockKey {
+    /// Wraps the key decoded from an IRP stack location.
+    const fn from_ulong(value: wdk_sys::ULONG) -> Self {
+        Self(value)
+    }
+
+    /// Returns the native key for FsRtl range checks.
+    pub(crate) const fn as_ulong(self) -> wdk_sys::ULONG {
+        self.0
+    }
+}
+
+/// Interprets a Windows low-part sentinel as its sign-extended 64-bit offset.
+fn signed_special_offset(value: u32) -> i64 {
+    i64::from(i32::from_ne_bytes(value.to_ne_bytes()))
+}
+
 /// Decoded read stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadStack {
@@ -3193,6 +3326,10 @@ pub(crate) struct ReadStack {
     file_object: KernelFileObject,
     /// Requested byte count.
     length: IrpBufferLength,
+    /// Semantic starting point decoded from ByteOffset.
+    starting_point: ReadStartingPoint,
+    /// Key used for byte-range lock ownership checks.
+    key: ByteRangeLockKey,
 }
 
 impl ReadStack {
@@ -3206,6 +3343,15 @@ impl ReadStack {
         self.length
     }
 
+    /// Returns the requested semantic starting point.
+    pub(crate) const fn starting_point(self) -> ReadStartingPoint {
+        self.starting_point
+    }
+
+    /// Returns the byte-range lock key.
+    pub(crate) const fn key(self) -> ByteRangeLockKey {
+        self.key
+    }
 }
 
 /// Decoded write stack parameters.
@@ -3215,6 +3361,10 @@ pub(crate) struct WriteStack {
     file_object: KernelFileObject,
     /// Requested byte count.
     length: IrpBufferLength,
+    /// Semantic starting point decoded from ByteOffset.
+    starting_point: WriteStartingPoint,
+    /// Key used for byte-range lock ownership checks.
+    key: ByteRangeLockKey,
 }
 
 impl WriteStack {
@@ -3228,6 +3378,15 @@ impl WriteStack {
         self.length
     }
 
+    /// Returns the requested semantic starting point.
+    pub(crate) const fn starting_point(self) -> WriteStartingPoint {
+        self.starting_point
+    }
+
+    /// Returns the byte-range lock key.
+    pub(crate) const fn key(self) -> ByteRangeLockKey {
+        self.key
+    }
 }
 
 impl QueryVolumeStack {
