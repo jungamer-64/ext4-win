@@ -5,16 +5,17 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Permissions,
-    Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileSize, NodeId,
-    RenameTargetCollision, WindowsName, WindowsOverlay,
+    Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileOffset, FileSize,
+    NodeId, RenameTargetCollision, WindowsName, WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
 use crate::irp::{
     DirectoryChangeFilter, DirectoryCursorPosition, DirectoryEntryEmission, DirectoryEntryIndex,
-    DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope, DispatchTarget,
-    IrpBufferLength, IrpCompletion, OwnedIrp, QueryDirectoryStack, QueryFileInformationClass,
-    QueryFileStack, SetFileInformationClass, SetFileStack,
+    DataIoKind, DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope,
+    DispatchTarget, IrpBufferLength, IrpCompletion, OwnedIrp, QueryDirectoryStack,
+    QueryFileInformationClass, QueryFileStack, ReadStartingPoint, RegularFileWriteAccess,
+    SetFileInformationClass, SetFileStack, WriteStartingPoint,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
@@ -347,6 +348,7 @@ fn query_file_information(request: QueryFileRequest) -> DriverResult<IrpCompleti
 fn set_file_information(request: SetFileRequest) -> DriverResult<IrpCompletion> {
     match request.stack.information_class() {
         SetFileInformationClass::Basic => set_basic_information(request),
+        SetFileInformationClass::Position => set_position_information(request),
         SetFileInformationClass::EndOfFile => set_end_of_file_information(request),
         SetFileInformationClass::Allocation => set_allocation_information(request),
         SetFileInformationClass::Disposition => set_disposition_information(request),
@@ -359,6 +361,24 @@ fn set_file_information(request: SetFileRequest) -> DriverResult<IrpCompletion> 
         }
     }?;
     Ok(IrpCompletion::EMPTY)
+}
+
+/// Applies FILE_POSITION_INFORMATION to the synchronous FILE_OBJECT position.
+/// # Errors
+///
+/// Returns an error when the input is truncated, negative, asynchronous, or misaligned for a
+/// no-intermediate-buffering handle.
+fn set_position_information(mut request: SetFileRequest) -> DriverResult<()> {
+    let info = read_file_information_input::<wdk_sys::FILE_POSITION_INFORMATION>(
+        request.target,
+        request.stack.length(),
+    )?;
+    let position = file_offset_from_large_integer(info.CurrentByteOffset)?;
+    request
+        .opened_file
+        .data_transfer_mode()
+        .validate_position(position.bytes())?;
+    request.opened_file.set_current_file_position(position)
 }
 
 /// Applies FILE_BASIC_INFORMATION timestamps and overlay attributes.
@@ -1828,6 +1848,17 @@ fn file_size_from_large_integer(value: LARGE_INTEGER) -> DriverResult<FileSize> 
     ))
 }
 
+/// Returns a non-negative file offset from a Windows LARGE_INTEGER.
+/// # Errors
+///
+/// Returns an error when the LARGE_INTEGER contains a negative offset.
+fn file_offset_from_large_integer(value: LARGE_INTEGER) -> DriverResult<FileOffset> {
+    let value = large_integer_quad(value);
+    Ok(FileOffset::from_bytes(
+        u64::try_from(value).map_err(|_| DriverError::InvalidParameter)?,
+    ))
+}
+
 /// Returns the current size of a regular file inode.
 /// # Errors
 ///
@@ -2034,25 +2065,17 @@ fn pack_internal_information(
 /// Packs FILE_POSITION_INFORMATION.
 /// # Errors
 ///
-/// Returns an error when the output buffer is too small for `FILE_POSITION_INFORMATION`.
+/// Returns an error when the handle has no synchronous current position or the output buffer is
+/// too small for `FILE_POSITION_INFORMATION`.
 fn pack_position_information(
     output: &mut [u8],
     opened_file: &OpenedObject,
 ) -> DriverResult<IrpCompletion> {
-    let file_object = opened_file.file_object();
-    let file_object = unsafe {
-        // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack and
-        // is read only for the current byte offset field.
-        file_object.as_ref()
-    };
-    let current = unsafe {
-        // SAFETY: CurrentByteOffset is read through its QuadPart arm.
-        file_object.CurrentByteOffset.QuadPart
-    };
+    let current = opened_file.current_file_position()?;
     write_fixed(
         output,
         wdk_sys::FILE_POSITION_INFORMATION {
-            CurrentByteOffset: LARGE_INTEGER { QuadPart: current },
+            CurrentByteOffset: large_integer_from_u64(current.bytes())?,
         },
     )
 }
@@ -2243,6 +2266,103 @@ fn boolean(value: bool) -> wdk_sys::BOOLEAN {
     u8::from(value)
 }
 
+/// Fully resolved signed Windows file range used by data I/O and byte locks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolvedFileRange {
+    /// First byte affected by the operation.
+    start: FileOffset,
+    /// Maximum byte count requested by the operation.
+    length: usize,
+}
+
+impl ResolvedFileRange {
+    /// Validates a resolved file range against the signed Windows offset domain.
+    /// # Errors
+    ///
+    /// Returns an error when the end offset overflows or exceeds `i64::MAX`.
+    fn new(start: FileOffset, length: usize) -> DriverResult<Self> {
+        let end = start.checked_add_len(length)?;
+        let _signed_end =
+            i64::try_from(end.bytes()).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(Self { start, length })
+    }
+
+    /// Returns the resolved starting byte.
+    const fn start(self) -> FileOffset {
+        self.start
+    }
+
+    /// Returns the requested byte count.
+    const fn length(self) -> usize {
+        self.length
+    }
+}
+
+/// Resolves a read starting point against handle and paging semantics.
+/// # Errors
+///
+/// Returns an error when paging I/O requests a handle position or a synchronous position is absent.
+fn resolve_read_start(
+    opened_file: &OpenedRegularFile,
+    kind: DataIoKind,
+    starting_point: ReadStartingPoint,
+) -> DriverResult<FileOffset> {
+    match (kind, starting_point) {
+        (DataIoKind::Handle, ReadStartingPoint::Absolute(offset))
+        | (DataIoKind::Paging, ReadStartingPoint::Absolute(offset)) => Ok(offset),
+        (DataIoKind::Handle, ReadStartingPoint::CurrentFilePosition) => {
+            opened_file.current_file_position()
+        }
+        (DataIoKind::Paging, ReadStartingPoint::CurrentFilePosition) => {
+            Err(DriverError::InvalidParameter)
+        }
+    }
+}
+
+/// Resolves a write starting point after write authority and I/O origin are known.
+/// # Errors
+///
+/// Returns an error for denied handle writes, paging sentinels, absent synchronous position, or an
+/// end of file outside the signed Windows offset domain.
+fn resolve_write_start(
+    opened_file: &OpenedRegularFile,
+    kind: DataIoKind,
+    starting_point: WriteStartingPoint,
+) -> DriverResult<FileOffset> {
+    if kind == DataIoKind::Paging {
+        return match starting_point {
+            WriteStartingPoint::Absolute(offset) => Ok(offset),
+            WriteStartingPoint::CurrentFilePosition | WriteStartingPoint::EndOfFile => {
+                Err(DriverError::InvalidParameter)
+            }
+        };
+    }
+
+    match opened_file.write_access() {
+        RegularFileWriteAccess::Denied => Err(DriverError::AccessDenied),
+        RegularFileWriteAccess::AppendOnly => regular_file_end(opened_file),
+        RegularFileWriteAccess::Positional => match starting_point {
+            WriteStartingPoint::Absolute(offset) => Ok(offset),
+            WriteStartingPoint::CurrentFilePosition => opened_file.current_file_position(),
+            WriteStartingPoint::EndOfFile => regular_file_end(opened_file),
+        },
+    }
+}
+
+/// Returns the latest committed EOF as a signed-Windows-compatible file offset.
+/// # Errors
+///
+/// Returns an error when the file cannot be loaded or EOF exceeds `i64::MAX`.
+fn regular_file_end(opened_file: &OpenedRegularFile) -> DriverResult<FileOffset> {
+    let vcb = unsafe {
+        // SAFETY: The opened regular file retains its mounted VCB for the FILE_OBJECT lifetime.
+        opened_file.volume().as_ref()
+    };
+    let end = FileOffset::from_bytes(regular_file_size(vcb, opened_file.id())?.bytes());
+    let _signed_end = i64::try_from(end.bytes()).map_err(|_| DriverError::InvalidParameter)?;
+    Ok(end)
+}
+
 /// Reads a regular file through ext4-core into the IRP output buffer.
 /// # Errors
 ///
@@ -2250,16 +2370,28 @@ fn boolean(value: bool) -> wdk_sys::BOOLEAN {
 /// regular file, or ext4 data read fails.
 fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.read()?;
-    let opened_file = OpenedRegularFile::decode(stack.file_object())?;
+    let mut opened_file = OpenedRegularFile::decode(stack.file_object())?;
+    let kind = target.data_io_kind();
     let length = stack.length();
+    let range = ResolvedFileRange::new(
+        resolve_read_start(&opened_file, kind, stack.starting_point())?,
+        length.as_usize(),
+    )?;
     let data_transfer_mode = opened_file.data_transfer_mode();
-    data_transfer_mode.validate_range(stack.byte_offset().bytes(), length.as_usize())?;
+    data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
     if length.is_empty() {
+        opened_file.update_current_file_position(kind, range.start(), 0)?;
         return Ok(IrpCompletion::EMPTY);
     }
     if !opened_file
         .file_control_block()
-        .permits_byte_range_read(target)
+        .permits_byte_range_read(
+            target,
+            opened_file.file_object(),
+            range.start(),
+            range.length(),
+            stack.key(),
+        )?
     {
         return Err(DriverError::FileLockConflict);
     }
@@ -2274,8 +2406,10 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let file = vcb.volume().load_file(opened_file.id())?;
     let bytes_read = vcb
         .volume()
-        .read_file(&file, stack.byte_offset(), output.as_mut_slice())?;
-    IrpCompletion::from_usize(bytes_read.as_usize())
+        .read_file(&file, range.start(), output.as_mut_slice())?;
+    let bytes_read = bytes_read.as_usize();
+    opened_file.update_current_file_position(kind, range.start(), bytes_read)?;
+    IrpCompletion::from_usize(bytes_read)
 }
 
 /// Writes a regular file range through an ext4 journal transaction.
@@ -2285,16 +2419,28 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// regular file, or the ext4 write transaction fails.
 fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let stack = target.current_stack()?.write()?;
-    let opened_file = OpenedRegularFile::decode(stack.file_object())?;
+    let mut opened_file = OpenedRegularFile::decode(stack.file_object())?;
+    let kind = target.data_io_kind();
     let length = stack.length();
+    let range = ResolvedFileRange::new(
+        resolve_write_start(&opened_file, kind, stack.starting_point())?,
+        length.as_usize(),
+    )?;
     let data_transfer_mode = opened_file.data_transfer_mode();
-    data_transfer_mode.validate_range(stack.byte_offset().bytes(), length.as_usize())?;
+    data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
     if length.is_empty() {
+        opened_file.update_current_file_position(kind, range.start(), 0)?;
         return Ok(IrpCompletion::EMPTY);
     }
     if !opened_file
         .file_control_block()
-        .permits_byte_range_write(target)
+        .permits_byte_range_write(
+            target,
+            opened_file.file_object(),
+            range.start(),
+            range.length(),
+            stack.key(),
+        )?
     {
         return Err(DriverError::FileLockConflict);
     }
@@ -2312,7 +2458,7 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
         .volume_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let file = transaction.file(opened_file.id())?;
-    transaction.write_file_range(file, stack.byte_offset(), input.as_slice())?;
+    transaction.write_file_range(file, range.start(), input.as_slice())?;
     transaction.commit()?;
     if matches!(
         opened_file.write_commitment(),
@@ -2320,7 +2466,9 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     ) {
         vcb.flush()?;
     }
-    IrpCompletion::from_usize(input.as_slice().len())
+    let bytes_written = input.as_slice().len();
+    opened_file.update_current_file_position(kind, range.start(), bytes_written)?;
+    IrpCompletion::from_usize(bytes_written)
 }
 
 /// Returns the mounted VCB referenced by an FCB.
@@ -2364,7 +2512,7 @@ fn release_file_contexts(file_object: KernelFileObject) {
 mod tests {
     use core::ptr::NonNull;
 
-    use crate::irp::{DirectoryInformationClass, DispatchTarget};
+    use crate::irp::{DirectoryInformationClass, DispatchTarget, RegularFileWriteAccess};
     use crate::kernel::status::DriverError;
     use crate::state::OpenedLocation;
     use ext4_core::{
@@ -2524,6 +2672,7 @@ mod tests {
             crate::state::CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,
             crate::state::DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
         );
         let mut file_object = wdk_sys::FILE_OBJECT {
             FsContext: core::ptr::addr_of_mut!(fcb).cast(),
@@ -2891,6 +3040,7 @@ mod tests {
             crate::state::CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,
             crate::state::DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
         );
         let mut file_object = wdk_sys::FILE_OBJECT {
             FsContext: core::ptr::addr_of_mut!(fcb).cast(),

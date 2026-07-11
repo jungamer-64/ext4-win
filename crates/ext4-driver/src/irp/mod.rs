@@ -3309,6 +3309,13 @@ impl ByteRangeLockKey {
     }
 
     /// Returns the native key for FsRtl range checks.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "native FsRtl byte-range checks are compiled out in unit tests"
+        )
+    )]
     pub(crate) const fn as_ulong(self) -> wdk_sys::ULONG {
         self.0
     }

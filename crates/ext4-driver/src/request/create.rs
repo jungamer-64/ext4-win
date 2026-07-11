@@ -13,7 +13,7 @@ use crate::{
     irp::{
         CreateDisposition, CreateNameInterpretation, CreateParameters, CreateReparsePointMode,
         CreateStack, CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering,
-        DesiredAccess, DispatchTarget, IrpCompletion, ShareAccess,
+        DesiredAccess, DispatchTarget, IrpCompletion, RegularFileWriteAccess, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
@@ -151,6 +151,8 @@ struct CreateHandlePolicy {
     write_commitment: WriteCommitment,
     /// Data transfer buffering policy stored on the opened handle.
     data_transfer_mode: DataTransferMode,
+    /// Regular-file write authority retained by the per-handle state.
+    regular_file_write_access: RegularFileWriteAccess,
     /// FILE_OBJECT flags projected from create options.
     file_object_flags: CreateFileObjectFlags,
 }
@@ -175,6 +177,9 @@ impl CreateHandlePolicy {
                     DataTransferMode::NoIntermediate(NoIntermediateTransfer::from_device(device)?)
                 }
             },
+            regular_file_write_access: parameters
+                .desired_access()
+                .regular_file_write_access(),
             file_object_flags,
         })
     }
@@ -202,6 +207,11 @@ impl CreateHandlePolicy {
     /// Returns data transfer buffering policy.
     const fn data_transfer_mode(self) -> DataTransferMode {
         self.data_transfer_mode
+    }
+
+    /// Returns the regular-file write authority selected by desired access.
+    const fn regular_file_write_access(self) -> RegularFileWriteAccess {
+        self.regular_file_write_access
     }
 
     /// Returns FILE_OBJECT flags projected from create options.
@@ -487,6 +497,7 @@ fn open_existing_node(
                     policy.close_disposition(),
                     policy.write_commitment(),
                     policy.data_transfer_mode(),
+                    policy.regular_file_write_access(),
                 ))
             })?;
             let fcb = open_shared_file_control_block(
@@ -585,6 +596,7 @@ fn create_missing_node(
             policy.close_disposition(),
             policy.write_commitment(),
             policy.data_transfer_mode(),
+            policy.regular_file_write_access(),
         ))
     })?;
     create_ea.apply_to_pending_child(&mut creation)?;
@@ -921,6 +933,7 @@ fn initialize_file_object(
             policy.close_disposition(),
             policy.write_commitment(),
             policy.data_transfer_mode(),
+            policy.regular_file_write_access(),
         ))
     })?;
     let fcb = open_shared_file_control_block(
@@ -1347,6 +1360,7 @@ mod tests {
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
         );
         let mut related = FILE_OBJECT::default();
         attach_opened_contexts(&mut related, &mut fcb, &mut handle);
@@ -1378,6 +1392,7 @@ mod tests {
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
         );
         let mut related = FILE_OBJECT::default();
         attach_opened_contexts(&mut related, &mut fcb, &mut handle);
