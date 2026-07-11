@@ -11,17 +11,20 @@ use core::ptr::NonNull;
 use ext4_core::{
     DeviceLength, DirectoryNodeId, Ext4Name, Ext4Timestamp, FileNodeId, FscryptKeyIdentifier,
     FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, InternalJournal, JournalTransaction,
-    JournaledVolume, MountContext, NewDirectoryMetadata, NewFileMetadata, NodeId,
+    JournaledVolume, MountContext, NewDirectoryMetadata, NewFileMetadata, NodeId, FileOffset,
     Result as Ext4Result, WindowsName, XattrName, XattrValue,
 };
 use wdk_sys::{
-    DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, PDEVICE_OBJECT, PDRIVER_OBJECT,
-    SHARE_ACCESS, STATUS_SUCCESS, UNICODE_STRING, VPB_MOUNTED,
+    DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, LARGE_INTEGER, PDEVICE_OBJECT,
+    PDRIVER_OBJECT, SHARE_ACCESS, STATUS_SUCCESS, UNICODE_STRING, VPB_MOUNTED,
 };
 #[cfg(not(test))]
 use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 
-use crate::irp::{DesiredAccess, DeviceIrpQueue, DirectoryEntryIndex, DispatchTarget, ShareAccess};
+use crate::irp::{
+    ByteRangeLockKey, DataIoKind, DesiredAccess, DeviceIrpQueue, DirectoryEntryIndex,
+    DispatchTarget, RegularFileWriteAccess, ShareAccess,
+};
 use crate::kernel::cng::CngFscryptNonceGenerator;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
@@ -1630,6 +1633,38 @@ impl FileControlBlock {
         self.byte_range_locks.process(target)
     }
 
+    /// Returns whether the requestor may read one fully resolved file byte range.
+    /// # Errors
+    ///
+    /// Returns an error when the resolved range cannot be represented by FsRtl.
+    pub(crate) fn permits_byte_range_read(
+        &self,
+        target: DispatchTarget,
+        file_object: KernelFileObject,
+        start: FileOffset,
+        length: usize,
+        key: ByteRangeLockKey,
+    ) -> DriverResult<bool> {
+        self.byte_range_locks
+            .permits_read(target, file_object, start, length, key)
+    }
+
+    /// Returns whether the requestor may write one fully resolved file byte range.
+    /// # Errors
+    ///
+    /// Returns an error when the resolved range cannot be represented by FsRtl.
+    pub(crate) fn permits_byte_range_write(
+        &self,
+        target: DispatchTarget,
+        file_object: KernelFileObject,
+        start: FileOffset,
+        length: usize,
+        key: ByteRangeLockKey,
+    ) -> DriverResult<bool> {
+        self.byte_range_locks
+            .permits_write(target, file_object, start, length, key)
+    }
+
     /// Releases all byte-range locks held by this FILE_OBJECT's requestor during cleanup.
     pub(crate) fn release_handle_byte_range_locks(
         &self,
@@ -1720,6 +1755,34 @@ struct FileByteRangeLocks {
     native: UnsafeCell<wdk_sys::FILE_LOCK>,
 }
 
+/// Signed native range passed to FsRtl after file-position resolution.
+struct NativeFileByteRange {
+    /// Non-negative starting byte.
+    start: LARGE_INTEGER,
+    /// Non-negative range length.
+    length: LARGE_INTEGER,
+}
+
+impl NativeFileByteRange {
+    /// Converts a core file range to the signed Windows lock domain.
+    /// # Errors
+    ///
+    /// Returns an error when either endpoint exceeds the signed Windows file-offset range.
+    fn new(start: FileOffset, length: usize) -> DriverResult<Self> {
+        let end = start.checked_add_len(length)?;
+        let _end = i64::try_from(end.bytes()).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(Self {
+            start: LARGE_INTEGER {
+                QuadPart: i64::try_from(start.bytes())
+                    .map_err(|_| DriverError::InvalidParameter)?,
+            },
+            length: LARGE_INTEGER {
+                QuadPart: i64::try_from(length).map_err(|_| DriverError::InvalidParameter)?,
+            },
+        })
+    }
+}
+
 impl FileByteRangeLocks {
     /// Initializes FsRtl state for a newly allocated FCB.
     fn new() -> Self {
@@ -1759,6 +1822,86 @@ impl FileByteRangeLocks {
         {
             let _target = target;
             wdk_sys::STATUS_SUCCESS
+        }
+    }
+
+    /// Checks one resolved read range against this FCB's byte-range locks.
+    fn permits_read(
+        &self,
+        target: DispatchTarget,
+        file_object: KernelFileObject,
+        start: FileOffset,
+        length: usize,
+        key: ByteRangeLockKey,
+    ) -> DriverResult<bool> {
+        let range = NativeFileByteRange::new(start, length)?;
+        #[cfg(not(test))]
+        {
+            let mut range = range;
+            let requestor_process = unsafe {
+                // SAFETY: `target` retains the live read IRP while the range check executes.
+                ffi::IoGetRequestorProcess(target.as_raw_irp())
+            };
+            Ok(unsafe {
+                // SAFETY: FsRtl receives initialized lock state, checked signed
+                // range values, the live FILE_OBJECT, and the IRP requestor.
+                ffi::FsRtlFastCheckLockForRead(
+                    self.native.get(),
+                    core::ptr::addr_of_mut!(range.start),
+                    core::ptr::addr_of_mut!(range.length),
+                    key.as_ulong(),
+                    file_object.as_ptr(),
+                    requestor_process.cast::<c_void>(),
+                ) != 0
+            })
+        }
+        #[cfg(test)]
+        {
+            let _target = target;
+            let _file_object = file_object;
+            let _key = key;
+            let _range = range;
+            Ok(true)
+        }
+    }
+
+    /// Checks one resolved write range against this FCB's byte-range locks.
+    fn permits_write(
+        &self,
+        target: DispatchTarget,
+        file_object: KernelFileObject,
+        start: FileOffset,
+        length: usize,
+        key: ByteRangeLockKey,
+    ) -> DriverResult<bool> {
+        let range = NativeFileByteRange::new(start, length)?;
+        #[cfg(not(test))]
+        {
+            let mut range = range;
+            let requestor_process = unsafe {
+                // SAFETY: `target` retains the live write IRP while the range check executes.
+                ffi::IoGetRequestorProcess(target.as_raw_irp())
+            };
+            Ok(unsafe {
+                // SAFETY: FsRtl receives initialized lock state, checked signed
+                // range values, the live FILE_OBJECT, and the IRP requestor.
+                ffi::FsRtlFastCheckLockForWrite(
+                    self.native.get(),
+                    core::ptr::addr_of_mut!(range.start),
+                    core::ptr::addr_of_mut!(range.length),
+                    key.as_ulong(),
+                    file_object.as_ptr().cast::<c_void>(),
+                    requestor_process.cast::<c_void>(),
+                ) != 0
+            })
+        }
+        #[cfg(test)]
+        {
+            let _target = target;
+            let _file_object = file_object;
+            let _key = key;
+            let _range = range;
+            Ok(true)
         }
     }
 
@@ -2024,7 +2167,10 @@ pub(crate) struct OpenedHandle {
 /// Kind-specific per-handle state.
 enum OpenedHandleKind {
     /// Regular file handle.
-    File,
+    File {
+        /// Data-write authority fixed when this handle was created.
+        write_access: RegularFileWriteAccess,
+    },
     /// Directory handle with enumeration cursor.
     Directory {
         /// Directory enumeration cursor.
@@ -2043,6 +2189,7 @@ impl OpenedHandle {
         close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
+        regular_file_write_access: RegularFileWriteAccess,
     ) -> Self {
         Self::from_parts(
             node,
@@ -2051,6 +2198,7 @@ impl OpenedHandle {
             close_disposition,
             write_commitment,
             data_transfer_mode,
+            regular_file_write_access,
         )
     }
 
@@ -2062,6 +2210,7 @@ impl OpenedHandle {
         close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
+        regular_file_write_access: RegularFileWriteAccess,
     ) -> Self {
         let state = OpenedHandleState::new(
             node_mode,
@@ -2071,7 +2220,9 @@ impl OpenedHandle {
             data_transfer_mode,
         );
         let kind = match node {
-            NodeId::File(_) => OpenedHandleKind::File,
+            NodeId::File(_) => OpenedHandleKind::File {
+                write_access: regular_file_write_access,
+            },
             NodeId::Directory(_) => OpenedHandleKind::Directory {
                 cursor: DirectoryCursor::start(),
             },
@@ -2131,11 +2282,19 @@ impl OpenedHandle {
         &self.kind
     }
 
+    /// Returns write authority for a regular-file handle variant.
+    fn regular_file_write_access(&self) -> Option<RegularFileWriteAccess> {
+        match &self.kind {
+            OpenedHandleKind::File { write_access } => Some(*write_access),
+            OpenedHandleKind::Directory { .. } | OpenedHandleKind::Symlink => None,
+        }
+    }
+
     /// Returns the mutable directory cursor for directory handles.
     fn directory_cursor_mut(&mut self) -> Option<&mut DirectoryCursor> {
         match &mut self.kind {
             OpenedHandleKind::Directory { cursor } => Some(cursor),
-            OpenedHandleKind::File | OpenedHandleKind::Symlink => None,
+            OpenedHandleKind::File { .. } | OpenedHandleKind::Symlink => None,
         }
     }
 }
@@ -2226,6 +2385,77 @@ impl OpenedObject {
         self.handle().data_transfer_mode()
     }
 
+    /// Returns the synchronous FILE_OBJECT current position.
+    /// # Errors
+    ///
+    /// Returns an error when the handle is asynchronous or its raw position is negative.
+    pub(crate) fn current_file_position(&self) -> DriverResult<FileOffset> {
+        if !self.has_synchronous_file_position() {
+            return Err(DriverError::InvalidParameter);
+        }
+        let file_object = unsafe {
+            // SAFETY: The opened object retains the live FILE_OBJECT and this
+            // method reads only the I/O Manager position field.
+            self.file_object.as_ref()
+        };
+        let position = unsafe {
+            // SAFETY: ext4win consistently uses the QuadPart LARGE_INTEGER arm.
+            file_object.CurrentByteOffset.QuadPart
+        };
+        Ok(FileOffset::from_bytes(
+            u64::try_from(position).map_err(|_| DriverError::InvalidParameter)?,
+        ))
+    }
+
+    /// Replaces the synchronous FILE_OBJECT current position.
+    /// # Errors
+    ///
+    /// Returns an error when the handle is asynchronous or the position exceeds signed Windows
+    /// range.
+    pub(crate) fn set_current_file_position(&mut self, position: FileOffset) -> DriverResult<()> {
+        if !self.has_synchronous_file_position() {
+            return Err(DriverError::InvalidParameter);
+        }
+        self.write_current_file_position(position)
+    }
+
+    /// Advances the current position after a successful normal handle I/O operation.
+    /// # Errors
+    ///
+    /// Returns an error when the resulting signed Windows position overflows.
+    pub(crate) fn update_current_file_position(
+        &mut self,
+        kind: DataIoKind,
+        start: FileOffset,
+        transferred: usize,
+    ) -> DriverResult<()> {
+        if kind == DataIoKind::Paging || !self.has_synchronous_file_position() {
+            return Ok(());
+        }
+        self.write_current_file_position(start.checked_add_len(transferred)?)
+    }
+
+    /// Returns whether this FILE_OBJECT owns a synchronized current-position field.
+    fn has_synchronous_file_position(&self) -> bool {
+        let file_object = unsafe {
+            // SAFETY: The opened object retains the live FILE_OBJECT and reads only its flags.
+            self.file_object.as_ref()
+        };
+        file_object.Flags & wdk_sys::FO_SYNCHRONOUS_IO != 0
+    }
+
+    /// Writes a preselected position after signed-range validation.
+    fn write_current_file_position(&mut self, position: FileOffset) -> DriverResult<()> {
+        let position = i64::try_from(position.bytes()).map_err(|_| DriverError::InvalidParameter)?;
+        let file_object = unsafe {
+            // SAFETY: Queued file operations serialize ext4win mutations of
+            // this live FILE_OBJECT's current-position field.
+            self.file_object.as_mut()
+        };
+        file_object.CurrentByteOffset = LARGE_INTEGER { QuadPart: position };
+        Ok(())
+    }
+
     /// Replaces the requested close disposition.
     pub(crate) fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
         self.mutable_handle()
@@ -2285,7 +2515,7 @@ impl OpenedObject {
     /// different node kinds.
     fn validate_handle_kind(&self) -> DriverResult<()> {
         match (self.node(), self.handle().kind()) {
-            (NodeId::File(_), OpenedHandleKind::File)
+            (NodeId::File(_), OpenedHandleKind::File { .. })
             | (NodeId::Directory(_), OpenedHandleKind::Directory { .. })
             | (NodeId::Symlink(_), OpenedHandleKind::Symlink) => Ok(()),
             _ => KernelWideInconsistency::file_object_context_corruption().bugcheck(),
@@ -2332,6 +2562,43 @@ impl OpenedRegularFile {
     /// Returns the shared FCB that owns this regular file's byte-range locks.
     pub(crate) fn file_control_block(&self) -> &FileControlBlock {
         self.opened.file_control_block()
+    }
+
+    /// Returns the typed kernel FILE_OBJECT for FsRtl ownership checks.
+    pub(crate) const fn file_object(&self) -> KernelFileObject {
+        self.opened.file_object()
+    }
+
+    /// Returns regular-file write authority fixed at create time.
+    pub(crate) fn write_access(&self) -> RegularFileWriteAccess {
+        self.opened
+            .handle()
+            .regular_file_write_access()
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::file_object_context_corruption().bugcheck()
+            })
+    }
+
+    /// Returns the synchronous per-handle file position.
+    /// # Errors
+    ///
+    /// Returns an error when the handle is asynchronous or its position is invalid.
+    pub(crate) fn current_file_position(&self) -> DriverResult<FileOffset> {
+        self.opened.current_file_position()
+    }
+
+    /// Advances the current position after successful normal file I/O.
+    /// # Errors
+    ///
+    /// Returns an error when the resulting signed Windows position overflows.
+    pub(crate) fn update_current_file_position(
+        &mut self,
+        kind: DataIoKind,
+        start: FileOffset,
+        transferred: usize,
+    ) -> DriverResult<()> {
+        self.opened
+            .update_current_file_position(kind, start, transferred)
     }
 
     /// Returns write completion durability requested for this regular-file handle.
