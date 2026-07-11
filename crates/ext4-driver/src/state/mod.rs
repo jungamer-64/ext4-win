@@ -184,6 +184,17 @@ impl NoIntermediateTransfer {
         Ok(())
     }
 
+    /// Validates one persistent FILE_OBJECT byte position.
+    /// # Errors
+    ///
+    /// Returns an error when the position is not sector-aligned.
+    fn validate_position(self, byte_offset: u64) -> DriverResult<()> {
+        if !self.sector_size.divides_u64(byte_offset) {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(())
+    }
+
     /// Validates one transfer buffer address.
     /// # Errors
     ///
@@ -214,6 +225,17 @@ impl DataTransferMode {
         match self {
             Self::IntermediateAllowed => Ok(()),
             Self::NoIntermediate(transfer) => transfer.validate_range(byte_offset, byte_count),
+        }
+    }
+
+    /// Validates one persistent FILE_OBJECT byte position for this handle.
+    /// # Errors
+    ///
+    /// Returns an error when no-intermediate buffering requires sector alignment.
+    pub(crate) fn validate_position(self, byte_offset: u64) -> DriverResult<()> {
+        match self {
+            Self::IntermediateAllowed => Ok(()),
+            Self::NoIntermediate(transfer) => transfer.validate_position(byte_offset),
         }
     }
 
@@ -1756,6 +1778,13 @@ struct FileByteRangeLocks {
 }
 
 /// Signed native range passed to FsRtl after file-position resolution.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "native FsRtl byte-range checks are compiled out in unit tests"
+    )
+)]
 struct NativeFileByteRange {
     /// Non-negative starting byte.
     start: LARGE_INTEGER,
@@ -2728,7 +2757,7 @@ mod tests {
 
     use ext4_core::{DirectoryNodeId, Ext4Name, NodeId};
 
-    use crate::irp::DirectoryEntryIndex;
+    use crate::irp::{DirectoryEntryIndex, RegularFileWriteAccess};
     use crate::kernel::status::DriverError;
 
     use super::{
@@ -2934,6 +2963,7 @@ mod tests {
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -2978,6 +3008,7 @@ mod tests {
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -3066,6 +3097,7 @@ mod tests {
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -3097,6 +3129,7 @@ mod tests {
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -3128,6 +3161,7 @@ mod tests {
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -3164,6 +3198,7 @@ mod tests {
             CloseDisposition::Keep,
             WriteCommitment::FlushThrough,
             DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
@@ -3205,6 +3240,7 @@ mod tests {
             CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::NoIntermediate(transfer),
+            RegularFileWriteAccess::Denied,
         );
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
