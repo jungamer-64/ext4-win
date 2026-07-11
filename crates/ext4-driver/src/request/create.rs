@@ -177,9 +177,7 @@ impl CreateHandlePolicy {
                     DataTransferMode::NoIntermediate(NoIntermediateTransfer::from_device(device)?)
                 }
             },
-            regular_file_write_access: parameters
-                .desired_access()
-                .regular_file_write_access(),
+            regular_file_write_access: parameters.desired_access().regular_file_write_access(),
             file_object_flags,
         })
     }

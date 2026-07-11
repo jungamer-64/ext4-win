@@ -3575,19 +3575,22 @@ impl SetSecurityStack {
 mod tests {
     use core::ffi::c_void;
 
+    use ext4_core::FileOffset;
     use wdk_sys::{STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
 
     use super::{
         CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateNameInterpretation,
         CreateReparsePointMode, CreateSynchronizationMode, CreateTargetRequirement,
-        CreateTransferBuffering, CurrentIrpStackLocation, DeviceIrpQueue, DirectoryChangeFilter,
-        DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
-        DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope, DispatchTarget,
-        EaEntryEmission, EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION,
-        FILE_OPEN_IF_DISPOSITION, FileSystemControlMinorFunction, FsControlCode, InformationLength,
-        IrpBufferLength, IrpCompletion, KernelIrp, QueryFileInformationClass,
-        QueryVolumeInformationClass, QueueWorkerState, ReceivedIrp, STATUS_CANCELLED,
+        CreateTransferBuffering, CurrentIrpStackLocation, DataIoKind, DeviceIrpQueue,
+        DirectoryChangeFilter, DirectoryControlMinorFunction, DirectoryCursorPosition,
+        DirectoryEntryEmission, DirectoryInformationClass, DirectoryPatternInput,
+        DirectoryWatchScope, DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection,
+        FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION, FileSystemControlMinorFunction,
+        FsControlCode, InformationLength, IrpBufferLength, IrpCompletion, KernelIrp,
+        QueryFileInformationClass, QueryVolumeInformationClass, QueueWorkerState,
+        ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, STATUS_CANCELLED,
         SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
+        WriteStartingPoint,
     };
     use crate::state::{
         CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
@@ -4873,7 +4876,285 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
+    /// Panics when read starting points or lock keys are decoded incorrectly.
+    #[test]
+    fn read_stack_decodes_absolute_and_current_positions() {
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        for (raw_offset, expected) in [
+            (
+                8192,
+                ReadStartingPoint::Absolute(FileOffset::from_bytes(8192)),
+            ),
+            (
+                super::signed_special_offset(wdk_sys::FILE_USE_FILE_POINTER_POSITION),
+                ReadStartingPoint::CurrentFilePosition,
+            ),
+        ] {
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                FileObject: file_object.as_ptr(),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
+                Length: 4096,
+                __bindgen_padding_0: 0,
+                Key: 17,
+                Flags: 0,
+                ByteOffset: wdk_sys::LARGE_INTEGER {
+                    QuadPart: raw_offset,
+                },
+            };
+
+            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            assert!(current.is_ok());
+            if let Ok(current) = current {
+                let read = current.read();
+                assert!(read.is_ok());
+                if let Ok(read) = read {
+                    assert_eq!(read.starting_point(), expected);
+                    assert_eq!(read.length().as_usize(), 4096);
+                    assert_eq!(read.key(), super::ByteRangeLockKey::from_ulong(17));
+                }
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when invalid read sentinels cross the IRP boundary.
+    #[test]
+    fn read_stack_rejects_end_of_file_and_unknown_negative_positions() {
+        for raw_offset in [
+            super::signed_special_offset(wdk_sys::FILE_WRITE_TO_END_OF_FILE),
+            -3,
+        ] {
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
+                Length: 1,
+                __bindgen_padding_0: 0,
+                Key: 0,
+                Flags: 0,
+                ByteOffset: wdk_sys::LARGE_INTEGER {
+                    QuadPart: raw_offset,
+                },
+            };
+
+            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            assert!(current.is_ok());
+            if let Ok(current) = current {
+                assert_eq!(
+                    current
+                        .read()
+                        .err()
+                        .map(crate::kernel::status::DriverError::ntstatus),
+                    Some(STATUS_INVALID_PARAMETER)
+                );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when write starting points or lock keys are decoded incorrectly.
+    #[test]
+    fn write_stack_decodes_absolute_current_and_end_positions() {
+        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        for (raw_offset, expected) in [
+            (
+                4096,
+                WriteStartingPoint::Absolute(FileOffset::from_bytes(4096)),
+            ),
+            (
+                super::signed_special_offset(wdk_sys::FILE_USE_FILE_POINTER_POSITION),
+                WriteStartingPoint::CurrentFilePosition,
+            ),
+            (
+                super::signed_special_offset(wdk_sys::FILE_WRITE_TO_END_OF_FILE),
+                WriteStartingPoint::EndOfFile,
+            ),
+        ] {
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                FileObject: file_object.as_ptr(),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
+                Length: 2048,
+                __bindgen_padding_0: 0,
+                Key: 23,
+                Flags: 0,
+                ByteOffset: wdk_sys::LARGE_INTEGER {
+                    QuadPart: raw_offset,
+                },
+            };
+
+            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            assert!(current.is_ok());
+            if let Ok(current) = current {
+                let write = current.write();
+                assert!(write.is_ok());
+                if let Ok(write) = write {
+                    assert_eq!(write.starting_point(), expected);
+                    assert_eq!(write.length().as_usize(), 2048);
+                    assert_eq!(write.key(), super::ByteRangeLockKey::from_ulong(23));
+                }
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when an unknown negative write position crosses the IRP boundary.
+    #[test]
+    fn write_stack_rejects_unknown_negative_position() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
+            Length: 1,
+            __bindgen_padding_0: 0,
+            Key: 0,
+            Flags: 0,
+            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: -3 },
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            assert_eq!(
+                current
+                    .write()
+                    .err()
+                    .map(crate::kernel::status::DriverError::ntstatus),
+                Some(STATUS_INVALID_PARAMETER)
+            );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when paging flags are not isolated from normal handle I/O.
+    #[test]
+    fn dispatch_target_decodes_data_io_kind() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        for (flags, expected) in [
+            (0, DataIoKind::Handle),
+            (wdk_sys::IRP_PAGING_IO, DataIoKind::Paging),
+        ] {
+            let mut irp = wdk_sys::IRP {
+                Flags: flags,
+                ..wdk_sys::IRP::default()
+            };
+            let target = DispatchTarget::decode(
+                core::ptr::addr_of_mut!(device),
+                core::ptr::addr_of_mut!(irp),
+            );
+            assert!(target.is_ok());
+            if let Ok(target) = target {
+                assert_eq!(target.data_io_kind(), expected);
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when desired access does not produce one exclusive write authority.
+    #[test]
+    fn desired_access_projects_regular_file_write_authority() {
+        for (raw, expected) in [
+            (0, RegularFileWriteAccess::Denied),
+            (
+                wdk_sys::FILE_APPEND_DATA,
+                RegularFileWriteAccess::AppendOnly,
+            ),
+            (wdk_sys::FILE_WRITE_DATA, RegularFileWriteAccess::Positional),
+            (
+                wdk_sys::FILE_WRITE_DATA | wdk_sys::FILE_APPEND_DATA,
+                RegularFileWriteAccess::Positional,
+            ),
+        ] {
+            assert_eq!(
+                super::DesiredAccess::from_raw(raw).regular_file_write_access(),
+                expected
+            );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when no-intermediate append access is rejected before EOF is known.
+    #[test]
+    fn create_stack_accepts_no_intermediate_append_access() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
+            DesiredAccess: wdk_sys::FILE_APPEND_DATA,
+            ..wdk_sys::IO_SECURITY_CONTEXT::default()
+        };
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let create = current.create();
+            assert!(create.is_ok());
+            if let Ok(create) = create {
+                assert_eq!(
+                    create.parameters().transfer_buffering(),
+                    CreateTransferBuffering::NoIntermediate
+                );
+                assert_eq!(
+                    create
+                        .parameters()
+                        .desired_access()
+                        .regular_file_write_access(),
+                    RegularFileWriteAccess::AppendOnly
+                );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when FilePositionInformation is not accepted for set-information.
+    #[test]
+    fn set_file_stack_decodes_position_information() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
+            Length: u32::try_from(core::mem::size_of::<wdk_sys::FILE_POSITION_INFORMATION>())
+                .unwrap_or(u32::MAX),
+            __bindgen_padding_0: 0,
+            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation,
+            FileObject: core::ptr::null_mut(),
+            __bindgen_anon_1:
+                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let set = current.set_file();
+            assert!(set.is_ok());
+            if let Ok(set) = set {
+                assert_eq!(set.information_class(), SetFileInformationClass::Position);
+            }
+        }
+    }
+
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.

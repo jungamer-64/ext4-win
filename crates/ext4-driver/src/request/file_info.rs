@@ -5,14 +5,14 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Permissions,
-    Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileOffset, FileSize,
-    NodeId, RenameTargetCollision, WindowsName, WindowsOverlay,
+    Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileOffset,
+    FileSize, NodeId, RenameTargetCollision, WindowsName, WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
 use crate::irp::{
-    DirectoryChangeFilter, DirectoryCursorPosition, DirectoryEntryEmission, DirectoryEntryIndex,
-    DataIoKind, DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope,
+    DataIoKind, DirectoryChangeFilter, DirectoryCursorPosition, DirectoryEntryEmission,
+    DirectoryEntryIndex, DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope,
     DispatchTarget, IrpBufferLength, IrpCompletion, OwnedIrp, QueryDirectoryStack,
     QueryFileInformationClass, QueryFileStack, ReadStartingPoint, RegularFileWriteAccess,
     SetFileInformationClass, SetFileStack, WriteStartingPoint,
@@ -323,20 +323,29 @@ impl QueryDirectoryRequest {
 /// Returns an error when metadata cannot be loaded, the output buffer is too small, or the requested
 /// information class cannot be packed into its Windows layout.
 fn query_file_information(request: QueryFileRequest) -> DriverResult<IrpCompletion> {
-    let metadata = load_file_metadata(&request.opened_file)?;
     let length = request.stack.length();
     let mut buffer = request.target.buffered_output(length)?;
     let output = buffer.as_mut_slice();
     match request.stack.information_class() {
-        QueryFileInformationClass::Basic => pack_basic_information(output, metadata),
-        QueryFileInformationClass::Standard => pack_standard_information(output, metadata),
-        QueryFileInformationClass::Internal => pack_internal_information(output, metadata),
+        QueryFileInformationClass::Basic => {
+            pack_basic_information(output, load_file_metadata(&request.opened_file)?)
+        }
+        QueryFileInformationClass::Standard => {
+            pack_standard_information(output, load_file_metadata(&request.opened_file)?)
+        }
+        QueryFileInformationClass::Internal => {
+            pack_internal_information(output, load_file_metadata(&request.opened_file)?)
+        }
         QueryFileInformationClass::Position => {
             pack_position_information(output, &request.opened_file)
         }
-        QueryFileInformationClass::NetworkOpen => pack_network_open_information(output, metadata),
+        QueryFileInformationClass::NetworkOpen => {
+            pack_network_open_information(output, load_file_metadata(&request.opened_file)?)
+        }
         QueryFileInformationClass::Name => pack_name_information(output, &request.opened_file),
-        QueryFileInformationClass::AttributeTag => pack_attribute_tag_information(output, metadata),
+        QueryFileInformationClass::AttributeTag => {
+            pack_attribute_tag_information(output, load_file_metadata(&request.opened_file)?)
+        }
     }
 }
 
@@ -2282,8 +2291,7 @@ impl ResolvedFileRange {
     /// Returns an error when the end offset overflows or exceeds `i64::MAX`.
     fn new(start: FileOffset, length: usize) -> DriverResult<Self> {
         let end = start.checked_add_len(length)?;
-        let _signed_end =
-            i64::try_from(end.bytes()).map_err(|_| DriverError::InvalidParameter)?;
+        let _signed_end = i64::try_from(end.bytes()).map_err(|_| DriverError::InvalidParameter)?;
         Ok(Self { start, length })
     }
 
@@ -2298,24 +2306,89 @@ impl ResolvedFileRange {
     }
 }
 
-/// Resolves a read starting point against handle and paging semantics.
+/// Read starting source after paging policy is applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectedReadStart {
+    /// Explicit offset independent of FILE_OBJECT state.
+    Absolute(FileOffset),
+    /// Synchronous FILE_OBJECT current position.
+    CurrentFilePosition,
+}
+
+/// Applies paging policy to a decoded read starting point.
 /// # Errors
 ///
-/// Returns an error when paging I/O requests a handle position or a synchronous position is absent.
+/// Returns an error when paging I/O requests a handle position.
+fn select_read_start(
+    kind: DataIoKind,
+    starting_point: ReadStartingPoint,
+) -> DriverResult<SelectedReadStart> {
+    match (kind, starting_point) {
+        (DataIoKind::Handle, ReadStartingPoint::Absolute(offset))
+        | (DataIoKind::Paging, ReadStartingPoint::Absolute(offset)) => {
+            Ok(SelectedReadStart::Absolute(offset))
+        }
+        (DataIoKind::Handle, ReadStartingPoint::CurrentFilePosition) => {
+            Ok(SelectedReadStart::CurrentFilePosition)
+        }
+        (DataIoKind::Paging, ReadStartingPoint::CurrentFilePosition) => {
+            Err(DriverError::InvalidParameter)
+        }
+    }
+}
+
+/// Resolves a selected read source to a concrete file offset.
+/// # Errors
+///
+/// Returns an error when the selected synchronous position is absent.
 fn resolve_read_start(
     opened_file: &OpenedRegularFile,
     kind: DataIoKind,
     starting_point: ReadStartingPoint,
 ) -> DriverResult<FileOffset> {
-    match (kind, starting_point) {
-        (DataIoKind::Handle, ReadStartingPoint::Absolute(offset))
-        | (DataIoKind::Paging, ReadStartingPoint::Absolute(offset)) => Ok(offset),
-        (DataIoKind::Handle, ReadStartingPoint::CurrentFilePosition) => {
-            opened_file.current_file_position()
-        }
-        (DataIoKind::Paging, ReadStartingPoint::CurrentFilePosition) => {
-            Err(DriverError::InvalidParameter)
-        }
+    match select_read_start(kind, starting_point)? {
+        SelectedReadStart::Absolute(offset) => Ok(offset),
+        SelectedReadStart::CurrentFilePosition => opened_file.current_file_position(),
+    }
+}
+
+/// Write starting source after paging and access policy are applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectedWriteStart {
+    /// Explicit offset independent of FILE_OBJECT state.
+    Absolute(FileOffset),
+    /// Synchronous FILE_OBJECT current position.
+    CurrentFilePosition,
+    /// Latest committed regular-file end.
+    EndOfFile,
+}
+
+/// Applies paging and write-authority policy to a decoded write starting point.
+/// # Errors
+///
+/// Returns an error for denied handle writes or paging sentinel positions.
+fn select_write_start(
+    write_access: RegularFileWriteAccess,
+    kind: DataIoKind,
+    starting_point: WriteStartingPoint,
+) -> DriverResult<SelectedWriteStart> {
+    if kind == DataIoKind::Paging {
+        return match starting_point {
+            WriteStartingPoint::Absolute(offset) => Ok(SelectedWriteStart::Absolute(offset)),
+            WriteStartingPoint::CurrentFilePosition | WriteStartingPoint::EndOfFile => {
+                Err(DriverError::InvalidParameter)
+            }
+        };
+    }
+
+    match write_access {
+        RegularFileWriteAccess::Denied => Err(DriverError::AccessDenied),
+        RegularFileWriteAccess::AppendOnly => Ok(SelectedWriteStart::EndOfFile),
+        RegularFileWriteAccess::Positional => match starting_point {
+            WriteStartingPoint::Absolute(offset) => Ok(SelectedWriteStart::Absolute(offset)),
+            WriteStartingPoint::CurrentFilePosition => Ok(SelectedWriteStart::CurrentFilePosition),
+            WriteStartingPoint::EndOfFile => Ok(SelectedWriteStart::EndOfFile),
+        },
     }
 }
 
@@ -2329,23 +2402,19 @@ fn resolve_write_start(
     kind: DataIoKind,
     starting_point: WriteStartingPoint,
 ) -> DriverResult<FileOffset> {
-    if kind == DataIoKind::Paging {
-        return match starting_point {
-            WriteStartingPoint::Absolute(offset) => Ok(offset),
-            WriteStartingPoint::CurrentFilePosition | WriteStartingPoint::EndOfFile => {
-                Err(DriverError::InvalidParameter)
-            }
-        };
-    }
-
-    match opened_file.write_access() {
-        RegularFileWriteAccess::Denied => Err(DriverError::AccessDenied),
-        RegularFileWriteAccess::AppendOnly => regular_file_end(opened_file),
-        RegularFileWriteAccess::Positional => match starting_point {
-            WriteStartingPoint::Absolute(offset) => Ok(offset),
-            WriteStartingPoint::CurrentFilePosition => opened_file.current_file_position(),
-            WriteStartingPoint::EndOfFile => regular_file_end(opened_file),
-        },
+    let current_position = if kind == DataIoKind::Handle
+        && starting_point == WriteStartingPoint::CurrentFilePosition
+    {
+        Some(opened_file.current_file_position()?)
+    } else {
+        None
+    };
+    match select_write_start(opened_file.write_access(), kind, starting_point)? {
+        SelectedWriteStart::Absolute(offset) => Ok(offset),
+        SelectedWriteStart::CurrentFilePosition => {
+            current_position.ok_or(DriverError::InvalidParameter)
+        }
+        SelectedWriteStart::EndOfFile => regular_file_end(opened_file),
     }
 }
 
@@ -2383,9 +2452,10 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
         opened_file.update_current_file_position(kind, range.start(), 0)?;
         return Ok(IrpCompletion::EMPTY);
     }
-    if !opened_file
-        .file_control_block()
-        .permits_byte_range_read(
+    let mut output = target.data_output(length)?;
+    data_transfer_mode.validate_buffer(output.address())?;
+    if kind == DataIoKind::Handle
+        && !opened_file.file_control_block().permits_byte_range_read(
             target,
             opened_file.file_object(),
             range.start(),
@@ -2395,8 +2465,6 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     {
         return Err(DriverError::FileLockConflict);
     }
-    let mut output = target.data_output(length)?;
-    data_transfer_mode.validate_buffer(output.address())?;
     let vcb = unsafe {
         // SAFETY: OpenedRegularFile is decoded from a live FCB whose VCB
         // pointer remains valid for the opened FILE_OBJECT lifetime.
@@ -2432,9 +2500,10 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
         opened_file.update_current_file_position(kind, range.start(), 0)?;
         return Ok(IrpCompletion::EMPTY);
     }
-    if !opened_file
-        .file_control_block()
-        .permits_byte_range_write(
+    let input = target.data_input(length)?;
+    data_transfer_mode.validate_buffer(input.address())?;
+    if kind == DataIoKind::Handle
+        && !opened_file.file_control_block().permits_byte_range_write(
             target,
             opened_file.file_object(),
             range.start(),
@@ -2444,8 +2513,6 @@ fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     {
         return Err(DriverError::FileLockConflict);
     }
-    let input = target.data_input(length)?;
-    data_transfer_mode.validate_buffer(input.address())?;
     let mut vcb = opened_file.volume();
     let vcb = unsafe {
         // SAFETY: FCBs are constructed only from live mounted VCB pointers and
@@ -2512,12 +2579,15 @@ fn release_file_contexts(file_object: KernelFileObject) {
 mod tests {
     use core::ptr::NonNull;
 
-    use crate::irp::{DirectoryInformationClass, DispatchTarget, RegularFileWriteAccess};
+    use crate::irp::{
+        DataIoKind, DirectoryInformationClass, DispatchTarget, ReadStartingPoint,
+        RegularFileWriteAccess, WriteStartingPoint,
+    };
     use crate::kernel::status::DriverError;
     use crate::state::OpenedLocation;
     use ext4_core::{
         BlockSize, DirectoryNodeId, Ext4Gid, Ext4LinkCount, Ext4Name, Ext4Owner, Ext4Permissions,
-        Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileSize, NodeId, WindowsName,
+        Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileOffset, FileSize, NodeId, WindowsName,
     };
 
     fn test_metadata(kind: super::FileMetadataKind) -> Option<super::FileMetadata> {
@@ -2655,6 +2725,200 @@ mod tests {
             core::ptr::addr_of_mut!(*device),
             core::ptr::addr_of_mut!(*irp),
         )
+    }
+
+    /// # Panics
+    ///
+    /// Panics when paging read policy accepts a FILE_OBJECT current-position dependency.
+    #[test]
+    fn read_start_selection_separates_handle_and_paging_io() {
+        let explicit = FileOffset::from_bytes(4096);
+        assert_eq!(
+            super::select_read_start(DataIoKind::Paging, ReadStartingPoint::Absolute(explicit),),
+            Ok(super::SelectedReadStart::Absolute(explicit))
+        );
+        assert_eq!(
+            super::select_read_start(DataIoKind::Handle, ReadStartingPoint::CurrentFilePosition,),
+            Ok(super::SelectedReadStart::CurrentFilePosition)
+        );
+        assert_eq!(
+            super::select_read_start(DataIoKind::Paging, ReadStartingPoint::CurrentFilePosition,),
+            Err(DriverError::InvalidParameter)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when append-only writes retain a caller-selected starting point.
+    #[test]
+    fn append_only_write_selection_always_uses_end_of_file() {
+        for starting_point in [
+            WriteStartingPoint::Absolute(FileOffset::from_bytes(1)),
+            WriteStartingPoint::CurrentFilePosition,
+            WriteStartingPoint::EndOfFile,
+        ] {
+            assert_eq!(
+                super::select_write_start(
+                    RegularFileWriteAccess::AppendOnly,
+                    DataIoKind::Handle,
+                    starting_point,
+                ),
+                Ok(super::SelectedWriteStart::EndOfFile)
+            );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when denied, positional, or paging write policy selects the wrong source.
+    #[test]
+    fn write_start_selection_enforces_access_and_paging_policy() {
+        let explicit = FileOffset::from_bytes(8192);
+        assert_eq!(
+            super::select_write_start(
+                RegularFileWriteAccess::Denied,
+                DataIoKind::Handle,
+                WriteStartingPoint::Absolute(explicit),
+            ),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            super::select_write_start(
+                RegularFileWriteAccess::Positional,
+                DataIoKind::Handle,
+                WriteStartingPoint::CurrentFilePosition,
+            ),
+            Ok(super::SelectedWriteStart::CurrentFilePosition)
+        );
+        assert_eq!(
+            super::select_write_start(
+                RegularFileWriteAccess::Denied,
+                DataIoKind::Paging,
+                WriteStartingPoint::Absolute(explicit),
+            ),
+            Ok(super::SelectedWriteStart::Absolute(explicit))
+        );
+        assert_eq!(
+            super::select_write_start(
+                RegularFileWriteAccess::Positional,
+                DataIoKind::Paging,
+                WriteStartingPoint::EndOfFile,
+            ),
+            Err(DriverError::InvalidParameter)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when resolved ranges cross the signed Windows file-offset boundary.
+    #[test]
+    fn resolved_file_range_rejects_signed_end_overflow() {
+        assert!(super::ResolvedFileRange::new(FileOffset::from_bytes(4096), 0).is_ok());
+        assert_eq!(
+            super::ResolvedFileRange::new(FileOffset::from_bytes(i64::MAX.unsigned_abs()), 1,)
+                .err(),
+            Some(DriverError::InvalidParameter)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when FilePositionInformation does not round-trip through the typed FILE_OBJECT state.
+    #[test]
+    fn file_position_information_set_and_query_round_trip() {
+        let volume = NonNull::<crate::state::VolumeControlBlock>::dangling();
+        let mut fcb =
+            crate::state::FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut handle = crate::state::OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            crate::state::OpenedNodeMode::Direct,
+            OpenedLocation::Root,
+            crate::state::CloseDisposition::Keep,
+            crate::state::WriteCommitment::CommitOnly,
+            crate::state::DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
+        );
+        let mut file_object = wdk_sys::FILE_OBJECT {
+            FsContext: core::ptr::addr_of_mut!(fcb).cast(),
+            FsContext2: core::ptr::addr_of_mut!(handle).cast(),
+            Flags: wdk_sys::FO_SYNCHRONOUS_IO,
+            ..wdk_sys::FILE_OBJECT::default()
+        };
+        let mut input = wdk_sys::FILE_POSITION_INFORMATION {
+            CurrentByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 12_345 },
+        };
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: core::ptr::addr_of_mut!(file_object),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
+            Length: u32::try_from(core::mem::size_of_val(&input)).unwrap_or(u32::MAX),
+            __bindgen_padding_0: 0,
+            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation,
+            FileObject: core::ptr::null_mut(),
+            __bindgen_anon_1:
+                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
+        };
+        let mut irp = wdk_sys::IRP::default();
+        irp.AssociatedIrp.SystemBuffer = core::ptr::addr_of_mut!(input).cast();
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let target = target_from_stack(&mut stack, &mut irp, &mut device);
+        assert!(target.is_ok());
+        let Ok(target) = target else {
+            return;
+        };
+        let request = super::SetFileRequest::decode(target);
+        assert!(request.is_ok());
+        if let Ok(request) = request {
+            assert_eq!(super::set_position_information(request), Ok(()));
+        }
+
+        let file_object_boundary =
+            crate::state::KernelFileObject::from_raw(core::ptr::addr_of_mut!(file_object));
+        assert!(file_object_boundary.is_some());
+        let Some(file_object_boundary) = file_object_boundary else {
+            return;
+        };
+        let opened = crate::state::OpenedObject::decode(file_object_boundary);
+        assert!(opened.is_ok());
+        let Ok(opened) = opened else {
+            return;
+        };
+        let mut output = [0_u8; core::mem::size_of::<wdk_sys::FILE_POSITION_INFORMATION>()];
+        assert!(super::pack_position_information(&mut output, &opened).is_ok());
+        let encoded = output.get(..core::mem::size_of::<i64>());
+        assert!(encoded.is_some());
+        let Some(encoded) = encoded else {
+            return;
+        };
+        let encoded = <[u8; core::mem::size_of::<i64>()]>::try_from(encoded);
+        assert!(encoded.is_ok());
+        if let Ok(encoded) = encoded {
+            assert_eq!(i64::from_ne_bytes(encoded), 12_345);
+        }
+
+        let mut negative_input = wdk_sys::FILE_POSITION_INFORMATION {
+            CurrentByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: -1 },
+        };
+        irp.AssociatedIrp.SystemBuffer = core::ptr::addr_of_mut!(negative_input).cast();
+        let negative_target = target_from_stack(&mut stack, &mut irp, &mut device);
+        assert!(negative_target.is_ok());
+        let Ok(negative_target) = negative_target else {
+            return;
+        };
+        let request = super::SetFileRequest::decode(negative_target);
+        assert!(request.is_ok());
+        if let Ok(request) = request {
+            assert_eq!(
+                super::set_position_information(request),
+                Err(DriverError::InvalidParameter)
+            );
+        }
+        let unchanged = unsafe {
+            // SAFETY: Tests consistently use the QuadPart LARGE_INTEGER arm.
+            file_object.CurrentByteOffset.QuadPart
+        };
+        assert_eq!(unchanged, 12_345);
     }
 
     /// # Panics
