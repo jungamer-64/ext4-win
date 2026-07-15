@@ -348,6 +348,7 @@ dependencies = [
 name = "ext4win"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "ext4-core",
  "wdk-alloc",
  "wdk-build",
