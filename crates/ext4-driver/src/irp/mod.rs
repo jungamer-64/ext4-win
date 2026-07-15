@@ -1,5 +1,6 @@
 //! Typed IRP boundary shared by FSD dispatch modules.
 
+use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
@@ -12,10 +13,12 @@ use wdk_sys::{
 #[cfg(not(test))]
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
+use crate::memory;
 use crate::state::{
     CloseDisposition, DirectoryChangeNotifier, DirectoryNotificationRegistration, FileControlBlock,
     KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb, WriteCommitment,
 };
+use crate::wire::{LittleEndianInput, WireOffset};
 
 /// Completion priority boost for IRPs that should not adjust thread priority.
 #[cfg(not(test))]
@@ -111,6 +114,90 @@ impl IrpCompletion {
     const fn information(self) -> InformationLength {
         self.information
     }
+}
+
+/// Owned, exact-length symbolic-link buffer returned to the I/O Manager for create-name reparsing.
+///
+/// Dropping this value releases the allocation. Ownership leaves Rust only when a successful
+/// create symlink completion installs the allocation in `IRP::Tail.Overlay.AuxiliaryBuffer`.
+#[derive(Debug)]
+pub(crate) struct CreateSymlinkReparseBuffer {
+    /// Nonpaged bytes in driver builds and ordinary globally allocated bytes in tests.
+    bytes: Box<[u8]>,
+}
+
+impl CreateSymlinkReparseBuffer {
+    /// Allocates, packs, and seals one exact-length symbolic-link reparse buffer.
+    /// # Errors
+    ///
+    /// Returns an error when `length` is zero or not representable, allocation or packing fails,
+    /// the packer writes a different length, or the completed header is not an exact symlink
+    /// reparse buffer.
+    pub(crate) fn try_pack_exact(
+        length: usize,
+        pack: impl FnOnce(&mut [u8]) -> DriverResult<usize>,
+    ) -> DriverResult<Self> {
+        if length == 0 {
+            return Err(DriverError::InvalidBufferSize);
+        }
+        let mut bytes = memory::boxed_zeroed_bytes(length)?;
+        if pack(&mut bytes)? != length {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        Self::validate_header(&bytes)?;
+        Ok(Self { bytes })
+    }
+
+    /// Transfers the allocation as the thin pool pointer expected by the IRP auxiliary field.
+    fn into_raw(self) -> *mut wdk_sys::CHAR {
+        Box::into_raw(self.bytes)
+            .cast::<u8>()
+            .cast::<wdk_sys::CHAR>()
+    }
+
+    /// Verifies the tag and exact `ReparseDataLength` before the buffer becomes completable.
+    /// # Errors
+    ///
+    /// Returns an internal-invariant error when the packed header is truncated, uses another tag,
+    /// exceeds the Windows reparse limit, or declares a non-exact payload length.
+    fn validate_header(bytes: &[u8]) -> DriverResult<()> {
+        const REPARSE_HEADER_LENGTH: usize = 8;
+        const SYMLINK_PAYLOAD_HEADER_LENGTH: usize = 12;
+
+        let maximum_length = usize::try_from(wdk_sys::MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        if bytes.len() > maximum_length {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let input = LittleEndianInput::new(bytes);
+        let tag = input
+            .read_u32(WireOffset::new(0))
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        if tag != wdk_sys::IO_REPARSE_TAG_SYMLINK {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let data_length = usize::from(
+            input
+                .read_u16(WireOffset::new(4))
+                .map_err(|_| DriverError::InternalInvariantViolation)?,
+        );
+        if data_length < SYMLINK_PAYLOAD_HEADER_LENGTH
+            || REPARSE_HEADER_LENGTH.checked_add(data_length) != Some(bytes.len())
+        {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        Ok(())
+    }
+}
+
+/// Mutually exclusive terminal outcomes of a create/open request.
+#[derive(Debug)]
+#[must_use]
+pub(crate) enum CreateCompletion {
+    /// The target was opened and the create IRP completes normally.
+    Opened,
+    /// Name resolution must continue through the Microsoft symbolic-link reparse handler.
+    ReparseSymlink(CreateSymlinkReparseBuffer),
 }
 
 /// IRP major-function slot owned by the ext4win dispatch boundary.
@@ -547,6 +634,21 @@ impl OwnedIrp {
             Ok(completion) => completion,
             Err(error) => IrpCompletion::from_error(error),
         })
+    }
+
+    /// Completes a create IRP from its ownership-bearing, mutually exclusive result.
+    ///
+    /// Normal opens use the ordinary success completion. A successful reparse transfers the
+    /// auxiliary buffer to the I/O Manager immediately before completing with `STATUS_REPARSE`.
+    /// Failed results never transfer an allocation.
+    pub(crate) fn complete_create_result(self, result: DriverResult<CreateCompletion>) -> NTSTATUS {
+        match result {
+            Ok(CreateCompletion::Opened) => self.complete(IrpCompletion::EMPTY),
+            Ok(CreateCompletion::ReparseSymlink(buffer)) => {
+                self.target.irp.complete_create_symlink_reparse(buffer)
+            }
+            Err(error) => self.complete(IrpCompletion::from_error(error)),
+        }
     }
 
     /// Transfers this queued directory-change IRP's terminal completion authority to FsRtl.
@@ -1288,27 +1390,60 @@ impl KernelIrp {
 
     /// Writes status and byte count to the IRP status block.
     fn write_status_block(self, completion: IrpCompletion) {
+        self.write_status_and_information(
+            completion.status(),
+            completion.information().as_ulong_ptr(),
+        );
+    }
+
+    /// Writes the raw WDK completion pair after a typed completion path selected its semantics.
+    fn write_status_and_information(self, status: NTSTATUS, information: wdk_sys::ULONG_PTR) {
+        let mut irp = self.irp;
         let irp = unsafe {
             // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP
-            // pointer supplied by the active WDK dispatch callback.
-            self.irp.as_ptr().as_mut()
+            // pointer, and the unique completion path owns terminal-field writes.
+            irp.as_mut()
         };
-        if let Some(irp) = irp {
-            irp.IoStatus.__bindgen_anon_1.Status = completion.status();
-            irp.IoStatus.Information = completion.information().as_ulong_ptr();
+        irp.IoStatus.__bindgen_anon_1.Status = status;
+        irp.IoStatus.Information = information;
+    }
+
+    /// Installs a Rust-owned create reparse allocation into the IRP tail overlay.
+    fn install_create_symlink_reparse_buffer(self, buffer: CreateSymlinkReparseBuffer) {
+        let mut irp = self.irp;
+        let irp = unsafe {
+            // SAFETY: `KernelIrp` retains the non-null active IRP, and unique
+            // completion authority permits mutation of its terminal fields.
+            irp.as_mut()
+        };
+        irp.Tail.Overlay.AuxiliaryBuffer = buffer.into_raw();
+    }
+
+    /// Invokes the I/O Manager after the unique owner wrote all terminal IRP fields.
+    fn finish_completion(self, status: NTSTATUS) -> NTSTATUS {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The IRP pointer belongs to the unique completion owner
+            // and the calling completion path wrote every terminal field first.
+            ffi::IofCompleteRequest(self.as_mut_ptr(), IO_NO_INCREMENT_PRIORITY);
         }
+        status
+    }
+
+    /// Transfers a create reparse buffer to the I/O Manager and completes exactly once.
+    fn complete_create_symlink_reparse(self, buffer: CreateSymlinkReparseBuffer) -> NTSTATUS {
+        // A name-surrogate buffer is identified by its reparse tag. `IO_REPARSE` is reserved for
+        // the separate contract where the filesystem has already replaced FILE_OBJECT::FileName.
+        let information = wdk_sys::ULONG_PTR::from(wdk_sys::IO_REPARSE_TAG_SYMLINK);
+        self.install_create_symlink_reparse_buffer(buffer);
+        self.write_status_and_information(wdk_sys::STATUS_REPARSE, information);
+        self.finish_completion(wdk_sys::STATUS_REPARSE)
     }
 
     /// Completes the IRP through the I/O Manager.
     fn complete(self, completion: IrpCompletion) -> NTSTATUS {
         self.write_status_block(completion);
-        #[cfg(not(test))]
-        unsafe {
-            // SAFETY: The IRP pointer belongs to the current dispatch callback
-            // and has had its final status block written immediately above.
-            ffi::IofCompleteRequest(self.as_mut_ptr(), IO_NO_INCREMENT_PRIORITY);
-        }
-        completion.status()
+        self.finish_completion(completion.status())
     }
 }
 
@@ -3573,22 +3708,23 @@ impl SetSecurityStack {
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
     use core::ffi::c_void;
 
     use ext4_core::FileOffset;
     use wdk_sys::{STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
 
     use super::{
-        CREATE_DISPOSITION_SHIFT, CreateDisposition, CreateNameInterpretation,
-        CreateReparsePointMode, CreateSynchronizationMode, CreateTargetRequirement,
-        CreateTransferBuffering, CurrentIrpStackLocation, DataIoKind, DeviceIrpQueue,
-        DirectoryChangeFilter, DirectoryControlMinorFunction, DirectoryCursorPosition,
-        DirectoryEntryEmission, DirectoryInformationClass, DirectoryPatternInput,
-        DirectoryWatchScope, DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection,
-        FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION, FileSystemControlMinorFunction,
-        FsControlCode, InformationLength, IrpBufferLength, IrpCompletion, KernelIrp,
-        QueryFileInformationClass, QueryVolumeInformationClass, QueueWorkerState,
-        ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, STATUS_CANCELLED,
+        CREATE_DISPOSITION_SHIFT, CreateCompletion, CreateDisposition, CreateNameInterpretation,
+        CreateReparsePointMode, CreateSymlinkReparseBuffer, CreateSynchronizationMode,
+        CreateTargetRequirement, CreateTransferBuffering, CurrentIrpStackLocation, DataIoKind,
+        DeviceIrpQueue, DirectoryChangeFilter, DirectoryControlMinorFunction,
+        DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
+        DirectoryPatternInput, DirectoryWatchScope, DispatchTarget, EaEntryEmission, EaEntryIndex,
+        EaSelection, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
+        FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
+        IrpCompletion, KernelIrp, OwnedIrp, QueryFileInformationClass, QueryVolumeInformationClass,
+        QueueWorkerState, ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, STATUS_CANCELLED,
         SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
         WriteStartingPoint,
     };
@@ -3722,6 +3858,186 @@ mod tests {
             },
             STATUS_INVALID_PARAMETER
         );
+        assert_eq!(irp.IoStatus.Information, 0);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when an empty allocation can become an invalid dangling auxiliary buffer.
+    #[test]
+    fn create_reparse_buffer_rejects_empty_allocation() {
+        assert_eq!(
+            CreateSymlinkReparseBuffer::try_pack_exact(0, |_| Ok(0)).err(),
+            Some(crate::kernel::status::DriverError::InvalidBufferSize)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a mismatched tag, declared length, or actual write length can become a sealed
+    /// symbolic-link completion buffer.
+    #[test]
+    fn create_symlink_reparse_buffer_seals_only_exact_matching_wire_data() {
+        const VALID: [u8; 22] = [
+            0x0C, 0x00, 0x00, 0xA0, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00,
+        ];
+        let invalid_tag = CreateSymlinkReparseBuffer::try_pack_exact(VALID.len(), |output| {
+            output.copy_from_slice(&VALID);
+            if let Some(tag) = output.first_mut() {
+                *tag = 0;
+            }
+            Ok(VALID.len())
+        });
+        assert_eq!(
+            invalid_tag.err(),
+            Some(crate::kernel::status::DriverError::InternalInvariantViolation)
+        );
+        let invalid_declared_length =
+            CreateSymlinkReparseBuffer::try_pack_exact(VALID.len(), |output| {
+                output.copy_from_slice(&VALID);
+                if let Some(length) = output.get_mut(4) {
+                    *length = 0;
+                }
+                Ok(VALID.len())
+            });
+        assert_eq!(
+            invalid_declared_length.err(),
+            Some(crate::kernel::status::DriverError::InternalInvariantViolation)
+        );
+        let incomplete_write = CreateSymlinkReparseBuffer::try_pack_exact(VALID.len(), |output| {
+            output.copy_from_slice(&VALID);
+            Ok(VALID.len() - 1)
+        });
+        assert_eq!(
+            incomplete_write.err(),
+            Some(crate::kernel::status::DriverError::InternalInvariantViolation)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when create reparse completion does not transfer the exact allocation and publish the
+    /// WDK reparse status pair.
+    #[test]
+    fn create_reparse_completion_transfers_exact_auxiliary_buffer() {
+        const EXPECTED: [u8; 22] = [
+            0x0C, 0x00, 0x00, 0xA0, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00,
+        ];
+
+        let mut device_object = wdk_sys::DEVICE_OBJECT::default();
+        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device_object));
+        assert!(device.is_some());
+        let Some(device) = device else {
+            return;
+        };
+        let mut irp = wdk_sys::IRP::default();
+        let owned = OwnedIrp::from_raw(device, core::ptr::addr_of_mut!(irp));
+        assert!(owned.is_some());
+        let Some(owned) = owned else {
+            return;
+        };
+
+        let buffer = CreateSymlinkReparseBuffer::try_pack_exact(EXPECTED.len(), |output| {
+            output.copy_from_slice(&EXPECTED);
+            Ok(EXPECTED.len())
+        });
+        assert!(buffer.is_ok());
+        let mut completion_status = None;
+        if let Ok(buffer) = buffer {
+            completion_status =
+                Some(owned.complete_create_result(Ok(CreateCompletion::ReparseSymlink(buffer))));
+        }
+
+        let auxiliary = unsafe {
+            // SAFETY: The create reparse completion selected and initialized the
+            // active IRP tail overlay immediately above.
+            irp.Tail.Overlay.AuxiliaryBuffer
+        };
+        let reclaimed = NonNull::new(auxiliary).map(|auxiliary| {
+            let allocation = core::ptr::slice_from_raw_parts_mut(
+                auxiliary.as_ptr().cast::<u8>(),
+                EXPECTED.len(),
+            );
+            unsafe {
+                // SAFETY: `complete_create_result` obtained this pointer from one
+                // `Box<[u8]>` of exactly `EXPECTED.len()` bytes. Unit tests do not
+                // invoke the I/O Manager, so this reconstruction is its sole owner.
+                Box::from_raw(allocation)
+            }
+        });
+        irp.Tail.Overlay.AuxiliaryBuffer = core::ptr::null_mut();
+
+        assert_eq!(completion_status, Some(wdk_sys::STATUS_REPARSE));
+        assert_eq!(irp_status(&irp), wdk_sys::STATUS_REPARSE);
+        assert_eq!(
+            irp.IoStatus.Information,
+            wdk_sys::ULONG_PTR::from(wdk_sys::IO_REPARSE_TAG_SYMLINK)
+        );
+        assert_eq!(reclaimed.as_deref(), Some(EXPECTED.as_slice()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a normal create completion publishes an auxiliary allocation or a non-success
+    /// status pair.
+    #[test]
+    fn opened_create_completion_uses_ordinary_empty_success() {
+        let mut device_object = wdk_sys::DEVICE_OBJECT::default();
+        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device_object));
+        assert!(device.is_some());
+        let Some(device) = device else {
+            return;
+        };
+        let mut irp = wdk_sys::IRP::default();
+        let owned = OwnedIrp::from_raw(device, core::ptr::addr_of_mut!(irp));
+        assert!(owned.is_some());
+        if let Some(owned) = owned {
+            assert_eq!(
+                owned.complete_create_result(Ok(CreateCompletion::Opened)),
+                wdk_sys::STATUS_SUCCESS
+            );
+        }
+
+        let auxiliary = unsafe {
+            // SAFETY: The test reads the active tail overlay after create completion.
+            irp.Tail.Overlay.AuxiliaryBuffer
+        };
+        assert!(auxiliary.is_null());
+        assert_eq!(irp_status(&irp), wdk_sys::STATUS_SUCCESS);
+        assert_eq!(irp.IoStatus.Information, 0);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a failed create request publishes ownership into the IRP tail overlay.
+    #[test]
+    fn failed_create_completion_never_publishes_auxiliary_buffer() {
+        let mut device_object = wdk_sys::DEVICE_OBJECT::default();
+        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device_object));
+        assert!(device.is_some());
+        let Some(device) = device else {
+            return;
+        };
+        let mut irp = wdk_sys::IRP::default();
+        let owned = OwnedIrp::from_raw(device, core::ptr::addr_of_mut!(irp));
+        assert!(owned.is_some());
+        if let Some(owned) = owned {
+            assert_eq!(
+                owned.complete_create_result(Err(
+                    crate::kernel::status::DriverError::InvalidParameter
+                )),
+                wdk_sys::STATUS_INVALID_PARAMETER
+            );
+        }
+
+        let auxiliary = unsafe {
+            // SAFETY: The test reads the active tail overlay after failed create completion.
+            irp.Tail.Overlay.AuxiliaryBuffer
+        };
+        assert!(auxiliary.is_null());
+        assert_eq!(irp_status(&irp), wdk_sys::STATUS_INVALID_PARAMETER);
         assert_eq!(irp.IoStatus.Information, 0);
     }
 

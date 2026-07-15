@@ -338,6 +338,9 @@ pub(crate) fn execute_queued(owned: OwnedIrp) -> NTSTATUS {
         Ok(major) => major,
         Err(error) => return owned.complete_result(Err(error)),
     };
+    if major == DispatchMajor::Create {
+        return owned.complete_create_result(crate::request::create::execute(target));
+    }
     if major == DispatchMajor::DirectoryControl {
         let minor = match target.current_stack() {
             Ok(stack) => stack.directory_control_minor(),
@@ -392,7 +395,8 @@ fn execute_immediate(major: DispatchMajor, target: DispatchTarget) -> DriverResu
 /// Returns an error when the selected request implementation rejects the decoded IRP.
 fn execute_major(major: DispatchMajor, target: DispatchTarget) -> DriverResult<IrpCompletion> {
     match major {
-        DispatchMajor::Create => crate::request::create::execute(target),
+        // Create has an ownership-bearing completion path selected by execute_queued.
+        DispatchMajor::Create => Err(DriverError::InvalidDeviceRequest),
         DispatchMajor::Close => crate::request::file_info::close(target),
         DispatchMajor::Cleanup => crate::request::file_info::cleanup(target),
         DispatchMajor::Read => crate::request::file_info::read(target),
@@ -418,9 +422,14 @@ fn execute_major(major: DispatchMajor, target: DispatchTarget) -> DriverResult<I
 
 #[cfg(test)]
 mod tests {
-    use crate::irp::DispatchMajor;
+    use core::ptr::NonNull;
 
-    use super::{DispatchPolicy, dispatch_policy};
+    use crate::{
+        irp::{DispatchMajor, DispatchTarget},
+        kernel::status::DriverError,
+    };
+
+    use super::{DispatchPolicy, dispatch_policy, execute_major};
 
     /// # Panics
     ///
@@ -453,5 +462,23 @@ mod tests {
             dispatch_policy(DispatchMajor::Cleanup),
             DispatchPolicy::QueuedCleanup
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when create execution can re-enter the generic, ownership-free completion path.
+    #[test]
+    fn generic_major_execution_rejects_create() {
+        let target = DispatchTarget::decode(
+            NonNull::<wdk_sys::DEVICE_OBJECT>::dangling().as_ptr(),
+            NonNull::<wdk_sys::IRP>::dangling().as_ptr(),
+        );
+        assert!(target.is_ok());
+        if let Ok(target) = target {
+            assert_eq!(
+                execute_major(DispatchMajor::Create, target),
+                Err(DriverError::InvalidDeviceRequest)
+            );
+        }
     }
 }
