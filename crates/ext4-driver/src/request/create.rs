@@ -4,9 +4,7 @@ use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::{
-    ChildLookup, DirectoryNodeId, Ext4Name, FileNodeId, FileSize, NodeId, WindowsName,
-};
+use ext4_core::{ChildLookup, DirectoryNodeId, Ext4Name, NodeId, WindowsName};
 use wdk_sys::FILE_OBJECT;
 
 use crate::{
@@ -24,11 +22,11 @@ use crate::{
         reparse::{NodeSymlinkReparsePoint, UnparsedPathLength},
     },
     state::{
-        ChildCreationTarget, CloseDisposition, DataTransferMode, DirectoryNameChange,
-        DirectoryNameChangeAction, FileControlBlock, KernelDevice, KernelFileObject,
-        MountedVolumeDevice, NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode,
-        OpenedObject, PendingChildCreation, UninitializedFileObject, VolumeControlBlock,
-        WriteCommitment, release_file_control_block,
+        ChildCreationTarget, DataTransferMode, DirectoryNameChange, DirectoryNameChangeAction,
+        FileControlBlock, KernelDevice, KernelFileObject, MountedVolumeDevice,
+        NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
+        PendingChildCreation, UninitializedFileObject, VolumeControlBlock, WriteCommitment,
+        release_file_control_block,
     },
 };
 
@@ -111,7 +109,6 @@ fn open_or_create(request: CreateRequest) -> DriverResult<CreateCompletion> {
         request.parameters().name_interpretation(),
         request.parameters().reparse_point_mode(),
         disposition,
-        request.parameters().close_disposition(),
     ) {
         Ok(CreateTargetLookup::Existing {
             node,
@@ -191,8 +188,6 @@ struct CreateHandlePolicy {
     existing_operation_access: ExistingOperationAccess,
     /// Share mask used for Windows share-access accounting.
     share_access: ShareAccess,
-    /// Cleanup-time lifecycle requested by create options.
-    close_disposition: CloseDisposition,
     /// Write completion durability requested by create options.
     write_commitment: WriteCommitment,
     /// Data transfer buffering policy stored on the opened handle.
@@ -214,7 +209,6 @@ impl CreateHandlePolicy {
             desired_access: parameters.desired_access(),
             existing_operation_access: parameters.existing_operation_access(),
             share_access: parameters.share_access(),
-            close_disposition: parameters.close_disposition(),
             write_commitment: parameters.write_commitment(),
             data_transfer_mode: match parameters.transfer_buffering() {
                 CreateTransferBuffering::IntermediateAllowed => {
@@ -242,11 +236,6 @@ impl CreateHandlePolicy {
     /// Returns the share access mask.
     const fn share_access(self) -> ShareAccess {
         self.share_access
-    }
-
-    /// Returns the cleanup-time lifecycle.
-    const fn close_disposition(self) -> CloseDisposition {
-        self.close_disposition
     }
 
     /// Returns write completion durability.
@@ -526,7 +515,7 @@ impl CreatePathAnchor {
 /// # Errors
 ///
 /// Returns an error when existing-node options conflict, create-only disposition collides, share
-/// access fails, or overwrite truncation fails.
+/// access fails, or an incomplete destructive disposition is requested.
 fn open_existing_node(
     request: CreateRequest,
     vcb: NonNull<crate::state::VolumeControlBlock>,
@@ -552,40 +541,10 @@ fn open_existing_node(
         }
         CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
         CreateDisposition::Overwrite | CreateDisposition::OverwriteIf => {
-            let inode = existing_overwrite_file(node, node_mode, parameters.target_requirement())?;
-            let handle = memory::boxed_try_with(|| {
-                Ok(OpenedHandle::new(
-                    node,
-                    node_mode,
-                    location,
-                    policy.close_disposition(),
-                    policy.write_commitment(),
-                    policy.data_transfer_mode(),
-                    policy.regular_file_write_access(),
-                ))
-            })?;
-            let fcb = open_shared_file_control_block(
-                request.file_object(),
-                vcb,
-                node,
-                policy.desired_access(),
-                policy.existing_operation_access(),
-                policy.share_access(),
-            )?;
-            match truncate_existing_file(vcb, inode) {
-                Ok(()) => {
-                    attach_preallocated_file_object(
-                        request.file_object(),
-                        fcb,
-                        handle,
-                        policy.file_object_flags(),
-                    );
-                    Ok(CreateAction::Overwritten)
-                }
-                Err(error) => {
-                    abandon_file_control_block(request.file_object().kernel_file_object(), fcb);
-                    Err(error)
-                }
+            validate_existing_node_options(node, parameters.target_requirement())?;
+            match node {
+                NodeId::Directory(directory) => Err(destructive_directory_error(directory)),
+                NodeId::File(_) | NodeId::Symlink(_) => Err(DriverError::NotSupported),
             }
         }
         CreateDisposition::Supersede => {
@@ -595,30 +554,6 @@ fn open_existing_node(
                 NodeId::File(_) | NodeId::Symlink(_) => Err(DriverError::NotSupported),
             }
         }
-    }
-}
-
-/// Resolves the ext4 regular file whose unnamed data stream is affected by overwrite.
-/// # Errors
-///
-/// Returns an error when overwrite is requested for a directory or a native symlink reparse point
-/// whose Windows stream projection has not yet been normalized independently from target bytes.
-fn existing_overwrite_file(
-    node: NodeId,
-    node_mode: OpenedNodeMode,
-    requirement: CreateTargetRequirement,
-) -> DriverResult<FileNodeId> {
-    if matches!(requirement, CreateTargetRequirement::Directory) {
-        return Err(DriverError::InvalidParameter);
-    }
-    validate_existing_node_options(node, requirement)?;
-    match node {
-        NodeId::File(file) => Ok(file),
-        NodeId::Directory(directory) => Err(destructive_directory_error(directory)),
-        NodeId::Symlink(_) if node_mode == OpenedNodeMode::ReparsePoint => {
-            Err(DriverError::NotSupported)
-        }
-        NodeId::Symlink(_) => Err(DriverError::InternalInvariantViolation),
     }
 }
 
@@ -677,7 +612,6 @@ fn create_missing_node(
             node,
             OpenedNodeMode::Direct,
             location,
-            policy.close_disposition(),
             policy.write_commitment(),
             policy.data_transfer_mode(),
             policy.regular_file_write_access(),
@@ -752,29 +686,6 @@ fn validate_existing_node_options(
     Ok(())
 }
 
-/// Truncates an existing regular file for overwrite-style create dispositions.
-/// # Errors
-///
-/// Returns an error when the file cannot be selected for mutation or the truncate transaction fails.
-fn truncate_existing_file(
-    mut vcb: NonNull<crate::state::VolumeControlBlock>,
-    file_id: FileNodeId,
-) -> DriverResult<()> {
-    let vcb = unsafe {
-        // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
-        // in the mounted device extension. The mutable borrow is the
-        // transaction boundary for this overwrite request.
-        vcb.as_mut()
-    };
-    let mut transaction = vcb
-        .volume_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let file = transaction.file(file_id)?;
-    transaction.truncate_file(file, FileSize::from_bytes(0))?;
-    transaction.commit()?;
-    Ok(())
-}
-
 /// Resolves a create target to an existing node or missing path leaf.
 /// # Errors
 ///
@@ -785,12 +696,11 @@ fn resolve_target(
     name_interpretation: CreateNameInterpretation,
     reparse_point_mode: CreateReparsePointMode,
     disposition: CreateDisposition,
-    close_disposition: CloseDisposition,
 ) -> DriverResult<CreateTargetLookup> {
     match name_interpretation {
         CreateNameInterpretation::Path => resolve_path(file_object, vcb, reparse_point_mode),
         CreateNameInterpretation::FileReference => {
-            validate_file_reference_create(disposition, close_disposition)?;
+            validate_file_reference_create(disposition)?;
             resolve_file_reference(file_object, vcb, reparse_point_mode)
         }
     }
@@ -801,10 +711,7 @@ fn resolve_target(
 ///
 /// Returns an error when the request needs a parent/name namespace target that file-reference opens
 /// do not provide.
-fn validate_file_reference_create(
-    disposition: CreateDisposition,
-    close_disposition: CloseDisposition,
-) -> DriverResult<()> {
+fn validate_file_reference_create(disposition: CreateDisposition) -> DriverResult<()> {
     match disposition {
         CreateDisposition::Open => {}
         CreateDisposition::Create
@@ -812,9 +719,6 @@ fn validate_file_reference_create(
         | CreateDisposition::Overwrite
         | CreateDisposition::OverwriteIf
         | CreateDisposition::Supersede => return Err(DriverError::InvalidParameter),
-    }
-    if close_disposition == CloseDisposition::Delete {
-        return Err(DriverError::NotSupported);
     }
     Ok(())
 }
@@ -1065,7 +969,6 @@ fn initialize_file_object(
             node,
             node_mode,
             location,
-            policy.close_disposition(),
             policy.write_commitment(),
             policy.data_transfer_mode(),
             policy.regular_file_write_access(),
@@ -1360,22 +1263,18 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn file_reference_create_accepts_only_existing_keep_opens() {
+    fn file_reference_create_accepts_only_existing_opens() {
         assert_eq!(
-            validate_file_reference_create(CreateDisposition::Open, CloseDisposition::Keep),
+            validate_file_reference_create(CreateDisposition::Open),
             Ok(())
         );
         assert_eq!(
-            validate_file_reference_create(CreateDisposition::Create, CloseDisposition::Keep),
+            validate_file_reference_create(CreateDisposition::Create),
             Err(DriverError::InvalidParameter)
         );
         assert_eq!(
-            validate_file_reference_create(CreateDisposition::OpenIf, CloseDisposition::Keep),
+            validate_file_reference_create(CreateDisposition::OpenIf),
             Err(DriverError::InvalidParameter)
-        );
-        assert_eq!(
-            validate_file_reference_create(CreateDisposition::Open, CloseDisposition::Delete),
-            Err(DriverError::NotSupported)
         );
     }
 
@@ -1559,31 +1458,15 @@ mod tests {
     ///
     /// Panics when destructive directory errors lose target-option or root distinctions.
     #[test]
-    fn existing_overwrite_rejects_directories_with_exact_status() {
+    fn destructive_create_rejects_root_and_non_directory_targets_with_exact_status() {
         let directory = NodeId::Directory(DirectoryNodeId::ROOT);
         assert_eq!(
-            existing_overwrite_file(
-                directory,
-                OpenedNodeMode::ReparsePoint,
-                CreateTargetRequirement::Any,
-            ),
-            Err(DriverError::AccessDenied)
+            destructive_directory_error(DirectoryNodeId::ROOT),
+            DriverError::AccessDenied
         );
         assert_eq!(
-            existing_overwrite_file(
-                directory,
-                OpenedNodeMode::ReparsePoint,
-                CreateTargetRequirement::NonDirectory,
-            ),
+            validate_existing_node_options(directory, CreateTargetRequirement::NonDirectory),
             Err(DriverError::FileIsDirectory)
-        );
-        assert_eq!(
-            existing_overwrite_file(
-                directory,
-                OpenedNodeMode::ReparsePoint,
-                CreateTargetRequirement::Directory,
-            ),
-            Err(DriverError::InvalidParameter)
         );
     }
 
@@ -1598,7 +1481,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -1630,7 +1512,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,

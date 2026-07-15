@@ -15,8 +15,8 @@ use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory;
 use crate::state::{
-    CloseDisposition, DirectoryChangeNotifier, DirectoryNotificationRegistration, FileControlBlock,
-    KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb, WriteCommitment,
+    DirectoryChangeNotifier, DirectoryNotificationRegistration, FileControlBlock, KernelDevice,
+    KernelFileObject, KernelSecurityDescriptor, KernelVpb, WriteCommitment,
 };
 use crate::wire::{LittleEndianInput, WireOffset};
 
@@ -207,8 +207,6 @@ pub(crate) enum CreateAction {
     Opened,
     /// A missing object was created.
     Created,
-    /// An existing object's data stream was overwritten.
-    Overwritten,
 }
 
 impl CreateAction {
@@ -217,7 +215,6 @@ impl CreateAction {
         match self {
             Self::Opened => wdk_sys::FILE_OPENED,
             Self::Created => wdk_sys::FILE_CREATED,
-            Self::Overwritten => wdk_sys::FILE_OVERWRITTEN,
         }
     }
 }
@@ -2746,8 +2743,6 @@ pub(crate) struct CreateParameters {
     disposition: CreateDisposition,
     /// File-vs-directory create/open requirement.
     target_requirement: CreateTargetRequirement,
-    /// Cleanup-time lifecycle requested by create options.
-    close_disposition: CloseDisposition,
     /// Write completion durability requested by create options.
     write_commitment: WriteCommitment,
     /// Data transfer buffering requested by create options.
@@ -2784,7 +2779,6 @@ impl CreateParameters {
             share_access: ShareAccess::from_raw(share_access)?,
             disposition,
             target_requirement,
-            close_disposition: create_options.close_disposition(),
             write_commitment: create_options.write_commitment(),
             transfer_buffering: create_options.transfer_buffering(),
             synchronization_mode: create_options.synchronization_mode(),
@@ -2826,11 +2820,6 @@ impl CreateParameters {
     /// Returns the target kind requirement.
     pub(crate) const fn target_requirement(self) -> CreateTargetRequirement {
         self.target_requirement
-    }
-
-    /// Returns the cleanup-time lifecycle requested at create/open.
-    pub(crate) const fn close_disposition(self) -> CloseDisposition {
-        self.close_disposition
     }
 
     /// Returns write completion durability requested by create options.
@@ -3132,8 +3121,6 @@ impl CreateTargetRequirement {
 struct CreateOptions {
     /// File-vs-directory requirement.
     target_requirement: CreateTargetRequirement,
-    /// Requested cleanup-time lifecycle.
-    close_disposition: CloseDisposition,
     /// Requested write completion durability.
     write_commitment: WriteCommitment,
     /// Requested data transfer buffering.
@@ -3156,6 +3143,9 @@ impl CreateOptions {
         if raw_options & !ACCEPTED_CREATE_OPTIONS != 0 {
             return Err(DriverError::NotSupported);
         }
+        if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
+            return Err(DriverError::NotSupported);
+        }
         let transfer_buffering =
             if create_option_selected(options, wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING) {
                 CreateTransferBuffering::NoIntermediate
@@ -3166,14 +3156,6 @@ impl CreateOptions {
             CreateSynchronizationMode::from_options(options, desired_access)?;
         let reparse_point_mode = CreateReparsePointMode::from_options(options);
         let name_interpretation = CreateNameInterpretation::from_options(options);
-        let close_disposition = if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
-            if !desired_access.contains(wdk_sys::DELETE) {
-                return Err(DriverError::InvalidParameter);
-            }
-            CloseDisposition::Delete
-        } else {
-            CloseDisposition::Keep
-        };
         let write_commitment = if create_option_selected(options, wdk_sys::FILE_WRITE_THROUGH)
             || matches!(transfer_buffering, CreateTransferBuffering::NoIntermediate)
         {
@@ -3183,7 +3165,6 @@ impl CreateOptions {
         };
         Ok(Self {
             target_requirement: CreateTargetRequirement::from_options(options)?,
-            close_disposition,
             write_commitment,
             transfer_buffering,
             synchronization_mode,
@@ -3195,11 +3176,6 @@ impl CreateOptions {
     /// Returns the decoded file-vs-directory requirement.
     const fn target_requirement(self) -> CreateTargetRequirement {
         self.target_requirement
-    }
-
-    /// Returns the decoded cleanup-time lifecycle.
-    const fn close_disposition(self) -> CloseDisposition {
-        self.close_disposition
     }
 
     /// Returns decoded write completion durability.
@@ -3820,8 +3796,7 @@ mod tests {
     };
     use crate::kernel::status::DriverError;
     use crate::state::{
-        CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
-        WriteCommitment,
+        KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb, WriteCommitment,
     };
 
     /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
@@ -4077,7 +4052,6 @@ mod tests {
         for (action, expected) in [
             (CreateAction::Opened, wdk_sys::FILE_OPENED),
             (CreateAction::Created, wdk_sys::FILE_CREATED),
-            (CreateAction::Overwritten, wdk_sys::FILE_OVERWRITTEN),
         ] {
             let mut device_object = wdk_sys::DEVICE_OBJECT::default();
             let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device_object));
@@ -4641,7 +4615,6 @@ mod tests {
                     parameters.target_requirement(),
                     CreateTargetRequirement::NonDirectory
                 );
-                assert_eq!(parameters.close_disposition(), CloseDisposition::Keep);
                 assert_eq!(parameters.write_commitment(), WriteCommitment::FlushThrough);
                 assert_eq!(
                     parameters.transfer_buffering(),
@@ -4758,7 +4731,7 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when delete-on-close is accepted without DELETE access.
+    /// Panics when the unsafe delete-on-close lifecycle is accepted.
     #[test]
     fn create_stack_rejects_delete_on_close_without_delete_access() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -4778,15 +4751,15 @@ mod tests {
         let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
         assert!(current.is_ok());
         if let Ok(current) = current {
-            assert_eq!(current.create().err(), Some(DriverError::InvalidParameter));
+            assert_eq!(current.create().err(), Some(DriverError::NotSupported));
         }
     }
 
     /// # Panics
     ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
+    /// Panics when delete-on-close is accepted even when DELETE was requested.
     #[test]
-    fn create_stack_decodes_delete_on_close_as_close_disposition() {
+    fn create_stack_rejects_delete_on_close_until_safe_orphan_lifecycle_exists() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
             DesiredAccess: wdk_sys::DELETE,
@@ -4808,33 +4781,7 @@ mod tests {
         let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
         assert!(current.is_ok());
         if let Ok(current) = current {
-            let create = current.create();
-            assert!(create.is_ok());
-            if let Ok(create) = create {
-                let parameters = create.parameters();
-                assert_eq!(
-                    parameters.target_requirement(),
-                    CreateTargetRequirement::Directory
-                );
-                assert_eq!(parameters.close_disposition(), CloseDisposition::Delete);
-                assert_eq!(parameters.write_commitment(), WriteCommitment::CommitOnly);
-                assert_eq!(
-                    parameters.transfer_buffering(),
-                    CreateTransferBuffering::IntermediateAllowed
-                );
-                assert_eq!(
-                    parameters.synchronization_mode(),
-                    CreateSynchronizationMode::Asynchronous
-                );
-                assert_eq!(
-                    parameters.reparse_point_mode(),
-                    CreateReparsePointMode::ResolveFinalTarget
-                );
-                assert_eq!(
-                    parameters.name_interpretation(),
-                    CreateNameInterpretation::Path
-                );
-            }
+            assert_eq!(current.create().err(), Some(DriverError::NotSupported));
         }
     }
 

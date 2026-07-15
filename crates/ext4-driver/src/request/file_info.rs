@@ -20,7 +20,7 @@ use crate::irp::{
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{
-    CloseDisposition, DirectoryCursor, DirectoryNameChange, DirectoryNameChangeAction,
+    DirectoryCursor, DirectoryNameChange, DirectoryNameChangeAction,
     DirectoryNotificationRegistration, FileControlBlock, KernelFileObject, MountedVolumeDevice,
     OpenedDirectory, OpenedHandle, OpenedLocation, OpenedObject, OpenedRegularFile,
     VolumeControlBlock, WriteCommitment, release_file_control_block,
@@ -40,15 +40,12 @@ pub(crate) fn cleanup(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// Executes close IRPs and releases FILE_OBJECT contexts.
 /// # Errors
 ///
-/// Returns an error when the close stack has no FILE_OBJECT.
+/// Returns an error when the close stack has no FILE_OBJECT, ordinary cleanup has not completed,
+/// or a filter-cancelled open has an invalid lifecycle.
 pub(crate) fn close(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    target
-        .current_stack()
-        .and_then(|stack| stack.file_object())
-        .map(|file_object| {
-            release_file_contexts(file_object);
-            IrpCompletion::EMPTY
-        })
+    let file_object = target.current_stack()?.file_object()?;
+    release_file_contexts(file_object)?;
+    Ok(IrpCompletion::EMPTY)
 }
 
 /// Executes regular file data reads.
@@ -470,61 +467,44 @@ fn set_allocation_information(request: SetFileRequest) -> DriverResult<()> {
     set_regular_file_size(&opened_file, requested)
 }
 
-/// Applies FILE_DISPOSITION_INFORMATION to the handle-local close disposition.
+/// Rejects FILE_DISPOSITION_INFORMATION deletion until identity-checked orphan lifecycle exists.
 /// # Errors
 ///
-/// Returns an error when the disposition input buffer is too small.
-fn set_disposition_information(mut request: SetFileRequest) -> DriverResult<()> {
+/// Returns an error when the input is truncated or requests deletion.
+fn set_disposition_information(request: SetFileRequest) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION>(
         request.target,
         request.stack.length(),
     )?;
-    let close_disposition = if info.DeleteFile == 0 {
-        CloseDisposition::Keep
+    if info.DeleteFile == 0 {
+        Ok(())
     } else {
-        CloseDisposition::Delete
-    };
-    set_close_disposition(&mut request, close_disposition)
+        Err(DriverError::NotSupported)
+    }
 }
 
-/// Applies FILE_DISPOSITION_INFORMATION_EX to the handle-local close disposition.
+/// Rejects FILE_DISPOSITION_INFORMATION_EX deletion until safe orphan lifecycle exists.
 /// # Errors
 ///
 /// Returns an error when the extended disposition input is truncated or carries unsupported flags.
-fn set_disposition_information_ex(mut request: SetFileRequest) -> DriverResult<()> {
+fn set_disposition_information_ex(request: SetFileRequest) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION_EX>(
         request.target,
         request.stack.length(),
     )?;
-    set_close_disposition(&mut request, disposition_ex_close_disposition(info.Flags)?)
+    validate_disposition_ex_flags(info.Flags)
 }
 
-/// Decodes FILE_DISPOSITION_INFORMATION_EX flags into handle lifecycle state.
+/// Validates FILE_DISPOSITION_INFORMATION_EX while deletion is unsupported.
 /// # Errors
 ///
-/// Returns an error when `flags` contains disposition bits outside the supported delete-on-close
-/// subset.
-fn disposition_ex_close_disposition(flags: wdk_sys::ULONG) -> DriverResult<CloseDisposition> {
-    if flags & !SUPPORTED_DISPOSITION_EX_FLAGS != 0 {
-        return Err(DriverError::NotSupported);
-    }
-    if flags & wdk_sys::FILE_DISPOSITION_DELETE != 0 {
-        Ok(CloseDisposition::Delete)
+/// Returns not supported for every non-empty disposition request.
+fn validate_disposition_ex_flags(flags: wdk_sys::ULONG) -> DriverResult<()> {
+    if flags == 0 {
+        Ok(())
     } else {
-        Ok(CloseDisposition::Keep)
+        Err(DriverError::NotSupported)
     }
-}
-
-/// Stores the decoded delete-on-close request on the opened handle.
-/// # Errors
-///
-/// Returns an error when the handle-local close disposition cannot be recorded.
-fn set_close_disposition(
-    request: &mut SetFileRequest,
-    close_disposition: CloseDisposition,
-) -> DriverResult<()> {
-    request.opened_file.set_close_disposition(close_disposition);
-    Ok(())
 }
 
 /// Applies FILE_RENAME_INFORMATION to the opened directory-entry location.
@@ -1337,51 +1317,17 @@ fn windows_time_quad(timestamp: Ext4Timestamp) -> i64 {
     }
 }
 
-/// Applies cleanup-time namespace mutations requested by this handle.
+/// Releases resources owned by one FILE_OBJECT handle lifecycle.
 /// # Errors
 ///
-/// Returns an error when the FILE_OBJECT has no opened context, the root is marked for deletion, or
-/// the cleanup-time namespace transaction fails.
+/// Returns an error when the FILE_OBJECT has no opened context or cleanup already ran.
 fn cleanup_file_object(target: DispatchTarget, file_object: KernelFileObject) -> DriverResult<()> {
     let mut opened_file = OpenedObject::decode(file_object)?;
+    opened_file.release_share_access_for_cleanup()?;
     opened_file
         .file_control_block()
         .release_handle_byte_range_locks(target, file_object);
     cleanup_directory_notification(&opened_file);
-    if opened_file.close_disposition() == CloseDisposition::Keep {
-        return Ok(());
-    }
-    let (parent, name) = match opened_file.location() {
-        OpenedLocation::DirectoryEntry { parent, name } => (*parent, name.try_to_owned_name()?),
-        OpenedLocation::Root => return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot)),
-        OpenedLocation::FileReference => return Err(DriverError::NotSupported),
-    };
-    let notification = DirectoryNameChange::new(
-        parent,
-        &name,
-        opened_file.node(),
-        DirectoryNameChangeAction::Removed,
-    )?;
-
-    let mut vcb = opened_file.volume();
-    let vcb = unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
-        // remain valid while file objects are open. The mutable borrow is the
-        // transaction boundary for this cleanup namespace mutation.
-        vcb.as_mut()
-    };
-    let mut transaction = vcb
-        .volume_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let parent = transaction.directory(parent)?;
-    match opened_file.node() {
-        NodeId::File(_) => transaction.unlink_file(parent, &name)?,
-        NodeId::Directory(_) => transaction.remove_empty_directory(parent, &name)?,
-        NodeId::Symlink(_) => transaction.remove_symlink(parent, &name)?,
-    }
-    transaction.commit()?;
-    vcb.report_directory_name_change(notification);
-    opened_file.set_close_disposition(CloseDisposition::Keep);
     Ok(())
 }
 
@@ -1577,9 +1523,6 @@ const FILE_RENAME_NAME_LENGTH_OFFSET: usize = 16;
 /// Offset of FILE_RENAME_INFORMATION FileName.
 const FILE_RENAME_NAME_OFFSET: usize = 20;
 /// FILE_DISPOSITION_INFORMATION_EX flags handled by this driver.
-const SUPPORTED_DISPOSITION_EX_FLAGS: wdk_sys::ULONG = wdk_sys::FILE_DISPOSITION_DELETE
-    | wdk_sys::FILE_DISPOSITION_ON_CLOSE
-    | wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
 /// FILE_RENAME_INFORMATION_EX flags handled by this driver.
 const SUPPORTED_RENAME_EX_FLAGS: wdk_sys::ULONG =
     wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE | wdk_sys::FILE_RENAME_REPLACE_IF_EXISTS;
@@ -2543,21 +2486,35 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
 }
 
 /// Releases heap-owned FCB and CCB pointers stored on a FILE_OBJECT.
-fn release_file_contexts(file_object: KernelFileObject) {
-    let file_object_ptr = file_object;
+/// # Errors
+///
+/// Returns an error when initialized contexts are invalid or cleanup has not consumed the
+/// FILE_OBJECT's cleanup-owned resources.
+fn release_file_contexts(file_object: KernelFileObject) -> DriverResult<()> {
+    let contexts = unsafe {
+        // SAFETY: Close receives the final live FILE_OBJECT and reads only its filesystem-owned
+        // context pointers before deciding whether they can be released.
+        let object = file_object.as_ref();
+        (object.FsContext, object.FsContext2)
+    };
+    match contexts {
+        (fcb, handle) if fcb.is_null() && handle.is_null() => return Ok(()),
+        (fcb, handle) if fcb.is_null() || handle.is_null() => {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                .bugcheck();
+        }
+        _ => {}
+    }
+    let close_kind = file_object.close_kind()?;
+    OpenedObject::decode(file_object)?.prepare_context_release_for_close(close_kind)?;
+
     let file_object = unsafe {
         // SAFETY: Close receives the final FILE_OBJECT and may clear its
         // filesystem-owned context pointers.
         file_object.as_mut()
     };
     let fcb = core::mem::replace(&mut file_object.FsContext, core::ptr::null_mut());
-    if let Some(mut fcb) = NonNull::new(fcb.cast::<FileControlBlock>()) {
-        let fcb_ref = unsafe {
-            // SAFETY: Successful create stores a live VCB-owned FCB in
-            // FsContext until this close path removes the handle reference.
-            fcb.as_mut()
-        };
-        fcb_ref.remove_share_access(file_object_ptr);
+    if let Some(fcb) = NonNull::new(fcb.cast::<FileControlBlock>()) {
         release_file_control_block(fcb);
     }
     let handle = core::mem::replace(&mut file_object.FsContext2, core::ptr::null_mut());
@@ -2568,6 +2525,7 @@ fn release_file_contexts(file_object: KernelFileObject) {
             drop(Box::from_raw(handle.cast::<OpenedHandle>()));
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2579,7 +2537,7 @@ mod tests {
         RegularFileWriteAccess, WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
-    use crate::state::{CloseDisposition, OpenedLocation, OpenedNodeMode};
+    use crate::state::{OpenedLocation, OpenedNodeMode};
     use ext4_core::{
         BlockSize, DirectoryNodeId, Ext4Gid, Ext4LinkCount, Ext4Name, Ext4Owner, Ext4Permissions,
         Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileOffset, FileSize, NodeId, WindowsName,
@@ -2818,9 +2776,9 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when a reparse-point handle cannot retain a disposition-delete request.
+    /// Panics when a reparse-point handle can request unsafe disposition deletion.
     #[test]
-    fn reparse_point_handle_accepts_disposition_delete() {
+    fn reparse_point_handle_rejects_disposition_delete() {
         let volume = NonNull::<crate::state::VolumeControlBlock>::dangling();
         let node = NodeId::Directory(DirectoryNodeId::ROOT);
         let mut fcb = crate::state::FileControlBlock::new(volume, node);
@@ -2836,7 +2794,6 @@ mod tests {
                 parent: DirectoryNodeId::ROOT,
                 name,
             },
-            CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,
             crate::state::DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -2873,7 +2830,10 @@ mod tests {
             return;
         };
 
-        assert_eq!(super::set_disposition_information(request), Ok(()));
+        assert_eq!(
+            super::set_disposition_information(request),
+            Err(DriverError::NotSupported)
+        );
 
         let file_object =
             crate::state::KernelFileObject::from_raw(core::ptr::addr_of_mut!(file_object));
@@ -2885,7 +2845,6 @@ mod tests {
         assert!(opened.is_ok());
         if let Ok(opened) = opened {
             assert_eq!(opened.node_mode(), OpenedNodeMode::ReparsePoint);
-            assert_eq!(opened.close_disposition(), CloseDisposition::Delete);
         }
     }
 
@@ -2901,7 +2860,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             crate::state::OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            crate::state::CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,
             crate::state::DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -3001,7 +2959,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             crate::state::OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            crate::state::CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,
             crate::state::DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -3251,19 +3208,16 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn disposition_ex_flags_decode_close_disposition_and_reject_posix_semantics() {
+    fn disposition_ex_flags_reject_all_delete_semantics() {
+        assert_eq!(super::validate_disposition_ex_flags(0), Ok(()));
         assert_eq!(
-            super::disposition_ex_close_disposition(0),
-            Ok(crate::state::CloseDisposition::Keep)
-        );
-        assert_eq!(
-            super::disposition_ex_close_disposition(
+            super::validate_disposition_ex_flags(
                 wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_ON_CLOSE
             ),
-            Ok(crate::state::CloseDisposition::Delete)
+            Err(DriverError::NotSupported)
         );
         assert_eq!(
-            super::disposition_ex_close_disposition(wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS),
+            super::validate_disposition_ex_flags(wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS),
             Err(DriverError::NotSupported)
         );
     }
@@ -3369,7 +3323,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             crate::state::OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            crate::state::CloseDisposition::Keep,
             crate::state::WriteCommitment::CommitOnly,
             crate::state::DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
