@@ -10,9 +10,10 @@ use wdk_sys::FILE_OBJECT;
 use crate::{
     irp::{
         CreateAction, CreateCompletion, CreateDisposition, CreateNameInterpretation,
-        CreateParameters, CreateReparsePointMode, CreateStack, CreateSymlinkReparseBuffer,
+        CreateParameters, CreateReparsePointMode, CreateSymlinkReparseBuffer,
         CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering, DesiredAccess,
-        DispatchTarget, ExistingOperationAccess, RegularFileWriteAccess, ShareAccess,
+        DispatchTarget, ExistingOperationAccess, PendingIrpLease, RegularFileWriteAccess,
+        ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
@@ -25,8 +26,8 @@ use crate::{
         ChildCreationTarget, DataTransferMode, DirectoryNameChange, DirectoryNameChangeAction,
         FileControlBlock, KernelDevice, KernelFileObject, MountedVolumeDevice,
         NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
-        PendingChildCreation, UninitializedFileObject, VolumeControlBlock, WriteCommitment,
-        abandon_file_control_block,
+        PendingChildCreation, UninitializedFileObject, VolumeControlBlock, VolumeOperationLane,
+        VolumeOperationLease, WriteCommitment, abandon_file_control_block,
     },
 };
 
@@ -37,58 +38,61 @@ const UTF16_BACKSLASH: u16 = 0x005C;
 /// # Errors
 ///
 /// Returns an error when create stack decoding or ext4 open/create handling rejects the request.
-pub(crate) fn execute(target: DispatchTarget) -> DriverResult<CreateCompletion> {
-    CreateRequest::decode(target).and_then(open_or_create)
+pub(crate) async fn execute(request: PendingIrpLease<'_>) -> DriverResult<CreateCompletion> {
+    open_or_create(CreateRequest::decode(request)?).await
 }
 
 /// Decoded create request at the filesystem boundary.
-#[derive(Clone, Copy, Debug)]
-struct CreateRequest {
-    /// Dispatch target carrying create-time auxiliary buffers.
-    target: DispatchTarget,
-    /// Mounted device receiving the create.
-    device: KernelDevice,
-    /// Create stack parameters.
-    stack: CreateStack,
+#[derive(Debug)]
+struct CreateRequest<'a> {
+    /// Pending IRP lease retaining every create-time pointer through terminal completion.
+    request: PendingIrpLease<'a>,
+    /// Owned semantic create parameters decoded before suspension.
+    parameters: CreateParameters,
     /// FILE_OBJECT before filesystem contexts are attached.
     file_object: UninitializedFileObject,
 }
 
-impl CreateRequest {
+// SAFETY: The exclusive pending-IRP lease pins the FILE_OBJECT and every auxiliary buffer until
+// this request is dropped. The mounted-device executor moves, but never concurrently polls, this
+// create operation between PASSIVE_LEVEL workers.
+unsafe impl Send for CreateRequest<'_> {}
+
+impl<'a> CreateRequest<'a> {
     /// Decodes the create request from the current IRP stack.
     /// # Errors
     ///
     /// Returns an error when the current stack is not create/open or the FILE_OBJECT is already
     /// initialized.
-    fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
+    fn decode(request: PendingIrpLease<'a>) -> Result<Self, crate::kernel::status::DriverError> {
+        let target = request.target();
         let stack = target.current_stack()?.create()?;
         let file_object = UninitializedFileObject::decode(stack.file_object())?;
         Ok(Self {
-            target,
-            device: target.device(),
-            stack,
+            request,
+            parameters: stack.parameters(),
             file_object,
         })
     }
 
     /// Returns the dispatch target carrying create-time auxiliary buffers.
-    const fn target(self) -> DispatchTarget {
-        self.target
+    const fn target(&self) -> DispatchTarget {
+        self.request.target()
     }
 
     /// Returns the mounted device receiving the create.
-    const fn device(self) -> KernelDevice {
-        self.device
+    const fn device(&self) -> KernelDevice {
+        self.request.target().device()
     }
 
     /// Returns the file object to initialize.
-    const fn file_object(self) -> UninitializedFileObject {
+    const fn file_object(&self) -> UninitializedFileObject {
         self.file_object
     }
 
     /// Returns decoded create parameters.
-    const fn parameters(self) -> CreateParameters {
-        self.stack.parameters()
+    const fn parameters(&self) -> CreateParameters {
+        self.parameters
     }
 }
 
@@ -97,34 +101,61 @@ impl CreateRequest {
 ///
 /// Returns an error when EA create input is supplied, the device is not mounted, path resolution
 /// fails, or the selected open/create disposition cannot be satisfied.
-fn open_or_create(request: CreateRequest) -> DriverResult<CreateCompletion> {
+async fn open_or_create(request: CreateRequest<'_>) -> DriverResult<CreateCompletion> {
     let create_ea = CreateEa::decode(request.target(), request.parameters().ea_length())?;
-    let Some(vcb) = MountedVolumeDevice::vcb(request.device()) else {
+    let Some(mounted_volume) = MountedVolumeDevice::vcb(request.device()) else {
         return Err(DriverError::InvalidDeviceRequest);
     };
     let disposition = request.parameters().disposition();
-    match resolve_target(
+    let target = CreateTargetSpecifier::decode(
         request.file_object(),
-        vcb,
+        mounted_volume,
         request.parameters().name_interpretation(),
-        request.parameters().reparse_point_mode(),
         disposition,
-    ) {
-        Ok(CreateTargetLookup::Existing {
+    )?;
+    let mut operations = unsafe {
+        // SAFETY: Create requests are queued through the mounted-device executor, which polls one
+        // active filesystem operation at a time and therefore grants this request the unique lane.
+        VolumeControlBlock::claim_operation_lane(mounted_volume)
+    };
+    match resolve_target(
+        target,
+        operations.lane_mut(),
+        request.parameters().reparse_point_mode(),
+    )
+    .await?
+    {
+        CreateTargetLookup::Existing {
             node,
             node_mode,
             location,
-        }) => open_existing_node(request, vcb, disposition, node, node_mode, location)
-            .map(CreateCompletion::Handle),
-        Ok(CreateTargetLookup::Missing { parent, name }) => {
-            create_missing_node(request, create_ea, vcb, disposition, parent, &name)
-                .map(CreateCompletion::Handle)
+        } => {
+            let mounted_volume = MountedVolumeDevice::vcb(request.device())
+                .ok_or(DriverError::InvalidDeviceRequest)?;
+            open_existing_node(
+                request,
+                mounted_volume,
+                disposition,
+                node,
+                node_mode,
+                location,
+            )
+            .map(CreateCompletion::Handle)
         }
-        Ok(CreateTargetLookup::ReparseSymlink {
+        CreateTargetLookup::Missing { parent, name } => create_missing_node(
+            request,
+            create_ea,
+            &mut operations,
+            disposition,
+            parent,
+            &name,
+        )
+        .await
+        .map(CreateCompletion::Handle),
+        CreateTargetLookup::ReparseSymlink {
             point,
             unparsed_path,
-        }) => create_symlink_reparse_completion(vcb, point, unparsed_path),
-        Err(error) => Err(error),
+        } => create_symlink_reparse_completion(operations.lane_mut(), point, unparsed_path).await,
     }
 }
 
@@ -133,22 +164,64 @@ fn open_or_create(request: CreateRequest) -> DriverResult<CreateCompletion> {
 ///
 /// Returns an error when the node target cannot be converted to the Windows symbolic-link wire
 /// form, its exact output buffer cannot be allocated, or packing violates the derived size.
-fn create_symlink_reparse_completion(
-    vcb: NonNull<VolumeControlBlock>,
+async fn create_symlink_reparse_completion(
+    operations: &mut VolumeOperationLane,
     point: NodeSymlinkReparsePoint,
     unparsed_path: UnparsedPathLength,
 ) -> DriverResult<CreateCompletion> {
-    let vcb = unsafe {
-        // SAFETY: `MountedVolumeDevice::vcb` returned this live VCB for the create request, and no
-        // FILE_OBJECT state or namespace mutation has been published on the reparse path.
-        vcb.as_ref()
-    };
-    let data = point.into_symlink_data(vcb)?;
+    let data = point.into_symlink_data(operations).await?;
     let required_length = data.required_length()?;
     let buffer = CreateSymlinkReparseBuffer::try_pack_exact(required_length, |output| {
         data.pack_create_redirect(unparsed_path, output)
     })?;
     Ok(CreateCompletion::ReparseSymlink(buffer))
+}
+
+/// Fully decoded create target that contains no raw FILE_OBJECT or VCB reference.
+#[derive(Debug, Eq, PartialEq)]
+enum CreateTargetSpecifier {
+    /// A Windows path anchored at the mounted root or a related opened directory.
+    Path {
+        /// Owned validated path components.
+        name: CreatePathName,
+        /// Validated directory where lookup begins.
+        anchor: CreatePathAnchor,
+    },
+    /// A stable Windows file index supplied through FILE_OPEN_BY_FILE_ID.
+    FileReference(CreateFileReference),
+}
+
+impl CreateTargetSpecifier {
+    /// Decodes every pointer-bearing create-name boundary before asynchronous volume access begins.
+    /// # Errors
+    ///
+    /// Returns an error when the path, related object, or file reference is malformed, or when the
+    /// requested disposition is not valid for a file-reference open.
+    fn decode(
+        file_object: UninitializedFileObject,
+        mounted_volume: NonNull<VolumeControlBlock>,
+        interpretation: CreateNameInterpretation,
+        disposition: CreateDisposition,
+    ) -> DriverResult<Self> {
+        let file_object = unsafe {
+            // SAFETY: The uninitialized FILE_OBJECT belongs to the active create stack and this
+            // synchronous decoder only reads immutable name and related-object fields.
+            file_object.as_ref()
+        };
+        match interpretation {
+            CreateNameInterpretation::Path => {
+                let name = CreatePathName::decode(file_object)?;
+                let anchor = CreatePathAnchor::decode(file_object, mounted_volume, name.rooting())?;
+                Ok(Self::Path { name, anchor })
+            }
+            CreateNameInterpretation::FileReference => {
+                validate_file_reference_create(disposition)?;
+                Ok(Self::FileReference(CreateFileReference::decode(
+                    file_object,
+                )?))
+            }
+        }
+    }
 }
 
 /// Result of resolving a create target against the mounted volume.
@@ -538,7 +611,7 @@ impl CreatePathAnchor {
 /// Returns an error when existing-node options conflict, create-only disposition collides, share
 /// access fails, or an incomplete destructive disposition is requested.
 fn open_existing_node(
-    request: CreateRequest,
+    request: CreateRequest<'_>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
     node: NodeId,
@@ -592,10 +665,10 @@ fn destructive_directory_error(directory: DirectoryNodeId) -> DriverError {
 ///
 /// Returns an error when the disposition requires an existing name, missing-child creation cannot
 /// be staged or committed, or the new file object cannot be initialized.
-fn create_missing_node(
-    request: CreateRequest,
+async fn create_missing_node(
+    request: CreateRequest<'_>,
     create_ea: CreateEa,
-    mut vcb: NonNull<crate::state::VolumeControlBlock>,
+    operations: &mut VolumeOperationLease,
     disposition: CreateDisposition,
     parent: DirectoryNodeId,
     name: &Ext4Name,
@@ -613,18 +686,14 @@ fn create_missing_node(
 
     let location = OpenedLocation::try_directory_entry(parent, name)?;
     let target = child_creation_target(parameters.target_requirement())?;
-    let mut creation = unsafe {
-        // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
-        // in the mounted device extension. The pending creation keeps the
-        // mutable borrow until its staged transaction is committed or dropped.
-        vcb.as_mut()
-    }
-    .begin_child_creation(
-        parent,
-        name,
-        target,
-        crate::kernel::time::current_ext4_timestamp()?,
-    )?;
+    let mut creation = operations
+        .begin_child_creation(
+            parent,
+            name,
+            target,
+            crate::kernel::time::current_ext4_timestamp()?,
+        )
+        .await?;
     let node = creation.node();
     let notification =
         DirectoryNameChange::new(parent, name, node, DirectoryNameChangeAction::Added)?;
@@ -638,34 +707,29 @@ fn create_missing_node(
             policy.regular_file_write_access(),
         ))
     })?;
-    create_ea.apply_to_pending_child(&mut creation)?;
-    let fcb = open_pending_child_file_control_block(
+    create_ea.apply_to_pending_child(&mut creation).await?;
+    let attachment = open_pending_child_file_control_block(
         &creation,
         request.file_object(),
         policy.desired_access(),
         policy.share_access(),
     )?;
 
-    match creation.commit() {
+    match creation.commit().await {
         Ok(()) => {
+            let Some(vcb) = MountedVolumeDevice::vcb(request.device()) else {
+                return Err(DriverError::InternalInvariantViolation);
+            };
+            attachment.attach(handle, policy.file_object_flags());
             let vcb = unsafe {
-                // SAFETY: The committed create kept the mounted VCB alive;
-                // reporting only reads its stable FsRtl notifier state.
+                // SAFETY: The mounted device still owns this heap-stable VCB while its create IRP
+                // is active; notification state is disjoint from the actor-owned operation lane.
                 vcb.as_ref()
             };
-            attach_preallocated_file_object(
-                request.file_object(),
-                fcb,
-                handle,
-                policy.file_object_flags(),
-            );
             vcb.report_directory_name_change(notification);
             Ok(CreateAction::Created)
         }
-        Err(error) => {
-            abandon_file_control_block(fcb, request.file_object().kernel_file_object());
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -711,18 +775,17 @@ fn validate_existing_node_options(
 /// # Errors
 ///
 /// Returns an error when path or file-reference resolution fails.
-fn resolve_target(
-    file_object: UninitializedFileObject,
-    vcb: NonNull<VolumeControlBlock>,
-    name_interpretation: CreateNameInterpretation,
+async fn resolve_target(
+    target: CreateTargetSpecifier,
+    operations: &mut VolumeOperationLane,
     reparse_point_mode: CreateReparsePointMode,
-    disposition: CreateDisposition,
 ) -> DriverResult<CreateTargetLookup> {
-    match name_interpretation {
-        CreateNameInterpretation::Path => resolve_path(file_object, vcb, reparse_point_mode),
-        CreateNameInterpretation::FileReference => {
-            validate_file_reference_create(disposition)?;
-            resolve_file_reference(file_object, vcb, reparse_point_mode)
+    match target {
+        CreateTargetSpecifier::Path { name, anchor } => {
+            resolve_path(name, anchor, operations, reparse_point_mode).await
+        }
+        CreateTargetSpecifier::FileReference(reference) => {
+            resolve_file_reference(reference, operations, reparse_point_mode).await
         }
     }
 }
@@ -748,33 +811,24 @@ fn validate_file_reference_create(disposition: CreateDisposition) -> DriverResul
 /// # Errors
 ///
 /// Returns an error when the file-reference name is malformed or no live inode exists for it.
-fn resolve_file_reference(
-    file_object: UninitializedFileObject,
-    vcb: NonNull<VolumeControlBlock>,
+async fn resolve_file_reference(
+    reference: CreateFileReference,
+    operations: &mut VolumeOperationLane,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
-    let file_object = unsafe {
-        // SAFETY: `file_object` comes from the active create stack and is read
-        // only for immutable name fields.
-        file_object.as_ref()
-    };
-    let reference = CreateFileReference::decode(file_object)?;
-    let vcb = unsafe {
-        // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
-        // in the mounted device extension and is read only for file-id lookup.
-        vcb.as_ref()
-    };
-    let node = vcb
-        .volume()
+    let node = operations
+        .journaled_mut()
         .load_node_by_file_index(reference.file_index())
+        .await
         .map_err(file_reference_lookup_error)?;
     resolve_final_node(
-        vcb,
+        operations,
         node,
         OpenedLocation::FileReference,
         reparse_point_mode,
         UnparsedPathLength::ZERO,
     )
+    .await
 }
 
 /// Maps file-reference lookup failures to create/open status.
@@ -790,23 +844,12 @@ fn file_reference_lookup_error(error: ext4_core::Error) -> DriverError {
 ///
 /// Returns an error when relative FILE_OBJECT opens are requested, a path component is invalid, an
 /// intermediate component is missing or not a directory, or lookup fails.
-fn resolve_path(
-    file_object: UninitializedFileObject,
-    vcb: NonNull<VolumeControlBlock>,
+async fn resolve_path(
+    name: CreatePathName,
+    anchor: CreatePathAnchor,
+    operations: &mut VolumeOperationLane,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
-    let file_object = unsafe {
-        // SAFETY: `file_object` comes from the active create stack and is read
-        // only for immutable path fields.
-        file_object.as_ref()
-    };
-    let name = CreatePathName::decode(file_object)?;
-    let anchor = CreatePathAnchor::decode(file_object, vcb, name.rooting())?;
-    let vcb = unsafe {
-        // SAFETY: MountedVolumeDevice::vcb returns the live VCB pointer stored
-        // in the mounted device extension and is read only for path lookup.
-        vcb.as_ref()
-    };
     let mut parent_id = anchor.directory();
     let components = name.components();
     let mut components = components.iter().peekable();
@@ -816,11 +859,15 @@ fn resolve_path(
         } else {
             PathComponentPosition::Intermediate
         };
-        let parent = match vcb.volume().load_directory(parent_id) {
+        let parent = match operations.journaled_mut().load_directory(parent_id).await {
             Ok(directory) => directory,
             Err(error) => return Err(DriverError::from(error)),
         };
-        let child = match vcb.volume().lookup_windows_child(&parent, component.name()) {
+        let child = match operations
+            .journaled_mut()
+            .lookup_windows_child(&parent, component.name())
+            .await
+        {
             Ok(ChildLookup::Found(child)) => child,
             Ok(ChildLookup::NotFound) if position == PathComponentPosition::Final => {
                 return Ok(CreateTargetLookup::Missing {
@@ -832,7 +879,7 @@ fn resolve_path(
             Err(error) => return Err(DriverError::from(error)),
         };
         let child_node = *child.node();
-        let reparse_point = NodeSymlinkReparsePoint::load(vcb, child_node)?;
+        let reparse_point = NodeSymlinkReparsePoint::load(operations, child_node).await?;
         if let Some(point) = reparse_point {
             match reparse_point_encounter(position, reparse_point_mode) {
                 ReparsePointEncounter::Redirect => {
@@ -907,14 +954,14 @@ const fn reparse_point_encounter(
 /// # Errors
 ///
 /// Returns an error when reparse metadata cannot be loaded.
-fn resolve_final_node(
-    vcb: &VolumeControlBlock,
+async fn resolve_final_node(
+    operations: &mut VolumeOperationLane,
     node: NodeId,
     location: OpenedLocation,
     reparse_point_mode: CreateReparsePointMode,
     unparsed_path: UnparsedPathLength,
 ) -> DriverResult<CreateTargetLookup> {
-    let Some(point) = NodeSymlinkReparsePoint::load(vcb, node)? else {
+    let Some(point) = NodeSymlinkReparsePoint::load(operations, node).await? else {
         return Ok(CreateTargetLookup::Existing {
             node,
             node_mode: OpenedNodeMode::Direct,
@@ -1039,12 +1086,48 @@ fn open_pending_child_file_control_block(
     file_object: UninitializedFileObject,
     desired_access: DesiredAccess,
     share_access: ShareAccess,
-) -> DriverResult<NonNull<FileControlBlock>> {
-    creation.open_file_control_block(
+) -> DriverResult<PendingFileObjectAttachment> {
+    let fcb = creation.open_file_control_block(
         file_object.kernel_file_object(),
         desired_access,
         share_access,
-    )
+    )?;
+    Ok(PendingFileObjectAttachment {
+        fcb: Some(fcb),
+        file_object,
+    })
+}
+
+/// Pre-attachment share/FCB claim that rolls back unless a committed create consumes it.
+struct PendingFileObjectAttachment {
+    /// FCB reference and share claim owned until attachment.
+    fcb: Option<NonNull<FileControlBlock>>,
+    /// Uninitialized FILE_OBJECT whose pending create IRP keeps it alive.
+    file_object: UninitializedFileObject,
+}
+
+// SAFETY: This value exclusively owns one pre-attachment FCB reference and share claim. The create
+// request's pending IRP pins the FILE_OBJECT, and the VCB ledger allocation remains stable while
+// that reference exists. Moving ownership between serialized executor workers creates no alias.
+unsafe impl Send for PendingFileObjectAttachment {}
+
+impl PendingFileObjectAttachment {
+    /// Consumes the pending claim into one successfully committed FILE_OBJECT attachment.
+    fn attach(mut self, handle: Box<OpenedHandle>, flags: CreateFileObjectFlags) {
+        let fcb = self.fcb.take().unwrap_or_else(|| {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                .bugcheck()
+        });
+        attach_preallocated_file_object(self.file_object, fcb, handle, flags);
+    }
+}
+
+impl Drop for PendingFileObjectAttachment {
+    fn drop(&mut self) {
+        if let Some(fcb) = self.fcb.take() {
+            abandon_file_control_block(fcb, self.file_object.kernel_file_object());
+        }
+    }
 }
 
 /// Stores already-opened FCB and preallocated CCB context pointers in the FILE_OBJECT.

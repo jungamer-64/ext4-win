@@ -15,7 +15,10 @@ use crate::{
     },
     kernel::status::{DriverError, DriverResult},
     memory::DriverVec,
-    state::{KernelDevice, MountedVolumeDevice, TransferSectorSize, VolumeControlBlock},
+    state::{
+        MountedVolumeDevice, TransferSectorSize, VolumeControlBlock, VolumeOperationLane,
+        VolumeOperationLease,
+    },
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
 
@@ -26,27 +29,28 @@ const FILE_SYSTEM_NAME: &[u16] = &[0x0045, 0x0058, 0x0054, 0x0034, 0x0057, 0x004
 /// # Errors
 ///
 /// Returns an error when volume stack decoding or information packing fails.
-pub(crate) fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    QueryVolumeRequest::decode(target).and_then(query_volume)
+pub(crate) async fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let request = QueryVolumeRequest::decode(target)?;
+    query_volume(request)
 }
 
 /// Executes volume information mutations.
 /// # Errors
 ///
 /// Returns an error when volume stack decoding or label mutation fails.
-pub(crate) fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    SetVolumeRequest::decode(target).and_then(set_volume)
+pub(crate) async fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let request = SetVolumeRequest::decode(target)?;
+    set_volume(request).await
 }
 
 /// Decoded query-volume request.
-#[derive(Clone, Copy, Debug)]
 struct QueryVolumeRequest {
-    /// Mounted device receiving the query.
-    device: KernelDevice,
     /// IRP target for buffer and result accounting.
     target: DispatchTarget,
     /// Query stack parameters.
     stack: QueryVolumeStack,
+    /// Exclusive actor-owned mounted-volume operation capability.
+    operations: VolumeOperationLease,
 }
 
 impl QueryVolumeRequest {
@@ -56,23 +60,30 @@ impl QueryVolumeRequest {
     /// Returns an error when the current stack is not a query-volume stack or the requested class is
     /// unsupported.
     fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
+        let stack = target.current_stack()?.query_volume()?;
+        let volume =
+            MountedVolumeDevice::vcb(target.device()).ok_or(DriverError::InvalidDeviceRequest)?;
+        let operations = unsafe {
+            // SAFETY: Query-volume runs only as the mounted-device executor's unique active
+            // operation. The lease is moved into this request until that operation completes.
+            VolumeControlBlock::claim_operation_lane(volume)
+        };
         Ok(Self {
-            device: target.device(),
             target,
-            stack: target.current_stack()?.query_volume()?,
+            stack,
+            operations,
         })
     }
 }
 
 /// Decoded set-volume request.
-#[derive(Clone, Copy, Debug)]
 struct SetVolumeRequest {
-    /// Mounted device receiving the mutation.
-    device: KernelDevice,
     /// IRP target for input buffer access.
     target: DispatchTarget,
     /// Set stack parameters.
     stack: SetVolumeStack,
+    /// Exclusive actor-owned mounted-volume operation capability.
+    operations: VolumeOperationLease,
 }
 
 impl SetVolumeRequest {
@@ -82,10 +93,18 @@ impl SetVolumeRequest {
     /// Returns an error when the current stack is not a set-volume stack or the requested class is
     /// unsupported.
     fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
+        let stack = target.current_stack()?.set_volume()?;
+        let volume =
+            MountedVolumeDevice::vcb(target.device()).ok_or(DriverError::InvalidDeviceRequest)?;
+        let operations = unsafe {
+            // SAFETY: Set-volume runs only as the mounted-device executor's unique active
+            // operation. The lease is moved into this request until that operation completes.
+            VolumeControlBlock::claim_operation_lane(volume)
+        };
         Ok(Self {
-            device: target.device(),
             target,
-            stack: target.current_stack()?.set_volume()?,
+            stack,
+            operations,
         })
     }
 }
@@ -96,23 +115,16 @@ impl SetVolumeRequest {
 /// Returns an error when the dispatch target is not a mounted volume or the selected class cannot be
 /// packed into the caller buffer.
 fn query_volume(request: QueryVolumeRequest) -> DriverResult<IrpCompletion> {
-    let Some(mut vcb) = MountedVolumeDevice::vcb(request.device) else {
-        return Err(DriverError::InvalidDeviceRequest);
-    };
-    let vcb = unsafe {
-        // SAFETY: MountedVolumeDevice::vcb returns a live VCB pointer stored in
-        // this mounted device extension.
-        vcb.as_mut()
-    };
     let length = request.stack.length();
     let mut buffer = request.target.buffered_output(length)?;
     let output = buffer.as_mut_slice();
+    let operations = request.operations.lane();
     match request.stack.information_class() {
-        QueryVolumeInformationClass::Volume => pack_volume_information(vcb, output),
-        QueryVolumeInformationClass::Size => pack_size_information(vcb, output),
+        QueryVolumeInformationClass::Volume => pack_volume_information(operations, output),
+        QueryVolumeInformationClass::Size => pack_size_information(operations, output),
         QueryVolumeInformationClass::Device => pack_device_information(output),
         QueryVolumeInformationClass::Attribute => pack_attribute_information(output),
-        QueryVolumeInformationClass::FullSize => pack_full_size_information(vcb, output),
+        QueryVolumeInformationClass::FullSize => pack_full_size_information(operations, output),
     }
 }
 
@@ -121,9 +133,9 @@ fn query_volume(request: QueryVolumeRequest) -> DriverResult<IrpCompletion> {
 ///
 /// Returns an error when the selected volume-information mutation input is invalid or cannot be
 /// committed.
-fn set_volume(request: SetVolumeRequest) -> DriverResult<IrpCompletion> {
+async fn set_volume(request: SetVolumeRequest) -> DriverResult<IrpCompletion> {
     match request.stack.information_class() {
-        SetVolumeInformationClass::Label => set_volume_label(request),
+        SetVolumeInformationClass::Label => set_volume_label(request).await,
     }?;
     Ok(IrpCompletion::EMPTY)
 }
@@ -133,29 +145,27 @@ fn set_volume(request: SetVolumeRequest) -> DriverResult<IrpCompletion> {
 ///
 /// Returns an error when the label input buffer is malformed, the device is not mounted, the
 /// superblock label transaction fails, or the VPB label cannot be refreshed.
-fn set_volume_label(request: SetVolumeRequest) -> DriverResult<()> {
+async fn set_volume_label(request: SetVolumeRequest) -> DriverResult<()> {
     let length = request.stack.length();
-    let input = request.target.buffered_input(length)?;
-    let label = volume_label_from_file_fs_label(input.as_slice())?;
-    let Some(mut vcb) = MountedVolumeDevice::vcb(request.device) else {
-        return Err(DriverError::InvalidDeviceRequest);
+    let label = {
+        let input = request.target.buffered_input(length)?;
+        volume_label_from_file_fs_label(input.as_slice())?
     };
-    let vcb = unsafe {
-        // SAFETY: MountedVolumeDevice::vcb returns a live VCB pointer stored in
-        // this mounted device extension. The mutable borrow is the transaction
-        // boundary for this label mutation.
-        vcb.as_mut()
-    };
-    if vcb.volume_label() == label {
+    let mut operations = request.operations;
+    if operations.lane().volume_label() == label {
         return Ok(());
     }
 
-    let mut transaction = vcb
-        .volume_mut()
+    let mut transaction = operations
+        .lane_mut()
+        .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     transaction.set_volume_label(label);
-    transaction.commit()?;
-    MountedVolumeDevice::refresh_vpb_label(request.device, vcb)
+    transaction.commit().await?;
+    MountedVolumeDevice::refresh_vpb_label(
+        request.target.device(),
+        operations.lane().volume_label(),
+    )
 }
 
 /// Decodes a Windows label information buffer into an ext4 volume label.
@@ -198,10 +208,10 @@ fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel
 ///
 /// Returns an error when the UTF-16 label byte count overflows or the output buffer is too small.
 fn pack_volume_information(
-    vcb: &VolumeControlBlock,
+    operations: &VolumeOperationLane,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let label = vcb.volume_label();
+    let label = operations.volume_label();
     let label_bytes = label.bytes();
     let header = core::mem::offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
     let label_len = label_bytes
@@ -231,7 +241,7 @@ fn pack_volume_information(
             FILE_FS_VOLUME_INFORMATION,
             VolumeSerialNumber
         )),
-        vcb.serial_number().as_u32(),
+        operations.serial_number().as_u32(),
     )?;
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
@@ -268,10 +278,10 @@ fn pack_volume_information(
 /// Returns an error when ext4 cluster geometry cannot be represented in `FILE_FS_SIZE_INFORMATION`
 /// or the output buffer is too small.
 fn pack_size_information(
-    vcb: &VolumeControlBlock,
+    operations: &VolumeOperationLane,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let geometry = vcb.volume().geometry();
+    let geometry = operations.journaled().geometry();
     write_fixed(
         output,
         FILE_FS_SIZE_INFORMATION {
@@ -309,10 +319,10 @@ fn pack_device_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
 /// Returns an error when ext4 cluster geometry cannot be represented in
 /// `FILE_FS_FULL_SIZE_INFORMATION` or the output buffer is too small.
 fn pack_full_size_information(
-    vcb: &VolumeControlBlock,
+    operations: &VolumeOperationLane,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let geometry = vcb.volume().geometry();
+    let geometry = operations.journaled().geometry();
     let available = LARGE_INTEGER {
         QuadPart: i64::try_from(geometry.free_cluster_count().as_u64())
             .map_err(|_| DriverError::InvalidParameter)?,

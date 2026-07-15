@@ -23,8 +23,8 @@ use crate::state::{
     CleanupStart, CloseReleasePlan, DirectoryCursor, DirectoryNameChange,
     DirectoryNameChangeAction, DirectoryNotificationRegistration, FileControlBlock,
     KernelFileObject, MountedVolumeDevice, OpenedDirectory, OpenedHandle, OpenedLocation,
-    OpenedObject, OpenedRegularFile, VolumeControlBlock, WriteCommitment,
-    release_cancelled_file_control_block, release_file_control_block,
+    OpenedObject, OpenedRegularFile, VolumeControlBlock, VolumeOperationLane, VolumeOperationLease,
+    WriteCommitment, release_cancelled_file_control_block, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -52,16 +52,16 @@ pub(crate) fn close(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// # Errors
 ///
 /// Returns an error when read stack decoding, output buffer mapping, or ext4 file reading fails.
-pub(crate) fn read(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    read_regular_file(target)
+pub(crate) async fn read(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    read_regular_file(target).await
 }
 
 /// Executes regular file data writes.
 /// # Errors
 ///
 /// Returns an error when write stack decoding, input buffer mapping, or ext4 file mutation fails.
-pub(crate) fn write(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    write_regular_file(target)
+pub(crate) async fn write(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    write_regular_file(target).await
 }
 
 /// Flushes cached or ordered file data.
@@ -69,8 +69,10 @@ pub(crate) fn write(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 ///
 /// Returns an error when the flush target cannot be resolved to a mounted ext4 volume or the
 /// lower storage flush fails.
-pub(crate) fn flush(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    flush_volume(FlushVolume::decode(target)?)
+pub(crate) async fn flush(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let mut operations = claim_volume_operation_lane(FlushVolume::decode(target)?.volume());
+    operations.lane_mut().flush().await?;
+    Ok(IrpCompletion::EMPTY)
 }
 
 /// Flushes one mounted volume during `IRP_MJ_SHUTDOWN`.
@@ -78,22 +80,10 @@ pub(crate) fn flush(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 ///
 /// Returns an error when shutdown was not addressed to a mounted ext4 volume or the lower storage
 /// flush fails.
-pub(crate) fn shutdown(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    flush_volume(FlushVolume::from_mounted_device(target.device())?)
-}
-
-/// Flushes the VCB selected by a flush or shutdown request.
-/// # Errors
-///
-/// Returns an error when the mounted ext4 volume cannot persist its filesystem-device writes.
-fn flush_volume(volume: FlushVolume) -> DriverResult<IrpCompletion> {
-    let mut volume = volume.volume();
-    let vcb = unsafe {
-        // SAFETY: The decoded flush volume is owned by the mounted device or
-        // an opened FILE_OBJECT context for the duration of this dispatch.
-        volume.as_mut()
-    };
-    vcb.flush()?;
+pub(crate) async fn shutdown(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let mut operations =
+        claim_volume_operation_lane(FlushVolume::from_mounted_device(target.device())?.volume());
+    operations.lane_mut().flush().await?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -101,16 +91,16 @@ fn flush_volume(volume: FlushVolume) -> DriverResult<IrpCompletion> {
 /// # Errors
 ///
 /// Returns an error when query stack decoding or information packing fails.
-pub(crate) fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    QueryFileRequest::decode(target).and_then(query_file_information)
+pub(crate) async fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    query_file_information(target).await
 }
 
 /// Executes file information mutations.
 /// # Errors
 ///
 /// Returns an error when set stack decoding or the requested file mutation fails.
-pub(crate) fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    SetFileRequest::decode(target).and_then(set_file_information)
+pub(crate) async fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    set_file_information(target).await
 }
 
 /// Transfers one queued directory-change IRP to the VCB's FsRtl notification list.
@@ -289,8 +279,6 @@ impl SetFileRequest {
 /// Decoded query-directory request.
 #[derive(Debug)]
 struct QueryDirectoryRequest {
-    /// Dispatch target receiving the query.
-    target: DispatchTarget,
     /// Decoded query-directory stack.
     stack: QueryDirectoryStack,
     /// Opened directory contexts decoded before handler execution.
@@ -306,11 +294,7 @@ impl QueryDirectoryRequest {
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.query_directory()?;
         let opened_file = OpenedDirectory::decode(stack.file_object())?;
-        Ok(Self {
-            target,
-            stack,
-            opened_file,
-        })
+        Ok(Self { stack, opened_file })
     }
 }
 
@@ -319,31 +303,93 @@ impl QueryDirectoryRequest {
 ///
 /// Returns an error when metadata cannot be loaded, the output buffer is too small, or the requested
 /// information class cannot be packed into its Windows layout.
-fn query_file_information(request: QueryFileRequest) -> DriverResult<IrpCompletion> {
-    let length = request.stack.length();
-    let mut buffer = request.target.buffered_output(length)?;
-    let output = buffer.as_mut_slice();
-    match request.stack.information_class() {
-        QueryFileInformationClass::Basic => {
-            pack_basic_information(output, load_file_metadata(&request.opened_file)?)
+async fn query_file_information(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let (length, information_class, node, operations) = {
+        let request = QueryFileRequest::decode(target)?;
+        let length = request.stack.length();
+        let information_class = request.stack.information_class();
+        match information_class {
+            QueryFileInformationClass::Position => {
+                let mut buffer = request.target.buffered_output(length)?;
+                return pack_position_information(buffer.as_mut_slice(), &request.opened_file);
+            }
+            QueryFileInformationClass::Name => {
+                let mut buffer = request.target.buffered_output(length)?;
+                return pack_name_information(buffer.as_mut_slice(), &request.opened_file);
+            }
+            QueryFileInformationClass::Basic
+            | QueryFileInformationClass::Standard
+            | QueryFileInformationClass::Internal
+            | QueryFileInformationClass::NetworkOpen
+            | QueryFileInformationClass::AttributeTag => {}
         }
+        let node = request.opened_file.node();
+        let operations = claim_file_operation_lane(request.opened_file.file_control_block());
+        (length, information_class, node, operations)
+    };
+    let metadata = {
+        let mut operations = operations;
+        metadata_from_node(operations.lane_mut(), node).await?
+    };
+    let mut buffer = target.buffered_output(length)?;
+    match information_class {
+        QueryFileInformationClass::Basic => pack_basic_information(buffer.as_mut_slice(), metadata),
         QueryFileInformationClass::Standard => {
-            pack_standard_information(output, load_file_metadata(&request.opened_file)?)
+            pack_standard_information(buffer.as_mut_slice(), metadata)
         }
         QueryFileInformationClass::Internal => {
-            pack_internal_information(output, load_file_metadata(&request.opened_file)?)
-        }
-        QueryFileInformationClass::Position => {
-            pack_position_information(output, &request.opened_file)
+            pack_internal_information(buffer.as_mut_slice(), metadata)
         }
         QueryFileInformationClass::NetworkOpen => {
-            pack_network_open_information(output, load_file_metadata(&request.opened_file)?)
+            pack_network_open_information(buffer.as_mut_slice(), metadata)
         }
-        QueryFileInformationClass::Name => pack_name_information(output, &request.opened_file),
         QueryFileInformationClass::AttributeTag => {
-            pack_attribute_tag_information(output, load_file_metadata(&request.opened_file)?)
+            pack_attribute_tag_information(buffer.as_mut_slice(), metadata)
+        }
+        QueryFileInformationClass::Position | QueryFileInformationClass::Name => {
+            Err(DriverError::InternalInvariantViolation)
         }
     }
+}
+
+/// Applies one supported set-file-information class.
+enum SetFilePlan {
+    /// The request completed entirely while decoding its synchronous control-plane mutation.
+    Complete,
+    /// Apply timestamps and overlay attributes to one node.
+    Basic {
+        /// Caller update copied from the IRP buffer.
+        info: wdk_sys::FILE_BASIC_INFORMATION,
+        /// Target ext4 node.
+        node: NodeId,
+        /// Exclusive mounted-volume operation capability.
+        operations: VolumeOperationLease,
+    },
+    /// Set the exact logical end of file.
+    EndOfFile {
+        /// Target regular file.
+        file: FileNodeId,
+        /// Requested logical size.
+        size: FileSize,
+        /// Exclusive mounted-volume operation capability.
+        operations: VolumeOperationLease,
+    },
+    /// Shrink allocation when the requested sparse-model size is below EOF.
+    Allocation {
+        /// Target regular file.
+        file: FileNodeId,
+        /// Requested allocation bound.
+        size: FileSize,
+        /// Exclusive mounted-volume operation capability.
+        operations: VolumeOperationLease,
+    },
+    /// Commit one fully owned namespace rename.
+    Rename {
+        /// Caller-independent rename domain values.
+        mutation: RenameMutation,
+        /// Exclusive mounted-volume operation capability.
+        operations: VolumeOperationLease,
+    },
 }
 
 /// Applies one supported set-file-information class.
@@ -351,21 +397,94 @@ fn query_file_information(request: QueryFileRequest) -> DriverResult<IrpCompleti
 ///
 /// Returns an error when the selected set-information class has invalid input or its ext4 metadata
 /// mutation cannot be committed.
-fn set_file_information(request: SetFileRequest) -> DriverResult<IrpCompletion> {
-    match request.stack.information_class() {
-        SetFileInformationClass::Basic => set_basic_information(request),
-        SetFileInformationClass::Position => set_position_information(request),
-        SetFileInformationClass::EndOfFile => set_end_of_file_information(request),
-        SetFileInformationClass::Allocation => set_allocation_information(request),
-        SetFileInformationClass::Disposition => set_disposition_information(request),
-        SetFileInformationClass::DispositionEx => set_disposition_information_ex(request),
-        SetFileInformationClass::Rename => {
-            set_rename_information(request, RenameInformationFormat::ReplaceIfExistsByte)
+async fn set_file_information(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let plan = {
+        let mut request = SetFileRequest::decode(target)?;
+        match request.stack.information_class() {
+            SetFileInformationClass::Basic => SetFilePlan::Basic {
+                info: read_file_information_input::<wdk_sys::FILE_BASIC_INFORMATION>(
+                    request.target,
+                    request.stack.length(),
+                )?,
+                node: request.opened_file.node(),
+                operations: claim_file_operation_lane(request.opened_file.file_control_block()),
+            },
+            SetFileInformationClass::Position => {
+                set_position_information(&mut request)?;
+                SetFilePlan::Complete
+            }
+            SetFileInformationClass::EndOfFile => {
+                let info = read_file_information_input::<wdk_sys::FILE_END_OF_FILE_INFORMATION>(
+                    request.target,
+                    request.stack.length(),
+                )?;
+                let opened_file = OpenedRegularFile::decode(request.stack.file_object())?;
+                SetFilePlan::EndOfFile {
+                    file: opened_file.id(),
+                    size: file_size_from_large_integer(info.EndOfFile)?,
+                    operations: claim_file_operation_lane(request.opened_file.file_control_block()),
+                }
+            }
+            SetFileInformationClass::Allocation => {
+                let info = read_file_information_input::<wdk_sys::FILE_ALLOCATION_INFORMATION>(
+                    request.target,
+                    request.stack.length(),
+                )?;
+                let opened_file = OpenedRegularFile::decode(request.stack.file_object())?;
+                SetFilePlan::Allocation {
+                    file: opened_file.id(),
+                    size: file_size_from_large_integer(info.AllocationSize)?,
+                    operations: claim_file_operation_lane(request.opened_file.file_control_block()),
+                }
+            }
+            SetFileInformationClass::Disposition => {
+                set_disposition_information(&request)?;
+                SetFilePlan::Complete
+            }
+            SetFileInformationClass::DispositionEx => {
+                set_disposition_information_ex(&request)?;
+                SetFilePlan::Complete
+            }
+            SetFileInformationClass::Rename => SetFilePlan::Rename {
+                mutation: RenameMutation::decode(
+                    &request,
+                    RenameInformationFormat::ReplaceIfExistsByte,
+                )?,
+                operations: claim_file_operation_lane(request.opened_file.file_control_block()),
+            },
+            SetFileInformationClass::RenameEx => SetFilePlan::Rename {
+                mutation: RenameMutation::decode(&request, RenameInformationFormat::Flags)?,
+                operations: claim_file_operation_lane(request.opened_file.file_control_block()),
+            },
         }
-        SetFileInformationClass::RenameEx => {
-            set_rename_information(request, RenameInformationFormat::Flags)
+    };
+    match plan {
+        SetFilePlan::Complete => {}
+        SetFilePlan::Basic {
+            info,
+            node,
+            mut operations,
+        } => set_basic_information(info, node, operations.lane_mut()).await?,
+        SetFilePlan::EndOfFile {
+            file,
+            size,
+            mut operations,
+        } => set_regular_file_size(operations.lane_mut(), file, size).await?,
+        SetFilePlan::Allocation {
+            file,
+            size,
+            mut operations,
+        } => {
+            let current = regular_file_size(operations.lane_mut(), file).await?;
+            if size < current {
+                set_regular_file_size(operations.lane_mut(), file, size).await?;
+            }
         }
-    }?;
+        SetFilePlan::Rename {
+            mutation,
+            operations,
+        } => return rename_file_information(target, mutation, operations).await,
+    }
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -374,7 +493,7 @@ fn set_file_information(request: SetFileRequest) -> DriverResult<IrpCompletion> 
 ///
 /// Returns an error when the input is truncated, negative, asynchronous, or misaligned for a
 /// no-intermediate-buffering handle.
-fn set_position_information(mut request: SetFileRequest) -> DriverResult<()> {
+fn set_position_information(request: &mut SetFileRequest) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_POSITION_INFORMATION>(
         request.target,
         request.stack.length(),
@@ -392,86 +511,40 @@ fn set_position_information(mut request: SetFileRequest) -> DriverResult<()> {
 ///
 /// Returns an error when the input structure is truncated, timestamps or attributes are invalid, or
 /// the resulting ext4 metadata transaction fails.
-fn set_basic_information(request: SetFileRequest) -> DriverResult<()> {
-    let info = read_file_information_input::<wdk_sys::FILE_BASIC_INFORMATION>(
-        request.target,
-        request.stack.length(),
-    )?;
-    let metadata = load_file_metadata(&request.opened_file)?;
+async fn set_basic_information(
+    info: wdk_sys::FILE_BASIC_INFORMATION,
+    node_id: NodeId,
+    operations: &mut VolumeOperationLane,
+) -> DriverResult<()> {
+    let metadata = metadata_from_node(operations, node_id).await?;
     let times = set_basic_times(metadata.times, info)?;
     let attributes = set_basic_attributes(metadata, info.FileAttributes)?;
     if times == metadata.times && attributes.is_empty() {
         return Ok(());
     }
 
-    let context = opened_file_context(&request.opened_file);
-    let mut vcb = context.volume;
-    let vcb = unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
-        // remain valid while file objects are open. The mutable borrow is the
-        // transaction boundary for this synchronous metadata mutation.
-        vcb.as_mut()
-    };
-    let mut transaction = vcb
-        .volume_mut()
+    let mut transaction = operations
+        .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let node = transaction.node(context.node)?;
+    let node = transaction.node(node_id).await?;
     if times != metadata.times {
-        transaction.set_times(node, times)?;
+        transaction.set_times(node, times).await?;
     }
     if let Some(security) = attributes.security() {
-        transaction.set_posix_security(node, security)?;
+        transaction.set_posix_security(node, security).await?;
     }
     if let Some(overlay) = attributes.overlay() {
-        transaction.set_windows_overlay(node, overlay)?;
+        transaction.set_windows_overlay(node, overlay).await?;
     }
-    transaction.commit()?;
+    transaction.commit().await?;
     Ok(())
-}
-
-/// Applies FILE_END_OF_FILE_INFORMATION to a regular file.
-/// # Errors
-///
-/// Returns an error when the input is truncated, the handle is not a regular file, the size is
-/// negative, or the file resize transaction fails.
-fn set_end_of_file_information(request: SetFileRequest) -> DriverResult<()> {
-    let info = read_file_information_input::<wdk_sys::FILE_END_OF_FILE_INFORMATION>(
-        request.target,
-        request.stack.length(),
-    )?;
-    let opened_file = OpenedRegularFile::decode(request.stack.file_object())?;
-    set_regular_file_size(&opened_file, file_size_from_large_integer(info.EndOfFile)?)
-}
-
-/// Applies FILE_ALLOCATION_INFORMATION within the ext4 sparse-file model.
-/// # Errors
-///
-/// Returns an error when the input is truncated, the handle is not a regular file, the requested
-/// allocation size is negative, or shrinking to that size fails.
-fn set_allocation_information(request: SetFileRequest) -> DriverResult<()> {
-    let info = read_file_information_input::<wdk_sys::FILE_ALLOCATION_INFORMATION>(
-        request.target,
-        request.stack.length(),
-    )?;
-    let requested = file_size_from_large_integer(info.AllocationSize)?;
-    let opened_file = OpenedRegularFile::decode(request.stack.file_object())?;
-    let vcb = unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
-        // remain valid while file objects are open.
-        opened_file.volume().as_ref()
-    };
-    let current = regular_file_size(vcb, opened_file.id())?;
-    if requested >= current {
-        return Ok(());
-    }
-    set_regular_file_size(&opened_file, requested)
 }
 
 /// Rejects FILE_DISPOSITION_INFORMATION deletion until identity-checked orphan lifecycle exists.
 /// # Errors
 ///
 /// Returns an error when the input is truncated or requests deletion.
-fn set_disposition_information(request: SetFileRequest) -> DriverResult<()> {
+fn set_disposition_information(request: &SetFileRequest) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION>(
         request.target,
         request.stack.length(),
@@ -495,7 +568,7 @@ fn validate_disposition_delete_flag(delete_file: wdk_sys::BOOLEAN) -> DriverResu
 /// # Errors
 ///
 /// Returns an error when the extended disposition input is truncated or carries unsupported flags.
-fn set_disposition_information_ex(request: SetFileRequest) -> DriverResult<()> {
+fn set_disposition_information_ex(request: &SetFileRequest) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION_EX>(
         request.target,
         request.stack.length(),
@@ -515,63 +588,143 @@ fn validate_disposition_ex_flags(flags: wdk_sys::ULONG) -> DriverResult<()> {
     }
 }
 
-/// Applies FILE_RENAME_INFORMATION to the opened directory-entry location.
+/// Owned rename mutation decoded completely before the first suspension.
+#[derive(Debug)]
+struct RenameMutation {
+    /// Current parent identity.
+    source_parent: DirectoryNodeId,
+    /// Current exact ext4 name.
+    source_name: Ext4Name,
+    /// Node being moved.
+    source_node: NodeId,
+    /// Root-relative destination and collision policy.
+    target: RenameTargetPath,
+}
+
+impl RenameMutation {
+    /// Copies every caller and handle-dependent rename field into owned domain values.
+    /// # Errors
+    ///
+    /// Returns an error when the input layout, source location, or destination path is invalid.
+    fn decode(request: &SetFileRequest, format: RenameInformationFormat) -> DriverResult<Self> {
+        let target = RenameTargetPath::parse(request.target, request.stack.length(), format)?;
+        let (source_parent, source_name) = match request.opened_file.location() {
+            OpenedLocation::DirectoryEntry { parent, name } => (*parent, name.try_to_owned_name()?),
+            OpenedLocation::Root => {
+                return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));
+            }
+            OpenedLocation::FileReference => return Err(DriverError::NotSupported),
+        };
+        Ok(Self {
+            source_parent,
+            source_name,
+            source_node: request.opened_file.node(),
+            target,
+        })
+    }
+}
+
+/// Result of a committed rename with mutually exclusive no-op and changed states.
+enum CommittedRename {
+    /// The transaction preserved the existing handle location and emitted no notifications.
+    Unchanged,
+    /// The committed namespace move requires one handle-location update and exact notifications.
+    Changed {
+        /// New CCB location.
+        location: OpenedLocation,
+        /// Namespace notifications derived before commit.
+        notifications: Box<RenameDirectoryNameChanges>,
+    },
+}
+
+/// Executes one owned rename and applies its post-commit control-plane effects.
 /// # Errors
 ///
-/// Returns an error when the rename buffer is malformed, the opened location cannot be renamed,
-/// the target parent cannot be resolved, or the ext4 rename transaction fails.
-fn set_rename_information(
-    mut request: SetFileRequest,
-    format: RenameInformationFormat,
-) -> DriverResult<()> {
-    let rename = RenameTargetPath::parse(request.target, request.stack.length(), format)?;
-
-    let (source_parent, source_name) = match request.opened_file.location() {
-        OpenedLocation::DirectoryEntry { parent, name } => (*parent, name.try_to_owned_name()?),
-        OpenedLocation::Root => return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot)),
-        OpenedLocation::FileReference => return Err(DriverError::NotSupported),
+/// Returns an error when the namespace transaction fails or post-commit handle decoding detects
+/// an invalid pending-IRP state.
+async fn rename_file_information(
+    target: DispatchTarget,
+    mutation: RenameMutation,
+    operations: VolumeOperationLease,
+) -> DriverResult<IrpCompletion> {
+    let committed = {
+        let mut operations = operations;
+        set_rename_information(mutation, operations.lane_mut()).await?
     };
-
-    let mut vcb = request.opened_file.volume();
-    let vcb = unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
-        // remain valid while file objects are open. The mutable borrow is the
-        // transaction boundary for this rename request.
-        vcb.as_mut()
-    };
-    let (target_parent, target_name) = resolve_rename_target(vcb, &rename)?;
-    let notifications = RenameDirectoryNameChanges::prepare(
-        vcb,
-        source_parent,
-        &source_name,
-        request.opened_file.node(),
-        target_parent,
-        &target_name,
-        &rename,
-    )?;
-    let mut transaction = vcb
-        .volume_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let source_parent = transaction.directory(source_parent)?;
-    let target_parent = transaction.directory(target_parent)?;
-    transaction.rename_child(
-        source_parent,
-        &source_name,
-        target_parent,
-        &target_name,
-        rename.target_collision(),
-    )?;
-    transaction.commit()?;
-    if let Some(notifications) = notifications {
-        request
-            .opened_file
-            .replace_location(OpenedLocation::DirectoryEntry {
-                parent: target_parent.id(),
-                name: target_name,
-            });
+    if let CommittedRename::Changed {
+        location,
+        notifications,
+    } = committed
+    {
+        let stack = target.current_stack()?.set_file()?;
+        let mut opened = OpenedObject::decode(stack.file_object())?;
+        opened.replace_location(location);
+        let volume = opened.volume();
+        let vcb = unsafe {
+            // SAFETY: The pending IRP retains the opened FCB and VCB. The operation lease was
+            // dropped before projecting this disjoint notifier control plane.
+            volume.as_ref()
+        };
         notifications.report(vcb);
     }
-    Ok(())
+    Ok(IrpCompletion::EMPTY)
+}
+
+/// Applies one owned FILE_RENAME_INFORMATION mutation to the ext4 namespace.
+/// # Errors
+///
+/// Returns an error when target resolution, notification preparation, or the rename transaction
+/// fails.
+async fn set_rename_information(
+    mutation: RenameMutation,
+    operations: &mut VolumeOperationLane,
+) -> DriverResult<CommittedRename> {
+    let RenameMutation {
+        source_parent,
+        source_name,
+        source_node,
+        target,
+    } = mutation;
+    let (target_parent, target_name) = resolve_rename_target(operations, &target).await?;
+    let notifications = RenameDirectoryNameChanges::prepare(
+        operations,
+        source_parent,
+        &source_name,
+        source_node,
+        target_parent,
+        &target_name,
+        &target,
+    )
+    .await?;
+    let notifications = notifications
+        .map(Box::try_new)
+        .transpose()
+        .map_err(|_| DriverError::InsufficientResources)?;
+    let mut transaction = operations
+        .journaled_mut()
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
+    let source_parent = transaction.directory(source_parent).await?;
+    let target_parent = transaction.directory(target_parent).await?;
+    transaction
+        .rename_child(
+            source_parent,
+            &source_name,
+            target_parent,
+            &target_name,
+            target.target_collision(),
+        )
+        .await?;
+    transaction.commit().await?;
+    match notifications {
+        Some(notifications) => Ok(CommittedRename::Changed {
+            location: OpenedLocation::DirectoryEntry {
+                parent: target_parent.id(),
+                name: target_name,
+            },
+            notifications,
+        }),
+        None => Ok(CommittedRename::Unchanged),
+    }
 }
 
 /// Committed directory-name changes caused by one non-no-op rename operation.
@@ -591,8 +744,8 @@ impl RenameDirectoryNameChanges {
     ///
     /// Returns an error when a replace-capable target cannot be read or a visible child name
     /// cannot be represented in the Windows notification namespace.
-    fn prepare(
-        vcb: &VolumeControlBlock,
+    async fn prepare(
+        operations: &mut VolumeOperationLane,
         source_parent: DirectoryNodeId,
         source_name: &Ext4Name,
         source_node: NodeId,
@@ -607,10 +760,14 @@ impl RenameDirectoryNameChanges {
         let replaced_target = match target.target_collision() {
             RenameTargetCollision::Reject => None,
             RenameTargetCollision::Replace => {
-                let parent = vcb.volume().load_directory(target_parent)?;
-                match vcb
-                    .volume()
-                    .lookup_windows_child(&parent, target.target_name())?
+                let parent = operations
+                    .journaled_mut()
+                    .load_directory(target_parent)
+                    .await?;
+                match operations
+                    .journaled_mut()
+                    .lookup_windows_child(&parent, target.target_name())
+                    .await?
                 {
                     ChildLookup::Found(child) if *child.node() == source_node => return Ok(None),
                     ChildLookup::Found(child) => Some(DirectoryNameChange::new(
@@ -656,30 +813,26 @@ impl RenameDirectoryNameChanges {
 ///
 /// Returns an error when the current file size cannot be loaded or the ext4 resize transaction
 /// fails.
-fn set_regular_file_size(opened_file: &OpenedRegularFile, new_size: FileSize) -> DriverResult<()> {
-    let file_id = opened_file.id();
-    let mut vcb = opened_file.volume();
-    let vcb = unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
-        // remain valid while file objects are open. The mutable borrow is the
-        // transaction boundary for this synchronous size mutation.
-        vcb.as_mut()
-    };
-    let current = regular_file_size(vcb, file_id)?;
+async fn set_regular_file_size(
+    operations: &mut VolumeOperationLane,
+    file_id: FileNodeId,
+    new_size: FileSize,
+) -> DriverResult<()> {
+    let current = regular_file_size(operations, file_id).await?;
     if new_size == current {
         return Ok(());
     }
 
-    let mut transaction = vcb
-        .volume_mut()
+    let mut transaction = operations
+        .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let file = transaction.file(file_id)?;
+    let file = transaction.file(file_id).await?;
     if new_size > current {
-        transaction.extend_file(file, new_size)?;
+        transaction.extend_file(file, new_size).await?;
     } else {
-        transaction.truncate_file(file, new_size)?;
+        transaction.truncate_file(file, new_size).await?;
     }
-    transaction.commit()?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -688,37 +841,70 @@ fn set_regular_file_size(opened_file: &OpenedRegularFile, new_size: FileSize) ->
 ///
 /// Returns an error when the directory query stack, pattern, output buffer, opened directory, or
 /// emitted directory record layout is invalid.
-pub(crate) fn query_directory(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let mut request = QueryDirectoryRequest::decode(target)?;
-    let class = request.stack.information_class();
-    let pattern = DirectoryPattern::from_stack(request.stack)?;
-    let length = request.stack.length();
-    let mut buffer = request.target.data_output(length)?;
-    let buffer = buffer.as_mut_slice();
-
-    let volume = request.opened_file.volume();
-    let vcb = unsafe {
-        // SAFETY: OpenedDirectory is decoded from a live FCB whose VCB
-        // pointer remains valid for the opened FILE_OBJECT lifetime.
-        volume.as_ref()
+pub(crate) async fn query_directory(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let (class, pattern, length, entry_emission, directory_id, mut cursor, operations) = {
+        let mut request = QueryDirectoryRequest::decode(target)?;
+        let class = request.stack.information_class();
+        let pattern = DirectoryPattern::from_stack(request.stack)?;
+        let length = request.stack.length();
+        let entry_emission = request.stack.entry_emission();
+        let directory_id = request.opened_file.id();
+        let mut cursor = *request.opened_file.cursor_mut();
+        initialize_directory_cursor(&mut cursor, request.stack.cursor_position());
+        let operations = claim_volume_operation_lane(request.opened_file.volume());
+        (
+            class,
+            pattern,
+            length,
+            entry_emission,
+            directory_id,
+            cursor,
+            operations,
+        )
     };
-    let directory_id = request.opened_file.id();
-    let directory = vcb.volume().load_directory(directory_id)?;
-    let entries = vcb.volume().read_directory(&directory)?;
+    let (cursor, packed, result) = {
+        let mut operations = operations;
+        let directory = operations
+            .lane_mut()
+            .journaled_mut()
+            .load_directory(directory_id)
+            .await?;
+        let entries = operations
+            .lane_mut()
+            .journaled_mut()
+            .read_directory(&directory)
+            .await?;
+        let mut packed = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
+        let result = emit_directory_entries(
+            operations.lane_mut(),
+            &mut cursor,
+            entry_emission,
+            class,
+            &pattern,
+            &entries,
+            packed.as_mut_slice(),
+        )
+        .await;
+        (cursor, packed, result)
+    };
 
-    let cursor = request.opened_file.cursor_mut();
-    initialize_directory_cursor(cursor, request.stack);
-
-    let result = emit_directory_entries(
-        vcb,
-        cursor,
-        request.stack,
-        class,
-        &pattern,
-        &entries,
-        buffer,
-    )?;
-    IrpCompletion::from_usize(result)
+    let information = result?;
+    let stack = target.current_stack()?.query_directory()?;
+    let mut opened_file = OpenedDirectory::decode(stack.file_object())?;
+    {
+        let mut output = target.data_output(length)?;
+        let destination = output
+            .as_mut_slice()
+            .get_mut(..information)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        let source = packed
+            .as_slice()
+            .get(..information)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        destination.copy_from_slice(source);
+    }
+    *opened_file.cursor_mut() = cursor;
+    IrpCompletion::from_usize(information)
 }
 
 impl DirectoryInformationClass {
@@ -1037,8 +1223,8 @@ fn is_all_directory_pattern(units: &[u16]) -> bool {
 }
 
 /// Applies QueryDirectory cursor reset/index flags.
-fn initialize_directory_cursor(cursor: &mut DirectoryCursor, stack: QueryDirectoryStack) {
-    match stack.cursor_position() {
+fn initialize_directory_cursor(cursor: &mut DirectoryCursor, position: DirectoryCursorPosition) {
+    match position {
         DirectoryCursorPosition::Current => {}
         DirectoryCursorPosition::Restart => cursor.seek(DirectoryEntryIndex::from_u32(0)),
         DirectoryCursorPosition::Index(index) => cursor.seek(index),
@@ -1050,10 +1236,10 @@ fn initialize_directory_cursor(cursor: &mut DirectoryCursor, stack: QueryDirecto
 ///
 /// Returns an error when cursor arithmetic overflows, a matching entry cannot fit in an empty
 /// output buffer, metadata loading fails, or a directory record cannot be packed.
-fn emit_directory_entries(
-    vcb: &VolumeControlBlock,
+async fn emit_directory_entries(
+    operations: &mut VolumeOperationLane,
     cursor: &mut DirectoryCursor,
-    stack: QueryDirectoryStack,
+    entry_emission: DirectoryEntryEmission,
     class: DirectoryInformationClass,
     pattern: &DirectoryPattern,
     entries: &[DirectoryEntry],
@@ -1080,7 +1266,7 @@ fn emit_directory_entries(
             continue;
         }
 
-        let metadata = metadata_from_node(vcb, *entry.node())?;
+        let metadata = metadata_from_node(operations, *entry.node()).await?;
         let layout = DirectoryRecordLayout::new(class, &name)?;
         let required = written
             .checked_add(layout.unpadded_size)
@@ -1113,7 +1299,7 @@ fn emit_directory_entries(
             .ok_or(DriverError::InvalidParameter)?;
         cursor.seek(DirectoryEntryIndex::from_u32(next_entry));
 
-        if matches!(stack.entry_emission(), DirectoryEntryEmission::Single) {
+        if matches!(entry_emission, DirectoryEntryEmission::Single) {
             break;
         }
     }
@@ -1362,23 +1548,6 @@ fn cleanup_directory_notification(opened_file: &OpenedObject) {
         .cleanup(opened_file.notification_context());
 }
 
-/// Open file state needed for journaled metadata mutations.
-#[derive(Clone, Copy, Debug)]
-struct OpenedFileContext {
-    /// Mounted VCB owning the open file.
-    volume: NonNull<VolumeControlBlock>,
-    /// ext4 node opened by this FILE_OBJECT.
-    node: NodeId,
-}
-
-/// Returns the opened FCB identity and VCB pointer.
-fn opened_file_context(opened_file: &OpenedObject) -> OpenedFileContext {
-    OpenedFileContext {
-        volume: opened_file.volume(),
-        node: opened_file.node(),
-    }
-}
-
 /// Reads a fixed-size set-information input structure.
 /// # Errors
 ///
@@ -1592,25 +1761,30 @@ fn utf16_units_from_le_bytes(bytes: &[u8]) -> DriverResult<DriverVec<u16>> {
 ///
 /// Returns an error when any parent component is absent or not a directory, or the target Windows
 /// name cannot be converted to an ext4 name.
-fn resolve_rename_target(
-    vcb: &VolumeControlBlock,
+async fn resolve_rename_target(
+    operations: &mut VolumeOperationLane,
     target: &RenameTargetPath,
 ) -> DriverResult<(DirectoryNodeId, Ext4Name)> {
     let mut parent_id = DirectoryNodeId::ROOT;
     for component in target.parents() {
-        let parent = vcb
-            .volume()
+        let parent = operations
+            .journaled_mut()
             .load_directory(parent_id)
+            .await
             .map_err(|_| DriverError::ObjectPathNotFound)?;
-        let child = vcb.volume().lookup_windows_child(&parent, component)?;
+        let child = operations
+            .journaled_mut()
+            .lookup_windows_child(&parent, component)
+            .await?;
         match child {
             ChildLookup::Found(child) => {
                 let NodeId::Directory(directory_id) = *child.node() else {
                     return Err(DriverError::ObjectPathNotFound);
                 };
-                if vcb
-                    .volume()
-                    .read_windows_symlink_reparse_point(NodeId::Directory(directory_id))?
+                if operations
+                    .journaled_mut()
+                    .read_windows_symlink_reparse_point(NodeId::Directory(directory_id))
+                    .await?
                     .is_some()
                 {
                     return Err(DriverError::NotSupported);
@@ -1829,8 +2003,11 @@ fn file_offset_from_large_integer(value: LARGE_INTEGER) -> DriverResult<FileOffs
 /// # Errors
 ///
 /// Returns an error when `file_id` cannot be loaded as a regular file.
-fn regular_file_size(vcb: &VolumeControlBlock, file_id: FileNodeId) -> DriverResult<FileSize> {
-    Ok(vcb.volume().load_file(file_id)?.size())
+async fn regular_file_size(
+    operations: &mut VolumeOperationLane,
+    file_id: FileNodeId,
+) -> DriverResult<FileSize> {
+    Ok(operations.journaled_mut().load_file(file_id).await?.size())
 }
 
 /// Returns the signed payload of a LARGE_INTEGER.
@@ -1885,33 +2062,28 @@ enum FileMetadataReparsePoint {
     SymbolicLink,
 }
 
-/// Loads metadata for the opened file currently being queried.
-/// # Errors
-///
-/// Returns an error when the opened node metadata or Windows overlay xattr cannot be loaded.
-fn load_file_metadata(opened_file: &OpenedObject) -> DriverResult<FileMetadata> {
-    let fcb = opened_file.file_control_block();
-    let vcb = volume_control_block(fcb);
-    metadata_from_node(vcb, fcb.node())
-}
-
 /// Builds Windows-facing metadata from a loaded ext4 node.
 /// # Errors
 ///
 /// Returns an error when `node_id` cannot be loaded as its typed ext4 node or its Windows overlay
 /// xattr is malformed.
-fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult<FileMetadata> {
-    let overlay_attributes = vcb
-        .volume()
-        .read_windows_overlay(node_id)?
+async fn metadata_from_node(
+    operations: &mut VolumeOperationLane,
+    node_id: NodeId,
+) -> DriverResult<FileMetadata> {
+    let overlay_attributes = operations
+        .journaled_mut()
+        .read_windows_overlay(node_id)
+        .await?
         .map(|overlay| overlay.attributes().bits())
         .unwrap_or(0);
     let reparse_point = match node_id {
         NodeId::Symlink(_) => FileMetadataReparsePoint::SymbolicLink,
         NodeId::File(_) | NodeId::Directory(_) => {
-            if vcb
-                .volume()
-                .read_windows_symlink_reparse_point(node_id)?
+            if operations
+                .journaled_mut()
+                .read_windows_symlink_reparse_point(node_id)
+                .await?
                 .is_some()
             {
                 FileMetadataReparsePoint::SymbolicLink
@@ -1922,10 +2094,10 @@ fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult
     };
 
     let file_index = node_id.file_index();
-    let block_size = vcb.volume().geometry().block_size();
+    let block_size = operations.journaled().geometry().block_size();
     match node_id {
         NodeId::File(file_id) => {
-            let file = vcb.volume().load_file(file_id)?;
+            let file = operations.journaled_mut().load_file(file_id).await?;
             Ok(FileMetadata {
                 file_index,
                 kind: FileMetadataKind::File,
@@ -1939,7 +2111,10 @@ fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult
             })
         }
         NodeId::Directory(directory_id) => {
-            let directory = vcb.volume().load_directory(directory_id)?;
+            let directory = operations
+                .journaled_mut()
+                .load_directory(directory_id)
+                .await?;
             Ok(FileMetadata {
                 file_index,
                 kind: FileMetadataKind::Directory,
@@ -1953,7 +2128,7 @@ fn metadata_from_node(vcb: &VolumeControlBlock, node_id: NodeId) -> DriverResult
             })
         }
         NodeId::Symlink(symlink_id) => {
-            let symlink = vcb.volume().load_symlink(symlink_id)?;
+            let symlink = operations.journaled_mut().load_symlink(symlink_id).await?;
             Ok(FileMetadata {
                 file_index,
                 kind: FileMetadataKind::Symlink,
@@ -2320,6 +2495,32 @@ enum SelectedWriteStart {
     EndOfFile,
 }
 
+/// Write range anchor after any FILE_OBJECT current-position dependency has been resolved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteRangeAnchor {
+    /// Offset fixed before asynchronous volume work starts.
+    Fixed(FileOffset),
+    /// Latest committed regular-file end, resolved inside the volume operation lane.
+    LatestEndOfFile,
+}
+
+impl SelectedWriteStart {
+    /// Binds the synchronous FILE_OBJECT position only when policy selected it as the source.
+    /// # Errors
+    ///
+    /// Returns an error when a selected current-position source cannot be read from the handle.
+    fn bind_current_position(
+        self,
+        current_position: impl FnOnce() -> DriverResult<FileOffset>,
+    ) -> DriverResult<WriteRangeAnchor> {
+        match self {
+            Self::Absolute(offset) => Ok(WriteRangeAnchor::Fixed(offset)),
+            Self::CurrentFilePosition => current_position().map(WriteRangeAnchor::Fixed),
+            Self::EndOfFile => Ok(WriteRangeAnchor::LatestEndOfFile),
+        }
+    }
+}
+
 /// Applies paging and write-authority policy to a decoded write starting point.
 /// # Errors
 ///
@@ -2349,29 +2550,19 @@ fn select_write_start(
     }
 }
 
-/// Resolves a write starting point after write authority and I/O origin are known.
+/// Resolves a write range anchor after access policy and FILE_OBJECT state are known.
 /// # Errors
 ///
-/// Returns an error for denied handle writes, paging sentinels, absent synchronous position, or an
-/// end of file outside the signed Windows offset domain.
-fn resolve_write_start(
-    opened_file: &OpenedRegularFile,
-    kind: DataIoKind,
-    starting_point: WriteStartingPoint,
+/// Returns an error when the latest committed end of file is outside the signed Windows offset
+/// domain.
+async fn resolve_write_start(
+    operations: &mut VolumeOperationLane,
+    file_id: FileNodeId,
+    anchor: WriteRangeAnchor,
 ) -> DriverResult<FileOffset> {
-    let current_position = if kind == DataIoKind::Handle
-        && starting_point == WriteStartingPoint::CurrentFilePosition
-    {
-        Some(opened_file.current_file_position()?)
-    } else {
-        None
-    };
-    match select_write_start(opened_file.write_access(), kind, starting_point)? {
-        SelectedWriteStart::Absolute(offset) => Ok(offset),
-        SelectedWriteStart::CurrentFilePosition => {
-            current_position.ok_or(DriverError::InvalidParameter)
-        }
-        SelectedWriteStart::EndOfFile => regular_file_end(opened_file),
+    match anchor {
+        WriteRangeAnchor::Fixed(offset) => Ok(offset),
+        WriteRangeAnchor::LatestEndOfFile => regular_file_end(operations, file_id).await,
     }
 }
 
@@ -2379,12 +2570,11 @@ fn resolve_write_start(
 /// # Errors
 ///
 /// Returns an error when the file cannot be loaded or EOF exceeds `i64::MAX`.
-fn regular_file_end(opened_file: &OpenedRegularFile) -> DriverResult<FileOffset> {
-    let vcb = unsafe {
-        // SAFETY: The opened regular file retains its mounted VCB for the FILE_OBJECT lifetime.
-        opened_file.volume().as_ref()
-    };
-    let end = FileOffset::from_bytes(regular_file_size(vcb, opened_file.id())?.bytes());
+async fn regular_file_end(
+    operations: &mut VolumeOperationLane,
+    file_id: FileNodeId,
+) -> DriverResult<FileOffset> {
+    let end = FileOffset::from_bytes(regular_file_size(operations, file_id).await?.bytes());
     let _signed_end = i64::try_from(end.bytes()).map_err(|_| DriverError::InvalidParameter)?;
     Ok(end)
 }
@@ -2394,45 +2584,69 @@ fn regular_file_end(opened_file: &OpenedRegularFile) -> DriverResult<FileOffset>
 ///
 /// Returns an error when the read stack or output buffer is invalid, the FILE_OBJECT is not a
 /// regular file, or ext4 data read fails.
-fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let stack = target.current_stack()?.read()?;
-    let mut opened_file = OpenedRegularFile::decode(stack.file_object())?;
-    let kind = target.data_io_kind();
-    let length = stack.length();
-    let range = ResolvedFileRange::new(
-        resolve_read_start(&opened_file, kind, stack.starting_point())?,
-        length.as_usize(),
-    )?;
-    let data_transfer_mode = opened_file.data_transfer_mode();
-    data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
-    if length.is_empty() {
-        opened_file.update_current_file_position(kind, range.start(), 0)?;
-        return Ok(IrpCompletion::EMPTY);
-    }
+async fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let (file_id, kind, length, range, data_transfer_mode, operations) = {
+        let stack = target.current_stack()?.read()?;
+        let mut opened_file = OpenedRegularFile::decode(stack.file_object())?;
+        let kind = target.data_io_kind();
+        let length = stack.length();
+        let range = ResolvedFileRange::new(
+            resolve_read_start(&opened_file, kind, stack.starting_point())?,
+            length.as_usize(),
+        )?;
+        let data_transfer_mode = opened_file.data_transfer_mode();
+        data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
+        if length.is_empty() {
+            opened_file.update_current_file_position(kind, range.start(), 0)?;
+            return Ok(IrpCompletion::EMPTY);
+        }
+        let output = target.data_output(length)?;
+        data_transfer_mode.validate_buffer(output.address())?;
+        if kind == DataIoKind::Handle
+            && !opened_file.file_control_block().permits_byte_range_read(
+                target,
+                opened_file.file_object(),
+                range.start(),
+                range.length(),
+                stack.key(),
+            )?
+        {
+            return Err(DriverError::FileLockConflict);
+        }
+        let file_id = opened_file.id();
+        let operations = claim_file_operation_lane(opened_file.file_control_block());
+        (file_id, kind, length, range, data_transfer_mode, operations)
+    };
+    let (bytes, bytes_read) = {
+        let mut operations = operations;
+        let mut bytes = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
+        let file = operations
+            .lane_mut()
+            .journaled_mut()
+            .load_file(file_id)
+            .await?;
+        let bytes_read = operations
+            .lane_mut()
+            .journaled_mut()
+            .read_file(&file, range.start(), bytes.as_mut_slice())
+            .await?
+            .as_usize();
+        (bytes, bytes_read)
+    };
     let mut output = target.data_output(length)?;
     data_transfer_mode.validate_buffer(output.address())?;
-    if kind == DataIoKind::Handle
-        && !opened_file.file_control_block().permits_byte_range_read(
-            target,
-            opened_file.file_object(),
-            range.start(),
-            range.length(),
-            stack.key(),
-        )?
-    {
-        return Err(DriverError::FileLockConflict);
-    }
-    let vcb = unsafe {
-        // SAFETY: OpenedRegularFile is decoded from a live FCB whose VCB
-        // pointer remains valid for the opened FILE_OBJECT lifetime.
-        opened_file.volume().as_ref()
-    };
-
-    let file = vcb.volume().load_file(opened_file.id())?;
-    let bytes_read = vcb
-        .volume()
-        .read_file(&file, range.start(), output.as_mut_slice())?;
-    let bytes_read = bytes_read.as_usize();
+    output
+        .as_mut_slice()
+        .get_mut(..bytes_read)
+        .ok_or(DriverError::InternalInvariantViolation)?
+        .copy_from_slice(
+            bytes
+                .as_slice()
+                .get(..bytes_read)
+                .ok_or(DriverError::InternalInvariantViolation)?,
+        );
+    let stack = target.current_stack()?.read()?;
+    let mut opened_file = OpenedRegularFile::decode(stack.file_object())?;
     opened_file.update_current_file_position(kind, range.start(), bytes_read)?;
     IrpCompletion::from_usize(bytes_read)
 }
@@ -2442,65 +2656,88 @@ fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 ///
 /// Returns an error when the write stack or input buffer is invalid, the FILE_OBJECT is not a
 /// regular file, or the ext4 write transaction fails.
-fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+async fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let (file_id, kind, length, anchor, write_commitment, operations) = {
+        let stack = target.current_stack()?.write()?;
+        let opened_file = OpenedRegularFile::decode(stack.file_object())?;
+        let kind = target.data_io_kind();
+        let length = stack.length();
+        let selected_start =
+            select_write_start(opened_file.write_access(), kind, stack.starting_point())?;
+        let anchor =
+            selected_start.bind_current_position(|| opened_file.current_file_position())?;
+        let operations = claim_file_operation_lane(opened_file.file_control_block());
+        (
+            opened_file.id(),
+            kind,
+            length,
+            anchor,
+            opened_file.write_commitment(),
+            operations,
+        )
+    };
+    let (range, bytes_written) = {
+        let mut operations = operations;
+        let range = ResolvedFileRange::new(
+            resolve_write_start(operations.lane_mut(), file_id, anchor).await?,
+            length.as_usize(),
+        )?;
+        let bytes = {
+            let stack = target.current_stack()?.write()?;
+            let mut opened_file = OpenedRegularFile::decode(stack.file_object())?;
+            let data_transfer_mode = opened_file.data_transfer_mode();
+            data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
+            if length.is_empty() {
+                opened_file.update_current_file_position(kind, range.start(), 0)?;
+                return Ok(IrpCompletion::EMPTY);
+            }
+            let input = target.data_input(length)?;
+            data_transfer_mode.validate_buffer(input.address())?;
+            if kind == DataIoKind::Handle
+                && !opened_file.file_control_block().permits_byte_range_write(
+                    target,
+                    opened_file.file_object(),
+                    range.start(),
+                    range.length(),
+                    stack.key(),
+                )?
+            {
+                return Err(DriverError::FileLockConflict);
+            }
+            DriverVec::try_copied_from_slice(input.as_slice())?
+        };
+        let mut transaction = operations
+            .lane_mut()
+            .journaled_mut()
+            .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
+        let file = transaction.file(file_id).await?;
+        transaction
+            .write_file_range(file, range.start(), bytes.as_slice())
+            .await?;
+        transaction.commit().await?;
+        if matches!(write_commitment, WriteCommitment::FlushThrough) {
+            operations.lane_mut().flush().await?;
+        }
+        (range, bytes.len())
+    };
     let stack = target.current_stack()?.write()?;
     let mut opened_file = OpenedRegularFile::decode(stack.file_object())?;
-    let kind = target.data_io_kind();
-    let length = stack.length();
-    let range = ResolvedFileRange::new(
-        resolve_write_start(&opened_file, kind, stack.starting_point())?,
-        length.as_usize(),
-    )?;
-    let data_transfer_mode = opened_file.data_transfer_mode();
-    data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
-    if length.is_empty() {
-        opened_file.update_current_file_position(kind, range.start(), 0)?;
-        return Ok(IrpCompletion::EMPTY);
-    }
-    let input = target.data_input(length)?;
-    data_transfer_mode.validate_buffer(input.address())?;
-    if kind == DataIoKind::Handle
-        && !opened_file.file_control_block().permits_byte_range_write(
-            target,
-            opened_file.file_object(),
-            range.start(),
-            range.length(),
-            stack.key(),
-        )?
-    {
-        return Err(DriverError::FileLockConflict);
-    }
-    let mut vcb = opened_file.volume();
-    let vcb = unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
-        // remain valid while file objects are open. The mutable borrow is the
-        // transaction boundary for this synchronous write path.
-        vcb.as_mut()
-    };
-
-    let mut transaction = vcb
-        .volume_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let file = transaction.file(opened_file.id())?;
-    transaction.write_file_range(file, range.start(), input.as_slice())?;
-    transaction.commit()?;
-    if matches!(
-        opened_file.write_commitment(),
-        WriteCommitment::FlushThrough
-    ) {
-        vcb.flush()?;
-    }
-    let bytes_written = input.as_slice().len();
     opened_file.update_current_file_position(kind, range.start(), bytes_written)?;
     IrpCompletion::from_usize(bytes_written)
 }
 
-/// Returns the mounted VCB referenced by an FCB.
-fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
+/// Claims the actor-owned operation lane referenced by one live FCB.
+fn claim_file_operation_lane(fcb: &FileControlBlock) -> VolumeOperationLease {
+    claim_volume_operation_lane(fcb.volume())
+}
+
+/// Claims the actor-owned operation lane for one serialized mounted-device request.
+fn claim_volume_operation_lane(volume: NonNull<VolumeControlBlock>) -> VolumeOperationLease {
     unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
-        // remain valid while file objects are open.
-        fcb.volume().as_ref()
+        // SAFETY: Every caller runs as the mounted-device executor's sole active data-plane
+        // request and returns the non-cloneable lease by value, so a second lane claim cannot be
+        // constructed before this request releases the first.
+        VolumeControlBlock::claim_operation_lane(volume)
     }
 }
 
@@ -2767,6 +3004,14 @@ mod tests {
         );
         assert_eq!(
             super::select_write_start(
+                RegularFileWriteAccess::Denied,
+                DataIoKind::Handle,
+                WriteStartingPoint::CurrentFilePosition,
+            ),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            super::select_write_start(
                 RegularFileWriteAccess::Positional,
                 DataIoKind::Handle,
                 WriteStartingPoint::CurrentFilePosition,
@@ -2789,6 +3034,51 @@ mod tests {
             ),
             Err(DriverError::InvalidParameter)
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when access policy reads a handle position before selecting the write source.
+    #[test]
+    fn write_start_policy_precedes_current_position_binding() {
+        let denied_position_read = core::cell::Cell::new(false);
+        let denied = super::select_write_start(
+            RegularFileWriteAccess::Denied,
+            DataIoKind::Handle,
+            WriteStartingPoint::CurrentFilePosition,
+        )
+        .and_then(|selected| {
+            selected.bind_current_position(|| {
+                denied_position_read.set(true);
+                Err(DriverError::InvalidParameter)
+            })
+        });
+        assert_eq!(denied, Err(DriverError::AccessDenied));
+        assert!(!denied_position_read.get());
+
+        let append_position_read = core::cell::Cell::new(false);
+        let append = super::select_write_start(
+            RegularFileWriteAccess::AppendOnly,
+            DataIoKind::Handle,
+            WriteStartingPoint::CurrentFilePosition,
+        )
+        .and_then(|selected| {
+            selected.bind_current_position(|| {
+                append_position_read.set(true);
+                Err(DriverError::InvalidParameter)
+            })
+        });
+        assert_eq!(append, Ok(super::WriteRangeAnchor::LatestEndOfFile));
+        assert!(!append_position_read.get());
+
+        let position = FileOffset::from_bytes(12288);
+        let positional = super::select_write_start(
+            RegularFileWriteAccess::Positional,
+            DataIoKind::Handle,
+            WriteStartingPoint::CurrentFilePosition,
+        )
+        .and_then(|selected| selected.bind_current_position(|| Ok(position)));
+        assert_eq!(positional, Ok(super::WriteRangeAnchor::Fixed(position)));
     }
 
     /// # Panics
@@ -2900,6 +3190,37 @@ mod tests {
         assert_eq!(
             super::DirectoryWildcardPattern::from_utf16(&[0xD800, super::UTF16_ASTERISK]),
             Err(DriverError::from(ext4_core::Error::InvalidName))
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when exhausted enumeration and explicit-search patterns expose the same status.
+    #[test]
+    fn directory_pattern_exhaustion_preserves_search_error_semantics() {
+        assert_eq!(
+            super::DirectoryPattern::All.exhausted_error(),
+            DriverError::NoMoreFiles
+        );
+
+        let exact = WindowsName::from_utf16(&[u16::from(b'a')]);
+        assert!(exact.is_ok());
+        let Ok(exact) = exact else {
+            return;
+        };
+        assert_eq!(
+            super::DirectoryPattern::Exact(exact).exhausted_error(),
+            DriverError::NoSuchFile
+        );
+
+        let wildcard = super::DirectoryWildcardPattern::from_utf16(&[super::UTF16_ASTERISK]);
+        assert!(wildcard.is_ok());
+        let Ok(wildcard) = wildcard else {
+            return;
+        };
+        assert_eq!(
+            super::DirectoryPattern::Wildcard(wildcard).exhausted_error(),
+            DriverError::NoSuchFile
         );
     }
 

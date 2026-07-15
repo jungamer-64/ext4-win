@@ -3,12 +3,11 @@
 use core::ptr::NonNull;
 
 use crate::irp::{
-    DispatchTarget, IrpCompletion, QuerySecurityStack, SecurityComponentSelection,
-    SecuritySelection, SetSecurityStack,
+    DispatchTarget, IrpBufferLength, IrpCompletion, SecurityComponentSelection, SecuritySelection,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
-use crate::state::{FileControlBlock, OpenedObject, VolumeControlBlock};
+use crate::state::{OpenedObject, VolumeControlBlock, VolumeOperationLane, VolumeOperationLease};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, NodeId};
 
@@ -45,27 +44,32 @@ const POSIX_RWX_BITS: u16 = 0o777;
 /// # Errors
 ///
 /// Returns an error when security stack decoding or descriptor packing fails.
-pub(crate) fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    QuerySecurityRequest::decode(target).and_then(|request| query_security(&request))
+pub(crate) async fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let request = QuerySecurityRequest::decode(target)?;
+    query_security(request).await
 }
 
 /// Executes IRP_MJ_SET_SECURITY.
 /// # Errors
 ///
 /// Returns an error when security stack decoding or descriptor mutation fails.
-pub(crate) fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    SetSecurityRequest::decode(target).and_then(|request| set_security(&request))
+pub(crate) async fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let request = SetSecurityRequest::decode(target)?;
+    set_security(request).await
 }
 
 /// Decoded query-security request.
-#[derive(Debug)]
 struct QuerySecurityRequest {
     /// Dispatch target receiving output.
     target: DispatchTarget,
-    /// Decoded query-security stack.
-    stack: QuerySecurityStack,
-    /// Opened file contexts decoded before security handling.
-    opened_file: OpenedObject,
+    /// Selected security descriptor components.
+    selection: SecuritySelection,
+    /// Caller output buffer length.
+    length: IrpBufferLength,
+    /// ext4 node selected by the opened FILE_OBJECT.
+    node: NodeId,
+    /// Exclusive actor-owned mounted-volume operation capability.
+    operations: VolumeOperationLease,
 }
 
 impl QuerySecurityRequest {
@@ -77,21 +81,33 @@ impl QuerySecurityRequest {
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.query_security()?;
         let opened_file = OpenedObject::decode(stack.file_object())?;
+        let volume = opened_file.volume();
+        let node = opened_file.node();
+        let operations = unsafe {
+            // SAFETY: Query-security runs only as the mounted-device executor's unique active
+            // operation. The lease is moved into this request until that operation completes.
+            VolumeControlBlock::claim_operation_lane(volume)
+        };
         Ok(Self {
             target,
-            stack,
-            opened_file,
+            selection: stack.selection(),
+            length: stack.length(),
+            node,
+            operations,
         })
     }
 }
 
 /// Decoded set-security request.
-#[derive(Debug)]
 struct SetSecurityRequest {
-    /// Decoded set-security stack.
-    stack: SetSecurityStack,
-    /// Opened file contexts decoded before security handling.
-    opened_file: OpenedObject,
+    /// Selected security descriptor components.
+    selection: SecuritySelection,
+    /// Owned descriptor bytes copied before the operation can suspend.
+    descriptor: DriverVec<u8>,
+    /// ext4 node selected by the opened FILE_OBJECT.
+    node: NodeId,
+    /// Exclusive actor-owned mounted-volume operation capability.
+    operations: VolumeOperationLease,
 }
 
 impl SetSecurityRequest {
@@ -103,7 +119,22 @@ impl SetSecurityRequest {
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.set_security()?;
         let opened_file = OpenedObject::decode(stack.file_object())?;
-        Ok(Self { stack, opened_file })
+        let selection = stack.selection();
+        let descriptor =
+            security_descriptor_bytes(stack.security_descriptor().as_non_null(), selection)?;
+        let volume = opened_file.volume();
+        let node = opened_file.node();
+        let operations = unsafe {
+            // SAFETY: Set-security runs only as the mounted-device executor's unique active
+            // operation. The lease is moved into this request until that operation completes.
+            VolumeControlBlock::claim_operation_lane(volume)
+        };
+        Ok(Self {
+            selection,
+            descriptor,
+            node,
+            operations,
+        })
     }
 }
 
@@ -121,17 +152,6 @@ struct AllowAce {
     mask: WindowsAccessMask,
     /// Trustee SID.
     sid: BinarySid,
-}
-
-/// Open security state needed for journaled security mutations.
-#[derive(Clone, Copy, Debug)]
-struct OpenedSecurityContext {
-    /// Mounted VCB owning the open file.
-    volume: NonNull<VolumeControlBlock>,
-    /// ext4 node opened by this FILE_OBJECT.
-    node: NodeId,
-    /// Current POSIX security metadata.
-    security: Ext4Security,
 }
 
 /// Parsed self-relative Windows security descriptor.
@@ -355,11 +375,11 @@ impl DaclPermissionBuilder {
 ///
 /// Returns an error when ext4 security metadata cannot be loaded, the requested descriptor cannot
 /// be built, or the user output buffer is too small.
-fn query_security(request: &QuerySecurityRequest) -> DriverResult<IrpCompletion> {
-    let security = load_ext4_security(&request.opened_file)?;
-    let descriptor = security_descriptor(security, request.stack.selection())?;
+async fn query_security(mut request: QuerySecurityRequest) -> DriverResult<IrpCompletion> {
+    let security = load_ext4_security(request.operations.lane_mut(), request.node).await?;
+    let descriptor = security_descriptor(security, request.selection)?;
     let required = descriptor.len();
-    let length = request.stack.length();
+    let length = request.length;
     if length.as_usize() < required {
         return Err(DriverError::BufferTooSmall);
     }
@@ -374,34 +394,22 @@ fn query_security(request: &QuerySecurityRequest) -> DriverResult<IrpCompletion>
 ///
 /// Returns an error when the input descriptor cannot be copied or mapped to ext4 owner/permissions,
 /// or the journaled security update fails.
-fn set_security(request: &SetSecurityRequest) -> DriverResult<IrpCompletion> {
-    let context = load_ext4_security_context(&request.opened_file)?;
-    let descriptor = security_descriptor_bytes(
-        request.stack.security_descriptor().as_non_null(),
-        request.stack.selection(),
-    )?;
-    let security = security_from_descriptor(
-        descriptor.as_slice(),
-        request.stack.selection(),
-        context.security,
-    )?;
-    if security == context.security {
+async fn set_security(mut request: SetSecurityRequest) -> DriverResult<IrpCompletion> {
+    let current = load_ext4_security(request.operations.lane_mut(), request.node).await?;
+    let security =
+        security_from_descriptor(request.descriptor.as_slice(), request.selection, current)?;
+    if security == current {
         return Ok(IrpCompletion::EMPTY);
     }
 
-    let mut vcb = context.volume;
-    let vcb = unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers
-        // and remain valid while file objects are open. The mutable borrow is
-        // the transaction boundary for this synchronous security mutation.
-        vcb.as_mut()
-    };
-    let mut transaction = vcb
-        .volume_mut()
+    let mut transaction = request
+        .operations
+        .lane_mut()
+        .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let node = transaction.node(context.node)?;
-    transaction.set_posix_security(node, security)?;
-    transaction.commit()?;
+    let node = transaction.node(request.node).await?;
+    transaction.set_posix_security(node, security).await?;
+    transaction.commit().await?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -409,34 +417,33 @@ fn set_security(request: &SetSecurityRequest) -> DriverResult<IrpCompletion> {
 /// # Errors
 ///
 /// Returns an error when the opened node cannot be loaded from ext4 metadata.
-fn load_ext4_security(opened_file: &OpenedObject) -> DriverResult<Ext4Security> {
-    load_ext4_security_context(opened_file).map(|context| context.security)
-}
-
-/// Loads ext4 security context for an opened node.
-/// # Errors
-///
-/// Returns an error when the opened node cannot be loaded or its security metadata is inconsistent
-/// with the FCB identity.
-fn load_ext4_security_context(opened_file: &OpenedObject) -> DriverResult<OpenedSecurityContext> {
-    let fcb = opened_file.file_control_block();
-    let vcb = volume_control_block(fcb);
-    Ok(OpenedSecurityContext {
-        volume: fcb.volume(),
-        node: fcb.node(),
-        security: security_from_node(vcb, fcb.node())?,
-    })
+async fn load_ext4_security(
+    operations: &mut VolumeOperationLane,
+    node: NodeId,
+) -> DriverResult<Ext4Security> {
+    security_from_node(operations, node).await
 }
 
 /// Extracts security metadata after validating FCB kind against core metadata.
 /// # Errors
 ///
 /// Returns an error when `identity` cannot be loaded as its typed ext4 node.
-fn security_from_node(vcb: &VolumeControlBlock, identity: NodeId) -> DriverResult<Ext4Security> {
+async fn security_from_node(
+    operations: &mut VolumeOperationLane,
+    identity: NodeId,
+) -> DriverResult<Ext4Security> {
     match identity {
-        NodeId::File(file) => Ok(vcb.volume().load_file(file)?.security()),
-        NodeId::Directory(directory) => Ok(vcb.volume().load_directory(directory)?.security()),
-        NodeId::Symlink(symlink) => Ok(vcb.volume().load_symlink(symlink)?.security()),
+        NodeId::File(file) => Ok(operations.journaled_mut().load_file(file).await?.security()),
+        NodeId::Directory(directory) => Ok(operations
+            .journaled_mut()
+            .load_directory(directory)
+            .await?
+            .security()),
+        NodeId::Symlink(symlink) => Ok(operations
+            .journaled_mut()
+            .load_symlink(symlink)
+            .await?
+            .security()),
     }
 }
 
@@ -1056,15 +1063,6 @@ fn sid(authority: u64, sub_authorities: &[u32]) -> DriverResult<BinarySid> {
         bytes.try_extend_from_copy_slice(sub_authority.to_le_bytes().as_slice())?;
     }
     Ok(BinarySid { bytes })
-}
-
-/// Returns the mounted VCB referenced by an FCB.
-fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
-    unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
-        // remain valid while file objects are open.
-        fcb.volume().as_ref()
-    }
 }
 
 /// Normalizes malformed security descriptor field access to the Windows set-security error.
