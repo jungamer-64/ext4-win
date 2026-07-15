@@ -258,6 +258,15 @@ pub(crate) struct KernelFileObject {
     file_object: NonNull<FILE_OBJECT>,
 }
 
+/// Windows reason that permits FILE_OBJECT context release at close.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileObjectCloseKind {
+    /// The ordinary handle lifecycle must already have completed cleanup.
+    Ordinary,
+    /// A filter cancelled the successful create before any handle was created.
+    CancelledOpen,
+}
+
 impl KernelFileObject {
     /// Converts a raw WDK file object pointer into the non-null boundary type.
     pub(crate) fn from_raw(file_object: *mut FILE_OBJECT) -> Option<Self> {
@@ -294,6 +303,25 @@ impl KernelFileObject {
     /// Returns the raw WDK pointer for FFI calls that require FILE_OBJECT.
     pub(crate) fn as_ptr(self) -> *mut FILE_OBJECT {
         self.file_object.as_ptr()
+    }
+
+    /// Decodes the I/O Manager's close reason from stable FILE_OBJECT flags.
+    /// # Errors
+    ///
+    /// Returns an internal invariant failure when a cancelled open also claims that a handle was
+    /// created, which violates the `IoCancelFileOpen` contract.
+    pub(crate) fn close_kind(self) -> DriverResult<FileObjectCloseKind> {
+        let flags = unsafe {
+            // SAFETY: Close owns the live FILE_OBJECT while classifying the I/O Manager lifecycle.
+            self.as_ref().Flags
+        };
+        let cancelled = flags & wdk_sys::FO_FILE_OPEN_CANCELLED != 0;
+        let handle_created = flags & wdk_sys::FO_HANDLE_CREATED != 0;
+        match (cancelled, handle_created) {
+            (true, true) => Err(DriverError::InternalInvariantViolation),
+            (true, false) => Ok(FileObjectCloseKind::CancelledOpen),
+            (false, _) => Ok(FileObjectCloseKind::Ordinary),
+        }
     }
 }
 
@@ -1759,7 +1787,7 @@ impl FileControlBlock {
     pub(crate) fn remove_share_access(&mut self, file_object: KernelFileObject) {
         unsafe {
             // SAFETY: Successful create recorded this FILE_OBJECT against this
-            // FCB-owned SHARE_ACCESS, and close is the unique removal point.
+            // FCB-owned SHARE_ACCESS, and cleanup is the unique removal point.
             ffi::IoRemoveShareAccess(
                 file_object.as_ptr(),
                 core::ptr::addr_of_mut!(self.share_access),
@@ -2096,12 +2124,14 @@ impl OpenedLocation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Action requested when the last handle cleanup occurs.
-pub(crate) enum CloseDisposition {
-    /// Keep the opened object.
-    Keep,
-    /// Delete the opened object during cleanup.
-    Delete,
+/// Cleanup lifecycle of one successfully opened FILE_OBJECT.
+enum HandleLifecycleState {
+    /// The share claim and cleanup-owned resources are active.
+    Active,
+    /// Cleanup has consumed the share claim and cleanup-owned resources.
+    CleanedUp,
+    /// A filter-cancelled create consumed its share claim directly at close.
+    CancelledOpenClosed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2138,8 +2168,8 @@ pub(crate) struct OpenedHandleState {
     node_mode: OpenedNodeMode,
     /// Location used for namespace mutations on cleanup when available.
     location: OpenedLocation,
-    /// Requested close disposition.
-    close_disposition: CloseDisposition,
+    /// Exactly-once cleanup lifecycle.
+    lifecycle_state: HandleLifecycleState,
     /// Write completion durability requested for this handle.
     write_commitment: WriteCommitment,
     /// Data transfer buffering policy requested for this handle.
@@ -2153,14 +2183,13 @@ impl OpenedHandleState {
     const fn new(
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
-        close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
     ) -> Self {
         Self {
             node_mode,
             location,
-            close_disposition,
+            lifecycle_state: HandleLifecycleState::Active,
             write_commitment,
             data_transfer_mode,
             directory_notification_name: DirectoryNotificationName::Unregistered,
@@ -2182,11 +2211,6 @@ impl OpenedHandleState {
         self.location = location;
     }
 
-    /// Returns the requested close disposition.
-    const fn close_disposition(&self) -> CloseDisposition {
-        self.close_disposition
-    }
-
     /// Returns write completion durability requested for this handle.
     const fn write_commitment(&self) -> WriteCommitment {
         self.write_commitment
@@ -2197,9 +2221,33 @@ impl OpenedHandleState {
         self.data_transfer_mode
     }
 
-    /// Replaces the requested close disposition.
-    const fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
-        self.close_disposition = close_disposition;
+    /// Begins the exactly-once cleanup transition.
+    /// # Errors
+    ///
+    /// Returns an internal invariant failure when cleanup already ran for this handle.
+    fn begin_cleanup(&mut self) -> DriverResult<()> {
+        if self.lifecycle_state != HandleLifecycleState::Active {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        self.lifecycle_state = HandleLifecycleState::CleanedUp;
+        Ok(())
+    }
+
+    /// Returns whether cleanup consumed this handle's share claim and cleanup resources.
+    const fn cleanup_completed(&self) -> bool {
+        matches!(self.lifecycle_state, HandleLifecycleState::CleanedUp)
+    }
+
+    /// Consumes an active handle whose successful create was cancelled by a filter.
+    /// # Errors
+    ///
+    /// Returns an internal invariant failure when cleanup or cancelled-open close already ran.
+    fn begin_cancelled_open_close(&mut self) -> DriverResult<()> {
+        if self.lifecycle_state != HandleLifecycleState::Active {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        self.lifecycle_state = HandleLifecycleState::CancelledOpenClosed;
+        Ok(())
     }
 
     /// Allocates the stable directory-name descriptor retained by FsRtl after registration.
@@ -2252,7 +2300,6 @@ impl OpenedHandle {
         node: NodeId,
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
-        close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
@@ -2261,7 +2308,6 @@ impl OpenedHandle {
             node,
             node_mode,
             location,
-            close_disposition,
             write_commitment,
             data_transfer_mode,
             regular_file_write_access,
@@ -2273,18 +2319,12 @@ impl OpenedHandle {
         node: NodeId,
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
-        close_disposition: CloseDisposition,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
     ) -> Self {
-        let state = OpenedHandleState::new(
-            node_mode,
-            location,
-            close_disposition,
-            write_commitment,
-            data_transfer_mode,
-        );
+        let state =
+            OpenedHandleState::new(node_mode, location, write_commitment, data_transfer_mode);
         let kind = match node {
             NodeId::File(_) => OpenedHandleKind::File {
                 write_access: regular_file_write_access,
@@ -2295,11 +2335,6 @@ impl OpenedHandle {
             NodeId::Symlink(_) => OpenedHandleKind::Symlink,
         };
         Self { state, kind }
-    }
-
-    /// Returns the requested close disposition.
-    const fn close_disposition(&self) -> CloseDisposition {
-        self.state.close_disposition()
     }
 
     /// Returns write completion durability requested for this handle.
@@ -2322,9 +2357,25 @@ impl OpenedHandle {
         self.state.node_mode()
     }
 
-    /// Replaces the requested close disposition.
-    const fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
-        self.state.set_close_disposition(close_disposition);
+    /// Begins this handle's exactly-once cleanup transition.
+    /// # Errors
+    ///
+    /// Returns an internal invariant failure when cleanup already ran.
+    fn begin_cleanup(&mut self) -> DriverResult<()> {
+        self.state.begin_cleanup()
+    }
+
+    /// Returns whether cleanup has consumed this handle's cleanup-owned resources.
+    const fn cleanup_completed(&self) -> bool {
+        self.state.cleanup_completed()
+    }
+
+    /// Consumes this handle through the cancelled-open close lifecycle.
+    /// # Errors
+    ///
+    /// Returns an internal invariant failure when the handle is not active.
+    fn begin_cancelled_open_close(&mut self) -> DriverResult<()> {
+        self.state.begin_cancelled_open_close()
     }
 
     /// Replaces the opened location after a successful rename.
@@ -2436,11 +2487,6 @@ impl OpenedObject {
         self.mutable_handle().replace_location(location);
     }
 
-    /// Returns the requested close disposition.
-    pub(crate) fn close_disposition(&self) -> CloseDisposition {
-        self.handle().close_disposition()
-    }
-
     /// Returns write completion durability requested for this opened handle.
     pub(crate) fn write_commitment(&self) -> WriteCommitment {
         self.handle().write_commitment()
@@ -2526,10 +2572,47 @@ impl OpenedObject {
         Ok(())
     }
 
-    /// Replaces the requested close disposition.
-    pub(crate) fn set_close_disposition(&mut self, close_disposition: CloseDisposition) {
-        self.mutable_handle()
-            .set_close_disposition(close_disposition);
+    /// Consumes this handle's share claim at the start of its cleanup transition.
+    /// # Errors
+    ///
+    /// Returns an internal invariant failure when cleanup already ran for this FILE_OBJECT.
+    pub(crate) fn release_share_access_for_cleanup(&mut self) -> DriverResult<()> {
+        self.mutable_handle().begin_cleanup()?;
+        let file_object = self.file_object;
+        let fcb = unsafe {
+            // SAFETY: Queued create, cleanup, and close execution serialize access to the live
+            // VCB-owned FCB for this FILE_OBJECT.
+            self.fcb.as_mut()
+        };
+        fcb.remove_share_access(file_object);
+        Ok(())
+    }
+
+    /// Validates the FILE_OBJECT close lifecycle and consumes a cancelled open's active share
+    /// claim when needed.
+    /// # Errors
+    ///
+    /// Returns an internal invariant failure when an ordinary close has not completed cleanup, or
+    /// when a cancelled-open close follows any prior lifecycle transition.
+    pub(crate) fn prepare_context_release_for_close(
+        &mut self,
+        close_kind: FileObjectCloseKind,
+    ) -> DriverResult<()> {
+        match close_kind {
+            FileObjectCloseKind::Ordinary if self.handle().cleanup_completed() => Ok(()),
+            FileObjectCloseKind::Ordinary => Err(DriverError::InternalInvariantViolation),
+            FileObjectCloseKind::CancelledOpen => {
+                self.mutable_handle().begin_cancelled_open_close()?;
+                let file_object = self.file_object;
+                let fcb = unsafe {
+                    // SAFETY: Queued create and close execution serialize access to the live
+                    // VCB-owned FCB for this filter-cancelled FILE_OBJECT.
+                    self.fcb.as_mut()
+                };
+                fcb.remove_share_access(file_object);
+                Ok(())
+            }
+        }
     }
 
     /// Returns the decoded file control block.
@@ -2800,13 +2883,13 @@ mod tests {
     use crate::kernel::status::DriverError;
 
     use super::{
-        CloseDisposition, ControlDeviceExtension, DIRECTORY_NOTIFICATION_DIRECTORY_UNITS,
-        DataTransferMode, DeviceExtensionKind, DirectoryNameChange, DirectoryNameChangeAction,
-        FileControlBlock, FileControlBlockRelease, KernelDevice, KernelFileObject,
-        MountedVolumeDevice, MountedVolumeDeviceExtension, NativeFileByteRange,
-        NoIntermediateTransfer, OpenedDirectory, OpenedHandle, OpenedLocation, OpenedNodeMode,
-        OpenedObject, OpenedRegularFile, TransferBufferAlignment, TransferSectorSize,
-        UninitializedFileObject, VolumeControlBlock, WriteCommitment, shutdown_registration_status,
+        ControlDeviceExtension, DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode,
+        DeviceExtensionKind, DirectoryNameChange, DirectoryNameChangeAction, FileControlBlock,
+        FileControlBlockRelease, KernelDevice, KernelFileObject, MountedVolumeDevice,
+        MountedVolumeDeviceExtension, NativeFileByteRange, NoIntermediateTransfer, OpenedDirectory,
+        OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
+        TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
+        WriteCommitment, shutdown_registration_status,
     };
 
     fn file_object_with_contexts(
@@ -3004,7 +3087,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -3049,7 +3131,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -3138,7 +3219,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -3170,7 +3250,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::ReparsePoint,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -3193,39 +3272,24 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
+    /// Panics when cleanup lifecycle constraints can be bypassed.
     #[test]
-    fn opened_object_updates_close_disposition() {
-        let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    fn handle_lifecycle_enforces_exactly_once_cleanup() {
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
         );
-        let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
-            core::ptr::addr_of_mut!(handle).cast(),
+        assert!(!handle.cleanup_completed());
+        assert_eq!(handle.begin_cleanup(), Ok(()));
+        assert!(handle.cleanup_completed());
+        assert_eq!(
+            handle.begin_cleanup(),
+            Err(DriverError::InternalInvariantViolation)
         );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        let opened = OpenedObject::decode(file_object);
-        assert!(opened.is_ok());
-        let Ok(mut opened) = opened else {
-            return;
-        };
-
-        opened.set_close_disposition(CloseDisposition::Delete);
-        assert_eq!(opened.close_disposition(), CloseDisposition::Delete);
-        opened.set_close_disposition(CloseDisposition::Keep);
-        assert_eq!(opened.close_disposition(), CloseDisposition::Keep);
     }
 
     /// # Panics
@@ -3239,7 +3303,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::FlushThrough,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -3281,7 +3344,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::NoIntermediate(transfer),
             RegularFileWriteAccess::Denied,
@@ -3316,7 +3378,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -3383,7 +3444,6 @@ mod tests {
                 state: super::OpenedHandleState::new(
                     OpenedNodeMode::Direct,
                     OpenedLocation::Root,
-                    CloseDisposition::Keep,
                     WriteCommitment::CommitOnly,
                     DataTransferMode::IntermediateAllowed,
                 ),
@@ -3404,7 +3464,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -3468,7 +3527,6 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            CloseDisposition::Keep,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,

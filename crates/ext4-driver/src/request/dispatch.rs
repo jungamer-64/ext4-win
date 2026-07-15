@@ -468,6 +468,17 @@ mod tests {
 
     /// # Panics
     ///
+    /// Panics when close can race queued create or cleanup FCB lifecycle transitions.
+    #[test]
+    fn close_is_serialized_with_fcb_lifecycle_operations() {
+        assert_eq!(
+            dispatch_policy(DispatchMajor::Close),
+            DispatchPolicy::Queued
+        );
+    }
+
+    /// # Panics
+    ///
     /// Panics when create execution can re-enter the generic, ownership-free completion path.
     #[test]
     fn generic_major_execution_rejects_create() {
