@@ -432,25 +432,6 @@ impl KernelVpb {
     }
 }
 
-/// Non-null security descriptor pointer supplied by the I/O Manager.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct KernelSecurityDescriptor {
-    /// Non-null opaque security descriptor pointer.
-    descriptor: NonNull<c_void>,
-}
-
-impl KernelSecurityDescriptor {
-    /// Converts a raw WDK security descriptor pointer into the non-null boundary type.
-    pub(crate) fn from_raw(descriptor: *mut c_void) -> Option<Self> {
-        NonNull::new(descriptor).map(|descriptor| Self { descriptor })
-    }
-
-    /// Returns an immutable descriptor reference as an opaque pointer.
-    pub(crate) const fn as_non_null(self) -> NonNull<c_void> {
-        self.descriptor
-    }
-}
-
 /// Driver-owned device extension kind stored after the queue common prefix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]

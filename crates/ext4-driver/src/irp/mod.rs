@@ -17,7 +17,7 @@ use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory;
 use crate::state::{
     DirectoryChangeNotifier, DirectoryNotificationRegistration, FileControlBlock, KernelDevice,
-    KernelFileObject, KernelSecurityDescriptor, KernelVpb, WriteCommitment,
+    KernelFileObject, KernelVpb, WriteCommitment,
 };
 use crate::wire::{LittleEndianInput, WireOffset};
 
@@ -436,19 +436,6 @@ impl DispatchTarget {
         length: IrpBufferLength,
     ) -> Result<BufferedOutput, DriverError> {
         BufferedOutput::new(self.data_buffer_address(length)?, length.as_usize())
-    }
-
-    /// Returns the IRP user output buffer as kernel-addressable memory.
-    /// # Errors
-    ///
-    /// Returns an error when `UserBuffer` is null or `length` exceeds the slice domain.
-    pub(crate) fn user_output(self, length: IrpBufferLength) -> Result<UserOutput, DriverError> {
-        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
-        let irp = unsafe { self.irp.as_ref() };
-        let Some(buffer) = NonNull::new(irp.UserBuffer) else {
-            return Err(DriverError::InvalidParameter);
-        };
-        UserOutput::new(buffer.cast(), length.as_usize())
     }
 
     /// Returns the buffered I/O system buffer address for this IRP.
@@ -1497,30 +1484,6 @@ impl BufferedOutput {
     /// Returns the first output byte address.
     pub(crate) const fn address(&self) -> NonNull<u8> {
         self.bytes.address()
-    }
-}
-
-/// Mutable bytes decoded from an IRP user output buffer.
-#[derive(Debug)]
-pub(crate) struct UserOutput {
-    /// Kernel-addressable IRP bytes.
-    bytes: IrpByteBuffer,
-}
-
-impl UserOutput {
-    /// Creates a mutable user output view after length validation.
-    /// # Errors
-    ///
-    /// Returns an error when the user-output length cannot safely back a mutable Rust slice.
-    fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
-        Ok(Self {
-            bytes: IrpByteBuffer::new(address, length)?,
-        })
-    }
-
-    /// Returns user output bytes.
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.bytes.as_mut_slice()
     }
 }
 
