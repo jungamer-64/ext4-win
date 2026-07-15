@@ -1,25 +1,20 @@
 //! PASSIVE_LEVEL future executor and cancel-safe IRP mailbox.
 
 use alloc::boxed::Box;
-use core::{
-    cell::UnsafeCell,
-    ffi::c_void,
-    future::Future,
-    pin::Pin,
-    ptr::NonNull,
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-};
-
 #[cfg(not(test))]
-use wdk_sys::STATUS_SUCCESS;
-use wdk_sys::{LIST_ENTRY, NTSTATUS, PIO_CSQ, PIO_WORKITEM, PIRP, PLIST_ENTRY, PVOID};
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use core::{cell::UnsafeCell, ffi::c_void, future::Future, pin::Pin, ptr::NonNull};
+
+use wdk_sys::{LIST_ENTRY, NTSTATUS, PIO_WORKITEM, PIRP, PLIST_ENTRY, PVOID};
+#[cfg(not(test))]
+use wdk_sys::{PIO_CSQ, STATUS_SUCCESS};
 
 #[cfg(not(test))]
 use crate::kernel::ffi;
+#[cfg(not(test))]
+use crate::{kernel::fatal::KernelWideInconsistency, memory};
 use crate::{
-    kernel::fatal::KernelWideInconsistency,
     kernel::status::{DriverError, DriverResult},
-    memory,
     state::{KernelDevice, KernelFileObject},
 };
 
@@ -303,6 +298,9 @@ impl DeviceExecutor {
     }
 
     /// Returns the executor embedded at offset zero in a driver device extension.
+    /// # Errors
+    ///
+    /// Returns an error when the device object or its driver-owned extension is absent.
     fn from_device(device: KernelDevice) -> DriverResult<NonNull<Self>> {
         let object = unsafe {
             // SAFETY: The typed device pointer remains live during dispatch and is read only for
@@ -314,6 +312,7 @@ impl DeviceExecutor {
     }
 
     /// Returns the embedded CSQ address.
+    #[cfg(not(test))]
     fn csq_ptr(&self) -> PIO_CSQ {
         core::ptr::addr_of!(self.csq).cast_mut()
     }
@@ -353,7 +352,7 @@ impl DeviceExecutor {
             }
         }
         #[cfg(test)]
-        let _ = should_queue;
+        let _: bool = should_queue;
     }
 
     /// Runs one closure while holding the executor spin lock.
@@ -384,6 +383,7 @@ impl DeviceExecutor {
     }
 
     /// Polls request futures until one awaits an unwoken lower operation or the mailbox is empty.
+    #[cfg(not(test))]
     fn run(&self) {
         if !self.with_worker_state(WorkerState::enter_worker) {
             KernelWideInconsistency::async_executor_state_corruption().bugcheck();
@@ -433,6 +433,7 @@ impl DeviceExecutor {
     }
 
     /// Removes the next pending IRP and installs its ownership-bearing future.
+    #[cfg(not(test))]
     fn install_next_task(&self) -> bool {
         loop {
             let irp = self.remove_next_irp(core::ptr::null_mut());
@@ -463,6 +464,7 @@ impl DeviceExecutor {
     }
 
     /// Builds the non-owning waker used only while this stable executor remains live.
+    #[cfg(not(test))]
     fn waker(&self) -> Waker {
         unsafe {
             // SAFETY: Device teardown excludes active tasks and lower completions, so every cloned
@@ -543,11 +545,20 @@ impl DeviceExecutor {
 unsafe impl Sync for DeviceExecutor {}
 
 /// Raw-waker clone retains the same non-owning stable executor address.
+/// # Safety
+///
+/// `data` must identify a live, device-stable `DeviceExecutor` whose teardown is excluded until
+/// every raw-waker callback has finished.
+#[cfg(not(test))]
 unsafe fn executor_waker_clone(data: *const ()) -> RawWaker {
     RawWaker::new(data, &EXECUTOR_WAKER_VTABLE)
 }
 
 /// Raw-waker wake records a PASSIVE_LEVEL poll request.
+/// # Safety
+///
+/// `data` must identify a live, device-stable `DeviceExecutor` whose work item remains allocated.
+#[cfg(not(test))]
 unsafe fn executor_waker_wake(data: *const ()) {
     let Some(executor) = NonNull::new(data.cast_mut().cast::<DeviceExecutor>()) else {
         return;
@@ -560,6 +571,11 @@ unsafe fn executor_waker_wake(data: *const ()) {
 }
 
 /// Raw-waker by-reference wake has identical scheduling semantics.
+/// # Safety
+///
+/// `data` must satisfy the live-executor contract of `executor_waker_wake` and remains owned by
+/// the caller after this function returns.
+#[cfg(not(test))]
 unsafe fn executor_waker_wake_by_ref(data: *const ()) {
     unsafe {
         // SAFETY: This forwards the same live non-owning raw-waker context without consuming it.
@@ -568,9 +584,15 @@ unsafe fn executor_waker_wake_by_ref(data: *const ()) {
 }
 
 /// Raw-waker drop is a no-op because device storage, not the waker, owns the executor.
+/// # Safety
+///
+/// `data` must be the non-owning executor address installed by `DeviceExecutor::waker`; no
+/// executor ownership is transferred through the raw waker.
+#[cfg(not(test))]
 unsafe fn executor_waker_drop(_data: *const ()) {}
 
 /// Vtable for executor-address wakers stored in lower completion state.
+#[cfg(not(test))]
 static EXECUTOR_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     executor_waker_clone,
     executor_waker_wake,
@@ -580,6 +602,10 @@ static EXECUTOR_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 
 #[cfg(not(test))]
 /// PASSIVE_LEVEL system work-item callback.
+/// # Safety
+///
+/// `context` must be the stable `DeviceExecutor` address passed to `IoQueueWorkItem`, and device
+/// teardown must remain excluded for the duration of the callback.
 unsafe extern "C" fn device_executor_worker(_device: wdk_sys::PDEVICE_OBJECT, context: PVOID) {
     let Some(executor) = NonNull::new(context.cast::<DeviceExecutor>()) else {
         return;
@@ -593,6 +619,10 @@ unsafe extern "C" fn device_executor_worker(_device: wdk_sys::PDEVICE_OBJECT, co
 
 #[cfg(not(test))]
 /// CSQ insertion callback.
+/// # Safety
+///
+/// `csq` must be the first-field CSQ of a live executor and `irp` must be an unlinked pending IRP
+/// handed to this callback by the I/O Manager while the CSQ lock is held.
 unsafe extern "C" fn csq_insert_irp(csq: PIO_CSQ, irp: PIRP) {
     if let Some(executor) = unsafe {
         // SAFETY: The CSQ is the first field of one live executor.
@@ -604,6 +634,10 @@ unsafe extern "C" fn csq_insert_irp(csq: PIO_CSQ, irp: PIRP) {
 
 #[cfg(not(test))]
 /// CSQ removal callback.
+/// # Safety
+///
+/// `csq` must belong to a live executor and `irp` must currently be linked in that executor's
+/// queue while the CSQ lock is held.
 unsafe extern "C" fn csq_remove_irp(csq: PIO_CSQ, irp: PIRP) {
     if let Some(executor) = unsafe {
         // SAFETY: The CSQ is the first field of one live executor.
@@ -615,6 +649,10 @@ unsafe extern "C" fn csq_remove_irp(csq: PIO_CSQ, irp: PIRP) {
 
 #[cfg(not(test))]
 /// CSQ FIFO peek callback.
+/// # Safety
+///
+/// `csq` must belong to a live executor; a non-null `irp` must be linked in that queue, and a
+/// non-null `context` must be a FILE_OBJECT identity supplied by the I/O Manager.
 unsafe extern "C" fn csq_peek_next_irp(csq: PIO_CSQ, irp: PIRP, context: PVOID) -> PIRP {
     unsafe {
         // SAFETY: The CSQ is the first field of one live executor.
@@ -627,6 +665,10 @@ unsafe extern "C" fn csq_peek_next_irp(csq: PIO_CSQ, irp: PIRP, context: PVOID) 
 
 #[cfg(not(test))]
 /// CSQ spin-lock acquisition callback.
+/// # Safety
+///
+/// `csq` must belong to a live executor and `irql` must point to writable saved-IRQL storage
+/// supplied by the I/O Manager.
 unsafe extern "C" fn csq_acquire_lock(csq: PIO_CSQ, irql: wdk_sys::PKIRQL) {
     let Some(executor) = (unsafe {
         // SAFETY: The CSQ is the first field of one live executor.
@@ -648,6 +690,10 @@ unsafe extern "C" fn csq_acquire_lock(csq: PIO_CSQ, irql: wdk_sys::PKIRQL) {
 
 #[cfg(not(test))]
 /// CSQ spin-lock release callback.
+/// # Safety
+///
+/// `csq` must identify the executor whose lock was acquired by `csq_acquire_lock`, and `irql`
+/// must be the value saved by that acquisition.
 unsafe extern "C" fn csq_release_lock(csq: PIO_CSQ, irql: wdk_sys::KIRQL) {
     let Some(executor) = (unsafe {
         // SAFETY: The CSQ is the first field of one live executor.
@@ -663,6 +709,10 @@ unsafe extern "C" fn csq_release_lock(csq: PIO_CSQ, irql: wdk_sys::KIRQL) {
 
 #[cfg(not(test))]
 /// CSQ cancellation callback that consumes the removed IRP's terminal authority.
+/// # Safety
+///
+/// `csq` must belong to a live executor and `irp` must be the canceled IRP atomically removed by
+/// the CSQ framework, with terminal completion authority transferred to this callback.
 unsafe extern "C" fn csq_complete_canceled_irp(csq: PIO_CSQ, irp: PIRP) {
     let Some(executor) = (unsafe {
         // SAFETY: The CSQ is the first field of one live executor.
@@ -677,6 +727,10 @@ unsafe extern "C" fn csq_complete_canceled_irp(csq: PIO_CSQ, irp: PIRP) {
 
 #[cfg(not(test))]
 /// Recovers the containing executor from its first-field CSQ pointer.
+/// # Safety
+///
+/// `csq` must point to the first field of a live `DeviceExecutor` for the returned borrow's full
+/// lifetime.
 unsafe fn executor_from_csq<'a>(csq: PIO_CSQ) -> Option<&'a DeviceExecutor> {
     let executor = NonNull::new(csq.cast::<DeviceExecutor>())?;
     Some(unsafe {
@@ -725,8 +779,11 @@ fn remove_entry_list(entry: PLIST_ENTRY) {
     let previous = entry_ref.Blink;
     let next = entry_ref.Flink;
     unsafe {
-        // SAFETY: Both adjacent entries belong to the same initialized list.
+        // SAFETY: `previous` belongs to the same initialized list and remains live under the lock.
         (*previous).Flink = next;
+    }
+    unsafe {
+        // SAFETY: `next` belongs to the same initialized list and remains live under the lock.
         (*next).Blink = previous;
     }
     initialize_list_head(entry);

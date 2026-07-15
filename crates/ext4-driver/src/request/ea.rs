@@ -6,7 +6,10 @@ use crate::irp::{
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
-use crate::state::{FileControlBlock, OpenedObject, PendingChildCreation, VolumeControlBlock};
+use crate::state::{
+    OpenedObject, PendingChildCreation, VolumeControlBlock, VolumeOperationLane,
+    VolumeOperationLease,
+};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{XattrName, XattrNamespace, XattrValue};
 
@@ -38,27 +41,34 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 /// # Errors
 ///
 /// Returns an error when query-EA stack decoding, EA selection, or output packing fails.
-pub(crate) fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    QueryEaRequest::decode(target).and_then(|request| query_ea(&request))
+pub(crate) async fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let request = QueryEaRequest::decode(target)?;
+    query_ea(request).await
 }
 
 /// Executes IRP_MJ_SET_EA.
 /// # Errors
 ///
 /// Returns an error when set-EA stack decoding or ext4 EA mutation fails.
-pub(crate) fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    SetEaRequest::decode(target).and_then(|request| set_ea(&request))
+pub(crate) async fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let request = SetEaRequest::decode(target)?;
+    set_ea(request).await
 }
 
 /// Decoded query-EA request.
-#[derive(Debug)]
 struct QueryEaRequest {
     /// Dispatch target receiving output.
     target: DispatchTarget,
-    /// Decoded query-EA stack.
-    stack: QueryEaStack,
-    /// Opened file contexts decoded before EA handling.
-    opened_file: OpenedObject,
+    /// Caller output buffer length.
+    length: IrpBufferLength,
+    /// EA entry emission cardinality.
+    entry_emission: EaEntryEmission,
+    /// Owned EA selection decoded before the operation can suspend.
+    selection: WindowsEaSelection,
+    /// ext4 node selected by the opened FILE_OBJECT.
+    node: ext4_core::NodeId,
+    /// Exclusive actor-owned mounted-volume operation capability.
+    operations: VolumeOperationLease,
 }
 
 impl QueryEaRequest {
@@ -70,23 +80,33 @@ impl QueryEaRequest {
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.query_ea()?;
         let opened_file = OpenedObject::decode(stack.file_object())?;
+        let volume = opened_file.volume();
+        let node = opened_file.node();
+        let selection = requested_eas(stack)?;
+        let operations = unsafe {
+            // SAFETY: Query-EA runs only as the mounted-device executor's unique active operation.
+            // The lease is moved into this request and lives until that operation completes.
+            VolumeControlBlock::claim_operation_lane(volume)
+        };
         Ok(Self {
             target,
-            stack,
-            opened_file,
+            length: stack.length(),
+            entry_emission: stack.entry_emission(),
+            selection,
+            node,
+            operations,
         })
     }
 }
 
 /// Decoded set-EA request.
-#[derive(Debug)]
 struct SetEaRequest {
-    /// Dispatch target carrying input.
-    target: DispatchTarget,
-    /// Decoded set-EA stack.
-    stack: SetEaStack,
-    /// Opened file contexts decoded before EA handling.
-    opened_file: OpenedObject,
+    /// Parsed EA records owned independently of the IRP input buffer.
+    entries: DriverVec<WindowsEaRecord>,
+    /// ext4 node selected by the opened FILE_OBJECT.
+    node: ext4_core::NodeId,
+    /// Exclusive actor-owned mounted-volume operation capability.
+    operations: VolumeOperationLease,
 }
 
 impl SetEaRequest {
@@ -98,10 +118,18 @@ impl SetEaRequest {
     fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
         let stack = target.current_stack()?.set_ea()?;
         let opened_file = OpenedObject::decode(stack.file_object())?;
+        let entries = parse_set_ea_entries(target, stack)?;
+        let volume = opened_file.volume();
+        let node = opened_file.node();
+        let operations = unsafe {
+            // SAFETY: Set-EA runs only as the mounted-device executor's unique active operation.
+            // The lease is moved into this request and lives until that operation completes.
+            VolumeControlBlock::claim_operation_lane(volume)
+        };
         Ok(Self {
-            target,
-            stack,
-            opened_file,
+            entries,
+            node,
+            operations,
         })
     }
 }
@@ -135,12 +163,12 @@ impl CreateEa {
     ///
     /// Returns an error when any EA name cannot be mapped to an ext4 xattr or the pending child
     /// rejects the xattr mutation.
-    pub(crate) fn apply_to_pending_child(
+    pub(crate) async fn apply_to_pending_child(
         &self,
-        creation: &mut PendingChildCreation,
+        creation: &mut PendingChildCreation<'_>,
     ) -> DriverResult<()> {
         for entry in self.entries.iter() {
-            apply_ea_record_to_pending_child(creation, entry)?;
+            apply_ea_record_to_pending_child(creation, entry).await?;
         }
         Ok(())
     }
@@ -292,9 +320,10 @@ enum WindowsEaSelection {
 ///
 /// Returns an error when selected EAs cannot be loaded, no EAs match, the output buffer is too
 /// small, or packed EA records cannot be emitted.
-fn query_ea(request: &QueryEaRequest) -> DriverResult<IrpCompletion> {
-    let entries = collect_query_entries(&request.opened_file, request.stack)?;
-    let entries = if matches!(request.stack.entry_emission(), EaEntryEmission::Single) {
+async fn query_ea(mut request: QueryEaRequest) -> DriverResult<IrpCompletion> {
+    let entries = load_windows_eas(request.operations.lane_mut(), request.node).await?;
+    let entries = collect_query_entries(entries, request.selection)?;
+    let entries = if matches!(request.entry_emission, EaEntryEmission::Single) {
         entries.as_slice().get(..entries.len().min(1))
     } else {
         Some(entries.as_slice())
@@ -304,7 +333,7 @@ fn query_ea(request: &QueryEaRequest) -> DriverResult<IrpCompletion> {
         return Err(DriverError::NoEasOnFile);
     }
 
-    let length = request.stack.length();
+    let length = request.length;
     let required = packed_full_ea_length(entries)?;
     if length.as_usize() < required {
         return Err(DriverError::BufferTooSmall);
@@ -318,9 +347,13 @@ fn query_ea(request: &QueryEaRequest) -> DriverResult<IrpCompletion> {
 /// # Errors
 ///
 /// Returns an error when the set-EA input list is malformed or the xattr update transaction fails.
-fn set_ea(request: &SetEaRequest) -> DriverResult<IrpCompletion> {
-    let entries = parse_set_ea_entries(request.target, request.stack)?;
-    apply_set_ea_entries(&request.opened_file, entries.as_slice())?;
+async fn set_ea(mut request: SetEaRequest) -> DriverResult<IrpCompletion> {
+    apply_set_ea_entries(
+        request.operations.lane_mut(),
+        request.node,
+        request.entries.as_slice(),
+    )
+    .await?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -329,11 +362,10 @@ fn set_ea(request: &SetEaRequest) -> DriverResult<IrpCompletion> {
 ///
 /// Returns an error when persisted EAs or the caller's requested EA-name list cannot be parsed.
 fn collect_query_entries(
-    opened_file: &OpenedObject,
-    stack: QueryEaStack,
+    entries: DriverVec<WindowsEaRecord>,
+    selection: WindowsEaSelection,
 ) -> DriverResult<DriverVec<WindowsEaRecord>> {
-    let entries = load_windows_eas(opened_file)?;
-    match requested_eas(stack)? {
+    match selection {
         WindowsEaSelection::All => Ok(entries),
         WindowsEaSelection::Names(names) => {
             let mut selected = DriverVec::new();
@@ -355,10 +387,11 @@ fn collect_query_entries(
 ///
 /// Returns an error when node xattrs cannot be read or any stored ext4win EA name/value no longer
 /// fits the Windows EA record domain.
-fn load_windows_eas(opened_file: &OpenedObject) -> DriverResult<DriverVec<WindowsEaRecord>> {
-    let fcb = opened_file.file_control_block();
-    let vcb = volume_control_block(fcb);
-    let xattrs = vcb.volume().read_xattrs(fcb.node())?;
+async fn load_windows_eas(
+    operations: &mut VolumeOperationLane,
+    node: ext4_core::NodeId,
+) -> DriverResult<DriverVec<WindowsEaRecord>> {
+    let xattrs = operations.journaled_mut().read_xattrs(node).await?;
     let mut entries = DriverVec::new();
     for (name, value) in xattrs.entries() {
         if name.namespace() != XattrNamespace::User {
@@ -382,35 +415,29 @@ fn load_windows_eas(opened_file: &OpenedObject) -> DriverResult<DriverVec<Window
 ///
 /// Returns an error when EA names cannot be mapped to xattrs or the journaled xattr set/remove
 /// operation fails.
-fn apply_set_ea_entries(
-    opened_file: &OpenedObject,
+async fn apply_set_ea_entries(
+    operations: &mut VolumeOperationLane,
+    node_id: ext4_core::NodeId,
     entries: &[WindowsEaRecord],
 ) -> DriverResult<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    let fcb = opened_file.file_control_block();
-    let node_id = fcb.node();
-    let mut vcb = fcb.volume();
-    let vcb = unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
-        // remain valid while file objects are open. The mutable borrow is the
-        // transaction boundary for this EA mutation.
-        vcb.as_mut()
-    };
-    let mut transaction = vcb
-        .volume_mut()
+    let mut transaction = operations
+        .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let node = transaction.node(node_id)?;
+    let node = transaction.node(node_id).await?;
     for entry in entries {
         let name = xattr_name_from_ea_name(&entry.name)?;
         if entry.value.is_empty() {
-            transaction.remove_xattr(node, &name)?;
+            transaction.remove_xattr(node, &name).await?;
         } else {
-            transaction.set_xattr(node, name, XattrValue::new(entry.value.as_bytes())?)?;
+            transaction
+                .set_xattr(node, name, XattrValue::new(entry.value.as_bytes())?)
+                .await?;
         }
     }
-    transaction.commit()?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -419,15 +446,17 @@ fn apply_set_ea_entries(
 ///
 /// Returns an error when the EA name cannot be mapped to an xattr or the pending child rejects the
 /// xattr mutation.
-fn apply_ea_record_to_pending_child(
-    creation: &mut PendingChildCreation,
+async fn apply_ea_record_to_pending_child(
+    creation: &mut PendingChildCreation<'_>,
     entry: &WindowsEaRecord,
 ) -> DriverResult<()> {
     let name = xattr_name_from_ea_name(&entry.name)?;
     if entry.value.is_empty() {
-        creation.remove_xattr(&name)
+        creation.remove_xattr(&name).await
     } else {
-        creation.set_xattr(name, XattrValue::new(entry.value.as_bytes())?)
+        creation
+            .set_xattr(name, XattrValue::new(entry.value.as_bytes())?)
+            .await
     }
 }
 
@@ -751,15 +780,6 @@ fn xattr_name_from_ea_name(name: &WindowsEaName) -> DriverResult<XattrName> {
     local.try_extend_from_copy_slice(EA_XATTR_PREFIX)?;
     local.try_extend_from_copy_slice(name.as_bytes())?;
     Ok(XattrName::new(XattrNamespace::User, local.as_slice())?)
-}
-
-/// Returns the mounted VCB referenced by an FCB.
-fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
-    unsafe {
-        // SAFETY: FCBs are constructed only from live mounted VCB pointers and
-        // remain valid while file objects are open.
-        fcb.volume().as_ref()
-    }
 }
 
 /// Aligns a byte count to a four-byte boundary.

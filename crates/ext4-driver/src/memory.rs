@@ -65,6 +65,13 @@ impl<T> PushError<T> {
 
 /// Failed box allocation that preserves the source value before construction begins.
 #[must_use]
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "ownership-preserving executor allocation is exercised only by kernel workers"
+    )
+)]
 pub(crate) struct BoxMapError<S> {
     /// Driver-domain allocation error.
     error: DriverError,
@@ -72,6 +79,13 @@ pub(crate) struct BoxMapError<S> {
     source: S,
 }
 
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "ownership-preserving executor allocation is exercised only by kernel workers"
+    )
+)]
 impl<S> BoxMapError<S> {
     /// Splits the allocation failure into its error and still-owned source value.
     pub(crate) fn into_parts(self) -> (DriverError, S) {
@@ -402,6 +416,13 @@ where
 ///
 /// Returns the allocation error together with the untouched source value when the destination slot
 /// cannot be allocated.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "ownership-preserving executor allocation is exercised only by kernel workers"
+    )
+)]
 pub(crate) fn boxed_try_map<S, T>(
     source: S,
     map: impl FnOnce(S) -> T,

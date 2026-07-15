@@ -112,26 +112,26 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 ///
 /// Returns an error when the enable payload is malformed, the FILE_OBJECT is not a regular file, or
 /// the fs-verity transaction fails.
-pub(crate) fn enable_verity(
-    target: DispatchTarget,
-    stack: FileSystemControlStack,
-) -> DriverResult<IrpCompletion> {
-    let payload = read_input(target, stack)
-        .and_then(|input| FsverityEnablePayload::parse(input.as_slice()))?;
-    let enable = payload.into_core_enable();
-    let opened_file = OpenedRegularFile::decode(stack.file_object())?;
-    let mut vcb = opened_file.volume();
-    let vcb = unsafe {
-        // SAFETY: FCBs only store live mounted VCB pointers. The mutable borrow
-        // is the transaction boundary for this synchronous FSCTL.
-        vcb.as_mut()
+pub(crate) async fn enable_verity(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let (enable, file_id, mut operations) = {
+        let stack = target.current_stack()?.file_system_control()?;
+        let payload = read_input(target, stack)
+            .and_then(|input| FsverityEnablePayload::parse(input.as_slice()))?;
+        let opened_file = OpenedRegularFile::decode(stack.file_object())?;
+        let operations = unsafe {
+            // SAFETY: Enable-verity runs only as the mounted-device executor's unique active
+            // operation. The lease remains owned until the transaction completes.
+            VolumeControlBlock::claim_operation_lane(opened_file.volume())
+        };
+        (payload.into_core_enable(), opened_file.id(), operations)
     };
-    let mut transaction = vcb
-        .volume_mut()
+    let mut transaction = operations
+        .lane_mut()
+        .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let file = transaction.file(opened_file.id())?;
-    transaction.enable_verity(file, &enable)?;
-    transaction.commit()?;
+    let file = transaction.file(file_id).await?;
+    transaction.enable_verity(file, &enable).await?;
+    transaction.commit().await?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -146,13 +146,15 @@ pub(crate) fn add_encryption_key(
 ) -> DriverResult<IrpCompletion> {
     let input = read_input(target, stack)?;
     let payload = FscryptAddKeyPayload::parse(input.as_slice())?;
-    let mut vcb = mounted_vcb(stack)?;
-    let vcb = unsafe {
-        // SAFETY: The VCB pointer comes from an open FCB that is valid for the
-        // duration of this synchronous FSCTL dispatch.
-        vcb.as_mut()
+    let volume = mounted_vcb(stack)?;
+    let mut operations = unsafe {
+        // SAFETY: Add-key runs only as the mounted-device executor's unique active operation. The
+        // non-cloneable lease is consumed before this operation returns.
+        VolumeControlBlock::claim_operation_lane(volume)
     };
-    vcb.add_fscrypt_key(payload.into_master_key())?;
+    operations
+        .lane_mut()
+        .add_fscrypt_key(payload.into_master_key())?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -167,13 +169,15 @@ pub(crate) fn remove_encryption_key(
 ) -> DriverResult<IrpCompletion> {
     let input = read_input(target, stack)?;
     let payload = FscryptRemoveKeyPayload::parse(input.as_slice())?;
-    let mut vcb = mounted_vcb(stack)?;
-    let vcb = unsafe {
-        // SAFETY: The VCB pointer comes from an open FCB that is valid for the
-        // duration of this synchronous FSCTL dispatch.
-        vcb.as_mut()
+    let volume = mounted_vcb(stack)?;
+    let mut operations = unsafe {
+        // SAFETY: Remove-key runs only as the mounted-device executor's unique active operation.
+        // The non-cloneable lease is consumed before this operation returns.
+        VolumeControlBlock::claim_operation_lane(volume)
     };
-    let _removed = vcb.remove_fscrypt_key(payload.identifier());
+    let _removed = operations
+        .lane_mut()
+        .remove_fscrypt_key(payload.identifier());
 
     let mut output = output_buffer(target, stack, FSCRYPT_REMOVE_KEY_BYTES)?;
     write_remove_key_output(output.as_mut_slice())?;
@@ -191,13 +195,13 @@ pub(crate) fn get_encryption_key_status(
 ) -> DriverResult<IrpCompletion> {
     let input = read_input(target, stack)?;
     let payload = FscryptKeyStatusPayload::parse(input.as_slice())?;
-    let vcb = mounted_vcb(stack)?;
-    let presence = unsafe {
-        // SAFETY: The VCB pointer comes from an open FCB that is valid for the
-        // duration of this synchronous FSCTL dispatch.
-        vcb.as_ref()
-    }
-    .fscrypt_key_presence(payload.identifier());
+    let volume = mounted_vcb(stack)?;
+    let operations = unsafe {
+        // SAFETY: Key-status runs only as the mounted-device executor's unique active operation.
+        // The non-cloneable lease is consumed before this operation returns.
+        VolumeControlBlock::claim_operation_lane(volume)
+    };
+    let presence = operations.lane().fscrypt_key_presence(payload.identifier());
 
     let mut output = output_buffer(target, stack, FSCRYPT_GET_KEY_STATUS_BYTES)?;
     write_key_status_output(output.as_mut_slice(), presence)?;

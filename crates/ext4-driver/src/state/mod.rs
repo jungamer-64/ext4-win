@@ -4,11 +4,10 @@ use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::fmt;
-use core::marker::PhantomData;
+use core::marker::{PhantomData, PhantomPinned};
 #[cfg(not(test))]
 use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
-#[cfg(not(test))]
 use core::pin::Pin;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -19,7 +18,7 @@ use ext4_core::{
     DeviceLength, DirectoryNodeId, Ext4Name, Ext4Timestamp, FileNodeId, FileOffset,
     FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, InternalJournal,
     JournalTransaction, JournaledVolume, MountContext, NewDirectoryMetadata, NewFileMetadata,
-    NodeId, Result as Ext4Result, WindowsName, XattrName, XattrValue,
+    NodeId, WindowsName, XattrName, XattrValue,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, LARGE_INTEGER, PDEVICE_OBJECT,
@@ -47,6 +46,13 @@ pub(crate) struct KernelDevice {
     /// Non-null opaque WDK device pointer.
     device: NonNull<c_void>,
 }
+
+// SAFETY: WDM device objects are I/O Manager-owned, nonpaged objects that may be dispatched on any
+// processor. This boundary exposes only stable identity and immutable device properties; teardown
+// contracts require every executor task and lower completion to drain before deletion.
+unsafe impl Send for KernelDevice {}
+// SAFETY: Shared copies do not grant Rust mutation of the DEVICE_OBJECT.
+unsafe impl Sync for KernelDevice {}
 
 impl KernelDevice {
     /// Converts a raw WDK device pointer into the non-null boundary type.
@@ -638,6 +644,167 @@ pub(crate) struct VolumeOperationLane {
     journaled: JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator>,
 }
 
+impl VolumeOperationLane {
+    /// Returns the mounted journaled volume for one serialized operation.
+    pub(crate) const fn journaled(
+        &self,
+    ) -> &JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator> {
+        &self.journaled
+    }
+
+    /// Returns the mounted journaled volume for one serialized mutable operation.
+    pub(crate) const fn journaled_mut(
+        &mut self,
+    ) -> &mut JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator> {
+        &mut self.journaled
+    }
+
+    /// Persists every write issued before this point in the operation lane.
+    /// # Errors
+    ///
+    /// Returns an error when journal or lower-device flush fails.
+    pub(crate) async fn flush(&mut self) -> ext4_core::Result<()> {
+        self.journaled.flush().await
+    }
+
+    /// Returns a stable serial number derived from the ext4 filesystem UUID.
+    pub(crate) fn serial_number(&self) -> VolumeSerialNumber {
+        let uuid = self.journaled.identity().uuid().bytes();
+        let [a, b, c, d, ..] = uuid;
+        VolumeSerialNumber::from_le_bytes([a, b, c, d])
+    }
+
+    /// Returns the mounted ext4 volume label.
+    pub(crate) fn volume_label(&self) -> ext4_core::Ext4VolumeLabel {
+        self.journaled.identity().label()
+    }
+
+    /// Adds one fscrypt master key to the mounted volume.
+    /// # Errors
+    ///
+    /// Returns an error when the key identifier is already installed or key storage is exhausted.
+    pub(crate) fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> ext4_core::Result<()> {
+        self.journaled.add_fscrypt_key(key)
+    }
+
+    /// Removes one fscrypt master key from the mounted volume.
+    pub(crate) fn remove_fscrypt_key(
+        &mut self,
+        identifier: FscryptKeyIdentifier,
+    ) -> Option<FscryptMasterKey> {
+        self.journaled.remove_fscrypt_key(identifier)
+    }
+
+    /// Returns the mounted volume's fscrypt key presence for one identifier.
+    pub(crate) fn fscrypt_key_presence(
+        &self,
+        identifier: FscryptKeyIdentifier,
+    ) -> FscryptKeyPresence {
+        self.journaled.fscrypt_key_presence(identifier)
+    }
+}
+
+/// Stable identity of one mounted VCB without granting a reference to its control-plane fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MountedVolumeRef {
+    /// Heap-stable mounted VCB.
+    volume: NonNull<VolumeControlBlock>,
+}
+
+// SAFETY: A mounted VCB allocation remains stable until all FILE_OBJECT references and executor
+// tasks have drained. This identity grants no direct access; each projected field has its own
+// synchronization or single-actor contract.
+unsafe impl Send for MountedVolumeRef {}
+// SAFETY: Copying the identity does not grant shared or mutable VCB references.
+unsafe impl Sync for MountedVolumeRef {}
+
+impl MountedVolumeRef {
+    /// Wraps a heap-stable mounted VCB identity.
+    const fn new(volume: NonNull<VolumeControlBlock>) -> Self {
+        Self { volume }
+    }
+
+    /// Returns the raw typed identity for existing FCB ownership boundaries.
+    const fn as_non_null(self) -> NonNull<VolumeControlBlock> {
+        self.volume
+    }
+}
+
+/// Exclusive capability for the mounted device's serialized ext4 operation actor.
+pub(crate) struct VolumeOperationLease {
+    /// Mounted VCB that owns the projected lane and control-plane ledger.
+    owner: MountedVolumeRef,
+    /// Disjoint actor-owned field projected without borrowing the whole VCB.
+    lane: NonNull<VolumeOperationLane>,
+}
+
+// SAFETY: The mounted-device executor transfers this exclusive capability between workers but
+// never polls two operation tasks concurrently. The projected journaled state is itself `Send`.
+unsafe impl Send for VolumeOperationLease {}
+
+impl VolumeOperationLease {
+    /// Returns the actor-owned operation lane through this exclusive capability.
+    pub(crate) fn lane(&self) -> &VolumeOperationLane {
+        unsafe {
+            // SAFETY: Construction requires unique actor authority for mutation; an immutable
+            // borrow through that same capability cannot alias a mutable borrow from it.
+            self.lane.as_ref()
+        }
+    }
+
+    /// Returns the actor-owned operation lane mutably through this exclusive capability.
+    pub(crate) fn lane_mut(&mut self) -> &mut VolumeOperationLane {
+        unsafe {
+            // SAFETY: The lease is non-cloneable and its constructor requires the unique mounted
+            // executor operation right.
+            self.lane.as_mut()
+        }
+    }
+
+    /// Starts a missing-child transaction without borrowing VCB control-plane state mutably.
+    /// # Errors
+    ///
+    /// Returns an error when the parent cannot be loaded or child creation cannot be staged.
+    pub(crate) async fn begin_child_creation(
+        &mut self,
+        parent: DirectoryNodeId,
+        name: &Ext4Name,
+        target: ChildCreationTarget,
+        now: Ext4Timestamp,
+    ) -> DriverResult<PendingChildCreation<'_>> {
+        let owner = self.owner;
+        let file_control_blocks = unsafe {
+            // SAFETY: `owner` stays live for the lease lifetime, so projecting the disjoint ledger
+            // field produces a stable raw address.
+            core::ptr::addr_of!((*owner.as_non_null().as_ptr()).file_control_blocks)
+        };
+        let file_control_blocks = unsafe {
+            // SAFETY: The projected ledger is independently synchronized and disjoint from the
+            // actor-owned operation lane.
+            &*file_control_blocks
+        };
+        let mut transaction = self.lane_mut().journaled_mut().begin_transaction(now);
+        let parent = transaction.directory(parent).await?;
+        let node = match target {
+            ChildCreationTarget::File(metadata) => {
+                NodeId::File(transaction.create_file(parent, name, metadata).await?.id())
+            }
+            ChildCreationTarget::Directory(metadata) => NodeId::Directory(
+                transaction
+                    .create_directory(parent, name, metadata)
+                    .await?
+                    .id(),
+            ),
+        };
+        Ok(PendingChildCreation {
+            transaction,
+            file_control_blocks,
+            volume: owner,
+            node,
+        })
+    }
+}
+
 /// VCB-owned FCB table and share accounting protected by one concrete executive resource.
 struct FileControlBlockLedger {
     /// Mutable ledger state reachable only while `lock` is held.
@@ -1021,10 +1188,11 @@ impl VolumeControlBlock {
     ///
     /// Returns an error when the lower device cannot be mounted as a journaled ext4 volume.
     pub(crate) async fn mount_journaled(
+        completion_owner: KernelDevice,
         target_device: KernelDevice,
         length: DeviceLength,
     ) -> DriverResult<Self> {
-        let block_device = KernelBlockDevice::new(target_device, length)?;
+        let block_device = KernelBlockDevice::new(completion_owner, target_device, length)?;
         let volume = JournaledVolume::<_, CngFscryptNonceGenerator>::mount(
             block_device,
             MountContext::new(FscryptKeySet::empty(), CngFscryptNonceGenerator),
@@ -1089,40 +1257,25 @@ impl VolumeControlBlock {
         )
     }
 
-    /// Starts a missing-child create transaction without committing filesystem state.
-    /// # Errors
+    /// Projects the actor-owned ext4 operation lane without borrowing VCB control-plane state.
+    /// # Safety
     ///
-    /// Returns an error when the parent cannot be selected, child creation cannot be staged, or
-    /// default metadata is rejected by the mounted ext4 profile.
-    pub(crate) async fn begin_child_creation(
-        &mut self,
-        parent: DirectoryNodeId,
-        name: &Ext4Name,
-        target: ChildCreationTarget,
-        now: Ext4Timestamp,
-    ) -> DriverResult<PendingChildCreation<'_>> {
-        let volume = NonNull::from(&mut *self);
-        let (mounted_volume, file_control_blocks) =
-            (&mut self.operations.journaled, &self.file_control_blocks);
-        let mut transaction = mounted_volume.begin_transaction(now);
-        let parent = transaction.directory(parent).await?;
-        let node = match target {
-            ChildCreationTarget::File(metadata) => {
-                NodeId::File(transaction.create_file(parent, name, metadata).await?.id())
-            }
-            ChildCreationTarget::Directory(metadata) => NodeId::Directory(
-                transaction
-                    .create_directory(parent, name, metadata)
-                    .await?
-                    .id(),
-            ),
+    /// The caller must own the mounted device executor's unique active-operation right and must
+    /// not construct another lease until the returned lease and every transaction borrowing it
+    /// have been dropped.
+    pub(crate) unsafe fn claim_operation_lane(volume: NonNull<Self>) -> VolumeOperationLease {
+        let lane = unsafe {
+            // SAFETY: The VCB is heap-stable, so its operation field has a stable address.
+            core::ptr::addr_of_mut!((*volume.as_ptr()).operations)
         };
-        Ok(PendingChildCreation {
-            transaction,
-            file_control_blocks,
-            volume,
-            node,
-        })
+        let lane = unsafe {
+            // SAFETY: A field address projected from a non-null live VCB cannot be null.
+            NonNull::new_unchecked(lane)
+        };
+        VolumeOperationLease {
+            owner: MountedVolumeRef::new(volume),
+            lane,
+        }
     }
 }
 
@@ -1486,6 +1639,8 @@ struct DirectoryNotificationDirectoryName {
     units: [u16; DIRECTORY_NOTIFICATION_DIRECTORY_UNITS],
     /// FsRtl retains this descriptor pointer until the CCB cleanup transition.
     string: UNICODE_STRING,
+    /// Prevents moving the self-referential descriptor after `Buffer` is initialized.
+    _pin: PhantomPinned,
 }
 
 impl DirectoryNotificationDirectoryName {
@@ -1493,7 +1648,7 @@ impl DirectoryNotificationDirectoryName {
     /// # Errors
     ///
     /// Returns an error when the stable descriptor allocation fails.
-    fn try_new(directory: DirectoryNodeId) -> DriverResult<Box<Self>> {
+    fn try_new(directory: DirectoryNodeId) -> DriverResult<Pin<Box<Self>>> {
         let units = Self::encode(directory);
         let byte_length = u16::try_from(core::mem::size_of_val(&units))
             .map_err(|_| DriverError::InvalidBufferSize)?;
@@ -1505,10 +1660,11 @@ impl DirectoryNotificationDirectoryName {
                     MaximumLength: byte_length,
                     Buffer: core::ptr::null_mut(),
                 },
+                _pin: PhantomPinned,
             })
         })?;
         name.string.Buffer = name.units.as_mut_ptr();
-        Ok(name)
+        Ok(Box::into_pin(name))
     }
 
     /// Encodes one directory identity without allocating storage.
@@ -1537,6 +1693,10 @@ impl PartialEq for DirectoryNotificationDirectoryName {
 }
 
 impl Eq for DirectoryNotificationDirectoryName {}
+
+// SAFETY: After construction this value is pinned in its own allocation, so `string.Buffer`
+// continues to address `units` when ownership of the pinned box moves between executor workers.
+unsafe impl Send for DirectoryNotificationDirectoryName {}
 
 /// Full synthetic target path reported to the FsRtl notification package.
 #[derive(Clone, Copy, Debug)]
@@ -1629,7 +1789,7 @@ pub(crate) struct PendingChildCreation<'a> {
     /// Synchronized FCB ledger borrowed independently from the mounted ext4 volume.
     file_control_blocks: &'a FileControlBlockLedger,
     /// VCB that owns any FCB opened for the staged node.
-    volume: NonNull<VolumeControlBlock>,
+    volume: MountedVolumeRef,
     /// Node identity allocated by the staged transaction.
     node: NodeId,
 }
@@ -1651,7 +1811,7 @@ impl PendingChildCreation<'_> {
         share_access: ShareAccess,
     ) -> DriverResult<NonNull<FileControlBlock>> {
         self.file_control_blocks.open_new(
-            self.volume,
+            self.volume.as_non_null(),
             self.node,
             file_object,
             desired_access,
@@ -1851,8 +2011,8 @@ impl MountedVolumeDevice {
             .ok_or(DriverError::InvalidParameter)?;
         let transfer_alignment = real_device.transfer_buffer_alignment()?;
         let mounted_flag = u16::try_from(VPB_MOUNTED).map_err(|_| DriverError::InvalidParameter)?;
-        let serial_number = vcb.serial_number().as_u32();
-        let volume_label = VpbLabel::encode(vcb.volume_label())?;
+        let serial_number = vcb.operations.serial_number().as_u32();
+        let volume_label = VpbLabel::encode(vcb.operations.volume_label())?;
         let device_object = unsafe {
             // SAFETY: The device was just created by this driver and remains
             // valid during mount initialization.
@@ -1951,7 +2111,7 @@ impl MountedVolumeDevice {
     /// not fit in the VPB label field.
     pub(crate) fn refresh_vpb_label(
         device: KernelDevice,
-        vcb: &VolumeControlBlock,
+        volume_label: ext4_core::Ext4VolumeLabel,
     ) -> DriverResult<()> {
         let device_object = unsafe {
             // SAFETY: `device` is a mounted volume device owned by this driver
@@ -1965,7 +2125,7 @@ impl MountedVolumeDevice {
             device_object.Vpb.as_mut()
         }
         .ok_or(DriverError::InvalidParameter)?;
-        VpbLabel::encode(vcb.volume_label()).map(|label| label.write_to(vpb))
+        VpbLabel::encode(volume_label).map(|label| label.write_to(vpb))
     }
 }
 
@@ -2728,7 +2888,7 @@ enum DirectoryNotificationName {
     /// No directory notification IRP has required a stable name yet.
     Unregistered,
     /// FsRtl may retain this descriptor until the FILE_OBJECT cleanup transition.
-    Registered(Box<DirectoryNotificationDirectoryName>),
+    Registered(Pin<Box<DirectoryNotificationDirectoryName>>),
 }
 
 #[derive(Debug)]

@@ -2,10 +2,10 @@
 
 use alloc::vec::Vec;
 
-use crate::irp::{DispatchTarget, FileSystemControlStack, IrpCompletion};
+use crate::irp::{DispatchTarget, IrpCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
-use crate::state::{OpenedLocation, OpenedObject, VolumeControlBlock};
+use crate::state::{OpenedLocation, OpenedObject, VolumeControlBlock, VolumeOperationLane};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{NodeId, SymlinkNodeId, SymlinkTarget, WindowsSymlinkReparsePoint};
 
@@ -36,12 +36,16 @@ impl NodeSymlinkReparsePoint {
     /// # Errors
     ///
     /// Returns an error when driver-owned Windows reparse metadata is malformed or cannot be read.
-    pub(crate) fn load(vcb: &VolumeControlBlock, node: NodeId) -> DriverResult<Option<Self>> {
+    pub(crate) async fn load(
+        operations: &mut VolumeOperationLane,
+        node: NodeId,
+    ) -> DriverResult<Option<Self>> {
         match node {
             NodeId::Symlink(symlink) => Ok(Some(Self::NativeSymlink(symlink))),
-            NodeId::File(_) | NodeId::Directory(_) => Ok(vcb
-                .volume()
-                .read_windows_symlink_reparse_point(node)?
+            NodeId::File(_) | NodeId::Directory(_) => Ok(operations
+                .journaled_mut()
+                .read_windows_symlink_reparse_point(node)
+                .await?
                 .map(Self::WindowsSymlink)),
         }
     }
@@ -52,16 +56,16 @@ impl NodeSymlinkReparsePoint {
     ///
     /// Returns an error when a native target cannot be read, the target is not UTF-8, allocation
     /// fails, or the resulting Windows reparse buffer would exceed 16 KiB.
-    pub(crate) fn into_symlink_data(
+    pub(crate) async fn into_symlink_data(
         self,
-        vcb: &VolumeControlBlock,
+        operations: &mut VolumeOperationLane,
     ) -> DriverResult<SymlinkReparseData> {
         match self {
             Self::WindowsSymlink(reparse_point) => {
                 SymlinkReparseData::from_windows_reparse_point(&reparse_point)
             }
             Self::NativeSymlink(symlink) => {
-                let target = read_core_symlink(vcb, symlink)?;
+                let target = read_core_symlink(operations, symlink).await?;
                 SymlinkReparseData::from_native_ext4_target(target.as_slice())
             }
         }
@@ -135,14 +139,24 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 ///
 /// Returns an error when the opened object is not a reparse point, its target cannot be read, or
 /// the output buffer cannot hold the reparse data.
-pub(crate) fn get_reparse_point(
-    target: DispatchTarget,
-    stack: FileSystemControlStack,
-) -> DriverResult<IrpCompletion> {
-    let opened = OpenedObject::decode(stack.file_object())?;
-    let length = stack.output_buffer_length();
+pub(crate) async fn get_reparse_point(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let (length, node, operations) = {
+        let stack = target.current_stack()?.file_system_control()?;
+        let opened = OpenedObject::decode(stack.file_object())?;
+        let node = opened.node();
+        let operations = unsafe {
+            // SAFETY: Queued filesystem-control requests run one at a time on the mounted-device
+            // executor, so this request owns the unique operation-lane capability until completion.
+            VolumeControlBlock::claim_operation_lane(opened.volume())
+        };
+        (stack.output_buffer_length(), node, operations)
+    };
+    let data = {
+        let mut operations = operations;
+        load_node_reparse_data(operations.lane_mut(), node).await?
+    };
     let mut output = target.buffered_output(length)?;
-    let written = pack_opened_reparse_point(&opened, output.as_mut_slice())?;
+    let written = data.pack_fsctl(output.as_mut_slice())?;
     IrpCompletion::from_usize(written)
 }
 
@@ -151,14 +165,22 @@ pub(crate) fn get_reparse_point(
 ///
 /// Returns an error when the input is malformed, the opened node is a native symbolic link, or
 /// the reparse xattr cannot be committed.
-pub(crate) fn set_reparse_point(
-    target: DispatchTarget,
-    stack: FileSystemControlStack,
-) -> DriverResult<IrpCompletion> {
-    let input = target.buffered_input(stack.input_buffer_length())?;
-    let reparse_point = parse_symlink_reparse_buffer(input.as_slice())?;
-    let opened = OpenedObject::decode(stack.file_object())?;
-    set_opened_reparse_point(&opened, reparse_point)?;
+pub(crate) async fn set_reparse_point(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let (reparse_point, node, mut operations) = {
+        let stack = target.current_stack()?.file_system_control()?;
+        let input = target.buffered_input(stack.input_buffer_length())?;
+        let reparse_point = parse_symlink_reparse_buffer(input.as_slice())?;
+        let opened = OpenedObject::decode(stack.file_object())?;
+        let node = opened.node();
+        validate_mutable_reparse_node(opened.location(), node)?;
+        let operations = unsafe {
+            // SAFETY: Queued filesystem-control requests run one at a time on the mounted-device
+            // executor, so this request owns the unique operation-lane capability until completion.
+            VolumeControlBlock::claim_operation_lane(opened.volume())
+        };
+        (reparse_point, node, operations)
+    };
+    set_node_reparse_point(operations.lane_mut(), node, reparse_point).await?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -167,14 +189,22 @@ pub(crate) fn set_reparse_point(
 ///
 /// Returns an error when the input is malformed, the opened object is not a driver-owned reparse
 /// point, or the xattr mutation cannot be committed.
-pub(crate) fn delete_reparse_point(
-    target: DispatchTarget,
-    stack: FileSystemControlStack,
-) -> DriverResult<IrpCompletion> {
-    let input = target.buffered_input(stack.input_buffer_length())?;
-    parse_delete_reparse_buffer(input.as_slice())?;
-    let opened = OpenedObject::decode(stack.file_object())?;
-    delete_opened_reparse_point(&opened)?;
+pub(crate) async fn delete_reparse_point(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+    let (node, mut operations) = {
+        let stack = target.current_stack()?.file_system_control()?;
+        let input = target.buffered_input(stack.input_buffer_length())?;
+        parse_delete_reparse_buffer(input.as_slice())?;
+        let opened = OpenedObject::decode(stack.file_object())?;
+        let node = opened.node();
+        validate_mutable_reparse_node(opened.location(), node)?;
+        let operations = unsafe {
+            // SAFETY: Queued filesystem-control requests run one at a time on the mounted-device
+            // executor, so this request owns the unique operation-lane capability until completion.
+            VolumeControlBlock::claim_operation_lane(opened.volume())
+        };
+        (node, operations)
+    };
+    delete_node_reparse_point(operations.lane_mut(), node).await?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -183,77 +213,71 @@ pub(crate) fn delete_reparse_point(
 ///
 /// Returns an error when the object has no reparse metadata, the target cannot be read, or the
 /// output cannot hold the symbolic-link reparse buffer.
-fn pack_opened_reparse_point(opened: &OpenedObject, output: &mut [u8]) -> DriverResult<usize> {
-    let vcb = unsafe {
-        // SAFETY: The decoded FCB owns a live mounted VCB for the whole FILE_OBJECT lifetime.
-        opened.volume().as_ref()
-    };
-    let reparse_point =
-        NodeSymlinkReparsePoint::load(vcb, opened.node())?.ok_or(DriverError::NotAReparsePoint)?;
-    reparse_point.into_symlink_data(vcb)?.pack_fsctl(output)
+async fn load_node_reparse_data(
+    operations: &mut VolumeOperationLane,
+    node: NodeId,
+) -> DriverResult<SymlinkReparseData> {
+    let reparse_point = NodeSymlinkReparsePoint::load(operations, node)
+        .await?
+        .ok_or(DriverError::NotAReparsePoint)?;
+    reparse_point.into_symlink_data(operations).await
 }
 
-/// Stores a Windows reparse point on an opened regular file or directory.
+/// Validates that an opened object can carry driver-owned Windows reparse metadata.
 /// # Errors
 ///
-/// Returns an error when the opened object is the volume root or a native symlink, or the xattr
-/// mutation cannot be committed.
-fn set_opened_reparse_point(
-    opened: &OpenedObject,
-    reparse_point: WindowsSymlinkReparsePoint,
-) -> DriverResult<()> {
-    if matches!(opened.location(), OpenedLocation::Root) {
+/// Returns an error when the opened object is the volume root or a native symbolic link.
+fn validate_mutable_reparse_node(location: &OpenedLocation, node: NodeId) -> DriverResult<()> {
+    if matches!(location, OpenedLocation::Root) {
         return Err(DriverError::NotSupported);
     }
-    match opened.node() {
-        NodeId::File(_) | NodeId::Directory(_) => {}
-        NodeId::Symlink(_) => return Err(DriverError::NotSupported),
+    match node {
+        NodeId::File(_) | NodeId::Directory(_) => Ok(()),
+        NodeId::Symlink(_) => Err(DriverError::NotSupported),
     }
-    let mut vcb = opened.volume();
-    let vcb = unsafe {
-        // SAFETY: The decoded FCB owns a live mounted VCB. The mutable borrow is the synchronous
-        // transaction boundary for this reparse metadata mutation.
-        vcb.as_mut()
-    };
-    let mut transaction = vcb
-        .volume_mut()
+}
+
+/// Stores a Windows reparse point on a validated regular file or directory.
+/// # Errors
+///
+/// Returns an error when the reparse xattr mutation cannot be committed.
+async fn set_node_reparse_point(
+    operations: &mut VolumeOperationLane,
+    node: NodeId,
+    reparse_point: WindowsSymlinkReparsePoint,
+) -> DriverResult<()> {
+    let mut transaction = operations
+        .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let node = transaction.node(opened.node())?;
-    transaction.set_windows_symlink_reparse_point(node, reparse_point)?;
-    transaction.commit()?;
+    let node = transaction.node(node).await?;
+    transaction
+        .set_windows_symlink_reparse_point(node, reparse_point)
+        .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
-/// Removes Windows reparse metadata from an opened regular file or directory.
+/// Removes Windows reparse metadata from a validated regular file or directory.
 /// # Errors
 ///
-/// Returns an error when the opened object is the volume root or a native symlink, has no
-/// driver-owned reparse metadata, or the xattr mutation cannot be committed.
-fn delete_opened_reparse_point(opened: &OpenedObject) -> DriverResult<()> {
-    if matches!(opened.location(), OpenedLocation::Root) {
-        return Err(DriverError::NotSupported);
-    }
-    match opened.node() {
-        NodeId::File(_) | NodeId::Directory(_) => {}
-        NodeId::Symlink(_) => return Err(DriverError::NotSupported),
-    }
-    let mut vcb = opened.volume();
-    let vcb = unsafe {
-        // SAFETY: The decoded FCB owns a live mounted VCB. The mutable borrow is the synchronous
-        // transaction boundary for this reparse metadata mutation.
-        vcb.as_mut()
-    };
-    let mut transaction = vcb
-        .volume_mut()
+/// Returns an error when the node has no driver-owned reparse metadata or the xattr mutation
+/// cannot be committed.
+async fn delete_node_reparse_point(
+    operations: &mut VolumeOperationLane,
+    node: NodeId,
+) -> DriverResult<()> {
+    let mut transaction = operations
+        .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let node = transaction.node(opened.node())?;
+    let node = transaction.node(node).await?;
     if transaction
-        .remove_windows_symlink_reparse_point(node)?
+        .remove_windows_symlink_reparse_point(node)
+        .await?
         .is_none()
     {
         return Err(DriverError::NotAReparsePoint);
     }
-    transaction.commit()?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -261,9 +285,12 @@ fn delete_opened_reparse_point(opened: &OpenedObject) -> DriverResult<()> {
 /// # Errors
 ///
 /// Returns an error when `symlink_id` cannot be loaded or its target bytes cannot be read.
-fn read_core_symlink(vcb: &VolumeControlBlock, symlink_id: SymlinkNodeId) -> DriverResult<Vec<u8>> {
-    let symlink = vcb.volume().load_symlink(symlink_id)?;
-    Ok(vcb.volume().read_symlink(&symlink)?)
+async fn read_core_symlink(
+    operations: &mut VolumeOperationLane,
+    symlink_id: SymlinkNodeId,
+) -> DriverResult<Vec<u8>> {
+    let symlink = operations.journaled_mut().load_symlink(symlink_id).await?;
+    Ok(operations.journaled_mut().read_symlink(&symlink).await?)
 }
 
 impl SymlinkReparseData {

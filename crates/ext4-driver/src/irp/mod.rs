@@ -621,6 +621,20 @@ pub(crate) struct OwnedIrp {
     target: DispatchTarget,
 }
 
+/// Exclusive borrow of one pending IRP while its executor task decodes or awaits request state.
+#[derive(Debug)]
+pub(crate) struct PendingIrpLease<'a> {
+    /// Completion owner retained mutably so the IRP cannot complete while derived pointers live.
+    owner: &'a mut OwnedIrp,
+}
+
+impl PendingIrpLease<'_> {
+    /// Returns the pending dispatch target whose kernel objects remain pinned by this lease.
+    pub(crate) const fn target(&self) -> DispatchTarget {
+        self.owner.target
+    }
+}
+
 impl OwnedIrp {
     /// Builds owned completion authority from a raw queued IRP.
     fn from_raw(device: KernelDevice, irp: PIRP) -> Option<Self> {
@@ -639,6 +653,11 @@ impl OwnedIrp {
     )]
     pub(crate) const fn target(&self) -> DispatchTarget {
         self.target
+    }
+
+    /// Borrows this pending IRP as an active request without releasing completion authority.
+    pub(crate) const fn request(&mut self) -> PendingIrpLease<'_> {
+        PendingIrpLease { owner: self }
     }
 
     /// Completes the IRP through the I/O Manager.

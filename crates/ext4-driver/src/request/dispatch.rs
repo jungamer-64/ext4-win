@@ -337,7 +337,7 @@ fn dispatch_file_lock(received: ReceivedIrp) -> NTSTATUS {
         reason = "kernel work-item worker is compiled out in unit tests"
     )
 )]
-pub(crate) async fn execute_owned(owned: OwnedIrp) {
+pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
     let target = owned.target();
     let major = match target.current_stack().and_then(|stack| stack.major()) {
         Ok(major) => major,
@@ -347,7 +347,13 @@ pub(crate) async fn execute_owned(owned: OwnedIrp) {
         }
     };
     if major == DispatchMajor::Create {
-        let _status = owned.complete_create_result(crate::request::create::execute(target));
+        let result = crate::request::create::execute(owned.request()).await;
+        let _status = owned.complete_create_result(result);
+        return;
+    }
+    if major == DispatchMajor::FileSystemControl {
+        let result = crate::request::file_system_control::execute(owned.request()).await;
+        let _status = owned.complete_result(result);
         return;
     }
     if major == DispatchMajor::DirectoryControl {
@@ -360,7 +366,7 @@ pub(crate) async fn execute_owned(owned: OwnedIrp) {
         };
         let _status = match minor {
             DirectoryControlMinorFunction::QueryDirectory => {
-                owned.complete_result(crate::request::file_info::query_directory(target))
+                owned.complete_result(crate::request::file_info::query_directory(target).await)
             }
             DirectoryControlMinorFunction::NotifyChangeDirectory => {
                 crate::request::file_info::notify_change_directory(owned)
@@ -371,7 +377,7 @@ pub(crate) async fn execute_owned(owned: OwnedIrp) {
         };
         return;
     }
-    let _status = owned.complete_result(execute_major(major, target));
+    let _status = owned.complete_result(execute_major(major, target).await);
 }
 
 /// Executes an immediate IRP during the dispatch callback.
@@ -381,7 +387,7 @@ pub(crate) async fn execute_owned(owned: OwnedIrp) {
 /// execution.
 fn execute_immediate(major: DispatchMajor, target: DispatchTarget) -> DriverResult<IrpCompletion> {
     match major {
-        DispatchMajor::DeviceControl => execute_major(major, target),
+        DispatchMajor::DeviceControl => crate::request::file_system_control::device_control(target),
         DispatchMajor::Create
         | DispatchMajor::Close
         | DispatchMajor::Cleanup
@@ -407,36 +413,45 @@ fn execute_immediate(major: DispatchMajor, target: DispatchTarget) -> DriverResu
 /// # Errors
 ///
 /// Returns an error when the selected request implementation rejects the decoded IRP.
-fn execute_major(major: DispatchMajor, target: DispatchTarget) -> DriverResult<IrpCompletion> {
+async fn execute_major(
+    major: DispatchMajor,
+    target: DispatchTarget,
+) -> DriverResult<IrpCompletion> {
     match major {
-        // Create has an ownership-bearing completion path selected by execute_queued.
+        // Create has an ownership-bearing completion path selected by execute_owned.
         DispatchMajor::Create => Err(DriverError::InvalidDeviceRequest),
         // Lifecycle IRPs have a requester-thread-only execution boundary selected in `dispatch`.
         DispatchMajor::Close | DispatchMajor::Cleanup => Err(DriverError::InvalidDeviceRequest),
-        DispatchMajor::Read => crate::request::file_info::read(target),
-        DispatchMajor::Write => crate::request::file_info::write(target),
-        DispatchMajor::QueryInformation => crate::request::file_info::query(target),
-        DispatchMajor::SetInformation => crate::request::file_info::set(target),
-        DispatchMajor::QueryVolumeInformation => crate::request::volume_info::query(target),
-        DispatchMajor::SetVolumeInformation => crate::request::volume_info::set(target),
-        // Directory control selects either normal completion or FsRtl ownership in execute_queued.
+        DispatchMajor::Read => crate::request::file_info::read(target).await,
+        DispatchMajor::Write => crate::request::file_info::write(target).await,
+        DispatchMajor::QueryInformation => crate::request::file_info::query(target).await,
+        DispatchMajor::SetInformation => crate::request::file_info::set(target).await,
+        DispatchMajor::QueryVolumeInformation => crate::request::volume_info::query(target).await,
+        DispatchMajor::SetVolumeInformation => crate::request::volume_info::set(target).await,
+        // Directory control selects either normal completion or FsRtl ownership in execute_owned.
         DispatchMajor::DirectoryControl => Err(DriverError::InvalidDeviceRequest),
-        DispatchMajor::FileSystemControl => crate::request::file_system_control::execute(target),
-        DispatchMajor::DeviceControl => crate::request::file_system_control::device_control(target),
-        DispatchMajor::FlushBuffers => crate::request::file_info::flush(target),
-        DispatchMajor::QueryEa => crate::request::ea::query(target),
-        DispatchMajor::SetEa => crate::request::ea::set(target),
+        // Mount retains a VPB lease and user FSCTLs share its ownership-bearing dispatch route.
+        DispatchMajor::FileSystemControl => Err(DriverError::InvalidDeviceRequest),
+        DispatchMajor::DeviceControl => Err(DriverError::InvalidDeviceRequest),
+        DispatchMajor::FlushBuffers => crate::request::file_info::flush(target).await,
+        DispatchMajor::QueryEa => crate::request::ea::query(target).await,
+        DispatchMajor::SetEa => crate::request::ea::set(target).await,
         // Lock control is terminally delegated to FsRtl before generic execution.
         DispatchMajor::LockControl => Err(DriverError::InvalidDeviceRequest),
-        DispatchMajor::Shutdown => crate::request::file_info::shutdown(target),
-        DispatchMajor::QuerySecurity => crate::request::security::query(target),
-        DispatchMajor::SetSecurity => crate::request::security::set(target),
+        DispatchMajor::Shutdown => crate::request::file_info::shutdown(target).await,
+        DispatchMajor::QuerySecurity => crate::request::security::query(target).await,
+        DispatchMajor::SetSecurity => crate::request::security::set(target).await,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use core::ptr::NonNull;
+    use core::{
+        future::Future,
+        pin::pin,
+        ptr::NonNull,
+        task::{Context, Poll, Waker},
+    };
 
     use crate::{
         irp::{DispatchMajor, DispatchTarget},
@@ -444,6 +459,19 @@ mod tests {
     };
 
     use super::{DispatchPolicy, dispatch_policy, execute_major};
+
+    /// Runs one continuation that is required to finish without lower I/O.
+    fn run_ready<T>(future: impl Future<Output = T>) -> T {
+        let mut future = pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => {
+                crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
+                    .bugcheck()
+            }
+        }
+    }
 
     /// # Panics
     ///
@@ -501,7 +529,7 @@ mod tests {
         assert!(target.is_ok());
         if let Ok(target) = target {
             assert_eq!(
-                execute_major(DispatchMajor::Create, target),
+                run_ready(execute_major(DispatchMajor::Create, target)),
                 Err(DriverError::InvalidDeviceRequest)
             );
         }
