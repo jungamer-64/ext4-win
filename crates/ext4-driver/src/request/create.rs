@@ -11,13 +11,18 @@ use wdk_sys::FILE_OBJECT;
 
 use crate::{
     irp::{
-        CreateDisposition, CreateNameInterpretation, CreateParameters, CreateReparsePointMode,
-        CreateStack, CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering,
-        DesiredAccess, DispatchTarget, IrpCompletion, RegularFileWriteAccess, ShareAccess,
+        CreateCompletion, CreateDisposition, CreateNameInterpretation, CreateParameters,
+        CreateReparsePointMode, CreateStack, CreateSymlinkReparseBuffer, CreateSynchronizationMode,
+        CreateTargetRequirement, CreateTransferBuffering, DesiredAccess, DispatchTarget,
+        RegularFileWriteAccess, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
-    request::{ea::CreateEa, metadata},
+    request::{
+        ea::CreateEa,
+        metadata,
+        reparse::{NodeSymlinkReparsePoint, UnparsedPathLength},
+    },
     state::{
         ChildCreationTarget, CloseDisposition, DataTransferMode, DirectoryNameChange,
         DirectoryNameChangeAction, FileControlBlock, KernelDevice, KernelFileObject,
@@ -34,10 +39,8 @@ const UTF16_BACKSLASH: u16 = 0x005C;
 /// # Errors
 ///
 /// Returns an error when create stack decoding or ext4 open/create handling rejects the request.
-pub(crate) fn execute(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    CreateRequest::decode(target)
-        .and_then(open_or_create)
-        .map(|()| IrpCompletion::EMPTY)
+pub(crate) fn execute(target: DispatchTarget) -> DriverResult<CreateCompletion> {
+    CreateRequest::decode(target).and_then(open_or_create)
 }
 
 /// Decoded create request at the filesystem boundary.
@@ -96,7 +99,7 @@ impl CreateRequest {
 ///
 /// Returns an error when EA create input is supplied, the device is not mounted, path resolution
 /// fails, or the selected open/create disposition cannot be satisfied.
-fn open_or_create(request: CreateRequest) -> DriverResult<()> {
+fn open_or_create(request: CreateRequest) -> DriverResult<CreateCompletion> {
     let create_ea = CreateEa::decode(request.target(), request.parameters().ea_length())?;
     let Some(vcb) = MountedVolumeDevice::vcb(request.device()) else {
         return Err(DriverError::InvalidDeviceRequest);
@@ -106,17 +109,49 @@ fn open_or_create(request: CreateRequest) -> DriverResult<()> {
         request.file_object(),
         vcb,
         request.parameters().name_interpretation(),
+        request.parameters().reparse_point_mode(),
         disposition,
         request.parameters().close_disposition(),
     ) {
-        Ok(CreateTargetLookup::Existing { node, location }) => {
-            open_existing_node(request, vcb, disposition, node, location)
-        }
+        Ok(CreateTargetLookup::Existing {
+            node,
+            node_mode,
+            location,
+        }) => open_existing_node(request, vcb, disposition, node, node_mode, location)
+            .map(|()| CreateCompletion::Opened),
         Ok(CreateTargetLookup::Missing { parent, name }) => {
             create_missing_node(request, create_ea, vcb, disposition, parent, &name)
+                .map(|()| CreateCompletion::Opened)
         }
+        Ok(CreateTargetLookup::ReparseSymlink {
+            point,
+            unparsed_path,
+        }) => create_symlink_reparse_completion(vcb, point, unparsed_path),
         Err(error) => Err(error),
     }
+}
+
+/// Builds the ownership-bearing completion for a reparse point encountered during create lookup.
+/// # Errors
+///
+/// Returns an error when the node target cannot be converted to the Windows symbolic-link wire
+/// form, its exact output buffer cannot be allocated, or packing violates the derived size.
+fn create_symlink_reparse_completion(
+    vcb: NonNull<VolumeControlBlock>,
+    point: NodeSymlinkReparsePoint,
+    unparsed_path: UnparsedPathLength,
+) -> DriverResult<CreateCompletion> {
+    let vcb = unsafe {
+        // SAFETY: `MountedVolumeDevice::vcb` returned this live VCB for the create request, and no
+        // FILE_OBJECT state or namespace mutation has been published on the reparse path.
+        vcb.as_ref()
+    };
+    let data = point.into_symlink_data(vcb)?;
+    let required_length = data.required_length()?;
+    let buffer = CreateSymlinkReparseBuffer::try_pack_exact(required_length, |output| {
+        data.pack_create_redirect(unparsed_path, output)
+    })?;
+    Ok(CreateCompletion::ReparseSymlink(buffer))
 }
 
 /// Result of resolving a create target against the mounted volume.
@@ -126,6 +161,8 @@ enum CreateTargetLookup {
     Existing {
         /// Opened ext4 node.
         node: NodeId,
+        /// Handle interpretation selected while resolving reparse state.
+        node_mode: OpenedNodeMode,
         /// Opened location identity.
         location: OpenedLocation,
     },
@@ -135,6 +172,13 @@ enum CreateTargetLookup {
         parent: DirectoryNodeId,
         /// New ext4 child name.
         name: Ext4Name,
+    },
+    /// Name resolution encountered a reparse point that Windows must process.
+    ReparseSymlink {
+        /// Reparse metadata captured from the encountered node.
+        point: NodeSymlinkReparsePoint,
+        /// UTF-16 byte length of the name suffix not consumed by this filesystem.
+        unparsed_path: UnparsedPathLength,
     },
 }
 
@@ -323,7 +367,7 @@ struct CreatePathName {
     /// Rooting syntax encoded by the raw FILE_OBJECT name.
     rooting: CreateNameRooting,
     /// Validated Windows path components after removing the syntactic root prefix.
-    components: DriverVec<WindowsName>,
+    components: DriverVec<CreatePathComponent>,
 }
 
 impl CreatePathName {
@@ -361,7 +405,7 @@ impl CreatePathName {
     }
 
     /// Returns validated path components.
-    fn components(&self) -> &[WindowsName] {
+    fn components(&self) -> &[CreatePathComponent] {
         self.components.as_slice()
     }
 
@@ -374,6 +418,27 @@ impl CreatePathName {
             units = rest;
         }
         (CreateNameRooting::Absolute, units)
+    }
+}
+
+/// One validated Windows path component and the suffix remaining after it.
+#[derive(Debug, Eq, PartialEq)]
+struct CreatePathComponent {
+    /// Namespace name used for lookup in the current parent directory.
+    name: WindowsName,
+    /// Original FILE_OBJECT name suffix beginning with the following separator.
+    unparsed_path: UnparsedPathLength,
+}
+
+impl CreatePathComponent {
+    /// Returns the component name used for namespace lookup.
+    const fn name(&self) -> &WindowsName {
+        &self.name
+    }
+
+    /// Returns the suffix that remains after this component is consumed.
+    const fn unparsed_path(&self) -> UnparsedPathLength {
+        self.unparsed_path
     }
 }
 
@@ -437,10 +502,12 @@ impl CreatePathAnchor {
         match self {
             Self::VolumeRoot => CreateTargetLookup::Existing {
                 node: NodeId::Directory(DirectoryNodeId::ROOT),
+                node_mode: OpenedNodeMode::Direct,
                 location: OpenedLocation::Root,
             },
             Self::OpenedDirectory { id, location } => CreateTargetLookup::Existing {
                 node: NodeId::Directory(id),
+                node_mode: OpenedNodeMode::Direct,
                 location,
             },
         }
@@ -457,10 +524,10 @@ fn open_existing_node(
     vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
     node: NodeId,
+    node_mode: OpenedNodeMode,
     location: OpenedLocation,
 ) -> DriverResult<()> {
     let parameters = request.parameters();
-    let node_mode = existing_node_open_mode(vcb, node, parameters.reparse_point_mode())?;
     let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
@@ -697,14 +764,15 @@ fn resolve_target(
     file_object: UninitializedFileObject,
     vcb: NonNull<VolumeControlBlock>,
     name_interpretation: CreateNameInterpretation,
+    reparse_point_mode: CreateReparsePointMode,
     disposition: CreateDisposition,
     close_disposition: CloseDisposition,
 ) -> DriverResult<CreateTargetLookup> {
     match name_interpretation {
-        CreateNameInterpretation::Path => resolve_path(file_object, vcb),
+        CreateNameInterpretation::Path => resolve_path(file_object, vcb, reparse_point_mode),
         CreateNameInterpretation::FileReference => {
             validate_file_reference_create(disposition, close_disposition)?;
-            resolve_file_reference(file_object, vcb)
+            resolve_file_reference(file_object, vcb, reparse_point_mode)
         }
     }
 }
@@ -739,6 +807,7 @@ fn validate_file_reference_create(
 fn resolve_file_reference(
     file_object: UninitializedFileObject,
     vcb: NonNull<VolumeControlBlock>,
+    reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is read
@@ -755,10 +824,13 @@ fn resolve_file_reference(
         .volume()
         .load_node_by_file_index(reference.file_index())
         .map_err(file_reference_lookup_error)?;
-    Ok(CreateTargetLookup::Existing {
+    resolve_final_node(
+        vcb,
         node,
-        location: OpenedLocation::FileReference,
-    })
+        OpenedLocation::FileReference,
+        reparse_point_mode,
+        UnparsedPathLength::ZERO,
+    )
 }
 
 /// Maps file-reference lookup failures to create/open status.
@@ -777,6 +849,7 @@ fn file_reference_lookup_error(error: ext4_core::Error) -> DriverError {
 fn resolve_path(
     file_object: UninitializedFileObject,
     vcb: NonNull<VolumeControlBlock>,
+    reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is read
@@ -794,42 +867,127 @@ fn resolve_path(
     let components = name.components();
     let mut components = components.iter().peekable();
     while let Some(component) = components.next() {
-        let is_final = components.peek().is_none();
+        let position = if components.peek().is_none() {
+            PathComponentPosition::Final
+        } else {
+            PathComponentPosition::Intermediate
+        };
         let parent = match vcb.volume().load_directory(parent_id) {
             Ok(directory) => directory,
             Err(error) => return Err(DriverError::from(error)),
         };
-        let child = match vcb.volume().lookup_windows_child(&parent, component) {
+        let child = match vcb.volume().lookup_windows_child(&parent, component.name()) {
             Ok(ChildLookup::Found(child)) => child,
-            Ok(ChildLookup::NotFound) if is_final => {
+            Ok(ChildLookup::NotFound) if position == PathComponentPosition::Final => {
                 return Ok(CreateTargetLookup::Missing {
                     parent: parent_id,
-                    name: component.to_ext4()?,
+                    name: component.name().to_ext4()?,
                 });
             }
             Ok(ChildLookup::NotFound) => return Err(DriverError::ObjectPathNotFound),
             Err(error) => return Err(DriverError::from(error)),
         };
-        if is_final {
+        let child_node = *child.node();
+        let reparse_point = NodeSymlinkReparsePoint::load(vcb, child_node)?;
+        if let Some(point) = reparse_point {
+            match reparse_point_encounter(position, reparse_point_mode) {
+                ReparsePointEncounter::Redirect => {
+                    return Ok(CreateTargetLookup::ReparseSymlink {
+                        point,
+                        unparsed_path: component.unparsed_path(),
+                    });
+                }
+                ReparsePointEncounter::OpenFinal => {
+                    return Ok(CreateTargetLookup::Existing {
+                        node: child_node,
+                        node_mode: OpenedNodeMode::ReparsePoint,
+                        location: OpenedLocation::try_directory_entry(
+                            child.parent(),
+                            child.name(),
+                        )?,
+                    });
+                }
+            }
+        }
+        if position == PathComponentPosition::Final {
             return Ok(CreateTargetLookup::Existing {
-                node: *child.node(),
+                node: child_node,
+                node_mode: OpenedNodeMode::Direct,
                 location: OpenedLocation::try_directory_entry(child.parent(), child.name())?,
             });
         }
-        let NodeId::Directory(directory_id) = *child.node() else {
+        let NodeId::Directory(directory_id) = child_node else {
             return Err(DriverError::ObjectPathNotFound);
         };
-        if vcb
-            .volume()
-            .read_windows_symlink_reparse_point(NodeId::Directory(directory_id))?
-            .is_some()
-        {
-            return Err(DriverError::NotSupported);
-        }
         parent_id = directory_id;
     }
 
     Ok(anchor.existing_directory())
+}
+
+/// Position of one component in the original create name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PathComponentPosition {
+    /// More path remains after this component.
+    Intermediate,
+    /// This is the final component supplied by the caller.
+    Final,
+}
+
+/// Action required after a reparse point is encountered during path resolution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReparsePointEncounter {
+    /// Return reparse data to the I/O Manager without opening an FCB/CCB.
+    Redirect,
+    /// Open the final reparse-point node itself.
+    OpenFinal,
+}
+
+/// Selects Windows reparse behavior for one encountered path component.
+const fn reparse_point_encounter(
+    position: PathComponentPosition,
+    mode: CreateReparsePointMode,
+) -> ReparsePointEncounter {
+    match (position, mode) {
+        (PathComponentPosition::Intermediate, _)
+        | (PathComponentPosition::Final, CreateReparsePointMode::ResolveFinalTarget) => {
+            ReparsePointEncounter::Redirect
+        }
+        (PathComponentPosition::Final, CreateReparsePointMode::OpenFinalReparsePoint) => {
+            ReparsePointEncounter::OpenFinal
+        }
+    }
+}
+
+/// Resolves one existing final node after applying reparse-point create semantics.
+/// # Errors
+///
+/// Returns an error when reparse metadata cannot be loaded.
+fn resolve_final_node(
+    vcb: &VolumeControlBlock,
+    node: NodeId,
+    location: OpenedLocation,
+    reparse_point_mode: CreateReparsePointMode,
+    unparsed_path: UnparsedPathLength,
+) -> DriverResult<CreateTargetLookup> {
+    let Some(point) = NodeSymlinkReparsePoint::load(vcb, node)? else {
+        return Ok(CreateTargetLookup::Existing {
+            node,
+            node_mode: OpenedNodeMode::Direct,
+            location,
+        });
+    };
+    match reparse_point_encounter(PathComponentPosition::Final, reparse_point_mode) {
+        ReparsePointEncounter::Redirect => Ok(CreateTargetLookup::ReparseSymlink {
+            point,
+            unparsed_path,
+        }),
+        ReparsePointEncounter::OpenFinal => Ok(CreateTargetLookup::Existing {
+            node,
+            node_mode: OpenedNodeMode::ReparsePoint,
+            location,
+        }),
+    }
 }
 
 /// Splits non-root path units into validated Windows components.
@@ -837,15 +995,36 @@ fn resolve_path(
 ///
 /// Returns an error when any component is empty or not representable in the Windows namespace
 /// domain.
-fn path_components(units: &[u16]) -> DriverResult<DriverVec<WindowsName>> {
+fn path_components(units: &[u16]) -> DriverResult<DriverVec<CreatePathComponent>> {
     if units.is_empty() {
         return Ok(DriverVec::new());
     }
     let mut components = DriverVec::new();
-    for component in units.split(|unit| *unit == UTF16_BACKSLASH) {
+    let mut remaining = units;
+    loop {
+        let separator = remaining.iter().position(|unit| *unit == UTF16_BACKSLASH);
+        let (component, suffix) = match separator {
+            Some(index) => remaining
+                .split_at_checked(index)
+                .ok_or(DriverError::InvalidParameter)?,
+            None => (remaining, &[][..]),
+        };
         components
-            .try_push_owned(WindowsName::from_utf16(component)?)
+            .try_push_owned(CreatePathComponent {
+                name: WindowsName::from_utf16(component)?,
+                unparsed_path: UnparsedPathLength::from_utf16_suffix(suffix)?,
+            })
             .map_err(|error| error.into_parts().0)?;
+        if suffix.is_empty() {
+            break;
+        }
+        let next = suffix
+            .strip_prefix(&[UTF16_BACKSLASH])
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        if next.is_empty() {
+            break;
+        }
+        remaining = next;
     }
     Ok(components)
 }
@@ -1199,12 +1378,34 @@ mod tests {
             assert_eq!(absolute.rooting(), CreateNameRooting::Absolute);
             assert_eq!(absolute.components().len(), 2);
             assert_eq!(
-                absolute.components().first().map(WindowsName::utf16),
+                absolute
+                    .components()
+                    .first()
+                    .map(CreatePathComponent::name)
+                    .map(WindowsName::utf16),
                 Some([u16::from(b'd'), u16::from(b'i'), u16::from(b'r')].as_slice())
             );
             assert_eq!(
-                absolute.components().get(1).map(WindowsName::utf16),
+                absolute
+                    .components()
+                    .get(1)
+                    .map(CreatePathComponent::name)
+                    .map(WindowsName::utf16),
                 Some([u16::from(b'f')].as_slice())
+            );
+            assert_eq!(
+                absolute
+                    .components()
+                    .first()
+                    .map(CreatePathComponent::unparsed_path),
+                UnparsedPathLength::from_utf16_suffix(&[UTF16_BACKSLASH, u16::from(b'f')]).ok()
+            );
+            assert_eq!(
+                absolute
+                    .components()
+                    .get(1)
+                    .map(CreatePathComponent::unparsed_path),
+                Some(UnparsedPathLength::ZERO)
             );
         }
 
@@ -1216,8 +1417,19 @@ mod tests {
             assert_eq!(relative.rooting(), CreateNameRooting::Relative);
             assert_eq!(relative.components().len(), 1);
             assert_eq!(
-                relative.components().first().map(WindowsName::utf16),
+                relative
+                    .components()
+                    .first()
+                    .map(CreatePathComponent::name)
+                    .map(WindowsName::utf16),
                 Some([u16::from(b'c'), u16::from(b'h'), u16::from(b'i')].as_slice())
+            );
+            assert_eq!(
+                relative
+                    .components()
+                    .first()
+                    .map(CreatePathComponent::unparsed_path),
+                Some(UnparsedPathLength::ZERO)
             );
         }
 
@@ -1245,6 +1457,79 @@ mod tests {
         assert_eq!(
             CreatePathName::decode(&file_object),
             Err(DriverError::from(ext4_core::Error::InvalidName))
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when each parsed component does not retain exactly the suffix following that
+    /// component in the original create name.
+    #[test]
+    fn create_path_components_retain_component_specific_unparsed_suffixes() {
+        let mut units = [
+            u16::from(b'a'),
+            UTF16_BACKSLASH,
+            u16::from(b'b'),
+            UTF16_BACKSLASH,
+            u16::from(b'c'),
+            UTF16_BACKSLASH,
+        ];
+        let file_object = file_object_with_name(&mut units);
+        let path = CreatePathName::decode(&file_object);
+        assert!(path.is_ok());
+        let Ok(path) = path else {
+            return;
+        };
+
+        let expected = [
+            UnparsedPathLength::from_utf16_suffix(&[
+                UTF16_BACKSLASH,
+                u16::from(b'b'),
+                UTF16_BACKSLASH,
+                u16::from(b'c'),
+                UTF16_BACKSLASH,
+            ]),
+            UnparsedPathLength::from_utf16_suffix(&[
+                UTF16_BACKSLASH,
+                u16::from(b'c'),
+                UTF16_BACKSLASH,
+            ]),
+            UnparsedPathLength::from_utf16_suffix(&[UTF16_BACKSLASH]),
+        ];
+        assert_eq!(path.components().len(), expected.len());
+        for (component, expected_suffix) in path.components().iter().zip(expected) {
+            assert_eq!(Ok(component.unparsed_path()), expected_suffix);
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when intermediate and final reparse encounters do not follow Windows create
+    /// semantics.
+    #[test]
+    fn reparse_encounters_redirect_intermediate_and_respect_final_open_mode() {
+        for mode in [
+            CreateReparsePointMode::ResolveFinalTarget,
+            CreateReparsePointMode::OpenFinalReparsePoint,
+        ] {
+            assert_eq!(
+                reparse_point_encounter(PathComponentPosition::Intermediate, mode),
+                ReparsePointEncounter::Redirect
+            );
+        }
+        assert_eq!(
+            reparse_point_encounter(
+                PathComponentPosition::Final,
+                CreateReparsePointMode::ResolveFinalTarget,
+            ),
+            ReparsePointEncounter::Redirect
+        );
+        assert_eq!(
+            reparse_point_encounter(
+                PathComponentPosition::Final,
+                CreateReparsePointMode::OpenFinalReparsePoint,
+            ),
+            ReparsePointEncounter::OpenFinal
         );
     }
 

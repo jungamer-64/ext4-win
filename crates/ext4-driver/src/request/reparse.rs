@@ -16,6 +16,106 @@ const SYMLINK_REPARSE_BUFFER_HEADER_SIZE: usize = 12;
 /// Offset of `PathBuffer` inside `REPARSE_DATA_BUFFER`.
 const SYMLINK_PATH_BUFFER_OFFSET: usize =
     REPARSE_DATA_BUFFER_HEADER_SIZE + SYMLINK_REPARSE_BUFFER_HEADER_SIZE;
+/// Maximum byte size accepted by Windows for one complete reparse data buffer.
+const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
+/// Maximum target length when substitute and print names share one UTF-16 path region.
+const MAXIMUM_SYMLINK_PATH_CODE_UNITS: usize =
+    (MAXIMUM_REPARSE_DATA_BUFFER_SIZE - SYMLINK_PATH_BUFFER_OFFSET) / core::mem::size_of::<u16>();
+
+/// Reparse metadata attached to one ext4 node without forcing its target into Windows wire form.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum NodeSymlinkReparsePoint {
+    /// Symbolic-link metadata stored in the driver's private Windows xattr.
+    WindowsSymlink(WindowsSymlinkReparsePoint),
+    /// A native ext4 symbolic-link inode whose target is loaded only when redirection is required.
+    NativeSymlink(SymlinkNodeId),
+}
+
+impl NodeSymlinkReparsePoint {
+    /// Loads the reparse classification for `node` without converting its target to UTF-16.
+    /// # Errors
+    ///
+    /// Returns an error when driver-owned Windows reparse metadata is malformed or cannot be read.
+    pub(crate) fn load(vcb: &VolumeControlBlock, node: NodeId) -> DriverResult<Option<Self>> {
+        match node {
+            NodeId::Symlink(symlink) => Ok(Some(Self::NativeSymlink(symlink))),
+            NodeId::File(_) | NodeId::Directory(_) => Ok(vcb
+                .volume()
+                .read_windows_symlink_reparse_point(node)?
+                .map(Self::WindowsSymlink)),
+        }
+    }
+
+    /// Converts this classified node into the owned symbolic-link data shared by create redirects
+    /// and `FSCTL_GET_REPARSE_POINT`.
+    /// # Errors
+    ///
+    /// Returns an error when a native target cannot be read, the target is not UTF-8, allocation
+    /// fails, or the resulting Windows reparse buffer would exceed 16 KiB.
+    pub(crate) fn into_symlink_data(
+        self,
+        vcb: &VolumeControlBlock,
+    ) -> DriverResult<SymlinkReparseData> {
+        match self {
+            Self::WindowsSymlink(reparse_point) => {
+                SymlinkReparseData::from_windows_reparse_point(&reparse_point)
+            }
+            Self::NativeSymlink(symlink) => {
+                let target = read_core_symlink(vcb, symlink)?;
+                SymlinkReparseData::from_native_ext4_target(target.as_slice())
+            }
+        }
+    }
+}
+
+/// Owned Windows symbolic-link target ready for either reparse wire boundary.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SymlinkReparseData {
+    /// Target shared by the substitute and print name fields.
+    path: DriverVec<u16>,
+    /// Whether the symbolic-link target is relative to its containing directory.
+    relative: bool,
+}
+
+/// Byte length of the create path suffix that Windows has not yet parsed.
+///
+/// Construction from UTF-16 keeps the wire unit and its `u16` representability out of create
+/// request code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UnparsedPathLength(u16);
+
+impl UnparsedPathLength {
+    /// No unparsed UTF-16 suffix remains.
+    pub(crate) const ZERO: Self = Self(0);
+
+    /// Creates a checked byte length from an unparsed UTF-16 path suffix.
+    /// # Errors
+    ///
+    /// Returns an error when twice the code-unit count cannot be represented by the Windows
+    /// `USHORT` field.
+    pub(crate) fn from_utf16_suffix(suffix: &[u16]) -> DriverResult<Self> {
+        let bytes = utf16_byte_len(suffix)?;
+        Ok(Self(
+            u16::try_from(bytes).map_err(|_| DriverError::InvalidParameter)?,
+        ))
+    }
+
+    /// Returns the validated byte length only at the wire encoder boundary.
+    const fn wire_value(self) -> u16 {
+        self.0
+    }
+}
+
+/// Derived symbolic-link wire lengths used by all output modes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SymlinkReparseLayout {
+    /// Byte length of one UTF-16 target copy.
+    path_bytes: u16,
+    /// Tag-specific byte length written to `ReparseDataLength`.
+    reparse_data_length: u16,
+    /// Complete `REPARSE_DATA_BUFFER` byte length.
+    total_length: usize,
+}
 
 /// Creates a wire offset from a reparse-buffer byte position.
 const fn wire_offset(offset: usize) -> WireOffset {
@@ -88,29 +188,9 @@ fn pack_opened_reparse_point(opened: &OpenedObject, output: &mut [u8]) -> Driver
         // SAFETY: The decoded FCB owns a live mounted VCB for the whole FILE_OBJECT lifetime.
         opened.volume().as_ref()
     };
-    match opened.node() {
-        NodeId::File(_) | NodeId::Directory(_) => {
-            let Some(reparse_point) = vcb
-                .volume()
-                .read_windows_symlink_reparse_point(opened.node())?
-            else {
-                return Err(DriverError::NotAReparsePoint);
-            };
-            pack_symlink_reparse_buffer(
-                reparse_point.target().bytes(),
-                reparse_point.is_relative(),
-                output,
-            )
-        }
-        NodeId::Symlink(symlink) => {
-            let target = read_core_symlink(vcb, symlink)?;
-            pack_symlink_reparse_buffer(
-                target.as_slice(),
-                is_relative_symlink_target(target.as_slice()),
-                output,
-            )
-        }
-    }
+    let reparse_point =
+        NodeSymlinkReparsePoint::load(vcb, opened.node())?.ok_or(DriverError::NotAReparsePoint)?;
+    reparse_point.into_symlink_data(vcb)?.pack_fsctl(output)
 }
 
 /// Stores a Windows reparse point on an opened regular file or directory.
@@ -186,62 +266,172 @@ fn read_core_symlink(vcb: &VolumeControlBlock, symlink_id: SymlinkNodeId) -> Dri
     Ok(vcb.volume().read_symlink(&symlink)?)
 }
 
-/// Packs symbolic-link data into a Windows symbolic-link reparse buffer.
-/// # Errors
-///
-/// Returns an error when the target is not UTF-8, path length fields overflow, or the output
-/// buffer is too small.
-fn pack_symlink_reparse_buffer(
-    target: &[u8],
-    relative: bool,
-    output: &mut [u8],
-) -> DriverResult<usize> {
-    let target = core::str::from_utf8(target).map_err(|_| DriverError::NotSupported)?;
-    let mut path = DriverVec::try_with_capacity(target.len())?;
-    for unit in target.encode_utf16() {
-        path.try_push(unit)?;
+impl SymlinkReparseData {
+    /// Converts driver-owned Windows xattr metadata without changing its target path syntax.
+    /// # Errors
+    ///
+    /// Returns an error when the target is not UTF-8, allocation fails, or the symbolic-link
+    /// reparse buffer would exceed 16 KiB.
+    fn from_windows_reparse_point(
+        reparse_point: &WindowsSymlinkReparsePoint,
+    ) -> DriverResult<Self> {
+        let target = reparse_point.target().bytes();
+        let target = core::str::from_utf8(target).map_err(|_| DriverError::NotSupported)?;
+        Self::from_windows_path_characters(
+            target.chars(),
+            target.len(),
+            reparse_point.is_relative(),
+        )
     }
-    let path_bytes = utf16_byte_len(path.as_slice())?;
-    let print_name_offset = u16::try_from(path_bytes).map_err(|_| DriverError::NotSupported)?;
-    let path_buffer_bytes = path_bytes
-        .checked_mul(2)
-        .ok_or(DriverError::InvalidParameter)?;
-    let reparse_data_length = SYMLINK_REPARSE_BUFFER_HEADER_SIZE
-        .checked_add(path_buffer_bytes)
-        .ok_or(DriverError::InvalidParameter)?;
-    let total_length = REPARSE_DATA_BUFFER_HEADER_SIZE
-        .checked_add(reparse_data_length)
-        .ok_or(DriverError::InvalidParameter)?;
-    if output.len() < total_length {
-        return Err(DriverError::BufferTooSmall);
-    }
-    let reparse_data_length =
-        u16::try_from(reparse_data_length).map_err(|_| DriverError::NotSupported)?;
-    let path_bytes = u16::try_from(path_bytes).map_err(|_| DriverError::NotSupported)?;
-    let flags = if relative {
-        wdk_sys::SYMLINK_FLAG_RELATIVE
-    } else {
-        0
-    };
 
-    let mut output = LittleEndianOutput::new(output);
-    output.write_u32(wire_offset(0), wdk_sys::IO_REPARSE_TAG_SYMLINK)?;
-    output.write_u16(wire_offset(4), reparse_data_length)?;
-    output.write_u16(wire_offset(6), 0)?;
-    output.write_u16(wire_offset(8), 0)?;
-    output.write_u16(wire_offset(10), path_bytes)?;
-    output.write_u16(wire_offset(12), print_name_offset)?;
-    output.write_u16(wire_offset(14), path_bytes)?;
-    output.write_u32(wire_offset(16), flags)?;
-    write_utf16(&mut output, SYMLINK_PATH_BUFFER_OFFSET, path.as_slice())?;
-    write_utf16(
-        &mut output,
-        SYMLINK_PATH_BUFFER_OFFSET
-            .checked_add(usize::from(path_bytes))
-            .ok_or(DriverError::InvalidParameter)?,
-        path.as_slice(),
-    )?;
-    Ok(total_length)
+    /// Converts a native ext4 target into Windows path syntax before encoding it as UTF-16.
+    /// # Errors
+    ///
+    /// Returns an error when the target is not UTF-8, one of its component characters cannot be
+    /// represented by the Windows namespace, allocation fails, or the symbolic-link reparse
+    /// buffer would exceed 16 KiB.
+    fn from_native_ext4_target(target: &[u8]) -> DriverResult<Self> {
+        let target = core::str::from_utf8(target).map_err(|_| DriverError::NotSupported)?;
+        if target
+            .chars()
+            .any(native_symlink_character_is_unrepresentable_on_windows)
+        {
+            return Err(DriverError::NotSupported);
+        }
+        let mut previous_was_separator = false;
+        Self::from_windows_path_characters(
+            target.chars().filter_map(|character| {
+                if character != '/' {
+                    previous_was_separator = false;
+                    return Some(character);
+                }
+                if previous_was_separator {
+                    return None;
+                }
+                previous_was_separator = true;
+                Some('\\')
+            }),
+            target.len(),
+            // Every native ext4 target stays on the mounted volume. A leading POSIX `/` becomes
+            // Windows root-relative syntax, which is still a relative symbolic-link form.
+            true,
+        )
+    }
+
+    /// Builds owned reparse data from a character stream already expressed in Windows syntax.
+    /// # Errors
+    ///
+    /// Returns an error when allocation fails or the symbolic-link reparse buffer would exceed
+    /// 16 KiB.
+    fn from_windows_path_characters(
+        characters: impl Iterator<Item = char>,
+        capacity_hint: usize,
+        relative: bool,
+    ) -> DriverResult<Self> {
+        let capacity = core::cmp::min(capacity_hint, MAXIMUM_SYMLINK_PATH_CODE_UNITS);
+        let mut path = DriverVec::try_with_capacity(capacity)?;
+        for character in characters {
+            let mut encoded = [0_u16; 2];
+            for unit in character.encode_utf16(&mut encoded).iter().copied() {
+                if path.len() == MAXIMUM_SYMLINK_PATH_CODE_UNITS {
+                    return Err(DriverError::NotSupported);
+                }
+                path.try_push(unit)?;
+            }
+        }
+        let data = Self { path, relative };
+        let _layout = data.layout()?;
+        Ok(data)
+    }
+
+    /// Returns the complete byte length required by either output representation.
+    /// # Errors
+    ///
+    /// Returns an error when a derived length overflows its Windows wire field or the complete
+    /// reparse buffer would exceed 16 KiB.
+    pub(crate) fn required_length(&self) -> DriverResult<usize> {
+        Ok(self.layout()?.total_length)
+    }
+
+    /// Packs an `FSCTL_GET_REPARSE_POINT` response with the reserved header field cleared.
+    /// # Errors
+    ///
+    /// Returns an error when a derived length is not representable or `output` is too small.
+    pub(crate) fn pack_fsctl(&self, output: &mut [u8]) -> DriverResult<usize> {
+        self.pack(UnparsedPathLength::ZERO, output)
+    }
+
+    /// Packs a create redirect carrying the checked byte length of the unparsed UTF-16 suffix.
+    /// # Errors
+    ///
+    /// Returns an error when a derived length is not representable or `output` is too small.
+    pub(crate) fn pack_create_redirect(
+        &self,
+        unparsed_path_length: UnparsedPathLength,
+        output: &mut [u8],
+    ) -> DriverResult<usize> {
+        self.pack(unparsed_path_length, output)
+    }
+
+    /// Computes every derived wire length from the single owned UTF-16 target.
+    /// # Errors
+    ///
+    /// Returns an error when a derived length overflows its Windows wire field or the complete
+    /// reparse buffer would exceed 16 KiB.
+    fn layout(&self) -> DriverResult<SymlinkReparseLayout> {
+        let path_bytes = utf16_byte_len(self.path.as_slice())?;
+        let reparse_data_length = SYMLINK_REPARSE_BUFFER_HEADER_SIZE
+            .checked_add(path_bytes)
+            .ok_or(DriverError::InvalidParameter)?;
+        let total_length = REPARSE_DATA_BUFFER_HEADER_SIZE
+            .checked_add(reparse_data_length)
+            .ok_or(DriverError::InvalidParameter)?;
+        if total_length > MAXIMUM_REPARSE_DATA_BUFFER_SIZE {
+            return Err(DriverError::NotSupported);
+        }
+        Ok(SymlinkReparseLayout {
+            path_bytes: u16::try_from(path_bytes).map_err(|_| DriverError::NotSupported)?,
+            reparse_data_length: u16::try_from(reparse_data_length)
+                .map_err(|_| DriverError::NotSupported)?,
+            total_length,
+        })
+    }
+
+    /// Writes the common symbolic-link layout with one already-validated reserved-field value.
+    /// # Errors
+    ///
+    /// Returns an error when a derived length is not representable or `output` is too small.
+    fn pack(
+        &self,
+        unparsed_path_length: UnparsedPathLength,
+        output: &mut [u8],
+    ) -> DriverResult<usize> {
+        let layout = self.layout()?;
+        if output.len() < layout.total_length {
+            return Err(DriverError::BufferTooSmall);
+        }
+        let flags = if self.relative {
+            wdk_sys::SYMLINK_FLAG_RELATIVE
+        } else {
+            0
+        };
+
+        let mut output = LittleEndianOutput::new(output);
+        output.write_u32(wire_offset(0), wdk_sys::IO_REPARSE_TAG_SYMLINK)?;
+        output.write_u16(wire_offset(4), layout.reparse_data_length)?;
+        output.write_u16(wire_offset(6), unparsed_path_length.wire_value())?;
+        output.write_u16(wire_offset(8), 0)?;
+        output.write_u16(wire_offset(10), layout.path_bytes)?;
+        output.write_u16(wire_offset(12), 0)?;
+        output.write_u16(wire_offset(14), layout.path_bytes)?;
+        output.write_u32(wire_offset(16), flags)?;
+        write_utf16(
+            &mut output,
+            SYMLINK_PATH_BUFFER_OFFSET,
+            self.path.as_slice(),
+        )?;
+        Ok(layout.total_length)
+    }
 }
 
 /// Parses a Windows symbolic-link reparse buffer into driver-owned reparse metadata.
@@ -259,6 +449,9 @@ fn parse_symlink_reparse_buffer(input: &[u8]) -> DriverResult<WindowsSymlinkRepa
     let total_length = REPARSE_DATA_BUFFER_HEADER_SIZE
         .checked_add(reparse_data_length)
         .ok_or(DriverError::InvalidParameter)?;
+    if total_length > MAXIMUM_REPARSE_DATA_BUFFER_SIZE {
+        return Err(DriverError::InvalidParameter);
+    }
     if input_len < total_length {
         return Err(DriverError::BufferTooSmall);
     }
@@ -391,15 +584,13 @@ fn utf16_byte_len(units: &[u16]) -> DriverResult<usize> {
         .ok_or(DriverError::InvalidParameter)
 }
 
-/// Returns whether a native ext4 symlink target should carry `SYMLINK_FLAG_RELATIVE`.
-fn is_relative_symlink_target(target: &[u8]) -> bool {
-    if target.starts_with(b"/") || target.starts_with(b"\\") {
-        return false;
-    }
-    if target.get(1).copied() == Some(b':') {
-        return false;
-    }
-    true
+/// Returns whether one native ext4 path character cannot be represented losslessly in a Windows
+/// path component.
+const fn native_symlink_character_is_unrepresentable_on_windows(character: char) -> bool {
+    matches!(
+        character,
+        '\0'..='\u{1F}' | '"' | '*' | ':' | '<' | '>' | '?' | '\\' | '|'
+    )
 }
 
 /// Writes UTF-16 code units into the reparse path buffer.
@@ -428,11 +619,37 @@ mod tests {
 
     use crate::kernel::status::DriverError;
     use crate::wire::{LittleEndianInput, LittleEndianOutput};
+    use ext4_core::{SymlinkTarget, WindowsSymlinkReparsePoint};
 
     use super::{
-        SYMLINK_PATH_BUFFER_OFFSET, pack_symlink_reparse_buffer, parse_delete_reparse_buffer,
-        parse_symlink_reparse_buffer, wire_offset,
+        MAXIMUM_REPARSE_DATA_BUFFER_SIZE, MAXIMUM_SYMLINK_PATH_CODE_UNITS,
+        SYMLINK_PATH_BUFFER_OFFSET, SymlinkReparseData, UnparsedPathLength,
+        parse_delete_reparse_buffer, parse_symlink_reparse_buffer, wire_offset,
     };
+
+    /// Builds Windows-xattr symbolic-link test data through its production conversion path.
+    /// # Errors
+    ///
+    /// Returns an error when the target is not valid xattr metadata or cannot be represented.
+    fn windows_symlink_data(
+        target: &[u8],
+        relative: bool,
+    ) -> Result<SymlinkReparseData, DriverError> {
+        let reparse_point = WindowsSymlinkReparsePoint::new(SymlinkTarget::new(target)?, relative);
+        SymlinkReparseData::from_windows_reparse_point(&reparse_point)
+    }
+
+    /// Builds and packs Windows-xattr symbolic-link test data through the production FSCTL path.
+    /// # Errors
+    ///
+    /// Returns an error when the test target or output buffer is not representable.
+    fn pack_fsctl_target(
+        target: &[u8],
+        relative: bool,
+        output: &mut [u8],
+    ) -> Result<usize, DriverError> {
+        windows_symlink_data(target, relative)?.pack_fsctl(output)
+    }
 
     /// # Panics
     ///
@@ -440,11 +657,11 @@ mod tests {
     #[test]
     fn packs_relative_symlink_reparse_buffer() {
         let mut output = vec![0; 128];
-        const WRITTEN_LENGTH: usize = 52;
-        const REPARSE_DATA_LENGTH: u16 = 44;
+        const WRITTEN_LENGTH: usize = 36;
+        const REPARSE_DATA_LENGTH: u16 = 28;
 
         assert_eq!(
-            pack_symlink_reparse_buffer(b"dir/file", true, output.as_mut_slice()),
+            pack_fsctl_target(br"dir\file", true, output.as_mut_slice()),
             Ok(WRITTEN_LENGTH)
         );
         assert_eq!(
@@ -453,9 +670,10 @@ mod tests {
         );
         let output = LittleEndianInput::new(output.as_slice());
         assert_eq!(output.read_u16(wire_offset(4)), Ok(REPARSE_DATA_LENGTH));
+        assert_eq!(output.read_u16(wire_offset(6)), Ok(0));
         assert_eq!(output.read_u16(wire_offset(8)), Ok(0));
         assert_eq!(output.read_u16(wire_offset(10)), Ok(16));
-        assert_eq!(output.read_u16(wire_offset(12)), Ok(16));
+        assert_eq!(output.read_u16(wire_offset(12)), Ok(0));
         assert_eq!(output.read_u16(wire_offset(14)), Ok(16));
         assert_eq!(
             output.read_u32(wire_offset(16)),
@@ -473,10 +691,10 @@ mod tests {
     #[test]
     fn packs_absolute_symlink_without_relative_flag() {
         let mut output = vec![0; 128];
-        const WRITTEN_LENGTH: usize = 72;
+        const WRITTEN_LENGTH: usize = 46;
 
         assert_eq!(
-            pack_symlink_reparse_buffer(br"\??\C:\target", false, output.as_mut_slice()),
+            pack_fsctl_target(br"\??\C:\target", false, output.as_mut_slice()),
             Ok(WRITTEN_LENGTH)
         );
         assert_eq!(
@@ -489,13 +707,172 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    fn native_relative_target_uses_windows_separators_on_wire() {
+        let data = SymlinkReparseData::from_native_ext4_target(b"dir/file");
+        assert!(data.is_ok());
+        let Ok(data) = data else {
+            return;
+        };
+        let mut output = vec![0; 128];
+        assert_eq!(data.pack_fsctl(output.as_mut_slice()), Ok(36));
+        assert_eq!(
+            LittleEndianInput::new(output.as_slice()).read_u32(wire_offset(16)),
+            Ok(wdk_sys::SYMLINK_FLAG_RELATIVE)
+        );
+
+        let parsed = parse_symlink_reparse_buffer(output.as_slice());
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else {
+            return;
+        };
+        assert_eq!(parsed.target().bytes(), br"dir\file");
+        assert!(parsed.is_relative());
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn native_rooted_target_becomes_windows_root_relative() {
+        let data = SymlinkReparseData::from_native_ext4_target(b"/dir/file");
+        assert!(data.is_ok());
+        let Ok(data) = data else {
+            return;
+        };
+        let mut output = vec![0; 128];
+        assert_eq!(data.pack_fsctl(output.as_mut_slice()), Ok(38));
+        assert_eq!(
+            LittleEndianInput::new(output.as_slice()).read_u32(wire_offset(16)),
+            Ok(wdk_sys::SYMLINK_FLAG_RELATIVE)
+        );
+
+        let parsed = parse_symlink_reparse_buffer(output.as_slice());
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else {
+            return;
+        };
+        assert_eq!(parsed.target().bytes(), br"\dir\file");
+        assert!(parsed.is_relative());
+    }
+
+    /// # Panics
+    ///
+    /// Panics when native POSIX separator normalization changes target meaning or accepts a path
+    /// component that Windows cannot represent losslessly.
+    #[test]
+    fn native_target_normalization_collapses_separators_and_rejects_windows_metacharacters() {
+        let data = SymlinkReparseData::from_native_ext4_target(b"/dir//child/");
+        assert!(data.is_ok());
+        let Ok(data) = data else {
+            return;
+        };
+        let mut output = vec![0; 128];
+        assert_eq!(data.pack_fsctl(output.as_mut_slice()), Ok(42));
+        let parsed = parse_symlink_reparse_buffer(output.as_slice());
+        assert!(parsed.is_ok());
+        if let Ok(parsed) = parsed {
+            assert_eq!(parsed.target().bytes(), br"\dir\child\");
+            assert!(parsed.is_relative());
+        }
+
+        for target in [
+            br"dir\child".as_slice(),
+            b"drive:name",
+            b"wild?card",
+            b"control\x1F",
+        ] {
+            assert_eq!(
+                SymlinkReparseData::from_native_ext4_target(target),
+                Err(DriverError::NotSupported)
+            );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
     fn rejects_too_small_reparse_buffer() {
         const TOO_SMALL_BUFFER_LENGTH: usize = 19;
         let mut output = vec![0; TOO_SMALL_BUFFER_LENGTH];
 
         assert_eq!(
-            pack_symlink_reparse_buffer(b"target", true, output.as_mut_slice()),
+            pack_fsctl_target(b"target", true, output.as_mut_slice()),
             Err(DriverError::BufferTooSmall)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn create_redirect_packs_checked_unparsed_utf16_byte_length() {
+        let mut output = vec![0; 128];
+        let suffix = Vec::from([u16::from(b'n'), u16::from(b'e'), u16::from(b'x')]);
+        let unparsed_path_length = UnparsedPathLength::from_utf16_suffix(suffix.as_slice());
+        assert_eq!(unparsed_path_length, Ok(UnparsedPathLength(6)));
+        let Ok(unparsed_path_length) = unparsed_path_length else {
+            return;
+        };
+
+        assert_eq!(
+            windows_symlink_data(b"target", true).and_then(|data| {
+                data.pack_create_redirect(unparsed_path_length, output.as_mut_slice())
+            }),
+            Ok(32)
+        );
+        assert_eq!(
+            LittleEndianInput::new(output.as_slice()).read_u16(wire_offset(6)),
+            Ok(6)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn unparsed_path_length_checks_utf16_byte_representation() {
+        assert_eq!(
+            UnparsedPathLength::from_utf16_suffix(&[]),
+            Ok(UnparsedPathLength::ZERO)
+        );
+        let largest_suffix = vec![0_u16; usize::from(u16::MAX) / 2];
+        assert_eq!(
+            UnparsedPathLength::from_utf16_suffix(largest_suffix.as_slice()),
+            Ok(UnparsedPathLength(u16::MAX - 1))
+        );
+        let oversized_suffix = vec![0_u16; usize::from(u16::MAX) / 2 + 1];
+        assert_eq!(
+            UnparsedPathLength::from_utf16_suffix(oversized_suffix.as_slice()),
+            Err(DriverError::InvalidParameter)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn symbolic_link_output_honors_windows_sixteen_kibibyte_limit() {
+        let largest_target = vec![b'a'; MAXIMUM_SYMLINK_PATH_CODE_UNITS];
+        let largest = windows_symlink_data(largest_target.as_slice(), true);
+        assert!(largest.is_ok());
+        let Ok(largest) = largest else {
+            return;
+        };
+        assert_eq!(
+            largest.required_length(),
+            Ok(MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+        );
+        let mut output = vec![0; MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+        assert_eq!(
+            largest.pack_fsctl(output.as_mut_slice()),
+            Ok(MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+        );
+
+        let oversized_target = vec![b'a'; MAXIMUM_SYMLINK_PATH_CODE_UNITS + 1];
+        assert_eq!(
+            windows_symlink_data(oversized_target.as_slice(), true),
+            Err(DriverError::NotSupported)
         );
     }
 
@@ -505,10 +882,10 @@ mod tests {
     #[test]
     fn parses_symlink_reparse_buffer_target_and_relative_flag() {
         let mut input = vec![0; 128];
-        let expected = Vec::from(&b"dir/file"[..]);
+        let expected = Vec::from(&br"dir\file"[..]);
         assert_eq!(
-            pack_symlink_reparse_buffer(expected.as_slice(), true, input.as_mut_slice()),
-            Ok(52)
+            pack_fsctl_target(expected.as_slice(), true, input.as_mut_slice()),
+            Ok(36)
         );
 
         let parsed = parse_symlink_reparse_buffer(input.as_slice());
@@ -527,8 +904,8 @@ mod tests {
     fn rejects_unhandled_reparse_tag_on_set() {
         let mut input = vec![0; 128];
         assert_eq!(
-            pack_symlink_reparse_buffer(b"target", true, input.as_mut_slice()),
-            Ok(44)
+            pack_fsctl_target(b"target", true, input.as_mut_slice()),
+            Ok(32)
         );
         assert_eq!(
             LittleEndianOutput::new(input.as_mut_slice()).write_u32(wire_offset(0), 0),
@@ -548,8 +925,8 @@ mod tests {
     fn rejects_unsupported_symlink_reparse_flags() {
         let mut input = vec![0; 128];
         assert_eq!(
-            pack_symlink_reparse_buffer(b"target", true, input.as_mut_slice()),
-            Ok(44)
+            pack_fsctl_target(b"target", true, input.as_mut_slice()),
+            Ok(32)
         );
         assert_eq!(
             LittleEndianOutput::new(input.as_mut_slice()).write_u32(wire_offset(16), 2),
@@ -559,6 +936,34 @@ mod tests {
         assert_eq!(
             parse_symlink_reparse_buffer(input.as_slice()),
             Err(DriverError::NotSupported)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn rejects_symlink_input_larger_than_windows_reparse_limit() {
+        let mut input = [0_u8; 8];
+        let oversized_data_length =
+            u16::try_from(MAXIMUM_REPARSE_DATA_BUFFER_SIZE - input.len() + 1);
+        assert!(oversized_data_length.is_ok());
+        let Ok(oversized_data_length) = oversized_data_length else {
+            return;
+        };
+        let mut output = LittleEndianOutput::new(&mut input);
+        assert_eq!(
+            output.write_u32(wire_offset(0), wdk_sys::IO_REPARSE_TAG_SYMLINK),
+            Ok(())
+        );
+        assert_eq!(
+            output.write_u16(wire_offset(4), oversized_data_length),
+            Ok(())
+        );
+
+        assert_eq!(
+            parse_symlink_reparse_buffer(&input),
+            Err(DriverError::InvalidParameter)
         );
     }
 

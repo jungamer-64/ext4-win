@@ -6,7 +6,7 @@ use alloc::{
     collections::{TryReserveError, TryReserveErrorKind},
     vec::Vec,
 };
-use core::fmt;
+use core::{alloc::Layout, fmt};
 
 use crate::kernel::status::{DriverError, DriverResult};
 
@@ -375,4 +375,24 @@ where
     F: FnOnce() -> DriverResult<T>,
 {
     boxed_try_with_in(Global, build)
+}
+
+/// Allocates an exact-length, zero-initialized byte slice with the global allocator.
+/// # Errors
+///
+/// Returns [`DriverError::InvalidBufferSize`] when `length` cannot form a byte-slice layout, or
+/// [`DriverError::InsufficientResources`] when the allocation fails.
+pub(crate) fn boxed_zeroed_bytes(length: usize) -> DriverResult<Box<[u8]>> {
+    if Layout::array::<u8>(length).is_err() {
+        return Err(DriverError::InvalidBufferSize);
+    }
+
+    let bytes =
+        Box::<[u8], Global>::try_new_zeroed_slice_in(length, Global).map_err(alloc_failed)?;
+    let bytes = unsafe {
+        // SAFETY: The allocator initialized every byte to zero, and every possible
+        // `u8` bit pattern represents a valid initialized value.
+        bytes.assume_init()
+    };
+    Ok(bytes)
 }
