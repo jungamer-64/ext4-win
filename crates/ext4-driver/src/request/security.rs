@@ -1,7 +1,5 @@
 //! Windows security descriptor boundary for ext4 owner and mode bits.
 
-use core::ptr::NonNull;
-
 use crate::irp::{
     DispatchTarget, IrpBufferLength, IrpCompletion, SecurityComponentSelection, SecuritySelection,
 };
@@ -491,43 +489,6 @@ fn security_descriptor(
     Ok(descriptor)
 }
 
-/// Copies the raw SetSecurity descriptor into a bounded byte image.
-/// # Errors
-///
-/// Returns an error when selected owner, group, or DACL offsets are invalid or their raw component
-/// lengths cannot be bounded.
-fn security_descriptor_bytes(
-    security_descriptor: NonNull<core::ffi::c_void>,
-    selection: SecuritySelection,
-) -> DriverResult<DriverVec<u8>> {
-    let pointer = security_descriptor.cast::<u8>();
-    let mut length = SECURITY_DESCRIPTOR_RELATIVE_BYTES;
-    let header = unsafe {
-        // SAFETY: The I/O Manager supplies a non-null security descriptor
-        // pointer for IRP_MJ_SET_SECURITY. Only the fixed header is read here;
-        // component reads below are selected by validated offsets.
-        core::slice::from_raw_parts(pointer.as_ptr(), SECURITY_DESCRIPTOR_RELATIVE_BYTES)
-    };
-    let descriptor = ParsedSecurityDescriptor::parse(header)?;
-
-    if matches!(selection.owner(), SecurityComponentSelection::Selected) {
-        length = length.max(raw_sid_end(pointer, descriptor.owner_offset)?);
-    }
-    if matches!(selection.group(), SecurityComponentSelection::Selected) {
-        length = length.max(raw_sid_end(pointer, descriptor.group_offset)?);
-    }
-    if matches!(selection.dacl(), SecurityComponentSelection::Selected) {
-        length = length.max(raw_acl_end(pointer, descriptor.dacl_offset)?);
-    }
-
-    let bytes = unsafe {
-        // SAFETY: Length was derived from the self-relative descriptor's SID
-        // and ACL size fields. Windows owns the descriptor for this dispatch.
-        core::slice::from_raw_parts(pointer.as_ptr(), length)
-    };
-    DriverVec::try_copied_from_slice(bytes)
-}
-
 /// Builds new ext4 security metadata from a Windows security descriptor.
 /// # Errors
 ///
@@ -660,60 +621,6 @@ impl<'a> ParsedSecurityDescriptor<'a> {
             .ok_or(DriverError::InvalidParameter)?;
         security_range(self.bytes, start, acl_len)
     }
-}
-
-/// Returns the byte end of a raw SID component.
-/// # Errors
-///
-/// Returns an error when the SID offset is absent or the computed SID length overflows.
-fn raw_sid_end(pointer: NonNull<u8>, offset: SecurityDescriptorOffset) -> DriverResult<usize> {
-    let start = offset.as_present_usize()?;
-    let count_offset = start.checked_add(1).ok_or(DriverError::InvalidParameter)?;
-    let count_pointer = unsafe {
-        // SAFETY: The offset is selected from a self-relative security
-        // descriptor supplied by the I/O Manager.
-        pointer.as_ptr().add(count_offset)
-    };
-    let count = unsafe {
-        // SAFETY: `count_pointer` addresses the SID sub-authority count byte
-        // selected above.
-        *count_pointer
-    };
-    let sid_len = sid_length_from_sub_authorities(usize::from(count))?;
-    start
-        .checked_add(sid_len)
-        .ok_or(DriverError::InvalidParameter)
-}
-
-/// Returns the byte end of a raw ACL component.
-/// # Errors
-///
-/// Returns an error when the ACL offset is absent or its size field cannot be used to bound the raw
-/// descriptor copy.
-fn raw_acl_end(pointer: NonNull<u8>, offset: SecurityDescriptorOffset) -> DriverResult<usize> {
-    if offset.is_absent() {
-        return Err(DriverError::NotSupported);
-    }
-    let start = offset.as_usize()?;
-    let acl_size_offset = start
-        .checked_add(ACL_SIZE_OFFSET)
-        .ok_or(DriverError::InvalidParameter)?;
-    let acl_size_pointer = unsafe {
-        // SAFETY: The offset is selected from a self-relative security
-        // descriptor supplied by the I/O Manager.
-        pointer.as_ptr().add(acl_size_offset)
-    };
-    let size_bytes = unsafe {
-        // SAFETY: `acl_size_pointer` addresses the two-byte ACL size field
-        // used to bound the subsequent copy.
-        core::slice::from_raw_parts(acl_size_pointer, 2)
-    };
-    let acl_len = usize::from(malformed_security(
-        LittleEndianInput::new(size_bytes).read_u16(wire_offset(0)),
-    )?);
-    start
-        .checked_add(acl_len)
-        .ok_or(DriverError::InvalidParameter)
 }
 
 /// Returns the serialized SID length for a sub-authority count.
