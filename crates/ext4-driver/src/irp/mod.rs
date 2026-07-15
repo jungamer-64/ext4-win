@@ -7,14 +7,18 @@ use core::ptr::NonNull;
 use ext4_core::FileOffset;
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_PENDING, STATUS_SUCCESS};
 
+mod capture;
 mod executor;
 
+use capture::QueueContext;
+pub(crate) use capture::{CapturedQuerySecurityOutput, PreparedRequestKind};
 pub(crate) use executor::DeviceExecutor;
 
 #[cfg(not(test))]
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory;
+use crate::security_descriptor::SecuritySelection;
 use crate::state::{
     DirectoryChangeNotifier, DirectoryNotificationRegistration, FileControlBlock, KernelDevice,
     KernelFileObject, KernelVpb, WriteCommitment,
@@ -96,6 +100,25 @@ impl IrpCompletion {
             status: error.ntstatus(),
             information: InformationLength::ZERO,
         }
+    }
+
+    /// Preserves one failed status raised by the native requestor-memory capture boundary.
+    const fn from_native_failure(status: NTSTATUS) -> Self {
+        Self {
+            status,
+            information: InformationLength::ZERO,
+        }
+    }
+
+    /// Builds the query-security compatibility result for an undersized output buffer.
+    /// # Errors
+    ///
+    /// Returns an error when `required` cannot be represented in the IRP information field.
+    pub(crate) fn security_buffer_overflow(required: usize) -> DriverResult<Self> {
+        Ok(Self {
+            status: DriverError::BufferOverflow.ntstatus(),
+            information: InformationLength::from_usize(required)?,
+        })
     }
 
     /// Builds a canceled IRP completion payload.
@@ -264,46 +287,6 @@ pub(crate) enum DispatchMajor {
 }
 
 impl DispatchMajor {
-    /// Decodes the raw major function stored in the current IRP stack location.
-    /// # Errors
-    ///
-    /// Returns an error when `value` does not name a dispatch slot owned by this driver.
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "queued worker dispatch is compiled out in unit tests"
-        )
-    )]
-    pub(crate) fn from_stack_major(value: wdk_sys::UCHAR) -> DriverResult<Self> {
-        match u32::from(value) {
-            value if value == wdk_sys::IRP_MJ_CREATE => Ok(Self::Create),
-            value if value == wdk_sys::IRP_MJ_CLOSE => Ok(Self::Close),
-            value if value == wdk_sys::IRP_MJ_CLEANUP => Ok(Self::Cleanup),
-            value if value == wdk_sys::IRP_MJ_READ => Ok(Self::Read),
-            value if value == wdk_sys::IRP_MJ_WRITE => Ok(Self::Write),
-            value if value == wdk_sys::IRP_MJ_QUERY_INFORMATION => Ok(Self::QueryInformation),
-            value if value == wdk_sys::IRP_MJ_SET_INFORMATION => Ok(Self::SetInformation),
-            value if value == wdk_sys::IRP_MJ_QUERY_VOLUME_INFORMATION => {
-                Ok(Self::QueryVolumeInformation)
-            }
-            value if value == wdk_sys::IRP_MJ_SET_VOLUME_INFORMATION => {
-                Ok(Self::SetVolumeInformation)
-            }
-            value if value == wdk_sys::IRP_MJ_DIRECTORY_CONTROL => Ok(Self::DirectoryControl),
-            value if value == wdk_sys::IRP_MJ_FILE_SYSTEM_CONTROL => Ok(Self::FileSystemControl),
-            value if value == wdk_sys::IRP_MJ_DEVICE_CONTROL => Ok(Self::DeviceControl),
-            value if value == wdk_sys::IRP_MJ_FLUSH_BUFFERS => Ok(Self::FlushBuffers),
-            value if value == wdk_sys::IRP_MJ_QUERY_EA => Ok(Self::QueryEa),
-            value if value == wdk_sys::IRP_MJ_SET_EA => Ok(Self::SetEa),
-            value if value == wdk_sys::IRP_MJ_LOCK_CONTROL => Ok(Self::LockControl),
-            value if value == wdk_sys::IRP_MJ_SHUTDOWN => Ok(Self::Shutdown),
-            value if value == wdk_sys::IRP_MJ_QUERY_SECURITY => Ok(Self::QuerySecurity),
-            value if value == wdk_sys::IRP_MJ_SET_SECURITY => Ok(Self::SetSecurity),
-            _ => Err(DriverError::InvalidDeviceRequest),
-        }
-    }
-
     /// Returns the index into `DRIVER_OBJECT::MajorFunction`.
     pub(crate) const fn table_index(self) -> usize {
         match self {
@@ -512,10 +495,7 @@ impl ReceivedIrp {
 
     /// Completes this received IRP immediately.
     pub(crate) fn complete(self, completion: IrpCompletion) -> NTSTATUS {
-        OwnedIrp {
-            target: self.target,
-        }
-        .complete(completion)
+        self.target.irp.complete(completion)
     }
 
     /// Completes this received IRP from a fallible request result.
@@ -548,49 +528,28 @@ impl ReceivedIrp {
     }
 }
 
-/// Failed transition from a received IRP into the pending queue state.
-#[derive(Debug)]
-#[must_use]
-struct PendingIrpError {
-    /// IRP that must still be completed synchronously.
-    received: ReceivedIrp,
-    /// Failure reported while marking the IRP pending.
-    error: DriverError,
-}
-
-impl PendingIrpError {
-    /// Completes the still-owned received IRP with the transition failure.
-    fn complete(self) -> NTSTATUS {
-        self.received
-            .complete(IrpCompletion::from_error(self.error))
-    }
-}
-
-/// IRP marked pending and ready to be inserted into a device queue.
+/// Prepared IRP ready to transfer into the cancel-safe queue.
 #[derive(Debug)]
 #[must_use]
 struct PendingIrp {
-    /// Pending dispatch target.
+    /// Dispatch target whose completion authority transfers with queue insertion.
     target: DispatchTarget,
+    /// Requestor-context capture transferred through `DriverContext[0]` before insertion.
+    context: Box<QueueContext>,
 }
 
 impl PendingIrp {
-    /// Marks a received IRP pending and builds the queue-owned typestate.
-    /// # Errors
-    ///
-    /// Returns the original received IRP with the failure when the active stack location is absent
-    /// or cannot represent the WDK pending bit.
-    fn from_received(received: ReceivedIrp) -> Result<Self, PendingIrpError> {
-        if let Err(error) = received.target.irp.mark_pending() {
-            return Err(PendingIrpError { received, error });
-        }
-        Ok(Self {
+    /// Joins the received completion authority with its fully captured queue context.
+    const fn from_received(received: ReceivedIrp, context: Box<QueueContext>) -> Self {
+        Self {
             target: received.target,
-        })
+            context,
+        }
     }
 
-    /// Returns the raw pending IRP pointer for queue insertion.
-    fn as_raw_irp(&self) -> PIRP {
+    /// Publishes the context into `DriverContext[0]` and transfers queue ownership.
+    fn publish(self) -> PIRP {
+        self.target.irp.publish_queue_context(self.context);
         self.target.irp.as_ptr()
     }
 
@@ -606,6 +565,8 @@ impl PendingIrp {
 pub(crate) struct OwnedIrp {
     /// Target whose IRP can be completed exactly once by this owner.
     target: DispatchTarget,
+    /// Request capture removed exactly once from `DriverContext[0]` with queue ownership.
+    context: Box<QueueContext>,
 }
 
 /// Exclusive borrow of one pending IRP while its executor task decodes or awaits request state.
@@ -615,18 +576,58 @@ pub(crate) struct PendingIrpLease<'a> {
     owner: &'a mut OwnedIrp,
 }
 
-impl PendingIrpLease<'_> {
+impl<'a> PendingIrpLease<'a> {
     /// Returns the pending dispatch target whose kernel objects remain pinned by this lease.
     pub(crate) const fn target(&self) -> DispatchTarget {
         self.owner.target
     }
+
+    /// Borrows the opaque query-security output target for the lifetime of this pending request.
+    /// # Errors
+    ///
+    /// Returns an invariant error when the queued request was not prepared as query-security.
+    pub(crate) fn query_security_parts(
+        self,
+    ) -> DriverResult<(
+        KernelFileObject,
+        SecuritySelection,
+        &'a mut CapturedQuerySecurityOutput,
+    )> {
+        self.owner.context.query_security_parts()
+    }
+
+    /// Borrows the owned set-security descriptor for the lifetime of this pending request.
+    /// # Errors
+    ///
+    /// Returns an invariant error when the queued request was not prepared as set-security.
+    pub(crate) fn set_security_parts(
+        self,
+    ) -> DriverResult<(KernelFileObject, SecuritySelection, &'a [u8])> {
+        self.owner.context.set_security_parts()
+    }
 }
 
 impl OwnedIrp {
-    /// Builds owned completion authority from a raw queued IRP.
-    fn from_raw(device: KernelDevice, irp: PIRP) -> Option<Self> {
-        KernelIrp::from_raw(irp).map(|irp| Self {
+    /// Takes queue context and terminal completion authority from one exclusively removed IRP.
+    fn from_queued_raw(device: KernelDevice, irp: PIRP) -> Self {
+        let Some(irp) = KernelIrp::from_raw(irp) else {
+            crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
+                .bugcheck();
+        };
+        let context = irp.take_queue_context();
+        Self {
             target: DispatchTarget { device, irp },
+            context,
+        }
+    }
+
+    /// Builds queued ownership directly for completion-focused unit tests.
+    #[cfg(test)]
+    fn from_test_raw(device: KernelDevice, irp: PIRP) -> Option<Self> {
+        let irp = KernelIrp::from_raw(irp)?;
+        Some(Self {
+            target: DispatchTarget { device, irp },
+            context: QueueContext::for_test_create().ok()?,
         })
     }
 
@@ -642,6 +643,11 @@ impl OwnedIrp {
         self.target
     }
 
+    /// Returns the execution selector sealed before queue insertion.
+    pub(crate) const fn prepared_kind(&self) -> PreparedRequestKind {
+        self.context.kind()
+    }
+
     /// Borrows this pending IRP as an active request without releasing completion authority.
     pub(crate) const fn request(&mut self) -> PendingIrpLease<'_> {
         PendingIrpLease { owner: self }
@@ -649,7 +655,9 @@ impl OwnedIrp {
 
     /// Completes the IRP through the I/O Manager.
     pub(crate) fn complete(self, completion: IrpCompletion) -> NTSTATUS {
-        self.target.irp.complete(completion)
+        let Self { target, context } = self;
+        drop(context);
+        target.irp.complete(completion)
     }
 
     /// Completes the IRP from a fallible request result.
@@ -672,12 +680,14 @@ impl OwnedIrp {
     /// A successful reparse transfers the auxiliary buffer to the I/O Manager immediately before
     /// completing with `STATUS_REPARSE`. Failed results never transfer an allocation.
     pub(crate) fn complete_create_result(self, result: DriverResult<CreateCompletion>) -> NTSTATUS {
+        let Self { target, context } = self;
+        drop(context);
         match result {
-            Ok(CreateCompletion::Handle(action)) => self.target.irp.complete_create_action(action),
+            Ok(CreateCompletion::Handle(action)) => target.irp.complete_create_action(action),
             Ok(CreateCompletion::ReparseSymlink(buffer)) => {
-                self.target.irp.complete_create_symlink_reparse(buffer)
+                target.irp.complete_create_symlink_reparse(buffer)
             }
-            Err(error) => self.complete(IrpCompletion::from_error(error)),
+            Err(error) => target.irp.complete(IrpCompletion::from_error(error)),
         }
     }
 
@@ -687,9 +697,11 @@ impl OwnedIrp {
         notifier: &DirectoryChangeNotifier,
         registration: DirectoryNotificationRegistration,
     ) -> NTSTATUS {
-        match notifier.register(self.target, registration) {
+        let Self { target, context } = self;
+        drop(context);
+        match notifier.register(target, registration) {
             Ok(status) => status,
-            Err(error) => self.complete_result(Err(error)),
+            Err(error) => target.irp.complete(IrpCompletion::from_error(error)),
         }
     }
 
@@ -753,22 +765,86 @@ impl KernelIrp {
         CurrentIrpStackLocation::from_raw(current_stack)
     }
 
-    /// Marks the current stack as pending before this IRP enters a driver-owned queue.
-    /// # Errors
-    ///
-    /// Returns an error when the current stack location is absent or the WDK pending bit cannot be
-    /// represented by the stack control byte.
-    fn mark_pending(self) -> DriverResult<()> {
-        let pending_bit = u8::try_from(wdk_sys::SL_PENDING_RETURNED)
-            .map_err(|_| DriverError::InvalidParameter)?;
-        let mut stack = self.current_stack()?;
-        let stack = unsafe {
-            // SAFETY: The current stack location belongs to this active IRP and
-            // the dispatch path owns the pending transition before queuing it.
-            stack.stack.as_mut()
+    /// Publishes one queue context into the sole driver-owned IRP context slot.
+    fn publish_queue_context(self, context: Box<QueueContext>) {
+        let mut irp = self.irp;
+        let irp = unsafe {
+            // SAFETY: Queue preparation retains unique dispatch ownership before CSQ insertion.
+            irp.as_mut()
         };
-        stack.Control |= pending_bit;
-        Ok(())
+        let overlay = unsafe {
+            // SAFETY: Queue metadata and list linkage both use the IRP tail overlay.
+            &mut irp.Tail.Overlay
+        };
+        let driver_storage = unsafe {
+            // SAFETY: The first nested union arm is reserved for driver-owned context slots;
+            // list linkage lives in the independent `overlay.__bindgen_anon_2` field.
+            &mut overlay.__bindgen_anon_1.__bindgen_anon_1
+        };
+        let driver_context = &mut driver_storage.DriverContext;
+        if !driver_context[0].is_null() {
+            crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
+                .bugcheck();
+        }
+        driver_context[0] = Box::into_raw(context).cast::<c_void>();
+    }
+
+    /// Takes the context after CSQ removal or cancellation transferred exclusive IRP ownership.
+    fn take_queue_context(self) -> Box<QueueContext> {
+        let mut irp = self.irp;
+        let irp = unsafe {
+            // SAFETY: The caller has exclusive IRP ownership after atomic CSQ removal.
+            irp.as_mut()
+        };
+        let overlay = unsafe {
+            // SAFETY: Exclusive CSQ removal permits mutable access to the IRP tail overlay.
+            &mut irp.Tail.Overlay
+        };
+        let driver_storage = unsafe {
+            // SAFETY: Queue publication selected the first nested union arm for driver context.
+            &mut overlay.__bindgen_anon_1.__bindgen_anon_1
+        };
+        let driver_context = &mut driver_storage.DriverContext;
+        let Some(context) = NonNull::new(driver_context[0].cast::<QueueContext>()) else {
+            crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
+                .bugcheck();
+        };
+        driver_context[0] = core::ptr::null_mut();
+        unsafe {
+            // SAFETY: The slot received this pointer from exactly one `Box::into_raw`, exclusive
+            // CSQ removal grants the sole take right, and the slot was cleared before rebuilding.
+            Box::from_raw(context.as_ptr())
+        }
+    }
+
+    /// Borrows queue metadata while the CSQ lock keeps this IRP queued and stable.
+    /// # Safety
+    ///
+    /// The caller must hold the owning CSQ lock and keep this IRP in the queue for the returned
+    /// reference's lifetime.
+    unsafe fn queue_context<'a>(self) -> &'a QueueContext {
+        let irp = unsafe {
+            // SAFETY: The CSQ lock retains this queued IRP for the returned callback-local borrow.
+            self.as_ref()
+        };
+        let overlay = unsafe {
+            // SAFETY: Queue membership keeps the IRP tail overlay live for this callback.
+            &irp.Tail.Overlay
+        };
+        let driver_storage = unsafe {
+            // SAFETY: Queue publication selected the first nested union arm for driver context.
+            &overlay.__bindgen_anon_1.__bindgen_anon_1
+        };
+        let driver_context = driver_storage.DriverContext;
+        let Some(context) = NonNull::new(driver_context[0].cast::<QueueContext>()) else {
+            crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
+                .bugcheck();
+        };
+        unsafe {
+            // SAFETY: The context remains Box-owned by this queued IRP and cannot be taken while
+            // the CSQ lock grants this callback its immutable queue-membership observation.
+            context.as_ref()
+        }
     }
 
     /// Returns the raw IRP pointer for writes to the WDK completion fields.
@@ -862,26 +938,6 @@ impl CurrentIrpStackLocation {
             return Err(DriverError::InvalidParameter);
         };
         Ok(Self { stack })
-    }
-
-    /// Decodes this stack location's major function.
-    /// # Errors
-    ///
-    /// Returns an error when the raw major function is not owned by this driver.
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "queued worker dispatch is compiled out in unit tests"
-        )
-    )]
-    pub(crate) fn major(self) -> DriverResult<DispatchMajor> {
-        let stack = unsafe {
-            // SAFETY: `stack` is non-null and belongs to the active IRP stack
-            // for a dispatch callback or queued IRP still owned by the I/O Manager.
-            self.stack.as_ref()
-        };
-        DispatchMajor::from_stack_major(stack.MajorFunction)
     }
 
     /// Decodes this stack location's filesystem-control minor function.
@@ -1293,8 +1349,7 @@ impl CurrentIrpStackLocation {
             // IRP_MJ_SET_SECURITY, where SetSecurity is active.
             stack.Parameters.SetSecurity
         };
-        let Some(security_descriptor) = KernelSecurityDescriptor::from_raw(set.SecurityDescriptor)
-        else {
+        let Some(security_descriptor) = NonNull::new(set.SecurityDescriptor) else {
             return Err(DriverError::InvalidParameter);
         };
         Ok(SetSecurityStack {
@@ -1713,87 +1768,6 @@ pub(crate) enum EaEntryEmission {
     Multiple,
     /// Emit at most one selected EA.
     Single,
-}
-
-/// Selection state for one self-relative security descriptor component.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SecurityComponentSelection {
-    /// Component was not selected by this IRP.
-    Omitted,
-    /// Component was selected by this IRP.
-    Selected,
-}
-
-/// Security descriptor components accepted by the driver security boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SecuritySelection {
-    /// Owner SID selection.
-    owner: SecurityComponentSelection,
-    /// Group SID selection.
-    group: SecurityComponentSelection,
-    /// DACL selection.
-    dacl: SecurityComponentSelection,
-}
-
-impl SecuritySelection {
-    /// Builds a security selection from already-decoded component states.
-    pub(crate) const fn from_components(
-        owner: SecurityComponentSelection,
-        group: SecurityComponentSelection,
-        dacl: SecurityComponentSelection,
-    ) -> Self {
-        Self { owner, group, dacl }
-    }
-
-    /// Converts raw `SECURITY_INFORMATION` bits into supported component state.
-    /// # Errors
-    ///
-    /// Returns an error when SACL access is requested or unsupported security-information bits are
-    /// present.
-    fn from_raw(value: wdk_sys::SECURITY_INFORMATION) -> Result<Self, DriverError> {
-        let supported = wdk_sys::OWNER_SECURITY_INFORMATION
-            | wdk_sys::GROUP_SECURITY_INFORMATION
-            | wdk_sys::DACL_SECURITY_INFORMATION;
-        if value & wdk_sys::SACL_SECURITY_INFORMATION != 0 {
-            return Err(DriverError::AccessDenied);
-        }
-        if value & !supported != 0 {
-            return Err(DriverError::NotSupported);
-        }
-
-        Ok(Self::from_components(
-            security_component(value, wdk_sys::OWNER_SECURITY_INFORMATION),
-            security_component(value, wdk_sys::GROUP_SECURITY_INFORMATION),
-            security_component(value, wdk_sys::DACL_SECURITY_INFORMATION),
-        ))
-    }
-
-    /// Returns owner SID selection.
-    pub(crate) const fn owner(self) -> SecurityComponentSelection {
-        self.owner
-    }
-
-    /// Returns group SID selection.
-    pub(crate) const fn group(self) -> SecurityComponentSelection {
-        self.group
-    }
-
-    /// Returns DACL selection.
-    pub(crate) const fn dacl(self) -> SecurityComponentSelection {
-        self.dacl
-    }
-}
-
-/// Converts one security bit into component selection.
-fn security_component(
-    value: wdk_sys::SECURITY_INFORMATION,
-    bit: wdk_sys::SECURITY_INFORMATION,
-) -> SecurityComponentSelection {
-    if value & bit == 0 {
-        SecurityComponentSelection::Omitted
-    } else {
-        SecurityComponentSelection::Selected
-    }
 }
 
 /// Tests one WDK `IO_STACK_LOCATION::Flags` bit while keeping raw flags local to decode.
@@ -2789,8 +2763,8 @@ pub(crate) struct SetSecurityStack {
     file_object: KernelFileObject,
     /// Selected security descriptor components.
     selection: SecuritySelection,
-    /// Caller-supplied security descriptor.
-    security_descriptor: KernelSecurityDescriptor,
+    /// Caller-supplied security descriptor, valid only during requestor-context capture.
+    security_descriptor: NonNull<c_void>,
 }
 
 /// Starting point selected by a Windows read request.
@@ -3111,8 +3085,8 @@ impl SetSecurityStack {
         self.selection
     }
 
-    /// Returns the caller-supplied security descriptor.
-    pub(crate) const fn security_descriptor(self) -> KernelSecurityDescriptor {
+    /// Returns the caller-supplied descriptor only to requestor-context capture.
+    const fn security_descriptor_source(self) -> NonNull<c_void> {
         self.security_descriptor
     }
 }
@@ -3131,19 +3105,18 @@ mod tests {
         CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering,
         CurrentIrpStackLocation, DataIoKind, DeviceExecutor, DirectoryChangeFilter,
         DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
-        DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope, DispatchTarget,
-        EaEntryEmission, EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION,
+        DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope, DispatchMajor,
+        DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION,
         FILE_OPEN_IF_DISPOSITION, FILE_OVERWRITE_DISPOSITION, FILE_OVERWRITE_IF_DISPOSITION,
         FILE_SUPERSEDE_DISPOSITION, FileSystemControlMinorFunction, FsControlCode,
         InformationLength, IrpBufferLength, IrpCompletion, KernelIrp, OwnedIrp,
         QueryFileInformationClass, QueryVolumeInformationClass, ReadStartingPoint, ReceivedIrp,
-        RegularFileWriteAccess, STATUS_CANCELLED, SecurityComponentSelection,
-        SetFileInformationClass, SetVolumeInformationClass, WriteStartingPoint,
+        RegularFileWriteAccess, STATUS_CANCELLED, SetFileInformationClass,
+        SetVolumeInformationClass, WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
-    use crate::state::{
-        KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb, WriteCommitment,
-    };
+    use crate::security_descriptor::SecurityComponentSelection;
+    use crate::state::{KernelDevice, KernelFileObject, KernelVpb, WriteCommitment};
 
     /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
     const MOUNT_VOLUME_MINOR: wdk_sys::UCHAR = 1;
@@ -3341,7 +3314,7 @@ mod tests {
             return;
         };
         let mut irp = wdk_sys::IRP::default();
-        let owned = OwnedIrp::from_raw(device, core::ptr::addr_of_mut!(irp));
+        let owned = OwnedIrp::from_test_raw(device, core::ptr::addr_of_mut!(irp));
         assert!(owned.is_some());
         let Some(owned) = owned else {
             return;
@@ -3402,7 +3375,7 @@ mod tests {
                 return;
             };
             let mut irp = wdk_sys::IRP::default();
-            let owned = OwnedIrp::from_raw(device, core::ptr::addr_of_mut!(irp));
+            let owned = OwnedIrp::from_test_raw(device, core::ptr::addr_of_mut!(irp));
             assert!(owned.is_some());
             let Some(owned) = owned else {
                 return;
@@ -3435,7 +3408,7 @@ mod tests {
             return;
         };
         let mut irp = wdk_sys::IRP::default();
-        let owned = OwnedIrp::from_raw(device, core::ptr::addr_of_mut!(irp));
+        let owned = OwnedIrp::from_test_raw(device, core::ptr::addr_of_mut!(irp));
         assert!(owned.is_some());
         if let Some(owned) = owned {
             assert_eq!(
@@ -3484,7 +3457,10 @@ mod tests {
         );
         assert!(received.is_ok());
         if let Ok(received) = received {
-            assert_eq!(DeviceExecutor::receive(received), wdk_sys::STATUS_PENDING);
+            assert_eq!(
+                DeviceExecutor::receive(received, DispatchMajor::Create),
+                wdk_sys::STATUS_PENDING
+            );
             assert!(stack_has_pending_returned(&stack));
             assert!(executor.test_worker_is_queued());
             assert_eq!(
@@ -3515,7 +3491,10 @@ mod tests {
         );
         assert!(received.is_ok());
         if let Ok(received) = received {
-            assert_eq!(DeviceExecutor::receive(received), STATUS_INVALID_PARAMETER);
+            assert_eq!(
+                DeviceExecutor::receive(received, DispatchMajor::Create),
+                STATUS_INVALID_PARAMETER
+            );
         }
 
         assert!(!stack_has_pending_returned(&stack));
@@ -3546,7 +3525,10 @@ mod tests {
         );
         assert!(received.is_ok());
         if let Ok(received) = received {
-            assert_eq!(DeviceExecutor::receive(received), STATUS_INVALID_PARAMETER);
+            assert_eq!(
+                DeviceExecutor::receive(received, DispatchMajor::Create),
+                STATUS_INVALID_PARAMETER
+            );
         }
 
         assert_eq!(irp_status(&irp), STATUS_INVALID_PARAMETER);
@@ -3607,7 +3589,10 @@ mod tests {
             let received = ReceivedIrp::decode(core::ptr::addr_of_mut!(kernel_device), irp);
             assert!(received.is_ok());
             if let Ok(received) = received {
-                assert_eq!(DeviceExecutor::receive(received), wdk_sys::STATUS_PENDING);
+                assert_eq!(
+                    DeviceExecutor::receive(received, DispatchMajor::Create),
+                    wdk_sys::STATUS_PENDING
+                );
             }
         }
 
@@ -3692,7 +3677,10 @@ mod tests {
             let received = ReceivedIrp::decode(core::ptr::addr_of_mut!(kernel_device), irp);
             assert!(received.is_ok());
             if let Ok(received) = received {
-                assert_eq!(DeviceExecutor::receive(received), wdk_sys::STATUS_PENDING);
+                assert_eq!(
+                    DeviceExecutor::receive(received, DispatchMajor::Create),
+                    wdk_sys::STATUS_PENDING
+                );
             }
         }
 
@@ -4686,10 +4674,7 @@ mod tests {
                     SecurityComponentSelection::Selected
                 );
                 assert_eq!(set.selection().dacl(), SecurityComponentSelection::Omitted);
-                assert_eq!(
-                    Some(set.security_descriptor()),
-                    KernelSecurityDescriptor::from_raw(descriptor.as_ptr())
-                );
+                assert_eq!(set.security_descriptor_source(), descriptor);
             }
         }
     }

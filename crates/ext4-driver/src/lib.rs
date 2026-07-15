@@ -13,6 +13,7 @@ mod irp;
 mod kernel;
 mod memory;
 mod request;
+mod security_descriptor;
 mod state;
 mod wire;
 

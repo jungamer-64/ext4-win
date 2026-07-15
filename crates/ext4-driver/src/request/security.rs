@@ -1,22 +1,16 @@
 //! Windows security descriptor boundary for ext4 owner and mode bits.
 
-use crate::irp::{
-    DispatchTarget, IrpBufferLength, IrpCompletion, SecurityComponentSelection, SecuritySelection,
-};
+use crate::irp::{CapturedQuerySecurityOutput, IrpCompletion, PendingIrpLease};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
+use crate::security_descriptor::{
+    ACCESS_ALLOWED_ACE_PREFIX_BYTES, ACL_HEADER_BYTES, SECURITY_DESCRIPTOR_RELATIVE_BYTES,
+    SID_PREFIX_BYTES, SecurityComponentSelection, SecuritySelection,
+};
 use crate::state::{OpenedObject, VolumeControlBlock, VolumeOperationLane, VolumeOperationLease};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, NodeId};
 
-/// SECURITY_DESCRIPTOR_RELATIVE byte size.
-const SECURITY_DESCRIPTOR_RELATIVE_BYTES: usize = 20;
-/// ACL header byte size.
-const ACL_HEADER_BYTES: usize = 8;
-/// ACCESS_ALLOWED_ACE bytes before the SID payload.
-const ACCESS_ALLOWED_ACE_PREFIX_BYTES: usize = 8;
-/// SID bytes before the first sub-authority.
-const SID_PREFIX_BYTES: usize = 8;
 /// SECURITY_DESCRIPTOR_RELATIVE owner SID offset.
 const SECURITY_DESCRIPTOR_OWNER_OFFSET: usize = 4;
 /// SECURITY_DESCRIPTOR_RELATIVE group SID offset.
@@ -42,8 +36,8 @@ const POSIX_RWX_BITS: u16 = 0o777;
 /// # Errors
 ///
 /// Returns an error when security stack decoding or descriptor packing fails.
-pub(crate) async fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let request = QuerySecurityRequest::decode(target)?;
+pub(crate) async fn query(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let request = QuerySecurityRequest::decode(request)?;
     query_security(request).await
 }
 
@@ -51,34 +45,32 @@ pub(crate) async fn query(target: DispatchTarget) -> DriverResult<IrpCompletion>
 /// # Errors
 ///
 /// Returns an error when security stack decoding or descriptor mutation fails.
-pub(crate) async fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let request = SetSecurityRequest::decode(target)?;
+pub(crate) async fn set(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let request = SetSecurityRequest::decode(request)?;
     set_security(request).await
 }
 
 /// Decoded query-security request.
-struct QuerySecurityRequest {
-    /// Dispatch target receiving output.
-    target: DispatchTarget,
+struct QuerySecurityRequest<'a> {
+    /// Opaque native target for the exact output descriptor length.
+    output: &'a mut CapturedQuerySecurityOutput,
     /// Selected security descriptor components.
     selection: SecuritySelection,
-    /// Caller output buffer length.
-    length: IrpBufferLength,
     /// ext4 node selected by the opened FILE_OBJECT.
     node: NodeId,
     /// Exclusive actor-owned mounted-volume operation capability.
     operations: VolumeOperationLease,
 }
 
-impl QuerySecurityRequest {
+impl<'a> QuerySecurityRequest<'a> {
     /// Decodes a query-security request.
     /// # Errors
     ///
     /// Returns an error when the current stack is not a query-security stack or its FILE_OBJECT has
     /// no opened ext4 context.
-    fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
-        let stack = target.current_stack()?.query_security()?;
-        let opened_file = OpenedObject::decode(stack.file_object())?;
+    fn decode(request: PendingIrpLease<'a>) -> Result<Self, DriverError> {
+        let (file_object, selection, output) = request.query_security_parts()?;
+        let opened_file = OpenedObject::decode(file_object)?;
         let volume = opened_file.volume();
         let node = opened_file.node();
         let operations = unsafe {
@@ -87,9 +79,8 @@ impl QuerySecurityRequest {
             VolumeControlBlock::claim_operation_lane(volume)
         };
         Ok(Self {
-            target,
-            selection: stack.selection(),
-            length: stack.length(),
+            output,
+            selection,
             node,
             operations,
         })
@@ -97,29 +88,26 @@ impl QuerySecurityRequest {
 }
 
 /// Decoded set-security request.
-struct SetSecurityRequest {
+struct SetSecurityRequest<'a> {
     /// Selected security descriptor components.
     selection: SecuritySelection,
     /// Owned descriptor bytes copied before the operation can suspend.
-    descriptor: DriverVec<u8>,
+    descriptor: &'a [u8],
     /// ext4 node selected by the opened FILE_OBJECT.
     node: NodeId,
     /// Exclusive actor-owned mounted-volume operation capability.
     operations: VolumeOperationLease,
 }
 
-impl SetSecurityRequest {
+impl<'a> SetSecurityRequest<'a> {
     /// Decodes a set-security request.
     /// # Errors
     ///
     /// Returns an error when the current stack is not a set-security stack or its FILE_OBJECT has no
     /// opened ext4 context.
-    fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
-        let stack = target.current_stack()?.set_security()?;
-        let opened_file = OpenedObject::decode(stack.file_object())?;
-        let selection = stack.selection();
-        let descriptor =
-            security_descriptor_bytes(stack.security_descriptor().as_non_null(), selection)?;
+    fn decode(request: PendingIrpLease<'a>) -> Result<Self, DriverError> {
+        let (file_object, selection, descriptor) = request.set_security_parts()?;
+        let opened_file = OpenedObject::decode(file_object)?;
         let volume = opened_file.volume();
         let node = opened_file.node();
         let operations = unsafe {
@@ -215,11 +203,6 @@ impl WindowsAccessMask {
     const fn as_u32(self) -> u32 {
         self.0
     }
-
-    /// Returns whether this mask grants no access.
-    const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
 }
 
 /// Self-relative security descriptor control flags.
@@ -284,14 +267,6 @@ impl SecurityDescriptorOffset {
         if self.is_absent() {
             return Err(DriverError::InvalidParameter);
         }
-        usize::try_from(self.0).map_err(|_| DriverError::InvalidParameter)
-    }
-
-    /// Converts an optional component offset to a host index.
-    /// # Errors
-    ///
-    /// Returns an error when the component offset cannot be represented as `usize`.
-    fn as_usize(self) -> DriverResult<usize> {
         usize::try_from(self.0).map_err(|_| DriverError::InvalidParameter)
     }
 }
@@ -373,17 +348,11 @@ impl DaclPermissionBuilder {
 ///
 /// Returns an error when ext4 security metadata cannot be loaded, the requested descriptor cannot
 /// be built, or the user output buffer is too small.
-async fn query_security(mut request: QuerySecurityRequest) -> DriverResult<IrpCompletion> {
+async fn query_security(mut request: QuerySecurityRequest<'_>) -> DriverResult<IrpCompletion> {
     let security = load_ext4_security(request.operations.lane_mut(), request.node).await?;
     let descriptor = security_descriptor(security, request.selection)?;
     let required = descriptor.len();
-    let length = request.length;
-    if length.as_usize() < required {
-        return Err(DriverError::BufferTooSmall);
-    }
-    let mut output = request.target.user_output(length)?;
-    LittleEndianOutput::new(output.as_mut_slice())
-        .write_bytes(wire_offset(0), descriptor.as_slice())?;
+    request.output.copy_from_owned(descriptor.as_slice())?;
     IrpCompletion::from_usize(required)
 }
 
@@ -392,10 +361,9 @@ async fn query_security(mut request: QuerySecurityRequest) -> DriverResult<IrpCo
 ///
 /// Returns an error when the input descriptor cannot be copied or mapped to ext4 owner/permissions,
 /// or the journaled security update fails.
-async fn set_security(mut request: SetSecurityRequest) -> DriverResult<IrpCompletion> {
+async fn set_security(mut request: SetSecurityRequest<'_>) -> DriverResult<IrpCompletion> {
     let current = load_ext4_security(request.operations.lane_mut(), request.node).await?;
-    let security =
-        security_from_descriptor(request.descriptor.as_slice(), request.selection, current)?;
+    let security = security_from_descriptor(request.descriptor, request.selection, current)?;
     if security == current {
         return Ok(IrpCompletion::EMPTY);
     }
@@ -454,7 +422,9 @@ fn security_descriptor(
     security: Ext4Security,
     selection: SecuritySelection,
 ) -> DriverResult<DriverVec<u8>> {
-    let mut descriptor = DriverVec::try_repeated_copy(0_u8, SECURITY_DESCRIPTOR_RELATIVE_BYTES)?;
+    let planned_length = selection.query_descriptor_length();
+    let mut descriptor = DriverVec::try_with_capacity(planned_length)?;
+    descriptor.try_resize_copy(SECURITY_DESCRIPTOR_RELATIVE_BYTES, 0_u8)?;
     LittleEndianOutput::new(descriptor.as_mut_slice()).write_u8(
         wire_offset(0),
         u8::try_from(wdk_sys::SECURITY_DESCRIPTOR_REVISION)
@@ -486,6 +456,9 @@ fn security_descriptor(
         wire_offset(2),
         u16::try_from(control).map_err(|_| DriverError::InvalidParameter)?,
     )?;
+    if descriptor.len() != planned_length {
+        return Err(DriverError::InternalInvariantViolation);
+    }
     Ok(descriptor)
 }
 
@@ -810,27 +783,24 @@ fn dacl_from_permissions(security: Ext4Security) -> DriverResult<DriverVec<u8>> 
     let group = permission_class_mask((permissions >> 3) & 0o7);
     let other = permission_class_mask(permissions & 0o7);
     let mut aces = DriverVec::new();
-    if !owner.is_empty() {
-        aces.try_push_owned(AllowAce {
-            mask: owner,
-            sid: uid_sid(security.owner().uid().as_u32())?,
-        })
-        .map_err(|error| error.into_parts().0)?;
-    }
-    if !group.is_empty() {
-        aces.try_push_owned(AllowAce {
-            mask: group,
-            sid: gid_sid(security.owner().gid().as_u32())?,
-        })
-        .map_err(|error| error.into_parts().0)?;
-    }
-    if !other.is_empty() {
-        aces.try_push_owned(AllowAce {
-            mask: other,
-            sid: everyone_sid()?,
-        })
-        .map_err(|error| error.into_parts().0)?;
-    }
+    // The query output is captured before asynchronous metadata I/O. Emitting one canonical ACE
+    // per POSIX class, including a zero-mask ACE, makes the exact descriptor length depend only on
+    // `SecuritySelection` and keeps capture planning independent of the eventual inode mode.
+    aces.try_push_owned(AllowAce {
+        mask: owner,
+        sid: uid_sid(security.owner().uid().as_u32())?,
+    })
+    .map_err(|error| error.into_parts().0)?;
+    aces.try_push_owned(AllowAce {
+        mask: group,
+        sid: gid_sid(security.owner().gid().as_u32())?,
+    })
+    .map_err(|error| error.into_parts().0)?;
+    aces.try_push_owned(AllowAce {
+        mask: other,
+        sid: everyone_sid()?,
+    })
+    .map_err(|error| error.into_parts().0)?;
 
     let mut acl = DriverVec::try_repeated_copy(0_u8, ACL_HEADER_BYTES)?;
     LittleEndianOutput::new(acl.as_mut_slice()).write_u8(
@@ -1009,9 +979,9 @@ mod tests {
     use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid};
 
     use crate::{
-        irp::{SecurityComponentSelection, SecuritySelection},
         kernel::status::DriverError,
         memory::DriverVec,
+        security_descriptor::{SecurityComponentSelection, SecuritySelection},
         wire::{LittleEndianInput, LittleEndianOutput},
     };
 
@@ -1028,6 +998,44 @@ mod tests {
             SecurityComponentSelection::Selected,
             SecurityComponentSelection::Selected,
         )
+    }
+
+    /// # Panics
+    ///
+    /// Panics when capture planning and canonical descriptor serialization disagree for any
+    /// selection or permission pattern.
+    #[test]
+    fn query_descriptor_plan_matches_every_serialized_selection() {
+        let omitted = SecurityComponentSelection::Omitted;
+        let selected = SecurityComponentSelection::Selected;
+        let selections = [
+            SecuritySelection::from_components(omitted, omitted, omitted),
+            SecuritySelection::from_components(selected, omitted, omitted),
+            SecuritySelection::from_components(omitted, selected, omitted),
+            SecuritySelection::from_components(selected, selected, omitted),
+            SecuritySelection::from_components(omitted, omitted, selected),
+            SecuritySelection::from_components(selected, omitted, selected),
+            SecuritySelection::from_components(omitted, selected, selected),
+            SecuritySelection::from_components(selected, selected, selected),
+        ];
+
+        for raw_permissions in [0, 0o754] {
+            let permissions = Ext4Permissions::new(raw_permissions);
+            assert!(permissions.is_ok());
+            if let Ok(permissions) = permissions {
+                let security = Ext4Security::new(
+                    Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(100)),
+                    permissions,
+                );
+                for selection in selections {
+                    let descriptor = security_descriptor(security, selection);
+                    assert!(descriptor.is_ok());
+                    if let Ok(descriptor) = descriptor {
+                        assert_eq!(descriptor.len(), selection.query_descriptor_length());
+                    }
+                }
+            }
+        }
     }
 
     fn dacl_security_component() -> SecuritySelection {
@@ -1179,11 +1187,54 @@ mod tests {
             let descriptor = security_descriptor(security, all_security_components());
             assert!(descriptor.is_ok());
             if let Ok(descriptor) = descriptor {
+                assert_eq!(
+                    descriptor.len(),
+                    all_security_components().query_descriptor_length()
+                );
                 let fields = LittleEndianInput::new(descriptor.as_slice());
                 assert_eq!(fields.read_u16(wire_offset(2)), Ok(32772));
                 assert_eq!(fields.read_u32(wire_offset(4)), Ok(20));
                 assert_eq!(fields.read_u32(wire_offset(8)), Ok(36));
                 assert_eq!(fields.read_u32(wire_offset(16)), Ok(52));
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when any POSIX permission mode changes the queue-time descriptor length plan or
+    /// fails to round-trip through the canonical three-ACE DACL.
+    #[test]
+    fn security_descriptor_shape_is_fixed_for_every_posix_permission_mode() {
+        let owner = Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(100));
+        let current_permissions = Ext4Permissions::new(0);
+        assert!(current_permissions.is_ok());
+        let Some(current_permissions) = current_permissions.ok() else {
+            return;
+        };
+        let current = Ext4Security::new(owner, current_permissions);
+        let selection = all_security_components();
+
+        for mode in 0_u16..=0o777 {
+            let permissions = Ext4Permissions::new(mode);
+            assert!(permissions.is_ok(), "mode {mode:o}");
+            let Some(permissions) = permissions.ok() else {
+                continue;
+            };
+            let expected = Ext4Security::new(owner, permissions);
+            let descriptor = security_descriptor(expected, selection);
+            assert!(descriptor.is_ok(), "mode {mode:o}");
+            if let Ok(descriptor) = descriptor {
+                assert_eq!(
+                    descriptor.len(),
+                    selection.query_descriptor_length(),
+                    "mode {mode:o}"
+                );
+                assert_eq!(
+                    security_from_descriptor(descriptor.as_slice(), selection, current),
+                    Ok(expected),
+                    "mode {mode:o}"
+                );
             }
         }
     }

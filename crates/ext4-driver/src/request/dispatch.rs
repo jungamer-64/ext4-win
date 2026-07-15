@@ -5,7 +5,7 @@ use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP};
 use crate::{
     irp::{
         DeviceExecutor, DirectoryControlMinorFunction, DispatchMajor, DispatchTarget,
-        IrpCompletion, OwnedIrp, ReceivedIrp,
+        IrpCompletion, OwnedIrp, PreparedRequestKind, ReceivedIrp,
     },
     kernel::status::{DriverError, DriverResult},
 };
@@ -257,7 +257,7 @@ fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS
             let target = received.target();
             received.complete_result(execute_immediate(major, target))
         }
-        DispatchPolicy::Queued => DeviceExecutor::receive(received),
+        DispatchPolicy::Queued => DeviceExecutor::receive(received, major),
         DispatchPolicy::SynchronousCleanup => dispatch_cleanup(received),
         DispatchPolicy::SynchronousClose => {
             let target = received.target();
@@ -338,34 +338,19 @@ fn dispatch_file_lock(received: ReceivedIrp) -> NTSTATUS {
     )
 )]
 pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
-    let target = owned.target();
-    let major = match target.current_stack().and_then(|stack| stack.major()) {
-        Ok(major) => major,
-        Err(error) => {
-            let _status = owned.complete_result(Err(error));
-            return;
+    let prepared = owned.prepared_kind();
+    let _status = match prepared {
+        PreparedRequestKind::Major(DispatchMajor::Create) => {
+            let result = crate::request::create::execute(owned.request()).await;
+            owned.complete_create_result(result)
         }
-    };
-    if major == DispatchMajor::Create {
-        let result = crate::request::create::execute(owned.request()).await;
-        let _status = owned.complete_create_result(result);
-        return;
-    }
-    if major == DispatchMajor::FileSystemControl {
-        let result = crate::request::file_system_control::execute(owned.request()).await;
-        let _status = owned.complete_result(result);
-        return;
-    }
-    if major == DispatchMajor::DirectoryControl {
-        let minor = match target.current_stack() {
-            Ok(stack) => stack.directory_control_minor(),
-            Err(error) => {
-                let _status = owned.complete_result(Err(error));
-                return;
-            }
-        };
-        let _status = match minor {
+        PreparedRequestKind::FileSystemControl(minor) => {
+            let result = crate::request::file_system_control::execute(owned.request(), minor).await;
+            owned.complete_result(result)
+        }
+        PreparedRequestKind::DirectoryControl(minor) => match minor {
             DirectoryControlMinorFunction::QueryDirectory => {
+                let target = owned.target();
                 owned.complete_result(crate::request::file_info::query_directory(target).await)
             }
             DirectoryControlMinorFunction::NotifyChangeDirectory => {
@@ -374,10 +359,20 @@ pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
             DirectoryControlMinorFunction::Unsupported => {
                 owned.complete_result(Err(DriverError::InvalidDeviceRequest))
             }
-        };
-        return;
-    }
-    let _status = owned.complete_result(execute_major(major, target).await);
+        },
+        PreparedRequestKind::Major(DispatchMajor::QuerySecurity) => {
+            let result = crate::request::security::query(owned.request()).await;
+            owned.complete_result(result)
+        }
+        PreparedRequestKind::Major(DispatchMajor::SetSecurity) => {
+            let result = crate::request::security::set(owned.request()).await;
+            owned.complete_result(result)
+        }
+        PreparedRequestKind::Major(major) => {
+            let target = owned.target();
+            owned.complete_result(execute_major(major, target).await)
+        }
+    };
 }
 
 /// Executes an immediate IRP during the dispatch callback.
@@ -439,8 +434,10 @@ async fn execute_major(
         // Lock control is terminally delegated to FsRtl before generic execution.
         DispatchMajor::LockControl => Err(DriverError::InvalidDeviceRequest),
         DispatchMajor::Shutdown => crate::request::file_info::shutdown(target).await,
-        DispatchMajor::QuerySecurity => crate::request::security::query(target).await,
-        DispatchMajor::SetSecurity => crate::request::security::set(target).await,
+        // Security requests require requestor-context capture and are selected in execute_owned.
+        DispatchMajor::QuerySecurity | DispatchMajor::SetSecurity => {
+            Err(DriverError::InvalidDeviceRequest)
+        }
     }
 }
 

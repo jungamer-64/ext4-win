@@ -25,8 +25,11 @@ use crate::{
 ///
 /// Returns an error when FSCTL stack decoding, mount, reparse, encryption-key, or verity handling
 /// rejects the request.
-pub(crate) async fn execute(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    match FileSystemControlRequest::decode(request)? {
+pub(crate) async fn execute(
+    request: PendingIrpLease<'_>,
+    minor: FileSystemControlMinorFunction,
+) -> DriverResult<IrpCompletion> {
+    match FileSystemControlRequest::decode(request, minor)? {
         FileSystemControlRequest::MountVolume(request) => {
             mount_volume(request).await.map(|()| IrpCompletion::EMPTY)
         }
@@ -60,10 +63,13 @@ impl<'a> FileSystemControlRequest<'a> {
     ///
     /// Returns an error when the current IRP stack is absent or its mount/user-FSCTL parameters are
     /// malformed.
-    fn decode(request: PendingIrpLease<'a>) -> Result<Self, crate::kernel::status::DriverError> {
+    fn decode(
+        request: PendingIrpLease<'a>,
+        minor: FileSystemControlMinorFunction,
+    ) -> Result<Self, crate::kernel::status::DriverError> {
         let target = request.target();
         let stack = target.current_stack()?;
-        match stack.file_system_control_minor() {
+        match minor {
             FileSystemControlMinorFunction::MountVolume => Ok(Self::MountVolume(
                 MountVolumeRequest::from_stack(request, stack.mount_volume()?),
             )),
