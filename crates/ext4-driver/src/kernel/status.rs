@@ -61,6 +61,10 @@ pub(crate) enum DriverError {
     ObjectPathNotFound,
     /// Create target kind does not satisfy the requested file/directory constraint.
     ObjectTypeMismatch,
+    /// A non-directory create target resolved to a directory.
+    FileIsDirectory,
+    /// A directory create target resolved to a non-directory.
+    NotADirectory,
     /// WDK share-access validation rejected this open.
     ShareAccessConflict,
     /// A byte-range lock held by another requestor blocks this I/O range.
@@ -104,6 +108,8 @@ impl DriverError {
             Self::ObjectNameNotFound => STATUS_OBJECT_NAME_NOT_FOUND,
             Self::ObjectPathNotFound => STATUS_OBJECT_PATH_NOT_FOUND,
             Self::ObjectTypeMismatch => STATUS_OBJECT_TYPE_MISMATCH,
+            Self::FileIsDirectory => ntstatus(0xC000_00BA),
+            Self::NotADirectory => ntstatus(0xC000_0103),
             Self::ShareAccessConflict => ntstatus(0xC000_0043),
             Self::FileLockConflict => ntstatus(0xC000_0054),
             Self::TooManyOpenReferences => STATUS_INSUFFICIENT_RESOURCES,
@@ -255,6 +261,21 @@ mod tests {
         assert_eq!(
             DriverError::FileLockConflict.ntstatus(),
             super::ntstatus(0xC000_0054)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when Windows file-vs-directory create failures lose their exact status.
+    #[test]
+    fn create_target_kind_errors_use_exact_statuses() {
+        assert_eq!(
+            DriverError::FileIsDirectory.ntstatus(),
+            super::ntstatus(0xC000_00BA)
+        );
+        assert_eq!(
+            DriverError::NotADirectory.ntstatus(),
+            super::ntstatus(0xC000_0103)
         );
     }
 
