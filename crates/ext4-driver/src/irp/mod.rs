@@ -194,8 +194,6 @@ impl CreateSymlinkReparseBuffer {
 #[derive(Debug)]
 #[must_use]
 pub(crate) enum CreateCompletion {
-    /// The target was opened and the create IRP completes normally.
-    Opened,
     /// Name resolution must continue through the Microsoft symbolic-link reparse handler.
     ReparseSymlink(CreateSymlinkReparseBuffer),
 }
@@ -638,12 +636,10 @@ impl OwnedIrp {
 
     /// Completes a create IRP from its ownership-bearing, mutually exclusive result.
     ///
-    /// Normal opens use the ordinary success completion. A successful reparse transfers the
-    /// auxiliary buffer to the I/O Manager immediately before completing with `STATUS_REPARSE`.
-    /// Failed results never transfer an allocation.
+    /// A successful reparse transfers the auxiliary buffer to the I/O Manager immediately before
+    /// completing with `STATUS_REPARSE`. Failed results never transfer an allocation.
     pub(crate) fn complete_create_result(self, result: DriverResult<CreateCompletion>) -> NTSTATUS {
         match result {
-            Ok(CreateCompletion::Opened) => self.complete(IrpCompletion::EMPTY),
             Ok(CreateCompletion::ReparseSymlink(buffer)) => {
                 self.target.irp.complete_create_symlink_reparse(buffer)
             }
@@ -3976,37 +3972,6 @@ mod tests {
             wdk_sys::ULONG_PTR::from(wdk_sys::IO_REPARSE_TAG_SYMLINK)
         );
         assert_eq!(reclaimed.as_deref(), Some(EXPECTED.as_slice()));
-    }
-
-    /// # Panics
-    ///
-    /// Panics when a normal create completion publishes an auxiliary allocation or a non-success
-    /// status pair.
-    #[test]
-    fn opened_create_completion_uses_ordinary_empty_success() {
-        let mut device_object = wdk_sys::DEVICE_OBJECT::default();
-        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device_object));
-        assert!(device.is_some());
-        let Some(device) = device else {
-            return;
-        };
-        let mut irp = wdk_sys::IRP::default();
-        let owned = OwnedIrp::from_raw(device, core::ptr::addr_of_mut!(irp));
-        assert!(owned.is_some());
-        if let Some(owned) = owned {
-            assert_eq!(
-                owned.complete_create_result(Ok(CreateCompletion::Opened)),
-                wdk_sys::STATUS_SUCCESS
-            );
-        }
-
-        let auxiliary = unsafe {
-            // SAFETY: The test reads the active tail overlay after create completion.
-            irp.Tail.Overlay.AuxiliaryBuffer
-        };
-        assert!(auxiliary.is_null());
-        assert_eq!(irp_status(&irp), wdk_sys::STATUS_SUCCESS);
-        assert_eq!(irp.IoStatus.Information, 0);
     }
 
     /// # Panics

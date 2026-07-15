@@ -542,9 +542,7 @@ fn open_existing_node(
             )
         }
         CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
-        CreateDisposition::Overwrite
-        | CreateDisposition::OverwriteIf
-        | CreateDisposition::Supersede => {
+        CreateDisposition::Overwrite | CreateDisposition::OverwriteIf => {
             if node_mode == OpenedNodeMode::ReparsePoint {
                 return Err(DriverError::NotSupported);
             }
