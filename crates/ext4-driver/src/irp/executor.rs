@@ -12,13 +12,16 @@ use wdk_sys::{PIO_CSQ, STATUS_SUCCESS};
 #[cfg(not(test))]
 use crate::kernel::ffi;
 #[cfg(not(test))]
-use crate::{kernel::fatal::KernelWideInconsistency, memory};
+use crate::memory;
 use crate::{
-    kernel::status::{DriverError, DriverResult},
+    kernel::{
+        fatal::KernelWideInconsistency,
+        status::{DriverError, DriverResult},
+    },
     state::{KernelDevice, KernelFileObject},
 };
 
-use super::{KernelIrp, OwnedIrp, PendingIrp, ReceivedIrp};
+use super::{DispatchMajor, KernelIrp, OwnedIrp, PendingIrp, QueueContext, ReceivedIrp};
 
 /// One pinned request continuation owned by a device execution lane.
 type DeviceTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -135,7 +138,11 @@ impl DeviceExecutor {
     /// Removes one FIFO IRP without invoking unavailable kernel CSQ services in tests.
     #[cfg(test)]
     pub(super) fn test_remove_next_irp(&self, context: PVOID) -> PIRP {
-        self.remove_next_irp(context)
+        let irp = self.remove_next_irp(context);
+        if let Some(irp) = KernelIrp::from_raw(irp) {
+            drop(irp.take_queue_context());
+        }
+        irp
     }
 
     /// Returns whether a unit-test wake has reserved exactly one worker callback.
@@ -252,17 +259,17 @@ impl DeviceExecutor {
         }
     }
 
-    /// Marks an async-capable IRP pending, inserts it into this device mailbox, and schedules its
-    /// execution lane.
-    pub(crate) fn receive(received: ReceivedIrp) -> NTSTATUS {
+    /// Captures an async request, inserts it into this device mailbox, and schedules its lane.
+    pub(crate) fn receive(received: ReceivedIrp, major: DispatchMajor) -> NTSTATUS {
         let executor = match Self::from_device(received.device()) {
             Ok(executor) => executor,
             Err(error) => return received.complete_result(Err(error)),
         };
-        let pending = match PendingIrp::from_received(received) {
-            Ok(pending) => pending,
-            Err(error) => return error.complete(),
+        let context = match QueueContext::capture(received.target(), major) {
+            Ok(context) => context,
+            Err(completion) => return received.complete(completion),
         };
+        let pending = PendingIrp::from_received(received, context);
         let status = pending.dispatch_status();
         let executor = unsafe {
             // SAFETY: The device extension remains stable for the pending IRP lifetime.
@@ -291,9 +298,8 @@ impl DeviceExecutor {
             if irp.is_null() {
                 return Ok(());
             }
-            if let Some(owned) = OwnedIrp::from_raw(executor.device, irp) {
-                let _status = owned.complete_cancelled();
-            }
+            let owned = OwnedIrp::from_queued_raw(executor.device, irp);
+            let _status = owned.complete_cancelled();
         }
     }
 
@@ -319,11 +325,14 @@ impl DeviceExecutor {
 
     /// Inserts a pending IRP through the cancel-safe queue and records a worker wake.
     fn enqueue(&self, pending: PendingIrp) {
-        let irp = pending.as_raw_irp();
+        #[cfg(test)]
+        mark_pending_for_csq_test(pending.target.irp);
+        let irp = pending.publish();
         #[cfg(not(test))]
         unsafe {
-            // SAFETY: The typestate proves this IRP is pending, and the CSQ now owns its
-            // cancellation-safe mailbox membership.
+            // SAFETY: Context publication transferred the Box before this call. IoCsqInsertIrp
+            // marks the IRP pending and may consume it through inline cancellation, so this path
+            // never dereferences the IRP after the call.
             ffi::IoCsqInsertIrp(
                 self.csq_ptr(),
                 irp,
@@ -440,9 +449,7 @@ impl DeviceExecutor {
             if irp.is_null() {
                 return false;
             }
-            let Some(owned) = OwnedIrp::from_raw(self.device, irp) else {
-                continue;
-            };
+            let owned = OwnedIrp::from_queued_raw(self.device, irp);
             let task = memory::boxed_try_map(owned, |owned| async move {
                 crate::request::dispatch::execute_owned(owned).await;
             });
@@ -496,7 +503,7 @@ impl DeviceExecutor {
     /// Inserts one IRP at the FIFO tail while the CSQ lock is held.
     fn insert_irp(&self, irp: PIRP) {
         let Some(entry) = irp_list_entry(irp) else {
-            return;
+            KernelWideInconsistency::async_executor_state_corruption().bugcheck();
         };
         insert_tail_list(self.list_head.get(), entry);
     }
@@ -504,7 +511,7 @@ impl DeviceExecutor {
     /// Removes one IRP from the FIFO while the CSQ lock is held.
     fn remove_irp(&self, irp: PIRP) {
         let Some(entry) = irp_list_entry(irp) else {
-            return;
+            KernelWideInconsistency::async_executor_state_corruption().bugcheck();
         };
         remove_entry_list(entry);
     }
@@ -519,7 +526,7 @@ impl DeviceExecutor {
             }
         } else {
             let Some(entry) = irp_list_entry(irp) else {
-                return core::ptr::null_mut();
+                KernelWideInconsistency::async_executor_state_corruption().bugcheck();
             };
             unsafe {
                 // SAFETY: The supplied IRP is currently linked under the CSQ lock.
@@ -528,7 +535,7 @@ impl DeviceExecutor {
         };
         while entry != head {
             let candidate = irp_from_list_entry(entry);
-            if irp_matches_context(candidate, context) {
+            if queued_irp_matches_context(candidate, context) {
                 return candidate;
             }
             entry = unsafe {
@@ -624,12 +631,13 @@ unsafe extern "C" fn device_executor_worker(_device: wdk_sys::PDEVICE_OBJECT, co
 /// `csq` must be the first-field CSQ of a live executor and `irp` must be an unlinked pending IRP
 /// handed to this callback by the I/O Manager while the CSQ lock is held.
 unsafe extern "C" fn csq_insert_irp(csq: PIO_CSQ, irp: PIRP) {
-    if let Some(executor) = unsafe {
+    let Some(executor) = (unsafe {
         // SAFETY: The CSQ is the first field of one live executor.
         executor_from_csq(csq)
-    } {
-        executor.insert_irp(irp);
-    }
+    }) else {
+        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
+    };
+    executor.insert_irp(irp);
 }
 
 #[cfg(not(test))]
@@ -639,12 +647,13 @@ unsafe extern "C" fn csq_insert_irp(csq: PIO_CSQ, irp: PIRP) {
 /// `csq` must belong to a live executor and `irp` must currently be linked in that executor's
 /// queue while the CSQ lock is held.
 unsafe extern "C" fn csq_remove_irp(csq: PIO_CSQ, irp: PIRP) {
-    if let Some(executor) = unsafe {
+    let Some(executor) = (unsafe {
         // SAFETY: The CSQ is the first field of one live executor.
         executor_from_csq(csq)
-    } {
-        executor.remove_irp(irp);
-    }
+    }) else {
+        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
+    };
+    executor.remove_irp(irp);
 }
 
 #[cfg(not(test))]
@@ -654,13 +663,13 @@ unsafe extern "C" fn csq_remove_irp(csq: PIO_CSQ, irp: PIRP) {
 /// `csq` must belong to a live executor; a non-null `irp` must be linked in that queue, and a
 /// non-null `context` must be a FILE_OBJECT identity supplied by the I/O Manager.
 unsafe extern "C" fn csq_peek_next_irp(csq: PIO_CSQ, irp: PIRP, context: PVOID) -> PIRP {
-    unsafe {
+    let Some(executor) = (unsafe {
         // SAFETY: The CSQ is the first field of one live executor.
         executor_from_csq(csq)
-    }
-    .map_or(core::ptr::null_mut(), |executor| {
-        executor.peek_next_irp(irp, context)
-    })
+    }) else {
+        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
+    };
+    executor.peek_next_irp(irp, context)
 }
 
 #[cfg(not(test))]
@@ -674,13 +683,13 @@ unsafe extern "C" fn csq_acquire_lock(csq: PIO_CSQ, irql: wdk_sys::PKIRQL) {
         // SAFETY: The CSQ is the first field of one live executor.
         executor_from_csq(csq)
     }) else {
-        return;
+        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
     };
     let Some(irql) = (unsafe {
         // SAFETY: The CSQ framework supplies writable saved-IRQL storage.
         irql.as_mut()
     }) else {
-        return;
+        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
     };
     *irql = unsafe {
         // SAFETY: This lock belongs to the recovered executor.
@@ -699,7 +708,7 @@ unsafe extern "C" fn csq_release_lock(csq: PIO_CSQ, irql: wdk_sys::KIRQL) {
         // SAFETY: The CSQ is the first field of one live executor.
         executor_from_csq(csq)
     }) else {
-        return;
+        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
     };
     unsafe {
         // SAFETY: This releases the acquisition performed by `csq_acquire_lock`.
@@ -718,11 +727,10 @@ unsafe extern "C" fn csq_complete_canceled_irp(csq: PIO_CSQ, irp: PIRP) {
         // SAFETY: The CSQ is the first field of one live executor.
         executor_from_csq(csq)
     }) else {
-        return;
+        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
     };
-    if let Some(owned) = OwnedIrp::from_raw(executor.device, irp) {
-        let _status = owned.complete_cancelled();
-    }
+    let owned = OwnedIrp::from_queued_raw(executor.device, irp);
+    let _status = owned.complete_cancelled();
 }
 
 #[cfg(not(test))]
@@ -748,6 +756,25 @@ fn initialize_list_head(head: PLIST_ENTRY) {
     };
     head.Flink = core::ptr::from_mut(head);
     head.Blink = core::ptr::from_mut(head);
+}
+
+/// Models the pending transition performed internally by `IoCsqInsertIrp` in unit tests.
+#[cfg(test)]
+fn mark_pending_for_csq_test(irp: KernelIrp) {
+    let pending_bit = match u8::try_from(wdk_sys::SL_PENDING_RETURNED) {
+        Ok(bit) => bit,
+        Err(_) => KernelWideInconsistency::async_executor_state_corruption().bugcheck(),
+    };
+    let mut stack = match irp.current_stack() {
+        Ok(stack) => stack,
+        Err(_) => KernelWideInconsistency::async_executor_state_corruption().bugcheck(),
+    };
+    let stack = unsafe {
+        // SAFETY: The test executor owns this not-yet-inserted IRP and models the exact stack-bit
+        // transition that the production IoCsqInsertIrp call performs.
+        stack.stack.as_mut()
+    };
+    stack.Control |= pending_bit;
 }
 
 /// Inserts one entry immediately before the list head.
@@ -815,21 +842,16 @@ fn irp_from_list_entry(entry: PLIST_ENTRY) -> PIRP {
 }
 
 /// Returns whether one queued IRP matches an optional FILE_OBJECT context.
-fn irp_matches_context(irp: PIRP, context: PVOID) -> bool {
-    if context.is_null() {
-        return true;
-    }
+fn queued_irp_matches_context(irp: PIRP, context: PVOID) -> bool {
     let Some(irp) = KernelIrp::from_raw(irp) else {
-        return false;
+        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
     };
-    let Ok(stack) = irp.current_stack() else {
-        return false;
-    };
-    let stack = unsafe {
-        // SAFETY: The pending IRP retains its current stack location while queued.
-        stack.stack.as_ref()
-    };
-    stack.FileObject.cast::<c_void>() == context
+    unsafe {
+        // SAFETY: The CSQ lock retains queue membership, so context publication cannot be taken
+        // until this callback returns its candidate decision.
+        irp.queue_context()
+    }
+    .matches_cancellation_context(context)
 }
 
 #[cfg(test)]
