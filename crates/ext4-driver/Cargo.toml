@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [build-dependencies]
+cc.workspace = true
 wdk-build.workspace = true
 
 [dependencies]
