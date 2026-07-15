@@ -279,10 +279,11 @@ enum DispatchPolicy {
 /// Returns the queue policy for a major function.
 const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
     match major {
-        DispatchMajor::Close | DispatchMajor::DeviceControl => DispatchPolicy::Immediate,
+        DispatchMajor::DeviceControl => DispatchPolicy::Immediate,
         DispatchMajor::Cleanup => DispatchPolicy::QueuedCleanup,
         DispatchMajor::LockControl => DispatchPolicy::FsRtlFileLock,
         DispatchMajor::Create
+        | DispatchMajor::Close
         | DispatchMajor::Read
         | DispatchMajor::Write
         | DispatchMajor::QueryInformation
@@ -368,8 +369,9 @@ pub(crate) fn execute_queued(owned: OwnedIrp) -> NTSTATUS {
 /// execution.
 fn execute_immediate(major: DispatchMajor, target: DispatchTarget) -> DriverResult<IrpCompletion> {
     match major {
-        DispatchMajor::Close | DispatchMajor::DeviceControl => execute_major(major, target),
+        DispatchMajor::DeviceControl => execute_major(major, target),
         DispatchMajor::Create
+        | DispatchMajor::Close
         | DispatchMajor::Cleanup
         | DispatchMajor::Read
         | DispatchMajor::Write
