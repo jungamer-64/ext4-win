@@ -23,7 +23,7 @@ use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 
 use crate::irp::{
     ByteRangeLockKey, DataIoKind, DesiredAccess, DeviceIrpQueue, DirectoryEntryIndex,
-    DispatchTarget, RegularFileWriteAccess, ShareAccess,
+    DispatchTarget, ExistingOperationAccess, RegularFileWriteAccess, ShareAccess,
 };
 use crate::kernel::cng::CngFscryptNonceGenerator;
 use crate::kernel::fatal::KernelWideInconsistency;
@@ -1697,19 +1697,50 @@ impl FileControlBlock {
             .release_for_cleanup(target, file_object);
     }
 
-    /// Checks and records one FILE_OBJECT's share-access claim.
+    /// Checks operation-implied access and records one FILE_OBJECT's requested share-access claim.
     /// # Errors
     ///
-    /// Returns an error when the I/O Manager rejects the requested share-access claim.
-    pub(crate) fn check_share_access(
+    /// Returns an error when existing handles do not share the effective operation access or when
+    /// the requested handle claim cannot be recorded.
+    pub(crate) fn check_operation_and_record_share_access(
+        &mut self,
+        file_object: KernelFileObject,
+        desired_access: DesiredAccess,
+        existing_operation_access: ExistingOperationAccess,
+        share_access: ShareAccess,
+    ) -> DriverResult<()> {
+        let operation_status = unsafe {
+            // SAFETY: The FCB owns this SHARE_ACCESS record for the opened inode identity.
+            // Update is false, so this call checks destructive operation access without recording
+            // it as authority granted to the returned FILE_OBJECT.
+            ffi::IoCheckShareAccess(
+                existing_operation_access.as_raw(),
+                share_access.as_ulong(),
+                file_object.as_ptr(),
+                core::ptr::addr_of_mut!(self.share_access),
+                0,
+            )
+        };
+        if operation_status < STATUS_SUCCESS {
+            return Err(DriverError::ShareAccessConflict);
+        }
+
+        self.record_share_access(file_object, desired_access, share_access)
+    }
+
+    /// Records one FILE_OBJECT's requested share-access claim.
+    /// # Errors
+    ///
+    /// Returns an error when the I/O Manager rejects the handle's requested share-access claim.
+    pub(crate) fn record_share_access(
         &mut self,
         file_object: KernelFileObject,
         desired_access: DesiredAccess,
         share_access: ShareAccess,
     ) -> DriverResult<()> {
         let status = unsafe {
-            // SAFETY: The FCB owns this SHARE_ACCESS record for the opened
-            // inode identity, and FILE_OBJECT is the active create target.
+            // SAFETY: The FCB owns this SHARE_ACCESS record for the opened inode identity. This
+            // call records only the access explicitly requested for the returned FILE_OBJECT.
             ffi::IoCheckShareAccess(
                 desired_access.as_raw(),
                 share_access.as_ulong(),

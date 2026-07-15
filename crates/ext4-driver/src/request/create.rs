@@ -11,10 +11,10 @@ use wdk_sys::FILE_OBJECT;
 
 use crate::{
     irp::{
-        CreateCompletion, CreateDisposition, CreateNameInterpretation, CreateParameters,
-        CreateReparsePointMode, CreateStack, CreateSymlinkReparseBuffer, CreateSynchronizationMode,
-        CreateTargetRequirement, CreateTransferBuffering, DesiredAccess, DispatchTarget,
-        RegularFileWriteAccess, ShareAccess,
+        CreateAction, CreateCompletion, CreateDisposition, CreateNameInterpretation,
+        CreateParameters, CreateReparsePointMode, CreateStack, CreateSymlinkReparseBuffer,
+        CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering, DesiredAccess,
+        DispatchTarget, ExistingOperationAccess, RegularFileWriteAccess, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
@@ -118,10 +118,10 @@ fn open_or_create(request: CreateRequest) -> DriverResult<CreateCompletion> {
             node_mode,
             location,
         }) => open_existing_node(request, vcb, disposition, node, node_mode, location)
-            .map(|()| CreateCompletion::Opened),
+            .map(CreateCompletion::Handle),
         Ok(CreateTargetLookup::Missing { parent, name }) => {
             create_missing_node(request, create_ea, vcb, disposition, parent, &name)
-                .map(|()| CreateCompletion::Opened)
+                .map(CreateCompletion::Handle)
         }
         Ok(CreateTargetLookup::ReparseSymlink {
             point,
@@ -185,8 +185,10 @@ enum CreateTargetLookup {
 /// Per-handle policy decoded from one create/open request.
 #[derive(Clone, Copy, Debug)]
 struct CreateHandlePolicy {
-    /// Access mask used for Windows share-access accounting.
+    /// Access explicitly requested for the returned handle.
     desired_access: DesiredAccess,
+    /// Virtual access used only to preflight an existing-object operation.
+    existing_operation_access: ExistingOperationAccess,
     /// Share mask used for Windows share-access accounting.
     share_access: ShareAccess,
     /// Cleanup-time lifecycle requested by create options.
@@ -210,6 +212,7 @@ impl CreateHandlePolicy {
         let file_object_flags = CreateFileObjectFlags::from_parameters(parameters);
         Ok(Self {
             desired_access: parameters.desired_access(),
+            existing_operation_access: parameters.existing_operation_access(),
             share_access: parameters.share_access(),
             close_disposition: parameters.close_disposition(),
             write_commitment: parameters.write_commitment(),
@@ -226,9 +229,14 @@ impl CreateHandlePolicy {
         })
     }
 
-    /// Returns the desired access mask.
+    /// Returns access explicitly requested for the returned handle.
     const fn desired_access(self) -> DesiredAccess {
         self.desired_access
+    }
+
+    /// Returns virtual access that existing handles must share for this operation.
+    const fn existing_operation_access(self) -> ExistingOperationAccess {
+        self.existing_operation_access
     }
 
     /// Returns the share access mask.
@@ -526,7 +534,7 @@ fn open_existing_node(
     node: NodeId,
     node_mode: OpenedNodeMode,
     location: OpenedLocation,
-) -> DriverResult<()> {
+) -> DriverResult<CreateAction> {
     let parameters = request.parameters();
     let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
     match disposition {
@@ -539,14 +547,12 @@ fn open_existing_node(
                 node_mode,
                 location,
                 policy,
-            )
+            )?;
+            Ok(CreateAction::Opened)
         }
         CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
         CreateDisposition::Overwrite | CreateDisposition::OverwriteIf => {
-            if node_mode == OpenedNodeMode::ReparsePoint {
-                return Err(DriverError::NotSupported);
-            }
-            let inode = overwrite_file_inode(node, parameters.target_requirement())?;
+            let inode = existing_overwrite_file(node, node_mode, parameters.target_requirement())?;
             let handle = memory::boxed_try_with(|| {
                 Ok(OpenedHandle::new(
                     node,
@@ -563,6 +569,7 @@ fn open_existing_node(
                 vcb,
                 node,
                 policy.desired_access(),
+                policy.existing_operation_access(),
                 policy.share_access(),
             )?;
             match truncate_existing_file(vcb, inode) {
@@ -573,7 +580,7 @@ fn open_existing_node(
                         handle,
                         policy.file_object_flags(),
                     );
-                    Ok(())
+                    Ok(CreateAction::Overwritten)
                 }
                 Err(error) => {
                     abandon_file_control_block(request.file_object().kernel_file_object(), fcb);
@@ -581,27 +588,46 @@ fn open_existing_node(
                 }
             }
         }
+        CreateDisposition::Supersede => {
+            validate_existing_node_options(node, parameters.target_requirement())?;
+            match node {
+                NodeId::Directory(directory) => Err(destructive_directory_error(directory)),
+                NodeId::File(_) | NodeId::Symlink(_) => Err(DriverError::NotSupported),
+            }
+        }
     }
 }
 
-/// Resolves an existing regular file inode for overwrite-style dispositions.
+/// Resolves the ext4 regular file whose unnamed data stream is affected by overwrite.
 /// # Errors
 ///
-/// Returns an error when overwrite is requested for a directory-required open or for an existing
-/// non-file node.
-fn overwrite_file_inode(
+/// Returns an error when overwrite is requested for a directory or a native symlink reparse point
+/// whose Windows stream projection has not yet been normalized independently from target bytes.
+fn existing_overwrite_file(
     node: NodeId,
+    node_mode: OpenedNodeMode,
     requirement: CreateTargetRequirement,
 ) -> DriverResult<FileNodeId> {
     if matches!(requirement, CreateTargetRequirement::Directory) {
-        return Err(DriverError::NotSupported);
+        return Err(DriverError::InvalidParameter);
     }
-    if matches!(requirement, CreateTargetRequirement::NonDirectory) {
-        validate_existing_node_options(node, requirement)?;
-    }
+    validate_existing_node_options(node, requirement)?;
     match node {
         NodeId::File(file) => Ok(file),
-        NodeId::Directory(_) | NodeId::Symlink(_) => Err(DriverError::ObjectTypeMismatch),
+        NodeId::Directory(directory) => Err(destructive_directory_error(directory)),
+        NodeId::Symlink(_) if node_mode == OpenedNodeMode::ReparsePoint => {
+            Err(DriverError::NotSupported)
+        }
+        NodeId::Symlink(_) => Err(DriverError::InternalInvariantViolation),
+    }
+}
+
+/// Returns the exact Windows error for a destructive create against a directory.
+fn destructive_directory_error(directory: DirectoryNodeId) -> DriverError {
+    if directory == DirectoryNodeId::ROOT {
+        DriverError::AccessDenied
+    } else {
+        DriverError::ObjectNameCollision
     }
 }
 
@@ -617,7 +643,7 @@ fn create_missing_node(
     disposition: CreateDisposition,
     parent: DirectoryNodeId,
     name: &Ext4Name,
-) -> DriverResult<()> {
+) -> DriverResult<CreateAction> {
     let parameters = request.parameters();
     let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
     match disposition {
@@ -679,7 +705,7 @@ fn create_missing_node(
                 policy.file_object_flags(),
             );
             vcb.report_directory_name_change(notification);
-            Ok(())
+            Ok(CreateAction::Created)
         }
         Err(error) => {
             abandon_file_control_block(request.file_object().kernel_file_object(), fcb);
@@ -716,10 +742,10 @@ fn validate_existing_node_options(
     match requirement {
         CreateTargetRequirement::Any => {}
         CreateTargetRequirement::Directory if !matches!(node, NodeId::Directory(_)) => {
-            return Err(DriverError::ObjectTypeMismatch);
+            return Err(DriverError::NotADirectory);
         }
         CreateTargetRequirement::NonDirectory if matches!(node, NodeId::Directory(_)) => {
-            return Err(DriverError::ObjectTypeMismatch);
+            return Err(DriverError::FileIsDirectory);
         }
         CreateTargetRequirement::Directory | CreateTargetRequirement::NonDirectory => {}
     }
@@ -1050,6 +1076,7 @@ fn initialize_file_object(
         vcb,
         node,
         policy.desired_access(),
+        policy.existing_operation_access(),
         policy.share_access(),
     )?;
     attach_preallocated_file_object(file_object, fcb, handle, policy.file_object_flags());
@@ -1066,6 +1093,7 @@ fn open_shared_file_control_block(
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: NodeId,
     desired_access: DesiredAccess,
+    existing_operation_access: ExistingOperationAccess,
     share_access: ShareAccess,
 ) -> DriverResult<NonNull<FileControlBlock>> {
     let mut fcb = VolumeControlBlock::open_file_control_block(vcb, node)?;
@@ -1074,9 +1102,10 @@ fn open_shared_file_control_block(
         // reference for this create request.
         fcb.as_mut()
     };
-    if let Err(error) = fcb_ref.check_share_access(
+    if let Err(error) = fcb_ref.check_operation_and_record_share_access(
         file_object.kernel_file_object(),
         desired_access,
+        existing_operation_access,
         share_access,
     ) {
         release_file_control_block(fcb);
@@ -1102,7 +1131,7 @@ fn open_pending_child_file_control_block(
         // an open reference for this create request.
         fcb.as_mut()
     };
-    if let Err(error) = fcb_ref.check_share_access(
+    if let Err(error) = fcb_ref.record_share_access(
         file_object.kernel_file_object(),
         desired_access,
         share_access,
@@ -1523,6 +1552,38 @@ mod tests {
                 CreateReparsePointMode::OpenFinalReparsePoint,
             ),
             ReparsePointEncounter::OpenFinal
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when destructive directory errors lose target-option or root distinctions.
+    #[test]
+    fn existing_overwrite_rejects_directories_with_exact_status() {
+        let directory = NodeId::Directory(DirectoryNodeId::ROOT);
+        assert_eq!(
+            existing_overwrite_file(
+                directory,
+                OpenedNodeMode::ReparsePoint,
+                CreateTargetRequirement::Any,
+            ),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            existing_overwrite_file(
+                directory,
+                OpenedNodeMode::ReparsePoint,
+                CreateTargetRequirement::NonDirectory,
+            ),
+            Err(DriverError::FileIsDirectory)
+        );
+        assert_eq!(
+            existing_overwrite_file(
+                directory,
+                OpenedNodeMode::ReparsePoint,
+                CreateTargetRequirement::Directory,
+            ),
+            Err(DriverError::InvalidParameter)
         );
     }
 

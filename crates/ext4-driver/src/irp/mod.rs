@@ -194,8 +194,32 @@ impl CreateSymlinkReparseBuffer {
 #[derive(Debug)]
 #[must_use]
 pub(crate) enum CreateCompletion {
+    /// A handle was established with one exact Windows create action.
+    Handle(CreateAction),
     /// Name resolution must continue through the Microsoft symbolic-link reparse handler.
     ReparseSymlink(CreateSymlinkReparseBuffer),
+}
+
+/// Successful Windows create action stored in `IO_STATUS_BLOCK::Information`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateAction {
+    /// An existing object was opened without destructive mutation.
+    Opened,
+    /// A missing object was created.
+    Created,
+    /// An existing object's data stream was overwritten.
+    Overwritten,
+}
+
+impl CreateAction {
+    /// Returns the WDK `FILE_*` create action value.
+    const fn as_ulong(self) -> wdk_sys::ULONG {
+        match self {
+            Self::Opened => wdk_sys::FILE_OPENED,
+            Self::Created => wdk_sys::FILE_CREATED,
+            Self::Overwritten => wdk_sys::FILE_OVERWRITTEN,
+        }
+    }
 }
 
 /// IRP major-function slot owned by the ext4win dispatch boundary.
@@ -640,6 +664,7 @@ impl OwnedIrp {
     /// completing with `STATUS_REPARSE`. Failed results never transfer an allocation.
     pub(crate) fn complete_create_result(self, result: DriverResult<CreateCompletion>) -> NTSTATUS {
         match result {
+            Ok(CreateCompletion::Handle(action)) => self.target.irp.complete_create_action(action),
             Ok(CreateCompletion::ReparseSymlink(buffer)) => {
                 self.target.irp.complete_create_symlink_reparse(buffer)
             }
@@ -1434,6 +1459,15 @@ impl KernelIrp {
         self.install_create_symlink_reparse_buffer(buffer);
         self.write_status_and_information(wdk_sys::STATUS_REPARSE, information);
         self.finish_completion(wdk_sys::STATUS_REPARSE)
+    }
+
+    /// Completes a successful create with its exact `FILE_*` action result.
+    fn complete_create_action(self, action: CreateAction) -> NTSTATUS {
+        self.write_status_and_information(
+            wdk_sys::STATUS_SUCCESS,
+            wdk_sys::ULONG_PTR::from(action.as_ulong()),
+        );
+        self.finish_completion(wdk_sys::STATUS_SUCCESS)
     }
 
     /// Completes the IRP through the I/O Manager.
@@ -2741,12 +2775,15 @@ impl CreateParameters {
         ea_length: IrpBufferLength,
     ) -> Result<Self, DriverError> {
         let desired_access = DesiredAccess::from_raw(desired_access);
+        let disposition = CreateDisposition::from_options(options)?;
         let create_options = CreateOptions::decode(options, desired_access)?;
+        let target_requirement = create_options.target_requirement();
+        disposition.validate_target_requirement(target_requirement)?;
         Ok(Self {
             desired_access,
             share_access: ShareAccess::from_raw(share_access)?,
-            disposition: CreateDisposition::from_options(options)?,
-            target_requirement: create_options.target_requirement(),
+            disposition,
+            target_requirement,
             close_disposition: create_options.close_disposition(),
             write_commitment: create_options.write_commitment(),
             transfer_buffering: create_options.transfer_buffering(),
@@ -2760,6 +2797,20 @@ impl CreateParameters {
     /// Returns the desired access mask.
     pub(crate) const fn desired_access(self) -> DesiredAccess {
         self.desired_access
+    }
+
+    /// Returns virtual access whose sharing must permit this existing-object operation.
+    pub(crate) const fn existing_operation_access(self) -> ExistingOperationAccess {
+        let required = match self.disposition {
+            CreateDisposition::Overwrite | CreateDisposition::OverwriteIf => {
+                wdk_sys::FILE_WRITE_DATA | wdk_sys::FILE_WRITE_EA | wdk_sys::FILE_WRITE_ATTRIBUTES
+            }
+            CreateDisposition::Supersede => {
+                wdk_sys::DELETE | wdk_sys::FILE_WRITE_EA | wdk_sys::FILE_WRITE_ATTRIBUTES
+            }
+            CreateDisposition::Open | CreateDisposition::Create | CreateDisposition::OpenIf => 0,
+        };
+        self.desired_access.including_for_operation(required)
     }
 
     /// Returns the share access.
@@ -2820,6 +2871,13 @@ pub(crate) struct DesiredAccess {
     raw: wdk_sys::ACCESS_MASK,
 }
 
+/// Virtual access used to preflight an existing-object create operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExistingOperationAccess {
+    /// Raw WDK access mask checked without recording it as returned handle authority.
+    raw: wdk_sys::ACCESS_MASK,
+}
+
 /// Write authority retained for one opened regular-file handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegularFileWriteAccess {
@@ -2842,6 +2900,16 @@ impl DesiredAccess {
         self.raw
     }
 
+    /// Adds rights implied only for the duration of an existing-object operation.
+    const fn including_for_operation(
+        self,
+        required: wdk_sys::ACCESS_MASK,
+    ) -> ExistingOperationAccess {
+        ExistingOperationAccess {
+            raw: self.raw | required,
+        }
+    }
+
     /// Projects Windows desired-access bits into regular-file write authority.
     pub(crate) const fn regular_file_write_access(self) -> RegularFileWriteAccess {
         if self.contains(wdk_sys::FILE_WRITE_DATA) {
@@ -2856,6 +2924,13 @@ impl DesiredAccess {
     /// Returns whether all selected access bits are present.
     const fn contains(self, mask: wdk_sys::ACCESS_MASK) -> bool {
         self.raw & mask == mask
+    }
+}
+
+impl ExistingOperationAccess {
+    /// Returns the WDK access mask for `IoCheckShareAccess`.
+    pub(crate) const fn as_raw(self) -> wdk_sys::ACCESS_MASK {
+        self.raw
     }
 }
 
@@ -2919,6 +2994,20 @@ impl CreateDisposition {
             FILE_OVERWRITE_IF_DISPOSITION => Ok(Self::OverwriteIf),
             _ => Err(DriverError::InvalidParameter),
         }
+    }
+
+    /// Validates create-disposition and target-kind combinations before path lookup.
+    /// # Errors
+    ///
+    /// Returns an error when a destructive file disposition is combined with
+    /// `FILE_DIRECTORY_FILE`.
+    fn validate_target_requirement(self, requirement: CreateTargetRequirement) -> DriverResult<()> {
+        if matches!(requirement, CreateTargetRequirement::Directory)
+            && matches!(self, Self::Overwrite | Self::OverwriteIf | Self::Supersede)
+        {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(())
     }
 }
 
@@ -3078,6 +3167,9 @@ impl CreateOptions {
         let reparse_point_mode = CreateReparsePointMode::from_options(options);
         let name_interpretation = CreateNameInterpretation::from_options(options);
         let close_disposition = if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
+            if !desired_access.contains(wdk_sys::DELETE) {
+                return Err(DriverError::InvalidParameter);
+            }
             CloseDisposition::Delete
         } else {
             CloseDisposition::Keep
@@ -3711,19 +3803,22 @@ mod tests {
     use wdk_sys::{STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
 
     use super::{
-        CREATE_DISPOSITION_SHIFT, CreateCompletion, CreateDisposition, CreateNameInterpretation,
-        CreateReparsePointMode, CreateSymlinkReparseBuffer, CreateSynchronizationMode,
-        CreateTargetRequirement, CreateTransferBuffering, CurrentIrpStackLocation, DataIoKind,
-        DeviceIrpQueue, DirectoryChangeFilter, DirectoryControlMinorFunction,
-        DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
-        DirectoryPatternInput, DirectoryWatchScope, DispatchTarget, EaEntryEmission, EaEntryIndex,
-        EaSelection, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
-        FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
-        IrpCompletion, KernelIrp, OwnedIrp, QueryFileInformationClass, QueryVolumeInformationClass,
-        QueueWorkerState, ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, STATUS_CANCELLED,
+        CREATE_DISPOSITION_SHIFT, CreateAction, CreateCompletion, CreateDisposition,
+        CreateNameInterpretation, CreateReparsePointMode, CreateSymlinkReparseBuffer,
+        CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering,
+        CurrentIrpStackLocation, DataIoKind, DeviceIrpQueue, DirectoryChangeFilter,
+        DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
+        DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope, DispatchTarget,
+        EaEntryEmission, EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION,
+        FILE_OPEN_IF_DISPOSITION, FILE_OVERWRITE_DISPOSITION, FILE_OVERWRITE_IF_DISPOSITION,
+        FILE_SUPERSEDE_DISPOSITION, FileSystemControlMinorFunction, FsControlCode,
+        InformationLength, IrpBufferLength, IrpCompletion, KernelIrp, OwnedIrp,
+        QueryFileInformationClass, QueryVolumeInformationClass, QueueWorkerState,
+        ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, STATUS_CANCELLED,
         SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
         WriteStartingPoint,
     };
+    use crate::kernel::status::DriverError;
     use crate::state::{
         CloseDisposition, KernelDevice, KernelFileObject, KernelSecurityDescriptor, KernelVpb,
         WriteCommitment,
@@ -3972,6 +4067,44 @@ mod tests {
             wdk_sys::ULONG_PTR::from(wdk_sys::IO_REPARSE_TAG_SYMLINK)
         );
         assert_eq!(reclaimed.as_deref(), Some(EXPECTED.as_slice()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a successful handle create does not publish its exact Windows create action.
+    #[test]
+    fn create_handle_completion_publishes_exact_action() {
+        for (action, expected) in [
+            (CreateAction::Opened, wdk_sys::FILE_OPENED),
+            (CreateAction::Created, wdk_sys::FILE_CREATED),
+            (CreateAction::Overwritten, wdk_sys::FILE_OVERWRITTEN),
+        ] {
+            let mut device_object = wdk_sys::DEVICE_OBJECT::default();
+            let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device_object));
+            assert!(device.is_some());
+            let Some(device) = device else {
+                return;
+            };
+            let mut irp = wdk_sys::IRP::default();
+            let owned = OwnedIrp::from_raw(device, core::ptr::addr_of_mut!(irp));
+            assert!(owned.is_some());
+            let Some(owned) = owned else {
+                return;
+            };
+
+            assert_eq!(
+                owned.complete_create_result(Ok(CreateCompletion::Handle(action))),
+                wdk_sys::STATUS_SUCCESS
+            );
+
+            let auxiliary = unsafe {
+                // SAFETY: The test reads the active tail overlay after create completion.
+                irp.Tail.Overlay.AuxiliaryBuffer
+            };
+            assert!(auxiliary.is_null());
+            assert_eq!(irp_status(&irp), wdk_sys::STATUS_SUCCESS);
+            assert_eq!(irp.IoStatus.Information, wdk_sys::ULONG_PTR::from(expected));
+        }
     }
 
     /// # Panics
@@ -4537,11 +4670,128 @@ mod tests {
 
     /// # Panics
     ///
+    /// Panics when a destructive file disposition is accepted with `FILE_DIRECTORY_FILE`.
+    #[test]
+    fn create_stack_rejects_directory_destructive_dispositions() {
+        for disposition in [
+            FILE_OVERWRITE_DISPOSITION,
+            FILE_OVERWRITE_IF_DISPOSITION,
+            FILE_SUPERSEDE_DISPOSITION,
+        ] {
+            let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+            let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
+            stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+            stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+                SecurityContext: core::ptr::addr_of_mut!(security_context),
+                Options: (disposition << CREATE_DISPOSITION_SHIFT) | wdk_sys::FILE_DIRECTORY_FILE,
+                __bindgen_padding_0: [0; 2],
+                FileAttributes: 0,
+                ShareAccess: 0,
+                __bindgen_padding_1: 0,
+                EaLength: 0,
+            };
+
+            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            assert!(current.is_ok());
+            if let Ok(current) = current {
+                assert_eq!(current.create().err(), Some(DriverError::InvalidParameter));
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when existing-object dispositions do not add virtual operation access.
+    #[test]
+    fn create_parameters_separate_handle_access_from_operation_access() {
+        let requested_access = wdk_sys::FILE_READ_ATTRIBUTES;
+        for (disposition, required_access) in [
+            (FILE_OPEN_DISPOSITION, 0),
+            (
+                FILE_OVERWRITE_DISPOSITION,
+                wdk_sys::FILE_WRITE_DATA | wdk_sys::FILE_WRITE_EA | wdk_sys::FILE_WRITE_ATTRIBUTES,
+            ),
+            (
+                FILE_OVERWRITE_IF_DISPOSITION,
+                wdk_sys::FILE_WRITE_DATA | wdk_sys::FILE_WRITE_EA | wdk_sys::FILE_WRITE_ATTRIBUTES,
+            ),
+            (
+                FILE_SUPERSEDE_DISPOSITION,
+                wdk_sys::DELETE | wdk_sys::FILE_WRITE_EA | wdk_sys::FILE_WRITE_ATTRIBUTES,
+            ),
+        ] {
+            let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+            let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
+                DesiredAccess: requested_access,
+                ..wdk_sys::IO_SECURITY_CONTEXT::default()
+            };
+            stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+            stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+                SecurityContext: core::ptr::addr_of_mut!(security_context),
+                Options: disposition << CREATE_DISPOSITION_SHIFT,
+                __bindgen_padding_0: [0; 2],
+                FileAttributes: 0,
+                ShareAccess: 0,
+                __bindgen_padding_1: 0,
+                EaLength: 0,
+            };
+
+            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            assert!(current.is_ok());
+            let Ok(current) = current else {
+                return;
+            };
+            let create = current.create();
+            assert!(create.is_ok());
+            if let Ok(create) = create {
+                assert_eq!(
+                    create.parameters().desired_access().as_raw(),
+                    requested_access
+                );
+                assert_eq!(
+                    create.parameters().existing_operation_access().as_raw(),
+                    requested_access | required_access
+                );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when delete-on-close is accepted without DELETE access.
+    #[test]
+    fn create_stack_rejects_delete_on_close_without_delete_access() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
+        stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
+        stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+            SecurityContext: core::ptr::addr_of_mut!(security_context),
+            Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
+                | wdk_sys::FILE_DELETE_ON_CLOSE,
+            __bindgen_padding_0: [0; 2],
+            FileAttributes: 0,
+            ShareAccess: 0,
+            __bindgen_padding_1: 0,
+            EaLength: 0,
+        };
+
+        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            assert_eq!(current.create().err(), Some(DriverError::InvalidParameter));
+        }
+    }
+
+    /// # Panics
+    ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn create_stack_decodes_delete_on_close_as_close_disposition() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
+        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
+            DesiredAccess: wdk_sys::DELETE,
+            ..wdk_sys::IO_SECURITY_CONTEXT::default()
+        };
         stack.FileObject = NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr();
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::addr_of_mut!(security_context),
