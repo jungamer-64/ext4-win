@@ -22,7 +22,7 @@ use crate::memory::DriverVec;
 use crate::state::{
     CloseDisposition, DirectoryCursor, DirectoryNameChange, DirectoryNameChangeAction,
     DirectoryNotificationRegistration, FileControlBlock, KernelFileObject, MountedVolumeDevice,
-    OpenedDirectory, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
+    OpenedDirectory, OpenedHandle, OpenedLocation, OpenedObject, OpenedRegularFile,
     VolumeControlBlock, WriteCommitment, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
@@ -2579,7 +2579,7 @@ mod tests {
         RegularFileWriteAccess, WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
-    use crate::state::OpenedLocation;
+    use crate::state::{CloseDisposition, OpenedLocation, OpenedNodeMode};
     use ext4_core::{
         BlockSize, DirectoryNodeId, Ext4Gid, Ext4LinkCount, Ext4Name, Ext4Owner, Ext4Permissions,
         Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileOffset, FileSize, NodeId, WindowsName,
@@ -2814,6 +2814,79 @@ mod tests {
                 .err(),
             Some(DriverError::InvalidParameter)
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a reparse-point handle cannot retain a disposition-delete request.
+    #[test]
+    fn reparse_point_handle_accepts_disposition_delete() {
+        let volume = NonNull::<crate::state::VolumeControlBlock>::dangling();
+        let node = NodeId::Directory(DirectoryNodeId::ROOT);
+        let mut fcb = crate::state::FileControlBlock::new(volume, node);
+        let name = Ext4Name::new(b"link");
+        assert!(name.is_ok());
+        let Ok(name) = name else {
+            return;
+        };
+        let mut handle = crate::state::OpenedHandle::new(
+            node,
+            OpenedNodeMode::ReparsePoint,
+            OpenedLocation::DirectoryEntry {
+                parent: DirectoryNodeId::ROOT,
+                name,
+            },
+            CloseDisposition::Keep,
+            crate::state::WriteCommitment::CommitOnly,
+            crate::state::DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
+        );
+        let mut file_object = wdk_sys::FILE_OBJECT {
+            FsContext: core::ptr::addr_of_mut!(fcb).cast(),
+            FsContext2: core::ptr::addr_of_mut!(handle).cast(),
+            ..wdk_sys::FILE_OBJECT::default()
+        };
+        let mut input = wdk_sys::FILE_DISPOSITION_INFORMATION { DeleteFile: 1 };
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: core::ptr::addr_of_mut!(file_object),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
+            Length: u32::try_from(core::mem::size_of_val(&input)).unwrap_or(u32::MAX),
+            __bindgen_padding_0: 0,
+            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformation,
+            FileObject: core::ptr::null_mut(),
+            __bindgen_anon_1:
+                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
+        };
+        let mut irp = wdk_sys::IRP::default();
+        irp.AssociatedIrp.SystemBuffer = core::ptr::addr_of_mut!(input).cast();
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let target = target_from_stack(&mut stack, &mut irp, &mut device);
+        assert!(target.is_ok());
+        let Ok(target) = target else {
+            return;
+        };
+        let request = super::SetFileRequest::decode(target);
+        assert!(request.is_ok());
+        let Ok(request) = request else {
+            return;
+        };
+
+        assert_eq!(super::set_disposition_information(request), Ok(()));
+
+        let file_object =
+            crate::state::KernelFileObject::from_raw(core::ptr::addr_of_mut!(file_object));
+        assert!(file_object.is_some());
+        let Some(file_object) = file_object else {
+            return;
+        };
+        let opened = crate::state::OpenedObject::decode(file_object);
+        assert!(opened.is_ok());
+        if let Ok(opened) = opened {
+            assert_eq!(opened.node_mode(), OpenedNodeMode::ReparsePoint);
+            assert_eq!(opened.close_disposition(), CloseDisposition::Delete);
+        }
     }
 
     /// # Panics
