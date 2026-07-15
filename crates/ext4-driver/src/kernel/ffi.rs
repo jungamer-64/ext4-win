@@ -19,5 +19,6 @@ pub(crate) use wdk_sys::ntddk::{
     FsRtlNotifyUninitializeSync, FsRtlProcessFileLock, FsRtlUninitializeFileLock,
     IoAllocateWorkItem, IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeWorkItem,
     IoGetRequestorProcess, IoQueueWorkItem, IoRegisterShutdownNotification,
-    KeAcquireSpinLockRaiseToDpc, KeInitializeSpinLock, KeReleaseSpinLock,
+    KeAcquireGuardedMutex, KeAcquireSpinLockRaiseToDpc, KeInitializeGuardedMutex,
+    KeInitializeSpinLock, KeReleaseGuardedMutex, KeReleaseSpinLock,
 };

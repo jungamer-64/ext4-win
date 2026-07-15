@@ -1,12 +1,13 @@
 //! Driver-local lifecycle and open-object state.
 
 use alloc::boxed::Box;
-#[cfg(not(test))]
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::fmt;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
+#[cfg(test)]
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use ext4_core::{
     DeviceLength, DirectoryNodeId, Ext4Name, Ext4Timestamp, FileNodeId, FileOffset,
@@ -597,8 +598,215 @@ pub(crate) struct VolumeControlBlock {
     directory_change_notifier: DirectoryChangeNotifier,
     /// Mounted journaled read-write ext4 volume.
     volume: JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator>,
-    /// VCB-owned FCBs keyed by ext4 node identity.
-    file_control_blocks: DriverVec<Box<FileControlBlock>>,
+    /// Synchronized VCB-owned FCB identities and Windows share ledger.
+    file_control_blocks: FileControlBlockLedger,
+}
+
+/// VCB-owned FCB table and share accounting protected by one concrete kernel mutex.
+#[derive(Debug)]
+struct FileControlBlockLedger {
+    /// Stable-address guarded mutex for every table/share/open-count transition.
+    lock: Box<FileControlBlockLedgerLock>,
+    /// Mutable ledger state reachable only while `lock` is held.
+    table: UnsafeCell<DriverVec<Box<FileControlBlock>>>,
+}
+
+// SAFETY: Every production and test access to `table` is serialized by `lock`; no reference to
+// the table or an FCB's ledger-owned mutable fields escapes the guard scope.
+unsafe impl Sync for FileControlBlockLedger {}
+
+/// Stable-address WDK guarded mutex dedicated to the FCB ledger.
+#[derive(Debug)]
+struct FileControlBlockLedgerLock {
+    /// Native mutex initialized only after this wrapper reaches its final Box address.
+    #[cfg(not(test))]
+    native: UnsafeCell<wdk_sys::KGUARDED_MUTEX>,
+    /// Sound single-owner model used by host unit tests where kernel mutex routines are absent.
+    #[cfg(test)]
+    held: AtomicBool,
+}
+
+// SAFETY: `native` is accessed only through the WDK guarded-mutex routines; the test ownership bit
+// is atomic. Both implementations provide exclusive guard ownership.
+unsafe impl Sync for FileControlBlockLedgerLock {}
+
+/// Exclusive ownership of the FCB ledger mutex.
+struct FileControlBlockLedgerGuard<'a> {
+    /// Lock released when the ledger transition scope ends.
+    lock: &'a FileControlBlockLedgerLock,
+}
+
+impl FileControlBlockLedgerLock {
+    /// Allocates and initializes a guarded mutex at its permanent address.
+    /// # Errors
+    ///
+    /// Returns an error when stable lock storage cannot be allocated.
+    fn try_new() -> DriverResult<Box<Self>> {
+        let lock = memory::boxed_try_with(|| {
+            Ok(Self {
+                #[cfg(not(test))]
+                native: UnsafeCell::new(wdk_sys::KGUARDED_MUTEX::default()),
+                #[cfg(test)]
+                held: AtomicBool::new(false),
+            })
+        })?;
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: `lock` is now Box-pinned for its entire initialized lifetime and guarded
+            // mutex initialization does not retain any caller-owned temporary storage.
+            ffi::KeInitializeGuardedMutex(lock.native.get());
+        }
+        Ok(lock)
+    }
+
+    /// Acquires exclusive ledger ownership until the returned guard drops.
+    fn acquire(&self) -> FileControlBlockLedgerGuard<'_> {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The mutex was initialized at this stable address and every acquisition is
+            // paired with `Drop` on the returned guard.
+            ffi::KeAcquireGuardedMutex(self.native.get());
+        }
+        #[cfg(test)]
+        while self
+            .held
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        FileControlBlockLedgerGuard { lock: self }
+    }
+}
+
+impl Drop for FileControlBlockLedgerGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: This guard uniquely owns the matching successful mutex acquisition.
+            ffi::KeReleaseGuardedMutex(self.lock.native.get());
+        }
+        #[cfg(test)]
+        self.lock.held.store(false, Ordering::Release);
+    }
+}
+
+impl FileControlBlockLedger {
+    /// Creates an empty synchronized FCB ledger.
+    /// # Errors
+    ///
+    /// Returns an error when the stable kernel mutex cannot be allocated.
+    fn try_new() -> DriverResult<Self> {
+        Ok(Self {
+            lock: FileControlBlockLedgerLock::try_new()?,
+            table: UnsafeCell::new(DriverVec::new()),
+        })
+    }
+
+    /// Opens an existing-node FCB and atomically records its share claim.
+    /// # Errors
+    ///
+    /// Returns an error when FCB allocation/reference growth or Windows share validation fails.
+    fn open_existing(
+        &self,
+        volume: NonNull<VolumeControlBlock>,
+        node: NodeId,
+        file_object: KernelFileObject,
+        desired_access: DesiredAccess,
+        existing_operation_access: ExistingOperationAccess,
+        share_access: ShareAccess,
+    ) -> DriverResult<NonNull<FileControlBlock>> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The guarded mutex uniquely owns ledger mutation for this scope.
+            &mut *self.table.get()
+        };
+        let mut fcb = open_file_control_block_in_table(table, volume, node)?;
+        let share_result = unsafe {
+            // SAFETY: `fcb` was returned from `table` while the ledger guard remains held.
+            fcb.as_mut()
+        }
+        .check_operation_and_record_share_access(
+            file_object,
+            desired_access,
+            existing_operation_access,
+            share_access,
+        );
+        if let Err(error) = share_result {
+            close_file_control_block_in_table(table, fcb);
+            return Err(error);
+        }
+        Ok(fcb)
+    }
+
+    /// Opens a staged-new-node FCB and atomically records its share claim.
+    /// # Errors
+    ///
+    /// Returns an error when FCB allocation/reference growth or Windows share validation fails.
+    fn open_new(
+        &self,
+        volume: NonNull<VolumeControlBlock>,
+        node: NodeId,
+        file_object: KernelFileObject,
+        desired_access: DesiredAccess,
+        share_access: ShareAccess,
+    ) -> DriverResult<NonNull<FileControlBlock>> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The guarded mutex uniquely owns ledger mutation for this scope.
+            &mut *self.table.get()
+        };
+        let mut fcb = open_file_control_block_in_table(table, volume, node)?;
+        let share_result = unsafe {
+            // SAFETY: `fcb` was returned from `table` while the ledger guard remains held.
+            fcb.as_mut()
+        }
+        .record_share_access(file_object, desired_access, share_access);
+        if let Err(error) = share_result {
+            close_file_control_block_in_table(table, fcb);
+            return Err(error);
+        }
+        Ok(fcb)
+    }
+
+    /// Releases a share claim while retaining the FILE_OBJECT's FCB reference until close.
+    fn release_share_access(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        file_object: KernelFileObject,
+    ) {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The guarded mutex uniquely owns ledger mutation for this scope.
+            &mut *self.table.get()
+        };
+        ledger_file_control_block_mut(table, fcb).remove_share_access(file_object);
+    }
+
+    /// Rolls back a recorded share claim and its FCB reference before FILE_OBJECT attachment.
+    fn abandon_open(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        file_object: KernelFileObject,
+    ) {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The guarded mutex uniquely owns ledger mutation for this scope.
+            &mut *self.table.get()
+        };
+        ledger_file_control_block_mut(table, fcb).remove_share_access(file_object);
+        close_file_control_block_in_table(table, fcb);
+    }
+
+    /// Releases one FILE_OBJECT's final FCB reference at close.
+    fn close(&self, fcb: NonNull<FileControlBlock>) {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The guarded mutex uniquely owns ledger mutation for this scope.
+            &mut *self.table.get()
+        };
+        close_file_control_block_in_table(table, fcb);
+    }
 }
 
 #[derive(Debug)]
@@ -618,7 +826,7 @@ impl VolumeControlBlock {
     pub(crate) fn mount_journaled(
         target_device: KernelDevice,
         length: DeviceLength,
-    ) -> Ext4Result<Self> {
+    ) -> DriverResult<Self> {
         let block_device = KernelBlockDevice::new(target_device, length);
         let volume = JournaledVolume::<_, CngFscryptNonceGenerator>::mount(
             block_device,
@@ -627,7 +835,7 @@ impl VolumeControlBlock {
         Ok(Self {
             directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
             volume,
-            file_control_blocks: DriverVec::new(),
+            file_control_blocks: FileControlBlockLedger::try_new()?,
         })
     }
 
@@ -707,20 +915,32 @@ impl VolumeControlBlock {
         self.volume.fscrypt_key_presence(identifier)
     }
 
-    /// Opens or reuses the VCB-owned FCB for a node.
+    /// Opens or reuses an existing node's FCB and records its share claim atomically.
     /// # Errors
     ///
-    /// Returns an error when an existing FCB's open-reference counter would overflow.
-    pub(crate) fn open_file_control_block(
-        mut volume: NonNull<Self>,
+    /// Returns an error when FCB allocation/reference growth or Windows share validation fails.
+    pub(crate) fn open_existing_file_control_block(
+        volume: NonNull<Self>,
         node: NodeId,
+        file_object: KernelFileObject,
+        desired_access: DesiredAccess,
+        existing_operation_access: ExistingOperationAccess,
+        share_access: ShareAccess,
     ) -> DriverResult<NonNull<FileControlBlock>> {
         let vcb = unsafe {
             // SAFETY: The caller passes a live mounted VCB pointer from the
-            // mounted device extension while processing create/open.
-            volume.as_mut()
+            // mounted device extension while processing create/open. The FCB ledger provides its
+            // own interior synchronization and is accessed through a shared VCB reference.
+            volume.as_ref()
         };
-        open_file_control_block_in_table(&mut vcb.file_control_blocks, volume, node)
+        vcb.file_control_blocks.open_existing(
+            volume,
+            node,
+            file_object,
+            desired_access,
+            existing_operation_access,
+            share_access,
+        )
     }
 
     /// Starts a missing-child create transaction without committing filesystem state.
@@ -737,7 +957,7 @@ impl VolumeControlBlock {
     ) -> DriverResult<PendingChildCreation<'_>> {
         let volume = NonNull::from(&mut *self);
         let (mounted_volume, file_control_blocks) =
-            (&mut self.volume, &mut self.file_control_blocks);
+            (&mut self.volume, &self.file_control_blocks);
         let mut transaction = mounted_volume.begin_transaction(now);
         let parent = transaction.directory(parent)?;
         let node = match target {
@@ -757,8 +977,8 @@ impl VolumeControlBlock {
     }
 
     /// Releases one open reference to a VCB-owned FCB.
-    fn close_file_control_block(&mut self, fcb: NonNull<FileControlBlock>) {
-        close_file_control_block_in_table(&mut self.file_control_blocks, fcb);
+    fn close_file_control_block(&self, fcb: NonNull<FileControlBlock>) {
+        self.file_control_blocks.close(fcb);
     }
 }
 
@@ -1262,8 +1482,8 @@ pub(crate) struct PendingChildCreation<'a> {
     /// Staged ext4 namespace mutation.
     transaction:
         JournalTransaction<'a, KernelBlockDevice, CngFscryptNonceGenerator, InternalJournal>,
-    /// VCB-owned FCB table, borrowed independently from the mounted ext4 volume.
-    file_control_blocks: &'a mut DriverVec<Box<FileControlBlock>>,
+    /// Synchronized FCB ledger borrowed independently from the mounted ext4 volume.
+    file_control_blocks: &'a FileControlBlockLedger,
     /// VCB that owns any FCB opened for the staged node.
     volume: NonNull<VolumeControlBlock>,
     /// Node identity allocated by the staged transaction.
@@ -1276,17 +1496,23 @@ impl PendingChildCreation<'_> {
         self.node
     }
 
-    /// Opens or reuses the VCB-owned FCB for the staged node.
+    /// Opens the staged node's FCB and records its share claim atomically.
     /// # Errors
     ///
-    /// Returns an error when FCB allocation fails or an existing FCB open count overflows.
-    pub(crate) fn open_file_control_block(&mut self) -> DriverResult<NonNull<FileControlBlock>> {
-        open_file_control_block_in_table(self.file_control_blocks, self.volume, self.node)
-    }
-
-    /// Releases one open reference to a VCB-owned FCB while the create is still pending.
-    pub(crate) fn release_file_control_block(&mut self, fcb: NonNull<FileControlBlock>) {
-        close_file_control_block_in_table(self.file_control_blocks, fcb);
+    /// Returns an error when FCB allocation/reference growth or Windows share validation fails.
+    pub(crate) fn open_file_control_block(
+        &self,
+        file_object: KernelFileObject,
+        desired_access: DesiredAccess,
+        share_access: ShareAccess,
+    ) -> DriverResult<NonNull<FileControlBlock>> {
+        self.file_control_blocks.open_new(
+            self.volume,
+            self.node,
+            file_object,
+            desired_access,
+            share_access,
+        )
     }
 
     /// Sets or replaces one xattr on the staged child in this create transaction.
@@ -1383,6 +1609,20 @@ fn find_file_control_block_in_table(
         .iter()
         .find(|fcb| fcb.node() == node)
         .map(|fcb| NonNull::from(fcb.as_ref()))
+}
+
+/// Returns one ledger-owned FCB for mutation while the caller holds the ledger mutex.
+fn ledger_file_control_block_mut(
+    table: &mut DriverVec<Box<FileControlBlock>>,
+    fcb: NonNull<FileControlBlock>,
+) -> &mut FileControlBlock {
+    table
+        .iter_mut()
+        .find(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+        .map(Box::as_mut)
+        .unwrap_or_else(|| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        })
 }
 
 /// Windows volume serial number derived from the ext4 filesystem UUID.
@@ -2578,13 +2818,7 @@ impl OpenedObject {
     /// Returns an internal invariant failure when cleanup already ran for this FILE_OBJECT.
     pub(crate) fn release_share_access_for_cleanup(&mut self) -> DriverResult<()> {
         self.mutable_handle().begin_cleanup()?;
-        let file_object = self.file_object;
-        let fcb = unsafe {
-            // SAFETY: Queued create, cleanup, and close execution serialize access to the live
-            // VCB-owned FCB for this FILE_OBJECT.
-            self.fcb.as_mut()
-        };
-        fcb.remove_share_access(file_object);
+        release_file_share_access(self.fcb, self.file_object);
         Ok(())
     }
 
@@ -2603,13 +2837,7 @@ impl OpenedObject {
             FileObjectCloseKind::Ordinary => Err(DriverError::InternalInvariantViolation),
             FileObjectCloseKind::CancelledOpen => {
                 self.mutable_handle().begin_cancelled_open_close()?;
-                let file_object = self.file_object;
-                let fcb = unsafe {
-                    // SAFETY: Queued create and close execution serialize access to the live
-                    // VCB-owned FCB for this filter-cancelled FILE_OBJECT.
-                    self.fcb.as_mut()
-                };
-                fcb.remove_share_access(file_object);
+                release_file_share_access(self.fcb, self.file_object);
                 Ok(())
             }
         }
@@ -2831,15 +3059,48 @@ impl OpenedDirectory {
 
 /// Releases one FILE_OBJECT reference to a VCB-owned FCB.
 pub(crate) fn release_file_control_block(fcb: NonNull<FileControlBlock>) {
-    let mut volume = unsafe {
-        // SAFETY: FCBs are owned by the VCB recorded in the FCB itself.
+    let volume = unsafe {
+        // SAFETY: The live FCB reference retains its owning VCB.
         fcb.as_ref().volume()
     };
     let vcb = unsafe {
-        // SAFETY: The VCB outlives all FCBs it owns.
-        volume.as_mut()
+        // SAFETY: The FCB reference proves the VCB remains live for this synchronous close.
+        volume.as_ref()
     };
     vcb.close_file_control_block(fcb);
+}
+
+/// Releases one FILE_OBJECT's share claim while retaining its FCB reference until close.
+pub(crate) fn release_file_share_access(
+    fcb: NonNull<FileControlBlock>,
+    file_object: KernelFileObject,
+) {
+    let volume = unsafe {
+        // SAFETY: The live FCB reference retains its owning VCB.
+        fcb.as_ref().volume()
+    };
+    let vcb = unsafe {
+        // SAFETY: The FCB reference proves the VCB remains live for this synchronous transition.
+        volume.as_ref()
+    };
+    vcb.file_control_blocks
+        .release_share_access(fcb, file_object);
+}
+
+/// Rolls back a pre-attachment FCB reference and its recorded share claim.
+pub(crate) fn abandon_file_control_block(
+    fcb: NonNull<FileControlBlock>,
+    file_object: KernelFileObject,
+) {
+    let volume = unsafe {
+        // SAFETY: The live FCB reference retains its owning VCB.
+        fcb.as_ref().volume()
+    };
+    let vcb = unsafe {
+        // SAFETY: The FCB reference proves the VCB remains live for this synchronous rollback.
+        volume.as_ref()
+    };
+    vcb.file_control_blocks.abandon_open(fcb, file_object);
 }
 
 /// Driver unload callback registered in the driver object.
