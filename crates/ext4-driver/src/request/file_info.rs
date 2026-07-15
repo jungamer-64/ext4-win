@@ -523,11 +523,6 @@ fn set_close_disposition(
     request: &mut SetFileRequest,
     close_disposition: CloseDisposition,
 ) -> DriverResult<()> {
-    if close_disposition == CloseDisposition::Delete
-        && request.opened_file.node_mode() == OpenedNodeMode::ReparsePoint
-    {
-        return Err(DriverError::NotSupported);
-    }
     request.opened_file.set_close_disposition(close_disposition);
     Ok(())
 }

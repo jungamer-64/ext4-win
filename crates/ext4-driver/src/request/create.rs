@@ -532,11 +532,6 @@ fn open_existing_node(
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
-            if node_mode == OpenedNodeMode::ReparsePoint
-                && policy.close_disposition() == CloseDisposition::Delete
-            {
-                return Err(DriverError::NotSupported);
-            }
             initialize_file_object(
                 request.file_object(),
                 vcb,
