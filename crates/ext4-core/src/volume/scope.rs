@@ -4,9 +4,7 @@
 pub(super) use alloc::vec;
 pub(super) use alloc::vec::Vec;
 
-pub(super) use crate::disk::block::{
-    BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset,
-};
+pub(super) use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 pub(super) use crate::disk::checksum::crc32c;
 pub(super) use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 #[cfg(test)]

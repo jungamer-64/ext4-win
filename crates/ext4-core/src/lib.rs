@@ -20,7 +20,7 @@ mod platform;
 mod protection;
 mod volume;
 
-pub use disk::block::{BlockReader, BlockSize, BlockWriter, ByteOffset, DeviceLength};
+pub use disk::block::{BlockSize, ByteOffset, DeviceLength};
 pub use disk_format::inode::{
     Ext4Gid, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
     Ext4Uid, FileOffset, FileSize, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata,
