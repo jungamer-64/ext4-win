@@ -16,8 +16,9 @@ pub(crate) use wdk_sys::ntddk::{
     FsRtlFastCheckLockForWrite, FsRtlFastUnlockAll, FsRtlInitializeFileLock, FsRtlNotifyCleanup,
     FsRtlNotifyCleanupAll, FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange,
     FsRtlNotifyInitializeSync, FsRtlNotifyUninitializeSync, FsRtlProcessFileLock,
-    FsRtlUninitializeFileLock, IoAllocateWorkItem, IoCsqInitialize, IoCsqInsertIrp,
-    IoCsqRemoveNextIrp, IoFreeWorkItem, IoGetRequestorProcess, IoQueueWorkItem,
-    IoRegisterShutdownNotification, KeAcquireSpinLockRaiseToDpc, KeInitializeSpinLock,
-    KeReleaseSpinLock,
+    FsRtlUninitializeFileLock, IoAllocateWorkItem, IoBuildAsynchronousFsdRequest, IoCsqInitialize,
+    IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeIrp, IoFreeMdl, IoFreeWorkItem,
+    IoGetRequestorProcess, IoQueueWorkItem, IoRegisterShutdownNotification,
+    IoSetCompletionRoutineEx, IofCallDriver, KeAcquireSpinLockRaiseToDpc, KeInitializeSpinLock,
+    KeReleaseSpinLock, MmUnlockPages,
 };
