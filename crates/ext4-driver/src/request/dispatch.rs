@@ -4,7 +4,7 @@ use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP};
 
 use crate::{
     irp::{
-        DeviceIrpQueue, DirectoryControlMinorFunction, DispatchMajor, DispatchTarget,
+        DeviceExecutor, DirectoryControlMinorFunction, DispatchMajor, DispatchTarget,
         IrpCompletion, OwnedIrp, ReceivedIrp,
     },
     kernel::status::{DriverError, DriverResult},
@@ -257,7 +257,7 @@ fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS
             let target = received.target();
             received.complete_result(execute_immediate(major, target))
         }
-        DispatchPolicy::Queued => DeviceIrpQueue::receive_async(received),
+        DispatchPolicy::Queued => DeviceExecutor::receive(received),
         DispatchPolicy::SynchronousCleanup => dispatch_cleanup(received),
         DispatchPolicy::SynchronousClose => {
             let target = received.target();
@@ -314,11 +314,9 @@ fn dispatch_cleanup(received: ReceivedIrp) -> NTSTATUS {
         Ok(file_object) => file_object,
         Err(error) => return received.complete_result(Err(error)),
     };
-    let queue = match DeviceIrpQueue::from_device(target.device()) {
-        Ok(queue) => queue,
-        Err(error) => return received.complete_result(Err(error)),
-    };
-    DeviceIrpQueue::cancel_file_object(queue, file_object);
+    if let Err(error) = DeviceExecutor::cancel_file_object(target.device(), file_object) {
+        return received.complete_result(Err(error));
+    }
     received.complete_result(crate::request::file_info::cleanup(target))
 }
 
@@ -331,7 +329,7 @@ fn dispatch_file_lock(received: ReceivedIrp) -> NTSTATUS {
     }
 }
 
-/// Executes and terminally completes or delegates one IRP removed from the device queue.
+/// Executes and terminally completes or delegates one IRP owned by the device executor.
 #[cfg_attr(
     test,
     expect(
@@ -339,21 +337,28 @@ fn dispatch_file_lock(received: ReceivedIrp) -> NTSTATUS {
         reason = "kernel work-item worker is compiled out in unit tests"
     )
 )]
-pub(crate) fn execute_queued(owned: OwnedIrp) -> NTSTATUS {
+pub(crate) async fn execute_owned(owned: OwnedIrp) {
     let target = owned.target();
     let major = match target.current_stack().and_then(|stack| stack.major()) {
         Ok(major) => major,
-        Err(error) => return owned.complete_result(Err(error)),
+        Err(error) => {
+            let _status = owned.complete_result(Err(error));
+            return;
+        }
     };
     if major == DispatchMajor::Create {
-        return owned.complete_create_result(crate::request::create::execute(target));
+        let _status = owned.complete_create_result(crate::request::create::execute(target));
+        return;
     }
     if major == DispatchMajor::DirectoryControl {
         let minor = match target.current_stack() {
             Ok(stack) => stack.directory_control_minor(),
-            Err(error) => return owned.complete_result(Err(error)),
+            Err(error) => {
+                let _status = owned.complete_result(Err(error));
+                return;
+            }
         };
-        return match minor {
+        let _status = match minor {
             DirectoryControlMinorFunction::QueryDirectory => {
                 owned.complete_result(crate::request::file_info::query_directory(target))
             }
@@ -364,8 +369,9 @@ pub(crate) fn execute_queued(owned: OwnedIrp) -> NTSTATUS {
                 owned.complete_result(Err(DriverError::InvalidDeviceRequest))
             }
         };
+        return;
     }
-    owned.complete_result(execute_major(major, target))
+    let _status = owned.complete_result(execute_major(major, target));
 }
 
 /// Executes an immediate IRP during the dispatch callback.

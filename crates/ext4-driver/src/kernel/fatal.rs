@@ -50,6 +50,11 @@ impl KernelWideInconsistency {
         Self::without_location(FatalReason::FileControlBlockOwnershipCorruption)
     }
 
+    /// Constructs a fatal state for impossible asynchronous executor ownership.
+    pub(crate) const fn async_executor_state_corruption() -> Self {
+        Self::without_location(FatalReason::AsyncExecutorStateCorruption)
+    }
+
     /// Constructs a fatal state without source location context.
     const fn without_location(reason: FatalReason) -> Self {
         Self {
@@ -103,6 +108,8 @@ enum FatalReason {
     FileObjectLifecycleCorruption,
     /// A VCB-owned FCB pointer is no longer present in the owning VCB table.
     FileControlBlockOwnershipCorruption,
+    /// A work item or wake violated the single-poller executor state machine.
+    AsyncExecutorStateCorruption,
 }
 
 impl FatalReason {
@@ -113,6 +120,7 @@ impl FatalReason {
             Self::FileObjectContextCorruption => 2,
             Self::FileControlBlockOwnershipCorruption => 3,
             Self::FileObjectLifecycleCorruption => 4,
+            Self::AsyncExecutorStateCorruption => 5,
         }
     }
 }
@@ -153,6 +161,7 @@ mod tests {
             3
         );
         assert_eq!(FatalReason::FileObjectLifecycleCorruption.as_parameter(), 4);
+        assert_eq!(FatalReason::AsyncExecutorStateCorruption.as_parameter(), 5);
     }
 
     /// # Panics
@@ -171,6 +180,10 @@ mod tests {
         assert_eq!(
             KernelWideInconsistency::file_control_block_ownership_corruption().reason,
             FatalReason::FileControlBlockOwnershipCorruption
+        );
+        assert_eq!(
+            KernelWideInconsistency::async_executor_state_corruption().reason,
+            FatalReason::AsyncExecutorStateCorruption
         );
     }
 }

@@ -17,9 +17,13 @@ use core::{
 };
 
 use ext4_core::{BlockSource, BlockStorage, ByteOffset, DeviceLength, Error, Result};
-use wdk_sys::{IRP_MJ_FLUSH_BUFFERS, IRP_MJ_READ, IRP_MJ_WRITE, LARGE_INTEGER, NTSTATUS, PIRP};
+use wdk_sys::{IRP_MJ_FLUSH_BUFFERS, IRP_MJ_READ, IRP_MJ_WRITE, NTSTATUS};
+#[cfg(not(test))]
+use wdk_sys::{LARGE_INTEGER, PIRP};
 
-use crate::{kernel::ffi, state::KernelDevice};
+#[cfg(not(test))]
+use crate::kernel::ffi;
+use crate::state::KernelDevice;
 
 /// Completion context has not yet received the terminal lower-driver status.
 const COMPLETION_IN_FLIGHT: u8 = 0;

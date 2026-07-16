@@ -63,6 +63,22 @@ impl<T> PushError<T> {
     }
 }
 
+/// Failed box allocation that preserves the source value before construction begins.
+#[must_use]
+pub(crate) struct BoxMapError<S> {
+    /// Driver-domain allocation error.
+    error: DriverError,
+    /// Source value that was never moved into the destination object.
+    source: S,
+}
+
+impl<S> BoxMapError<S> {
+    /// Splits the allocation failure into its error and still-owned source value.
+    pub(crate) fn into_parts(self) -> (DriverError, S) {
+        (self.error, self.source)
+    }
+}
+
 /// Kernel-bound vector wrapper.
 ///
 /// This intentionally does not implement `Deref<Target = [T]>` and does not expose `into_inner`.
@@ -375,6 +391,31 @@ where
     F: FnOnce() -> DriverResult<T>,
 {
     boxed_try_with_in(Global, build)
+}
+
+/// Allocates a destination slot before moving an ownership-bearing source into it.
+///
+/// This is used when dropping `source` on allocation failure would violate a terminal ownership
+/// obligation, such as completing a pending IRP. The mapping closure cannot run until allocation
+/// has succeeded.
+/// # Errors
+///
+/// Returns the allocation error together with the untouched source value when the destination slot
+/// cannot be allocated.
+pub(crate) fn boxed_try_map<S, T>(
+    source: S,
+    map: impl FnOnce(S) -> T,
+) -> Result<Box<T>, BoxMapError<S>> {
+    let slot = match Box::<T, Global>::try_new_uninit_in(Global) {
+        Ok(slot) => slot,
+        Err(error) => {
+            return Err(BoxMapError {
+                error: alloc_failed(error),
+                source,
+            });
+        }
+    };
+    Ok(Box::write(slot, map(source)))
 }
 
 /// Allocates an exact-length, zero-initialized byte slice with the global allocator.
