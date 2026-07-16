@@ -29,7 +29,7 @@ use wdk_sys::{
 use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 
 use crate::irp::{
-    ByteRangeLockKey, DataIoKind, DesiredAccess, DeviceIrpQueue, DirectoryEntryIndex,
+    ByteRangeLockKey, DataIoKind, DesiredAccess, DeviceExecutor, DirectoryEntryIndex,
     DispatchTarget, ExistingOperationAccess, RegularFileWriteAccess, ShareAccess,
 };
 use crate::kernel::cng::CngFscryptNonceGenerator;
@@ -463,9 +463,9 @@ impl DeviceExtensionKind {
 /// Common prefix shared by all driver-owned device extensions.
 #[repr(C)]
 struct DeviceExtensionHeader {
-    /// Device-owned queue for pended IRPs.
-    queue: DeviceIrpQueue,
-    /// Concrete extension kind following the queue prefix.
+    /// Device-owned asynchronous request execution lane.
+    executor: DeviceExecutor,
+    /// Concrete extension kind following the executor prefix.
     kind: DeviceExtensionKind,
 }
 
@@ -480,7 +480,7 @@ impl ControlDeviceExtension {
     /// Initializes the extension attached to the control device.
     /// # Errors
     ///
-    /// Returns an error when the device has no extension or its IRP queue cannot be initialized.
+    /// Returns an error when the device has no extension or its executor cannot be initialized.
     fn initialize(device: KernelDevice) -> DriverResult<()> {
         let device_object = unsafe {
             // SAFETY: `device` is the newly created control device object.
@@ -499,7 +499,10 @@ impl ControlDeviceExtension {
         extension.header.kind = DeviceExtensionKind::CONTROL;
         unsafe {
             // SAFETY: The extension is stable device-owned storage.
-            DeviceIrpQueue::initialize_at(core::ptr::addr_of_mut!(extension.header.queue), device)
+            DeviceExecutor::initialize_at(
+                core::ptr::addr_of_mut!(extension.header.executor),
+                device,
+            )
         }
     }
 
@@ -525,7 +528,7 @@ impl ControlDeviceExtension {
         };
         unsafe {
             // SAFETY: Teardown has exclusive access to the extension.
-            DeviceIrpQueue::release_at(core::ptr::addr_of_mut!(extension.header.queue));
+            DeviceExecutor::release_at(core::ptr::addr_of_mut!(extension.header.executor));
         }
     }
 }
@@ -1918,13 +1921,16 @@ impl MountedVolumeDevice {
         unsafe {
             // SAFETY: The extension is stable device-owned storage for this
             // just-created mounted volume device.
-            DeviceIrpQueue::initialize_at(core::ptr::addr_of_mut!(extension.header.queue), device)?;
+            DeviceExecutor::initialize_at(
+                core::ptr::addr_of_mut!(extension.header.executor),
+                device,
+            )?;
         }
         if let Err(error) = register_shutdown_notification(device) {
             unsafe {
                 // SAFETY: Shutdown registration failed before this device was
-                // published, so no queue worker can still own the queue.
-                DeviceIrpQueue::release_at(core::ptr::addr_of_mut!(extension.header.queue));
+                // published, so no worker or continuation can still own the executor.
+                DeviceExecutor::release_at(core::ptr::addr_of_mut!(extension.header.executor));
             }
             return Err(error);
         }

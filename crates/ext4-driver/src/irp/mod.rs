@@ -5,10 +5,11 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ext4_core::FileOffset;
-use wdk_sys::{
-    LIST_ENTRY, NTSTATUS, PDEVICE_OBJECT, PIO_CSQ, PIO_STACK_LOCATION, PIO_WORKITEM, PIRP,
-    PLIST_ENTRY, PVOID, STATUS_PENDING, STATUS_SUCCESS,
-};
+use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_PENDING, STATUS_SUCCESS};
+
+mod executor;
+
+pub(crate) use executor::DeviceExecutor;
 
 #[cfg(not(test))]
 use crate::kernel::ffi;
@@ -346,6 +347,11 @@ pub(crate) struct DispatchTarget {
     /// IRP being dispatched.
     irp: KernelIrp,
 }
+
+// SAFETY: The I/O Manager keeps both kernel objects alive while the driver owns the pending IRP,
+// and the device executor transfers this pointer-only boundary between workers without concurrent
+// request execution.
+unsafe impl Send for DispatchTarget {}
 
 impl DispatchTarget {
     /// Decodes raw WDK dispatch pointers.
@@ -3141,17 +3147,16 @@ mod tests {
         CREATE_DISPOSITION_SHIFT, CreateAction, CreateCompletion, CreateDisposition,
         CreateNameInterpretation, CreateReparsePointMode, CreateSymlinkReparseBuffer,
         CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering,
-        CurrentIrpStackLocation, DataIoKind, DeviceIrpQueue, DirectoryChangeFilter,
+        CurrentIrpStackLocation, DataIoKind, DeviceExecutor, DirectoryChangeFilter,
         DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
         DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope, DispatchTarget,
         EaEntryEmission, EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION,
         FILE_OPEN_IF_DISPOSITION, FILE_OVERWRITE_DISPOSITION, FILE_OVERWRITE_IF_DISPOSITION,
         FILE_SUPERSEDE_DISPOSITION, FileSystemControlMinorFunction, FsControlCode,
         InformationLength, IrpBufferLength, IrpCompletion, KernelIrp, OwnedIrp,
-        QueryFileInformationClass, QueryVolumeInformationClass, QueueWorkerState,
-        ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, STATUS_CANCELLED,
-        SecurityComponentSelection, SetFileInformationClass, SetVolumeInformationClass,
-        WriteStartingPoint,
+        QueryFileInformationClass, QueryVolumeInformationClass, ReadStartingPoint, ReceivedIrp,
+        RegularFileWriteAccess, STATUS_CANCELLED, SecurityComponentSelection,
+        SetFileInformationClass, SetVolumeInformationClass, WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
     use crate::state::{
@@ -3177,26 +3182,22 @@ mod tests {
         }
     }
 
-    /// Builds unlinked queue storage for a device-owned extension.
-    fn queue_storage(device: KernelDevice) -> DeviceIrpQueue {
-        DeviceIrpQueue {
-            csq: wdk_sys::IO_CSQ::default(),
-            lock: 0,
-            list_head: wdk_sys::LIST_ENTRY::default(),
-            work_item: core::ptr::null_mut(),
-            worker_state: QueueWorkerState::Idle,
-            device,
-        }
+    /// Builds unlinked executor storage for a device-owned extension.
+    fn executor_storage(device: KernelDevice) -> DeviceExecutor {
+        DeviceExecutor::test_storage(device)
     }
 
-    /// Initializes queue links after the queue has reached its stable stack address.
-    fn initialize_queue_links(queue: &mut DeviceIrpQueue) {
-        super::initialize_list_head(core::ptr::addr_of_mut!(queue.list_head));
+    /// Initializes executor links after the storage has reached its stable stack address.
+    fn initialize_executor_links(executor: &DeviceExecutor) {
+        executor.initialize_test_links();
     }
 
-    /// Publishes queue storage as the device extension used by queue lookup.
-    fn attach_queue_extension(device: &mut wdk_sys::DEVICE_OBJECT, queue: &mut DeviceIrpQueue) {
-        device.DeviceExtension = core::ptr::from_mut(queue).cast::<c_void>();
+    /// Publishes executor storage as the device extension used by dispatch lookup.
+    fn attach_executor_extension(
+        device: &mut wdk_sys::DEVICE_OBJECT,
+        executor: &mut DeviceExecutor,
+    ) {
+        device.DeviceExtension = core::ptr::from_mut(executor).cast::<c_void>();
     }
 
     /// Returns whether the current stack control byte contains the pending-returned bit.
@@ -3476,16 +3477,16 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn device_irp_queue_receive_async_marks_current_stack_pending() {
+    fn device_executor_receive_marks_current_stack_pending() {
         let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
         let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
         assert!(device.is_some());
         let Some(device) = device else {
             return;
         };
-        let mut queue = queue_storage(device);
-        initialize_queue_links(&mut queue);
-        attach_queue_extension(&mut kernel_device, &mut queue);
+        let mut executor = executor_storage(device);
+        initialize_executor_links(&executor);
+        attach_executor_extension(&mut kernel_device, &mut executor);
 
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let mut irp = wdk_sys::IRP::default();
@@ -3501,14 +3502,11 @@ mod tests {
         );
         assert!(received.is_ok());
         if let Ok(received) = received {
-            assert_eq!(
-                DeviceIrpQueue::receive_async(received),
-                wdk_sys::STATUS_PENDING
-            );
+            assert_eq!(DeviceExecutor::receive(received), wdk_sys::STATUS_PENDING);
             assert!(stack_has_pending_returned(&stack));
-            assert_eq!(queue.worker_state, QueueWorkerState::Scheduled);
+            assert!(executor.test_worker_is_queued());
             assert_eq!(
-                queue.remove_next_irp(core::ptr::null_mut()),
+                executor.test_remove_next_irp(core::ptr::null_mut()),
                 core::ptr::addr_of_mut!(irp)
             );
         }
@@ -3518,7 +3516,7 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn device_irp_queue_receive_async_completes_without_pending_when_extension_is_absent() {
+    fn device_executor_receive_completes_without_pending_when_extension_is_absent() {
         let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let mut irp = wdk_sys::IRP::default();
@@ -3535,10 +3533,7 @@ mod tests {
         );
         assert!(received.is_ok());
         if let Ok(received) = received {
-            assert_eq!(
-                DeviceIrpQueue::receive_async(received),
-                STATUS_INVALID_PARAMETER
-            );
+            assert_eq!(DeviceExecutor::receive(received), STATUS_INVALID_PARAMETER);
         }
 
         assert!(!stack_has_pending_returned(&stack));
@@ -3550,16 +3545,16 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn device_irp_queue_receive_async_completes_when_pending_mark_fails() {
+    fn device_executor_receive_completes_when_pending_mark_fails() {
         let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
         let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
         assert!(device.is_some());
         let Some(device) = device else {
             return;
         };
-        let mut queue = queue_storage(device);
-        initialize_queue_links(&mut queue);
-        attach_queue_extension(&mut kernel_device, &mut queue);
+        let mut executor = executor_storage(device);
+        initialize_executor_links(&executor);
+        attach_executor_extension(&mut kernel_device, &mut executor);
 
         let mut irp = wdk_sys::IRP::default();
         irp.IoStatus.Information = 99;
@@ -3569,32 +3564,33 @@ mod tests {
         );
         assert!(received.is_ok());
         if let Ok(received) = received {
-            assert_eq!(
-                DeviceIrpQueue::receive_async(received),
-                STATUS_INVALID_PARAMETER
-            );
+            assert_eq!(DeviceExecutor::receive(received), STATUS_INVALID_PARAMETER);
         }
 
         assert_eq!(irp_status(&irp), STATUS_INVALID_PARAMETER);
         assert_eq!(irp.IoStatus.Information, 0);
-        assert_eq!(queue.worker_state, QueueWorkerState::Idle);
-        assert!(queue.remove_next_irp(core::ptr::null_mut()).is_null());
+        assert!(executor.test_worker_is_dormant());
+        assert!(
+            executor
+                .test_remove_next_irp(core::ptr::null_mut())
+                .is_null()
+        );
     }
 
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn device_irp_queue_removes_irps_in_fifo_order() {
+    fn device_executor_removes_irps_in_fifo_order() {
         let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
         let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
         assert!(device.is_some());
         let Some(device) = device else {
             return;
         };
-        let mut queue = queue_storage(device);
-        initialize_queue_links(&mut queue);
-        attach_queue_extension(&mut kernel_device, &mut queue);
+        let mut executor = executor_storage(device);
+        initialize_executor_links(&executor);
+        attach_executor_extension(&mut kernel_device, &mut executor);
 
         let mut stack_a = wdk_sys::IO_STACK_LOCATION::default();
         let mut stack_b = wdk_sys::IO_STACK_LOCATION::default();
@@ -3629,42 +3625,43 @@ mod tests {
             let received = ReceivedIrp::decode(core::ptr::addr_of_mut!(kernel_device), irp);
             assert!(received.is_ok());
             if let Ok(received) = received {
-                assert_eq!(
-                    DeviceIrpQueue::receive_async(received),
-                    wdk_sys::STATUS_PENDING
-                );
+                assert_eq!(DeviceExecutor::receive(received), wdk_sys::STATUS_PENDING);
             }
         }
 
         assert_eq!(
-            queue.remove_next_irp(core::ptr::null_mut()),
+            executor.test_remove_next_irp(core::ptr::null_mut()),
             core::ptr::addr_of_mut!(irp_a)
         );
         assert_eq!(
-            queue.remove_next_irp(core::ptr::null_mut()),
+            executor.test_remove_next_irp(core::ptr::null_mut()),
             core::ptr::addr_of_mut!(irp_b)
         );
         assert_eq!(
-            queue.remove_next_irp(core::ptr::null_mut()),
+            executor.test_remove_next_irp(core::ptr::null_mut()),
             core::ptr::addr_of_mut!(irp_c)
         );
-        assert!(queue.remove_next_irp(core::ptr::null_mut()).is_null());
+        assert!(
+            executor
+                .test_remove_next_irp(core::ptr::null_mut())
+                .is_null()
+        );
     }
 
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn device_irp_queue_cancels_only_matching_file_object() {
+    fn device_executor_cancels_only_matching_file_object() {
         let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
         let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
         assert!(device.is_some());
         let Some(device) = device else {
             return;
         };
-        let mut queue = queue_storage(device);
-        initialize_queue_links(&mut queue);
-        attach_queue_extension(&mut kernel_device, &mut queue);
+        let mut executor = executor_storage(device);
+        initialize_executor_links(&executor);
+        attach_executor_extension(&mut kernel_device, &mut executor);
 
         let mut file_a = wdk_sys::FILE_OBJECT::default();
         let mut file_b = wdk_sys::FILE_OBJECT::default();
@@ -3713,17 +3710,17 @@ mod tests {
             let received = ReceivedIrp::decode(core::ptr::addr_of_mut!(kernel_device), irp);
             assert!(received.is_ok());
             if let Ok(received) = received {
-                assert_eq!(
-                    DeviceIrpQueue::receive_async(received),
-                    wdk_sys::STATUS_PENDING
-                );
+                assert_eq!(DeviceExecutor::receive(received), wdk_sys::STATUS_PENDING);
             }
         }
 
         let file_object = KernelFileObject::from_raw(core::ptr::addr_of_mut!(file_a));
         assert!(file_object.is_some());
         if let Some(file_object) = file_object {
-            DeviceIrpQueue::cancel_file_object(NonNull::from(&mut queue), file_object);
+            assert_eq!(
+                DeviceExecutor::cancel_file_object(device, file_object),
+                Ok(())
+            );
         }
 
         assert_eq!(irp_status(&irp_a1), STATUS_CANCELLED);
@@ -3733,10 +3730,14 @@ mod tests {
         assert_eq!(irp_status(&irp_b), wdk_sys::STATUS_SUCCESS);
         assert_eq!(irp_b.IoStatus.Information, 99);
         assert_eq!(
-            queue.remove_next_irp(core::ptr::null_mut()),
+            executor.test_remove_next_irp(core::ptr::null_mut()),
             core::ptr::addr_of_mut!(irp_b)
         );
-        assert!(queue.remove_next_irp(core::ptr::null_mut()).is_null());
+        assert!(
+            executor
+                .test_remove_next_irp(core::ptr::null_mut())
+                .is_null()
+        );
     }
 
     /// # Panics
