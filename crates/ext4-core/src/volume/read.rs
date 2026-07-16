@@ -5,7 +5,7 @@ use super::scope::*;
 #[cfg(test)]
 impl<D, N> ReadOnlyVolume<D, N>
 where
-    D: BlockReader,
+    D: BlockSource,
 {
     /// Stable filesystem identity.
     #[must_use]
@@ -161,7 +161,7 @@ where
 }
 impl<D, N, J> JournaledVolume<D, N, J>
 where
-    D: BlockReader,
+    D: BlockSource,
 {
     /// Stable filesystem identity.
     #[must_use]
@@ -323,7 +323,7 @@ where
         self.volume.lookup_windows_child(parent, requested)
     }
 }
-impl<D: BlockReader, State, N> MountedVolume<D, State, N> {
+impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// Stable filesystem identity.
     #[must_use]
     pub(super) const fn identity(&self) -> VolumeIdentity {

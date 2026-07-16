@@ -101,7 +101,7 @@ impl TransactionNode {
 
 /// In-progress ext4 write transaction.
 #[derive(Debug)]
-pub struct JournalTransaction<'a, D: BlockWriter, N, J = InternalJournal> {
+pub struct JournalTransaction<'a, D: BlockStorage, N, J = InternalJournal> {
     /// Mounted read-write volume being mutated.
     volume: &'a mut MountedVolume<D, JournaledMount<J>, N>,
     /// Timestamp applied consistently to staged inode updates.
@@ -132,7 +132,7 @@ pub struct JournalTransaction<'a, D: BlockWriter, N, J = InternalJournal> {
     volume_label_update: Option<Ext4VolumeLabel>,
 }
 
-impl<'a, D: BlockWriter, N, J> JournalTransaction<'a, D, N, J> {
+impl<'a, D: BlockStorage, N, J> JournalTransaction<'a, D, N, J> {
     /// Starts an empty journal transaction for a mounted read-write volume.
     pub(super) fn begin(
         volume: &'a mut MountedVolume<D, JournaledMount<J>, N>,
@@ -156,7 +156,7 @@ impl<'a, D: BlockWriter, N, J> JournalTransaction<'a, D, N, J> {
         }
     }
 }
-impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
+impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Verifies that the mounted profile admits xattr storage mutation.
     /// # Errors
     ///

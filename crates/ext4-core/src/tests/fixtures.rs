@@ -1145,7 +1145,7 @@ impl<'a> FailOneWriteAt<'a> {
     }
 }
 
-impl BlockReader for FailOneWriteAt<'_> {
+impl BlockSource for FailOneWriteAt<'_> {
     fn len(&self) -> DeviceLength {
         DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
     }
@@ -1159,7 +1159,7 @@ impl BlockReader for FailOneWriteAt<'_> {
     }
 }
 
-impl BlockWriter for FailOneWriteAt<'_> {
+impl BlockStorage for FailOneWriteAt<'_> {
     fn write_exact_at(&mut self, offset: ByteOffset, bytes: &[u8]) -> crate::Result<()> {
         if offset == self.fail_offset && !self.failed {
             self.failed = true;

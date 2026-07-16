@@ -7,7 +7,7 @@ use super::*;
 fn directory_entries_are_parsed_from_root_inode() {
     let image = fixture_image();
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let entries = read_directory(&volume, InodeId::ROOT);
@@ -26,7 +26,7 @@ fn directory_entries_are_parsed_from_root_inode() {
 fn symlink_inline_target_is_read_without_extents() {
     let image = fixture_image();
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let target = read_symlink(&volume, 4);
@@ -41,7 +41,7 @@ fn symlink_inline_target_is_read_without_extents() {
 fn exact_ext4_lookup_uses_raw_bytes() {
     let image = fixture_image();
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let child = lookup_ext4(&volume, InodeId::ROOT, b"file");
@@ -59,7 +59,7 @@ fn exact_ext4_lookup_uses_raw_bytes() {
 #[test]
 fn file_index_lookup_classifies_live_inode() {
     let mut image = minimal_write_fixture_image();
-    let device = SliceBlockDeviceMut::new(&mut image);
+    let device = MemoryBlockStorage::new(&mut image);
     let volume = must(JournaledVolume::mount(device, test_mount_context()));
 
     let node = must(volume.load_node_by_file_index(3));
@@ -86,7 +86,7 @@ fn windows_name_projection_rejects_reserved_separator() {
 fn windows_lookup_accepts_unique_ascii_case_fold() {
     let image = fixture_image();
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let child = lookup_windows(&volume, InodeId::ROOT, &[0x0046, 0x0049, 0x004C, 0x0045]);
@@ -105,7 +105,7 @@ fn windows_lookup_accepts_unique_ascii_case_fold() {
 fn lookup_reports_not_found_without_option() {
     let image = fixture_image();
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
 
@@ -127,7 +127,7 @@ fn windows_lookup_rejects_ambiguous_case_fold() {
         1,
     );
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let root = directory_node(&volume, InodeId::ROOT);
@@ -170,7 +170,7 @@ fn minimal_profile_supports_file_and_namespace_mutations() {
     let mut image = minimal_write_fixture_image();
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let file_id = file_node_id(&volume, 3);
 
@@ -230,7 +230,7 @@ fn create_file_adds_directory_entry_and_inode() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
@@ -256,7 +256,7 @@ fn create_file_adds_directory_entry_and_inode() {
 #[test]
 fn create_file_rejects_duplicate_name() {
     let mut image = modern_fixture_image();
-    let device = SliceBlockDeviceMut::new(&mut image);
+    let device = MemoryBlockStorage::new(&mut image);
     let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
     let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
@@ -274,7 +274,7 @@ fn unlink_file_removes_directory_entry_and_frees_inode() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let name = must(Ext4Name::new(b"new"));
 
@@ -300,7 +300,7 @@ fn unlink_file_removes_directory_entry_and_frees_inode() {
 #[test]
 fn unlink_file_reports_missing_entry() {
     let mut image = modern_fixture_image();
-    let device = SliceBlockDeviceMut::new(&mut image);
+    let device = MemoryBlockStorage::new(&mut image);
     let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
     let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
@@ -318,7 +318,7 @@ fn rename_file_updates_staged_directory_entry() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
@@ -351,7 +351,7 @@ fn rename_file_updates_staged_directory_entry() {
 #[test]
 fn rename_rejects_existing_target() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
-    let device = SliceBlockDeviceMut::new(&mut image);
+    let device = MemoryBlockStorage::new(&mut image);
     let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
     let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
@@ -372,7 +372,7 @@ fn rename_file_replaces_existing_file_target() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let source_name = must(Ext4Name::new(b"source"));
         let target_name = must(Ext4Name::new(b"target"));
@@ -414,7 +414,7 @@ fn rename_directory_replaces_empty_directory_target() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let source_name = must(Ext4Name::new(b"source-dir"));
         let target_name = must(Ext4Name::new(b"target-dir"));
@@ -457,7 +457,7 @@ fn rename_directory_replaces_empty_directory_target() {
 #[test]
 fn rename_file_replace_rejects_directory_target() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
-    let device = SliceBlockDeviceMut::new(&mut image);
+    let device = MemoryBlockStorage::new(&mut image);
     let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let source_name = must(Ext4Name::new(b"source"));
     let target_name = must(Ext4Name::new(b"target-dir"));
@@ -489,7 +489,7 @@ fn create_and_remove_empty_directory_updates_namespace() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let name = must(Ext4Name::new(b"dir"));
 
@@ -523,7 +523,7 @@ fn create_inline_symlink_adds_directory_entry_and_inode() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
@@ -552,7 +552,7 @@ fn create_extent_symlink_writes_target_blocks() {
     let target_bytes = [b't'; 96];
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
@@ -576,7 +576,7 @@ fn remove_symlink_removes_directory_entry_and_frees_inode() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let name = must(Ext4Name::new(b"delete-link"));
         let target = must(SymlinkTarget::new(b"file"));
@@ -606,7 +606,7 @@ fn rename_directory_across_parents_updates_dotdot() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let source_name = must(Ext4Name::new(b"a"));
         let target_parent_name = must(Ext4Name::new(b"b"));
@@ -666,7 +666,7 @@ fn rename_directory_across_parents_updates_dotdot() {
 #[test]
 fn remove_directory_rejects_non_empty_child() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
-    let device = SliceBlockDeviceMut::new(&mut image);
+    let device = MemoryBlockStorage::new(&mut image);
     let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let dir_name = must(Ext4Name::new(b"dir"));
     let file_name = must(Ext4Name::new(b"child"));
@@ -694,7 +694,7 @@ fn remove_directory_rejects_non_empty_child() {
 #[test]
 fn remove_directory_rejects_root_entry() {
     let mut image = modern_fixture_image();
-    let device = SliceBlockDeviceMut::new(&mut image);
+    let device = MemoryBlockStorage::new(&mut image);
     let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
     let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
@@ -713,7 +713,7 @@ fn indexed_directory_create_rebuilds_real_htree() {
     make_indexed_root_directory(&mut image);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
@@ -744,7 +744,7 @@ fn indexed_directory_create_rebuilds_real_htree() {
 fn htree_directory_read_lookup_and_windows_lookup_use_real_index() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     make_indexed_root_directory(&mut image);
-    let device = SliceBlockDevice::new(&image);
+    let device = MemoryBlockSource::new(&image);
     let volume = must(ReadOnlyVolume::mount(device, test_mount_context()));
 
     let entries = read_directory(&volume, InodeId::ROOT);
@@ -779,7 +779,7 @@ fn htree_dx_tail_checksum_mismatch_is_rejected() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     make_indexed_root_directory(&mut image);
     image[block_offset(MODERN_ROOT_DIR_BLOCK) + 36] ^= 1;
-    let device = SliceBlockDevice::new(&image);
+    let device = MemoryBlockSource::new(&image);
     let volume = must(ReadOnlyVolume::mount(device, test_mount_context()));
     let root = directory_node(&volume, InodeId::ROOT);
 
@@ -794,7 +794,7 @@ fn htree_leaf_tail_checksum_mismatch_is_rejected() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     make_indexed_root_directory(&mut image);
     image[block_offset(MODERN_EXTENT_INDEX_BLOCK) + 8] ^= 1;
-    let device = SliceBlockDevice::new(&image);
+    let device = MemoryBlockSource::new(&image);
     let volume = must(ReadOnlyVolume::mount(device, test_mount_context()));
     let root = directory_node(&volume, InodeId::ROOT);
 
@@ -809,7 +809,7 @@ fn linear_directory_converts_to_htree_when_full() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         for index in 0..4_u8 {
             let mut bytes = vec![b'a' + index; 240];
@@ -844,7 +844,7 @@ fn indexed_directory_rename_and_unlink_rebuild_htree_consistently() {
     make_indexed_root_directory(&mut image);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let old_name = must(Ext4Name::new(b"temp"));
         let renamed_name = must(Ext4Name::new(b"renamed"));

@@ -2,9 +2,10 @@
 
 use alloc::vec::Vec;
 
-use crate::disk::block::{BlockAddress, BlockReader, BlockSize};
+use crate::disk::block::{BlockAddress, BlockSize};
 use crate::disk::checksum::crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::disk::io::BlockSource;
 use crate::disk_format::inode::{InodeExtentRoot, InodeId};
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
@@ -292,22 +293,23 @@ impl ExtentTree {
     /// # Errors
     /// Returns an error when the tree is malformed, too deep, has a bad
     /// metadata checksum, or an index block cannot be read.
-    pub fn load_inode_tree(
+    pub async fn load_inode_tree(
         root: &InodeExtentRoot,
         block_size: BlockSize,
-        reader: &impl BlockReader,
+        reader: &mut impl BlockSource,
         context: ExtentTreeContext,
     ) -> Result<Self> {
         let mut extents = Vec::new();
         let mut metadata_blocks = Vec::new();
-        parse_node_recursive(
+        load_external_extent_nodes(
             root.bytes(),
             block_size,
             reader,
             context,
             &mut extents,
             &mut metadata_blocks,
-        )?;
+        )
+        .await?;
         normalize_extents(&mut extents)?;
         Ok(Self {
             extents,
@@ -360,13 +362,13 @@ impl MutableExtentTree {
     ///
     /// # Errors
     /// Returns an error when loading the backing immutable tree fails.
-    pub fn load_inode_tree(
+    pub async fn load_inode_tree(
         root: &InodeExtentRoot,
         block_size: BlockSize,
-        reader: &impl BlockReader,
+        reader: &mut impl BlockSource,
         context: ExtentTreeContext,
     ) -> Result<Self> {
-        let tree = ExtentTree::load_inode_tree(root, block_size, reader, context)?;
+        let tree = ExtentTree::load_inode_tree(root, block_size, reader, context).await?;
         Ok(Self {
             extents: tree.extents,
             metadata_blocks: tree.metadata_blocks,
@@ -597,15 +599,24 @@ struct SerializedNode {
     bytes: Vec<u8>,
 }
 
+/// External extent node waiting to be read in depth-first disk order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingExtentNode {
+    /// Physical block containing the child node.
+    block: BlockAddress,
+    /// Depth required by the parent index entry.
+    expected_depth: u16,
+}
+
 /// Walks an extent node and all index children, collecting leaf extents.
 /// # Errors
 ///
 /// Returns an error when the current node is malformed, an index child cannot be read, a child
 /// checksum fails, or recursive parsing rejects a child node.
-fn parse_node_recursive(
+async fn load_external_extent_nodes(
     raw: &[u8],
     block_size: BlockSize,
-    reader: &impl BlockReader,
+    reader: &mut impl BlockSource,
     context: ExtentTreeContext,
     extents: &mut Vec<Extent>,
     metadata_blocks: &mut Vec<BlockAddress>,
@@ -614,33 +625,37 @@ fn parse_node_recursive(
     if depth == 0 {
         return Ok(());
     }
-    parse_index_node(
-        raw,
-        depth,
-        block_size,
-        reader,
-        context,
-        extents,
-        metadata_blocks,
-    )
+    let mut pending = Vec::new();
+    push_index_children(raw, depth, &mut pending)?;
+    while let Some(child) = pending.pop() {
+        if metadata_blocks.contains(&child.block) {
+            return Err(Error::InvalidExtentTree);
+        }
+        metadata_blocks.try_push(child.block)?;
+        let mut bytes = memory::repeated_vec(
+            0_u8,
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        reader
+            .read_exact_at(block_size.offset_of(child.block)?, &mut bytes)
+            .await?;
+        verify_external_extent_block_checksum(context, bytes.as_slice())?;
+        let child_depth = parse_node(bytes.as_slice(), Some(child.expected_depth), extents)?;
+        if child_depth > 0 {
+            push_index_children(bytes.as_slice(), child_depth, &mut pending)?;
+        }
+    }
+    Ok(())
 }
 
-/// Parses an extent index node and validates each referenced child block.
+/// Pushes an index node's children in reverse so stack traversal preserves disk order.
 /// # Errors
 ///
-/// Returns an error when an index entry is truncated, points at a repeated metadata block, cannot be
-/// read from the device, has a bad checksum, or has an unexpected child depth.
-fn parse_index_node(
-    raw: &[u8],
-    depth: u16,
-    block_size: BlockSize,
-    reader: &impl BlockReader,
-    context: ExtentTreeContext,
-    extents: &mut Vec<Extent>,
-    metadata_blocks: &mut Vec<BlockAddress>,
-) -> Result<()> {
+/// Returns an error when an index entry is truncated or its parent depth cannot select a child.
+fn push_index_children(raw: &[u8], depth: u16, pending: &mut Vec<PendingExtentNode>) -> Result<()> {
     let entries = header_entries(raw)?;
-    for entry_index in 0..entries {
+    let expected_depth = depth.checked_sub(1).ok_or(Error::InvalidExtentTree)?;
+    for entry_index in (0..entries).rev() {
         let offset = entry_offset(entry_index)?;
         let end = offset
             .checked_add(EXTENT_ENTRY_SIZE)
@@ -657,33 +672,10 @@ fn parse_index_node(
             disk_offset(offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?),
         )?);
         let leaf = BlockAddress::new((leaf_hi << 32) | leaf_lo);
-        if metadata_blocks.contains(&leaf) {
-            return Err(Error::InvalidExtentTree);
-        }
-        metadata_blocks.try_push(leaf)?;
-
-        let mut child = memory::repeated_vec(
-            0_u8,
-            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-        reader.read_exact_at(block_size.offset_of(leaf)?, &mut child)?;
-        verify_external_extent_block_checksum(context, child.as_slice())?;
-        let child_depth = parse_node(
-            child.as_slice(),
-            Some(depth.checked_sub(1).ok_or(Error::InvalidExtentTree)?),
-            extents,
-        )?;
-        if child_depth > 0 {
-            parse_index_node(
-                child.as_slice(),
-                child_depth,
-                block_size,
-                reader,
-                context,
-                extents,
-                metadata_blocks,
-            )?;
-        }
+        pending.try_push(PendingExtentNode {
+            block: leaf,
+            expected_depth,
+        })?;
     }
     Ok(())
 }
