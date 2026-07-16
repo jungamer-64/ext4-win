@@ -9,10 +9,11 @@ use core::{
     cell::UnsafeCell,
     ffi::c_void,
     future::Future,
+    mem::MaybeUninit,
     pin::Pin,
     ptr::NonNull,
-    sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering},
-    task::{Context, Poll},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering},
+    task::{Context, Poll, Waker},
 };
 
 use ext4_core::{BlockSource, BlockStorage, ByteOffset, DeviceLength, Error, Result};
@@ -28,52 +29,6 @@ const COMPLETION_READY: u8 = 1;
 const BOOLEAN_TRUE: wdk_sys::BOOLEAN = 1;
 /// Stops I/O Manager completion after this driver frees its private lower IRP.
 const STATUS_MORE_PROCESSING_REQUIRED: NTSTATUS = 0xC000_0016_u32 as NTSTATUS;
-
-/// Stable executor callback recorded in each in-flight lower request.
-#[derive(Clone, Copy)]
-pub(crate) struct CompletionWake {
-    /// Stable executor-owned context.
-    context: NonNull<c_void>,
-    /// Schedules that executor from a completion callback at or below `DISPATCH_LEVEL`.
-    schedule: unsafe fn(NonNull<c_void>),
-}
-
-impl core::fmt::Debug for CompletionWake {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter
-            .debug_struct("CompletionWake")
-            .field("context", &self.context)
-            .finish_non_exhaustive()
-    }
-}
-
-impl CompletionWake {
-    /// Binds a stable executor context to its nonblocking schedule callback.
-    /// # Safety
-    ///
-    /// `context` must remain valid until every lower request carrying this value has completed.
-    /// `schedule` must be callable at any IRQL at or below `DISPATCH_LEVEL`.
-    pub(crate) const unsafe fn new(
-        context: NonNull<c_void>,
-        schedule: unsafe fn(NonNull<c_void>),
-    ) -> Self {
-        Self { context, schedule }
-    }
-
-    /// Schedules the owning executor after a lower request completes.
-    fn schedule(self) {
-        unsafe {
-            // SAFETY: Construction requires this context/callback pair to stay valid through every
-            // completion that carries it.
-            (self.schedule)(self.context);
-        }
-    }
-}
-
-// SAFETY: The constructor requires a stable, cross-thread executor context and callback.
-unsafe impl Send for CompletionWake {}
-// SAFETY: Completion callbacks may copy and invoke the same immutable callback pair concurrently.
-unsafe impl Sync for CompletionWake {}
 
 /// Physical lower-device transfer constraints.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,8 +207,10 @@ unsafe impl Send for AlignedTransferBuffer {}
 struct LowerCompletion {
     /// Aligned buffer used only by the lower device until completion becomes ready.
     buffer: UnsafeCell<AlignedTransferBuffer>,
-    /// Executor to schedule after recording terminal completion.
-    wake: CompletionWake,
+    /// Executor waker installed before the private IRP can be submitted.
+    waker: UnsafeCell<MaybeUninit<Waker>>,
+    /// Publish point for the initialized executor waker.
+    waker_ready: AtomicBool,
     /// Whether the I/O builder created a direct-I/O MDL that must be unlocked.
     direct_io: bool,
     /// Lower terminal status.
@@ -266,16 +223,12 @@ struct LowerCompletion {
 
 impl LowerCompletion {
     /// Creates one in-flight lower request state.
-    fn try_new(
-        len: usize,
-        alignment: usize,
-        wake: CompletionWake,
-        direct_io: bool,
-    ) -> Result<Arc<Self>> {
+    fn try_new(len: usize, alignment: usize, direct_io: bool) -> Result<Arc<Self>> {
         let buffer = AlignedTransferBuffer::try_zeroed(len, alignment)?;
         Arc::try_new(Self {
             buffer: UnsafeCell::new(buffer),
-            wake,
+            waker: UnsafeCell::new(MaybeUninit::uninit()),
+            waker_ready: AtomicBool::new(false),
             direct_io,
             status: AtomicI32::new(wdk_sys::STATUS_PENDING),
             information: AtomicUsize::new(0),
@@ -284,17 +237,38 @@ impl LowerCompletion {
         .map_err(|_| Error::OutOfMemory)
     }
 
+    /// Installs the task executor waker before a lower driver can observe the private IRP.
+    fn register_waker(&self, waker: &Waker) -> Result<()> {
+        if self.waker_ready.load(Ordering::Relaxed) {
+            return Err(Error::DeviceIo);
+        }
+        unsafe {
+            // SAFETY: The first poll is the sole writer, and submission cannot expose this
+            // completion to another thread until after the release store below.
+            (*self.waker.get()).write(waker.clone());
+        }
+        self.waker_ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
     /// Returns the buffer before submission, while no lower device can access it.
     fn buffer_before_submission(&mut self) -> &mut AlignedTransferBuffer {
         self.buffer.get_mut()
     }
 
-    /// Records a lower completion and schedules the owning executor.
-    fn complete(&self, status: NTSTATUS, information: usize) {
+    /// Records a lower completion and returns the task executor waker.
+    fn complete(&self, status: NTSTATUS, information: usize) -> Option<Waker> {
         self.status.store(status, Ordering::Relaxed);
         self.information.store(information, Ordering::Relaxed);
         self.phase.store(COMPLETION_READY, Ordering::Release);
-        self.wake.schedule();
+        if self.waker_ready.load(Ordering::Acquire) {
+            return Some(unsafe {
+                // SAFETY: `waker_ready` publishes one fully initialized waker before submission.
+                // It is immutable until this completion state is finally dropped.
+                (*self.waker.get()).assume_init_ref().clone()
+            });
+        }
+        None
     }
 
     /// Reads the published terminal result.
@@ -322,6 +296,35 @@ impl LowerCompletion {
             &*self.buffer.get()
         }
     }
+
+    /// Returns this completed state to the not-yet-submitted state under unique ownership.
+    fn rearm(&mut self) -> Result<()> {
+        if *self.phase.get_mut() != COMPLETION_READY {
+            return Err(Error::DeviceIo);
+        }
+        if *self.waker_ready.get_mut() {
+            unsafe {
+                // SAFETY: The readiness flag proves that the waker slot was initialized once.
+                self.waker.get_mut().assume_init_drop();
+            }
+            *self.waker_ready.get_mut() = false;
+        }
+        *self.status.get_mut() = wdk_sys::STATUS_PENDING;
+        *self.information.get_mut() = 0;
+        *self.phase.get_mut() = COMPLETION_IN_FLIGHT;
+        Ok(())
+    }
+}
+
+impl Drop for LowerCompletion {
+    fn drop(&mut self) {
+        if *self.waker_ready.get_mut() {
+            unsafe {
+                // SAFETY: A true readiness flag means `register_waker` initialized this slot once.
+                self.waker.get_mut().assume_init_drop();
+            }
+        }
+    }
 }
 
 // SAFETY: Lower-device access and future access to `buffer` are separated by `phase` release/acquire.
@@ -329,6 +332,49 @@ unsafe impl Send for LowerCompletion {}
 // SAFETY: The only interior writes are atomic completion fields and lower-device buffer access that
 // ends before `phase` publishes readiness.
 unsafe impl Sync for LowerCompletion {}
+
+/// A transfer state that has not yet been exposed to a lower driver.
+struct ArmedLowerTransfer {
+    /// Shared state retained by the lower completion routine after submission.
+    state: Arc<LowerCompletion>,
+}
+
+impl ArmedLowerTransfer {
+    /// Creates a fresh not-yet-submitted transfer state.
+    fn try_new(len: usize, alignment: usize, direct_io: bool) -> Result<Self> {
+        Ok(Self {
+            state: LowerCompletion::try_new(len, alignment, direct_io)?,
+        })
+    }
+}
+
+/// A transfer whose lower driver has terminally released its buffer.
+struct CompletedLowerTransfer {
+    /// Completed state exclusively retained by the awaiting task.
+    state: Arc<LowerCompletion>,
+}
+
+impl CompletedLowerTransfer {
+    /// Returns immutable completed transfer bytes.
+    fn buffer(&self) -> &AlignedTransferBuffer {
+        self.state.completed_buffer()
+    }
+
+    /// Returns mutable completed transfer bytes under unique post-completion ownership.
+    fn buffer_mut(&mut self) -> Result<&mut AlignedTransferBuffer> {
+        Arc::get_mut(&mut self.state)
+            .map(LowerCompletion::buffer_before_submission)
+            .ok_or(Error::DeviceIo)
+    }
+
+    /// Rearms this exact buffer for one subsequent lower transfer.
+    fn rearm(mut self) -> Result<ArmedLowerTransfer> {
+        Arc::get_mut(&mut self.state)
+            .ok_or(Error::DeviceIo)?
+            .rearm()?;
+        Ok(ArmedLowerTransfer { state: self.state })
+    }
+}
 
 /// One driver-created lower IRP represented as a cancellation-safe future.
 struct LowerRequest {
@@ -339,7 +385,7 @@ struct LowerRequest {
     /// Sector-aligned starting offset.
     offset: ByteOffset,
     /// Completion-owned state and bounce buffer.
-    completion: Arc<LowerCompletion>,
+    completion: Option<ArmedLowerTransfer>,
     /// Whether byte-count equality is required.
     expected_information: Option<usize>,
     /// Submission occurs on the first poll at `PASSIVE_LEVEL`.
@@ -352,14 +398,14 @@ impl LowerRequest {
         device: KernelDevice,
         major: wdk_sys::ULONG,
         offset: ByteOffset,
-        completion: Arc<LowerCompletion>,
+        completion: ArmedLowerTransfer,
         expected_information: Option<usize>,
     ) -> Self {
         Self {
             device,
             major,
             offset,
-            completion,
+            completion: Some(completion),
             expected_information,
             submitted: false,
         }
@@ -368,7 +414,8 @@ impl LowerRequest {
     /// Builds and submits the private lower IRP.
     #[cfg(not(test))]
     fn submit(&mut self) -> Result<()> {
-        let request_len = wdk_sys::ULONG::try_from(self.completion.completed_buffer().len())
+        let completion = self.completion.as_ref().ok_or(Error::DeviceIo)?;
+        let request_len = wdk_sys::ULONG::try_from(completion.state.completed_buffer().len())
             .map_err(|_| Error::DeviceRange)?;
         let mut starting_offset = LARGE_INTEGER {
             QuadPart: i64::try_from(self.offset.get()).map_err(|_| Error::DeviceRange)?,
@@ -384,7 +431,7 @@ impl LowerRequest {
             ffi::IoBuildAsynchronousFsdRequest(
                 self.major,
                 self.device.as_ptr(),
-                self.completion.completed_buffer().as_void_ptr(),
+                completion.state.completed_buffer().as_void_ptr(),
                 request_len,
                 starting_offset,
                 core::ptr::null_mut(),
@@ -393,7 +440,7 @@ impl LowerRequest {
         let Some(irp) = NonNull::new(irp) else {
             return Err(Error::OutOfMemory);
         };
-        let callback_state = Arc::into_raw(Arc::clone(&self.completion))
+        let callback_state = Arc::into_raw(Arc::clone(&completion.state))
             .cast_mut()
             .cast::<c_void>();
         let status = unsafe {
@@ -413,7 +460,7 @@ impl LowerRequest {
             unsafe {
                 // SAFETY: Registration failed, so no callback owns the raw Arc or IRP resources.
                 drop(Arc::from_raw(callback_state.cast::<LowerCompletion>()));
-                release_private_irp(irp.as_ptr(), self.completion.direct_io);
+                release_private_irp(irp.as_ptr(), completion.state.direct_io);
             }
             return Err(Error::DeviceIo);
         }
@@ -433,17 +480,34 @@ impl LowerRequest {
 }
 
 impl Future for LowerRequest {
-    type Output = Result<()>;
+    type Output = Result<CompletedLowerTransfer>;
 
-    fn poll(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.submitted {
+            let Some(completion) = self.completion.as_ref() else {
+                return Poll::Ready(Err(Error::DeviceIo));
+            };
+            if let Err(error) = completion.state.register_waker(context.waker()) {
+                return Poll::Ready(Err(error));
+            }
             self.submitted = true;
             if let Err(error) = self.submit() {
                 return Poll::Ready(Err(error));
             }
         }
-        match self.completion.result(self.expected_information) {
-            Some(result) => Poll::Ready(result),
+        let Some(completion) = self.completion.as_ref() else {
+            return Poll::Ready(Err(Error::DeviceIo));
+        };
+        match completion.state.result(self.expected_information) {
+            Some(Ok(())) => {
+                let Some(completion) = self.completion.take() else {
+                    return Poll::Ready(Err(Error::DeviceIo));
+                };
+                Poll::Ready(Ok(CompletedLowerTransfer {
+                    state: completion.state,
+                }))
+            }
+            Some(Err(error)) => Poll::Ready(Err(error)),
             None => Poll::Pending,
         }
     }
@@ -460,8 +524,6 @@ pub(crate) struct KernelBlockDevice {
     device: KernelDevice,
     /// Validated physical transfer constraints.
     geometry: TransferGeometry,
-    /// Executor woken by lower completions.
-    wake: CompletionWake,
     /// Whether the lower target uses direct I/O MDLs.
     direct_io: bool,
 }
@@ -471,11 +533,7 @@ impl KernelBlockDevice {
     /// # Errors
     ///
     /// Returns an error when the lower device advertises invalid sector or buffer alignment.
-    pub(crate) fn new(
-        device: KernelDevice,
-        length: DeviceLength,
-        wake: CompletionWake,
-    ) -> Result<Self> {
+    pub(crate) fn new(device: KernelDevice, length: DeviceLength) -> Result<Self> {
         let geometry = TransferGeometry::from_device(device, length)?;
         let object = unsafe {
             // SAFETY: `device` remains live for the mounted block-device lifetime and is read only
@@ -486,40 +544,33 @@ impl KernelBlockDevice {
         Ok(Self {
             device,
             geometry,
-            wake,
             direct_io: object.Flags & wdk_sys::DO_DIRECT_IO != 0,
         })
     }
 
     /// Creates completion-owned storage for one aligned transfer.
-    fn completion(&self, len: usize) -> Result<Arc<LowerCompletion>> {
-        LowerCompletion::try_new(
-            len,
-            self.geometry.buffer_alignment,
-            self.wake,
-            self.direct_io,
-        )
+    fn completion(&self, len: usize) -> Result<ArmedLowerTransfer> {
+        ArmedLowerTransfer::try_new(len, self.geometry.buffer_alignment, self.direct_io)
     }
 
     /// Reads one already aligned transfer into completion-owned storage.
-    async fn read_aligned(&mut self, transfer: CoveredTransfer) -> Result<Arc<LowerCompletion>> {
+    async fn read_aligned(&mut self, transfer: CoveredTransfer) -> Result<CompletedLowerTransfer> {
         let completion = self.completion(transfer.transfer_len)?;
         LowerRequest::new(
             self.device,
             IRP_MJ_READ,
             transfer.lower_offset,
-            Arc::clone(&completion),
+            completion,
             Some(transfer.transfer_len),
         )
-        .await?;
-        Ok(completion)
+        .await
     }
 
     /// Writes one already aligned completion-owned transfer.
     async fn write_aligned(
         &mut self,
         transfer: CoveredTransfer,
-        completion: Arc<LowerCompletion>,
+        completion: ArmedLowerTransfer,
     ) -> Result<()> {
         LowerRequest::new(
             self.device,
@@ -529,6 +580,7 @@ impl KernelBlockDevice {
             Some(transfer.transfer_len),
         )
         .await
+        .map(|_| ())
     }
 }
 
@@ -549,7 +601,7 @@ impl BlockSource for KernelBlockDevice {
         let completion = self.read_aligned(transfer).await?;
         out.copy_from_slice(
             completion
-                .completed_buffer()
+                .buffer()
                 .as_slice()
                 .get(transfer.requested_range())
                 .ok_or(Error::DeviceRange)?,
@@ -564,13 +616,21 @@ impl BlockStorage for KernelBlockDevice {
             return Ok(());
         }
         let transfer = self.geometry.cover(offset, bytes.len())?;
-        let mut completion = if transfer.is_complete_sector_range() {
+        let completion = if transfer.is_complete_sector_range() {
             self.completion(transfer.transfer_len)?
         } else {
-            self.read_aligned(transfer).await?
+            let mut completed = self.read_aligned(transfer).await?;
+            completed
+                .buffer_mut()?
+                .as_mut_slice()
+                .get_mut(transfer.requested_range())
+                .ok_or(Error::DeviceRange)?
+                .copy_from_slice(bytes);
+            return self.write_aligned(transfer, completed.rearm()?).await;
         };
-        let buffer = Arc::get_mut(&mut completion).ok_or(Error::DeviceIo)?;
-        buffer
+        let mut completion = completion;
+        Arc::get_mut(&mut completion.state)
+            .ok_or(Error::DeviceIo)?
             .buffer_before_submission()
             .as_mut_slice()
             .get_mut(transfer.requested_range())
@@ -589,6 +649,7 @@ impl BlockStorage for KernelBlockDevice {
             None,
         )
         .await
+        .map(|_| ())
     }
 }
 
@@ -651,25 +712,18 @@ unsafe extern "C" fn lower_request_completed(
         // SAFETY: This completion routine owns final release of the private lower IRP.
         release_private_irp(irp, completion.direct_io);
     }
-    completion.complete(status, usize::try_from(information).unwrap_or(usize::MAX));
+    let waker = completion.complete(status, usize::try_from(information).unwrap_or(usize::MAX));
+    drop(completion);
+    if let Some(waker) = waker {
+        waker.wake();
+    }
     STATUS_MORE_PROCESSING_REQUIRED
 }
 
 #[cfg(test)]
 mod tests {
-    use core::{ffi::c_void, ptr::NonNull};
-
-    use super::{CompletionWake, TransferGeometry};
+    use super::TransferGeometry;
     use ext4_core::{ByteOffset, DeviceLength, Error};
-
-    unsafe fn ignore_wake(_context: NonNull<c_void>) {}
-
-    fn wake() -> CompletionWake {
-        unsafe {
-            // SAFETY: Tests never submit a lower IRP, so this inert stable pair is never invoked.
-            CompletionWake::new(NonNull::dangling(), ignore_wake)
-        }
-    }
 
     /// # Panics
     ///
@@ -706,6 +760,5 @@ mod tests {
             geometry.cover(ByteOffset::new(4095), 2),
             Err(Error::DeviceRange)
         );
-        let _wake = wake();
     }
 }
