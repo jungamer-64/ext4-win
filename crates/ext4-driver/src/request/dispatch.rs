@@ -258,7 +258,11 @@ fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS
             received.complete_result(execute_immediate(major, target))
         }
         DispatchPolicy::Queued => DeviceIrpQueue::receive_async(received),
-        DispatchPolicy::QueuedCleanup => dispatch_cleanup(received),
+        DispatchPolicy::SynchronousCleanup => dispatch_cleanup(received),
+        DispatchPolicy::SynchronousClose => {
+            let target = received.target();
+            received.complete_result(crate::request::file_info::close(target))
+        }
         DispatchPolicy::FsRtlFileLock => dispatch_file_lock(received),
     }
 }
@@ -270,8 +274,10 @@ enum DispatchPolicy {
     Immediate,
     /// Mark pending and execute from the device queue worker.
     Queued,
-    /// Cancel pending IRPs for the FILE_OBJECT, then execute cleanup from the device queue worker.
-    QueuedCleanup,
+    /// Cancel pending IRPs and consume cleanup-owned state in the requestor thread.
+    SynchronousCleanup,
+    /// Release terminal FILE_OBJECT contexts synchronously, including post-create cancellation.
+    SynchronousClose,
     /// Transfer terminal completion to the FsRtl byte-range lock package.
     FsRtlFileLock,
 }
@@ -280,10 +286,10 @@ enum DispatchPolicy {
 const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
     match major {
         DispatchMajor::DeviceControl => DispatchPolicy::Immediate,
-        DispatchMajor::Cleanup => DispatchPolicy::QueuedCleanup,
+        DispatchMajor::Cleanup => DispatchPolicy::SynchronousCleanup,
+        DispatchMajor::Close => DispatchPolicy::SynchronousClose,
         DispatchMajor::LockControl => DispatchPolicy::FsRtlFileLock,
         DispatchMajor::Create
-        | DispatchMajor::Close
         | DispatchMajor::Read
         | DispatchMajor::Write
         | DispatchMajor::QueryInformation
@@ -301,7 +307,7 @@ const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
     }
 }
 
-/// Cancels queued IRPs for a FILE_OBJECT, then executes its cleanup at PASSIVE_LEVEL.
+/// Cancels queued IRPs for a FILE_OBJECT, then executes cleanup in the requestor thread.
 fn dispatch_cleanup(received: ReceivedIrp) -> NTSTATUS {
     let target = received.target();
     let file_object = match target.current_stack().and_then(|stack| stack.file_object()) {
@@ -313,7 +319,7 @@ fn dispatch_cleanup(received: ReceivedIrp) -> NTSTATUS {
         Err(error) => return received.complete_result(Err(error)),
     };
     DeviceIrpQueue::cancel_file_object(queue, file_object);
-    DeviceIrpQueue::receive_async(received)
+    received.complete_result(crate::request::file_info::cleanup(target))
 }
 
 /// Decodes a lock target, then lets FsRtl own and complete the lock-control IRP.
@@ -399,8 +405,8 @@ fn execute_major(major: DispatchMajor, target: DispatchTarget) -> DriverResult<I
     match major {
         // Create has an ownership-bearing completion path selected by execute_queued.
         DispatchMajor::Create => Err(DriverError::InvalidDeviceRequest),
-        DispatchMajor::Close => crate::request::file_info::close(target),
-        DispatchMajor::Cleanup => crate::request::file_info::cleanup(target),
+        // Lifecycle IRPs have a requester-thread-only execution boundary selected in `dispatch`.
+        DispatchMajor::Close | DispatchMajor::Cleanup => Err(DriverError::InvalidDeviceRequest),
         DispatchMajor::Read => crate::request::file_info::read(target),
         DispatchMajor::Write => crate::request::file_info::write(target),
         DispatchMajor::QueryInformation => crate::request::file_info::query(target),
@@ -457,23 +463,23 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when cleanup can run above PASSIVE_LEVEL after cancelling its pending IRPs.
+    /// Panics when cleanup leaves the requestor thread after cancelling its pending IRPs.
     #[test]
-    fn cleanup_is_queued_after_pending_irps_are_cancelled() {
+    fn cleanup_runs_synchronously_after_pending_irps_are_cancelled() {
         assert_eq!(
             dispatch_policy(DispatchMajor::Cleanup),
-            DispatchPolicy::QueuedCleanup
+            DispatchPolicy::SynchronousCleanup
         );
     }
 
     /// # Panics
     ///
-    /// Panics when close can race queued create or cleanup FCB lifecycle transitions.
+    /// Panics when close is queued behind a create whose completion can synchronously cancel it.
     #[test]
-    fn close_is_serialized_with_fcb_lifecycle_operations() {
+    fn close_runs_synchronously_for_post_create_cancellation() {
         assert_eq!(
             dispatch_policy(DispatchMajor::Close),
-            DispatchPolicy::Queued
+            DispatchPolicy::SynchronousClose
         );
     }
 

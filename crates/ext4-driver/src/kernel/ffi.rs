@@ -13,12 +13,13 @@ pub(crate) use wdk_sys::ntddk::{
 
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{
-    FsRtlFastCheckLockForRead, FsRtlFastCheckLockForWrite, FsRtlFastUnlockAll,
-    FsRtlInitializeFileLock, FsRtlNotifyCleanup, FsRtlNotifyCleanupAll,
-    FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange, FsRtlNotifyInitializeSync,
-    FsRtlNotifyUninitializeSync, FsRtlProcessFileLock, FsRtlUninitializeFileLock,
-    IoAllocateWorkItem, IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeWorkItem,
-    IoGetRequestorProcess, IoQueueWorkItem, IoRegisterShutdownNotification,
-    KeAcquireGuardedMutex, KeAcquireSpinLockRaiseToDpc, KeInitializeGuardedMutex,
-    KeInitializeSpinLock, KeReleaseGuardedMutex, KeReleaseSpinLock,
+    ExDeleteResourceLite, ExEnterCriticalRegionAndAcquireResourceExclusive,
+    ExInitializeResourceLite, ExReleaseResourceAndLeaveCriticalRegion, FsRtlFastCheckLockForRead,
+    FsRtlFastCheckLockForWrite, FsRtlFastUnlockAll, FsRtlInitializeFileLock, FsRtlNotifyCleanup,
+    FsRtlNotifyCleanupAll, FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange,
+    FsRtlNotifyInitializeSync, FsRtlNotifyUninitializeSync, FsRtlProcessFileLock,
+    FsRtlUninitializeFileLock, IoAllocateWorkItem, IoCsqInitialize, IoCsqInsertIrp,
+    IoCsqRemoveNextIrp, IoFreeWorkItem, IoGetRequestorProcess, IoQueueWorkItem,
+    IoRegisterShutdownNotification, KeAcquireSpinLockRaiseToDpc, KeInitializeSpinLock,
+    KeReleaseSpinLock,
 };

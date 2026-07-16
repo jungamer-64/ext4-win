@@ -4,10 +4,16 @@ use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::fmt;
+use core::marker::PhantomData;
+#[cfg(not(test))]
+use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
+#[cfg(not(test))]
+use core::pin::Pin;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU8, Ordering};
 #[cfg(test)]
-use core::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use ext4_core::{
     DeviceLength, DirectoryNodeId, Ext4Name, Ext4Timestamp, FileNodeId, FileOffset,
@@ -306,12 +312,31 @@ impl KernelFileObject {
         self.file_object.as_ptr()
     }
 
+    /// Returns whether this filesystem has completed cleanup for the FILE_OBJECT.
+    pub(crate) fn cleanup_complete(self) -> bool {
+        let flags = unsafe {
+            // SAFETY: The active cleanup or close callback retains this live FILE_OBJECT while
+            // reading the filesystem-owned cleanup flag.
+            self.as_ref().Flags
+        };
+        flags & wdk_sys::FO_CLEANUP_COMPLETE != 0
+    }
+
+    /// Publishes completion of every cleanup-owned release as the final cleanup mutation.
+    pub(crate) fn mark_cleanup_complete(self) {
+        let file_object = unsafe {
+            // SAFETY: Cleanup is the unique FILE_OBJECT lifecycle transition that publishes this
+            // filesystem-owned flag, after all cleanup side effects have completed.
+            self.as_mut()
+        };
+        file_object.Flags |= wdk_sys::FO_CLEANUP_COMPLETE;
+    }
+
     /// Decodes the I/O Manager's close reason from stable FILE_OBJECT flags.
-    /// # Errors
     ///
-    /// Returns an internal invariant failure when a cancelled open also claims that a handle was
-    /// created, which violates the `IoCancelFileOpen` contract.
-    pub(crate) fn close_kind(self) -> DriverResult<FileObjectCloseKind> {
+    /// A cancelled open that also claims a created handle violates the `IoCancelFileOpen`
+    /// contract and cannot be recovered without risking a double lifecycle release.
+    pub(crate) fn close_kind_or_bugcheck(self) -> FileObjectCloseKind {
         let flags = unsafe {
             // SAFETY: Close owns the live FILE_OBJECT while classifying the I/O Manager lifecycle.
             self.as_ref().Flags
@@ -319,9 +344,9 @@ impl KernelFileObject {
         let cancelled = flags & wdk_sys::FO_FILE_OPEN_CANCELLED != 0;
         let handle_created = flags & wdk_sys::FO_HANDLE_CREATED != 0;
         match (cancelled, handle_created) {
-            (true, true) => Err(DriverError::InternalInvariantViolation),
-            (true, false) => Ok(FileObjectCloseKind::CancelledOpen),
-            (false, _) => Ok(FileObjectCloseKind::Ordinary),
+            (true, true) => KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck(),
+            (true, false) => FileObjectCloseKind::CancelledOpen,
+            (false, _) => FileObjectCloseKind::Ordinary,
         }
     }
 }
@@ -596,86 +621,127 @@ pub(crate) struct VolumeControlBlock {
     /// Volume-wide opaque FsRtl notification state. This field drops before filesystem state so
     /// pending notify IRPs cannot outlive the mounted namespace they observe.
     directory_change_notifier: DirectoryChangeNotifier,
+    /// Synchronized VCB-owned FCB identities and Windows share ledger. This field drops before
+    /// the mounted volume because every FCB retains that volume as its data-plane owner.
+    file_control_blocks: FileControlBlockLedger,
     /// Mounted journaled read-write ext4 volume.
     volume: JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator>,
-    /// Synchronized VCB-owned FCB identities and Windows share ledger.
-    file_control_blocks: FileControlBlockLedger,
 }
 
-/// VCB-owned FCB table and share accounting protected by one concrete kernel mutex.
-#[derive(Debug)]
+/// VCB-owned FCB table and share accounting protected by one concrete executive resource.
 struct FileControlBlockLedger {
-    /// Stable-address guarded mutex for every table/share/open-count transition.
-    lock: Box<FileControlBlockLedgerLock>,
     /// Mutable ledger state reachable only while `lock` is held.
     table: UnsafeCell<DriverVec<Box<FileControlBlock>>>,
+    /// Stable-address executive resource for every table/share/reference transition.
+    lock: FileControlBlockLedgerLock,
 }
 
 // SAFETY: Every production and test access to `table` is serialized by `lock`; no reference to
 // the table or an FCB's ledger-owned mutable fields escapes the guard scope.
 unsafe impl Sync for FileControlBlockLedger {}
 
-/// Stable-address WDK guarded mutex dedicated to the FCB ledger.
-#[derive(Debug)]
-struct FileControlBlockLedgerLock {
-    /// Native mutex initialized only after this wrapper reaches its final Box address.
-    #[cfg(not(test))]
-    native: UnsafeCell<wdk_sys::KGUARDED_MUTEX>,
-    /// Sound single-owner model used by host unit tests where kernel mutex routines are absent.
-    #[cfg(test)]
-    held: AtomicBool,
+impl fmt::Debug for FileControlBlockLedger {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FileControlBlockLedger(..)")
+    }
 }
 
-// SAFETY: `native` is accessed only through the WDK guarded-mutex routines; the test ownership bit
-// is atomic. Both implementations provide exclusive guard ownership.
+impl Drop for FileControlBlockLedger {
+    fn drop(&mut self) {
+        if !self.table.get_mut().is_empty() {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
+    }
+}
+
+/// Stable-address WDK executive resource dedicated to the FCB ledger.
+struct FileControlBlockLedgerLock {
+    /// Native resource initialized only after this allocation reaches its final pinned address.
+    #[cfg(not(test))]
+    native: Pin<Box<MaybeUninit<wdk_sys::ERESOURCE>>>,
+    /// Host mutex with the same exclusive RAII ownership model as the native resource.
+    #[cfg(test)]
+    native: Mutex<()>,
+}
+
+// SAFETY: Production access uses only the executive-resource routines against pinned initialized
+// storage. The host backend is a `Mutex`. Both provide exclusive guard ownership.
 unsafe impl Sync for FileControlBlockLedgerLock {}
 
-/// Exclusive ownership of the FCB ledger mutex.
+impl fmt::Debug for FileControlBlockLedgerLock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FileControlBlockLedgerLock(..)")
+    }
+}
+
+/// Exclusive requester-thread ownership of the FCB ledger resource.
 struct FileControlBlockLedgerGuard<'a> {
-    /// Lock released when the ledger transition scope ends.
+    /// Native resource released on the same thread when this guard drops.
+    #[cfg(not(test))]
     lock: &'a FileControlBlockLedgerLock,
+    /// Host guard used only where WDK executive-resource routines are unavailable.
+    #[cfg(test)]
+    _native: MutexGuard<'a, ()>,
+    /// Executive resources cannot be released by a different thread than their acquirer.
+    _not_send: PhantomData<*mut ()>,
 }
 
 impl FileControlBlockLedgerLock {
-    /// Allocates and initializes a guarded mutex at its permanent address.
+    /// Allocates and initializes an executive resource at its permanent address.
     /// # Errors
     ///
-    /// Returns an error when stable lock storage cannot be allocated.
-    fn try_new() -> DriverResult<Box<Self>> {
-        let lock = memory::boxed_try_with(|| {
-            Ok(Self {
-                #[cfg(not(test))]
-                native: UnsafeCell::new(wdk_sys::KGUARDED_MUTEX::default()),
-                #[cfg(test)]
-                held: AtomicBool::new(false),
-            })
-        })?;
+    /// Returns an error when stable resource storage cannot be allocated or initialized.
+    fn try_new() -> DriverResult<Self> {
         #[cfg(not(test))]
-        unsafe {
-            // SAFETY: `lock` is now Box-pinned for its entire initialized lifetime and guarded
-            // mutex initialization does not retain any caller-owned temporary storage.
-            ffi::KeInitializeGuardedMutex(lock.native.get());
+        {
+            let native =
+                memory::boxed_try_with(|| Ok(MaybeUninit::<wdk_sys::ERESOURCE>::uninit()))?;
+            let native = Box::into_pin(native);
+            let status = unsafe {
+                // SAFETY: `native` is pinned at its final nonpaged address. The storage is not
+                // exposed or dropped as an initialized ERESOURCE unless initialization succeeds.
+                ffi::ExInitializeResourceLite(native.as_ref().get_ref().as_ptr().cast_mut())
+            };
+            if status < STATUS_SUCCESS {
+                return Err(DriverError::InsufficientResources);
+            }
+            Ok(Self { native })
         }
-        Ok(lock)
+        #[cfg(test)]
+        {
+            Ok(Self {
+                native: Mutex::new(()),
+            })
+        }
     }
 
     /// Acquires exclusive ledger ownership until the returned guard drops.
     fn acquire(&self) -> FileControlBlockLedgerGuard<'_> {
         #[cfg(not(test))]
         unsafe {
-            // SAFETY: The mutex was initialized at this stable address and every acquisition is
-            // paired with `Drop` on the returned guard.
-            ffi::KeAcquireGuardedMutex(self.native.get());
+            // SAFETY: The resource was initialized at this pinned address. This combined routine
+            // retains PASSIVE_LEVEL while disabling normal kernel APC delivery, and guard Drop
+            // releases it on the acquiring thread.
+            ffi::ExEnterCriticalRegionAndAcquireResourceExclusive(self.native_ptr());
         }
         #[cfg(test)]
-        while self
-            .held
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
+        let native = match self.native.lock() {
+            Ok(native) => native,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        FileControlBlockLedgerGuard {
+            #[cfg(not(test))]
+            lock: self,
+            #[cfg(test)]
+            _native: native,
+            _not_send: PhantomData,
         }
-        FileControlBlockLedgerGuard { lock: self }
+    }
+
+    /// Returns the initialized native resource pointer.
+    #[cfg(not(test))]
+    fn native_ptr(&self) -> *mut wdk_sys::ERESOURCE {
+        self.native.as_ref().get_ref().as_ptr().cast_mut()
     }
 }
 
@@ -683,23 +749,45 @@ impl Drop for FileControlBlockLedgerGuard<'_> {
     fn drop(&mut self) {
         #[cfg(not(test))]
         unsafe {
-            // SAFETY: This guard uniquely owns the matching successful mutex acquisition.
-            ffi::KeReleaseGuardedMutex(self.lock.native.get());
+            // SAFETY: This !Send guard is dropping on the thread that exclusively acquired the
+            // matching resource and entered its critical region.
+            ffi::ExReleaseResourceAndLeaveCriticalRegion(self.lock.native_ptr());
         }
-        #[cfg(test)]
-        self.lock.held.store(false, Ordering::Release);
     }
 }
 
+#[cfg(not(test))]
+impl Drop for FileControlBlockLedgerLock {
+    fn drop(&mut self) {
+        let status = unsafe {
+            // SAFETY: Construction publishes this wrapper only after successful initialization,
+            // and ledger teardown guarantees no guard or table entry remains.
+            ffi::ExDeleteResourceLite(self.native_ptr())
+        };
+        if status < STATUS_SUCCESS {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
+    }
+}
+
+/// Share validation required before publishing one handle claim.
+#[derive(Clone, Copy, Debug)]
+enum FileControlBlockShareCheck {
+    /// Existing-node operations must first respect the access shared by prior handles.
+    ExistingNode(ExistingOperationAccess),
+    /// A transaction-local new node has no pre-existing operation access to validate.
+    NewNode,
+}
+
 impl FileControlBlockLedger {
-    /// Creates an empty synchronized FCB ledger.
+    /// Creates an empty synchronized FCB ledger and its native resource.
     /// # Errors
     ///
-    /// Returns an error when the stable kernel mutex cannot be allocated.
+    /// Returns an error when the stable executive resource cannot be allocated or initialized.
     fn try_new() -> DriverResult<Self> {
         Ok(Self {
-            lock: FileControlBlockLedgerLock::try_new()?,
             table: UnsafeCell::new(DriverVec::new()),
+            lock: FileControlBlockLedgerLock::try_new()?,
         })
     }
 
@@ -716,27 +804,14 @@ impl FileControlBlockLedger {
         existing_operation_access: ExistingOperationAccess,
         share_access: ShareAccess,
     ) -> DriverResult<NonNull<FileControlBlock>> {
-        let _guard = self.lock.acquire();
-        let table = unsafe {
-            // SAFETY: The guarded mutex uniquely owns ledger mutation for this scope.
-            &mut *self.table.get()
-        };
-        let mut fcb = open_file_control_block_in_table(table, volume, node)?;
-        let share_result = unsafe {
-            // SAFETY: `fcb` was returned from `table` while the ledger guard remains held.
-            fcb.as_mut()
-        }
-        .check_operation_and_record_share_access(
+        self.open(
+            volume,
+            node,
             file_object,
             desired_access,
-            existing_operation_access,
             share_access,
-        );
-        if let Err(error) = share_result {
-            close_file_control_block_in_table(table, fcb);
-            return Err(error);
-        }
-        Ok(fcb)
+            FileControlBlockShareCheck::ExistingNode(existing_operation_access),
+        )
     }
 
     /// Opens a staged-new-node FCB and atomically records its share claim.
@@ -751,61 +826,173 @@ impl FileControlBlockLedger {
         desired_access: DesiredAccess,
         share_access: ShareAccess,
     ) -> DriverResult<NonNull<FileControlBlock>> {
+        self.open(
+            volume,
+            node,
+            file_object,
+            desired_access,
+            share_access,
+            FileControlBlockShareCheck::NewNode,
+        )
+    }
+
+    /// Opens or creates one ledger entry and records the FILE_OBJECT share claim atomically.
+    /// # Errors
+    ///
+    /// Returns an error when allocation, reference growth, or share validation fails.
+    fn open(
+        &self,
+        volume: NonNull<VolumeControlBlock>,
+        node: NodeId,
+        file_object: KernelFileObject,
+        desired_access: DesiredAccess,
+        share_access: ShareAccess,
+        share_check: FileControlBlockShareCheck,
+    ) -> DriverResult<NonNull<FileControlBlock>> {
+        if let Some(result) =
+            self.try_open_present(node, file_object, desired_access, share_access, share_check)
+        {
+            return result;
+        }
+
+        let candidate = memory::boxed_try_with(|| Ok(self.file_control_block(volume, node)))?;
+        let mut discarded = None;
+        let mut removed = None;
+        let result = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource uniquely owns table mutation for this scope.
+                &mut *self.table.get()
+            };
+            if let Some(fcb) = find_file_control_block_in_table(table, node) {
+                discarded = Some(candidate);
+                record_reused_file_control_block_open(
+                    table,
+                    fcb,
+                    file_object,
+                    desired_access,
+                    share_access,
+                    share_check,
+                )
+                .map(|()| fcb)
+            } else {
+                let fcb = NonNull::from(candidate.as_ref());
+                match table.try_push_owned(candidate) {
+                    Ok(()) => match record_file_control_block_share(
+                        table,
+                        fcb,
+                        file_object,
+                        desired_access,
+                        share_access,
+                        share_check,
+                    ) {
+                        Ok(()) => Ok(fcb),
+                        Err(error) => {
+                            removed = close_file_control_block_in_table(table, fcb);
+                            Err(error)
+                        }
+                    },
+                    Err(error) => {
+                        let (error, candidate) = error.into_parts();
+                        discarded = Some(candidate);
+                        Err(error)
+                    }
+                }
+            }
+        };
+        drop(removed);
+        drop(discarded);
+        result
+    }
+
+    /// Creates an uninserted FCB candidate owned by this ledger.
+    fn file_control_block(
+        &self,
+        volume: NonNull<VolumeControlBlock>,
+        node: NodeId,
+    ) -> FileControlBlock {
+        FileControlBlock::new(volume, NonNull::from(self), node)
+    }
+
+    /// Attempts to reuse an existing entry without allocating a candidate FCB.
+    fn try_open_present(
+        &self,
+        node: NodeId,
+        file_object: KernelFileObject,
+        desired_access: DesiredAccess,
+        share_access: ShareAccess,
+        share_check: FileControlBlockShareCheck,
+    ) -> Option<DriverResult<NonNull<FileControlBlock>>> {
         let _guard = self.lock.acquire();
         let table = unsafe {
-            // SAFETY: The guarded mutex uniquely owns ledger mutation for this scope.
-            &mut *self.table.get()
+            // SAFETY: The executive resource serializes table lookup and open-state mutation.
+            &*self.table.get()
         };
-        let mut fcb = open_file_control_block_in_table(table, volume, node)?;
-        let share_result = unsafe {
-            // SAFETY: `fcb` was returned from `table` while the ledger guard remains held.
-            fcb.as_mut()
-        }
-        .record_share_access(file_object, desired_access, share_access);
-        if let Err(error) = share_result {
-            close_file_control_block_in_table(table, fcb);
-            return Err(error);
-        }
-        Ok(fcb)
+        let fcb = find_file_control_block_in_table(table, node)?;
+        Some(
+            record_reused_file_control_block_open(
+                table,
+                fcb,
+                file_object,
+                desired_access,
+                share_access,
+                share_check,
+            )
+            .map(|()| fcb),
+        )
     }
 
     /// Releases a share claim while retaining the FILE_OBJECT's FCB reference until close.
-    fn release_share_access(
-        &self,
-        fcb: NonNull<FileControlBlock>,
-        file_object: KernelFileObject,
-    ) {
+    fn release_share_access(&self, fcb: NonNull<FileControlBlock>, file_object: KernelFileObject) {
         let _guard = self.lock.acquire();
         let table = unsafe {
-            // SAFETY: The guarded mutex uniquely owns ledger mutation for this scope.
-            &mut *self.table.get()
+            // SAFETY: The executive resource serializes lookup and open-state mutation.
+            &*self.table.get()
         };
-        ledger_file_control_block_mut(table, fcb).remove_share_access(file_object);
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: The ledger resource remains exclusively held and the helper validated this
+            // state pointer against the owning table.
+            state.as_mut()
+        }
+        .remove_share_access(file_object);
     }
 
-    /// Rolls back a recorded share claim and its FCB reference before FILE_OBJECT attachment.
-    fn abandon_open(
+    /// Atomically releases a share claim and the same FILE_OBJECT's final FCB reference.
+    fn release_share_access_and_reference(
         &self,
         fcb: NonNull<FileControlBlock>,
         file_object: KernelFileObject,
     ) {
-        let _guard = self.lock.acquire();
-        let table = unsafe {
-            // SAFETY: The guarded mutex uniquely owns ledger mutation for this scope.
-            &mut *self.table.get()
+        let removed = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource uniquely owns table and open-state mutation.
+                &mut *self.table.get()
+            };
+            let mut state = ledger_file_control_block_open_state(table, fcb);
+            unsafe {
+                // SAFETY: The ledger resource remains exclusively held and the helper validated
+                // this state pointer against the owning table.
+                state.as_mut()
+            }
+            .remove_share_access(file_object);
+            close_file_control_block_in_table(table, fcb)
         };
-        ledger_file_control_block_mut(table, fcb).remove_share_access(file_object);
-        close_file_control_block_in_table(table, fcb);
+        drop(removed);
     }
 
     /// Releases one FILE_OBJECT's final FCB reference at close.
     fn close(&self, fcb: NonNull<FileControlBlock>) {
-        let _guard = self.lock.acquire();
-        let table = unsafe {
-            // SAFETY: The guarded mutex uniquely owns ledger mutation for this scope.
-            &mut *self.table.get()
+        let removed = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource uniquely owns table and open-state mutation.
+                &mut *self.table.get()
+            };
+            close_file_control_block_in_table(table, fcb)
         };
-        close_file_control_block_in_table(table, fcb);
+        drop(removed);
     }
 }
 
@@ -834,8 +1021,8 @@ impl VolumeControlBlock {
         )?;
         Ok(Self {
             directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
-            volume,
             file_control_blocks: FileControlBlockLedger::try_new()?,
+            volume,
         })
     }
 
@@ -927,13 +1114,19 @@ impl VolumeControlBlock {
         existing_operation_access: ExistingOperationAccess,
         share_access: ShareAccess,
     ) -> DriverResult<NonNull<FileControlBlock>> {
-        let vcb = unsafe {
-            // SAFETY: The caller passes a live mounted VCB pointer from the
-            // mounted device extension while processing create/open. The FCB ledger provides its
-            // own interior synchronization and is accessed through a shared VCB reference.
-            volume.as_ref()
+        let volume_ptr = volume.as_ptr();
+        let file_control_blocks = unsafe {
+            // SAFETY: `volume_ptr` identifies the live, stable mounted VCB. `addr_of!` projects
+            // the ledger address without creating a reference to the transaction-owned volume.
+            core::ptr::addr_of!((*volume_ptr).file_control_blocks)
         };
-        vcb.file_control_blocks.open_existing(
+        let file_control_blocks = unsafe {
+            // SAFETY: The mounted VCB pointer is stable for request processing. Raw field
+            // projection borrows only the independently synchronized ledger and never creates a
+            // shared reference spanning the transaction-owned `volume` field.
+            &*file_control_blocks
+        };
+        file_control_blocks.open_existing(
             volume,
             node,
             file_object,
@@ -956,8 +1149,7 @@ impl VolumeControlBlock {
         now: Ext4Timestamp,
     ) -> DriverResult<PendingChildCreation<'_>> {
         let volume = NonNull::from(&mut *self);
-        let (mounted_volume, file_control_blocks) =
-            (&mut self.volume, &self.file_control_blocks);
+        let (mounted_volume, file_control_blocks) = (&mut self.volume, &self.file_control_blocks);
         let mut transaction = mounted_volume.begin_transaction(now);
         let parent = transaction.directory(parent)?;
         let node = match target {
@@ -974,11 +1166,6 @@ impl VolumeControlBlock {
             volume,
             node,
         })
-    }
-
-    /// Releases one open reference to a VCB-owned FCB.
-    fn close_file_control_block(&self, fcb: NonNull<FileControlBlock>) {
-        self.file_control_blocks.close(fcb);
     }
 }
 
@@ -1545,64 +1732,81 @@ impl PendingChildCreation<'_> {
     }
 }
 
-/// Opens or reuses an FCB in a VCB-owned table.
+/// Records a share claim and then publishes one additional FILE_OBJECT reference.
 /// # Errors
 ///
-/// Returns an error when FCB allocation fails or an existing FCB open count overflows.
-fn open_file_control_block_in_table(
-    table: &mut DriverVec<Box<FileControlBlock>>,
-    volume: NonNull<VolumeControlBlock>,
-    node: NodeId,
-) -> DriverResult<NonNull<FileControlBlock>> {
-    if let Some(mut fcb) = find_file_control_block_in_table(table, node) {
-        let fcb_ref = unsafe {
-            // SAFETY: FCB pointers in the table are Box allocations owned
-            // by this VCB and remain valid until their open count reaches
-            // zero in `close_file_control_block_in_table`.
-            fcb.as_mut()
-        };
-        fcb_ref.add_open_reference()?;
-        return Ok(fcb);
-    }
+/// Returns an error without changing either count when reference growth or share validation fails.
+fn record_reused_file_control_block_open(
+    table: &DriverVec<Box<FileControlBlock>>,
+    fcb: NonNull<FileControlBlock>,
+    file_object: KernelFileObject,
+    desired_access: DesiredAccess,
+    share_access: ShareAccess,
+    share_check: FileControlBlockShareCheck,
+) -> DriverResult<()> {
+    let mut state = ledger_file_control_block_open_state(table, fcb);
+    let state = unsafe {
+        // SAFETY: The caller holds the ledger resource exclusively and the helper validated this
+        // state pointer against the owning table.
+        state.as_mut()
+    };
+    let references = state.next_file_object_reference()?;
+    state.record_share_access(file_object, desired_access, share_access, share_check)?;
+    state.file_object_references = references;
+    Ok(())
+}
 
-    let mut fcb = memory::boxed_try_with(|| Ok(FileControlBlock::new(volume, node)))?;
-    let fcb_ptr = NonNull::from(fcb.as_mut());
-    table
-        .try_push_owned(fcb)
-        .map_err(|error| error.into_parts().0)?;
-    Ok(fcb_ptr)
+/// Records the first share claim on a newly inserted FCB.
+/// # Errors
+///
+/// Returns an error when Windows rejects the requested share claim.
+fn record_file_control_block_share(
+    table: &DriverVec<Box<FileControlBlock>>,
+    fcb: NonNull<FileControlBlock>,
+    file_object: KernelFileObject,
+    desired_access: DesiredAccess,
+    share_access: ShareAccess,
+    share_check: FileControlBlockShareCheck,
+) -> DriverResult<()> {
+    let mut state = ledger_file_control_block_open_state(table, fcb);
+    unsafe {
+        // SAFETY: The caller holds the ledger resource exclusively and the helper validated this
+        // state pointer against the owning table.
+        state.as_mut()
+    }
+    .record_share_access(file_object, desired_access, share_access, share_check)
 }
 
 /// Releases one open reference to an FCB in a VCB-owned table.
 fn close_file_control_block_in_table(
     table: &mut DriverVec<Box<FileControlBlock>>,
     fcb: NonNull<FileControlBlock>,
-) {
+) -> Option<Box<FileControlBlock>> {
     let Some(index) = table
         .iter()
         .position(|candidate| NonNull::from(candidate.as_ref()) == fcb)
     else {
         KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
     };
-    let mut fcb = fcb;
-    let fcb_ref = unsafe {
-        // SAFETY: The FCB was found in this VCB's ownership table.
-        fcb.as_mut()
-    };
-    match fcb_ref.release_open_reference() {
-        FileControlBlockRelease::StillOpen => {}
-        FileControlBlockRelease::LastReference => {
-            let Some(removed) = table.swap_remove(index) else {
-                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-            };
-            drop(removed);
-        }
+    let mut state = ledger_file_control_block_open_state(table, fcb);
+    let release = unsafe {
+        // SAFETY: The caller holds the ledger resource exclusively and the helper validated this
+        // state pointer against the owning table.
+        state.as_mut()
+    }
+    .release_open_reference();
+    match release {
+        FileControlBlockRelease::StillOpen => None,
+        FileControlBlockRelease::LastReference => match table.swap_remove(index) {
+            Some(removed) => Some(removed),
+            None => KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck(),
+        },
     }
 }
 
 /// Finds a VCB-owned FCB by node identity.
 fn find_file_control_block_in_table(
-    table: &mut DriverVec<Box<FileControlBlock>>,
+    table: &DriverVec<Box<FileControlBlock>>,
     node: NodeId,
 ) -> Option<NonNull<FileControlBlock>> {
     table
@@ -1611,18 +1815,21 @@ fn find_file_control_block_in_table(
         .map(|fcb| NonNull::from(fcb.as_ref()))
 }
 
-/// Returns one ledger-owned FCB for mutation while the caller holds the ledger mutex.
-fn ledger_file_control_block_mut(
-    table: &mut DriverVec<Box<FileControlBlock>>,
+/// Returns one ledger-owned FCB's open-state address after validating table ownership.
+fn ledger_file_control_block_open_state(
+    table: &DriverVec<Box<FileControlBlock>>,
     fcb: NonNull<FileControlBlock>,
-) -> &mut FileControlBlock {
-    table
-        .iter_mut()
+) -> NonNull<FileControlBlockOpenState> {
+    let fcb = table
+        .iter()
         .find(|candidate| NonNull::from(candidate.as_ref()) == fcb)
-        .map(Box::as_mut)
+        .map(Box::as_ref)
         .unwrap_or_else(|| {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
-        })
+        });
+    NonNull::new(fcb.open_state.get()).unwrap_or_else(|| {
+        KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+    })
 }
 
 /// Windows volume serial number derived from the ext4 filesystem UUID.
@@ -1873,44 +2080,62 @@ impl VpbLabel {
     }
 }
 
-#[derive(Debug)]
 /// File control block stored in `FILE_OBJECT::FsContext`.
 pub(crate) struct FileControlBlock {
     /// Mounted volume that owns this file.
     volume: NonNull<VolumeControlBlock>,
+    /// Ledger that owns this FCB allocation and every open-state transition.
+    owner: NonNull<FileControlBlockLedger>,
     /// Ext4 node opened by this FCB.
     node: NodeId,
-    /// I/O manager share-access accounting for this inode identity.
-    share_access: SHARE_ACCESS,
     /// FsRtl-owned byte-range lock state for this opened inode identity.
     byte_range_locks: FileByteRangeLocks,
-    /// Number of open FILE_OBJECTs currently referencing this FCB.
-    open_count: NonZeroU32,
+    /// Ledger-owned mutable state; accessed only under `owner`'s exclusive resource.
+    open_state: UnsafeCell<FileControlBlockOpenState>,
+}
+
+// SAFETY: `volume`, `owner`, and `node` are immutable after construction. FsRtl synchronizes its
+// opaque byte-range lock package, while `open_state` is accessed only under the owner ledger's
+// exclusive executive resource.
+unsafe impl Sync for FileControlBlock {}
+
+impl fmt::Debug for FileControlBlock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileControlBlock")
+            .field("volume", &self.volume)
+            .field("owner", &self.owner)
+            .field("node", &self.node)
+            .field("byte_range_locks", &self.byte_range_locks)
+            .field("open_state", &"FileControlBlockOpenState(..)")
+            .finish()
+    }
 }
 
 impl FileControlBlock {
     /// Creates an FCB boundary value for a mounted node with one open reference.
-    pub(crate) fn new(volume: NonNull<VolumeControlBlock>, node: NodeId) -> Self {
+    fn new(
+        volume: NonNull<VolumeControlBlock>,
+        owner: NonNull<FileControlBlockLedger>,
+        node: NodeId,
+    ) -> Self {
         Self {
             volume,
+            owner,
             node,
-            share_access: SHARE_ACCESS {
-                OpenCount: 0,
-                Readers: 0,
-                Writers: 0,
-                Deleters: 0,
-                SharedRead: 0,
-                SharedWrite: 0,
-                SharedDelete: 0,
-            },
             byte_range_locks: FileByteRangeLocks::new(),
-            open_count: NonZeroU32::MIN,
+            open_state: UnsafeCell::new(FileControlBlockOpenState::new()),
         }
     }
 
     /// Returns the mounted VCB pointer that owns this open node.
     pub(crate) const fn volume(&self) -> NonNull<VolumeControlBlock> {
         self.volume
+    }
+
+    /// Returns the ledger that owns this FCB without borrowing the enclosing VCB.
+    const fn owner(&self) -> NonNull<FileControlBlockLedger> {
+        self.owner
     }
 
     /// Returns the ext4 node identity opened by this FCB.
@@ -1964,51 +2189,65 @@ impl FileControlBlock {
         self.byte_range_locks
             .release_for_cleanup(target, file_object);
     }
+}
 
-    /// Checks operation-implied access and records one FILE_OBJECT's requested share-access claim.
+/// Mutable FCB lifecycle state owned exclusively by `FileControlBlockLedger`.
+struct FileControlBlockOpenState {
+    /// I/O manager share-access accounting for this inode identity.
+    share_access: SHARE_ACCESS,
+    /// Number of open FILE_OBJECTs currently referencing this FCB.
+    file_object_references: NonZeroU32,
+}
+
+impl FileControlBlockOpenState {
+    /// Creates empty share accounting for the first FILE_OBJECT reference.
+    const fn new() -> Self {
+        Self {
+            share_access: SHARE_ACCESS {
+                OpenCount: 0,
+                Readers: 0,
+                Writers: 0,
+                Deleters: 0,
+                SharedRead: 0,
+                SharedWrite: 0,
+                SharedDelete: 0,
+            },
+            file_object_references: NonZeroU32::MIN,
+        }
+    }
+
+    /// Checks any operation-implied access and records the FILE_OBJECT share claim.
     /// # Errors
     ///
     /// Returns an error when existing handles do not share the effective operation access or when
     /// the requested handle claim cannot be recorded.
-    pub(crate) fn check_operation_and_record_share_access(
+    fn record_share_access(
         &mut self,
         file_object: KernelFileObject,
         desired_access: DesiredAccess,
-        existing_operation_access: ExistingOperationAccess,
         share_access: ShareAccess,
+        share_check: FileControlBlockShareCheck,
     ) -> DriverResult<()> {
-        let operation_status = unsafe {
-            // SAFETY: The FCB owns this SHARE_ACCESS record for the opened inode identity.
-            // Update is false, so this call checks destructive operation access without recording
-            // it as authority granted to the returned FILE_OBJECT.
-            ffi::IoCheckShareAccess(
-                existing_operation_access.as_raw(),
-                share_access.as_ulong(),
-                file_object.as_ptr(),
-                core::ptr::addr_of_mut!(self.share_access),
-                0,
-            )
-        };
-        if operation_status < STATUS_SUCCESS {
-            return Err(DriverError::ShareAccessConflict);
+        if let FileControlBlockShareCheck::ExistingNode(existing_operation_access) = share_check {
+            let operation_status = unsafe {
+                // SAFETY: The ledger exclusively owns this SHARE_ACCESS record. Update is false,
+                // so operation-implied access is checked without recording it as returned-handle
+                // authority.
+                ffi::IoCheckShareAccess(
+                    existing_operation_access.as_raw(),
+                    share_access.as_ulong(),
+                    file_object.as_ptr(),
+                    core::ptr::addr_of_mut!(self.share_access),
+                    0,
+                )
+            };
+            if operation_status < STATUS_SUCCESS {
+                return Err(DriverError::ShareAccessConflict);
+            }
         }
-
-        self.record_share_access(file_object, desired_access, share_access)
-    }
-
-    /// Records one FILE_OBJECT's requested share-access claim.
-    /// # Errors
-    ///
-    /// Returns an error when the I/O Manager rejects the handle's requested share-access claim.
-    pub(crate) fn record_share_access(
-        &mut self,
-        file_object: KernelFileObject,
-        desired_access: DesiredAccess,
-        share_access: ShareAccess,
-    ) -> DriverResult<()> {
         let status = unsafe {
-            // SAFETY: The FCB owns this SHARE_ACCESS record for the opened inode identity. This
-            // call records only the access explicitly requested for the returned FILE_OBJECT.
+            // SAFETY: The ledger exclusively owns this SHARE_ACCESS record. This call records only
+            // the access explicitly requested for the returned FILE_OBJECT.
             ffi::IoCheckShareAccess(
                 desired_access.as_raw(),
                 share_access.as_ulong(),
@@ -2024,10 +2263,10 @@ impl FileControlBlock {
     }
 
     /// Removes one FILE_OBJECT's recorded share-access claim.
-    pub(crate) fn remove_share_access(&mut self, file_object: KernelFileObject) {
+    fn remove_share_access(&mut self, file_object: KernelFileObject) {
         unsafe {
-            // SAFETY: Successful create recorded this FILE_OBJECT against this
-            // FCB-owned SHARE_ACCESS, and cleanup is the unique removal point.
+            // SAFETY: Successful create recorded this FILE_OBJECT against this ledger-owned
+            // SHARE_ACCESS, and the lifecycle transition selects one unique removal point.
             ffi::IoRemoveShareAccess(
                 file_object.as_ptr(),
                 core::ptr::addr_of_mut!(self.share_access),
@@ -2035,32 +2274,29 @@ impl FileControlBlock {
         }
     }
 
-    /// Adds one FILE_OBJECT reference to an already-open FCB.
+    /// Computes one additional FILE_OBJECT reference without mutating state.
     /// # Errors
     ///
     /// Returns an error when the FCB open-reference counter cannot be incremented.
-    fn add_open_reference(&mut self) -> DriverResult<()> {
-        let count = self
-            .open_count
+    fn next_file_object_reference(&self) -> DriverResult<NonZeroU32> {
+        self.file_object_references
             .get()
             .checked_add(1)
             .and_then(NonZeroU32::new)
-            .ok_or(DriverError::TooManyOpenReferences)?;
-        self.open_count = count;
-        Ok(())
+            .ok_or(DriverError::TooManyOpenReferences)
     }
 
     /// Releases one FILE_OBJECT reference from a non-empty FCB.
     fn release_open_reference(&mut self) -> FileControlBlockRelease {
         let Some(remaining) = self
-            .open_count
+            .file_object_references
             .get()
             .checked_sub(1)
             .and_then(NonZeroU32::new)
         else {
             return FileControlBlockRelease::LastReference;
         };
-        self.open_count = remaining;
+        self.file_object_references = remaining;
         FileControlBlockRelease::StillOpen
     }
 }
@@ -2368,11 +2604,141 @@ impl OpenedLocation {
 enum HandleLifecycleState {
     /// The share claim and cleanup-owned resources are active.
     Active,
+    /// Cleanup owns the one-way release transition.
+    Cleaning,
     /// Cleanup has consumed the share claim and cleanup-owned resources.
-    CleanedUp,
-    /// A filter-cancelled create consumed its share claim directly at close.
-    CancelledOpenClosed,
+    Cleaned,
 }
+
+impl HandleLifecycleState {
+    /// Encodes the state in the atomic storage representation.
+    const fn as_raw(self) -> u8 {
+        match self {
+            Self::Active => 0,
+            Self::Cleaning => 1,
+            Self::Cleaned => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Result of entering the synchronous cleanup transition.
+pub(crate) enum CleanupStart {
+    /// This caller owns every cleanup side effect.
+    First,
+    /// Cleanup was already completed before this request arrived.
+    AlreadyComplete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Ownership release selected before close detaches both FILE_OBJECT contexts.
+pub(crate) enum CloseReleasePlan {
+    /// Cleanup already removed the share claim; close releases only the FCB reference and CCB.
+    CleanedHandle,
+    /// A filter cancelled create before cleanup; close atomically removes share and FCB reference.
+    CancelledOpen,
+}
+
+/// Selects a legal close release from the filesystem lifecycle and Windows cleanup state.
+const fn select_close_release_plan(
+    lifecycle: HandleLifecycleState,
+    cleanup_complete: bool,
+    close_kind: FileObjectCloseKind,
+) -> Option<CloseReleasePlan> {
+    match (lifecycle, cleanup_complete, close_kind) {
+        (HandleLifecycleState::Cleaned, true, _) => Some(CloseReleasePlan::CleanedHandle),
+        (HandleLifecycleState::Active, false, FileObjectCloseKind::CancelledOpen) => {
+            Some(CloseReleasePlan::CancelledOpen)
+        }
+        _ => None,
+    }
+}
+
+/// Atomic lifecycle gate shared by synchronous Cleanup/Close and outstanding request completion.
+struct HandleLifecycle {
+    /// Numeric `HandleLifecycleState` representation used for one-way compare-exchange transitions.
+    state: AtomicU8,
+}
+
+impl HandleLifecycle {
+    /// Creates an active handle lifecycle.
+    const fn active() -> Self {
+        Self {
+            state: AtomicU8::new(HandleLifecycleState::Active.as_raw()),
+        }
+    }
+
+    /// Loads the current typed lifecycle state.
+    fn state(&self) -> HandleLifecycleState {
+        match self.state.load(Ordering::Acquire) {
+            value if value == HandleLifecycleState::Active.as_raw() => HandleLifecycleState::Active,
+            value if value == HandleLifecycleState::Cleaning.as_raw() => {
+                HandleLifecycleState::Cleaning
+            }
+            value if value == HandleLifecycleState::Cleaned.as_raw() => {
+                HandleLifecycleState::Cleaned
+            }
+            _ => KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck(),
+        }
+    }
+
+    /// Enters cleanup once while making a completed retry idempotent.
+    fn begin_cleanup(&self) -> CleanupStart {
+        match self.state.compare_exchange(
+            HandleLifecycleState::Active.as_raw(),
+            HandleLifecycleState::Cleaning.as_raw(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => CleanupStart::First,
+            Err(value) if value == HandleLifecycleState::Cleaned.as_raw() => {
+                CleanupStart::AlreadyComplete
+            }
+            Err(_) => KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck(),
+        }
+    }
+
+    /// Publishes completion after every cleanup-owned side effect has finished.
+    fn finish_cleanup(&self) {
+        if self
+            .state
+            .compare_exchange(
+                HandleLifecycleState::Cleaning.as_raw(),
+                HandleLifecycleState::Cleaned.as_raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
+        }
+    }
+
+    /// Selects the only legal terminal release for the observed Windows close reason.
+    fn close_release_plan(
+        &self,
+        close_kind: FileObjectCloseKind,
+        cleanup_complete: bool,
+    ) -> CloseReleasePlan {
+        select_close_release_plan(self.state(), cleanup_complete, close_kind).unwrap_or_else(|| {
+            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
+        })
+    }
+}
+
+impl fmt::Debug for HandleLifecycle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.state().fmt(formatter)
+    }
+}
+
+impl PartialEq for HandleLifecycle {
+    fn eq(&self, other: &Self) -> bool {
+        self.state() == other.state()
+    }
+}
+
+impl Eq for HandleLifecycle {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Per-handle write completion durability requested at create/open.
@@ -2401,21 +2767,21 @@ enum DirectoryNotificationName {
     Registered(Box<DirectoryNotificationDirectoryName>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 /// Common per-handle state shared by every opened node kind.
-pub(crate) struct OpenedHandleState {
+struct OpenedHandleState {
     /// Namespace interpretation selected when this handle was opened.
     node_mode: OpenedNodeMode,
     /// Location used for namespace mutations on cleanup when available.
-    location: OpenedLocation,
-    /// Exactly-once cleanup lifecycle.
-    lifecycle_state: HandleLifecycleState,
+    location: UnsafeCell<OpenedLocation>,
+    /// One-way cleanup lifecycle shared with the synchronous control plane.
+    lifecycle: HandleLifecycle,
     /// Write completion durability requested for this handle.
     write_commitment: WriteCommitment,
     /// Data transfer buffering policy requested for this handle.
     data_transfer_mode: DataTransferMode,
     /// Stable FsRtl directory-name descriptor, retained even if the opened node changes kind.
-    directory_notification_name: DirectoryNotificationName,
+    directory_notification_name: UnsafeCell<DirectoryNotificationName>,
 }
 
 impl OpenedHandleState {
@@ -2428,17 +2794,21 @@ impl OpenedHandleState {
     ) -> Self {
         Self {
             node_mode,
-            location,
-            lifecycle_state: HandleLifecycleState::Active,
+            location: UnsafeCell::new(location),
+            lifecycle: HandleLifecycle::active(),
             write_commitment,
             data_transfer_mode,
-            directory_notification_name: DirectoryNotificationName::Unregistered,
+            directory_notification_name: UnsafeCell::new(DirectoryNotificationName::Unregistered),
         }
     }
 
     /// Returns the opened location identity.
-    const fn location(&self) -> &OpenedLocation {
-        &self.location
+    fn location(&self) -> &OpenedLocation {
+        unsafe {
+            // SAFETY: The device operation lane serializes every location read and replacement.
+            // Cleanup accesses only the disjoint atomic lifecycle and never this cell.
+            &*self.location.get()
+        }
     }
 
     /// Returns the namespace interpretation selected for this handle.
@@ -2447,8 +2817,12 @@ impl OpenedHandleState {
     }
 
     /// Replaces the opened location after a successful rename.
-    fn replace_location(&mut self, location: OpenedLocation) {
-        self.location = location;
+    fn replace_location(&self, location: OpenedLocation) {
+        unsafe {
+            // SAFETY: The device operation lane serializes rename with every other operation that
+            // reads or replaces this handle-local location.
+            *self.location.get() = location;
+        }
     }
 
     /// Returns write completion durability requested for this handle.
@@ -2461,33 +2835,24 @@ impl OpenedHandleState {
         self.data_transfer_mode
     }
 
-    /// Begins the exactly-once cleanup transition.
-    /// # Errors
-    ///
-    /// Returns an internal invariant failure when cleanup already ran for this handle.
-    fn begin_cleanup(&mut self) -> DriverResult<()> {
-        if self.lifecycle_state != HandleLifecycleState::Active {
-            return Err(DriverError::InternalInvariantViolation);
-        }
-        self.lifecycle_state = HandleLifecycleState::CleanedUp;
-        Ok(())
+    /// Begins the idempotent cleanup transition.
+    fn begin_cleanup(&self) -> CleanupStart {
+        self.lifecycle.begin_cleanup()
     }
 
-    /// Returns whether cleanup consumed this handle's share claim and cleanup resources.
-    const fn cleanup_completed(&self) -> bool {
-        matches!(self.lifecycle_state, HandleLifecycleState::CleanedUp)
+    /// Publishes completion after every cleanup-owned release has finished.
+    fn finish_cleanup(&self) {
+        self.lifecycle.finish_cleanup();
     }
 
-    /// Consumes an active handle whose successful create was cancelled by a filter.
-    /// # Errors
-    ///
-    /// Returns an internal invariant failure when cleanup or cancelled-open close already ran.
-    fn begin_cancelled_open_close(&mut self) -> DriverResult<()> {
-        if self.lifecycle_state != HandleLifecycleState::Active {
-            return Err(DriverError::InternalInvariantViolation);
-        }
-        self.lifecycle_state = HandleLifecycleState::CancelledOpenClosed;
-        Ok(())
+    /// Selects the legal terminal release for close.
+    fn close_release_plan(
+        &self,
+        close_kind: FileObjectCloseKind,
+        cleanup_complete: bool,
+    ) -> CloseReleasePlan {
+        self.lifecycle
+            .close_release_plan(close_kind, cleanup_complete)
     }
 
     /// Allocates the stable directory-name descriptor retained by FsRtl after registration.
@@ -2495,20 +2860,27 @@ impl OpenedHandleState {
     ///
     /// Returns an error when allocation of the CCB-owned descriptor fails.
     fn ensure_directory_notification_name(
-        &mut self,
+        &self,
         directory: DirectoryNodeId,
     ) -> DriverResult<NonNull<UNICODE_STRING>> {
-        if let DirectoryNotificationName::Registered(name) = &self.directory_notification_name {
-            return Ok(name.descriptor());
+        let notification_name = unsafe {
+            // SAFETY: The device operation lane serializes notification registration. Cleanup
+            // passes only the stable CCB address to FsRtl and does not access this cell.
+            &mut *self.directory_notification_name.get()
+        };
+        match notification_name {
+            DirectoryNotificationName::Registered(name) => Ok(name.descriptor()),
+            DirectoryNotificationName::Unregistered => {
+                let name = DirectoryNotificationDirectoryName::try_new(directory)?;
+                let descriptor = name.descriptor();
+                *notification_name = DirectoryNotificationName::Registered(name);
+                Ok(descriptor)
+            }
         }
-        let name = DirectoryNotificationDirectoryName::try_new(directory)?;
-        let descriptor = name.descriptor();
-        self.directory_notification_name = DirectoryNotificationName::Registered(name);
-        Ok(descriptor)
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 /// Per-handle state stored in `FILE_OBJECT::FsContext2`.
 pub(crate) struct OpenedHandle {
     /// Common handle state independent of node kind.
@@ -2517,7 +2889,7 @@ pub(crate) struct OpenedHandle {
     kind: OpenedHandleKind,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 /// Kind-specific per-handle state.
 enum OpenedHandleKind {
     /// Regular file handle.
@@ -2528,7 +2900,7 @@ enum OpenedHandleKind {
     /// Directory handle with enumeration cursor.
     Directory {
         /// Directory enumeration cursor.
-        cursor: DirectoryCursor,
+        cursor: UnsafeCell<DirectoryCursor>,
     },
     /// Symlink handle.
     Symlink,
@@ -2570,7 +2942,7 @@ impl OpenedHandle {
                 write_access: regular_file_write_access,
             },
             NodeId::Directory(_) => OpenedHandleKind::Directory {
-                cursor: DirectoryCursor::start(),
+                cursor: UnsafeCell::new(DirectoryCursor::start()),
             },
             NodeId::Symlink(_) => OpenedHandleKind::Symlink,
         };
@@ -2588,7 +2960,7 @@ impl OpenedHandle {
     }
 
     /// Returns the opened location identity.
-    const fn location(&self) -> &OpenedLocation {
+    fn location(&self) -> &OpenedLocation {
         self.state.location()
     }
 
@@ -2597,29 +2969,27 @@ impl OpenedHandle {
         self.state.node_mode()
     }
 
-    /// Begins this handle's exactly-once cleanup transition.
-    /// # Errors
-    ///
-    /// Returns an internal invariant failure when cleanup already ran.
-    fn begin_cleanup(&mut self) -> DriverResult<()> {
+    /// Begins this handle's idempotent cleanup transition.
+    fn begin_cleanup(&self) -> CleanupStart {
         self.state.begin_cleanup()
     }
 
-    /// Returns whether cleanup has consumed this handle's cleanup-owned resources.
-    const fn cleanup_completed(&self) -> bool {
-        self.state.cleanup_completed()
+    /// Publishes cleanup completion after every release has finished.
+    fn finish_cleanup(&self) {
+        self.state.finish_cleanup();
     }
 
-    /// Consumes this handle through the cancelled-open close lifecycle.
-    /// # Errors
-    ///
-    /// Returns an internal invariant failure when the handle is not active.
-    fn begin_cancelled_open_close(&mut self) -> DriverResult<()> {
-        self.state.begin_cancelled_open_close()
+    /// Selects the legal terminal release for close.
+    fn close_release_plan(
+        &self,
+        close_kind: FileObjectCloseKind,
+        cleanup_complete: bool,
+    ) -> CloseReleasePlan {
+        self.state.close_release_plan(close_kind, cleanup_complete)
     }
 
     /// Replaces the opened location after a successful rename.
-    fn replace_location(&mut self, location: OpenedLocation) {
+    fn replace_location(&self, location: OpenedLocation) {
         self.state.replace_location(location);
     }
 
@@ -2628,7 +2998,7 @@ impl OpenedHandle {
     ///
     /// Returns an error when the descriptor allocation fails on its first registration.
     fn ensure_directory_notification_name(
-        &mut self,
+        &self,
         directory: DirectoryNodeId,
     ) -> DriverResult<NonNull<UNICODE_STRING>> {
         self.state.ensure_directory_notification_name(directory)
@@ -2647,10 +3017,10 @@ impl OpenedHandle {
         }
     }
 
-    /// Returns the mutable directory cursor for directory handles.
-    fn directory_cursor_mut(&mut self) -> Option<&mut DirectoryCursor> {
-        match &mut self.kind {
-            OpenedHandleKind::Directory { cursor } => Some(cursor),
+    /// Returns the stable interior cursor address for directory handles.
+    fn directory_cursor(&self) -> Option<NonNull<DirectoryCursor>> {
+        match &self.kind {
+            OpenedHandleKind::Directory { cursor } => NonNull::new(cursor.get()),
             OpenedHandleKind::File { .. } | OpenedHandleKind::Symlink => None,
         }
     }
@@ -2724,7 +3094,7 @@ impl OpenedObject {
 
     /// Replaces the opened location after a successful rename.
     pub(crate) fn replace_location(&mut self, location: OpenedLocation) {
-        self.mutable_handle().replace_location(location);
+        self.handle().replace_location(location);
     }
 
     /// Returns write completion durability requested for this opened handle.
@@ -2812,35 +3182,25 @@ impl OpenedObject {
         Ok(())
     }
 
-    /// Consumes this handle's share claim at the start of its cleanup transition.
-    /// # Errors
-    ///
-    /// Returns an internal invariant failure when cleanup already ran for this FILE_OBJECT.
-    pub(crate) fn release_share_access_for_cleanup(&mut self) -> DriverResult<()> {
-        self.mutable_handle().begin_cleanup()?;
-        release_file_share_access(self.fcb, self.file_object);
-        Ok(())
+    /// Enters this handle's synchronous cleanup transition.
+    pub(crate) fn begin_cleanup(&self) -> CleanupStart {
+        self.handle().begin_cleanup()
     }
 
-    /// Validates the FILE_OBJECT close lifecycle and consumes a cancelled open's active share
-    /// claim when needed.
-    /// # Errors
-    ///
-    /// Returns an internal invariant failure when an ordinary close has not completed cleanup, or
-    /// when a cancelled-open close follows any prior lifecycle transition.
-    pub(crate) fn prepare_context_release_for_close(
-        &mut self,
-        close_kind: FileObjectCloseKind,
-    ) -> DriverResult<()> {
-        match close_kind {
-            FileObjectCloseKind::Ordinary if self.handle().cleanup_completed() => Ok(()),
-            FileObjectCloseKind::Ordinary => Err(DriverError::InternalInvariantViolation),
-            FileObjectCloseKind::CancelledOpen => {
-                self.mutable_handle().begin_cancelled_open_close()?;
-                release_file_share_access(self.fcb, self.file_object);
-                Ok(())
-            }
-        }
+    /// Removes this handle's share claim while retaining its FCB reference until close.
+    pub(crate) fn release_share_access_for_cleanup(&self) {
+        release_file_share_access(self.fcb, self.file_object);
+    }
+
+    /// Publishes lifecycle completion after every cleanup-owned release has finished.
+    pub(crate) fn finish_cleanup(&self) {
+        self.handle().finish_cleanup();
+    }
+
+    /// Selects the only legal terminal release before close detaches both contexts.
+    pub(crate) fn close_release_plan(&self, close_kind: FileObjectCloseKind) -> CloseReleasePlan {
+        self.handle()
+            .close_release_plan(close_kind, self.file_object.cleanup_complete())
     }
 
     /// Returns the decoded file control block.
@@ -2863,11 +3223,10 @@ impl OpenedObject {
     ///
     /// Returns an error when the descriptor allocation fails on its first registration.
     fn ensure_directory_notification_name(
-        &mut self,
+        &self,
         directory: DirectoryNodeId,
     ) -> DriverResult<NonNull<UNICODE_STRING>> {
-        self.mutable_handle()
-            .ensure_directory_notification_name(directory)
+        self.handle().ensure_directory_notification_name(directory)
     }
 
     /// Returns the decoded per-handle state.
@@ -2877,15 +3236,6 @@ impl OpenedObject {
             // FsContext2 written by successful create and used during the
             // active FILE_OBJECT lifetime.
             self.handle.as_ref()
-        }
-    }
-
-    /// Returns mutable per-handle state for atomic state transitions.
-    fn mutable_handle(&mut self) -> &mut OpenedHandle {
-        unsafe {
-            // SAFETY: Mutating handle-local state is limited to `OpenedObject`
-            // methods that keep it aligned with the FCB node kind.
-            self.handle.as_mut()
         }
     }
 
@@ -3009,17 +3359,16 @@ impl OpenedDirectory {
     /// Returns an error when the FILE_OBJECT contexts are invalid or when the
     /// opened node is not a directory.
     pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
-        let mut opened = OpenedObject::decode(file_object)?;
+        let opened = OpenedObject::decode(file_object)?;
         let NodeId::Directory(id) = opened.node() else {
             return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
         };
         if opened.node_mode() == OpenedNodeMode::ReparsePoint {
             return Err(DriverError::NotSupported);
         }
-        let Some(cursor) = opened.mutable_handle().directory_cursor_mut() else {
+        let Some(cursor) = opened.handle().directory_cursor() else {
             return Err(DriverError::InvalidParameter);
         };
-        let cursor = NonNull::from(cursor);
         Ok(Self { opened, id, cursor })
     }
 
@@ -3059,15 +3408,12 @@ impl OpenedDirectory {
 
 /// Releases one FILE_OBJECT reference to a VCB-owned FCB.
 pub(crate) fn release_file_control_block(fcb: NonNull<FileControlBlock>) {
-    let volume = unsafe {
-        // SAFETY: The live FCB reference retains its owning VCB.
-        fcb.as_ref().volume()
+    let owner = file_control_block_owner(fcb);
+    let owner = unsafe {
+        // SAFETY: The live FCB reference is owned by this ledger until `close` returns.
+        owner.as_ref()
     };
-    let vcb = unsafe {
-        // SAFETY: The FCB reference proves the VCB remains live for this synchronous close.
-        volume.as_ref()
-    };
-    vcb.close_file_control_block(fcb);
+    owner.close(fcb);
 }
 
 /// Releases one FILE_OBJECT's share claim while retaining its FCB reference until close.
@@ -3075,16 +3421,12 @@ pub(crate) fn release_file_share_access(
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
 ) {
-    let volume = unsafe {
-        // SAFETY: The live FCB reference retains its owning VCB.
-        fcb.as_ref().volume()
+    let owner = file_control_block_owner(fcb);
+    let owner = unsafe {
+        // SAFETY: The retained FCB reference keeps its owner ledger live for cleanup.
+        owner.as_ref()
     };
-    let vcb = unsafe {
-        // SAFETY: The FCB reference proves the VCB remains live for this synchronous transition.
-        volume.as_ref()
-    };
-    vcb.file_control_blocks
-        .release_share_access(fcb, file_object);
+    owner.release_share_access(fcb, file_object);
 }
 
 /// Rolls back a pre-attachment FCB reference and its recorded share claim.
@@ -3092,15 +3434,33 @@ pub(crate) fn abandon_file_control_block(
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
 ) {
-    let volume = unsafe {
-        // SAFETY: The live FCB reference retains its owning VCB.
-        fcb.as_ref().volume()
+    let owner = file_control_block_owner(fcb);
+    let owner = unsafe {
+        // SAFETY: The unpublished FCB remains owned by this ledger until rollback returns.
+        owner.as_ref()
     };
-    let vcb = unsafe {
-        // SAFETY: The FCB reference proves the VCB remains live for this synchronous rollback.
-        volume.as_ref()
+    owner.release_share_access_and_reference(fcb, file_object);
+}
+
+/// Atomically releases a cancelled open's active share claim and final FCB reference.
+pub(crate) fn release_cancelled_file_control_block(
+    fcb: NonNull<FileControlBlock>,
+    file_object: KernelFileObject,
+) {
+    let owner = file_control_block_owner(fcb);
+    let owner = unsafe {
+        // SAFETY: The cancelled FILE_OBJECT retains its FCB and owner until close consumes both.
+        owner.as_ref()
     };
-    vcb.file_control_blocks.abandon_open(fcb, file_object);
+    owner.release_share_access_and_reference(fcb, file_object);
+}
+
+/// Returns the ledger pointer stored immutably in one live FCB.
+fn file_control_block_owner(fcb: NonNull<FileControlBlock>) -> NonNull<FileControlBlockLedger> {
+    unsafe {
+        // SAFETY: All callers hold one live FILE_OBJECT or pre-attachment reference to this FCB.
+        fcb.as_ref().owner()
+    }
 }
 
 /// Driver unload callback registered in the driver object.
@@ -3144,13 +3504,15 @@ mod tests {
     use crate::kernel::status::DriverError;
 
     use super::{
-        ControlDeviceExtension, DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode,
-        DeviceExtensionKind, DirectoryNameChange, DirectoryNameChangeAction, FileControlBlock,
-        FileControlBlockRelease, KernelDevice, KernelFileObject, MountedVolumeDevice,
-        MountedVolumeDeviceExtension, NativeFileByteRange, NoIntermediateTransfer, OpenedDirectory,
-        OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
-        TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
-        WriteCommitment, shutdown_registration_status,
+        CleanupStart, CloseReleasePlan, ControlDeviceExtension,
+        DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode, DeviceExtensionKind,
+        DirectoryNameChange, DirectoryNameChangeAction, FileControlBlock, FileControlBlockLedger,
+        FileControlBlockOpenState, FileControlBlockRelease, FileObjectCloseKind, KernelDevice,
+        KernelFileObject, MountedVolumeDevice, MountedVolumeDeviceExtension, NativeFileByteRange,
+        NoIntermediateTransfer, OpenedDirectory, OpenedHandle, OpenedLocation, OpenedNodeMode,
+        OpenedObject, OpenedRegularFile, TransferBufferAlignment, TransferSectorSize,
+        UninitializedFileObject, VolumeControlBlock, WriteCommitment, select_close_release_plan,
+        shutdown_registration_status,
     };
 
     fn file_object_with_contexts(
@@ -3167,6 +3529,14 @@ mod tests {
     /// Builds the typed FILE_OBJECT boundary from a local non-null test object.
     fn kernel_file_object(file: &mut wdk_sys::FILE_OBJECT) -> Option<KernelFileObject> {
         KernelFileObject::from_raw(core::ptr::addr_of_mut!(*file))
+    }
+
+    /// Builds an isolated FCB for tests that exercise only immutable data-plane fields.
+    fn test_file_control_block(
+        volume: NonNull<VolumeControlBlock>,
+        node: NodeId,
+    ) -> FileControlBlock {
+        FileControlBlock::new(volume, NonNull::<FileControlBlockLedger>::dangling(), node)
     }
 
     /// # Panics
@@ -3343,7 +3713,7 @@ mod tests {
     #[test]
     fn typed_opened_directory_exposes_cursor_without_option() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
@@ -3387,7 +3757,7 @@ mod tests {
     #[test]
     fn opened_directory_reuses_a_stable_notification_name_descriptor() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
@@ -3475,7 +3845,7 @@ mod tests {
     #[test]
     fn typed_opened_decoders_reject_wrong_node_kind() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
@@ -3506,7 +3876,7 @@ mod tests {
     #[test]
     fn reparse_point_directory_handle_rejects_directory_operations() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::ReparsePoint,
@@ -3533,10 +3903,10 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when cleanup lifecycle constraints can be bypassed.
+    /// Panics when cleanup retries repeat cleanup-owned side effects.
     #[test]
-    fn handle_lifecycle_enforces_exactly_once_cleanup() {
-        let mut handle = OpenedHandle::new(
+    fn handle_lifecycle_makes_completed_cleanup_idempotent() {
+        let handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
@@ -3544,12 +3914,58 @@ mod tests {
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
         );
-        assert!(!handle.cleanup_completed());
-        assert_eq!(handle.begin_cleanup(), Ok(()));
-        assert!(handle.cleanup_completed());
+        assert_eq!(handle.begin_cleanup(), CleanupStart::First);
+        handle.finish_cleanup();
+        assert_eq!(handle.begin_cleanup(), CleanupStart::AlreadyComplete);
         assert_eq!(
-            handle.begin_cleanup(),
-            Err(DriverError::InternalInvariantViolation)
+            handle.close_release_plan(FileObjectCloseKind::Ordinary, true),
+            CloseReleasePlan::CleanedHandle
+        );
+        assert_eq!(
+            handle.close_release_plan(FileObjectCloseKind::CancelledOpen, true),
+            CloseReleasePlan::CleanedHandle
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a filter-cancelled open cannot select its one atomic release path.
+    #[test]
+    fn active_cancelled_open_selects_combined_share_and_reference_release() {
+        let handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            OpenedNodeMode::Direct,
+            OpenedLocation::Root,
+            WriteCommitment::CommitOnly,
+            DataTransferMode::IntermediateAllowed,
+            RegularFileWriteAccess::Denied,
+        );
+        assert_eq!(
+            handle.close_release_plan(FileObjectCloseKind::CancelledOpen, false),
+            CloseReleasePlan::CancelledOpen
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when ordinary close before cleanup is accidentally accepted.
+    #[test]
+    fn ordinary_close_before_cleanup_has_no_release_plan() {
+        assert_eq!(
+            select_close_release_plan(
+                super::HandleLifecycleState::Active,
+                false,
+                FileObjectCloseKind::Ordinary,
+            ),
+            None
+        );
+        assert_eq!(
+            select_close_release_plan(
+                super::HandleLifecycleState::Cleaned,
+                false,
+                FileObjectCloseKind::Ordinary,
+            ),
+            None
         );
     }
 
@@ -3559,7 +3975,7 @@ mod tests {
     #[test]
     fn opened_object_preserves_write_commitment() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
@@ -3600,7 +4016,7 @@ mod tests {
             buffer_alignment,
         };
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
@@ -3634,7 +4050,7 @@ mod tests {
     #[test]
     fn synchronous_opened_object_reads_sets_and_advances_position() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
@@ -3720,7 +4136,7 @@ mod tests {
     #[test]
     fn asynchronous_and_paging_io_do_not_advance_position() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
@@ -3783,7 +4199,7 @@ mod tests {
     #[test]
     fn file_position_and_native_lock_range_reject_signed_overflow() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let mut handle = OpenedHandle::new(
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
@@ -3871,20 +4287,27 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn file_control_block_open_count_cannot_represent_zero() {
-        let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    fn file_control_block_reference_count_cannot_represent_zero() {
+        let mut state = FileControlBlockOpenState::new();
 
-        assert_eq!(fcb.open_count.get(), 1);
-        assert_eq!(fcb.add_open_reference(), Ok(()));
-        assert_eq!(fcb.open_count.get(), 2);
+        assert_eq!(state.file_object_references.get(), 1);
+        let next = state.next_file_object_reference();
         assert_eq!(
-            fcb.release_open_reference(),
+            next,
+            NonZeroU32::new(2).ok_or(DriverError::TooManyOpenReferences)
+        );
+        let Ok(next) = next else {
+            return;
+        };
+        state.file_object_references = next;
+        assert_eq!(state.file_object_references.get(), 2);
+        assert_eq!(
+            state.release_open_reference(),
             FileControlBlockRelease::StillOpen
         );
-        assert_eq!(fcb.open_count.get(), 1);
+        assert_eq!(state.file_object_references.get(), 1);
         assert_eq!(
-            fcb.release_open_reference(),
+            state.release_open_reference(),
             FileControlBlockRelease::LastReference
         );
     }
@@ -3893,16 +4316,15 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn file_control_block_open_count_overflow_is_typed() {
-        let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        fcb.open_count = NonZeroU32::MAX;
+    fn file_control_block_reference_count_overflow_is_typed() {
+        let mut state = FileControlBlockOpenState::new();
+        state.file_object_references = NonZeroU32::MAX;
 
         assert_eq!(
-            fcb.add_open_reference(),
+            state.next_file_object_reference(),
             Err(DriverError::TooManyOpenReferences)
         );
-        assert_eq!(fcb.open_count, NonZeroU32::MAX);
+        assert_eq!(state.file_object_references, NonZeroU32::MAX);
     }
 
     /// # Panics
@@ -3910,15 +4332,14 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_control_block_starts_with_empty_share_access() {
-        let volume = NonNull::<VolumeControlBlock>::dangling();
-        let fcb = FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let state = FileControlBlockOpenState::new();
 
-        assert_eq!(fcb.share_access.OpenCount, 0);
-        assert_eq!(fcb.share_access.Readers, 0);
-        assert_eq!(fcb.share_access.Writers, 0);
-        assert_eq!(fcb.share_access.Deleters, 0);
-        assert_eq!(fcb.share_access.SharedRead, 0);
-        assert_eq!(fcb.share_access.SharedWrite, 0);
-        assert_eq!(fcb.share_access.SharedDelete, 0);
+        assert_eq!(state.share_access.OpenCount, 0);
+        assert_eq!(state.share_access.Readers, 0);
+        assert_eq!(state.share_access.Writers, 0);
+        assert_eq!(state.share_access.Deleters, 0);
+        assert_eq!(state.share_access.SharedRead, 0);
+        assert_eq!(state.share_access.SharedWrite, 0);
+        assert_eq!(state.share_access.SharedDelete, 0);
     }
 }

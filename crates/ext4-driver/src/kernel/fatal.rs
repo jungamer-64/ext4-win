@@ -40,6 +40,11 @@ impl KernelWideInconsistency {
         Self::without_location(FatalReason::FileObjectContextCorruption)
     }
 
+    /// Constructs a fatal state for an impossible FILE_OBJECT Cleanup/Close transition.
+    pub(crate) const fn file_object_lifecycle_corruption() -> Self {
+        Self::without_location(FatalReason::FileObjectLifecycleCorruption)
+    }
+
     /// Constructs a fatal state for corrupted VCB-owned FCB ownership.
     pub(crate) const fn file_control_block_ownership_corruption() -> Self {
         Self::without_location(FatalReason::FileControlBlockOwnershipCorruption)
@@ -94,6 +99,8 @@ enum FatalReason {
     RustPanicBoundaryViolation,
     /// FILE_OBJECT context pointers no longer describe one coherent opened object.
     FileObjectContextCorruption,
+    /// FILE_OBJECT flags and the filesystem-owned handle lifecycle disagree.
+    FileObjectLifecycleCorruption,
     /// A VCB-owned FCB pointer is no longer present in the owning VCB table.
     FileControlBlockOwnershipCorruption,
 }
@@ -105,6 +112,7 @@ impl FatalReason {
             Self::RustPanicBoundaryViolation => 1,
             Self::FileObjectContextCorruption => 2,
             Self::FileControlBlockOwnershipCorruption => 3,
+            Self::FileObjectLifecycleCorruption => 4,
         }
     }
 }
@@ -144,6 +152,7 @@ mod tests {
             FatalReason::FileControlBlockOwnershipCorruption.as_parameter(),
             3
         );
+        assert_eq!(FatalReason::FileObjectLifecycleCorruption.as_parameter(), 4);
     }
 
     /// # Panics
@@ -154,6 +163,10 @@ mod tests {
         assert_eq!(
             KernelWideInconsistency::file_object_context_corruption().reason,
             FatalReason::FileObjectContextCorruption
+        );
+        assert_eq!(
+            KernelWideInconsistency::file_object_lifecycle_corruption().reason,
+            FatalReason::FileObjectLifecycleCorruption
         );
         assert_eq!(
             KernelWideInconsistency::file_control_block_ownership_corruption().reason,

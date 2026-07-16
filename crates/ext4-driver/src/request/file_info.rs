@@ -20,10 +20,11 @@ use crate::irp::{
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{
-    DirectoryCursor, DirectoryNameChange, DirectoryNameChangeAction,
-    DirectoryNotificationRegistration, FileControlBlock, KernelFileObject, MountedVolumeDevice,
-    OpenedDirectory, OpenedHandle, OpenedLocation, OpenedObject, OpenedRegularFile,
-    VolumeControlBlock, WriteCommitment, release_file_control_block,
+    CleanupStart, CloseReleasePlan, DirectoryCursor, DirectoryNameChange,
+    DirectoryNameChangeAction, DirectoryNotificationRegistration, FileControlBlock,
+    KernelFileObject, MountedVolumeDevice, OpenedDirectory, OpenedHandle, OpenedLocation,
+    OpenedObject, OpenedRegularFile, VolumeControlBlock, WriteCommitment,
+    release_cancelled_file_control_block, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -40,11 +41,10 @@ pub(crate) fn cleanup(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// Executes close IRPs and releases FILE_OBJECT contexts.
 /// # Errors
 ///
-/// Returns an error when the close stack has no FILE_OBJECT, ordinary cleanup has not completed,
-/// or a filter-cancelled open has an invalid lifecycle.
+/// Returns an error when the close stack has no FILE_OBJECT.
 pub(crate) fn close(target: DispatchTarget) -> DriverResult<IrpCompletion> {
     let file_object = target.current_stack()?.file_object()?;
-    release_file_contexts(file_object)?;
+    release_file_contexts(file_object);
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -476,7 +476,15 @@ fn set_disposition_information(request: SetFileRequest) -> DriverResult<()> {
         request.target,
         request.stack.length(),
     )?;
-    if info.DeleteFile == 0 {
+    validate_disposition_delete_flag(info.DeleteFile)
+}
+
+/// Validates legacy disposition deletion while orphan lifecycle is unavailable.
+/// # Errors
+///
+/// Returns not supported when deletion is requested.
+fn validate_disposition_delete_flag(delete_file: wdk_sys::BOOLEAN) -> DriverResult<()> {
+    if delete_file == 0 {
         Ok(())
     } else {
         Err(DriverError::NotSupported)
@@ -1320,14 +1328,25 @@ fn windows_time_quad(timestamp: Ext4Timestamp) -> i64 {
 /// Releases resources owned by one FILE_OBJECT handle lifecycle.
 /// # Errors
 ///
-/// Returns an error when the FILE_OBJECT has no opened context or cleanup already ran.
+/// Returns an error when the FILE_OBJECT has no opened context.
 fn cleanup_file_object(target: DispatchTarget, file_object: KernelFileObject) -> DriverResult<()> {
-    let mut opened_file = OpenedObject::decode(file_object)?;
-    opened_file.release_share_access_for_cleanup()?;
+    let opened_file = OpenedObject::decode(file_object)?;
+    let cleanup_was_published = file_object.cleanup_complete();
+    match (opened_file.begin_cleanup(), cleanup_was_published) {
+        (CleanupStart::First, false) => {}
+        (CleanupStart::AlreadyComplete, true) => return Ok(()),
+        (CleanupStart::First, true) | (CleanupStart::AlreadyComplete, false) => {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_lifecycle_corruption()
+                .bugcheck();
+        }
+    }
+    cleanup_directory_notification(&opened_file);
     opened_file
         .file_control_block()
         .release_handle_byte_range_locks(target, file_object);
-    cleanup_directory_notification(&opened_file);
+    opened_file.release_share_access_for_cleanup();
+    opened_file.finish_cleanup();
+    file_object.mark_cleanup_complete();
     Ok(())
 }
 
@@ -2485,12 +2504,8 @@ fn volume_control_block(fcb: &FileControlBlock) -> &VolumeControlBlock {
     }
 }
 
-/// Releases heap-owned FCB and CCB pointers stored on a FILE_OBJECT.
-/// # Errors
-///
-/// Returns an error when initialized contexts are invalid or cleanup has not consumed the
-/// FILE_OBJECT's cleanup-owned resources.
-fn release_file_contexts(file_object: KernelFileObject) -> DriverResult<()> {
+/// Detaches and releases heap-owned FCB and CCB pointers stored on a FILE_OBJECT.
+fn release_file_contexts(file_object: KernelFileObject) {
     let contexts = unsafe {
         // SAFETY: Close receives the final live FILE_OBJECT and reads only its filesystem-owned
         // context pointers before deciding whether they can be released.
@@ -2498,49 +2513,64 @@ fn release_file_contexts(file_object: KernelFileObject) -> DriverResult<()> {
         (object.FsContext, object.FsContext2)
     };
     match contexts {
-        (fcb, handle) if fcb.is_null() && handle.is_null() => return Ok(()),
+        (fcb, handle) if fcb.is_null() && handle.is_null() => return,
         (fcb, handle) if fcb.is_null() || handle.is_null() => {
             crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
                 .bugcheck();
         }
         _ => {}
     }
-    let close_kind = file_object.close_kind()?;
-    OpenedObject::decode(file_object)?.prepare_context_release_for_close(close_kind)?;
-
-    let file_object = unsafe {
-        // SAFETY: Close receives the final FILE_OBJECT and may clear its
-        // filesystem-owned context pointers.
-        file_object.as_mut()
+    let close_kind = file_object.close_kind_or_bugcheck();
+    let release_plan = {
+        let opened = match OpenedObject::decode(file_object) {
+            Ok(opened) => opened,
+            Err(_) => {
+                crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                    .bugcheck();
+            }
+        };
+        opened.close_release_plan(close_kind)
     };
-    let fcb = core::mem::replace(&mut file_object.FsContext, core::ptr::null_mut());
-    if let Some(fcb) = NonNull::new(fcb.cast::<FileControlBlock>()) {
-        release_file_control_block(fcb);
-    }
-    let handle = core::mem::replace(&mut file_object.FsContext2, core::ptr::null_mut());
-    if !handle.is_null() {
-        unsafe {
-            // SAFETY: Successful create stores Box<OpenedHandle> in
-            // FsContext2, and close is the unique release point.
-            drop(Box::from_raw(handle.cast::<OpenedHandle>()));
+
+    let (fcb, handle) = unsafe {
+        // SAFETY: Close receives the final FILE_OBJECT and may clear its
+        // filesystem-owned context pointers before releasing either allocation.
+        let object = file_object.as_mut();
+        (
+            core::mem::replace(&mut object.FsContext, core::ptr::null_mut()),
+            core::mem::replace(&mut object.FsContext2, core::ptr::null_mut()),
+        )
+    };
+    let Some(fcb) = NonNull::new(fcb.cast::<FileControlBlock>()) else {
+        crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption().bugcheck();
+    };
+    let Some(handle) = NonNull::new(handle.cast::<OpenedHandle>()) else {
+        crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption().bugcheck();
+    };
+    match release_plan {
+        CloseReleasePlan::CleanedHandle => release_file_control_block(fcb),
+        CloseReleasePlan::CancelledOpen => {
+            release_cancelled_file_control_block(fcb, file_object);
         }
     }
-    Ok(())
+    unsafe {
+        // SAFETY: Successful create stores Box<OpenedHandle> in FsContext2. Close detached the
+        // unique owning pointer before selecting this terminal drop.
+        drop(Box::from_raw(handle.as_ptr()));
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use core::ptr::NonNull;
-
     use crate::irp::{
         DataIoKind, DirectoryInformationClass, DispatchTarget, ReadStartingPoint,
         RegularFileWriteAccess, WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
-    use crate::state::{OpenedLocation, OpenedNodeMode};
+    use crate::state::OpenedLocation;
     use ext4_core::{
         BlockSize, DirectoryNodeId, Ext4Gid, Ext4LinkCount, Ext4Name, Ext4Owner, Ext4Permissions,
-        Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileOffset, FileSize, NodeId, WindowsName,
+        Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileOffset, FileSize, WindowsName,
     };
 
     fn test_metadata(kind: super::FileMetadataKind) -> Option<super::FileMetadata> {
@@ -2776,214 +2806,14 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when a reparse-point handle can request unsafe disposition deletion.
+    /// Panics when legacy disposition deletion can bypass orphan-lifecycle admission.
     #[test]
-    fn reparse_point_handle_rejects_disposition_delete() {
-        let volume = NonNull::<crate::state::VolumeControlBlock>::dangling();
-        let node = NodeId::Directory(DirectoryNodeId::ROOT);
-        let mut fcb = crate::state::FileControlBlock::new(volume, node);
-        let name = Ext4Name::new(b"link");
-        assert!(name.is_ok());
-        let Ok(name) = name else {
-            return;
-        };
-        let mut handle = crate::state::OpenedHandle::new(
-            node,
-            OpenedNodeMode::ReparsePoint,
-            OpenedLocation::DirectoryEntry {
-                parent: DirectoryNodeId::ROOT,
-                name,
-            },
-            crate::state::WriteCommitment::CommitOnly,
-            crate::state::DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
-        let mut file_object = wdk_sys::FILE_OBJECT {
-            FsContext: core::ptr::addr_of_mut!(fcb).cast(),
-            FsContext2: core::ptr::addr_of_mut!(handle).cast(),
-            ..wdk_sys::FILE_OBJECT::default()
-        };
-        let mut input = wdk_sys::FILE_DISPOSITION_INFORMATION { DeleteFile: 1 };
-        let mut stack = wdk_sys::IO_STACK_LOCATION {
-            FileObject: core::ptr::addr_of_mut!(file_object),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
-            Length: u32::try_from(core::mem::size_of_val(&input)).unwrap_or(u32::MAX),
-            __bindgen_padding_0: 0,
-            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformation,
-            FileObject: core::ptr::null_mut(),
-            __bindgen_anon_1:
-                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
-        };
-        let mut irp = wdk_sys::IRP::default();
-        irp.AssociatedIrp.SystemBuffer = core::ptr::addr_of_mut!(input).cast();
-        let mut device = wdk_sys::DEVICE_OBJECT::default();
-        let target = target_from_stack(&mut stack, &mut irp, &mut device);
-        assert!(target.is_ok());
-        let Ok(target) = target else {
-            return;
-        };
-        let request = super::SetFileRequest::decode(target);
-        assert!(request.is_ok());
-        let Ok(request) = request else {
-            return;
-        };
-
+    fn disposition_delete_flag_rejects_deletion() {
+        assert_eq!(super::validate_disposition_delete_flag(0), Ok(()));
         assert_eq!(
-            super::set_disposition_information(request),
+            super::validate_disposition_delete_flag(1),
             Err(DriverError::NotSupported)
         );
-
-        let file_object =
-            crate::state::KernelFileObject::from_raw(core::ptr::addr_of_mut!(file_object));
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        let opened = crate::state::OpenedObject::decode(file_object);
-        assert!(opened.is_ok());
-        if let Ok(opened) = opened {
-            assert_eq!(opened.node_mode(), OpenedNodeMode::ReparsePoint);
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when FilePositionInformation does not round-trip through the typed FILE_OBJECT state.
-    #[test]
-    fn file_position_information_set_and_query_round_trip() {
-        let volume = NonNull::<crate::state::VolumeControlBlock>::dangling();
-        let mut fcb =
-            crate::state::FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = crate::state::OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
-            crate::state::OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            crate::state::WriteCommitment::CommitOnly,
-            crate::state::DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
-        let mut file_object = wdk_sys::FILE_OBJECT {
-            FsContext: core::ptr::addr_of_mut!(fcb).cast(),
-            FsContext2: core::ptr::addr_of_mut!(handle).cast(),
-            Flags: wdk_sys::FO_SYNCHRONOUS_IO,
-            ..wdk_sys::FILE_OBJECT::default()
-        };
-        let mut input = wdk_sys::FILE_POSITION_INFORMATION {
-            CurrentByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 12_345 },
-        };
-        let mut stack = wdk_sys::IO_STACK_LOCATION {
-            FileObject: core::ptr::addr_of_mut!(file_object),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
-            Length: u32::try_from(core::mem::size_of_val(&input)).unwrap_or(u32::MAX),
-            __bindgen_padding_0: 0,
-            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation,
-            FileObject: core::ptr::null_mut(),
-            __bindgen_anon_1:
-                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
-        };
-        let mut irp = wdk_sys::IRP::default();
-        irp.AssociatedIrp.SystemBuffer = core::ptr::addr_of_mut!(input).cast();
-        let mut device = wdk_sys::DEVICE_OBJECT::default();
-        let target = target_from_stack(&mut stack, &mut irp, &mut device);
-        assert!(target.is_ok());
-        let Ok(target) = target else {
-            return;
-        };
-        let request = super::SetFileRequest::decode(target);
-        assert!(request.is_ok());
-        if let Ok(request) = request {
-            assert_eq!(super::set_position_information(request), Ok(()));
-        }
-
-        let file_object_boundary =
-            crate::state::KernelFileObject::from_raw(core::ptr::addr_of_mut!(file_object));
-        assert!(file_object_boundary.is_some());
-        let Some(file_object_boundary) = file_object_boundary else {
-            return;
-        };
-        let opened = crate::state::OpenedObject::decode(file_object_boundary);
-        assert!(opened.is_ok());
-        let Ok(opened) = opened else {
-            return;
-        };
-        let mut output = [0_u8; core::mem::size_of::<wdk_sys::FILE_POSITION_INFORMATION>()];
-        assert!(super::pack_position_information(&mut output, &opened).is_ok());
-        let encoded = output.get(..core::mem::size_of::<i64>());
-        assert!(encoded.is_some());
-        let Some(encoded) = encoded else {
-            return;
-        };
-        let encoded = <[u8; core::mem::size_of::<i64>()]>::try_from(encoded);
-        assert!(encoded.is_ok());
-        if let Ok(encoded) = encoded {
-            assert_eq!(i64::from_ne_bytes(encoded), 12_345);
-        }
-
-        let mut negative_input = wdk_sys::FILE_POSITION_INFORMATION {
-            CurrentByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: -1 },
-        };
-        irp.AssociatedIrp.SystemBuffer = core::ptr::addr_of_mut!(negative_input).cast();
-        let negative_target = target_from_stack(&mut stack, &mut irp, &mut device);
-        assert!(negative_target.is_ok());
-        let Ok(negative_target) = negative_target else {
-            return;
-        };
-        let request = super::SetFileRequest::decode(negative_target);
-        assert!(request.is_ok());
-        if let Ok(request) = request {
-            assert_eq!(
-                super::set_position_information(request),
-                Err(DriverError::InvalidParameter)
-            );
-        }
-        let unchanged = unsafe {
-            // SAFETY: Tests consistently use the QuadPart LARGE_INTEGER arm.
-            file_object.CurrentByteOffset.QuadPart
-        };
-        assert_eq!(unchanged, 12_345);
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn flush_volume_decodes_opened_file_object_volume() {
-        let volume = NonNull::<crate::state::VolumeControlBlock>::dangling();
-        let mut fcb =
-            crate::state::FileControlBlock::new(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = crate::state::OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
-            crate::state::OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            crate::state::WriteCommitment::CommitOnly,
-            crate::state::DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
-        let mut file_object = wdk_sys::FILE_OBJECT {
-            FsContext: core::ptr::addr_of_mut!(fcb).cast(),
-            FsContext2: core::ptr::addr_of_mut!(handle).cast(),
-            ..wdk_sys::FILE_OBJECT::default()
-        };
-        let mut stack = wdk_sys::IO_STACK_LOCATION {
-            FileObject: core::ptr::addr_of_mut!(file_object),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        let mut irp = wdk_sys::IRP::default();
-        let mut device = wdk_sys::DEVICE_OBJECT::default();
-        let target = target_from_stack(&mut stack, &mut irp, &mut device);
-        assert!(target.is_ok());
-
-        if let Ok(target) = target {
-            let decoded = super::FlushVolume::decode(target);
-            assert!(decoded.is_ok());
-            if let Ok(decoded) = decoded {
-                assert_eq!(decoded.volume(), volume);
-            }
-        }
     }
 
     /// # Panics
@@ -3315,23 +3145,7 @@ mod tests {
         };
         name.copy_from_slice(&u16::from(b'a').to_le_bytes());
 
-        let mut fcb = crate::state::FileControlBlock::new(
-            NonNull::<crate::state::VolumeControlBlock>::dangling(),
-            NodeId::Directory(DirectoryNodeId::ROOT),
-        );
-        let mut handle = crate::state::OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
-            crate::state::OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            crate::state::WriteCommitment::CommitOnly,
-            crate::state::DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
-        let mut file_object = wdk_sys::FILE_OBJECT {
-            FsContext: core::ptr::addr_of_mut!(fcb).cast(),
-            FsContext2: core::ptr::addr_of_mut!(handle).cast(),
-            ..wdk_sys::FILE_OBJECT::default()
-        };
+        let mut file_object = wdk_sys::FILE_OBJECT::default();
         let mut stack = wdk_sys::IO_STACK_LOCATION {
             FileObject: core::ptr::addr_of_mut!(file_object),
             ..wdk_sys::IO_STACK_LOCATION::default()

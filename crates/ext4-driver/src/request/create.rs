@@ -26,7 +26,7 @@ use crate::{
         FileControlBlock, KernelDevice, KernelFileObject, MountedVolumeDevice,
         NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
         PendingChildCreation, UninitializedFileObject, VolumeControlBlock, WriteCommitment,
-        release_file_control_block,
+        abandon_file_control_block,
     },
 };
 
@@ -471,18 +471,39 @@ impl CreatePathAnchor {
             return Err(DriverError::InvalidParameter);
         }
         let opened = OpenedObject::decode(related_file)?;
-        if opened.volume() != vcb {
+        Self::from_related_opened_directory(
+            vcb,
+            opened.volume(),
+            opened.node(),
+            opened.node_mode(),
+            opened.location(),
+        )
+    }
+
+    /// Builds a relative-path anchor from an already decoded related object.
+    /// # Errors
+    ///
+    /// Returns an error when the related object belongs to another volume, is a reparse-point
+    /// handle, or does not identify a directory.
+    fn from_related_opened_directory(
+        target_volume: NonNull<VolumeControlBlock>,
+        related_volume: NonNull<VolumeControlBlock>,
+        node: NodeId,
+        node_mode: OpenedNodeMode,
+        location: &OpenedLocation,
+    ) -> DriverResult<Self> {
+        if related_volume != target_volume {
             return Err(DriverError::InvalidDeviceRequest);
         }
-        if opened.node_mode() == OpenedNodeMode::ReparsePoint {
+        if node_mode == OpenedNodeMode::ReparsePoint {
             return Err(DriverError::NotSupported);
         }
-        let NodeId::Directory(id) = opened.node() else {
+        let NodeId::Directory(id) = node else {
             return Err(DriverError::ObjectTypeMismatch);
         };
         Ok(Self::OpenedDirectory {
             id,
-            location: opened.location().try_to_owned_location()?,
+            location: location.try_to_owned_location()?,
         })
     }
 
@@ -619,7 +640,7 @@ fn create_missing_node(
     })?;
     create_ea.apply_to_pending_child(&mut creation)?;
     let fcb = open_pending_child_file_control_block(
-        &mut creation,
+        &creation,
         request.file_object(),
         policy.desired_access(),
         policy.share_access(),
@@ -642,7 +663,7 @@ fn create_missing_node(
             Ok(CreateAction::Created)
         }
         Err(error) => {
-            abandon_file_control_block(request.file_object().kernel_file_object(), fcb);
+            abandon_file_control_block(fcb, request.file_object().kernel_file_object());
             Err(error)
         }
     }
@@ -999,23 +1020,14 @@ fn open_shared_file_control_block(
     existing_operation_access: ExistingOperationAccess,
     share_access: ShareAccess,
 ) -> DriverResult<NonNull<FileControlBlock>> {
-    let mut fcb = VolumeControlBlock::open_file_control_block(vcb, node)?;
-    let fcb_ref = unsafe {
-        // SAFETY: The VCB returned a live owned FCB pointer with an open
-        // reference for this create request.
-        fcb.as_mut()
-    };
-    if let Err(error) = fcb_ref.check_operation_and_record_share_access(
+    VolumeControlBlock::open_existing_file_control_block(
+        vcb,
+        node,
         file_object.kernel_file_object(),
         desired_access,
         existing_operation_access,
         share_access,
-    ) {
-        release_file_control_block(fcb);
-        return Err(error);
-    }
-
-    Ok(fcb)
+    )
 }
 
 /// Opens the staged child FCB and records the create share-access claim before commit.
@@ -1023,27 +1035,16 @@ fn open_shared_file_control_block(
 ///
 /// Returns an error when FCB creation fails or Windows share-access checking rejects the new handle.
 fn open_pending_child_file_control_block(
-    creation: &mut PendingChildCreation<'_>,
+    creation: &PendingChildCreation<'_>,
     file_object: UninitializedFileObject,
     desired_access: DesiredAccess,
     share_access: ShareAccess,
 ) -> DriverResult<NonNull<FileControlBlock>> {
-    let mut fcb = creation.open_file_control_block()?;
-    let fcb_ref = unsafe {
-        // SAFETY: The pending creation returned a live owned FCB pointer with
-        // an open reference for this create request.
-        fcb.as_mut()
-    };
-    if let Err(error) = fcb_ref.record_share_access(
+    creation.open_file_control_block(
         file_object.kernel_file_object(),
         desired_access,
         share_access,
-    ) {
-        creation.release_file_control_block(fcb);
-        return Err(error);
-    }
-
-    Ok(fcb)
+    )
 }
 
 /// Stores already-opened FCB and preallocated CCB context pointers in the FILE_OBJECT.
@@ -1061,17 +1062,6 @@ fn attach_preallocated_file_object(
     file_object_flags.apply_to(file_object);
     file_object.FsContext = fcb.as_ptr().cast::<c_void>();
     file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
-}
-
-/// Rolls back an FCB open whose FILE_OBJECT was not attached.
-fn abandon_file_control_block(file_object: KernelFileObject, mut fcb: NonNull<FileControlBlock>) {
-    let fcb_ref = unsafe {
-        // SAFETY: The FCB was opened for this create request and has not been
-        // published into FILE_OBJECT::FsContext.
-        fcb.as_mut()
-    };
-    fcb_ref.remove_share_access(file_object);
-    release_file_control_block(fcb);
 }
 
 #[cfg(test)]
@@ -1148,15 +1138,6 @@ mod tests {
             },
             ..FILE_OBJECT::default()
         }
-    }
-
-    fn attach_opened_contexts(
-        file_object: &mut FILE_OBJECT,
-        fcb: &mut FileControlBlock,
-        handle: &mut OpenedHandle,
-    ) {
-        file_object.FsContext = core::ptr::addr_of_mut!(*fcb).cast();
-        file_object.FsContext2 = core::ptr::addr_of_mut!(*handle).cast();
     }
 
     /// # Panics
@@ -1476,24 +1457,15 @@ mod tests {
     #[test]
     fn create_path_anchor_accepts_opened_relative_directory() {
         let vcb = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(vcb, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
+        let anchor = CreatePathAnchor::from_related_opened_directory(
+            vcb,
+            vcb,
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            WriteCommitment::CommitOnly,
-            DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
+            &OpenedLocation::Root,
         );
-        let mut related = FILE_OBJECT::default();
-        attach_opened_contexts(&mut related, &mut fcb, &mut handle);
-        let create = FILE_OBJECT {
-            RelatedFileObject: core::ptr::addr_of_mut!(related),
-            ..FILE_OBJECT::default()
-        };
-
         assert_eq!(
-            CreatePathAnchor::decode(&create, vcb, CreateNameRooting::Relative),
+            anchor,
             Ok(CreatePathAnchor::OpenedDirectory {
                 id: DirectoryNodeId::ROOT,
                 location: OpenedLocation::Root,
@@ -1507,17 +1479,7 @@ mod tests {
     #[test]
     fn create_path_anchor_rejects_conflicting_absolute_related_object() {
         let vcb = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = FileControlBlock::new(vcb, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            WriteCommitment::CommitOnly,
-            DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
         let mut related = FILE_OBJECT::default();
-        attach_opened_contexts(&mut related, &mut fcb, &mut handle);
         let create = FILE_OBJECT {
             RelatedFileObject: core::ptr::addr_of_mut!(related),
             ..FILE_OBJECT::default()
