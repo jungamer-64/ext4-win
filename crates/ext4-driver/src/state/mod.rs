@@ -627,8 +627,15 @@ pub(crate) struct VolumeControlBlock {
     /// Synchronized VCB-owned FCB identities and Windows share ledger. This field drops before
     /// the mounted volume because every FCB retains that volume as its data-plane owner.
     file_control_blocks: FileControlBlockLedger,
+    /// Actor-owned journaled volume state used only by the serialized operation executor.
+    operations: VolumeOperationLane,
+}
+
+/// Mutable ext4 state owned exclusively by one mounted-device operation actor.
+#[derive(Debug)]
+pub(crate) struct VolumeOperationLane {
     /// Mounted journaled read-write ext4 volume.
-    volume: JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator>,
+    journaled: JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator>,
 }
 
 /// VCB-owned FCB table and share accounting protected by one concrete executive resource.
@@ -1013,19 +1020,20 @@ impl VolumeControlBlock {
     /// # Errors
     ///
     /// Returns an error when the lower device cannot be mounted as a journaled ext4 volume.
-    pub(crate) fn mount_journaled(
+    pub(crate) async fn mount_journaled(
         target_device: KernelDevice,
         length: DeviceLength,
     ) -> DriverResult<Self> {
-        let block_device = KernelBlockDevice::new(target_device, length);
+        let block_device = KernelBlockDevice::new(target_device, length)?;
         let volume = JournaledVolume::<_, CngFscryptNonceGenerator>::mount(
             block_device,
             MountContext::new(FscryptKeySet::empty(), CngFscryptNonceGenerator),
-        )?;
+        )
+        .await?;
         Ok(Self {
             directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
             file_control_blocks: FileControlBlockLedger::try_new()?,
-            volume,
+            operations: VolumeOperationLane { journaled: volume },
         })
     }
 
@@ -1045,64 +1053,6 @@ impl VolumeControlBlock {
     /// Reports one committed namespace name change to pending directory watchers.
     pub(crate) fn report_directory_name_change(&self, change: DirectoryNameChange) {
         self.directory_change_notifier.report(change);
-    }
-
-    /// Returns a stable serial number derived from the ext4 filesystem UUID.
-    pub(crate) fn serial_number(&self) -> VolumeSerialNumber {
-        let uuid = self.volume.identity().uuid().bytes();
-        let [a, b, c, d, ..] = uuid;
-        VolumeSerialNumber::from_le_bytes([a, b, c, d])
-    }
-
-    /// Returns the mounted ext4 volume.
-    pub(crate) const fn volume(
-        &self,
-    ) -> &JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator> {
-        &self.volume
-    }
-
-    /// Returns the mounted ext4 volume for journaled mutation.
-    pub(crate) const fn volume_mut(
-        &mut self,
-    ) -> &mut JournaledVolume<KernelBlockDevice, CngFscryptNonceGenerator> {
-        &mut self.volume
-    }
-
-    /// Persists writes issued through the mounted ext4 volume.
-    /// # Errors
-    ///
-    /// Returns an error when the lower storage device cannot guarantee persistence.
-    pub(crate) fn flush(&mut self) -> Ext4Result<()> {
-        self.volume.flush()
-    }
-
-    /// Returns the mounted ext4 volume label.
-    pub(crate) fn volume_label(&self) -> ext4_core::Ext4VolumeLabel {
-        self.volume.identity().label()
-    }
-
-    /// Adds one fscrypt master key to the mounted volume.
-    /// # Errors
-    ///
-    /// Returns an error when the mounted volume rejects the fscrypt master key.
-    pub(crate) fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> Ext4Result<()> {
-        self.volume.add_fscrypt_key(key)
-    }
-
-    /// Removes one fscrypt master key from the mounted volume.
-    pub(crate) fn remove_fscrypt_key(
-        &mut self,
-        identifier: FscryptKeyIdentifier,
-    ) -> Option<FscryptMasterKey> {
-        self.volume.remove_fscrypt_key(identifier)
-    }
-
-    /// Returns the mounted volume's fscrypt key presence for one identifier.
-    pub(crate) fn fscrypt_key_presence(
-        &self,
-        identifier: FscryptKeyIdentifier,
-    ) -> FscryptKeyPresence {
-        self.volume.fscrypt_key_presence(identifier)
     }
 
     /// Opens or reuses an existing node's FCB and records its share claim atomically.
@@ -1144,7 +1094,7 @@ impl VolumeControlBlock {
     ///
     /// Returns an error when the parent cannot be selected, child creation cannot be staged, or
     /// default metadata is rejected by the mounted ext4 profile.
-    pub(crate) fn begin_child_creation(
+    pub(crate) async fn begin_child_creation(
         &mut self,
         parent: DirectoryNodeId,
         name: &Ext4Name,
@@ -1152,16 +1102,20 @@ impl VolumeControlBlock {
         now: Ext4Timestamp,
     ) -> DriverResult<PendingChildCreation<'_>> {
         let volume = NonNull::from(&mut *self);
-        let (mounted_volume, file_control_blocks) = (&mut self.volume, &self.file_control_blocks);
+        let (mounted_volume, file_control_blocks) =
+            (&mut self.operations.journaled, &self.file_control_blocks);
         let mut transaction = mounted_volume.begin_transaction(now);
-        let parent = transaction.directory(parent)?;
+        let parent = transaction.directory(parent).await?;
         let node = match target {
             ChildCreationTarget::File(metadata) => {
-                NodeId::File(transaction.create_file(parent, name, metadata)?.id())
+                NodeId::File(transaction.create_file(parent, name, metadata).await?.id())
             }
-            ChildCreationTarget::Directory(metadata) => {
-                NodeId::Directory(transaction.create_directory(parent, name, metadata)?.id())
-            }
+            ChildCreationTarget::Directory(metadata) => NodeId::Directory(
+                transaction
+                    .create_directory(parent, name, metadata)
+                    .await?
+                    .id(),
+            ),
         };
         Ok(PendingChildCreation {
             transaction,
@@ -1709,9 +1663,13 @@ impl PendingChildCreation<'_> {
     /// # Errors
     ///
     /// Returns an error when the staged node rejects xattr mutation.
-    pub(crate) fn set_xattr(&mut self, name: XattrName, value: XattrValue) -> DriverResult<()> {
-        let node = self.transaction.node(self.node)?;
-        self.transaction.set_xattr(node, name, value)?;
+    pub(crate) async fn set_xattr(
+        &mut self,
+        name: XattrName,
+        value: XattrValue,
+    ) -> DriverResult<()> {
+        let node = self.transaction.node(self.node).await?;
+        self.transaction.set_xattr(node, name, value).await?;
         Ok(())
     }
 
@@ -1719,9 +1677,9 @@ impl PendingChildCreation<'_> {
     /// # Errors
     ///
     /// Returns an error when the staged node rejects xattr mutation.
-    pub(crate) fn remove_xattr(&mut self, name: &XattrName) -> DriverResult<()> {
-        let node = self.transaction.node(self.node)?;
-        self.transaction.remove_xattr(node, name)?;
+    pub(crate) async fn remove_xattr(&mut self, name: &XattrName) -> DriverResult<()> {
+        let node = self.transaction.node(self.node).await?;
+        self.transaction.remove_xattr(node, name).await?;
         Ok(())
     }
 
@@ -1729,8 +1687,8 @@ impl PendingChildCreation<'_> {
     /// # Errors
     ///
     /// Returns an error when the journal cannot durably commit the staged mutation.
-    pub(crate) fn commit(self) -> DriverResult<()> {
-        self.transaction.commit()?;
+    pub(crate) async fn commit(self) -> DriverResult<()> {
+        self.transaction.commit().await?;
         Ok(())
     }
 }
