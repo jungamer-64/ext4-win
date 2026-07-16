@@ -1,5 +1,6 @@
 //! Kernel boundary helpers and WDK-facing services.
 
+pub(crate) mod block_device;
 pub(crate) mod cng;
 pub(crate) mod fatal;
 pub(crate) mod ffi;
