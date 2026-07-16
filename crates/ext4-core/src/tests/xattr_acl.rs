@@ -11,25 +11,25 @@ fn in_inode_xattr_round_trips_through_inode_body() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let node_id = node_id(&volume, inode(3));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&mut volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, node_id);
-        must(transaction.set_xattr(node, name.clone(), value.clone()));
-        must(transaction.commit());
+        let node = transaction_node(&mut transaction, node_id);
+        must_run(transaction.set_xattr(node, name.clone(), value.clone()));
+        must_run(transaction.commit());
     }
 
     let inode_offset = modern_inode_offset(3);
     assert_eq!(get_u32(&image, inode_offset + 104), 0);
     assert_eq!(get_u32(&image, inode_offset + 160), 0xEA02_0000);
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = node_id(&volume, inode(3));
-    assert_eq!(must(volume.read_xattr(file, &name)), Some(value));
-    assert_eq!(must(volume.read_xattrs(file)).entries().len(), 1);
+    let file = node_id(&mut volume, inode(3));
+    assert_eq!(must_run(volume.read_xattr(file, &name)), Some(value));
+    assert_eq!(must_run(volume.read_xattrs(file)).entries().len(), 1);
 }
 
 /// # Panics
@@ -44,12 +44,12 @@ fn external_xattr_block_is_allocated_and_removed() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let node_id = node_id(&volume, inode(3));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&mut volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, node_id);
-        must(transaction.set_xattr(node, name.clone(), value.clone()));
-        must(transaction.commit());
+        let node = transaction_node(&mut transaction, node_id);
+        must_run(transaction.set_xattr(node, name.clone(), value.clone()));
+        must_run(transaction.commit());
     }
 
     let inode_offset = modern_inode_offset(3);
@@ -61,33 +61,33 @@ fn external_xattr_block_is_allocated_and_removed() {
     assert_eq!(get_u32(&image, xattr_block_offset + 8), 1);
     assert_ne!(get_u32(&image, xattr_block_offset + 16), 0);
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = node_id(&volume, inode(3));
-    assert_eq!(must(volume.read_xattr(file, &name)), Some(value));
+    let file = node_id(&mut volume, inode(3));
+    assert_eq!(must_run(volume.read_xattr(file, &name)), Some(value));
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let node_id = node_id(&volume, inode(3));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&mut volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, node_id);
+        let node = transaction_node(&mut transaction, node_id);
         assert_eq!(
-            must(transaction.remove_xattr(node, &name)),
+            must_run(transaction.remove_xattr(node, &name)),
             Some(must(XattrValue::new(&payload)))
         );
-        must(transaction.commit());
+        must_run(transaction.commit());
     }
 
     assert_eq!(get_u32(&image, inode_offset + 104), 0);
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = node_id(&volume, inode(3));
-    assert_eq!(must(volume.read_xattr(file, &name)), None);
+    let file = node_id(&mut volume, inode(3));
+    assert_eq!(must_run(volume.read_xattr(file, &name)), None);
 }
 
 /// # Panics
@@ -105,25 +105,25 @@ fn posix_acl_uses_typed_acl_boundary() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let node_id = node_id(&volume, inode(3));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&mut volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, node_id);
-        must(transaction.set_posix_acl(node, PosixAclKind::Access, acl.clone()));
-        must(transaction.commit());
+        let node = transaction_node(&mut transaction, node_id);
+        must_run(transaction.set_posix_acl(node, PosixAclKind::Access, acl.clone()));
+        must_run(transaction.commit());
     }
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = node_id(&volume, inode(3));
+    let file = node_id(&mut volume, inode(3));
     assert_eq!(
-        must(volume.read_posix_acl(file, PosixAclKind::Access)),
+        must_run(volume.read_posix_acl(file, PosixAclKind::Access)),
         Some(acl)
     );
     assert_eq!(
-        must(volume.read_xattr(file, &must(PosixAcl::access_xattr_name()))),
+        must_run(volume.read_xattr(file, &must(PosixAcl::access_xattr_name()))),
         Some(acl_value)
     );
 }
@@ -140,22 +140,22 @@ fn windows_overlay_is_stored_in_user_ext4win_xattr() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let node_id = node_id(&volume, inode(3));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&mut volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, node_id);
-        must(transaction.set_windows_overlay(node, overlay));
-        must(transaction.commit());
+        let node = transaction_node(&mut transaction, node_id);
+        must_run(transaction.set_windows_overlay(node, overlay));
+        must_run(transaction.commit());
     }
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = node_id(&volume, inode(3));
-    assert_eq!(must(volume.read_windows_overlay(file)), Some(overlay));
+    let file = node_id(&mut volume, inode(3));
+    assert_eq!(must_run(volume.read_windows_overlay(file)), Some(overlay));
     assert_eq!(
-        must(volume.read_xattr(file, &must(WindowsOverlay::attributes_xattr_name()))),
+        must_run(volume.read_xattr(file, &must(WindowsOverlay::attributes_xattr_name()))),
         Some(must(overlay.to_xattr_value()))
     );
 }
@@ -171,47 +171,50 @@ fn windows_symlink_reparse_point_is_stored_and_removed_in_user_ext4win_xattr() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let node_id = node_id(&volume, inode(3));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&mut volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, node_id);
-        must(transaction.set_windows_symlink_reparse_point(node, point.clone()));
-        must(transaction.commit());
+        let node = transaction_node(&mut transaction, node_id);
+        must_run(transaction.set_windows_symlink_reparse_point(node, point.clone()));
+        must_run(transaction.commit());
     }
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = node_id(&volume, inode(3));
+    let file = node_id(&mut volume, inode(3));
     assert_eq!(
-        must(volume.read_windows_symlink_reparse_point(file)),
+        must_run(volume.read_windows_symlink_reparse_point(file)),
         Some(point.clone())
     );
     assert_eq!(
-        must(volume.read_xattr(file, &must(WindowsSymlinkReparsePoint::xattr_name()))),
+        must_run(volume.read_xattr(file, &must(WindowsSymlinkReparsePoint::xattr_name()))),
         Some(must(point.to_xattr_value()))
     );
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let node_id = node_id(&volume, inode(3));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&mut volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, node_id);
+        let node = transaction_node(&mut transaction, node_id);
         assert_eq!(
-            must(transaction.remove_windows_symlink_reparse_point(node)),
+            must_run(transaction.remove_windows_symlink_reparse_point(node)),
             Some(point)
         );
-        must(transaction.commit());
+        must_run(transaction.commit());
     }
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = node_id(&volume, inode(3));
-    assert_eq!(must(volume.read_windows_symlink_reparse_point(file)), None);
+    let file = node_id(&mut volume, inode(3));
+    assert_eq!(
+        must_run(volume.read_windows_symlink_reparse_point(file)),
+        None
+    );
 }
 
 /// # Panics
@@ -232,37 +235,40 @@ fn minimal_profile_mounts_without_ext_attr_but_rejects_xattr_mutations() {
     ]));
 
     let device = MemoryBlockStorage::new(&mut image);
-    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-    let file = node_id(&volume, inode(3));
+    let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+    let file = node_id(&mut volume, inode(3));
     assert_eq!(
-        must(volume.read_xattr(file, &must(XattrName::new(XattrNamespace::User, b"name")))),
+        must_run(volume.read_xattr(file, &must(XattrName::new(XattrNamespace::User, b"name")))),
         None
     );
-    assert_eq!(must(volume.read_windows_overlay(file)), None);
-    assert_eq!(must(volume.read_windows_symlink_reparse_point(file)), None);
+    assert_eq!(must_run(volume.read_windows_overlay(file)), None);
+    assert_eq!(
+        must_run(volume.read_windows_symlink_reparse_point(file)),
+        None
+    );
 
     let node_id = file;
     let mut xattr = volume.begin_transaction(NOW);
-    let node = transaction_node(&xattr, node_id);
-    let result = xattr.set_xattr(
+    let node = transaction_node(&mut xattr, node_id);
+    let result = run(xattr.set_xattr(
         node,
         must(XattrName::new(XattrNamespace::User, b"name")),
         must(XattrValue::new(b"value")),
-    );
+    ));
     assert_eq!(result, Err(Error::UnsupportedWriteFeature));
 
     let mut posix_acl = volume.begin_transaction(NOW);
-    let node = transaction_node(&posix_acl, node_id);
-    let result = posix_acl.set_posix_acl(node, PosixAclKind::Access, acl);
+    let node = transaction_node(&mut posix_acl, node_id);
+    let result = run(posix_acl.set_posix_acl(node, PosixAclKind::Access, acl));
     assert_eq!(result, Err(Error::UnsupportedWriteFeature));
 
     let mut windows = volume.begin_transaction(NOW);
-    let node = transaction_node(&windows, node_id);
-    let result = windows.set_windows_overlay(node, overlay);
+    let node = transaction_node(&mut windows, node_id);
+    let result = run(windows.set_windows_overlay(node, overlay));
     assert_eq!(result, Err(Error::UnsupportedWriteFeature));
 
     let mut reparse = volume.begin_transaction(NOW);
-    let node = transaction_node(&reparse, node_id);
-    let result = reparse.set_windows_symlink_reparse_point(node, reparse_point);
+    let node = transaction_node(&mut reparse, node_id);
+    let result = run(reparse.set_windows_symlink_reparse_point(node, reparse_point));
     assert_eq!(result, Err(Error::UnsupportedWriteFeature));
 }

@@ -8,12 +8,12 @@ fn read_only_mount_accepts_encryption_and_verity_feature_bits() {
     let mut image = fixture_image();
     put_u32(&mut image, 1024 + 96, 0x0002 | 0x0040 | INCOMPAT_ENCRYPT);
     put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | RO_COMPAT_VERITY);
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
 
-    assert_eq!(read_directory(&volume, InodeId::ROOT).len(), 4);
+    assert_eq!(read_directory(&mut volume, InodeId::ROOT).len(), 4);
 }
 
 /// # Panics
@@ -25,17 +25,17 @@ fn private_fscrypt_context_is_not_public_xattr() {
     let context_bytes = fscrypt_v2_context_bytes();
     install_inline_fscrypt_context(&mut image, 3, &context_bytes);
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = node_id(&volume, inode(3));
+    let file = node_id(&mut volume, inode(3));
 
     assert_eq!(
-        must(volume.read_fscrypt_context(file)),
+        must_run(volume.read_fscrypt_context(file)),
         Some(must(FscryptContextV2::parse(&context_bytes)))
     );
-    assert_eq!(must(volume.read_xattrs(file)).entries().len(), 0);
+    assert_eq!(must_run(volume.read_xattrs(file)).entries().len(), 0);
 }
 
 /// # Panics
@@ -51,25 +51,25 @@ fn public_xattr_update_preserves_private_fscrypt_context() {
     let value = must(XattrValue::new(b"value"));
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let node_id = node_id(&volume, inode(3));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&mut volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, node_id);
-        must(transaction.set_xattr(node, name.clone(), value.clone()));
-        must(transaction.commit());
+        let node = transaction_node(&mut transaction, node_id);
+        must_run(transaction.set_xattr(node, name.clone(), value.clone()));
+        must_run(transaction.commit());
     }
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = node_id(&volume, inode(3));
+    let file = node_id(&mut volume, inode(3));
     assert_eq!(
-        must(volume.read_fscrypt_context(file)),
+        must_run(volume.read_fscrypt_context(file)),
         Some(must(FscryptContextV2::parse(&context_bytes)))
     );
-    assert_eq!(must(volume.read_xattr(file, &name)), Some(value));
-    assert_eq!(must(volume.read_xattrs(file)).entries().len(), 1);
+    assert_eq!(must_run(volume.read_xattr(file, &name)), Some(value));
+    assert_eq!(must_run(volume.read_xattrs(file)).entries().len(), 1);
 }
 
 /// # Panics
@@ -81,15 +81,15 @@ fn encrypted_file_read_requires_mount_key() {
     let context_bytes = fscrypt_v2_context_bytes();
     install_inline_fscrypt_context(&mut image, 3, &context_bytes);
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = file_node(&volume, 3);
+    let file = file_node(&mut volume, 3);
     let mut output = [0_u8; 1];
 
     assert_eq!(
-        volume.read_file(&file, FileOffset::ZERO, &mut output),
+        run(volume.read_file(&file, FileOffset::ZERO, &mut output)),
         Err(Error::MissingEncryptionKey)
     );
 }
@@ -105,15 +105,15 @@ fn encrypted_file_read_with_key_decrypts_plaintext() {
     install_inline_fscrypt_context(&mut image, 3, &context_bytes);
     encrypt_modern_file_data_block(&mut image, &master_key, &context_bytes);
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
-    let file = file_node(&volume, 3);
+    let file = file_node(&mut volume, 3);
     let mut output = [0_u8; 5];
 
     assert_eq!(
-        must(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
+        must_run(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
         5
     );
     assert_eq!(&output, b"hello");
@@ -131,25 +131,25 @@ fn encrypted_file_write_roundtrips_ciphertext() {
     encrypt_modern_file_data_block(&mut image, &master_key, &context_bytes);
 
     {
-        let mut volume = must(JournaledVolume::mount(
+        let mut volume = must_run(JournaledVolume::mount(
             MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
-        let file_id = file_node_id(&volume, 3);
+        let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         write_file(&mut transaction, file_id, 1, b"EL");
-        must(transaction.commit());
+        must_run(transaction.commit());
     }
 
     let raw_offset = block_offset(MODERN_FILE_DATA_BLOCK);
     assert_ne!(&image[raw_offset..raw_offset + 5], b"hELlo");
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     let mut output = [0_u8; 5];
-    assert_eq!(read_file(&volume, 3, 0, &mut output), 5);
+    assert_eq!(read_file(&mut volume, 3, 0, &mut output), 5);
     assert_eq!(&output, b"hELlo");
 }
 
@@ -168,24 +168,24 @@ fn encrypted_extending_write_zeroes_visible_gap() {
     encrypt_modern_file_data_block(&mut image, &master_key, &context_bytes);
 
     {
-        let mut volume = must(JournaledVolume::mount(
+        let mut volume = must_run(JournaledVolume::mount(
             MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
-        let file_id = file_node_id(&volume, 3);
+        let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         write_file(&mut transaction, file_id, 7, b"!");
-        must(transaction.commit());
+        must_run(transaction.commit());
     }
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
-    let file = file_node(&volume, 3);
+    let file = file_node(&mut volume, 3);
     assert_eq!(file.size().bytes(), 8);
     let mut output = [0_u8; 8];
-    assert_eq!(read_file(&volume, 3, 0, &mut output), 8);
+    assert_eq!(read_file(&mut volume, 3, 0, &mut output), 8);
     assert_eq!(&output, b"hello\0\0!");
 }
 
@@ -201,28 +201,28 @@ fn encrypted_truncate_zeroes_plaintext_tail() {
     encrypt_modern_file_data_block(&mut image, &master_key, &context_bytes);
 
     {
-        let mut volume = must(JournaledVolume::mount(
+        let mut volume = must_run(JournaledVolume::mount(
             MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
-        let file_id = file_node_id(&volume, 3);
+        let file_id = file_node_id(&mut volume, 3);
         let mut truncate = volume.begin_transaction(NOW);
-        let file = transaction_file(&truncate, file_id);
-        must(truncate.truncate_file(file, FileSize::from_bytes(3)));
-        must(truncate.commit());
+        let file = transaction_file(&mut truncate, file_id);
+        must_run(truncate.truncate_file(file, FileSize::from_bytes(3)));
+        must_run(truncate.commit());
 
         let mut extend = volume.begin_transaction(NOW);
-        let file = transaction_file(&extend, file_id);
-        must(extend.extend_file(file, FileSize::from_bytes(5)));
-        must(extend.commit());
+        let file = transaction_file(&mut extend, file_id);
+        must_run(extend.extend_file(file, FileSize::from_bytes(5)));
+        must_run(extend.commit());
     }
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     let mut output = [0_u8; 5];
-    assert_eq!(read_file(&volume, 3, 0, &mut output), 5);
+    assert_eq!(read_file(&mut volume, 3, 0, &mut output), 5);
     assert_eq!(&output, b"hel\0\0");
 }
 
@@ -232,16 +232,16 @@ fn encrypted_truncate_zeroes_plaintext_tail() {
 #[test]
 fn verity_file_read_verifies_post_eof_metadata() {
     let image = verity_fixture_image();
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = file_node(&volume, 3);
+    let file = file_node(&mut volume, 3);
     let mut output = [0_u8; 5];
 
     assert_eq!(file.protection(), InodeProtection::Verity);
     assert_eq!(
-        must(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
+        must_run(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
         5
     );
     assert_eq!(&output, b"hello");
@@ -254,26 +254,26 @@ fn verity_file_read_verifies_post_eof_metadata() {
 fn verity_file_read_rejects_corruption() {
     let mut corrupt_data = verity_fixture_image();
     corrupt_data[block_offset(MODERN_FILE_DATA_BLOCK)] ^= 0x80;
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&corrupt_data),
         test_mount_context(),
     ));
-    let file = file_node(&volume, 3);
+    let file = file_node(&mut volume, 3);
     let mut output = [0_u8; 5];
     assert_eq!(
-        volume.read_file(&file, FileOffset::ZERO, &mut output),
+        run(volume.read_file(&file, FileOffset::ZERO, &mut output)),
         Err(Error::VerityMismatch)
     );
 
     let mut corrupt_tree = verity_fixture_image();
     corrupt_tree[block_offset(64)] ^= 0x80;
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&corrupt_tree),
         test_mount_context(),
     ));
-    let file = file_node(&volume, 3);
+    let file = file_node(&mut volume, 3);
     assert_eq!(
-        volume.read_file(&file, FileOffset::ZERO, &mut output),
+        run(volume.read_file(&file, FileOffset::ZERO, &mut output)),
         Err(Error::VerityMismatch)
     );
 }
@@ -289,10 +289,10 @@ fn enable_verity_commits_metadata_and_remount_verifies() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let file_id = file_node_id(&volume, 3);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        let file = transaction_file(&transaction, file_id);
+        let file = transaction_file(&mut transaction, file_id);
         let enable = FsverityEnable::new(
             FsverityHashAlgorithm::Sha256,
             must(FsverityBlockSize::new(
@@ -302,20 +302,20 @@ fn enable_verity_commits_metadata_and_remount_verifies() {
             FsveritySignature::empty(),
         );
 
-        must(transaction.enable_verity(file, &enable));
-        must(transaction.commit());
+        must_run(transaction.enable_verity(file, &enable));
+        must_run(transaction.commit());
     }
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let file = file_node(&volume, 3);
+    let file = file_node(&mut volume, 3);
     let mut output = [0_u8; 5];
 
     assert_eq!(file.protection(), InodeProtection::Verity);
     assert_eq!(
-        must(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
+        must_run(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
         5
     );
     assert_eq!(&output, b"hello");
@@ -335,13 +335,13 @@ fn encrypted_enable_verity_remount_verifies_after_decrypt() {
     encrypt_modern_file_data_block(&mut image, &master_key, &context_bytes);
 
     {
-        let mut volume = must(JournaledVolume::mount(
+        let mut volume = must_run(JournaledVolume::mount(
             MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
-        let file_id = file_node_id(&volume, 3);
+        let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        let file = transaction_file(&transaction, file_id);
+        let file = transaction_file(&mut transaction, file_id);
         let enable = FsverityEnable::new(
             FsverityHashAlgorithm::Sha256,
             must(FsverityBlockSize::new(
@@ -351,20 +351,20 @@ fn encrypted_enable_verity_remount_verifies_after_decrypt() {
             FsveritySignature::empty(),
         );
 
-        must(transaction.enable_verity(file, &enable));
-        must(transaction.commit());
+        must_run(transaction.enable_verity(file, &enable));
+        must_run(transaction.commit());
     }
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
-    let file = file_node(&volume, 3);
+    let file = file_node(&mut volume, 3);
     let mut output = [0_u8; 5];
 
     assert_eq!(file.protection(), InodeProtection::EncryptedVerity);
     assert_eq!(
-        must(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
+        must_run(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
         5
     );
     assert_eq!(&output, b"hello");
@@ -380,13 +380,13 @@ fn encrypted_directory_create_requires_mount_key() {
     install_inline_fscrypt_context(&mut image, 2, &context_bytes);
 
     let device = MemoryBlockStorage::new(&mut image);
-    let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+    let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
-    let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
+    let root = transaction_directory(&mut transaction, crate::DirectoryNodeId::ROOT);
     let name = must(Ext4Name::new(b"new"));
 
     assert_eq!(
-        transaction.create_file(root, &name, test_file_metadata()),
+        run(transaction.create_file(root, &name, test_file_metadata())),
         Err(Error::MissingEncryptionKey)
     );
 }
@@ -402,11 +402,11 @@ fn encrypted_directory_read_projects_names_when_key_is_present() {
     install_inline_fscrypt_context(&mut image, 2, &context_bytes);
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
-    let locked = must(ReadOnlyVolume::mount(
+    let mut locked = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let locked_entries = read_directory(&locked, InodeId::ROOT);
+    let locked_entries = read_directory(&mut locked, InodeId::ROOT);
     let encoded = directory_entry_name(&locked_entries, inode(3));
     assert!(
         locked_entries
@@ -416,11 +416,11 @@ fn encrypted_directory_read_projects_names_when_key_is_present() {
     assert!(encoded.bytes().starts_with(b"_fscrypt_"));
     assert!(WindowsName::from_ext4(&encoded).is_ok());
 
-    let unlocked = must(ReadOnlyVolume::mount(
+    let mut unlocked = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
-    let entries = read_directory(&unlocked, InodeId::ROOT);
+    let entries = read_directory(&mut unlocked, InodeId::ROOT);
     assert!(entries.iter().any(|entry| entry.name().bytes() == b"file"));
 }
 
@@ -435,14 +435,14 @@ fn encrypted_directory_windows_lookup_encrypts_requested_name() {
     install_inline_fscrypt_context(&mut image, 2, &context_bytes);
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
 
     assert_eq!(
         lookup_windows_inode(
-            &volume,
+            &mut volume,
             InodeId::ROOT,
             &[
                 u16::from(b'f'),
@@ -466,15 +466,15 @@ fn encrypted_directory_encoded_lookup_does_not_require_mount_key() {
     install_inline_fscrypt_context(&mut image, 2, &context_bytes);
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
-    let encoded = directory_entry_name(&read_directory(&volume, InodeId::ROOT), inode(3));
+    let encoded = directory_entry_name(&read_directory(&mut volume, InodeId::ROOT), inode(3));
     let requested: Vec<u16> = encoded.bytes().iter().copied().map(u16::from).collect();
 
     assert_eq!(
-        lookup_windows_inode(&volume, InodeId::ROOT, &requested),
+        lookup_windows_inode(&mut volume, InodeId::ROOT, &requested),
         Some(inode(3))
     );
 }
@@ -491,16 +491,16 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
     {
-        let mut volume = must(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
+        let mut volume = must_run(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
             MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key_and_nonce_source(master_key.clone()),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
+        let root = transaction_directory(&mut transaction, crate::DirectoryNodeId::ROOT);
         let name = must(Ext4Name::new(b"created"));
-        let file = must(transaction.create_file(root, &name, test_file_metadata()));
+        let file = must_run(transaction.create_file(root, &name, test_file_metadata()));
         assert_eq!(file.id().inode(), inode(11));
-        must(transaction.commit());
+        must_run(transaction.commit());
     }
 
     let directory_block = &image
@@ -511,12 +511,12 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
             .any(|window| window == b"created")
     );
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
-    let child = node_id(&volume, inode(11));
-    let child_context = must(volume.read_fscrypt_context(child));
+    let child = node_id(&mut volume, inode(11));
+    let child_context = must_run(volume.read_fscrypt_context(child));
     assert!(child_context.is_some());
     let Some(child_context) = child_context else {
         return;
@@ -528,12 +528,12 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
         FscryptFileNonce::new([TestFscryptNonceGenerator::FIRST_NONCE_BYTE; 16])
     );
     assert_eq!(
-        file_node(&volume, 11).protection(),
+        file_node(&mut volume, 11).protection(),
         InodeProtection::Encrypted
     );
     assert_eq!(
         lookup_windows_inode(
-            &volume,
+            &mut volume,
             InodeId::ROOT,
             &[
                 u16::from(b'c'),
@@ -561,24 +561,25 @@ fn encrypted_directory_create_directory_inherits_child_context_when_key_is_prese
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
     {
-        let mut volume = must(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
+        let mut volume = must_run(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
             MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key_and_nonce_source(master_key.clone()),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
+        let root = transaction_directory(&mut transaction, crate::DirectoryNodeId::ROOT);
         let name = must(Ext4Name::new(b"childdir"));
-        let directory = must(transaction.create_directory(root, &name, test_directory_metadata()));
+        let directory =
+            must_run(transaction.create_directory(root, &name, test_directory_metadata()));
         assert_eq!(directory.id().inode(), inode(11));
-        must(transaction.commit());
+        must_run(transaction.commit());
     }
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
-    let child = node_id(&volume, inode(11));
-    let child_context = must(volume.read_fscrypt_context(child));
+    let child = node_id(&mut volume, inode(11));
+    let child_context = must_run(volume.read_fscrypt_context(child));
     assert!(child_context.is_some());
     let Some(child_context) = child_context else {
         return;
@@ -590,12 +591,12 @@ fn encrypted_directory_create_directory_inherits_child_context_when_key_is_prese
         FscryptFileNonce::new([TestFscryptNonceGenerator::FIRST_NONCE_BYTE; 16])
     );
     assert_eq!(
-        directory_node(&volume, inode(11)).protection(),
+        directory_node(&mut volume, inode(11)).protection(),
         InodeProtection::Encrypted
     );
     assert_eq!(
         lookup_windows_inode(
-            &volume,
+            &mut volume,
             InodeId::ROOT,
             &[
                 u16::from(b'c'),
@@ -622,17 +623,17 @@ fn encrypted_directory_create_symlink_rejects_plaintext_target() {
     let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
     install_inline_fscrypt_context(&mut image, 2, &context_bytes);
 
-    let mut volume = must(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
+    let mut volume = must_run(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
         MemoryBlockStorage::new(&mut image),
         test_mount_context_with_key_and_nonce_source(master_key),
     ));
     let mut transaction = volume.begin_transaction(NOW);
-    let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
+    let root = transaction_directory(&mut transaction, crate::DirectoryNodeId::ROOT);
     let name = must(Ext4Name::new(b"link"));
     let target = must(SymlinkTarget::new(b"target"));
 
     assert_eq!(
-        transaction.create_symlink(root, &name, &target, test_symlink_metadata()),
+        run(transaction.create_symlink(root, &name, &target, test_symlink_metadata())),
         Err(Error::UnsupportedEncryption)
     );
 }
@@ -649,22 +650,22 @@ fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
     {
-        let mut volume = must(JournaledVolume::mount(
+        let mut volume = must_run(JournaledVolume::mount(
             MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
+        let root = transaction_directory(&mut transaction, crate::DirectoryNodeId::ROOT);
         let old_name = must(Ext4Name::new(b"file"));
         let new_name = must(Ext4Name::new(b"renamed"));
-        must(transaction.rename_child(
+        must_run(transaction.rename_child(
             root,
             &old_name,
             root,
             &new_name,
             RenameTargetCollision::Reject,
         ));
-        must(transaction.commit());
+        must_run(transaction.commit());
     }
 
     let directory_block = &image
@@ -675,13 +676,13 @@ fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
             .any(|window| window == b"renamed")
     );
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     assert_eq!(
         lookup_windows_inode(
-            &volume,
+            &mut volume,
             InodeId::ROOT,
             &[
                 u16::from(b'r'),
@@ -710,28 +711,28 @@ fn encrypted_directory_encoded_delete_does_not_require_mount_key() {
     put_u16(&mut image, modern_inode_offset(3) + 26, 1);
 
     let encoded = {
-        let volume = must(ReadOnlyVolume::mount(
+        let mut volume = must_run(ReadOnlyVolume::mount(
             MemoryBlockSource::new(&image),
             test_mount_context(),
         ));
-        directory_entry_name(&read_directory(&volume, InodeId::ROOT), inode(3))
+        directory_entry_name(&read_directory(&mut volume, InodeId::ROOT), inode(3))
     };
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
-        must(transaction.unlink_file(root, &encoded));
-        must(transaction.commit());
+        let root = transaction_directory(&mut transaction, crate::DirectoryNodeId::ROOT);
+        must_run(transaction.unlink_file(root, &encoded));
+        must_run(transaction.commit());
     }
 
-    let volume = must(ReadOnlyVolume::mount(
+    let mut volume = must_run(ReadOnlyVolume::mount(
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     assert!(
-        !read_directory(&volume, InodeId::ROOT)
+        !read_directory(&mut volume, InodeId::ROOT)
             .iter()
             .any(|entry| entry.name() == &encoded)
     );
