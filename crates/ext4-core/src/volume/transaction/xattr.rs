@@ -13,7 +13,7 @@ fn require_windows_reparse_storage_node(node: TransactionNode) -> Result<()> {
     }
 }
 
-impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
+impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Sets or replaces one ext4 extended attribute.
     ///
     /// # Errors

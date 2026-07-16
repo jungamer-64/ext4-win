@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
+impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Allocates the first free allocation cluster visible in group bitmaps.
     /// # Errors
     ///

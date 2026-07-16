@@ -13,7 +13,7 @@ enum ExistingRenameTarget {
     SameInode,
 }
 
-impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
+impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Creates an empty regular file under a directory.
     ///
     /// # Errors

@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
+impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Writes bytes into a regular file and extends EOF when the range reaches beyond it.
     ///
     /// # Errors

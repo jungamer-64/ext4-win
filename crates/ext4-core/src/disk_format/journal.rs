@@ -7,11 +7,13 @@
 //! booleans in the volume layer.
 
 use alloc::vec::Vec;
+use core::future::Future;
 use core::marker::PhantomData;
 
-use crate::disk::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
+use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::disk::checksum::crc32c;
 use crate::disk::endian::{DiskOffset, be_u16, be_u32, be_u64, put_be_u16, put_be_u32};
+use crate::disk::io::{BlockSource, BlockStorage};
 use crate::disk_format::extent::{ExtentTree, ExtentTreeContext};
 use crate::disk_format::inode::Inode;
 use crate::disk_format::superblock::RecoveryState;
@@ -188,11 +190,11 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when the inode is not a supported extent-backed journal, the journal
     /// superblock cannot be read or parsed, or the ring layout is inconsistent with the inode size.
-    pub(crate) fn from_inode(
+    pub(crate) async fn from_inode(
         inode: &Inode,
         block_size: BlockSize,
         filesystem_blocks: u64,
-        reader: &impl BlockReader,
+        reader: &mut impl BlockSource,
     ) -> Result<Journal<LoadedJournal>> {
         if inode.size().bytes() == 0 || block_size.bytes() == 0 {
             return Err(Error::UnsupportedJournal);
@@ -213,14 +215,15 @@ impl<State> Journal<State> {
             block_size,
             reader,
             ExtentTreeContext::none(),
-        )?;
+        )
+        .await?;
         let location =
             JournalLocation::Internal(InternalJournalLayout::new(tree.extents(), capacity_blocks)?);
         let mut raw = memory::repeated_vec(
             0_u8,
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        read_journal_block(reader, &location, block_size, 0, &mut raw)?;
+        read_journal_block(reader, &location, block_size, 0, &mut raw).await?;
         let superblock = JournalSuperblock::parse(&raw)?;
         let ring = superblock.validate_for_mount(block_size, capacity_blocks)?;
         location.validate_ring(&ring)?;
@@ -239,8 +242,8 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when the external superblock cannot be read or parsed, its UUID does not
     /// match the filesystem, or the external ring geometry is unsupported.
-    pub(crate) fn from_external_device(
-        journal: &impl BlockReader,
+    pub(crate) async fn from_external_device(
+        journal: &mut impl BlockSource,
         block_size: BlockSize,
         expected_uuid: [u8; 16],
         filesystem_blocks: u64,
@@ -249,10 +252,12 @@ impl<State> Journal<State> {
             0_u8,
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        journal.read_exact_at(
-            ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET),
-            &mut raw,
-        )?;
+        journal
+            .read_exact_at(
+                ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET),
+                &mut raw,
+            )
+            .await?;
         let superblock = JournalSuperblock::parse(&raw)?;
         if *superblock.uuid() != expected_uuid {
             return Err(Error::UnsupportedJournal);
@@ -294,14 +299,15 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when replay scanning, checkpoint writes, flushes, or clean-superblock writes
     /// fail on the filesystem device.
-    pub(crate) fn replay_and_checkpoint_internal(
+    pub(crate) async fn replay_and_checkpoint_internal(
         mut self,
-        filesystem: &mut impl BlockWriter,
+        filesystem: &mut impl BlockStorage,
         block_size: BlockSize,
         recovery_state: RecoveryState,
     ) -> Result<Journal<CleanJournal>> {
         let mut io = InternalJournalIo { device: filesystem };
         self.replay_and_checkpoint(&mut io, block_size, recovery_state)
+            .await
     }
 
     /// Replays and checkpoints an external journal through separate I/O targets.
@@ -309,10 +315,10 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when journal scanning, home-block checkpoint writes, journal writes, or
     /// flushes fail across the filesystem and external journal devices.
-    pub(crate) fn replay_and_checkpoint_external(
+    pub(crate) async fn replay_and_checkpoint_external(
         mut self,
-        filesystem: &mut impl BlockWriter,
-        journal: &mut impl BlockWriter,
+        filesystem: &mut impl BlockStorage,
+        journal: &mut impl BlockStorage,
         block_size: BlockSize,
         recovery_state: RecoveryState,
     ) -> Result<Journal<CleanJournal>> {
@@ -321,6 +327,7 @@ impl<State> Journal<State> {
             journal,
         };
         self.replay_and_checkpoint(&mut io, block_size, recovery_state)
+            .await
     }
 
     /// Commits metadata blocks through an internal journal.
@@ -328,14 +335,15 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when transaction preparation, journal writes, checkpoint writes, or flushes
     /// fail on the filesystem device.
-    pub(crate) fn commit_internal(
+    pub(crate) async fn commit_internal(
         &mut self,
-        filesystem: &mut impl BlockWriter,
+        filesystem: &mut impl BlockStorage,
         block_size: BlockSize,
         metadata_blocks: &[MetadataBlock],
     ) -> Result<()> {
         let mut io = InternalJournalIo { device: filesystem };
         self.commit_metadata_transaction(&mut io, block_size, metadata_blocks)
+            .await
     }
 
     /// Commits metadata blocks through an external journal.
@@ -343,10 +351,10 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when transaction preparation, external journal writes, filesystem
     /// checkpoint writes, or flushes fail.
-    pub(crate) fn commit_external(
+    pub(crate) async fn commit_external(
         &mut self,
-        filesystem: &mut impl BlockWriter,
-        journal: &mut impl BlockWriter,
+        filesystem: &mut impl BlockStorage,
+        journal: &mut impl BlockStorage,
         block_size: BlockSize,
         metadata_blocks: &[MetadataBlock],
     ) -> Result<()> {
@@ -355,6 +363,7 @@ impl<State> Journal<State> {
             journal,
         };
         self.commit_metadata_transaction(&mut io, block_size, metadata_blocks)
+            .await
     }
 
     /// Replays committed transactions and advances the journal to a clean state.
@@ -362,7 +371,7 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when the superblock recovery state is inconsistent, transaction scanning
     /// fails, checkpoint I/O fails, or the clean superblock cannot be written.
-    fn replay_and_checkpoint(
+    async fn replay_and_checkpoint(
         &mut self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
@@ -371,12 +380,13 @@ impl<State> Journal<State> {
         if recovery_state == RecoveryState::NeedsRecovery && self.superblock.start() == 0 {
             return Err(Error::JournalCorrupt);
         }
-        let scan = self.committed_transactions(io, block_size)?;
+        let scan = self.committed_transactions(io, block_size).await?;
         if scan.tail == JournalScanTail::CleanSuperblock {
             return self.copy_without_state();
         }
         if scan.transactions.is_empty() {
-            self.mark_clean(io, block_size, self.superblock.sequence())?;
+            self.mark_clean(io, block_size, self.superblock.sequence())
+                .await?;
             return self.copy_without_state();
         }
 
@@ -401,12 +411,13 @@ impl<State> Journal<State> {
                     if is_revoked_after(&revokes, entry.home, transaction.sequence, order) {
                         continue;
                     }
-                    io.write_home_block(block_size, entry.home, &entry.bytes)?;
+                    io.write_home_block(block_size.offset_of(entry.home)?, &entry.bytes)
+                        .await?;
                 }
             }
         }
-        io.flush_all()?;
-        self.mark_clean(io, block_size, next_sequence)?;
+        io.flush_all().await?;
+        self.mark_clean(io, block_size, next_sequence).await?;
         self.copy_without_state()
     }
 
@@ -415,7 +426,7 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when the journal is already dirty, the transaction cannot be prepared, or any
     /// durable write, checkpoint, or clean step fails.
-    fn commit_metadata_transaction(
+    async fn commit_metadata_transaction(
         &mut self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
@@ -425,10 +436,14 @@ impl<State> Journal<State> {
             return Err(Error::JournalCorrupt);
         }
         let prepared = self.prepare_metadata_transaction(block_size, metadata_blocks)?;
-        let durable = self.write_prepared_transaction(io, block_size, prepared)?;
-        let checkpointed =
-            self.checkpoint_durable_transaction(io, block_size, metadata_blocks, durable)?;
+        let durable = self
+            .write_prepared_transaction(io, block_size, prepared)
+            .await?;
+        let checkpointed = self
+            .checkpoint_durable_transaction(io, block_size, metadata_blocks, durable)
+            .await?;
         self.clean_checkpointed_transaction(io, block_size, checkpointed)
+            .await
     }
 
     /// Persists descriptor, data, and commit blocks in crash-safe order.
@@ -436,7 +451,7 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when dirty-superblock encoding, ring advancement, journal writes, or flushes
     /// fail.
-    fn write_prepared_transaction(
+    async fn write_prepared_transaction(
         &mut self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
@@ -446,21 +461,28 @@ impl<State> Journal<State> {
         let dirty_superblock =
             self.superblock
                 .encode_dirty(block_size, prepared.descriptor, prepared.sequence)?;
-        io.write_journal_block(self, block_size, 0, &dirty_superblock)?;
+        io.write_journal_block(self.offset_of(0, block_size)?, &dirty_superblock)
+            .await?;
         self.superblock
             .apply_dirty(prepared.descriptor, prepared.sequence, dirty_superblock);
 
-        io.write_journal_block(self, block_size, cursor, &prepared.descriptor_block)?;
+        io.write_journal_block(
+            self.offset_of(cursor, block_size)?,
+            &prepared.descriptor_block,
+        )
+        .await?;
         cursor = self.next_logical(cursor)?;
 
         for data in &prepared.data_blocks {
-            io.write_journal_block(self, block_size, cursor, data)?;
+            io.write_journal_block(self.offset_of(cursor, block_size)?, data)
+                .await?;
             cursor = self.next_logical(cursor)?;
         }
-        io.flush_all()?;
+        io.flush_all().await?;
 
-        io.write_journal_block(self, block_size, cursor, &prepared.commit_block)?;
-        io.flush_all()?;
+        io.write_journal_block(self.offset_of(cursor, block_size)?, &prepared.commit_block)
+            .await?;
+        io.flush_all().await?;
 
         Ok(JournalDurableTransaction {
             next_sequence: prepared.next_sequence,
@@ -473,7 +495,7 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when any metadata block cannot be written to its home location or the
     /// checkpoint flush fails.
-    fn checkpoint_durable_transaction(
+    async fn checkpoint_durable_transaction(
         &mut self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
@@ -481,9 +503,10 @@ impl<State> Journal<State> {
         durable: JournalDurableTransaction,
     ) -> Result<CheckpointedJournalTransaction> {
         for metadata in metadata_blocks {
-            io.write_home_block(block_size, metadata.block(), metadata.bytes())?;
+            io.write_home_block(block_size.offset_of(metadata.block())?, metadata.bytes())
+                .await?;
         }
-        io.flush_all()?;
+        io.flush_all().await?;
         Ok(CheckpointedJournalTransaction {
             next_sequence: durable.next_sequence,
             state: PhantomData,
@@ -494,13 +517,14 @@ impl<State> Journal<State> {
     /// # Errors
     ///
     /// Returns an error when the clean journal superblock cannot be encoded, written, or flushed.
-    fn clean_checkpointed_transaction(
+    async fn clean_checkpointed_transaction(
         &mut self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
         checkpointed: CheckpointedJournalTransaction,
     ) -> Result<()> {
-        self.mark_clean(io, block_size, checkpointed.next_sequence)?;
+        self.mark_clean(io, block_size, checkpointed.next_sequence)
+            .await?;
         Ok(())
     }
 
@@ -554,7 +578,7 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when usable ring bounds cannot be computed or a transaction block cannot be
     /// read and parsed.
-    fn committed_transactions(
+    async fn committed_transactions(
         &self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
@@ -571,7 +595,10 @@ impl<State> Journal<State> {
         let mut sequence = self.superblock.sequence();
         let mut consumed = 0_u32;
         while consumed < self.usable_log_blocks()? {
-            match self.parse_transaction(io, block_size, cursor, sequence)? {
+            match self
+                .parse_transaction(io, block_size, cursor, sequence)
+                .await?
+            {
                 JournalTransactionScan::Committed {
                     transaction,
                     next_cursor,
@@ -612,7 +639,7 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when a transaction has inconsistent sequence numbers, duplicate descriptor
     /// blocks, corrupt escaped data, duplicate home blocks, invalid revokes, or a bad commit block.
-    fn parse_transaction(
+    async fn parse_transaction(
         &self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
@@ -628,7 +655,7 @@ impl<State> Journal<State> {
         let mut descriptor_seen = false;
 
         while consumed < self.usable_log_blocks()? {
-            let block = self.read_journal_block(io, block_size, cursor)?;
+            let block = self.read_journal_block(io, block_size, cursor).await?;
             let Ok(header) = Jbd2Header::parse(&block) else {
                 return Ok(transaction_tail(consumed));
             };
@@ -649,7 +676,7 @@ impl<State> Journal<State> {
                     cursor = self.next_logical(cursor)?;
                     consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
                     for tag in descriptor.tags {
-                        let mut data = self.read_journal_block(io, block_size, cursor)?;
+                        let mut data = self.read_journal_block(io, block_size, cursor).await?;
                         if tag.flags & JBD2_TAG_FLAG_DELETED == 0 {
                             self.verify_tag_checksum(sequence, &tag, &data)?;
                             if tag.flags & JBD2_TAG_FLAG_ESCAPE != 0 {
@@ -713,7 +740,7 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when the journal block size cannot be allocated or the logical block cannot
     /// be read from the journal location.
-    fn read_journal_block(
+    async fn read_journal_block(
         &self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
@@ -723,7 +750,8 @@ impl<State> Journal<State> {
             0_u8,
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        io.read_journal_block(self, block_size, logical, &mut block)?;
+        io.read_journal_block(self.offset_of(logical, block_size)?, &mut block)
+            .await?;
         Ok(block)
     }
 
@@ -1102,15 +1130,16 @@ impl<State> Journal<State> {
     /// # Errors
     ///
     /// Returns an error when clean superblock encoding, journal superblock write, or flush fails.
-    fn mark_clean(
+    async fn mark_clean(
         &mut self,
         io: &mut impl JournalIo,
         block_size: BlockSize,
         next_sequence: JournalSequence,
     ) -> Result<()> {
         let block = self.superblock.encode_clean(block_size, next_sequence)?;
-        io.write_journal_block(self, block_size, 0, &block)?;
-        io.flush_all()?;
+        io.write_journal_block(self.offset_of(0, block_size)?, &block)
+            .await?;
+        io.flush_all().await?;
         self.superblock.apply_clean(next_sequence, block);
         Ok(())
     }
@@ -1587,7 +1616,7 @@ impl ExternalJournalLayout {
     ///
     /// Returns an error when the device is too small after the external superblock offset or its
     /// block capacity is outside the supported range.
-    fn new(journal: &impl BlockReader, block_size: BlockSize) -> Result<Self> {
+    fn new(journal: &impl BlockSource, block_size: BlockSize) -> Result<Self> {
         let base = ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET);
         let remaining = journal
             .len()
@@ -2092,42 +2121,37 @@ trait JournalIo {
     /// # Errors
     ///
     /// Returns an error when the logical journal block cannot be mapped or read.
-    fn read_journal_block<S>(
-        &mut self,
-        journal: &Journal<S>,
-        block_size: BlockSize,
-        logical: u32,
-        out: &mut [u8],
-    ) -> Result<()>;
+    fn read_journal_block<'a>(
+        &'a mut self,
+        offset: ByteOffset,
+        out: &'a mut [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a;
 
     /// Writes one logical journal block to the journal device.
     /// # Errors
     ///
     /// Returns an error when the logical journal block cannot be mapped or written.
-    fn write_journal_block<S>(
-        &mut self,
-        journal: &Journal<S>,
-        block_size: BlockSize,
-        logical: u32,
-        bytes: &[u8],
-    ) -> Result<()>;
+    fn write_journal_block<'a>(
+        &'a mut self,
+        offset: ByteOffset,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a;
 
     /// Writes one filesystem home block.
     /// # Errors
     ///
     /// Returns an error when the filesystem block offset cannot be computed or the write fails.
-    fn write_home_block(
-        &mut self,
-        block_size: BlockSize,
-        block: BlockAddress,
-        bytes: &[u8],
-    ) -> Result<()>;
+    fn write_home_block<'a>(
+        &'a mut self,
+        offset: ByteOffset,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a;
 
     /// Flushes all devices touched by this journal operation.
     /// # Errors
     ///
     /// Returns an error when any touched device fails to flush.
-    fn flush_all(&mut self) -> Result<()>;
+    fn flush_all(&mut self) -> impl Future<Output = Result<()>> + Send + '_;
 }
 
 /// Journal I/O for an internal journal stored on the filesystem device.
@@ -2136,40 +2160,32 @@ struct InternalJournalIo<'a, D> {
     device: &'a mut D,
 }
 
-impl<D: BlockWriter> JournalIo for InternalJournalIo<'_, D> {
-    fn read_journal_block<S>(
-        &mut self,
-        journal: &Journal<S>,
-        block_size: BlockSize,
-        logical: u32,
-        out: &mut [u8],
-    ) -> Result<()> {
-        self.device
-            .read_exact_at(journal.offset_of(logical, block_size)?, out)
+impl<D: BlockStorage> JournalIo for InternalJournalIo<'_, D> {
+    fn read_journal_block<'a>(
+        &'a mut self,
+        offset: ByteOffset,
+        out: &'a mut [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        self.device.read_exact_at(offset, out)
     }
 
-    fn write_journal_block<S>(
-        &mut self,
-        journal: &Journal<S>,
-        block_size: BlockSize,
-        logical: u32,
-        bytes: &[u8],
-    ) -> Result<()> {
-        self.device
-            .write_exact_at(journal.offset_of(logical, block_size)?, bytes)
+    fn write_journal_block<'a>(
+        &'a mut self,
+        offset: ByteOffset,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        self.device.write_exact_at(offset, bytes)
     }
 
-    fn write_home_block(
-        &mut self,
-        block_size: BlockSize,
-        block: BlockAddress,
-        bytes: &[u8],
-    ) -> Result<()> {
-        self.device
-            .write_exact_at(block_size.offset_of(block)?, bytes)
+    fn write_home_block<'a>(
+        &'a mut self,
+        offset: ByteOffset,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        self.device.write_exact_at(offset, bytes)
     }
 
-    fn flush_all(&mut self) -> Result<()> {
+    fn flush_all(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
         self.device.flush()
     }
 }
@@ -2182,42 +2198,36 @@ struct ExternalJournalIo<'a, F, J> {
     journal: &'a mut J,
 }
 
-impl<F: BlockWriter, J: BlockWriter> JournalIo for ExternalJournalIo<'_, F, J> {
-    fn read_journal_block<S>(
-        &mut self,
-        journal: &Journal<S>,
-        block_size: BlockSize,
-        logical: u32,
-        out: &mut [u8],
-    ) -> Result<()> {
-        self.journal
-            .read_exact_at(journal.offset_of(logical, block_size)?, out)
+impl<F: BlockStorage, J: BlockStorage> JournalIo for ExternalJournalIo<'_, F, J> {
+    fn read_journal_block<'a>(
+        &'a mut self,
+        offset: ByteOffset,
+        out: &'a mut [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        self.journal.read_exact_at(offset, out)
     }
 
-    fn write_journal_block<S>(
-        &mut self,
-        journal: &Journal<S>,
-        block_size: BlockSize,
-        logical: u32,
-        bytes: &[u8],
-    ) -> Result<()> {
-        self.journal
-            .write_exact_at(journal.offset_of(logical, block_size)?, bytes)
+    fn write_journal_block<'a>(
+        &'a mut self,
+        offset: ByteOffset,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        self.journal.write_exact_at(offset, bytes)
     }
 
-    fn write_home_block(
-        &mut self,
-        block_size: BlockSize,
-        block: BlockAddress,
-        bytes: &[u8],
-    ) -> Result<()> {
-        self.filesystem
-            .write_exact_at(block_size.offset_of(block)?, bytes)
+    fn write_home_block<'a>(
+        &'a mut self,
+        offset: ByteOffset,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        self.filesystem.write_exact_at(offset, bytes)
     }
 
-    fn flush_all(&mut self) -> Result<()> {
-        self.journal.flush()?;
-        self.filesystem.flush()
+    fn flush_all(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
+        async move {
+            self.journal.flush().await?;
+            self.filesystem.flush().await
+        }
     }
 }
 
@@ -2235,15 +2245,15 @@ impl<State> Journal<State> {
 /// # Errors
 ///
 /// Returns an error when the location cannot map `logical` or the backing reader fails.
-fn read_journal_block(
-    reader: &impl BlockReader,
+async fn read_journal_block(
+    reader: &mut impl BlockSource,
     location: &JournalLocation,
     block_size: BlockSize,
     logical: u32,
     out: &mut [u8],
 ) -> Result<()> {
     let offset = location.offset_of(logical, block_size)?;
-    reader.read_exact_at(offset, out)
+    reader.read_exact_at(offset, out).await
 }
 
 /// Returns whether a metadata payload must be escaped before journaling.

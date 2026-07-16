@@ -35,3 +35,31 @@ pub trait BlockStorage: BlockSource {
     /// Persists every preceding write according to the storage contract.
     fn flush(&mut self) -> impl Future<Output = Result<()>> + Send + '_;
 }
+
+impl<T: BlockSource + ?Sized> BlockSource for &mut T {
+    fn len(&self) -> DeviceLength {
+        (**self).len()
+    }
+
+    fn read_exact_at<'a>(
+        &'a mut self,
+        offset: ByteOffset,
+        out: &'a mut [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        (**self).read_exact_at(offset, out)
+    }
+}
+
+impl<T: BlockStorage + ?Sized> BlockStorage for &mut T {
+    fn write_exact_at<'a>(
+        &'a mut self,
+        offset: ByteOffset,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        (**self).write_exact_at(offset, bytes)
+    }
+
+    fn flush(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
+        (**self).flush()
+    }
+}

@@ -9,7 +9,7 @@ fn read_only_mount_accepts_encryption_and_verity_feature_bits() {
     put_u32(&mut image, 1024 + 96, 0x0002 | 0x0040 | INCOMPAT_ENCRYPT);
     put_u32(&mut image, 1024 + 100, 0x0001 | 0x0002 | RO_COMPAT_VERITY);
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
 
@@ -26,7 +26,7 @@ fn private_fscrypt_context_is_not_public_xattr() {
     install_inline_fscrypt_context(&mut image, 3, &context_bytes);
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = node_id(&volume, inode(3));
@@ -50,7 +50,7 @@ fn public_xattr_update_preserves_private_fscrypt_context() {
     let name = must(XattrName::new(XattrNamespace::User, b"visible"));
     let value = must(XattrValue::new(b"value"));
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
@@ -60,7 +60,7 @@ fn public_xattr_update_preserves_private_fscrypt_context() {
     }
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = node_id(&volume, inode(3));
@@ -82,7 +82,7 @@ fn encrypted_file_read_requires_mount_key() {
     install_inline_fscrypt_context(&mut image, 3, &context_bytes);
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = file_node(&volume, 3);
@@ -106,7 +106,7 @@ fn encrypted_file_read_with_key_decrypts_plaintext() {
     encrypt_modern_file_data_block(&mut image, &master_key, &context_bytes);
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     let file = file_node(&volume, 3);
@@ -132,7 +132,7 @@ fn encrypted_file_write_roundtrips_ciphertext() {
 
     {
         let mut volume = must(JournaledVolume::mount(
-            SliceBlockDeviceMut::new(&mut image),
+            MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
         let file_id = file_node_id(&volume, 3);
@@ -145,7 +145,7 @@ fn encrypted_file_write_roundtrips_ciphertext() {
     assert_ne!(&image[raw_offset..raw_offset + 5], b"hELlo");
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     let mut output = [0_u8; 5];
@@ -169,7 +169,7 @@ fn encrypted_extending_write_zeroes_visible_gap() {
 
     {
         let mut volume = must(JournaledVolume::mount(
-            SliceBlockDeviceMut::new(&mut image),
+            MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
         let file_id = file_node_id(&volume, 3);
@@ -179,7 +179,7 @@ fn encrypted_extending_write_zeroes_visible_gap() {
     }
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     let file = file_node(&volume, 3);
@@ -202,7 +202,7 @@ fn encrypted_truncate_zeroes_plaintext_tail() {
 
     {
         let mut volume = must(JournaledVolume::mount(
-            SliceBlockDeviceMut::new(&mut image),
+            MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
         let file_id = file_node_id(&volume, 3);
@@ -218,7 +218,7 @@ fn encrypted_truncate_zeroes_plaintext_tail() {
     }
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     let mut output = [0_u8; 5];
@@ -233,7 +233,7 @@ fn encrypted_truncate_zeroes_plaintext_tail() {
 fn verity_file_read_verifies_post_eof_metadata() {
     let image = verity_fixture_image();
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = file_node(&volume, 3);
@@ -255,7 +255,7 @@ fn verity_file_read_rejects_corruption() {
     let mut corrupt_data = verity_fixture_image();
     corrupt_data[block_offset(MODERN_FILE_DATA_BLOCK)] ^= 0x80;
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&corrupt_data),
+        MemoryBlockSource::new(&corrupt_data),
         test_mount_context(),
     ));
     let file = file_node(&volume, 3);
@@ -268,7 +268,7 @@ fn verity_file_read_rejects_corruption() {
     let mut corrupt_tree = verity_fixture_image();
     corrupt_tree[block_offset(64)] ^= 0x80;
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&corrupt_tree),
+        MemoryBlockSource::new(&corrupt_tree),
         test_mount_context(),
     ));
     let file = file_node(&volume, 3);
@@ -288,7 +288,7 @@ fn enable_verity_commits_metadata_and_remount_verifies() {
     put_u32(&mut image, 1024 + 100, read_only_compat);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let file_id = file_node_id(&volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
@@ -307,7 +307,7 @@ fn enable_verity_commits_metadata_and_remount_verifies() {
     }
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = file_node(&volume, 3);
@@ -336,7 +336,7 @@ fn encrypted_enable_verity_remount_verifies_after_decrypt() {
 
     {
         let mut volume = must(JournaledVolume::mount(
-            SliceBlockDeviceMut::new(&mut image),
+            MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
         let file_id = file_node_id(&volume, 3);
@@ -356,7 +356,7 @@ fn encrypted_enable_verity_remount_verifies_after_decrypt() {
     }
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     let file = file_node(&volume, 3);
@@ -379,7 +379,7 @@ fn encrypted_directory_create_requires_mount_key() {
     let context_bytes = fscrypt_v2_context_bytes();
     install_inline_fscrypt_context(&mut image, 2, &context_bytes);
 
-    let device = SliceBlockDeviceMut::new(&mut image);
+    let device = MemoryBlockStorage::new(&mut image);
     let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let mut transaction = volume.begin_transaction(NOW);
     let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
@@ -403,7 +403,7 @@ fn encrypted_directory_read_projects_names_when_key_is_present() {
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
     let locked = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let locked_entries = read_directory(&locked, InodeId::ROOT);
@@ -417,7 +417,7 @@ fn encrypted_directory_read_projects_names_when_key_is_present() {
     assert!(WindowsName::from_ext4(&encoded).is_ok());
 
     let unlocked = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     let entries = read_directory(&unlocked, InodeId::ROOT);
@@ -436,7 +436,7 @@ fn encrypted_directory_windows_lookup_encrypts_requested_name() {
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
 
@@ -467,7 +467,7 @@ fn encrypted_directory_encoded_lookup_does_not_require_mount_key() {
     encrypt_modern_root_file_name(&mut image, &master_key, &context_bytes);
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let encoded = directory_entry_name(&read_directory(&volume, InodeId::ROOT), inode(3));
@@ -492,7 +492,7 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
 
     {
         let mut volume = must(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
-            SliceBlockDeviceMut::new(&mut image),
+            MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key_and_nonce_source(master_key.clone()),
         ));
         let mut transaction = volume.begin_transaction(NOW);
@@ -512,7 +512,7 @@ fn encrypted_directory_create_encrypts_child_name_when_key_is_present() {
     );
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     let child = node_id(&volume, inode(11));
@@ -562,7 +562,7 @@ fn encrypted_directory_create_directory_inherits_child_context_when_key_is_prese
 
     {
         let mut volume = must(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
-            SliceBlockDeviceMut::new(&mut image),
+            MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key_and_nonce_source(master_key.clone()),
         ));
         let mut transaction = volume.begin_transaction(NOW);
@@ -574,7 +574,7 @@ fn encrypted_directory_create_directory_inherits_child_context_when_key_is_prese
     }
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     let child = node_id(&volume, inode(11));
@@ -623,7 +623,7 @@ fn encrypted_directory_create_symlink_rejects_plaintext_target() {
     install_inline_fscrypt_context(&mut image, 2, &context_bytes);
 
     let mut volume = must(JournaledVolume::<_, TestFscryptNonceGenerator>::mount(
-        SliceBlockDeviceMut::new(&mut image),
+        MemoryBlockStorage::new(&mut image),
         test_mount_context_with_key_and_nonce_source(master_key),
     ));
     let mut transaction = volume.begin_transaction(NOW);
@@ -650,7 +650,7 @@ fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
 
     {
         let mut volume = must(JournaledVolume::mount(
-            SliceBlockDeviceMut::new(&mut image),
+            MemoryBlockStorage::new(&mut image),
             test_mount_context_with_key(master_key.clone()),
         ));
         let mut transaction = volume.begin_transaction(NOW);
@@ -676,7 +676,7 @@ fn encrypted_directory_rename_encrypts_target_name_when_key_is_present() {
     );
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context_with_key(master_key),
     ));
     assert_eq!(
@@ -711,14 +711,14 @@ fn encrypted_directory_encoded_delete_does_not_require_mount_key() {
 
     let encoded = {
         let volume = must(ReadOnlyVolume::mount(
-            SliceBlockDevice::new(&image),
+            MemoryBlockSource::new(&image),
             test_mount_context(),
         ));
         directory_entry_name(&read_directory(&volume, InodeId::ROOT), inode(3))
     };
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
         let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
@@ -727,7 +727,7 @@ fn encrypted_directory_encoded_delete_does_not_require_mount_key() {
     }
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     assert!(

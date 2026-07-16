@@ -6,9 +6,10 @@
 
 use alloc::vec::Vec;
 
-use crate::disk::block::{BlockAddress, BlockReader, BlockSize, ByteOffset};
+use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::disk::checksum::{crc16, crc32c};
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16};
+use crate::disk::io::BlockSource;
 use crate::disk_format::superblock::{
     BlockGroupDescriptorChecksum, BlockGroupDescriptorLayout, BlockGroupDescriptorSize,
     BlockGroupId, FreeClusterDelta, Superblock,
@@ -93,8 +94,8 @@ impl BlockGroupDescriptor {
     ///
     /// Returns an error when the group is outside the mounted geometry, descriptor I/O fails, the
     /// descriptor checksum is invalid, or any descriptor field is truncated.
-    pub(crate) fn read_from(
-        reader: &impl BlockReader,
+    pub(crate) async fn read_from(
+        reader: &mut impl BlockSource,
         superblock: &Superblock,
         group: BlockGroupId,
     ) -> Result<Self> {
@@ -105,7 +106,7 @@ impl BlockGroupDescriptor {
             descriptor_offset(superblock.block_size(), superblock.descriptor_size(), group)?;
         let mut bytes =
             memory::repeated_vec(0_u8, usize::from(superblock.descriptor_size().as_u16()))?;
-        reader.read_exact_at(offset, &mut bytes)?;
+        reader.read_exact_at(offset, &mut bytes).await?;
         verify_block_group_descriptor_checksum(superblock, group, &bytes)?;
         let block_bitmap = descriptor_block_address(
             &bytes,

@@ -31,7 +31,7 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when static metadata or live inode block references cannot be validated
     /// against allocation bitmaps.
-    pub(super) fn load<D: BlockReader, State, N>(
+    pub(super) fn load<D: BlockSource, State, N>(
         volume: &MountedVolume<D, State, N>,
     ) -> Result<Self> {
         let mut index = Self {
@@ -72,7 +72,7 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when `block` is already known through another owner or is not marked
     /// allocated in the mounted cluster bitmap.
-    pub(super) fn add_exclusive_reference<D: BlockReader, State, N>(
+    pub(super) fn add_exclusive_reference<D: BlockSource, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
         block: BlockAddress,
@@ -89,7 +89,7 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when `block` conflicts with an exclusive owner or is not allocated in the
     /// mounted cluster bitmap.
-    pub(super) fn add_xattr_reference<D: BlockReader, State, N>(
+    pub(super) fn add_xattr_reference<D: BlockSource, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
         block: BlockAddress,
@@ -108,7 +108,7 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when `block` cannot be translated to a mounted cluster, the bitmap cannot
     /// be read, or the cluster is marked free.
-    pub(super) fn add_cluster_reference<D: BlockReader, State, N>(
+    pub(super) fn add_cluster_reference<D: BlockSource, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
         block: BlockAddress,
@@ -128,7 +128,7 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when descriptor-table, bitmap, or inode-table blocks cannot be enumerated
     /// or are not exclusively allocated.
-    pub(super) fn add_static_metadata<D: BlockReader, State, N>(
+    pub(super) fn add_static_metadata<D: BlockSource, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
     ) -> Result<()> {
@@ -179,7 +179,7 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when inode bitmaps, raw inode records, external xattr blocks, or extent tree
     /// blocks cannot be read or validated as allocated.
-    pub(super) fn add_live_inodes<D: BlockReader, State, N>(
+    pub(super) fn add_live_inodes<D: BlockSource, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
     ) -> Result<()> {
@@ -229,7 +229,7 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when the extent block range overflows or any represented block is not an
     /// exclusively allocated cluster.
-    pub(super) fn add_extent_references<D: BlockReader, State, N>(
+    pub(super) fn add_extent_references<D: BlockSource, State, N>(
         &mut self,
         volume: &MountedVolume<D, State, N>,
         extent: Extent,
@@ -507,7 +507,7 @@ pub(super) fn set_inode_bitmap_bit(
 /// Returns an error when `cluster` is outside the mounted geometry, its group descriptor cannot be
 /// read, or the bitmap block cannot be loaded.
 pub(super) fn cluster_bitmap_state(
-    reader: &impl BlockReader,
+    reader: &impl BlockSource,
     superblock: &Superblock,
     cluster: ClusterAddress,
 ) -> Result<BitmapBitState> {
@@ -533,7 +533,7 @@ pub(super) fn cluster_bitmap_state(
 /// Returns an error when `inode_id` is outside the mounted inode range, its group descriptor cannot
 /// be read, or the bitmap block cannot be loaded.
 pub(super) fn inode_bitmap_state(
-    reader: &impl BlockReader,
+    reader: &impl BlockSource,
     superblock: &Superblock,
     inode_id: InodeId,
 ) -> Result<BitmapBitState> {
@@ -650,7 +650,7 @@ pub(super) fn inode_table_blocks(superblock: &Superblock, group: BlockGroupId) -
 /// Returns an error when `inode_id` cannot be mapped to a group, the descriptor cannot be read, or
 /// inode-table offset arithmetic overflows.
 pub(super) fn inode_offset_on_device(
-    reader: &impl BlockReader,
+    reader: &impl BlockSource,
     superblock: &Superblock,
     inode_id: InodeId,
 ) -> Result<ByteOffset> {

@@ -17,10 +17,8 @@
 
 use alloc::{vec, vec::Vec};
 
-use crate::disk::block::{
-    BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset, DeviceLength, SliceBlockDevice,
-    SliceBlockDeviceMut,
-};
+use crate::disk::block::{BlockAddress, BlockSize, ByteOffset, DeviceLength};
+use crate::disk::io::{BlockSource, BlockStorage};
 use crate::disk_format::acl::{PosixAcl, PosixAclEntry, PosixAclKind};
 use crate::disk_format::dir::{DirectoryEntry as RawDirectoryEntry, DirectoryEntryKind};
 use crate::disk_format::extent::{
@@ -195,7 +193,7 @@ trait MountedVolumeTestExt {
     ) -> crate::Result<crate::ChildLookup>;
 }
 
-impl<D: BlockReader, N> MountedVolumeTestExt for ReadOnlyVolume<D, N> {
+impl<D: BlockSource, N> MountedVolumeTestExt for ReadOnlyVolume<D, N> {
     fn load_file(&self, id: FileNodeId) -> crate::Result<FileNode> {
         Self::load_file(self, id)
     }
@@ -242,7 +240,7 @@ impl<D: BlockReader, N> MountedVolumeTestExt for ReadOnlyVolume<D, N> {
     }
 }
 
-impl<D: BlockReader, N, J> MountedVolumeTestExt for JournaledVolume<D, N, J> {
+impl<D: BlockSource, N, J> MountedVolumeTestExt for JournaledVolume<D, N, J> {
     fn load_file(&self, id: FileNodeId) -> crate::Result<FileNode> {
         Self::load_file(self, id)
     }
@@ -432,21 +430,21 @@ fn lookup_windows_inode<V: MountedVolumeTestExt>(
     }
 }
 
-fn transaction_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
+fn transaction_file<D: BlockStorage, N: FscryptNonceGenerator, J>(
     transaction: &JournalTransaction<'_, D, N, J>,
     file_id: FileNodeId,
 ) -> TransactionFile {
     must(transaction.file(file_id))
 }
 
-fn transaction_directory<D: BlockWriter, N: FscryptNonceGenerator, J>(
+fn transaction_directory<D: BlockStorage, N: FscryptNonceGenerator, J>(
     transaction: &JournalTransaction<'_, D, N, J>,
     directory_id: DirectoryNodeId,
 ) -> TransactionDirectory {
     must(transaction.directory(directory_id))
 }
 
-fn transaction_node<D: BlockWriter, N: FscryptNonceGenerator, J>(
+fn transaction_node<D: BlockStorage, N: FscryptNonceGenerator, J>(
     transaction: &JournalTransaction<'_, D, N, J>,
     id: NodeId,
 ) -> crate::TransactionNode {
@@ -567,7 +565,7 @@ fn encrypt_modern_root_file_name(image: &mut [u8], master_key: &FscryptMasterKey
     );
 }
 
-fn write_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
+fn write_file<D: BlockStorage, N: FscryptNonceGenerator, J>(
     transaction: &mut JournalTransaction<'_, D, N, J>,
     file_id: FileNodeId,
     offset: u64,
@@ -577,7 +575,7 @@ fn write_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
     must(transaction.write_file_range(file, FileOffset::from_bytes(offset), bytes));
 }
 
-fn extend_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
+fn extend_file<D: BlockStorage, N: FscryptNonceGenerator, J>(
     transaction: &mut JournalTransaction<'_, D, N, J>,
     file_id: FileNodeId,
     new_size: u64,
@@ -586,7 +584,7 @@ fn extend_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
     must(transaction.extend_file(file, FileSize::from_bytes(new_size)));
 }
 
-fn truncate_file<D: BlockWriter, N: FscryptNonceGenerator, J>(
+fn truncate_file<D: BlockStorage, N: FscryptNonceGenerator, J>(
     transaction: &mut JournalTransaction<'_, D, N, J>,
     file_id: FileNodeId,
     new_size: u64,

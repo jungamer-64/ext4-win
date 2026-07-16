@@ -10,7 +10,7 @@ fn in_inode_xattr_round_trips_through_inode_body() {
     let value = must(XattrValue::new(b"value"));
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
@@ -24,7 +24,7 @@ fn in_inode_xattr_round_trips_through_inode_body() {
     assert_eq!(get_u32(&image, inode_offset + 160), 0xEA02_0000);
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = node_id(&volume, inode(3));
@@ -43,7 +43,7 @@ fn external_xattr_block_is_allocated_and_removed() {
     let value = must(XattrValue::new(&payload));
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
@@ -62,14 +62,14 @@ fn external_xattr_block_is_allocated_and_removed() {
     assert_ne!(get_u32(&image, xattr_block_offset + 16), 0);
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = node_id(&volume, inode(3));
     assert_eq!(must(volume.read_xattr(file, &name)), Some(value));
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
@@ -83,7 +83,7 @@ fn external_xattr_block_is_allocated_and_removed() {
 
     assert_eq!(get_u32(&image, inode_offset + 104), 0);
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = node_id(&volume, inode(3));
@@ -104,7 +104,7 @@ fn posix_acl_uses_typed_acl_boundary() {
     let acl_value = must(acl.to_xattr_value());
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
@@ -114,7 +114,7 @@ fn posix_acl_uses_typed_acl_boundary() {
     }
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = node_id(&volume, inode(3));
@@ -139,7 +139,7 @@ fn windows_overlay_is_stored_in_user_ext4win_xattr() {
     )));
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
@@ -149,7 +149,7 @@ fn windows_overlay_is_stored_in_user_ext4win_xattr() {
     }
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = node_id(&volume, inode(3));
@@ -170,7 +170,7 @@ fn windows_symlink_reparse_point_is_stored_and_removed_in_user_ext4win_xattr() {
         WindowsSymlinkReparsePoint::new(must(SymlinkTarget::new(b"relative\\target")), true);
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
@@ -180,7 +180,7 @@ fn windows_symlink_reparse_point_is_stored_and_removed_in_user_ext4win_xattr() {
     }
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = node_id(&volume, inode(3));
@@ -194,7 +194,7 @@ fn windows_symlink_reparse_point_is_stored_and_removed_in_user_ext4win_xattr() {
     );
 
     {
-        let device = SliceBlockDeviceMut::new(&mut image);
+        let device = MemoryBlockStorage::new(&mut image);
         let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
         let node_id = node_id(&volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
@@ -207,7 +207,7 @@ fn windows_symlink_reparse_point_is_stored_and_removed_in_user_ext4win_xattr() {
     }
 
     let volume = must(ReadOnlyVolume::mount(
-        SliceBlockDevice::new(&image),
+        MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
     let file = node_id(&volume, inode(3));
@@ -231,7 +231,7 @@ fn minimal_profile_mounts_without_ext_attr_but_rejects_xattr_mutations() {
         PosixAclEntry::Other(must(Ext4Permissions::new(0o000))),
     ]));
 
-    let device = SliceBlockDeviceMut::new(&mut image);
+    let device = MemoryBlockStorage::new(&mut image);
     let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
     let file = node_id(&volume, inode(3));
     assert_eq!(

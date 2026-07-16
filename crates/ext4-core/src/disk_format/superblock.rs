@@ -1,8 +1,9 @@
 //! Superblock parsing and mount-policy validation.
 
-use crate::disk::block::{BlockAddress, BlockReader, BlockSize, BlockWriter, ByteOffset};
+use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::disk::checksum::{crc32c, verify_crc32c};
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u32};
+use crate::disk::io::{BlockSource, BlockStorage};
 use crate::disk_format::inode::InodeId;
 use crate::error::{Error, Result};
 
@@ -1384,9 +1385,11 @@ impl Superblock {
     /// Returns an error when the primary superblock cannot be read or does not
     /// satisfy the clean v1 mount policy.
     #[cfg(test)]
-    pub fn read_from(device: &impl BlockReader) -> Result<Self> {
+    pub async fn read_from(device: &mut impl BlockSource) -> Result<Self> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
-        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
+        device
+            .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)
+            .await?;
         Self::parse(&raw)
     }
 
@@ -1394,9 +1397,11 @@ impl Superblock {
     ///
     /// # Errors
     /// Returns an error when the superblock cannot support journaled writes.
-    pub fn read_write_from(device: &impl BlockReader) -> Result<Self> {
+    pub async fn read_write_from(device: &mut impl BlockSource) -> Result<Self> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
-        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
+        device
+            .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)
+            .await?;
         Self::parse_read_write(&raw)
     }
 
@@ -1742,14 +1747,18 @@ impl Superblock {
     ///
     /// # Errors
     /// Returns an error when the primary superblock cannot be read or written.
-    pub fn clear_recover_on_device(device: &mut impl BlockWriter) -> Result<()> {
+    pub async fn clear_recover_on_device(device: &mut impl BlockStorage) -> Result<()> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
-        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
+        device
+            .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)
+            .await?;
         let incompat = le_u32(&raw, disk_offset(96))? & !INCOMPAT_RECOVER;
         put_le_u32(&mut raw, disk_offset(96), incompat)?;
         Self::refresh_checksum(&mut raw)?;
-        device.write_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &raw)?;
-        device.flush()
+        device
+            .write_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &raw)
+            .await?;
+        device.flush().await
     }
 
     /// Recomputes the primary superblock checksum when the on-disk checksum is present.

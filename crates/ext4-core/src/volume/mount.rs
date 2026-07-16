@@ -190,7 +190,7 @@ impl VolumeGeometry {
 }
 
 #[cfg(test)]
-impl<D: BlockReader, N> MountedVolume<D, ReadOnlyMount, N> {
+impl<D: BlockSource, N> MountedVolume<D, ReadOnlyMount, N> {
     /// Validates an ext4 volume and constructs read-only mounted state.
     ///
     /// # Errors
@@ -207,7 +207,7 @@ impl<D: BlockReader, N> MountedVolume<D, ReadOnlyMount, N> {
 }
 
 #[cfg(test)]
-impl<D: BlockReader, N> ReadOnlyVolume<D, N> {
+impl<D: BlockSource, N> ReadOnlyVolume<D, N> {
     /// Validates an ext4 volume and constructs read-only mounted state.
     ///
     /// # Errors
@@ -219,7 +219,7 @@ impl<D: BlockReader, N> ReadOnlyVolume<D, N> {
     }
 }
 
-impl<D: BlockWriter, N: FscryptNonceGenerator + Clone>
+impl<D: BlockStorage, N: FscryptNonceGenerator + Clone>
     MountedVolume<D, JournaledMount<InternalJournal>, N>
 {
     /// Replays the internal journal boundary and constructs journaled read-write state.
@@ -285,7 +285,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator + Clone>
     }
 }
 
-impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> JournaledVolume<D, N, InternalJournal> {
+impl<D: BlockStorage, N: FscryptNonceGenerator + Clone> JournaledVolume<D, N, InternalJournal> {
     /// Replays the internal journal boundary and constructs journaled read-write state.
     ///
     /// # Errors
@@ -306,7 +306,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator + Clone> JournaledVolume<D, N, Int
     }
 }
 
-impl<D: BlockWriter, N> JournaledVolume<D, N, InternalJournal> {
+impl<D: BlockStorage, N> JournaledVolume<D, N, InternalJournal> {
     /// Persists all filesystem-device writes issued through this mounted volume.
     ///
     /// # Errors
@@ -316,7 +316,7 @@ impl<D: BlockWriter, N> JournaledVolume<D, N, InternalJournal> {
     }
 }
 
-impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
+impl<D: BlockStorage, J: BlockStorage, N: FscryptNonceGenerator + Clone>
     MountedVolume<D, JournaledMount<ExternalJournal<J>>, N>
 {
     /// Replays an external journal and constructs journaled read-write state.
@@ -381,7 +381,7 @@ impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
     }
 }
 
-impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
+impl<D: BlockStorage, J: BlockStorage, N: FscryptNonceGenerator + Clone>
     JournaledVolume<D, N, ExternalJournal<J>>
 {
     /// Replays an external journal and constructs journaled read-write state.
@@ -408,7 +408,7 @@ impl<D: BlockWriter, J: BlockWriter, N: FscryptNonceGenerator + Clone>
     }
 }
 
-impl<D: BlockWriter, J: BlockWriter, N> JournaledVolume<D, N, ExternalJournal<J>> {
+impl<D: BlockStorage, J: BlockStorage, N> JournaledVolume<D, N, ExternalJournal<J>> {
     /// Persists all journal and filesystem-device writes issued through this mounted volume.
     ///
     /// # Errors

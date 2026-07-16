@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
+impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
     /// Serializes all staged metadata mutations into byte-range writes.
     /// # Errors
     ///
@@ -275,7 +275,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J
     }
 }
 
-impl<D: BlockWriter, N: FscryptNonceGenerator> JournalTransaction<'_, D, N, InternalJournal> {
+impl<D: BlockStorage, N: FscryptNonceGenerator> JournalTransaction<'_, D, N, InternalJournal> {
     /// Commits staged data and metadata through the internal journal.
     ///
     /// # Errors
@@ -304,7 +304,7 @@ impl<D: BlockWriter, N: FscryptNonceGenerator> JournalTransaction<'_, D, N, Inte
     }
 }
 
-impl<D: BlockWriter, N: FscryptNonceGenerator, J: BlockWriter>
+impl<D: BlockStorage, N: FscryptNonceGenerator, J: BlockStorage>
     JournalTransaction<'_, D, N, ExternalJournal<J>>
 {
     /// Commits staged data and metadata through the external journal device.
