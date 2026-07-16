@@ -195,8 +195,8 @@ impl<D: BlockSource, N> MountedVolume<D, ReadOnlyMount, N> {
     ///
     /// # Errors
     /// Returns an error when the device does not contain a supported ext4 superblock.
-    pub(super) fn mount(device: D, mount_context: MountContext<N>) -> Result<Self> {
-        let superblock = Superblock::read_from(&device)?;
+    pub(super) async fn mount(mut device: D, mount_context: MountContext<N>) -> Result<Self> {
+        let superblock = Superblock::read_from(&mut device).await?;
         Ok(Self {
             device,
             superblock,
@@ -212,9 +212,9 @@ impl<D: BlockSource, N> ReadOnlyVolume<D, N> {
     ///
     /// # Errors
     /// Returns an error when the device does not contain a supported ext4 superblock.
-    pub(crate) fn mount(device: D, mount_context: MountContext<N>) -> Result<Self> {
+    pub(crate) async fn mount(device: D, mount_context: MountContext<N>) -> Result<Self> {
         Ok(Self {
-            volume: MountedVolume::mount(device, mount_context)?,
+            volume: MountedVolume::mount(device, mount_context).await?,
         })
     }
 }
@@ -226,46 +226,47 @@ impl<D: BlockStorage, N: FscryptNonceGenerator + Clone>
     ///
     /// # Errors
     /// Returns an error when the device is not a supported journaled ext4 volume.
-    pub(super) fn mount_internal_journal(
+    pub(super) async fn mount_internal_journal(
         mut device: D,
         mount_context: MountContext<N>,
     ) -> Result<Self> {
-        let mut superblock = Superblock::read_write_from(&device)?;
+        let mut superblock = Superblock::read_write_from(&mut device).await?;
         let JournalMode::Internal(journal_inode_id) = superblock.journal_mode() else {
             return Err(Error::UnsupportedJournal);
         };
-        let read_only = MountedVolume::<&mut D, ReadOnlyMount, N> {
-            device: &mut device,
-            superblock,
-            mount_context: mount_context.clone(),
-            state: ReadOnlyMount,
-        };
-        let journal_inode = read_only.read_inode_record(journal_inode_id)?;
-        let journal = Journal::<LoadedJournal>::from_inode(
-            &journal_inode,
-            superblock.block_size(),
-            superblock.block_count().as_u64(),
-            &read_only.device,
-        )?;
-        let recovery_state = superblock.recovery_state();
-        let journal = journal.replay_and_checkpoint_internal(
-            &mut device,
-            superblock.block_size(),
-            recovery_state,
-        )?;
-        let journal = InternalJournal { journal };
-        if recovery_state == RecoveryState::NeedsRecovery {
-            Superblock::clear_recover_on_device(&mut device)?;
-            superblock = Superblock::read_write_from(&device)?;
-        }
-        let clusters = {
-            let recovered = MountedVolume::<&mut D, ReadOnlyMount, N> {
+        let journal_inode = {
+            let mut read_only = MountedVolume::<&mut D, ReadOnlyMount, N> {
                 device: &mut device,
                 superblock,
                 mount_context: mount_context.clone(),
                 state: ReadOnlyMount,
             };
-            ClusterReferenceIndex::load(&recovered)?
+            read_only.read_inode_record(journal_inode_id).await?
+        };
+        let journal = Journal::<LoadedJournal>::from_inode(
+            &journal_inode,
+            superblock.block_size(),
+            superblock.block_count().as_u64(),
+            &mut device,
+        )
+        .await?;
+        let recovery_state = superblock.recovery_state();
+        let journal = journal
+            .replay_and_checkpoint_internal(&mut device, superblock.block_size(), recovery_state)
+            .await?;
+        let journal = InternalJournal { journal };
+        if recovery_state == RecoveryState::NeedsRecovery {
+            Superblock::clear_recover_on_device(&mut device).await?;
+            superblock = Superblock::read_write_from(&mut device).await?;
+        }
+        let clusters = {
+            let mut recovered = MountedVolume::<&mut D, ReadOnlyMount, N> {
+                device: &mut device,
+                superblock,
+                mount_context: mount_context.clone(),
+                state: ReadOnlyMount,
+            };
+            ClusterReferenceIndex::load(&mut recovered).await?
         };
         Ok(Self {
             device,
@@ -290,9 +291,9 @@ impl<D: BlockStorage, N: FscryptNonceGenerator + Clone> JournaledVolume<D, N, In
     ///
     /// # Errors
     /// Returns an error when the device is not a supported journaled ext4 volume.
-    pub fn mount(device: D, mount_context: MountContext<N>) -> Result<Self> {
+    pub async fn mount(device: D, mount_context: MountContext<N>) -> Result<Self> {
         Ok(Self {
-            volume: MountedVolume::mount_internal_journal(device, mount_context)?,
+            volume: MountedVolume::mount_internal_journal(device, mount_context).await?,
         })
     }
 
@@ -311,8 +312,8 @@ impl<D: BlockStorage, N> JournaledVolume<D, N, InternalJournal> {
     ///
     /// # Errors
     /// Returns an error when the filesystem backing device cannot guarantee persistence.
-    pub fn flush(&mut self) -> Result<()> {
-        self.volume.device.flush()
+    pub async fn flush(&mut self) -> Result<()> {
+        self.volume.device.flush().await
     }
 }
 
@@ -323,45 +324,47 @@ impl<D: BlockStorage, J: BlockStorage, N: FscryptNonceGenerator + Clone>
     ///
     /// # Errors
     /// Returns an error when either device cannot support the external journal contract.
-    pub(super) fn mount_external_journal(
+    pub(super) async fn mount_external_journal(
         mut device: D,
-        journal_device: J,
+        mut journal_device: J,
         mount_context: MountContext<N>,
     ) -> Result<Self> {
-        let mut superblock = Superblock::read_write_from(&device)?;
+        let mut superblock = Superblock::read_write_from(&mut device).await?;
         let JournalMode::External(journal_uuid) = superblock.journal_mode() else {
             return Err(Error::UnsupportedJournal);
         };
         let journal = Journal::<LoadedJournal>::from_external_device(
-            &journal_device,
+            &mut journal_device,
             superblock.block_size(),
             journal_uuid.bytes(),
             superblock.block_count().as_u64(),
-        )?;
+        )
+        .await?;
         let recovery_state = superblock.recovery_state();
-        let mut journal_device = journal_device;
-        let journal = journal.replay_and_checkpoint_external(
-            &mut device,
-            &mut journal_device,
-            superblock.block_size(),
-            recovery_state,
-        )?;
+        let journal = journal
+            .replay_and_checkpoint_external(
+                &mut device,
+                &mut journal_device,
+                superblock.block_size(),
+                recovery_state,
+            )
+            .await?;
         let journal = ExternalJournal {
             device: journal_device,
             journal,
         };
         if recovery_state == RecoveryState::NeedsRecovery {
-            Superblock::clear_recover_on_device(&mut device)?;
-            superblock = Superblock::read_write_from(&device)?;
+            Superblock::clear_recover_on_device(&mut device).await?;
+            superblock = Superblock::read_write_from(&mut device).await?;
         }
         let clusters = {
-            let recovered = MountedVolume::<&mut D, ReadOnlyMount, N> {
+            let mut recovered = MountedVolume::<&mut D, ReadOnlyMount, N> {
                 device: &mut device,
                 superblock,
                 mount_context: mount_context.clone(),
                 state: ReadOnlyMount,
             };
-            ClusterReferenceIndex::load(&recovered)?
+            ClusterReferenceIndex::load(&mut recovered).await?
         };
         Ok(Self {
             device,
@@ -388,13 +391,14 @@ impl<D: BlockStorage, J: BlockStorage, N: FscryptNonceGenerator + Clone>
     ///
     /// # Errors
     /// Returns an error when either device cannot support the external journal contract.
-    pub fn mount_with_external_journal(
+    pub async fn mount_with_external_journal(
         device: D,
         journal_device: J,
         mount_context: MountContext<N>,
     ) -> Result<Self> {
         Ok(Self {
-            volume: MountedVolume::mount_external_journal(device, journal_device, mount_context)?,
+            volume: MountedVolume::mount_external_journal(device, journal_device, mount_context)
+                .await?,
         })
     }
 
@@ -413,8 +417,8 @@ impl<D: BlockStorage, J: BlockStorage, N> JournaledVolume<D, N, ExternalJournal<
     ///
     /// # Errors
     /// Returns an error when either backing device cannot guarantee persistence.
-    pub fn flush(&mut self) -> Result<()> {
-        self.volume.state.journal.device.flush()?;
-        self.volume.device.flush()
+    pub async fn flush(&mut self) -> Result<()> {
+        self.volume.state.journal.device.flush().await?;
+        self.volume.device.flush().await
     }
 }

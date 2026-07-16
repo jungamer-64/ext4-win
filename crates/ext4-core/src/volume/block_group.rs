@@ -31,16 +31,16 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when static metadata or live inode block references cannot be validated
     /// against allocation bitmaps.
-    pub(super) fn load<D: BlockSource, State, N>(
-        volume: &MountedVolume<D, State, N>,
+    pub(super) async fn load<D: BlockSource, State, N>(
+        volume: &mut MountedVolume<D, State, N>,
     ) -> Result<Self> {
         let mut index = Self {
             refs: Vec::new(),
             exclusive_blocks: Vec::new(),
             xattr_blocks: Vec::new(),
         };
-        index.add_static_metadata(volume)?;
-        index.add_live_inodes(volume)?;
+        index.add_static_metadata(volume).await?;
+        index.add_live_inodes(volume).await?;
         Ok(index)
     }
 
@@ -72,16 +72,16 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when `block` is already known through another owner or is not marked
     /// allocated in the mounted cluster bitmap.
-    pub(super) fn add_exclusive_reference<D: BlockSource, State, N>(
+    pub(super) async fn add_exclusive_reference<D: BlockSource, State, N>(
         &mut self,
-        volume: &MountedVolume<D, State, N>,
+        volume: &mut MountedVolume<D, State, N>,
         block: BlockAddress,
     ) -> Result<()> {
         if self.exclusive_blocks.contains(&block) || self.xattr_blocks.contains(&block) {
             return Err(Error::ClusterReferenceConflict);
         }
         self.exclusive_blocks.try_push(block)?;
-        self.add_cluster_reference(volume, block)
+        self.add_cluster_reference(volume, block).await
     }
 
     /// Adds one external-xattr mounted reference after validating bitmap allocation.
@@ -89,9 +89,9 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when `block` conflicts with an exclusive owner or is not allocated in the
     /// mounted cluster bitmap.
-    pub(super) fn add_xattr_reference<D: BlockSource, State, N>(
+    pub(super) async fn add_xattr_reference<D: BlockSource, State, N>(
         &mut self,
-        volume: &MountedVolume<D, State, N>,
+        volume: &mut MountedVolume<D, State, N>,
         block: BlockAddress,
     ) -> Result<()> {
         if self.exclusive_blocks.contains(&block) {
@@ -100,7 +100,7 @@ impl ClusterReferenceIndex {
         if !self.xattr_blocks.contains(&block) {
             self.xattr_blocks.try_push(block)?;
         }
-        self.add_cluster_reference(volume, block)
+        self.add_cluster_reference(volume, block).await
     }
 
     /// Adds one mounted cluster reference after validating bitmap allocation.
@@ -108,13 +108,13 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when `block` cannot be translated to a mounted cluster, the bitmap cannot
     /// be read, or the cluster is marked free.
-    pub(super) fn add_cluster_reference<D: BlockSource, State, N>(
+    pub(super) async fn add_cluster_reference<D: BlockSource, State, N>(
         &mut self,
-        volume: &MountedVolume<D, State, N>,
+        volume: &mut MountedVolume<D, State, N>,
         block: BlockAddress,
     ) -> Result<()> {
         let cluster = volume.superblock.cluster_of_block(block)?;
-        if cluster_bitmap_state(&volume.device, &volume.superblock, cluster)?
+        if cluster_bitmap_state(&mut volume.device, &volume.superblock, cluster).await?
             != BitmapBitState::Used
         {
             return Err(Error::ClusterReferenceConflict);
@@ -128,9 +128,9 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when descriptor-table, bitmap, or inode-table blocks cannot be enumerated
     /// or are not exclusively allocated.
-    pub(super) fn add_static_metadata<D: BlockSource, State, N>(
+    pub(super) async fn add_static_metadata<D: BlockSource, State, N>(
         &mut self,
-        volume: &MountedVolume<D, State, N>,
+        volume: &mut MountedVolume<D, State, N>,
     ) -> Result<()> {
         let groups = volume.superblock.block_group_count()?;
         let descriptor_blocks = descriptor_table_blocks(&volume.superblock)?;
@@ -138,7 +138,8 @@ impl ClusterReferenceIndex {
             let group = BlockGroupId::from_u32(group);
             if group_has_superblock(volume, group) {
                 let superblock_block = group_start_block(&volume.superblock, group)?;
-                self.add_exclusive_reference(volume, superblock_block)?;
+                self.add_exclusive_reference(volume, superblock_block)
+                    .await?;
                 for offset in 0..descriptor_blocks {
                     self.add_exclusive_reference(
                         volume,
@@ -149,14 +150,18 @@ impl ClusterReferenceIndex {
                                 .and_then(|value| value.checked_add(offset))
                                 .ok_or(Error::ArithmeticOverflow)?,
                         ),
-                    )?;
+                    )
+                    .await?;
                 }
             }
 
             let descriptor =
-                BlockGroupDescriptor::read_from(&volume.device, &volume.superblock, group)?;
-            self.add_exclusive_reference(volume, descriptor.block_bitmap())?;
-            self.add_exclusive_reference(volume, descriptor.inode_bitmap())?;
+                BlockGroupDescriptor::read_from(&mut volume.device, &volume.superblock, group)
+                    .await?;
+            self.add_exclusive_reference(volume, descriptor.block_bitmap())
+                .await?;
+            self.add_exclusive_reference(volume, descriptor.inode_bitmap())
+                .await?;
             let inode_table_blocks = inode_table_blocks(&volume.superblock, group)?;
             for offset in 0..inode_table_blocks {
                 self.add_exclusive_reference(
@@ -168,7 +173,8 @@ impl ClusterReferenceIndex {
                             .checked_add(offset)
                             .ok_or(Error::ArithmeticOverflow)?,
                     ),
-                )?;
+                )
+                .await?;
             }
         }
         Ok(())
@@ -179,23 +185,23 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when inode bitmaps, raw inode records, external xattr blocks, or extent tree
     /// blocks cannot be read or validated as allocated.
-    pub(super) fn add_live_inodes<D: BlockSource, State, N>(
+    pub(super) async fn add_live_inodes<D: BlockSource, State, N>(
         &mut self,
-        volume: &MountedVolume<D, State, N>,
+        volume: &mut MountedVolume<D, State, N>,
     ) -> Result<()> {
         for inode_number in 1..=volume.superblock.inode_count().as_u32() {
             let inode_id = InodeId::try_from(inode_number)?;
-            if inode_bitmap_state(&volume.device, &volume.superblock, inode_id)?
+            if inode_bitmap_state(&mut volume.device, &volume.superblock, inode_id).await?
                 != BitmapBitState::Used
             {
                 continue;
             }
-            let raw_inode = volume.read_raw_inode_record(inode_id)?;
+            let raw_inode = volume.read_raw_inode_record(inode_id).await?;
             if raw_inode.mode()? == 0 {
                 continue;
             }
             if let Some(block) = raw_inode.xattr_block()? {
-                self.add_xattr_reference(volume, block)?;
+                self.add_xattr_reference(volume, block).await?;
             }
             let Ok(inode) = raw_inode.parse() else {
                 if raw_inode.has_extent_tree()? {
@@ -208,17 +214,19 @@ impl ClusterReferenceIndex {
                 InodeStorage::InlineBytes(_) => continue,
                 InodeStorage::UnsupportedBlockMap => return Err(Error::UnsupportedBlockMap),
             };
+            let context = volume.extent_tree_context(&inode);
             let tree = ExtentTree::load_inode_tree(
-                root,
+                &root,
                 volume.superblock.block_size(),
-                &volume.device,
-                volume.extent_tree_context(&inode),
-            )?;
+                &mut volume.device,
+                context,
+            )
+            .await?;
             for extent in tree.extents().iter().copied() {
-                self.add_extent_references(volume, extent)?;
+                self.add_extent_references(volume, extent).await?;
             }
             for block in tree.metadata_blocks().iter().copied() {
-                self.add_exclusive_reference(volume, block)?;
+                self.add_exclusive_reference(volume, block).await?;
             }
         }
         Ok(())
@@ -229,9 +237,9 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when the extent block range overflows or any represented block is not an
     /// exclusively allocated cluster.
-    pub(super) fn add_extent_references<D: BlockSource, State, N>(
+    pub(super) async fn add_extent_references<D: BlockSource, State, N>(
         &mut self,
-        volume: &MountedVolume<D, State, N>,
+        volume: &mut MountedVolume<D, State, N>,
         extent: Extent,
     ) -> Result<()> {
         for offset in 0..extent.len().as_u64() {
@@ -244,7 +252,8 @@ impl ClusterReferenceIndex {
                         .checked_add(offset)
                         .ok_or(Error::ArithmeticOverflow)?,
                 ),
-            )?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -506,24 +515,26 @@ pub(super) fn set_inode_bitmap_bit(
 ///
 /// Returns an error when `cluster` is outside the mounted geometry, its group descriptor cannot be
 /// read, or the bitmap block cannot be loaded.
-pub(super) fn cluster_bitmap_state(
-    reader: &impl BlockSource,
+pub(super) async fn cluster_bitmap_state(
+    reader: &mut impl BlockSource,
     superblock: &Superblock,
     cluster: ClusterAddress,
 ) -> Result<BitmapBitState> {
     let position = ClusterBitmapPosition::from_cluster(superblock, cluster)?;
     let group = position.group();
-    let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
+    let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group).await?;
     let mut bytes = memory::repeated_vec(
         0_u8,
         usize::try_from(superblock.block_size().bytes()).map_err(|_| Error::ArithmeticOverflow)?,
     )?;
-    reader.read_exact_at(
-        superblock
-            .block_size()
-            .offset_of(descriptor.block_bitmap())?,
-        &mut bytes,
-    )?;
+    reader
+        .read_exact_at(
+            superblock
+                .block_size()
+                .offset_of(descriptor.block_bitmap())?,
+            &mut bytes,
+        )
+        .await?;
     cluster_bitmap_bit_state(bytes.as_slice(), position)
 }
 
@@ -532,24 +543,26 @@ pub(super) fn cluster_bitmap_state(
 ///
 /// Returns an error when `inode_id` is outside the mounted inode range, its group descriptor cannot
 /// be read, or the bitmap block cannot be loaded.
-pub(super) fn inode_bitmap_state(
-    reader: &impl BlockSource,
+pub(super) async fn inode_bitmap_state(
+    reader: &mut impl BlockSource,
     superblock: &Superblock,
     inode_id: InodeId,
 ) -> Result<BitmapBitState> {
     let position = InodeBitmapPosition::from_inode(superblock, inode_id)?;
     let group = position.group();
-    let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
+    let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group).await?;
     let mut bytes = memory::repeated_vec(
         0_u8,
         usize::try_from(superblock.block_size().bytes()).map_err(|_| Error::ArithmeticOverflow)?,
     )?;
-    reader.read_exact_at(
-        superblock
-            .block_size()
-            .offset_of(descriptor.inode_bitmap())?,
-        &mut bytes,
-    )?;
+    reader
+        .read_exact_at(
+            superblock
+                .block_size()
+                .offset_of(descriptor.inode_bitmap())?,
+            &mut bytes,
+        )
+        .await?;
     inode_bitmap_bit_state(bytes.as_slice(), position)
 }
 
@@ -649,14 +662,14 @@ pub(super) fn inode_table_blocks(superblock: &Superblock, group: BlockGroupId) -
 ///
 /// Returns an error when `inode_id` cannot be mapped to a group, the descriptor cannot be read, or
 /// inode-table offset arithmetic overflows.
-pub(super) fn inode_offset_on_device(
-    reader: &impl BlockSource,
+pub(super) async fn inode_offset_on_device(
+    reader: &mut impl BlockSource,
     superblock: &Superblock,
     inode_id: InodeId,
 ) -> Result<ByteOffset> {
     let position = InodeBitmapPosition::from_inode(superblock, inode_id)?;
     let group = position.group();
-    let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
+    let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group).await?;
     let inode_size = u64::from(superblock.inode_size().as_u16());
     let offset = superblock
         .block_size()

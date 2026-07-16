@@ -198,8 +198,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the inode cannot be read or carries mutation
     /// semantics outside the write domain.
-    pub fn node(&self, id: NodeId) -> Result<TransactionNode> {
-        let inode = self.volume.read_inode_record(id.inode())?;
+    pub async fn node(&mut self, id: NodeId) -> Result<TransactionNode> {
+        let inode = self.volume.read_inode_record(id.inode()).await?;
         let _metadata = inode.metadata_mutation()?;
         match (id, inode.kind()) {
             (NodeId::File(_), InodeKind::File)
@@ -213,8 +213,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// # Errors
     /// Returns an error when the inode is not a regular file or cannot be read.
-    pub fn file(&self, id: FileNodeId) -> Result<TransactionFile> {
-        let inode = self.volume.read_inode_record(id.inode())?;
+    pub async fn file(&mut self, id: FileNodeId) -> Result<TransactionFile> {
+        let inode = self.volume.read_inode_record(id.inode()).await?;
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
@@ -225,8 +225,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// # Errors
     /// Returns an error when the inode is not a directory or cannot be read.
-    pub fn directory(&self, id: DirectoryNodeId) -> Result<TransactionDirectory> {
-        let inode = self.volume.read_inode_record(id.inode())?;
+    pub async fn directory(&mut self, id: DirectoryNodeId) -> Result<TransactionDirectory> {
+        let inode = self.volume.read_inode_record(id.inode()).await?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
@@ -238,12 +238,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the inode is not a symbolic link or carries
     /// mutation semantics outside the write domain.
-    pub fn symlink(&self, id: SymlinkNodeId) -> Result<TransactionSymlink> {
-        let inode = self.volume.read_inode_record(id.inode())?;
+    pub async fn symlink(&mut self, id: SymlinkNodeId) -> Result<TransactionSymlink> {
+        let inode = self.volume.read_inode_record(id.inode()).await?;
         if inode.kind() != InodeKind::Symlink {
             return Err(Error::WrongInodeKind);
         }
-        self.require_file_data_mutation(&inode)?;
+        self.require_file_data_mutation(&inode).await?;
         Ok(TransactionSymlink { id })
     }
 
@@ -252,12 +252,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the inode leaves the mutable write domain or the
     /// inode record cannot be rewritten.
-    pub fn set_posix_security(
+    pub async fn set_posix_security(
         &mut self,
         node: TransactionNode,
         security: Ext4Security,
     ) -> Result<()> {
-        let inode_index = self.ensure_inode_update(node.inode())?;
+        let inode_index = self.ensure_inode_update(node.inode()).await?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         let _metadata = inode.metadata_mutation()?;
@@ -273,8 +273,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the inode leaves the mutable write domain or the
     /// inode record cannot be rewritten.
-    pub fn set_times(&mut self, node: TransactionNode, times: Ext4Times) -> Result<()> {
-        let inode_index = self.ensure_inode_update(node.inode())?;
+    pub async fn set_times(&mut self, node: TransactionNode, times: Ext4Times) -> Result<()> {
+        let inode_index = self.ensure_inode_update(node.inode()).await?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         let _metadata = inode.metadata_mutation()?;
@@ -306,13 +306,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the parent inode cannot be loaded from staged/device state or does not
     /// permit directory-entry creation.
-    fn require_directory_entry_create_mutation(
-        &self,
+    async fn require_directory_entry_create_mutation(
+        &mut self,
         inode_id: InodeId,
     ) -> Result<DirectoryEntryMutationCapability> {
-        let raw_inode = self.raw_inode_for_policy(inode_id)?;
+        let raw_inode = self.raw_inode_for_policy(inode_id).await?;
         let inode = raw_inode.parse()?;
         self.require_directory_entry_create_mutation_for_inode(&inode)
+            .await
     }
 
     /// Verifies directory-entry creation policy with mount-scoped fscrypt keys.
@@ -320,15 +321,15 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `inode` is not a directory, lacks a required fscrypt key, or its
     /// storage policy rejects entry creation.
-    fn require_directory_entry_create_mutation_for_inode(
-        &self,
+    async fn require_directory_entry_create_mutation_for_inode(
+        &mut self,
         inode: &Inode,
     ) -> Result<DirectoryEntryMutationCapability> {
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
         if inode.protection().is_encrypted() {
-            self.volume.require_encryption_key(inode)?;
+            self.volume.require_encryption_key(inode).await?;
         }
         inode.directory_entry_mutation()
     }
@@ -353,11 +354,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the source directory cannot satisfy entry creation-style mutation
     /// requirements for rename staging.
-    fn require_directory_entry_rename_mutation_for_inode(
-        &self,
+    async fn require_directory_entry_rename_mutation_for_inode(
+        &mut self,
         inode: &Inode,
     ) -> Result<DirectoryEntryMutationCapability> {
         self.require_directory_entry_create_mutation_for_inode(inode)
+            .await
     }
 
     /// Verifies directory-entry replacement policy with mount-scoped fscrypt keys.
@@ -365,11 +367,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the target directory cannot satisfy entry creation-style mutation
     /// requirements for replacement staging.
-    fn require_directory_entry_replace_mutation_for_inode(
-        &self,
+    async fn require_directory_entry_replace_mutation_for_inode(
+        &mut self,
         inode: &Inode,
     ) -> Result<DirectoryEntryMutationCapability> {
         self.require_directory_entry_create_mutation_for_inode(inode)
+            .await
     }
 
     /// Builds the fscrypt context inherited by a new child of this directory.
@@ -377,11 +380,15 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the encrypted parent has no mounted master key or a new file nonce
     /// cannot be generated.
-    fn inherited_fscrypt_context(&mut self, parent: &Inode) -> Result<Option<FscryptContextV2>> {
+    async fn inherited_fscrypt_context(
+        &mut self,
+        parent: &Inode,
+    ) -> Result<Option<FscryptContextV2>> {
         if !parent.protection().is_encrypted() {
             return Ok(None);
         }
-        let (parent_context, _master_key) = self.volume.fscrypt_master_key_for_inode(parent)?;
+        let (parent_context, _master_key) =
+            self.volume.fscrypt_master_key_for_inode(parent).await?;
         let nonce = self.volume.mount_context.next_fscrypt_file_nonce()?;
         Ok(Some(FscryptContextV2::new(parent_context.policy(), nonce)))
     }
@@ -391,7 +398,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when xattr mutation is unsupported, the encryption flag cannot be written,
     /// or the context cannot be stored in inode xattr storage.
-    fn apply_fscrypt_context(
+    async fn apply_fscrypt_context(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
         context: Option<FscryptContextV2>,
@@ -401,9 +408,9 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         };
         self.require_xattr_mutation()?;
         raw_inode.mark_encrypted()?;
-        let mut set = self.xattr_set_for_raw_inode(raw_inode)?;
+        let mut set = self.xattr_set_for_raw_inode(raw_inode).await?;
         set.set_encryption_context(XattrValue::new(&context.to_bytes())?);
-        self.store_xattr_set(raw_inode, &set)
+        self.store_xattr_set(raw_inode, &set).await
     }
 
     /// Returns the staged inode record when present, otherwise the device image.
@@ -411,7 +418,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when an existing staged record is deleted or the live inode cannot be read
     /// from the mounted device.
-    fn raw_inode_for_policy(&self, inode_id: InodeId) -> Result<LiveInodeRecord> {
+    async fn raw_inode_for_policy(&mut self, inode_id: InodeId) -> Result<LiveInodeRecord> {
         if let Some(raw_inode) = self
             .inode_updates
             .iter()
@@ -419,7 +426,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         {
             return raw_inode.clone_live();
         }
-        self.volume.read_live_inode_record(inode_id)
+        self.volume.read_live_inode_record(inode_id).await
     }
 
     /// Loads a mutable extent tree for an inode selected by this transaction.
@@ -427,13 +434,15 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the inode does not expose a supported extent root or its extent tree
     /// cannot be loaded.
-    fn mutable_extent_tree(&self, inode: &Inode) -> Result<MutableExtentTree> {
+    async fn mutable_extent_tree(&mut self, inode: &Inode) -> Result<MutableExtentTree> {
+        let context = self.volume.extent_tree_context(inode);
         MutableExtentTree::load_inode_tree(
             inode.extent_root()?,
             self.volume.superblock.block_size(),
-            &self.volume.device,
-            self.volume.extent_tree_context(inode),
+            &mut self.volume.device,
+            context,
         )
+        .await
     }
 
     /// Stages an updated extent tree and adjusts its metadata block ownership.
@@ -441,7 +450,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when metadata block allocation or release fails, extent serialization fails,
     /// or the updated inode block charge cannot be represented.
-    fn stage_extent_tree(
+    async fn stage_extent_tree(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
         mut tree: MutableExtentTree,
@@ -450,11 +459,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         let required = tree.required_metadata_blocks(block_size)?;
         let mut metadata_blocks = memory::copied_slice(tree.metadata_blocks())?;
         while metadata_blocks.len() < required {
-            metadata_blocks.try_push(self.allocate_cluster()?)?;
+            metadata_blocks.try_push(self.allocate_cluster().await?)?;
         }
         while metadata_blocks.len() > required {
             let block = metadata_blocks.pop().ok_or(Error::InvalidExtentTree)?;
-            self.release_cluster_reference(block)?;
+            self.release_cluster_reference(block).await?;
         }
         tree.set_metadata_blocks(metadata_blocks);
 
@@ -522,8 +531,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the directory inode cannot be staged, its link count is saturated, or
     /// timestamps cannot be written.
-    fn increment_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
-        let inode_index = self.ensure_inode_update(inode_id)?;
+    async fn increment_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
+        let inode_index = self.ensure_inode_update(inode_id).await?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         raw_inode.increment_links_count()?;
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
@@ -536,8 +545,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the directory inode cannot be staged or the decremented link count and
     /// timestamps cannot be written.
-    fn decrement_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
-        let inode_index = self.ensure_inode_update(inode_id)?;
+    async fn decrement_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
+        let inode_index = self.ensure_inode_update(inode_id).await?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let _links = raw_inode.decrement_links_count()?;
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
@@ -550,7 +559,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `inode_id` cannot be read as a live inode or the staged index cannot be
     /// represented.
-    fn ensure_inode_update(&mut self, inode_id: InodeId) -> Result<StagedInodeIndex> {
+    async fn ensure_inode_update(&mut self, inode_id: InodeId) -> Result<StagedInodeIndex> {
         if let Some(index) = self
             .inode_updates
             .iter()
@@ -558,7 +567,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         {
             return Ok(StagedInodeIndex::new(index));
         }
-        let raw_inode = self.volume.read_live_inode_record(inode_id)?;
+        let raw_inode = self.volume.read_live_inode_record(inode_id).await?;
         self.inode_updates.try_push(raw_inode.into())?;
         Ok(StagedInodeIndex::new(
             self.inode_updates

@@ -8,16 +8,19 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when no full free cluster is available, bitmap state conflicts with staged
     /// references, or cluster/group accounting cannot be updated.
-    pub(super) fn allocate_cluster(&mut self) -> Result<BlockAddress> {
+    pub(super) async fn allocate_cluster(&mut self) -> Result<BlockAddress> {
         let groups = self.volume.superblock.block_group_count()?;
         for group in 0..groups.as_u32() {
             let group = BlockGroupId::from_u32(group);
             let descriptor = BlockGroupDescriptor::read_from(
-                &self.volume.device,
+                &mut self.volume.device,
                 &self.volume.superblock,
                 group,
-            )?;
-            let bitmap_index = self.ensure_block_bitmap_update(descriptor.block_bitmap())?;
+            )
+            .await?;
+            let bitmap_index = self
+                .ensure_block_bitmap_update(descriptor.block_bitmap())
+                .await?;
             let clusters_in_group = self.volume.superblock.clusters_in_group(group)?;
             for bit in 0..clusters_in_group {
                 let position = ClusterBitmapPosition::new(group, bit);
@@ -147,11 +150,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `block` cannot be mapped to a cluster or releasing it would underflow
     /// the staged reference count.
-    pub(super) fn release_cluster_reference(&mut self, block: BlockAddress) -> Result<()> {
+    pub(super) async fn release_cluster_reference(&mut self, block: BlockAddress) -> Result<()> {
         let cluster = self.volume.superblock.cluster_of_block(block)?;
         self.record_cluster_reference_delta(cluster, -1)?;
         if self.staged_cluster_reference_count(cluster)? == 0 {
-            self.free_cluster(cluster)?;
+            self.free_cluster(cluster).await?;
         }
         Ok(())
     }
@@ -161,12 +164,18 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the cluster is not currently allocated, its bitmap cannot be staged, or
     /// free-cluster counters overflow.
-    pub(super) fn free_cluster(&mut self, cluster: ClusterAddress) -> Result<()> {
+    pub(super) async fn free_cluster(&mut self, cluster: ClusterAddress) -> Result<()> {
         let position = ClusterBitmapPosition::from_cluster(&self.volume.superblock, cluster)?;
         let group = position.group();
-        let descriptor =
-            BlockGroupDescriptor::read_from(&self.volume.device, &self.volume.superblock, group)?;
-        let bitmap_index = self.ensure_block_bitmap_update(descriptor.block_bitmap())?;
+        let descriptor = BlockGroupDescriptor::read_from(
+            &mut self.volume.device,
+            &self.volume.superblock,
+            group,
+        )
+        .await?;
+        let bitmap_index = self
+            .ensure_block_bitmap_update(descriptor.block_bitmap())
+            .await?;
         let bitmap = self
             .block_bitmap_updates
             .get_mut(bitmap_index)
@@ -186,7 +195,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the suffix block range overflows or any released cluster reference is
     /// inconsistent.
-    pub(super) fn free_extent(&mut self, extent: Extent, keep_len: u16) -> Result<()> {
+    pub(super) async fn free_extent(&mut self, extent: Extent, keep_len: u16) -> Result<()> {
         let start = u64::from(keep_len);
         let len = extent.len().as_u64();
         let physical_start = extent
@@ -202,7 +211,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                     .checked_add(offset)
                     .ok_or(Error::ArithmeticOverflow)?,
             );
-            self.release_cluster_reference(block)?;
+            self.release_cluster_reference(block).await?;
         }
         if physical_start > extent.physical_start().get() || keep_len == 0 {
             Ok(())
@@ -216,19 +225,22 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when no free non-reserved inode exists, inode bitmap staging fails, or free
     /// inode counters cannot be updated.
-    pub(super) fn allocate_inode(&mut self) -> Result<AllocatedInodeRecord> {
+    pub(super) async fn allocate_inode(&mut self) -> Result<AllocatedInodeRecord> {
         let groups = self.volume.superblock.block_group_count()?;
         for group in 0..groups.as_u32() {
             let group = BlockGroupId::from_u32(group);
             let descriptor = BlockGroupDescriptor::read_from(
-                &self.volume.device,
+                &mut self.volume.device,
                 &self.volume.superblock,
                 group,
-            )?;
+            )
+            .await?;
             if descriptor.free_inodes_count() == 0 {
                 continue;
             }
-            let bitmap_index = self.ensure_inode_bitmap_update(descriptor.inode_bitmap())?;
+            let bitmap_index = self
+                .ensure_inode_bitmap_update(descriptor.inode_bitmap())
+                .await?;
             let inodes_in_group = self.inodes_in_group(group)?;
             for bit in 0..inodes_in_group {
                 let position = InodeBitmapPosition::new(group, bit);
@@ -249,7 +261,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                         BitmapBitState::Used,
                     )?;
                     self.record_group_free_inodes_delta(group, -1)?;
-                    return self.empty_allocated_inode_record(inode_id);
+                    return self.empty_allocated_inode_record(inode_id).await;
                 }
             }
         }
@@ -261,15 +273,21 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `inode_id` is the root inode, cannot be mapped to a bitmap bit, or the
     /// free-inode delta overflows.
-    pub(super) fn free_inode(&mut self, inode_id: InodeId) -> Result<()> {
+    pub(super) async fn free_inode(&mut self, inode_id: InodeId) -> Result<()> {
         if inode_id == InodeId::ROOT {
             return Err(Error::CannotRemoveRoot);
         }
         let position = InodeBitmapPosition::from_inode(&self.volume.superblock, inode_id)?;
         let group = position.group();
-        let descriptor =
-            BlockGroupDescriptor::read_from(&self.volume.device, &self.volume.superblock, group)?;
-        let bitmap_index = self.ensure_inode_bitmap_update(descriptor.inode_bitmap())?;
+        let descriptor = BlockGroupDescriptor::read_from(
+            &mut self.volume.device,
+            &self.volume.superblock,
+            group,
+        )
+        .await?;
+        let bitmap_index = self
+            .ensure_inode_bitmap_update(descriptor.inode_bitmap())
+            .await?;
         let bitmap = self
             .inode_bitmap_updates
             .get_mut(bitmap_index)
@@ -286,7 +304,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the bitmap block cannot be read or its staged vector index cannot be
     /// represented.
-    pub(super) fn ensure_block_bitmap_update(
+    pub(super) async fn ensure_block_bitmap_update(
         &mut self,
         bitmap_block: BlockAddress,
     ) -> Result<usize> {
@@ -302,13 +320,16 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             usize::try_from(self.volume.superblock.block_size().bytes())
                 .map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        self.volume.device.read_exact_at(
-            self.volume
-                .superblock
-                .block_size()
-                .offset_of(bitmap_block)?,
-            &mut bytes,
-        )?;
+        self.volume
+            .device
+            .read_exact_at(
+                self.volume
+                    .superblock
+                    .block_size()
+                    .offset_of(bitmap_block)?,
+                &mut bytes,
+            )
+            .await?;
         self.block_bitmap_updates.try_push(BlockImage {
             block: bitmap_block,
             bytes,
@@ -324,7 +345,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the inode bitmap block cannot be read or its staged vector index cannot
     /// be represented.
-    pub(super) fn ensure_inode_bitmap_update(
+    pub(super) async fn ensure_inode_bitmap_update(
         &mut self,
         bitmap_block: BlockAddress,
     ) -> Result<usize> {
@@ -340,13 +361,16 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             usize::try_from(self.volume.superblock.block_size().bytes())
                 .map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        self.volume.device.read_exact_at(
-            self.volume
-                .superblock
-                .block_size()
-                .offset_of(bitmap_block)?,
-            &mut bytes,
-        )?;
+        self.volume
+            .device
+            .read_exact_at(
+                self.volume
+                    .superblock
+                    .block_size()
+                    .offset_of(bitmap_block)?,
+                &mut bytes,
+            )
+            .await?;
         self.inode_bitmap_updates.try_push(BlockImage {
             block: bitmap_block,
             bytes,
@@ -381,13 +405,18 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     ///
     /// Returns an error when `inode_id` cannot be mapped to an inode-table offset.
-    pub(super) fn empty_allocated_inode_record(
-        &self,
+    pub(super) async fn empty_allocated_inode_record(
+        &mut self,
         inode_id: InodeId,
     ) -> Result<AllocatedInodeRecord> {
         Ok(RawInodeRecord {
             id: inode_id,
-            offset: inode_offset_on_device(&self.volume.device, &self.volume.superblock, inode_id)?,
+            offset: inode_offset_on_device(
+                &mut self.volume.device,
+                &self.volume.superblock,
+                inode_id,
+            )
+            .await?,
             bytes: memory::repeated_vec(
                 0_u8,
                 usize::from(self.volume.superblock.inode_size().as_u16()),

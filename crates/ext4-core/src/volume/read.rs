@@ -23,32 +23,32 @@ where
     ///
     /// # Errors
     /// Returns an error when the inode cannot be read or no longer is a regular file.
-    pub(crate) fn load_file(&self, id: FileNodeId) -> Result<FileNode> {
-        self.volume.load_file(id)
+    pub(crate) async fn load_file(&mut self, id: FileNodeId) -> Result<FileNode> {
+        self.volume.load_file(id).await
     }
 
     /// Loads a directory by previously validated directory identity.
     ///
     /// # Errors
     /// Returns an error when the inode cannot be read or no longer is a directory.
-    pub(crate) fn load_directory(&self, id: DirectoryNodeId) -> Result<DirectoryNode> {
-        self.volume.load_directory(id)
+    pub(crate) async fn load_directory(&mut self, id: DirectoryNodeId) -> Result<DirectoryNode> {
+        self.volume.load_directory(id).await
     }
 
     /// Loads a symbolic link by previously validated symlink identity.
     ///
     /// # Errors
     /// Returns an error when the inode cannot be read or no longer is a symbolic link.
-    pub(crate) fn load_symlink(&self, id: SymlinkNodeId) -> Result<SymlinkNode> {
-        self.volume.load_symlink(id)
+    pub(crate) async fn load_symlink(&mut self, id: SymlinkNodeId) -> Result<SymlinkNode> {
+        self.volume.load_symlink(id).await
     }
 
     /// Reads all extended attributes attached to a typed node.
     ///
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
-    pub(crate) fn read_xattrs(&self, node: NodeId) -> Result<XattrSet> {
-        self.volume.read_inode_xattrs(node.inode())
+    pub(crate) async fn read_xattrs(&mut self, node: NodeId) -> Result<XattrSet> {
+        self.volume.read_inode_xattrs(node.inode()).await
     }
 
     /// Reads one extended attribute value by name.
@@ -56,8 +56,12 @@ where
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
     #[cfg(test)]
-    pub(crate) fn read_xattr(&self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>> {
-        self.volume.read_inode_xattr(node.inode(), name)
+    pub(crate) async fn read_xattr(
+        &mut self,
+        node: NodeId,
+        name: &XattrName,
+    ) -> Result<Option<XattrValue>> {
+        self.volume.read_inode_xattr(node.inode(), name).await
     }
 
     /// Reads a POSIX ACL from its ext4 xattr slot.
@@ -65,32 +69,36 @@ where
     /// # Errors
     /// Returns an error when the backing xattr or ACL payload is malformed.
     #[cfg(test)]
-    pub(crate) fn read_posix_acl(
-        &self,
+    pub(crate) async fn read_posix_acl(
+        &mut self,
         node: NodeId,
         kind: PosixAclKind,
     ) -> Result<Option<PosixAcl>> {
-        self.volume.read_inode_posix_acl(node.inode(), kind)
+        self.volume.read_inode_posix_acl(node.inode(), kind).await
     }
 
     /// Reads Windows overlay metadata isolated in user.ext4win.* xattrs.
     ///
     /// # Errors
     /// Returns an error when the overlay xattr payload is malformed.
-    pub(crate) fn read_windows_overlay(&self, node: NodeId) -> Result<Option<WindowsOverlay>> {
-        self.volume.read_inode_windows_overlay(node.inode())
+    pub(crate) async fn read_windows_overlay(
+        &mut self,
+        node: NodeId,
+    ) -> Result<Option<WindowsOverlay>> {
+        self.volume.read_inode_windows_overlay(node.inode()).await
     }
 
     /// Reads Windows symbolic-link reparse metadata isolated in user.ext4win.* xattrs.
     ///
     /// # Errors
     /// Returns an error when the reparse xattr payload is malformed.
-    pub(crate) fn read_windows_symlink_reparse_point(
-        &self,
+    pub(crate) async fn read_windows_symlink_reparse_point(
+        &mut self,
         node: NodeId,
     ) -> Result<Option<WindowsSymlinkReparsePoint>> {
         self.volume
             .read_inode_windows_symlink_reparse_point(node.inode())
+            .await
     }
 
     /// Reads the fscrypt v2 context stored in ext4's private inode xattr slot.
@@ -99,29 +107,32 @@ where
     /// Returns an error when the inode's xattr storage is malformed or the stored fscrypt context
     /// is not in the supported v2 AES profile.
     #[cfg(test)]
-    pub(crate) fn read_fscrypt_context(&self, node: NodeId) -> Result<Option<FscryptContextV2>> {
-        self.volume.read_inode_fscrypt_context(node.inode())
+    pub(crate) async fn read_fscrypt_context(
+        &mut self,
+        node: NodeId,
+    ) -> Result<Option<FscryptContextV2>> {
+        self.volume.read_inode_fscrypt_context(node.inode()).await
     }
 
     /// Reads file bytes from a typed regular file node.
     ///
     /// # Errors
     /// Returns an error when the file extent mapping cannot be traversed.
-    pub(crate) fn read_file(
-        &self,
+    pub(crate) async fn read_file(
+        &mut self,
         file: &FileNode,
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
-        self.volume.read_file(file, offset, out)
+        self.volume.read_file(file, offset, out).await
     }
 
     /// Reads a typed symlink target as bytes.
     ///
     /// # Errors
     /// Returns an error when the symlink target cannot be read.
-    pub(crate) fn read_symlink(&self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
-        self.volume.read_symlink(symlink)
+    pub(crate) async fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
+        self.volume.read_symlink(symlink).await
     }
 
     /// Enumerates directory entries as validated node identities.
@@ -129,8 +140,11 @@ where
     /// # Errors
     /// Returns an error when the directory is too large for eager enumeration, contains malformed
     /// entries, or references an invalid inode.
-    pub(crate) fn read_directory(&self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
-        self.volume.read_directory(directory)
+    pub(crate) async fn read_directory(
+        &mut self,
+        directory: &DirectoryNode,
+    ) -> Result<Vec<DirectoryEntry>> {
+        self.volume.read_directory(directory).await
     }
 
     /// Looks up an exact ext4 child name under a directory.
@@ -138,12 +152,12 @@ where
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
     #[cfg(test)]
-    pub(crate) fn lookup_child(
-        &self,
+    pub(crate) async fn lookup_child(
+        &mut self,
         parent: &DirectoryNode,
         name: &Ext4Name,
     ) -> Result<ChildLookup> {
-        self.volume.lookup_child(parent, name)
+        self.volume.lookup_child(parent, name).await
     }
 
     /// Looks up a Windows-visible child name, accepting case-insensitive matches only when unique.
@@ -151,12 +165,12 @@ where
     /// # Errors
     /// Returns an error when the parent cannot be enumerated or the case-insensitive Windows
     /// projection is ambiguous.
-    pub(crate) fn lookup_windows_child(
-        &self,
+    pub(crate) async fn lookup_windows_child(
+        &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> Result<ChildLookup> {
-        self.volume.lookup_windows_child(parent, requested)
+        self.volume.lookup_windows_child(parent, requested).await
     }
 }
 impl<D, N, J> JournaledVolume<D, N, J>
@@ -202,40 +216,40 @@ where
     ///
     /// # Errors
     /// Returns an error when the inode cannot be read or no longer is a regular file.
-    pub fn load_file(&self, id: FileNodeId) -> Result<FileNode> {
-        self.volume.load_file(id)
+    pub async fn load_file(&mut self, id: FileNodeId) -> Result<FileNode> {
+        self.volume.load_file(id).await
     }
 
     /// Loads a directory by previously validated directory identity.
     ///
     /// # Errors
     /// Returns an error when the inode cannot be read or no longer is a directory.
-    pub fn load_directory(&self, id: DirectoryNodeId) -> Result<DirectoryNode> {
-        self.volume.load_directory(id)
+    pub async fn load_directory(&mut self, id: DirectoryNodeId) -> Result<DirectoryNode> {
+        self.volume.load_directory(id).await
     }
 
     /// Loads a symbolic link by previously validated symlink identity.
     ///
     /// # Errors
     /// Returns an error when the inode cannot be read or no longer is a symbolic link.
-    pub fn load_symlink(&self, id: SymlinkNodeId) -> Result<SymlinkNode> {
-        self.volume.load_symlink(id)
+    pub async fn load_symlink(&mut self, id: SymlinkNodeId) -> Result<SymlinkNode> {
+        self.volume.load_symlink(id).await
     }
 
     /// Loads and classifies one Windows-facing file index as a typed node identity.
     ///
     /// # Errors
     /// Returns an error when the file index cannot be mapped to a live inode.
-    pub fn load_node_by_file_index(&self, file_index: u32) -> Result<NodeId> {
-        self.volume.load_node_by_file_index(file_index)
+    pub async fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId> {
+        self.volume.load_node_by_file_index(file_index).await
     }
 
     /// Reads all extended attributes attached to a typed node.
     ///
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
-    pub fn read_xattrs(&self, node: NodeId) -> Result<XattrSet> {
-        self.volume.read_inode_xattrs(node.inode())
+    pub async fn read_xattrs(&mut self, node: NodeId) -> Result<XattrSet> {
+        self.volume.read_inode_xattrs(node.inode()).await
     }
 
     /// Reads one extended attribute value by name.
@@ -243,49 +257,54 @@ where
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
     #[cfg(test)]
-    pub(crate) fn read_xattr(&self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>> {
-        self.volume.read_inode_xattr(node.inode(), name)
+    pub(crate) async fn read_xattr(
+        &mut self,
+        node: NodeId,
+        name: &XattrName,
+    ) -> Result<Option<XattrValue>> {
+        self.volume.read_inode_xattr(node.inode(), name).await
     }
 
     /// Reads Windows overlay metadata isolated in user.ext4win.* xattrs.
     ///
     /// # Errors
     /// Returns an error when the overlay xattr payload is malformed.
-    pub fn read_windows_overlay(&self, node: NodeId) -> Result<Option<WindowsOverlay>> {
-        self.volume.read_inode_windows_overlay(node.inode())
+    pub async fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>> {
+        self.volume.read_inode_windows_overlay(node.inode()).await
     }
 
     /// Reads Windows symbolic-link reparse metadata isolated in user.ext4win.* xattrs.
     ///
     /// # Errors
     /// Returns an error when the reparse xattr payload is malformed.
-    pub fn read_windows_symlink_reparse_point(
-        &self,
+    pub async fn read_windows_symlink_reparse_point(
+        &mut self,
         node: NodeId,
     ) -> Result<Option<WindowsSymlinkReparsePoint>> {
         self.volume
             .read_inode_windows_symlink_reparse_point(node.inode())
+            .await
     }
 
     /// Reads file bytes from a typed regular file node.
     ///
     /// # Errors
     /// Returns an error when the file extent mapping cannot be traversed.
-    pub fn read_file(
-        &self,
+    pub async fn read_file(
+        &mut self,
         file: &FileNode,
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
-        self.volume.read_file(file, offset, out)
+        self.volume.read_file(file, offset, out).await
     }
 
     /// Reads a typed symlink target as bytes.
     ///
     /// # Errors
     /// Returns an error when the symlink target cannot be read.
-    pub fn read_symlink(&self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
-        self.volume.read_symlink(symlink)
+    pub async fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
+        self.volume.read_symlink(symlink).await
     }
 
     /// Enumerates directory entries as validated node identities.
@@ -293,8 +312,11 @@ where
     /// # Errors
     /// Returns an error when the directory is too large for eager enumeration, contains malformed
     /// entries, or references an invalid inode.
-    pub fn read_directory(&self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
-        self.volume.read_directory(directory)
+    pub async fn read_directory(
+        &mut self,
+        directory: &DirectoryNode,
+    ) -> Result<Vec<DirectoryEntry>> {
+        self.volume.read_directory(directory).await
     }
 
     /// Looks up an exact ext4 child name under a directory.
@@ -302,12 +324,12 @@ where
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
     #[cfg(test)]
-    pub(crate) fn lookup_child(
-        &self,
+    pub(crate) async fn lookup_child(
+        &mut self,
         parent: &DirectoryNode,
         name: &Ext4Name,
     ) -> Result<ChildLookup> {
-        self.volume.lookup_child(parent, name)
+        self.volume.lookup_child(parent, name).await
     }
 
     /// Looks up a Windows-visible child name, accepting case-insensitive matches only when unique.
@@ -315,12 +337,12 @@ where
     /// # Errors
     /// Returns an error when the parent cannot be enumerated or the case-insensitive Windows
     /// projection is ambiguous.
-    pub fn lookup_windows_child(
-        &self,
+    pub async fn lookup_windows_child(
+        &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> Result<ChildLookup> {
-        self.volume.lookup_windows_child(parent, requested)
+        self.volume.lookup_windows_child(parent, requested).await
     }
 }
 impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
@@ -374,8 +396,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     ///
     /// Returns an error when the identity's inode cannot be loaded or is no longer a regular file.
-    pub(super) fn load_file(&self, id: FileNodeId) -> Result<FileNode> {
-        match self.load_validated_node(NodeId::File(id))? {
+    pub(super) async fn load_file(&mut self, id: FileNodeId) -> Result<FileNode> {
+        match self.load_validated_node(NodeId::File(id)).await? {
             LoadedNode::File(file) => Ok(file),
             LoadedNode::Directory(_) | LoadedNode::Symlink(_) => Err(Error::WrongInodeKind),
         }
@@ -385,8 +407,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     ///
     /// Returns an error when the identity's inode cannot be loaded or is no longer a directory.
-    pub(super) fn load_directory(&self, id: DirectoryNodeId) -> Result<DirectoryNode> {
-        match self.load_validated_node(NodeId::Directory(id))? {
+    pub(super) async fn load_directory(&mut self, id: DirectoryNodeId) -> Result<DirectoryNode> {
+        match self.load_validated_node(NodeId::Directory(id)).await? {
             LoadedNode::Directory(directory) => Ok(directory),
             LoadedNode::File(_) | LoadedNode::Symlink(_) => Err(Error::WrongInodeKind),
         }
@@ -396,8 +418,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     ///
     /// Returns an error when the identity's inode cannot be loaded or is no longer a symbolic link.
-    pub(super) fn load_symlink(&self, id: SymlinkNodeId) -> Result<SymlinkNode> {
-        match self.load_validated_node(NodeId::Symlink(id))? {
+    pub(super) async fn load_symlink(&mut self, id: SymlinkNodeId) -> Result<SymlinkNode> {
+        match self.load_validated_node(NodeId::Symlink(id)).await? {
             LoadedNode::Symlink(symlink) => Ok(symlink),
             LoadedNode::File(_) | LoadedNode::Directory(_) => Err(Error::WrongInodeKind),
         }
@@ -407,8 +429,10 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
-    pub(super) fn read_inode_xattrs(&self, inode_id: InodeId) -> Result<XattrSet> {
-        self.read_inode_xattrs_from_live(&self.read_live_inode_record(inode_id)?)?
+    pub(super) async fn read_inode_xattrs(&mut self, inode_id: InodeId) -> Result<XattrSet> {
+        let inode = self.read_live_inode_record(inode_id).await?;
+        self.read_inode_xattrs_from_live(&inode)
+            .await?
             .public()
             .try_clone()
     }
@@ -417,12 +441,13 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the inode or its external xattr block is malformed.
-    pub(super) fn read_inode_xattr(
-        &self,
+    pub(super) async fn read_inode_xattr(
+        &mut self,
         inode_id: InodeId,
         name: &XattrName,
     ) -> Result<Option<XattrValue>> {
-        self.read_inode_xattrs(inode_id)?
+        self.read_inode_xattrs(inode_id)
+            .await?
             .get(name)
             .map(XattrValue::try_clone)
             .transpose()
@@ -433,12 +458,15 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     /// Returns an error when the backing xattr or ACL payload is malformed.
     #[cfg(test)]
-    pub(super) fn read_inode_posix_acl(
-        &self,
+    pub(super) async fn read_inode_posix_acl(
+        &mut self,
         inode_id: InodeId,
         kind: PosixAclKind,
     ) -> Result<Option<PosixAcl>> {
-        let Some(value) = self.read_inode_xattr(inode_id, &PosixAcl::xattr_name(kind)?)? else {
+        let Some(value) = self
+            .read_inode_xattr(inode_id, &PosixAcl::xattr_name(kind)?)
+            .await?
+        else {
             return Ok(None);
         };
         Ok(Some(PosixAcl::parse(&value)?))
@@ -448,12 +476,13 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the overlay xattr payload is malformed.
-    pub(super) fn read_inode_windows_overlay(
-        &self,
+    pub(super) async fn read_inode_windows_overlay(
+        &mut self,
         inode_id: InodeId,
     ) -> Result<Option<WindowsOverlay>> {
-        let Some(value) =
-            self.read_inode_xattr(inode_id, &WindowsOverlay::attributes_xattr_name()?)?
+        let Some(value) = self
+            .read_inode_xattr(inode_id, &WindowsOverlay::attributes_xattr_name()?)
+            .await?
         else {
             return Ok(None);
         };
@@ -464,12 +493,13 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the backing xattr or its payload is malformed.
-    pub(super) fn read_inode_windows_symlink_reparse_point(
-        &self,
+    pub(super) async fn read_inode_windows_symlink_reparse_point(
+        &mut self,
         inode_id: InodeId,
     ) -> Result<Option<WindowsSymlinkReparsePoint>> {
-        let Some(value) =
-            self.read_inode_xattr(inode_id, &WindowsSymlinkReparsePoint::xattr_name()?)?
+        let Some(value) = self
+            .read_inode_xattr(inode_id, &WindowsSymlinkReparsePoint::xattr_name()?)
+            .await?
         else {
             return Ok(None);
         };
@@ -481,11 +511,12 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     /// Returns an error when the inode's xattr storage is malformed or the
     /// stored fscrypt context is not in the supported v2 AES profile.
-    pub(super) fn read_inode_fscrypt_context(
-        &self,
+    pub(super) async fn read_inode_fscrypt_context(
+        &mut self,
         inode_id: InodeId,
     ) -> Result<Option<FscryptContextV2>> {
-        let xattrs = self.read_inode_xattrs_from_live(&self.read_live_inode_record(inode_id)?)?;
+        let inode = self.read_live_inode_record(inode_id).await?;
+        let xattrs = self.read_inode_xattrs_from_live(&inode).await?;
         let Some(value) = xattrs.encryption_context() else {
             return Ok(None);
         };
@@ -497,11 +528,11 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the inode is encrypted but its fscrypt context is malformed or no
     /// matching mounted master key exists.
-    pub(super) fn require_encryption_key(&self, inode: &Inode) -> Result<()> {
+    pub(super) async fn require_encryption_key(&mut self, inode: &Inode) -> Result<()> {
         if !inode.protection().is_encrypted() {
             return Ok(());
         }
-        let _key = self.fscrypt_master_key_for_inode(inode)?;
+        let _key = self.fscrypt_master_key_for_inode(inode).await?;
         Ok(())
     }
 
@@ -510,11 +541,11 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the inode has no valid fscrypt context or the matching master key is
     /// absent from the mount context.
-    pub(super) fn fscrypt_master_key_for_inode(
-        &self,
+    pub(super) async fn fscrypt_master_key_for_inode(
+        &mut self,
         inode: &Inode,
     ) -> Result<(FscryptContextV2, &FscryptMasterKey)> {
-        let Some(context) = self.read_inode_fscrypt_context(inode.id())? else {
+        let Some(context) = self.read_inode_fscrypt_context(inode.id()).await? else {
             return Err(Error::InvalidEncryptionContext);
         };
         let Some(key) = self
@@ -532,11 +563,11 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the inode's master key cannot be resolved or contents-key derivation
     /// rejects the policy parameters.
-    pub(super) fn fscrypt_contents_key_for_inode(
-        &self,
+    pub(super) async fn fscrypt_contents_key_for_inode(
+        &mut self,
         inode: &Inode,
     ) -> Result<FscryptContentsKey> {
-        let (context, master_key) = self.fscrypt_master_key_for_inode(inode)?;
+        let (context, master_key) = self.fscrypt_master_key_for_inode(inode).await?;
         master_key.derive_contents_key(context.nonce())
     }
 
@@ -545,11 +576,11 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the inode's master key cannot be resolved or filename-key derivation
     /// rejects the policy parameters.
-    pub(super) fn fscrypt_filenames_key_for_inode(
-        &self,
+    pub(super) async fn fscrypt_filenames_key_for_inode(
+        &mut self,
         inode: &Inode,
     ) -> Result<(FscryptFilenamesKey, FscryptFilenamePadding)> {
-        let (context, master_key) = self.fscrypt_master_key_for_inode(inode)?;
+        let (context, master_key) = self.fscrypt_master_key_for_inode(inode).await?;
         Ok((
             master_key.derive_filenames_key(context.nonce())?,
             context.policy().filename_padding(),
@@ -561,15 +592,15 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when an encrypted parent lacks a filename key or the encrypted name is not a
     /// valid ext4 component.
-    pub(super) fn encrypt_directory_child_name(
-        &self,
+    pub(super) async fn encrypt_directory_child_name(
+        &mut self,
         parent: &Inode,
         name: &Ext4Name,
     ) -> Result<Ext4Name> {
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
             return Ext4Name::new(name.bytes());
         }
-        let (key, padding) = self.fscrypt_filenames_key_for_inode(parent)?;
+        let (key, padding) = self.fscrypt_filenames_key_for_inode(parent).await?;
         Ext4Name::from_disk(&key.encrypt_filename(name.bytes(), padding)?)
     }
 
@@ -578,15 +609,15 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when an encrypted parent lacks a filename key or the decrypted name is not a
     /// valid ext4 component.
-    pub(super) fn decrypt_directory_child_name(
-        &self,
+    pub(super) async fn decrypt_directory_child_name(
+        &mut self,
         parent: &Inode,
         name: &Ext4Name,
     ) -> Result<Ext4Name> {
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
             return Ext4Name::new(name.bytes());
         }
-        let (key, _padding) = self.fscrypt_filenames_key_for_inode(parent)?;
+        let (key, _padding) = self.fscrypt_filenames_key_for_inode(parent).await?;
         Ext4Name::new(&key.decrypt_filename(name.bytes())?)
     }
 
@@ -595,9 +626,12 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the inode is encrypted or verity-protected, including the missing-key
     /// case for encrypted payloads.
-    pub(super) fn reject_unsupported_protected_payload_access(&self, inode: &Inode) -> Result<()> {
+    pub(super) async fn reject_unsupported_protected_payload_access(
+        &mut self,
+        inode: &Inode,
+    ) -> Result<()> {
         if inode.protection().is_encrypted() {
-            self.require_encryption_key(inode)?;
+            self.require_encryption_key(inode).await?;
             return Err(Error::UnsupportedEncryption);
         }
         if inode.protection().is_verity() {
@@ -611,17 +645,19 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     /// Returns an error when the inode number is outside the volume or the inode
     /// table cannot be read and parsed.
-    pub(super) fn load_inode_node(&self, inode_id: InodeId) -> Result<LoadedNode> {
-        Ok(LoadedNode::from_inode(self.read_inode_record(inode_id)?))
+    pub(super) async fn load_inode_node(&mut self, inode_id: InodeId) -> Result<LoadedNode> {
+        Ok(LoadedNode::from_inode(
+            self.read_inode_record(inode_id).await?,
+        ))
     }
 
     /// Loads and classifies one Windows-facing file index as a typed node identity.
     ///
     /// # Errors
     /// Returns an error when the file index cannot represent a live ext4 inode.
-    pub(super) fn load_node_by_file_index(&self, file_index: u32) -> Result<NodeId> {
+    pub(super) async fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId> {
         let inode_id = InodeId::try_from(file_index)?;
-        Ok(self.load_inode_node(inode_id)?.id())
+        Ok(self.load_inode_node(inode_id).await?.id())
     }
 
     /// Loads an inode through a previously validated public identity.
@@ -629,8 +665,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the inode cannot be loaded or its actual typed identity no longer
     /// matches `id`.
-    pub(super) fn load_validated_node(&self, id: NodeId) -> Result<LoadedNode> {
-        let node = self.load_inode_node(id.inode())?;
+    pub(super) async fn load_validated_node(&mut self, id: NodeId) -> Result<LoadedNode> {
+        let node = self.load_inode_node(id.inode()).await?;
         if node.id() == id {
             Ok(node)
         } else {
@@ -642,30 +678,34 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the file extent mapping cannot be traversed.
-    pub(super) fn read_file(
-        &self,
+    pub(super) async fn read_file(
+        &mut self,
         file: &FileNode,
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
         if file.protection().is_verity() {
-            return self.read_verified_file(file, offset, out);
+            return self.read_verified_file(file, offset, out).await;
         }
         self.read_inode_plaintext_data(file.inode(), offset, out)
+            .await
     }
 
     /// Reads a typed symlink target as bytes.
     ///
     /// # Errors
     /// Returns an error when the symlink target cannot be read.
-    pub(super) fn read_symlink(&self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
-        self.reject_unsupported_protected_payload_access(symlink.inode())?;
+    pub(super) async fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
+        self.reject_unsupported_protected_payload_access(symlink.inode())
+            .await?;
         let len = symlink.size().to_usize()?;
         if let Ok(inline) = symlink.inode().inline_bytes() {
             return memory::copied_slice(inline.prefix(symlink.size())?);
         }
         let mut target = memory::repeated_vec(0_u8, len)?;
-        let _bytes_read = self.read_inode_data(symlink.inode(), FileOffset::ZERO, &mut target)?;
+        let _bytes_read = self
+            .read_inode_data(symlink.inode(), FileOffset::ZERO, &mut target)
+            .await?;
         Ok(target)
     }
 
@@ -674,8 +714,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when verity metadata cannot be read, full-file plaintext cannot be read, the
     /// Merkle tree verification fails, or the requested output slice is out of range.
-    pub(super) fn read_verified_file(
-        &self,
+    pub(super) async fn read_verified_file(
+        &mut self,
         file: &FileNode,
         offset: FileOffset,
         out: &mut [u8],
@@ -683,10 +723,11 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
         if out.is_empty() || offset.bytes() >= file.size().bytes() {
             return Ok(ReadBytes::from_usize(0));
         }
-        let metadata = self.read_verity_metadata(file)?;
+        let metadata = self.read_verity_metadata(file).await?;
         let mut plaintext = memory::repeated_vec(0_u8, file.size().to_usize()?)?;
-        let read =
-            self.read_inode_plaintext_data(file.inode(), FileOffset::ZERO, &mut plaintext)?;
+        let read = self
+            .read_inode_plaintext_data(file.inode(), FileOffset::ZERO, &mut plaintext)
+            .await?;
         if read.as_usize() != plaintext.len() {
             return Err(Error::InvalidVerityMetadata);
         }
@@ -712,14 +753,19 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when post-EOF metadata is absent, layout offsets are invalid, descriptor
     /// bytes are malformed, or metadata extents cannot be read.
-    pub(super) fn read_verity_metadata(&self, file: &FileNode) -> Result<Ext4VerityMetadata> {
+    pub(super) async fn read_verity_metadata(
+        &mut self,
+        file: &FileNode,
+    ) -> Result<Ext4VerityMetadata> {
         let block_size = self.superblock.block_size();
+        let context = self.extent_tree_context(file.inode());
         let extent_tree = ExtentTree::load_inode_tree(
             file.inode().extent_root()?,
             block_size,
-            &self.device,
-            self.extent_tree_context(file.inode()),
-        )?;
+            &mut self.device,
+            context,
+        )
+        .await?;
         let metadata_end = extent_payload_end_bytes(&extent_tree, block_size)?;
         if metadata_end <= file.size().bytes() {
             return Err(Error::InvalidVerityMetadata);
@@ -733,7 +779,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             &extent_tree,
             tail_offset,
             &mut descriptor_size_tail,
-        )?;
+        )
+        .await?;
         let descriptor_bytes = u32::from_le_bytes(descriptor_size_tail);
         let descriptor_offset = Ext4VerityMetadataLayout::descriptor_offset_from_metadata_end(
             block_size,
@@ -748,7 +795,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             &extent_tree,
             descriptor_offset,
             &mut descriptor_image,
-        )?;
+        )
+        .await?;
         let descriptor = FsverityDescriptor::parse(
             descriptor_image
                 .get(..FSVERITY_DESCRIPTOR_BYTES)
@@ -769,7 +817,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             &extent_tree,
             layout.merkle_tree_offset(),
             &mut merkle_tree,
-        )?;
+        )
+        .await?;
         let signature = memory::copied_slice(
             descriptor_image
                 .get(FSVERITY_DESCRIPTOR_BYTES..)
@@ -783,10 +832,19 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     /// Returns an error when the directory is too large for eager
     /// enumeration, or contains malformed entries.
-    pub(super) fn read_directory(&self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
-        let entries = self.read_directory_layout(directory.inode())?.entries()?;
+    pub(super) async fn read_directory(
+        &mut self,
+        directory: &DirectoryNode,
+    ) -> Result<Vec<DirectoryEntry>> {
+        let entries = self
+            .read_directory_layout(directory.inode())
+            .await?
+            .entries()?;
         let entries = if directory.protection().is_encrypted() {
-            match self.decrypt_directory_entries(directory.inode(), &entries) {
+            match self
+                .decrypt_directory_entries(directory.inode(), &entries)
+                .await
+            {
                 Err(Error::MissingEncryptionKey) => {
                     Self::project_locked_directory_entries(entries)?
                 }
@@ -795,7 +853,7 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
         } else {
             entries
         };
-        self.validate_directory_entries(entries)
+        self.validate_directory_entries(entries).await
     }
 
     /// Decrypts directory-entry names for an unlocked encrypted directory.
@@ -803,8 +861,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the directory filename key is unavailable or any decrypted entry name
     /// is not a valid ext4 component.
-    pub(super) fn decrypt_directory_entries(
-        &self,
+    pub(super) async fn decrypt_directory_entries(
+        &mut self,
         directory: &Inode,
         entries: &[RawDirectoryEntry],
     ) -> Result<Vec<RawDirectoryEntry>> {
@@ -813,7 +871,9 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             .try_reserve_exact(entries.len())
             .map_err(|_| Error::OutOfMemory)?;
         for entry in entries {
-            let name = self.decrypt_directory_child_name(directory, entry.name())?;
+            let name = self
+                .decrypt_directory_child_name(directory, entry.name())
+                .await?;
             decrypted.try_push(RawDirectoryEntry::new(entry.inode(), &name, entry.kind())?)?;
         }
         Ok(decrypted)
@@ -868,13 +928,19 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
     #[cfg(test)]
-    pub(super) fn lookup_child(
-        &self,
+    pub(super) async fn lookup_child(
+        &mut self,
         parent: &DirectoryNode,
         name: &Ext4Name,
     ) -> Result<ChildLookup> {
-        if let Some(entry) = self.read_directory_layout(parent.inode())?.find(name)? {
-            return Ok(ChildLookup::Found(self.directory_child(parent, entry)?));
+        if let Some(entry) = self
+            .read_directory_layout(parent.inode())
+            .await?
+            .find(name)?
+        {
+            return Ok(ChildLookup::Found(
+                self.directory_child(parent, entry).await?,
+            ));
         }
         Ok(ChildLookup::NotFound)
     }
@@ -884,12 +950,12 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     /// Returns an error when the parent cannot be enumerated or the
     /// case-insensitive Windows projection is ambiguous.
-    pub(super) fn lookup_windows_child(
-        &self,
+    pub(super) async fn lookup_windows_child(
+        &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> Result<ChildLookup> {
-        match self.lookup_windows_child_entry(parent, requested)? {
+        match self.lookup_windows_child_entry(parent, requested).await? {
             Some(entry) => Ok(ChildLookup::Found(DirectoryChild::new(
                 parent.id(),
                 entry.name(),
@@ -904,14 +970,16 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     /// Returns an error when the parent cannot be enumerated or the
     /// case-insensitive Windows projection is ambiguous.
-    pub(super) fn lookup_windows_child_entry(
-        &self,
+    pub(super) async fn lookup_windows_child_entry(
+        &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> Result<Option<DirectoryEntry>> {
         if parent.protection().is_encrypted() {
             let visible_name = requested.to_ext4()?;
-            let ciphertext = match self.encrypt_directory_child_name(parent.inode(), &visible_name)
+            let ciphertext = match self
+                .encrypt_directory_child_name(parent.inode(), &visible_name)
+                .await
             {
                 Ok(ciphertext) => ciphertext,
                 Err(Error::MissingEncryptionKey) => {
@@ -923,18 +991,23 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
                 }
                 Err(error) => return Err(error),
             };
-            return self
-                .read_directory_layout(parent.inode())?
-                .find(&ciphertext)?
-                .map(|entry| self.validate_directory_entry(entry, &visible_name))
-                .transpose();
+            let entry = self
+                .read_directory_layout(parent.inode())
+                .await?
+                .find(&ciphertext)?;
+            return match entry {
+                Some(entry) => Ok(Some(
+                    self.validate_directory_entry(entry, &visible_name).await?,
+                )),
+                None => Ok(None),
+            };
         }
         if parent.protection().is_verity() {
             return Err(Error::UnsupportedVerity);
         }
         let mut folded = None;
 
-        for entry in self.read_directory(parent)? {
+        for entry in self.read_directory(parent).await? {
             let Ok(name) = WindowsName::from_ext4(entry.name()) else {
                 continue;
             };
@@ -957,12 +1030,12 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the entry inode cannot be loaded and classified.
     #[cfg(test)]
-    pub(super) fn directory_child(
-        &self,
+    pub(super) async fn directory_child(
+        &mut self,
         parent: &DirectoryNode,
         entry: RawDirectoryEntry,
     ) -> Result<DirectoryChild> {
-        let node = self.load_inode_node(entry.inode())?.id();
+        let node = self.load_inode_node(entry.inode()).await?.id();
         Ok(DirectoryChild::new(parent.id(), entry.name(), node))
     }
 
@@ -971,8 +1044,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when any directory entry references an inode that cannot be loaded and
     /// classified.
-    pub(super) fn validate_directory_entries(
-        &self,
+    pub(super) async fn validate_directory_entries(
+        &mut self,
         entries: Vec<RawDirectoryEntry>,
     ) -> Result<Vec<DirectoryEntry>> {
         let mut validated = Vec::new();
@@ -980,7 +1053,7 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             .try_reserve_exact(entries.len())
             .map_err(|_| Error::OutOfMemory)?;
         for entry in entries {
-            let node = self.load_inode_node(entry.inode())?.id();
+            let node = self.load_inode_node(entry.inode()).await?.id();
             validated.try_push(DirectoryEntry::new(entry.name(), node, entry.kind()))?;
         }
         Ok(validated)
@@ -990,12 +1063,12 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     ///
     /// Returns an error when `entry` references an inode that cannot be loaded and classified.
-    pub(super) fn validate_directory_entry(
-        &self,
+    pub(super) async fn validate_directory_entry(
+        &mut self,
         entry: RawDirectoryEntry,
         visible_name: &Ext4Name,
     ) -> Result<DirectoryEntry> {
-        let node = self.load_inode_node(entry.inode())?.id();
+        let node = self.load_inode_node(entry.inode()).await?.id();
         Ok(DirectoryEntry::new(visible_name, node, entry.kind()))
     }
 
@@ -1004,7 +1077,7 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the directory exceeds eager-read limits, uses unsupported indexed
     /// storage, or its blocks cannot be parsed as the selected layout.
-    pub(super) fn read_directory_layout(&self, inode: &Inode) -> Result<DirectoryLayout> {
+    pub(super) async fn read_directory_layout(&mut self, inode: &Inode) -> Result<DirectoryLayout> {
         if inode.size().bytes() > MAX_EAGER_DIRECTORY_BYTES {
             return Err(Error::DirectoryTooLarge);
         }
@@ -1014,7 +1087,7 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
         }
         DirectoryLayout::from_storage_kind(
             storage,
-            self.read_directory_block_data(inode)?,
+            self.read_directory_block_data(inode).await?,
             self.superblock.directory_hash_seed(),
             self.superblock.default_directory_hash_version(),
             self.directory_checksum(inode),
@@ -1026,20 +1099,22 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the directory extent tree contains holes or uninitialized extents,
     /// range arithmetic fails, or a directory block cannot be read.
-    pub(super) fn read_directory_block_data(
-        &self,
+    pub(super) async fn read_directory_block_data(
+        &mut self,
         inode: &Inode,
     ) -> Result<Vec<DirectoryBlockData>> {
         let block_size = self.superblock.block_size();
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
         let block_count = round_up_div(inode.size().bytes(), u64::from(block_size.bytes()))?;
+        let context = self.extent_tree_context(inode);
         let tree = MutableExtentTree::load_inode_tree(
             inode.extent_root()?,
             block_size,
-            &self.device,
-            self.extent_tree_context(inode),
-        )?;
+            &mut self.device,
+            context,
+        )
+        .await?;
         let mut blocks = Vec::new();
         for logical in 0..block_count {
             let logical_block = LogicalBlock::try_from(logical)?;
@@ -1051,7 +1126,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             };
             let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
             self.device
-                .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
+                .read_exact_at(block_size.offset_of(physical)?, &mut bytes)
+                .await?;
             blocks.try_push(DirectoryBlockData::new(logical_block.as_u32(), bytes))?;
         }
         Ok(blocks)
@@ -1062,14 +1138,14 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when extent traversal fails, encrypted contents cannot be decrypted, or the
     /// requested output range cannot be represented.
-    pub(super) fn read_inode_plaintext_data(
-        &self,
+    pub(super) async fn read_inode_plaintext_data(
+        &mut self,
         inode: &Inode,
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
         if !inode.protection().is_encrypted() {
-            return self.read_inode_data(inode, offset, out);
+            return self.read_inode_data(inode, offset, out).await;
         }
         if out.is_empty() || offset.bytes() >= inode.size().bytes() {
             return Ok(ReadBytes::from_usize(0));
@@ -1079,19 +1155,22 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?,
             inode.size().remaining_from(offset)?,
         );
+        let context = self.extent_tree_context(inode);
         let extent_tree = ExtentTree::load_inode_tree(
             inode.extent_root()?,
             self.superblock.block_size(),
-            &self.device,
-            self.extent_tree_context(inode),
-        )?;
+            &mut self.device,
+            context,
+        )
+        .await?;
         let readable_len = usize::try_from(readable).map_err(|_| Error::ArithmeticOverflow)?;
         self.read_inode_plaintext_stream_range(
             inode,
             &extent_tree,
             offset.bytes(),
             out.get_mut(..readable_len).ok_or(Error::DeviceRange)?,
-        )?;
+        )
+        .await?;
         Ok(ReadBytes::from_usize(readable_len))
     }
 
@@ -1100,8 +1179,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the extent tree cannot be loaded, read range arithmetic fails, or a
     /// mapped physical block cannot be read.
-    pub(super) fn read_inode_data(
-        &self,
+    pub(super) async fn read_inode_data(
+        &mut self,
         inode: &Inode,
         offset: FileOffset,
         out: &mut [u8],
@@ -1114,18 +1193,21 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?,
             inode.size().remaining_from(offset)?,
         );
+        let context = self.extent_tree_context(inode);
         let extent_tree = ExtentTree::load_inode_tree(
             inode.extent_root()?,
             self.superblock.block_size(),
-            &self.device,
-            self.extent_tree_context(inode),
-        )?;
+            &mut self.device,
+            context,
+        )
+        .await?;
         let readable_len = usize::try_from(readable).map_err(|_| Error::ArithmeticOverflow)?;
         self.read_inode_stream_range(
             &extent_tree,
             offset.bytes(),
             out.get_mut(..readable_len).ok_or(Error::DeviceRange)?,
-        )?;
+        )
+        .await?;
         Ok(ReadBytes::from_usize(readable_len))
     }
 
@@ -1133,18 +1215,19 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     ///
     /// Returns an error when encrypted stream key lookup or the selected stream reader fails.
-    pub(super) fn read_inode_plaintext_stream_range(
-        &self,
+    pub(super) async fn read_inode_plaintext_stream_range(
+        &mut self,
         inode: &Inode,
         extent_tree: &ExtentTree,
         offset: u64,
         out: &mut [u8],
     ) -> Result<()> {
         if inode.protection().is_encrypted() {
-            let contents_key = self.fscrypt_contents_key_for_inode(inode)?;
+            let contents_key = self.fscrypt_contents_key_for_inode(inode).await?;
             self.read_encrypted_inode_stream_range(&contents_key, extent_tree, offset, out)
+                .await
         } else {
-            self.read_inode_stream_range(extent_tree, offset, out)
+            self.read_inode_stream_range(extent_tree, offset, out).await
         }
     }
 
@@ -1153,8 +1236,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when stream range arithmetic fails, a mapped block cannot be read, or block
     /// decryption fails.
-    pub(super) fn read_encrypted_inode_stream_range(
-        &self,
+    pub(super) async fn read_encrypted_inode_stream_range(
+        &mut self,
         contents_key: &FscryptContentsKey,
         extent_tree: &ExtentTree,
         offset: u64,
@@ -1196,10 +1279,12 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             match extent_tree.map_logical(LogicalBlock::try_from(logical_block)?) {
                 BlockMapping::Physical(physical_block) => {
                     let mut block = memory::repeated_vec(0_u8, block_bytes)?;
-                    self.device.read_exact_at(
-                        self.superblock.block_size().offset_of(physical_block)?,
-                        &mut block,
-                    )?;
+                    self.device
+                        .read_exact_at(
+                            self.superblock.block_size().offset_of(physical_block)?,
+                            &mut block,
+                        )
+                        .await?;
                     contents_key.decrypt_block(logical_block, &mut block)?;
                     let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
                     let block_end = start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
@@ -1224,8 +1309,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when stream range arithmetic fails or a mapped physical block cannot be
     /// read.
-    pub(super) fn read_inode_stream_range(
-        &self,
+    pub(super) async fn read_inode_stream_range(
+        &mut self,
         extent_tree: &ExtentTree,
         offset: u64,
         out: &mut [u8],
@@ -1270,10 +1355,12 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
                         .get()
                         .checked_add(in_block)
                         .ok_or(Error::ArithmeticOverflow)?;
-                    self.device.read_exact_at(
-                        ByteOffset::new(device_offset),
-                        out.get_mut(completed..end).ok_or(Error::DeviceRange)?,
-                    )?;
+                    self.device
+                        .read_exact_at(
+                            ByteOffset::new(device_offset),
+                            out.get_mut(completed..end).ok_or(Error::DeviceRange)?,
+                        )
+                        .await?;
                 }
                 BlockMapping::Uninitialized | BlockMapping::Hole => {
                     out.get_mut(completed..end)
@@ -1292,16 +1379,20 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when `inode_id` is outside the filesystem inode range, its table offset
     /// cannot be computed, or the record cannot be read.
-    pub(super) fn read_raw_inode_record(&self, inode_id: InodeId) -> Result<RawInodeRecord> {
+    pub(super) async fn read_raw_inode_record(
+        &mut self,
+        inode_id: InodeId,
+    ) -> Result<RawInodeRecord> {
         if inode_id.as_u32() > self.superblock.inode_count().as_u32() {
             return Err(Error::InvalidInode);
         }
 
-        let inode_offset = inode_offset_on_device(&self.device, &self.superblock, inode_id)?;
+        let inode_offset =
+            inode_offset_on_device(&mut self.device, &self.superblock, inode_id).await?;
 
         let mut bytes =
             memory::repeated_vec(0_u8, usize::from(self.superblock.inode_size().as_u16()))?;
-        self.device.read_exact_at(inode_offset, &mut bytes)?;
+        self.device.read_exact_at(inode_offset, &mut bytes).await?;
         Ok(RawInodeRecord {
             id: inode_id,
             offset: inode_offset,
@@ -1313,8 +1404,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     ///
     /// Returns an error when the live inode record cannot be read or parsed as a supported inode.
-    pub(super) fn read_inode_record(&self, inode_id: InodeId) -> Result<Inode> {
-        self.read_live_inode_record(inode_id)?.parse()
+    pub(super) async fn read_inode_record(&mut self, inode_id: InodeId) -> Result<Inode> {
+        self.read_live_inode_record(inode_id).await?.parse()
     }
 
     /// Reads a live inode record for mutation or metadata interpretation.
@@ -1322,8 +1413,11 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when the raw inode record cannot be read or does not satisfy live-inode
     /// invariants.
-    pub(super) fn read_live_inode_record(&self, inode_id: InodeId) -> Result<LiveInodeRecord> {
-        self.read_raw_inode_record(inode_id)?.into_live()
+    pub(super) async fn read_live_inode_record(
+        &mut self,
+        inode_id: InodeId,
+    ) -> Result<LiveInodeRecord> {
+        self.read_raw_inode_record(inode_id).await?.into_live()
     }
 
     /// Reads all xattr storage locations referenced by a live inode.
@@ -1331,8 +1425,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// Returns an error when inline xattrs, the external xattr pointer, external block I/O, or
     /// merged xattr namespaces are malformed.
-    pub(super) fn read_inode_xattrs_from_live(
-        &self,
+    pub(super) async fn read_inode_xattrs_from_live(
+        &mut self,
         raw_inode: &LiveInodeRecord,
     ) -> Result<InodeXattrSet> {
         match self.superblock.xattr_mutation() {
@@ -1349,7 +1443,8 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
                 .map_err(|_| Error::ArithmeticOverflow)?,
         )?;
         self.device
-            .read_exact_at(self.superblock.block_size().offset_of(block)?, &mut bytes)?;
+            .read_exact_at(self.superblock.block_size().offset_of(block)?, &mut bytes)
+            .await?;
         let external = xattr_storage::parse_external_xattr_block(&bytes, block, &self.superblock)?;
         xattr_storage::merge_xattr_sets(inline, external)
     }
