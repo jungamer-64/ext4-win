@@ -19,26 +19,29 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the parent is not mutable, the name exists, no
     /// inode is free, or the parent directory cannot receive another entry.
-    pub fn create_file(
+    pub async fn create_file(
         &mut self,
         parent: TransactionDirectory,
         name: &Ext4Name,
         metadata: NewFileMetadata,
     ) -> Result<TransactionFile> {
-        self.ensure_child_absent(parent.inode(), name)?;
-        self.require_directory_entry_create_mutation(parent.inode())?;
-        let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
-        let inherited_context = self.inherited_fscrypt_context(&parent_inode)?;
-        let allocated_inode = self.allocate_inode()?;
+        self.ensure_child_absent(parent.inode(), name).await?;
+        self.require_directory_entry_create_mutation(parent.inode())
+            .await?;
+        let parent_inode = self.raw_inode_for_policy(parent.inode()).await?.parse()?;
+        let inherited_context = self.inherited_fscrypt_context(&parent_inode).await?;
+        let allocated_inode = self.allocate_inode().await?;
         let mut raw_inode = allocated_inode.initialize_file(
             metadata,
             self.now,
             self.volume.superblock.block_size(),
             self.volume.superblock.inode_timestamp_encoding(),
         )?;
-        self.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
+        self.apply_fscrypt_context(&mut raw_inode, inherited_context)
+            .await?;
         let inode_id = raw_inode.id();
-        self.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::File)?;
+        self.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::File)
+            .await?;
         self.inode_updates.try_push(raw_inode.into())?;
         Ok(TransactionFile {
             id: FileNodeId::new(inode_id),
@@ -51,9 +54,13 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the entry is absent, the child is not a mutable
     /// regular file, or metadata cannot be updated.
-    pub fn unlink_file(&mut self, parent: TransactionDirectory, name: &Ext4Name) -> Result<()> {
-        let removed = self.remove_directory_entry(parent.inode(), name)?;
-        let inode_index = self.ensure_inode_update(removed.inode())?;
+    pub async fn unlink_file(
+        &mut self,
+        parent: TransactionDirectory,
+        name: &Ext4Name,
+    ) -> Result<()> {
+        let removed = self.remove_directory_entry(parent.inode(), name).await?;
+        let inode_index = self.ensure_inode_update(removed.inode()).await?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         if inode.kind() != InodeKind::File {
@@ -67,14 +74,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 self.replace_live_inode(inode_index, raw_inode)?;
             }
             LinkCountAfterDecrement::Unlinked => {
-                let tree = self.mutable_extent_tree(&inode)?;
+                let tree = self.mutable_extent_tree(&inode).await?;
                 for extent in tree.extents().iter().copied() {
-                    self.free_extent(extent, 0)?;
+                    self.free_extent(extent, 0).await?;
                 }
                 for block in tree.metadata_blocks().iter().copied() {
-                    self.release_cluster_reference(block)?;
+                    self.release_cluster_reference(block).await?;
                 }
-                self.free_inode(raw_inode.id())?;
+                self.free_inode(raw_inode.id()).await?;
                 let deleted = raw_inode.delete_and_touch(
                     self.now,
                     self.volume.superblock.block_size(),
@@ -91,18 +98,19 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the parent is not mutable, the name exists, no
     /// inode or block is free, or metadata cannot be updated.
-    pub fn create_directory(
+    pub async fn create_directory(
         &mut self,
         parent: TransactionDirectory,
         name: &Ext4Name,
         metadata: NewDirectoryMetadata,
     ) -> Result<TransactionDirectory> {
-        self.ensure_child_absent(parent.inode(), name)?;
-        self.require_directory_entry_create_mutation(parent.inode())?;
-        let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
-        let inherited_context = self.inherited_fscrypt_context(&parent_inode)?;
-        let block = self.allocate_cluster()?;
-        let allocated_inode = self.allocate_inode()?;
+        self.ensure_child_absent(parent.inode(), name).await?;
+        self.require_directory_entry_create_mutation(parent.inode())
+            .await?;
+        let parent_inode = self.raw_inode_for_policy(parent.inode()).await?.parse()?;
+        let inherited_context = self.inherited_fscrypt_context(&parent_inode).await?;
+        let block = self.allocate_cluster().await?;
+        let allocated_inode = self.allocate_inode().await?;
         let block_size = self.volume.superblock.block_size();
         let allocated_blocks = u64::from(
             self.volume
@@ -118,7 +126,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             allocated_blocks,
             self.volume.superblock.inode_timestamp_encoding(),
         )?;
-        self.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
+        self.apply_fscrypt_context(&mut raw_inode, inherited_context)
+            .await?;
         let inode_id = raw_inode.id();
 
         let mut directory = DirectoryBlock::empty(
@@ -132,8 +141,9 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             name,
             inode_id,
             DirectoryEntryKind::Directory,
-        )?;
-        self.increment_directory_links(parent.inode())?;
+        )
+        .await?;
+        self.increment_directory_links(parent.inode()).await?;
         let group = InodeBitmapPosition::from_inode(&self.volume.superblock, inode_id)?.group();
         self.record_group_used_dirs_delta(group, 1)?;
         self.inode_updates.try_push(raw_inode.into())?;
@@ -147,20 +157,21 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the parent is not mutable, the name exists, no
     /// inode or data block is free, or the target cannot be represented.
-    pub fn create_symlink(
+    pub async fn create_symlink(
         &mut self,
         parent: TransactionDirectory,
         name: &Ext4Name,
         target: &SymlinkTarget,
         metadata: NewSymlinkMetadata,
     ) -> Result<TransactionSymlink> {
-        self.ensure_child_absent(parent.inode(), name)?;
-        self.require_directory_entry_create_mutation(parent.inode())?;
-        let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
+        self.ensure_child_absent(parent.inode(), name).await?;
+        self.require_directory_entry_create_mutation(parent.inode())
+            .await?;
+        let parent_inode = self.raw_inode_for_policy(parent.inode()).await?.parse()?;
         if parent_inode.protection().is_encrypted() {
             return Err(Error::UnsupportedEncryption);
         }
-        let allocated_inode = self.allocate_inode()?;
+        let allocated_inode = self.allocate_inode().await?;
         let raw_inode = if target.is_inline() {
             allocated_inode.initialize_inline_symlink(
                 metadata,
@@ -181,7 +192,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
             let mut tree = MutableExtentTree::from_extents(Vec::new())?;
             for (logical, chunk) in target.bytes().chunks(block_bytes).enumerate() {
-                let block = self.allocate_cluster()?;
+                let block = self.allocate_cluster().await?;
                 let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
                 bytes
                     .get_mut(..chunk.len())
@@ -198,11 +209,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                     block,
                 )?;
             }
-            self.stage_extent_tree(&mut raw_inode, tree)?;
+            self.stage_extent_tree(&mut raw_inode, tree).await?;
             raw_inode
         };
         let inode_id = raw_inode.id();
-        self.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::Symlink)?;
+        self.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::Symlink)
+            .await?;
         self.inode_updates.try_push(raw_inode.into())?;
         Ok(TransactionSymlink {
             id: SymlinkNodeId::new(inode_id),
@@ -214,37 +226,37 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the entry is absent, not a directory, not empty,
     /// is the root directory, or metadata cannot be updated.
-    pub fn remove_empty_directory(
+    pub async fn remove_empty_directory(
         &mut self,
         parent: TransactionDirectory,
         name: &Ext4Name,
     ) -> Result<()> {
-        let removed = self.find_child_entry(parent.inode(), name)?;
+        let removed = self.find_child_entry(parent.inode(), name).await?;
         if removed.inode() == InodeId::ROOT {
             return Err(Error::CannotRemoveRoot);
         }
-        let inode_index = self.ensure_inode_update(removed.inode())?;
+        let inode_index = self.ensure_inode_update(removed.inode()).await?;
         let raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
         let _deletion = inode.deletion_mutation()?;
-        if !self.directory_is_empty(&inode)? {
+        if !self.directory_is_empty(&inode).await? {
             return Err(Error::DirectoryNotEmpty);
         }
-        let _removed = self.remove_directory_entry(parent.inode(), name)?;
-        let tree = self.mutable_extent_tree(&inode)?;
+        let _removed = self.remove_directory_entry(parent.inode(), name).await?;
+        let tree = self.mutable_extent_tree(&inode).await?;
         for extent in tree.extents().iter().copied() {
-            self.free_extent(extent, 0)?;
+            self.free_extent(extent, 0).await?;
         }
         for block in tree.metadata_blocks().iter().copied() {
-            self.release_cluster_reference(block)?;
+            self.release_cluster_reference(block).await?;
         }
-        self.free_inode(raw_inode.id())?;
+        self.free_inode(raw_inode.id()).await?;
         let deleted = raw_inode.delete(self.now, self.volume.superblock.block_size())?;
         self.replace_deleted_inode(inode_index, deleted)?;
-        self.decrement_directory_links(parent.inode())?;
+        self.decrement_directory_links(parent.inode()).await?;
         let group =
             InodeBitmapPosition::from_inode(&self.volume.superblock, removed.inode())?.group();
         self.record_group_used_dirs_delta(group, -1)
@@ -256,7 +268,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// Returns an error when the source entry is absent, the target collision mode rejects an
     /// existing target, either parent is outside the mutable directory domain, or a moved directory
     /// cannot have its parent link updated.
-    pub fn rename_child(
+    pub async fn rename_child(
         &mut self,
         source_parent: TransactionDirectory,
         source_name: &Ext4Name,
@@ -269,15 +281,15 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
 
         let source_parent = source_parent.inode();
         let target_parent = target_parent.inode();
-        let source = self.find_child_entry(source_parent, source_name)?;
+        let source = self.find_child_entry(source_parent, source_name).await?;
         if source_parent == target_parent && source_name == target_name {
             return Ok(());
         }
         if matches!(target_collision, RenameTargetCollision::Reject) {
-            self.ensure_child_absent(target_parent, target_name)?;
+            self.ensure_child_absent(target_parent, target_name).await?;
         }
 
-        let child_index = self.ensure_inode_update(source.inode())?;
+        let child_index = self.ensure_inode_update(source.inode()).await?;
         let mut child_raw = self.staged_live_inode(child_index)?;
         let child_inode = child_raw.parse()?;
         let _metadata = child_inode.metadata_mutation()?;
@@ -286,47 +298,56 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         }
         let kind = directory_entry_kind(child_inode.kind());
         if matches!(target_collision, RenameTargetCollision::Replace) {
-            let existing_target = self.remove_existing_rename_target(
-                target_parent,
-                target_name,
-                source.inode(),
-                child_inode.kind(),
-            )?;
+            let existing_target = self
+                .remove_existing_rename_target(
+                    target_parent,
+                    target_name,
+                    source.inode(),
+                    child_inode.kind(),
+                )
+                .await?;
             if matches!(existing_target, ExistingRenameTarget::SameInode) {
                 return Ok(());
             }
         }
 
         if source_parent == target_parent {
-            let renamed = self.rename_directory_entry(
-                source_parent,
-                source_name,
-                target_name,
-                source.inode(),
-                kind,
-            )?;
+            let renamed = self
+                .rename_directory_entry(
+                    source_parent,
+                    source_name,
+                    target_name,
+                    source.inode(),
+                    kind,
+                )
+                .await?;
             if renamed.inode() != source.inode() {
                 return Err(Error::InvalidDirectoryEntry);
             }
         } else {
-            self.add_directory_entry(target_parent, target_name, source.inode(), kind)?;
-            let removed = self.remove_directory_entry(source_parent, source_name)?;
+            self.add_directory_entry(target_parent, target_name, source.inode(), kind)
+                .await?;
+            let removed = self
+                .remove_directory_entry(source_parent, source_name)
+                .await?;
             if removed.inode() != source.inode() {
                 return Err(Error::InvalidDirectoryEntry);
             }
             if child_inode.kind() == InodeKind::Directory {
                 let dotdot = Ext4Name::new(b"..")?;
-                let replaced = self.replace_directory_entry(
-                    source.inode(),
-                    &dotdot,
-                    target_parent,
-                    DirectoryEntryKind::Directory,
-                )?;
+                let replaced = self
+                    .replace_directory_entry(
+                        source.inode(),
+                        &dotdot,
+                        target_parent,
+                        DirectoryEntryKind::Directory,
+                    )
+                    .await?;
                 if replaced.inode() != source_parent {
                     return Err(Error::InvalidDirectoryEntry);
                 }
-                self.decrement_directory_links(source_parent)?;
-                self.increment_directory_links(target_parent)?;
+                self.decrement_directory_links(source_parent).await?;
+                self.increment_directory_links(target_parent).await?;
             }
         }
 
@@ -340,14 +361,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the target exists with a kind that cannot be replaced by the source
     /// kind or when the target's deletion policy rejects removal.
-    fn remove_existing_rename_target(
+    async fn remove_existing_rename_target(
         &mut self,
         target_parent: InodeId,
         target_name: &Ext4Name,
         source: InodeId,
         source_kind: InodeKind,
     ) -> Result<ExistingRenameTarget> {
-        let target = match self.find_child_entry(target_parent, target_name) {
+        let target = match self.find_child_entry(target_parent, target_name).await {
             Ok(target) => target,
             Err(Error::DirectoryEntryNotFound) => return Ok(ExistingRenameTarget::Absent),
             Err(error) => return Err(error),
@@ -356,23 +377,28 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             return Ok(ExistingRenameTarget::SameInode);
         }
 
-        let target_kind = self.raw_inode_for_policy(target.inode())?.parse()?.kind();
+        let target_kind = self
+            .raw_inode_for_policy(target.inode())
+            .await?
+            .parse()?
+            .kind();
         let target_parent = TransactionDirectory {
             id: DirectoryNodeId::new(target_parent),
         };
         match (source_kind, target_kind) {
             (InodeKind::Directory, InodeKind::Directory) => {
-                self.remove_empty_directory(target_parent, target_name)?;
+                self.remove_empty_directory(target_parent, target_name)
+                    .await?;
             }
             (InodeKind::Directory, InodeKind::File | InodeKind::Symlink)
             | (InodeKind::File | InodeKind::Symlink, InodeKind::Directory) => {
                 return Err(Error::WrongInodeKind);
             }
             (InodeKind::File | InodeKind::Symlink, InodeKind::File) => {
-                self.unlink_file(target_parent, target_name)?;
+                self.unlink_file(target_parent, target_name).await?;
             }
             (InodeKind::File | InodeKind::Symlink, InodeKind::Symlink) => {
-                self.remove_symlink(target_parent, target_name)?;
+                self.remove_symlink(target_parent, target_name).await?;
             }
         }
         Ok(ExistingRenameTarget::Removed)
@@ -383,24 +409,28 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the entry is absent, not a symbolic link, or
     /// metadata cannot be updated.
-    pub fn remove_symlink(&mut self, parent: TransactionDirectory, name: &Ext4Name) -> Result<()> {
-        let removed = self.remove_directory_entry(parent.inode(), name)?;
-        let inode_index = self.ensure_inode_update(removed.inode())?;
+    pub async fn remove_symlink(
+        &mut self,
+        parent: TransactionDirectory,
+        name: &Ext4Name,
+    ) -> Result<()> {
+        let removed = self.remove_directory_entry(parent.inode(), name).await?;
+        let inode_index = self.ensure_inode_update(removed.inode()).await?;
         let raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         if inode.kind() != InodeKind::Symlink {
             return Err(Error::WrongInodeKind);
         }
         let _deletion = inode.deletion_mutation()?;
-        if let Ok(tree) = self.mutable_extent_tree(&inode) {
+        if let Ok(tree) = self.mutable_extent_tree(&inode).await {
             for extent in tree.extents().iter().copied() {
-                self.free_extent(extent, 0)?;
+                self.free_extent(extent, 0).await?;
             }
             for block in tree.metadata_blocks().iter().copied() {
-                self.release_cluster_reference(block)?;
+                self.release_cluster_reference(block).await?;
             }
         }
-        self.free_inode(raw_inode.id())?;
+        self.free_inode(raw_inode.id()).await?;
         let deleted = raw_inode.delete(self.now, self.volume.superblock.block_size())?;
         self.replace_deleted_inode(inode_index, deleted)?;
         Ok(())
@@ -411,8 +441,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `name` already exists in `parent` or the parent directory cannot be
     /// searched.
-    fn ensure_child_absent(&self, parent: InodeId, name: &Ext4Name) -> Result<()> {
-        match self.find_child_entry(parent, name) {
+    async fn ensure_child_absent(&mut self, parent: InodeId, name: &Ext4Name) -> Result<()> {
+        match self.find_child_entry(parent, name).await {
             Ok(_) => Err(Error::NameAlreadyExists),
             Err(Error::DirectoryEntryNotFound) => Ok(()),
             Err(error) => Err(error),
@@ -424,13 +454,17 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `parent` is not a directory, its lookup name cannot be derived, or the
     /// requested entry is absent.
-    fn find_child_entry(&self, parent: InodeId, name: &Ext4Name) -> Result<RawDirectoryEntry> {
-        let inode = self.volume.read_inode_record(parent)?;
+    async fn find_child_entry(
+        &mut self,
+        parent: InodeId,
+        name: &Ext4Name,
+    ) -> Result<RawDirectoryEntry> {
+        let inode = self.volume.read_inode_record(parent).await?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        let lookup_name = self.directory_lookup_name(&inode, name)?;
-        if let Some(entry) = self.directory_layout(&inode)?.find(&lookup_name)? {
+        let lookup_name = self.directory_lookup_name(&inode, name).await?;
+        if let Some(entry) = self.directory_layout(&inode).await?.find(&lookup_name)? {
             return Ok(entry);
         }
         Err(Error::DirectoryEntryNotFound)
@@ -441,8 +475,16 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the encrypted lookup name cannot be derived and no locked-directory
     /// ciphertext fallback can represent `name`.
-    fn directory_lookup_name(&self, directory: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
-        match self.volume.encrypt_directory_child_name(directory, name) {
+    async fn directory_lookup_name(
+        &mut self,
+        directory: &Inode,
+        name: &Ext4Name,
+    ) -> Result<Ext4Name> {
+        match self
+            .volume
+            .encrypt_directory_child_name(directory, name)
+            .await
+        {
             Err(Error::MissingEncryptionKey) => {
                 if let Some(ciphertext) =
                     MountedVolume::<D, JournaledMount<J>, N>::locked_directory_ciphertext_name(
@@ -463,25 +505,28 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `parent` is not mutable, `name` already exists, encryption or HTree
     /// rebuild fails, or a new directory block cannot be allocated and staged.
-    fn add_directory_entry(
+    async fn add_directory_entry(
         &mut self,
         parent: InodeId,
         name: &Ext4Name,
         child: InodeId,
         kind: DirectoryEntryKind,
     ) -> Result<()> {
-        let inode_index = self.ensure_inode_update(parent)?;
+        let inode_index = self.ensure_inode_update(parent).await?;
         let mut raw_parent = self.staged_live_inode(inode_index)?;
         let parent_inode = raw_parent.parse()?;
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        self.require_directory_entry_create_mutation_for_inode(&parent_inode)?;
+        self.require_directory_entry_create_mutation_for_inode(&parent_inode)
+            .await?;
         let disk_name = self
             .volume
-            .encrypt_directory_child_name(&parent_inode, name)?;
+            .encrypt_directory_child_name(&parent_inode, name)
+            .await?;
         if self
-            .directory_layout(&parent_inode)?
+            .directory_layout(&parent_inode)
+            .await?
             .find(&disk_name)?
             .is_some()
         {
@@ -491,13 +536,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
+            let mut entries = self.directory_layout(&parent_inode).await?.entries()?;
             entries.try_push(RawDirectoryEntry::new(child, &disk_name, kind)?)?;
-            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
+            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)
+                .await?;
             return Ok(());
         }
 
-        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
+        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode).await? {
             if block.insert(child, &disk_name, kind)? {
                 self.stage_directory_block(physical, block.into_bytes())?;
                 raw_parent
@@ -509,14 +555,15 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
 
         match self.volume.superblock.directory_indexing() {
             DirectoryIndexing::Enabled => {
-                let mut entries = self.directory_layout(&parent_inode)?.entries()?;
+                let mut entries = self.directory_layout(&parent_inode).await?.entries()?;
                 entries.try_push(RawDirectoryEntry::new(child, &disk_name, kind)?)?;
                 self.stage_rebuilt_htree_directory(
                     inode_index,
                     raw_parent,
                     &parent_inode,
                     &entries,
-                )?;
+                )
+                .await?;
                 return Ok(());
             }
             DirectoryIndexing::Disabled => {}
@@ -524,8 +571,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
 
         let block_size = self.volume.superblock.block_size();
         let block_size_u64 = u64::from(block_size.bytes());
-        let new_physical = self.allocate_cluster()?;
-        let mut tree = self.mutable_extent_tree(&parent_inode)?;
+        let new_physical = self.allocate_cluster().await?;
+        let mut tree = self.mutable_extent_tree(&parent_inode).await?;
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
@@ -552,7 +599,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         self.require_inode_size_supported(new_parent_size)?;
         raw_parent.set_size(new_parent_size)?;
         raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.stage_extent_tree(&mut raw_parent, tree)?;
+        self.stage_extent_tree(&mut raw_parent, tree).await?;
         self.replace_live_inode(inode_index, raw_parent)?;
         Ok(())
     }
@@ -562,32 +609,33 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `parent` is not mutable, `name` is absent, or the linear/HTree
     /// directory image cannot be rewritten.
-    fn remove_directory_entry(
+    async fn remove_directory_entry(
         &mut self,
         parent: InodeId,
         name: &Ext4Name,
     ) -> Result<RawDirectoryEntry> {
-        let inode_index = self.ensure_inode_update(parent)?;
+        let inode_index = self.ensure_inode_update(parent).await?;
         let mut raw_parent = self.staged_live_inode(inode_index)?;
         let parent_inode = raw_parent.parse()?;
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
         self.require_directory_entry_delete_mutation_for_inode(&parent_inode)?;
-        let disk_name = self.directory_lookup_name(&parent_inode, name)?;
+        let disk_name = self.directory_lookup_name(&parent_inode, name).await?;
         if matches!(
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
+            let mut entries = self.directory_layout(&parent_inode).await?.entries()?;
             let Some(position) = entries.iter().position(|entry| entry.name() == &disk_name) else {
                 return Err(Error::DirectoryEntryNotFound);
             };
             let removed = entries.remove(position);
-            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
+            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)
+                .await?;
             return Ok(removed);
         }
-        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
+        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode).await? {
             if let Some(removed) = block.remove(&disk_name)? {
                 self.stage_directory_block(physical, block.into_bytes())?;
                 raw_parent
@@ -604,7 +652,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the old entry is absent, the new name already exists, the existing
     /// entry does not match `child`, or the directory image cannot be rewritten.
-    fn rename_directory_entry(
+    async fn rename_directory_entry(
         &mut self,
         parent: InodeId,
         old_name: &Ext4Name,
@@ -612,24 +660,27 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         child: InodeId,
         kind: DirectoryEntryKind,
     ) -> Result<RawDirectoryEntry> {
-        let inode_index = self.ensure_inode_update(parent)?;
+        let inode_index = self.ensure_inode_update(parent).await?;
         let mut raw_parent = self.staged_live_inode(inode_index)?;
         let parent_inode = raw_parent.parse()?;
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        self.require_directory_entry_rename_mutation_for_inode(&parent_inode)?;
+        self.require_directory_entry_rename_mutation_for_inode(&parent_inode)
+            .await?;
         let old_disk_name = self
             .volume
-            .encrypt_directory_child_name(&parent_inode, old_name)?;
+            .encrypt_directory_child_name(&parent_inode, old_name)
+            .await?;
         let new_disk_name = self
             .volume
-            .encrypt_directory_child_name(&parent_inode, new_name)?;
+            .encrypt_directory_child_name(&parent_inode, new_name)
+            .await?;
         if matches!(
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
+            let mut entries = self.directory_layout(&parent_inode).await?.entries()?;
             if entries.iter().any(|entry| entry.name() == &new_disk_name) {
                 return Err(Error::NameAlreadyExists);
             }
@@ -650,10 +701,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 .get_mut(position)
                 .ok_or(Error::InvalidDirectoryEntry)? =
                 RawDirectoryEntry::new(child, &new_disk_name, kind)?;
-            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
+            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)
+                .await?;
             return Ok(renamed);
         }
-        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
+        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode).await? {
             if let Some(renamed) = block.rename(&old_disk_name, &new_disk_name)? {
                 if renamed.inode() != child {
                     return Err(Error::InvalidDirectoryEntry);
@@ -677,28 +729,30 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `name` is absent, `parent` is not mutable, or the replacement cannot be
     /// staged in the directory image.
-    fn replace_directory_entry(
+    async fn replace_directory_entry(
         &mut self,
         parent: InodeId,
         name: &Ext4Name,
         child: InodeId,
         kind: DirectoryEntryKind,
     ) -> Result<RawDirectoryEntry> {
-        let inode_index = self.ensure_inode_update(parent)?;
+        let inode_index = self.ensure_inode_update(parent).await?;
         let mut raw_parent = self.staged_live_inode(inode_index)?;
         let parent_inode = raw_parent.parse()?;
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        self.require_directory_entry_replace_mutation_for_inode(&parent_inode)?;
+        self.require_directory_entry_replace_mutation_for_inode(&parent_inode)
+            .await?;
         let disk_name = self
             .volume
-            .encrypt_directory_child_name(&parent_inode, name)?;
+            .encrypt_directory_child_name(&parent_inode, name)
+            .await?;
         if matches!(
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
+            let mut entries = self.directory_layout(&parent_inode).await?.entries()?;
             let Some(position) = entries.iter().position(|entry| entry.name() == &disk_name) else {
                 return Err(Error::DirectoryEntryNotFound);
             };
@@ -710,10 +764,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 .get_mut(position)
                 .ok_or(Error::InvalidDirectoryEntry)? =
                 RawDirectoryEntry::new(child, &disk_name, kind)?;
-            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
+            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)
+                .await?;
             return Ok(replaced);
         }
-        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
+        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode).await? {
             if let Some(replaced) = block.replace(&disk_name, child, kind)? {
                 self.stage_directory_block(physical, block.into_bytes())?;
                 raw_parent
@@ -730,7 +785,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when dot entries are invalid, HTree construction fails, required blocks
     /// cannot be allocated, or the rebuilt extent tree/size cannot be staged.
-    fn stage_rebuilt_htree_directory(
+    async fn stage_rebuilt_htree_directory(
         &mut self,
         inode_index: StagedInodeIndex,
         mut raw_parent: LiveInodeRecord,
@@ -766,7 +821,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         let image_blocks =
             u64::try_from(image.block_count()).map_err(|_| Error::ArithmeticOverflow)?;
         let target_blocks = existing_blocks.max(image_blocks);
-        let mut tree = self.mutable_extent_tree(parent_inode)?;
+        let mut tree = self.mutable_extent_tree(parent_inode).await?;
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
@@ -776,7 +831,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 BlockMapping::Physical(physical) => physical,
                 BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
                 BlockMapping::Hole => {
-                    let physical = self.allocate_cluster()?;
+                    let physical = self.allocate_cluster().await?;
                     tree.insert_or_extend_initialized(logical_block, physical)?;
                     physical
                 }
@@ -797,7 +852,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         self.require_inode_size_supported(rebuilt_size)?;
         raw_parent.set_size(rebuilt_size)?;
         raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.stage_extent_tree(&mut raw_parent, tree)?;
+        self.stage_extent_tree(&mut raw_parent, tree).await?;
         self.replace_live_inode(inode_index, raw_parent)
     }
 
@@ -823,8 +878,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     ///
     /// Returns an error when the directory layout cannot be loaded or parsed.
-    fn directory_is_empty(&self, inode: &Inode) -> Result<bool> {
-        for entry in self.directory_layout(inode)?.entries()? {
+    async fn directory_is_empty(&mut self, inode: &Inode) -> Result<bool> {
+        for entry in self.directory_layout(inode).await?.entries()? {
             let name = entry.name().bytes();
             if name != b"." && name != b".." {
                 return Ok(false);
@@ -838,7 +893,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when directory storage is unsupported, indexed layout is disabled, or staged
     /// directory blocks cannot be parsed into a layout.
-    fn directory_layout(&self, inode: &Inode) -> Result<DirectoryLayout> {
+    async fn directory_layout(&mut self, inode: &Inode) -> Result<DirectoryLayout> {
         let storage = inode.directory_storage_kind()?;
         if matches!(storage, DirectoryStorageKind::HTree) {
             self.volume
@@ -847,7 +902,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 .require_supported()?;
         }
         let mut blocks = Vec::new();
-        for (logical, _physical, block) in self.directory_blocks(inode)? {
+        for (logical, _physical, block) in self.directory_blocks(inode).await? {
             blocks.try_push(DirectoryBlockData::new(
                 logical.as_u32(),
                 block.into_bytes(),
@@ -867,20 +922,22 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the directory extent tree contains holes, a staged block has the wrong
     /// size, a device block cannot be read, or block-count arithmetic fails.
-    fn directory_blocks(
-        &self,
+    async fn directory_blocks(
+        &mut self,
         inode: &Inode,
     ) -> Result<Vec<(LogicalBlock, BlockAddress, DirectoryBlock)>> {
         let block_size = self.volume.superblock.block_size();
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
         let block_count = round_up_div(inode.size().bytes(), u64::from(block_size.bytes()))?;
+        let context = self.volume.extent_tree_context(inode);
         let tree = MutableExtentTree::load_inode_tree(
             inode.extent_root()?,
             block_size,
-            &self.volume.device,
-            self.volume.extent_tree_context(inode),
-        )?;
+            &mut self.volume.device,
+            context,
+        )
+        .await?;
         let mut blocks = Vec::new();
         for logical in 0..block_count {
             let logical = LogicalBlock::try_from(logical)?;
@@ -903,7 +960,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
                 self.volume
                     .device
-                    .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
+                    .read_exact_at(block_size.offset_of(physical)?, &mut bytes)
+                    .await?;
                 bytes
             };
             blocks.try_push((logical, physical, DirectoryBlock::new(bytes)))?;

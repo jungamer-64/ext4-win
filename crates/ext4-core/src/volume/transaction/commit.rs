@@ -8,7 +8,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when staged bitmap, directory, extent, xattr, group, superblock, or inode
     /// metadata cannot be serialized to device byte ranges.
-    fn metadata_writes(&mut self) -> Result<Vec<RangeWrite>> {
+    async fn metadata_writes(&mut self) -> Result<Vec<RangeWrite>> {
         let mut writes = Vec::new();
         for bitmap in &self.block_bitmap_updates {
             writes.try_push(RangeWrite {
@@ -58,10 +58,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         }
         for delta in &self.group_deltas {
             let mut descriptor = BlockGroupDescriptor::read_from(
-                &self.volume.device,
+                &mut self.volume.device,
                 &self.volume.superblock,
                 delta.group,
-            )?;
+            )
+            .await?;
             if !delta.free_clusters_delta.is_zero() {
                 descriptor.apply_free_clusters_delta(
                     delta.free_clusters_delta,
@@ -116,7 +117,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         {
             writes.try_push(RangeWrite {
                 offset: ByteOffset::new(SUPERBLOCK_OFFSET),
-                bytes: self.updated_superblock_bytes()?,
+                bytes: self.updated_superblock_bytes().await?,
             })?;
         }
         for inode in &self.inode_updates {
@@ -135,14 +136,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when a metadata write does not fit within one block or an original metadata
     /// block cannot be read before patching.
-    fn metadata_blocks(&mut self) -> Result<Vec<MetadataBlock>> {
+    async fn metadata_blocks(&mut self) -> Result<Vec<MetadataBlock>> {
         let block_size = self.volume.superblock.block_size();
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
         let block_bytes_u64 = u64::from(block_size.bytes());
         let mut blocks = Vec::new();
 
-        for write in self.metadata_writes()? {
+        for write in self.metadata_writes().await? {
             let block = BlockAddress::new(
                 write
                     .offset
@@ -174,7 +175,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
                 self.volume
                     .device
-                    .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
+                    .read_exact_at(block_size.offset_of(block)?, &mut bytes)
+                    .await?;
                 blocks.try_push(MetadataBlock::new(block, bytes))?;
                 blocks
                     .len()
@@ -197,13 +199,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     ///
     /// Returns an error when any ordered data write or the following device flush fails.
-    fn write_ordered_data(&mut self) -> Result<()> {
+    async fn write_ordered_data(&mut self) -> Result<()> {
         for write in &self.data_writes {
             self.volume
                 .device
-                .write_exact_at(write.offset, write.bytes.as_slice())?;
+                .write_exact_at(write.offset, write.bytes.as_slice())
+                .await?;
         }
-        self.volume.device.flush()
+        self.volume.device.flush().await
     }
 
     /// Applies accumulated free-count deltas to a superblock image.
@@ -211,11 +214,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the primary superblock cannot be read, free counters underflow or
     /// overflow, the label cannot be written, or the checksum cannot be refreshed.
-    fn updated_superblock_bytes(&self) -> Result<Vec<u8>> {
+    async fn updated_superblock_bytes(&mut self) -> Result<Vec<u8>> {
         let mut bytes = memory::repeated_vec(0_u8, 1024)?;
         self.volume
             .device
-            .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut bytes)?;
+            .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut bytes)
+            .await?;
         let current = u64::from(le_u32(
             &bytes,
             disk_offset(SUPERBLOCK_FREE_BLOCKS_LO_OFFSET),
@@ -281,23 +285,24 @@ impl<D: BlockStorage, N: FscryptNonceGenerator> JournalTransaction<'_, D, N, Int
     /// # Errors
     /// Returns an error when the transaction exceeds journal capacity or any
     /// backing device write/flush fails.
-    pub fn commit(mut self) -> Result<()> {
+    pub async fn commit(mut self) -> Result<()> {
         let block_size = self.volume.superblock.block_size();
-        let metadata_blocks = self.metadata_blocks()?;
+        let metadata_blocks = self.metadata_blocks().await?;
         let (clusters, superblock) = self.committed_cluster_state()?;
         self.volume
             .state
             .journal
             .journal
             .ensure_transaction_capacity(metadata_blocks.len())?;
-        self.write_ordered_data()?;
+        self.write_ordered_data().await?;
 
         let volume = self.volume;
-        volume.state.journal.journal.commit_internal(
-            &mut volume.device,
-            block_size,
-            &metadata_blocks,
-        )?;
+        volume
+            .state
+            .journal
+            .journal
+            .commit_internal(&mut volume.device, block_size, &metadata_blocks)
+            .await?;
         volume.state.clusters = clusters;
         volume.superblock = superblock;
         Ok(())
@@ -312,25 +317,28 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J: BlockStorage>
     /// # Errors
     /// Returns an error when the transaction exceeds journal capacity or any
     /// backing device write/flush fails.
-    pub fn commit(mut self) -> Result<()> {
+    pub async fn commit(mut self) -> Result<()> {
         let block_size = self.volume.superblock.block_size();
-        let metadata_blocks = self.metadata_blocks()?;
+        let metadata_blocks = self.metadata_blocks().await?;
         let (clusters, superblock) = self.committed_cluster_state()?;
         self.volume
             .state
             .journal
             .journal
             .ensure_transaction_capacity(metadata_blocks.len())?;
-        self.write_ordered_data()?;
+        self.write_ordered_data().await?;
 
         let volume = self.volume;
         let journal = &mut volume.state.journal;
-        journal.journal.commit_external(
-            &mut volume.device,
-            &mut journal.device,
-            block_size,
-            &metadata_blocks,
-        )?;
+        journal
+            .journal
+            .commit_external(
+                &mut volume.device,
+                &mut journal.device,
+                block_size,
+                &metadata_blocks,
+            )
+            .await?;
         volume.state.clusters = clusters;
         volume.superblock = superblock;
         Ok(())

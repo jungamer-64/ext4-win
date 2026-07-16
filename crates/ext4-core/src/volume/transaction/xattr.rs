@@ -19,20 +19,21 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the inode is not mutable or the xattr set cannot
     /// fit in supported in-inode or single-block external storage.
-    pub fn set_xattr(
+    pub async fn set_xattr(
         &mut self,
         node: TransactionNode,
         name: XattrName,
         value: XattrValue,
     ) -> Result<()> {
         self.update_xattrs(node, |set| set.insert(name, value))
+            .await
     }
 
     /// Removes one ext4 extended attribute.
     ///
     /// # Errors
     /// Returns an error when the inode or current xattr storage is malformed.
-    pub fn remove_xattr(
+    pub async fn remove_xattr(
         &mut self,
         node: TransactionNode,
         name: &XattrName,
@@ -41,7 +42,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         self.update_xattrs(node, |set| {
             removed = set.remove(name);
             Ok(())
-        })?;
+        })
+        .await?;
         Ok(removed)
     }
 
@@ -50,20 +52,21 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the ACL cannot be serialized or stored.
     #[cfg(test)]
-    pub(crate) fn set_posix_acl(
+    pub(crate) async fn set_posix_acl(
         &mut self,
         node: TransactionNode,
         kind: PosixAclKind,
         acl: PosixAcl,
     ) -> Result<()> {
         self.set_xattr(node, PosixAcl::xattr_name(kind)?, acl.to_xattr_value()?)
+            .await
     }
 
     /// Sets Windows overlay metadata in `user.ext4win.*` xattrs.
     ///
     /// # Errors
     /// Returns an error when the overlay cannot be serialized or stored.
-    pub fn set_windows_overlay(
+    pub async fn set_windows_overlay(
         &mut self,
         node: TransactionNode,
         overlay: WindowsOverlay,
@@ -73,6 +76,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             WindowsOverlay::attributes_xattr_name()?,
             overlay.to_xattr_value()?,
         )
+        .await
     }
 
     /// Sets Windows symbolic-link reparse metadata on a regular file or directory.
@@ -80,7 +84,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the node is a native symbolic link or the reparse
     /// xattr cannot be serialized or stored.
-    pub fn set_windows_symlink_reparse_point(
+    pub async fn set_windows_symlink_reparse_point(
         &mut self,
         node: TransactionNode,
         reparse_point: WindowsSymlinkReparsePoint,
@@ -91,6 +95,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             WindowsSymlinkReparsePoint::xattr_name()?,
             reparse_point.to_xattr_value()?,
         )
+        .await
     }
 
     /// Removes Windows symbolic-link reparse metadata from a regular file or directory.
@@ -98,12 +103,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the node is a native symbolic link or the stored
     /// xattr payload is malformed.
-    pub fn remove_windows_symlink_reparse_point(
+    pub async fn remove_windows_symlink_reparse_point(
         &mut self,
         node: TransactionNode,
     ) -> Result<Option<WindowsSymlinkReparsePoint>> {
         require_windows_reparse_storage_node(node)?;
-        let Some(value) = self.remove_xattr(node, &WindowsSymlinkReparsePoint::xattr_name()?)?
+        let Some(value) = self
+            .remove_xattr(node, &WindowsSymlinkReparsePoint::xattr_name()?)
+            .await?
         else {
             return Ok(None);
         };
@@ -132,7 +139,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `block` cannot be read from the mounted device or block-size arithmetic
     /// cannot be represented.
-    fn xattr_block_bytes(&self, block: BlockAddress) -> Result<Vec<u8>> {
+    async fn xattr_block_bytes(&mut self, block: BlockAddress) -> Result<Vec<u8>> {
         if let Some(staged) = self
             .xattr_updates
             .iter()
@@ -148,7 +155,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         )?;
         self.volume
             .device
-            .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
+            .read_exact_at(block_size.offset_of(block)?, &mut bytes)
+            .await?;
         Ok(bytes)
     }
 
@@ -157,8 +165,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when inline xattrs, the external block pointer, the external xattr block, or
     /// merged xattr namespaces are malformed.
-    pub(super) fn xattr_set_for_raw_inode(
-        &self,
+    pub(super) async fn xattr_set_for_raw_inode(
+        &mut self,
         raw_inode: &LiveInodeRecord,
     ) -> Result<InodeXattrSet> {
         match self.volume.superblock.xattr_mutation() {
@@ -169,7 +177,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         let Some(block) = raw_inode.xattr_block()? else {
             return Ok(inline);
         };
-        let bytes = self.xattr_block_bytes(block)?;
+        let bytes = self.xattr_block_bytes(block).await?;
         let external =
             xattr_storage::parse_external_xattr_block(&bytes, block, &self.volume.superblock)?;
         xattr_storage::merge_xattr_sets(inline, external)
@@ -180,20 +188,20 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when xattr mutation is disabled, the inode cannot be staged, the existing
     /// set is malformed, `update` fails, or the updated set cannot be stored.
-    fn update_xattrs(
+    async fn update_xattrs(
         &mut self,
         node: TransactionNode,
         update: impl FnOnce(&mut XattrSet) -> Result<()>,
     ) -> Result<()> {
         self.require_xattr_mutation()?;
-        let inode_index = self.ensure_inode_update(node.inode())?;
+        let inode_index = self.ensure_inode_update(node.inode()).await?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         let _metadata = inode.metadata_mutation()?;
 
-        let mut set = self.xattr_set_for_raw_inode(&raw_inode)?;
+        let mut set = self.xattr_set_for_raw_inode(&raw_inode).await?;
         update(set.public_mut())?;
-        self.store_xattr_set(&mut raw_inode, &set)?;
+        self.store_xattr_set(&mut raw_inode, &set).await?;
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
@@ -205,7 +213,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when inline storage cannot be cleared or written, external xattr references
     /// cannot be released, or the set cannot fit supported xattr storage.
-    pub(super) fn store_xattr_set(
+    pub(super) async fn store_xattr_set(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
         set: &InodeXattrSet,
@@ -214,7 +222,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         if set.is_empty() {
             raw_inode.clear_inline_xattr_region()?;
             if let Some(block) = old_block {
-                self.release_xattr_block_ref(block)?;
+                self.release_xattr_block_ref(block).await?;
             }
             raw_inode.set_xattr_block(None)?;
             return Ok(());
@@ -227,11 +235,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                     .writable_inline_xattr_region()?
                     .copy_from_slice(&bytes);
                 if let Some(block) = old_block {
-                    self.release_xattr_block_ref(block)?;
+                    self.release_xattr_block_ref(block).await?;
                 }
                 raw_inode.set_xattr_block(None)
             }
-            Err(Error::NoSpace) => self.store_external_xattr_set(raw_inode, set, old_block),
+            Err(Error::NoSpace) => {
+                self.store_external_xattr_set(raw_inode, set, old_block)
+                    .await
+            }
             Err(error) => Err(error),
         }
     }
@@ -241,7 +252,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the set exceeds one external block, shared-block refcounts cannot be
     /// adjusted, a replacement block cannot be allocated, or serialization fails.
-    fn store_external_xattr_set(
+    async fn store_external_xattr_set(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
         set: &InodeXattrSet,
@@ -253,18 +264,18 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         xattr_storage::ensure_external_xattrs_fit(set, block_bytes)?;
 
         let block = if let Some(block) = old_block {
-            let bytes = self.xattr_block_bytes(block)?;
+            let bytes = self.xattr_block_bytes(block).await?;
             let refcount = xattr_storage::external_xattr_refcount(&bytes)?;
             if refcount == 1 {
                 block
             } else {
-                let new_block = self.allocate_cluster()?;
-                self.release_cluster_reference(block)?;
+                let new_block = self.allocate_cluster().await?;
+                self.release_cluster_reference(block).await?;
                 self.decrement_xattr_block_ref(block, bytes, refcount)?;
                 new_block
             }
         } else {
-            self.allocate_cluster()?
+            self.allocate_cluster().await?
         };
         let bytes = xattr_storage::serialize_external_xattr_block(
             set,
@@ -282,10 +293,10 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the block image or refcount is malformed, or the backing cluster
     /// reference cannot be released.
-    fn release_xattr_block_ref(&mut self, block: BlockAddress) -> Result<()> {
-        let bytes = self.xattr_block_bytes(block)?;
+    async fn release_xattr_block_ref(&mut self, block: BlockAddress) -> Result<()> {
+        let bytes = self.xattr_block_bytes(block).await?;
         let refcount = xattr_storage::external_xattr_refcount(&bytes)?;
-        self.release_cluster_reference(block)?;
+        self.release_cluster_reference(block).await?;
         if refcount > 1 {
             self.decrement_xattr_block_ref(block, bytes, refcount)
         } else {
