@@ -8,7 +8,7 @@ fn write_mount_accepts_bigalloc() {
     let mut image = bigalloc_fixture_image();
     let superblock = must(Superblock::parse_read_write(&image[1024..2048]));
     let device = MemoryBlockStorage::new(&mut image);
-    let volume = must(JournaledVolume::mount(device, test_mount_context()));
+    let volume = must_run(JournaledVolume::mount(device, test_mount_context()));
 
     assert_eq!(volume.geometry().cluster_size().bytes(), 4096);
     assert_eq!(superblock.blocks_per_cluster().as_u32(), 4);
@@ -62,18 +62,18 @@ fn bigalloc_hole_write_reuses_logical_cluster() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let file_id = file_node_id(&volume, 3);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         write_file(&mut transaction, file_id, 1024, b"hole");
-        must(transaction.commit());
+        must_run(transaction.commit());
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
             u64::from(initial_free)
         );
         let mut output = [0_u8; 4];
-        assert_eq!(read_file(&volume, 3, 1024, &mut output), 4);
+        assert_eq!(read_file(&mut volume, 3, 1024, &mut output), 4);
         assert_eq!(&output, b"hole");
     }
 
@@ -96,8 +96,8 @@ fn bigalloc_sparse_extension_allocates_one_cluster() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let file_id = file_node_id(&volume, 3);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
@@ -110,7 +110,7 @@ fn bigalloc_sparse_extension_allocates_one_cluster() {
             u64::try_from(BLOCK_SIZE * 4).unwrap_or(u64::MAX),
             b"next",
         );
-        must(transaction.commit());
+        must_run(transaction.commit());
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
@@ -119,7 +119,7 @@ fn bigalloc_sparse_extension_allocates_one_cluster() {
         let mut output = [0_u8; 4];
         assert_eq!(
             read_file(
-                &volume,
+                &mut volume,
                 3,
                 u64::try_from(BLOCK_SIZE * 4).unwrap_or(u64::MAX),
                 &mut output,
@@ -147,15 +147,15 @@ fn bigalloc_partial_truncate_preserves_referenced_cluster() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let file_id = file_node_id(&volume, 3);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         truncate_file(
             &mut transaction,
             file_id,
             u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX),
         );
-        must(transaction.commit());
+        must_run(transaction.commit());
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
@@ -178,11 +178,11 @@ fn bigalloc_full_truncate_frees_last_cluster_reference() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let file_id = file_node_id(&volume, 3);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         truncate_file(&mut transaction, file_id, 0);
-        must(transaction.commit());
+        must_run(transaction.commit());
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
@@ -206,11 +206,11 @@ fn bigalloc_unlink_file_frees_last_cluster_reference() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
-        must(transaction.unlink_file(root, &must(Ext4Name::new(b"file"))));
-        must(transaction.commit());
+        let root = transaction_directory(&mut transaction, crate::DirectoryNodeId::ROOT);
+        must_run(transaction.unlink_file(root, &must(Ext4Name::new(b"file"))));
+        must_run(transaction.commit());
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
@@ -249,15 +249,15 @@ fn bigalloc_two_extents_in_same_physical_cluster_are_indexed() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let file_id = file_node_id(&volume, 3);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         truncate_file(
             &mut transaction,
             file_id,
             u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX),
         );
-        must(transaction.commit());
+        must_run(transaction.commit());
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
@@ -291,7 +291,7 @@ fn bigalloc_duplicate_physical_block_reference_is_rejected() {
         MODERN_FILE_DATA_BLOCK,
     );
     let device = MemoryBlockStorage::new(&mut image);
-    let result = JournaledVolume::mount(device, test_mount_context());
+    let result = run(JournaledVolume::mount(device, test_mount_context()));
 
     assert_eq!(result.map(|_| ()), Err(Error::ClusterReferenceConflict));
 }
@@ -308,7 +308,7 @@ fn bigalloc_mount_rejects_references_into_free_clusters() {
         false,
     );
     let device = MemoryBlockStorage::new(&mut image);
-    let result = JournaledVolume::mount(device, test_mount_context());
+    let result = run(JournaledVolume::mount(device, test_mount_context()));
 
     assert_eq!(result.map(|_| ()), Err(Error::ClusterReferenceConflict));
 }
@@ -329,8 +329,8 @@ fn bigalloc_allocated_unreferenced_cluster_remains_unavailable() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let file_id = file_node_id(&volume, 3);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
@@ -343,7 +343,7 @@ fn bigalloc_allocated_unreferenced_cluster_remains_unavailable() {
             u64::try_from(BLOCK_SIZE * 4).unwrap_or(u64::MAX),
             b"next",
         );
-        must(transaction.commit());
+        must_run(transaction.commit());
     }
 
     assert!(bigalloc_cluster_is_used(&image, reserved_cluster));
@@ -361,17 +361,17 @@ fn bigalloc_directory_create_remove_returns_cluster_count() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
         let mut transaction = volume.begin_transaction(NOW);
-        let root = transaction_directory(&transaction, crate::DirectoryNodeId::ROOT);
-        let child = must(transaction.create_directory(
+        let root = transaction_directory(&mut transaction, crate::DirectoryNodeId::ROOT);
+        let child = must_run(transaction.create_directory(
             root,
             &must(Ext4Name::new(b"child")),
             test_directory_metadata(),
         ));
-        must(transaction.remove_empty_directory(root, &must(Ext4Name::new(b"child"))));
+        must_run(transaction.remove_empty_directory(root, &must(Ext4Name::new(b"child"))));
         assert_eq!(child.id().inode().as_u32(), 11);
-        must(transaction.commit());
+        must_run(transaction.commit());
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
@@ -392,8 +392,8 @@ fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let file_id = file_node_id(&volume, 3);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
         extend_file(
             &mut transaction,
@@ -408,7 +408,7 @@ fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
                 b"x",
             );
         }
-        must(transaction.commit());
+        must_run(transaction.commit());
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
@@ -440,12 +440,12 @@ fn bigalloc_external_xattr_allocation_uses_cluster_accounting() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let node_id = node_id(&volume, inode(3));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&mut volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, node_id);
-        must(transaction.set_xattr(node, name.clone(), value.clone()));
-        must(transaction.commit());
+        let node = transaction_node(&mut transaction, node_id);
+        must_run(transaction.set_xattr(node, name.clone(), value.clone()));
+        must_run(transaction.commit());
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
@@ -461,12 +461,12 @@ fn bigalloc_external_xattr_allocation_uses_cluster_accounting() {
 
     {
         let device = MemoryBlockStorage::new(&mut image);
-        let mut volume = must(JournaledVolume::mount(device, test_mount_context()));
-        let node_id = node_id(&volume, inode(3));
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let node_id = node_id(&mut volume, inode(3));
         let mut transaction = volume.begin_transaction(NOW);
-        let node = transaction_node(&transaction, node_id);
-        assert_eq!(must(transaction.remove_xattr(node, &name)), Some(value));
-        must(transaction.commit());
+        let node = transaction_node(&mut transaction, node_id);
+        assert_eq!(must_run(transaction.remove_xattr(node, &name)), Some(value));
+        must_run(transaction.commit());
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),

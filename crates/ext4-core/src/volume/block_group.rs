@@ -216,7 +216,7 @@ impl ClusterReferenceIndex {
             };
             let context = volume.extent_tree_context(&inode);
             let tree = ExtentTree::load_inode_tree(
-                &root,
+                root,
                 volume.superblock.block_size(),
                 &mut volume.device,
                 context,

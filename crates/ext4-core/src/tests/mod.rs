@@ -16,6 +16,8 @@
 )]
 
 use alloc::{vec, vec::Vec};
+use core::future::Future;
+use core::task::{Context, Poll, Waker};
 
 use crate::disk::block::{BlockAddress, BlockSize, ByteOffset, DeviceLength};
 use crate::disk::io::{BlockSource, BlockStorage};
@@ -125,8 +127,100 @@ const JBD2_CHECKSUM_CRC32C: u8 = 4;
 const COMPAT_ORPHAN_FILE: u32 = 0x1000;
 const EXTERNAL_JOURNAL_SUPERBLOCK_OFFSET: usize = 2048;
 
+/// Runs an in-memory I/O continuation that must not depend on an external wake source.
+///
+/// # Panics
+///
+/// Panics when the continuation suspends instead of completing from in-memory data.
+fn run<F: Future>(future: F) -> F::Output {
+    let mut future = core::pin::pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(output) => output,
+        Poll::Pending => panic!("in-memory continuation unexpectedly suspended"),
+    }
+}
+
+/// Read-only in-memory storage used by parser and traversal tests.
+#[derive(Clone, Copy, Debug)]
+struct MemoryBlockSource<'a> {
+    /// Whole device image exposed through checked random-access reads.
+    bytes: &'a [u8],
+}
+
+impl<'a> MemoryBlockSource<'a> {
+    /// Creates a read-only in-memory storage image.
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+}
+
+impl BlockSource for MemoryBlockSource<'_> {
+    fn len(&self) -> DeviceLength {
+        DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
+    }
+
+    async fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(out.len()).ok_or(Error::DeviceRange)?;
+        let source = self.bytes.get(start..end).ok_or(Error::DeviceRange)?;
+        out.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+/// Mutable in-memory storage used by journaled mutation tests.
+#[derive(Debug)]
+struct MemoryBlockStorage<'a> {
+    /// Whole device image exposed through checked random-access I/O.
+    bytes: &'a mut [u8],
+}
+
+impl<'a> MemoryBlockStorage<'a> {
+    /// Creates a mutable in-memory storage image.
+    const fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes }
+    }
+}
+
+impl BlockSource for MemoryBlockStorage<'_> {
+    fn len(&self) -> DeviceLength {
+        DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
+    }
+
+    async fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(out.len()).ok_or(Error::DeviceRange)?;
+        let source = self.bytes.get(start..end).ok_or(Error::DeviceRange)?;
+        out.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+impl BlockStorage for MemoryBlockStorage<'_> {
+    async fn write_exact_at(&mut self, offset: ByteOffset, bytes: &[u8]) -> crate::Result<()> {
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(bytes.len()).ok_or(Error::DeviceRange)?;
+        let target = self.bytes.get_mut(start..end).ok_or(Error::DeviceRange)?;
+        target.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> impl Future<Output = crate::Result<()>> + Send + '_ {
+        core::future::ready(Ok(()))
+    }
+}
+
 fn inode(value: u32) -> InodeId {
     must(InodeId::try_from(value))
+}
+
+/// Runs one in-memory continuation and unwraps its ext4 result.
+fn must_run<F, T>(future: F) -> T
+where
+    F: Future<Output = crate::Result<T>>,
+{
+    must(run(future))
 }
 
 trait MountedVolumeTestExt {
@@ -134,26 +228,26 @@ trait MountedVolumeTestExt {
     /// # Errors
     ///
     /// Returns an error when the inode cannot be loaded as a regular file.
-    fn load_file(&self, id: FileNodeId) -> crate::Result<FileNode>;
+    fn load_file(&mut self, id: FileNodeId) -> crate::Result<FileNode>;
 
     /// Loads a typed directory node through the mounted-volume variant under test.
     /// # Errors
     ///
     /// Returns an error when the inode cannot be loaded as a directory.
-    fn load_directory(&self, id: DirectoryNodeId) -> crate::Result<DirectoryNode>;
+    fn load_directory(&mut self, id: DirectoryNodeId) -> crate::Result<DirectoryNode>;
 
     /// Loads a typed symlink node through the mounted-volume variant under test.
     /// # Errors
     ///
     /// Returns an error when the inode cannot be loaded as a symlink.
-    fn load_symlink(&self, id: crate::SymlinkNodeId) -> crate::Result<SymlinkNode>;
+    fn load_symlink(&mut self, id: crate::SymlinkNodeId) -> crate::Result<SymlinkNode>;
 
     /// Reads file bytes through the mounted-volume variant under test.
     /// # Errors
     ///
     /// Returns an error when file extent traversal or backing-device reads fail.
     fn read_file(
-        &self,
+        &mut self,
         file: &FileNode,
         offset: FileOffset,
         out: &mut [u8],
@@ -163,20 +257,20 @@ trait MountedVolumeTestExt {
     /// # Errors
     ///
     /// Returns an error when directory traversal or entry validation fails.
-    fn read_directory(&self, directory: &DirectoryNode) -> crate::Result<Vec<DirectoryEntry>>;
+    fn read_directory(&mut self, directory: &DirectoryNode) -> crate::Result<Vec<DirectoryEntry>>;
 
     /// Reads a symlink target through the mounted-volume variant under test.
     /// # Errors
     ///
     /// Returns an error when symlink target bytes cannot be read.
-    fn read_symlink(&self, symlink: &SymlinkNode) -> crate::Result<Vec<u8>>;
+    fn read_symlink(&mut self, symlink: &SymlinkNode) -> crate::Result<Vec<u8>>;
 
     /// Performs exact child lookup through the mounted-volume variant under test.
     /// # Errors
     ///
     /// Returns an error when the parent cannot be enumerated.
     fn lookup_child(
-        &self,
+        &mut self,
         parent: &DirectoryNode,
         name: &Ext4Name,
     ) -> crate::Result<crate::ChildLookup>;
@@ -187,110 +281,110 @@ trait MountedVolumeTestExt {
     /// Returns an error when the parent cannot be enumerated or the Windows projection is
     /// ambiguous.
     fn lookup_windows_child(
-        &self,
+        &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> crate::Result<crate::ChildLookup>;
 }
 
 impl<D: BlockSource, N> MountedVolumeTestExt for ReadOnlyVolume<D, N> {
-    fn load_file(&self, id: FileNodeId) -> crate::Result<FileNode> {
-        Self::load_file(self, id)
+    fn load_file(&mut self, id: FileNodeId) -> crate::Result<FileNode> {
+        run(Self::load_file(self, id))
     }
 
-    fn load_directory(&self, id: DirectoryNodeId) -> crate::Result<DirectoryNode> {
-        Self::load_directory(self, id)
+    fn load_directory(&mut self, id: DirectoryNodeId) -> crate::Result<DirectoryNode> {
+        run(Self::load_directory(self, id))
     }
 
-    fn load_symlink(&self, id: crate::SymlinkNodeId) -> crate::Result<SymlinkNode> {
-        Self::load_symlink(self, id)
+    fn load_symlink(&mut self, id: crate::SymlinkNodeId) -> crate::Result<SymlinkNode> {
+        run(Self::load_symlink(self, id))
     }
 
     fn read_file(
-        &self,
+        &mut self,
         file: &FileNode,
         offset: FileOffset,
         out: &mut [u8],
     ) -> crate::Result<crate::ReadBytes> {
-        Self::read_file(self, file, offset, out)
+        run(Self::read_file(self, file, offset, out))
     }
 
-    fn read_directory(&self, directory: &DirectoryNode) -> crate::Result<Vec<DirectoryEntry>> {
-        Self::read_directory(self, directory)
+    fn read_directory(&mut self, directory: &DirectoryNode) -> crate::Result<Vec<DirectoryEntry>> {
+        run(Self::read_directory(self, directory))
     }
 
-    fn read_symlink(&self, symlink: &SymlinkNode) -> crate::Result<Vec<u8>> {
-        Self::read_symlink(self, symlink)
+    fn read_symlink(&mut self, symlink: &SymlinkNode) -> crate::Result<Vec<u8>> {
+        run(Self::read_symlink(self, symlink))
     }
 
     fn lookup_child(
-        &self,
+        &mut self,
         parent: &DirectoryNode,
         name: &Ext4Name,
     ) -> crate::Result<crate::ChildLookup> {
-        Self::lookup_child(self, parent, name)
+        run(Self::lookup_child(self, parent, name))
     }
 
     fn lookup_windows_child(
-        &self,
+        &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> crate::Result<crate::ChildLookup> {
-        Self::lookup_windows_child(self, parent, requested)
+        run(Self::lookup_windows_child(self, parent, requested))
     }
 }
 
 impl<D: BlockSource, N, J> MountedVolumeTestExt for JournaledVolume<D, N, J> {
-    fn load_file(&self, id: FileNodeId) -> crate::Result<FileNode> {
-        Self::load_file(self, id)
+    fn load_file(&mut self, id: FileNodeId) -> crate::Result<FileNode> {
+        run(Self::load_file(self, id))
     }
 
-    fn load_directory(&self, id: DirectoryNodeId) -> crate::Result<DirectoryNode> {
-        Self::load_directory(self, id)
+    fn load_directory(&mut self, id: DirectoryNodeId) -> crate::Result<DirectoryNode> {
+        run(Self::load_directory(self, id))
     }
 
-    fn load_symlink(&self, id: crate::SymlinkNodeId) -> crate::Result<SymlinkNode> {
-        Self::load_symlink(self, id)
+    fn load_symlink(&mut self, id: crate::SymlinkNodeId) -> crate::Result<SymlinkNode> {
+        run(Self::load_symlink(self, id))
     }
 
     fn read_file(
-        &self,
+        &mut self,
         file: &FileNode,
         offset: FileOffset,
         out: &mut [u8],
     ) -> crate::Result<crate::ReadBytes> {
-        Self::read_file(self, file, offset, out)
+        run(Self::read_file(self, file, offset, out))
     }
 
-    fn read_directory(&self, directory: &DirectoryNode) -> crate::Result<Vec<DirectoryEntry>> {
-        Self::read_directory(self, directory)
+    fn read_directory(&mut self, directory: &DirectoryNode) -> crate::Result<Vec<DirectoryEntry>> {
+        run(Self::read_directory(self, directory))
     }
 
-    fn read_symlink(&self, symlink: &SymlinkNode) -> crate::Result<Vec<u8>> {
-        Self::read_symlink(self, symlink)
+    fn read_symlink(&mut self, symlink: &SymlinkNode) -> crate::Result<Vec<u8>> {
+        run(Self::read_symlink(self, symlink))
     }
 
     fn lookup_child(
-        &self,
+        &mut self,
         parent: &DirectoryNode,
         name: &Ext4Name,
     ) -> crate::Result<crate::ChildLookup> {
-        Self::lookup_child(self, parent, name)
+        run(Self::lookup_child(self, parent, name))
     }
 
     fn lookup_windows_child(
-        &self,
+        &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> crate::Result<crate::ChildLookup> {
-        Self::lookup_windows_child(self, parent, requested)
+        run(Self::lookup_windows_child(self, parent, requested))
     }
 }
 
 /// # Panics
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
-fn node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> NodeId {
+fn node_id<V: MountedVolumeTestExt>(volume: &mut V, inode_id: InodeId) -> NodeId {
     if inode_id == InodeId::ROOT {
         return NodeId::Directory(DirectoryNodeId::ROOT);
     }
@@ -325,21 +419,21 @@ fn node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> NodeId {
 /// # Panics
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
-fn file_node<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> FileNode {
+fn file_node<V: MountedVolumeTestExt>(volume: &mut V, inode_id: u32) -> FileNode {
     let NodeId::File(file_id) = node_id(volume, inode(inode_id)) else {
         panic!("expected file node");
     };
     must(volume.load_file(file_id))
 }
 
-fn file_node_id<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> FileNodeId {
+fn file_node_id<V: MountedVolumeTestExt>(volume: &mut V, inode_id: u32) -> FileNodeId {
     file_node(volume, inode_id).id()
 }
 
 /// # Panics
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
-fn directory_node<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> DirectoryNode {
+fn directory_node<V: MountedVolumeTestExt>(volume: &mut V, inode_id: InodeId) -> DirectoryNode {
     let NodeId::Directory(directory_id) = node_id(volume, inode_id) else {
         panic!("expected directory node");
     };
@@ -349,7 +443,7 @@ fn directory_node<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> Dir
 /// # Panics
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
-fn symlink_node<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> SymlinkNode {
+fn symlink_node<V: MountedVolumeTestExt>(volume: &mut V, inode_id: u32) -> SymlinkNode {
     let NodeId::Symlink(symlink_id) = node_id(volume, inode(inode_id)) else {
         panic!("expected symlink node");
     };
@@ -357,7 +451,7 @@ fn symlink_node<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> SymlinkNo
 }
 
 fn read_file<V: MountedVolumeTestExt>(
-    volume: &V,
+    volume: &mut V,
     inode_id: u32,
     offset: u64,
     out: &mut [u8],
@@ -366,7 +460,10 @@ fn read_file<V: MountedVolumeTestExt>(
     must(volume.read_file(&file, FileOffset::from_bytes(offset), out)).as_usize()
 }
 
-fn read_directory<V: MountedVolumeTestExt>(volume: &V, inode_id: InodeId) -> Vec<DirectoryEntry> {
+fn read_directory<V: MountedVolumeTestExt>(
+    volume: &mut V,
+    inode_id: InodeId,
+) -> Vec<DirectoryEntry> {
     let directory = directory_node(volume, inode_id);
     must(volume.read_directory(&directory))
 }
@@ -383,13 +480,13 @@ fn directory_entry_name(entries: &[DirectoryEntry], inode_id: InodeId) -> Ext4Na
     panic!("expected directory entry");
 }
 
-fn read_symlink<V: MountedVolumeTestExt>(volume: &V, inode_id: u32) -> Vec<u8> {
+fn read_symlink<V: MountedVolumeTestExt>(volume: &mut V, inode_id: u32) -> Vec<u8> {
     let symlink = symlink_node(volume, inode_id);
     must(volume.read_symlink(&symlink))
 }
 
 fn lookup_ext4<V: MountedVolumeTestExt>(
-    volume: &V,
+    volume: &mut V,
     parent: InodeId,
     name: &[u8],
 ) -> crate::ChildLookup {
@@ -399,7 +496,7 @@ fn lookup_ext4<V: MountedVolumeTestExt>(
 }
 
 fn lookup_windows<V: MountedVolumeTestExt>(
-    volume: &V,
+    volume: &mut V,
     parent: InodeId,
     name: &[u16],
 ) -> crate::ChildLookup {
@@ -409,7 +506,7 @@ fn lookup_windows<V: MountedVolumeTestExt>(
 }
 
 fn lookup_ext4_inode<V: MountedVolumeTestExt>(
-    volume: &V,
+    volume: &mut V,
     parent: InodeId,
     name: &[u8],
 ) -> Option<InodeId> {
@@ -420,7 +517,7 @@ fn lookup_ext4_inode<V: MountedVolumeTestExt>(
 }
 
 fn lookup_windows_inode<V: MountedVolumeTestExt>(
-    volume: &V,
+    volume: &mut V,
     parent: InodeId,
     name: &[u16],
 ) -> Option<InodeId> {
@@ -431,24 +528,24 @@ fn lookup_windows_inode<V: MountedVolumeTestExt>(
 }
 
 fn transaction_file<D: BlockStorage, N: FscryptNonceGenerator, J>(
-    transaction: &JournalTransaction<'_, D, N, J>,
+    transaction: &mut JournalTransaction<'_, D, N, J>,
     file_id: FileNodeId,
 ) -> TransactionFile {
-    must(transaction.file(file_id))
+    must(run(transaction.file(file_id)))
 }
 
 fn transaction_directory<D: BlockStorage, N: FscryptNonceGenerator, J>(
-    transaction: &JournalTransaction<'_, D, N, J>,
+    transaction: &mut JournalTransaction<'_, D, N, J>,
     directory_id: DirectoryNodeId,
 ) -> TransactionDirectory {
-    must(transaction.directory(directory_id))
+    must(run(transaction.directory(directory_id)))
 }
 
 fn transaction_node<D: BlockStorage, N: FscryptNonceGenerator, J>(
-    transaction: &JournalTransaction<'_, D, N, J>,
+    transaction: &mut JournalTransaction<'_, D, N, J>,
     id: NodeId,
 ) -> crate::TransactionNode {
-    must(transaction.node(id))
+    must(run(transaction.node(id)))
 }
 
 fn test_owner() -> Ext4Owner {
@@ -572,7 +669,7 @@ fn write_file<D: BlockStorage, N: FscryptNonceGenerator, J>(
     bytes: &[u8],
 ) {
     let file = transaction_file(transaction, file_id);
-    must(transaction.write_file_range(file, FileOffset::from_bytes(offset), bytes));
+    must_run(transaction.write_file_range(file, FileOffset::from_bytes(offset), bytes));
 }
 
 fn extend_file<D: BlockStorage, N: FscryptNonceGenerator, J>(
@@ -581,7 +678,7 @@ fn extend_file<D: BlockStorage, N: FscryptNonceGenerator, J>(
     new_size: u64,
 ) {
     let file = transaction_file(transaction, file_id);
-    must(transaction.extend_file(file, FileSize::from_bytes(new_size)));
+    must_run(transaction.extend_file(file, FileSize::from_bytes(new_size)));
 }
 
 fn truncate_file<D: BlockStorage, N: FscryptNonceGenerator, J>(
@@ -590,7 +687,7 @@ fn truncate_file<D: BlockStorage, N: FscryptNonceGenerator, J>(
     new_size: u64,
 ) {
     let file = transaction_file(transaction, file_id);
-    must(transaction.truncate_file(file, FileSize::from_bytes(new_size)));
+    must_run(transaction.truncate_file(file, FileSize::from_bytes(new_size)));
 }
 mod bigalloc;
 mod fixtures;

@@ -2223,11 +2223,9 @@ impl<F: BlockStorage, J: BlockStorage> JournalIo for ExternalJournalIo<'_, F, J>
         self.filesystem.write_exact_at(offset, bytes)
     }
 
-    fn flush_all(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
-        async move {
-            self.journal.flush().await?;
-            self.filesystem.flush().await
-        }
+    async fn flush_all(&mut self) -> Result<()> {
+        self.journal.flush().await?;
+        self.filesystem.flush().await
     }
 }
 

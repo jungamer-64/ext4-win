@@ -1150,7 +1150,7 @@ impl BlockSource for FailOneWriteAt<'_> {
         DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
     }
 
-    fn read_exact_at(&self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
+    async fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
         let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
         let end = start.checked_add(out.len()).ok_or(Error::DeviceRange)?;
         let source = self.bytes.get(start..end).ok_or(Error::DeviceRange)?;
@@ -1160,7 +1160,7 @@ impl BlockSource for FailOneWriteAt<'_> {
 }
 
 impl BlockStorage for FailOneWriteAt<'_> {
-    fn write_exact_at(&mut self, offset: ByteOffset, bytes: &[u8]) -> crate::Result<()> {
+    async fn write_exact_at(&mut self, offset: ByteOffset, bytes: &[u8]) -> crate::Result<()> {
         if offset == self.fail_offset && !self.failed {
             self.failed = true;
             return Err(Error::DeviceRange);
@@ -1172,8 +1172,8 @@ impl BlockStorage for FailOneWriteAt<'_> {
         Ok(())
     }
 
-    fn flush(&mut self) -> crate::Result<()> {
-        Ok(())
+    fn flush(&mut self) -> impl Future<Output = crate::Result<()>> + Send + '_ {
+        core::future::ready(Ok(()))
     }
 }
 
