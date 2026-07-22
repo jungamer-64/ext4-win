@@ -1195,14 +1195,14 @@ impl CurrentIrpStackLocation {
             // IRP_MN_QUERY_DIRECTORY, where QueryDirectory is active.
             stack.Parameters.QueryDirectory
         };
-        let pattern = match NonNull::new(query.FileName) {
-            Some(file_name) => DirectoryPatternInput::Name(file_name),
-            None => DirectoryPatternInput::All,
-        };
+        if !query.FileName.is_null() {
+            return Err(DriverError::InvalidParameter);
+        }
+        let pattern = DirectoryPatternInput::All;
         let cursor_position = if stack_flag(stack.Flags, wdk_sys::SL_INDEX_SPECIFIED) {
             DirectoryCursorPosition::Index(DirectoryEntryIndex(query.FileIndex))
         } else if stack_flag(stack.Flags, wdk_sys::SL_RESTART_SCAN)
-            || matches!(pattern, DirectoryPatternInput::Name(_))
+            
         {
             DirectoryCursorPosition::Restart
         } else {
@@ -1264,13 +1264,7 @@ impl CurrentIrpStackLocation {
         };
         let ea_list_length = IrpBufferLength::from_ulong(query.EaListLength)?;
         let selection = if !ea_list_length.is_empty() {
-            let Some(address) = NonNull::new(query.EaList.cast::<u8>()) else {
-                return Err(DriverError::InvalidParameter);
-            };
-            EaSelection::Names {
-                address,
-                length: ea_list_length,
-            }
+            return Err(DriverError::InvalidParameter);
         } else if stack_flag(stack.Flags, wdk_sys::SL_INDEX_SPECIFIED) {
             EaSelection::Index(EaEntryIndex::from_u32(query.EaIndex))
         } else {
@@ -1661,8 +1655,6 @@ pub(crate) enum DirectoryCursorPosition {
 pub(crate) enum DirectoryPatternInput {
     /// No filename pattern was supplied.
     All,
-    /// Caller supplied a `UNICODE_STRING` filename pattern.
-    Name(NonNull<wdk_sys::UNICODE_STRING>),
 }
 
 /// Directory entry emission cardinality requested by the caller.
@@ -1750,13 +1742,6 @@ impl EaEntryIndex {
 pub(crate) enum EaSelection {
     /// Return every EA associated with the opened file.
     All,
-    /// Return only names listed in the caller's `FILE_GET_EA_INFORMATION` buffer.
-    Names {
-        /// First byte of the caller's name list.
-        address: NonNull<u8>,
-        /// Byte length of the caller's name list.
-        length: IrpBufferLength,
-    },
     /// Return the entry at a caller-supplied one-based index, then continue scanning.
     Index(EaEntryIndex),
 }
