@@ -5,7 +5,7 @@ use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP};
 use crate::{
     irp::{
         DeviceExecutor, DirectoryControlMinorFunction, DispatchMajor, DispatchTarget,
-        IrpCompletion, OwnedIrp, PreparedRequestKind, ReceivedIrp,
+        IrpCompletion, OwnedIrp, PreparedRequest, ReceivedIrp,
     },
     kernel::status::{DriverError, DriverResult},
 };
@@ -338,17 +338,17 @@ fn dispatch_file_lock(received: ReceivedIrp) -> NTSTATUS {
     )
 )]
 pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
-    let prepared = owned.prepared_kind();
-    let _status = match prepared {
-        PreparedRequestKind::Major(DispatchMajor::Create) => {
+    let _status = match owned.prepared_request() {
+        PreparedRequest::Create => {
             let result = crate::request::create::execute(owned.request()).await;
             owned.complete_create_result(result)
         }
-        PreparedRequestKind::FileSystemControl(minor) => {
+        PreparedRequest::FileSystemControl(minor) => {
+            let minor = *minor;
             let result = crate::request::file_system_control::execute(owned.request(), minor).await;
             owned.complete_result(result)
         }
-        PreparedRequestKind::DirectoryControl(minor) => match minor {
+        PreparedRequest::DirectoryControl(minor) => match *minor {
             DirectoryControlMinorFunction::QueryDirectory => {
                 let target = owned.target();
                 owned.complete_result(crate::request::file_info::query_directory(target).await)
@@ -360,17 +360,55 @@ pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
                 owned.complete_result(Err(DriverError::InvalidDeviceRequest))
             }
         },
-        PreparedRequestKind::Major(DispatchMajor::QuerySecurity) => {
+        PreparedRequest::QuerySecurity { .. } => {
             let result = crate::request::security::query(owned.request()).await;
             owned.complete_result(result)
         }
-        PreparedRequestKind::Major(DispatchMajor::SetSecurity) => {
+        PreparedRequest::SetSecurity { .. } => {
             let result = crate::request::security::set(owned.request()).await;
             owned.complete_result(result)
         }
-        PreparedRequestKind::Major(major) => {
+        PreparedRequest::Read => {
             let target = owned.target();
-            owned.complete_result(execute_major(major, target).await)
+            owned.complete_result(execute_major(DispatchMajor::Read, target).await)
+        }
+        PreparedRequest::Write => {
+            let target = owned.target();
+            owned.complete_result(execute_major(DispatchMajor::Write, target).await)
+        }
+        PreparedRequest::QueryInformation => {
+            let target = owned.target();
+            owned.complete_result(execute_major(DispatchMajor::QueryInformation, target).await)
+        }
+        PreparedRequest::SetInformation => {
+            let target = owned.target();
+            owned.complete_result(execute_major(DispatchMajor::SetInformation, target).await)
+        }
+        PreparedRequest::QueryVolumeInformation => {
+            let target = owned.target();
+            owned.complete_result(
+                execute_major(DispatchMajor::QueryVolumeInformation, target).await,
+            )
+        }
+        PreparedRequest::SetVolumeInformation => {
+            let target = owned.target();
+            owned.complete_result(execute_major(DispatchMajor::SetVolumeInformation, target).await)
+        }
+        PreparedRequest::FlushBuffers => {
+            let target = owned.target();
+            owned.complete_result(execute_major(DispatchMajor::FlushBuffers, target).await)
+        }
+        PreparedRequest::QueryEa => {
+            let target = owned.target();
+            owned.complete_result(execute_major(DispatchMajor::QueryEa, target).await)
+        }
+        PreparedRequest::SetEa => {
+            let target = owned.target();
+            owned.complete_result(execute_major(DispatchMajor::SetEa, target).await)
+        }
+        PreparedRequest::Shutdown => {
+            let target = owned.target();
+            owned.complete_result(execute_major(DispatchMajor::Shutdown, target).await)
         }
     };
 }
