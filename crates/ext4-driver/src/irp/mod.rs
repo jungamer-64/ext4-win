@@ -11,7 +11,7 @@ mod capture;
 mod executor;
 
 use capture::QueueContext;
-pub(crate) use capture::CapturedQuerySecurityOutput;
+pub(crate) use capture::{CapturedQuerySecurityOutput, PreparedRequest};
 pub(crate) use executor::DeviceExecutor;
 
 #[cfg(not(test))]
@@ -646,6 +646,11 @@ impl OwnedIrp {
     /// Borrows this pending IRP as an active request without releasing completion authority.
     pub(crate) const fn request(&mut self) -> PendingIrpLease<'_> {
         PendingIrpLease { owner: self }
+    }
+
+    /// Returns the complete request variant sealed before queue insertion.
+    pub(crate) fn prepared_request(&self) -> &crate::irp::capture::PreparedRequest {
+        self.context.prepared()
     }
 
     /// Completes the IRP through the I/O Manager.

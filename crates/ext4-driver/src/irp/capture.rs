@@ -74,6 +74,11 @@ impl QueueContext {
         context.is_null() || self.cancellation_key.matches(context)
     }
 
+    /// Returns the request variant sealed before the IRP entered the queue.
+    pub(super) const fn prepared(&self) -> &PreparedRequest {
+        &self.prepared
+    }
+
     /// Borrows the opaque query-security output target.
     /// # Errors
     ///
@@ -114,7 +119,7 @@ impl QueueContext {
 
 /// Complete set of requests accepted by the asynchronous device lane.
 #[derive(Debug)]
-enum PreparedRequest {
+pub(crate) enum PreparedRequest {
     /// Create/open request.
     Create,
     /// Read request.
@@ -459,7 +464,7 @@ impl Drop for CapturedQuerySecurityOutput {
 
 /// Naturally aligned, C-owned set-security snapshot validated after its bounded copy.
 #[derive(Debug)]
-struct CapturedSetSecurityDescriptor {
+pub(crate) struct CapturedSetSecurityDescriptor {
     /// First byte of the native nonpaged allocation.
     address: NonNull<u8>,
     /// Exact logical descriptor length validated by the native boundary.
@@ -568,7 +573,7 @@ fn ensure_native_success(status: NTSTATUS) -> Result<(), IrpCompletion> {
 mod tests {
     use core::ffi::c_void;
 
-    use super::{PreparedRequestKind, QueueContext};
+    use super::{PreparedRequest, QueueContext};
     use crate::irp::{
         DirectoryControlMinorFunction, DispatchMajor, DispatchTarget,
         FileSystemControlMinorFunction, IrpCompletion, KernelIrp,
@@ -610,10 +615,7 @@ mod tests {
             if let Ok(context) = context {
                 stack.MajorFunction = u8::try_from(wdk_sys::IRP_MJ_WRITE).unwrap_or_default();
                 assert_eq!(u32::from(stack.MajorFunction), wdk_sys::IRP_MJ_WRITE);
-                assert_eq!(
-                    context.kind(),
-                    PreparedRequestKind::Major(DispatchMajor::Read)
-                );
+                assert!(matches!(context.prepared(), PreparedRequest::Read));
             }
         }
 
@@ -632,12 +634,12 @@ mod tests {
             if let Ok(context) = context {
                 stack.MinorFunction = u8::MAX;
                 assert_eq!(stack.MinorFunction, u8::MAX);
-                assert_eq!(
-                    context.kind(),
-                    PreparedRequestKind::DirectoryControl(
+                assert!(matches!(
+                    context.prepared(),
+                    PreparedRequest::DirectoryControl(
                         DirectoryControlMinorFunction::QueryDirectory
                     )
-                );
+                ));
             }
         }
 
@@ -655,12 +657,12 @@ mod tests {
             if let Ok(context) = context {
                 stack.MinorFunction = u8::MAX;
                 assert_eq!(stack.MinorFunction, u8::MAX);
-                assert_eq!(
-                    context.kind(),
-                    PreparedRequestKind::FileSystemControl(
+                assert!(matches!(
+                    context.prepared(),
+                    PreparedRequest::FileSystemControl(
                         FileSystemControlMinorFunction::MountVolume
                     )
-                );
+                ));
             }
         }
     }
@@ -735,10 +737,7 @@ mod tests {
                 // SAFETY: This single-threaded test models a held CSQ lock until the take below.
                 kernel_irp.queue_context()
             };
-            assert_eq!(
-                queued.kind(),
-                PreparedRequestKind::Major(DispatchMajor::Create)
-            );
+            assert!(matches!(queued.prepared(), PreparedRequest::Create));
             drop(kernel_irp.take_queue_context());
 
             let overlay = unsafe {
