@@ -11,7 +11,7 @@ mod capture;
 mod executor;
 
 use capture::QueueContext;
-pub(crate) use capture::{CapturedQuerySecurityOutput, PreparedRequestKind};
+pub(crate) use capture::CapturedQuerySecurityOutput;
 pub(crate) use executor::DeviceExecutor;
 
 #[cfg(not(test))]
@@ -641,11 +641,6 @@ impl OwnedIrp {
     )]
     pub(crate) const fn target(&self) -> DispatchTarget {
         self.target
-    }
-
-    /// Returns the execution selector sealed before queue insertion.
-    pub(crate) const fn prepared_kind(&self) -> PreparedRequestKind {
-        self.context.kind()
     }
 
     /// Borrows this pending IRP as an active request without releasing completion authority.

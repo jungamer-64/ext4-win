@@ -69,11 +69,6 @@ impl QueueContext {
         })
     }
 
-    /// Returns the execution classification sealed at queue entry.
-    pub(super) const fn kind(&self) -> PreparedRequestKind {
-        self.prepared.kind()
-    }
-
     /// Returns whether this queued request belongs to a cleanup cancellation identity.
     pub(super) fn matches_cancellation_context(&self, context: PVOID) -> bool {
         context.is_null() || self.cancellation_key.matches(context)
@@ -115,17 +110,6 @@ impl QueueContext {
             _ => Err(DriverError::InternalInvariantViolation),
         }
     }
-}
-
-/// Copyable execution selector derived from a fully prepared queued request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PreparedRequestKind {
-    /// One queued major function without a minor-function branch.
-    Major(DispatchMajor),
-    /// Directory-control request with its minor function already classified.
-    DirectoryControl(DirectoryControlMinorFunction),
-    /// File-system-control request with its minor function already classified.
-    FileSystemControl(FileSystemControlMinorFunction),
 }
 
 /// Complete set of requests accepted by the asynchronous device lane.
@@ -250,30 +234,6 @@ impl PreparedRequest {
         }
     }
 
-    /// Projects the request into the copyable worker dispatch selector.
-    const fn kind(&self) -> PreparedRequestKind {
-        match self {
-            Self::Create => PreparedRequestKind::Major(DispatchMajor::Create),
-            Self::Read => PreparedRequestKind::Major(DispatchMajor::Read),
-            Self::Write => PreparedRequestKind::Major(DispatchMajor::Write),
-            Self::QueryInformation => PreparedRequestKind::Major(DispatchMajor::QueryInformation),
-            Self::SetInformation => PreparedRequestKind::Major(DispatchMajor::SetInformation),
-            Self::QueryVolumeInformation => {
-                PreparedRequestKind::Major(DispatchMajor::QueryVolumeInformation)
-            }
-            Self::SetVolumeInformation => {
-                PreparedRequestKind::Major(DispatchMajor::SetVolumeInformation)
-            }
-            Self::DirectoryControl(minor) => PreparedRequestKind::DirectoryControl(*minor),
-            Self::FileSystemControl(minor) => PreparedRequestKind::FileSystemControl(*minor),
-            Self::FlushBuffers => PreparedRequestKind::Major(DispatchMajor::FlushBuffers),
-            Self::QueryEa => PreparedRequestKind::Major(DispatchMajor::QueryEa),
-            Self::SetEa => PreparedRequestKind::Major(DispatchMajor::SetEa),
-            Self::QuerySecurity { .. } => PreparedRequestKind::Major(DispatchMajor::QuerySecurity),
-            Self::SetSecurity { .. } => PreparedRequestKind::Major(DispatchMajor::SetSecurity),
-            Self::Shutdown => PreparedRequestKind::Major(DispatchMajor::Shutdown),
-        }
-    }
 }
 
 /// Stable FILE_OBJECT identity used by cleanup while the IRP is queue-owned.
