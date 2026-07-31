@@ -107,6 +107,9 @@ struct QueueSlotReservation {
 
 impl QueueSlotReservation {
     /// Reserves one slot without allowing the counter to exceed the per-device bound.
+    /// # Errors
+    ///
+    /// Returns insufficient resources when this device already owns the maximum queue depth.
     fn acquire(queued_requests: &AtomicUsize) -> DriverResult<Self> {
         queued_requests
             .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
