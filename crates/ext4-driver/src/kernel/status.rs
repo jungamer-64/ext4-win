@@ -31,6 +31,10 @@ pub(crate) enum DriverError {
     InsufficientResources,
     /// Access is denied by the current FSD policy.
     AccessDenied,
+    /// The mounted volume has entered its terminal logical dismount state.
+    VolumeDismounted,
+    /// The caller does not own a volume lock that can be released.
+    NotLocked,
     /// Caller output buffer cannot hold the required fixed payload.
     BufferTooSmall,
     /// Caller output buffer holds a partial variable payload.
@@ -93,6 +97,8 @@ impl DriverError {
             Self::InternalInvariantViolation => STATUS_INTERNAL_ERROR,
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,
+            Self::VolumeDismounted => ntstatus(0xC000_026E),
+            Self::NotLocked => ntstatus(0xC000_002A),
             Self::BufferTooSmall => STATUS_BUFFER_TOO_SMALL,
             Self::BufferOverflow => STATUS_BUFFER_OVERFLOW,
             Self::InvalidInfoClass => STATUS_INVALID_INFO_CLASS,

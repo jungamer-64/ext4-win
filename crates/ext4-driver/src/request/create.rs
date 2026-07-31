@@ -163,6 +163,7 @@ async fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<Crea
         // active filesystem operation at a time and therefore grants this request the unique lane.
         VolumeControlBlock::claim_operation_lane(mounted_volume)
     };
+    operations.authorize_create()?;
     match resolve_target(
         target,
         operations.lane_mut(),

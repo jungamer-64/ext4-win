@@ -1979,6 +1979,14 @@ const MOUNT_VOLUME_MINOR_FUNCTION: u32 = 1;
 /// Decoded user FSCTL code selected by the caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FsControlCode {
+    /// Windows `FSCTL_LOCK_VOLUME`.
+    LockVolume,
+    /// Windows `FSCTL_UNLOCK_VOLUME`.
+    UnlockVolume,
+    /// Windows `FSCTL_DISMOUNT_VOLUME`.
+    DismountVolume,
+    /// Windows `FSCTL_IS_VOLUME_MOUNTED`.
+    IsVolumeMounted,
     /// Windows `FSCTL_GET_REPARSE_POINT`.
     GetReparsePoint,
     /// Windows `FSCTL_SET_REPARSE_POINT`.
@@ -2002,6 +2010,10 @@ impl FsControlCode {
     /// Returns an error when `value` is not one of the supported Windows or ext4win FSCTL codes.
     fn from_raw(value: wdk_sys::ULONG) -> Result<Self, DriverError> {
         match value {
+            FSCTL_LOCK_VOLUME => Ok(Self::LockVolume),
+            FSCTL_UNLOCK_VOLUME => Ok(Self::UnlockVolume),
+            FSCTL_DISMOUNT_VOLUME => Ok(Self::DismountVolume),
+            FSCTL_IS_VOLUME_MOUNTED => Ok(Self::IsVolumeMounted),
             FSCTL_GET_REPARSE_POINT => Ok(Self::GetReparsePoint),
             FSCTL_SET_REPARSE_POINT => Ok(Self::SetReparsePoint),
             FSCTL_DELETE_REPARSE_POINT => Ok(Self::DeleteReparsePoint),
@@ -2014,6 +2026,14 @@ impl FsControlCode {
     }
 }
 
+/// `FSCTL_LOCK_VOLUME`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 6, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+const FSCTL_LOCK_VOLUME: wdk_sys::ULONG = buffered_file_system_control(6);
+/// `FSCTL_UNLOCK_VOLUME`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 7, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+const FSCTL_UNLOCK_VOLUME: wdk_sys::ULONG = buffered_file_system_control(7);
+/// `FSCTL_DISMOUNT_VOLUME`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 8, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+const FSCTL_DISMOUNT_VOLUME: wdk_sys::ULONG = buffered_file_system_control(8);
+/// `FSCTL_IS_VOLUME_MOUNTED`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 10, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+const FSCTL_IS_VOLUME_MOUNTED: wdk_sys::ULONG = buffered_file_system_control(10);
 /// `FSCTL_GET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_GET_REPARSE_POINT: wdk_sys::ULONG = 589_992;
 /// `FSCTL_SET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
@@ -2036,22 +2056,23 @@ const EXT4WIN_GET_ENCRYPTION_KEY_STATUS_FUNCTION: wdk_sys::ULONG = 0x902;
 /// ext4win private function code for enabling fs-verity.
 const EXT4WIN_ENABLE_VERITY_FUNCTION: wdk_sys::ULONG = 0x903;
 
-/// Builds a Windows `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, function, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
-const fn ext4win_fsctl(function: wdk_sys::ULONG) -> wdk_sys::ULONG {
+/// Builds a buffered, unrestricted Windows filesystem control code.
+const fn buffered_file_system_control(function: wdk_sys::ULONG) -> wdk_sys::ULONG {
     (FILE_DEVICE_FILE_SYSTEM << 16) | (FILE_ANY_ACCESS << 14) | (function << 2) | METHOD_BUFFERED
 }
 
 /// ext4win FSCTL carrying Linux `struct fscrypt_add_key_arg`.
 const FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY: wdk_sys::ULONG =
-    ext4win_fsctl(EXT4WIN_ADD_ENCRYPTION_KEY_FUNCTION);
+    buffered_file_system_control(EXT4WIN_ADD_ENCRYPTION_KEY_FUNCTION);
 /// ext4win FSCTL carrying Linux `struct fscrypt_remove_key_arg`.
 const FSCTL_EXT4WIN_REMOVE_ENCRYPTION_KEY: wdk_sys::ULONG =
-    ext4win_fsctl(EXT4WIN_REMOVE_ENCRYPTION_KEY_FUNCTION);
+    buffered_file_system_control(EXT4WIN_REMOVE_ENCRYPTION_KEY_FUNCTION);
 /// ext4win FSCTL carrying Linux `struct fscrypt_get_key_status_arg`.
 const FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS: wdk_sys::ULONG =
-    ext4win_fsctl(EXT4WIN_GET_ENCRYPTION_KEY_STATUS_FUNCTION);
+    buffered_file_system_control(EXT4WIN_GET_ENCRYPTION_KEY_STATUS_FUNCTION);
 /// ext4win FSCTL carrying Linux `struct fsverity_enable_arg`.
-const FSCTL_EXT4WIN_ENABLE_VERITY: wdk_sys::ULONG = ext4win_fsctl(EXT4WIN_ENABLE_VERITY_FUNCTION);
+const FSCTL_EXT4WIN_ENABLE_VERITY: wdk_sys::ULONG =
+    buffered_file_system_control(EXT4WIN_ENABLE_VERITY_FUNCTION);
 
 /// Decoded query-volume filesystem information class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
