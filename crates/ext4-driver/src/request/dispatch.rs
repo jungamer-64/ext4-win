@@ -4,8 +4,8 @@ use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP};
 
 use crate::{
     irp::{
-        DeviceExecutor, DirectoryControlMinorFunction, DispatchMajor, DispatchTarget,
-        IrpCompletion, OwnedIrp, PreparedRequest, ReceivedIrp,
+        DeviceExecutor, DispatchMajor, DispatchTarget, IrpCompletion, OwnedIrp,
+        PreparedDirectoryControl, PreparedRequest, ReceivedIrp,
     },
     kernel::status::{DriverError, DriverResult},
 };
@@ -348,16 +348,13 @@ pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
             let result = crate::request::file_system_control::execute(owned.request(), minor).await;
             owned.complete_result(result)
         }
-        PreparedRequest::DirectoryControl(minor) => match *minor {
-            DirectoryControlMinorFunction::QueryDirectory => {
-                let target = owned.target();
-                owned.complete_result(crate::request::file_info::query_directory(target).await)
+        PreparedRequest::DirectoryControl(request) => match request {
+            PreparedDirectoryControl::QueryDirectory(_) => {
+                let result = crate::request::file_info::query_directory(owned.request()).await;
+                owned.complete_result(result)
             }
-            DirectoryControlMinorFunction::NotifyChangeDirectory => {
+            PreparedDirectoryControl::NotifyChangeDirectory => {
                 crate::request::file_info::notify_change_directory(owned)
-            }
-            DirectoryControlMinorFunction::Unsupported => {
-                owned.complete_result(Err(DriverError::InvalidDeviceRequest))
             }
         },
         PreparedRequest::QuerySecurity { .. } => {
@@ -386,9 +383,8 @@ pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
         }
         PreparedRequest::QueryVolumeInformation => {
             let target = owned.target();
-            owned.complete_result(
-                execute_major(DispatchMajor::QueryVolumeInformation, target).await,
-            )
+            owned
+                .complete_result(execute_major(DispatchMajor::QueryVolumeInformation, target).await)
         }
         PreparedRequest::SetVolumeInformation => {
             let target = owned.target();
@@ -398,9 +394,9 @@ pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
             let target = owned.target();
             owned.complete_result(execute_major(DispatchMajor::FlushBuffers, target).await)
         }
-        PreparedRequest::QueryEa => {
-            let target = owned.target();
-            owned.complete_result(execute_major(DispatchMajor::QueryEa, target).await)
+        PreparedRequest::QueryEa(_) => {
+            let result = crate::request::ea::query(owned.request()).await;
+            owned.complete_result(result)
         }
         PreparedRequest::SetEa => {
             let target = owned.target();
@@ -467,7 +463,7 @@ async fn execute_major(
         DispatchMajor::FileSystemControl => Err(DriverError::InvalidDeviceRequest),
         DispatchMajor::DeviceControl => Err(DriverError::InvalidDeviceRequest),
         DispatchMajor::FlushBuffers => crate::request::file_info::flush(target).await,
-        DispatchMajor::QueryEa => crate::request::ea::query(target).await,
+        DispatchMajor::QueryEa => Err(DriverError::InternalInvariantViolation),
         DispatchMajor::SetEa => crate::request::ea::set(target).await,
         // Lock control is terminally delegated to FsRtl before generic execution.
         DispatchMajor::LockControl => Err(DriverError::InvalidDeviceRequest),

@@ -12,10 +12,10 @@ use wdk_sys::LARGE_INTEGER;
 
 use crate::irp::{
     DataIoKind, DirectoryChangeFilter, DirectoryCursorPosition, DirectoryEntryEmission,
-    DirectoryEntryIndex, DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope,
-    DispatchTarget, IrpBufferLength, IrpCompletion, OwnedIrp, QueryDirectoryStack,
-    QueryFileInformationClass, QueryFileStack, ReadStartingPoint, RegularFileWriteAccess,
-    SetFileInformationClass, SetFileStack, WriteStartingPoint,
+    DirectoryEntryIndex, DirectoryInformationClass, DirectoryWatchScope, DispatchTarget,
+    IrpBufferLength, IrpCompletion, OwnedIrp, PendingIrpLease, PreparedDirectoryPattern,
+    QueryDirectoryStack, QueryFileInformationClass, QueryFileStack, ReadStartingPoint,
+    RegularFileWriteAccess, SetFileInformationClass, SetFileStack, WriteStartingPoint,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
@@ -286,14 +286,12 @@ struct QueryDirectoryRequest {
 }
 
 impl QueryDirectoryRequest {
-    /// Decodes a query-directory request.
+    /// Builds a query-directory request from the scalar payload sealed at queue entry.
     /// # Errors
     ///
-    /// Returns an error when the current IRP stack is not a query-directory stack or the FILE_OBJECT
-    /// is not an opened directory.
-    fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
-        let stack = target.current_stack()?.query_directory()?;
-        let opened_file = OpenedDirectory::decode(stack.file_object())?;
+    /// Returns an error when the FILE_OBJECT is not an opened directory.
+    fn from_stack(target: DispatchTarget, stack: QueryDirectoryStack) -> Result<Self, DriverError> {
+        let opened_file = OpenedDirectory::decode(target.current_stack()?.file_object()?)?;
         Ok(Self { stack, opened_file })
     }
 }
@@ -841,11 +839,14 @@ async fn set_regular_file_size(
 ///
 /// Returns an error when the directory query stack, pattern, output buffer, opened directory, or
 /// emitted directory record layout is invalid.
-pub(crate) async fn query_directory(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+pub(crate) async fn query_directory(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let target = request.target();
+    let prepared = request.prepared_query_directory()?;
+    let prepared_stack = prepared.stack();
     let (class, pattern, length, entry_emission, directory_id, mut cursor, operations) = {
-        let mut request = QueryDirectoryRequest::decode(target)?;
+        let mut request = QueryDirectoryRequest::from_stack(target, prepared_stack)?;
         let class = request.stack.information_class();
-        let pattern = DirectoryPattern::from_stack(request.stack)?;
+        let pattern = DirectoryPattern::from_prepared(prepared.pattern())?;
         let length = request.stack.length();
         let entry_emission = request.stack.entry_emission();
         let directory_id = request.opened_file.id();
@@ -889,8 +890,7 @@ pub(crate) async fn query_directory(target: DispatchTarget) -> DriverResult<IrpC
     };
 
     let information = result?;
-    let stack = target.current_stack()?.query_directory()?;
-    let mut opened_file = OpenedDirectory::decode(stack.file_object())?;
+    let mut opened_file = OpenedDirectory::decode(target.current_stack()?.file_object()?)?;
     {
         let mut output = target.data_output(length)?;
         let destination = output
@@ -931,21 +931,16 @@ enum DirectoryPattern {
 }
 
 impl DirectoryPattern {
-    /// Decodes the optional QueryDirectory filename pattern.
+    /// Decodes the captured QueryDirectory filename pattern.
     /// # Errors
     ///
     /// Returns an error when the pattern UNICODE_STRING is malformed, contains unsupported
     /// wildcards, or is not a valid Windows name.
-    fn from_stack(stack: QueryDirectoryStack) -> DriverResult<Self> {
-        let DirectoryPatternInput::Name(name) = stack.pattern() else {
+    fn from_prepared(pattern: &PreparedDirectoryPattern) -> DriverResult<Self> {
+        let PreparedDirectoryPattern::Name(units) = pattern else {
             return Ok(Self::All);
         };
-        let name = unsafe {
-            // SAFETY: QueryDirectoryStack stores the non-null UNICODE_STRING
-            // pointer supplied by the active IRP stack.
-            name.as_ref()
-        };
-        let units = unicode_string_units(name)?;
+        let units = units.as_slice();
         if is_all_directory_pattern(units) {
             return Ok(Self::All);
         }
@@ -1188,32 +1183,6 @@ const UTF16_ASTERISK: u16 = 0x002A;
 const UTF16_DOT: u16 = 0x002E;
 /// UTF-16 `?`.
 const UTF16_QUESTION_MARK: u16 = 0x003F;
-
-/// Returns the UTF-16 units described by a WDK UNICODE_STRING.
-/// # Errors
-///
-/// Returns an error when the UNICODE_STRING has an odd byte length or a null buffer with nonzero
-/// length.
-fn unicode_string_units(name: &wdk_sys::UNICODE_STRING) -> DriverResult<&[u16]> {
-    if name.Length & 1 != 0 {
-        return Err(DriverError::InvalidParameter);
-    }
-    if name.Length == 0 {
-        return Ok(&[]);
-    }
-    let Some(buffer) = NonNull::new(name.Buffer) else {
-        return Err(DriverError::InvalidParameter);
-    };
-    let units = usize::from(name.Length)
-        .checked_div(core::mem::size_of::<u16>())
-        .ok_or(DriverError::InvalidParameter)?;
-    Ok(unsafe {
-        // SAFETY: The caller supplied a non-null UNICODE_STRING buffer with an
-        // even byte length for the active IRP stack. The resulting slice is
-        // read only and does not outlive this dispatch callback.
-        core::slice::from_raw_parts(buffer.as_ptr(), units)
-    })
-}
 
 /// Returns true for the all-entries patterns accepted without wildcard matching.
 fn is_all_directory_pattern(units: &[u16]) -> bool {
@@ -3222,6 +3191,31 @@ mod tests {
             super::DirectoryPattern::Wildcard(wildcard).exhausted_error(),
             DriverError::NoSuchFile
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a queue-owned UTF-16 pattern is not converted into the same wildcard domain
+    /// used by the directory emitter.
+    #[test]
+    fn prepared_directory_pattern_uses_owned_utf16_units() {
+        let mut units = crate::memory::DriverVec::new();
+        assert!(
+            units
+                .try_extend_from_copy_slice(&[
+                    u16::from(b'f'),
+                    super::UTF16_ASTERISK,
+                    u16::from(b'.'),
+                    u16::from(b't'),
+                    u16::from(b'x'),
+                    u16::from(b't'),
+                ])
+                .is_ok()
+        );
+        let pattern = super::DirectoryPattern::from_prepared(
+            &crate::irp::PreparedDirectoryPattern::Name(units),
+        );
+        assert!(matches!(pattern, Ok(super::DirectoryPattern::Wildcard(_))));
     }
 
     /// # Panics

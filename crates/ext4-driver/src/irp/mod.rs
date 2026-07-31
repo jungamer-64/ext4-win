@@ -11,7 +11,10 @@ mod capture;
 mod executor;
 
 use capture::QueueContext;
-pub(crate) use capture::{CapturedQuerySecurityOutput, PreparedRequest};
+pub(crate) use capture::{
+    CapturedQuerySecurityOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
+    PreparedEaSelection, PreparedQueryDirectory, PreparedQueryEa, PreparedRequest,
+};
 pub(crate) use executor::DeviceExecutor;
 
 #[cfg(not(test))]
@@ -605,6 +608,22 @@ impl<'a> PendingIrpLease<'a> {
     ) -> DriverResult<(KernelFileObject, SecuritySelection, &'a [u8])> {
         self.owner.context.set_security_parts()
     }
+
+    /// Borrows the complete QueryDirectory payload sealed before queue insertion.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this is not a query-directory request.
+    pub(crate) fn prepared_query_directory(&self) -> DriverResult<&PreparedQueryDirectory> {
+        self.owner.context.query_directory()
+    }
+
+    /// Borrows the complete QueryEa payload sealed before queue insertion.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this is not a query-EA request.
+    pub(crate) fn prepared_query_ea(&self) -> DriverResult<&PreparedQueryEa> {
+        self.owner.context.query_ea()
+    }
 }
 
 impl OwnedIrp {
@@ -1195,15 +1214,9 @@ impl CurrentIrpStackLocation {
             // IRP_MN_QUERY_DIRECTORY, where QueryDirectory is active.
             stack.Parameters.QueryDirectory
         };
-        if !query.FileName.is_null() {
-            return Err(DriverError::InvalidParameter);
-        }
-        let pattern = DirectoryPatternInput::All;
         let cursor_position = if stack_flag(stack.Flags, wdk_sys::SL_INDEX_SPECIFIED) {
             DirectoryCursorPosition::Index(DirectoryEntryIndex(query.FileIndex))
-        } else if stack_flag(stack.Flags, wdk_sys::SL_RESTART_SCAN)
-            
-        {
+        } else if stack_flag(stack.Flags, wdk_sys::SL_RESTART_SCAN) || !query.FileName.is_null() {
             DirectoryCursorPosition::Restart
         } else {
             DirectoryCursorPosition::Current
@@ -1213,14 +1226,31 @@ impl CurrentIrpStackLocation {
         } else {
             DirectoryEntryEmission::Multiple
         };
+        self.kernel_file_object()?;
         Ok(QueryDirectoryStack {
-            file_object: self.kernel_file_object()?,
             cursor_position,
-            pattern,
             entry_emission,
             length: IrpBufferLength::from_ulong(query.Length)?,
             information_class: DirectoryInformationClass::from_raw(query.FileInformationClass)?,
         })
+    }
+
+    /// Returns the requestor filename descriptor for queue-time directory capture.
+    /// # Errors
+    ///
+    /// Returns an error when the current stack location cannot be decoded.
+    pub(crate) fn query_directory_file_name(
+        self,
+    ) -> Result<Option<NonNull<wdk_sys::UNICODE_STRING>>, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack during capture.
+            self.stack.as_ref()
+        };
+        let query = unsafe {
+            // SAFETY: The caller selects this accessor only for IRP_MN_QUERY_DIRECTORY.
+            stack.Parameters.QueryDirectory
+        };
+        Ok(NonNull::new(query.FileName))
     }
 
     /// Decodes directory-change-notification parameters.
@@ -1264,7 +1294,9 @@ impl CurrentIrpStackLocation {
         };
         let ea_list_length = IrpBufferLength::from_ulong(query.EaListLength)?;
         let selection = if !ea_list_length.is_empty() {
-            return Err(DriverError::InvalidParameter);
+            // The requestor-owned list is captured before queue insertion. The stack view keeps a
+            // neutral selection because the raw pointer must never escape this callback boundary.
+            EaSelection::All
         } else if stack_flag(stack.Flags, wdk_sys::SL_INDEX_SPECIFIED) {
             EaSelection::Index(EaEntryIndex::from_u32(query.EaIndex))
         } else {
@@ -1275,12 +1307,35 @@ impl CurrentIrpStackLocation {
         } else {
             EaEntryEmission::Multiple
         };
+        self.kernel_file_object()?;
         Ok(QueryEaStack {
-            file_object: self.kernel_file_object()?,
             selection,
             entry_emission,
             length: IrpBufferLength::from_ulong(query.Length)?,
         })
+    }
+
+    /// Returns the requestor EA-name list for queue-time capture.
+    /// # Errors
+    ///
+    /// Returns an error when the list length is invalid or a non-empty list has no address.
+    pub(crate) fn query_ea_name_list(
+        self,
+    ) -> Result<Option<(NonNull<c_void>, IrpBufferLength)>, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack during capture.
+            self.stack.as_ref()
+        };
+        let query = unsafe {
+            // SAFETY: The caller selects this accessor only for IRP_MJ_QUERY_EA.
+            stack.Parameters.QueryEa
+        };
+        let length = IrpBufferLength::from_ulong(query.EaListLength)?;
+        if length.is_empty() {
+            return Ok(None);
+        }
+        let address = NonNull::new(query.EaList).ok_or(DriverError::InvalidParameter)?;
+        Ok(Some((address, length)))
     }
 
     /// Decodes set-EA parameters.
@@ -1648,13 +1703,6 @@ pub(crate) enum DirectoryCursorPosition {
     Restart,
     /// Seek to a caller-supplied directory index.
     Index(DirectoryEntryIndex),
-}
-
-/// Query-directory filename pattern supplied by the caller.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DirectoryPatternInput {
-    /// No filename pattern was supplied.
-    All,
 }
 
 /// Directory entry emission cardinality requested by the caller.
@@ -2683,12 +2731,8 @@ pub(crate) struct SetFileStack {
 /// Decoded query-directory stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryDirectoryStack {
-    /// FILE_OBJECT carrying the directory CCB.
-    file_object: KernelFileObject,
     /// Initial CCB cursor position.
     cursor_position: DirectoryCursorPosition,
-    /// Filename pattern supplied by the caller.
-    pattern: DirectoryPatternInput,
     /// Directory entry emission cardinality.
     entry_emission: DirectoryEntryEmission,
     /// Output buffer length.
@@ -2711,8 +2755,6 @@ pub(crate) struct NotifyDirectoryStack {
 /// Decoded query-EA stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryEaStack {
-    /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: KernelFileObject,
     /// EA selection requested by the caller.
     selection: EaSelection,
     /// EA entry emission cardinality.
@@ -2960,19 +3002,9 @@ impl SetFileStack {
 }
 
 impl QueryDirectoryStack {
-    /// Returns the FILE_OBJECT carrying this query.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns the initial directory cursor position.
     pub(crate) const fn cursor_position(self) -> DirectoryCursorPosition {
         self.cursor_position
-    }
-
-    /// Returns the query-directory filename pattern input.
-    pub(crate) const fn pattern(self) -> DirectoryPatternInput {
-        self.pattern
     }
 
     /// Returns directory entry emission cardinality.
@@ -3009,11 +3041,6 @@ impl NotifyDirectoryStack {
 }
 
 impl QueryEaStack {
-    /// Returns the FILE_OBJECT carrying this query.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns the EA selection.
     pub(crate) const fn selection(self) -> EaSelection {
         self.selection
@@ -3090,8 +3117,8 @@ mod tests {
         CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering,
         CurrentIrpStackLocation, DataIoKind, DeviceExecutor, DirectoryChangeFilter,
         DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
-        DirectoryInformationClass, DirectoryPatternInput, DirectoryWatchScope, DispatchMajor,
-        DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION,
+        DirectoryInformationClass, DirectoryWatchScope, DispatchMajor, DispatchTarget,
+        EaEntryEmission, EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION,
         FILE_OPEN_IF_DISPOSITION, FILE_OVERWRITE_DISPOSITION, FILE_OVERWRITE_IF_DISPOSITION,
         FILE_SUPERSEDE_DISPOSITION, FileSystemControlMinorFunction, FsControlCode,
         InformationLength, IrpBufferLength, IrpCompletion, KernelIrp, OwnedIrp,
@@ -4381,17 +4408,15 @@ mod tests {
             assert!(query.is_ok());
             if let Ok(query) = query {
                 assert_eq!(
-                    Some(query.file_object()),
+                    current.file_object().ok(),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 assert_eq!(query.entry_emission(), EaEntryEmission::Single);
                 assert_eq!(query.length().as_usize(), 128);
+                assert_eq!(query.selection(), EaSelection::All);
                 assert_eq!(
-                    query.selection(),
-                    EaSelection::Names {
-                        address: ea_list,
-                        length: super::IrpBufferLength(24),
-                    }
+                    current.query_ea_name_list().ok().flatten(),
+                    Some((ea_list.cast(), super::IrpBufferLength(24)))
                 );
             }
         }
@@ -5104,11 +5129,11 @@ mod tests {
             assert!(query.is_ok());
             if let Ok(query) = query {
                 assert_eq!(
-                    Some(query.file_object()),
+                    current.file_object().ok(),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 assert_eq!(query.cursor_position(), DirectoryCursorPosition::Restart);
-                assert_eq!(query.pattern(), DirectoryPatternInput::Name(file_name));
+                assert!(current.query_directory_file_name().ok().flatten().is_some());
                 assert_eq!(query.entry_emission(), DirectoryEntryEmission::Single);
                 assert_eq!(query.length().as_usize(), 128);
                 assert_eq!(
@@ -5173,7 +5198,6 @@ mod tests {
                     query.cursor_position(),
                     DirectoryCursorPosition::Index(super::DirectoryEntryIndex(3))
                 );
-                assert_eq!(query.pattern(), DirectoryPatternInput::All);
                 assert_eq!(query.entry_emission(), DirectoryEntryEmission::Multiple);
             }
         }

@@ -2,6 +2,11 @@
 
 #define EXT4WIN_SECURITY_POOL_TAG ((ULONG)0x53773445UL)
 
+/* Neither-I/O lengths are requestor controlled, so each capture stays bounded. */
+#define EXT4WIN_MAX_SECURITY_DESCRIPTOR_SIZE (128UL * 1024UL)
+#define EXT4WIN_MAX_REQUESTOR_SNAPSHOT_SIZE (1024UL * 1024UL)
+#define EXT4WIN_MAX_QUERY_OUTPUT_SIZE (128UL * 1024UL)
+
 /*
  * This translation unit is the only boundary that touches neither-I/O security
  * buffers supplied by an untrusted requestor. Rust receives only an opaque
@@ -248,7 +253,7 @@ ext4win_measure_relative_security_descriptor(
         }
     }
 
-    if (header.Sacl != 0) {
+    if (((header.Control & SE_SACL_PRESENT) != 0) && (header.Sacl != 0)) {
         status = ext4win_measure_relative_acl(
             source,
             header.Sacl,
@@ -260,7 +265,7 @@ ext4win_measure_relative_security_descriptor(
         }
     }
 
-    if (header.Dacl != 0) {
+    if (((header.Control & SE_DACL_PRESENT) != 0) && (header.Dacl != 0)) {
         status = ext4win_measure_relative_acl(
             source,
             header.Dacl,
@@ -299,7 +304,7 @@ NTAPI
 ext4win_capture_query_security_output(
     _Outptr_ PVOID *output_out,
     _Out_ PULONG required_length_out,
-    _In_reads_bytes_opt_(requestor_buffer_length) PVOID requestor_buffer,
+    _Out_writes_bytes_to_opt_(requestor_buffer_length, required_length) PVOID requestor_buffer,
     _In_ ULONG requestor_buffer_length,
     _In_ ULONG required_length,
     _In_ KPROCESSOR_MODE requestor_mode)
@@ -319,6 +324,9 @@ ext4win_capture_query_security_output(
         !ext4win_is_requestor_mode_valid(requestor_mode) ||
         (required_length == 0)) {
         return STATUS_INVALID_PARAMETER;
+    }
+    if (required_length > EXT4WIN_MAX_QUERY_OUTPUT_SIZE) {
+        return STATUS_INVALID_BUFFER_SIZE;
     }
     if (requestor_buffer_length < required_length) {
         return STATUS_BUFFER_OVERFLOW;
@@ -444,9 +452,13 @@ ext4win_capture_set_security_descriptor(
 
     if ((snapshot_out == NULL) || (length_out == NULL) ||
         !ext4win_is_requestor_mode_valid(requestor_mode) ||
+        (required_information == 0) ||
         ((required_information & ~supported_information) != 0) ||
         (maximum_length < header_length)) {
         return STATUS_INVALID_PARAMETER;
+    }
+    if (maximum_length > EXT4WIN_MAX_SECURITY_DESCRIPTOR_SIZE) {
+        return STATUS_INVALID_BUFFER_SIZE;
     }
     if (source == NULL) {
         return STATUS_INVALID_SECURITY_DESCR;
@@ -466,6 +478,11 @@ ext4win_capture_set_security_descriptor(
     }
     if (!NT_SUCCESS(status)) {
         return status;
+    }
+
+    if ((candidate_length < header_length) ||
+        (candidate_length > EXT4WIN_MAX_SECURITY_DESCRIPTOR_SIZE)) {
+        return STATUS_INVALID_SECURITY_DESCR;
     }
 
     snapshot = ExAllocatePool2(
@@ -521,5 +538,167 @@ ext4win_release_set_security_descriptor(_Frees_ptr_opt_ PVOID snapshot)
 {
     if (snapshot != NULL) {
         ExFreePoolWithTag(snapshot, EXT4WIN_SECURITY_POOL_TAG);
+    }
+}
+
+#define EXT4WIN_REQUESTOR_POOL_TAG ((ULONG)0x43573445UL)
+
+/*
+ * Copies requestor-owned auxiliary inputs while dispatch still runs in the
+ * requestor context.  The returned bytes are nonpaged and have no aliases to
+ * the requestor mapping, so the async request plane never dereferences these
+ * pointers after queue insertion.
+ */
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_capture_requestor_bytes(
+    _In_reads_bytes_(length) const VOID *source,
+    _In_ ULONG length,
+    _In_ KPROCESSOR_MODE requestor_mode,
+    _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
+    _Out_ PULONG length_out)
+{
+    PVOID snapshot;
+    NTSTATUS status;
+
+    if (snapshot_out != NULL) {
+        *snapshot_out = NULL;
+    }
+    if (length_out != NULL) {
+        *length_out = 0;
+    }
+    if ((snapshot_out == NULL) || (length_out == NULL) ||
+        !ext4win_is_requestor_mode_valid(requestor_mode)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (length > EXT4WIN_MAX_REQUESTOR_SNAPSHOT_SIZE) {
+        return STATUS_INVALID_BUFFER_SIZE;
+    }
+    if (length == 0) {
+        return STATUS_SUCCESS;
+    }
+    if (source == NULL) {
+        return STATUS_INVALID_USER_BUFFER;
+    }
+
+    snapshot = ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        length,
+        EXT4WIN_REQUESTOR_POOL_TAG);
+    if (snapshot == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = STATUS_SUCCESS;
+    __try {
+        if (requestor_mode == UserMode) {
+            ProbeForRead(source, length, TYPE_ALIGNMENT(UCHAR));
+        }
+        RtlCopyMemory(snapshot, source, length);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = ext4win_normalize_user_buffer_exception(GetExceptionCode());
+    }
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(snapshot, EXT4WIN_REQUESTOR_POOL_TAG);
+        return status;
+    }
+
+    *snapshot_out = snapshot;
+    *length_out = length;
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_capture_requestor_unicode_string(
+    _In_ PCUNICODE_STRING source,
+    _In_ KPROCESSOR_MODE requestor_mode,
+    _In_ USHORT maximum_length,
+    _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
+    _Out_ PULONG length_out)
+{
+    UNICODE_STRING header;
+    PVOID snapshot;
+    NTSTATUS status;
+
+    if (snapshot_out != NULL) {
+        *snapshot_out = NULL;
+    }
+    if (length_out != NULL) {
+        *length_out = 0;
+    }
+    if ((snapshot_out == NULL) || (length_out == NULL) ||
+        !ext4win_is_requestor_mode_valid(requestor_mode)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (source == NULL) {
+        return STATUS_INVALID_USER_BUFFER;
+    }
+
+    RtlZeroMemory(&header, sizeof(header));
+    status = STATUS_SUCCESS;
+    __try {
+        if (requestor_mode == UserMode) {
+            ProbeForRead(source, sizeof(header), TYPE_ALIGNMENT(USHORT));
+        }
+        RtlCopyMemory(&header, source, sizeof(header));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = ext4win_normalize_user_buffer_exception(GetExceptionCode());
+    }
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    if ((header.Length > header.MaximumLength) ||
+        ((header.Length & (sizeof(WCHAR) - 1)) != 0) ||
+        (header.Length > maximum_length) ||
+        ((header.Length != 0) && (header.Buffer == NULL))) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (header.Length == 0) {
+        return STATUS_SUCCESS;
+    }
+
+    snapshot = ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        header.Length,
+        EXT4WIN_REQUESTOR_POOL_TAG);
+    if (snapshot == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = STATUS_SUCCESS;
+    __try {
+        if (requestor_mode == UserMode) {
+            ProbeForRead(header.Buffer, header.Length, TYPE_ALIGNMENT(WCHAR));
+        }
+        RtlCopyMemory(snapshot, header.Buffer, header.Length);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = ext4win_normalize_user_buffer_exception(GetExceptionCode());
+    }
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(snapshot, EXT4WIN_REQUESTOR_POOL_TAG);
+        return status;
+    }
+
+    *snapshot_out = snapshot;
+    *length_out = header.Length;
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+NTAPI
+ext4win_release_requestor_snapshot(_Frees_ptr_opt_ PVOID snapshot)
+{
+    if (snapshot != NULL) {
+        ExFreePoolWithTag(snapshot, EXT4WIN_REQUESTOR_POOL_TAG);
     }
 }

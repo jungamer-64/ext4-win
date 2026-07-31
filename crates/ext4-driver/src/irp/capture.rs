@@ -12,18 +12,266 @@ use crate::kernel::ffi;
 use crate::{
     kernel::status::{DriverError, DriverResult},
     memory,
+    memory::DriverVec,
     security_descriptor::SecuritySelection,
     state::KernelFileObject,
 };
 
 use super::{
     DirectoryControlMinorFunction, DispatchMajor, DispatchTarget, FileSystemControlMinorFunction,
-    IrpCompletion,
+    IrpCompletion, QueryDirectoryStack, QueryEaStack,
 };
 
 /// Maximum self-relative security descriptor accepted from one untrusted requestor.
 #[cfg(not(test))]
-const SET_SECURITY_DESCRIPTOR_MAXIMUM: wdk_sys::ULONG = 65_536;
+const SET_SECURITY_DESCRIPTOR_MAXIMUM: wdk_sys::ULONG = 128 * 1024;
+
+/// Maximum UTF-16 payload accepted for a queued directory filename pattern.
+#[cfg(not(test))]
+const DIRECTORY_PATTERN_MAXIMUM: wdk_sys::USHORT = 65_534;
+
+/// Owned directory pattern captured before queue insertion.
+#[derive(Debug)]
+pub(crate) enum PreparedDirectoryPattern {
+    /// No filename filter was supplied.
+    All,
+    /// Requestor-owned UTF-16 filename filter copied into nonpaged driver memory.
+    Name(DriverVec<u16>),
+}
+
+/// Owned query-EA selection captured before queue insertion.
+#[derive(Debug)]
+pub(crate) enum PreparedEaSelection {
+    /// Return every EA associated with the opened file.
+    All,
+    /// Requestor-owned FILE_GET_EA_INFORMATION bytes.
+    Names(DriverVec<u8>),
+    /// Return the entry at a caller-supplied one-based index.
+    Index(super::EaEntryIndex),
+}
+
+/// Directory-control request whose meaningful auxiliary inputs are sealed before queue insertion.
+#[derive(Debug)]
+pub(crate) enum PreparedDirectoryControl {
+    /// Query-directory request with an owned filename pattern.
+    QueryDirectory(PreparedQueryDirectory),
+    /// Standard directory-change notification.
+    NotifyChangeDirectory,
+}
+
+/// Complete QueryDirectory payload sealed at queue entry.
+#[derive(Debug)]
+pub(crate) struct PreparedQueryDirectory {
+    /// Scalar stack fields that remain valid with the pending IRP.
+    stack: QueryDirectoryStack,
+    /// Requestor-owned filename pattern.
+    pattern: PreparedDirectoryPattern,
+}
+
+impl PreparedQueryDirectory {
+    /// Returns the immutable scalar stack payload.
+    pub(crate) const fn stack(&self) -> QueryDirectoryStack {
+        self.stack
+    }
+
+    /// Borrows the captured filename pattern.
+    pub(crate) fn pattern(&self) -> &PreparedDirectoryPattern {
+        &self.pattern
+    }
+}
+
+/// Complete QueryEa payload sealed at queue entry.
+#[derive(Debug)]
+pub(crate) struct PreparedQueryEa {
+    /// Scalar stack fields that remain valid with the pending IRP.
+    stack: QueryEaStack,
+    /// Requestor-owned EA selection.
+    selection: PreparedEaSelection,
+}
+
+impl PreparedQueryEa {
+    /// Returns the immutable scalar stack payload.
+    pub(crate) const fn stack(&self) -> QueryEaStack {
+        self.stack
+    }
+
+    /// Borrows the captured EA selection.
+    pub(crate) fn selection(&self) -> &PreparedEaSelection {
+        &self.selection
+    }
+}
+
+/// Requestor auxiliary bytes copied into nonpaged native memory.
+#[derive(Debug)]
+struct CapturedRequestorBytes {
+    /// First byte of the native allocation.
+    address: NonNull<u8>,
+    /// Exact copied byte count.
+    length: NonZeroUsize,
+}
+
+// SAFETY: The allocation is immutable, nonpaged, and uniquely owned by this value.
+unsafe impl Send for CapturedRequestorBytes {}
+
+impl CapturedRequestorBytes {
+    /// Captures an exact-length requestor byte range before an IRP is queued.
+    /// # Errors
+    ///
+    /// Returns a completion preserving native capture failure or allocation validation failure.
+    fn capture_bytes(
+        target: DispatchTarget,
+        source: NonNull<c_void>,
+        length: super::IrpBufferLength,
+    ) -> Result<Self, IrpCompletion> {
+        #[cfg(not(test))]
+        {
+            let length = wdk_sys::ULONG::try_from(length.as_usize())
+                .map_err(|_| IrpCompletion::from_error(DriverError::InvalidParameter))?;
+            let requestor_mode = unsafe {
+                // SAFETY: Dispatch retains the received IRP until capture returns.
+                target.irp.as_ref().RequestorMode
+            };
+            let mut snapshot = core::ptr::null_mut();
+            let mut captured_length = 0;
+            let status = unsafe {
+                // SAFETY: The native boundary probes/copies only the bounded requestor range.
+                ffi::ext4win_capture_requestor_bytes(
+                    source.as_ptr(),
+                    length,
+                    requestor_mode,
+                    core::ptr::addr_of_mut!(snapshot),
+                    core::ptr::addr_of_mut!(captured_length),
+                )
+            };
+            ensure_native_success(status)?;
+            if captured_length != length {
+                if !snapshot.is_null() {
+                    unsafe {
+                        // SAFETY: Native capture transferred this allocation to the constructor.
+                        ffi::ext4win_release_requestor_snapshot(snapshot);
+                    }
+                }
+                return Err(IrpCompletion::from_error(
+                    DriverError::InternalInvariantViolation,
+                ));
+            }
+            let Some(address) = NonNull::new(snapshot.cast::<u8>()) else {
+                return Err(IrpCompletion::from_error(
+                    DriverError::InternalInvariantViolation,
+                ));
+            };
+            let Some(length) =
+                NonZeroUsize::new(usize::try_from(captured_length).map_err(|_| {
+                    IrpCompletion::from_error(DriverError::InternalInvariantViolation)
+                })?)
+            else {
+                unsafe {
+                    // SAFETY: Native capture returned a null-length violation with ownership
+                    // transferred to this failed constructor.
+                    ffi::ext4win_release_requestor_snapshot(address.as_ptr().cast());
+                }
+                return Err(IrpCompletion::from_error(
+                    DriverError::InternalInvariantViolation,
+                ));
+            };
+            Ok(Self { address, length })
+        }
+        #[cfg(test)]
+        {
+            let _: DispatchTarget = target;
+            let _: NonNull<c_void> = source;
+            let _: super::IrpBufferLength = length;
+            Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
+        }
+    }
+
+    /// Captures a requestor UNICODE_STRING payload, returning `None` for an empty string.
+    /// # Errors
+    ///
+    /// Returns a completion preserving native capture failure or allocation validation failure.
+    fn capture_unicode(
+        target: DispatchTarget,
+        source: NonNull<wdk_sys::UNICODE_STRING>,
+    ) -> Result<Option<Self>, IrpCompletion> {
+        #[cfg(not(test))]
+        {
+            let requestor_mode = unsafe {
+                // SAFETY: Dispatch retains the received IRP until capture returns.
+                target.irp.as_ref().RequestorMode
+            };
+            let mut snapshot = core::ptr::null_mut();
+            let mut captured_length = 0;
+            let status = unsafe {
+                // SAFETY: The native boundary captures and validates the string header and then
+                // copies its bounded buffer under SEH protection.
+                ffi::ext4win_capture_requestor_unicode_string(
+                    source.as_ptr(),
+                    requestor_mode,
+                    DIRECTORY_PATTERN_MAXIMUM,
+                    core::ptr::addr_of_mut!(snapshot),
+                    core::ptr::addr_of_mut!(captured_length),
+                )
+            };
+            ensure_native_success(status)?;
+            if captured_length == 0 {
+                if !snapshot.is_null() {
+                    unsafe {
+                        // SAFETY: Native capture transferred this unexpected allocation to the
+                        // constructor, which releases it before reporting the invariant failure.
+                        ffi::ext4win_release_requestor_snapshot(snapshot);
+                    }
+                    return Err(IrpCompletion::from_error(
+                        DriverError::InternalInvariantViolation,
+                    ));
+                }
+                return Ok(None);
+            }
+            let Some(address) = NonNull::new(snapshot.cast::<u8>()) else {
+                return Err(IrpCompletion::from_error(
+                    DriverError::InternalInvariantViolation,
+                ));
+            };
+            let Some(length) =
+                NonZeroUsize::new(usize::try_from(captured_length).map_err(|_| {
+                    IrpCompletion::from_error(DriverError::InternalInvariantViolation)
+                })?)
+            else {
+                unsafe {
+                    // SAFETY: Native capture transferred this allocation to the constructor.
+                    ffi::ext4win_release_requestor_snapshot(address.as_ptr().cast());
+                }
+                return Err(IrpCompletion::from_error(
+                    DriverError::InternalInvariantViolation,
+                ));
+            };
+            Ok(Some(Self { address, length }))
+        }
+        #[cfg(test)]
+        {
+            let _: DispatchTarget = target;
+            let _: NonNull<wdk_sys::UNICODE_STRING> = source;
+            Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
+        }
+    }
+
+    /// Borrows the exact captured bytes.
+    fn as_slice(&self) -> &[u8] {
+        unsafe {
+            // SAFETY: Native capture initialized exactly `length` bytes in this owned allocation.
+            core::slice::from_raw_parts(self.address.as_ptr(), self.length.get())
+        }
+    }
+}
+
+impl Drop for CapturedRequestorBytes {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: This value uniquely owns the native snapshot allocation.
+            ffi::ext4win_release_requestor_snapshot(self.address.as_ptr().cast());
+        }
+    }
+}
 
 /// Request identity captured before the IRP enters the cancel-safe queue.
 #[derive(Debug)]
@@ -77,6 +325,30 @@ impl QueueContext {
     /// Returns the request variant sealed before the IRP entered the queue.
     pub(super) const fn prepared(&self) -> &PreparedRequest {
         &self.prepared
+    }
+
+    /// Borrows the complete QueryDirectory payload sealed before queue insertion.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this context is not a query-directory request.
+    pub(super) fn query_directory(&self) -> DriverResult<&PreparedQueryDirectory> {
+        match &self.prepared {
+            PreparedRequest::DirectoryControl(PreparedDirectoryControl::QueryDirectory(
+                request,
+            )) => Ok(request),
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Borrows the complete QueryEa payload sealed before queue insertion.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this context is not a query-EA request.
+    pub(super) fn query_ea(&self) -> DriverResult<&PreparedQueryEa> {
+        match &self.prepared {
+            PreparedRequest::QueryEa(request) => Ok(request),
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
     }
 
     /// Borrows the opaque query-security output target.
@@ -134,14 +406,14 @@ pub(crate) enum PreparedRequest {
     QueryVolumeInformation,
     /// Volume information mutation.
     SetVolumeInformation,
-    /// Directory request with a sealed minor-function classification.
-    DirectoryControl(DirectoryControlMinorFunction),
+    /// Directory request with all requestor-owned auxiliary input captured.
+    DirectoryControl(PreparedDirectoryControl),
     /// File-system control with a sealed minor-function classification.
     FileSystemControl(FileSystemControlMinorFunction),
     /// Flush request.
     FlushBuffers,
-    /// Extended-attribute query.
-    QueryEa,
+    /// Extended-attribute query with an owned selection list.
+    QueryEa(PreparedQueryEa),
     /// Extended-attribute mutation.
     SetEa,
     /// Query-security request with locked output pages and a system mapping.
@@ -184,20 +456,52 @@ impl PreparedRequest {
             }
             DispatchMajor::SetVolumeInformation => Ok((Self::SetVolumeInformation, generic_key())),
             DispatchMajor::DirectoryControl => Ok((
-                Self::DirectoryControl(stack.directory_control_minor()),
+                match stack.directory_control_minor() {
+                    DirectoryControlMinorFunction::QueryDirectory => {
+                        let query = stack.query_directory().map_err(IrpCompletion::from_error)?;
+                        let pattern = capture_directory_pattern(target, stack)?;
+                        Self::DirectoryControl(PreparedDirectoryControl::QueryDirectory(
+                            PreparedQueryDirectory {
+                                stack: query,
+                                pattern,
+                            },
+                        ))
+                    }
+                    DirectoryControlMinorFunction::NotifyChangeDirectory => {
+                        stack
+                            .notify_directory()
+                            .map_err(IrpCompletion::from_error)?;
+                        Self::DirectoryControl(PreparedDirectoryControl::NotifyChangeDirectory)
+                    }
+                    DirectoryControlMinorFunction::Unsupported => {
+                        return Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest));
+                    }
+                },
                 generic_key(),
             )),
             DispatchMajor::FileSystemControl => {
                 let minor = stack.file_system_control_minor();
                 let key = match minor {
                     FileSystemControlMinorFunction::MountVolume => QueueCancellationKey::Device,
-                    FileSystemControlMinorFunction::UserFsRequest
-                    | FileSystemControlMinorFunction::Unsupported => generic_key(),
+                    FileSystemControlMinorFunction::UserFsRequest => generic_key(),
+                    FileSystemControlMinorFunction::Unsupported => {
+                        return Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest));
+                    }
                 };
                 Ok((Self::FileSystemControl(minor), key))
             }
             DispatchMajor::FlushBuffers => Ok((Self::FlushBuffers, generic_key())),
-            DispatchMajor::QueryEa => Ok((Self::QueryEa, generic_key())),
+            DispatchMajor::QueryEa => {
+                let query = stack.query_ea().map_err(IrpCompletion::from_error)?;
+                let selection = capture_ea_selection(target, stack)?;
+                Ok((
+                    Self::QueryEa(PreparedQueryEa {
+                        stack: query,
+                        selection,
+                    }),
+                    generic_key(),
+                ))
+            }
             DispatchMajor::SetEa => Ok((Self::SetEa, generic_key())),
             DispatchMajor::QuerySecurity => {
                 let query = stack.query_security().map_err(IrpCompletion::from_error)?;
@@ -238,7 +542,76 @@ impl PreparedRequest {
             }
         }
     }
+}
 
+/// Captures and validates a QueryDirectory filename pattern.
+/// # Errors
+///
+/// Returns a completion when the descriptor cannot be captured or its payload is malformed.
+fn capture_directory_pattern(
+    target: DispatchTarget,
+    stack: super::CurrentIrpStackLocation,
+) -> Result<PreparedDirectoryPattern, IrpCompletion> {
+    let Some(source) = stack
+        .query_directory_file_name()
+        .map_err(IrpCompletion::from_error)?
+    else {
+        return Ok(PreparedDirectoryPattern::All);
+    };
+    let Some(captured) = CapturedRequestorBytes::capture_unicode(target, source)? else {
+        return Ok(PreparedDirectoryPattern::All);
+    };
+    decode_directory_pattern(captured.as_slice())
+}
+
+/// Converts a captured little-endian UTF-16 payload into its driver-owned representation.
+/// # Errors
+///
+/// Returns an invalid-parameter completion for a truncated UTF-16 code unit or an allocation
+/// completion when the owned vector cannot be constructed.
+fn decode_directory_pattern(bytes: &[u8]) -> Result<PreparedDirectoryPattern, IrpCompletion> {
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(IrpCompletion::from_error(DriverError::InvalidParameter));
+    }
+    let mut units = DriverVec::try_with_capacity(pairs.len()).map_err(IrpCompletion::from_error)?;
+    for pair in pairs {
+        let unit = u16::from_le_bytes(*pair);
+        units.try_push(unit).map_err(IrpCompletion::from_error)?;
+    }
+    Ok(PreparedDirectoryPattern::Name(units))
+}
+
+/// Captures the requestor-owned QueryEa name list or seals its scalar selection.
+/// # Errors
+///
+/// Returns a completion when the name list cannot be captured or an owned copy cannot be
+/// allocated.
+fn capture_ea_selection(
+    target: DispatchTarget,
+    stack: super::CurrentIrpStackLocation,
+) -> Result<PreparedEaSelection, IrpCompletion> {
+    if let Some((source, length)) = stack
+        .query_ea_name_list()
+        .map_err(IrpCompletion::from_error)?
+    {
+        let captured = CapturedRequestorBytes::capture_bytes(target, source, length)?;
+        let mut bytes = DriverVec::try_with_capacity(captured.as_slice().len())
+            .map_err(IrpCompletion::from_error)?;
+        bytes
+            .try_extend_from_copy_slice(captured.as_slice())
+            .map_err(IrpCompletion::from_error)?;
+        return Ok(PreparedEaSelection::Names(bytes));
+    }
+
+    let selection = stack
+        .query_ea()
+        .map_err(IrpCompletion::from_error)?
+        .selection();
+    Ok(match selection {
+        super::EaSelection::All => PreparedEaSelection::All,
+        super::EaSelection::Index(index) => PreparedEaSelection::Index(index),
+    })
 }
 
 /// Stable FILE_OBJECT identity used by cleanup while the IRP is queue-owned.
@@ -573,10 +946,12 @@ fn ensure_native_success(status: NTSTATUS) -> Result<(), IrpCompletion> {
 mod tests {
     use core::ffi::c_void;
 
-    use super::{PreparedRequest, QueueContext};
+    use super::{
+        PreparedDirectoryPattern, PreparedRequest, QueueContext, decode_directory_pattern,
+    };
     use crate::irp::{
-        DirectoryControlMinorFunction, DispatchMajor, DispatchTarget,
-        FileSystemControlMinorFunction, IrpCompletion, KernelIrp,
+        DispatchMajor, DispatchTarget, FileSystemControlMinorFunction, IrpCompletion, KernelIrp,
+        PreparedDirectoryControl,
     };
 
     /// Builds a typed target and installs its current stack pointer.
@@ -626,6 +1001,13 @@ mod tests {
             FileObject: core::ptr::addr_of_mut!(file_object),
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
+        stack.Parameters.QueryDirectory = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_6 {
+            Length: 128,
+            FileName: core::ptr::null_mut(),
+            FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileDirectoryInformation,
+            __bindgen_padding_0: 0,
+            FileIndex: 0,
+        };
         let target = build_target(&mut device, &mut irp, &mut stack);
         assert!(target.is_some());
         if let Some(target) = target {
@@ -636,9 +1018,7 @@ mod tests {
                 assert_eq!(stack.MinorFunction, u8::MAX);
                 assert!(matches!(
                     context.prepared(),
-                    PreparedRequest::DirectoryControl(
-                        DirectoryControlMinorFunction::QueryDirectory
-                    )
+                    PreparedRequest::DirectoryControl(PreparedDirectoryControl::QueryDirectory(_))
                 ));
             }
         }
@@ -659,11 +1039,34 @@ mod tests {
                 assert_eq!(stack.MinorFunction, u8::MAX);
                 assert!(matches!(
                     context.prepared(),
-                    PreparedRequest::FileSystemControl(
-                        FileSystemControlMinorFunction::MountVolume
-                    )
+                    PreparedRequest::FileSystemControl(FileSystemControlMinorFunction::MountVolume)
                 ));
             }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when captured UTF-16 bytes are not converted without retaining the source buffer.
+    #[test]
+    fn captured_directory_pattern_becomes_owned_utf16() {
+        let pattern = decode_directory_pattern(&[b'a', 0, 0x42, 0x30]);
+        assert!(pattern.is_ok());
+        assert!(matches!(pattern, Ok(PreparedDirectoryPattern::Name(_))));
+        if let Ok(PreparedDirectoryPattern::Name(units)) = pattern {
+            assert_eq!(units.as_slice(), &[u16::from(b'a'), 0x3042]);
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a truncated UTF-16 code unit is accepted.
+    #[test]
+    fn captured_directory_pattern_rejects_truncated_code_unit() {
+        let pattern = decode_directory_pattern(b"a");
+        assert!(pattern.is_err());
+        if let Err(completion) = pattern {
+            assert_eq!(completion.status(), wdk_sys::STATUS_INVALID_PARAMETER);
         }
     }
 
