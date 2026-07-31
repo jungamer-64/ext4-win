@@ -60,6 +60,11 @@ impl KernelWideInconsistency {
         Self::without_location(FatalReason::MountedVolumeStateCorruption)
     }
 
+    /// Constructs a fatal state for an impossible driver-owned device teardown.
+    pub(crate) const fn driver_device_teardown_corruption() -> Self {
+        Self::without_location(FatalReason::DriverDeviceTeardownCorruption)
+    }
+
     /// Constructs a fatal state without source location context.
     const fn without_location(reason: FatalReason) -> Self {
         Self {
@@ -117,6 +122,8 @@ enum FatalReason {
     AsyncExecutorStateCorruption,
     /// Actor-owned mounted-volume state and its kernel-visible VPB diverged.
     MountedVolumeStateCorruption,
+    /// The driver device chain no longer matches its typed extension ownership.
+    DriverDeviceTeardownCorruption,
 }
 
 impl FatalReason {
@@ -129,6 +136,7 @@ impl FatalReason {
             Self::FileObjectLifecycleCorruption => 4,
             Self::AsyncExecutorStateCorruption => 5,
             Self::MountedVolumeStateCorruption => 6,
+            Self::DriverDeviceTeardownCorruption => 7,
         }
     }
 }
@@ -171,6 +179,10 @@ mod tests {
         assert_eq!(FatalReason::FileObjectLifecycleCorruption.as_parameter(), 4);
         assert_eq!(FatalReason::AsyncExecutorStateCorruption.as_parameter(), 5);
         assert_eq!(FatalReason::MountedVolumeStateCorruption.as_parameter(), 6);
+        assert_eq!(
+            FatalReason::DriverDeviceTeardownCorruption.as_parameter(),
+            7
+        );
     }
 
     /// # Panics
@@ -197,6 +209,10 @@ mod tests {
         assert_eq!(
             KernelWideInconsistency::mounted_volume_state_corruption().reason,
             FatalReason::MountedVolumeStateCorruption
+        );
+        assert_eq!(
+            KernelWideInconsistency::driver_device_teardown_corruption().reason,
+            FatalReason::DriverDeviceTeardownCorruption
         );
     }
 }
