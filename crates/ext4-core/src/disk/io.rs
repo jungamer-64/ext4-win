@@ -6,7 +6,7 @@ use super::block::{ByteOffset, DeviceLength};
 use crate::error::Result;
 
 /// Serialized readable storage owned by one filesystem operation lane.
-pub trait BlockSource: Send {
+pub trait BlockSource {
     /// Total readable length in bytes.
     fn len(&self) -> DeviceLength;
 
@@ -15,7 +15,7 @@ pub trait BlockSource: Send {
         &'a mut self,
         offset: ByteOffset,
         out: &'a mut [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a;
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Returns true when the storage has no bytes.
     fn is_empty(&self) -> bool {
@@ -30,10 +30,10 @@ pub trait BlockStorage: BlockSource {
         &'a mut self,
         offset: ByteOffset,
         bytes: &'a [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a;
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Persists every preceding write according to the storage contract.
-    fn flush(&mut self) -> impl Future<Output = Result<()>> + Send + '_;
+    fn flush(&mut self) -> impl Future<Output = Result<()>> + '_;
 }
 
 impl<T: BlockSource + ?Sized> BlockSource for &mut T {
@@ -45,7 +45,7 @@ impl<T: BlockSource + ?Sized> BlockSource for &mut T {
         &'a mut self,
         offset: ByteOffset,
         out: &'a mut [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
+    ) -> impl Future<Output = Result<()>> + 'a {
         (**self).read_exact_at(offset, out)
     }
 }
@@ -55,11 +55,11 @@ impl<T: BlockStorage + ?Sized> BlockStorage for &mut T {
         &'a mut self,
         offset: ByteOffset,
         bytes: &'a [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
+    ) -> impl Future<Output = Result<()>> + 'a {
         (**self).write_exact_at(offset, bytes)
     }
 
-    fn flush(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
+    fn flush(&mut self) -> impl Future<Output = Result<()>> + '_ {
         (**self).flush()
     }
 }
