@@ -286,33 +286,6 @@ impl KernelFileObject {
         NonNull::new(file_object).map(|file_object| Self { file_object })
     }
 
-    /// Returns an immutable WDK file object reference.
-    ///
-    /// # Safety
-    /// The returned reference must not outlive the active WDK callback that supplied this
-    /// FILE_OBJECT, and the caller must not mutate the object through another alias for that
-    /// lifetime.
-    pub(crate) unsafe fn as_ref<'a>(self) -> &'a FILE_OBJECT {
-        unsafe {
-            // SAFETY: The caller ties the returned reference to the active WDK
-            // callback lifetime that supplied this non-null FILE_OBJECT.
-            self.file_object.as_ref()
-        }
-    }
-
-    /// Returns a mutable WDK file object reference.
-    ///
-    /// # Safety
-    /// The caller must own the current mutation point for this FILE_OBJECT and ensure no other
-    /// FILE_OBJECT reference aliases the returned mutable reference.
-    pub(crate) unsafe fn as_mut<'a>(mut self) -> &'a mut FILE_OBJECT {
-        unsafe {
-            // SAFETY: The caller owns the active mutation point for this
-            // FILE_OBJECT during the current dispatch callback.
-            self.file_object.as_mut()
-        }
-    }
-
     /// Returns the raw WDK pointer for FFI calls that require FILE_OBJECT.
     pub(crate) fn as_ptr(self) -> *mut FILE_OBJECT {
         self.file_object.as_ptr()
@@ -386,31 +359,6 @@ impl UninitializedFileObject {
         self.file_object
     }
 
-    /// Returns an immutable WDK FILE_OBJECT reference.
-    ///
-    /// # Safety
-    /// The returned reference must stay within the active create dispatch lifetime and must not
-    /// alias any concurrent mutable access to the FILE_OBJECT.
-    pub(crate) unsafe fn as_ref<'a>(self) -> &'a FILE_OBJECT {
-        unsafe {
-            // SAFETY: The caller ties the returned reference to the active
-            // create dispatch lifetime that supplied this FILE_OBJECT.
-            self.file_object.as_ref()
-        }
-    }
-
-    /// Returns a mutable WDK FILE_OBJECT reference.
-    ///
-    /// # Safety
-    /// The caller must hold the unique create attach point for this uninitialized FILE_OBJECT while
-    /// the returned mutable reference is alive.
-    pub(crate) unsafe fn as_mut<'a>(self) -> &'a mut FILE_OBJECT {
-        unsafe {
-            // SAFETY: The caller owns the successful create attach point for
-            // this not-yet-initialized FILE_OBJECT.
-            self.file_object.as_mut()
-        }
-    }
 }
 
 /// Non-null VPB pointer supplied by the I/O Manager.

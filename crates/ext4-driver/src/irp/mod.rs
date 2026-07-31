@@ -326,18 +326,13 @@ pub(crate) enum DataIoKind {
 }
 
 /// Non-null dispatch target decoded from raw WDK callback inputs.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub(crate) struct DispatchTarget {
     /// Device object receiving the IRP.
     device: KernelDevice,
     /// IRP being dispatched.
     irp: KernelIrp,
 }
-
-// SAFETY: The I/O Manager keeps both kernel objects alive while the driver owns the pending IRP,
-// and the device executor transfers this pointer-only boundary between workers without concurrent
-// request execution.
-unsafe impl Send for DispatchTarget {}
 
 impl DispatchTarget {
     /// Decodes raw WDK dispatch pointers.
@@ -746,19 +741,6 @@ impl KernelIrp {
     /// Returns the raw IRP pointer.
     fn as_ptr(self) -> PIRP {
         self.irp.as_ptr()
-    }
-
-    /// Returns an immutable IRP reference for active dispatch decoding.
-    ///
-    /// # Safety
-    /// The returned reference must not outlive the WDK dispatch callback that supplied this IRP, and
-    /// the caller must not mutate the same IRP through another alias for that lifetime.
-    unsafe fn as_ref<'a>(self) -> &'a wdk_sys::IRP {
-        unsafe {
-            // SAFETY: The caller ties the returned reference to the current WDK
-            // dispatch callback that supplied this IRP.
-            self.irp.as_ref()
-        }
     }
 
     /// Returns the current stack location selected by the I/O Manager.
