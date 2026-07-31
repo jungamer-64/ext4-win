@@ -86,7 +86,6 @@ pub unsafe extern "system" fn driver_entry(
         // SAFETY: `control_device` was initialized by a successful IoCreateDevice call.
         kernel::ffi::IoRegisterFileSystem(control_device.as_ptr());
     }
-    state::publish_control_device(control_device);
 
     STATUS_SUCCESS
 }
