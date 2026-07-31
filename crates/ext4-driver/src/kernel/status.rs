@@ -272,6 +272,21 @@ mod tests {
 
     /// # Panics
     ///
+    /// Panics when volume lifecycle failures lose their Windows status identities.
+    #[test]
+    fn volume_lifecycle_errors_use_exact_statuses() {
+        assert_eq!(
+            DriverError::VolumeDismounted.ntstatus(),
+            super::ntstatus(0xC000_026E)
+        );
+        assert_eq!(
+            DriverError::NotLocked.ntstatus(),
+            super::ntstatus(0xC000_002A)
+        );
+    }
+
+    /// # Panics
+    ///
     /// Panics when Windows file-vs-directory create failures lose their exact status.
     #[test]
     fn create_target_kind_errors_use_exact_statuses() {

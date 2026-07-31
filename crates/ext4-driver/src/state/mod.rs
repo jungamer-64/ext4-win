@@ -630,6 +630,109 @@ enum MountedVolumeState {
     },
 }
 
+impl MountedVolumeState {
+    /// Selects the locked state reached by one direct-volume FILE_OBJECT.
+    /// # Errors
+    ///
+    /// Returns access denied when already locked or volume dismounted after terminal dismount.
+    fn lock(self, owner: KernelFileObject) -> DriverResult<Self> {
+        match self {
+            Self::Mounted => Ok(Self::Locked { owner }),
+            Self::Locked { .. } => Err(DriverError::AccessDenied),
+            Self::Dismounted { .. } => Err(DriverError::VolumeDismounted),
+        }
+    }
+
+    /// Selects the state reached when one FILE_OBJECT releases its volume lock.
+    /// # Errors
+    ///
+    /// Returns not locked when `owner` does not own the current lock.
+    fn unlock(self, owner: KernelFileObject) -> DriverResult<Self> {
+        match self {
+            Self::Locked {
+                owner: current_owner,
+            } if current_owner == owner => Ok(Self::Mounted),
+            Self::Dismounted {
+                lock_owner: Some(current_owner),
+            } if current_owner == owner => Ok(Self::Dismounted { lock_owner: None }),
+            Self::Mounted | Self::Locked { .. } | Self::Dismounted { .. } => {
+                Err(DriverError::NotLocked)
+            }
+        }
+    }
+
+    /// Selects the terminal state reached by a forced dismount request.
+    /// # Errors
+    ///
+    /// Returns access denied for another lock owner or volume dismounted after terminal dismount.
+    fn dismount(self, owner: KernelFileObject) -> DriverResult<Self> {
+        match self {
+            Self::Mounted => Ok(Self::Dismounted { lock_owner: None }),
+            Self::Locked {
+                owner: current_owner,
+            } if current_owner == owner => Ok(Self::Dismounted {
+                lock_owner: Some(owner),
+            }),
+            Self::Locked { .. } => Err(DriverError::AccessDenied),
+            Self::Dismounted { .. } => Err(DriverError::VolumeDismounted),
+        }
+    }
+
+    /// Applies implicit lock release when the owning FILE_OBJECT is cleaned up.
+    fn cleanup(self, owner: KernelFileObject) -> (Self, VolumeHandleCleanup) {
+        match self {
+            Self::Locked {
+                owner: current_owner,
+            } if current_owner == owner => (Self::Mounted, VolumeHandleCleanup::Unlocked),
+            Self::Dismounted {
+                lock_owner: Some(current_owner),
+            } if current_owner == owner => (
+                Self::Dismounted { lock_owner: None },
+                VolumeHandleCleanup::Unlocked,
+            ),
+            Self::Mounted | Self::Locked { .. } | Self::Dismounted { .. } => {
+                (self, VolumeHandleCleanup::Released)
+            }
+        }
+    }
+
+    /// Reports whether this volume remains logically mounted.
+    /// # Errors
+    ///
+    /// Returns volume dismounted after the terminal transition.
+    fn ensure_mounted(self) -> DriverResult<()> {
+        match self {
+            Self::Mounted | Self::Locked { .. } => Ok(()),
+            Self::Dismounted { .. } => Err(DriverError::VolumeDismounted),
+        }
+    }
+
+    /// Applies create/open admission policy.
+    /// # Errors
+    ///
+    /// Returns access denied while locked or volume dismounted after terminal dismount.
+    fn authorize_create(self) -> DriverResult<()> {
+        match self {
+            Self::Mounted => Ok(()),
+            Self::Locked { .. } => Err(DriverError::AccessDenied),
+            Self::Dismounted { .. } => Err(DriverError::VolumeDismounted),
+        }
+    }
+
+    /// Applies ordinary handle-operation policy.
+    /// # Errors
+    ///
+    /// Returns access denied for a competing lock owner or volume dismounted after dismount.
+    fn authorize_handle(self, file_object: KernelFileObject) -> DriverResult<()> {
+        match self {
+            Self::Mounted => Ok(()),
+            Self::Locked { owner } if owner == file_object => Ok(()),
+            Self::Locked { .. } => Err(DriverError::AccessDenied),
+            Self::Dismounted { .. } => Err(DriverError::VolumeDismounted),
+        }
+    }
+}
+
 /// Direct-volume FILE_OBJECT share claims owned by the mounted-device actor.
 struct VolumeHandleLedger {
     /// I/O Manager share-access accounting for the mounted volume identity.
@@ -846,21 +949,9 @@ impl VolumeOperationLease {
             self.control.as_mut()
         };
         control.handles.cleanup(file_object);
-        match control.state {
-            MountedVolumeState::Locked { owner } if owner == file_object => {
-                control.state = MountedVolumeState::Mounted;
-                VolumeHandleCleanup::Unlocked
-            }
-            MountedVolumeState::Dismounted {
-                lock_owner: Some(owner),
-            } if owner == file_object => {
-                control.state = MountedVolumeState::Dismounted { lock_owner: None };
-                VolumeHandleCleanup::Unlocked
-            }
-            MountedVolumeState::Mounted
-            | MountedVolumeState::Locked { .. }
-            | MountedVolumeState::Dismounted { .. } => VolumeHandleCleanup::Released,
-        }
+        let (state, effect) = control.state.cleanup(file_object);
+        control.state = state;
+        effect
     }
 
     /// Flushes and locks a volume whose caller is its only active handle.
@@ -873,13 +964,7 @@ impl VolumeOperationLease {
             // SAFETY: This non-cloneable actor lease uniquely owns volume lifecycle transitions.
             self.control.as_ref()
         };
-        match control.state {
-            MountedVolumeState::Mounted => {}
-            MountedVolumeState::Locked { .. } => return Err(DriverError::AccessDenied),
-            MountedVolumeState::Dismounted { .. } => {
-                return Err(DriverError::VolumeDismounted);
-            }
-        }
+        let next_state = control.state.lock(owner)?;
         let namespace_handles = unsafe {
             // SAFETY: The heap-stable VCB retains this ledger throughout the actor lease.
             self.file_control_blocks.as_ref()
@@ -889,14 +974,11 @@ impl VolumeOperationLease {
             return Err(DriverError::AccessDenied);
         }
         self.lane_mut().flush().await?;
-        let control = unsafe {
+        unsafe {
             // SAFETY: No other actor operation can change the state across this awaited flush.
             self.control.as_mut()
-        };
-        if control.state != MountedVolumeState::Mounted {
-            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
         }
-        control.state = MountedVolumeState::Locked { owner };
+        .state = next_state;
         Ok(())
     }
 
@@ -909,23 +991,8 @@ impl VolumeOperationLease {
             // SAFETY: This non-cloneable actor lease uniquely owns volume lifecycle transitions.
             self.control.as_mut()
         };
-        match control.state {
-            MountedVolumeState::Locked {
-                owner: current_owner,
-            } if current_owner == owner => {
-                control.state = MountedVolumeState::Mounted;
-                Ok(())
-            }
-            MountedVolumeState::Dismounted {
-                lock_owner: Some(current_owner),
-            } if current_owner == owner => {
-                control.state = MountedVolumeState::Dismounted { lock_owner: None };
-                Ok(())
-            }
-            MountedVolumeState::Mounted
-            | MountedVolumeState::Locked { .. }
-            | MountedVolumeState::Dismounted { .. } => Err(DriverError::NotLocked),
-        }
+        control.state = control.state.unlock(owner)?;
+        Ok(())
     }
 
     /// Flushes and enters the terminal logical dismount state.
@@ -934,27 +1001,18 @@ impl VolumeOperationLease {
     /// Returns access denied when another FILE_OBJECT owns the volume lock, volume dismounted for
     /// a repeated request, or the lower flush error.
     pub(crate) async fn dismount_volume(&mut self, owner: KernelFileObject) -> DriverResult<()> {
-        let lock_owner = match unsafe {
+        let next_state = unsafe {
             // SAFETY: This non-cloneable actor lease uniquely observes volume lifecycle state.
             self.control.as_ref()
         }
         .state
-        {
-            MountedVolumeState::Mounted => None,
-            MountedVolumeState::Locked {
-                owner: current_owner,
-            } if current_owner == owner => Some(owner),
-            MountedVolumeState::Locked { .. } => return Err(DriverError::AccessDenied),
-            MountedVolumeState::Dismounted { .. } => {
-                return Err(DriverError::VolumeDismounted);
-            }
-        };
+        .dismount(owner)?;
         self.lane_mut().flush().await?;
-        let control = unsafe {
+        unsafe {
             // SAFETY: No other actor operation can change the state across this awaited flush.
             self.control.as_mut()
-        };
-        control.state = MountedVolumeState::Dismounted { lock_owner };
+        }
+        .state = next_state;
         Ok(())
     }
 
@@ -963,15 +1021,12 @@ impl VolumeOperationLease {
     ///
     /// Returns volume dismounted after a successful forced dismount.
     pub(crate) fn ensure_mounted(&self) -> DriverResult<()> {
-        match unsafe {
+        unsafe {
             // SAFETY: The actor lease keeps the heap-stable volume control plane live.
             self.control.as_ref()
         }
         .state
-        {
-            MountedVolumeState::Mounted | MountedVolumeState::Locked { .. } => Ok(()),
-            MountedVolumeState::Dismounted { .. } => Err(DriverError::VolumeDismounted),
-        }
+        .ensure_mounted()
     }
 
     /// Authorizes creation of a new FILE_OBJECT against the current volume state.
@@ -979,16 +1034,12 @@ impl VolumeOperationLease {
     ///
     /// Returns access denied while locked or volume dismounted after terminal dismount.
     pub(crate) fn authorize_create(&self) -> DriverResult<()> {
-        match unsafe {
+        unsafe {
             // SAFETY: The actor lease keeps the heap-stable volume control plane live.
             self.control.as_ref()
         }
         .state
-        {
-            MountedVolumeState::Mounted => Ok(()),
-            MountedVolumeState::Locked { .. } => Err(DriverError::AccessDenied),
-            MountedVolumeState::Dismounted { .. } => Err(DriverError::VolumeDismounted),
-        }
+        .authorize_create()
     }
 
     /// Authorizes one ordinary handle operation against the current volume state.
@@ -997,17 +1048,12 @@ impl VolumeOperationLease {
     /// Returns access denied when another handle owns the lock, or volume dismounted after
     /// terminal logical dismount.
     pub(crate) fn authorize_handle(&self, file_object: KernelFileObject) -> DriverResult<()> {
-        match unsafe {
+        unsafe {
             // SAFETY: The actor lease keeps the heap-stable volume control plane live.
             self.control.as_ref()
         }
         .state
-        {
-            MountedVolumeState::Mounted => Ok(()),
-            MountedVolumeState::Locked { owner } if owner == file_object => Ok(()),
-            MountedVolumeState::Locked { .. } => Err(DriverError::AccessDenied),
-            MountedVolumeState::Dismounted { .. } => Err(DriverError::VolumeDismounted),
-        }
+        .authorize_handle(file_object)
     }
 
     /// Returns the actor-owned operation lane through this exclusive capability.
@@ -2437,10 +2483,11 @@ impl MountedVolumeDevice {
     /// Publishes whether the mounted VPB rejects creates for a volume lock.
     /// # Errors
     ///
-    /// Returns an error when the mounted device has no VPB or the flag is not representable.
-    pub(crate) fn publish_volume_lock(device: KernelDevice, locked: bool) -> DriverResult<()> {
-        let locked_flag =
-            u16::try_from(wdk_sys::VPB_LOCKED).map_err(|_| DriverError::InvalidParameter)?;
+    /// Stops the system if the live mounted device has lost its VPB association.
+    pub(crate) fn publish_volume_lock(device: KernelDevice, locked: bool) {
+        let locked_flag = u16::try_from(wdk_sys::VPB_LOCKED).unwrap_or_else(|_| {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+        });
         Self::update_vpb_flags(device, |flags| {
             if locked {
                 *flags |= locked_flag;
@@ -2448,16 +2495,21 @@ impl MountedVolumeDevice {
                 *flags &= !locked_flag;
             }
         })
+        .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
     }
 
     /// Publishes that direct lower-volume writes are permitted after logical dismount.
     /// # Errors
     ///
-    /// Returns an error when the mounted device has no VPB or the flag is not representable.
-    pub(crate) fn publish_direct_writes_allowed(device: KernelDevice) -> DriverResult<()> {
-        let direct_writes = u16::try_from(wdk_sys::VPB_DIRECT_WRITES_ALLOWED)
-            .map_err(|_| DriverError::InvalidParameter)?;
-        Self::update_vpb_flags(device, |flags| *flags |= direct_writes)
+    /// Stops the system if the live mounted device has lost its VPB association.
+    pub(crate) fn publish_direct_writes_allowed(device: KernelDevice) {
+        let direct_writes =
+            u16::try_from(wdk_sys::VPB_DIRECT_WRITES_ALLOWED).unwrap_or_else(|_| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            });
+        Self::update_vpb_flags(device, |flags| *flags |= direct_writes).unwrap_or_else(|_| {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+        });
     }
 
     /// Stops shutdown IRP delivery after this volume has logically dismounted.
@@ -2475,11 +2527,13 @@ impl MountedVolumeDevice {
     /// Notifies FsRtl that this lower storage volume completed a dismount request.
     /// # Errors
     ///
-    /// Returns an error when the mounted device or its VPB/real-device association is absent.
-    pub(crate) fn complete_dismount(device: KernelDevice) -> DriverResult<()> {
+    /// Stops the system if the mounted device has lost its VPB/real-device association.
+    pub(crate) fn complete_dismount(device: KernelDevice) {
         let real_device = Self::with_vpb(device, |vpb| {
             KernelDevice::from_raw(vpb.RealDevice).ok_or(DriverError::InvalidParameter)
-        })??;
+        })
+        .and_then(core::convert::identity)
+        .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
         #[cfg(not(test))]
         unsafe {
             // SAFETY: The VPB identified this live lower storage device and logical dismount
@@ -2488,7 +2542,6 @@ impl MountedVolumeDevice {
         }
         #[cfg(test)]
         let _real_device = real_device;
-        Ok(())
     }
 
     /// Mutates VPB flags while holding the global VPB spin lock in production.
@@ -4195,11 +4248,12 @@ mod tests {
         DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode, DeviceExtensionKind,
         DirectoryNameChange, DirectoryNameChangeAction, FileControlBlock, FileControlBlockLedger,
         FileControlBlockOpenState, FileControlBlockRelease, FileObjectCloseKind, KernelDevice,
-        KernelFileObject, MountedVolumeDevice, MountedVolumeDeviceExtension, NativeFileByteRange,
-        NoIntermediateTransfer, OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation,
-        OpenedNodeMode, OpenedObject, OpenedRegularFile, OpenedVolumeHandle,
-        TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
-        WriteCommitment, select_close_release_plan, shutdown_registration_status,
+        KernelFileObject, MountedVolumeDevice, MountedVolumeDeviceExtension, MountedVolumeState,
+        NativeFileByteRange, NoIntermediateTransfer, OpenedDirectory, OpenedFileObject,
+        OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
+        OpenedVolumeHandle, TransferBufferAlignment, TransferSectorSize, UninitializedFileObject,
+        VolumeControlBlock, VolumeHandleCleanup, WriteCommitment, select_close_release_plan,
+        shutdown_registration_status,
     };
 
     fn file_object_with_contexts(
@@ -4239,6 +4293,90 @@ mod tests {
             Ok(())
         });
         assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the mounted/locked policy permits a competing handle or create.
+    #[test]
+    fn mounted_volume_lock_policy_is_owned_by_one_file_object() {
+        let mut owner_file = wdk_sys::FILE_OBJECT::default();
+        let mut competing_file = wdk_sys::FILE_OBJECT::default();
+        let Some(owner) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(owner_file)) else {
+            return;
+        };
+        let Some(competing) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(competing_file))
+        else {
+            return;
+        };
+
+        let mounted = MountedVolumeState::Mounted;
+        assert_eq!(mounted.authorize_create(), Ok(()));
+        assert_eq!(mounted.authorize_handle(competing), Ok(()));
+        let locked = mounted.lock(owner);
+        assert_eq!(locked, Ok(MountedVolumeState::Locked { owner }));
+        let Ok(locked) = locked else {
+            return;
+        };
+        assert_eq!(locked.authorize_create(), Err(DriverError::AccessDenied));
+        assert_eq!(locked.authorize_handle(owner), Ok(()));
+        assert_eq!(
+            locked.authorize_handle(competing),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(locked.unlock(competing), Err(DriverError::NotLocked));
+        assert_eq!(locked.unlock(owner), Ok(MountedVolumeState::Mounted));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when logical dismount can be reversed or loses its retained lock owner.
+    #[test]
+    fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
+        let mut owner_file = wdk_sys::FILE_OBJECT::default();
+        let mut competing_file = wdk_sys::FILE_OBJECT::default();
+        let Some(owner) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(owner_file)) else {
+            return;
+        };
+        let Some(competing) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(competing_file))
+        else {
+            return;
+        };
+
+        let dismounted = MountedVolumeState::Locked { owner }.dismount(owner);
+        assert_eq!(
+            dismounted,
+            Ok(MountedVolumeState::Dismounted {
+                lock_owner: Some(owner)
+            })
+        );
+        let Ok(dismounted) = dismounted else {
+            return;
+        };
+        assert_eq!(
+            dismounted.ensure_mounted(),
+            Err(DriverError::VolumeDismounted)
+        );
+        assert_eq!(
+            dismounted.authorize_handle(owner),
+            Err(DriverError::VolumeDismounted)
+        );
+        assert_eq!(
+            dismounted.dismount(owner),
+            Err(DriverError::VolumeDismounted)
+        );
+        assert_eq!(dismounted.unlock(competing), Err(DriverError::NotLocked));
+        assert_eq!(
+            dismounted.cleanup(competing),
+            (dismounted, VolumeHandleCleanup::Released)
+        );
+        assert_eq!(
+            dismounted.cleanup(owner),
+            (
+                MountedVolumeState::Dismounted { lock_owner: None },
+                VolumeHandleCleanup::Unlocked
+            )
+        );
     }
 
     /// Runs one decoder against a FILE_OBJECT whose lifetime is owned by an active test IRP.

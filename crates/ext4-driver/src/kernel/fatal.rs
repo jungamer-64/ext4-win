@@ -55,6 +55,11 @@ impl KernelWideInconsistency {
         Self::without_location(FatalReason::AsyncExecutorStateCorruption)
     }
 
+    /// Constructs a fatal state for an impossible mounted-volume/VPB lifecycle.
+    pub(crate) const fn mounted_volume_state_corruption() -> Self {
+        Self::without_location(FatalReason::MountedVolumeStateCorruption)
+    }
+
     /// Constructs a fatal state without source location context.
     const fn without_location(reason: FatalReason) -> Self {
         Self {
@@ -110,6 +115,8 @@ enum FatalReason {
     FileControlBlockOwnershipCorruption,
     /// A mailbox, wake, or actor transition violated the executor state machine.
     AsyncExecutorStateCorruption,
+    /// Actor-owned mounted-volume state and its kernel-visible VPB diverged.
+    MountedVolumeStateCorruption,
 }
 
 impl FatalReason {
@@ -121,6 +128,7 @@ impl FatalReason {
             Self::FileControlBlockOwnershipCorruption => 3,
             Self::FileObjectLifecycleCorruption => 4,
             Self::AsyncExecutorStateCorruption => 5,
+            Self::MountedVolumeStateCorruption => 6,
         }
     }
 }
@@ -162,6 +170,7 @@ mod tests {
         );
         assert_eq!(FatalReason::FileObjectLifecycleCorruption.as_parameter(), 4);
         assert_eq!(FatalReason::AsyncExecutorStateCorruption.as_parameter(), 5);
+        assert_eq!(FatalReason::MountedVolumeStateCorruption.as_parameter(), 6);
     }
 
     /// # Panics
@@ -184,6 +193,10 @@ mod tests {
         assert_eq!(
             KernelWideInconsistency::async_executor_state_corruption().reason,
             FatalReason::AsyncExecutorStateCorruption
+        );
+        assert_eq!(
+            KernelWideInconsistency::mounted_volume_state_corruption().reason,
+            FatalReason::MountedVolumeStateCorruption
         );
     }
 }

@@ -1584,7 +1584,7 @@ fn cleanup_opened_volume(
     let mut operations = claim_volume_operation_lane(opened_volume.volume());
     let effect = operations.cleanup_volume_handle(opened_volume.file_object());
     if effect == VolumeHandleCleanup::Unlocked {
-        MountedVolumeDevice::publish_volume_lock(device, false)?;
+        MountedVolumeDevice::publish_volume_lock(device, false);
     }
     opened_volume.finish_cleanup();
     file_object.mark_cleanup_complete();
@@ -2877,11 +2877,8 @@ fn release_file_contexts(device: crate::state::KernelDevice, file_object: Active
             if release_plan == CloseReleasePlan::CancelledOpen {
                 let mut operations = claim_volume_operation_lane(volume);
                 let effect = operations.cleanup_volume_handle(file_object_address);
-                if effect == VolumeHandleCleanup::Unlocked
-                    && MountedVolumeDevice::publish_volume_lock(device, false).is_err()
-                {
-                    crate::kernel::fatal::KernelWideInconsistency::file_object_lifecycle_corruption()
-                        .bugcheck();
+                if effect == VolumeHandleCleanup::Unlocked {
+                    MountedVolumeDevice::publish_volume_lock(device, false);
                 }
             }
             unsafe {
