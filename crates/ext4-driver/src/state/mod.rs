@@ -418,6 +418,31 @@ impl DeviceExtensionKind {
     const MOUNTED_VOLUME: Self = Self { value: 2 };
 }
 
+/// Driver-owned device kind decoded before selecting a concrete extension teardown path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DriverDeviceKind {
+    /// Registered filesystem control device.
+    Control,
+    /// Mounted ext4 volume device.
+    MountedVolume,
+}
+
+impl DriverDeviceKind {
+    /// Decodes the common extension discriminant.
+    /// # Errors
+    ///
+    /// Returns an invariant error when driver-owned extension storage has an unknown kind.
+    fn decode(kind: DeviceExtensionKind) -> DriverResult<Self> {
+        if kind == DeviceExtensionKind::CONTROL {
+            Ok(Self::Control)
+        } else if kind == DeviceExtensionKind::MOUNTED_VOLUME {
+            Ok(Self::MountedVolume)
+        } else {
+            Err(DriverError::InternalInvariantViolation)
+        }
+    }
+}
+
 /// Common prefix shared by all driver-owned device extensions.
 #[repr(C)]
 struct DeviceExtensionHeader {
@@ -512,17 +537,6 @@ impl ControlDevice {
     /// Returns the raw WDK device pointer for FFI calls.
     pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
         self.device.as_ptr()
-    }
-
-    /// Releases resources stored in the control device extension.
-    /// # Safety
-    ///
-    /// No dispatch callback or device actor may still access the control device.
-    pub(crate) unsafe fn release(self) {
-        unsafe {
-            // SAFETY: The caller owns control-device teardown.
-            ControlDeviceExtension::release(self.device);
-        }
     }
 }
 
@@ -1614,6 +1628,14 @@ impl VolumeControlBlock {
             file_control_blocks,
         }
     }
+
+    /// Returns whether logical dismount already consumed shutdown registration.
+    fn is_logically_dismounted(&self) -> bool {
+        matches!(
+            self.volume_control.state,
+            MountedVolumeState::Dismounted { .. }
+        )
+    }
 }
 
 /// One validated directory-notification registration owned by a FILE_OBJECT.
@@ -2443,6 +2465,50 @@ impl MountedVolumeDevice {
         NonNull::new(extension.vcb)
     }
 
+    /// Releases actor, VPB, and VCB resources before the I/O Manager deletes this device.
+    /// # Safety
+    ///
+    /// New dispatch must be excluded. Every FILE_OBJECT must have completed Close, or teardown
+    /// terminates at the VCB ownership boundary instead of freeing referenced state.
+    unsafe fn release(device: KernelDevice) {
+        let device_object = unsafe {
+            // SAFETY: The caller owns terminal teardown of this mounted device.
+            device.as_ptr().as_mut()
+        }
+        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+        let extension = unsafe {
+            // SAFETY: The common extension kind was decoded as mounted before this call.
+            device_object
+                .DeviceExtension
+                .cast::<MountedVolumeDeviceExtension>()
+                .as_mut()
+        }
+        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+        unsafe {
+            // SAFETY: Terminal teardown closes admission, drains IRPs, and joins the actor before
+            // any VCB or VPB storage is released.
+            DeviceExecutor::release_at(core::ptr::addr_of_mut!(extension.header.executor));
+        }
+        let vcb = NonNull::new(extension.vcb).unwrap_or_else(|| {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+        });
+        if !unsafe {
+            // SAFETY: The executor is joined, granting teardown exclusive VCB access.
+            vcb.as_ref()
+        }
+        .is_logically_dismounted()
+        {
+            Self::unregister_shutdown_notification(device);
+        }
+        Self::detach_vpb(device);
+        extension.vcb = core::ptr::null_mut();
+        unsafe {
+            // SAFETY: Mount transferred this Box to the extension and terminal teardown takes it
+            // exactly once after every actor access ended.
+            drop(Box::from_raw(vcb.as_ptr()));
+        }
+    }
+
     /// Refreshes the VPB volume label after a successful label mutation.
     /// # Errors
     ///
@@ -2537,6 +2603,36 @@ impl MountedVolumeDevice {
     /// Returns an error when the mounted device or its VPB is absent.
     fn update_vpb_flags(device: KernelDevice, update: impl FnOnce(&mut u16)) -> DriverResult<()> {
         Self::with_vpb(device, |vpb| update(&mut vpb.Flags))
+    }
+
+    /// Removes this mounted device from its VPB while holding the global VPB lock.
+    fn detach_vpb(device: KernelDevice) {
+        let mounted = u16::try_from(wdk_sys::VPB_MOUNTED).unwrap_or_else(|_| {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+        });
+        let locked = u16::try_from(wdk_sys::VPB_LOCKED).unwrap_or_else(|_| {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+        });
+        let direct_writes =
+            u16::try_from(wdk_sys::VPB_DIRECT_WRITES_ALLOWED).unwrap_or_else(|_| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            });
+        Self::with_vpb(device, |vpb| {
+            if vpb.DeviceObject != device.as_ptr() {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
+            }
+            vpb.Flags &= !(mounted | locked | direct_writes);
+            vpb.DeviceObject = core::ptr::null_mut();
+            let device_object = unsafe {
+                // SAFETY: The VPB lock is held and terminal teardown still owns the device.
+                device.as_ptr().as_mut()
+            }
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            });
+            device_object.Vpb = core::ptr::null_mut();
+        })
+        .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
     }
 
     /// Runs one nonblocking VPB access under the global VPB spin lock in production.
@@ -4193,7 +4289,67 @@ fn file_control_block_owner(fcb: NonNull<FileControlBlock>) -> NonNull<FileContr
 /// # Safety
 /// The I/O Manager must call this only as the registered unload routine for this driver object,
 /// after no dispatch callbacks can still use the control device being unregistered.
-pub(crate) unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {}
+pub(crate) unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
+    let Some(driver) = (unsafe {
+        // SAFETY: The I/O Manager invokes DriverUnload with this driver's live object.
+        driver.as_mut()
+    }) else {
+        return;
+    };
+    let mut next = driver.DeviceObject;
+    while let Some(device) = KernelDevice::from_raw(next) {
+        next = unsafe {
+            // SAFETY: Save the I/O Manager-owned chain link before deleting this device.
+            device.as_ptr().as_ref()
+        }
+        .map_or(core::ptr::null_mut(), |object| object.NextDevice);
+        let kind = driver_device_kind(device).unwrap_or_else(|_| {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck()
+        });
+        match kind {
+            DriverDeviceKind::Control => {
+                unsafe {
+                    // SAFETY: Unload excludes new dispatch and this is the registered FSD device.
+                    ffi::IoUnregisterFileSystem(device.as_ptr());
+                }
+                unsafe {
+                    // SAFETY: Unregistration and unload exclude every executor user.
+                    ControlDeviceExtension::release(device);
+                }
+            }
+            DriverDeviceKind::MountedVolume => unsafe {
+                // SAFETY: Unload excludes new dispatch and all user handles by I/O Manager
+                // contract; mounted teardown drains its remaining actor work before release.
+                MountedVolumeDevice::release(device);
+            },
+        }
+        unsafe {
+            // SAFETY: Concrete extension resources were released exactly once above.
+            ffi::IoDeleteDevice(device.as_ptr());
+        }
+    }
+}
+
+/// Decodes the common extension kind for one device in this driver's I/O Manager-owned chain.
+/// # Errors
+///
+/// Returns an invariant error when the device or its typed extension header is absent or unknown.
+fn driver_device_kind(device: KernelDevice) -> DriverResult<DriverDeviceKind> {
+    let device = unsafe {
+        // SAFETY: The unload chain retains this device until its resources are selected.
+        device.as_ptr().as_ref()
+    }
+    .ok_or(DriverError::InternalInvariantViolation)?;
+    let header = unsafe {
+        // SAFETY: Every device created by this driver begins with DeviceExtensionHeader.
+        device
+            .DeviceExtension
+            .cast::<DeviceExtensionHeader>()
+            .as_ref()
+    }
+    .ok_or(DriverError::InternalInvariantViolation)?;
+    DriverDeviceKind::decode(header.kind)
+}
 
 #[cfg(test)]
 mod tests {
@@ -4210,13 +4366,14 @@ mod tests {
     use super::{
         CleanupStart, CloseReleasePlan, ControlDeviceExtension,
         DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode, DeviceExtensionKind,
-        DirectoryNameChange, DirectoryNameChangeAction, FileControlBlock, FileControlBlockLedger,
-        FileControlBlockOpenState, FileControlBlockRelease, FileObjectCloseKind, KernelDevice,
-        KernelFileObject, MountedVolumeDevice, MountedVolumeDeviceExtension, MountedVolumeState,
-        NativeFileByteRange, NoIntermediateTransfer, OpenedDirectory, OpenedFileObject,
-        OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
-        OpenedVolumeHandle, TransferBufferAlignment, TransferSectorSize, UninitializedFileObject,
-        VolumeControlBlock, VolumeHandleCleanup, WriteCommitment, select_close_release_plan,
+        DirectoryNameChange, DirectoryNameChangeAction, DriverDeviceKind, FileControlBlock,
+        FileControlBlockLedger, FileControlBlockOpenState, FileControlBlockRelease,
+        FileObjectCloseKind, KernelDevice, KernelFileObject, MountedVolumeDevice,
+        MountedVolumeDeviceExtension, MountedVolumeState, NativeFileByteRange,
+        NoIntermediateTransfer, OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation,
+        OpenedNodeMode, OpenedObject, OpenedRegularFile, OpenedVolumeHandle,
+        TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
+        VolumeHandleCleanup, WriteCommitment, select_close_release_plan,
         shutdown_registration_status,
     };
 
@@ -4398,6 +4555,25 @@ mod tests {
                 ControlDeviceExtension::release(device);
             }
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a device extension discriminant decodes to the wrong teardown owner.
+    #[test]
+    fn driver_device_kinds_select_exact_teardown_owners() {
+        assert_eq!(
+            DriverDeviceKind::decode(DeviceExtensionKind::CONTROL),
+            Ok(DriverDeviceKind::Control)
+        );
+        assert_eq!(
+            DriverDeviceKind::decode(DeviceExtensionKind::MOUNTED_VOLUME),
+            Ok(DriverDeviceKind::MountedVolume)
+        );
+        assert_eq!(
+            DriverDeviceKind::decode(DeviceExtensionKind { value: u8::MAX }),
+            Err(DriverError::InternalInvariantViolation)
+        );
     }
 
     /// # Panics
