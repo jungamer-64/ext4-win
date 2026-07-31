@@ -2870,23 +2870,6 @@ fn release_file_contexts(device: crate::state::KernelDevice, file_object: Active
                 drop(Box::from_raw(handle.as_ptr()));
             }
         }
-        OpenedFileObject::Volume(opened) => {
-            let release_plan = opened.close_release_plan(close_kind);
-            let file_object_address = opened.file_object();
-            let (volume, handle) = opened.detach_contexts();
-            if release_plan == CloseReleasePlan::CancelledOpen {
-                let mut operations = claim_volume_operation_lane(volume);
-                let effect = operations.cleanup_volume_handle(file_object_address);
-                if effect == VolumeHandleCleanup::Unlocked {
-                    MountedVolumeDevice::publish_volume_lock(device, false);
-                }
-            }
-            unsafe {
-                // SAFETY: Successful volume create stores Box<OpenedVolumeHandle> in FsContext2.
-                // Close detached the unique owning pointer before this terminal drop.
-                drop(Box::from_raw(handle.as_ptr()));
-            }
-        }
     }
 }
 
