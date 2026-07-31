@@ -10,11 +10,11 @@ use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_PENDING
 mod capture;
 mod executor;
 
-use capture::QueueContext;
 pub(crate) use capture::{
     CapturedQuerySecurityOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
     PreparedEaSelection, PreparedQueryDirectory, PreparedQueryEa, PreparedRequest,
 };
+use capture::{QueueContext, QueueContextOwnership};
 pub(crate) use executor::DeviceExecutor;
 
 #[cfg(not(test))]
@@ -31,6 +31,24 @@ use crate::wire::{LittleEndianInput, WireOffset};
 /// Completion priority boost for IRPs that should not adjust thread priority.
 #[cfg(not(test))]
 const IO_NO_INCREMENT_PRIORITY: wdk_sys::CCHAR = 0;
+
+/// Stable allocation-free marker storage for queued cleanup and close operations.
+///
+/// Both identities are offsets inside one object, so linker constant folding cannot merge them.
+static QUEUE_CONTEXT_MARKERS: [u8; 2] = [0; 2];
+/// Marker offset for a queued cleanup barrier.
+const CLEANUP_QUEUE_CONTEXT_MARKER: usize = 0;
+/// Marker offset for a queued close operation.
+const CLOSE_QUEUE_CONTEXT_MARKER: usize = 1;
+
+/// Returns one stable allocation-free queue-context marker identity.
+fn queue_context_marker(index: usize) -> *mut c_void {
+    core::ptr::addr_of!(QUEUE_CONTEXT_MARKERS)
+        .cast::<u8>()
+        .wrapping_add(index)
+        .cast_mut()
+        .cast::<c_void>()
+}
 
 /// `STATUS_CANCELLED` is not emitted by the current `wdk-sys` bindings.
 const STATUS_CANCELLED: NTSTATUS = i32::from_ne_bytes(0xC000_0120_u32.to_ne_bytes());
@@ -648,12 +666,12 @@ struct PendingIrp {
     /// Dispatch target whose completion authority transfers with queue insertion.
     target: DispatchTarget,
     /// Requestor-context capture transferred through `DriverContext[0]` before insertion.
-    context: Box<QueueContext>,
+    context: QueueContextOwnership,
 }
 
 impl PendingIrp {
     /// Joins the received completion authority with its fully captured queue context.
-    const fn from_received(received: ReceivedIrp, context: Box<QueueContext>) -> Self {
+    const fn from_received(received: ReceivedIrp, context: QueueContextOwnership) -> Self {
         Self {
             target: received.target,
             context,
@@ -679,7 +697,17 @@ pub(crate) struct OwnedIrp {
     /// Target whose IRP can be completed exactly once by this owner.
     target: DispatchTarget,
     /// Request capture removed exactly once from `DriverContext[0]` with queue ownership.
-    context: Box<QueueContext>,
+    context: QueueContextOwnership,
+}
+
+/// Actor-local request classification after queue metadata ownership is recovered.
+pub(crate) enum ActorRequest<'a> {
+    /// Request whose complete classification and requestor state were captured at dispatch.
+    Captured(&'a PreparedRequest),
+    /// FILE_OBJECT cleanup barrier.
+    Cleanup,
+    /// Terminal FILE_OBJECT close.
+    Close,
 }
 
 /// Exclusive borrow of one pending IRP while its executor task decodes or awaits request state.
@@ -754,7 +782,7 @@ impl OwnedIrp {
         let irp = KernelIrp::from_raw(irp)?;
         Some(Self {
             target: DispatchTarget { device, irp },
-            context: QueueContext::for_test_create().ok()?,
+            context: QueueContextOwnership::Captured(QueueContext::for_test_create().ok()?),
         })
     }
 
@@ -763,9 +791,13 @@ impl OwnedIrp {
         PendingIrpLease { owner: self }
     }
 
-    /// Returns the complete request variant sealed before queue insertion.
-    pub(crate) fn prepared_request(&self) -> &crate::irp::capture::PreparedRequest {
-        self.context.prepared()
+    /// Returns the exhaustive actor-local request classification.
+    pub(crate) fn actor_request(&self) -> ActorRequest<'_> {
+        match &self.context {
+            QueueContextOwnership::Captured(context) => ActorRequest::Captured(context.prepared()),
+            QueueContextOwnership::Cleanup => ActorRequest::Cleanup,
+            QueueContextOwnership::Close => ActorRequest::Close,
+        }
     }
 
     /// Completes the IRP through the I/O Manager.
@@ -850,7 +882,7 @@ impl KernelIrp {
     }
 
     /// Publishes one queue context into the sole driver-owned IRP context slot.
-    fn publish_queue_context(self, context: Box<QueueContext>) {
+    fn publish_queue_context(self, context: QueueContextOwnership) {
         let mut irp = self.irp;
         let irp = unsafe {
             // SAFETY: Queue preparation retains unique dispatch ownership before CSQ insertion.
@@ -870,11 +902,17 @@ impl KernelIrp {
             crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
                 .bugcheck();
         }
-        driver_context[0] = into_device_actor_mailbox(context).cast::<c_void>();
+        driver_context[0] = match context {
+            QueueContextOwnership::Captured(context) => {
+                into_device_actor_mailbox(context).cast::<c_void>()
+            }
+            QueueContextOwnership::Cleanup => queue_context_marker(CLEANUP_QUEUE_CONTEXT_MARKER),
+            QueueContextOwnership::Close => queue_context_marker(CLOSE_QUEUE_CONTEXT_MARKER),
+        };
     }
 
     /// Takes the context after CSQ removal or cancellation transferred exclusive IRP ownership.
-    fn take_queue_context(self) -> Box<QueueContext> {
+    fn take_queue_context(self) -> QueueContextOwnership {
         let mut irp = self.irp;
         let irp = unsafe {
             // SAFETY: The caller has exclusive IRP ownership after atomic CSQ removal.
@@ -889,15 +927,28 @@ impl KernelIrp {
             &mut overlay.__bindgen_anon_1.__bindgen_anon_1
         };
         let driver_context = &mut driver_storage.DriverContext;
-        let Some(context) = NonNull::new(driver_context[0].cast::<QueueContext>()) else {
+        let Some(context) = NonNull::new(driver_context[0]) else {
             crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
                 .bugcheck();
         };
         driver_context[0] = core::ptr::null_mut();
+        if core::ptr::eq(
+            context.as_ptr().cast_const(),
+            queue_context_marker(CLEANUP_QUEUE_CONTEXT_MARKER).cast_const(),
+        ) {
+            return QueueContextOwnership::Cleanup;
+        }
+        if core::ptr::eq(
+            context.as_ptr().cast_const(),
+            queue_context_marker(CLOSE_QUEUE_CONTEXT_MARKER).cast_const(),
+        ) {
+            return QueueContextOwnership::Close;
+        }
+        let context = context.cast::<QueueContext>();
         unsafe {
             // SAFETY: The slot received this pointer from exactly one `Box::into_raw`, exclusive
             // CSQ removal grants the sole take right, and the slot was cleared before rebuilding.
-            Box::from_raw(context.as_ptr())
+            QueueContextOwnership::Captured(Box::from_raw(context.as_ptr()))
         }
     }
 
@@ -919,11 +970,20 @@ impl KernelIrp {
             // SAFETY: Queue publication selected the first nested union arm for driver context.
             &overlay.__bindgen_anon_1.__bindgen_anon_1
         };
-        let Some(context) = NonNull::new(driver_storage.DriverContext[0].cast::<QueueContext>())
-        else {
+        let Some(context) = NonNull::new(driver_storage.DriverContext[0]) else {
             crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
                 .bugcheck();
         };
+        if core::ptr::eq(
+            context.as_ptr().cast_const(),
+            queue_context_marker(CLEANUP_QUEUE_CONTEXT_MARKER).cast_const(),
+        ) || core::ptr::eq(
+            context.as_ptr().cast_const(),
+            queue_context_marker(CLOSE_QUEUE_CONTEXT_MARKER).cast_const(),
+        ) {
+            return cancellation.is_null();
+        }
+        let context = context.cast::<QueueContext>();
         unsafe {
             // SAFETY: The CSQ lock keeps this published Box allocation live for the call.
             context.as_ref()

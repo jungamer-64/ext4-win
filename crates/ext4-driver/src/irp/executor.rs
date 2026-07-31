@@ -97,6 +97,22 @@ impl QueueSlotReservation {
         })
     }
 
+    /// Reserves one non-rejectable lifecycle slot beyond the bounded ordinary-request capacity.
+    /// # Errors
+    ///
+    /// Returns an invariant error only when the device-local counter cannot represent another
+    /// cleanup or close request.
+    fn acquire_lifecycle(queued_requests: &AtomicUsize) -> DriverResult<Self> {
+        queued_requests
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        Ok(Self {
+            queued_requests: NonNull::from(queued_requests),
+        })
+    }
+
     /// Transfers this reservation to the cancel-safe queue.
     fn publish(self) {
         core::mem::forget(self);
@@ -407,7 +423,25 @@ impl DeviceExecutor {
         if executor.actor_state() != ActorState::Running {
             return received.complete_result(Err(DriverError::InvalidDeviceRequest));
         }
-        let reservation = match QueueSlotReservation::acquire(&executor.queued_requests) {
+        if major == DispatchMajor::Cleanup {
+            let file_object = match received.with_active(|active| {
+                active
+                    .current_stack()?
+                    .file_object()
+                    .map(|file_object| file_object.address())
+            }) {
+                Ok(file_object) => file_object,
+                Err(error) => return received.complete_result(Err(error)),
+            };
+            if let Err(error) = Self::cancel_file_object(received.device(), file_object) {
+                return received.complete_result(Err(error));
+            }
+        }
+        let reservation = match if matches!(major, DispatchMajor::Cleanup | DispatchMajor::Close) {
+            QueueSlotReservation::acquire_lifecycle(&executor.queued_requests)
+        } else {
+            QueueSlotReservation::acquire(&executor.queued_requests)
+        } {
             Ok(reservation) => reservation,
             Err(error) => return received.complete_result(Err(error)),
         };
@@ -1019,6 +1053,31 @@ mod tests {
         assert!(reservations.iter().all(Result::is_ok));
         assert!(QueueSlotReservation::acquire(&queued_requests).is_err());
         drop(reservations);
+        assert_eq!(queued_requests.load(Ordering::Acquire), 0);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when cleanup or close can be rejected by ordinary queue saturation.
+    #[test]
+    fn lifecycle_reservations_bypass_the_ordinary_device_bound() {
+        let queued_requests = AtomicUsize::new(0);
+        let ordinary: [_; MAX_QUEUED_REQUESTS] =
+            core::array::from_fn(|_| QueueSlotReservation::acquire(&queued_requests));
+
+        assert!(ordinary.iter().all(Result::is_ok));
+        let cleanup = QueueSlotReservation::acquire_lifecycle(&queued_requests);
+        let close = QueueSlotReservation::acquire_lifecycle(&queued_requests);
+        assert!(cleanup.is_ok());
+        assert!(close.is_ok());
+        assert_eq!(
+            queued_requests.load(Ordering::Acquire),
+            MAX_QUEUED_REQUESTS + 2
+        );
+
+        drop(cleanup);
+        drop(close);
+        drop(ordinary);
         assert_eq!(queued_requests.load(Ordering::Acquire), 0);
     }
 
