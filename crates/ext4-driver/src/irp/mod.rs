@@ -349,86 +349,127 @@ impl DispatchTarget {
         Ok(Self { device, irp })
     }
 
+    /// Borrows the live IRP only while its completion owner remains exclusively borrowed.
+    fn active(&mut self) -> ActiveIrp<'_> {
+        ActiveIrp {
+            device: self.device,
+            irp: self.irp.irp,
+            owner: core::marker::PhantomData,
+        }
+    }
+}
+
+/// Lifetime-bound view of an IRP held by one completion owner.
+#[derive(Debug)]
+pub(crate) struct ActiveIrp<'owner> {
+    /// Device object receiving the request.
+    device: KernelDevice,
+    /// Live IRP retained by the exclusively borrowed completion owner.
+    irp: NonNull<wdk_sys::IRP>,
+    /// Prevents this view or any derived stack/buffer view from outliving the owner borrow.
+    owner: core::marker::PhantomData<&'owner mut DispatchTarget>,
+}
+
+impl ActiveIrp<'_> {
     /// Returns the typed device object boundary.
-    pub(crate) const fn device(self) -> KernelDevice {
+    pub(crate) const fn device(&self) -> KernelDevice {
         self.device
     }
 
     /// Returns whether this request is normal handle I/O or paging I/O.
-    pub(crate) fn data_io_kind(self) -> DataIoKind {
-        let irp = unsafe {
-            // SAFETY: The dispatch target retains the live IRP for the active
-            // callback or queue-owned request lifetime.
-            self.irp.as_ref()
+    pub(crate) fn data_io_kind(&self) -> DataIoKind {
+        let flags = unsafe {
+            // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
+            self.irp.as_ref().Flags
         };
-        if irp.Flags & wdk_sys::IRP_PAGING_IO == 0 {
+        if flags & wdk_sys::IRP_PAGING_IO == 0 {
             DataIoKind::Handle
         } else {
             DataIoKind::Paging
         }
     }
 
-    /// Returns the live raw IRP pointer for a kernel helper that owns this request's semantics.
+    /// Returns the live raw IRP pointer for a kernel helper that takes over request semantics.
     #[cfg(not(test))]
-    pub(crate) fn as_raw_irp(self) -> PIRP {
+    pub(crate) fn as_raw_irp(&mut self) -> PIRP {
         self.irp.as_ptr()
     }
 
-    /// Returns METHOD_BUFFERED input bytes from the IRP system buffer.
+    /// Returns METHOD_BUFFERED input bytes tied to this active owner borrow.
     /// # Errors
     ///
-    /// Returns an error when the associated system buffer is null or `length` exceeds the slice
-    /// domain.
+    /// Returns an error when the associated system buffer is null.
     pub(crate) fn buffered_input(
-        self,
+        &self,
         length: IrpBufferLength,
-    ) -> Result<BufferedInput, DriverError> {
-        BufferedInput::new(self.associated_system_buffer()?, length.as_usize())
+    ) -> Result<BufferedInput<'_>, DriverError> {
+        BufferedInput::from_active(self.associated_system_buffer()?, length.as_usize())
     }
 
-    /// Returns METHOD_BUFFERED output bytes from the IRP system buffer.
+    /// Returns METHOD_BUFFERED output bytes tied to this active owner borrow.
     /// # Errors
     ///
-    /// Returns an error when the associated system buffer is null or `length` exceeds the slice
-    /// domain.
+    /// Returns an error when the associated system buffer is null.
     pub(crate) fn buffered_output(
-        self,
+        &mut self,
         length: IrpBufferLength,
-    ) -> Result<BufferedOutput, DriverError> {
-        BufferedOutput::new(self.associated_system_buffer()?, length.as_usize())
+    ) -> Result<BufferedOutput<'_>, DriverError> {
+        BufferedOutput::from_active(self.associated_system_buffer()?, length.as_usize())
     }
 
-    /// Returns read-like IRP data bytes as immutable kernel memory.
+    /// Returns read-like IRP data bytes tied to this active owner borrow.
     /// # Errors
     ///
-    /// Returns an error when neither a system buffer nor a mapped MDL can provide `length` input
-    /// bytes.
-    pub(crate) fn data_input(self, length: IrpBufferLength) -> Result<BufferedInput, DriverError> {
-        BufferedInput::new(self.data_buffer_address(length)?, length.as_usize())
+    /// Returns an error when neither a system buffer nor a mapped MDL can provide the input.
+    pub(crate) fn data_input(
+        &self,
+        length: IrpBufferLength,
+    ) -> Result<BufferedInput<'_>, DriverError> {
+        BufferedInput::from_active(self.data_buffer_address(length)?, length.as_usize())
     }
 
-    /// Returns write-like IRP data bytes as mutable kernel memory.
+    /// Returns write-like IRP data bytes tied to this active owner borrow.
     /// # Errors
     ///
-    /// Returns an error when neither a system buffer nor a mapped MDL can provide `length` output
-    /// bytes.
+    /// Returns an error when neither a system buffer nor a mapped MDL can provide the output.
     pub(crate) fn data_output(
-        self,
+        &mut self,
         length: IrpBufferLength,
-    ) -> Result<BufferedOutput, DriverError> {
-        BufferedOutput::new(self.data_buffer_address(length)?, length.as_usize())
+    ) -> Result<BufferedOutput<'_>, DriverError> {
+        BufferedOutput::from_active(self.data_buffer_address(length)?, length.as_usize())
     }
 
-    /// Returns the buffered I/O system buffer address for this IRP.
+    /// Returns the current stack location tied to this active owner borrow.
     /// # Errors
     ///
-    /// Returns an error when `AssociatedIrp.SystemBuffer` is null.
-    fn associated_system_buffer(self) -> Result<NonNull<u8>, DriverError> {
-        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
-        let irp = unsafe { self.irp.as_ref() };
+    /// Returns an error when the current stack pointer is null.
+    pub(crate) fn current_stack(&self) -> Result<CurrentIrpStackLocation<'_>, DriverError> {
+        let irp = unsafe {
+            // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
+            self.irp.as_ref()
+        };
+        let tail_overlay = unsafe {
+            // SAFETY: CurrentStackLocation is stored through the active IRP tail overlay.
+            irp.Tail.Overlay
+        };
+        let current_stack = unsafe {
+            // SAFETY: The list overlay contains the active current stack pointer.
+            tail_overlay
+                .__bindgen_anon_2
+                .__bindgen_anon_1
+                .CurrentStackLocation
+        };
+        CurrentIrpStackLocation::from_active(current_stack)
+    }
+
+    /// Returns the buffered I/O system-buffer address.
+    fn associated_system_buffer(&self) -> Result<NonNull<u8>, DriverError> {
+        let irp = unsafe {
+            // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
+            self.irp.as_ref()
+        };
         let system_buffer = unsafe {
-            // SAFETY: SystemBuffer is the active AssociatedIrp arm for
-            // buffered requests delivered to this driver.
+            // SAFETY: SystemBuffer is the active AssociatedIrp arm for buffered requests.
             irp.AssociatedIrp.SystemBuffer
         };
         NonNull::new(system_buffer)
@@ -436,29 +477,20 @@ impl DispatchTarget {
             .ok_or(DriverError::InvalidParameter)
     }
 
-    /// Returns the read/write IRP data buffer address as kernel memory.
-    /// # Errors
-    ///
-    /// Returns an error when the system buffer is unavailable and the IRP has no usable MDL mapping.
-    fn data_buffer_address(self, length: IrpBufferLength) -> Result<NonNull<u8>, DriverError> {
+    /// Returns a system-mapped read/write data-buffer address.
+    fn data_buffer_address(&self, length: IrpBufferLength) -> Result<NonNull<u8>, DriverError> {
         if let Ok(system_buffer) = self.associated_system_buffer() {
             return Ok(system_buffer);
         }
 
-        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
-        let irp = unsafe { self.irp.as_ref() };
+        let irp = unsafe {
+            // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
+            self.irp.as_ref()
+        };
         let Some(mdl) = NonNull::new(irp.MdlAddress) else {
             return Err(DriverError::InvalidParameter);
         };
         mdl_data_buffer_address(mdl, length)
-    }
-
-    /// Returns the current stack location selected by the I/O Manager.
-    /// # Errors
-    ///
-    /// Returns an error when the IRP current stack location pointer is null.
-    pub(crate) fn current_stack(self) -> Result<CurrentIrpStackLocation, DriverError> {
-        self.irp.current_stack()
     }
 }
 
@@ -481,9 +513,9 @@ impl ReceivedIrp {
         })
     }
 
-    /// Returns the dispatch target for stack and buffer decoding.
-    pub(crate) const fn target(&self) -> DispatchTarget {
-        self.target
+    /// Borrows the active IRP without releasing immediate completion authority.
+    pub(crate) fn request(&mut self) -> ActiveIrp<'_> {
+        self.target.active()
     }
 
     /// Returns the target device that received this IRP.
@@ -567,6 +599,11 @@ pub(crate) struct OwnedIrp {
     context: Box<QueueContext>,
 }
 
+// SAFETY: CSQ removal grants this value the sole completion right for the pending IRP. The I/O
+// Manager keeps the IRP, its stack, FILE_OBJECT, and device alive until that right is consumed, and
+// `ActiveIrp` can only be created through an exclusive borrow of this owner.
+unsafe impl Send for OwnedIrp {}
+
 /// Exclusive borrow of one pending IRP while its executor task decodes or awaits request state.
 #[derive(Debug)]
 pub(crate) struct PendingIrpLease<'a> {
@@ -575,9 +612,9 @@ pub(crate) struct PendingIrpLease<'a> {
 }
 
 impl<'a> PendingIrpLease<'a> {
-    /// Returns the pending dispatch target whose kernel objects remain pinned by this lease.
-    pub(crate) const fn target(&self) -> DispatchTarget {
-        self.owner.target
+    /// Borrows the active IRP while queued completion authority remains exclusively held.
+    pub(crate) fn active(&mut self) -> ActiveIrp<'_> {
+        self.owner.target.active()
     }
 
     /// Borrows the opaque query-security output target for the lifetime of this pending request.
@@ -643,18 +680,6 @@ impl OwnedIrp {
             target: DispatchTarget { device, irp },
             context: QueueContext::for_test_create().ok()?,
         })
-    }
-
-    /// Returns the dispatch target for request execution.
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "queued worker completion is compiled out in unit tests"
-        )
-    )]
-    pub(crate) const fn target(&self) -> DispatchTarget {
-        self.target
     }
 
     /// Borrows this pending IRP as an active request without releasing completion authority.
@@ -743,29 +768,6 @@ impl KernelIrp {
         self.irp.as_ptr()
     }
 
-    /// Returns the current stack location selected by the I/O Manager.
-    /// # Errors
-    ///
-    /// Returns an error when the IRP current stack location pointer is null.
-    fn current_stack(self) -> Result<CurrentIrpStackLocation, DriverError> {
-        // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP pointer.
-        let irp = unsafe { self.as_ref() };
-        let tail_overlay = unsafe {
-            // SAFETY: CurrentStackLocation is stored through the IRP tail
-            // overlay for active IRPs delivered to driver dispatch routines.
-            irp.Tail.Overlay
-        };
-        let current_stack = unsafe {
-            // SAFETY: The list overlay contains the current stack pointer in
-            // active dispatch IRPs.
-            tail_overlay
-                .__bindgen_anon_2
-                .__bindgen_anon_1
-                .CurrentStackLocation
-        };
-        CurrentIrpStackLocation::from_raw(current_stack)
-    }
-
     /// Publishes one queue context into the sole driver-owned IRP context slot.
     fn publish_queue_context(self, context: Box<QueueContext>) {
         let mut irp = self.irp;
@@ -815,36 +817,6 @@ impl KernelIrp {
             // SAFETY: The slot received this pointer from exactly one `Box::into_raw`, exclusive
             // CSQ removal grants the sole take right, and the slot was cleared before rebuilding.
             Box::from_raw(context.as_ptr())
-        }
-    }
-
-    /// Borrows queue metadata while the CSQ lock keeps this IRP queued and stable.
-    /// # Safety
-    ///
-    /// The caller must hold the owning CSQ lock and keep this IRP in the queue for the returned
-    /// reference's lifetime.
-    unsafe fn queue_context<'a>(self) -> &'a QueueContext {
-        let irp = unsafe {
-            // SAFETY: The CSQ lock retains this queued IRP for the returned callback-local borrow.
-            self.as_ref()
-        };
-        let overlay = unsafe {
-            // SAFETY: Queue membership keeps the IRP tail overlay live for this callback.
-            &irp.Tail.Overlay
-        };
-        let driver_storage = unsafe {
-            // SAFETY: Queue publication selected the first nested union arm for driver context.
-            &overlay.__bindgen_anon_1.__bindgen_anon_1
-        };
-        let driver_context = driver_storage.DriverContext;
-        let Some(context) = NonNull::new(driver_context[0].cast::<QueueContext>()) else {
-            crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
-                .bugcheck();
-        };
-        unsafe {
-            // SAFETY: The context remains Box-owned by this queued IRP and cannot be taken while
-            // the CSQ lock grants this callback its immutable queue-membership observation.
-            context.as_ref()
         }
     }
 
@@ -924,21 +896,26 @@ impl KernelIrp {
 
 /// Non-null current IRP stack location.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct CurrentIrpStackLocation {
+pub(crate) struct CurrentIrpStackLocation<'owner> {
     /// Current stack location selected by the I/O Manager.
     stack: NonNull<wdk_sys::IO_STACK_LOCATION>,
+    /// Prevents this view from outliving the active completion-owner borrow.
+    owner: core::marker::PhantomData<&'owner wdk_sys::IO_STACK_LOCATION>,
 }
 
-impl CurrentIrpStackLocation {
-    /// Decodes a raw stack location pointer.
+impl CurrentIrpStackLocation<'_> {
+    /// Binds a raw stack location to an active IRP owner borrow.
     /// # Errors
     ///
     /// Returns an error when `stack` is null.
-    fn from_raw(stack: PIO_STACK_LOCATION) -> Result<Self, DriverError> {
+    fn from_active(stack: PIO_STACK_LOCATION) -> Result<Self, DriverError> {
         let Some(stack) = NonNull::new(stack) else {
             return Err(DriverError::InvalidParameter);
         };
-        Ok(Self { stack })
+        Ok(Self {
+            stack,
+            owner: core::marker::PhantomData,
+        })
     }
 
     /// Decodes this stack location's filesystem-control minor function.
@@ -1509,19 +1486,22 @@ impl IrpByteBuffer {
 
 /// Immutable bytes decoded from a buffered or data-input IRP boundary.
 #[derive(Debug)]
-pub(crate) struct BufferedInput {
+pub(crate) struct BufferedInput<'owner> {
     /// Kernel-addressable IRP bytes.
     bytes: IrpByteBuffer,
+    /// Prevents the view from outliving the active completion-owner borrow.
+    owner: core::marker::PhantomData<&'owner [u8]>,
 }
 
-impl BufferedInput {
-    /// Creates an immutable buffer view after length validation.
+impl BufferedInput<'_> {
+    /// Binds an immutable buffer view to an active completion-owner borrow.
     /// # Errors
     ///
     /// Returns an error when the input buffer length cannot safely back a Rust slice.
-    fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
+    fn from_active(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
         Ok(Self {
             bytes: IrpByteBuffer::new(address, length)?,
+            owner: core::marker::PhantomData,
         })
     }
 
@@ -1546,19 +1526,22 @@ impl BufferedInput {
 
 /// Mutable bytes decoded from a buffered or data-output IRP boundary.
 #[derive(Debug)]
-pub(crate) struct BufferedOutput {
+pub(crate) struct BufferedOutput<'owner> {
     /// Kernel-addressable IRP bytes.
     bytes: IrpByteBuffer,
+    /// Prevents mutable access from outliving the active completion-owner borrow.
+    owner: core::marker::PhantomData<&'owner mut [u8]>,
 }
 
-impl BufferedOutput {
-    /// Creates a mutable buffer view after length validation.
+impl BufferedOutput<'_> {
+    /// Binds a mutable buffer view to an active completion-owner borrow.
     /// # Errors
     ///
     /// Returns an error when the output buffer length cannot safely back a mutable Rust slice.
-    fn new(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
+    fn from_active(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
         Ok(Self {
             bytes: IrpByteBuffer::new(address, length)?,
+            owner: core::marker::PhantomData,
         })
     }
 
