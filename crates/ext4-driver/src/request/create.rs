@@ -620,21 +620,6 @@ impl CreatePathAnchor {
         }
     }
 
-    /// Converts an empty create name into the already-opened anchor directory.
-    fn existing_directory(self) -> CreateTargetLookup {
-        match self {
-            Self::VolumeRoot => CreateTargetLookup::Existing {
-                node: NodeId::Directory(DirectoryNodeId::ROOT),
-                node_mode: OpenedNodeMode::Direct,
-                location: OpenedLocation::Root,
-            },
-            Self::OpenedDirectory { id, location } => CreateTargetLookup::Existing {
-                node: NodeId::Directory(id),
-                node_mode: OpenedNodeMode::Direct,
-                location,
-            },
-        }
-    }
 }
 
 /// Opens an existing path according to the requested disposition and options.
