@@ -851,7 +851,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "wdk-alloc"
 version = "0.4.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=66223e9310a2fd1e9755c064228f4abd62a8c21f#66223e9310a2fd1e9755c064228f4abd62a8c21f"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -862,7 +862,7 @@ dependencies = [
 [[package]]
 name = "wdk-build"
 version = "0.5.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=66223e9310a2fd1e9755c064228f4abd62a8c21f#66223e9310a2fd1e9755c064228f4abd62a8c21f"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -885,7 +885,7 @@ dependencies = [
 [[package]]
 name = "wdk-macros"
 version = "0.5.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=66223e9310a2fd1e9755c064228f4abd62a8c21f#66223e9310a2fd1e9755c064228f4abd62a8c21f"
 dependencies = [
  "cfg-if",
  "fs4",
@@ -901,7 +901,7 @@ dependencies = [
 [[package]]
 name = "wdk-sys"
 version = "0.5.1"
-source = "git+https://github.com/microsoft/windows-drivers-rs?rev=21ec8f86ea16766ec5cebc33341de744f3119bbf#21ec8f86ea16766ec5cebc33341de744f3119bbf"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=66223e9310a2fd1e9755c064228f4abd62a8c21f#66223e9310a2fd1e9755c064228f4abd62a8c21f"
 dependencies = [
  "anyhow",
  "bindgen",
