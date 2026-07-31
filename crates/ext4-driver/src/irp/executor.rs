@@ -69,6 +69,122 @@ impl ActorState {
     }
 }
 
+/// Rundown gate that makes request capture/insertion atomic with terminal admission closure.
+struct AdmissionRundown {
+    /// Native executive rundown state used by kernel builds.
+    #[cfg(not(test))]
+    native: UnsafeCell<wdk_sys::EX_RUNDOWN_REF>,
+    /// Closed bit plus active-admission count used by deterministic unit tests.
+    #[cfg(test)]
+    state: AtomicUsize,
+}
+
+/// High bit marking a closed unit-test admission rundown.
+#[cfg(test)]
+const TEST_ADMISSION_CLOSED: usize = 1_usize << (usize::BITS - 1);
+
+impl AdmissionRundown {
+    /// Builds uninitialized native storage or an open test gate.
+    fn new() -> Self {
+        Self {
+            #[cfg(not(test))]
+            native: UnsafeCell::new(wdk_sys::EX_RUNDOWN_REF::default()),
+            #[cfg(test)]
+            state: AtomicUsize::new(0),
+        }
+    }
+
+    /// Initializes native rundown protection after this object reaches stable storage.
+    fn initialize(&self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The executor and this embedded rundown storage are stable before admission.
+            ffi::ExInitializeRundownProtection(self.native.get());
+        }
+    }
+
+    /// Acquires one request-admission lease unless terminal rundown has begun.
+    fn acquire(&self) -> Option<AdmissionLease<'_>> {
+        #[cfg(not(test))]
+        {
+            let acquired = unsafe {
+                // SAFETY: Native rundown storage was initialized before the device was published.
+                ffi::ExAcquireRundownProtection(self.native.get())
+            };
+            if acquired == 0 {
+                return None;
+            }
+        }
+        #[cfg(test)]
+        {
+            self.state
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    if state & TEST_ADMISSION_CLOSED != 0 {
+                        None
+                    } else {
+                        state
+                            .checked_add(1)
+                            .filter(|next| next & TEST_ADMISSION_CLOSED == 0)
+                    }
+                })
+                .ok()?;
+        }
+        Some(AdmissionLease { rundown: self })
+    }
+
+    /// Closes admission and waits until every capture/insertion lease has been released.
+    fn close_and_wait(&self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Teardown runs at PASSIVE_LEVEL and calls this exactly once after publishing
+            // draining. Executive rundown blocks until all acquired leases release.
+            ffi::ExWaitForRundownProtectionRelease(self.native.get());
+        }
+        #[cfg(test)]
+        {
+            let previous = self.state.fetch_or(TEST_ADMISSION_CLOSED, Ordering::AcqRel);
+            if previous & TEST_ADMISSION_CLOSED != 0 {
+                KernelWideInconsistency::async_executor_state_corruption().bugcheck();
+            }
+            while self.state.load(Ordering::Acquire) != TEST_ADMISSION_CLOSED {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Releases one successful admission acquisition.
+    fn release(&self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Each AdmissionLease is created by one successful native acquisition.
+            ffi::ExReleaseRundownProtection(self.native.get());
+        }
+        #[cfg(test)]
+        {
+            let previous = self.state.fetch_sub(1, Ordering::AcqRel);
+            if previous == 0 || previous == TEST_ADMISSION_CLOSED {
+                KernelWideInconsistency::async_executor_state_corruption().bugcheck();
+            }
+        }
+    }
+}
+
+// SAFETY: Executive rundown functions synchronize native access; the test representation is
+// atomic. Neither representation exposes the interior storage directly.
+unsafe impl Sync for AdmissionRundown {}
+
+/// One in-flight request capture/insertion protected from executor teardown.
+struct AdmissionLease<'rundown> {
+    /// Gate whose active count this lease owns.
+    rundown: &'rundown AdmissionRundown,
+}
+
+impl Drop for AdmissionLease<'_> {
+    fn drop(&mut self) {
+        self.rundown.release();
+    }
+}
+
 /// One queue slot reserved before requestor-owned memory is captured.
 ///
 /// Dropping this value rolls back an unpublished reservation. Publishing consumes it without
@@ -156,6 +272,8 @@ pub(crate) struct DeviceExecutor {
     wake_event: wdk_sys::KEVENT,
     /// Running/draining/stopped lifecycle shared with admission and teardown.
     lifecycle: AtomicU8,
+    /// Rundown gate covering the complete capture-to-CSQ-insertion interval.
+    admission: AdmissionRundown,
     /// Kernel handle used by teardown to join the dedicated actor thread.
     thread_handle: wdk_sys::HANDLE,
     /// Pinned request future accessed only by the dedicated actor thread.
@@ -199,6 +317,7 @@ impl DeviceExecutor {
             queued_requests: AtomicUsize::new(0),
             wake_event: wdk_sys::KEVENT::default(),
             lifecycle: AtomicU8::new(ActorState::Running.as_raw()),
+            admission: AdmissionRundown::new(),
             thread_handle: core::ptr::null_mut(),
             active: UnsafeCell::new(None),
             wake_requested: core::sync::atomic::AtomicBool::new(false),
@@ -258,6 +377,7 @@ impl DeviceExecutor {
                     queued_requests: AtomicUsize::new(0),
                     wake_event: wdk_sys::KEVENT::default(),
                     lifecycle: AtomicU8::new(ActorState::Running.as_raw()),
+                    admission: AdmissionRundown::new(),
                     thread_handle: core::ptr::null_mut(),
                     active: UnsafeCell::new(None),
                     #[cfg(test)]
@@ -272,6 +392,7 @@ impl DeviceExecutor {
         }
         .ok_or(DriverError::InvalidParameter)?;
         initialize_list_head(executor.list_head.get());
+        executor.admission.initialize();
 
         #[cfg(not(test))]
         {
@@ -353,6 +474,7 @@ impl DeviceExecutor {
             executor_address.as_ref()
         };
         executor.begin_drain();
+        executor.admission.close_and_wait();
         loop {
             let irp = executor.remove_next_irp(core::ptr::null_mut());
             if irp.is_null() {
@@ -420,6 +542,12 @@ impl DeviceExecutor {
             // SAFETY: The device extension remains stable throughout request capture and queueing.
             executor.as_ref()
         };
+        let Some(_admission) = executor.admission.acquire() else {
+            return received.complete_result(Err(DriverError::InvalidDeviceRequest));
+        };
+        if executor.actor_state() != ActorState::Running {
+            return received.complete_result(Err(DriverError::InvalidDeviceRequest));
+        }
         if major == DispatchMajor::Cleanup {
             let file_object = match received.with_active(|active| {
                 active
@@ -1029,7 +1157,9 @@ mod tests {
     use core::ptr::NonNull;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{ActorState, DeviceExecutor, MAX_QUEUED_REQUESTS, QueueSlotReservation};
+    use super::{
+        ActorState, AdmissionRundown, DeviceExecutor, MAX_QUEUED_REQUESTS, QueueSlotReservation,
+    };
     use crate::state::KernelDevice;
 
     /// Builds actor storage around a non-dereferenced device identity.
@@ -1092,9 +1222,9 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when terminal draining does not close admission and wake the actor.
+    /// Panics when terminal draining does not publish its state before waking the actor.
     #[test]
-    fn actor_drain_closes_admission_before_publishing_wake() {
+    fn actor_drain_publishes_terminal_state_before_wake() {
         let executor = actor_storage();
         assert!(executor.is_some());
         let Some(executor) = executor else {
@@ -1109,5 +1239,20 @@ mod tests {
 
         executor.request_poll();
         assert!(executor.test_wake_is_requested());
+    }
+
+    /// # Panics
+    ///
+    /// Panics when rundown closure admits another capture/insertion lease.
+    #[test]
+    fn admission_rundown_permanently_closes_capture() {
+        let rundown = AdmissionRundown::new();
+        rundown.initialize();
+        let lease = rundown.acquire();
+        assert!(lease.is_some());
+        drop(lease);
+
+        rundown.close_and_wait();
+        assert!(rundown.acquire().is_none());
     }
 }
