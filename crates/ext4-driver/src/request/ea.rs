@@ -154,6 +154,11 @@ impl CreateEa {
         })
     }
 
+    /// Returns whether this create supplied no extended attributes.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Applies this create-time EA list to a pending child before the create transaction commits.
     /// # Errors
     ///

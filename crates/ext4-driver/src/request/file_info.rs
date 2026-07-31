@@ -22,9 +22,9 @@ use crate::memory::DriverVec;
 use crate::state::{
     CleanupStart, CloseReleasePlan, DirectoryCursor, DirectoryNameChange,
     DirectoryNameChangeAction, DirectoryNotificationRegistration, FileControlBlock,
-    MountedVolumeDevice, OpenedDirectory, OpenedLocation, OpenedObject, OpenedRegularFile,
-    VolumeControlBlock, VolumeOperationLane, VolumeOperationLease, WriteCommitment,
-    release_cancelled_file_control_block, release_file_control_block,
+    MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation, OpenedObject,
+    OpenedRegularFile, VolumeControlBlock, VolumeOperationLane, VolumeOperationLease,
+    WriteCommitment, release_cancelled_file_control_block, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -212,7 +212,10 @@ impl FlushVolume {
     fn decode(target: &mut ActiveIrp<'_>) -> DriverResult<Self> {
         let stack = target.current_stack()?;
         let volume = match stack.file_object() {
-            Ok(file_object) => OpenedObject::decode(file_object)?.volume(),
+            Ok(file_object) => match OpenedFileObject::decode(file_object)? {
+                OpenedFileObject::Node(opened) => opened.volume(),
+                OpenedFileObject::Volume(opened) => opened.volume(),
+            },
             Err(DriverError::InvalidParameter) => {
                 Self::from_mounted_device(target.device())?.volume
             }
@@ -1519,7 +1522,26 @@ fn cleanup_file_object(
     active: &ActiveIrp<'_>,
     file_object: ActiveFileObject<'_>,
 ) -> DriverResult<()> {
-    let opened_file = OpenedObject::decode(file_object)?;
+    let opened_file = OpenedFileObject::decode(file_object)?;
+    match opened_file {
+        OpenedFileObject::Node(opened_file) => {
+            cleanup_opened_node(active, file_object, opened_file)
+        }
+        OpenedFileObject::Volume(opened_volume) => {
+            cleanup_opened_volume(file_object, opened_volume)
+        }
+    }
+}
+
+/// Releases cleanup-owned state for one namespace-node FILE_OBJECT.
+/// # Errors
+///
+/// Returns an error when the requestor process identity is unavailable.
+fn cleanup_opened_node(
+    active: &ActiveIrp<'_>,
+    file_object: ActiveFileObject<'_>,
+    opened_file: OpenedObject<'_>,
+) -> DriverResult<()> {
     let cleanup_was_published = file_object.cleanup_complete();
     match (opened_file.begin_cleanup(), cleanup_was_published) {
         (CleanupStart::First, false) => {}
@@ -1536,6 +1558,30 @@ fn cleanup_file_object(
         .release_handle_byte_range_locks(requestor, file_object.address());
     opened_file.release_share_access_for_cleanup();
     opened_file.finish_cleanup();
+    file_object.mark_cleanup_complete();
+    Ok(())
+}
+
+/// Removes one direct-volume share claim during its cleanup barrier.
+/// # Errors
+///
+/// Returns an error when FILE_OBJECT and handle lifecycle state disagree.
+fn cleanup_opened_volume(
+    file_object: ActiveFileObject<'_>,
+    opened_volume: crate::state::OpenedVolume<'_>,
+) -> DriverResult<()> {
+    let cleanup_was_published = file_object.cleanup_complete();
+    match (opened_volume.begin_cleanup(), cleanup_was_published) {
+        (CleanupStart::First, false) => {}
+        (CleanupStart::AlreadyComplete, true) => return Ok(()),
+        (CleanupStart::First, true) | (CleanupStart::AlreadyComplete, false) => {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_lifecycle_corruption()
+                .bugcheck();
+        }
+    }
+    let mut operations = claim_volume_operation_lane(opened_volume.volume());
+    operations.cleanup_volume_handle(opened_volume.file_object());
+    opened_volume.finish_cleanup();
     file_object.mark_cleanup_complete();
     Ok(())
 }
@@ -2795,26 +2841,44 @@ fn release_file_contexts(file_object: ActiveFileObject<'_>) {
         return;
     }
     let close_kind = file_object.close_kind_or_bugcheck();
-    let opened = match OpenedObject::decode(file_object) {
+    let opened = match OpenedFileObject::decode(file_object) {
         Ok(opened) => opened,
         Err(_) => {
             crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
                 .bugcheck();
         }
     };
-    let release_plan = opened.close_release_plan(close_kind);
-    let file_object_address = file_object.address();
-    let (fcb, handle) = opened.detach_contexts();
-    match release_plan {
-        CloseReleasePlan::CleanedHandle => release_file_control_block(fcb),
-        CloseReleasePlan::CancelledOpen => {
-            release_cancelled_file_control_block(fcb, file_object_address);
+    match opened {
+        OpenedFileObject::Node(opened) => {
+            let release_plan = opened.close_release_plan(close_kind);
+            let file_object_address = file_object.address();
+            let (fcb, handle) = opened.detach_contexts();
+            match release_plan {
+                CloseReleasePlan::CleanedHandle => release_file_control_block(fcb),
+                CloseReleasePlan::CancelledOpen => {
+                    release_cancelled_file_control_block(fcb, file_object_address);
+                }
+            }
+            unsafe {
+                // SAFETY: Successful node create stores Box<OpenedHandle> in FsContext2. Close
+                // detached the unique owning pointer before this terminal drop.
+                drop(Box::from_raw(handle.as_ptr()));
+            }
         }
-    }
-    unsafe {
-        // SAFETY: Successful create stores Box<OpenedHandle> in FsContext2. Close detached the
-        // unique owning pointer before selecting this terminal drop.
-        drop(Box::from_raw(handle.as_ptr()));
+        OpenedFileObject::Volume(opened) => {
+            let release_plan = opened.close_release_plan(close_kind);
+            let file_object_address = opened.file_object();
+            let (volume, handle) = opened.detach_contexts();
+            if release_plan == CloseReleasePlan::CancelledOpen {
+                let mut operations = claim_volume_operation_lane(volume);
+                operations.cleanup_volume_handle(file_object_address);
+            }
+            unsafe {
+                // SAFETY: Successful volume create stores Box<OpenedVolumeHandle> in FsContext2.
+                // Close detached the unique owning pointer before this terminal drop.
+                drop(Box::from_raw(handle.as_ptr()));
+            }
+        }
     }
 }
 
