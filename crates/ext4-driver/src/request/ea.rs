@@ -1,8 +1,8 @@
 //! Windows extended-attribute IRP handling.
 
 use crate::irp::{
-    DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection, IrpBufferLength, IrpCompletion,
-    QueryEaStack, SetEaStack,
+    DispatchTarget, EaEntryEmission, EaEntryIndex, IrpBufferLength, IrpCompletion, PendingIrpLease,
+    PreparedEaSelection, PreparedQueryEa, SetEaStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
@@ -41,8 +41,10 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 /// # Errors
 ///
 /// Returns an error when query-EA stack decoding, EA selection, or output packing fails.
-pub(crate) async fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let request = QueryEaRequest::decode(target)?;
+pub(crate) async fn query(request_irp: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let target = request_irp.target();
+    let prepared = request_irp.prepared_query_ea()?;
+    let request = QueryEaRequest::from_prepared(target, prepared)?;
     query_ea(request).await
 }
 
@@ -77,12 +79,15 @@ impl QueryEaRequest {
     ///
     /// Returns an error when the current stack is not a query-EA stack or its FILE_OBJECT has no
     /// opened ext4 context.
-    fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
-        let stack = target.current_stack()?.query_ea()?;
-        let opened_file = OpenedObject::decode(stack.file_object())?;
+    fn from_prepared(
+        target: DispatchTarget,
+        prepared: &PreparedQueryEa,
+    ) -> Result<Self, DriverError> {
+        let stack = prepared.stack();
+        let opened_file = OpenedObject::decode(target.current_stack()?.file_object()?)?;
         let volume = opened_file.volume();
         let node = opened_file.node();
-        let selection = requested_eas(stack)?;
+        let selection = requested_eas(prepared.selection())?;
         let operations = unsafe {
             // SAFETY: Query-EA runs only as the mounted-device executor's unique active operation.
             // The lease is moved into this request and lives until that operation completes.
@@ -481,18 +486,13 @@ fn parse_set_ea_entries(
 /// # Errors
 ///
 /// Returns an error when the caller's EA-name selection buffer is malformed.
-fn requested_eas(stack: QueryEaStack) -> DriverResult<WindowsEaSelection> {
-    match stack.selection() {
-        EaSelection::All => Ok(WindowsEaSelection::All),
-        EaSelection::Names { address, length } => {
-            let bytes = unsafe {
-                // SAFETY: QueryEa supplies EaList/EaListLength as a kernel-addressable
-                // input list for the lifetime of this dispatch callback.
-                core::slice::from_raw_parts(address.as_ptr(), length.as_usize())
-            };
-            parse_get_ea_list(bytes).map(WindowsEaSelection::Names)
+fn requested_eas(selection: &PreparedEaSelection) -> DriverResult<WindowsEaSelection> {
+    match selection {
+        PreparedEaSelection::All => Ok(WindowsEaSelection::All),
+        PreparedEaSelection::Names(bytes) => {
+            parse_get_ea_list(bytes.as_slice()).map(WindowsEaSelection::Names)
         }
-        EaSelection::Index(index) => Ok(WindowsEaSelection::Index(index)),
+        PreparedEaSelection::Index(index) => Ok(WindowsEaSelection::Index(*index)),
     }
 }
 

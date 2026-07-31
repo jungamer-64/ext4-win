@@ -75,6 +75,9 @@ impl SecuritySelection {
         let supported = wdk_sys::OWNER_SECURITY_INFORMATION
             | wdk_sys::GROUP_SECURITY_INFORMATION
             | wdk_sys::DACL_SECURITY_INFORMATION;
+        if value == 0 {
+            return Err(DriverError::InvalidParameter);
+        }
         if value & wdk_sys::SACL_SECURITY_INFORMATION != 0 {
             return Err(DriverError::AccessDenied);
         }
@@ -201,5 +204,18 @@ mod tests {
         if let Ok(selection) = selection {
             assert_eq!(selection.required_information(), information);
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when an empty security-information request does not fail at the typed boundary.
+    #[test]
+    fn rejects_an_empty_security_information_mask() {
+        assert_eq!(
+            SecuritySelection::from_raw(0)
+                .err()
+                .map(crate::kernel::status::DriverError::ntstatus),
+            Some(wdk_sys::STATUS_INVALID_PARAMETER)
+        );
     }
 }
