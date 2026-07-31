@@ -676,11 +676,6 @@ pub(crate) struct OwnedIrp {
     context: Box<QueueContext>,
 }
 
-// SAFETY: CSQ removal grants this value the sole completion right for the pending IRP. The I/O
-// Manager keeps the IRP, its stack, FILE_OBJECT, and device alive until that right is consumed, and
-// `ActiveIrp` can only be created through an exclusive borrow of this owner.
-unsafe impl Send for OwnedIrp {}
-
 /// Exclusive borrow of one pending IRP while its executor task decodes or awaits request state.
 #[derive(Debug)]
 pub(crate) struct PendingIrpLease<'a> {
