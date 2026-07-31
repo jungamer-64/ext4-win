@@ -412,9 +412,6 @@ impl Drop for AlignedTransferBuffer {
     }
 }
 
-// SAFETY: Ownership of the nonpaged allocation transfers with this value.
-unsafe impl Send for AlignedTransferBuffer {}
-
 /// Completion-owned state that outlives cancellation of the awaiting core future.
 struct LowerCompletion {
     /// Aligned buffer used only by the lower device until completion becomes ready.
@@ -845,10 +842,6 @@ impl Future for LowerRequest {
     }
 }
 
-// SAFETY: The lower device pointer is stable for the mounted-device lifetime and all completion
-// state shared across workers is synchronized atomically.
-unsafe impl Send for LowerRequest {}
-
 /// Output contract of `IOCTL_DISK_GET_LENGTH_INFO`.
 #[repr(C)]
 struct DiskLengthInformation {
@@ -1102,10 +1095,6 @@ impl Future for LengthQuery {
     }
 }
 
-// SAFETY: Both device objects remain stable for mount processing and shared completion state uses
-// the explicit release/acquire completion protocol.
-unsafe impl Send for LengthQuery {}
-
 /// Queries and validates a lower storage device's byte length asynchronously.
 /// # Errors
 ///
@@ -1204,10 +1193,6 @@ impl KernelBlockDevice {
         .map(|_| ())
     }
 }
-
-// SAFETY: Device objects and completion executors remain stable across worker threads by mount and
-// teardown construction; mutation is serialized through `&mut self`.
-unsafe impl Send for KernelBlockDevice {}
 
 impl BlockSource for KernelBlockDevice {
     fn len(&self) -> DeviceLength {

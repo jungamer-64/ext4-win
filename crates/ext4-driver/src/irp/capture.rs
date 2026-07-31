@@ -106,7 +106,8 @@ struct CapturedRequestorInput {
     length: NonZeroUsize,
 }
 
-// SAFETY: The allocation is immutable, nonpaged, and uniquely owned by this value.
+// SAFETY: The immutable nonpaged allocation is uniquely owned and crosses threads only inside the
+// typed device-mailbox payload whose publication requires `Send`.
 unsafe impl Send for CapturedRequestorInput {}
 
 impl CapturedRequestorInput {
@@ -678,9 +679,9 @@ enum QuerySecurityOutputState {
     Written,
 }
 
-// SAFETY: The native target owns locked pages and its mapping, but neither pointer is exposed or
-// dereferenced by Rust. The serialized PASSIVE_LEVEL worker consumes it through C, while Drop
-// releases only an unconsumed pending target.
+// SAFETY: The native target owns locked pages and exposes no dereferenceable Rust pointer. Its
+// unique state crosses threads only inside the typed device-mailbox payload and is consumed by the
+// device actor or released by Drop.
 unsafe impl Send for CapturedQuerySecurityOutput {}
 
 impl CapturedQuerySecurityOutput {
@@ -821,8 +822,8 @@ pub(crate) struct CapturedSetSecurityDescriptor {
     length: NonZeroUsize,
 }
 
-// SAFETY: Capture returns an immutable nonpaged allocation with no requestor aliases. Ownership of
-// that allocation moves with this value and Drop frees it exactly once.
+// SAFETY: Capture returns an immutable nonpaged allocation without requestor aliases. Unique
+// ownership crosses threads only inside the typed device-mailbox payload and Drop frees it once.
 unsafe impl Send for CapturedSetSecurityDescriptor {}
 
 impl CapturedSetSecurityDescriptor {

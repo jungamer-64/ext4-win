@@ -1172,7 +1172,7 @@ impl BlockStorage for FailOneWriteAt<'_> {
         Ok(())
     }
 
-    fn flush(&mut self) -> impl Future<Output = crate::Result<()>> + Send + '_ {
+    fn flush(&mut self) -> impl Future<Output = crate::Result<()>> + '_ {
         core::future::ready(Ok(()))
     }
 }
