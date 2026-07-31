@@ -26,10 +26,6 @@ use super::{
 #[cfg(not(test))]
 const SET_SECURITY_DESCRIPTOR_MAXIMUM: wdk_sys::ULONG = 128 * 1024;
 
-/// Maximum UTF-16 payload accepted for a queued directory filename pattern.
-#[cfg(not(test))]
-const DIRECTORY_PATTERN_MAXIMUM: wdk_sys::USHORT = 65_534;
-
 /// Owned directory pattern captured before queue insertion.
 #[derive(Debug)]
 pub(crate) enum PreparedDirectoryPattern {
@@ -103,7 +99,7 @@ impl PreparedQueryEa {
 
 /// Requestor auxiliary bytes copied into nonpaged native memory.
 #[derive(Debug)]
-struct CapturedRequestorBytes {
+struct CapturedRequestorInput {
     /// First byte of the native allocation.
     address: NonNull<u8>,
     /// Exact copied byte count.
@@ -111,14 +107,14 @@ struct CapturedRequestorBytes {
 }
 
 // SAFETY: The allocation is immutable, nonpaged, and uniquely owned by this value.
-unsafe impl Send for CapturedRequestorBytes {}
+unsafe impl Send for CapturedRequestorInput {}
 
-impl CapturedRequestorBytes {
-    /// Captures an exact-length requestor byte range before an IRP is queued.
+impl CapturedRequestorInput {
+    /// Captures a bounded EA name list before an IRP is queued.
     /// # Errors
     ///
     /// Returns a completion preserving native capture failure or allocation validation failure.
-    fn capture_bytes(
+    fn capture_ea_name_list(
         target: &ActiveIrp<'_>,
         source: NonNull<c_void>,
         length: super::IrpBufferLength,
@@ -135,7 +131,7 @@ impl CapturedRequestorBytes {
             let mut captured_length = 0;
             let status = unsafe {
                 // SAFETY: The native boundary probes/copies only the bounded requestor range.
-                ffi::ext4win_capture_requestor_bytes(
+                ffi::ext4win_capture_ea_name_list(
                     source.as_ptr(),
                     length,
                     requestor_mode,
@@ -148,7 +144,7 @@ impl CapturedRequestorBytes {
                 if !snapshot.is_null() {
                     unsafe {
                         // SAFETY: Native capture transferred this allocation to the constructor.
-                        ffi::ext4win_release_requestor_snapshot(snapshot);
+                        ffi::ext4win_release_captured_requestor_input(snapshot);
                     }
                 }
                 return Err(IrpCompletion::from_error(
@@ -168,7 +164,7 @@ impl CapturedRequestorBytes {
                 unsafe {
                     // SAFETY: Native capture returned a null-length violation with ownership
                     // transferred to this failed constructor.
-                    ffi::ext4win_release_requestor_snapshot(address.as_ptr().cast());
+                    ffi::ext4win_release_captured_requestor_input(address.as_ptr().cast());
                 }
                 return Err(IrpCompletion::from_error(
                     DriverError::InternalInvariantViolation,
@@ -185,11 +181,11 @@ impl CapturedRequestorBytes {
         }
     }
 
-    /// Captures a requestor UNICODE_STRING payload, returning `None` for an empty string.
+    /// Captures a query-directory filename pattern, returning `None` for an empty string.
     /// # Errors
     ///
     /// Returns a completion preserving native capture failure or allocation validation failure.
-    fn capture_unicode(
+    fn capture_directory_pattern(
         target: &ActiveIrp<'_>,
         source: NonNull<wdk_sys::UNICODE_STRING>,
     ) -> Result<Option<Self>, IrpCompletion> {
@@ -204,10 +200,9 @@ impl CapturedRequestorBytes {
             let status = unsafe {
                 // SAFETY: The native boundary captures and validates the string header and then
                 // copies its bounded buffer under SEH protection.
-                ffi::ext4win_capture_requestor_unicode_string(
+                ffi::ext4win_capture_directory_pattern(
                     source.as_ptr(),
                     requestor_mode,
-                    DIRECTORY_PATTERN_MAXIMUM,
                     core::ptr::addr_of_mut!(snapshot),
                     core::ptr::addr_of_mut!(captured_length),
                 )
@@ -218,7 +213,7 @@ impl CapturedRequestorBytes {
                     unsafe {
                         // SAFETY: Native capture transferred this unexpected allocation to the
                         // constructor, which releases it before reporting the invariant failure.
-                        ffi::ext4win_release_requestor_snapshot(snapshot);
+                        ffi::ext4win_release_captured_requestor_input(snapshot);
                     }
                     return Err(IrpCompletion::from_error(
                         DriverError::InternalInvariantViolation,
@@ -238,7 +233,7 @@ impl CapturedRequestorBytes {
             else {
                 unsafe {
                     // SAFETY: Native capture transferred this allocation to the constructor.
-                    ffi::ext4win_release_requestor_snapshot(address.as_ptr().cast());
+                    ffi::ext4win_release_captured_requestor_input(address.as_ptr().cast());
                 }
                 return Err(IrpCompletion::from_error(
                     DriverError::InternalInvariantViolation,
@@ -263,12 +258,12 @@ impl CapturedRequestorBytes {
     }
 }
 
-impl Drop for CapturedRequestorBytes {
+impl Drop for CapturedRequestorInput {
     fn drop(&mut self) {
         #[cfg(not(test))]
         unsafe {
             // SAFETY: This value uniquely owns the native snapshot allocation.
-            ffi::ext4win_release_requestor_snapshot(self.address.as_ptr().cast());
+            ffi::ext4win_release_captured_requestor_input(self.address.as_ptr().cast());
         }
     }
 }
@@ -560,7 +555,7 @@ fn capture_directory_pattern(
     else {
         return Ok(PreparedDirectoryPattern::All);
     };
-    let Some(captured) = CapturedRequestorBytes::capture_unicode(target, source)? else {
+    let Some(captured) = CapturedRequestorInput::capture_directory_pattern(target, source)? else {
         return Ok(PreparedDirectoryPattern::All);
     };
     decode_directory_pattern(captured.as_slice())
@@ -597,7 +592,7 @@ fn capture_ea_selection(
         .query_ea_name_list()
         .map_err(IrpCompletion::from_error)?
     {
-        let captured = CapturedRequestorBytes::capture_bytes(target, source, length)?;
+        let captured = CapturedRequestorInput::capture_ea_name_list(target, source, length)?;
         let mut bytes = DriverVec::try_with_capacity(captured.as_slice().len())
             .map_err(IrpCompletion::from_error)?;
         bytes
