@@ -4,8 +4,8 @@ use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP};
 
 use crate::{
     irp::{
-        DeviceExecutor, DispatchMajor, IrpCompletion, OwnedIrp, PreparedDirectoryControl,
-        PreparedRequest, ReceivedIrp,
+        ActorRequest, DeviceExecutor, DispatchMajor, IrpCompletion, OwnedIrp,
+        PreparedDirectoryControl, PreparedRequest, ReceivedIrp,
     },
     kernel::status::{DriverError, DriverResult},
 };
@@ -247,7 +247,7 @@ unsafe extern "C" fn shutdown(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
 
 /// Dispatches one IRP through the unified async-capable receive boundary.
 fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS {
-    let mut received = match ReceivedIrp::decode(device, irp) {
+    let received = match ReceivedIrp::decode(device, irp) {
         Ok(received) => received,
         Err(error) => return ReceivedIrp::complete_decode_error(irp, error),
     };
@@ -312,73 +312,88 @@ fn dispatch_file_lock(mut received: ReceivedIrp) -> NTSTATUS {
     )
 )]
 pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
-    let _status = match owned.prepared_request() {
-        PreparedRequest::Create => {
-            let result = crate::request::create::execute(owned.request()).await;
-            owned.complete_create_result(result)
-        }
-        PreparedRequest::FileSystemControl(minor) => {
-            let minor = *minor;
-            let result = crate::request::file_system_control::execute(owned.request(), minor).await;
+    let _status = match owned.actor_request() {
+        ActorRequest::Cleanup => {
+            let result = owned
+                .request()
+                .with_active(crate::request::file_info::cleanup);
             owned.complete_result(result)
         }
-        PreparedRequest::DirectoryControl(request) => match request {
-            PreparedDirectoryControl::QueryDirectory(_) => {
-                let result = crate::request::file_info::query_directory(owned.request()).await;
+        ActorRequest::Close => {
+            let result = owned
+                .request()
+                .with_active(crate::request::file_info::close);
+            owned.complete_result(result)
+        }
+        ActorRequest::Captured(prepared) => match prepared {
+            PreparedRequest::Create => {
+                let result = crate::request::create::execute(owned.request()).await;
+                owned.complete_create_result(result)
+            }
+            PreparedRequest::FileSystemControl(minor) => {
+                let minor = *minor;
+                let result =
+                    crate::request::file_system_control::execute(owned.request(), minor).await;
                 owned.complete_result(result)
             }
-            PreparedDirectoryControl::NotifyChangeDirectory => {
-                crate::request::file_info::notify_change_directory(owned)
+            PreparedRequest::DirectoryControl(request) => match request {
+                PreparedDirectoryControl::QueryDirectory(_) => {
+                    let result = crate::request::file_info::query_directory(owned.request()).await;
+                    owned.complete_result(result)
+                }
+                PreparedDirectoryControl::NotifyChangeDirectory => {
+                    crate::request::file_info::notify_change_directory(owned)
+                }
+            },
+            PreparedRequest::QuerySecurity { .. } => {
+                let result = crate::request::security::query(owned.request()).await;
+                owned.complete_result(result)
+            }
+            PreparedRequest::SetSecurity { .. } => {
+                let result = crate::request::security::set(owned.request()).await;
+                owned.complete_result(result)
+            }
+            PreparedRequest::Read => {
+                let result = crate::request::file_info::read(owned.request()).await;
+                owned.complete_result(result)
+            }
+            PreparedRequest::Write => {
+                let result = crate::request::file_info::write(owned.request()).await;
+                owned.complete_result(result)
+            }
+            PreparedRequest::QueryInformation => {
+                let result = crate::request::file_info::query(owned.request()).await;
+                owned.complete_result(result)
+            }
+            PreparedRequest::SetInformation => {
+                let result = crate::request::file_info::set(owned.request()).await;
+                owned.complete_result(result)
+            }
+            PreparedRequest::QueryVolumeInformation => {
+                let result = crate::request::volume_info::query(owned.request()).await;
+                owned.complete_result(result)
+            }
+            PreparedRequest::SetVolumeInformation => {
+                let result = crate::request::volume_info::set(owned.request()).await;
+                owned.complete_result(result)
+            }
+            PreparedRequest::FlushBuffers => {
+                let result = crate::request::file_info::flush(owned.request()).await;
+                owned.complete_result(result)
+            }
+            PreparedRequest::QueryEa(_) => {
+                let result = crate::request::ea::query(owned.request()).await;
+                owned.complete_result(result)
+            }
+            PreparedRequest::SetEa => {
+                let result = crate::request::ea::set(owned.request()).await;
+                owned.complete_result(result)
+            }
+            PreparedRequest::Shutdown => {
+                let result = crate::request::file_info::shutdown(owned.request()).await;
+                owned.complete_result(result)
             }
         },
-        PreparedRequest::QuerySecurity { .. } => {
-            let result = crate::request::security::query(owned.request()).await;
-            owned.complete_result(result)
-        }
-        PreparedRequest::SetSecurity { .. } => {
-            let result = crate::request::security::set(owned.request()).await;
-            owned.complete_result(result)
-        }
-        PreparedRequest::Read => {
-            let result = crate::request::file_info::read(owned.request()).await;
-            owned.complete_result(result)
-        }
-        PreparedRequest::Write => {
-            let result = crate::request::file_info::write(owned.request()).await;
-            owned.complete_result(result)
-        }
-        PreparedRequest::QueryInformation => {
-            let result = crate::request::file_info::query(owned.request()).await;
-            owned.complete_result(result)
-        }
-        PreparedRequest::SetInformation => {
-            let result = crate::request::file_info::set(owned.request()).await;
-            owned.complete_result(result)
-        }
-        PreparedRequest::QueryVolumeInformation => {
-            let result = crate::request::volume_info::query(owned.request()).await;
-            owned.complete_result(result)
-        }
-        PreparedRequest::SetVolumeInformation => {
-            let result = crate::request::volume_info::set(owned.request()).await;
-            owned.complete_result(result)
-        }
-        PreparedRequest::FlushBuffers => {
-            let result = crate::request::file_info::flush(owned.request()).await;
-            owned.complete_result(result)
-        }
-        PreparedRequest::QueryEa(_) => {
-            let result = crate::request::ea::query(owned.request()).await;
-            owned.complete_result(result)
-        }
-        PreparedRequest::SetEa => {
-            let result = crate::request::ea::set(owned.request()).await;
-            owned.complete_result(result)
-        }
-        PreparedRequest::Shutdown => {
-            let result = crate::request::file_info::shutdown(owned.request()).await;
-            owned.complete_result(result)
-        }
     };
 }
 
@@ -441,23 +456,23 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when cleanup leaves the requestor thread after cancelling its pending IRPs.
+    /// Panics when cleanup stops using the actor barrier after cancelling earlier pending IRPs.
     #[test]
-    fn cleanup_runs_synchronously_after_pending_irps_are_cancelled() {
+    fn cleanup_runs_on_actor_after_pending_irps_are_cancelled() {
         assert_eq!(
             dispatch_policy(DispatchMajor::Cleanup),
-            DispatchPolicy::SynchronousCleanup
+            DispatchPolicy::Queued
         );
     }
 
     /// # Panics
     ///
-    /// Panics when close is queued behind a create whose completion can synchronously cancel it.
+    /// Panics when close stops following create and cleanup on the same actor.
     #[test]
-    fn close_runs_synchronously_for_post_create_cancellation() {
+    fn close_runs_after_prior_file_object_operations() {
         assert_eq!(
             dispatch_policy(DispatchMajor::Close),
-            DispatchPolicy::SynchronousClose
+            DispatchPolicy::Queued
         );
     }
 }

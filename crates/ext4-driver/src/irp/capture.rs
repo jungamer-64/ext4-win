@@ -278,6 +278,66 @@ pub(super) struct QueueContext {
     cancellation_key: QueueCancellationKey,
 }
 
+/// Queue metadata ownership after dispatch selects allocation-free lifecycle requests or captured
+/// requestor state.
+#[derive(Debug)]
+pub(super) enum QueueContextOwnership {
+    /// Heap-owned request classification and requestor-context capture.
+    Captured(Box<QueueContext>),
+    /// Allocation-free cleanup barrier executed after earlier file requests.
+    Cleanup,
+    /// Allocation-free terminal FILE_OBJECT release executed after cleanup.
+    Close,
+}
+
+impl QueueContextOwnership {
+    /// Borrows the opaque query-security output target.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this is not captured query-security metadata.
+    pub(super) fn query_security_parts(
+        &mut self,
+    ) -> DriverResult<(SecuritySelection, &mut CapturedQuerySecurityOutput)> {
+        match self {
+            Self::Captured(context) => context.query_security_parts(),
+            Self::Cleanup | Self::Close => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Borrows the immutable set-security snapshot.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this is not captured set-security metadata.
+    pub(super) fn set_security_parts(&self) -> DriverResult<(SecuritySelection, &[u8])> {
+        match self {
+            Self::Captured(context) => context.set_security_parts(),
+            Self::Cleanup | Self::Close => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Borrows the complete QueryDirectory payload.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this is not captured query-directory metadata.
+    pub(super) fn query_directory(&self) -> DriverResult<&PreparedQueryDirectory> {
+        match self {
+            Self::Captured(context) => context.query_directory(),
+            Self::Cleanup | Self::Close => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Borrows the complete QueryEa payload.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this is not captured query-EA metadata.
+    pub(super) fn query_ea(&self) -> DriverResult<&PreparedQueryEa> {
+        match self {
+            Self::Captured(context) => context.query_ea(),
+            Self::Cleanup | Self::Close => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+}
+
 impl QueueContext {
     /// Captures one queued request while dispatch still runs in the requestor's context.
     /// # Errors
@@ -287,8 +347,19 @@ impl QueueContext {
     pub(super) fn capture(
         target: &ActiveIrp<'_>,
         major: DispatchMajor,
-    ) -> Result<Box<Self>, IrpCompletion> {
+    ) -> Result<QueueContextOwnership, IrpCompletion> {
         let stack = target.current_stack().map_err(IrpCompletion::from_error)?;
+        match major {
+            DispatchMajor::Cleanup => {
+                stack.file_object().map_err(IrpCompletion::from_error)?;
+                return Ok(QueueContextOwnership::Cleanup);
+            }
+            DispatchMajor::Close => {
+                stack.file_object().map_err(IrpCompletion::from_error)?;
+                return Ok(QueueContextOwnership::Close);
+            }
+            _ => {}
+        }
         let (prepared, cancellation_key) = PreparedRequest::capture(target, stack, major)?;
         memory::boxed_try_with(|| {
             Ok(Self {
@@ -296,6 +367,7 @@ impl QueueContext {
                 cancellation_key,
             })
         })
+        .map(QueueContextOwnership::Captured)
         .map_err(IrpCompletion::from_error)
     }
 
@@ -922,11 +994,11 @@ fn ensure_native_success(status: NTSTATUS) -> Result<(), IrpCompletion> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::boxed::Box;
     use core::ffi::c_void;
 
     use super::{
-        PreparedDirectoryPattern, PreparedRequest, QueueContext, decode_directory_pattern,
+        PreparedDirectoryPattern, PreparedRequest, QueueContext, QueueContextOwnership,
+        decode_directory_pattern,
     };
     use crate::irp::{
         DispatchMajor, FileSystemControlMinorFunction, IrpCompletion, KernelIrp,
@@ -954,8 +1026,45 @@ mod tests {
     fn capture_context(
         received: &mut ReceivedIrp,
         major: DispatchMajor,
-    ) -> Result<Box<QueueContext>, IrpCompletion> {
+    ) -> Result<QueueContextOwnership, IrpCompletion> {
         received.with_active(|active| QueueContext::capture(active, major))
+    }
+
+    /// # Panics
+    ///
+    /// Panics when cleanup or close inherits requestor-state allocation instead of its typed
+    /// lifecycle identity.
+    #[test]
+    fn lifecycle_requests_capture_allocation_free_identities() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut file_object = wdk_sys::FILE_OBJECT::default();
+
+        for (major, expected) in [
+            (DispatchMajor::Cleanup, QueueContextOwnership::Cleanup),
+            (DispatchMajor::Close, QueueContextOwnership::Close),
+        ] {
+            let mut irp = wdk_sys::IRP::default();
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                FileObject: core::ptr::addr_of_mut!(file_object),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            let target = build_target(&mut device, &mut irp, &mut stack);
+            assert!(target.is_some());
+            if let Some(mut target) = target {
+                let context = capture_context(&mut target, major);
+                assert!(context.is_ok());
+                assert!(matches!(
+                    (context, expected),
+                    (
+                        Ok(QueueContextOwnership::Cleanup),
+                        QueueContextOwnership::Cleanup
+                    ) | (
+                        Ok(QueueContextOwnership::Close),
+                        QueueContextOwnership::Close
+                    )
+                ));
+            }
+        }
     }
 
     /// # Panics
@@ -980,7 +1089,11 @@ mod tests {
             if let Ok(context) = context {
                 stack.MajorFunction = u8::try_from(wdk_sys::IRP_MJ_WRITE).unwrap_or_default();
                 assert_eq!(u32::from(stack.MajorFunction), wdk_sys::IRP_MJ_WRITE);
-                assert!(matches!(context.prepared(), PreparedRequest::Read));
+                assert!(matches!(
+                    context,
+                    QueueContextOwnership::Captured(context)
+                        if matches!(context.prepared(), PreparedRequest::Read)
+                ));
             }
         }
 
@@ -1007,8 +1120,14 @@ mod tests {
                 stack.MinorFunction = u8::MAX;
                 assert_eq!(stack.MinorFunction, u8::MAX);
                 assert!(matches!(
-                    context.prepared(),
-                    PreparedRequest::DirectoryControl(PreparedDirectoryControl::QueryDirectory(_))
+                    context,
+                    QueueContextOwnership::Captured(context)
+                        if matches!(
+                            context.prepared(),
+                            PreparedRequest::DirectoryControl(
+                                PreparedDirectoryControl::QueryDirectory(_)
+                            )
+                        )
                 ));
             }
         }
@@ -1028,8 +1147,14 @@ mod tests {
                 stack.MinorFunction = u8::MAX;
                 assert_eq!(stack.MinorFunction, u8::MAX);
                 assert!(matches!(
-                    context.prepared(),
-                    PreparedRequest::FileSystemControl(FileSystemControlMinorFunction::MountVolume)
+                    context,
+                    QueueContextOwnership::Captured(context)
+                        if matches!(
+                            context.prepared(),
+                            PreparedRequest::FileSystemControl(
+                                FileSystemControlMinorFunction::MountVolume
+                            )
+                        )
                 ));
             }
         }
@@ -1079,7 +1204,7 @@ mod tests {
         if let Some(mut target) = target {
             let context = capture_context(&mut target, DispatchMajor::Create);
             assert!(context.is_ok());
-            if let Ok(context) = context {
+            if let Ok(QueueContextOwnership::Captured(context)) = context {
                 assert!(context.matches_cancellation_context(
                     core::ptr::addr_of_mut!(file_object).cast::<c_void>()
                 ));
@@ -1099,7 +1224,7 @@ mod tests {
         if let Some(mut target) = target {
             let context = capture_context(&mut target, DispatchMajor::Shutdown);
             assert!(context.is_ok());
-            if let Ok(context) = context {
+            if let Ok(QueueContextOwnership::Captured(context)) = context {
                 assert!(!context.matches_cancellation_context(
                     core::ptr::addr_of_mut!(file_object).cast::<c_void>()
                 ));
@@ -1129,7 +1254,11 @@ mod tests {
         if let (Some(kernel_irp), Ok(Some(context))) = (kernel_irp, context) {
             kernel_irp.publish_queue_context(context);
             let queued = kernel_irp.take_queue_context();
-            assert!(matches!(queued.prepared(), PreparedRequest::Create));
+            assert!(matches!(
+                queued,
+                QueueContextOwnership::Captured(ref context)
+                    if matches!(context.prepared(), PreparedRequest::Create)
+            ));
             drop(queued);
 
             let overlay = unsafe {
@@ -1142,6 +1271,35 @@ mod tests {
             };
             assert!(driver_storage.DriverContext[0].is_null());
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when allocation-free lifecycle markers alias or fail to round-trip exactly.
+    #[test]
+    fn lifecycle_queue_context_markers_remain_distinct() {
+        let mut irp = wdk_sys::IRP::default();
+        let Some(kernel_irp) = KernelIrp::from_raw(core::ptr::addr_of_mut!(irp)) else {
+            return;
+        };
+
+        kernel_irp.publish_queue_context(QueueContextOwnership::Cleanup);
+        let cleanup = kernel_irp.take_queue_context();
+        assert!(matches!(cleanup, QueueContextOwnership::Cleanup));
+
+        kernel_irp.publish_queue_context(QueueContextOwnership::Close);
+        let close = kernel_irp.take_queue_context();
+        assert!(matches!(close, QueueContextOwnership::Close));
+
+        let overlay = unsafe {
+            // SAFETY: The test reads the tail overlay after both unique queue-context takes.
+            irp.Tail.Overlay
+        };
+        let driver_storage = unsafe {
+            // SAFETY: Queue publication selected this nested driver-context union arm.
+            overlay.__bindgen_anon_1.__bindgen_anon_1
+        };
+        assert!(driver_storage.DriverContext[0].is_null());
     }
 
     /// # Panics
