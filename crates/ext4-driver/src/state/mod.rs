@@ -28,8 +28,9 @@ use wdk_sys::{
 use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 
 use crate::irp::{
-    ByteRangeLockKey, DataIoKind, DesiredAccess, DeviceExecutor, DirectoryEntryIndex,
-    DispatchTarget, ExistingOperationAccess, RegularFileWriteAccess, ShareAccess,
+    ActiveFileObject, ByteRangeLockKey, DataIoKind, DesiredAccess, DeviceExecutor,
+    DirectoryEntryIndex, DispatchTarget, ExistingOperationAccess, RegularFileWriteAccess,
+    RequestorProcess, ShareAccess,
 };
 use crate::kernel::cng::CngFscryptNonceGenerator;
 use crate::kernel::fatal::KernelWideInconsistency;
@@ -287,28 +288,30 @@ impl KernelFileObject {
     }
 
     /// Returns the raw WDK pointer for FFI calls that require FILE_OBJECT.
-    pub(crate) fn as_ptr(self) -> *mut FILE_OBJECT {
+    pub(crate) const fn as_ptr(self) -> *mut FILE_OBJECT {
         self.file_object.as_ptr()
     }
+}
 
-    /// Returns whether this filesystem has completed cleanup for the FILE_OBJECT.
+impl ActiveFileObject<'_> {
+    /// Returns whether neither filesystem context has been attached to this FILE_OBJECT.
+    pub(crate) fn has_no_file_system_contexts(self) -> bool {
+        let object = self.as_ref();
+        object.FsContext.is_null() && object.FsContext2.is_null()
+    }
+
+    /// Returns whether this filesystem has completed cleanup for this active FILE_OBJECT.
     pub(crate) fn cleanup_complete(self) -> bool {
-        let flags = unsafe {
-            // SAFETY: The active cleanup or close callback retains this live FILE_OBJECT while
-            // reading the filesystem-owned cleanup flag.
-            self.as_ref().Flags
-        };
-        flags & wdk_sys::FO_CLEANUP_COMPLETE != 0
+        self.as_ref().Flags & wdk_sys::FO_CLEANUP_COMPLETE != 0
     }
 
     /// Publishes completion of every cleanup-owned release as the final cleanup mutation.
     pub(crate) fn mark_cleanup_complete(self) {
-        let file_object = unsafe {
-            // SAFETY: Cleanup is the unique FILE_OBJECT lifecycle transition that publishes this
-            // filesystem-owned flag, after all cleanup side effects have completed.
-            self.as_mut()
-        };
-        file_object.Flags |= wdk_sys::FO_CLEANUP_COMPLETE;
+        unsafe {
+            // SAFETY: Cleanup is the unique lifecycle transition that publishes this
+            // filesystem-owned flag while the active IRP keeps the FILE_OBJECT live.
+            (*self.as_ptr()).Flags |= wdk_sys::FO_CLEANUP_COMPLETE;
+        }
     }
 
     /// Decodes the I/O Manager's close reason from stable FILE_OBJECT flags.
@@ -316,10 +319,7 @@ impl KernelFileObject {
     /// A cancelled open that also claims a created handle violates the `IoCancelFileOpen`
     /// contract and cannot be recovered without risking a double lifecycle release.
     pub(crate) fn close_kind_or_bugcheck(self) -> FileObjectCloseKind {
-        let flags = unsafe {
-            // SAFETY: Close owns the live FILE_OBJECT while classifying the I/O Manager lifecycle.
-            self.as_ref().Flags
-        };
+        let flags = self.as_ref().Flags;
         let cancelled = flags & wdk_sys::FO_FILE_OPEN_CANCELLED != 0;
         let handle_created = flags & wdk_sys::FO_HANDLE_CREATED != 0;
         match (cancelled, handle_created) {
@@ -328,26 +328,31 @@ impl KernelFileObject {
             (false, _) => FileObjectCloseKind::Ordinary,
         }
     }
+
+    /// Writes the synchronized current position while the owning operation is serialized.
+    fn write_current_byte_offset(self, position: i64) {
+        unsafe {
+            // SAFETY: The caller has validated synchronous-handle serialization and this active
+            // view keeps the FILE_OBJECT live for the write.
+            (*self.as_ptr()).CurrentByteOffset = LARGE_INTEGER { QuadPart: position };
+        }
+    }
 }
 
 /// FILE_OBJECT during create before filesystem contexts are attached.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct UninitializedFileObject {
+#[derive(Debug)]
+pub(crate) struct UninitializedFileObject<'owner> {
     /// Kernel FILE_OBJECT that has not yet been opened by this filesystem.
-    file_object: KernelFileObject,
+    file_object: ActiveFileObject<'owner>,
 }
 
-impl UninitializedFileObject {
+impl<'owner> UninitializedFileObject<'owner> {
     /// Decodes a create target whose FCB and CCB slots are both empty.
     /// # Errors
     ///
     /// Returns an error when the FILE_OBJECT already has filesystem-owned FCB or CCB context.
-    pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
-        let object = unsafe {
-            // SAFETY: The FILE_OBJECT pointer comes from the active create
-            // stack and is read only for filesystem-owned context pointers.
-            file_object.as_ref()
-        };
+    pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
+        let object = file_object.as_ref();
         if !object.FsContext.is_null() || !object.FsContext2.is_null() {
             return Err(DriverError::InvalidParameter);
         }
@@ -355,10 +360,26 @@ impl UninitializedFileObject {
     }
 
     /// Returns the underlying kernel FILE_OBJECT for FFI calls.
-    pub(crate) const fn kernel_file_object(self) -> KernelFileObject {
-        self.file_object
+    pub(crate) const fn kernel_file_object(&self) -> KernelFileObject {
+        self.file_object.address()
     }
 
+    /// Returns the immutable create-time FILE_OBJECT.
+    pub(crate) fn as_ref(&self) -> &FILE_OBJECT {
+        self.file_object.as_ref()
+    }
+
+    /// Returns the unpublished create-time FILE_OBJECT at its unique attachment point.
+    ///
+    /// # Safety
+    /// The caller must own the sole successful-create attachment transition for this FILE_OBJECT.
+    pub(crate) unsafe fn as_mut(&mut self) -> &mut FILE_OBJECT {
+        unsafe {
+            // SAFETY: This non-copy typestate is constructed only while FsContext/FsContext2 are
+            // both null, and successful create consumes its sole attachment point.
+            &mut *self.file_object.as_ptr()
+        }
+    }
 }
 
 /// Non-null VPB pointer supplied by the I/O Manager.
@@ -1389,20 +1410,26 @@ impl DirectoryChangeNotifier {
         }
     }
 
-    /// Gives one queued directory-change IRP to FsRtl for pending completion.
+    /// Verifies that this mounted-volume notifier can accept one IRP transfer.
     /// # Errors
     ///
     /// Returns an error when the mounted VCB notifier was not initialized.
+    pub(crate) fn ensure_registration_ready(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        if !self.initialized {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        Ok(())
+    }
+
+    /// Gives one queued directory-change IRP to FsRtl for pending completion.
     pub(crate) fn register(
         &self,
         target: DispatchTarget,
         registration: DirectoryNotificationRegistration,
-    ) -> DriverResult<wdk_sys::NTSTATUS> {
+    ) -> wdk_sys::NTSTATUS {
         #[cfg(not(test))]
         {
-            if !self.initialized {
-                return Err(DriverError::InternalInvariantViolation);
-            }
             let native = self.native.get();
             let sync = unsafe {
                 // SAFETY: `initialized` guarantees FsRtl populated this
@@ -1426,12 +1453,12 @@ impl DirectoryChangeNotifier {
                     0,
                     0,
                     registration.completion_filter,
-                    target.as_raw_irp(),
+                    target.into_raw_irp(),
                     None,
                     core::ptr::null_mut(),
                 );
             }
-            Ok(STATUS_PENDING)
+            STATUS_PENDING
         }
         #[cfg(test)]
         {
@@ -1441,7 +1468,7 @@ impl DirectoryChangeNotifier {
                 completion_filter,
             } = registration;
             core::hint::black_box((target, full_directory_name, context, completion_filter));
-            Ok(STATUS_SUCCESS)
+            STATUS_SUCCESS
         }
     }
 
@@ -2207,14 +2234,14 @@ impl FileControlBlock {
     /// Returns an error when the resolved range cannot be represented by FsRtl.
     pub(crate) fn permits_byte_range_read(
         &self,
-        target: DispatchTarget,
+        requestor: RequestorProcess,
         file_object: KernelFileObject,
         start: FileOffset,
         length: usize,
         key: ByteRangeLockKey,
     ) -> DriverResult<bool> {
         self.byte_range_locks
-            .permits_read(target, file_object, start, length, key)
+            .permits_read(requestor, file_object, start, length, key)
     }
 
     /// Returns whether the requestor may write one fully resolved file byte range.
@@ -2223,24 +2250,24 @@ impl FileControlBlock {
     /// Returns an error when the resolved range cannot be represented by FsRtl.
     pub(crate) fn permits_byte_range_write(
         &self,
-        target: DispatchTarget,
+        requestor: RequestorProcess,
         file_object: KernelFileObject,
         start: FileOffset,
         length: usize,
         key: ByteRangeLockKey,
     ) -> DriverResult<bool> {
         self.byte_range_locks
-            .permits_write(target, file_object, start, length, key)
+            .permits_write(requestor, file_object, start, length, key)
     }
 
     /// Releases all byte-range locks held by this FILE_OBJECT's requestor during cleanup.
     pub(crate) fn release_handle_byte_range_locks(
         &self,
-        target: DispatchTarget,
+        requestor: RequestorProcess,
         file_object: KernelFileObject,
     ) {
         self.byte_range_locks
-            .release_for_cleanup(target, file_object);
+            .release_for_cleanup(requestor, file_object);
     }
 }
 
@@ -2430,7 +2457,7 @@ impl FileByteRangeLocks {
                 // and takes over completion of the live lock-control IRP.
                 ffi::FsRtlProcessFileLock(
                     self.native.get(),
-                    target.as_raw_irp(),
+                    target.into_raw_irp(),
                     core::ptr::null_mut(),
                 )
             }
@@ -2448,7 +2475,7 @@ impl FileByteRangeLocks {
     /// Returns an error when the resolved range cannot be represented by FsRtl.
     fn permits_read(
         &self,
-        target: DispatchTarget,
+        requestor: RequestorProcess,
         file_object: KernelFileObject,
         start: FileOffset,
         length: usize,
@@ -2458,10 +2485,6 @@ impl FileByteRangeLocks {
         #[cfg(not(test))]
         {
             let mut range = range;
-            let requestor_process = unsafe {
-                // SAFETY: `target` retains the live read IRP while the range check executes.
-                ffi::IoGetRequestorProcess(target.as_raw_irp())
-            };
             Ok(unsafe {
                 // SAFETY: FsRtl receives initialized lock state, checked signed
                 // range values, the live FILE_OBJECT, and the IRP requestor.
@@ -2471,13 +2494,13 @@ impl FileByteRangeLocks {
                     core::ptr::addr_of_mut!(range.length),
                     key.as_ulong(),
                     file_object.as_ptr(),
-                    requestor_process.cast::<c_void>(),
+                    requestor.as_ptr(),
                 ) != 0
             })
         }
         #[cfg(test)]
         {
-            let _target = target;
+            let _requestor = requestor;
             let _file_object = file_object;
             let _key = key;
             let _range = range;
@@ -2491,7 +2514,7 @@ impl FileByteRangeLocks {
     /// Returns an error when the resolved range cannot be represented by FsRtl.
     fn permits_write(
         &self,
-        target: DispatchTarget,
+        requestor: RequestorProcess,
         file_object: KernelFileObject,
         start: FileOffset,
         length: usize,
@@ -2501,10 +2524,6 @@ impl FileByteRangeLocks {
         #[cfg(not(test))]
         {
             let mut range = range;
-            let requestor_process = unsafe {
-                // SAFETY: `target` retains the live write IRP while the range check executes.
-                ffi::IoGetRequestorProcess(target.as_raw_irp())
-            };
             Ok(unsafe {
                 // SAFETY: FsRtl receives initialized lock state, checked signed
                 // range values, the live FILE_OBJECT, and the IRP requestor.
@@ -2514,13 +2533,13 @@ impl FileByteRangeLocks {
                     core::ptr::addr_of_mut!(range.length),
                     key.as_ulong(),
                     file_object.as_ptr().cast::<c_void>(),
-                    requestor_process.cast::<c_void>(),
+                    requestor.as_ptr(),
                 ) != 0
             })
         }
         #[cfg(test)]
         {
-            let _target = target;
+            let _requestor = requestor;
             let _file_object = file_object;
             let _key = key;
             let _range = range;
@@ -2529,13 +2548,7 @@ impl FileByteRangeLocks {
     }
 
     /// Releases all locks associated with this cleanup IRP's FILE_OBJECT and requestor.
-    fn release_for_cleanup(&self, target: DispatchTarget, file_object: KernelFileObject) {
-        #[cfg(not(test))]
-        let requestor_process = unsafe {
-            // SAFETY: `target` retains the live cleanup IRP until this
-            // queued cleanup handler returns.
-            ffi::IoGetRequestorProcess(target.as_raw_irp())
-        };
+    fn release_for_cleanup(&self, requestor: RequestorProcess, file_object: KernelFileObject) {
         #[cfg(not(test))]
         unsafe {
             // SAFETY: Cleanup runs for this live FILE_OBJECT. Passing the
@@ -2544,13 +2557,13 @@ impl FileByteRangeLocks {
             let _status = ffi::FsRtlFastUnlockAll(
                 self.native.get(),
                 file_object.as_ptr(),
-                requestor_process,
+                requestor.as_ptr().cast(),
                 core::ptr::null_mut(),
             );
         }
         #[cfg(test)]
         {
-            let _target = target;
+            let _requestor = requestor;
             let _file_object = file_object;
         }
     }
@@ -3081,27 +3094,23 @@ impl OpenedHandle {
 
 /// FILE_OBJECT whose FCB and CCB contexts have both been initialized by create.
 #[derive(Debug)]
-pub(crate) struct OpenedObject {
+pub(crate) struct OpenedObject<'owner> {
     /// Kernel FILE_OBJECT carrying the contexts.
-    file_object: KernelFileObject,
+    file_object: ActiveFileObject<'owner>,
     /// Shared file control block stored in FsContext.
     fcb: NonNull<FileControlBlock>,
     /// Per-handle context stored in FsContext2.
     handle: NonNull<OpenedHandle>,
 }
 
-impl OpenedObject {
+impl<'owner> OpenedObject<'owner> {
     /// Decodes an initialized FILE_OBJECT context pair.
     ///
     /// # Errors
     /// Returns an error when either filesystem context pointer is absent or
     /// when the shared FCB node kind does not match the per-handle state kind.
-    pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
-        let object = unsafe {
-            // SAFETY: The FILE_OBJECT pointer comes from the active IRP stack
-            // and is read only for filesystem-owned context pointers.
-            file_object.as_ref()
-        };
+    pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
+        let object = file_object.as_ref();
         let fcb = NonNull::new(object.FsContext.cast::<FileControlBlock>());
         let handle = NonNull::new(object.FsContext2.cast::<OpenedHandle>());
         let (fcb, handle) = match (fcb, handle) {
@@ -3122,7 +3131,7 @@ impl OpenedObject {
 
     /// Returns the kernel FILE_OBJECT associated with this opened handle.
     pub(crate) const fn file_object(&self) -> KernelFileObject {
-        self.file_object
+        self.file_object.address()
     }
 
     /// Returns the mounted VCB pointer owning this opened node.
@@ -3168,11 +3177,7 @@ impl OpenedObject {
         if !self.has_synchronous_file_position() {
             return Err(DriverError::InvalidParameter);
         }
-        let file_object = unsafe {
-            // SAFETY: The opened object retains the live FILE_OBJECT and this
-            // method reads only the I/O Manager position field.
-            self.file_object.as_ref()
-        };
+        let file_object = self.file_object.as_ref();
         let position = unsafe {
             // SAFETY: ext4win consistently uses the QuadPart LARGE_INTEGER arm.
             file_object.CurrentByteOffset.QuadPart
@@ -3212,10 +3217,7 @@ impl OpenedObject {
 
     /// Returns whether this FILE_OBJECT owns a synchronized current-position field.
     fn has_synchronous_file_position(&self) -> bool {
-        let file_object = unsafe {
-            // SAFETY: The opened object retains the live FILE_OBJECT and reads only its flags.
-            self.file_object.as_ref()
-        };
+        let file_object = self.file_object.as_ref();
         file_object.Flags & wdk_sys::FO_SYNCHRONOUS_IO != 0
     }
 
@@ -3226,12 +3228,7 @@ impl OpenedObject {
     fn write_current_file_position(&mut self, position: FileOffset) -> DriverResult<()> {
         let position =
             i64::try_from(position.bytes()).map_err(|_| DriverError::InvalidParameter)?;
-        let file_object = unsafe {
-            // SAFETY: Queued file operations serialize ext4win mutations of
-            // this live FILE_OBJECT's current-position field.
-            self.file_object.as_mut()
-        };
-        file_object.CurrentByteOffset = LARGE_INTEGER { QuadPart: position };
+        self.file_object.write_current_byte_offset(position);
         Ok(())
     }
 
@@ -3242,7 +3239,7 @@ impl OpenedObject {
 
     /// Removes this handle's share claim while retaining its FCB reference until close.
     pub(crate) fn release_share_access_for_cleanup(&self) {
-        release_file_share_access(self.fcb, self.file_object);
+        release_file_share_access(self.fcb, self.file_object.address());
     }
 
     /// Publishes lifecycle completion after every cleanup-owned release has finished.
@@ -3254,6 +3251,30 @@ impl OpenedObject {
     pub(crate) fn close_release_plan(&self, close_kind: FileObjectCloseKind) -> CloseReleasePlan {
         self.handle()
             .close_release_plan(close_kind, self.file_object.cleanup_complete())
+    }
+
+    /// Detaches the exact FCB and CCB pair validated by this opened-object capability.
+    ///
+    /// A close IRP is the sole transition permitted to consume this pair. Any pointer change
+    /// between decode and detachment is global lifecycle corruption.
+    pub(crate) fn detach_contexts(self) -> (NonNull<FileControlBlock>, NonNull<OpenedHandle>) {
+        let object = unsafe {
+            // SAFETY: This consumed active opened-object capability represents the unique close
+            // transition for the live FILE_OBJECT.
+            &mut *self.file_object.as_ptr()
+        };
+        let fcb = NonNull::new(
+            core::mem::replace(&mut object.FsContext, core::ptr::null_mut())
+                .cast::<FileControlBlock>(),
+        );
+        let handle = NonNull::new(
+            core::mem::replace(&mut object.FsContext2, core::ptr::null_mut())
+                .cast::<OpenedHandle>(),
+        );
+        match (fcb, handle) {
+            (Some(fcb), Some(handle)) if fcb == self.fcb && handle == self.handle => (fcb, handle),
+            _ => KernelWideInconsistency::file_object_context_corruption().bugcheck(),
+        }
     }
 
     /// Returns the decoded file control block.
@@ -3309,20 +3330,20 @@ impl OpenedObject {
 
 #[derive(Debug)]
 /// Opened regular file decoded from a FILE_OBJECT context pair.
-pub(crate) struct OpenedRegularFile {
+pub(crate) struct OpenedRegularFile<'owner> {
     /// Opened object context validated as a regular file.
-    opened: OpenedObject,
+    opened: OpenedObject<'owner>,
     /// Typed file node identity.
     id: FileNodeId,
 }
 
-impl OpenedRegularFile {
+impl<'owner> OpenedRegularFile<'owner> {
     /// Decodes an opened FILE_OBJECT and requires a regular-file node.
     ///
     /// # Errors
     /// Returns an error when the FILE_OBJECT contexts are invalid or when the
     /// opened node is not a regular file.
-    pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
+    pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
         let opened = OpenedObject::decode(file_object)?;
         let NodeId::File(id) = opened.node() else {
             return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
@@ -3396,22 +3417,22 @@ impl OpenedRegularFile {
 
 #[derive(Debug)]
 /// Opened directory decoded from a FILE_OBJECT context pair.
-pub(crate) struct OpenedDirectory {
+pub(crate) struct OpenedDirectory<'owner> {
     /// Opened object context validated as a directory.
-    opened: OpenedObject,
+    opened: OpenedObject<'owner>,
     /// Typed directory node identity.
     id: DirectoryNodeId,
     /// Directory cursor stored in the directory handle variant.
     cursor: NonNull<DirectoryCursor>,
 }
 
-impl OpenedDirectory {
+impl<'owner> OpenedDirectory<'owner> {
     /// Decodes an opened FILE_OBJECT and requires a directory node.
     ///
     /// # Errors
     /// Returns an error when the FILE_OBJECT contexts are invalid or when the
     /// opened node is not a directory.
-    pub(crate) fn decode(file_object: KernelFileObject) -> DriverResult<Self> {
+    pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
         let opened = OpenedObject::decode(file_object)?;
         let NodeId::Directory(id) = opened.node() else {
             return Err(DriverError::from(ext4_core::Error::WrongInodeKind));

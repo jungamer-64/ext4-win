@@ -68,11 +68,13 @@ impl<'a> QuerySecurityRequest<'a> {
     ///
     /// Returns an error when the current stack is not a query-security stack or its FILE_OBJECT has
     /// no opened ext4 context.
-    fn decode(request: PendingIrpLease<'a>) -> Result<Self, DriverError> {
-        let (file_object, selection, output) = request.query_security_parts()?;
-        let opened_file = OpenedObject::decode(file_object)?;
-        let volume = opened_file.volume();
-        let node = opened_file.node();
+    fn decode(mut request: PendingIrpLease<'a>) -> Result<Self, DriverError> {
+        let (volume, node) = request.with_active(|active| {
+            let file_object = active.current_stack()?.file_object()?;
+            let opened_file = OpenedObject::decode(file_object)?;
+            Ok::<_, DriverError>((opened_file.volume(), opened_file.node()))
+        })?;
+        let (selection, output) = request.query_security_parts()?;
         let operations = unsafe {
             // SAFETY: Query-security runs only as the mounted-device executor's unique active
             // operation. The lease is moved into this request until that operation completes.
@@ -105,11 +107,13 @@ impl<'a> SetSecurityRequest<'a> {
     ///
     /// Returns an error when the current stack is not a set-security stack or its FILE_OBJECT has no
     /// opened ext4 context.
-    fn decode(request: PendingIrpLease<'a>) -> Result<Self, DriverError> {
-        let (file_object, selection, descriptor) = request.set_security_parts()?;
-        let opened_file = OpenedObject::decode(file_object)?;
-        let volume = opened_file.volume();
-        let node = opened_file.node();
+    fn decode(mut request: PendingIrpLease<'a>) -> Result<Self, DriverError> {
+        let (volume, node) = request.with_active(|active| {
+            let file_object = active.current_stack()?.file_object()?;
+            let opened_file = OpenedObject::decode(file_object)?;
+            Ok::<_, DriverError>((opened_file.volume(), opened_file.node()))
+        })?;
+        let (selection, descriptor) = request.set_security_parts()?;
         let operations = unsafe {
             // SAFETY: Set-security runs only as the mounted-device executor's unique active
             // operation. The lease is moved into this request until that operation completes.

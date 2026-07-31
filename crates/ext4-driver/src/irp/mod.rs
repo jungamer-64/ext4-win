@@ -357,6 +357,12 @@ impl DispatchTarget {
             owner: core::marker::PhantomData,
         }
     }
+
+    /// Consumes terminal completion ownership and yields the raw IRP to a native subsystem.
+    #[cfg(not(test))]
+    pub(crate) fn into_raw_irp(self) -> PIRP {
+        self.irp.as_ptr()
+    }
 }
 
 /// Lifetime-bound view of an IRP held by one completion owner.
@@ -387,6 +393,24 @@ impl ActiveIrp<'_> {
         } else {
             DataIoKind::Paging
         }
+    }
+
+    /// Returns the kernel process identity used by FsRtl byte-range lock ownership.
+    /// # Errors
+    ///
+    /// Returns an invariant error when the I/O Manager does not expose a requestor process for
+    /// this live IRP.
+    pub(crate) fn requestor_process(&self) -> DriverResult<RequestorProcess> {
+        #[cfg(not(test))]
+        let process = unsafe {
+            // SAFETY: This active view keeps the IRP live for the duration of the native query.
+            ffi::IoGetRequestorProcess(self.irp.as_ptr()).cast::<c_void>()
+        };
+        #[cfg(test)]
+        let process = NonNull::<c_void>::dangling().as_ptr();
+        NonNull::new(process)
+            .map(RequestorProcess)
+            .ok_or(DriverError::InternalInvariantViolation)
     }
 
     /// Returns the live raw IRP pointer for a kernel helper that takes over request semantics.
@@ -494,6 +518,47 @@ impl ActiveIrp<'_> {
     }
 }
 
+/// Opaque kernel process identity used solely for native byte-range lock ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestorProcess(NonNull<c_void>);
+
+impl RequestorProcess {
+    /// Returns the opaque process pointer for FsRtl.
+    pub(crate) const fn as_ptr(self) -> *mut c_void {
+        self.0.as_ptr()
+    }
+}
+
+/// FILE_OBJECT view whose lifetime is bounded by an active IRP owner borrow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ActiveFileObject<'owner> {
+    /// Stable non-null FILE_OBJECT address.
+    address: KernelFileObject,
+    /// Prevents dereference after the active IRP owner borrow ends.
+    owner: core::marker::PhantomData<&'owner wdk_sys::FILE_OBJECT>,
+}
+
+impl ActiveFileObject<'_> {
+    /// Returns the stable address for identity comparison and native calls.
+    pub(crate) const fn address(self) -> KernelFileObject {
+        self.address
+    }
+
+    /// Returns the WDK FILE_OBJECT for the lifetime of this active view.
+    pub(crate) fn as_ref(&self) -> &wdk_sys::FILE_OBJECT {
+        unsafe {
+            // SAFETY: Construction is private to a lifetime-bound current-stack view whose IRP
+            // owner keeps the FILE_OBJECT alive.
+            &*self.address.as_ptr()
+        }
+    }
+
+    /// Returns the raw pointer for native APIs whose call cannot outlive this view.
+    pub(crate) const fn as_ptr(self) -> *mut wdk_sys::FILE_OBJECT {
+        self.address.as_ptr()
+    }
+}
+
 /// IRP received by a dispatch callback before its completion policy is selected.
 #[derive(Debug)]
 #[must_use]
@@ -513,9 +578,13 @@ impl ReceivedIrp {
         })
     }
 
-    /// Borrows the active IRP without releasing immediate completion authority.
-    pub(crate) fn request(&mut self) -> ActiveIrp<'_> {
-        self.target.active()
+    /// Executes one non-suspending operation against a lifetime-bound active IRP view.
+    pub(crate) fn with_active<R>(
+        &mut self,
+        operation: impl for<'view> FnOnce(&'view mut ActiveIrp<'view>) -> R,
+    ) -> R {
+        let mut active = self.target.active();
+        operation(&mut active)
     }
 
     /// Returns the target device that received this IRP.
@@ -543,8 +612,13 @@ impl ReceivedIrp {
     /// same IRP again.
     pub(crate) fn delegate_byte_range_lock(
         self,
-        file_control_block: &FileControlBlock,
+        file_control_block: NonNull<FileControlBlock>,
     ) -> NTSTATUS {
+        let file_control_block = unsafe {
+            // SAFETY: Lock-control decode obtained this pointer from the active FILE_OBJECT's
+            // FsContext, and the consumed IRP keeps that context alive through delegation.
+            file_control_block.as_ref()
+        };
         file_control_block.process_byte_range_lock(self.target)
     }
 
@@ -612,9 +686,13 @@ pub(crate) struct PendingIrpLease<'a> {
 }
 
 impl<'a> PendingIrpLease<'a> {
-    /// Borrows the active IRP while queued completion authority remains exclusively held.
-    pub(crate) fn active(&mut self) -> ActiveIrp<'_> {
-        self.owner.target.active()
+    /// Executes one non-suspending operation against a lifetime-bound active IRP view.
+    pub(crate) fn with_active<R>(
+        &mut self,
+        operation: impl for<'view> FnOnce(&'view mut ActiveIrp<'view>) -> R,
+    ) -> R {
+        let mut active = self.owner.target.active();
+        operation(&mut active)
     }
 
     /// Borrows the opaque query-security output target for the lifetime of this pending request.
@@ -623,11 +701,7 @@ impl<'a> PendingIrpLease<'a> {
     /// Returns an invariant error when the queued request was not prepared as query-security.
     pub(crate) fn query_security_parts(
         self,
-    ) -> DriverResult<(
-        KernelFileObject,
-        SecuritySelection,
-        &'a mut CapturedQuerySecurityOutput,
-    )> {
+    ) -> DriverResult<(SecuritySelection, &'a mut CapturedQuerySecurityOutput)> {
         self.owner.context.query_security_parts()
     }
 
@@ -635,9 +709,7 @@ impl<'a> PendingIrpLease<'a> {
     /// # Errors
     ///
     /// Returns an invariant error when the queued request was not prepared as set-security.
-    pub(crate) fn set_security_parts(
-        self,
-    ) -> DriverResult<(KernelFileObject, SecuritySelection, &'a [u8])> {
+    pub(crate) fn set_security_parts(self) -> DriverResult<(SecuritySelection, &'a [u8])> {
         self.owner.context.set_security_parts()
     }
 
@@ -733,15 +805,20 @@ impl OwnedIrp {
     /// Transfers this queued directory-change IRP's terminal completion authority to FsRtl.
     pub(crate) fn delegate_directory_notification(
         self,
-        notifier: &DirectoryChangeNotifier,
+        notifier: NonNull<DirectoryChangeNotifier>,
         registration: DirectoryNotificationRegistration,
     ) -> NTSTATUS {
         let Self { target, context } = self;
         drop(context);
-        match notifier.register(target, registration) {
-            Ok(status) => status,
-            Err(error) => target.irp.complete(IrpCompletion::from_error(error)),
+        let notifier = unsafe {
+            // SAFETY: Registration decoded the notifier from the mounted VCB kept live by this
+            // consumed pending IRP.
+            notifier.as_ref()
+        };
+        if let Err(error) = notifier.ensure_registration_ready() {
+            return target.irp.complete(IrpCompletion::from_error(error));
         }
+        notifier.register(target, registration)
     }
 
     /// Completes the IRP as canceled.
@@ -903,7 +980,7 @@ pub(crate) struct CurrentIrpStackLocation<'owner> {
     owner: core::marker::PhantomData<&'owner wdk_sys::IO_STACK_LOCATION>,
 }
 
-impl CurrentIrpStackLocation<'_> {
+impl<'owner> CurrentIrpStackLocation<'owner> {
     /// Binds a raw stack location to an active IRP owner borrow.
     /// # Errors
     ///
@@ -959,8 +1036,11 @@ impl CurrentIrpStackLocation<'_> {
     /// # Errors
     ///
     /// Returns an error when the public IRP stack view cannot produce a kernel FILE_OBJECT.
-    pub(crate) fn file_object(self) -> Result<KernelFileObject, DriverError> {
-        self.kernel_file_object()
+    pub(crate) fn file_object(self) -> Result<ActiveFileObject<'owner>, DriverError> {
+        Ok(ActiveFileObject {
+            address: self.kernel_file_object()?,
+            owner: core::marker::PhantomData,
+        })
     }
 
     /// Decodes the FILE_OBJECT carried by the current stack location.
@@ -1023,8 +1103,8 @@ impl CurrentIrpStackLocation<'_> {
             // IRP_MN_USER_FS_REQUEST, where FileSystemControl is active.
             stack.Parameters.FileSystemControl
         };
+        self.kernel_file_object()?;
         Ok(FileSystemControlStack {
-            file_object: self.kernel_file_object()?,
             input_buffer_length: IrpBufferLength::from_ulong(control.InputBufferLength)?,
             output_buffer_length: IrpBufferLength::from_ulong(control.OutputBufferLength)?,
             fs_control_code: FsControlCode::from_raw(control.FsControlCode)?,
@@ -1047,7 +1127,7 @@ impl CurrentIrpStackLocation<'_> {
             // where the Create union arm is active.
             stack.Parameters.Create
         };
-        let file_object = self.kernel_file_object()?;
+        self.kernel_file_object()?;
         let Some(security_context) = NonNull::new(create.SecurityContext) else {
             return Err(DriverError::InvalidParameter);
         };
@@ -1057,7 +1137,6 @@ impl CurrentIrpStackLocation<'_> {
             security_context.as_ref()
         };
         Ok(CreateStack {
-            file_object,
             parameters: CreateParameters::decode(
                 security_context.DesiredAccess,
                 create.Options,
@@ -1127,8 +1206,8 @@ impl CurrentIrpStackLocation<'_> {
             // IRP_MJ_QUERY_INFORMATION, where QueryFile is active.
             stack.Parameters.QueryFile
         };
+        self.kernel_file_object()?;
         Ok(QueryFileStack {
-            file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(query.Length)?,
             information_class: QueryFileInformationClass::from_raw(query.FileInformationClass)?,
         })
@@ -1150,8 +1229,8 @@ impl CurrentIrpStackLocation<'_> {
             // IRP_MJ_SET_INFORMATION, where SetFile is active.
             stack.Parameters.SetFile
         };
+        self.kernel_file_object()?;
         Ok(SetFileStack {
-            file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(set.Length)?,
             information_class: SetFileInformationClass::from_raw(set.FileInformationClass)?,
         })
@@ -1228,8 +1307,8 @@ impl CurrentIrpStackLocation<'_> {
             // IRP_MN_NOTIFY_CHANGE_DIRECTORY, where NotifyDirectory is active.
             stack.Parameters.NotifyDirectory
         };
+        self.kernel_file_object()?;
         Ok(NotifyDirectoryStack {
-            file_object: self.kernel_file_object()?,
             completion_filter: DirectoryChangeFilter::from_raw(notify.CompletionFilter)?,
             watch_scope: DirectoryWatchScope::from_stack_flags(stack.Flags),
         })
@@ -1312,8 +1391,8 @@ impl CurrentIrpStackLocation<'_> {
             // where SetEa is active.
             stack.Parameters.SetEa
         };
+        self.kernel_file_object()?;
         Ok(SetEaStack {
-            file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(set.Length)?,
         })
     }
@@ -1334,8 +1413,8 @@ impl CurrentIrpStackLocation<'_> {
             // IRP_MJ_QUERY_SECURITY, where QuerySecurity is active.
             stack.Parameters.QuerySecurity
         };
+        self.kernel_file_object()?;
         Ok(QuerySecurityStack {
-            file_object: self.kernel_file_object()?,
             selection: SecuritySelection::from_raw(query.SecurityInformation)?,
             length: IrpBufferLength::from_ulong(query.Length)?,
         })
@@ -1360,8 +1439,8 @@ impl CurrentIrpStackLocation<'_> {
         let Some(security_descriptor) = NonNull::new(set.SecurityDescriptor) else {
             return Err(DriverError::InvalidParameter);
         };
+        self.kernel_file_object()?;
         Ok(SetSecurityStack {
-            file_object: self.kernel_file_object()?,
             selection: SecuritySelection::from_raw(set.SecurityInformation)?,
             security_descriptor,
         })
@@ -1386,8 +1465,8 @@ impl CurrentIrpStackLocation<'_> {
             // SAFETY: ByteOffset uses the QuadPart arm for read/write stack locations.
             read.ByteOffset.QuadPart
         };
+        self.kernel_file_object()?;
         Ok(ReadStack {
-            file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(read.Length)?,
             starting_point: ReadStartingPoint::from_quad(byte_offset)?,
             key: ByteRangeLockKey::from_ulong(read.Key),
@@ -1413,8 +1492,8 @@ impl CurrentIrpStackLocation<'_> {
             // SAFETY: ByteOffset uses the QuadPart arm for read/write stack locations.
             write.ByteOffset.QuadPart
         };
+        self.kernel_file_object()?;
         Ok(WriteStack {
-            file_object: self.kernel_file_object()?,
             length: IrpBufferLength::from_ulong(write.Length)?,
             starting_point: WriteStartingPoint::from_quad(byte_offset)?,
             key: ByteRangeLockKey::from_ulong(write.Key),
@@ -2583,8 +2662,6 @@ pub(crate) struct MountVolumeStack {
 /// Decoded user file-system-control stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FileSystemControlStack {
-    /// FILE_OBJECT carrying the FCB/CCB for path-scoped controls.
-    file_object: KernelFileObject,
     /// Input system-buffer length.
     input_buffer_length: IrpBufferLength,
     /// Output system-buffer length.
@@ -2611,11 +2688,6 @@ impl MountVolumeStack {
 }
 
 impl FileSystemControlStack {
-    /// Returns the FILE_OBJECT carrying this FSCTL.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns the input system-buffer length.
     pub(crate) const fn input_buffer_length(self) -> IrpBufferLength {
         self.input_buffer_length
@@ -2635,18 +2707,11 @@ impl FileSystemControlStack {
 /// Decoded create/open stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CreateStack {
-    /// FILE_OBJECT receiving FsContext/FsContext2 on successful create.
-    file_object: KernelFileObject,
     /// Decoded create parameters.
     parameters: CreateParameters,
 }
 
 impl CreateStack {
-    /// Returns the FILE_OBJECT receiving this create request.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns the decoded create parameters.
     pub(crate) const fn parameters(self) -> CreateParameters {
         self.parameters
@@ -2674,8 +2739,6 @@ pub(crate) struct SetVolumeStack {
 /// Decoded query-file-information stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryFileStack {
-    /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: KernelFileObject,
     /// Output buffer length.
     length: IrpBufferLength,
     /// Requested file information class.
@@ -2685,8 +2748,6 @@ pub(crate) struct QueryFileStack {
 /// Decoded set-file-information stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SetFileStack {
-    /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: KernelFileObject,
     /// Input buffer length.
     length: IrpBufferLength,
     /// Requested file information class.
@@ -2709,8 +2770,6 @@ pub(crate) struct QueryDirectoryStack {
 /// Decoded directory-change-notification stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NotifyDirectoryStack {
-    /// FILE_OBJECT carrying the directory CCB.
-    file_object: KernelFileObject,
     /// Changes that complete this notification request.
     completion_filter: DirectoryChangeFilter,
     /// Directory depth covered by the notification request.
@@ -2731,8 +2790,6 @@ pub(crate) struct QueryEaStack {
 /// Decoded set-EA stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SetEaStack {
-    /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: KernelFileObject,
     /// Input FILE_FULL_EA_INFORMATION byte length.
     length: IrpBufferLength,
 }
@@ -2740,8 +2797,6 @@ pub(crate) struct SetEaStack {
 /// Decoded query-security stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QuerySecurityStack {
-    /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: KernelFileObject,
     /// Selected security descriptor components.
     selection: SecuritySelection,
     /// Output buffer length.
@@ -2751,8 +2806,6 @@ pub(crate) struct QuerySecurityStack {
 /// Decoded set-security stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SetSecurityStack {
-    /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: KernelFileObject,
     /// Selected security descriptor components.
     selection: SecuritySelection,
     /// Caller-supplied security descriptor, valid only during requestor-context capture.
@@ -2841,8 +2894,6 @@ fn signed_special_offset(value: u32) -> i64 {
 /// Decoded read stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadStack {
-    /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: KernelFileObject,
     /// Requested byte count.
     length: IrpBufferLength,
     /// Semantic starting point decoded from ByteOffset.
@@ -2852,11 +2903,6 @@ pub(crate) struct ReadStack {
 }
 
 impl ReadStack {
-    /// Returns the FILE_OBJECT carrying this read.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns the requested byte count.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -2876,8 +2922,6 @@ impl ReadStack {
 /// Decoded write stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WriteStack {
-    /// FILE_OBJECT carrying the FCB/CCB.
-    file_object: KernelFileObject,
     /// Requested byte count.
     length: IrpBufferLength,
     /// Semantic starting point decoded from ByteOffset.
@@ -2887,11 +2931,6 @@ pub(crate) struct WriteStack {
 }
 
 impl WriteStack {
-    /// Returns the FILE_OBJECT carrying this write.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns the requested byte count.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -2933,11 +2972,6 @@ impl SetVolumeStack {
 }
 
 impl QueryFileStack {
-    /// Returns the FILE_OBJECT carrying this query.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns the output buffer length.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -2950,11 +2984,6 @@ impl QueryFileStack {
 }
 
 impl SetFileStack {
-    /// Returns the FILE_OBJECT carrying this mutation.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns the input buffer length.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -2989,11 +3018,6 @@ impl QueryDirectoryStack {
 }
 
 impl NotifyDirectoryStack {
-    /// Returns the FILE_OBJECT carrying this notification request.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns the validated completion-filter set.
     pub(crate) const fn completion_filter(self) -> DirectoryChangeFilter {
         self.completion_filter
@@ -3023,11 +3047,6 @@ impl QueryEaStack {
 }
 
 impl SetEaStack {
-    /// Returns the FILE_OBJECT carrying this mutation.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns the input FILE_FULL_EA_INFORMATION byte length.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
@@ -3035,11 +3054,6 @@ impl SetEaStack {
 }
 
 impl QuerySecurityStack {
-    /// Returns the FILE_OBJECT carrying this query.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns selected security descriptor components.
     pub(crate) const fn selection(self) -> SecuritySelection {
         self.selection
@@ -3052,11 +3066,6 @@ impl QuerySecurityStack {
 }
 
 impl SetSecurityStack {
-    /// Returns the FILE_OBJECT carrying this mutation.
-    pub(crate) const fn file_object(self) -> KernelFileObject {
-        self.file_object
-    }
-
     /// Returns selected security descriptor components.
     pub(crate) const fn selection(self) -> SecuritySelection {
         self.selection

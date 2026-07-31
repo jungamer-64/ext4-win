@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    DirectoryControlMinorFunction, DispatchMajor, DispatchTarget, FileSystemControlMinorFunction,
+    ActiveIrp, DirectoryControlMinorFunction, DispatchMajor, FileSystemControlMinorFunction,
     IrpCompletion, QueryDirectoryStack, QueryEaStack,
 };
 
@@ -119,7 +119,7 @@ impl CapturedRequestorBytes {
     ///
     /// Returns a completion preserving native capture failure or allocation validation failure.
     fn capture_bytes(
-        target: DispatchTarget,
+        target: &ActiveIrp<'_>,
         source: NonNull<c_void>,
         length: super::IrpBufferLength,
     ) -> Result<Self, IrpCompletion> {
@@ -178,7 +178,7 @@ impl CapturedRequestorBytes {
         }
         #[cfg(test)]
         {
-            let _: DispatchTarget = target;
+            let _: &ActiveIrp<'_> = target;
             let _: NonNull<c_void> = source;
             let _: super::IrpBufferLength = length;
             Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
@@ -190,7 +190,7 @@ impl CapturedRequestorBytes {
     ///
     /// Returns a completion preserving native capture failure or allocation validation failure.
     fn capture_unicode(
-        target: DispatchTarget,
+        target: &ActiveIrp<'_>,
         source: NonNull<wdk_sys::UNICODE_STRING>,
     ) -> Result<Option<Self>, IrpCompletion> {
         #[cfg(not(test))]
@@ -248,7 +248,7 @@ impl CapturedRequestorBytes {
         }
         #[cfg(test)]
         {
-            let _: DispatchTarget = target;
+            let _: &ActiveIrp<'_> = target;
             let _: NonNull<wdk_sys::UNICODE_STRING> = source;
             Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
         }
@@ -289,7 +289,7 @@ impl QueueContext {
     /// Returns a completion payload when stack classification, requestor-memory capture, or
     /// queue-context allocation fails.
     pub(super) fn capture(
-        target: DispatchTarget,
+        target: &ActiveIrp<'_>,
         major: DispatchMajor,
     ) -> Result<Box<Self>, IrpCompletion> {
         let stack = target.current_stack().map_err(IrpCompletion::from_error)?;
@@ -357,16 +357,9 @@ impl QueueContext {
     /// Returns an invariant error when this context is not a file-scoped query-security request.
     pub(super) fn query_security_parts(
         &mut self,
-    ) -> DriverResult<(
-        KernelFileObject,
-        SecuritySelection,
-        &mut CapturedQuerySecurityOutput,
-    )> {
-        let file_object = self.cancellation_key.file_object()?;
+    ) -> DriverResult<(SecuritySelection, &mut CapturedQuerySecurityOutput)> {
         match &mut self.prepared {
-            PreparedRequest::QuerySecurity { selection, output } => {
-                Ok((file_object, *selection, output))
-            }
+            PreparedRequest::QuerySecurity { selection, output } => Ok((*selection, output)),
             _ => Err(DriverError::InternalInvariantViolation),
         }
     }
@@ -375,15 +368,12 @@ impl QueueContext {
     /// # Errors
     ///
     /// Returns an invariant error when this context is not a file-scoped set-security request.
-    pub(super) fn set_security_parts(
-        &self,
-    ) -> DriverResult<(KernelFileObject, SecuritySelection, &[u8])> {
-        let file_object = self.cancellation_key.file_object()?;
+    pub(super) fn set_security_parts(&self) -> DriverResult<(SecuritySelection, &[u8])> {
         match &self.prepared {
             PreparedRequest::SetSecurity {
                 selection,
                 descriptor,
-            } => Ok((file_object, *selection, descriptor.as_slice())),
+            } => Ok((*selection, descriptor.as_slice())),
             _ => Err(DriverError::InternalInvariantViolation),
         }
     }
@@ -440,8 +430,8 @@ impl PreparedRequest {
     ///
     /// Returns a completion payload when the major is not queueable or security capture fails.
     fn capture(
-        target: DispatchTarget,
-        stack: super::CurrentIrpStackLocation,
+        target: &ActiveIrp<'_>,
+        stack: super::CurrentIrpStackLocation<'_>,
         major: DispatchMajor,
     ) -> Result<(Self, QueueCancellationKey), IrpCompletion> {
         let generic_key = || QueueCancellationKey::from_stack(stack);
@@ -515,7 +505,13 @@ impl PreparedRequest {
                         selection: query.selection(),
                         output,
                     },
-                    QueueCancellationKey::File(query.file_object().into()),
+                    QueueCancellationKey::File(
+                        stack
+                            .file_object()
+                            .map_err(IrpCompletion::from_error)?
+                            .address()
+                            .into(),
+                    ),
                 ))
             }
             DispatchMajor::SetSecurity => {
@@ -530,7 +526,13 @@ impl PreparedRequest {
                         selection: set.selection(),
                         descriptor,
                     },
-                    QueueCancellationKey::File(set.file_object().into()),
+                    QueueCancellationKey::File(
+                        stack
+                            .file_object()
+                            .map_err(IrpCompletion::from_error)?
+                            .address()
+                            .into(),
+                    ),
                 ))
             }
             DispatchMajor::Shutdown => Ok((Self::Shutdown, QueueCancellationKey::Device)),
@@ -549,8 +551,8 @@ impl PreparedRequest {
 ///
 /// Returns a completion when the descriptor cannot be captured or its payload is malformed.
 fn capture_directory_pattern(
-    target: DispatchTarget,
-    stack: super::CurrentIrpStackLocation,
+    target: &ActiveIrp<'_>,
+    stack: super::CurrentIrpStackLocation<'_>,
 ) -> Result<PreparedDirectoryPattern, IrpCompletion> {
     let Some(source) = stack
         .query_directory_file_name()
@@ -588,8 +590,8 @@ fn decode_directory_pattern(bytes: &[u8]) -> Result<PreparedDirectoryPattern, Ir
 /// Returns a completion when the name list cannot be captured or an owned copy cannot be
 /// allocated.
 fn capture_ea_selection(
-    target: DispatchTarget,
-    stack: super::CurrentIrpStackLocation,
+    target: &ActiveIrp<'_>,
+    stack: super::CurrentIrpStackLocation<'_>,
 ) -> Result<PreparedEaSelection, IrpCompletion> {
     if let Some((source, length)) = stack
         .query_ea_name_list()
@@ -625,10 +627,10 @@ enum QueueCancellationKey {
 
 impl QueueCancellationKey {
     /// Captures the stack FILE_OBJECT when present without retaining the stack itself.
-    fn from_stack(stack: super::CurrentIrpStackLocation) -> Self {
-        stack
-            .file_object()
-            .map_or(Self::Device, |file_object| Self::File(file_object.into()))
+    fn from_stack(stack: super::CurrentIrpStackLocation<'_>) -> Self {
+        stack.file_object().map_or(Self::Device, |file_object| {
+            Self::File(file_object.address().into())
+        })
     }
 
     /// Compares this captured identity with an `IoCsqRemoveNextIrp` context.
@@ -636,17 +638,6 @@ impl QueueCancellationKey {
         match self {
             Self::File(file_object) => file_object.matches(context),
             Self::Device => false,
-        }
-    }
-
-    /// Projects the unique FILE_OBJECT source for request execution.
-    /// # Errors
-    ///
-    /// Returns an invariant error for a device-wide request.
-    fn file_object(self) -> DriverResult<KernelFileObject> {
-        match self {
-            Self::File(file_object) => file_object.as_kernel_file_object(),
-            Self::Device => Err(DriverError::InternalInvariantViolation),
         }
     }
 }
@@ -669,15 +660,6 @@ impl QueueFileObjectAddress {
     /// Returns whether a CSQ cleanup context names this captured FILE_OBJECT.
     fn matches(self, context: PVOID) -> bool {
         NonZeroUsize::new(context.expose_provenance()) == Some(self.0)
-    }
-
-    /// Reconstitutes the typed pointer while the queue-owned IRP keeps the object live.
-    /// # Errors
-    ///
-    /// Returns an invariant error if the stored non-zero address cannot form a FILE_OBJECT.
-    fn as_kernel_file_object(self) -> DriverResult<KernelFileObject> {
-        let pointer = core::ptr::with_exposed_provenance_mut(self.0.get());
-        KernelFileObject::from_raw(pointer).ok_or(DriverError::InternalInvariantViolation)
     }
 }
 
@@ -713,7 +695,7 @@ impl CapturedQuerySecurityOutput {
     /// Returns overflow with the exact required length, a native capture failure, or an invariant
     /// error when the native ownership contract is violated.
     fn capture(
-        target: DispatchTarget,
+        target: &ActiveIrp<'_>,
         declared_length: super::IrpBufferLength,
         selection: SecuritySelection,
     ) -> Result<Self, IrpCompletion> {
@@ -778,7 +760,7 @@ impl CapturedQuerySecurityOutput {
         }
         #[cfg(test)]
         {
-            let _: DispatchTarget = target;
+            let _: &ActiveIrp<'_> = target;
             let _: NonZeroUsize = length;
             Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
         }
@@ -855,7 +837,7 @@ impl CapturedSetSecurityDescriptor {
     /// Returns a native boundary failure or an invariant error when successful output ownership is
     /// incomplete.
     fn capture(
-        target: DispatchTarget,
+        target: &ActiveIrp<'_>,
         source: NonNull<c_void>,
         selection: SecuritySelection,
     ) -> Result<Self, IrpCompletion> {
@@ -902,7 +884,7 @@ impl CapturedSetSecurityDescriptor {
         }
         #[cfg(test)]
         {
-            let _: DispatchTarget = target;
+            let _: &ActiveIrp<'_> = target;
             let _: NonNull<c_void> = source;
             let _: SecuritySelection = selection;
             Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
