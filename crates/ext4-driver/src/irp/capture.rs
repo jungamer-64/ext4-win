@@ -665,7 +665,7 @@ pub(crate) struct CapturedQuerySecurityOutput {
     /// Native ownership state; Rust never dereferences the opaque pending target.
     #[cfg(not(test))]
     state: QuerySecurityOutputState,
-    /// Exact descriptor length fixed before the request enters the worker queue.
+    /// Exact descriptor length fixed before the request enters the actor mailbox.
     length: NonZeroUsize,
 }
 
@@ -948,6 +948,9 @@ mod tests {
     }
 
     /// Captures one prepared request through its lifetime-bound active IRP view.
+    /// # Errors
+    ///
+    /// Returns the exact immediate completion when requestor input capture fails.
     fn capture_context(
         received: &mut ReceivedIrp,
         major: DispatchMajor,

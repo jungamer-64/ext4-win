@@ -108,7 +108,7 @@ enum FatalReason {
     FileObjectLifecycleCorruption,
     /// A VCB-owned FCB pointer is no longer present in the owning VCB table.
     FileControlBlockOwnershipCorruption,
-    /// A work item or wake violated the single-poller executor state machine.
+    /// A mailbox, wake, or actor transition violated the executor state machine.
     AsyncExecutorStateCorruption,
 }
 

@@ -118,6 +118,10 @@ impl CreateCompletionOwner<'_> {
 
     /// Executes one non-suspending operation at the sole uninitialized FILE_OBJECT attachment
     /// boundary.
+    /// # Errors
+    ///
+    /// Returns an error when the active create stack or uninitialized FILE_OBJECT is invalid, or
+    /// when `operation` rejects the attachment.
     fn with_file_object<R>(
         &mut self,
         operation: impl for<'view> FnOnce(UninitializedFileObject<'view>) -> DriverResult<R>,
@@ -1138,6 +1142,9 @@ impl PendingFileObjectAttachment<'_> {
     }
 
     /// Consumes the pending claim into one successfully committed FILE_OBJECT attachment.
+    /// # Errors
+    ///
+    /// Returns an error when the completion-owned FILE_OBJECT can no longer accept the attachment.
     fn attach(
         &mut self,
         handle: Box<OpenedHandle>,
