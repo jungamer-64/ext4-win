@@ -1,6 +1,7 @@
 //! PASSIVE_LEVEL future executor and cancel-safe IRP mailbox.
 
 use alloc::boxed::Box;
+use core::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(test))]
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use core::{cell::UnsafeCell, ffi::c_void, future::Future, pin::Pin, ptr::NonNull};
@@ -25,6 +26,9 @@ use super::{DispatchMajor, KernelIrp, OwnedIrp, PendingIrp, QueueContext, Receiv
 
 /// One pinned request continuation owned by a device execution lane.
 type DeviceTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Maximum captured requests waiting in one serialized device execution lane.
+const MAX_QUEUED_REQUESTS: usize = 64;
 
 /// PASSIVE_LEVEL worker scheduling state protected by the executor spin lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,6 +95,55 @@ enum WorkerContinuation {
     Invalid,
 }
 
+/// One queue slot reserved before requestor-owned memory is captured.
+///
+/// Dropping this value rolls back an unpublished reservation. Publishing consumes it without
+/// decrementing; the cancel-safe queue then releases the count at atomic removal.
+#[derive(Debug)]
+struct QueueSlotReservation {
+    /// Stable per-device counter owned by the executor extension.
+    queued_requests: NonNull<AtomicUsize>,
+}
+
+impl QueueSlotReservation {
+    /// Reserves one slot without allowing the counter to exceed the per-device bound.
+    fn acquire(queued_requests: &AtomicUsize) -> DriverResult<Self> {
+        queued_requests
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(1)
+                    .filter(|next| *next <= MAX_QUEUED_REQUESTS)
+            })
+            .map_err(|_| DriverError::InsufficientResources)?;
+        Ok(Self {
+            queued_requests: NonNull::from(queued_requests),
+        })
+    }
+
+    /// Transfers this reservation to the cancel-safe queue.
+    fn publish(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for QueueSlotReservation {
+    fn drop(&mut self) {
+        let queued_requests = unsafe {
+            // SAFETY: The executor storage remains live throughout receive, including every
+            // rollback path before queue publication.
+            self.queued_requests.as_ref()
+        };
+        release_queue_slot(queued_requests);
+    }
+}
+
+/// Releases one previously reserved or published queue slot.
+fn release_queue_slot(queued_requests: &AtomicUsize) {
+    if queued_requests.fetch_sub(1, Ordering::AcqRel) == 0 {
+        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
+    }
+}
+
 /// Device-owned executor that serializes filesystem request futures.
 ///
 /// The embedded CSQ is the first field because the WDK callback API supplies only its address.
@@ -104,6 +157,8 @@ pub(crate) struct DeviceExecutor {
     lock: wdk_sys::KSPIN_LOCK,
     /// FIFO of pending IRPs using `IRP.Tail.Overlay.ListEntry`.
     list_head: UnsafeCell<LIST_ENTRY>,
+    /// Captured requests admitted but not yet atomically removed from the CSQ.
+    queued_requests: AtomicUsize,
     /// System work item whose callback always runs at `PASSIVE_LEVEL`.
     work_item: PIO_WORKITEM,
     /// Wake/poll state protected by `lock`.
@@ -122,6 +177,7 @@ impl DeviceExecutor {
             csq: wdk_sys::IO_CSQ::default(),
             lock: 0,
             list_head: UnsafeCell::new(LIST_ENTRY::default()),
+            queued_requests: AtomicUsize::new(0),
             work_item: core::ptr::null_mut(),
             worker_state: UnsafeCell::new(WorkerState::Dormant),
             active: UnsafeCell::new(None),
@@ -177,6 +233,7 @@ impl DeviceExecutor {
                     csq: wdk_sys::IO_CSQ::default(),
                     lock: 0,
                     list_head: UnsafeCell::new(LIST_ENTRY::default()),
+                    queued_requests: AtomicUsize::new(0),
                     work_item: core::ptr::null_mut(),
                     worker_state: UnsafeCell::new(WorkerState::Dormant),
                     active: UnsafeCell::new(None),
@@ -265,17 +322,21 @@ impl DeviceExecutor {
             Ok(executor) => executor,
             Err(error) => return received.complete_result(Err(error)),
         };
+        let executor = unsafe {
+            // SAFETY: The device extension remains stable throughout request capture and queueing.
+            executor.as_ref()
+        };
+        let reservation = match QueueSlotReservation::acquire(&executor.queued_requests) {
+            Ok(reservation) => reservation,
+            Err(error) => return received.complete_result(Err(error)),
+        };
         let context = match received.with_active(|active| QueueContext::capture(active, major)) {
             Ok(context) => context,
             Err(completion) => return received.complete(completion),
         };
         let pending = PendingIrp::from_received(received, context);
         let status = pending.dispatch_status();
-        let executor = unsafe {
-            // SAFETY: The device extension remains stable for the pending IRP lifetime.
-            executor.as_ref()
-        };
-        executor.enqueue(pending);
+        executor.enqueue(pending, reservation);
         status
     }
 
@@ -324,10 +385,11 @@ impl DeviceExecutor {
     }
 
     /// Inserts a pending IRP through the cancel-safe queue and records a worker wake.
-    fn enqueue(&self, pending: PendingIrp) {
+    fn enqueue(&self, pending: PendingIrp, reservation: QueueSlotReservation) {
         #[cfg(test)]
         mark_pending_for_csq_test(pending.target.irp);
         let irp = pending.publish();
+        reservation.publish();
         #[cfg(not(test))]
         unsafe {
             // SAFETY: Context publication transferred the Box before this call. IoCsqInsertIrp
@@ -514,6 +576,7 @@ impl DeviceExecutor {
             KernelWideInconsistency::async_executor_state_corruption().bugcheck();
         };
         remove_entry_list(entry);
+        release_queue_slot(&self.queued_requests);
     }
 
     /// Finds the next FIFO IRP matching an optional FILE_OBJECT context.
@@ -550,6 +613,28 @@ impl DeviceExecutor {
 // SAFETY: The device extension is stable and all shared mutation follows the spin-lock or unique
 // polling-worker disciplines documented on each `UnsafeCell` field.
 unsafe impl Sync for DeviceExecutor {}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{MAX_QUEUED_REQUESTS, QueueSlotReservation};
+
+    /// # Panics
+    ///
+    /// Panics when one device can reserve beyond its bounded queue depth or rollback leaks slots.
+    #[test]
+    fn queue_slot_reservations_enforce_the_device_bound() {
+        let queued_requests = AtomicUsize::new(0);
+        let reservations: [_; MAX_QUEUED_REQUESTS] =
+            core::array::from_fn(|_| QueueSlotReservation::acquire(&queued_requests));
+
+        assert!(reservations.iter().all(Result::is_ok));
+        assert!(QueueSlotReservation::acquire(&queued_requests).is_err());
+        drop(reservations);
+        assert_eq!(queued_requests.load(Ordering::Acquire), 0);
+    }
+}
 
 /// Raw-waker clone retains the same non-owning stable executor address.
 /// # Safety
