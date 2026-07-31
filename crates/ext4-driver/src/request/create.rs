@@ -24,7 +24,7 @@ use crate::{
     state::{
         ChildCreationTarget, DataTransferMode, DirectoryNameChange, DirectoryNameChangeAction,
         FileControlBlock, KernelDevice, MountedVolumeDevice, NoIntermediateTransfer, OpenedHandle,
-        OpenedLocation, OpenedNodeMode, OpenedObject, PendingChildCreation,
+        OpenedLocation, OpenedNodeMode, OpenedObject, OpenedVolumeHandle, PendingChildCreation,
         UninitializedFileObject, VolumeControlBlock, VolumeOperationLane, VolumeOperationLease,
         WriteCommitment, abandon_file_control_block,
     },
@@ -150,6 +150,14 @@ async fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<Crea
         return Err(DriverError::InvalidDeviceRequest);
     };
     let disposition = owner.parameters().disposition();
+    let target = match target {
+        CreateTargetSpecifier::Volume => {
+            return open_volume(owner, create_ea, mounted_volume).map(CreateCompletion::Handle);
+        }
+        target @ (CreateTargetSpecifier::Path { .. } | CreateTargetSpecifier::FileReference(_)) => {
+            target
+        }
+    };
     let mut operations = unsafe {
         // SAFETY: Create requests are queued through the mounted-device executor, which polls one
         // active filesystem operation at a time and therefore grants this request the unique lane.
@@ -217,6 +225,8 @@ async fn create_symlink_reparse_completion(
 /// Fully decoded create target that contains no raw FILE_OBJECT or VCB reference.
 #[derive(Debug, Eq, PartialEq)]
 enum CreateTargetSpecifier {
+    /// Direct user open of the mounted volume rather than a namespace node.
+    Volume,
     /// A Windows path anchored at the mounted root or a related opened directory.
     Path {
         /// Owned validated path components.
@@ -243,6 +253,10 @@ impl CreateTargetSpecifier {
         match interpretation {
             CreateNameInterpretation::Path => {
                 let name = CreatePathName::decode(file_object.as_ref())?;
+                if name.is_direct_volume_open() && file_object.related_file_object().is_none() {
+                    validate_volume_open_create(disposition)?;
+                    return Ok(Self::Volume);
+                }
                 let anchor = CreatePathAnchor::decode(file_object, mounted_volume, name.rooting())?;
                 Ok(Self::Path { name, anchor })
             }
@@ -511,6 +525,11 @@ impl CreatePathName {
         self.components.as_slice()
     }
 
+    /// Returns whether this empty relative name selects the mounted volume itself.
+    fn is_direct_volume_open(&self) -> bool {
+        matches!(self.rooting, CreateNameRooting::Relative) && self.components.is_empty()
+    }
+
     /// Splits the syntactic root prefix from the component payload.
     fn split_rooting(mut units: &[u16]) -> (CreateNameRooting, &[u16]) {
         if !units.starts_with(&[UTF16_BACKSLASH]) {
@@ -619,7 +638,6 @@ impl CreatePathAnchor {
             Self::OpenedDirectory { id, .. } => *id,
         }
     }
-
 }
 
 /// Opens an existing path according to the requested disposition and options.
@@ -660,6 +678,53 @@ fn open_existing_node(
                 NodeId::File(_) | NodeId::Symlink(_) => Err(DriverError::NotSupported),
             }
         }
+    }
+}
+
+/// Opens the mounted volume itself and publishes a typed volume FILE_OBJECT.
+/// # Errors
+///
+/// Returns an error when EAs are supplied, share-access validation fails, handle allocation fails,
+/// or the completion-owned FILE_OBJECT cannot be attached.
+fn open_volume(
+    mut request: CreateCompletionOwner<'_>,
+    create_ea: CreateEa,
+    volume: NonNull<VolumeControlBlock>,
+) -> DriverResult<CreateAction> {
+    if !create_ea.is_empty() {
+        return Err(DriverError::InvalidParameter);
+    }
+    let parameters = request.parameters();
+    let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
+    let handle = memory::boxed_try_with(|| Ok(OpenedVolumeHandle::new()))?;
+    let mut operations = unsafe {
+        // SAFETY: This create runs as the mounted-device actor's unique active operation.
+        VolumeControlBlock::claim_operation_lane(volume)
+    };
+    request.with_file_object(move |file_object| {
+        operations.open_volume_handle(
+            file_object.kernel_file_object(),
+            policy.desired_access(),
+            policy.share_access(),
+        )?;
+        attach_volume_file_object(file_object, volume, handle, policy.file_object_flags());
+        Ok(())
+    })?;
+    Ok(CreateAction::Opened)
+}
+
+/// Validates create semantics that are meaningful for a direct volume open.
+/// # Errors
+///
+/// Returns an error when the caller requests creation or replacement of the volume object.
+fn validate_volume_open_create(disposition: CreateDisposition) -> DriverResult<()> {
+    match disposition {
+        CreateDisposition::Open => Ok(()),
+        CreateDisposition::Create
+        | CreateDisposition::OpenIf
+        | CreateDisposition::Overwrite
+        | CreateDisposition::OverwriteIf
+        | CreateDisposition::Supersede => Err(DriverError::InvalidParameter),
     }
 }
 
@@ -799,6 +864,7 @@ async fn resolve_target(
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
     match target {
+        CreateTargetSpecifier::Volume => Err(DriverError::InternalInvariantViolation),
         CreateTargetSpecifier::Path { name, anchor } => {
             resolve_path(name, anchor, operations, reparse_point_mode).await
         }
@@ -931,7 +997,18 @@ async fn resolve_path(
         parent_id = directory_id;
     }
 
-    Ok(anchor.existing_directory())
+    Ok(match anchor {
+        CreatePathAnchor::VolumeRoot => CreateTargetLookup::Existing {
+            node: NodeId::Directory(DirectoryNodeId::ROOT),
+            node_mode: OpenedNodeMode::Direct,
+            location: OpenedLocation::Root,
+        },
+        CreatePathAnchor::OpenedDirectory { id, location } => CreateTargetLookup::Existing {
+            node: NodeId::Directory(id),
+            node_mode: OpenedNodeMode::Direct,
+            location,
+        },
+    })
 }
 
 /// Position of one component in the original create name.
@@ -1184,6 +1261,23 @@ fn attach_preallocated_file_object(
     file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
 }
 
+/// Stores a typed VCB/volume-handle context pair in one direct-volume FILE_OBJECT.
+fn attach_volume_file_object(
+    mut file_object: UninitializedFileObject<'_>,
+    volume: NonNull<VolumeControlBlock>,
+    handle: Box<OpenedVolumeHandle>,
+    file_object_flags: CreateFileObjectFlags,
+) {
+    let file_object = unsafe {
+        // SAFETY: This is the sole successful-create attachment transition for the FILE_OBJECT.
+        file_object.as_mut()
+    };
+    file_object_flags.apply_to(file_object);
+    file_object.Flags |= wdk_sys::FO_VOLUME_OPEN;
+    file_object.FsContext = volume.as_ptr().cast::<c_void>();
+    file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,6 +1474,26 @@ mod tests {
 
     /// # Panics
     ///
+    /// Panics when direct volume opens accept create/replace dispositions.
+    #[test]
+    fn volume_open_accepts_only_existing_open_disposition() {
+        assert_eq!(validate_volume_open_create(CreateDisposition::Open), Ok(()));
+        for disposition in [
+            CreateDisposition::Create,
+            CreateDisposition::OpenIf,
+            CreateDisposition::Overwrite,
+            CreateDisposition::OverwriteIf,
+            CreateDisposition::Supersede,
+        ] {
+            assert_eq!(
+                validate_volume_open_create(disposition),
+                Err(DriverError::InvalidParameter)
+            );
+        }
+    }
+
+    /// # Panics
+    ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn create_path_name_decodes_absolute_relative_and_empty_names() {
@@ -1460,6 +1574,17 @@ mod tests {
         if let Ok(empty) = empty {
             assert_eq!(empty.rooting(), CreateNameRooting::Relative);
             assert!(empty.components().is_empty());
+            assert!(empty.is_direct_volume_open());
+        }
+
+        let mut root_units = [UTF16_BACKSLASH];
+        let root_file = file_object_with_name(&mut root_units);
+        let root = CreatePathName::decode(&root_file);
+        assert!(root.is_ok());
+        if let Ok(root) = root {
+            assert_eq!(root.rooting(), CreateNameRooting::Absolute);
+            assert!(root.components().is_empty());
+            assert!(!root.is_direct_volume_open());
         }
     }
 

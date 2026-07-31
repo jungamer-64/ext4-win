@@ -588,8 +588,78 @@ pub(crate) struct VolumeControlBlock {
     /// Synchronized VCB-owned FCB identities and Windows share ledger. This field drops before
     /// the mounted volume because every FCB retains that volume as its data-plane owner.
     file_control_blocks: FileControlBlockLedger,
+    /// Actor-owned share accounting for direct user volume opens.
+    volume_handles: VolumeHandleLedger,
     /// Actor-owned journaled volume state used only by the serialized operation executor.
     operations: VolumeOperationLane,
+}
+
+/// Direct-volume FILE_OBJECT share claims owned by the mounted-device actor.
+struct VolumeHandleLedger {
+    /// I/O Manager share-access accounting for the mounted volume identity.
+    share_access: SHARE_ACCESS,
+}
+
+impl VolumeHandleLedger {
+    /// Creates empty direct-volume share accounting.
+    const fn new() -> Self {
+        Self {
+            share_access: SHARE_ACCESS {
+                OpenCount: 0,
+                Readers: 0,
+                Writers: 0,
+                Deleters: 0,
+                SharedRead: 0,
+                SharedWrite: 0,
+                SharedDelete: 0,
+            },
+        }
+    }
+
+    /// Records one direct-volume FILE_OBJECT share claim.
+    /// # Errors
+    ///
+    /// Returns an error when an existing direct-volume handle conflicts with the requested access.
+    fn open(
+        &mut self,
+        file_object: KernelFileObject,
+        desired_access: DesiredAccess,
+        share_access: ShareAccess,
+    ) -> DriverResult<()> {
+        let status = unsafe {
+            // SAFETY: The mounted-device actor exclusively owns this SHARE_ACCESS record and this
+            // successful check records the returned FILE_OBJECT's exact claim.
+            ffi::IoCheckShareAccess(
+                desired_access.as_raw(),
+                share_access.as_ulong(),
+                file_object.as_ptr(),
+                core::ptr::addr_of_mut!(self.share_access),
+                1,
+            )
+        };
+        if status < STATUS_SUCCESS {
+            return Err(DriverError::ShareAccessConflict);
+        }
+        Ok(())
+    }
+
+    /// Removes one direct-volume FILE_OBJECT share claim at cleanup or canceled-open close.
+    fn cleanup(&mut self, file_object: KernelFileObject) {
+        unsafe {
+            // SAFETY: A successful volume open recorded this FILE_OBJECT exactly once, and the
+            // handle lifecycle selects one terminal share-removal transition.
+            ffi::IoRemoveShareAccess(
+                file_object.as_ptr(),
+                core::ptr::addr_of_mut!(self.share_access),
+            );
+        }
+    }
+}
+
+impl fmt::Debug for VolumeHandleLedger {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VolumeHandleLedger(..)")
+    }
 }
 
 /// Mutable ext4 state owned exclusively by one mounted-device operation actor.
@@ -684,9 +754,37 @@ pub(crate) struct VolumeOperationLease {
     owner: MountedVolumeRef,
     /// Disjoint actor-owned field projected without borrowing the whole VCB.
     lane: NonNull<VolumeOperationLane>,
+    /// Direct-volume share ledger projected under the same unique actor authority.
+    volume_handles: NonNull<VolumeHandleLedger>,
 }
 
 impl VolumeOperationLease {
+    /// Records one direct-volume FILE_OBJECT share claim.
+    /// # Errors
+    ///
+    /// Returns an error when an existing volume handle denies the requested sharing.
+    pub(crate) fn open_volume_handle(
+        &mut self,
+        file_object: KernelFileObject,
+        desired_access: DesiredAccess,
+        share_access: ShareAccess,
+    ) -> DriverResult<()> {
+        unsafe {
+            // SAFETY: This non-cloneable actor lease uniquely owns volume-handle transitions.
+            self.volume_handles.as_mut()
+        }
+        .open(file_object, desired_access, share_access)
+    }
+
+    /// Removes one direct-volume FILE_OBJECT share claim.
+    pub(crate) fn cleanup_volume_handle(&mut self, file_object: KernelFileObject) {
+        unsafe {
+            // SAFETY: This non-cloneable actor lease uniquely owns volume-handle transitions.
+            self.volume_handles.as_mut()
+        }
+        .cleanup(file_object);
+    }
+
     /// Returns the actor-owned operation lane through this exclusive capability.
     pub(crate) fn lane(&self) -> &VolumeOperationLane {
         unsafe {
@@ -1145,6 +1243,7 @@ impl VolumeControlBlock {
         Ok(Self {
             directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
             file_control_blocks: FileControlBlockLedger::try_new()?,
+            volume_handles: VolumeHandleLedger::new(),
             operations: VolumeOperationLane { journaled: volume },
         })
     }
@@ -1216,9 +1315,18 @@ impl VolumeControlBlock {
             // SAFETY: A field address projected from a non-null live VCB cannot be null.
             NonNull::new_unchecked(lane)
         };
+        let volume_handles = unsafe {
+            // SAFETY: The VCB is heap-stable, so its volume-handle ledger has a stable address.
+            core::ptr::addr_of_mut!((*volume.as_ptr()).volume_handles)
+        };
+        let volume_handles = unsafe {
+            // SAFETY: A field address projected from a non-null live VCB cannot be null.
+            NonNull::new_unchecked(volume_handles)
+        };
         VolumeOperationLease {
             owner: MountedVolumeRef::new(volume),
             lane,
+            volume_handles,
         }
     }
 }
@@ -2796,6 +2904,42 @@ impl PartialEq for HandleLifecycle {
 
 impl Eq for HandleLifecycle {}
 
+/// Per-handle state stored in `FsContext2` for a direct user volume open.
+#[derive(Debug)]
+pub(crate) struct OpenedVolumeHandle {
+    /// One-way cleanup lifecycle shared with the volume FILE_OBJECT.
+    lifecycle: HandleLifecycle,
+}
+
+impl OpenedVolumeHandle {
+    /// Creates one active direct-volume handle.
+    pub(crate) const fn new() -> Self {
+        Self {
+            lifecycle: HandleLifecycle::active(),
+        }
+    }
+
+    /// Begins this volume handle's idempotent cleanup transition.
+    fn begin_cleanup(&self) -> CleanupStart {
+        self.lifecycle.begin_cleanup()
+    }
+
+    /// Publishes completion after its share claim has been removed.
+    fn finish_cleanup(&self) {
+        self.lifecycle.finish_cleanup();
+    }
+
+    /// Selects the legal terminal close release.
+    fn close_release_plan(
+        &self,
+        close_kind: FileObjectCloseKind,
+        cleanup_complete: bool,
+    ) -> CloseReleasePlan {
+        self.lifecycle
+            .close_release_plan(close_kind, cleanup_complete)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Per-handle write completion durability requested at create/open.
 pub(crate) enum WriteCommitment {
@@ -3101,6 +3245,9 @@ impl<'owner> OpenedObject<'owner> {
     /// when the shared FCB node kind does not match the per-handle state kind.
     pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
         let object = file_object.as_ref();
+        if object.Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
+            return Err(DriverError::ObjectTypeMismatch);
+        }
         let fcb = NonNull::new(object.FsContext.cast::<FileControlBlock>());
         let handle = NonNull::new(object.FsContext2.cast::<OpenedHandle>());
         let (fcb, handle) = match (fcb, handle) {
@@ -3313,6 +3460,127 @@ impl<'owner> OpenedObject<'owner> {
             (NodeId::File(_), OpenedHandleKind::File { .. })
             | (NodeId::Directory(_), OpenedHandleKind::Directory { .. })
             | (NodeId::Symlink(_), OpenedHandleKind::Symlink) => Ok(()),
+            _ => KernelWideInconsistency::file_object_context_corruption().bugcheck(),
+        }
+    }
+}
+
+/// Successfully opened FILE_OBJECT kind selected without reinterpreting context pointers.
+#[derive(Debug)]
+pub(crate) enum OpenedFileObject<'owner> {
+    /// Namespace node backed by an FCB and `OpenedHandle`.
+    Node(OpenedObject<'owner>),
+    /// Direct mounted-volume handle backed by a VCB and `OpenedVolumeHandle`.
+    Volume(OpenedVolume<'owner>),
+}
+
+impl<'owner> OpenedFileObject<'owner> {
+    /// Decodes the filesystem-owned context pair according to the FSD-owned volume-open flag.
+    /// # Errors
+    ///
+    /// Returns an error when the selected context pair is absent or inconsistent.
+    pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
+        if file_object.as_ref().Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
+            OpenedVolume::decode(file_object).map(Self::Volume)
+        } else {
+            OpenedObject::decode(file_object).map(Self::Node)
+        }
+    }
+}
+
+/// Direct user volume open decoded from its typed FILE_OBJECT context pair.
+#[derive(Debug)]
+pub(crate) struct OpenedVolume<'owner> {
+    /// Live direct-volume FILE_OBJECT.
+    file_object: ActiveFileObject<'owner>,
+    /// Mounted VCB stored in `FsContext`.
+    volume: NonNull<VolumeControlBlock>,
+    /// Per-handle lifecycle stored in `FsContext2`.
+    handle: NonNull<OpenedVolumeHandle>,
+}
+
+impl<'owner> OpenedVolume<'owner> {
+    /// Decodes a direct-volume FILE_OBJECT.
+    /// # Errors
+    ///
+    /// Returns an error when the volume flag or either typed context pointer is absent.
+    pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
+        let object = file_object.as_ref();
+        if object.Flags & wdk_sys::FO_VOLUME_OPEN == 0 {
+            return Err(DriverError::ObjectTypeMismatch);
+        }
+        let volume = NonNull::new(object.FsContext.cast::<VolumeControlBlock>());
+        let handle = NonNull::new(object.FsContext2.cast::<OpenedVolumeHandle>());
+        match (volume, handle) {
+            (Some(volume), Some(handle)) => Ok(Self {
+                file_object,
+                volume,
+                handle,
+            }),
+            (None, None) => Err(DriverError::InvalidParameter),
+            (Some(_), None) | (None, Some(_)) => {
+                KernelWideInconsistency::file_object_context_corruption().bugcheck()
+            }
+        }
+    }
+
+    /// Returns the mounted VCB identified by this volume handle.
+    pub(crate) const fn volume(&self) -> NonNull<VolumeControlBlock> {
+        self.volume
+    }
+
+    /// Returns the kernel FILE_OBJECT identity whose share claim is recorded.
+    pub(crate) const fn file_object(&self) -> KernelFileObject {
+        self.file_object.address()
+    }
+
+    /// Begins this handle's idempotent cleanup transition.
+    pub(crate) fn begin_cleanup(&self) -> CleanupStart {
+        unsafe {
+            // SAFETY: Decode validated the live `OpenedVolumeHandle` context pointer.
+            self.handle.as_ref()
+        }
+        .begin_cleanup()
+    }
+
+    /// Publishes completion after its share claim has been removed.
+    pub(crate) fn finish_cleanup(&self) {
+        unsafe {
+            // SAFETY: Decode validated the live `OpenedVolumeHandle` context pointer.
+            self.handle.as_ref()
+        }
+        .finish_cleanup();
+    }
+
+    /// Selects the only legal terminal close release.
+    pub(crate) fn close_release_plan(&self, close_kind: FileObjectCloseKind) -> CloseReleasePlan {
+        unsafe {
+            // SAFETY: Decode validated the live `OpenedVolumeHandle` context pointer.
+            self.handle.as_ref()
+        }
+        .close_release_plan(close_kind, self.file_object.cleanup_complete())
+    }
+
+    /// Detaches the exact VCB and volume-handle pair at terminal close.
+    pub(crate) fn detach_contexts(
+        self,
+    ) -> (NonNull<VolumeControlBlock>, NonNull<OpenedVolumeHandle>) {
+        let object = unsafe {
+            // SAFETY: This consumed capability represents the unique close transition.
+            &mut *self.file_object.as_ptr()
+        };
+        let volume = NonNull::new(
+            core::mem::replace(&mut object.FsContext, core::ptr::null_mut())
+                .cast::<VolumeControlBlock>(),
+        );
+        let handle = NonNull::new(
+            core::mem::replace(&mut object.FsContext2, core::ptr::null_mut())
+                .cast::<OpenedVolumeHandle>(),
+        );
+        match (volume, handle) {
+            (Some(volume), Some(handle)) if volume == self.volume && handle == self.handle => {
+                (volume, handle)
+            }
             _ => KernelWideInconsistency::file_object_context_corruption().bugcheck(),
         }
     }
@@ -3575,10 +3843,10 @@ mod tests {
         DirectoryNameChange, DirectoryNameChangeAction, FileControlBlock, FileControlBlockLedger,
         FileControlBlockOpenState, FileControlBlockRelease, FileObjectCloseKind, KernelDevice,
         KernelFileObject, MountedVolumeDevice, MountedVolumeDeviceExtension, NativeFileByteRange,
-        NoIntermediateTransfer, OpenedDirectory, OpenedHandle, OpenedLocation, OpenedNodeMode,
-        OpenedObject, OpenedRegularFile, TransferBufferAlignment, TransferSectorSize,
-        UninitializedFileObject, VolumeControlBlock, WriteCommitment, select_close_release_plan,
-        shutdown_registration_status,
+        NoIntermediateTransfer, OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation,
+        OpenedNodeMode, OpenedObject, OpenedRegularFile, OpenedVolumeHandle,
+        TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
+        WriteCommitment, select_close_release_plan, shutdown_registration_status,
     };
 
     fn file_object_with_contexts(
@@ -3590,6 +3858,34 @@ mod tests {
             FsContext2: fs_context2,
             ..wdk_sys::FILE_OBJECT::default()
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the FSD-owned volume flag does not select the VCB/volume-handle context layout.
+    #[test]
+    fn volume_open_flag_selects_typed_volume_contexts() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut handle = OpenedVolumeHandle::new();
+        let mut file = file_object_with_contexts(
+            volume.as_ptr().cast(),
+            core::ptr::addr_of_mut!(handle).cast(),
+        );
+        file.Flags |= wdk_sys::FO_VOLUME_OPEN;
+
+        let result = with_active_file_object(&mut file, |file_object| {
+            assert!(matches!(
+                OpenedObject::decode(file_object),
+                Err(DriverError::ObjectTypeMismatch)
+            ));
+            let opened = OpenedFileObject::decode(file_object)?;
+            let OpenedFileObject::Volume(opened) = opened else {
+                return Err(DriverError::InternalInvariantViolation);
+            };
+            assert_eq!(opened.volume(), volume);
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
     }
 
     /// Runs one decoder against a FILE_OBJECT whose lifetime is owned by an active test IRP.
