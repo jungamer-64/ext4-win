@@ -12,8 +12,7 @@ use crate::{
         CreateAction, CreateCompletion, CreateDisposition, CreateNameInterpretation,
         CreateParameters, CreateReparsePointMode, CreateSymlinkReparseBuffer,
         CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering, DesiredAccess,
-        DispatchTarget, ExistingOperationAccess, PendingIrpLease, RegularFileWriteAccess,
-        ShareAccess,
+        ExistingOperationAccess, PendingIrpLease, RegularFileWriteAccess, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
@@ -24,10 +23,10 @@ use crate::{
     },
     state::{
         ChildCreationTarget, DataTransferMode, DirectoryNameChange, DirectoryNameChangeAction,
-        FileControlBlock, KernelDevice, KernelFileObject, MountedVolumeDevice,
-        NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
-        PendingChildCreation, UninitializedFileObject, VolumeControlBlock, VolumeOperationLane,
-        VolumeOperationLease, WriteCommitment, abandon_file_control_block,
+        FileControlBlock, KernelDevice, MountedVolumeDevice, NoIntermediateTransfer, OpenedHandle,
+        OpenedLocation, OpenedNodeMode, OpenedObject, PendingChildCreation,
+        UninitializedFileObject, VolumeControlBlock, VolumeOperationLane, VolumeOperationLease,
+        WriteCommitment, abandon_file_control_block,
     },
 };
 
@@ -39,60 +38,96 @@ const UTF16_BACKSLASH: u16 = 0x005C;
 ///
 /// Returns an error when create stack decoding or ext4 open/create handling rejects the request.
 pub(crate) async fn execute(request: PendingIrpLease<'_>) -> DriverResult<CreateCompletion> {
-    open_or_create(CreateRequest::decode(request)?).await
+    open_or_create(PreparedCreateRequest::decode(request)?).await
 }
 
-/// Decoded create request at the filesystem boundary.
+/// Create request whose pointer-bearing inputs have all become owned domain values.
 #[derive(Debug)]
-struct CreateRequest<'a> {
+struct PreparedCreateRequest<'a> {
+    /// Completion and final FILE_OBJECT attachment authority.
+    owner: CreateCompletionOwner<'a>,
+    /// Fully owned namespace target.
+    target: CreateTargetSpecifier,
+    /// Fully owned create-time EA list.
+    create_ea: CreateEa,
+}
+
+/// Completion authority retained after pointer-bearing create input decoding.
+#[derive(Debug)]
+struct CreateCompletionOwner<'a> {
     /// Pending IRP lease retaining every create-time pointer through terminal completion.
     request: PendingIrpLease<'a>,
     /// Owned semantic create parameters decoded before suspension.
     parameters: CreateParameters,
-    /// FILE_OBJECT before filesystem contexts are attached.
-    file_object: UninitializedFileObject,
+    /// Mounted device receiving the create.
+    device: KernelDevice,
 }
 
-// SAFETY: The exclusive pending-IRP lease pins the FILE_OBJECT and every auxiliary buffer until
-// this request is dropped. The mounted-device executor moves, but never concurrently polls, this
-// create operation between PASSIVE_LEVEL workers.
-unsafe impl Send for CreateRequest<'_> {}
-
-impl<'a> CreateRequest<'a> {
+impl<'a> PreparedCreateRequest<'a> {
     /// Decodes the create request from the current IRP stack.
     /// # Errors
     ///
-    /// Returns an error when the current stack is not create/open or the FILE_OBJECT is already
-    /// initialized.
-    fn decode(request: PendingIrpLease<'a>) -> Result<Self, crate::kernel::status::DriverError> {
-        let target = request.target();
-        let stack = target.current_stack()?.create()?;
-        let file_object = UninitializedFileObject::decode(stack.file_object())?;
+    /// Returns an error when the stack, FILE_OBJECT, create name, related object, or EA payload is
+    /// malformed.
+    fn decode(
+        mut request: PendingIrpLease<'a>,
+    ) -> Result<Self, crate::kernel::status::DriverError> {
+        let (device, parameters, target, create_ea) = request.with_active(|active| {
+            let current = active.current_stack()?;
+            let file_object = current.file_object()?;
+            let stack = current.create()?;
+            let parameters = stack.parameters();
+            let file_object = UninitializedFileObject::decode(file_object)?;
+            let device = active.device();
+            let mounted_volume =
+                MountedVolumeDevice::vcb(device).ok_or(DriverError::InvalidDeviceRequest)?;
+            Ok::<_, DriverError>((
+                device,
+                parameters,
+                CreateTargetSpecifier::decode(
+                    &file_object,
+                    mounted_volume,
+                    parameters.name_interpretation(),
+                    parameters.disposition(),
+                )?,
+                CreateEa::decode(active, parameters.ea_length())?,
+            ))
+        })?;
         Ok(Self {
-            request,
-            parameters: stack.parameters(),
-            file_object,
+            owner: CreateCompletionOwner {
+                request,
+                parameters,
+                device,
+            },
+            target,
+            create_ea,
         })
     }
+}
 
-    /// Returns the dispatch target carrying create-time auxiliary buffers.
-    const fn target(&self) -> DispatchTarget {
-        self.request.target()
-    }
-
+impl CreateCompletionOwner<'_> {
     /// Returns the mounted device receiving the create.
     const fn device(&self) -> KernelDevice {
-        self.request.target().device()
-    }
-
-    /// Returns the file object to initialize.
-    const fn file_object(&self) -> UninitializedFileObject {
-        self.file_object
+        self.device
     }
 
     /// Returns decoded create parameters.
     const fn parameters(&self) -> CreateParameters {
         self.parameters
+    }
+
+    /// Executes one non-suspending operation at the sole uninitialized FILE_OBJECT attachment
+    /// boundary.
+    fn with_file_object<R>(
+        &mut self,
+        operation: impl for<'view> FnOnce(UninitializedFileObject<'view>) -> DriverResult<R>,
+    ) -> DriverResult<R> {
+        self.request.with_active(|active| {
+            let current = active.current_stack()?;
+            let file_object = current.file_object()?;
+            let _stack = current.create()?;
+            operation(UninitializedFileObject::decode(file_object)?)
+        })
     }
 }
 
@@ -101,18 +136,16 @@ impl<'a> CreateRequest<'a> {
 ///
 /// Returns an error when EA create input is supplied, the device is not mounted, path resolution
 /// fails, or the selected open/create disposition cannot be satisfied.
-async fn open_or_create(request: CreateRequest<'_>) -> DriverResult<CreateCompletion> {
-    let create_ea = CreateEa::decode(request.target(), request.parameters().ea_length())?;
-    let Some(mounted_volume) = MountedVolumeDevice::vcb(request.device()) else {
+async fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<CreateCompletion> {
+    let PreparedCreateRequest {
+        mut owner,
+        target,
+        create_ea,
+    } = request;
+    let Some(mounted_volume) = MountedVolumeDevice::vcb(owner.device()) else {
         return Err(DriverError::InvalidDeviceRequest);
     };
-    let disposition = request.parameters().disposition();
-    let target = CreateTargetSpecifier::decode(
-        request.file_object(),
-        mounted_volume,
-        request.parameters().name_interpretation(),
-        disposition,
-    )?;
+    let disposition = owner.parameters().disposition();
     let mut operations = unsafe {
         // SAFETY: Create requests are queued through the mounted-device executor, which polls one
         // active filesystem operation at a time and therefore grants this request the unique lane.
@@ -121,7 +154,7 @@ async fn open_or_create(request: CreateRequest<'_>) -> DriverResult<CreateComple
     match resolve_target(
         target,
         operations.lane_mut(),
-        request.parameters().reparse_point_mode(),
+        owner.parameters().reparse_point_mode(),
     )
     .await?
     {
@@ -130,10 +163,10 @@ async fn open_or_create(request: CreateRequest<'_>) -> DriverResult<CreateComple
             node_mode,
             location,
         } => {
-            let mounted_volume = MountedVolumeDevice::vcb(request.device())
+            let mounted_volume = MountedVolumeDevice::vcb(owner.device())
                 .ok_or(DriverError::InvalidDeviceRequest)?;
             open_existing_node(
-                request,
+                &mut owner,
                 mounted_volume,
                 disposition,
                 node,
@@ -143,7 +176,7 @@ async fn open_or_create(request: CreateRequest<'_>) -> DriverResult<CreateComple
             .map(CreateCompletion::Handle)
         }
         CreateTargetLookup::Missing { parent, name } => create_missing_node(
-            request,
+            owner,
             create_ea,
             &mut operations,
             disposition,
@@ -198,26 +231,21 @@ impl CreateTargetSpecifier {
     /// Returns an error when the path, related object, or file reference is malformed, or when the
     /// requested disposition is not valid for a file-reference open.
     fn decode(
-        file_object: UninitializedFileObject,
+        file_object: &UninitializedFileObject<'_>,
         mounted_volume: NonNull<VolumeControlBlock>,
         interpretation: CreateNameInterpretation,
         disposition: CreateDisposition,
     ) -> DriverResult<Self> {
-        let file_object = unsafe {
-            // SAFETY: The uninitialized FILE_OBJECT belongs to the active create stack and this
-            // synchronous decoder only reads immutable name and related-object fields.
-            file_object.as_ref()
-        };
         match interpretation {
             CreateNameInterpretation::Path => {
-                let name = CreatePathName::decode(file_object)?;
+                let name = CreatePathName::decode(file_object.as_ref())?;
                 let anchor = CreatePathAnchor::decode(file_object, mounted_volume, name.rooting())?;
                 Ok(Self::Path { name, anchor })
             }
             CreateNameInterpretation::FileReference => {
                 validate_file_reference_create(disposition)?;
                 Ok(Self::FileReference(CreateFileReference::decode(
-                    file_object,
+                    file_object.as_ref(),
                 )?))
             }
         }
@@ -533,11 +561,11 @@ impl CreatePathAnchor {
     /// Returns an error when an absolute path also supplies a related object, or when the related
     /// object is not an opened directory on the mounted volume receiving this create.
     fn decode(
-        file_object: &FILE_OBJECT,
+        file_object: &UninitializedFileObject<'_>,
         vcb: NonNull<VolumeControlBlock>,
         rooting: CreateNameRooting,
     ) -> DriverResult<Self> {
-        let Some(related_file) = KernelFileObject::from_raw(file_object.RelatedFileObject) else {
+        let Some(related_file) = file_object.related_file_object() else {
             return Ok(Self::VolumeRoot);
         };
         if rooting == CreateNameRooting::Absolute {
@@ -611,7 +639,7 @@ impl CreatePathAnchor {
 /// Returns an error when existing-node options conflict, create-only disposition collides, share
 /// access fails, or an incomplete destructive disposition is requested.
 fn open_existing_node(
-    request: CreateRequest<'_>,
+    request: &mut CreateCompletionOwner<'_>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
     node: NodeId,
@@ -623,14 +651,9 @@ fn open_existing_node(
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
-            initialize_file_object(
-                request.file_object(),
-                vcb,
-                node,
-                node_mode,
-                location,
-                policy,
-            )?;
+            request.with_file_object(|file_object| {
+                initialize_file_object(file_object, vcb, node, node_mode, location, policy)
+            })?;
             Ok(CreateAction::Opened)
         }
         CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
@@ -666,7 +689,7 @@ fn destructive_directory_error(directory: DirectoryNodeId) -> DriverError {
 /// Returns an error when the disposition requires an existing name, missing-child creation cannot
 /// be staged or committed, or the new file object cannot be initialized.
 async fn create_missing_node(
-    request: CreateRequest<'_>,
+    mut request: CreateCompletionOwner<'_>,
     create_ea: CreateEa,
     operations: &mut VolumeOperationLease,
     disposition: CreateDisposition,
@@ -708,19 +731,25 @@ async fn create_missing_node(
         ))
     })?;
     create_ea.apply_to_pending_child(&mut creation).await?;
-    let attachment = open_pending_child_file_control_block(
-        &creation,
-        request.file_object(),
-        policy.desired_access(),
-        policy.share_access(),
-    )?;
+    let attachment = request.with_file_object(|file_object| {
+        open_pending_child_file_control_block(
+            &creation,
+            file_object,
+            policy.desired_access(),
+            policy.share_access(),
+        )
+    })?;
+    let mut attachment = PendingFileObjectAttachment {
+        fcb: Some(attachment),
+        request,
+    };
 
     match creation.commit().await {
         Ok(()) => {
-            let Some(vcb) = MountedVolumeDevice::vcb(request.device()) else {
+            let Some(vcb) = MountedVolumeDevice::vcb(attachment.device()) else {
                 return Err(DriverError::InternalInvariantViolation);
             };
-            attachment.attach(handle, policy.file_object_flags());
+            attachment.attach(handle, policy.file_object_flags())?;
             let vcb = unsafe {
                 // SAFETY: The mounted device still owns this heap-stable VCB while its create IRP
                 // is active; notification state is disjoint from the actor-owned operation lane.
@@ -1025,7 +1054,7 @@ fn path_components(units: &[u16]) -> DriverResult<DriverVec<CreatePathComponent>
 ///
 /// Returns an error when the shared FCB cannot be opened or the handle context cannot be attached.
 fn initialize_file_object(
-    file_object: UninitializedFileObject,
+    file_object: UninitializedFileObject<'_>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: NodeId,
     node_mode: OpenedNodeMode,
@@ -1043,7 +1072,7 @@ fn initialize_file_object(
         ))
     })?;
     let fcb = open_shared_file_control_block(
-        file_object,
+        &file_object,
         vcb,
         node,
         policy.desired_access(),
@@ -1060,7 +1089,7 @@ fn initialize_file_object(
 /// Returns an error when the VCB cannot open an FCB for `node` or Windows share-access checking
 /// rejects the new handle.
 fn open_shared_file_control_block(
-    file_object: UninitializedFileObject,
+    file_object: &UninitializedFileObject<'_>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: NodeId,
     desired_access: DesiredAccess,
@@ -1083,56 +1112,72 @@ fn open_shared_file_control_block(
 /// Returns an error when FCB creation fails or Windows share-access checking rejects the new handle.
 fn open_pending_child_file_control_block(
     creation: &PendingChildCreation<'_>,
-    file_object: UninitializedFileObject,
+    file_object: UninitializedFileObject<'_>,
     desired_access: DesiredAccess,
     share_access: ShareAccess,
-) -> DriverResult<PendingFileObjectAttachment> {
-    let fcb = creation.open_file_control_block(
+) -> DriverResult<NonNull<FileControlBlock>> {
+    creation.open_file_control_block(
         file_object.kernel_file_object(),
         desired_access,
         share_access,
-    )?;
-    Ok(PendingFileObjectAttachment {
-        fcb: Some(fcb),
-        file_object,
-    })
+    )
 }
 
 /// Pre-attachment share/FCB claim that rolls back unless a committed create consumes it.
-struct PendingFileObjectAttachment {
+struct PendingFileObjectAttachment<'a> {
     /// FCB reference and share claim owned until attachment.
     fcb: Option<NonNull<FileControlBlock>>,
-    /// Uninitialized FILE_OBJECT whose pending create IRP keeps it alive.
-    file_object: UninitializedFileObject,
+    /// Completion owner that pins and exclusively exposes the FILE_OBJECT.
+    request: CreateCompletionOwner<'a>,
 }
 
-// SAFETY: This value exclusively owns one pre-attachment FCB reference and share claim. The create
-// request's pending IRP pins the FILE_OBJECT, and the VCB ledger allocation remains stable while
-// that reference exists. Moving ownership between serialized executor workers creates no alias.
-unsafe impl Send for PendingFileObjectAttachment {}
+impl PendingFileObjectAttachment<'_> {
+    /// Returns the mounted device whose create IRP pins the pending FILE_OBJECT.
+    const fn device(&self) -> KernelDevice {
+        self.request.device()
+    }
 
-impl PendingFileObjectAttachment {
     /// Consumes the pending claim into one successfully committed FILE_OBJECT attachment.
-    fn attach(mut self, handle: Box<OpenedHandle>, flags: CreateFileObjectFlags) {
-        let fcb = self.fcb.take().unwrap_or_else(|| {
+    fn attach(
+        &mut self,
+        handle: Box<OpenedHandle>,
+        flags: CreateFileObjectFlags,
+    ) -> DriverResult<()> {
+        let fcb = self.fcb.unwrap_or_else(|| {
             crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
                 .bugcheck()
         });
-        attach_preallocated_file_object(self.file_object, fcb, handle, flags);
+        self.request.with_file_object(|file_object| {
+            attach_preallocated_file_object(file_object, fcb, handle, flags);
+            Ok(())
+        })?;
+        let detached = self.fcb.take();
+        if detached != Some(fcb) {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                .bugcheck();
+        }
+        Ok(())
     }
 }
 
-impl Drop for PendingFileObjectAttachment {
+impl Drop for PendingFileObjectAttachment<'_> {
     fn drop(&mut self) {
         if let Some(fcb) = self.fcb.take() {
-            abandon_file_control_block(fcb, self.file_object.kernel_file_object());
+            let result = self.request.with_file_object(|file_object| {
+                abandon_file_control_block(fcb, file_object.kernel_file_object());
+                Ok(())
+            });
+            if result.is_err() {
+                crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                    .bugcheck();
+            }
         }
     }
 }
 
 /// Stores already-opened FCB and preallocated CCB context pointers in the FILE_OBJECT.
 fn attach_preallocated_file_object(
-    file_object: UninitializedFileObject,
+    mut file_object: UninitializedFileObject<'_>,
     fcb: NonNull<FileControlBlock>,
     handle: Box<OpenedHandle>,
     file_object_flags: CreateFileObjectFlags,
@@ -1150,6 +1195,7 @@ fn attach_preallocated_file_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::irp::ReceivedIrp;
 
     const TEST_FILE_OPEN_DISPOSITION_OPTIONS: wdk_sys::ULONG = 1 << 24;
 
@@ -1186,13 +1232,11 @@ mod tests {
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
 
-        Ok(DispatchTarget::decode(
+        let mut received = ReceivedIrp::decode(
             core::ptr::addr_of_mut!(device),
             core::ptr::addr_of_mut!(irp),
-        )?
-        .current_stack()?
-        .create()?
-        .parameters())
+        )?;
+        received.with_active(|active| Ok(active.current_stack()?.create()?.parameters()))
     }
 
     fn file_object_with_name(units: &mut [u16]) -> FILE_OBJECT {
@@ -1567,10 +1611,34 @@ mod tests {
             RelatedFileObject: core::ptr::addr_of_mut!(related),
             ..FILE_OBJECT::default()
         };
+        let mut create = create;
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: core::ptr::addr_of_mut!(create),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        let mut irp = wdk_sys::IRP::default();
+        irp.Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+        let mut received = ReceivedIrp::decode(
+            core::ptr::addr_of_mut!(device),
+            core::ptr::addr_of_mut!(irp),
+        );
+        assert!(received.is_ok());
+        let decoded = received.as_mut().map(|received| {
+            received.with_active(|active| {
+                let file_object =
+                    UninitializedFileObject::decode(active.current_stack()?.file_object()?)?;
+                CreatePathAnchor::decode(&file_object, vcb, CreateNameRooting::Absolute)
+            })
+        });
 
         assert_eq!(
-            CreatePathAnchor::decode(&create, vcb, CreateNameRooting::Absolute),
-            Err(DriverError::InvalidParameter)
+            decoded.ok().and_then(Result::err),
+            Some(DriverError::InvalidParameter)
         );
     }
 }

@@ -921,14 +921,15 @@ fn ensure_native_success(status: NTSTATUS) -> Result<(), IrpCompletion> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
     use core::ffi::c_void;
 
     use super::{
         PreparedDirectoryPattern, PreparedRequest, QueueContext, decode_directory_pattern,
     };
     use crate::irp::{
-        DispatchMajor, DispatchTarget, FileSystemControlMinorFunction, IrpCompletion, KernelIrp,
-        PreparedDirectoryControl,
+        DispatchMajor, FileSystemControlMinorFunction, IrpCompletion, KernelIrp,
+        PreparedDirectoryControl, ReceivedIrp,
     };
 
     /// Builds a typed target and installs its current stack pointer.
@@ -936,13 +937,21 @@ mod tests {
         device: &mut wdk_sys::DEVICE_OBJECT,
         irp: &mut wdk_sys::IRP,
         stack: &mut wdk_sys::IO_STACK_LOCATION,
-    ) -> Option<DispatchTarget> {
+    ) -> Option<ReceivedIrp> {
         irp.Tail
             .Overlay
             .__bindgen_anon_2
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::from_mut(stack);
-        DispatchTarget::decode(core::ptr::from_mut(device), core::ptr::from_mut(irp)).ok()
+        ReceivedIrp::decode(core::ptr::from_mut(device), core::ptr::from_mut(irp)).ok()
+    }
+
+    /// Captures one prepared request through its lifetime-bound active IRP view.
+    fn capture_context(
+        received: &mut ReceivedIrp,
+        major: DispatchMajor,
+    ) -> Result<Box<QueueContext>, IrpCompletion> {
+        received.with_active(|active| QueueContext::capture(active, major))
     }
 
     /// # Panics
@@ -961,8 +970,8 @@ mod tests {
         };
         let target = build_target(&mut device, &mut irp, &mut stack);
         assert!(target.is_some());
-        if let Some(target) = target {
-            let context = QueueContext::capture(target, DispatchMajor::Read);
+        if let Some(mut target) = target {
+            let context = capture_context(&mut target, DispatchMajor::Read);
             assert!(context.is_ok());
             if let Ok(context) = context {
                 stack.MajorFunction = u8::try_from(wdk_sys::IRP_MJ_WRITE).unwrap_or_default();
@@ -987,8 +996,8 @@ mod tests {
         };
         let target = build_target(&mut device, &mut irp, &mut stack);
         assert!(target.is_some());
-        if let Some(target) = target {
-            let context = QueueContext::capture(target, DispatchMajor::DirectoryControl);
+        if let Some(mut target) = target {
+            let context = capture_context(&mut target, DispatchMajor::DirectoryControl);
             assert!(context.is_ok());
             if let Ok(context) = context {
                 stack.MinorFunction = u8::MAX;
@@ -1008,8 +1017,8 @@ mod tests {
         };
         let target = build_target(&mut device, &mut irp, &mut stack);
         assert!(target.is_some());
-        if let Some(target) = target {
-            let context = QueueContext::capture(target, DispatchMajor::FileSystemControl);
+        if let Some(mut target) = target {
+            let context = capture_context(&mut target, DispatchMajor::FileSystemControl);
             assert!(context.is_ok());
             if let Ok(context) = context {
                 stack.MinorFunction = u8::MAX;
@@ -1063,8 +1072,8 @@ mod tests {
         };
         let target = build_target(&mut device, &mut irp, &mut stack);
         assert!(target.is_some());
-        if let Some(target) = target {
-            let context = QueueContext::capture(target, DispatchMajor::Create);
+        if let Some(mut target) = target {
+            let context = capture_context(&mut target, DispatchMajor::Create);
             assert!(context.is_ok());
             if let Ok(context) = context {
                 assert!(context.matches_cancellation_context(
@@ -1083,8 +1092,8 @@ mod tests {
         };
         let target = build_target(&mut device, &mut irp, &mut stack);
         assert!(target.is_some());
-        if let Some(target) = target {
-            let context = QueueContext::capture(target, DispatchMajor::Shutdown);
+        if let Some(mut target) = target {
+            let context = capture_context(&mut target, DispatchMajor::Shutdown);
             assert!(context.is_ok());
             if let Ok(context) = context {
                 assert!(!context.matches_cancellation_context(
@@ -1105,20 +1114,19 @@ mod tests {
             MajorFunction: u8::try_from(wdk_sys::IRP_MJ_CREATE).unwrap_or_default(),
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
-        let target = build_target(&mut device, &mut irp, &mut stack);
+        let mut target = build_target(&mut device, &mut irp, &mut stack);
         let kernel_irp = KernelIrp::from_raw(core::ptr::addr_of_mut!(irp));
         assert!(kernel_irp.is_some());
-        let context = target.map(|target| QueueContext::capture(target, DispatchMajor::Create));
+        let context = target
+            .as_mut()
+            .map(|target| capture_context(target, DispatchMajor::Create));
         let context = context.transpose();
         assert!(context.is_ok());
         if let (Some(kernel_irp), Ok(Some(context))) = (kernel_irp, context) {
             kernel_irp.publish_queue_context(context);
-            let queued = unsafe {
-                // SAFETY: This single-threaded test models a held CSQ lock until the take below.
-                kernel_irp.queue_context()
-            };
+            let queued = kernel_irp.take_queue_context();
             assert!(matches!(queued.prepared(), PreparedRequest::Create));
-            drop(kernel_irp.take_queue_context());
+            drop(queued);
 
             let overlay = unsafe {
                 // SAFETY: The test reads the tail overlay after the unique queue-context take.
