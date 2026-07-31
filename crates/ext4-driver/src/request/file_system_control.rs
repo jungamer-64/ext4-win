@@ -1,5 +1,7 @@
 //! File-system control, mount, reparse, and device-control dispatch boundary.
 
+use core::ptr::NonNull;
+
 use wdk_sys::STATUS_SUCCESS;
 
 use crate::{
@@ -15,8 +17,8 @@ use crate::{
     memory,
     request::{fsctl, reparse},
     state::{
-        KernelDevice, KernelVpb, MountCandidate, MountedVolumeDevice, MountedVolumeDeviceExtension,
-        VolumeControlBlock,
+        KernelDevice, KernelFileObject, KernelVpb, MountCandidate, MountedVolumeDevice,
+        MountedVolumeDeviceExtension, OpenedFileObject, OpenedVolume, VolumeControlBlock,
     },
 };
 
@@ -241,7 +243,21 @@ async fn mount_volume(request: MountVolumeRequest<'_>) -> DriverResult<()> {
 /// Returns an error when the requested reparse, encryption-key, or verity operation rejects its
 /// buffers, file object, or mounted-volume state.
 async fn user_fs_control(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
-    match request.fs_control_code() {
+    let control_code = request.fs_control_code();
+    if !matches!(
+        control_code,
+        FsControlCode::LockVolume
+            | FsControlCode::UnlockVolume
+            | FsControlCode::DismountVolume
+            | FsControlCode::IsVolumeMounted
+    ) {
+        authorize_fs_control_handle(&mut request.request)?;
+    }
+    match control_code {
+        FsControlCode::LockVolume => lock_volume(request).await,
+        FsControlCode::UnlockVolume => unlock_volume(request),
+        FsControlCode::DismountVolume => dismount_volume(request).await,
+        FsControlCode::IsVolumeMounted => is_volume_mounted(request),
         FsControlCode::GetReparsePoint => reparse::get_reparse_point(request.request).await,
         FsControlCode::SetReparsePoint => reparse::set_reparse_point(request.request).await,
         FsControlCode::DeleteReparsePoint => reparse::delete_reparse_point(request.request).await,
@@ -256,4 +272,147 @@ async fn user_fs_control(mut request: UserFsControlRequest<'_>) -> DriverResult<
         }
         FsControlCode::EnableVerity => fsctl::enable_verity(request.request).await,
     }
+}
+
+/// Direct-volume identity decoded from one standard volume-control request.
+#[derive(Clone, Copy, Debug)]
+struct DirectVolumeTarget {
+    /// Mounted filesystem device receiving the request.
+    device: KernelDevice,
+    /// VCB stored in the direct-volume FILE_OBJECT.
+    volume: NonNull<VolumeControlBlock>,
+    /// Direct-volume FILE_OBJECT that owns the handle state.
+    owner: KernelFileObject,
+}
+
+/// Flushes and locks a volume when the caller is its only active handle.
+/// # Errors
+///
+/// Returns an error for invalid buffers or handles, competing opens, dismount, or flush failure.
+async fn lock_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
+    let target = direct_volume_target(&mut request)?;
+    let _request_owner = request.request;
+    let mut operations = unsafe {
+        // SAFETY: User FSCTLs execute on the mounted-device actor, which grants this request the
+        // unique operation lease until terminal completion.
+        VolumeControlBlock::claim_operation_lane(target.volume)
+    };
+    operations.lock_volume(target.owner).await?;
+    MountedVolumeDevice::publish_volume_lock(target.device, true);
+    Ok(IrpCompletion::EMPTY)
+}
+
+/// Releases the volume lock owned by the calling direct-volume handle.
+/// # Errors
+///
+/// Returns an error for invalid buffers or handles, or when the caller does not own the lock.
+fn unlock_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
+    let target = direct_volume_target(&mut request)?;
+    let _request_owner = request.request;
+    let mut operations = unsafe {
+        // SAFETY: User FSCTLs execute on the mounted-device actor, which uniquely owns lifecycle
+        // transitions for this VCB.
+        VolumeControlBlock::claim_operation_lane(target.volume)
+    };
+    operations.unlock_volume(target.owner)?;
+    MountedVolumeDevice::publish_volume_lock(target.device, false);
+    Ok(IrpCompletion::EMPTY)
+}
+
+/// Flushes and enters the terminal logical-dismount state.
+/// # Errors
+///
+/// Returns an error for invalid buffers or handles, a competing lock owner, repeated dismount, or
+/// flush failure.
+async fn dismount_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
+    let target = direct_volume_target(&mut request)?;
+    let _request_owner = request.request;
+    let mut operations = unsafe {
+        // SAFETY: User FSCTLs execute on the mounted-device actor, which uniquely owns lifecycle
+        // transitions for this VCB.
+        VolumeControlBlock::claim_operation_lane(target.volume)
+    };
+    operations.dismount_volume(target.owner).await?;
+    MountedVolumeDevice::publish_direct_writes_allowed(target.device);
+    MountedVolumeDevice::unregister_shutdown_notification(target.device);
+    MountedVolumeDevice::complete_dismount(target.device);
+    Ok(IrpCompletion::EMPTY)
+}
+
+/// Reports whether the direct-volume handle still names a logically mounted volume.
+/// # Errors
+///
+/// Returns an error for invalid buffers or handles, or after logical dismount.
+fn is_volume_mounted(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
+    let target = direct_volume_target(&mut request)?;
+    let _request_owner = request.request;
+    let operations = unsafe {
+        // SAFETY: User FSCTLs execute on the mounted-device actor, which uniquely observes this
+        // VCB's lifecycle state.
+        VolumeControlBlock::claim_operation_lane(target.volume)
+    };
+    operations.ensure_mounted()?;
+    Ok(IrpCompletion::EMPTY)
+}
+
+/// Decodes and validates the direct-volume FILE_OBJECT for a standard volume FSCTL.
+/// # Errors
+///
+/// Returns an error when buffers are nonempty or the FILE_OBJECT is not a valid direct-volume
+/// handle.
+fn direct_volume_target(
+    request: &mut UserFsControlRequest<'_>,
+) -> DriverResult<DirectVolumeTarget> {
+    require_empty_volume_control_buffers(request.stack)?;
+    request.request.with_active(|active| {
+        let device = active.device();
+        let opened = OpenedVolume::decode(active.current_stack()?.file_object()?)?;
+        let volume = opened.volume();
+        if MountedVolumeDevice::vcb(device) != Some(volume) {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                .bugcheck();
+        }
+        Ok(DirectVolumeTarget {
+            device,
+            volume,
+            owner: opened.file_object(),
+        })
+    })
+}
+
+/// Rejects payload buffers on standard volume FSCTLs whose wire contract has no payload.
+/// # Errors
+///
+/// Returns invalid parameter when either input or output length is nonzero.
+fn require_empty_volume_control_buffers(stack: FileSystemControlStack) -> DriverResult<()> {
+    if stack.input_buffer_length().is_empty() && stack.output_buffer_length().is_empty() {
+        Ok(())
+    } else {
+        Err(DriverError::InvalidParameter)
+    }
+}
+
+/// Applies the actor-owned mount/lock policy before a path-scoped user FSCTL.
+/// # Errors
+///
+/// Returns an error when the FILE_OBJECT is invalid, locked by another handle, or dismounted.
+fn authorize_fs_control_handle(request: &mut PendingIrpLease<'_>) -> DriverResult<()> {
+    request.with_active(|active| {
+        let device = active.device();
+        let opened = OpenedFileObject::decode(active.current_stack()?.file_object()?)?;
+        let (volume, file_object) = match opened {
+            OpenedFileObject::Node(opened) => (opened.volume(), opened.file_object()),
+            OpenedFileObject::Volume(opened) => (opened.volume(), opened.file_object()),
+        };
+        if MountedVolumeDevice::vcb(device) != Some(volume) {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                .bugcheck();
+        }
+        let operations = unsafe {
+            // SAFETY: User FSCTLs execute on the mounted-device actor and this synchronous policy
+            // check does not retain the lease beyond the active IRP borrow.
+            VolumeControlBlock::claim_operation_lane(volume)
+        };
+        operations.authorize_handle(file_object)
+    })
 }

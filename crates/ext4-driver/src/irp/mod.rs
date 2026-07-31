@@ -4032,6 +4032,29 @@ mod tests {
 
     /// # Panics
     ///
+    /// Panics when the standard volume-control wire codes drift from the Windows ABI.
+    #[test]
+    fn standard_volume_fsctl_codes_decode_to_domain_variants() {
+        assert_eq!(
+            FsControlCode::from_raw(0x0009_0018),
+            Ok(FsControlCode::LockVolume)
+        );
+        assert_eq!(
+            FsControlCode::from_raw(0x0009_001c),
+            Ok(FsControlCode::UnlockVolume)
+        );
+        assert_eq!(
+            FsControlCode::from_raw(0x0009_0020),
+            Ok(FsControlCode::DismountVolume)
+        );
+        assert_eq!(
+            FsControlCode::from_raw(0x0009_0028),
+            Ok(FsControlCode::IsVolumeMounted)
+        );
+    }
+
+    /// # Panics
+    ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn create_stack_preserves_access_share_options_and_ea_length() {
