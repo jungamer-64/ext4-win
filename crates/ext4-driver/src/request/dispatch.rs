@@ -255,11 +255,6 @@ fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS
     match dispatch_policy(major) {
         DispatchPolicy::Immediate => received.complete_result(execute_immediate(major)),
         DispatchPolicy::Queued => DeviceExecutor::receive(received, major),
-        DispatchPolicy::SynchronousCleanup => dispatch_cleanup(received),
-        DispatchPolicy::SynchronousClose => {
-            let result = received.with_active(crate::request::file_info::close);
-            received.complete_result(result)
-        }
         DispatchPolicy::FsRtlFileLock => dispatch_file_lock(received),
     }
 }
@@ -271,10 +266,6 @@ enum DispatchPolicy {
     Immediate,
     /// Mark pending and execute on the dedicated device actor.
     Queued,
-    /// Cancel pending IRPs and consume cleanup-owned state in the requestor thread.
-    SynchronousCleanup,
-    /// Release terminal FILE_OBJECT contexts synchronously, including post-create cancellation.
-    SynchronousClose,
     /// Transfer terminal completion to the FsRtl byte-range lock package.
     FsRtlFileLock,
 }
@@ -283,10 +274,10 @@ enum DispatchPolicy {
 const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
     match major {
         DispatchMajor::DeviceControl => DispatchPolicy::Immediate,
-        DispatchMajor::Cleanup => DispatchPolicy::SynchronousCleanup,
-        DispatchMajor::Close => DispatchPolicy::SynchronousClose,
         DispatchMajor::LockControl => DispatchPolicy::FsRtlFileLock,
         DispatchMajor::Create
+        | DispatchMajor::Cleanup
+        | DispatchMajor::Close
         | DispatchMajor::Read
         | DispatchMajor::Write
         | DispatchMajor::QueryInformation
@@ -302,23 +293,6 @@ const fn dispatch_policy(major: DispatchMajor) -> DispatchPolicy {
         | DispatchMajor::SetSecurity
         | DispatchMajor::Shutdown => DispatchPolicy::Queued,
     }
-}
-
-/// Cancels queued IRPs for a FILE_OBJECT, then executes cleanup in the requestor thread.
-fn dispatch_cleanup(mut received: ReceivedIrp) -> NTSTATUS {
-    let cancellation = received.with_active(|active| {
-        let file_object = active.current_stack()?.file_object()?;
-        Ok((active.device(), file_object.address()))
-    });
-    let (device, file_object) = match cancellation {
-        Ok(cancellation) => cancellation,
-        Err(error) => return received.complete_result(Err(error)),
-    };
-    if let Err(error) = DeviceExecutor::cancel_file_object(device, file_object) {
-        return received.complete_result(Err(error));
-    }
-    let result = received.with_active(crate::request::file_info::cleanup);
-    received.complete_result(result)
 }
 
 /// Decodes a lock target, then lets FsRtl own and complete the lock-control IRP.
