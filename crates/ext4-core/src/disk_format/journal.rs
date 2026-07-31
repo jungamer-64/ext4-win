@@ -2125,7 +2125,7 @@ trait JournalIo {
         &'a mut self,
         offset: ByteOffset,
         out: &'a mut [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a;
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Writes one logical journal block to the journal device.
     /// # Errors
@@ -2135,7 +2135,7 @@ trait JournalIo {
         &'a mut self,
         offset: ByteOffset,
         bytes: &'a [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a;
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Writes one filesystem home block.
     /// # Errors
@@ -2145,13 +2145,13 @@ trait JournalIo {
         &'a mut self,
         offset: ByteOffset,
         bytes: &'a [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a;
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Flushes all devices touched by this journal operation.
     /// # Errors
     ///
     /// Returns an error when any touched device fails to flush.
-    fn flush_all(&mut self) -> impl Future<Output = Result<()>> + Send + '_;
+    fn flush_all(&mut self) -> impl Future<Output = Result<()>> + '_;
 }
 
 /// Journal I/O for an internal journal stored on the filesystem device.
@@ -2165,7 +2165,7 @@ impl<D: BlockStorage> JournalIo for InternalJournalIo<'_, D> {
         &'a mut self,
         offset: ByteOffset,
         out: &'a mut [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
+    ) -> impl Future<Output = Result<()>> + 'a {
         self.device.read_exact_at(offset, out)
     }
 
@@ -2173,7 +2173,7 @@ impl<D: BlockStorage> JournalIo for InternalJournalIo<'_, D> {
         &'a mut self,
         offset: ByteOffset,
         bytes: &'a [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
+    ) -> impl Future<Output = Result<()>> + 'a {
         self.device.write_exact_at(offset, bytes)
     }
 
@@ -2181,11 +2181,11 @@ impl<D: BlockStorage> JournalIo for InternalJournalIo<'_, D> {
         &'a mut self,
         offset: ByteOffset,
         bytes: &'a [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
+    ) -> impl Future<Output = Result<()>> + 'a {
         self.device.write_exact_at(offset, bytes)
     }
 
-    fn flush_all(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
+    fn flush_all(&mut self) -> impl Future<Output = Result<()>> + '_ {
         self.device.flush()
     }
 }
@@ -2203,7 +2203,7 @@ impl<F: BlockStorage, J: BlockStorage> JournalIo for ExternalJournalIo<'_, F, J>
         &'a mut self,
         offset: ByteOffset,
         out: &'a mut [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
+    ) -> impl Future<Output = Result<()>> + 'a {
         self.journal.read_exact_at(offset, out)
     }
 
@@ -2211,7 +2211,7 @@ impl<F: BlockStorage, J: BlockStorage> JournalIo for ExternalJournalIo<'_, F, J>
         &'a mut self,
         offset: ByteOffset,
         bytes: &'a [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
+    ) -> impl Future<Output = Result<()>> + 'a {
         self.journal.write_exact_at(offset, bytes)
     }
 
@@ -2219,7 +2219,7 @@ impl<F: BlockStorage, J: BlockStorage> JournalIo for ExternalJournalIo<'_, F, J>
         &'a mut self,
         offset: ByteOffset,
         bytes: &'a [u8],
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
+    ) -> impl Future<Output = Result<()>> + 'a {
         self.filesystem.write_exact_at(offset, bytes)
     }
 

@@ -666,13 +666,6 @@ struct MountedVolumeRef {
     volume: NonNull<VolumeControlBlock>,
 }
 
-// SAFETY: A mounted VCB allocation remains stable until all FILE_OBJECT references and executor
-// tasks have drained. This identity grants no direct access; each projected field has its own
-// synchronization or single-actor contract.
-unsafe impl Send for MountedVolumeRef {}
-// SAFETY: Copying the identity does not grant shared or mutable VCB references.
-unsafe impl Sync for MountedVolumeRef {}
-
 impl MountedVolumeRef {
     /// Wraps a heap-stable mounted VCB identity.
     const fn new(volume: NonNull<VolumeControlBlock>) -> Self {
@@ -692,10 +685,6 @@ pub(crate) struct VolumeOperationLease {
     /// Disjoint actor-owned field projected without borrowing the whole VCB.
     lane: NonNull<VolumeOperationLane>,
 }
-
-// SAFETY: The mounted-device executor transfers this exclusive capability between workers but
-// never polls two operation tasks concurrently. The projected journaled state is itself `Send`.
-unsafe impl Send for VolumeOperationLease {}
 
 impl VolumeOperationLease {
     /// Returns the actor-owned operation lane through this exclusive capability.
@@ -1654,10 +1643,6 @@ impl PartialEq for DirectoryNotificationDirectoryName {
 }
 
 impl Eq for DirectoryNotificationDirectoryName {}
-
-// SAFETY: After construction this value is pinned in its own allocation, so `string.Buffer`
-// continues to address `units` when ownership of the pinned box moves between executor workers.
-unsafe impl Send for DirectoryNotificationDirectoryName {}
 
 /// Full synthetic target path reported to the FsRtl notification package.
 #[derive(Clone, Copy, Debug)]

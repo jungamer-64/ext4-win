@@ -864,7 +864,7 @@ impl KernelIrp {
             crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
                 .bugcheck();
         }
-        driver_context[0] = Box::into_raw(context).cast::<c_void>();
+        driver_context[0] = into_device_actor_mailbox(context).cast::<c_void>();
     }
 
     /// Takes the context after CSQ removal or cancellation transferred exclusive IRP ownership.
@@ -997,6 +997,11 @@ impl KernelIrp {
         self.write_status_block(completion);
         self.finish_completion(completion.status())
     }
+}
+
+/// Transfers one typed payload from an arbitrary dispatch CPU into the device actor mailbox.
+fn into_device_actor_mailbox<T: Send>(payload: Box<T>) -> *mut T {
+    Box::into_raw(payload)
 }
 
 /// Non-null current IRP stack location.
