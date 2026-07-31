@@ -12,16 +12,18 @@ pub(crate) use wdk_sys::ntddk::{
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{
     ExDeleteResourceLite, ExEnterCriticalRegionAndAcquireResourceExclusive,
-    ExInitializeResourceLite, ExReleaseResourceAndLeaveCriticalRegion, FsRtlFastCheckLockForRead,
-    FsRtlFastCheckLockForWrite, FsRtlFastUnlockAll, FsRtlInitializeFileLock, FsRtlNotifyCleanup,
-    FsRtlNotifyCleanupAll, FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange,
-    FsRtlNotifyInitializeSync, FsRtlNotifyUninitializeSync, FsRtlProcessFileLock,
-    FsRtlUninitializeFileLock, IoAllocateIrp, IoAllocateMdl, IoCsqInitialize, IoCsqInsertIrp,
+    ExInitializeResourceLite, ExReleaseResourceAndLeaveCriticalRegion, FsRtlDismountComplete,
+    FsRtlFastCheckLockForRead, FsRtlFastCheckLockForWrite, FsRtlFastUnlockAll,
+    FsRtlInitializeFileLock, FsRtlNotifyCleanup, FsRtlNotifyCleanupAll,
+    FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange, FsRtlNotifyInitializeSync,
+    FsRtlNotifyUninitializeSync, FsRtlProcessFileLock, FsRtlUninitializeFileLock,
+    IoAcquireVpbSpinLock, IoAllocateIrp, IoAllocateMdl, IoCsqInitialize, IoCsqInsertIrp,
     IoCsqRemoveNextIrp, IoFreeIrp, IoFreeMdl, IoGetRequestorProcess,
-    IoRegisterShutdownNotification, IoSetCompletionRoutineEx, IofCallDriver,
-    KeAcquireSpinLockRaiseToDpc, KeInitializeEvent, KeInitializeSpinLock, KeReleaseSpinLock,
-    KeSetEvent, KeWaitForSingleObject, MmBuildMdlForNonPagedPool, MmUnlockPages,
-    PsCreateSystemThread, PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
+    IoRegisterShutdownNotification, IoReleaseVpbSpinLock, IoSetCompletionRoutineEx,
+    IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc,
+    KeInitializeEvent, KeInitializeSpinLock, KeReleaseSpinLock, KeSetEvent, KeWaitForSingleObject,
+    MmBuildMdlForNonPagedPool, MmUnlockPages, PsCreateSystemThread, PsTerminateSystemThread,
+    ZwClose, ZwWaitForSingleObject,
 };
 
 #[cfg(not(test))]

@@ -23,8 +23,9 @@ use crate::state::{
     CleanupStart, CloseReleasePlan, DirectoryCursor, DirectoryNameChange,
     DirectoryNameChangeAction, DirectoryNotificationRegistration, FileControlBlock,
     MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation, OpenedObject,
-    OpenedRegularFile, VolumeControlBlock, VolumeOperationLane, VolumeOperationLease,
-    WriteCommitment, release_cancelled_file_control_block, release_file_control_block,
+    OpenedRegularFile, VolumeControlBlock, VolumeHandleCleanup, VolumeOperationLane,
+    VolumeOperationLease, WriteCommitment, release_cancelled_file_control_block,
+    release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -44,7 +45,7 @@ pub(crate) fn cleanup(target: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion>
 /// Returns an error when the close stack has no FILE_OBJECT.
 pub(crate) fn close(target: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion> {
     let file_object = target.current_stack()?.file_object()?;
-    release_file_contexts(file_object);
+    release_file_contexts(target.device(), file_object);
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -1528,7 +1529,7 @@ fn cleanup_file_object(
             cleanup_opened_node(active, file_object, opened_file)
         }
         OpenedFileObject::Volume(opened_volume) => {
-            cleanup_opened_volume(file_object, opened_volume)
+            cleanup_opened_volume(active.device(), file_object, opened_volume)
         }
     }
 }
@@ -1567,6 +1568,7 @@ fn cleanup_opened_node(
 ///
 /// Returns an error when FILE_OBJECT and handle lifecycle state disagree.
 fn cleanup_opened_volume(
+    device: crate::state::KernelDevice,
     file_object: ActiveFileObject<'_>,
     opened_volume: crate::state::OpenedVolume<'_>,
 ) -> DriverResult<()> {
@@ -1580,7 +1582,10 @@ fn cleanup_opened_volume(
         }
     }
     let mut operations = claim_volume_operation_lane(opened_volume.volume());
-    operations.cleanup_volume_handle(opened_volume.file_object());
+    let effect = operations.cleanup_volume_handle(opened_volume.file_object());
+    if effect == VolumeHandleCleanup::Unlocked {
+        MountedVolumeDevice::publish_volume_lock(device, false)?;
+    }
     opened_volume.finish_cleanup();
     file_object.mark_cleanup_complete();
     Ok(())
@@ -2836,7 +2841,7 @@ fn claim_volume_operation_lane(volume: NonNull<VolumeControlBlock>) -> VolumeOpe
 }
 
 /// Detaches and releases heap-owned FCB and CCB pointers stored on a FILE_OBJECT.
-fn release_file_contexts(file_object: ActiveFileObject<'_>) {
+fn release_file_contexts(device: crate::state::KernelDevice, file_object: ActiveFileObject<'_>) {
     if file_object.has_no_file_system_contexts() {
         return;
     }
@@ -2871,7 +2876,13 @@ fn release_file_contexts(file_object: ActiveFileObject<'_>) {
             let (volume, handle) = opened.detach_contexts();
             if release_plan == CloseReleasePlan::CancelledOpen {
                 let mut operations = claim_volume_operation_lane(volume);
-                operations.cleanup_volume_handle(file_object_address);
+                let effect = operations.cleanup_volume_handle(file_object_address);
+                if effect == VolumeHandleCleanup::Unlocked
+                    && MountedVolumeDevice::publish_volume_lock(device, false).is_err()
+                {
+                    crate::kernel::fatal::KernelWideInconsistency::file_object_lifecycle_corruption()
+                        .bugcheck();
+                }
             }
             unsafe {
                 // SAFETY: Successful volume create stores Box<OpenedVolumeHandle> in FsContext2.
