@@ -38,9 +38,6 @@ use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::{block_device::KernelBlockDevice, ffi};
 use crate::memory::{self, DriverVec};
 
-/// Registered control device observed by the unload callback.
-static mut CONTROL_DEVICE: Option<ControlDevice> = None;
-
 /// Non-null kernel device object pointer at the WDK boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KernelDevice {
@@ -526,16 +523,6 @@ impl ControlDevice {
             // SAFETY: The caller owns control-device teardown.
             ControlDeviceExtension::release(self.device);
         }
-    }
-}
-
-/// Publishes the registered control device for driver unload teardown.
-pub(crate) fn publish_control_device(control_device: ControlDevice) {
-    let control_device_slot = core::ptr::addr_of_mut!(CONTROL_DEVICE);
-    unsafe {
-        // SAFETY: `control_device_slot` points to the driver-owned global state.
-        // Raw pointer write avoids borrowing the mutable static.
-        core::ptr::write(control_device_slot, Some(control_device));
     }
 }
 
@@ -4206,30 +4193,7 @@ fn file_control_block_owner(fcb: NonNull<FileControlBlock>) -> NonNull<FileContr
 /// # Safety
 /// The I/O Manager must call this only as the registered unload routine for this driver object,
 /// after no dispatch callbacks can still use the control device being unregistered.
-pub(crate) unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {
-    let control_device = core::ptr::addr_of_mut!(CONTROL_DEVICE);
-    let device = unsafe {
-        // SAFETY: `control_device` points to the driver-owned global state.
-        // Replacement takes ownership of the registered device for teardown.
-        core::ptr::replace(control_device, None)
-    };
-    if let Some(control_device) = device {
-        let device = control_device.as_ptr();
-        unsafe {
-            // SAFETY: The device was created and registered by DriverEntry.
-            ffi::IoUnregisterFileSystem(device);
-        }
-        unsafe {
-            // SAFETY: The control device is no longer registered and no
-            // dispatch callbacks can access its queue.
-            control_device.release();
-        }
-        unsafe {
-            // SAFETY: The device is no longer registered and is owned by this driver.
-            ffi::IoDeleteDevice(device);
-        }
-    }
-}
+pub(crate) unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {}
 
 #[cfg(test)]
 mod tests {
