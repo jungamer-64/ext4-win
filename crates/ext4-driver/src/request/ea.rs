@@ -1,8 +1,8 @@
 //! Windows extended-attribute IRP handling.
 
 use crate::irp::{
-    DispatchTarget, EaEntryEmission, EaEntryIndex, IrpBufferLength, IrpCompletion, PendingIrpLease,
-    PreparedEaSelection, PreparedQueryEa, SetEaStack,
+    ActiveIrp, EaEntryEmission, EaEntryIndex, IrpBufferLength, IrpCompletion, PendingIrpLease,
+    PreparedEaSelection, SetEaStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
@@ -41,10 +41,26 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 /// # Errors
 ///
 /// Returns an error when query-EA stack decoding, EA selection, or output packing fails.
-pub(crate) async fn query(request_irp: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    let target = request_irp.target();
+pub(crate) async fn query(mut request_irp: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let prepared = request_irp.prepared_query_ea()?;
-    let request = QueryEaRequest::from_prepared(target, prepared)?;
+    let stack = prepared.stack();
+    let selection = requested_eas(prepared.selection())?;
+    let (volume, node) = request_irp.with_active(|active| {
+        let opened_file = OpenedObject::decode(active.current_stack()?.file_object()?)?;
+        Ok::<_, DriverError>((opened_file.volume(), opened_file.node()))
+    })?;
+    let operations = unsafe {
+        // SAFETY: Query-EA runs only as the mounted-device executor's unique active operation.
+        VolumeControlBlock::claim_operation_lane(volume)
+    };
+    let request = QueryEaRequest {
+        request: request_irp,
+        length: stack.length(),
+        entry_emission: stack.entry_emission(),
+        selection,
+        node,
+        operations,
+    };
     query_ea(request).await
 }
 
@@ -52,15 +68,15 @@ pub(crate) async fn query(request_irp: PendingIrpLease<'_>) -> DriverResult<IrpC
 /// # Errors
 ///
 /// Returns an error when set-EA stack decoding or ext4 EA mutation fails.
-pub(crate) async fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let request = SetEaRequest::decode(target)?;
+pub(crate) async fn set(mut request_irp: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let request = SetEaRequest::decode(&mut request_irp)?;
     set_ea(request).await
 }
 
 /// Decoded query-EA request.
-struct QueryEaRequest {
-    /// Dispatch target receiving output.
-    target: DispatchTarget,
+struct QueryEaRequest<'a> {
+    /// Pending IRP lease receiving output after the ext4 operation completes.
+    request: PendingIrpLease<'a>,
     /// Caller output buffer length.
     length: IrpBufferLength,
     /// EA entry emission cardinality.
@@ -71,37 +87,6 @@ struct QueryEaRequest {
     node: ext4_core::NodeId,
     /// Exclusive actor-owned mounted-volume operation capability.
     operations: VolumeOperationLease,
-}
-
-impl QueryEaRequest {
-    /// Decodes a query-EA request.
-    /// # Errors
-    ///
-    /// Returns an error when the current stack is not a query-EA stack or its FILE_OBJECT has no
-    /// opened ext4 context.
-    fn from_prepared(
-        target: DispatchTarget,
-        prepared: &PreparedQueryEa,
-    ) -> Result<Self, DriverError> {
-        let stack = prepared.stack();
-        let opened_file = OpenedObject::decode(target.current_stack()?.file_object()?)?;
-        let volume = opened_file.volume();
-        let node = opened_file.node();
-        let selection = requested_eas(prepared.selection())?;
-        let operations = unsafe {
-            // SAFETY: Query-EA runs only as the mounted-device executor's unique active operation.
-            // The lease is moved into this request and lives until that operation completes.
-            VolumeControlBlock::claim_operation_lane(volume)
-        };
-        Ok(Self {
-            target,
-            length: stack.length(),
-            entry_emission: stack.entry_emission(),
-            selection,
-            node,
-            operations,
-        })
-    }
 }
 
 /// Decoded set-EA request.
@@ -120,12 +105,18 @@ impl SetEaRequest {
     ///
     /// Returns an error when the current stack is not a set-EA stack or its FILE_OBJECT has no
     /// opened ext4 context.
-    fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
-        let stack = target.current_stack()?.set_ea()?;
-        let opened_file = OpenedObject::decode(stack.file_object())?;
-        let entries = parse_set_ea_entries(target, stack)?;
-        let volume = opened_file.volume();
-        let node = opened_file.node();
+    fn decode(request: &mut PendingIrpLease<'_>) -> Result<Self, DriverError> {
+        let (entries, volume, node) = request.with_active(|active| {
+            let current = active.current_stack()?;
+            let file_object = current.file_object()?;
+            let stack = current.set_ea()?;
+            let opened_file = OpenedObject::decode(file_object)?;
+            Ok::<_, DriverError>((
+                parse_set_ea_entries(active, stack)?,
+                opened_file.volume(),
+                opened_file.node(),
+            ))
+        })?;
         let operations = unsafe {
             // SAFETY: Set-EA runs only as the mounted-device executor's unique active operation.
             // The lease is moved into this request and lives until that operation completes.
@@ -151,7 +142,7 @@ impl CreateEa {
     /// # Errors
     ///
     /// Returns an error when the create EA buffer is unavailable or malformed.
-    pub(crate) fn decode(target: DispatchTarget, length: IrpBufferLength) -> DriverResult<Self> {
+    pub(crate) fn decode(target: &ActiveIrp<'_>, length: IrpBufferLength) -> DriverResult<Self> {
         if length.is_empty() {
             return Ok(Self {
                 entries: DriverVec::new(),
@@ -325,7 +316,7 @@ enum WindowsEaSelection {
 ///
 /// Returns an error when selected EAs cannot be loaded, no EAs match, the output buffer is too
 /// small, or packed EA records cannot be emitted.
-async fn query_ea(mut request: QueryEaRequest) -> DriverResult<IrpCompletion> {
+async fn query_ea(mut request: QueryEaRequest<'_>) -> DriverResult<IrpCompletion> {
     let entries = load_windows_eas(request.operations.lane_mut(), request.node).await?;
     let entries = collect_query_entries(entries, request.selection)?;
     let entries = if matches!(request.entry_emission, EaEntryEmission::Single) {
@@ -343,8 +334,10 @@ async fn query_ea(mut request: QueryEaRequest) -> DriverResult<IrpCompletion> {
     if length.as_usize() < required {
         return Err(DriverError::BufferTooSmall);
     }
-    let mut output = request.target.data_output(length)?;
-    let written = pack_full_ea_entries(entries, output.as_mut_slice())?;
+    let written = request.request.with_active(|active| {
+        let mut output = active.data_output(length)?;
+        pack_full_ea_entries(entries, output.as_mut_slice())
+    })?;
     IrpCompletion::from_usize(written)
 }
 
@@ -471,7 +464,7 @@ async fn apply_ea_record_to_pending_child(
 /// Returns an error when the IRP input buffer is unavailable or the FILE_FULL_EA_INFORMATION list is
 /// malformed.
 fn parse_set_ea_entries(
-    target: DispatchTarget,
+    target: &ActiveIrp<'_>,
     stack: SetEaStack,
 ) -> DriverResult<DriverVec<WindowsEaRecord>> {
     let length = stack.length();

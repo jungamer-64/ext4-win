@@ -260,12 +260,12 @@ impl DeviceExecutor {
     }
 
     /// Captures an async request, inserts it into this device mailbox, and schedules its lane.
-    pub(crate) fn receive(received: ReceivedIrp, major: DispatchMajor) -> NTSTATUS {
+    pub(crate) fn receive(mut received: ReceivedIrp, major: DispatchMajor) -> NTSTATUS {
         let executor = match Self::from_device(received.device()) {
             Ok(executor) => executor,
             Err(error) => return received.complete_result(Err(error)),
         };
-        let context = match QueueContext::capture(received.target(), major) {
+        let context = match received.with_active(|active| QueueContext::capture(active, major)) {
             Ok(context) => context,
             Err(completion) => return received.complete(completion),
         };

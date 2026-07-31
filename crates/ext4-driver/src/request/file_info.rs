@@ -11,20 +11,20 @@ use ext4_core::{
 use wdk_sys::LARGE_INTEGER;
 
 use crate::irp::{
-    DataIoKind, DirectoryChangeFilter, DirectoryCursorPosition, DirectoryEntryEmission,
-    DirectoryEntryIndex, DirectoryInformationClass, DirectoryWatchScope, DispatchTarget,
+    ActiveFileObject, ActiveIrp, DataIoKind, DirectoryChangeFilter, DirectoryCursorPosition,
+    DirectoryEntryEmission, DirectoryEntryIndex, DirectoryInformationClass, DirectoryWatchScope,
     IrpBufferLength, IrpCompletion, OwnedIrp, PendingIrpLease, PreparedDirectoryPattern,
-    QueryDirectoryStack, QueryFileInformationClass, QueryFileStack, ReadStartingPoint,
-    RegularFileWriteAccess, SetFileInformationClass, SetFileStack, WriteStartingPoint,
+    QueryFileInformationClass, ReadStartingPoint, RegularFileWriteAccess, SetFileInformationClass,
+    SetFileStack, WriteStartingPoint,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{
     CleanupStart, CloseReleasePlan, DirectoryCursor, DirectoryNameChange,
     DirectoryNameChangeAction, DirectoryNotificationRegistration, FileControlBlock,
-    KernelFileObject, MountedVolumeDevice, OpenedDirectory, OpenedHandle, OpenedLocation,
-    OpenedObject, OpenedRegularFile, VolumeControlBlock, VolumeOperationLane, VolumeOperationLease,
-    WriteCommitment, release_cancelled_file_control_block, release_file_control_block,
+    MountedVolumeDevice, OpenedDirectory, OpenedLocation, OpenedObject, OpenedRegularFile,
+    VolumeControlBlock, VolumeOperationLane, VolumeOperationLease, WriteCommitment,
+    release_cancelled_file_control_block, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -32,7 +32,7 @@ use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset
 /// # Errors
 ///
 /// Returns an error when the IRP stack has no opened FILE_OBJECT or cleanup state is invalid.
-pub(crate) fn cleanup(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+pub(crate) fn cleanup(target: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion> {
     let file_object = target.current_stack()?.file_object()?;
     cleanup_file_object(target, file_object)?;
     Ok(IrpCompletion::EMPTY)
@@ -42,7 +42,7 @@ pub(crate) fn cleanup(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// # Errors
 ///
 /// Returns an error when the close stack has no FILE_OBJECT.
-pub(crate) fn close(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+pub(crate) fn close(target: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion> {
     let file_object = target.current_stack()?.file_object()?;
     release_file_contexts(file_object);
     Ok(IrpCompletion::EMPTY)
@@ -52,16 +52,16 @@ pub(crate) fn close(target: DispatchTarget) -> DriverResult<IrpCompletion> {
 /// # Errors
 ///
 /// Returns an error when read stack decoding, output buffer mapping, or ext4 file reading fails.
-pub(crate) async fn read(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    read_regular_file(target).await
+pub(crate) async fn read(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    read_regular_file(request).await
 }
 
 /// Executes regular file data writes.
 /// # Errors
 ///
 /// Returns an error when write stack decoding, input buffer mapping, or ext4 file mutation fails.
-pub(crate) async fn write(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    write_regular_file(target).await
+pub(crate) async fn write(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    write_regular_file(request).await
 }
 
 /// Flushes cached or ordered file data.
@@ -69,8 +69,10 @@ pub(crate) async fn write(target: DispatchTarget) -> DriverResult<IrpCompletion>
 ///
 /// Returns an error when the flush target cannot be resolved to a mounted ext4 volume or the
 /// lower storage flush fails.
-pub(crate) async fn flush(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let mut operations = claim_volume_operation_lane(FlushVolume::decode(target)?.volume());
+pub(crate) async fn flush(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let volume =
+        request.with_active(|active| FlushVolume::decode(active).map(FlushVolume::volume))?;
+    let mut operations = claim_volume_operation_lane(volume);
     operations.lane_mut().flush().await?;
     Ok(IrpCompletion::EMPTY)
 }
@@ -80,9 +82,11 @@ pub(crate) async fn flush(target: DispatchTarget) -> DriverResult<IrpCompletion>
 ///
 /// Returns an error when shutdown was not addressed to a mounted ext4 volume or the lower storage
 /// flush fails.
-pub(crate) async fn shutdown(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let mut operations =
-        claim_volume_operation_lane(FlushVolume::from_mounted_device(target.device())?.volume());
+pub(crate) async fn shutdown(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let volume = request.with_active(|active| {
+        FlushVolume::from_mounted_device(active.device()).map(FlushVolume::volume)
+    })?;
+    let mut operations = claim_volume_operation_lane(volume);
     operations.lane_mut().flush().await?;
     Ok(IrpCompletion::EMPTY)
 }
@@ -91,30 +95,30 @@ pub(crate) async fn shutdown(target: DispatchTarget) -> DriverResult<IrpCompleti
 /// # Errors
 ///
 /// Returns an error when query stack decoding or information packing fails.
-pub(crate) async fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    query_file_information(target).await
+pub(crate) async fn query(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    query_file_information(request).await
 }
 
 /// Executes file information mutations.
 /// # Errors
 ///
 /// Returns an error when set stack decoding or the requested file mutation fails.
-pub(crate) async fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    set_file_information(target).await
+pub(crate) async fn set(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    set_file_information(request).await
 }
 
 /// Transfers one queued directory-change IRP to the VCB's FsRtl notification list.
-pub(crate) fn notify_change_directory(owned: OwnedIrp) -> wdk_sys::NTSTATUS {
-    let target = owned.target();
-    let registration = DirectoryNotificationRequest::decode(target).and_then(|mut request| {
-        let registration = request.registration()?;
-        let volume = request.opened_directory().volume();
-        let vcb = unsafe {
-            // SAFETY: OpenedDirectory was decoded from the live FILE_OBJECT
-            // that owns this pending notification IRP.
-            volume.as_ref()
-        };
-        Ok((vcb.directory_change_notifier(), registration))
+pub(crate) fn notify_change_directory(mut owned: OwnedIrp) -> wdk_sys::NTSTATUS {
+    let registration = owned.request().with_active(|active| {
+        DirectoryNotificationRequest::decode(active).and_then(|mut request| {
+            let registration = request.registration()?;
+            let volume = request.opened_directory().volume();
+            let vcb = unsafe {
+                // SAFETY: OpenedDirectory was decoded from this active pending IRP.
+                volume.as_ref()
+            };
+            Ok((NonNull::from(vcb.directory_change_notifier()), registration))
+        })
     });
     match registration {
         Ok((notifier, registration)) => {
@@ -126,31 +130,33 @@ pub(crate) fn notify_change_directory(owned: OwnedIrp) -> wdk_sys::NTSTATUS {
 
 /// Directory notification selected from a valid notify-change IRP.
 #[derive(Debug)]
-pub(crate) struct DirectoryNotificationRequest {
+pub(crate) struct DirectoryNotificationRequest<'owner> {
     /// Opened directory whose FILE_OBJECT owns this notification.
-    opened_directory: OpenedDirectory,
+    opened_directory: OpenedDirectory<'owner>,
     /// Change kinds that may complete this request.
     completion_filter: DirectoryChangeFilter,
     /// Direct-child or descendant directory scope.
     watch_scope: DirectoryWatchScope,
 }
 
-impl DirectoryNotificationRequest {
+impl<'owner> DirectoryNotificationRequest<'owner> {
     /// Decodes the active directory-change stack location.
     /// # Errors
     ///
     /// Returns an error when the stack is malformed or its FILE_OBJECT is not an opened directory.
-    fn decode(target: DispatchTarget) -> DriverResult<Self> {
-        let stack = target.current_stack()?.notify_directory()?;
+    fn decode(target: &'owner mut ActiveIrp<'_>) -> DriverResult<Self> {
+        let current = target.current_stack()?;
+        let file_object = current.file_object()?;
+        let stack = current.notify_directory()?;
         Ok(Self {
-            opened_directory: OpenedDirectory::decode(stack.file_object())?,
+            opened_directory: OpenedDirectory::decode(file_object)?,
             completion_filter: stack.completion_filter(),
             watch_scope: stack.watch_scope(),
         })
     }
 
     /// Returns the directory that owns this notification request.
-    pub(crate) fn opened_directory(&self) -> &OpenedDirectory {
+    pub(crate) fn opened_directory(&self) -> &OpenedDirectory<'owner> {
         &self.opened_directory
     }
 
@@ -175,9 +181,10 @@ impl DirectoryNotificationRequest {
 /// # Errors
 ///
 /// Returns an error when the lock stack is malformed or the target is not an opened regular file.
-pub(crate) fn lock_control(target: DispatchTarget) -> DriverResult<OpenedRegularFile> {
+pub(crate) fn lock_control(target: &mut ActiveIrp<'_>) -> DriverResult<NonNull<FileControlBlock>> {
     let file_object = target.current_stack()?.file_object()?;
-    OpenedRegularFile::decode(file_object)
+    let opened = OpenedRegularFile::decode(file_object)?;
+    Ok(NonNull::from(opened.file_control_block()))
 }
 
 /// Decoded mounted volume selected by a flush IRP.
@@ -202,7 +209,7 @@ impl FlushVolume {
     ///
     /// Returns an error when the current stack is absent, the opened FILE_OBJECT context is invalid,
     /// or a device-level flush is not directed at a mounted volume device.
-    fn decode(target: DispatchTarget) -> DriverResult<Self> {
+    fn decode(target: &mut ActiveIrp<'_>) -> DriverResult<Self> {
         let stack = target.current_stack()?;
         let volume = match stack.file_object() {
             Ok(file_object) => OpenedObject::decode(file_object)?.volume(),
@@ -220,80 +227,28 @@ impl FlushVolume {
     }
 }
 
-/// Decoded query-file-information request.
-#[derive(Debug)]
-struct QueryFileRequest {
-    /// Dispatch target receiving the query.
-    target: DispatchTarget,
-    /// Decoded query stack.
-    stack: QueryFileStack,
-    /// Opened file contexts decoded before handler execution.
-    opened_file: OpenedObject,
-}
-
-impl QueryFileRequest {
-    /// Decodes a query-file-information request.
-    /// # Errors
-    ///
-    /// Returns an error when the current IRP stack is not a query-file stack or its FILE_OBJECT has
-    /// no opened ext4 context.
-    fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
-        let stack = target.current_stack()?.query_file()?;
-        let opened_file = OpenedObject::decode(stack.file_object())?;
-        Ok(Self {
-            target,
-            stack,
-            opened_file,
-        })
-    }
-}
-
-/// Decoded set-file-information request.
-#[derive(Debug)]
-struct SetFileRequest {
-    /// Dispatch target receiving the mutation.
-    target: DispatchTarget,
-    /// Decoded set stack.
-    stack: SetFileStack,
-    /// Opened file contexts decoded before handler execution.
-    opened_file: OpenedObject,
-}
-
-impl SetFileRequest {
-    /// Decodes a set-file-information request.
-    /// # Errors
-    ///
-    /// Returns an error when the current IRP stack is not a set-file stack or its FILE_OBJECT has no
-    /// opened ext4 context.
-    fn decode(target: DispatchTarget) -> Result<Self, DriverError> {
-        let stack = target.current_stack()?.set_file()?;
-        let opened_file = OpenedObject::decode(stack.file_object())?;
-        Ok(Self {
-            target,
-            stack,
-            opened_file,
-        })
-    }
-}
-
-/// Decoded query-directory request.
-#[derive(Debug)]
-struct QueryDirectoryRequest {
-    /// Decoded query-directory stack.
-    stack: QueryDirectoryStack,
-    /// Opened directory contexts decoded before handler execution.
-    opened_file: OpenedDirectory,
-}
-
-impl QueryDirectoryRequest {
-    /// Builds a query-directory request from the scalar payload sealed at queue entry.
-    /// # Errors
-    ///
-    /// Returns an error when the FILE_OBJECT is not an opened directory.
-    fn from_stack(target: DispatchTarget, stack: QueryDirectoryStack) -> Result<Self, DriverError> {
-        let opened_file = OpenedDirectory::decode(target.current_stack()?.file_object()?)?;
-        Ok(Self { stack, opened_file })
-    }
+/// Owned query-file work selected before the first suspension point.
+enum QueryFilePlan {
+    /// The synchronous FILE_OBJECT state was packed into driver-owned storage.
+    Complete {
+        /// Caller output capacity.
+        length: IrpBufferLength,
+        /// Fully initialized staging buffer.
+        output: DriverVec<u8>,
+        /// Information length produced by the selected packer.
+        completion: IrpCompletion,
+    },
+    /// Load ext4 metadata and pack the selected information class afterwards.
+    Metadata {
+        /// Caller output capacity.
+        length: IrpBufferLength,
+        /// Information layout selected by the stack.
+        information_class: QueryFileInformationClass,
+        /// Target ext4 node.
+        node: NodeId,
+        /// Exclusive mounted-volume operation capability.
+        operations: VolumeOperationLease,
+    },
 }
 
 /// Packs one supported file information class.
@@ -301,19 +256,32 @@ impl QueryDirectoryRequest {
 ///
 /// Returns an error when metadata cannot be loaded, the output buffer is too small, or the requested
 /// information class cannot be packed into its Windows layout.
-async fn query_file_information(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let (length, information_class, node, operations) = {
-        let request = QueryFileRequest::decode(target)?;
-        let length = request.stack.length();
-        let information_class = request.stack.information_class();
+async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let plan = request.with_active(|active| {
+        let current = active.current_stack()?;
+        let file_object = current.file_object()?;
+        let stack = current.query_file()?;
+        let opened_file = OpenedObject::decode(file_object)?;
+        let length = stack.length();
+        let information_class = stack.information_class();
         match information_class {
             QueryFileInformationClass::Position => {
-                let mut buffer = request.target.buffered_output(length)?;
-                return pack_position_information(buffer.as_mut_slice(), &request.opened_file);
+                let mut output = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
+                let completion = pack_position_information(output.as_mut_slice(), &opened_file)?;
+                return Ok::<_, DriverError>(QueryFilePlan::Complete {
+                    length,
+                    output,
+                    completion,
+                });
             }
             QueryFileInformationClass::Name => {
-                let mut buffer = request.target.buffered_output(length)?;
-                return pack_name_information(buffer.as_mut_slice(), &request.opened_file);
+                let mut output = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
+                let completion = pack_name_information(output.as_mut_slice(), &opened_file)?;
+                return Ok::<_, DriverError>(QueryFilePlan::Complete {
+                    length,
+                    output,
+                    completion,
+                });
             }
             QueryFileInformationClass::Basic
             | QueryFileInformationClass::Standard
@@ -321,33 +289,64 @@ async fn query_file_information(target: DispatchTarget) -> DriverResult<IrpCompl
             | QueryFileInformationClass::NetworkOpen
             | QueryFileInformationClass::AttributeTag => {}
         }
-        let node = request.opened_file.node();
-        let operations = claim_file_operation_lane(request.opened_file.file_control_block());
-        (length, information_class, node, operations)
+        Ok(QueryFilePlan::Metadata {
+            length,
+            information_class,
+            node: opened_file.node(),
+            operations: claim_file_operation_lane(opened_file.file_control_block()),
+        })
+    })?;
+    let QueryFilePlan::Metadata {
+        length,
+        information_class,
+        node,
+        operations,
+    } = plan
+    else {
+        let QueryFilePlan::Complete {
+            length,
+            output,
+            completion,
+        } = plan
+        else {
+            unreachable!();
+        };
+        request.with_active(|active| {
+            active
+                .buffered_output(length)?
+                .as_mut_slice()
+                .copy_from_slice(output.as_slice());
+            Ok::<_, DriverError>(())
+        })?;
+        return Ok(completion);
     };
     let metadata = {
         let mut operations = operations;
         metadata_from_node(operations.lane_mut(), node).await?
     };
-    let mut buffer = target.buffered_output(length)?;
-    match information_class {
-        QueryFileInformationClass::Basic => pack_basic_information(buffer.as_mut_slice(), metadata),
-        QueryFileInformationClass::Standard => {
-            pack_standard_information(buffer.as_mut_slice(), metadata)
+    request.with_active(|active| {
+        let mut buffer = active.buffered_output(length)?;
+        match information_class {
+            QueryFileInformationClass::Basic => {
+                pack_basic_information(buffer.as_mut_slice(), metadata)
+            }
+            QueryFileInformationClass::Standard => {
+                pack_standard_information(buffer.as_mut_slice(), metadata)
+            }
+            QueryFileInformationClass::Internal => {
+                pack_internal_information(buffer.as_mut_slice(), metadata)
+            }
+            QueryFileInformationClass::NetworkOpen => {
+                pack_network_open_information(buffer.as_mut_slice(), metadata)
+            }
+            QueryFileInformationClass::AttributeTag => {
+                pack_attribute_tag_information(buffer.as_mut_slice(), metadata)
+            }
+            QueryFileInformationClass::Position | QueryFileInformationClass::Name => {
+                Err(DriverError::InternalInvariantViolation)
+            }
         }
-        QueryFileInformationClass::Internal => {
-            pack_internal_information(buffer.as_mut_slice(), metadata)
-        }
-        QueryFileInformationClass::NetworkOpen => {
-            pack_network_open_information(buffer.as_mut_slice(), metadata)
-        }
-        QueryFileInformationClass::AttributeTag => {
-            pack_attribute_tag_information(buffer.as_mut_slice(), metadata)
-        }
-        QueryFileInformationClass::Position | QueryFileInformationClass::Name => {
-            Err(DriverError::InternalInvariantViolation)
-        }
-    }
+    })
 }
 
 /// Applies one supported set-file-information class.
@@ -395,67 +394,78 @@ enum SetFilePlan {
 ///
 /// Returns an error when the selected set-information class has invalid input or its ext4 metadata
 /// mutation cannot be committed.
-async fn set_file_information(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let plan = {
-        let mut request = SetFileRequest::decode(target)?;
-        match request.stack.information_class() {
+async fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let plan = request.with_active(|active| {
+        let current = active.current_stack()?;
+        let file_object = current.file_object()?;
+        let stack = current.set_file()?;
+        let mut opened_file = OpenedObject::decode(file_object)?;
+        let plan = match stack.information_class() {
             SetFileInformationClass::Basic => SetFilePlan::Basic {
                 info: read_file_information_input::<wdk_sys::FILE_BASIC_INFORMATION>(
-                    request.target,
-                    request.stack.length(),
+                    active,
+                    stack.length(),
                 )?,
-                node: request.opened_file.node(),
-                operations: claim_file_operation_lane(request.opened_file.file_control_block()),
+                node: opened_file.node(),
+                operations: claim_file_operation_lane(opened_file.file_control_block()),
             },
             SetFileInformationClass::Position => {
-                set_position_information(&mut request)?;
+                set_position_information(active, stack, &mut opened_file)?;
                 SetFilePlan::Complete
             }
             SetFileInformationClass::EndOfFile => {
                 let info = read_file_information_input::<wdk_sys::FILE_END_OF_FILE_INFORMATION>(
-                    request.target,
-                    request.stack.length(),
+                    active,
+                    stack.length(),
                 )?;
-                let opened_file = OpenedRegularFile::decode(request.stack.file_object())?;
+                let regular_file = OpenedRegularFile::decode(file_object)?;
                 SetFilePlan::EndOfFile {
-                    file: opened_file.id(),
+                    file: regular_file.id(),
                     size: file_size_from_large_integer(info.EndOfFile)?,
-                    operations: claim_file_operation_lane(request.opened_file.file_control_block()),
+                    operations: claim_file_operation_lane(opened_file.file_control_block()),
                 }
             }
             SetFileInformationClass::Allocation => {
                 let info = read_file_information_input::<wdk_sys::FILE_ALLOCATION_INFORMATION>(
-                    request.target,
-                    request.stack.length(),
+                    active,
+                    stack.length(),
                 )?;
-                let opened_file = OpenedRegularFile::decode(request.stack.file_object())?;
+                let regular_file = OpenedRegularFile::decode(file_object)?;
                 SetFilePlan::Allocation {
-                    file: opened_file.id(),
+                    file: regular_file.id(),
                     size: file_size_from_large_integer(info.AllocationSize)?,
-                    operations: claim_file_operation_lane(request.opened_file.file_control_block()),
+                    operations: claim_file_operation_lane(opened_file.file_control_block()),
                 }
             }
             SetFileInformationClass::Disposition => {
-                set_disposition_information(&request)?;
+                set_disposition_information(active, stack)?;
                 SetFilePlan::Complete
             }
             SetFileInformationClass::DispositionEx => {
-                set_disposition_information_ex(&request)?;
+                set_disposition_information_ex(active, stack)?;
                 SetFilePlan::Complete
             }
             SetFileInformationClass::Rename => SetFilePlan::Rename {
                 mutation: RenameMutation::decode(
-                    &request,
+                    active,
+                    stack,
+                    &opened_file,
                     RenameInformationFormat::ReplaceIfExistsByte,
                 )?,
-                operations: claim_file_operation_lane(request.opened_file.file_control_block()),
+                operations: claim_file_operation_lane(opened_file.file_control_block()),
             },
             SetFileInformationClass::RenameEx => SetFilePlan::Rename {
-                mutation: RenameMutation::decode(&request, RenameInformationFormat::Flags)?,
-                operations: claim_file_operation_lane(request.opened_file.file_control_block()),
+                mutation: RenameMutation::decode(
+                    active,
+                    stack,
+                    &opened_file,
+                    RenameInformationFormat::Flags,
+                )?,
+                operations: claim_file_operation_lane(opened_file.file_control_block()),
             },
-        }
-    };
+        };
+        Ok::<_, DriverError>(plan)
+    })?;
     match plan {
         SetFilePlan::Complete => {}
         SetFilePlan::Basic {
@@ -481,7 +491,7 @@ async fn set_file_information(target: DispatchTarget) -> DriverResult<IrpComplet
         SetFilePlan::Rename {
             mutation,
             operations,
-        } => return rename_file_information(target, mutation, operations).await,
+        } => return rename_file_information(&mut request, mutation, operations).await,
     }
     Ok(IrpCompletion::EMPTY)
 }
@@ -491,17 +501,18 @@ async fn set_file_information(target: DispatchTarget) -> DriverResult<IrpComplet
 ///
 /// Returns an error when the input is truncated, negative, asynchronous, or misaligned for a
 /// no-intermediate-buffering handle.
-fn set_position_information(request: &mut SetFileRequest) -> DriverResult<()> {
-    let info = read_file_information_input::<wdk_sys::FILE_POSITION_INFORMATION>(
-        request.target,
-        request.stack.length(),
-    )?;
+fn set_position_information(
+    active: &ActiveIrp<'_>,
+    stack: SetFileStack,
+    opened_file: &mut OpenedObject<'_>,
+) -> DriverResult<()> {
+    let info =
+        read_file_information_input::<wdk_sys::FILE_POSITION_INFORMATION>(active, stack.length())?;
     let position = file_offset_from_large_integer(info.CurrentByteOffset)?;
-    request
-        .opened_file
+    opened_file
         .data_transfer_mode()
         .validate_position(position.bytes())?;
-    request.opened_file.set_current_file_position(position)
+    opened_file.set_current_file_position(position)
 }
 
 /// Applies FILE_BASIC_INFORMATION timestamps and overlay attributes.
@@ -542,10 +553,10 @@ async fn set_basic_information(
 /// # Errors
 ///
 /// Returns an error when the input is truncated or requests deletion.
-fn set_disposition_information(request: &SetFileRequest) -> DriverResult<()> {
+fn set_disposition_information(active: &ActiveIrp<'_>, stack: SetFileStack) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION>(
-        request.target,
-        request.stack.length(),
+        active,
+        stack.length(),
     )?;
     validate_disposition_delete_flag(info.DeleteFile)
 }
@@ -566,10 +577,10 @@ fn validate_disposition_delete_flag(delete_file: wdk_sys::BOOLEAN) -> DriverResu
 /// # Errors
 ///
 /// Returns an error when the extended disposition input is truncated or carries unsupported flags.
-fn set_disposition_information_ex(request: &SetFileRequest) -> DriverResult<()> {
+fn set_disposition_information_ex(active: &ActiveIrp<'_>, stack: SetFileStack) -> DriverResult<()> {
     let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION_EX>(
-        request.target,
-        request.stack.length(),
+        active,
+        stack.length(),
     )?;
     validate_disposition_ex_flags(info.Flags)
 }
@@ -604,9 +615,14 @@ impl RenameMutation {
     /// # Errors
     ///
     /// Returns an error when the input layout, source location, or destination path is invalid.
-    fn decode(request: &SetFileRequest, format: RenameInformationFormat) -> DriverResult<Self> {
-        let target = RenameTargetPath::parse(request.target, request.stack.length(), format)?;
-        let (source_parent, source_name) = match request.opened_file.location() {
+    fn decode(
+        active: &ActiveIrp<'_>,
+        stack: SetFileStack,
+        opened_file: &OpenedObject<'_>,
+        format: RenameInformationFormat,
+    ) -> DriverResult<Self> {
+        let target = RenameTargetPath::parse(active, stack.length(), format)?;
+        let (source_parent, source_name) = match opened_file.location() {
             OpenedLocation::DirectoryEntry { parent, name } => (*parent, name.try_to_owned_name()?),
             OpenedLocation::Root => {
                 return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));
@@ -616,7 +632,7 @@ impl RenameMutation {
         Ok(Self {
             source_parent,
             source_name,
-            source_node: request.opened_file.node(),
+            source_node: opened_file.node(),
             target,
         })
     }
@@ -641,7 +657,7 @@ enum CommittedRename {
 /// Returns an error when the namespace transaction fails or post-commit handle decoding detects
 /// an invalid pending-IRP state.
 async fn rename_file_information(
-    target: DispatchTarget,
+    request: &mut PendingIrpLease<'_>,
     mutation: RenameMutation,
     operations: VolumeOperationLease,
 ) -> DriverResult<IrpCompletion> {
@@ -654,16 +670,21 @@ async fn rename_file_information(
         notifications,
     } = committed
     {
-        let stack = target.current_stack()?.set_file()?;
-        let mut opened = OpenedObject::decode(stack.file_object())?;
-        opened.replace_location(location);
-        let volume = opened.volume();
-        let vcb = unsafe {
-            // SAFETY: The pending IRP retains the opened FCB and VCB. The operation lease was
-            // dropped before projecting this disjoint notifier control plane.
-            volume.as_ref()
-        };
-        notifications.report(vcb);
+        request.with_active(|active| {
+            let current = active.current_stack()?;
+            let file_object = current.file_object()?;
+            let _stack = current.set_file()?;
+            let mut opened = OpenedObject::decode(file_object)?;
+            opened.replace_location(location);
+            let volume = opened.volume();
+            let vcb = unsafe {
+                // SAFETY: The pending IRP retains the opened FCB and VCB. The operation lease was
+                // dropped before projecting this disjoint notifier control plane.
+                volume.as_ref()
+            };
+            notifications.report(vcb);
+            Ok::<_, DriverError>(())
+        })?;
     }
     Ok(IrpCompletion::EMPTY)
 }
@@ -839,29 +860,37 @@ async fn set_regular_file_size(
 ///
 /// Returns an error when the directory query stack, pattern, output buffer, opened directory, or
 /// emitted directory record layout is invalid.
-pub(crate) async fn query_directory(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    let target = request.target();
-    let prepared = request.prepared_query_directory()?;
-    let prepared_stack = prepared.stack();
-    let (class, pattern, length, entry_emission, directory_id, mut cursor, operations) = {
-        let mut request = QueryDirectoryRequest::from_stack(target, prepared_stack)?;
-        let class = request.stack.information_class();
-        let pattern = DirectoryPattern::from_prepared(prepared.pattern())?;
-        let length = request.stack.length();
-        let entry_emission = request.stack.entry_emission();
-        let directory_id = request.opened_file.id();
-        let mut cursor = *request.opened_file.cursor_mut();
-        initialize_directory_cursor(&mut cursor, request.stack.cursor_position());
-        let operations = claim_volume_operation_lane(request.opened_file.volume());
+pub(crate) async fn query_directory(
+    mut request: PendingIrpLease<'_>,
+) -> DriverResult<IrpCompletion> {
+    let (prepared_stack, pattern) = {
+        let prepared = request.prepared_query_directory()?;
         (
-            class,
-            pattern,
-            length,
-            entry_emission,
-            directory_id,
-            cursor,
-            operations,
+            prepared.stack(),
+            DirectoryPattern::from_prepared(prepared.pattern())?,
         )
+    };
+    let (class, pattern, length, entry_emission, directory_id, mut cursor, operations) = {
+        request.with_active(|active| {
+            let file_object = active.current_stack()?.file_object()?;
+            let mut opened_file = OpenedDirectory::decode(file_object)?;
+            let class = prepared_stack.information_class();
+            let length = prepared_stack.length();
+            let entry_emission = prepared_stack.entry_emission();
+            let directory_id = opened_file.id();
+            let mut cursor = *opened_file.cursor_mut();
+            initialize_directory_cursor(&mut cursor, prepared_stack.cursor_position());
+            let operations = claim_volume_operation_lane(opened_file.volume());
+            Ok::<_, DriverError>((
+                class,
+                pattern,
+                length,
+                entry_emission,
+                directory_id,
+                cursor,
+                operations,
+            ))
+        })?
     };
     let (cursor, packed, result) = {
         let mut operations = operations;
@@ -890,20 +919,24 @@ pub(crate) async fn query_directory(request: PendingIrpLease<'_>) -> DriverResul
     };
 
     let information = result?;
-    let mut opened_file = OpenedDirectory::decode(target.current_stack()?.file_object()?)?;
-    {
-        let mut output = target.data_output(length)?;
-        let destination = output
-            .as_mut_slice()
-            .get_mut(..information)
-            .ok_or(DriverError::InternalInvariantViolation)?;
-        let source = packed
-            .as_slice()
-            .get(..information)
-            .ok_or(DriverError::InternalInvariantViolation)?;
-        destination.copy_from_slice(source);
-    }
-    *opened_file.cursor_mut() = cursor;
+    request.with_active(|active| {
+        {
+            let mut output = active.data_output(length)?;
+            let destination = output
+                .as_mut_slice()
+                .get_mut(..information)
+                .ok_or(DriverError::InternalInvariantViolation)?;
+            let source = packed
+                .as_slice()
+                .get(..information)
+                .ok_or(DriverError::InternalInvariantViolation)?;
+            destination.copy_from_slice(source);
+        }
+        let file_object = active.current_stack()?.file_object()?;
+        let mut opened_file = OpenedDirectory::decode(file_object)?;
+        *opened_file.cursor_mut() = cursor;
+        Ok::<_, DriverError>(())
+    })?;
     IrpCompletion::from_usize(information)
 }
 
@@ -1484,7 +1517,10 @@ fn windows_time_quad(timestamp: Ext4Timestamp) -> i64 {
 /// # Errors
 ///
 /// Returns an error when the FILE_OBJECT has no opened context.
-fn cleanup_file_object(target: DispatchTarget, file_object: KernelFileObject) -> DriverResult<()> {
+fn cleanup_file_object(
+    active: &ActiveIrp<'_>,
+    file_object: ActiveFileObject<'_>,
+) -> DriverResult<()> {
     let opened_file = OpenedObject::decode(file_object)?;
     let cleanup_was_published = file_object.cleanup_complete();
     match (opened_file.begin_cleanup(), cleanup_was_published) {
@@ -1496,9 +1532,10 @@ fn cleanup_file_object(target: DispatchTarget, file_object: KernelFileObject) ->
         }
     }
     cleanup_directory_notification(&opened_file);
+    let requestor = active.requestor_process()?;
     opened_file
         .file_control_block()
-        .release_handle_byte_range_locks(target, file_object);
+        .release_handle_byte_range_locks(requestor, file_object.address());
     opened_file.release_share_access_for_cleanup();
     opened_file.finish_cleanup();
     file_object.mark_cleanup_complete();
@@ -1506,7 +1543,7 @@ fn cleanup_file_object(target: DispatchTarget, file_object: KernelFileObject) ->
 }
 
 /// Releases FsRtl notification records owned by a FILE_OBJECT during its cleanup transition.
-fn cleanup_directory_notification(opened_file: &OpenedObject) {
+fn cleanup_directory_notification(opened_file: &OpenedObject<'_>) {
     let volume = opened_file.volume();
     let vcb = unsafe {
         // SAFETY: The opened FILE_OBJECT keeps its FCB and mounted VCB alive
@@ -1522,10 +1559,10 @@ fn cleanup_directory_notification(opened_file: &OpenedObject) {
 ///
 /// Returns an error when the buffered input is smaller than `T`.
 fn read_file_information_input<T: Copy>(
-    target: DispatchTarget,
+    active: &ActiveIrp<'_>,
     length: IrpBufferLength,
 ) -> DriverResult<T> {
-    target.buffered_input(length)?.read_unaligned()
+    active.buffered_input(length)?.read_unaligned()
 }
 
 /// Decoded FILE_RENAME_INFORMATION target path.
@@ -1544,11 +1581,11 @@ impl RenameTargetPath {
     /// Returns an error when the rename input buffer is truncated, uses unsupported flags or root
     /// handles, has an invalid name length, or encodes an invalid target path.
     fn parse(
-        target: DispatchTarget,
+        active: &ActiveIrp<'_>,
         length: IrpBufferLength,
         format: RenameInformationFormat,
     ) -> DriverResult<Self> {
-        let input = target.buffered_input(length)?;
+        let input = active.buffered_input(length)?;
         let bytes = input.as_slice();
         let target_collision = format.target_collision(bytes)?;
         reject_root_directory(bytes)?;
@@ -2553,38 +2590,55 @@ async fn regular_file_end(
 ///
 /// Returns an error when the read stack or output buffer is invalid, the FILE_OBJECT is not a
 /// regular file, or ext4 data read fails.
-async fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let (file_id, kind, length, range, data_transfer_mode, operations) = {
-        let stack = target.current_stack()?.read()?;
-        let mut opened_file = OpenedRegularFile::decode(stack.file_object())?;
-        let kind = target.data_io_kind();
-        let length = stack.length();
-        let range = ResolvedFileRange::new(
-            resolve_read_start(&opened_file, kind, stack.starting_point())?,
-            length.as_usize(),
-        )?;
-        let data_transfer_mode = opened_file.data_transfer_mode();
-        data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
-        if length.is_empty() {
-            opened_file.update_current_file_position(kind, range.start(), 0)?;
-            return Ok(IrpCompletion::EMPTY);
-        }
-        let output = target.data_output(length)?;
-        data_transfer_mode.validate_buffer(output.address())?;
-        if kind == DataIoKind::Handle
-            && !opened_file.file_control_block().permits_byte_range_read(
-                target,
-                opened_file.file_object(),
-                range.start(),
-                range.length(),
-                stack.key(),
-            )?
-        {
-            return Err(DriverError::FileLockConflict);
-        }
-        let file_id = opened_file.id();
-        let operations = claim_file_operation_lane(opened_file.file_control_block());
-        (file_id, kind, length, range, data_transfer_mode, operations)
+async fn read_regular_file(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let Some((file_id, kind, length, range, data_transfer_mode, operations)) = request
+        .with_active(|active| {
+            let stack = active.current_stack()?.read()?;
+            let kind = active.data_io_kind();
+            let length = stack.length();
+            let output_address = if length.is_empty() {
+                None
+            } else {
+                Some(active.data_output(length)?.address())
+            };
+            let file_object = active.current_stack()?.file_object()?;
+            let mut opened_file = OpenedRegularFile::decode(file_object)?;
+            let range = ResolvedFileRange::new(
+                resolve_read_start(&opened_file, kind, stack.starting_point())?,
+                length.as_usize(),
+            )?;
+            let data_transfer_mode = opened_file.data_transfer_mode();
+            data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
+            if length.is_empty() {
+                opened_file.update_current_file_position(kind, range.start(), 0)?;
+                return Ok(None);
+            }
+            data_transfer_mode
+                .validate_buffer(output_address.ok_or(DriverError::InternalInvariantViolation)?)?;
+            if kind == DataIoKind::Handle
+                && !opened_file.file_control_block().permits_byte_range_read(
+                    active.requestor_process()?,
+                    opened_file.file_object(),
+                    range.start(),
+                    range.length(),
+                    stack.key(),
+                )?
+            {
+                return Err(DriverError::FileLockConflict);
+            }
+            let file_id = opened_file.id();
+            let operations = claim_file_operation_lane(opened_file.file_control_block());
+            Ok(Some((
+                file_id,
+                kind,
+                length,
+                range,
+                data_transfer_mode,
+                operations,
+            )))
+        })?
+    else {
+        return Ok(IrpCompletion::EMPTY);
     };
     let (bytes, bytes_read) = {
         let mut operations = operations;
@@ -2602,21 +2656,25 @@ async fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion
             .as_usize();
         (bytes, bytes_read)
     };
-    let mut output = target.data_output(length)?;
-    data_transfer_mode.validate_buffer(output.address())?;
-    output
-        .as_mut_slice()
-        .get_mut(..bytes_read)
-        .ok_or(DriverError::InternalInvariantViolation)?
-        .copy_from_slice(
-            bytes
-                .as_slice()
-                .get(..bytes_read)
-                .ok_or(DriverError::InternalInvariantViolation)?,
-        );
-    let stack = target.current_stack()?.read()?;
-    let mut opened_file = OpenedRegularFile::decode(stack.file_object())?;
-    opened_file.update_current_file_position(kind, range.start(), bytes_read)?;
+    request.with_active(|active| {
+        {
+            let mut output = active.data_output(length)?;
+            data_transfer_mode.validate_buffer(output.address())?;
+            output
+                .as_mut_slice()
+                .get_mut(..bytes_read)
+                .ok_or(DriverError::InternalInvariantViolation)?
+                .copy_from_slice(
+                    bytes
+                        .as_slice()
+                        .get(..bytes_read)
+                        .ok_or(DriverError::InternalInvariantViolation)?,
+                );
+        }
+        let file_object = active.current_stack()?.file_object()?;
+        let mut opened_file = OpenedRegularFile::decode(file_object)?;
+        opened_file.update_current_file_position(kind, range.start(), bytes_read)
+    })?;
     IrpCompletion::from_usize(bytes_read)
 }
 
@@ -2625,25 +2683,28 @@ async fn read_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion
 ///
 /// Returns an error when the write stack or input buffer is invalid, the FILE_OBJECT is not a
 /// regular file, or the ext4 write transaction fails.
-async fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+async fn write_regular_file(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let (file_id, kind, length, anchor, write_commitment, operations) = {
-        let stack = target.current_stack()?.write()?;
-        let opened_file = OpenedRegularFile::decode(stack.file_object())?;
-        let kind = target.data_io_kind();
-        let length = stack.length();
-        let selected_start =
-            select_write_start(opened_file.write_access(), kind, stack.starting_point())?;
-        let anchor =
-            selected_start.bind_current_position(|| opened_file.current_file_position())?;
-        let operations = claim_file_operation_lane(opened_file.file_control_block());
-        (
-            opened_file.id(),
-            kind,
-            length,
-            anchor,
-            opened_file.write_commitment(),
-            operations,
-        )
+        request.with_active(|active| {
+            let stack = active.current_stack()?.write()?;
+            let file_object = active.current_stack()?.file_object()?;
+            let opened_file = OpenedRegularFile::decode(file_object)?;
+            let kind = active.data_io_kind();
+            let length = stack.length();
+            let selected_start =
+                select_write_start(opened_file.write_access(), kind, stack.starting_point())?;
+            let anchor =
+                selected_start.bind_current_position(|| opened_file.current_file_position())?;
+            let operations = claim_file_operation_lane(opened_file.file_control_block());
+            Ok::<_, DriverError>((
+                opened_file.id(),
+                kind,
+                length,
+                anchor,
+                opened_file.write_commitment(),
+                operations,
+            ))
+        })?
     };
     let (range, bytes_written) = {
         let mut operations = operations;
@@ -2651,20 +2712,30 @@ async fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletio
             resolve_write_start(operations.lane_mut(), file_id, anchor).await?,
             length.as_usize(),
         )?;
-        let bytes = {
-            let stack = target.current_stack()?.write()?;
-            let mut opened_file = OpenedRegularFile::decode(stack.file_object())?;
+        let bytes = request.with_active(|active| {
+            let stack = active.current_stack()?.write()?;
+            let input = if length.is_empty() {
+                None
+            } else {
+                Some(active.data_input(length)?)
+            };
+            let input_address = input.as_ref().map(|input| input.address());
+            let bytes = match input {
+                Some(input) => DriverVec::try_copied_from_slice(input.as_slice())?,
+                None => DriverVec::new(),
+            };
+            let file_object = active.current_stack()?.file_object()?;
+            let opened_file = OpenedRegularFile::decode(file_object)?;
             let data_transfer_mode = opened_file.data_transfer_mode();
             data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
             if length.is_empty() {
-                opened_file.update_current_file_position(kind, range.start(), 0)?;
-                return Ok(IrpCompletion::EMPTY);
+                return Ok(bytes);
             }
-            let input = target.data_input(length)?;
-            data_transfer_mode.validate_buffer(input.address())?;
+            data_transfer_mode
+                .validate_buffer(input_address.ok_or(DriverError::InternalInvariantViolation)?)?;
             if kind == DataIoKind::Handle
                 && !opened_file.file_control_block().permits_byte_range_write(
-                    target,
+                    active.requestor_process()?,
                     opened_file.file_object(),
                     range.start(),
                     range.length(),
@@ -2673,8 +2744,16 @@ async fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletio
             {
                 return Err(DriverError::FileLockConflict);
             }
-            DriverVec::try_copied_from_slice(input.as_slice())?
-        };
+            Ok(bytes)
+        })?;
+        if bytes.is_empty() {
+            request.with_active(|active| {
+                let file_object = active.current_stack()?.file_object()?;
+                let mut opened_file = OpenedRegularFile::decode(file_object)?;
+                opened_file.update_current_file_position(kind, range.start(), 0)
+            })?;
+            return Ok(IrpCompletion::EMPTY);
+        }
         let mut transaction = operations
             .lane_mut()
             .journaled_mut()
@@ -2689,9 +2768,11 @@ async fn write_regular_file(target: DispatchTarget) -> DriverResult<IrpCompletio
         }
         (range, bytes.len())
     };
-    let stack = target.current_stack()?.write()?;
-    let mut opened_file = OpenedRegularFile::decode(stack.file_object())?;
-    opened_file.update_current_file_position(kind, range.start(), bytes_written)?;
+    request.with_active(|active| {
+        let file_object = active.current_stack()?.file_object()?;
+        let mut opened_file = OpenedRegularFile::decode(file_object)?;
+        opened_file.update_current_file_position(kind, range.start(), bytes_written)
+    })?;
     IrpCompletion::from_usize(bytes_written)
 }
 
@@ -2711,52 +2792,25 @@ fn claim_volume_operation_lane(volume: NonNull<VolumeControlBlock>) -> VolumeOpe
 }
 
 /// Detaches and releases heap-owned FCB and CCB pointers stored on a FILE_OBJECT.
-fn release_file_contexts(file_object: KernelFileObject) {
-    let contexts = unsafe {
-        // SAFETY: Close receives the final live FILE_OBJECT and reads only its filesystem-owned
-        // context pointers before deciding whether they can be released.
-        let object = file_object.as_ref();
-        (object.FsContext, object.FsContext2)
-    };
-    match contexts {
-        (fcb, handle) if fcb.is_null() && handle.is_null() => return,
-        (fcb, handle) if fcb.is_null() || handle.is_null() => {
+fn release_file_contexts(file_object: ActiveFileObject<'_>) {
+    if file_object.has_no_file_system_contexts() {
+        return;
+    }
+    let close_kind = file_object.close_kind_or_bugcheck();
+    let opened = match OpenedObject::decode(file_object) {
+        Ok(opened) => opened,
+        Err(_) => {
             crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
                 .bugcheck();
         }
-        _ => {}
-    }
-    let close_kind = file_object.close_kind_or_bugcheck();
-    let release_plan = {
-        let opened = match OpenedObject::decode(file_object) {
-            Ok(opened) => opened,
-            Err(_) => {
-                crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
-                    .bugcheck();
-            }
-        };
-        opened.close_release_plan(close_kind)
     };
-
-    let (fcb, handle) = unsafe {
-        // SAFETY: Close receives the final FILE_OBJECT and may clear its
-        // filesystem-owned context pointers before releasing either allocation.
-        let object = file_object.as_mut();
-        (
-            core::mem::replace(&mut object.FsContext, core::ptr::null_mut()),
-            core::mem::replace(&mut object.FsContext2, core::ptr::null_mut()),
-        )
-    };
-    let Some(fcb) = NonNull::new(fcb.cast::<FileControlBlock>()) else {
-        crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption().bugcheck();
-    };
-    let Some(handle) = NonNull::new(handle.cast::<OpenedHandle>()) else {
-        crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption().bugcheck();
-    };
+    let release_plan = opened.close_release_plan(close_kind);
+    let file_object_address = file_object.address();
+    let (fcb, handle) = opened.detach_contexts();
     match release_plan {
         CloseReleasePlan::CleanedHandle => release_file_control_block(fcb),
         CloseReleasePlan::CancelledOpen => {
-            release_cancelled_file_control_block(fcb, file_object);
+            release_cancelled_file_control_block(fcb, file_object_address);
         }
     }
     unsafe {

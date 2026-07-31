@@ -9,16 +9,10 @@ use wdk_sys::{
 };
 
 use crate::{
-    irp::{
-        DispatchTarget, IrpCompletion, QueryVolumeInformationClass, QueryVolumeStack,
-        SetVolumeInformationClass, SetVolumeStack,
-    },
+    irp::{IrpCompletion, PendingIrpLease, QueryVolumeInformationClass, SetVolumeInformationClass},
     kernel::status::{DriverError, DriverResult},
     memory::DriverVec,
-    state::{
-        MountedVolumeDevice, TransferSectorSize, VolumeControlBlock, VolumeOperationLane,
-        VolumeOperationLease,
-    },
+    state::{MountedVolumeDevice, TransferSectorSize, VolumeControlBlock, VolumeOperationLane},
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
 
@@ -29,131 +23,55 @@ const FILE_SYSTEM_NAME: &[u16] = &[0x0045, 0x0058, 0x0054, 0x0034, 0x0057, 0x004
 /// # Errors
 ///
 /// Returns an error when volume stack decoding or information packing fails.
-pub(crate) async fn query(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let request = QueryVolumeRequest::decode(target)?;
-    query_volume(request)
+pub(crate) async fn query(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let (stack, volume) = request.with_active(|active| {
+        Ok::<_, DriverError>((
+            active.current_stack()?.query_volume()?,
+            MountedVolumeDevice::vcb(active.device()).ok_or(DriverError::InvalidDeviceRequest)?,
+        ))
+    })?;
+    let operations = unsafe {
+        // SAFETY: Query-volume runs only as the mounted-device executor's unique active operation.
+        VolumeControlBlock::claim_operation_lane(volume)
+    };
+    request.with_active(|active| {
+        let length = stack.length();
+        let mut buffer = active.buffered_output(length)?;
+        let output = buffer.as_mut_slice();
+        let operations = operations.lane();
+        match stack.information_class() {
+            QueryVolumeInformationClass::Volume => pack_volume_information(operations, output),
+            QueryVolumeInformationClass::Size => pack_size_information(operations, output),
+            QueryVolumeInformationClass::Device => pack_device_information(output),
+            QueryVolumeInformationClass::Attribute => pack_attribute_information(output),
+            QueryVolumeInformationClass::FullSize => pack_full_size_information(operations, output),
+        }
+    })
 }
 
 /// Executes volume information mutations.
 /// # Errors
 ///
 /// Returns an error when volume stack decoding or label mutation fails.
-pub(crate) async fn set(target: DispatchTarget) -> DriverResult<IrpCompletion> {
-    let request = SetVolumeRequest::decode(target)?;
-    set_volume(request).await
-}
-
-/// Decoded query-volume request.
-struct QueryVolumeRequest {
-    /// IRP target for buffer and result accounting.
-    target: DispatchTarget,
-    /// Query stack parameters.
-    stack: QueryVolumeStack,
-    /// Exclusive actor-owned mounted-volume operation capability.
-    operations: VolumeOperationLease,
-}
-
-impl QueryVolumeRequest {
-    /// Decodes query-volume parameters.
-    /// # Errors
-    ///
-    /// Returns an error when the current stack is not a query-volume stack or the requested class is
-    /// unsupported.
-    fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
-        let stack = target.current_stack()?.query_volume()?;
+pub(crate) async fn set(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let (device, volume, label) = request.with_active(|active| {
+        let stack = active.current_stack()?.set_volume()?;
         let volume =
-            MountedVolumeDevice::vcb(target.device()).ok_or(DriverError::InvalidDeviceRequest)?;
-        let operations = unsafe {
-            // SAFETY: Query-volume runs only as the mounted-device executor's unique active
-            // operation. The lease is moved into this request until that operation completes.
-            VolumeControlBlock::claim_operation_lane(volume)
+            MountedVolumeDevice::vcb(active.device()).ok_or(DriverError::InvalidDeviceRequest)?;
+        let label = match stack.information_class() {
+            SetVolumeInformationClass::Label => {
+                let input = active.buffered_input(stack.length())?;
+                volume_label_from_file_fs_label(input.as_slice())?
+            }
         };
-        Ok(Self {
-            target,
-            stack,
-            operations,
-        })
-    }
-}
-
-/// Decoded set-volume request.
-struct SetVolumeRequest {
-    /// IRP target for input buffer access.
-    target: DispatchTarget,
-    /// Set stack parameters.
-    stack: SetVolumeStack,
-    /// Exclusive actor-owned mounted-volume operation capability.
-    operations: VolumeOperationLease,
-}
-
-impl SetVolumeRequest {
-    /// Decodes set-volume parameters.
-    /// # Errors
-    ///
-    /// Returns an error when the current stack is not a set-volume stack or the requested class is
-    /// unsupported.
-    fn decode(target: DispatchTarget) -> Result<Self, crate::kernel::status::DriverError> {
-        let stack = target.current_stack()?.set_volume()?;
-        let volume =
-            MountedVolumeDevice::vcb(target.device()).ok_or(DriverError::InvalidDeviceRequest)?;
-        let operations = unsafe {
-            // SAFETY: Set-volume runs only as the mounted-device executor's unique active
-            // operation. The lease is moved into this request until that operation completes.
-            VolumeControlBlock::claim_operation_lane(volume)
-        };
-        Ok(Self {
-            target,
-            stack,
-            operations,
-        })
-    }
-}
-
-/// Executes one volume information query.
-/// # Errors
-///
-/// Returns an error when the dispatch target is not a mounted volume or the selected class cannot be
-/// packed into the caller buffer.
-fn query_volume(request: QueryVolumeRequest) -> DriverResult<IrpCompletion> {
-    let length = request.stack.length();
-    let mut buffer = request.target.buffered_output(length)?;
-    let output = buffer.as_mut_slice();
-    let operations = request.operations.lane();
-    match request.stack.information_class() {
-        QueryVolumeInformationClass::Volume => pack_volume_information(operations, output),
-        QueryVolumeInformationClass::Size => pack_size_information(operations, output),
-        QueryVolumeInformationClass::Device => pack_device_information(output),
-        QueryVolumeInformationClass::Attribute => pack_attribute_information(output),
-        QueryVolumeInformationClass::FullSize => pack_full_size_information(operations, output),
-    }
-}
-
-/// Executes one volume information mutation.
-/// # Errors
-///
-/// Returns an error when the selected volume-information mutation input is invalid or cannot be
-/// committed.
-async fn set_volume(request: SetVolumeRequest) -> DriverResult<IrpCompletion> {
-    match request.stack.information_class() {
-        SetVolumeInformationClass::Label => set_volume_label(request).await,
-    }?;
-    Ok(IrpCompletion::EMPTY)
-}
-
-/// Applies `FILE_FS_LABEL_INFORMATION` to the mounted ext4 superblock.
-/// # Errors
-///
-/// Returns an error when the label input buffer is malformed, the device is not mounted, the
-/// superblock label transaction fails, or the VPB label cannot be refreshed.
-async fn set_volume_label(request: SetVolumeRequest) -> DriverResult<()> {
-    let length = request.stack.length();
-    let label = {
-        let input = request.target.buffered_input(length)?;
-        volume_label_from_file_fs_label(input.as_slice())?
+        Ok::<_, DriverError>((active.device(), volume, label))
+    })?;
+    let mut operations = unsafe {
+        // SAFETY: Set-volume runs only as the mounted-device executor's unique active operation.
+        VolumeControlBlock::claim_operation_lane(volume)
     };
-    let mut operations = request.operations;
     if operations.lane().volume_label() == label {
-        return Ok(());
+        return Ok(IrpCompletion::EMPTY);
     }
 
     let mut transaction = operations
@@ -162,10 +80,8 @@ async fn set_volume_label(request: SetVolumeRequest) -> DriverResult<()> {
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     transaction.set_volume_label(label);
     transaction.commit().await?;
-    MountedVolumeDevice::refresh_vpb_label(
-        request.target.device(),
-        operations.lane().volume_label(),
-    )
+    MountedVolumeDevice::refresh_vpb_label(device, operations.lane().volume_label())?;
+    Ok(IrpCompletion::EMPTY)
 }
 
 /// Decodes a Windows label information buffer into an ext4 volume label.

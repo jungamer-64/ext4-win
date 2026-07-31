@@ -4,8 +4,8 @@ use wdk_sys::STATUS_SUCCESS;
 
 use crate::{
     irp::{
-        DispatchTarget, FileSystemControlMinorFunction, FileSystemControlStack, FsControlCode,
-        IrpBufferLength, IrpCompletion, MountVolumeStack, PendingIrpLease,
+        FileSystemControlMinorFunction, FileSystemControlStack, FsControlCode, IrpBufferLength,
+        IrpCompletion, MountVolumeStack, PendingIrpLease,
     },
     kernel::{
         block_device::query_device_length,
@@ -42,7 +42,7 @@ pub(crate) async fn execute(
 /// # Errors
 ///
 /// Always returns `InvalidDeviceRequest`; device controls are not owned by this FSD path.
-pub(crate) fn device_control(_target: DispatchTarget) -> DriverResult<IrpCompletion> {
+pub(crate) fn device_control() -> DriverResult<IrpCompletion> {
     Err(DriverError::InvalidDeviceRequest)
 }
 
