@@ -420,9 +420,6 @@ impl DeviceExecutor {
             // SAFETY: The device extension remains stable throughout request capture and queueing.
             executor.as_ref()
         };
-        if executor.actor_state() != ActorState::Running {
-            return received.complete_result(Err(DriverError::InvalidDeviceRequest));
-        }
         if major == DispatchMajor::Cleanup {
             let file_object = match received.with_active(|active| {
                 active
