@@ -58,24 +58,4 @@ unsafe extern "system" {
     /// Releases one native set-security snapshot.
     pub(crate) fn ext4win_release_set_security_descriptor(snapshot: wdk_sys::PVOID);
 
-    /// Copies one bounded requestor-owned byte range into nonpaged native memory.
-    pub(crate) fn ext4win_capture_requestor_bytes(
-        source: *const core::ffi::c_void,
-        length: wdk_sys::ULONG,
-        requestor_mode: wdk_sys::KPROCESSOR_MODE,
-        snapshot_out: *mut wdk_sys::PVOID,
-        length_out: *mut wdk_sys::ULONG,
-    ) -> wdk_sys::NTSTATUS;
-
-    /// Copies a requestor-owned UNICODE_STRING payload into nonpaged native memory.
-    pub(crate) fn ext4win_capture_requestor_unicode_string(
-        source: *const wdk_sys::UNICODE_STRING,
-        requestor_mode: wdk_sys::KPROCESSOR_MODE,
-        maximum_length: wdk_sys::USHORT,
-        snapshot_out: *mut wdk_sys::PVOID,
-        length_out: *mut wdk_sys::ULONG,
-    ) -> wdk_sys::NTSTATUS;
-
-    /// Releases one requestor auxiliary snapshot.
-    pub(crate) fn ext4win_release_requestor_snapshot(snapshot: wdk_sys::PVOID);
 }
