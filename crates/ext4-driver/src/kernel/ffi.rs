@@ -11,8 +11,10 @@ pub(crate) use wdk_sys::ntddk::{
 
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{
-    ExDeleteResourceLite, ExEnterCriticalRegionAndAcquireResourceExclusive,
-    ExInitializeResourceLite, ExReleaseResourceAndLeaveCriticalRegion, FsRtlDismountComplete,
+    ExAcquireRundownProtection, ExDeleteResourceLite,
+    ExEnterCriticalRegionAndAcquireResourceExclusive, ExInitializeResourceLite,
+    ExInitializeRundownProtection, ExReleaseResourceAndLeaveCriticalRegion,
+    ExReleaseRundownProtection, ExWaitForRundownProtectionRelease, FsRtlDismountComplete,
     FsRtlFastCheckLockForRead, FsRtlFastCheckLockForWrite, FsRtlFastUnlockAll,
     FsRtlInitializeFileLock, FsRtlNotifyCleanup, FsRtlNotifyCleanupAll,
     FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange, FsRtlNotifyInitializeSync,
