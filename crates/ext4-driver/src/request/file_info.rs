@@ -296,29 +296,27 @@ async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResul
             operations: claim_file_operation_lane(opened_file.file_control_block()),
         })
     })?;
-    let QueryFilePlan::Metadata {
-        length,
-        information_class,
-        node,
-        operations,
-    } = plan
-    else {
-        let QueryFilePlan::Complete {
+    let (length, information_class, node, operations) = match plan {
+        QueryFilePlan::Metadata {
+            length,
+            information_class,
+            node,
+            operations,
+        } => (length, information_class, node, operations),
+        QueryFilePlan::Complete {
             length,
             output,
             completion,
-        } = plan
-        else {
-            unreachable!();
-        };
-        request.with_active(|active| {
-            active
-                .buffered_output(length)?
-                .as_mut_slice()
-                .copy_from_slice(output.as_slice());
-            Ok::<_, DriverError>(())
-        })?;
-        return Ok(completion);
+        } => {
+            request.with_active(|active| {
+                active
+                    .buffered_output(length)?
+                    .as_mut_slice()
+                    .copy_from_slice(output.as_slice());
+                Ok::<_, DriverError>(())
+            })?;
+            return Ok(completion);
+        }
     };
     let metadata = {
         let mut operations = operations;

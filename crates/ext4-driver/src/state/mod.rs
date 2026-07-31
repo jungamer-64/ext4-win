@@ -470,7 +470,7 @@ impl ControlDeviceExtension {
     /// Releases resources stored in the extension.
     /// # Safety
     ///
-    /// No dispatch callback or queue worker may still access the control device.
+    /// No dispatch callback or device actor may still access the control device.
     unsafe fn release(device: KernelDevice) {
         let Some(device_object) = (unsafe {
             // SAFETY: The caller owns teardown of the control device.
@@ -520,7 +520,7 @@ impl ControlDevice {
     /// Releases resources stored in the control device extension.
     /// # Safety
     ///
-    /// No dispatch callback or queue worker may still access the control device.
+    /// No dispatch callback or device actor may still access the control device.
     pub(crate) unsafe fn release(self) {
         unsafe {
             // SAFETY: The caller owns control-device teardown.
@@ -1993,7 +1993,7 @@ impl MountedVolumeDevice {
         if let Err(error) = register_shutdown_notification(device) {
             unsafe {
                 // SAFETY: Shutdown registration failed before this device was
-                // published, so no worker or continuation can still own the executor.
+                // published, so no actor continuation can still own the executor.
                 DeviceExecutor::release_at(core::ptr::addr_of_mut!(extension.header.executor));
             }
             return Err(error);
@@ -3593,6 +3593,9 @@ mod tests {
     }
 
     /// Runs one decoder against a FILE_OBJECT whose lifetime is owned by an active test IRP.
+    /// # Errors
+    ///
+    /// Returns an error when the test IRP boundary or `operation` rejects the FILE_OBJECT.
     fn with_active_file_object<R>(
         file: &mut wdk_sys::FILE_OBJECT,
         operation: impl for<'view> FnOnce(ActiveFileObject<'view>) -> Result<R, DriverError>,

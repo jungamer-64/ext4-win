@@ -481,6 +481,9 @@ impl ActiveIrp<'_> {
     }
 
     /// Returns the buffered I/O system-buffer address.
+    /// # Errors
+    ///
+    /// Returns an error when the active IRP has no system buffer.
     fn associated_system_buffer(&self) -> Result<NonNull<u8>, DriverError> {
         let irp = unsafe {
             // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
@@ -496,6 +499,9 @@ impl ActiveIrp<'_> {
     }
 
     /// Returns a system-mapped read/write data-buffer address.
+    /// # Errors
+    ///
+    /// Returns an error when neither a system buffer nor a valid mapped MDL covers `length`.
     fn data_buffer_address(&self, length: IrpBufferLength) -> Result<NonNull<u8>, DriverError> {
         if let Ok(system_buffer) = self.associated_system_buffer() {
             return Ok(system_buffer);
@@ -666,7 +672,7 @@ impl PendingIrp {
     }
 }
 
-/// Unique IRP completion authority held by queue, worker, and immediate paths.
+/// Unique IRP completion authority held by the queue, device actor, or immediate path.
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct OwnedIrp {
@@ -774,7 +780,7 @@ impl OwnedIrp {
         test,
         expect(
             dead_code,
-            reason = "queued worker completion is compiled out in unit tests"
+            reason = "kernel device-actor completion is compiled out in unit tests"
         )
     )]
     pub(crate) fn complete_result(self, result: DriverResult<IrpCompletion>) -> NTSTATUS {
@@ -3180,6 +3186,9 @@ mod tests {
     }
 
     /// Builds a lifetime-bound stack view from one live unit-test fixture.
+    /// # Errors
+    ///
+    /// Returns an error when the fixture address is unexpectedly null.
     fn current_stack_fixture(
         stack: &mut wdk_sys::IO_STACK_LOCATION,
     ) -> Result<CurrentIrpStackLocation<'_>, DriverError> {
@@ -3491,7 +3500,7 @@ mod tests {
                 wdk_sys::STATUS_PENDING
             );
             assert!(stack_has_pending_returned(&stack));
-            assert!(executor.test_worker_is_queued());
+            assert!(executor.test_wake_is_requested());
             assert_eq!(
                 executor.test_remove_next_irp(core::ptr::null_mut()),
                 core::ptr::addr_of_mut!(irp)
@@ -3562,7 +3571,7 @@ mod tests {
 
         assert_eq!(irp_status(&irp), STATUS_INVALID_PARAMETER);
         assert_eq!(irp.IoStatus.Information, 0);
-        assert!(executor.test_worker_is_dormant());
+        assert!(executor.test_has_no_pending_wake());
         assert!(
             executor
                 .test_remove_next_irp(core::ptr::null_mut())

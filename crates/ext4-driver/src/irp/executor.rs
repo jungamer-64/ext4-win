@@ -49,6 +49,15 @@ enum ActorState {
 }
 
 impl ActorState {
+    /// Encodes this declared state for atomic publication.
+    const fn as_raw(self) -> u8 {
+        match self {
+            Self::Running => 0,
+            Self::Draining => 1,
+            Self::Stopped => 2,
+        }
+    }
+
     /// Decodes a lifecycle state published through the atomic boundary.
     fn from_raw(raw: u8) -> Option<Self> {
         match raw {
@@ -121,7 +130,7 @@ fn release_queue_slot(queued_requests: &AtomicUsize) {
 pub(crate) struct DeviceExecutor {
     /// Cancel-safe queue callback table. This must remain the first field.
     csq: wdk_sys::IO_CSQ,
-    /// Spin lock shared by CSQ callbacks and worker scheduling transitions.
+    /// Spin lock shared by CSQ callbacks and mailbox transitions.
     lock: wdk_sys::KSPIN_LOCK,
     /// FIFO of pending IRPs using `IRP.Tail.Overlay.ListEntry`.
     list_head: UnsafeCell<LIST_ENTRY>,
@@ -153,8 +162,8 @@ impl DeviceExecutor {
     /// Closes request admission and starts terminal draining exactly once.
     fn begin_drain(&self) {
         match self.lifecycle.compare_exchange(
-            ActorState::Running as u8,
-            ActorState::Draining as u8,
+            ActorState::Running.as_raw(),
+            ActorState::Draining.as_raw(),
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
@@ -173,7 +182,7 @@ impl DeviceExecutor {
             list_head: UnsafeCell::new(LIST_ENTRY::default()),
             queued_requests: AtomicUsize::new(0),
             wake_event: wdk_sys::KEVENT::default(),
-            lifecycle: AtomicU8::new(ActorState::Running as u8),
+            lifecycle: AtomicU8::new(ActorState::Running.as_raw()),
             thread_handle: core::ptr::null_mut(),
             active: UnsafeCell::new(None),
             wake_requested: core::sync::atomic::AtomicBool::new(false),
@@ -197,15 +206,15 @@ impl DeviceExecutor {
         irp
     }
 
-    /// Returns whether a unit-test wake has reserved exactly one worker callback.
+    /// Returns whether a unit-test wake was requested for the actor.
     #[cfg(test)]
-    pub(super) fn test_worker_is_queued(&self) -> bool {
+    pub(super) fn test_wake_is_requested(&self) -> bool {
         self.wake_requested.load(Ordering::Acquire)
     }
 
-    /// Returns whether a unit-test executor has no reserved worker callback.
+    /// Returns whether a unit-test executor has no pending actor wake.
     #[cfg(test)]
-    pub(super) fn test_worker_is_dormant(&self) -> bool {
+    pub(super) fn test_has_no_pending_wake(&self) -> bool {
         !self.wake_requested.load(Ordering::Acquire)
     }
 
@@ -232,7 +241,7 @@ impl DeviceExecutor {
                     list_head: UnsafeCell::new(LIST_ENTRY::default()),
                     queued_requests: AtomicUsize::new(0),
                     wake_event: wdk_sys::KEVENT::default(),
-                    lifecycle: AtomicU8::new(ActorState::Running as u8),
+                    lifecycle: AtomicU8::new(ActorState::Running.as_raw()),
                     thread_handle: core::ptr::null_mut(),
                     active: UnsafeCell::new(None),
                     #[cfg(test)]
@@ -362,7 +371,7 @@ impl DeviceExecutor {
         #[cfg(test)]
         executor
             .lifecycle
-            .store(ActorState::Stopped as u8, Ordering::Release);
+            .store(ActorState::Stopped.as_raw(), Ordering::Release);
 
         if executor.actor_state() != ActorState::Stopped
             || executor.queued_requests.load(Ordering::Acquire) != 0
@@ -456,7 +465,7 @@ impl DeviceExecutor {
         core::ptr::addr_of!(self.csq).cast_mut()
     }
 
-    /// Inserts a pending IRP through the cancel-safe queue and records a worker wake.
+    /// Inserts a pending IRP through the cancel-safe queue and wakes the actor.
     fn enqueue(&self, pending: PendingIrp, reservation: QueueSlotReservation) {
         #[cfg(test)]
         mark_pending_for_csq_test(pending.target.irp);
@@ -501,7 +510,7 @@ impl DeviceExecutor {
             {
                 if self.actor_state() == ActorState::Draining {
                     self.lifecycle
-                        .store(ActorState::Stopped as u8, Ordering::Release);
+                        .store(ActorState::Stopped.as_raw(), Ordering::Release);
                     return;
                 }
                 self.wait_for_wake();
@@ -567,7 +576,7 @@ impl DeviceExecutor {
                 Ok(task) => {
                     let task: DeviceTask = Box::into_pin(task);
                     unsafe {
-                        // SAFETY: This worker owns the empty active slot under `Polling`.
+                        // SAFETY: The dedicated actor owns the empty active slot.
                         *self.active.get() = Some(task);
                     }
                     return true;
@@ -659,30 +668,8 @@ impl DeviceExecutor {
 }
 
 // SAFETY: The device extension is stable and all shared mutation follows the spin-lock or unique
-// polling-worker disciplines documented on each `UnsafeCell` field.
+// actor-thread disciplines documented on each `UnsafeCell` field.
 unsafe impl Sync for DeviceExecutor {}
-
-#[cfg(test)]
-mod tests {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::{MAX_QUEUED_REQUESTS, QueueSlotReservation};
-
-    /// # Panics
-    ///
-    /// Panics when one device can reserve beyond its bounded queue depth or rollback leaks slots.
-    #[test]
-    fn queue_slot_reservations_enforce_the_device_bound() {
-        let queued_requests = AtomicUsize::new(0);
-        let reservations: [_; MAX_QUEUED_REQUESTS] =
-            core::array::from_fn(|_| QueueSlotReservation::acquire(&queued_requests));
-
-        assert!(reservations.iter().all(Result::is_ok));
-        assert!(QueueSlotReservation::acquire(&queued_requests).is_err());
-        drop(reservations);
-        assert_eq!(queued_requests.load(Ordering::Acquire), 0);
-    }
-}
 
 /// Raw-waker clone retains the same non-owning stable executor address.
 /// # Safety
@@ -1003,5 +990,68 @@ fn queued_irp_matches_context(irp: PIRP, context: PVOID) -> bool {
         // SAFETY: The CSQ lock retains queue membership, so context publication cannot be taken
         // until this callback returns its candidate decision.
         irp.published_queue_context_matches(context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ptr::NonNull;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{ActorState, DeviceExecutor, MAX_QUEUED_REQUESTS, QueueSlotReservation};
+    use crate::state::KernelDevice;
+
+    /// Builds actor storage around a non-dereferenced device identity.
+    fn actor_storage() -> Option<DeviceExecutor> {
+        let device = KernelDevice::from_raw(NonNull::<wdk_sys::DEVICE_OBJECT>::dangling().as_ptr());
+        device.map(DeviceExecutor::test_storage)
+    }
+
+    /// # Panics
+    ///
+    /// Panics when one device can reserve beyond its bounded queue depth or rollback leaks slots.
+    #[test]
+    fn queue_slot_reservations_enforce_the_device_bound() {
+        let queued_requests = AtomicUsize::new(0);
+        let reservations: [_; MAX_QUEUED_REQUESTS] =
+            core::array::from_fn(|_| QueueSlotReservation::acquire(&queued_requests));
+
+        assert!(reservations.iter().all(Result::is_ok));
+        assert!(QueueSlotReservation::acquire(&queued_requests).is_err());
+        drop(reservations);
+        assert_eq!(queued_requests.load(Ordering::Acquire), 0);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the actor lifecycle accepts an unknown atomic discriminant.
+    #[test]
+    fn actor_state_decodes_only_declared_lifecycle_states() {
+        assert_eq!(ActorState::from_raw(0), Some(ActorState::Running));
+        assert_eq!(ActorState::from_raw(1), Some(ActorState::Draining));
+        assert_eq!(ActorState::from_raw(2), Some(ActorState::Stopped));
+        assert_eq!(ActorState::from_raw(3), None);
+        assert_eq!(ActorState::from_raw(u8::MAX), None);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when terminal draining does not close admission and wake the actor.
+    #[test]
+    fn actor_drain_closes_admission_before_publishing_wake() {
+        let executor = actor_storage();
+        assert!(executor.is_some());
+        let Some(executor) = executor else {
+            return;
+        };
+        assert_eq!(executor.actor_state(), ActorState::Running);
+        assert!(executor.test_has_no_pending_wake());
+
+        executor.begin_drain();
+        assert_eq!(executor.actor_state(), ActorState::Draining);
+        assert!(executor.test_has_no_pending_wake());
+
+        executor.request_poll();
+        assert!(executor.test_wake_is_requested());
     }
 }

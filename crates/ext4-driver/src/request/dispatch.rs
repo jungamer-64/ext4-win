@@ -257,7 +257,7 @@ fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS
         DispatchPolicy::Queued => DeviceExecutor::receive(received, major),
         DispatchPolicy::SynchronousCleanup => dispatch_cleanup(received),
         DispatchPolicy::SynchronousClose => {
-            let result = received.with_active(|active| crate::request::file_info::close(active));
+            let result = received.with_active(crate::request::file_info::close);
             received.complete_result(result)
         }
         DispatchPolicy::FsRtlFileLock => dispatch_file_lock(received),
@@ -269,7 +269,7 @@ fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS
 enum DispatchPolicy {
     /// Complete during the dispatch callback.
     Immediate,
-    /// Mark pending and execute from the device queue worker.
+    /// Mark pending and execute on the dedicated device actor.
     Queued,
     /// Cancel pending IRPs and consume cleanup-owned state in the requestor thread.
     SynchronousCleanup,
@@ -334,7 +334,7 @@ fn dispatch_file_lock(mut received: ReceivedIrp) -> NTSTATUS {
     test,
     expect(
         dead_code,
-        reason = "kernel work-item worker is compiled out in unit tests"
+        reason = "kernel device actor is compiled out in unit tests"
     )
 )]
 pub(crate) async fn execute_owned(mut owned: OwnedIrp) {

@@ -69,7 +69,7 @@ impl<T> PushError<T> {
     test,
     expect(
         dead_code,
-        reason = "ownership-preserving executor allocation is exercised only by kernel workers"
+        reason = "ownership-preserving executor allocation is exercised only by kernel actors"
     )
 )]
 pub(crate) struct BoxMapError<S> {
@@ -83,7 +83,7 @@ pub(crate) struct BoxMapError<S> {
     test,
     expect(
         dead_code,
-        reason = "ownership-preserving executor allocation is exercised only by kernel workers"
+        reason = "ownership-preserving executor allocation is exercised only by kernel actors"
     )
 )]
 impl<S> BoxMapError<S> {
@@ -420,7 +420,7 @@ where
     test,
     expect(
         dead_code,
-        reason = "ownership-preserving executor allocation is exercised only by kernel workers"
+        reason = "ownership-preserving executor allocation is exercised only by kernel actors"
     )
 )]
 pub(crate) fn boxed_try_map<S, T>(
