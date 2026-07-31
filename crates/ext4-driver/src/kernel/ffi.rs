@@ -16,11 +16,12 @@ pub(crate) use wdk_sys::ntddk::{
     FsRtlFastCheckLockForWrite, FsRtlFastUnlockAll, FsRtlInitializeFileLock, FsRtlNotifyCleanup,
     FsRtlNotifyCleanupAll, FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange,
     FsRtlNotifyInitializeSync, FsRtlNotifyUninitializeSync, FsRtlProcessFileLock,
-    FsRtlUninitializeFileLock, IoAllocateIrp, IoAllocateMdl, IoAllocateWorkItem, IoCsqInitialize,
-    IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeIrp, IoFreeMdl, IoFreeWorkItem,
-    IoGetRequestorProcess, IoQueueWorkItem, IoRegisterShutdownNotification,
-    IoSetCompletionRoutineEx, IofCallDriver, KeAcquireSpinLockRaiseToDpc, KeInitializeSpinLock,
-    KeReleaseSpinLock, MmBuildMdlForNonPagedPool, MmUnlockPages,
+    FsRtlUninitializeFileLock, IoAllocateIrp, IoAllocateMdl, IoCsqInitialize, IoCsqInsertIrp,
+    IoCsqRemoveNextIrp, IoFreeIrp, IoFreeMdl, IoGetRequestorProcess,
+    IoRegisterShutdownNotification, IoSetCompletionRoutineEx, IofCallDriver,
+    KeAcquireSpinLockRaiseToDpc, KeInitializeEvent, KeInitializeSpinLock, KeReleaseSpinLock,
+    KeSetEvent, KeWaitForSingleObject, MmBuildMdlForNonPagedPool, MmUnlockPages,
+    PsCreateSystemThread, PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
 };
 
 #[cfg(not(test))]

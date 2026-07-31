@@ -1,12 +1,18 @@
 //! PASSIVE_LEVEL future executor and cancel-safe IRP mailbox.
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(test))]
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use core::{cell::UnsafeCell, ffi::c_void, future::Future, pin::Pin, ptr::NonNull};
+use core::{
+    cell::UnsafeCell,
+    ffi::c_void,
+    future::Future,
+    pin::Pin,
+    ptr::NonNull,
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+};
 
-use wdk_sys::{LIST_ENTRY, NTSTATUS, PIO_WORKITEM, PIRP, PLIST_ENTRY, PVOID};
+use wdk_sys::{LIST_ENTRY, NTSTATUS, PIRP, PLIST_ENTRY, PVOID};
 #[cfg(not(test))]
 use wdk_sys::{PIO_CSQ, STATUS_SUCCESS};
 
@@ -25,74 +31,33 @@ use crate::{
 use super::{DispatchMajor, KernelIrp, OwnedIrp, PendingIrp, QueueContext, ReceivedIrp};
 
 /// One pinned request continuation owned by a device execution lane.
-type DeviceTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type DeviceTask = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
 /// Maximum captured requests waiting in one serialized device execution lane.
 const MAX_QUEUED_REQUESTS: usize = 64;
 
-/// PASSIVE_LEVEL worker scheduling state protected by the executor spin lock.
+/// Dedicated device actor lifecycle.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkerState {
-    /// No work item is queued and no task is being polled.
-    Dormant,
-    /// Exactly one work item is queued but has not entered its callback.
-    Queued,
-    /// Exactly one worker is polling the active task.
-    Polling,
-    /// A wake occurred while the active worker was polling.
-    PollingWoken,
+enum ActorState {
+    /// The actor accepts new IRPs and serially executes them.
+    Running = 0,
+    /// Admission is closed; queued IRPs are canceled and the active task is draining.
+    Draining = 1,
+    /// The actor thread has released every task and terminated.
+    Stopped = 2,
 }
 
-impl WorkerState {
-    /// Records a wake and returns whether a system work item must be queued.
-    fn request_poll(&mut self) -> bool {
-        match self {
-            Self::Dormant => {
-                *self = Self::Queued;
-                true
-            }
-            Self::Queued | Self::PollingWoken => false,
-            Self::Polling => {
-                *self = Self::PollingWoken;
-                false
-            }
+impl ActorState {
+    /// Decodes a lifecycle state published through the atomic boundary.
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Running),
+            1 => Some(Self::Draining),
+            2 => Some(Self::Stopped),
+            _ => None,
         }
     }
-
-    /// Transfers the single queued-work-item right into the polling worker.
-    fn enter_worker(&mut self) -> bool {
-        if *self != Self::Queued {
-            return false;
-        }
-        *self = Self::Polling;
-        true
-    }
-
-    /// Resolves one pending poll without losing a concurrent wake.
-    fn settle_pending(&mut self) -> WorkerContinuation {
-        match self {
-            Self::Polling => {
-                *self = Self::Dormant;
-                WorkerContinuation::Sleep
-            }
-            Self::PollingWoken => {
-                *self = Self::Polling;
-                WorkerContinuation::Repoll
-            }
-            Self::Dormant | Self::Queued => WorkerContinuation::Invalid,
-        }
-    }
-}
-
-/// Decision made after an active task returns `Poll::Pending`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkerContinuation {
-    /// No wake raced with the poll; the worker relinquished execution ownership.
-    Sleep,
-    /// A wake raced with the poll; the same worker must poll again.
-    Repoll,
-    /// The protected state machine was already corrupted.
-    Invalid,
 }
 
 /// One queue slot reserved before requestor-owned memory is captured.
@@ -151,7 +116,7 @@ fn release_queue_slot(queued_requests: &AtomicUsize) {
 ///
 /// The embedded CSQ is the first field because the WDK callback API supplies only its address.
 /// Every field mutated outside initialization is either protected by `lock` or confined to the one
-/// worker represented by [`WorkerState::Polling`].
+/// dedicated actor thread.
 #[repr(C)]
 pub(crate) struct DeviceExecutor {
     /// Cancel-safe queue callback table. This must remain the first field.
@@ -162,17 +127,43 @@ pub(crate) struct DeviceExecutor {
     list_head: UnsafeCell<LIST_ENTRY>,
     /// Captured requests admitted but not yet atomically removed from the CSQ.
     queued_requests: AtomicUsize,
-    /// System work item whose callback always runs at `PASSIVE_LEVEL`.
-    work_item: PIO_WORKITEM,
-    /// Wake/poll state protected by `lock`.
-    worker_state: UnsafeCell<WorkerState>,
-    /// Pinned request future accessed only by the unique polling worker.
+    /// Auto-reset event that wakes the dedicated PASSIVE_LEVEL actor thread.
+    wake_event: wdk_sys::KEVENT,
+    /// Running/draining/stopped lifecycle shared with admission and teardown.
+    lifecycle: AtomicU8,
+    /// Kernel handle used by teardown to join the dedicated actor thread.
+    thread_handle: wdk_sys::HANDLE,
+    /// Pinned request future accessed only by the dedicated actor thread.
     active: UnsafeCell<Option<DeviceTask>>,
+    /// Unit-test observation of whether a mailbox wake was published.
+    #[cfg(test)]
+    wake_requested: core::sync::atomic::AtomicBool,
     /// Device object that owns this stable executor storage.
     device: KernelDevice,
 }
 
 impl DeviceExecutor {
+    /// Returns the current actor lifecycle or terminates on an impossible discriminant.
+    fn actor_state(&self) -> ActorState {
+        ActorState::from_raw(self.lifecycle.load(Ordering::Acquire)).unwrap_or_else(|| {
+            KernelWideInconsistency::async_executor_state_corruption().bugcheck()
+        })
+    }
+
+    /// Closes request admission and starts terminal draining exactly once.
+    fn begin_drain(&self) {
+        match self.lifecycle.compare_exchange(
+            ActorState::Running as u8,
+            ActorState::Draining as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(raw) if ActorState::from_raw(raw) == Some(ActorState::Stopped) => {}
+            Err(_) => KernelWideInconsistency::async_executor_state_corruption().bugcheck(),
+        }
+    }
+
     /// Builds unlinked executor storage for placement in a unit-test device extension.
     #[cfg(test)]
     pub(super) fn test_storage(device: KernelDevice) -> Self {
@@ -181,9 +172,11 @@ impl DeviceExecutor {
             lock: 0,
             list_head: UnsafeCell::new(LIST_ENTRY::default()),
             queued_requests: AtomicUsize::new(0),
-            work_item: core::ptr::null_mut(),
-            worker_state: UnsafeCell::new(WorkerState::Dormant),
+            wake_event: wdk_sys::KEVENT::default(),
+            lifecycle: AtomicU8::new(ActorState::Running as u8),
+            thread_handle: core::ptr::null_mut(),
             active: UnsafeCell::new(None),
+            wake_requested: core::sync::atomic::AtomicBool::new(false),
             device,
         }
     }
@@ -207,13 +200,13 @@ impl DeviceExecutor {
     /// Returns whether a unit-test wake has reserved exactly one worker callback.
     #[cfg(test)]
     pub(super) fn test_worker_is_queued(&self) -> bool {
-        self.with_worker_state(|state| *state == WorkerState::Queued)
+        self.wake_requested.load(Ordering::Acquire)
     }
 
     /// Returns whether a unit-test executor has no reserved worker callback.
     #[cfg(test)]
     pub(super) fn test_worker_is_dormant(&self) -> bool {
-        self.with_worker_state(|state| *state == WorkerState::Dormant)
+        !self.wake_requested.load(Ordering::Acquire)
     }
 
     /// Initializes an executor directly inside stable device-extension storage.
@@ -223,7 +216,8 @@ impl DeviceExecutor {
     /// [`Self::release_at`]. The owning device must remain alive throughout that interval.
     /// # Errors
     ///
-    /// Returns an error when the CSQ or its PASSIVE_LEVEL work item cannot be initialized.
+    /// Returns an error when the CSQ or its dedicated PASSIVE_LEVEL actor thread cannot be
+    /// initialized.
     pub(crate) unsafe fn initialize_at(
         executor: *mut Self,
         device: KernelDevice,
@@ -237,9 +231,12 @@ impl DeviceExecutor {
                     lock: 0,
                     list_head: UnsafeCell::new(LIST_ENTRY::default()),
                     queued_requests: AtomicUsize::new(0),
-                    work_item: core::ptr::null_mut(),
-                    worker_state: UnsafeCell::new(WorkerState::Dormant),
+                    wake_event: wdk_sys::KEVENT::default(),
+                    lifecycle: AtomicU8::new(ActorState::Running as u8),
+                    thread_handle: core::ptr::null_mut(),
                     active: UnsafeCell::new(None),
+                    #[cfg(test)]
+                    wake_requested: core::sync::atomic::AtomicBool::new(false),
                     device,
                 },
             );
@@ -273,18 +270,43 @@ impl DeviceExecutor {
             if status < STATUS_SUCCESS {
                 return Err(DriverError::InsufficientResources);
             }
-            let work_item = unsafe {
-                // SAFETY: The live device owns this executor and therefore the work item.
-                ffi::IoAllocateWorkItem(device.as_ptr())
+            unsafe {
+                // SAFETY: The event is stable executor-owned storage initialized before the actor
+                // thread can observe it.
+                ffi::KeInitializeEvent(
+                    core::ptr::addr_of!(executor.wake_event).cast_mut(),
+                    wdk_sys::_EVENT_TYPE::SynchronizationEvent,
+                    0,
+                );
+            }
+            let mut attributes = wdk_sys::OBJECT_ATTRIBUTES {
+                Length: u32::try_from(core::mem::size_of::<wdk_sys::OBJECT_ATTRIBUTES>())
+                    .map_err(|_| DriverError::InvalidParameter)?,
+                Attributes: wdk_sys::OBJ_KERNEL_HANDLE,
+                ..wdk_sys::OBJECT_ATTRIBUTES::default()
             };
-            let Some(work_item) = NonNull::new(work_item) else {
+            let mut thread_handle = core::ptr::null_mut();
+            let status = unsafe {
+                // SAFETY: The stable executor address remains valid until release joins this
+                // kernel-handle-owned system thread.
+                ffi::PsCreateSystemThread(
+                    core::ptr::addr_of_mut!(thread_handle),
+                    wdk_sys::SYNCHRONIZE,
+                    core::ptr::addr_of_mut!(attributes),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    Some(device_executor_thread),
+                    core::ptr::from_ref(executor).cast_mut().cast::<c_void>(),
+                )
+            };
+            if status < STATUS_SUCCESS || thread_handle.is_null() {
                 return Err(DriverError::InsufficientResources);
-            };
+            }
             unsafe {
                 // SAFETY: Initialization retains exclusive access before the device is published.
-                core::ptr::addr_of!(executor.work_item)
+                core::ptr::addr_of!(executor.thread_handle)
                     .cast_mut()
-                    .write(work_item.as_ptr());
+                    .write(thread_handle);
             }
         }
 
@@ -294,24 +316,68 @@ impl DeviceExecutor {
     /// Releases executor-owned resources in device-extension storage.
     /// # Safety
     ///
-    /// No dispatch, completion callback, queued IRP, work item, active task, or lower request may
-    /// still reference this executor.
+    /// No new dispatch callback may enter this executor. This transition closes admission,
+    /// cancels queued IRPs, drains the active request and lower completions, joins the actor, and
+    /// only then destroys the executor storage.
     pub(crate) unsafe fn release_at(executor: *mut Self) {
-        let Some(executor) = (unsafe {
-            // SAFETY: The caller guarantees exclusive teardown access.
-            executor.as_mut()
-        }) else {
+        let Some(mut executor_address) = NonNull::new(executor) else {
             return;
         };
-        #[cfg(not(test))]
-        if let Some(work_item) = NonNull::new(executor.work_item) {
-            unsafe {
-                // SAFETY: This work item was allocated once during successful initialization and
-                // the teardown precondition excludes any queued callback.
-                ffi::IoFreeWorkItem(work_item.as_ptr());
+        let executor = unsafe {
+            // SAFETY: Teardown keeps the stable device extension alive until the actor is joined.
+            executor_address.as_ref()
+        };
+        executor.begin_drain();
+        loop {
+            let irp = executor.remove_next_irp(core::ptr::null_mut());
+            if irp.is_null() {
+                break;
             }
-            executor.work_item = core::ptr::null_mut();
+            let owned = OwnedIrp::from_queued_raw(executor.device, irp);
+            let _status = owned.complete_cancelled();
         }
+        executor.request_poll();
+
+        #[cfg(not(test))]
+        {
+            let thread_handle = executor.thread_handle;
+            if thread_handle.is_null() {
+                KernelWideInconsistency::async_executor_state_corruption().bugcheck();
+            }
+            let wait_status = unsafe {
+                // SAFETY: Initialization stored a kernel handle for the sole actor thread.
+                ffi::ZwWaitForSingleObject(thread_handle, 0, core::ptr::null_mut())
+            };
+            if wait_status < STATUS_SUCCESS {
+                KernelWideInconsistency::async_executor_state_corruption().bugcheck();
+            }
+            let close_status = unsafe {
+                // SAFETY: The actor has terminated and teardown owns its sole kernel handle.
+                ffi::ZwClose(thread_handle)
+            };
+            if close_status < STATUS_SUCCESS {
+                KernelWideInconsistency::async_executor_state_corruption().bugcheck();
+            }
+        }
+        #[cfg(test)]
+        executor
+            .lifecycle
+            .store(ActorState::Stopped as u8, Ordering::Release);
+
+        if executor.actor_state() != ActorState::Stopped
+            || executor.queued_requests.load(Ordering::Acquire) != 0
+            || unsafe {
+                // SAFETY: The actor is joined, so teardown exclusively observes the task slot.
+                (*executor.active.get()).is_some()
+            }
+        {
+            KernelWideInconsistency::async_executor_state_corruption().bugcheck();
+        }
+        let executor = unsafe {
+            // SAFETY: Joining the actor and closing admission grants exclusive teardown access.
+            executor_address.as_mut()
+        };
+        executor.thread_handle = core::ptr::null_mut();
         unsafe {
             // SAFETY: Teardown is exclusive and releases any Rust-owned task allocation exactly
             // once before the I/O Manager frees the extension bytes.
@@ -329,6 +395,9 @@ impl DeviceExecutor {
             // SAFETY: The device extension remains stable throughout request capture and queueing.
             executor.as_ref()
         };
+        if executor.actor_state() != ActorState::Running {
+            return received.complete_result(Err(DriverError::InvalidDeviceRequest));
+        }
         let reservation = match QueueSlotReservation::acquire(&executor.queued_requests) {
             Ok(reservation) => reservation,
             Err(error) => return received.complete_result(Err(error)),
@@ -409,79 +478,41 @@ impl DeviceExecutor {
         self.request_poll();
     }
 
-    /// Records that the active task must be polled from a PASSIVE_LEVEL worker.
+    /// Signals the dedicated PASSIVE_LEVEL actor that mailbox or continuation work is ready.
     fn request_poll(&self) {
-        let should_queue = self.with_worker_state(WorkerState::request_poll);
         #[cfg(not(test))]
-        if should_queue {
-            unsafe {
-                // SAFETY: The transition to `Queued` grants exactly one work-item callback the
-                // right to enter polling, and this executor address is stable device storage.
-                ffi::IoQueueWorkItem(
-                    self.work_item,
-                    Some(device_executor_worker),
-                    wdk_sys::_WORK_QUEUE_TYPE::DelayedWorkQueue,
-                    core::ptr::from_ref(self).cast_mut().cast::<c_void>(),
-                );
-            }
+        unsafe {
+            // SAFETY: The event is initialized before thread publication and remains live until
+            // every waker has been drained and the actor thread is joined.
+            let _previous = ffi::KeSetEvent(core::ptr::addr_of!(self.wake_event).cast_mut(), 0, 0);
         }
         #[cfg(test)]
-        let _: bool = should_queue;
+        self.wake_requested.store(true, Ordering::Release);
     }
 
-    /// Runs one closure while holding the executor spin lock.
-    fn with_worker_state<T>(&self, operation: impl FnOnce(&mut WorkerState) -> T) -> T {
-        #[cfg(not(test))]
-        {
-            let old_irql = unsafe {
-                // SAFETY: The spin lock belongs to this stable executor.
-                ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
-            };
-            let result = operation(unsafe {
-                // SAFETY: The spin lock serializes every access to `worker_state`.
-                &mut *self.worker_state.get()
-            });
-            unsafe {
-                // SAFETY: Releases the exact acquisition above at its saved IRQL.
-                ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
-            }
-            result
-        }
-        #[cfg(test)]
-        {
-            operation(unsafe {
-                // SAFETY: Executor unit tests access this state from one thread only.
-                &mut *self.worker_state.get()
-            })
-        }
-    }
-
-    /// Polls request futures until one awaits an unwoken lower operation or the mailbox is empty.
+    /// Owns and polls every device future on one system thread until terminal draining completes.
     #[cfg(not(test))]
     fn run(&self) {
-        if !self.with_worker_state(WorkerState::enter_worker) {
-            KernelWideInconsistency::async_executor_state_corruption().bugcheck();
-        }
         loop {
             if unsafe {
-                // SAFETY: `Polling` grants this worker exclusive access to the active slot.
+                // SAFETY: The dedicated actor thread is the sole accessor of the active slot.
                 (*self.active.get()).is_none()
             } && !self.install_next_task()
             {
-                match self.with_worker_state(WorkerState::settle_pending) {
-                    WorkerContinuation::Repoll => continue,
-                    WorkerContinuation::Sleep => return,
-                    WorkerContinuation::Invalid => {
-                        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
-                    }
+                if self.actor_state() == ActorState::Draining {
+                    self.lifecycle
+                        .store(ActorState::Stopped as u8, Ordering::Release);
+                    return;
                 }
+                self.wait_for_wake();
+                continue;
             }
 
             let poll = {
                 let waker = self.waker();
                 let mut context = Context::from_waker(&waker);
                 let active = unsafe {
-                    // SAFETY: Only the unique `Polling` worker accesses the pinned active task.
+                    // SAFETY: Only the dedicated actor thread accesses the pinned active task.
                     &mut *self.active.get()
                 };
                 let Some(task) = active.as_mut() else {
@@ -491,18 +522,32 @@ impl DeviceExecutor {
             };
             match poll {
                 Poll::Ready(()) => unsafe {
-                    // SAFETY: This is the unique polling worker, and a ready task retains no
+                    // SAFETY: This is the dedicated actor thread, and a ready task retains no
                     // terminal IRP authority after its async body returns.
                     *self.active.get() = None;
                 },
-                Poll::Pending => match self.with_worker_state(WorkerState::settle_pending) {
-                    WorkerContinuation::Repoll => {}
-                    WorkerContinuation::Sleep => return,
-                    WorkerContinuation::Invalid => {
-                        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
-                    }
-                },
+                Poll::Pending => self.wait_for_wake(),
             }
+        }
+    }
+
+    /// Blocks the actor until queue admission, lower-I/O completion, or teardown signals its event.
+    #[cfg(not(test))]
+    fn wait_for_wake(&self) {
+        let status = unsafe {
+            // SAFETY: The actor is the only waiter on this initialized auto-reset event.
+            ffi::KeWaitForSingleObject(
+                core::ptr::addr_of!(self.wake_event)
+                    .cast_mut()
+                    .cast::<c_void>(),
+                wdk_sys::_KWAIT_REASON::Executive,
+                i8::try_from(wdk_sys::_MODE::KernelMode).unwrap_or(0),
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        if status < STATUS_SUCCESS {
+            KernelWideInconsistency::async_executor_state_corruption().bugcheck();
         }
     }
 
@@ -652,7 +697,7 @@ unsafe fn executor_waker_clone(data: *const ()) -> RawWaker {
 /// Raw-waker wake records a PASSIVE_LEVEL poll request.
 /// # Safety
 ///
-/// `data` must identify a live, device-stable `DeviceExecutor` whose work item remains allocated.
+/// `data` must identify a live, device-stable `DeviceExecutor` whose wake event remains initialized.
 #[cfg(not(test))]
 unsafe fn executor_waker_wake(data: *const ()) {
     let Some(executor) = NonNull::new(data.cast_mut().cast::<DeviceExecutor>()) else {
@@ -696,20 +741,27 @@ static EXECUTOR_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 );
 
 #[cfg(not(test))]
-/// PASSIVE_LEVEL system work-item callback.
+/// Dedicated PASSIVE_LEVEL device actor thread.
 /// # Safety
 ///
-/// `context` must be the stable `DeviceExecutor` address passed to `IoQueueWorkItem`, and device
-/// teardown must remain excluded for the duration of the callback.
-unsafe extern "C" fn device_executor_worker(_device: wdk_sys::PDEVICE_OBJECT, context: PVOID) {
+/// `context` must be the stable `DeviceExecutor` address passed to `PsCreateSystemThread`.
+unsafe extern "C" fn device_executor_thread(context: PVOID) {
     let Some(executor) = NonNull::new(context.cast::<DeviceExecutor>()) else {
+        let _status = unsafe {
+            // SAFETY: This callback is running as a system thread and cannot return normally.
+            ffi::PsTerminateSystemThread(DriverError::InternalInvariantViolation.ntstatus())
+        };
         return;
     };
     unsafe {
-        // SAFETY: `IoQueueWorkItem` received this stable executor address as its context.
+        // SAFETY: `PsCreateSystemThread` received this stable executor address as its context.
         executor.as_ref()
     }
     .run();
+    let _status = unsafe {
+        // SAFETY: The actor published `Stopped` and released its task before terminating itself.
+        ffi::PsTerminateSystemThread(STATUS_SUCCESS)
+    };
 }
 
 #[cfg(not(test))]
@@ -853,14 +905,27 @@ fn mark_pending_for_csq_test(irp: KernelIrp) {
         Ok(bit) => bit,
         Err(_) => KernelWideInconsistency::async_executor_state_corruption().bugcheck(),
     };
-    let mut stack = match irp.current_stack() {
-        Ok(stack) => stack,
-        Err(_) => KernelWideInconsistency::async_executor_state_corruption().bugcheck(),
+    let mut raw_irp = irp.irp;
+    let raw_irp = unsafe {
+        // SAFETY: The test executor owns this not-yet-inserted IRP.
+        raw_irp.as_mut()
     };
-    let stack = unsafe {
-        // SAFETY: The test executor owns this not-yet-inserted IRP and models the exact stack-bit
-        // transition that the production IoCsqInsertIrp call performs.
-        stack.stack.as_mut()
+    let overlay = unsafe {
+        // SAFETY: The test fixture initialized the current-stack tail overlay.
+        raw_irp.Tail.Overlay
+    };
+    let current_stack = unsafe {
+        // SAFETY: The list overlay contains the current stack fixture pointer.
+        overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation
+    };
+    let Some(stack) = (unsafe {
+        // SAFETY: Successful queue capture already validated this fixture stack pointer.
+        current_stack.as_mut()
+    }) else {
+        KernelWideInconsistency::async_executor_state_corruption().bugcheck();
     };
     stack.Control |= pending_bit;
 }
@@ -937,54 +1002,6 @@ fn queued_irp_matches_context(irp: PIRP, context: PVOID) -> bool {
     unsafe {
         // SAFETY: The CSQ lock retains queue membership, so context publication cannot be taken
         // until this callback returns its candidate decision.
-        irp.queue_context()
-    }
-    .matches_cancellation_context(context)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{WorkerContinuation, WorkerState};
-
-    /// # Panics
-    ///
-    /// Panics when repeated wakes can enqueue more than one PASSIVE_LEVEL worker.
-    #[test]
-    fn dormant_executor_queues_exactly_one_worker() {
-        let mut state = WorkerState::Dormant;
-        assert!(state.request_poll());
-        assert_eq!(state, WorkerState::Queued);
-        assert!(!state.request_poll());
-        assert_eq!(state, WorkerState::Queued);
-    }
-
-    /// # Panics
-    ///
-    /// Panics when a wake racing with `Poll::Pending` can be lost.
-    #[test]
-    fn polling_wake_forces_repoll_before_sleep() {
-        let mut state = WorkerState::Queued;
-        assert!(state.enter_worker());
-        assert!(!state.request_poll());
-        assert_eq!(state, WorkerState::PollingWoken);
-        assert_eq!(state.settle_pending(), WorkerContinuation::Repoll);
-        assert_eq!(state, WorkerState::Polling);
-        assert_eq!(state.settle_pending(), WorkerContinuation::Sleep);
-        assert_eq!(state, WorkerState::Dormant);
-    }
-
-    /// # Panics
-    ///
-    /// Panics when an unowned worker can enter the polling section.
-    #[test]
-    fn only_queued_worker_can_enter_polling() {
-        for state in [
-            WorkerState::Dormant,
-            WorkerState::Polling,
-            WorkerState::PollingWoken,
-        ] {
-            let mut state = state;
-            assert!(!state.enter_worker());
-        }
+        irp.published_queue_context_matches(context)
     }
 }

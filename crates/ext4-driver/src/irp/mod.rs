@@ -413,12 +413,6 @@ impl ActiveIrp<'_> {
             .ok_or(DriverError::InternalInvariantViolation)
     }
 
-    /// Returns the live raw IRP pointer for a kernel helper that takes over request semantics.
-    #[cfg(not(test))]
-    pub(crate) fn as_raw_irp(&mut self) -> PIRP {
-        self.irp.as_ptr()
-    }
-
     /// Returns METHOD_BUFFERED input bytes tied to this active owner borrow.
     /// # Errors
     ///
@@ -524,6 +518,7 @@ pub(crate) struct RequestorProcess(NonNull<c_void>);
 
 impl RequestorProcess {
     /// Returns the opaque process pointer for FsRtl.
+    #[cfg(not(test))]
     pub(crate) const fn as_ptr(self) -> *mut c_void {
         self.0.as_ptr()
     }
@@ -556,6 +551,14 @@ impl ActiveFileObject<'_> {
     /// Returns the raw pointer for native APIs whose call cannot outlive this view.
     pub(crate) const fn as_ptr(self) -> *mut wdk_sys::FILE_OBJECT {
         self.address.as_ptr()
+    }
+
+    /// Returns the related FILE_OBJECT retained by this active create request, when present.
+    pub(crate) fn related_file_object(self) -> Option<Self> {
+        KernelFileObject::from_raw(self.as_ref().RelatedFileObject).map(|address| Self {
+            address,
+            owner: core::marker::PhantomData,
+        })
     }
 }
 
@@ -895,6 +898,36 @@ impl KernelIrp {
             // CSQ removal grants the sole take right, and the slot was cleared before rebuilding.
             Box::from_raw(context.as_ptr())
         }
+    }
+
+    /// Tests the published queue context without allowing its reference to escape the CSQ lock.
+    ///
+    /// # Safety
+    /// The caller must hold the owning cancel-safe queue lock so removal cannot take or free the
+    /// context until this method returns.
+    unsafe fn published_queue_context_matches(self, cancellation: *mut c_void) -> bool {
+        let irp = unsafe {
+            // SAFETY: The caller's CSQ lock contract keeps the queued IRP and context live.
+            self.irp.as_ref()
+        };
+        let overlay = unsafe {
+            // SAFETY: Queue publication selected the IRP tail overlay.
+            &irp.Tail.Overlay
+        };
+        let driver_storage = unsafe {
+            // SAFETY: Queue publication selected the first nested union arm for driver context.
+            &overlay.__bindgen_anon_1.__bindgen_anon_1
+        };
+        let Some(context) = NonNull::new(driver_storage.DriverContext[0].cast::<QueueContext>())
+        else {
+            crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
+                .bugcheck();
+        };
+        unsafe {
+            // SAFETY: The CSQ lock keeps this published Box allocation live for the call.
+            context.as_ref()
+        }
+        .matches_cancellation_context(cancellation)
     }
 
     /// Returns the raw IRP pointer for writes to the WDK completion fields.
@@ -3086,13 +3119,13 @@ mod tests {
     use wdk_sys::{STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
 
     use super::{
-        CREATE_DISPOSITION_SHIFT, CreateAction, CreateCompletion, CreateDisposition,
-        CreateNameInterpretation, CreateReparsePointMode, CreateSymlinkReparseBuffer,
-        CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering,
-        CurrentIrpStackLocation, DataIoKind, DeviceExecutor, DirectoryChangeFilter,
-        DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
-        DirectoryInformationClass, DirectoryWatchScope, DispatchMajor, DispatchTarget,
-        EaEntryEmission, EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION,
+        ActiveFileObject, CREATE_DISPOSITION_SHIFT, CreateAction, CreateCompletion,
+        CreateDisposition, CreateNameInterpretation, CreateReparsePointMode,
+        CreateSymlinkReparseBuffer, CreateSynchronizationMode, CreateTargetRequirement,
+        CreateTransferBuffering, CurrentIrpStackLocation, DataIoKind, DeviceExecutor,
+        DirectoryChangeFilter, DirectoryControlMinorFunction, DirectoryCursorPosition,
+        DirectoryEntryEmission, DirectoryInformationClass, DirectoryWatchScope, DispatchMajor,
+        DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION,
         FILE_OPEN_IF_DISPOSITION, FILE_OVERWRITE_DISPOSITION, FILE_OVERWRITE_IF_DISPOSITION,
         FILE_SUPERSEDE_DISPOSITION, FileSystemControlMinorFunction, FsControlCode,
         InformationLength, IrpBufferLength, IrpCompletion, KernelIrp, OwnedIrp,
@@ -3146,6 +3179,16 @@ mod tests {
         u32::from(stack.Control) & wdk_sys::SL_PENDING_RETURNED == wdk_sys::SL_PENDING_RETURNED
     }
 
+    /// Builds a lifetime-bound stack view from one live unit-test fixture.
+    fn current_stack_fixture(
+        stack: &mut wdk_sys::IO_STACK_LOCATION,
+    ) -> Result<CurrentIrpStackLocation<'_>, DriverError> {
+        Ok(CurrentIrpStackLocation {
+            stack: NonNull::from(stack),
+            owner: core::marker::PhantomData,
+        })
+    }
+
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
@@ -3172,10 +3215,10 @@ mod tests {
     fn decoded_dispatch_target_preserves_pointers() {
         let device = opaque::<wdk_sys::DEVICE_OBJECT>();
         let irp = opaque::<wdk_sys::IRP>();
-        let decoded = DispatchTarget::decode(device, irp);
+        let decoded = ReceivedIrp::decode(device, irp);
         assert!(decoded.is_ok());
-        if let Ok(target) = decoded {
-            assert_eq!(target.device().as_ptr(), device);
+        if let Ok(received) = decoded {
+            assert_eq!(received.device().as_ptr(), device);
         }
     }
 
@@ -3714,10 +3757,26 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn current_stack_location_rejects_null_pointer() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut irp = wdk_sys::IRP::default();
+        let mut received = ReceivedIrp::decode(
+            core::ptr::addr_of_mut!(device),
+            core::ptr::addr_of_mut!(irp),
+        );
+        assert!(received.is_ok());
         assert_eq!(
-            CurrentIrpStackLocation::from_raw(core::ptr::null_mut())
-                .err()
-                .map(crate::kernel::status::DriverError::ntstatus),
+            received
+                .as_mut()
+                .map(|received| {
+                    received.with_active(|active| {
+                        active
+                            .current_stack()
+                            .err()
+                            .map(crate::kernel::status::DriverError::ntstatus)
+                    })
+                })
+                .ok()
+                .flatten(),
             Some(STATUS_INVALID_PARAMETER)
         );
     }
@@ -3733,8 +3792,7 @@ mod tests {
         };
 
         assert_eq!(
-            CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack))
-                .map(|current| current.file_system_control_minor()),
+            current_stack_fixture(&mut stack).map(|current| current.file_system_control_minor()),
             Ok(FileSystemControlMinorFunction::Unsupported)
         );
     }
@@ -3750,8 +3808,7 @@ mod tests {
         };
 
         assert_eq!(
-            CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack))
-                .map(|current| current.directory_control_minor()),
+            current_stack_fixture(&mut stack).map(|current| current.directory_control_minor()),
             Ok(DirectoryControlMinorFunction::Unsupported)
         );
     }
@@ -3771,7 +3828,7 @@ mod tests {
             OutputBufferLength: 16,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(
@@ -3811,14 +3868,14 @@ mod tests {
                 Type3InputBuffer: core::ptr::null_mut(),
             };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let control = current.file_system_control();
             assert!(control.is_ok());
             if let Ok(control) = control {
                 assert_eq!(
-                    Some(control.file_object()),
+                    current.file_object().ok().map(ActiveFileObject::address),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 assert_eq!(control.input_buffer_length().as_usize(), 32);
@@ -3847,7 +3904,7 @@ mod tests {
                 Type3InputBuffer: core::ptr::null_mut(),
             };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(
@@ -3914,14 +3971,14 @@ mod tests {
             EaLength: 48,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let create = current.create();
             assert!(create.is_ok());
             if let Ok(create) = create {
                 assert_eq!(
-                    Some(create.file_object()),
+                    current.file_object().ok().map(ActiveFileObject::address),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 let parameters = create.parameters();
@@ -3980,7 +4037,7 @@ mod tests {
                 EaLength: 0,
             };
 
-            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            let current = current_stack_fixture(&mut stack);
             assert!(current.is_ok());
             if let Ok(current) = current {
                 assert_eq!(current.create().err(), Some(DriverError::InvalidParameter));
@@ -4025,7 +4082,7 @@ mod tests {
                 EaLength: 0,
             };
 
-            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            let current = current_stack_fixture(&mut stack);
             assert!(current.is_ok());
             let Ok(current) = current else {
                 return;
@@ -4064,7 +4121,7 @@ mod tests {
             EaLength: 0,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(current.create().err(), Some(DriverError::NotSupported));
@@ -4094,7 +4151,7 @@ mod tests {
             EaLength: 0,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(current.create().err(), Some(DriverError::NotSupported));
@@ -4123,7 +4180,7 @@ mod tests {
             EaLength: 0,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let create = current.create();
@@ -4170,7 +4227,7 @@ mod tests {
             EaLength: 0,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let create = current.create();
@@ -4203,7 +4260,7 @@ mod tests {
             EaLength: 0,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let create = current.create();
@@ -4239,7 +4296,7 @@ mod tests {
             EaLength: 0,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let create = current.create();
@@ -4275,7 +4332,7 @@ mod tests {
             EaLength: 0,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(
@@ -4311,7 +4368,7 @@ mod tests {
             EaLength: 0,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(
@@ -4343,7 +4400,7 @@ mod tests {
             EaLength: 0,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(
@@ -4375,14 +4432,14 @@ mod tests {
             EaIndex: 3,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let query = current.query_ea();
             assert!(query.is_ok());
             if let Ok(query) = query {
                 assert_eq!(
-                    current.file_object().ok(),
+                    current.file_object().ok().map(ActiveFileObject::address),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 assert_eq!(query.entry_emission(), EaEntryEmission::Single);
@@ -4413,7 +4470,7 @@ mod tests {
             EaIndex: 3,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let query = current.query_ea();
@@ -4435,14 +4492,14 @@ mod tests {
         stack.Parameters.SetEa =
             wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_12 { Length: 64 };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let set = current.set_ea();
             assert!(set.is_ok());
             if let Ok(set) = set {
                 assert_eq!(
-                    Some(set.file_object()),
+                    current.file_object().ok().map(ActiveFileObject::address),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 assert_eq!(set.length().as_usize(), 64);
@@ -4465,14 +4522,14 @@ mod tests {
             Length: 256,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let query = current.query_security();
             assert!(query.is_ok());
             if let Ok(query) = query {
                 assert_eq!(
-                    Some(query.file_object()),
+                    current.file_object().ok().map(ActiveFileObject::address),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 assert_eq!(
@@ -4506,7 +4563,7 @@ mod tests {
             Length: 256,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(
@@ -4535,7 +4592,7 @@ mod tests {
             Length: 256,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(
@@ -4560,7 +4617,7 @@ mod tests {
             FsInformationClass: wdk_sys::_FSINFOCLASS::FileFsLabelInformation,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let set = current.set_volume();
@@ -4584,7 +4641,7 @@ mod tests {
             FsInformationClass: wdk_sys::_FSINFOCLASS::FileFsFullSizeInformation,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let query = current.query_volume();
@@ -4611,7 +4668,7 @@ mod tests {
             FsInformationClass: 0x7FFF_FFFF,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(
@@ -4639,14 +4696,14 @@ mod tests {
             SecurityDescriptor: descriptor.as_ptr(),
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let set = current.set_security();
             assert!(set.is_ok());
             if let Ok(set) = set {
                 assert_eq!(
-                    Some(set.file_object()),
+                    current.file_object().ok().map(ActiveFileObject::address),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 assert_eq!(
@@ -4693,7 +4750,7 @@ mod tests {
                 },
             };
 
-            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            let current = current_stack_fixture(&mut stack);
             assert!(current.is_ok());
             if let Ok(current) = current {
                 let read = current.read();
@@ -4730,7 +4787,7 @@ mod tests {
                 },
             };
 
-            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            let current = current_stack_fixture(&mut stack);
             assert!(current.is_ok());
             if let Ok(current) = current {
                 assert_eq!(
@@ -4778,7 +4835,7 @@ mod tests {
                 },
             };
 
-            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            let current = current_stack_fixture(&mut stack);
             assert!(current.is_ok());
             if let Ok(current) = current {
                 let write = current.write();
@@ -4809,7 +4866,7 @@ mod tests {
             ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: -3 },
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(
@@ -4836,13 +4893,16 @@ mod tests {
                 Flags: flags,
                 ..wdk_sys::IRP::default()
             };
-            let target = DispatchTarget::decode(
+            let mut received = ReceivedIrp::decode(
                 core::ptr::addr_of_mut!(device),
                 core::ptr::addr_of_mut!(irp),
             );
-            assert!(target.is_ok());
-            if let Ok(target) = target {
-                assert_eq!(target.data_io_kind(), expected);
+            assert!(received.is_ok());
+            if let Ok(received) = received.as_mut() {
+                assert_eq!(
+                    received.with_active(|active| active.data_io_kind()),
+                    expected
+                );
             }
         }
     }
@@ -4893,7 +4953,7 @@ mod tests {
             EaLength: 0,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let create = current.create();
@@ -4933,7 +4993,7 @@ mod tests {
                 wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let set = current.set_file();
@@ -4958,14 +5018,14 @@ mod tests {
             FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let query = current.query_file();
             assert!(query.is_ok());
             if let Ok(query) = query {
                 assert_eq!(
-                    Some(query.file_object()),
+                    current.file_object().ok().map(ActiveFileObject::address),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 assert_eq!(query.length().as_usize(), 64);
@@ -5005,7 +5065,7 @@ mod tests {
                 ..wdk_sys::IO_STACK_LOCATION::default()
             };
 
-            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            let current = current_stack_fixture(&mut stack);
             assert!(current.is_ok());
             if let Ok(current) = current {
                 let query = current.query_file();
@@ -5034,14 +5094,14 @@ mod tests {
                 wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let set = current.set_file();
             assert!(set.is_ok());
             if let Ok(set) = set {
                 assert_eq!(
-                    Some(set.file_object()),
+                    current.file_object().ok().map(ActiveFileObject::address),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 assert_eq!(set.length().as_usize(), 40);
@@ -5064,7 +5124,7 @@ mod tests {
             FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             assert_eq!(
@@ -5096,14 +5156,14 @@ mod tests {
             FileIndex: 3,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let query = current.query_directory();
             assert!(query.is_ok());
             if let Ok(query) = query {
                 assert_eq!(
-                    current.file_object().ok(),
+                    current.file_object().ok().map(ActiveFileObject::address),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 assert_eq!(query.cursor_position(), DirectoryCursorPosition::Restart);
@@ -5134,7 +5194,7 @@ mod tests {
             FileIndex: 0,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let query = current.query_directory();
@@ -5162,7 +5222,7 @@ mod tests {
             FileIndex: 3,
         };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let query = current.query_directory();
@@ -5199,14 +5259,14 @@ mod tests {
                 CompletionFilter: completion_filter,
             };
 
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let notification = current.notify_directory();
             assert!(notification.is_ok());
             if let Ok(notification) = notification {
                 assert_eq!(
-                    Some(notification.file_object()),
+                    current.file_object().ok().map(ActiveFileObject::address),
                     KernelFileObject::from_raw(file_object.as_ptr())
                 );
                 assert_eq!(
@@ -5227,7 +5287,7 @@ mod tests {
         );
 
         stack.Flags = 0;
-        let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+        let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
             let notification = current.notify_directory();
@@ -5260,7 +5320,7 @@ mod tests {
                     CompletionFilter: completion_filter,
                 };
 
-            let current = CurrentIrpStackLocation::from_raw(core::ptr::addr_of_mut!(stack));
+            let current = current_stack_fixture(&mut stack);
             assert!(current.is_ok());
             if let Ok(current) = current {
                 assert_eq!(

@@ -2823,7 +2823,7 @@ fn release_file_contexts(file_object: ActiveFileObject<'_>) {
 #[cfg(test)]
 mod tests {
     use crate::irp::{
-        DataIoKind, DirectoryInformationClass, DispatchTarget, ReadStartingPoint,
+        DataIoKind, DirectoryInformationClass, ReadStartingPoint, ReceivedIrp,
         RegularFileWriteAccess, WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
@@ -2958,13 +2958,13 @@ mod tests {
         stack: &mut wdk_sys::IO_STACK_LOCATION,
         irp: &mut wdk_sys::IRP,
         device: &mut wdk_sys::DEVICE_OBJECT,
-    ) -> Result<DispatchTarget, DriverError> {
+    ) -> Result<ReceivedIrp, DriverError> {
         irp.Tail
             .Overlay
             .__bindgen_anon_2
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::addr_of_mut!(*stack);
-        DispatchTarget::decode(
+        ReceivedIrp::decode(
             core::ptr::addr_of_mut!(*device),
             core::ptr::addr_of_mut!(*irp),
         )
@@ -3140,9 +3140,9 @@ mod tests {
         let target = target_from_stack(&mut stack, &mut irp, &mut device);
         assert!(target.is_ok());
 
-        if let Ok(target) = target {
+        if let Ok(mut target) = target {
             assert_eq!(
-                super::FlushVolume::decode(target).err(),
+                target.with_active(|active| super::FlushVolume::decode(active).err()),
                 Some(DriverError::InvalidDeviceRequest)
             );
         }
@@ -3537,22 +3537,20 @@ mod tests {
             .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
 
         let mut device = wdk_sys::DEVICE_OBJECT::default();
-        let target = DispatchTarget::decode(
+        let mut target = ReceivedIrp::decode(
             core::ptr::addr_of_mut!(device),
             core::ptr::addr_of_mut!(irp),
         );
         assert!(target.is_ok());
-        if let Ok(target) = target {
-            let stack = target.current_stack().and_then(|stack| stack.set_file());
-            assert!(stack.is_ok());
-            let Ok(stack) = stack else {
-                return;
-            };
-            let parsed = super::RenameTargetPath::parse(
-                target,
-                stack.length(),
-                super::RenameInformationFormat::ReplaceIfExistsByte,
-            );
+        if let Ok(target) = target.as_mut() {
+            let parsed = target.with_active(|active| {
+                let stack = active.current_stack()?.set_file()?;
+                super::RenameTargetPath::parse(
+                    active,
+                    stack.length(),
+                    super::RenameInformationFormat::ReplaceIfExistsByte,
+                )
+            });
             assert!(parsed.is_ok());
             if let Ok(parsed) = parsed {
                 assert_eq!(

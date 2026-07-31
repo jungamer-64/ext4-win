@@ -364,6 +364,11 @@ impl<'owner> UninitializedFileObject<'owner> {
         self.file_object.address()
     }
 
+    /// Returns the related opened FILE_OBJECT retained by this active create IRP, when present.
+    pub(crate) fn related_file_object(&self) -> Option<ActiveFileObject<'owner>> {
+        self.file_object.related_file_object()
+    }
+
     /// Returns the immutable create-time FILE_OBJECT.
     pub(crate) fn as_ref(&self) -> &FILE_OBJECT {
         self.file_object.as_ref()
@@ -3574,7 +3579,9 @@ mod tests {
 
     use ext4_core::{DirectoryNodeId, Ext4Name, FileOffset, NodeId};
 
-    use crate::irp::{DataIoKind, DirectoryEntryIndex, RegularFileWriteAccess};
+    use crate::irp::{
+        ActiveFileObject, DataIoKind, DirectoryEntryIndex, ReceivedIrp, RegularFileWriteAccess,
+    };
     use crate::kernel::status::DriverError;
 
     use super::{
@@ -3600,9 +3607,27 @@ mod tests {
         }
     }
 
-    /// Builds the typed FILE_OBJECT boundary from a local non-null test object.
-    fn kernel_file_object(file: &mut wdk_sys::FILE_OBJECT) -> Option<KernelFileObject> {
-        KernelFileObject::from_raw(core::ptr::addr_of_mut!(*file))
+    /// Runs one decoder against a FILE_OBJECT whose lifetime is owned by an active test IRP.
+    fn with_active_file_object<R>(
+        file: &mut wdk_sys::FILE_OBJECT,
+        operation: impl for<'view> FnOnce(ActiveFileObject<'view>) -> Result<R, DriverError>,
+    ) -> Result<R, DriverError> {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: core::ptr::from_mut(file),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        let mut irp = wdk_sys::IRP::default();
+        irp.Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::from_mut(&mut stack);
+        let mut received = ReceivedIrp::decode(
+            core::ptr::from_mut(&mut device),
+            core::ptr::from_mut(&mut irp),
+        )?;
+        received.with_active(|active| operation(active.current_stack()?.file_object()?))
     }
 
     /// Builds an isolated FCB for tests that exercise only immutable data-plane fields.
@@ -3769,14 +3794,12 @@ mod tests {
     #[test]
     fn unopened_object_without_contexts_is_invalid_parameter() {
         let mut file = file_object_with_contexts(core::ptr::null_mut(), core::ptr::null_mut());
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
 
         assert_eq!(
-            OpenedObject::decode(file_object).err(),
+            with_active_file_object(&mut file, |file_object| {
+                OpenedObject::decode(file_object).map(|_| ())
+            })
+            .err(),
             Some(DriverError::InvalidParameter)
         );
     }
@@ -3800,29 +3823,23 @@ mod tests {
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        let directory = OpenedDirectory::decode(file_object);
-        assert!(directory.is_ok());
-        let Ok(mut directory) = directory else {
-            return;
-        };
-
-        assert_eq!(directory.id(), DirectoryNodeId::ROOT);
-        assert_eq!(
-            directory.cursor_mut().next_entry(),
-            DirectoryEntryIndex::from_u32(0)
-        );
-        directory
-            .cursor_mut()
-            .seek(DirectoryEntryIndex::from_u32(7));
-        assert_eq!(
-            directory.cursor_mut().next_entry(),
-            DirectoryEntryIndex::from_u32(7)
-        );
+        let result = with_active_file_object(&mut file, |file_object| {
+            let mut directory = OpenedDirectory::decode(file_object)?;
+            assert_eq!(directory.id(), DirectoryNodeId::ROOT);
+            assert_eq!(
+                directory.cursor_mut().next_entry(),
+                DirectoryEntryIndex::from_u32(0)
+            );
+            directory
+                .cursor_mut()
+                .seek(DirectoryEntryIndex::from_u32(7));
+            assert_eq!(
+                directory.cursor_mut().next_entry(),
+                DirectoryEntryIndex::from_u32(7)
+            );
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
     }
 
     /// # Panics
@@ -3844,31 +3861,21 @@ mod tests {
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        let directory = OpenedDirectory::decode(file_object);
-        assert!(directory.is_ok());
-        let Ok(mut directory) = directory else {
-            return;
-        };
-
-        let first = directory.notification_directory_name();
-        assert!(first.is_ok());
-        let Ok(first) = first else {
-            return;
-        };
-        let second = directory.notification_directory_name();
-        assert_eq!(second, Ok(first));
-        let descriptor = unsafe {
-            // SAFETY: The descriptor is owned by the live CCB and the test
-            // has not executed its cleanup or close transition.
-            first.as_ref()
-        };
-        assert_eq!(descriptor.Length, descriptor.MaximumLength);
-        assert!(!descriptor.Buffer.is_null());
+        let result = with_active_file_object(&mut file, |file_object| {
+            let mut directory = OpenedDirectory::decode(file_object)?;
+            let first = directory.notification_directory_name()?;
+            let second = directory.notification_directory_name();
+            assert_eq!(second, Ok(first));
+            let descriptor = unsafe {
+                // SAFETY: The descriptor is owned by the live CCB and the test
+                // has not executed its cleanup or close transition.
+                first.as_ref()
+            };
+            assert_eq!(descriptor.Length, descriptor.MaximumLength);
+            assert!(!descriptor.Buffer.is_null());
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
     }
 
     /// # Panics
@@ -3932,14 +3939,11 @@ mod tests {
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-
         assert_eq!(
-            OpenedRegularFile::decode(file_object).err(),
+            with_active_file_object(&mut file, |file_object| {
+                OpenedRegularFile::decode(file_object).map(|_| ())
+            })
+            .err(),
             Some(DriverError::Core(ext4_core::Error::WrongInodeKind))
         );
     }
@@ -3963,14 +3967,11 @@ mod tests {
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-
         assert_eq!(
-            OpenedDirectory::decode(file_object).err(),
+            with_active_file_object(&mut file, |file_object| {
+                OpenedDirectory::decode(file_object).map(|_| ())
+            })
+            .err(),
             Some(DriverError::NotSupported)
         );
     }
@@ -4062,16 +4063,12 @@ mod tests {
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        let opened = OpenedObject::decode(file_object);
-        assert!(opened.is_ok());
-        if let Ok(opened) = opened {
+        let result = with_active_file_object(&mut file, |file_object| {
+            let opened = OpenedObject::decode(file_object)?;
             assert_eq!(opened.write_commitment(), WriteCommitment::FlushThrough);
-        }
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
     }
 
     /// # Panics
@@ -4103,19 +4100,15 @@ mod tests {
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        let opened = OpenedObject::decode(file_object);
-        assert!(opened.is_ok());
-        if let Ok(opened) = opened {
+        let result = with_active_file_object(&mut file, |file_object| {
+            let opened = OpenedObject::decode(file_object)?;
             assert_eq!(
                 opened.data_transfer_mode(),
                 DataTransferMode::NoIntermediate(transfer)
             );
-        }
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
     }
 
     /// # Panics
@@ -4139,46 +4132,43 @@ mod tests {
         );
         file.Flags = wdk_sys::FO_SYNCHRONOUS_IO;
         file.CurrentByteOffset = wdk_sys::LARGE_INTEGER { QuadPart: 11 };
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        let opened = OpenedObject::decode(file_object);
-        assert!(opened.is_ok());
-        let Ok(mut opened) = opened else {
-            return;
-        };
-
-        assert_eq!(
-            opened.current_file_position(),
-            Ok(FileOffset::from_bytes(11))
-        );
-        assert_eq!(
-            opened.set_current_file_position(FileOffset::from_bytes(32)),
+        let result = with_active_file_object(&mut file, |file_object| {
+            let mut opened = OpenedObject::decode(file_object)?;
+            assert_eq!(
+                opened.current_file_position(),
+                Ok(FileOffset::from_bytes(11))
+            );
+            assert_eq!(
+                opened.set_current_file_position(FileOffset::from_bytes(32)),
+                Ok(())
+            );
+            assert_eq!(
+                opened.update_current_file_position(
+                    DataIoKind::Handle,
+                    FileOffset::from_bytes(100),
+                    0,
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                opened.current_file_position(),
+                Ok(FileOffset::from_bytes(100))
+            );
+            assert_eq!(
+                opened.update_current_file_position(
+                    DataIoKind::Handle,
+                    FileOffset::from_bytes(100),
+                    23,
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                opened.current_file_position(),
+                Ok(FileOffset::from_bytes(123))
+            );
             Ok(())
-        );
-        assert_eq!(
-            opened
-                .update_current_file_position(DataIoKind::Handle, FileOffset::from_bytes(100), 0,),
-            Ok(())
-        );
-        assert_eq!(
-            opened.current_file_position(),
-            Ok(FileOffset::from_bytes(100))
-        );
-        assert_eq!(
-            opened.update_current_file_position(
-                DataIoKind::Handle,
-                FileOffset::from_bytes(100),
-                23,
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            opened.current_file_position(),
-            Ok(FileOffset::from_bytes(123))
-        );
+        });
+        assert_eq!(result, Ok(()));
     }
 
     /// # Panics
@@ -4224,42 +4214,41 @@ mod tests {
             core::ptr::addr_of_mut!(handle).cast(),
         );
         file.CurrentByteOffset = wdk_sys::LARGE_INTEGER { QuadPart: 7 };
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        let opened = OpenedObject::decode(file_object);
-        assert!(opened.is_ok());
-        let Ok(mut opened) = opened else {
-            return;
-        };
-
-        assert_eq!(
-            opened.current_file_position(),
-            Err(DriverError::InvalidParameter)
-        );
-        assert_eq!(
-            opened.set_current_file_position(FileOffset::from_bytes(9)),
-            Err(DriverError::InvalidParameter)
-        );
-        assert_eq!(
-            opened.update_current_file_position(
-                DataIoKind::Handle,
-                FileOffset::from_bytes(100),
-                23,
-            ),
+        let asynchronous = with_active_file_object(&mut file, |file_object| {
+            let mut opened = OpenedObject::decode(file_object)?;
+            assert_eq!(
+                opened.current_file_position(),
+                Err(DriverError::InvalidParameter)
+            );
+            assert_eq!(
+                opened.set_current_file_position(FileOffset::from_bytes(9)),
+                Err(DriverError::InvalidParameter)
+            );
+            assert_eq!(
+                opened.update_current_file_position(
+                    DataIoKind::Handle,
+                    FileOffset::from_bytes(100),
+                    23,
+                ),
+                Ok(())
+            );
             Ok(())
-        );
+        });
+        assert_eq!(asynchronous, Ok(()));
         file.Flags = wdk_sys::FO_SYNCHRONOUS_IO;
-        assert_eq!(
-            opened.update_current_file_position(
-                DataIoKind::Paging,
-                FileOffset::from_bytes(100),
-                23,
-            ),
+        let paging = with_active_file_object(&mut file, |file_object| {
+            let mut opened = OpenedObject::decode(file_object)?;
+            assert_eq!(
+                opened.update_current_file_position(
+                    DataIoKind::Paging,
+                    FileOffset::from_bytes(100),
+                    23,
+                ),
+                Ok(())
+            );
             Ok(())
-        );
+        });
+        assert_eq!(paging, Ok(()));
         let position = unsafe {
             // SAFETY: Tests consistently use the QuadPart LARGE_INTEGER arm.
             file.CurrentByteOffset.QuadPart
@@ -4288,25 +4277,19 @@ mod tests {
         );
         file.Flags = wdk_sys::FO_SYNCHRONOUS_IO;
         file.CurrentByteOffset = wdk_sys::LARGE_INTEGER { QuadPart: -1 };
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-        let opened = OpenedObject::decode(file_object);
-        assert!(opened.is_ok());
-        let Ok(mut opened) = opened else {
-            return;
-        };
-
-        assert_eq!(
-            opened.current_file_position(),
-            Err(DriverError::InvalidParameter)
-        );
-        assert_eq!(
-            opened.set_current_file_position(FileOffset::from_bytes(u64::MAX)),
-            Err(DriverError::InvalidParameter)
-        );
+        let result = with_active_file_object(&mut file, |file_object| {
+            let mut opened = OpenedObject::decode(file_object)?;
+            assert_eq!(
+                opened.current_file_position(),
+                Err(DriverError::InvalidParameter)
+            );
+            assert_eq!(
+                opened.set_current_file_position(FileOffset::from_bytes(u64::MAX)),
+                Err(DriverError::InvalidParameter)
+            );
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
         assert_eq!(
             NativeFileByteRange::new(FileOffset::from_bytes(i64::MAX.unsigned_abs()), 1).err(),
             Some(DriverError::InvalidParameter)
@@ -4320,25 +4303,21 @@ mod tests {
     #[test]
     fn uninitialized_file_object_rejects_existing_contexts() {
         let mut file = file_object_with_contexts(core::ptr::null_mut(), core::ptr::null_mut());
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
-
-        assert!(UninitializedFileObject::decode(file_object).is_ok());
+        assert!(
+            with_active_file_object(&mut file, |file_object| {
+                UninitializedFileObject::decode(file_object).map(|_| ())
+            })
+            .is_ok()
+        );
 
         let mut file = file_object_with_contexts(
             NonNull::<FileControlBlock>::dangling().as_ptr().cast(),
             core::ptr::null_mut(),
         );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
         assert_eq!(
-            UninitializedFileObject::decode(file_object),
+            with_active_file_object(&mut file, |file_object| {
+                UninitializedFileObject::decode(file_object).map(|_| ())
+            }),
             Err(DriverError::InvalidParameter)
         );
 
@@ -4346,13 +4325,10 @@ mod tests {
             core::ptr::null_mut(),
             NonNull::<super::OpenedHandle>::dangling().as_ptr().cast(),
         );
-        let file_object = kernel_file_object(&mut file);
-        assert!(file_object.is_some());
-        let Some(file_object) = file_object else {
-            return;
-        };
         assert_eq!(
-            UninitializedFileObject::decode(file_object),
+            with_active_file_object(&mut file, |file_object| {
+                UninitializedFileObject::decode(file_object).map(|_| ())
+            }),
             Err(DriverError::InvalidParameter)
         );
     }

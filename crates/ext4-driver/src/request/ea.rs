@@ -800,7 +800,7 @@ mod tests {
     use core::ffi::c_void;
 
     use crate::{
-        irp::{DispatchTarget, EaEntryIndex},
+        irp::{EaEntryIndex, ReceivedIrp},
         kernel::status::DriverError,
         memory::DriverVec,
         wire::{LittleEndianInput, LittleEndianOutput},
@@ -824,7 +824,7 @@ mod tests {
         stack: &mut wdk_sys::IO_STACK_LOCATION,
         irp: &mut wdk_sys::IRP,
         device: &mut wdk_sys::DEVICE_OBJECT,
-    ) -> Result<DispatchTarget, DriverError> {
+    ) -> Result<ReceivedIrp, DriverError> {
         stack.FileObject = core::ptr::addr_of_mut!(*file_object);
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::addr_of_mut!(*security_context),
@@ -842,7 +842,7 @@ mod tests {
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::addr_of_mut!(*stack);
 
-        DispatchTarget::decode(
+        ReceivedIrp::decode(
             core::ptr::addr_of_mut!(*device),
             core::ptr::addr_of_mut!(*irp),
         )
@@ -997,16 +997,13 @@ mod tests {
             &mut device,
         );
         assert!(target.is_ok());
-        let Ok(target) = target else {
+        let Ok(mut target) = target else {
             return;
         };
-        let create = target.current_stack().and_then(|stack| stack.create());
-        assert!(create.is_ok());
-        let Ok(create) = create else {
-            return;
-        };
-
-        let parsed = CreateEa::decode(target, create.parameters().ea_length());
+        let parsed = target.with_active(|active| {
+            let create = active.current_stack()?.create()?;
+            CreateEa::decode(active, create.parameters().ea_length())
+        });
         assert!(parsed.is_ok());
         if let Ok(parsed) = parsed {
             assert_eq!(parsed.entries.as_slice(), expected.as_slice());
@@ -1033,16 +1030,13 @@ mod tests {
             &mut device,
         );
         assert!(target.is_ok());
-        let Ok(target) = target else {
+        let Ok(mut target) = target else {
             return;
         };
-        let create = target.current_stack().and_then(|stack| stack.create());
-        assert!(create.is_ok());
-        let Ok(create) = create else {
-            return;
-        };
-
-        let parsed = CreateEa::decode(target, create.parameters().ea_length());
+        let parsed = target.with_active(|active| {
+            let create = active.current_stack()?.create()?;
+            CreateEa::decode(active, create.parameters().ea_length())
+        });
         assert!(parsed.is_ok());
         if let Ok(parsed) = parsed {
             assert!(parsed.entries.is_empty());

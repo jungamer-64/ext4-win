@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use crate::irp::{DispatchTarget, IrpCompletion};
+use crate::irp::{IrpCompletion, PendingIrpLease};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{OpenedLocation, OpenedObject, VolumeControlBlock, VolumeOperationLane};
@@ -139,24 +139,32 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 ///
 /// Returns an error when the opened object is not a reparse point, its target cannot be read, or
 /// the output buffer cannot hold the reparse data.
-pub(crate) async fn get_reparse_point(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+pub(crate) async fn get_reparse_point(
+    mut request: PendingIrpLease<'_>,
+) -> DriverResult<IrpCompletion> {
     let (length, node, operations) = {
-        let stack = target.current_stack()?.file_system_control()?;
-        let opened = OpenedObject::decode(stack.file_object())?;
-        let node = opened.node();
-        let operations = unsafe {
-            // SAFETY: Queued filesystem-control requests run one at a time on the mounted-device
-            // executor, so this request owns the unique operation-lane capability until completion.
-            VolumeControlBlock::claim_operation_lane(opened.volume())
-        };
-        (stack.output_buffer_length(), node, operations)
+        request.with_active(|active| {
+            let current = active.current_stack()?;
+            let file_object = current.file_object()?;
+            let stack = current.file_system_control()?;
+            let opened = OpenedObject::decode(file_object)?;
+            let node = opened.node();
+            let operations = unsafe {
+                // SAFETY: Queued filesystem-control requests run one at a time on the
+                // mounted-device executor, so this request owns the unique operation lane.
+                VolumeControlBlock::claim_operation_lane(opened.volume())
+            };
+            Ok::<_, DriverError>((stack.output_buffer_length(), node, operations))
+        })?
     };
     let data = {
         let mut operations = operations;
         load_node_reparse_data(operations.lane_mut(), node).await?
     };
-    let mut output = target.buffered_output(length)?;
-    let written = data.pack_fsctl(output.as_mut_slice())?;
+    let written = request.with_active(|active| {
+        let mut output = active.buffered_output(length)?;
+        data.pack_fsctl(output.as_mut_slice())
+    })?;
     IrpCompletion::from_usize(written)
 }
 
@@ -165,20 +173,26 @@ pub(crate) async fn get_reparse_point(target: DispatchTarget) -> DriverResult<Ir
 ///
 /// Returns an error when the input is malformed, the opened node is a native symbolic link, or
 /// the reparse xattr cannot be committed.
-pub(crate) async fn set_reparse_point(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+pub(crate) async fn set_reparse_point(
+    mut request: PendingIrpLease<'_>,
+) -> DriverResult<IrpCompletion> {
     let (reparse_point, node, mut operations) = {
-        let stack = target.current_stack()?.file_system_control()?;
-        let input = target.buffered_input(stack.input_buffer_length())?;
-        let reparse_point = parse_symlink_reparse_buffer(input.as_slice())?;
-        let opened = OpenedObject::decode(stack.file_object())?;
-        let node = opened.node();
-        validate_mutable_reparse_node(opened.location(), node)?;
-        let operations = unsafe {
-            // SAFETY: Queued filesystem-control requests run one at a time on the mounted-device
-            // executor, so this request owns the unique operation-lane capability until completion.
-            VolumeControlBlock::claim_operation_lane(opened.volume())
-        };
-        (reparse_point, node, operations)
+        request.with_active(|active| {
+            let current = active.current_stack()?;
+            let file_object = current.file_object()?;
+            let stack = current.file_system_control()?;
+            let input = active.buffered_input(stack.input_buffer_length())?;
+            let reparse_point = parse_symlink_reparse_buffer(input.as_slice())?;
+            let opened = OpenedObject::decode(file_object)?;
+            let node = opened.node();
+            validate_mutable_reparse_node(opened.location(), node)?;
+            let operations = unsafe {
+                // SAFETY: Queued filesystem-control requests run one at a time on the
+                // mounted-device executor, so this request owns the unique operation lane.
+                VolumeControlBlock::claim_operation_lane(opened.volume())
+            };
+            Ok::<_, DriverError>((reparse_point, node, operations))
+        })?
     };
     set_node_reparse_point(operations.lane_mut(), node, reparse_point).await?;
     Ok(IrpCompletion::EMPTY)
@@ -189,20 +203,26 @@ pub(crate) async fn set_reparse_point(target: DispatchTarget) -> DriverResult<Ir
 ///
 /// Returns an error when the input is malformed, the opened object is not a driver-owned reparse
 /// point, or the xattr mutation cannot be committed.
-pub(crate) async fn delete_reparse_point(target: DispatchTarget) -> DriverResult<IrpCompletion> {
+pub(crate) async fn delete_reparse_point(
+    mut request: PendingIrpLease<'_>,
+) -> DriverResult<IrpCompletion> {
     let (node, mut operations) = {
-        let stack = target.current_stack()?.file_system_control()?;
-        let input = target.buffered_input(stack.input_buffer_length())?;
-        parse_delete_reparse_buffer(input.as_slice())?;
-        let opened = OpenedObject::decode(stack.file_object())?;
-        let node = opened.node();
-        validate_mutable_reparse_node(opened.location(), node)?;
-        let operations = unsafe {
-            // SAFETY: Queued filesystem-control requests run one at a time on the mounted-device
-            // executor, so this request owns the unique operation-lane capability until completion.
-            VolumeControlBlock::claim_operation_lane(opened.volume())
-        };
-        (node, operations)
+        request.with_active(|active| {
+            let current = active.current_stack()?;
+            let file_object = current.file_object()?;
+            let stack = current.file_system_control()?;
+            let input = active.buffered_input(stack.input_buffer_length())?;
+            parse_delete_reparse_buffer(input.as_slice())?;
+            let opened = OpenedObject::decode(file_object)?;
+            let node = opened.node();
+            validate_mutable_reparse_node(opened.location(), node)?;
+            let operations = unsafe {
+                // SAFETY: Queued filesystem-control requests run one at a time on the
+                // mounted-device executor, so this request owns the unique operation lane.
+                VolumeControlBlock::claim_operation_lane(opened.volume())
+            };
+            Ok::<_, DriverError>((node, operations))
+        })?
     };
     delete_node_reparse_point(operations.lane_mut(), node).await?;
     Ok(IrpCompletion::EMPTY)

@@ -64,18 +64,25 @@ impl<'a> FileSystemControlRequest<'a> {
     /// Returns an error when the current IRP stack is absent or its mount/user-FSCTL parameters are
     /// malformed.
     fn decode(
-        request: PendingIrpLease<'a>,
+        mut request: PendingIrpLease<'a>,
         minor: FileSystemControlMinorFunction,
     ) -> Result<Self, crate::kernel::status::DriverError> {
-        let target = request.target();
-        let stack = target.current_stack()?;
         match minor {
-            FileSystemControlMinorFunction::MountVolume => Ok(Self::MountVolume(
-                MountVolumeRequest::from_stack(request, stack.mount_volume()?),
-            )),
-            FileSystemControlMinorFunction::UserFsRequest => Ok(Self::UserFsControl(
-                UserFsControlRequest::from_stack(request, stack.file_system_control()?),
-            )),
+            FileSystemControlMinorFunction::MountVolume => {
+                let (device, stack) = request.with_active(|active| {
+                    Ok::<_, DriverError>((active.device(), active.current_stack()?.mount_volume()?))
+                })?;
+                Ok(Self::MountVolume(MountVolumeRequest::from_stack(
+                    request, device, stack,
+                )))
+            }
+            FileSystemControlMinorFunction::UserFsRequest => {
+                let stack =
+                    request.with_active(|active| active.current_stack()?.file_system_control())?;
+                Ok(Self::UserFsControl(UserFsControlRequest::from_stack(
+                    request, stack,
+                )))
+            }
             FileSystemControlMinorFunction::Unsupported => Ok(Self::Unsupported),
         }
     }
@@ -90,24 +97,10 @@ struct UserFsControlRequest<'a> {
     stack: FileSystemControlStack,
 }
 
-// SAFETY: The pending lease pins all decoded stack pointers while the mounted-device executor
-// serially moves this request between PASSIVE_LEVEL workers.
-unsafe impl Send for UserFsControlRequest<'_> {}
-
 impl<'a> UserFsControlRequest<'a> {
     /// Converts decoded stack parameters into the user-FSCTL domain boundary.
     const fn from_stack(request: PendingIrpLease<'a>, stack: FileSystemControlStack) -> Self {
         Self { request, stack }
-    }
-
-    /// Returns the dispatch target.
-    const fn target(&self) -> DispatchTarget {
-        self.request.target()
-    }
-
-    /// Returns the decoded FSCTL stack.
-    const fn stack(&self) -> FileSystemControlStack {
-        self.stack
     }
 
     /// Returns the requested FSCTL code.
@@ -131,15 +124,15 @@ struct MountVolumeRequest<'a> {
     output_buffer_length: IrpBufferLength,
 }
 
-// SAFETY: The pending-IRP lease keeps the VPB and target device alive while the serialized mount
-// future moves between PASSIVE_LEVEL workers. No second executor task polls this request.
-unsafe impl Send for MountVolumeRequest<'_> {}
-
 impl<'a> MountVolumeRequest<'a> {
     /// Converts decoded stack parameters into the mount domain boundary.
-    fn from_stack(request: PendingIrpLease<'a>, stack: MountVolumeStack) -> Self {
+    fn from_stack(
+        request: PendingIrpLease<'a>,
+        file_system_device: KernelDevice,
+        stack: MountVolumeStack,
+    ) -> Self {
         Self {
-            file_system_device: request.target().device(),
+            file_system_device,
             _request: request,
             vpb: stack.vpb(),
             target_device: stack.target_device(),
@@ -247,20 +240,20 @@ async fn mount_volume(request: MountVolumeRequest<'_>) -> DriverResult<()> {
 ///
 /// Returns an error when the requested reparse, encryption-key, or verity operation rejects its
 /// buffers, file object, or mounted-volume state.
-async fn user_fs_control(request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
+async fn user_fs_control(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
     match request.fs_control_code() {
-        FsControlCode::GetReparsePoint => reparse::get_reparse_point(request.target()).await,
-        FsControlCode::SetReparsePoint => reparse::set_reparse_point(request.target()).await,
-        FsControlCode::DeleteReparsePoint => reparse::delete_reparse_point(request.target()).await,
+        FsControlCode::GetReparsePoint => reparse::get_reparse_point(request.request).await,
+        FsControlCode::SetReparsePoint => reparse::set_reparse_point(request.request).await,
+        FsControlCode::DeleteReparsePoint => reparse::delete_reparse_point(request.request).await,
         FsControlCode::AddEncryptionKey => {
-            fsctl::add_encryption_key(request.target(), request.stack())
+            fsctl::add_encryption_key(&mut request.request, request.stack)
         }
         FsControlCode::RemoveEncryptionKey => {
-            fsctl::remove_encryption_key(request.target(), request.stack())
+            fsctl::remove_encryption_key(&mut request.request, request.stack)
         }
         FsControlCode::GetEncryptionKeyStatus => {
-            fsctl::get_encryption_key_status(request.target(), request.stack())
+            fsctl::get_encryption_key_status(&mut request.request, request.stack)
         }
-        FsControlCode::EnableVerity => fsctl::enable_verity(request.target()).await,
+        FsControlCode::EnableVerity => fsctl::enable_verity(request.request).await,
     }
 }
