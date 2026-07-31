@@ -45,7 +45,10 @@ pub(crate) enum SecurityComponentSelection {
     Selected,
 }
 
-/// Security descriptor components accepted by the driver security boundary.
+/// Security descriptor components accepted by the POSIX owner/mode boundary.
+///
+/// DACL inheritance-control flags are intentionally outside this type because ext4 owner and mode
+/// bits have no state capable of representing Windows ACL inheritance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SecuritySelection {
     /// Owner SID selection.
@@ -69,8 +72,8 @@ impl SecuritySelection {
     /// Converts raw `SECURITY_INFORMATION` bits into supported component state.
     /// # Errors
     ///
-    /// Returns an error when SACL access is requested or unsupported security-information bits are
-    /// present.
+    /// Returns an error when SACL access is requested or when unsupported information, including
+    /// DACL inheritance-control state, is present.
     pub(crate) fn from_raw(value: wdk_sys::SECURITY_INFORMATION) -> DriverResult<Self> {
         let supported = wdk_sys::OWNER_SECURITY_INFORMATION
             | wdk_sys::GROUP_SECURITY_INFORMATION
@@ -217,5 +220,26 @@ mod tests {
                 .map(crate::kernel::status::DriverError::ntstatus),
             Some(wdk_sys::STATUS_INVALID_PARAMETER)
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when Windows DACL inheritance state enters the POSIX owner/mode domain.
+    #[test]
+    fn rejects_dacl_inheritance_control_bits() {
+        const UNPROTECTED_DACL_SECURITY_INFORMATION: wdk_sys::SECURITY_INFORMATION = 0x2000_0000;
+        const PROTECTED_DACL_SECURITY_INFORMATION: wdk_sys::SECURITY_INFORMATION = 0x8000_0000;
+
+        for information in [
+            wdk_sys::DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            wdk_sys::DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        ] {
+            assert_eq!(
+                SecuritySelection::from_raw(information)
+                    .err()
+                    .map(crate::kernel::status::DriverError::ntstatus),
+                Some(wdk_sys::STATUS_NOT_SUPPORTED)
+            );
+        }
     }
 }

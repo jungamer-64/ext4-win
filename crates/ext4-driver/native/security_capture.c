@@ -4,8 +4,9 @@
 
 /* Neither-I/O lengths are requestor controlled, so each capture stays bounded. */
 #define EXT4WIN_MAX_SECURITY_DESCRIPTOR_SIZE (128UL * 1024UL)
-#define EXT4WIN_MAX_REQUESTOR_SNAPSHOT_SIZE (1024UL * 1024UL)
 #define EXT4WIN_MAX_QUERY_OUTPUT_SIZE (128UL * 1024UL)
+#define EXT4WIN_MAX_EA_NAME_LIST_SIZE (64UL * 1024UL)
+#define EXT4WIN_MAX_DIRECTORY_PATTERN_SIZE (64UL * 1024UL - sizeof(WCHAR))
 
 /*
  * This translation unit is the only boundary that touches neither-I/O security
@@ -23,7 +24,7 @@ typedef struct _EXT4WIN_SID_PREFIX {
 typedef struct _EXT4WIN_QUERY_SECURITY_OUTPUT {
     PMDL Mdl;
     PVOID SystemAddress;
-    ULONG Length;
+    ULONG ExactLength;
 } EXT4WIN_QUERY_SECURITY_OUTPUT, *PEXT4WIN_QUERY_SECURITY_OUTPUT;
 
 C_ASSERT(sizeof(SECURITY_DESCRIPTOR_RELATIVE) == 20);
@@ -201,6 +202,7 @@ static NTSTATUS
 ext4win_measure_relative_security_descriptor(
     _In_ PSECURITY_DESCRIPTOR source,
     _In_ KPROCESSOR_MODE requestor_mode,
+    _In_ SECURITY_INFORMATION required_information,
     _In_ ULONG maximum_length,
     _Out_ PULONG measured_length_out)
 {
@@ -229,7 +231,8 @@ ext4win_measure_relative_security_descriptor(
 
     measured_length = header_length;
 
-    if (header.Owner != 0) {
+    if (((required_information & OWNER_SECURITY_INFORMATION) != 0) &&
+        (header.Owner != 0)) {
         status = ext4win_measure_relative_sid(
             source,
             header.Owner,
@@ -241,7 +244,8 @@ ext4win_measure_relative_security_descriptor(
         }
     }
 
-    if (header.Group != 0) {
+    if (((required_information & GROUP_SECURITY_INFORMATION) != 0) &&
+        (header.Group != 0)) {
         status = ext4win_measure_relative_sid(
             source,
             header.Group,
@@ -253,19 +257,9 @@ ext4win_measure_relative_security_descriptor(
         }
     }
 
-    if (((header.Control & SE_SACL_PRESENT) != 0) && (header.Sacl != 0)) {
-        status = ext4win_measure_relative_acl(
-            source,
-            header.Sacl,
-            requestor_mode,
-            maximum_length,
-            &measured_length);
-        if (!NT_SUCCESS(status)) {
-            return status;
-        }
-    }
-
-    if (((header.Control & SE_DACL_PRESENT) != 0) && (header.Dacl != 0)) {
+    if (((required_information & DACL_SECURITY_INFORMATION) != 0) &&
+        ((header.Control & SE_DACL_PRESENT) != 0) &&
+        (header.Dacl != 0)) {
         status = ext4win_measure_relative_acl(
             source,
             header.Dacl,
@@ -295,6 +289,39 @@ ext4win_release_query_security_output_internal(
     }
     RtlSecureZeroMemory(output, sizeof(*output));
     ExFreePoolWithTag(output, EXT4WIN_SECURITY_POOL_TAG);
+}
+
+static VOID
+ext4win_retain_selected_security_information(
+    _Inout_ SECURITY_DESCRIPTOR_RELATIVE *descriptor,
+    _In_ SECURITY_INFORMATION required_information)
+{
+    if ((required_information & OWNER_SECURITY_INFORMATION) == 0) {
+        descriptor->Owner = 0;
+        descriptor->Control &= ~SE_OWNER_DEFAULTED;
+    }
+    if ((required_information & GROUP_SECURITY_INFORMATION) == 0) {
+        descriptor->Group = 0;
+        descriptor->Control &= ~SE_GROUP_DEFAULTED;
+    }
+
+    descriptor->Sacl = 0;
+    descriptor->Control &= ~(
+        SE_SACL_PRESENT |
+        SE_SACL_DEFAULTED |
+        SE_SACL_AUTO_INHERIT_REQ |
+        SE_SACL_AUTO_INHERITED |
+        SE_SACL_PROTECTED);
+
+    if ((required_information & DACL_SECURITY_INFORMATION) == 0) {
+        descriptor->Dacl = 0;
+        descriptor->Control &= ~(
+            SE_DACL_PRESENT |
+            SE_DACL_DEFAULTED |
+            SE_DACL_AUTO_INHERIT_REQ |
+            SE_DACL_AUTO_INHERITED |
+            SE_DACL_PROTECTED);
+    }
 }
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -342,7 +369,6 @@ ext4win_capture_query_security_output(
     if (output == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    RtlZeroMemory(output, sizeof(*output));
 
     output->Mdl = IoAllocateMdl(
         requestor_buffer,
@@ -378,7 +404,7 @@ ext4win_capture_query_security_output(
     }
 
     output->SystemAddress = system_address;
-    output->Length = required_length;
+    output->ExactLength = required_length;
     *output_out = output;
     return STATUS_SUCCESS;
 }
@@ -400,7 +426,7 @@ ext4win_copy_query_security_output(
     }
 
     output = (PEXT4WIN_QUERY_SECURITY_OUTPUT)output_handle;
-    if ((owned_source == NULL) || (source_length != output->Length) ||
+    if ((owned_source == NULL) || (source_length != output->ExactLength) ||
         (output->Mdl == NULL) || (output->SystemAddress == NULL)) {
         status = STATUS_INVALID_PARAMETER;
     } else {
@@ -470,6 +496,7 @@ ext4win_capture_set_security_descriptor(
         status = ext4win_measure_relative_security_descriptor(
             source,
             requestor_mode,
+            required_information,
             maximum_length,
             &candidate_length);
     }
@@ -509,6 +536,10 @@ ext4win_capture_set_security_descriptor(
         return status;
     }
 
+    ext4win_retain_selected_security_information(
+        (SECURITY_DESCRIPTOR_RELATIVE *)snapshot,
+        required_information);
+
     if (!RtlValidRelativeSecurityDescriptor(
             (PSECURITY_DESCRIPTOR)snapshot,
             candidate_length,
@@ -520,10 +551,16 @@ ext4win_capture_set_security_descriptor(
 
     snapshot_length = RtlLengthSecurityDescriptor(
         (PSECURITY_DESCRIPTOR)snapshot);
-    if (snapshot_length != candidate_length) {
+    if ((snapshot_length < header_length) ||
+        (snapshot_length > candidate_length)) {
         RtlSecureZeroMemory(snapshot, candidate_length);
         ExFreePoolWithTag(snapshot, EXT4WIN_SECURITY_POOL_TAG);
         return STATUS_INVALID_SECURITY_DESCR;
+    }
+    if (snapshot_length < candidate_length) {
+        RtlSecureZeroMemory(
+            (PUCHAR)snapshot + snapshot_length,
+            candidate_length - snapshot_length);
     }
 
     *snapshot_out = snapshot;
@@ -538,5 +575,162 @@ ext4win_release_set_security_descriptor(_Frees_ptr_opt_ PVOID snapshot)
 {
     if (snapshot != NULL) {
         ExFreePoolWithTag(snapshot, EXT4WIN_SECURITY_POOL_TAG);
+    }
+}
+
+#define EXT4WIN_REQUESTOR_INPUT_POOL_TAG ((ULONG)0x43573445UL)
+
+/*
+ * These purpose-specific captures run while dispatch still owns the
+ * requestor process context. The common helper is private: callers must choose
+ * the contract whose bound matches the actual queued input.
+ */
+static NTSTATUS
+ext4win_capture_requestor_input(
+    _In_reads_bytes_(length) const VOID *source,
+    _In_ ULONG length,
+    _In_ ULONG maximum_length,
+    _In_ ULONG alignment,
+    _In_ KPROCESSOR_MODE requestor_mode,
+    _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
+    _Out_ PULONG length_out)
+{
+    PVOID snapshot;
+    NTSTATUS status;
+
+    if (snapshot_out != NULL) {
+        *snapshot_out = NULL;
+    }
+    if (length_out != NULL) {
+        *length_out = 0;
+    }
+    if ((snapshot_out == NULL) || (length_out == NULL) ||
+        !ext4win_is_requestor_mode_valid(requestor_mode)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (length > maximum_length) {
+        return STATUS_INVALID_BUFFER_SIZE;
+    }
+    if (length == 0) {
+        return STATUS_SUCCESS;
+    }
+    if (source == NULL) {
+        return STATUS_INVALID_USER_BUFFER;
+    }
+
+    snapshot = ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        length,
+        EXT4WIN_REQUESTOR_INPUT_POOL_TAG);
+    if (snapshot == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = STATUS_SUCCESS;
+    __try {
+        if (requestor_mode == UserMode) {
+            ProbeForRead(source, length, alignment);
+        }
+        RtlCopyMemory(snapshot, source, length);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = ext4win_normalize_user_buffer_exception(GetExceptionCode());
+    }
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(snapshot, EXT4WIN_REQUESTOR_INPUT_POOL_TAG);
+        return status;
+    }
+
+    *snapshot_out = snapshot;
+    *length_out = length;
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_capture_ea_name_list(
+    _In_reads_bytes_(length) const VOID *source,
+    _In_ ULONG length,
+    _In_ KPROCESSOR_MODE requestor_mode,
+    _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
+    _Out_ PULONG length_out)
+{
+    return ext4win_capture_requestor_input(
+        source,
+        length,
+        EXT4WIN_MAX_EA_NAME_LIST_SIZE,
+        TYPE_ALIGNMENT(UCHAR),
+        requestor_mode,
+        snapshot_out,
+        length_out);
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_capture_directory_pattern(
+    _In_ PCUNICODE_STRING source,
+    _In_ KPROCESSOR_MODE requestor_mode,
+    _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
+    _Out_ PULONG length_out)
+{
+    UNICODE_STRING header = {0};
+    NTSTATUS status;
+
+    if (snapshot_out != NULL) {
+        *snapshot_out = NULL;
+    }
+    if (length_out != NULL) {
+        *length_out = 0;
+    }
+    if ((snapshot_out == NULL) || (length_out == NULL) ||
+        !ext4win_is_requestor_mode_valid(requestor_mode)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (source == NULL) {
+        return STATUS_INVALID_USER_BUFFER;
+    }
+
+    status = STATUS_SUCCESS;
+    __try {
+        if (requestor_mode == UserMode) {
+            ProbeForRead(source, sizeof(header), TYPE_ALIGNMENT(USHORT));
+        }
+        RtlCopyMemory(&header, source, sizeof(header));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = ext4win_normalize_user_buffer_exception(GetExceptionCode());
+    }
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    if ((header.Length > header.MaximumLength) ||
+        ((header.Length & (sizeof(WCHAR) - 1)) != 0) ||
+        ((header.MaximumLength & (sizeof(WCHAR) - 1)) != 0) ||
+        (header.Length > EXT4WIN_MAX_DIRECTORY_PATTERN_SIZE) ||
+        ((header.Length != 0) && (header.Buffer == NULL))) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    return ext4win_capture_requestor_input(
+        header.Buffer,
+        header.Length,
+        EXT4WIN_MAX_DIRECTORY_PATTERN_SIZE,
+        TYPE_ALIGNMENT(WCHAR),
+        requestor_mode,
+        snapshot_out,
+        length_out);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+NTAPI
+ext4win_release_captured_requestor_input(_Frees_ptr_opt_ PVOID snapshot)
+{
+    if (snapshot != NULL) {
+        ExFreePoolWithTag(snapshot, EXT4WIN_REQUESTOR_INPUT_POOL_TAG);
     }
 }
