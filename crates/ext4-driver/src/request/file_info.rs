@@ -674,8 +674,6 @@ enum DeletePendingPublication {
 pub(crate) enum DeleteReadonlyPolicy {
     /// A Windows read-only attribute prevents deletion.
     Enforce,
-    /// `FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE` explicitly bypasses the attribute.
-    Ignore,
 }
 
 /// Builds a disposition plan from one fully decoded handle and buffered input.
