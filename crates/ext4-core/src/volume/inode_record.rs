@@ -11,6 +11,8 @@ pub(super) struct RawInodeRecord {
     pub(super) offset: ByteOffset,
     /// Writable inode record bytes.
     pub(super) bytes: Vec<u8>,
+    /// Mounted encoding required to parse and rewrite inode data fields.
+    pub(super) encoding: InodeDataEncoding,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,6 +83,7 @@ impl RawInodeRecord {
             id: self.id,
             offset: self.offset,
             bytes: memory::copied_slice(&self.bytes)?,
+            encoding: self.encoding,
         })
     }
 
@@ -285,6 +288,25 @@ impl LiveInodeRecord {
         self.raw.set_ext4_times(times, timestamp_encoding)
     }
 
+    /// Writes a file size already validated by the mounted inode encoding.
+    /// # Errors
+    ///
+    /// Returns an error when either inode size field is not writable.
+    pub(super) fn set_encoded_size(&mut self, size: EncodedInodeSize) -> Result<()> {
+        self.raw.set_encoded_size(size)
+    }
+
+    /// Writes an allocation count already validated by the mounted inode encoding.
+    /// # Errors
+    ///
+    /// Returns an error when block-count or inode-flag fields are not writable.
+    pub(super) fn set_encoded_allocation_size(
+        &mut self,
+        block_count: EncodedInodeBlockCount,
+    ) -> Result<()> {
+        self.raw.set_encoded_allocation_size(block_count)
+    }
+
     /// Writes serialized extent root bytes.
     /// # Errors
     ///
@@ -372,8 +394,13 @@ impl LiveInodeRecord {
     ) -> Result<DeletedInodeRecord> {
         self.raw.set_deletion_time(now.seconds())?;
         self.raw.set_deleted_links_count()?;
-        self.raw.set_size(FileSize::from_bytes(0))?;
-        self.raw.set_allocated_blocks(0, 1024)?;
+        let size = self.raw.encoding.encode_size(FileSize::from_bytes(0))?;
+        self.raw.set_encoded_size(size)?;
+        let allocation_size = self
+            .raw
+            .encoding
+            .encode_allocation_size(FileAllocationSize::from_bytes(0))?;
+        self.raw.set_encoded_allocation_size(allocation_size)?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.raw.set_extent_root_bytes(serialized.inode_root())?;
@@ -393,8 +420,13 @@ impl LiveInodeRecord {
     ) -> Result<DeletedInodeRecord> {
         self.raw.set_deletion_time(now.seconds())?;
         self.raw.set_deleted_links_count()?;
-        self.raw.set_size(FileSize::from_bytes(0))?;
-        self.raw.set_allocated_blocks(0, 1024)?;
+        let size = self.raw.encoding.encode_size(FileSize::from_bytes(0))?;
+        self.raw.set_encoded_size(size)?;
+        let allocation_size = self
+            .raw
+            .encoding
+            .encode_allocation_size(FileAllocationSize::from_bytes(0))?;
+        self.raw.set_encoded_allocation_size(allocation_size)?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.raw.set_extent_root_bytes(serialized.inode_root())?;
@@ -491,7 +523,7 @@ impl RawInodeRecord {
     /// Returns an error when required inode fields are truncated or encode an unsupported inode
     /// layout.
     pub(super) fn parse(&self) -> Result<Inode> {
-        Inode::parse(self.id, &self.bytes)
+        Inode::parse(self.id, &self.bytes, self.encoding)
     }
 
     /// Initializes a zeroed inode record as an empty extent-backed file.
@@ -509,7 +541,8 @@ impl RawInodeRecord {
         self.bytes.fill(0);
         self.set_mode(InodeMode::regular_file(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
-        self.set_size(FileSize::from_bytes(0))?;
+        let size = self.encoding.encode_size(FileSize::from_bytes(0))?;
+        self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::ONE)?;
         self.set_timestamps(now, timestamp_encoding)?;
         self.set_creation_time(now, timestamp_encoding)?;
@@ -518,7 +551,10 @@ impl RawInodeRecord {
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
-        self.set_allocated_blocks(0, 1024)
+        let allocation_size = self
+            .encoding
+            .encode_allocation_size(FileAllocationSize::from_bytes(0))?;
+        self.set_encoded_allocation_size(allocation_size)
     }
 
     /// Initializes a zeroed inode record as a directory owning its first block.
@@ -538,7 +574,10 @@ impl RawInodeRecord {
         self.bytes.fill(0);
         self.set_mode(InodeMode::directory(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
-        self.set_size(FileSize::from_bytes(u64::from(block_size.bytes())))?;
+        let size = self
+            .encoding
+            .encode_size(FileSize::from_bytes(u64::from(block_size.bytes())))?;
+        self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::TWO)?;
         self.set_timestamps(now, timestamp_encoding)?;
         self.set_creation_time(now, timestamp_encoding)?;
@@ -553,7 +592,13 @@ impl RawInodeRecord {
         let tree = MutableExtentTree::from_extents(extents)?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
-        self.set_allocated_blocks(allocated_blocks, u64::from(block_size.bytes()))
+        let allocation_bytes = allocated_blocks
+            .checked_mul(u64::from(block_size.bytes()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let allocation_size = self
+            .encoding
+            .encode_allocation_size(FileAllocationSize::from_bytes(allocation_bytes))?;
+        self.set_encoded_allocation_size(allocation_size)
     }
 
     /// Initializes a zeroed inode record as an inline symbolic link.
@@ -574,16 +619,20 @@ impl RawInodeRecord {
         self.bytes.fill(0);
         self.set_mode(InodeMode::symlink(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
-        self.set_size(FileSize::from_bytes(
+        let size = self.encoding.encode_size(FileSize::from_bytes(
             u64::try_from(target.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
         ))?;
+        self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::ONE)?;
         self.set_timestamps(now, timestamp_encoding)?;
         self.set_creation_time(now, timestamp_encoding)?;
         self.set_deletion_time(0)?;
         self.set_flags(InodeFlags::EMPTY)?;
         self.set_inline_target(target.bytes())?;
-        self.set_allocated_blocks(0, 1024)
+        let allocation_size = self
+            .encoding
+            .encode_allocation_size(FileAllocationSize::from_bytes(0))?;
+        self.set_encoded_allocation_size(allocation_size)
     }
 
     /// Initializes a zeroed inode record as an extent-backed symbolic link.
@@ -605,9 +654,10 @@ impl RawInodeRecord {
         self.bytes.fill(0);
         self.set_mode(InodeMode::symlink(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
-        self.set_size(FileSize::from_bytes(
+        let size = self.encoding.encode_size(FileSize::from_bytes(
             u64::try_from(target.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
         ))?;
+        self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::ONE)?;
         self.set_timestamps(now, timestamp_encoding)?;
         self.set_creation_time(now, timestamp_encoding)?;
@@ -616,7 +666,10 @@ impl RawInodeRecord {
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
-        self.set_allocated_blocks(0, 1024)
+        let allocation_size = self
+            .encoding
+            .encode_allocation_size(FileAllocationSize::from_bytes(0))?;
+        self.set_encoded_allocation_size(allocation_size)
     }
 
     /// Writes inode type and permission bits into `i_mode`.
@@ -718,6 +771,48 @@ impl RawInodeRecord {
             &self.bytes,
             disk_offset(INODE_FLAGS_OFFSET),
         )?))
+    }
+
+    /// Writes a validated low/high inode size pair.
+    /// # Errors
+    ///
+    /// Returns an error when either inode size field is not writable.
+    pub(super) fn set_encoded_size(&mut self, size: EncodedInodeSize) -> Result<()> {
+        put_le_u32(
+            &mut self.bytes,
+            disk_offset(INODE_SIZE_LO_OFFSET),
+            size.low(),
+        )?;
+        put_le_u32(
+            &mut self.bytes,
+            disk_offset(INODE_SIZE_HIGH_OFFSET),
+            size.high(),
+        )
+    }
+
+    /// Writes a validated inode block count and synchronizes its unit flag.
+    /// # Errors
+    ///
+    /// Returns an error when block-count or inode-flag fields are not writable.
+    pub(super) fn set_encoded_allocation_size(
+        &mut self,
+        block_count: EncodedInodeBlockCount,
+    ) -> Result<()> {
+        put_le_u32(
+            &mut self.bytes,
+            disk_offset(INODE_BLOCKS_LO_OFFSET),
+            block_count.low(),
+        )?;
+        put_le_u16(
+            &mut self.bytes,
+            disk_offset(INODE_BLOCKS_HIGH_OFFSET),
+            block_count.high(),
+        )?;
+        let flags = match block_count.unit() {
+            InodeBlockCountUnit::Sectors => self.flags()?.without_huge_file_blocks(),
+            InodeBlockCountUnit::FileSystemBlocks => self.flags()?.with_huge_file_blocks(),
+        };
+        self.set_flags(flags)
     }
 
     /// Updates access, change, and modification timestamps.
@@ -1042,6 +1137,11 @@ mod tests {
             id: InodeId::try_from(value)?,
             offset: ByteOffset::new(0),
             bytes: vec![0_u8; 128],
+            encoding: InodeDataEncoding::new(
+                crate::disk_format::inode::FileSizeEncoding::LargeFile,
+                crate::disk_format::inode::InodeBlockCountEncoding::HugeFile,
+                block_size()?,
+            ),
         })
     }
 

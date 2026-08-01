@@ -20,10 +20,11 @@ pub(super) use crate::disk_format::extent::{
 };
 pub(super) use crate::disk_format::group::BlockGroupDescriptor;
 pub(super) use crate::disk_format::inode::{
-    DirectoryEntryMutationCapability, DirectoryStorageKind, Ext4LinkCount, Ext4Owner,
-    Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, FileOffset,
-    FilePayloadMutationCapability, FileSize, FileSizeMutationCapability, Inode, InodeFlags,
-    InodeId, InodeKind, InodeMode, InodeStorage, LinkCountAfterDecrement, NewDirectoryMetadata,
+    DirectoryEntryMutationCapability, DirectoryStorageKind, EncodedInodeBlockCount,
+    EncodedInodeSize, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times,
+    Ext4Timestamp, FileAllocationSize, FileOffset, FilePayloadMutationCapability, FileSize,
+    FileSizeMutationCapability, Inode, InodeBlockCountUnit, InodeDataEncoding, InodeFlags, InodeId,
+    InodeKind, InodeMode, InodeStorage, LinkCountAfterDecrement, NewDirectoryMetadata,
     NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 pub(super) use crate::disk_format::journal::{Journal, LoadedJournal, MetadataBlock};
@@ -153,10 +154,6 @@ pub(super) const INODE_GID_HI_OFFSET: usize = 122;
 pub(super) const INODE_CHECKSUM_HI_OFFSET: usize = 130;
 /// Minimum ext4 extra inode size required for checksum and creation-time fields.
 pub(super) const EXT4_INODE_MIN_EXTRA_ISIZE: u16 = 32;
-/// Largest regular-file size accepted when `large_file` is absent.
-pub(super) const LEGACY_FILE_SIZE_LIMIT: u64 = 0x7fff_ffff;
-/// Largest 512-byte sector count accepted when `huge_file` is absent.
-pub(super) const LEGACY_I_BLOCKS_LIMIT: u64 = 0xffff_ffff;
 /// Offset of `s_free_blocks_count_lo` in the superblock.
 pub(super) const SUPERBLOCK_FREE_BLOCKS_LO_OFFSET: usize = 12;
 /// Offset of `s_free_inodes_count` in the superblock.

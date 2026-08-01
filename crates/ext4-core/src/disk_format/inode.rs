@@ -3,6 +3,7 @@
 use alloc::vec::Vec;
 use core::num::NonZeroU16;
 
+use crate::disk::block::BlockSize;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32};
 use crate::error::{Error, Result};
 use crate::memory;
@@ -38,6 +39,8 @@ const fn disk_offset(offset: usize) -> DiskOffset {
 }
 /// Inode flag selecting extent-based data mapping.
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+/// Inode flag selecting filesystem-block units for `i_blocks`.
+const EXT4_HUGE_FILE_FL: u32 = 0x0004_0000;
 /// Inode flag selecting indexed directory data.
 const EXT4_INDEX_FL: u32 = 0x0000_1000;
 /// Inode flag rejecting write-domain mutation.
@@ -52,6 +55,14 @@ const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
 const EXT4_CASEFOLD_FL: u32 = 0x4000_0000;
 /// Inode flag selecting fs-verity authenticated file contents.
 const EXT4_VERITY_FL: u32 = 0x0010_0000;
+/// Largest regular-file size accepted without the large-file feature.
+const LEGACY_FILE_SIZE_LIMIT: u64 = 0x7fff_ffff;
+/// Largest legacy `i_blocks` sector count.
+const LEGACY_I_BLOCKS_LIMIT: u64 = u32::MAX as u64;
+/// Largest value stored across `i_blocks_lo` and `i_blocks_high`.
+const WIDE_I_BLOCKS_LIMIT: u64 = 0xffff_ffff_ffff;
+/// Unit used by sector-count `i_blocks` encodings.
+const SECTOR_BYTES: u64 = 512;
 /// Permission and special-mode bits allowed apart from the inode file type.
 const PERMISSION_BITS: u16 = 0o7777;
 
@@ -122,6 +133,238 @@ impl FileSize {
             .checked_sub(offset.bytes())
             .ok_or(Error::ArithmeticOverflow)
     }
+}
+
+/// Number of bytes allocated to an inode by ext4 allocation accounting.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FileAllocationSize(u64);
+
+impl FileAllocationSize {
+    /// Creates an allocation size from a byte count.
+    #[must_use]
+    pub const fn from_bytes(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the inode allocation charge in bytes.
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        self.0
+    }
+}
+
+/// File-size encoding selected by the mounted superblock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileSizeEncoding {
+    /// Only the pre-large-file size range is valid.
+    Legacy,
+    /// Both inode size halves form one 64-bit value.
+    LargeFile,
+}
+
+/// Block-count encoding selected by the mounted superblock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InodeBlockCountEncoding {
+    /// `i_blocks` contains at most a 32-bit sector count.
+    LegacySectors,
+    /// `i_blocks_high` and huge-file block units are available.
+    HugeFile,
+}
+
+/// Unit represented by a validated encoded inode block count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InodeBlockCountUnit {
+    /// The encoded count is measured in 512-byte sectors.
+    Sectors,
+    /// The encoded count is measured in filesystem blocks.
+    FileSystemBlocks,
+}
+
+/// Validated low and high inode size fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EncodedInodeSize {
+    low: u32,
+    high: u32,
+}
+
+impl EncodedInodeSize {
+    /// Returns the encoded low size field.
+    pub(crate) const fn low(self) -> u32 {
+        self.low
+    }
+
+    /// Returns the encoded high size field.
+    pub(crate) const fn high(self) -> u32 {
+        self.high
+    }
+}
+
+/// Validated inode block-count fields and their selected unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EncodedInodeBlockCount {
+    low: u32,
+    high: u16,
+    unit: InodeBlockCountUnit,
+}
+
+impl EncodedInodeBlockCount {
+    /// Returns the encoded low block-count field.
+    pub(crate) const fn low(self) -> u32 {
+        self.low
+    }
+
+    /// Returns the encoded high block-count field.
+    pub(crate) const fn high(self) -> u16 {
+        self.high
+    }
+
+    /// Returns the unit selected for the encoded count.
+    pub(crate) const fn unit(self) -> InodeBlockCountUnit {
+        self.unit
+    }
+}
+
+/// Mounted inode size and allocation-count encoding policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InodeDataEncoding {
+    file_size: FileSizeEncoding,
+    block_count: InodeBlockCountEncoding,
+    block_size: BlockSize,
+}
+
+impl InodeDataEncoding {
+    /// Builds the single inode data encoding selected by mounted features and geometry.
+    pub(crate) const fn new(
+        file_size: FileSizeEncoding,
+        block_count: InodeBlockCountEncoding,
+        block_size: BlockSize,
+    ) -> Self {
+        Self {
+            file_size,
+            block_count,
+            block_size,
+        }
+    }
+
+    /// Returns the largest byte size addressable by the extent logical-block field.
+    pub(crate) const fn maximum_file_size(self) -> FileSize {
+        FileSize::from_bytes((u32::MAX as u64 + 1) * self.block_size.bytes() as u64)
+    }
+
+    /// Validates and splits a file size for inode serialization.
+    ///
+    /// # Errors
+    /// Returns an error when the mounted feature profile or extent logical-block domain cannot
+    /// represent `size`.
+    pub(crate) fn encode_size(self, size: FileSize) -> Result<EncodedInodeSize> {
+        let bytes = size.bytes();
+        if self.file_size == FileSizeEncoding::Legacy && bytes > LEGACY_FILE_SIZE_LIMIT {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        if bytes > self.maximum_file_size().bytes() {
+            return Err(Error::InvalidWriteRange);
+        }
+        Ok(EncodedInodeSize {
+            low: u32::try_from(bytes & u64::from(u32::MAX))
+                .map_err(|_| Error::ArithmeticOverflow)?,
+            high: u32::try_from(bytes >> 32).map_err(|_| Error::ArithmeticOverflow)?,
+        })
+    }
+
+    /// Parses and validates the combined inode size fields.
+    ///
+    /// # Errors
+    /// Returns an error when the fields contradict the mounted large-file feature or exceed the
+    /// extent logical-block domain.
+    pub(crate) fn decode_size(self, low: u32, high: u32) -> Result<FileSize> {
+        let size = FileSize::from_bytes(u64::from(low) | (u64::from(high) << 32));
+        if self.file_size == FileSizeEncoding::Legacy && size.bytes() > LEGACY_FILE_SIZE_LIMIT {
+            return Err(Error::InvalidInode);
+        }
+        if size.bytes() > self.maximum_file_size().bytes() {
+            return Err(Error::InvalidInode);
+        }
+        Ok(size)
+    }
+
+    /// Encodes one inode allocation charge using ext4 sector or filesystem-block units.
+    ///
+    /// # Errors
+    /// Returns an error when `allocation_size` is not block aligned or cannot fit the active
+    /// `i_blocks` representation.
+    pub(crate) fn encode_allocation_size(
+        self,
+        allocation_size: FileAllocationSize,
+    ) -> Result<EncodedInodeBlockCount> {
+        let bytes = allocation_size.bytes();
+        let block_bytes = u64::from(self.block_size.bytes());
+        if bytes % block_bytes != 0 {
+            return Err(Error::InvalidWriteRange);
+        }
+        let sectors = bytes
+            .checked_div(SECTOR_BYTES)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if sectors <= LEGACY_I_BLOCKS_LIMIT {
+            return split_block_count(sectors, InodeBlockCountUnit::Sectors);
+        }
+        if self.block_count == InodeBlockCountEncoding::LegacySectors {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        if sectors <= WIDE_I_BLOCKS_LIMIT {
+            return split_block_count(sectors, InodeBlockCountUnit::Sectors);
+        }
+        let blocks = bytes
+            .checked_div(block_bytes)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if blocks > WIDE_I_BLOCKS_LIMIT {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        split_block_count(blocks, InodeBlockCountUnit::FileSystemBlocks)
+    }
+
+    /// Decodes inode block-count fields under the mounted feature and inode-flag policy.
+    ///
+    /// # Errors
+    /// Returns an error when high count bits or filesystem-block units are present without the
+    /// huge-file feature, or when byte conversion overflows.
+    pub(crate) fn decode_allocation_size(
+        self,
+        low: u32,
+        high: u16,
+        flags: InodeFlags,
+    ) -> Result<FileAllocationSize> {
+        let count = u64::from(low) | (u64::from(high) << 32);
+        let bytes = if flags.has_huge_file_blocks() {
+            if self.block_count != InodeBlockCountEncoding::HugeFile {
+                return Err(Error::InvalidInode);
+            }
+            count
+                .checked_mul(u64::from(self.block_size.bytes()))
+                .ok_or(Error::ArithmeticOverflow)?
+        } else {
+            if self.block_count == InodeBlockCountEncoding::LegacySectors
+                && count > LEGACY_I_BLOCKS_LIMIT
+            {
+                return Err(Error::InvalidInode);
+            }
+            count
+                .checked_mul(SECTOR_BYTES)
+                .ok_or(Error::ArithmeticOverflow)?
+        };
+        Ok(FileAllocationSize::from_bytes(bytes))
+    }
+}
+
+/// Splits one validated 48-bit inode block count.
+fn split_block_count(count: u64, unit: InodeBlockCountUnit) -> Result<EncodedInodeBlockCount> {
+    if count > WIDE_I_BLOCKS_LIMIT {
+        return Err(Error::UnsupportedInodeMutation);
+    }
+    Ok(EncodedInodeBlockCount {
+        low: u32::try_from(count & u64::from(u32::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
+        high: u16::try_from(count >> 32).map_err(|_| Error::ArithmeticOverflow)?,
+        unit,
+    })
 }
 
 /// Number of bytes read into a caller buffer.
@@ -681,6 +924,18 @@ impl InodeFlags {
         Self(self.0 | EXT4_EXTENTS_FL)
     }
 
+    /// Returns flags with filesystem-block `i_blocks` units selected.
+    #[must_use]
+    pub(crate) const fn with_huge_file_blocks(self) -> Self {
+        Self(self.0 | EXT4_HUGE_FILE_FL)
+    }
+
+    /// Returns flags with sector `i_blocks` units selected.
+    #[must_use]
+    pub(crate) const fn without_huge_file_blocks(self) -> Self {
+        Self(self.0 & !EXT4_HUGE_FILE_FL)
+    }
+
     /// Returns flags with the indexed-directory bit set.
     #[must_use]
     pub const fn with_indexed_directory(self) -> Self {
@@ -703,6 +958,12 @@ impl InodeFlags {
     #[must_use]
     pub const fn has_extent_tree(self) -> bool {
         self.0 & EXT4_EXTENTS_FL != 0
+    }
+
+    /// Returns whether `i_blocks` is measured in filesystem blocks.
+    #[must_use]
+    pub(crate) const fn has_huge_file_blocks(self) -> bool {
+        self.0 & EXT4_HUGE_FILE_FL != 0
     }
 
     /// Returns whether this directory is indexed by an HTree.
@@ -926,6 +1187,8 @@ pub struct Inode {
     mode: InodeMode,
     /// Combined low/high inode size.
     size: FileSize,
+    /// Decoded inode allocation charge.
+    allocation_size: FileAllocationSize,
     /// POSIX owner parsed from uid/gid fields.
     owner: Ext4Owner,
     /// Timestamps parsed from ext4 inode time fields.
@@ -946,7 +1209,7 @@ impl Inode {
     /// # Errors
     /// Returns an error when the inode record is truncated or has an unsupported
     /// inode kind.
-    pub fn parse(id: InodeId, raw: &[u8]) -> Result<Self> {
+    pub(crate) fn parse(id: InodeId, raw: &[u8], encoding: InodeDataEncoding) -> Result<Self> {
         if raw.len() < 128 {
             return Err(Error::TruncatedStructure);
         }
@@ -955,13 +1218,16 @@ impl Inode {
             Ext4Uid::from_u32(parse_uid(raw)?),
             Ext4Gid::from_u32(parse_gid(raw)?),
         );
-        let size = FileSize::from_bytes(
-            u64::from(le_u32(raw, disk_offset(4))?)
-                | (u64::from(le_u32(raw, disk_offset(108))?) << 32),
-        );
+        let size =
+            encoding.decode_size(le_u32(raw, disk_offset(4))?, le_u32(raw, disk_offset(108))?)?;
         let times = parse_times(raw)?;
         let links_count = Ext4LinkCount::new(le_u16(raw, disk_offset(26))?)?;
         let flags = InodeFlags::from_u32(le_u32(raw, disk_offset(32))?);
+        let allocation_size = encoding.decode_allocation_size(
+            le_u32(raw, disk_offset(28))?,
+            le_u16(raw, disk_offset(116))?,
+            flags,
+        )?;
         let generation = InodeGeneration::from_u32(le_u32(raw, disk_offset(100))?);
         let block_slice = raw.get(40..100).ok_or(Error::TruncatedStructure)?;
         let mut block = [0_u8; 60];
@@ -977,6 +1243,7 @@ impl Inode {
             id,
             mode,
             size,
+            allocation_size,
             owner,
             times,
             links_count,
@@ -1002,6 +1269,12 @@ impl Inode {
     #[must_use]
     pub const fn size(&self) -> FileSize {
         self.size
+    }
+
+    /// Bytes allocated to this inode according to ext4 `i_blocks`.
+    #[must_use]
+    pub const fn allocation_size(&self) -> FileAllocationSize {
+        self.allocation_size
     }
 
     /// POSIX security state parsed from owner and mode fields.
@@ -1183,9 +1456,11 @@ fn parse_times(raw: &[u8]) -> Result<Ext4Times> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectoryStorageKind, Ext4LinkCount, Ext4Permissions, Inode, InodeFlags, InodeId,
-        InodeMode, MODE_DIRECTORY, MODE_REGULAR,
+        DirectoryStorageKind, Ext4LinkCount, Ext4Permissions, FileSizeEncoding, Inode,
+        InodeBlockCountEncoding, InodeDataEncoding, InodeFlags, InodeId, InodeMode, MODE_DIRECTORY,
+        MODE_REGULAR,
     };
+    use crate::disk::block::BlockSize;
     use crate::disk::endian::{put_le_u16, put_le_u32};
     use crate::error::{Error, Result};
 
@@ -1195,6 +1470,18 @@ mod tests {
     /// Returns an error if the fixed test inode number leaves the inode-id domain.
     fn inode_id() -> Result<InodeId> {
         InodeId::try_from(11)
+    }
+
+    /// Builds the modern inode encoding used by parser tests.
+    /// # Errors
+    ///
+    /// Returns an error when the fixed 1024-byte block size is unsupported.
+    fn inode_data_encoding() -> Result<InodeDataEncoding> {
+        Ok(InodeDataEncoding::new(
+            FileSizeEncoding::LargeFile,
+            InodeBlockCountEncoding::HugeFile,
+            BlockSize::from_superblock_log(0)?,
+        ))
     }
 
     /// Builds a raw 128-byte inode image for parser tests.
@@ -1215,7 +1502,8 @@ mod tests {
     #[test]
     fn directory_storage_kind_decodes_linear_and_htree() {
         let linear = inode_id().and_then(|id| {
-            inode_bytes(MODE_DIRECTORY, 0).and_then(|bytes| Inode::parse(id, &bytes))
+            inode_bytes(MODE_DIRECTORY, 0)
+                .and_then(|bytes| Inode::parse(id, &bytes, inode_data_encoding()?))
         });
         assert!(linear.is_ok());
         let Ok(linear) = linear else {
@@ -1228,7 +1516,7 @@ mod tests {
 
         let htree = inode_id().and_then(|id| {
             inode_bytes(MODE_DIRECTORY, super::EXT4_INDEX_FL)
-                .and_then(|bytes| Inode::parse(id, &bytes))
+                .and_then(|bytes| Inode::parse(id, &bytes, inode_data_encoding()?))
         });
         assert!(htree.is_ok());
         let Ok(htree) = htree else {
@@ -1245,8 +1533,10 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn directory_storage_kind_rejects_non_directory_inode() {
-        let file = inode_id()
-            .and_then(|id| inode_bytes(MODE_REGULAR, 0).and_then(|bytes| Inode::parse(id, &bytes)));
+        let file = inode_id().and_then(|id| {
+            inode_bytes(MODE_REGULAR, 0)
+                .and_then(|bytes| Inode::parse(id, &bytes, inode_data_encoding()?))
+        });
         assert!(file.is_ok());
         let Ok(file) = file else {
             return;

@@ -4,7 +4,9 @@ use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::disk::checksum::{crc32c, verify_crc32c};
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u32};
 use crate::disk::io::{BlockSource, BlockStorage};
-use crate::disk_format::inode::InodeId;
+use crate::disk_format::inode::{
+    FileSizeEncoding, InodeBlockCountEncoding, InodeDataEncoding, InodeId,
+};
 use crate::error::{Error, Result};
 
 // ext4 superblock and feature-policy constants. Feature masks stay here so the
@@ -966,63 +968,6 @@ impl XattrMutationSupport {
     }
 }
 
-/// File-size encoding available in inode records.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FileSizeEncoding {
-    /// Only the pre-large-file size profile is supported.
-    Legacy,
-    /// The inode high size field is available.
-    LargeFile,
-}
-
-impl FileSizeEncoding {
-    /// Verifies that `bytes` can be encoded by this profile.
-    /// # Errors
-    ///
-    /// Returns an error when the legacy inode size profile is active and `bytes` exceeds its limit.
-    pub(crate) const fn require_supported(self, bytes: u64, legacy_limit: u64) -> Result<()> {
-        match self {
-            Self::LargeFile => Ok(()),
-            Self::Legacy => {
-                if bytes > legacy_limit {
-                    Err(Error::UnsupportedInodeMutation)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-}
-
-/// Inode block-count encoding available in inode records.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InodeBlockCountEncoding {
-    /// `i_blocks` is limited to the legacy sector count.
-    LegacySectors,
-    /// Huge-file block count semantics are available.
-    HugeFile,
-}
-
-impl InodeBlockCountEncoding {
-    /// Verifies that `sectors` can be encoded by this profile.
-    /// # Errors
-    ///
-    /// Returns an error when the legacy inode block-count profile is active and `sectors` exceeds
-    /// its limit.
-    pub(crate) const fn require_supported(self, sectors: u64, legacy_limit: u64) -> Result<()> {
-        match self {
-            Self::HugeFile => Ok(()),
-            Self::LegacySectors => {
-                if sectors > legacy_limit {
-                    Err(Error::UnsupportedInodeMutation)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-}
-
 /// Inode timestamp encoding available in inode records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InodeTimestampEncoding {
@@ -1306,16 +1251,6 @@ impl FeatureSet {
     /// Returns the public xattr mutation capability.
     pub(crate) const fn xattr_mutation(self) -> XattrMutationSupport {
         self.xattr_mutation
-    }
-
-    /// Returns the file-size encoding capability.
-    pub(crate) const fn file_size_encoding(self) -> FileSizeEncoding {
-        self.file_size_encoding
-    }
-
-    /// Returns the inode block-count encoding capability.
-    pub(crate) const fn inode_block_count_encoding(self) -> InodeBlockCountEncoding {
-        self.inode_block_count_encoding
     }
 
     /// Returns the inode timestamp encoding capability.
@@ -1698,16 +1633,14 @@ impl Superblock {
         self.features.xattr_mutation()
     }
 
-    /// Returns the file-size encoding capability.
+    /// Returns the single mounted encoding for inode size and allocation fields.
     #[must_use]
-    pub(crate) const fn file_size_encoding(self) -> FileSizeEncoding {
-        self.features.file_size_encoding()
-    }
-
-    /// Returns the inode block-count encoding capability.
-    #[must_use]
-    pub(crate) const fn inode_block_count_encoding(self) -> InodeBlockCountEncoding {
-        self.features.inode_block_count_encoding()
+    pub(crate) const fn inode_data_encoding(self) -> InodeDataEncoding {
+        InodeDataEncoding::new(
+            self.features.file_size_encoding,
+            self.features.inode_block_count_encoding,
+            self.block_size,
+        )
     }
 
     /// Returns the inode timestamp encoding capability.

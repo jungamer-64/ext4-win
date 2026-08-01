@@ -225,25 +225,34 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 self.release_xattr_block_ref(block).await?;
             }
             raw_inode.set_xattr_block(None)?;
-            return Ok(());
+        } else {
+            let inline_capacity = raw_inode.writable_inline_xattr_region()?.len();
+            match xattr_storage::serialize_inline_xattrs(set, inline_capacity) {
+                Ok(bytes) => {
+                    raw_inode
+                        .writable_inline_xattr_region()?
+                        .copy_from_slice(&bytes);
+                    if let Some(block) = old_block {
+                        self.release_xattr_block_ref(block).await?;
+                    }
+                    raw_inode.set_xattr_block(None)?;
+                }
+                Err(Error::NoSpace) => {
+                    self.store_external_xattr_set(raw_inode, set, old_block)
+                        .await?;
+                }
+                Err(error) => return Err(error),
+            }
         }
 
-        let inline_capacity = raw_inode.writable_inline_xattr_region()?.len();
-        match xattr_storage::serialize_inline_xattrs(set, inline_capacity) {
-            Ok(bytes) => {
-                raw_inode
-                    .writable_inline_xattr_region()?
-                    .copy_from_slice(&bytes);
-                if let Some(block) = old_block {
-                    self.release_xattr_block_ref(block).await?;
-                }
-                raw_inode.set_xattr_block(None)
+        let inode = raw_inode.parse()?;
+        match inode.storage() {
+            InodeStorage::Extents(_) => {
+                let tree = self.mutable_extent_tree(&inode).await?;
+                self.set_inode_allocation_size(raw_inode, Some(&tree))
             }
-            Err(Error::NoSpace) => {
-                self.store_external_xattr_set(raw_inode, set, old_block)
-                    .await
-            }
-            Err(error) => Err(error),
+            InodeStorage::InlineBytes(_) => self.set_inode_allocation_size(raw_inode, None),
+            InodeStorage::UnsupportedBlockMap => Err(Error::UnsupportedBlockMap),
         }
     }
 

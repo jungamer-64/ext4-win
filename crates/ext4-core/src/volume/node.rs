@@ -2,7 +2,8 @@
 
 use crate::disk_format::dir::DirectoryEntryKind;
 use crate::disk_format::inode::{
-    Ext4LinkCount, Ext4Security, Ext4Times, FileSize, Inode, InodeId, InodeKind, InodeProtection,
+    Ext4LinkCount, Ext4Security, Ext4Times, FileAllocationSize, FileSize, Inode, InodeId,
+    InodeKind, InodeProtection,
 };
 use crate::platform::name::Ext4Name;
 
@@ -152,6 +153,12 @@ impl FileNode {
         self.inode.size()
     }
 
+    /// Allocation charge parsed from the file inode.
+    #[must_use]
+    pub const fn allocation_size(&self) -> FileAllocationSize {
+        self.inode.allocation_size()
+    }
+
     /// POSIX security state parsed from the file inode.
     #[must_use]
     pub const fn security(&self) -> Ext4Security {
@@ -208,6 +215,12 @@ impl DirectoryNode {
         self.inode.size()
     }
 
+    /// Allocation charge parsed from the directory inode.
+    #[must_use]
+    pub const fn allocation_size(&self) -> FileAllocationSize {
+        self.inode.allocation_size()
+    }
+
     /// ext4 timestamps parsed from the directory inode.
     #[must_use]
     pub const fn times(&self) -> Ext4Times {
@@ -250,6 +263,12 @@ impl SymlinkNode {
     #[must_use]
     pub const fn size(&self) -> FileSize {
         self.inode.size()
+    }
+
+    /// Allocation charge parsed from the symlink inode.
+    #[must_use]
+    pub const fn allocation_size(&self) -> FileAllocationSize {
+        self.inode.allocation_size()
     }
 
     /// POSIX security state parsed from the symlink inode.

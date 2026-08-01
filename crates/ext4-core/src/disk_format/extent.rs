@@ -241,15 +241,10 @@ impl Extent {
         self.initialization
     }
 
-    /// Returns the exclusive logical end of this extent.
-    /// # Errors
-    ///
-    /// Returns an error when `logical_start + len` overflows the on-disk logical block range.
-    pub(crate) fn end_logical(self) -> Result<u32> {
-        self.logical_start
-            .as_u32()
-            .checked_add(self.len.as_u32())
-            .ok_or(Error::ArithmeticOverflow)
+    /// Returns the exclusive logical end, including the one-past-`u32::MAX` boundary.
+    #[must_use]
+    pub(crate) fn end_logical(self) -> u64 {
+        self.logical_start.as_u64() + self.len.as_u64()
     }
 
     /// Maps a logical block if it falls inside this extent.
@@ -801,11 +796,11 @@ fn normalize_extents(extents: &mut Vec<Extent>) -> Result<()> {
     let mut normalized: Vec<Extent> = Vec::new();
     for extent in extents.iter().copied() {
         if let Some(last) = normalized.last_mut() {
-            let last_end = last.end_logical()?;
-            if extent.logical_start().as_u32() < last_end {
+            let last_end = last.end_logical();
+            if extent.logical_start().as_u64() < last_end {
                 return Err(Error::InvalidExtentTree);
             }
-            if extent.logical_start().as_u32() == last_end
+            if extent.logical_start().as_u64() == last_end
                 && extent.initialization() == last.initialization()
                 && last
                     .physical_start()
