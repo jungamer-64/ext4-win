@@ -151,8 +151,7 @@ where
     ///
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
-    #[cfg(test)]
-    pub(crate) async fn lookup_child(
+    pub async fn lookup_child(
         &mut self,
         parent: &DirectoryNode,
         name: &Ext4Name,
@@ -323,8 +322,7 @@ where
     ///
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
-    #[cfg(test)]
-    pub(crate) async fn lookup_child(
+    pub async fn lookup_child(
         &mut self,
         parent: &DirectoryNode,
         name: &Ext4Name,
@@ -927,7 +925,6 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     ///
     /// # Errors
     /// Returns an error when the parent cannot be enumerated.
-    #[cfg(test)]
     pub(super) async fn lookup_child(
         &mut self,
         parent: &DirectoryNode,
@@ -1029,7 +1026,6 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
     /// # Errors
     ///
     /// Returns an error when the entry inode cannot be loaded and classified.
-    #[cfg(test)]
     pub(super) async fn directory_child(
         &mut self,
         parent: &DirectoryNode,

@@ -2396,6 +2396,28 @@ pub(crate) enum RegularFileWriteAccess {
     Positional,
 }
 
+/// Delete authority retained by one opened namespace handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeleteAccess {
+    /// The handle was not opened with `DELETE` access.
+    Denied,
+    /// The handle may change the node's deletion disposition.
+    Granted,
+}
+
+impl DeleteAccess {
+    /// Requires delete authority for a namespace mutation.
+    /// # Errors
+    ///
+    /// Returns access denied when the opened handle lacks `DELETE`.
+    pub(crate) const fn require(self) -> DriverResult<()> {
+        match self {
+            Self::Denied => Err(DriverError::AccessDenied),
+            Self::Granted => Ok(()),
+        }
+    }
+}
+
 impl DesiredAccess {
     /// Wraps the raw WDK access mask.
     const fn from_raw(raw: wdk_sys::ACCESS_MASK) -> Self {
@@ -2425,6 +2447,15 @@ impl DesiredAccess {
             RegularFileWriteAccess::AppendOnly
         } else {
             RegularFileWriteAccess::Denied
+        }
+    }
+
+    /// Projects Windows `DELETE` into retained per-handle authority.
+    pub(crate) const fn delete_access(self) -> DeleteAccess {
+        if self.contains(wdk_sys::DELETE) {
+            DeleteAccess::Granted
+        } else {
+            DeleteAccess::Denied
         }
     }
 
@@ -5042,6 +5073,26 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when `DELETE` is not retained as an explicit handle authority.
+    #[test]
+    fn desired_access_projects_delete_authority() {
+        assert_eq!(
+            super::DesiredAccess::from_raw(0).delete_access(),
+            super::DeleteAccess::Denied
+        );
+        assert_eq!(
+            super::DesiredAccess::from_raw(wdk_sys::DELETE).delete_access(),
+            super::DeleteAccess::Granted
+        );
+        assert_eq!(
+            super::DeleteAccess::Denied.require(),
+            Err(crate::kernel::status::DriverError::AccessDenied)
+        );
+        assert_eq!(super::DeleteAccess::Granted.require(), Ok(()));
     }
 
     /// # Panics

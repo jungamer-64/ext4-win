@@ -28,7 +28,7 @@ use wdk_sys::{
 use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 
 use crate::irp::{
-    ActiveFileObject, ByteRangeLockKey, DataIoKind, DesiredAccess, DeviceExecutor,
+    ActiveFileObject, ByteRangeLockKey, DataIoKind, DeleteAccess, DesiredAccess, DeviceExecutor,
     DirectoryEntryIndex, DispatchTarget, ExistingOperationAccess, RegularFileWriteAccess,
     RequestorProcess, ShareAccess,
 };
@@ -1159,6 +1159,60 @@ impl VolumeOperationLease {
         .authorize_handle(file_object)
     }
 
+    /// Rejects namespace traversal through an inode that is delete-pending.
+    /// # Errors
+    ///
+    /// Returns delete-pending while an open FCB owns a deferred deletion for `node`.
+    pub(crate) fn ensure_node_openable(&self, node: NodeId) -> DriverResult<()> {
+        let ledger = unsafe {
+            // SAFETY: The mounted VCB and its independently synchronized ledger remain live for
+            // this actor lease.
+            self.file_control_blocks.as_ref()
+        };
+        if ledger.node_delete_pending(node) {
+            Err(DriverError::DeletePending)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Publishes successful removal of the exact FCB-owned delete target.
+    pub(crate) fn complete_file_delete(
+        &mut self,
+        fcb: NonNull<FileControlBlock>,
+        target: NonNull<FileDeleteTarget>,
+    ) {
+        unsafe {
+            // SAFETY: The mounted VCB and its synchronized ledger remain live, and this actor lease
+            // serializes deletion completion with every namespace operation.
+            self.file_control_blocks.as_ref()
+        }
+        .complete_delete(fcb, target);
+    }
+
+    /// Publishes a validated delete-pending target into one live FCB.
+    pub(crate) fn set_file_delete_pending(
+        &mut self,
+        fcb: NonNull<FileControlBlock>,
+        pending: PendingFileDeletion,
+    ) {
+        unsafe {
+            // SAFETY: The mounted VCB and its synchronized ledger remain live, and this actor lease
+            // serializes the disposition mutation with every namespace operation.
+            self.file_control_blocks.as_ref()
+        }
+        .set_delete_pending(fcb, pending);
+    }
+
+    /// Reports one committed namespace mutation through the mounted VCB notifier.
+    pub(crate) fn report_directory_name_change(&self, change: DirectoryNameChange) {
+        let volume = unsafe {
+            // SAFETY: The actor lease retains the heap-stable mounted VCB for this request.
+            self.owner.as_non_null().as_ref()
+        };
+        volume.report_directory_name_change(change);
+    }
+
     /// Returns the actor-owned operation lane through this exclusive capability.
     pub(crate) fn lane(&self) -> &VolumeOperationLane {
         unsafe {
@@ -1535,20 +1589,94 @@ impl FileControlBlockLedger {
         )
     }
 
-    /// Releases a share claim while retaining the FILE_OBJECT's FCB reference until close.
-    fn release_share_access(&self, fcb: NonNull<FileControlBlock>, file_object: KernelFileObject) {
+    /// Releases a share claim and selects final-active-handle deletion while retaining the FCB.
+    fn release_share_access(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        file_object: KernelFileObject,
+    ) -> FileCleanupDisposition {
         let _guard = self.lock.acquire();
         let table = unsafe {
             // SAFETY: The executive resource serializes lookup and open-state mutation.
             &*self.table.get()
         };
         let mut state = ledger_file_control_block_open_state(table, fcb);
-        unsafe {
+        let state = unsafe {
             // SAFETY: The ledger resource remains exclusively held and the helper validated this
             // state pointer against the owning table.
             state.as_mut()
+        };
+        state.remove_share_access(file_object);
+        state.cleanup_disposition()
+    }
+
+    /// Publishes a stable delete-pending target for one live FCB.
+    fn set_delete_pending(&self, fcb: NonNull<FileControlBlock>, pending: PendingFileDeletion) {
+        let previous = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource serializes lookup and open-state mutation.
+                &*self.table.get()
+            };
+            let mut state = ledger_file_control_block_open_state(table, fcb);
+            unsafe {
+                // SAFETY: The FCB was validated against the table while the resource is held.
+                state.as_mut()
+            }
+            .set_delete_pending(pending)
+        };
+        drop(previous);
+    }
+
+    /// Cancels delete-pending for one live FCB.
+    fn clear_delete_pending(&self, fcb: NonNull<FileControlBlock>) {
+        let previous = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource serializes lookup and open-state mutation.
+                &*self.table.get()
+            };
+            let mut state = ledger_file_control_block_open_state(table, fcb);
+            unsafe {
+                // SAFETY: The FCB was validated against the table while the resource is held.
+                state.as_mut()
+            }
+            .clear_delete_pending()
+        };
+        drop(previous);
+    }
+
+    /// Returns whether one live FCB is delete-pending.
+    fn delete_pending(&self, fcb: NonNull<FileControlBlock>) -> bool {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table and open-state observation.
+            &*self.table.get()
+        };
+        let state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: The FCB was validated against the table while the resource is held.
+            state.as_ref()
         }
-        .remove_share_access(file_object);
+        .delete_pending()
+    }
+
+    /// Publishes committed removal of the exact pending target.
+    fn complete_delete(&self, fcb: NonNull<FileControlBlock>, target: NonNull<FileDeleteTarget>) {
+        let completed = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource serializes lookup and open-state mutation.
+                &*self.table.get()
+            };
+            let mut state = ledger_file_control_block_open_state(table, fcb);
+            unsafe {
+                // SAFETY: The FCB was validated against the table while the resource is held.
+                state.as_mut()
+            }
+            .complete_delete(target)
+        };
+        drop(completed);
     }
 
     /// Atomically releases a share claim and the same FILE_OBJECT's final FCB reference.
@@ -1613,6 +1741,27 @@ impl FileControlBlockLedger {
             // SAFETY: The executive resource serializes table observation.
             (*self.table.get()).is_empty()
         }
+    }
+
+    /// Returns whether a currently open inode identity rejects new namespace traversal.
+    fn node_delete_pending(&self, node: NodeId) -> bool {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table and open-state observation.
+            &*self.table.get()
+        };
+        let Some(fcb) = find_file_control_block_in_table(table, node) else {
+            return false;
+        };
+        let fcb = unsafe {
+            // SAFETY: The table owns this FCB and the resource remains held for the observation.
+            fcb.as_ref()
+        };
+        let state = unsafe {
+            // SAFETY: The ledger resource serializes this FCB open-state observation.
+            &*fcb.open_state.get()
+        };
+        state.delete_pending()
     }
 }
 
@@ -3089,6 +3238,8 @@ struct FileControlBlockOpenState {
     share_access: SHARE_ACCESS,
     /// Number of open FILE_OBJECTs currently referencing this FCB.
     file_object_references: NonZeroU32,
+    /// One namespace deletion truth shared by every handle for this inode.
+    deletion: FileDeletionState,
 }
 
 impl FileControlBlockOpenState {
@@ -3105,6 +3256,7 @@ impl FileControlBlockOpenState {
                 SharedDelete: 0,
             },
             file_object_references: NonZeroU32::MIN,
+            deletion: FileDeletionState::Live,
         }
     }
 
@@ -3120,6 +3272,7 @@ impl FileControlBlockOpenState {
         share_access: ShareAccess,
         share_check: FileControlBlockShareCheck,
     ) -> DriverResult<()> {
+        self.deletion.ensure_openable()?;
         if let FileControlBlockShareCheck::ExistingNode(existing_operation_access) = share_check {
             let operation_status = unsafe {
                 // SAFETY: The ledger exclusively owns this SHARE_ACCESS record. Update is false,
@@ -3163,6 +3316,55 @@ impl FileControlBlockOpenState {
                 file_object.as_ptr(),
                 core::ptr::addr_of_mut!(self.share_access),
             );
+        }
+    }
+
+    /// Selects deferred deletion after one share claim has been removed.
+    fn cleanup_disposition(&self) -> FileCleanupDisposition {
+        self.deletion
+            .cleanup_target(self.share_access.OpenCount)
+            .map_or(
+                FileCleanupDisposition::Retained,
+                FileCleanupDisposition::Delete,
+            )
+    }
+
+    /// Replaces the shared delete-pending target and returns the previous allocation.
+    fn set_delete_pending(&mut self, pending: PendingFileDeletion) -> Option<PendingFileDeletion> {
+        match core::mem::replace(&mut self.deletion, FileDeletionState::Pending(pending)) {
+            FileDeletionState::Live => None,
+            FileDeletionState::Pending(previous) => Some(previous),
+            FileDeletionState::Deleted => {
+                KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
+            }
+        }
+    }
+
+    /// Cancels delete-pending before the final active cleanup.
+    fn clear_delete_pending(&mut self) -> Option<PendingFileDeletion> {
+        match core::mem::replace(&mut self.deletion, FileDeletionState::Live) {
+            FileDeletionState::Live => None,
+            FileDeletionState::Pending(previous) => Some(previous),
+            FileDeletionState::Deleted => {
+                KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
+            }
+        }
+    }
+
+    /// Returns whether the inode has crossed into delete-pending.
+    const fn delete_pending(&self) -> bool {
+        self.deletion.is_pending()
+    }
+
+    /// Publishes successful removal of the exact target selected by cleanup.
+    fn complete_delete(&mut self, target: NonNull<FileDeleteTarget>) -> PendingFileDeletion {
+        match core::mem::replace(&mut self.deletion, FileDeletionState::Deleted) {
+            FileDeletionState::Pending(pending) if pending.target() == target => pending,
+            FileDeletionState::Live
+            | FileDeletionState::Pending(_)
+            | FileDeletionState::Deleted => {
+                KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
+            }
         }
     }
 
@@ -3433,6 +3635,112 @@ impl DirectoryCursor {
     }
 }
 
+/// Stable namespace identity selected for a deferred Windows deletion.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct FileDeleteTarget {
+    /// Directory containing the link selected by the deleting handle.
+    parent: DirectoryNodeId,
+    /// Exact ext4 link name that must still resolve to the opened inode.
+    name: Ext4Name,
+}
+
+impl FileDeleteTarget {
+    /// Returns the parent directory containing the selected link.
+    pub(crate) const fn parent(&self) -> DirectoryNodeId {
+        self.parent
+    }
+
+    /// Returns the exact ext4 link name selected for deletion.
+    pub(crate) const fn name(&self) -> &Ext4Name {
+        &self.name
+    }
+}
+
+/// Heap-stable delete target owned by one FCB until deletion completes or is cancelled.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct PendingFileDeletion {
+    /// Stable target storage referenced by an actor-local cleanup plan across suspension.
+    target: Box<FileDeleteTarget>,
+}
+
+impl PendingFileDeletion {
+    /// Copies a deletable handle location into stable FCB-owned storage.
+    /// # Errors
+    ///
+    /// Returns cannot-delete for root and file-reference handles, or an allocation error when the
+    /// exact directory-entry name cannot be retained.
+    fn try_from_location(location: &OpenedLocation) -> DriverResult<Self> {
+        let OpenedLocation::DirectoryEntry { parent, name } = location else {
+            return Err(DriverError::CannotDelete);
+        };
+        let name = name.try_to_owned_name()?;
+        Ok(Self {
+            target: memory::boxed_try_with(|| {
+                Ok(FileDeleteTarget {
+                    parent: *parent,
+                    name,
+                })
+            })?,
+        })
+    }
+
+    /// Returns the stable target pointer retained by this pending state.
+    fn target(&self) -> NonNull<FileDeleteTarget> {
+        NonNull::from(self.target.as_ref())
+    }
+
+    /// Borrows the exact target before this pending state is published into the FCB.
+    pub(crate) fn target_ref(&self) -> &FileDeleteTarget {
+        self.target.as_ref()
+    }
+}
+
+/// Namespace deletion state shared by every FILE_OBJECT for one inode identity.
+#[derive(Debug, Eq, PartialEq)]
+enum FileDeletionState {
+    /// The inode may be opened and no link has been selected for deletion.
+    Live,
+    /// New opens are rejected and the selected link is removed after the final active cleanup.
+    Pending(PendingFileDeletion),
+    /// The selected link has been removed; only terminal FILE_OBJECT close references remain.
+    Deleted,
+}
+
+impl FileDeletionState {
+    /// Rejects a new open after delete-pending has been published.
+    /// # Errors
+    ///
+    /// Returns delete-pending after the one-way namespace transition begins.
+    const fn ensure_openable(&self) -> DriverResult<()> {
+        match self {
+            Self::Live => Ok(()),
+            Self::Pending(_) | Self::Deleted => Err(DriverError::DeletePending),
+        }
+    }
+
+    /// Returns whether Windows queries must expose `DeletePending`.
+    const fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending(_) | Self::Deleted)
+    }
+
+    /// Returns the stable target when the final active handle may perform deletion.
+    fn cleanup_target(&self, active_handles: u32) -> Option<NonNull<FileDeleteTarget>> {
+        match self {
+            Self::Pending(pending) if active_handles == 0 => Some(pending.target()),
+            Self::Live | Self::Pending(_) | Self::Deleted => None,
+        }
+    }
+}
+
+/// Cleanup effect selected atomically with removal of one FILE_OBJECT share claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileCleanupDisposition {
+    /// Other active handles remain or no deletion is pending.
+    Retained,
+    /// This was the final active handle and must remove the selected namespace link.
+    Delete(NonNull<FileDeleteTarget>),
+}
+
 #[derive(Debug, Eq, PartialEq)]
 /// Opened location identity stored with a handle.
 pub(crate) enum OpenedLocation {
@@ -3690,6 +3998,8 @@ struct OpenedHandleState {
     location: UnsafeCell<OpenedLocation>,
     /// One-way cleanup lifecycle shared with the synchronous control plane.
     lifecycle: HandleLifecycle,
+    /// Delete authority fixed when this handle was opened.
+    delete_access: DeleteAccess,
     /// Write completion durability requested for this handle.
     write_commitment: WriteCommitment,
     /// Data transfer buffering policy requested for this handle.
@@ -3703,6 +4013,7 @@ impl OpenedHandleState {
     const fn new(
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
+        delete_access: DeleteAccess,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
     ) -> Self {
@@ -3710,6 +4021,7 @@ impl OpenedHandleState {
             node_mode,
             location: UnsafeCell::new(location),
             lifecycle: HandleLifecycle::active(),
+            delete_access,
             write_commitment,
             data_transfer_mode,
             directory_notification_name: UnsafeCell::new(DirectoryNotificationName::Unregistered),
@@ -3728,6 +4040,11 @@ impl OpenedHandleState {
     /// Returns the namespace interpretation selected for this handle.
     const fn node_mode(&self) -> OpenedNodeMode {
         self.node_mode
+    }
+
+    /// Returns delete authority retained by this handle.
+    const fn delete_access(&self) -> DeleteAccess {
+        self.delete_access
     }
 
     /// Replaces the opened location after a successful rename.
@@ -3826,6 +4143,7 @@ impl OpenedHandle {
         node: NodeId,
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
+        delete_access: DeleteAccess,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
@@ -3834,6 +4152,7 @@ impl OpenedHandle {
             node,
             node_mode,
             location,
+            delete_access,
             write_commitment,
             data_transfer_mode,
             regular_file_write_access,
@@ -3845,12 +4164,18 @@ impl OpenedHandle {
         node: NodeId,
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
+        delete_access: DeleteAccess,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
     ) -> Self {
-        let state =
-            OpenedHandleState::new(node_mode, location, write_commitment, data_transfer_mode);
+        let state = OpenedHandleState::new(
+            node_mode,
+            location,
+            delete_access,
+            write_commitment,
+            data_transfer_mode,
+        );
         let kind = match node {
             NodeId::File(_) => OpenedHandleKind::File {
                 write_access: regular_file_write_access,
@@ -3881,6 +4206,11 @@ impl OpenedHandle {
     /// Returns the namespace interpretation selected for this handle.
     const fn node_mode(&self) -> OpenedNodeMode {
         self.state.node_mode()
+    }
+
+    /// Returns delete authority retained by this handle.
+    const fn delete_access(&self) -> DeleteAccess {
+        self.state.delete_access()
     }
 
     /// Begins this handle's idempotent cleanup transition.
@@ -4005,6 +4335,47 @@ impl<'owner> OpenedObject<'owner> {
         self.handle().node_mode()
     }
 
+    /// Requires delete authority retained by this handle.
+    /// # Errors
+    ///
+    /// Returns access denied when the create/open did not request `DELETE`.
+    pub(crate) fn require_delete_access(&self) -> DriverResult<()> {
+        self.handle().delete_access().require()
+    }
+
+    /// Copies this handle's exact deletable location into stable FCB-owned storage.
+    /// # Errors
+    ///
+    /// Returns cannot-delete for root or file-reference handles, or an allocation failure.
+    pub(crate) fn prepare_pending_deletion(&self) -> DriverResult<PendingFileDeletion> {
+        PendingFileDeletion::try_from_location(self.location())
+    }
+
+    /// Cancels delete-pending for the shared FCB.
+    pub(crate) fn clear_delete_pending(&self) {
+        let owner = file_control_block_owner(self.fcb);
+        unsafe {
+            // SAFETY: This opened FILE_OBJECT keeps the FCB and its ledger owner live.
+            owner.as_ref()
+        }
+        .clear_delete_pending(self.fcb);
+    }
+
+    /// Returns whether the shared FCB is delete-pending.
+    pub(crate) fn delete_pending(&self) -> bool {
+        let owner = file_control_block_owner(self.fcb);
+        unsafe {
+            // SAFETY: This opened FILE_OBJECT keeps the FCB and its ledger owner live.
+            owner.as_ref()
+        }
+        .delete_pending(self.fcb)
+    }
+
+    /// Returns the stable FCB address retained by this FILE_OBJECT.
+    pub(crate) const fn file_control_block_address(&self) -> NonNull<FileControlBlock> {
+        self.fcb
+    }
+
     /// Replaces the opened location after a successful rename.
     pub(crate) fn replace_location(&mut self, location: OpenedLocation) {
         self.handle().replace_location(location);
@@ -4088,9 +4459,9 @@ impl<'owner> OpenedObject<'owner> {
         self.handle().begin_cleanup()
     }
 
-    /// Removes this handle's share claim while retaining its FCB reference until close.
-    pub(crate) fn release_share_access_for_cleanup(&self) {
-        release_file_share_access(self.fcb, self.file_object.address());
+    /// Removes this handle's share claim and selects final-active-handle deletion.
+    pub(crate) fn release_share_access_for_cleanup(&self) -> FileCleanupDisposition {
+        release_file_share_access(self.fcb, self.file_object.address())
     }
 
     /// Publishes lifecycle completion after every cleanup-owned release has finished.
@@ -4466,13 +4837,13 @@ pub(crate) fn release_file_control_block(fcb: NonNull<FileControlBlock>) {
 pub(crate) fn release_file_share_access(
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
-) {
+) -> FileCleanupDisposition {
     let owner = file_control_block_owner(fcb);
     let owner = unsafe {
         // SAFETY: The retained FCB reference keeps its owner ledger live for cleanup.
         owner.as_ref()
     };
-    owner.release_share_access(fcb, file_object);
+    owner.release_share_access(fcb, file_object)
 }
 
 /// Rolls back a pre-attachment FCB reference and its recorded share claim.
@@ -4606,7 +4977,8 @@ mod tests {
     use ext4_core::{DirectoryNodeId, Ext4Name, FileOffset, NodeId};
 
     use crate::irp::{
-        ActiveFileObject, DataIoKind, DirectoryEntryIndex, ReceivedIrp, RegularFileWriteAccess,
+        ActiveFileObject, DataIoKind, DeleteAccess, DirectoryEntryIndex, ReceivedIrp,
+        RegularFileWriteAccess,
     };
     use crate::kernel::status::DriverError;
 
@@ -5001,6 +5373,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
+            DeleteAccess::Denied,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5039,6 +5412,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
+            DeleteAccess::Denied,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5117,6 +5491,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
+            DeleteAccess::Denied,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5145,6 +5520,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::ReparsePoint,
             OpenedLocation::Root,
+            DeleteAccess::Denied,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5171,6 +5547,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
+            DeleteAccess::Denied,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5197,6 +5574,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
+            DeleteAccess::Denied,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5241,6 +5619,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
+            DeleteAccess::Denied,
             WriteCommitment::FlushThrough,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5278,6 +5657,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
+            DeleteAccess::Denied,
             WriteCommitment::CommitOnly,
             DataTransferMode::NoIntermediate(transfer),
             RegularFileWriteAccess::Denied,
@@ -5308,6 +5688,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
+            DeleteAccess::Denied,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5371,6 +5752,7 @@ mod tests {
                 state: super::OpenedHandleState::new(
                     OpenedNodeMode::Direct,
                     OpenedLocation::Root,
+                    DeleteAccess::Denied,
                     WriteCommitment::CommitOnly,
                     DataTransferMode::IntermediateAllowed,
                 ),
@@ -5391,6 +5773,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
+            DeleteAccess::Denied,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5453,6 +5836,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
+            DeleteAccess::Denied,
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5577,5 +5961,91 @@ mod tests {
         assert_eq!(state.share_access.SharedRead, 0);
         assert_eq!(state.share_access.SharedWrite, 0);
         assert_eq!(state.share_access.SharedDelete, 0);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the shared FCB deletion state permits reopen or deletes before final cleanup.
+    #[test]
+    fn file_deletion_state_is_shared_and_waits_for_final_active_cleanup() {
+        let name = Ext4Name::new(b"pending");
+        assert!(name.is_ok());
+        let Ok(name) = name else {
+            return;
+        };
+        let location = OpenedLocation::try_directory_entry(DirectoryNodeId::ROOT, &name);
+        assert!(location.is_ok());
+        let Ok(location) = location else {
+            return;
+        };
+        let pending = super::PendingFileDeletion::try_from_location(&location);
+        assert!(pending.is_ok());
+        let Ok(pending) = pending else {
+            return;
+        };
+        let target = pending.target();
+        let mut state = FileControlBlockOpenState::new();
+
+        assert_eq!(state.deletion.ensure_openable(), Ok(()));
+        assert!(!state.delete_pending());
+        assert!(state.set_delete_pending(pending).is_none());
+        assert_eq!(
+            state.deletion.ensure_openable(),
+            Err(DriverError::DeletePending)
+        );
+        state.share_access.OpenCount = 1;
+        assert_eq!(
+            state.cleanup_disposition(),
+            super::FileCleanupDisposition::Retained
+        );
+        state.share_access.OpenCount = 0;
+        assert_eq!(
+            state.cleanup_disposition(),
+            super::FileCleanupDisposition::Delete(target)
+        );
+
+        let completed = state.complete_delete(target);
+        assert_eq!(completed.target(), target);
+        assert!(state.delete_pending());
+        assert_eq!(
+            state.deletion.ensure_openable(),
+            Err(DriverError::DeletePending)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when cancellation or non-directory-entry deletion targets become ambiguous.
+    #[test]
+    fn pending_file_deletion_cancels_only_before_commit_and_requires_a_link() {
+        assert_eq!(
+            super::PendingFileDeletion::try_from_location(&OpenedLocation::Root),
+            Err(DriverError::CannotDelete)
+        );
+        assert_eq!(
+            super::PendingFileDeletion::try_from_location(&OpenedLocation::FileReference),
+            Err(DriverError::CannotDelete)
+        );
+
+        let name = Ext4Name::new(b"cancel");
+        assert!(name.is_ok());
+        let Ok(name) = name else {
+            return;
+        };
+        let location = OpenedLocation::try_directory_entry(DirectoryNodeId::ROOT, &name);
+        assert!(location.is_ok());
+        let Ok(location) = location else {
+            return;
+        };
+        let pending = super::PendingFileDeletion::try_from_location(&location);
+        assert!(pending.is_ok());
+        let Ok(pending) = pending else {
+            return;
+        };
+        let mut state = FileControlBlockOpenState::new();
+        assert!(state.set_delete_pending(pending).is_none());
+        assert!(state.clear_delete_pending().is_some());
+        assert_eq!(state.deletion.ensure_openable(), Ok(()));
+        assert!(!state.delete_pending());
     }
 }

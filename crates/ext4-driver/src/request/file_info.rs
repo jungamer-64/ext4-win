@@ -21,21 +21,24 @@ use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{
     CleanupStart, CloseReleasePlan, DirectoryCursor, DirectoryNameChange,
-    DirectoryNameChangeAction, DirectoryNotificationRegistration, FileControlBlock,
-    MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation, OpenedObject,
-    OpenedRegularFile, VolumeControlBlock, VolumeHandleCleanup, VolumeOperationLane,
-    VolumeOperationLease, VolumeRetirement, WriteCommitment, release_cancelled_file_control_block,
-    release_file_control_block,
+    DirectoryNameChangeAction, DirectoryNotificationRegistration, FileCleanupDisposition,
+    FileControlBlock, FileDeleteTarget, MountedVolumeDevice, OpenedDirectory, OpenedFileObject,
+    OpenedLocation, OpenedObject, OpenedRegularFile, PendingFileDeletion, VolumeControlBlock,
+    VolumeHandleCleanup, VolumeOperationLane, VolumeOperationLease, VolumeRetirement,
+    WriteCommitment, release_cancelled_file_control_block, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
-/// Executes cleanup IRPs.
+/// Executes cleanup IRPs, including final-active-handle deferred deletion.
 /// # Errors
 ///
-/// Returns an error when the IRP stack has no opened FILE_OBJECT or cleanup state is invalid.
-pub(crate) fn cleanup(target: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion> {
-    let file_object = target.current_stack()?.file_object()?;
-    cleanup_file_object(target, file_object)?;
+/// Returns an error when the IRP stack has no opened FILE_OBJECT, cleanup state is invalid, or a
+/// pending namespace deletion cannot be committed.
+pub(crate) async fn cleanup(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let plan = request.with_active(begin_cleanup_file_object)?;
+    if let CleanupPlan::Delete(plan) = plan {
+        delete_after_final_cleanup(plan).await?;
+    }
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -252,6 +255,8 @@ enum QueryFilePlan {
         information_class: QueryFileInformationClass,
         /// Target ext4 node.
         node: NodeId,
+        /// Shared FCB deletion state captured before metadata I/O.
+        delete_pending: bool,
         /// Exclusive mounted-volume operation capability.
         operations: VolumeOperationLease,
     },
@@ -299,16 +304,18 @@ async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResul
             length,
             information_class,
             node: opened_file.node(),
+            delete_pending: opened_file.delete_pending(),
             operations: claim_file_operation_lane(opened_file.file_control_block()),
         })
     })?;
-    let (length, information_class, node, operations) = match plan {
+    let (length, information_class, node, delete_pending, operations) = match plan {
         QueryFilePlan::Metadata {
             length,
             information_class,
             node,
+            delete_pending,
             operations,
-        } => (length, information_class, node, operations),
+        } => (length, information_class, node, delete_pending, operations),
         QueryFilePlan::Complete {
             length,
             output,
@@ -335,7 +342,7 @@ async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResul
                 pack_basic_information(buffer.as_mut_slice(), metadata)
             }
             QueryFileInformationClass::Standard => {
-                pack_standard_information(buffer.as_mut_slice(), metadata)
+                pack_standard_information(buffer.as_mut_slice(), metadata, delete_pending)
             }
             QueryFileInformationClass::Internal => {
                 pack_internal_information(buffer.as_mut_slice(), metadata)
@@ -381,6 +388,19 @@ enum SetFilePlan {
         file: FileNodeId,
         /// Requested allocation bound.
         size: FileSize,
+        /// Exclusive mounted-volume operation capability.
+        operations: VolumeOperationLease,
+    },
+    /// Validate and publish one identity-bound delete-pending target.
+    Disposition {
+        /// Target ext4 inode identity.
+        node: NodeId,
+        /// Stable FCB whose shared deletion state is mutated.
+        fcb: NonNull<FileControlBlock>,
+        /// Prepared exact parent/name identity.
+        pending: PendingFileDeletion,
+        /// Whether the extended request bypasses the read-only Windows attribute.
+        readonly: DeleteReadonlyPolicy,
         /// Exclusive mounted-volume operation capability.
         operations: VolumeOperationLease,
     },
@@ -442,13 +462,14 @@ async fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<
                 }
             }
             SetFileInformationClass::Disposition => {
-                set_disposition_information(active, stack)?;
-                SetFilePlan::Complete
+                disposition_plan(active, stack, &opened_file, DispositionInputFormat::Legacy)?
             }
-            SetFileInformationClass::DispositionEx => {
-                set_disposition_information_ex(active, stack)?;
-                SetFilePlan::Complete
-            }
+            SetFileInformationClass::DispositionEx => disposition_plan(
+                active,
+                stack,
+                &opened_file,
+                DispositionInputFormat::Extended,
+            )?,
             SetFileInformationClass::Rename => SetFilePlan::Rename {
                 mutation: RenameMutation::decode(
                     active,
@@ -491,6 +512,17 @@ async fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<
             if size < current {
                 set_regular_file_size(operations.lane_mut(), file, size).await?;
             }
+        }
+        SetFilePlan::Disposition {
+            node,
+            fcb,
+            pending,
+            readonly,
+            mut operations,
+        } => {
+            validate_pending_deletion(operations.lane_mut(), node, pending.target_ref(), readonly)
+                .await?;
+            operations.set_file_delete_pending(fcb, pending);
         }
         SetFilePlan::Rename {
             mutation,
@@ -553,6 +585,157 @@ async fn set_basic_information(
     Ok(())
 }
 
+/// Raw Windows disposition layout selected by the information class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispositionInputFormat {
+    /// `FILE_DISPOSITION_INFORMATION`.
+    Legacy,
+    /// `FILE_DISPOSITION_INFORMATION_EX`.
+    Extended,
+}
+
+/// Effect requested for the shared FCB deletion state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileDispositionRequest {
+    /// Cancel a previously published delete-pending state.
+    Keep,
+    /// Publish delete-pending after validating the selected link.
+    Delete(DeleteReadonlyPolicy),
+}
+
+/// Read-only attribute policy selected by an extended disposition request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeleteReadonlyPolicy {
+    /// A Windows read-only attribute prevents deletion.
+    Enforce,
+    /// `FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE` explicitly bypasses the attribute.
+    Ignore,
+}
+
+/// Builds a disposition plan from one fully decoded handle and buffered input.
+/// # Errors
+///
+/// Returns an error when the input is malformed, the handle lacks `DELETE`, unsupported extended
+/// semantics are requested, or the handle has no deletable directory-entry identity.
+fn disposition_plan(
+    active: &ActiveIrp<'_>,
+    stack: SetFileStack,
+    opened: &OpenedObject<'_>,
+    format: DispositionInputFormat,
+) -> DriverResult<SetFilePlan> {
+    opened.require_delete_access()?;
+    let request = match format {
+        DispositionInputFormat::Legacy => {
+            let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION>(
+                active,
+                stack.length(),
+            )?;
+            if info.DeleteFile == 0 {
+                FileDispositionRequest::Keep
+            } else {
+                FileDispositionRequest::Delete(DeleteReadonlyPolicy::Enforce)
+            }
+        }
+        DispositionInputFormat::Extended => {
+            let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION_EX>(
+                active,
+                stack.length(),
+            )?;
+            decode_extended_disposition(info.Flags)?
+        }
+    };
+    match request {
+        FileDispositionRequest::Keep => {
+            opened.clear_delete_pending();
+            Ok(SetFilePlan::Complete)
+        }
+        FileDispositionRequest::Delete(readonly) => Ok(SetFilePlan::Disposition {
+            node: opened.node(),
+            fcb: opened.file_control_block_address(),
+            pending: opened.prepare_pending_deletion()?,
+            readonly,
+            operations: claim_file_operation_lane(opened.file_control_block()),
+        }),
+    }
+}
+
+/// Decodes the supported non-POSIX subset of `FILE_DISPOSITION_INFORMATION_EX`.
+/// # Errors
+///
+/// Returns not-supported for POSIX, image-section, or ON_CLOSE semantics, and invalid-parameter for
+/// unknown or meaningless flag combinations.
+fn decode_extended_disposition(flags: wdk_sys::ULONG) -> DriverResult<FileDispositionRequest> {
+    const SUPPORTED_FLAGS: wdk_sys::ULONG =
+        wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
+    const UNSUPPORTED_FLAGS: wdk_sys::ULONG = wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS
+        | wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK
+        | wdk_sys::FILE_DISPOSITION_ON_CLOSE;
+    if flags & UNSUPPORTED_FLAGS != 0 {
+        return Err(DriverError::NotSupported);
+    }
+    if flags & !(SUPPORTED_FLAGS | UNSUPPORTED_FLAGS) != 0 {
+        return Err(DriverError::InvalidParameter);
+    }
+    let delete = flags & wdk_sys::FILE_DISPOSITION_DELETE != 0;
+    let ignore_readonly = flags & wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE != 0;
+    match (delete, ignore_readonly) {
+        (false, false) => Ok(FileDispositionRequest::Keep),
+        (false, true) => Err(DriverError::InvalidParameter),
+        (true, false) => Ok(FileDispositionRequest::Delete(
+            DeleteReadonlyPolicy::Enforce,
+        )),
+        (true, true) => Ok(FileDispositionRequest::Delete(DeleteReadonlyPolicy::Ignore)),
+    }
+}
+
+/// Validates the exact parent/name/inode identity before publishing delete-pending.
+/// # Errors
+///
+/// Returns cannot-delete when the link no longer identifies the opened inode or has the read-only
+/// attribute, directory-not-empty for a non-empty directory, or the underlying read error.
+async fn validate_pending_deletion(
+    operations: &mut VolumeOperationLane,
+    node: NodeId,
+    target: &FileDeleteTarget,
+    readonly: DeleteReadonlyPolicy,
+) -> DriverResult<()> {
+    let parent = operations
+        .journaled_mut()
+        .load_directory(target.parent())
+        .await?;
+    match operations
+        .journaled_mut()
+        .lookup_child(&parent, target.name())
+        .await?
+    {
+        ChildLookup::Found(child) if *child.node() == node => {}
+        ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
+    }
+    let metadata = metadata_from_node(operations, node).await?;
+    if readonly == DeleteReadonlyPolicy::Enforce
+        && file_attributes(metadata) & wdk_sys::FILE_ATTRIBUTE_READONLY != 0
+    {
+        return Err(DriverError::CannotDelete);
+    }
+    if let NodeId::Directory(directory_id) = node {
+        let directory = operations
+            .journaled_mut()
+            .load_directory(directory_id)
+            .await?;
+        let entries = operations
+            .journaled_mut()
+            .read_directory(&directory)
+            .await?;
+        if entries
+            .iter()
+            .any(|entry| !matches!(entry.name().bytes(), b"." | b".."))
+        {
+            return Err(DriverError::from(ext4_core::Error::DirectoryNotEmpty));
+        }
+    }
+    Ok(())
+}
+
 /// Owned rename mutation decoded completely before the first suspension.
 #[derive(Debug)]
 struct RenameMutation {
@@ -577,6 +760,9 @@ impl RenameMutation {
         opened_file: &OpenedObject<'_>,
         format: RenameInformationFormat,
     ) -> DriverResult<Self> {
+        if opened_file.delete_pending() {
+            return Err(DriverError::DeletePending);
+        }
         let target = RenameTargetPath::parse(active, stack.length(), format)?;
         let (source_parent, source_name) = match opened_file.location() {
             OpenedLocation::DirectoryEntry { parent, name } => (*parent, name.try_to_owned_name()?),
@@ -619,7 +805,7 @@ async fn rename_file_information(
 ) -> DriverResult<IrpCompletion> {
     let committed = {
         let mut operations = operations;
-        set_rename_information(mutation, operations.lane_mut()).await?
+        set_rename_information(mutation, &mut operations).await?
     };
     if let CommittedRename::Changed {
         location,
@@ -652,7 +838,7 @@ async fn rename_file_information(
 /// fails.
 async fn set_rename_information(
     mutation: RenameMutation,
-    operations: &mut VolumeOperationLane,
+    operations: &mut VolumeOperationLease,
 ) -> DriverResult<CommittedRename> {
     let RenameMutation {
         source_parent,
@@ -660,7 +846,8 @@ async fn set_rename_information(
         source_node,
         target,
     } = mutation;
-    let (target_parent, target_name) = resolve_rename_target(operations, &target).await?;
+    let (target_parent, target_name) =
+        resolve_rename_target(operations.lane_mut(), &target).await?;
     let notifications = RenameDirectoryNameChanges::prepare(
         operations,
         source_parent,
@@ -676,6 +863,7 @@ async fn set_rename_information(
         .transpose()
         .map_err(|_| DriverError::InsufficientResources)?;
     let mut transaction = operations
+        .lane_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let source_parent = transaction.directory(source_parent).await?;
@@ -720,7 +908,7 @@ impl RenameDirectoryNameChanges {
     /// Returns an error when a replace-capable target cannot be read or a visible child name
     /// cannot be represented in the Windows notification namespace.
     async fn prepare(
-        operations: &mut VolumeOperationLane,
+        operations: &mut VolumeOperationLease,
         source_parent: DirectoryNodeId,
         source_name: &Ext4Name,
         source_node: NodeId,
@@ -736,21 +924,26 @@ impl RenameDirectoryNameChanges {
             RenameTargetCollision::Reject => None,
             RenameTargetCollision::Replace => {
                 let parent = operations
+                    .lane_mut()
                     .journaled_mut()
                     .load_directory(target_parent)
                     .await?;
                 match operations
+                    .lane_mut()
                     .journaled_mut()
                     .lookup_windows_child(&parent, target.target_name())
                     .await?
                 {
                     ChildLookup::Found(child) if *child.node() == source_node => return Ok(None),
-                    ChildLookup::Found(child) => Some(DirectoryNameChange::new(
-                        target_parent,
-                        child.name(),
-                        *child.node(),
-                        DirectoryNameChangeAction::Removed,
-                    )?),
+                    ChildLookup::Found(child) => {
+                        operations.ensure_node_openable(*child.node())?;
+                        Some(DirectoryNameChange::new(
+                            target_parent,
+                            child.name(),
+                            *child.node(),
+                            DirectoryNameChangeAction::Removed,
+                        )?)
+                    }
                     ChildLookup::NotFound => None,
                 }
             }
@@ -1469,21 +1662,40 @@ fn windows_time_quad(timestamp: Ext4Timestamp) -> i64 {
     }
 }
 
+/// Cleanup work selected after all synchronous FILE_OBJECT state has been released.
+enum CleanupPlan {
+    /// No namespace deletion became ready.
+    Complete,
+    /// The final active handle must remove one exact FCB-owned namespace link.
+    Delete(PendingCleanupDeletion),
+}
+
+/// Actor-local deferred deletion plan whose FCB remains pinned by the cleanup FILE_OBJECT.
+struct PendingCleanupDeletion {
+    /// Shared FCB retained until the later Close IRP.
+    fcb: NonNull<FileControlBlock>,
+    /// Immutable opened inode identity.
+    node: NodeId,
+    /// Stable FCB-owned target allocation.
+    target: NonNull<FileDeleteTarget>,
+    /// Exclusive mounted-volume operation capability.
+    operations: VolumeOperationLease,
+}
+
 /// Releases resources owned by one FILE_OBJECT handle lifecycle.
 /// # Errors
 ///
 /// Returns an error when the FILE_OBJECT has no opened context.
-fn cleanup_file_object(
-    active: &ActiveIrp<'_>,
-    file_object: ActiveFileObject<'_>,
-) -> DriverResult<()> {
+fn begin_cleanup_file_object(active: &mut ActiveIrp<'_>) -> DriverResult<CleanupPlan> {
+    let file_object = active.current_stack()?.file_object()?;
     let opened_file = OpenedFileObject::decode(file_object)?;
     match opened_file {
         OpenedFileObject::Node(opened_file) => {
             cleanup_opened_node(active, file_object, opened_file)
         }
         OpenedFileObject::Volume(opened_volume) => {
-            cleanup_opened_volume(active.device(), file_object, opened_volume)
+            cleanup_opened_volume(active.device(), file_object, opened_volume)?;
+            Ok(CleanupPlan::Complete)
         }
     }
 }
@@ -1496,24 +1708,90 @@ fn cleanup_opened_node(
     active: &ActiveIrp<'_>,
     file_object: ActiveFileObject<'_>,
     opened_file: OpenedObject<'_>,
-) -> DriverResult<()> {
+) -> DriverResult<CleanupPlan> {
+    let requestor = active.requestor_process()?;
     let cleanup_was_published = file_object.cleanup_complete();
     match (opened_file.begin_cleanup(), cleanup_was_published) {
         (CleanupStart::First, false) => {}
-        (CleanupStart::AlreadyComplete, true) => return Ok(()),
+        (CleanupStart::AlreadyComplete, true) => return Ok(CleanupPlan::Complete),
         (CleanupStart::First, true) | (CleanupStart::AlreadyComplete, false) => {
             crate::kernel::fatal::KernelWideInconsistency::file_object_lifecycle_corruption()
                 .bugcheck();
         }
     }
     cleanup_directory_notification(&opened_file);
-    let requestor = active.requestor_process()?;
     opened_file
         .file_control_block()
         .release_handle_byte_range_locks(requestor, file_object.address());
-    opened_file.release_share_access_for_cleanup();
+    let cleanup = opened_file.release_share_access_for_cleanup();
+    let fcb = opened_file.file_control_block_address();
+    let node = opened_file.node();
+    let volume = opened_file.volume();
     opened_file.finish_cleanup();
     file_object.mark_cleanup_complete();
+    Ok(match cleanup {
+        FileCleanupDisposition::Retained => CleanupPlan::Complete,
+        FileCleanupDisposition::Delete(target) => CleanupPlan::Delete(PendingCleanupDeletion {
+            fcb,
+            node,
+            target,
+            operations: claim_volume_operation_lane(volume),
+        }),
+    })
+}
+
+/// Removes an identity-checked pending link after the final active handle cleanup.
+/// # Errors
+///
+/// Returns an error when the target name no longer identifies the FCB inode, the directory is no
+/// longer empty, or the ext4 transaction cannot be committed.
+async fn delete_after_final_cleanup(mut plan: PendingCleanupDeletion) -> DriverResult<()> {
+    let target = unsafe {
+        // SAFETY: The cleanup FILE_OBJECT retains `fcb` until its later Close IRP. The FCB owns this
+        // stable allocation in Pending state, and the device actor cannot mutate that state until
+        // this function calls `complete_file_delete` after the final await.
+        plan.target.as_ref()
+    };
+    let parent = plan
+        .operations
+        .lane_mut()
+        .journaled_mut()
+        .load_directory(target.parent())
+        .await?;
+    match plan
+        .operations
+        .lane_mut()
+        .journaled_mut()
+        .lookup_child(&parent, target.name())
+        .await?
+    {
+        ChildLookup::Found(child) if *child.node() == plan.node => {}
+        ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
+    }
+    let notification = DirectoryNameChange::new(
+        target.parent(),
+        target.name(),
+        plan.node,
+        DirectoryNameChangeAction::Removed,
+    )?;
+    let mut transaction = plan
+        .operations
+        .lane_mut()
+        .journaled_mut()
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
+    let parent = transaction.directory(target.parent()).await?;
+    match plan.node {
+        NodeId::File(_) => transaction.unlink_file(parent, target.name()).await?,
+        NodeId::Directory(_) => {
+            transaction
+                .remove_empty_directory(parent, target.name())
+                .await?;
+        }
+        NodeId::Symlink(_) => transaction.remove_symlink(parent, target.name()).await?,
+    }
+    transaction.commit().await?;
+    plan.operations.complete_file_delete(plan.fcb, plan.target);
+    plan.operations.report_directory_name_change(notification);
     Ok(())
 }
 
@@ -2180,6 +2458,7 @@ fn pack_basic_information(
 fn pack_standard_information(
     output: &mut [u8],
     metadata: FileMetadata,
+    delete_pending: bool,
 ) -> DriverResult<IrpCompletion> {
     write_fixed(
         output,
@@ -2187,7 +2466,7 @@ fn pack_standard_information(
             AllocationSize: large_integer_from_u64(metadata.allocation_size.bytes())?,
             EndOfFile: large_integer_from_u64(metadata.size.bytes())?,
             NumberOfLinks: wdk_sys::ULONG::from(metadata.links_count.get()),
-            DeletePending: boolean(false),
+            DeletePending: boolean(delete_pending),
             Directory: boolean(metadata.kind == FileMetadataKind::Directory),
         },
     )
@@ -3132,6 +3411,46 @@ mod tests {
 
     /// # Panics
     ///
+    /// Panics when the extended disposition boundary accepts ambiguous deletion semantics.
+    #[test]
+    fn extended_disposition_decodes_only_normal_delete_semantics() {
+        assert_eq!(
+            super::decode_extended_disposition(0),
+            Ok(super::FileDispositionRequest::Keep)
+        );
+        assert_eq!(
+            super::decode_extended_disposition(wdk_sys::FILE_DISPOSITION_DELETE),
+            Ok(super::FileDispositionRequest::Delete(
+                super::DeleteReadonlyPolicy::Enforce
+            ))
+        );
+        assert_eq!(
+            super::decode_extended_disposition(
+                wdk_sys::FILE_DISPOSITION_DELETE
+                    | wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE
+            ),
+            Ok(super::FileDispositionRequest::Delete(
+                super::DeleteReadonlyPolicy::Ignore
+            ))
+        );
+        assert_eq!(
+            super::decode_extended_disposition(wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE),
+            Err(DriverError::InvalidParameter)
+        );
+        for unsupported in [
+            wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS,
+            wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK,
+            wdk_sys::FILE_DISPOSITION_ON_CLOSE,
+        ] {
+            assert_eq!(
+                super::decode_extended_disposition(wdk_sys::FILE_DISPOSITION_DELETE | unsupported),
+                Err(DriverError::NotSupported)
+            );
+        }
+    }
+
+    /// # Panics
+    ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn flush_volume_rejects_unmounted_device_without_file_object() {
@@ -3398,7 +3717,16 @@ mod tests {
         metadata.allocation_size = FileAllocationSize::from_bytes(allocation_size);
 
         let mut standard = [0_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>()];
-        assert!(super::pack_standard_information(&mut standard, metadata).is_ok());
+        assert!(super::pack_standard_information(&mut standard, metadata, false).is_ok());
+        assert_eq!(
+            standard[core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, DeletePending)],
+            0
+        );
+        assert!(super::pack_standard_information(&mut standard, metadata, true).is_ok());
+        assert_eq!(
+            standard[core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, DeletePending)],
+            1
+        );
         assert_eq!(le_i64(&standard, 0), i64::try_from(allocation_size).ok());
         assert_eq!(le_i64(&standard, 8), i64::try_from(eof).ok());
 

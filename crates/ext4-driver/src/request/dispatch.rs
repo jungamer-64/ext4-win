@@ -321,9 +321,7 @@ pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
     }
     let _status = match owned.actor_request() {
         ActorRequest::Cleanup => {
-            let result = owned
-                .request()
-                .with_active(crate::request::file_info::cleanup);
+            let result = crate::request::file_info::cleanup(owned.request()).await;
             owned.complete_result(result)
         }
         ActorRequest::Close => {

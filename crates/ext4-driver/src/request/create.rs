@@ -11,8 +11,9 @@ use crate::{
     irp::{
         CreateAction, CreateCompletion, CreateDisposition, CreateNameInterpretation,
         CreateParameters, CreateReparsePointMode, CreateSymlinkReparseBuffer,
-        CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering, DesiredAccess,
-        ExistingOperationAccess, PendingIrpLease, RegularFileWriteAccess, ShareAccess,
+        CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering, DeleteAccess,
+        DesiredAccess, ExistingOperationAccess, PendingIrpLease, RegularFileWriteAccess,
+        ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
@@ -166,7 +167,7 @@ async fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<Crea
     operations.authorize_create()?;
     match resolve_target(
         target,
-        operations.lane_mut(),
+        &mut operations,
         owner.parameters().reparse_point_mode(),
     )
     .await?
@@ -314,6 +315,8 @@ struct CreateHandlePolicy {
     data_transfer_mode: DataTransferMode,
     /// Regular-file write authority retained by the per-handle state.
     regular_file_write_access: RegularFileWriteAccess,
+    /// Delete authority retained by the per-handle state.
+    delete_access: DeleteAccess,
     /// FILE_OBJECT flags projected from create options.
     file_object_flags: CreateFileObjectFlags,
 }
@@ -339,6 +342,7 @@ impl CreateHandlePolicy {
                 }
             },
             regular_file_write_access: parameters.desired_access().regular_file_write_access(),
+            delete_access: parameters.desired_access().delete_access(),
             file_object_flags,
         })
     }
@@ -366,6 +370,11 @@ impl CreateHandlePolicy {
     /// Returns data transfer buffering policy.
     const fn data_transfer_mode(self) -> DataTransferMode {
         self.data_transfer_mode
+    }
+
+    /// Returns retained delete authority.
+    const fn delete_access(self) -> DeleteAccess {
+        self.delete_access
     }
 
     /// Returns the regular-file write authority selected by desired access.
@@ -780,6 +789,7 @@ async fn create_missing_node(
             node,
             OpenedNodeMode::Direct,
             location,
+            policy.delete_access(),
             policy.write_commitment(),
             policy.data_transfer_mode(),
             policy.regular_file_write_access(),
@@ -861,7 +871,7 @@ fn validate_existing_node_options(
 /// Returns an error when path or file-reference resolution fails.
 async fn resolve_target(
     target: CreateTargetSpecifier,
-    operations: &mut VolumeOperationLane,
+    operations: &mut VolumeOperationLease,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
     match target {
@@ -870,7 +880,13 @@ async fn resolve_target(
             resolve_path(name, anchor, operations, reparse_point_mode).await
         }
         CreateTargetSpecifier::FileReference(reference) => {
-            resolve_file_reference(reference, operations, reparse_point_mode).await
+            let target =
+                resolve_file_reference(reference, operations.lane_mut(), reparse_point_mode)
+                    .await?;
+            if let CreateTargetLookup::Existing { node, .. } = &target {
+                operations.ensure_node_openable(*node)?;
+            }
+            Ok(target)
         }
     }
 }
@@ -932,7 +948,7 @@ fn file_reference_lookup_error(error: ext4_core::Error) -> DriverError {
 async fn resolve_path(
     name: CreatePathName,
     anchor: CreatePathAnchor,
-    operations: &mut VolumeOperationLane,
+    operations: &mut VolumeOperationLease,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
     let mut parent_id = anchor.directory();
@@ -944,11 +960,18 @@ async fn resolve_path(
         } else {
             PathComponentPosition::Intermediate
         };
-        let parent = match operations.journaled_mut().load_directory(parent_id).await {
+        operations.ensure_node_openable(NodeId::Directory(parent_id))?;
+        let parent = match operations
+            .lane_mut()
+            .journaled_mut()
+            .load_directory(parent_id)
+            .await
+        {
             Ok(directory) => directory,
             Err(error) => return Err(DriverError::from(error)),
         };
         let child = match operations
+            .lane_mut()
             .journaled_mut()
             .lookup_windows_child(&parent, component.name())
             .await
@@ -964,7 +987,9 @@ async fn resolve_path(
             Err(error) => return Err(DriverError::from(error)),
         };
         let child_node = *child.node();
-        let reparse_point = NodeSymlinkReparsePoint::load(operations, child_node).await?;
+        operations.ensure_node_openable(child_node)?;
+        let reparse_point =
+            NodeSymlinkReparsePoint::load(operations.lane_mut(), child_node).await?;
         if let Some(point) = reparse_point {
             match reparse_point_encounter(position, reparse_point_mode) {
                 ReparsePointEncounter::Redirect => {
@@ -1133,6 +1158,7 @@ fn initialize_file_object(
             node,
             node_mode,
             location,
+            policy.delete_access(),
             policy.write_commitment(),
             policy.data_transfer_mode(),
             policy.regular_file_write_access(),
