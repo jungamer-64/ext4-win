@@ -540,17 +540,6 @@ impl ControlDevice {
     }
 }
 
-#[expect(
-    dead_code,
-    reason = "mount state is introduced before FSCTL mount IRP handling"
-)]
-#[derive(Clone, Copy, Debug)]
-/// Driver state after the control device has been registered.
-pub(crate) struct RegisteredDriver {
-    /// Registered control device owned by the driver.
-    control_device: KernelDevice,
-}
-
 #[derive(Clone, Copy, Debug)]
 /// Target device selected by mount FSCTL validation before VCB creation.
 pub(crate) struct MountCandidate {
