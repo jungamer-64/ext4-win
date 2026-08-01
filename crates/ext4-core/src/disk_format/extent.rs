@@ -26,6 +26,8 @@ const INODE_ROOT_ENTRY_CAPACITY: usize = 4;
 const EXTENT_TAIL_SIZE: usize = 4;
 /// ext4 extent trees are bounded; deeper trees are rejected before recursion.
 const MAX_EXTENT_DEPTH: u16 = 5;
+/// Exclusive end of the 32-bit logical block domain.
+const LOGICAL_BLOCK_EXCLUSIVE_END: u64 = 1_u64 << 32;
 
 /// Builds an extent-tree field offset.
 const fn disk_offset(offset: usize) -> DiskOffset {
@@ -244,7 +246,9 @@ impl Extent {
     /// Returns the exclusive logical end, including the one-past-`u32::MAX` boundary.
     #[must_use]
     pub(crate) fn end_logical(self) -> u64 {
-        self.logical_start.as_u64() + self.len.as_u64()
+        self.logical_start
+            .as_u64()
+            .saturating_add(self.len.as_u64())
     }
 
     /// Maps a logical block if it falls inside this extent.
@@ -795,6 +799,9 @@ fn normalize_extents(extents: &mut Vec<Extent>) -> Result<()> {
     extents.sort_by_key(|extent| extent.logical_start());
     let mut normalized: Vec<Extent> = Vec::new();
     for extent in extents.iter().copied() {
+        if extent.end_logical() > LOGICAL_BLOCK_EXCLUSIVE_END {
+            return Err(Error::InvalidExtentTree);
+        }
         if let Some(last) = normalized.last_mut() {
             let last_end = last.end_logical();
             if extent.logical_start().as_u64() < last_end {

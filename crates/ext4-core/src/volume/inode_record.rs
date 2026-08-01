@@ -146,7 +146,7 @@ impl AllocatedInodeRecord {
         now: Ext4Timestamp,
         block_size: BlockSize,
         first_block: BlockAddress,
-        allocated_blocks: u64,
+        allocation_size: FileAllocationSize,
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<LiveInodeRecord> {
         self.raw.initialize_directory(
@@ -154,7 +154,7 @@ impl AllocatedInodeRecord {
             now,
             block_size,
             first_block,
-            allocated_blocks,
+            allocation_size,
             timestamp_encoding,
         )?;
         self.raw.into_live()
@@ -568,7 +568,7 @@ impl RawInodeRecord {
         now: Ext4Timestamp,
         block_size: BlockSize,
         first_block: BlockAddress,
-        allocated_blocks: u64,
+        allocation_size: FileAllocationSize,
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<()> {
         self.bytes.fill(0);
@@ -592,12 +592,7 @@ impl RawInodeRecord {
         let tree = MutableExtentTree::from_extents(extents)?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
-        let allocation_bytes = allocated_blocks
-            .checked_mul(u64::from(block_size.bytes()))
-            .ok_or(Error::ArithmeticOverflow)?;
-        let allocation_size = self
-            .encoding
-            .encode_allocation_size(FileAllocationSize::from_bytes(allocation_bytes))?;
+        let allocation_size = self.encoding.encode_allocation_size(allocation_size)?;
         self.set_encoded_allocation_size(allocation_size)
     }
 
@@ -1233,7 +1228,7 @@ mod tests {
                 now(),
                 block_size()?,
                 BlockAddress::new(8),
-                1,
+                FileAllocationSize::from_bytes(u64::from(block_size()?.bytes())),
                 InodeTimestampEncoding::LegacySeconds,
             )
         });
@@ -1312,6 +1307,46 @@ mod tests {
         assert_eq!(
             flags(&deleted.raw).map(|flags| flags & EXT4_EXTENTS_FL),
             Ok(EXT4_EXTENTS_FL)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn sector_allocation_encoding_clears_stale_huge_file_state() {
+        let record = raw_record(15);
+        assert!(record.is_ok());
+        let Ok(mut record) = record else {
+            return;
+        };
+        assert_eq!(
+            record.set_flags(InodeFlags::EMPTY.with_huge_file_blocks()),
+            Ok(())
+        );
+        assert_eq!(
+            put_le_u16(
+                &mut record.bytes,
+                disk_offset(INODE_BLOCKS_HIGH_OFFSET),
+                u16::MAX,
+            ),
+            Ok(())
+        );
+        let encoded = record
+            .encoding
+            .encode_allocation_size(FileAllocationSize::from_bytes(1024));
+        assert!(encoded.is_ok());
+        let Ok(encoded) = encoded else {
+            return;
+        };
+        assert_eq!(record.set_encoded_allocation_size(encoded), Ok(()));
+        assert_eq!(
+            record.flags().map(|flags| flags.has_huge_file_blocks()),
+            Ok(false)
+        );
+        assert_eq!(
+            le_u16(record.bytes(), disk_offset(INODE_BLOCKS_HIGH_OFFSET)),
+            Ok(0)
         );
     }
 }

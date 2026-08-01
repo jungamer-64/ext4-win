@@ -117,12 +117,17 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 .superblock
                 .blocks_in_cluster(self.volume.superblock.cluster_of_block(block)?)?,
         );
+        let allocation_size = FileAllocationSize::from_bytes(
+            allocated_blocks
+                .checked_mul(u64::from(block_size.bytes()))
+                .ok_or(Error::ArithmeticOverflow)?,
+        );
         let mut raw_inode = allocated_inode.initialize_directory(
             metadata,
             self.now,
             block_size,
             block,
-            allocated_blocks,
+            allocation_size,
             self.volume.superblock.inode_timestamp_encoding(),
         )?;
         self.apply_fscrypt_context(&mut raw_inode, inherited_context)

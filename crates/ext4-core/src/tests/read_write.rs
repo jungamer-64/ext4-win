@@ -61,6 +61,33 @@ fn extent_hole_mapping_is_explicit() {
 
 /// # Panics
 ///
+/// Panics when the extent domain rejects the final logical block or accepts blocks beyond it.
+#[test]
+fn extent_logical_boundary_allows_only_one_final_block() {
+    let final_extent = Extent::initialized(
+        LogicalBlock::from_u32(u32::MAX),
+        must(ExtentLength::new(1)),
+        BlockAddress::new(1),
+    );
+    let tree = MutableExtentTree::from_extents(vec![final_extent]);
+    assert!(tree.is_ok());
+    let Ok(tree) = tree else {
+        return;
+    };
+    assert_eq!(tree.extents()[0].end_logical(), u64::from(u32::MAX) + 1);
+
+    assert_eq!(
+        MutableExtentTree::from_extents(vec![Extent::initialized(
+            LogicalBlock::from_u32(u32::MAX),
+            must(ExtentLength::new(2)),
+            BlockAddress::new(1),
+        )]),
+        Err(Error::InvalidExtentTree)
+    );
+}
+
+/// # Panics
+///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn sparse_hole_write_allocates_block() {
@@ -172,6 +199,10 @@ fn write_allocates_external_extent_leaf_after_root_capacity() {
             1
         );
         assert_eq!(output, [0]);
+        assert_eq!(
+            file_node(&mut volume, 3).allocation_size().bytes(),
+            6 * BLOCK_SIZE_U64
+        );
     }
 
     let inode_base = modern_inode_offset(3);
@@ -195,6 +226,10 @@ fn write_allocates_external_extent_leaf_after_root_capacity() {
         1
     );
     assert_eq!(output, [b'x']);
+    assert_eq!(
+        file_node(&mut volume, 3).allocation_size().bytes(),
+        6 * BLOCK_SIZE_U64
+    );
 }
 
 /// # Panics
@@ -340,6 +375,106 @@ fn extend_file_creates_sparse_range() {
     assert_eq!(file.size().bytes(), 3072);
     assert_eq!(read, 4);
     assert_eq!(output, [0, 0, 0, 0]);
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn large_file_write_round_trips_size_and_sparse_allocation() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let write_offset = (1_u64 << 32) + 37;
+
+    {
+        let device = MemoryBlockStorage::new(&mut image);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let file_id = file_node_id(&mut volume, 3);
+        let mut transaction = volume.begin_transaction(NOW);
+        write_file(&mut transaction, file_id, write_offset, b"large");
+        must_run(transaction.commit());
+
+        let file = file_node(&mut volume, 3);
+        assert_eq!(file.size().bytes(), write_offset + 5);
+        assert_eq!(file.allocation_size().bytes(), 2 * BLOCK_SIZE_U64);
+        let mut output = [0xAA; 7];
+        assert_eq!(
+            read_file(&mut volume, 3, write_offset - 2, &mut output),
+            output.len()
+        );
+        assert_eq!(&output, b"\0\0large");
+    }
+
+    let inode_base = modern_inode_offset(3);
+    assert_eq!(get_u32(&image, inode_base + 4), 42);
+    assert_eq!(get_u32(&image, inode_base + 108), 1);
+
+    let mut volume = must_run(ReadOnlyVolume::mount(
+        MemoryBlockSource::new(&image),
+        test_mount_context(),
+    ));
+    let file = file_node(&mut volume, 3);
+    assert_eq!(file.size().bytes(), write_offset + 5);
+    assert_eq!(file.allocation_size().bytes(), 2 * BLOCK_SIZE_U64);
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn final_logical_block_accepts_exact_maximum_eof() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let maximum_size = (u64::from(u32::MAX) + 1) * BLOCK_SIZE_U64;
+
+    {
+        let device = MemoryBlockStorage::new(&mut image);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let file_id = file_node_id(&mut volume, 3);
+
+        let mut extension = volume.begin_transaction(NOW);
+        extend_file(&mut extension, file_id, maximum_size);
+        must_run(extension.commit());
+        assert_eq!(file_node(&mut volume, 3).size().bytes(), maximum_size);
+
+        let mut rejected = volume.begin_transaction(NOW);
+        let file = transaction_file(&mut rejected, file_id);
+        assert_eq!(
+            run(rejected.extend_file(file, FileSize::from_bytes(maximum_size + 1))),
+            Err(Error::InvalidWriteRange)
+        );
+        drop(rejected);
+        assert_eq!(file_node(&mut volume, 3).size().bytes(), maximum_size);
+
+        let mut last_block_write = volume.begin_transaction(NOW);
+        write_file(&mut last_block_write, file_id, maximum_size - 1, b"z");
+        must_run(last_block_write.commit());
+        let file = file_node(&mut volume, 3);
+        assert_eq!(file.size().bytes(), maximum_size);
+        assert_eq!(file.allocation_size().bytes(), 2 * BLOCK_SIZE_U64);
+        let mut output = [0xAA; 2];
+        assert_eq!(
+            read_file(&mut volume, 3, maximum_size - 2, &mut output),
+            output.len()
+        );
+        assert_eq!(output, [0, b'z']);
+
+        let mut truncate = volume.begin_transaction(NOW);
+        truncate_file(&mut truncate, file_id, 5);
+        must_run(truncate.commit());
+        let file = file_node(&mut volume, 3);
+        assert_eq!(file.size().bytes(), 5);
+        assert_eq!(file.allocation_size().bytes(), BLOCK_SIZE_U64);
+    }
+
+    let inode_base = modern_inode_offset(3);
+    assert_eq!(get_u32(&image, inode_base + 4), 5);
+    assert_eq!(get_u32(&image, inode_base + 108), 0);
+    let mut volume = must_run(ReadOnlyVolume::mount(
+        MemoryBlockSource::new(&image),
+        test_mount_context(),
+    ));
+    let file = file_node(&mut volume, 3);
+    assert_eq!(file.size().bytes(), 5);
+    assert_eq!(file.allocation_size().bytes(), BLOCK_SIZE_U64);
 }
 
 /// # Panics

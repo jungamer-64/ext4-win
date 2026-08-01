@@ -48,6 +48,7 @@ use crate::{
 };
 
 const BLOCK_SIZE: usize = 1024;
+const BLOCK_SIZE_U64: u64 = 1024;
 const IMAGE_BLOCKS: usize = 16;
 const INODE_TABLE_BLOCK: u32 = 5;
 const ROOT_DIR_BLOCK: u32 = 8;

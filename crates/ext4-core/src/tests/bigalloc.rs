@@ -72,6 +72,10 @@ fn bigalloc_hole_write_reuses_logical_cluster() {
             volume.geometry().free_cluster_count().as_u64(),
             u64::from(initial_free)
         );
+        assert_eq!(
+            file_node(&mut volume, 3).allocation_size().bytes(),
+            u64::from(BIGALLOC_BLOCKS_PER_CLUSTER) * BLOCK_SIZE_U64
+        );
         let mut output = [0_u8; 4];
         assert_eq!(read_file(&mut volume, 3, 1024, &mut output), 4);
         assert_eq!(&output, b"hole");
@@ -115,6 +119,10 @@ fn bigalloc_sparse_extension_allocates_one_cluster() {
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
             u64::from(initial_free - 1)
+        );
+        assert_eq!(
+            file_node(&mut volume, 3).allocation_size().bytes(),
+            2 * u64::from(BIGALLOC_BLOCKS_PER_CLUSTER) * BLOCK_SIZE_U64
         );
         let mut output = [0_u8; 4];
         assert_eq!(
@@ -160,6 +168,10 @@ fn bigalloc_partial_truncate_preserves_referenced_cluster() {
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
             u64::from(initial_free)
+        );
+        assert_eq!(
+            file_node(&mut volume, 3).allocation_size().bytes(),
+            u64::from(BIGALLOC_BLOCKS_PER_CLUSTER) * BLOCK_SIZE_U64
         );
     }
 
@@ -413,6 +425,10 @@ fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
             u64::from(initial_free - 3)
+        );
+        assert_eq!(
+            file_node(&mut volume, 3).allocation_size().bytes(),
+            4 * u64::from(BIGALLOC_BLOCKS_PER_CLUSTER) * BLOCK_SIZE_U64
         );
     }
 

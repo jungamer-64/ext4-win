@@ -2925,6 +2925,14 @@ mod tests {
         Some(u32::from_le_bytes(bytes))
     }
 
+    /// Reads one little-endian i64 from a test output buffer.
+    fn le_i64(buffer: &[u8], offset: usize) -> Option<i64> {
+        let end = offset.checked_add(core::mem::size_of::<i64>())?;
+        let bytes = buffer.get(offset..end)?;
+        let bytes = <[u8; 8]>::try_from(bytes).ok()?;
+        Some(i64::from_le_bytes(bytes))
+    }
+
     /// Writes one little-endian u32 into a test input buffer.
     fn put_le_u32(buffer: &mut [u8], offset: usize, value: u32) -> bool {
         let Some(end) = offset.checked_add(core::mem::size_of::<u32>()) else {
@@ -3431,6 +3439,72 @@ mod tests {
         };
         let expected_name: &[u8] = &[b'a', 0];
         assert_eq!(name_bytes.get(..2), Some(expected_name));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a large EOF or sparse allocation charge is truncated or recomputed by a Windows
+    /// information packer.
+    #[test]
+    fn large_file_information_preserves_eof_and_inode_allocation_size() {
+        let metadata = test_metadata(super::FileMetadataKind::File);
+        assert!(metadata.is_some());
+        let Some(mut metadata) = metadata else {
+            return;
+        };
+        let eof = (1_u64 << 32) + 17;
+        let allocation_size = 4096_u64;
+        metadata.size = FileSize::from_bytes(eof);
+        metadata.allocation_size = FileAllocationSize::from_bytes(allocation_size);
+
+        let mut standard = [0_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>()];
+        assert!(super::pack_standard_information(&mut standard, metadata).is_ok());
+        assert_eq!(le_i64(&standard, 0), i64::try_from(allocation_size).ok());
+        assert_eq!(le_i64(&standard, 8), i64::try_from(eof).ok());
+
+        let mut network = [0_u8; core::mem::size_of::<wdk_sys::FILE_NETWORK_OPEN_INFORMATION>()];
+        assert!(super::pack_network_open_information(&mut network, metadata).is_ok());
+        assert_eq!(le_i64(&network, 32), i64::try_from(allocation_size).ok());
+        assert_eq!(le_i64(&network, 40), i64::try_from(eof).ok());
+
+        let name = WindowsName::from_utf16(&[u16::from(b'a')]);
+        assert!(name.is_ok());
+        let Ok(name) = name else {
+            return;
+        };
+        let layout = super::DirectoryRecordLayout::new(DirectoryInformationClass::Directory, &name);
+        assert!(layout.is_ok());
+        let Ok(layout) = layout else {
+            return;
+        };
+        let mut directory = [0_u8; 72];
+        assert!(
+            super::pack_directory_record(
+                &mut directory,
+                0,
+                DirectoryInformationClass::Directory,
+                1,
+                &name,
+                metadata,
+                layout,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            le_i64(&directory, super::DIRECTORY_ALLOCATION_SIZE_OFFSET),
+            i64::try_from(allocation_size).ok()
+        );
+        assert_eq!(
+            le_i64(&directory, super::DIRECTORY_END_OF_FILE_OFFSET),
+            i64::try_from(eof).ok()
+        );
+
+        assert_eq!(
+            super::file_size_from_large_integer(wdk_sys::LARGE_INTEGER {
+                QuadPart: i64::try_from(eof).unwrap_or(i64::MAX),
+            }),
+            Ok(FileSize::from_bytes(eof))
+        );
     }
 
     /// # Panics

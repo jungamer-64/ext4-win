@@ -27,6 +27,10 @@ fn in_inode_xattr_round_trips_through_inode_body() {
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
+    assert_eq!(
+        file_node(&mut volume, 3).allocation_size().bytes(),
+        BLOCK_SIZE_U64
+    );
     let file = node_id(&mut volume, inode(3));
     assert_eq!(must_run(volume.read_xattr(file, &name)), Some(value));
     assert_eq!(must_run(volume.read_xattrs(file)).entries().len(), 1);
@@ -65,6 +69,10 @@ fn external_xattr_block_is_allocated_and_removed() {
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
+    assert_eq!(
+        file_node(&mut volume, 3).allocation_size().bytes(),
+        2 * BLOCK_SIZE_U64
+    );
     let file = node_id(&mut volume, inode(3));
     assert_eq!(must_run(volume.read_xattr(file, &name)), Some(value));
 
@@ -86,8 +94,62 @@ fn external_xattr_block_is_allocated_and_removed() {
         MemoryBlockSource::new(&image),
         test_mount_context(),
     ));
+    assert_eq!(
+        file_node(&mut volume, 3).allocation_size().bytes(),
+        BLOCK_SIZE_U64
+    );
     let file = node_id(&mut volume, inode(3));
     assert_eq!(must_run(volume.read_xattr(file, &name)), None);
+}
+
+/// # Panics
+///
+/// Panics when staged extent metadata and an external xattr cannot be combined in one allocation
+/// projection.
+#[test]
+fn staged_extent_metadata_and_xattr_share_one_allocation_projection() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let name = must(XattrName::new(XattrNamespace::User, b"large"));
+    let value = must(XattrValue::new(&[0xCD; 700]));
+
+    {
+        let device = MemoryBlockStorage::new(&mut image);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let file_id = file_node_id(&mut volume, 3);
+        let mut transaction = volume.begin_transaction(NOW);
+        extend_file(
+            &mut transaction,
+            file_id,
+            u64::try_from(BLOCK_SIZE * 10).unwrap_or(u64::MAX),
+        );
+        for logical in [0_u64, 2, 4, 6, 8] {
+            write_file(
+                &mut transaction,
+                file_id,
+                logical.saturating_mul(u64::try_from(BLOCK_SIZE).unwrap_or(u64::MAX)),
+                b"x",
+            );
+        }
+        let node = transaction_node(&mut transaction, NodeId::File(file_id));
+        must_run(transaction.set_xattr(node, name.clone(), value.clone()));
+        must_run(transaction.commit());
+
+        assert_eq!(
+            file_node(&mut volume, 3).allocation_size().bytes(),
+            7 * BLOCK_SIZE_U64
+        );
+    }
+
+    let mut volume = must_run(ReadOnlyVolume::mount(
+        MemoryBlockSource::new(&image),
+        test_mount_context(),
+    ));
+    let file = file_node(&mut volume, 3);
+    assert_eq!(file.allocation_size().bytes(), 7 * BLOCK_SIZE_U64);
+    assert_eq!(
+        must_run(volume.read_xattr(NodeId::File(file.id()), &name)),
+        Some(value)
+    );
 }
 
 /// # Panics
