@@ -58,7 +58,7 @@ const EXT4_VERITY_FL: u32 = 0x0010_0000;
 /// Largest regular-file size accepted without the large-file feature.
 const LEGACY_FILE_SIZE_LIMIT: u64 = 0x7fff_ffff;
 /// Largest legacy `i_blocks` sector count.
-const LEGACY_I_BLOCKS_LIMIT: u64 = u32::MAX as u64;
+const LEGACY_I_BLOCKS_LIMIT: u64 = 0xffff_ffff;
 /// Largest value stored across `i_blocks_lo` and `i_blocks_high`.
 const WIDE_I_BLOCKS_LIMIT: u64 = 0xffff_ffff_ffff;
 /// Unit used by sector-count `i_blocks` encodings.
@@ -183,7 +183,9 @@ pub(crate) enum InodeBlockCountUnit {
 /// Validated low and high inode size fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EncodedInodeSize {
+    /// Encoded `i_size_lo` value.
     low: u32,
+    /// Encoded `i_size_high` value.
     high: u32,
 }
 
@@ -202,8 +204,11 @@ impl EncodedInodeSize {
 /// Validated inode block-count fields and their selected unit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EncodedInodeBlockCount {
+    /// Encoded `i_blocks_lo` value.
     low: u32,
+    /// Encoded `i_blocks_high` value.
     high: u16,
+    /// Unit selected by the huge-file inode flag.
     unit: InodeBlockCountUnit,
 }
 
@@ -227,8 +232,11 @@ impl EncodedInodeBlockCount {
 /// Mounted inode size and allocation-count encoding policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InodeDataEncoding {
+    /// Mounted large-file feature selection.
     file_size: FileSizeEncoding,
+    /// Mounted huge-file feature selection.
     block_count: InodeBlockCountEncoding,
+    /// Mounted block geometry used by size limits and block units.
     block_size: BlockSize,
 }
 
@@ -247,8 +255,8 @@ impl InodeDataEncoding {
     }
 
     /// Returns the largest byte size addressable by the extent logical-block field.
-    pub(crate) const fn maximum_file_size(self) -> FileSize {
-        FileSize::from_bytes((u32::MAX as u64 + 1) * self.block_size.bytes() as u64)
+    pub(crate) fn maximum_file_size(self) -> FileSize {
+        FileSize::from_bytes((1_u64 << 32).saturating_mul(u64::from(self.block_size.bytes())))
     }
 
     /// Validates and splits a file size for inode serialization.
@@ -298,7 +306,7 @@ impl InodeDataEncoding {
     ) -> Result<EncodedInodeBlockCount> {
         let bytes = allocation_size.bytes();
         let block_bytes = u64::from(self.block_size.bytes());
-        if bytes % block_bytes != 0 {
+        if !bytes.is_multiple_of(block_bytes) {
             return Err(Error::InvalidWriteRange);
         }
         let sectors = bytes
@@ -356,6 +364,9 @@ impl InodeDataEncoding {
 }
 
 /// Splits one validated 48-bit inode block count.
+///
+/// # Errors
+/// Returns an error when `count` exceeds the combined low/high field width.
 fn split_block_count(count: u64, unit: InodeBlockCountUnit) -> Result<EncodedInodeBlockCount> {
     if count > WIDE_I_BLOCKS_LIMIT {
         return Err(Error::UnsupportedInodeMutation);
@@ -1456,9 +1467,9 @@ fn parse_times(raw: &[u8]) -> Result<Ext4Times> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectoryStorageKind, Ext4LinkCount, Ext4Permissions, FileSizeEncoding, Inode,
-        InodeBlockCountEncoding, InodeDataEncoding, InodeFlags, InodeId, InodeMode, MODE_DIRECTORY,
-        MODE_REGULAR,
+        DirectoryStorageKind, Ext4LinkCount, Ext4Permissions, FileAllocationSize, FileSize,
+        FileSizeEncoding, Inode, InodeBlockCountEncoding, InodeBlockCountUnit, InodeDataEncoding,
+        InodeFlags, InodeId, InodeMode, MODE_DIRECTORY, MODE_REGULAR,
     };
     use crate::disk::block::BlockSize;
     use crate::disk::endian::{put_le_u16, put_le_u32};
@@ -1542,6 +1553,173 @@ mod tests {
             return;
         };
         assert_eq!(file.directory_storage_kind(), Err(Error::WrongInodeKind));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn large_file_encoding_accepts_full_extent_domain() {
+        let encoding = inode_data_encoding();
+        assert!(encoding.is_ok());
+        let Ok(encoding) = encoding else {
+            return;
+        };
+
+        let above_four_gib = FileSize::from_bytes((1_u64 << 32) + 17);
+        let encoded = encoding.encode_size(above_four_gib);
+        assert!(encoded.is_ok());
+        let Ok(encoded) = encoded else {
+            return;
+        };
+        assert_eq!(encoded.low(), 17);
+        assert_eq!(encoded.high(), 1);
+        assert_eq!(
+            encoding.decode_size(encoded.low(), encoded.high()),
+            Ok(above_four_gib)
+        );
+
+        let maximum = encoding.maximum_file_size();
+        assert!(encoding.encode_size(maximum).is_ok());
+        assert_eq!(
+            encoding.encode_size(FileSize::from_bytes(maximum.bytes() + 1)),
+            Err(Error::InvalidWriteRange)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn legacy_file_encoding_rejects_large_file_fields() {
+        let block_size = BlockSize::from_superblock_log(0);
+        assert!(block_size.is_ok());
+        let Ok(block_size) = block_size else {
+            return;
+        };
+        let encoding = InodeDataEncoding::new(
+            FileSizeEncoding::Legacy,
+            InodeBlockCountEncoding::LegacySectors,
+            block_size,
+        );
+
+        assert_eq!(
+            encoding.encode_size(FileSize::from_bytes(0x8000_0000)),
+            Err(Error::UnsupportedInodeMutation)
+        );
+        assert_eq!(
+            encoding.decode_size(0x8000_0000, 0),
+            Err(Error::InvalidInode)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn huge_file_encoding_selects_sector_and_filesystem_block_units() {
+        let encoding = inode_data_encoding();
+        assert!(encoding.is_ok());
+        let Ok(encoding) = encoding else {
+            return;
+        };
+
+        let wide_sectors = 1_u64 << 32;
+        let sector_encoded =
+            encoding.encode_allocation_size(FileAllocationSize::from_bytes(wide_sectors * 512));
+        assert!(sector_encoded.is_ok());
+        let Ok(sector_encoded) = sector_encoded else {
+            return;
+        };
+        assert_eq!(sector_encoded.low(), 0);
+        assert_eq!(sector_encoded.high(), 1);
+        assert_eq!(sector_encoded.unit(), InodeBlockCountUnit::Sectors);
+
+        let largest_block_aligned_wide_sectors = (1_u64 << 48) - 2;
+        let wide_sector_encoded = encoding.encode_allocation_size(FileAllocationSize::from_bytes(
+            largest_block_aligned_wide_sectors * 512,
+        ));
+        assert!(wide_sector_encoded.is_ok());
+        let Ok(wide_sector_encoded) = wide_sector_encoded else {
+            return;
+        };
+        assert_eq!(wide_sector_encoded.unit(), InodeBlockCountUnit::Sectors);
+        assert_eq!(wide_sector_encoded.low(), u32::MAX - 1);
+        assert_eq!(wide_sector_encoded.high(), u16::MAX);
+        assert_eq!(
+            encoding.decode_allocation_size(
+                wide_sector_encoded.low(),
+                wide_sector_encoded.high(),
+                InodeFlags::EMPTY,
+            ),
+            Ok(FileAllocationSize::from_bytes(
+                largest_block_aligned_wide_sectors * 512
+            ))
+        );
+
+        let first_block_unit_bytes = (1_u64 << 48) * 512;
+        let block_encoded =
+            encoding.encode_allocation_size(FileAllocationSize::from_bytes(first_block_unit_bytes));
+        assert!(block_encoded.is_ok());
+        let Ok(block_encoded) = block_encoded else {
+            return;
+        };
+        assert_eq!(block_encoded.unit(), InodeBlockCountUnit::FileSystemBlocks);
+        assert_eq!(
+            encoding.decode_allocation_size(
+                block_encoded.low(),
+                block_encoded.high(),
+                InodeFlags::EMPTY.with_huge_file_blocks(),
+            ),
+            Ok(FileAllocationSize::from_bytes(first_block_unit_bytes))
+        );
+
+        let first_unrepresentable_bytes = (1_u64 << 48) * 1024;
+        assert_eq!(
+            encoding.encode_allocation_size(FileAllocationSize::from_bytes(
+                first_unrepresentable_bytes
+            )),
+            Err(Error::UnsupportedInodeMutation)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn legacy_block_count_rejects_high_bits_and_huge_units() {
+        let block_size = BlockSize::from_superblock_log(0);
+        assert!(block_size.is_ok());
+        let Ok(block_size) = block_size else {
+            return;
+        };
+        let encoding = InodeDataEncoding::new(
+            FileSizeEncoding::LargeFile,
+            InodeBlockCountEncoding::LegacySectors,
+            block_size,
+        );
+        let largest_block_aligned_legacy_sectors = u64::from(u32::MAX) - 1;
+        assert!(
+            encoding
+                .encode_allocation_size(FileAllocationSize::from_bytes(
+                    largest_block_aligned_legacy_sectors * 512
+                ))
+                .is_ok()
+        );
+        assert_eq!(
+            encoding.encode_allocation_size(FileAllocationSize::from_bytes(
+                (largest_block_aligned_legacy_sectors + 2) * 512
+            )),
+            Err(Error::UnsupportedInodeMutation)
+        );
+        assert_eq!(
+            encoding.decode_allocation_size(0, 1, InodeFlags::EMPTY),
+            Err(Error::InvalidInode)
+        );
+        assert_eq!(
+            encoding.decode_allocation_size(1, 0, InodeFlags::EMPTY.with_huge_file_blocks(),),
+            Err(Error::InvalidInode)
+        );
     }
 
     /// # Panics

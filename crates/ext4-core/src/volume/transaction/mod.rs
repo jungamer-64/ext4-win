@@ -15,6 +15,176 @@ use commit::{
 };
 use staging::{BlockImage, EncryptedBlockBase, GroupDelta, RangeWrite};
 
+/// Extent-tree reader that overlays this transaction's staged metadata blocks on the device.
+struct TransactionExtentSource<'a, D> {
+    /// Mounted storage containing committed extent metadata.
+    device: &'a mut D,
+    /// Newer extent metadata images staged by this transaction.
+    staged: &'a [BlockImage],
+    /// Mounted filesystem block size used to locate staged images.
+    block_size: BlockSize,
+}
+
+impl<D: BlockSource> BlockSource for TransactionExtentSource<'_, D> {
+    fn len(&self) -> DeviceLength {
+        self.device.len()
+    }
+
+    async fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
+        self.device.read_exact_at(offset, out).await?;
+        let request_start = offset.get();
+        let request_end = request_start
+            .checked_add(u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?)
+            .ok_or(Error::ArithmeticOverflow)?;
+        for image in self.staged {
+            let image_start = self.block_size.offset_of(image.block)?.get();
+            let image_end = image_start
+                .checked_add(
+                    u64::try_from(image.bytes.len()).map_err(|_| Error::ArithmeticOverflow)?,
+                )
+                .ok_or(Error::ArithmeticOverflow)?;
+            let overlap_start = core::cmp::max(request_start, image_start);
+            let overlap_end = core::cmp::min(request_end, image_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let target_start = usize::try_from(
+                overlap_start
+                    .checked_sub(request_start)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let target_end = usize::try_from(
+                overlap_end
+                    .checked_sub(request_start)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let source_start = usize::try_from(
+                overlap_start
+                    .checked_sub(image_start)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let source_end = usize::try_from(
+                overlap_end
+                    .checked_sub(image_start)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            out.get_mut(target_start..target_end)
+                .ok_or(Error::DeviceRange)?
+                .copy_from_slice(
+                    image
+                        .bytes
+                        .get(source_start..source_end)
+                        .ok_or(Error::DeviceRange)?,
+                );
+        }
+        Ok(())
+    }
+}
+
+/// Contiguous allocation-cluster ownership contributed by one inode structure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InodeAllocationClusterRange {
+    /// First allocation cluster owned by the inode structure.
+    start: ClusterAddress,
+    /// Exclusive cluster boundary, which may equal the filesystem cluster count.
+    end_exclusive: u64,
+}
+
+impl InodeAllocationClusterRange {
+    /// Maps one contiguous physical extent to its inclusive allocation-cluster coverage.
+    /// # Errors
+    ///
+    /// Returns an error when the extent's physical range overflows or lies outside the filesystem.
+    fn from_extent(superblock: Superblock, extent: Extent) -> Result<Self> {
+        let last_offset = extent
+            .len()
+            .as_u64()
+            .checked_sub(1)
+            .ok_or(Error::InvalidExtentTree)?;
+        let last_block = BlockAddress::new(
+            extent
+                .physical_start()
+                .get()
+                .checked_add(last_offset)
+                .ok_or(Error::ArithmeticOverflow)?,
+        );
+        Self::from_inclusive_clusters(
+            superblock.cluster_of_block(extent.physical_start())?,
+            superblock.cluster_of_block(last_block)?,
+        )
+    }
+
+    /// Maps one inode-owned metadata block to its allocation cluster.
+    /// # Errors
+    ///
+    /// Returns an error when `block` lies outside the filesystem or its exclusive cluster boundary
+    /// overflows.
+    fn from_block(superblock: Superblock, block: BlockAddress) -> Result<Self> {
+        let cluster = superblock.cluster_of_block(block)?;
+        Self::from_inclusive_clusters(cluster, cluster)
+    }
+
+    /// Builds a nonempty range from validated inclusive cluster boundaries.
+    /// # Errors
+    ///
+    /// Returns an error when the boundaries are reversed or the exclusive end overflows.
+    fn from_inclusive_clusters(start: ClusterAddress, end: ClusterAddress) -> Result<Self> {
+        if end < start {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        Ok(Self {
+            start,
+            end_exclusive: end.get().checked_add(1).ok_or(Error::ArithmeticOverflow)?,
+        })
+    }
+
+    /// Extends this range across an overlapping or adjacent sorted range.
+    ///
+    /// Returns whether `next` was merged.
+    fn merge_sorted(&mut self, next: Self) -> bool {
+        if next.start.get() > self.end_exclusive {
+            return false;
+        }
+        self.end_exclusive = core::cmp::max(self.end_exclusive, next.end_exclusive);
+        true
+    }
+
+    /// Returns the physical filesystem-block charge for this cluster range.
+    /// # Errors
+    ///
+    /// Returns an error when cluster arithmetic overflows or the filesystem's final cluster cannot
+    /// be inspected.
+    fn charged_blocks(self, superblock: Superblock) -> Result<u64> {
+        let clusters = self
+            .end_exclusive
+            .checked_sub(self.start.get())
+            .ok_or(Error::InvalidClusterGeometry)?;
+        let blocks_per_cluster = u64::from(superblock.blocks_per_cluster().as_u32());
+        let mut blocks = clusters
+            .checked_mul(blocks_per_cluster)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if self.end_exclusive == superblock.cluster_count().as_u64() {
+            let final_cluster = ClusterAddress::new(
+                self.end_exclusive
+                    .checked_sub(1)
+                    .ok_or(Error::InvalidClusterGeometry)?,
+            );
+            let final_blocks = u64::from(superblock.blocks_in_cluster(final_cluster)?);
+            let missing_tail = blocks_per_cluster
+                .checked_sub(final_blocks)
+                .ok_or(Error::InvalidClusterGeometry)?;
+            blocks = blocks
+                .checked_sub(missing_tail)
+                .ok_or(Error::InvalidClusterGeometry)?;
+        }
+        Ok(blocks)
+    }
+}
+
 /// Regular file selected for mutation inside a write transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionFile {
@@ -408,13 +578,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// cannot be loaded.
     async fn mutable_extent_tree(&mut self, inode: &Inode) -> Result<MutableExtentTree> {
         let context = self.volume.extent_tree_context(inode);
-        MutableExtentTree::load_inode_tree(
-            inode.extent_root()?,
-            self.volume.superblock.block_size(),
-            &mut self.volume.device,
-            context,
-        )
-        .await
+        let block_size = self.volume.superblock.block_size();
+        let mut source = TransactionExtentSource {
+            device: &mut self.volume.device,
+            staged: &self.extent_updates,
+            block_size,
+        };
+        MutableExtentTree::load_inode_tree(inode.extent_root()?, block_size, &mut source, context)
+            .await
     }
 
     /// Stages an updated extent tree and adjusts its metadata block ownership.
@@ -474,41 +645,40 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         raw_inode: &LiveInodeRecord,
         tree: Option<&MutableExtentTree>,
     ) -> Result<FileAllocationSize> {
-        let mut clusters = Vec::new();
+        let superblock = self.volume.superblock;
+        let mut ranges = Vec::new();
         if let Some(tree) = tree {
             for extent in tree.extents().iter().copied() {
-                for offset in 0..extent.len().as_u64() {
-                    clusters.try_push(
-                        self.volume.superblock.cluster_of_block(BlockAddress::new(
-                            extent
-                                .physical_start()
-                                .get()
-                                .checked_add(offset)
-                                .ok_or(Error::ArithmeticOverflow)?,
-                        ))?,
-                    )?;
-                }
+                ranges.try_push(InodeAllocationClusterRange::from_extent(
+                    superblock, extent,
+                )?)?;
             }
             for block in tree.metadata_blocks().iter().copied() {
-                clusters.try_push(self.volume.superblock.cluster_of_block(block)?)?;
+                ranges.try_push(InodeAllocationClusterRange::from_block(superblock, block)?)?;
             }
         }
         if let Some(block) = raw_inode.xattr_block()? {
-            clusters.try_push(self.volume.superblock.cluster_of_block(block)?)?;
+            ranges.try_push(InodeAllocationClusterRange::from_block(superblock, block)?)?;
         }
-        clusters.sort_unstable();
-        clusters.dedup();
+        ranges.sort_unstable_by_key(|range| range.start);
 
+        let mut merged_ranges: Vec<InodeAllocationClusterRange> = Vec::new();
+        for range in ranges {
+            if let Some(previous) = merged_ranges.last_mut()
+                && previous.merge_sorted(range)
+            {
+                continue;
+            }
+            merged_ranges.try_push(range)?;
+        }
         let mut blocks = 0_u64;
-        for cluster in clusters {
+        for range in merged_ranges {
             blocks = blocks
-                .checked_add(u64::from(
-                    self.volume.superblock.blocks_in_cluster(cluster)?,
-                ))
+                .checked_add(range.charged_blocks(superblock)?)
                 .ok_or(Error::ArithmeticOverflow)?;
         }
         let bytes = blocks
-            .checked_mul(u64::from(self.volume.superblock.block_size().bytes()))
+            .checked_mul(u64::from(superblock.block_size().bytes()))
             .ok_or(Error::ArithmeticOverflow)?;
         Ok(FileAllocationSize::from_bytes(bytes))
     }

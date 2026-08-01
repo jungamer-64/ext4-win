@@ -18,6 +18,13 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         if bytes.is_empty() {
             return Ok(());
         }
+        let end_offset = offset.checked_add_len(bytes.len())?;
+        let new_size = FileSize::from_bytes(end_offset.bytes());
+        let encoded_size = self
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_size(new_size)?;
         let inode_index = self.ensure_inode_update(file.inode()).await?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
@@ -25,17 +32,10 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             return Err(Error::WrongInodeKind);
         }
         self.require_file_data_mutation(&inode).await?;
-        let end_offset = offset.checked_add_len(bytes.len())?;
-        let new_size = FileSize::from_bytes(end_offset.bytes());
         let extends_file = new_size > inode.size();
         let encoded_new_size = if extends_file {
             self.require_file_size_mutation(&inode).await?;
-            Some(
-                self.volume
-                    .superblock
-                    .inode_data_encoding()
-                    .encode_size(new_size)?,
-            )
+            Some(encoded_size)
         } else {
             None
         };
@@ -507,6 +507,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when `new_size` would shrink the file.
     pub async fn extend_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
+        let encoded_size = self
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_size(new_size)?;
         let inode_index = self.ensure_inode_update(file.inode()).await?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
@@ -514,11 +519,6 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         if new_size < inode.size() {
             return Err(Error::InvalidWriteRange);
         }
-        let encoded_size = self
-            .volume
-            .superblock
-            .inode_data_encoding()
-            .encode_size(new_size)?;
         raw_inode.set_encoded_size(encoded_size)?;
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
         self.replace_live_inode(inode_index, raw_inode)?;
@@ -531,6 +531,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// Returns an error when `new_size` would extend the file or root extent
     /// updates cannot fit in the inode.
     pub async fn truncate_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
+        let encoded_size = self
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_size(new_size)?;
         let inode_index = self.ensure_inode_update(file.inode()).await?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
@@ -538,11 +543,6 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         if new_size > inode.size() {
             return Err(Error::InvalidWriteRange);
         }
-        let encoded_size = self
-            .volume
-            .superblock
-            .inode_data_encoding()
-            .encode_size(new_size)?;
         let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
         let mut tree = self.mutable_extent_tree(&inode).await?;
         if tree.contains_uninitialized() {
