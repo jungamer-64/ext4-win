@@ -395,10 +395,10 @@ enum SetFilePlan {
     Disposition {
         /// Target ext4 inode identity.
         node: NodeId,
-        /// Stable FCB whose shared deletion state is mutated.
-        fcb: NonNull<FileControlBlock>,
         /// Prepared exact parent/name identity.
         pending: PendingFileDeletion,
+        /// Whether validation publishes a new state or reaffirms create-time delete-on-close.
+        publication: DeletePendingPublication,
         /// Whether the extended request bypasses the read-only Windows attribute.
         readonly: DeleteReadonlyPolicy,
         /// Exclusive mounted-volume operation capability.
@@ -515,14 +515,19 @@ async fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<
         }
         SetFilePlan::Disposition {
             node,
-            fcb,
             pending,
+            publication,
             readonly,
             mut operations,
         } => {
             validate_pending_deletion(operations.lane_mut(), node, pending.target_ref(), readonly)
                 .await?;
-            operations.set_file_delete_pending(fcb, pending);
+            match publication {
+                DeletePendingPublication::Publish { fcb } => {
+                    operations.set_file_delete_pending(fcb, pending);
+                }
+                DeletePendingPublication::AlreadyPublishedByCreate => drop(pending),
+            }
         }
         SetFilePlan::Rename {
             mutation,
@@ -594,13 +599,74 @@ enum DispositionInputFormat {
     Extended,
 }
 
-/// Effect requested for the shared FCB deletion state.
+/// Fully decoded effect and target state for one disposition request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FileDispositionRequest {
-    /// Cancel a previously published delete-pending state.
+struct FileDispositionRequest {
+    /// Requested deletion-state transition.
+    action: FileDispositionAction,
+    /// State selected by ordinary disposition or create-time delete-on-close.
+    target: FileDispositionTarget,
+}
+
+impl FileDispositionRequest {
+    /// Creates a request that retains the namespace link.
+    const fn keep(target: FileDispositionTarget) -> Self {
+        Self {
+            action: FileDispositionAction::Keep,
+            target,
+        }
+    }
+
+    /// Creates a request that validates deletion under one read-only policy.
+    const fn delete(target: FileDispositionTarget, readonly: DeleteReadonlyPolicy) -> Self {
+        Self {
+            action: FileDispositionAction::Delete(readonly),
+            target,
+        }
+    }
+}
+
+/// Deletion-state transition requested by a disposition input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileDispositionAction {
+    /// Retain the link, cancelling only an ordinary mutable disposition state.
     Keep,
-    /// Publish delete-pending after validating the selected link.
+    /// Validate deletion, then publish or reaffirm the selected target state.
     Delete(DeleteReadonlyPolicy),
+}
+
+/// Deletion state selected by extended `FILE_DISPOSITION_ON_CLOSE`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileDispositionTarget {
+    /// Operate on the ordinary cancellable disposition state.
+    Mutable,
+    /// Reaffirm the mandatory state created by `FILE_DELETE_ON_CLOSE`.
+    CreateDeleteOnClose,
+}
+
+impl FileDispositionTarget {
+    /// Validates that ON_CLOSE refers to a handle opened with `FILE_DELETE_ON_CLOSE`.
+    /// # Errors
+    ///
+    /// Returns not-supported when an ON_CLOSE request targets an ordinary retained handle.
+    const fn validate(self, create_deletion: CreateDeletion) -> DriverResult<()> {
+        match (self, create_deletion) {
+            (Self::CreateDeleteOnClose, CreateDeletion::Retain) => Err(DriverError::NotSupported),
+            (Self::Mutable, CreateDeletion::Retain | CreateDeletion::DeleteOnClose)
+            | (Self::CreateDeleteOnClose, CreateDeletion::DeleteOnClose) => Ok(()),
+        }
+    }
+}
+
+/// Post-validation mutation selected without optional FCB authority.
+enum DeletePendingPublication {
+    /// Publish a new cancellable disposition state to this exact FCB.
+    Publish {
+        /// Stable FCB whose shared deletion state is mutated.
+        fcb: NonNull<FileControlBlock>,
+    },
+    /// Create already published the mandatory delete-on-close state.
+    AlreadyPublishedByCreate,
 }
 
 /// Read-only attribute policy selected by an extended disposition request.
@@ -631,9 +697,12 @@ fn disposition_plan(
                 stack.length(),
             )?;
             if info.DeleteFile == 0 {
-                FileDispositionRequest::Keep
+                FileDispositionRequest::keep(FileDispositionTarget::Mutable)
             } else {
-                FileDispositionRequest::Delete(DeleteReadonlyPolicy::Enforce)
+                FileDispositionRequest::delete(
+                    FileDispositionTarget::Mutable,
+                    DeleteReadonlyPolicy::Enforce,
+                )
             }
         }
         DispositionInputFormat::Extended => {
@@ -644,49 +713,76 @@ fn disposition_plan(
             decode_extended_disposition(info.Flags)?
         }
     };
-    match request {
-        FileDispositionRequest::Keep => {
-            if opened.create_deletion() == CreateDeletion::Retain {
+    request.target.validate(opened.create_deletion())?;
+    match request.action {
+        FileDispositionAction::Keep => {
+            if request.target == FileDispositionTarget::Mutable
+                && opened.create_deletion() == CreateDeletion::Retain
+            {
                 opened.clear_delete_pending();
             }
             Ok(SetFilePlan::Complete)
         }
-        FileDispositionRequest::Delete(readonly) => Ok(SetFilePlan::Disposition {
-            node: opened.node(),
-            fcb: opened.file_control_block_address(),
-            pending: opened.prepare_pending_deletion()?,
-            readonly,
-            operations: claim_file_operation_lane(opened.file_control_block()),
-        }),
+        FileDispositionAction::Delete(readonly) => {
+            let (pending, publication) = match request.target {
+                FileDispositionTarget::Mutable => (
+                    opened.prepare_pending_deletion()?,
+                    DeletePendingPublication::Publish {
+                        fcb: opened.file_control_block_address(),
+                    },
+                ),
+                FileDispositionTarget::CreateDeleteOnClose => (
+                    PendingFileDeletion::try_from_delete_on_close(opened.location())?,
+                    DeletePendingPublication::AlreadyPublishedByCreate,
+                ),
+            };
+            Ok(SetFilePlan::Disposition {
+                node: opened.node(),
+                pending,
+                publication,
+                readonly,
+                operations: claim_file_operation_lane(opened.file_control_block()),
+            })
+        }
     }
 }
 
 /// Decodes the supported non-POSIX subset of `FILE_DISPOSITION_INFORMATION_EX`.
 /// # Errors
 ///
-/// Returns not-supported for POSIX or image-section semantics, and invalid-parameter for unknown or
-/// meaningless flag combinations.
+/// Returns not-supported when a delete requests POSIX or image-section semantics, when ON_CLOSE
+/// requests POSIX mode, or when unknown flags are present.
 fn decode_extended_disposition(flags: wdk_sys::ULONG) -> DriverResult<FileDispositionRequest> {
-    const SUPPORTED_FLAGS: wdk_sys::ULONG =
-        wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
-    const UNSUPPORTED_FLAGS: wdk_sys::ULONG = wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS
-        | wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK;
-    if flags & UNSUPPORTED_FLAGS != 0 {
+    const KNOWN_FLAGS: wdk_sys::ULONG = wdk_sys::FILE_DISPOSITION_DELETE
+        | wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS
+        | wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK
+        | wdk_sys::FILE_DISPOSITION_ON_CLOSE
+        | wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
+    if flags & !KNOWN_FLAGS != 0 {
         return Err(DriverError::NotSupported);
     }
-    if flags & !(SUPPORTED_FLAGS | UNSUPPORTED_FLAGS) != 0 {
-        return Err(DriverError::InvalidParameter);
-    }
     let delete = flags & wdk_sys::FILE_DISPOSITION_DELETE != 0;
+    let posix = flags & wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS != 0;
+    let force_image_check = flags & wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK != 0;
+    let on_close = flags & wdk_sys::FILE_DISPOSITION_ON_CLOSE != 0;
     let ignore_readonly = flags & wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE != 0;
-    match (delete, ignore_readonly) {
-        (false, false) => Ok(FileDispositionRequest::Keep),
-        (false, true) => Err(DriverError::InvalidParameter),
-        (true, false) => Ok(FileDispositionRequest::Delete(
-            DeleteReadonlyPolicy::Enforce,
-        )),
-        (true, true) => Ok(FileDispositionRequest::Delete(DeleteReadonlyPolicy::Ignore)),
+    if (delete && (posix || force_image_check)) || (on_close && posix) {
+        return Err(DriverError::NotSupported);
     }
+    let target = if on_close {
+        FileDispositionTarget::CreateDeleteOnClose
+    } else {
+        FileDispositionTarget::Mutable
+    };
+    if !delete {
+        return Ok(FileDispositionRequest::keep(target));
+    }
+    let readonly = if ignore_readonly {
+        DeleteReadonlyPolicy::Ignore
+    } else {
+        DeleteReadonlyPolicy::Enforce
+    };
+    Ok(FileDispositionRequest::delete(target, readonly))
 }
 
 /// Validates the exact parent/name/inode identity before publishing delete-pending.
@@ -3109,7 +3205,7 @@ fn release_file_contexts(
 #[cfg(test)]
 mod tests {
     use crate::irp::{
-        DataIoKind, DirectoryInformationClass, ReadStartingPoint, ReceivedIrp,
+        CreateDeletion, DataIoKind, DirectoryInformationClass, ReadStartingPoint, ReceivedIrp,
         RegularFileWriteAccess, WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
@@ -3414,16 +3510,19 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when the extended disposition boundary accepts ambiguous deletion semantics.
+    /// Panics when the extended disposition boundary loses non-POSIX ON_CLOSE semantics.
     #[test]
-    fn extended_disposition_decodes_only_normal_delete_semantics() {
+    fn extended_disposition_decodes_non_posix_and_on_close_semantics() {
         assert_eq!(
             super::decode_extended_disposition(0),
-            Ok(super::FileDispositionRequest::Keep)
+            Ok(super::FileDispositionRequest::keep(
+                super::FileDispositionTarget::Mutable
+            ))
         );
         assert_eq!(
             super::decode_extended_disposition(wdk_sys::FILE_DISPOSITION_DELETE),
-            Ok(super::FileDispositionRequest::Delete(
+            Ok(super::FileDispositionRequest::delete(
+                super::FileDispositionTarget::Mutable,
                 super::DeleteReadonlyPolicy::Enforce
             ))
         );
@@ -3432,24 +3531,91 @@ mod tests {
                 wdk_sys::FILE_DISPOSITION_DELETE
                     | wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE
             ),
-            Ok(super::FileDispositionRequest::Delete(
+            Ok(super::FileDispositionRequest::delete(
+                super::FileDispositionTarget::Mutable,
                 super::DeleteReadonlyPolicy::Ignore
             ))
         );
         assert_eq!(
             super::decode_extended_disposition(wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE),
-            Err(DriverError::InvalidParameter)
+            Ok(super::FileDispositionRequest::keep(
+                super::FileDispositionTarget::Mutable
+            ))
         );
-        for unsupported in [
+        for inactive in [
             wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS,
             wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK,
-            wdk_sys::FILE_DISPOSITION_ON_CLOSE,
         ] {
             assert_eq!(
-                super::decode_extended_disposition(wdk_sys::FILE_DISPOSITION_DELETE | unsupported),
+                super::decode_extended_disposition(inactive),
+                Ok(super::FileDispositionRequest::keep(
+                    super::FileDispositionTarget::Mutable
+                ))
+            );
+        }
+        assert_eq!(
+            super::decode_extended_disposition(wdk_sys::FILE_DISPOSITION_ON_CLOSE),
+            Ok(super::FileDispositionRequest::keep(
+                super::FileDispositionTarget::CreateDeleteOnClose
+            ))
+        );
+        assert_eq!(
+            super::decode_extended_disposition(
+                wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_ON_CLOSE
+            ),
+            Ok(super::FileDispositionRequest::delete(
+                super::FileDispositionTarget::CreateDeleteOnClose,
+                super::DeleteReadonlyPolicy::Enforce
+            ))
+        );
+        assert_eq!(
+            super::decode_extended_disposition(
+                wdk_sys::FILE_DISPOSITION_DELETE
+                    | wdk_sys::FILE_DISPOSITION_ON_CLOSE
+                    | wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE
+            ),
+            Ok(super::FileDispositionRequest::delete(
+                super::FileDispositionTarget::CreateDeleteOnClose,
+                super::DeleteReadonlyPolicy::Ignore
+            ))
+        );
+        for unsupported in [
+            wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS,
+            wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK,
+            wdk_sys::FILE_DISPOSITION_DELETE
+                | wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS
+                | wdk_sys::FILE_DISPOSITION_ON_CLOSE,
+            0x20,
+        ] {
+            assert_eq!(
+                super::decode_extended_disposition(unsupported),
                 Err(DriverError::NotSupported)
             );
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when ON_CLOSE can target a handle not opened with FILE_DELETE_ON_CLOSE.
+    #[test]
+    fn on_close_disposition_requires_create_delete_on_close() {
+        assert_eq!(
+            super::FileDispositionTarget::Mutable.validate(CreateDeletion::Retain),
+            Ok(())
+        );
+        assert_eq!(
+            super::FileDispositionTarget::Mutable.validate(CreateDeletion::DeleteOnClose),
+            Ok(())
+        );
+        assert_eq!(
+            super::FileDispositionTarget::CreateDeleteOnClose.validate(CreateDeletion::Retain),
+            Err(DriverError::NotSupported)
+        );
+        assert_eq!(
+            super::FileDispositionTarget::CreateDeleteOnClose
+                .validate(CreateDeletion::DeleteOnClose),
+            Ok(())
+        );
     }
 
     /// # Panics
