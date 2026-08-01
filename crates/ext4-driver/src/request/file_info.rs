@@ -664,14 +664,13 @@ fn disposition_plan(
 /// Decodes the supported non-POSIX subset of `FILE_DISPOSITION_INFORMATION_EX`.
 /// # Errors
 ///
-/// Returns not-supported for POSIX, image-section, or ON_CLOSE semantics, and invalid-parameter for
-/// unknown or meaningless flag combinations.
+/// Returns not-supported for POSIX or image-section semantics, and invalid-parameter for unknown or
+/// meaningless flag combinations.
 fn decode_extended_disposition(flags: wdk_sys::ULONG) -> DriverResult<FileDispositionRequest> {
     const SUPPORTED_FLAGS: wdk_sys::ULONG =
         wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
     const UNSUPPORTED_FLAGS: wdk_sys::ULONG = wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS
-        | wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK
-        | wdk_sys::FILE_DISPOSITION_ON_CLOSE;
+        | wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK;
     if flags & UNSUPPORTED_FLAGS != 0 {
         return Err(DriverError::NotSupported);
     }
