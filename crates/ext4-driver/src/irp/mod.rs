@@ -2413,6 +2413,15 @@ pub(crate) enum DeleteAccess {
     Granted,
 }
 
+/// `FILE_WRITE_ATTRIBUTES` authority retained for one opened handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileAttributesWriteAccess {
+    /// The handle cannot change file attributes or override read-only deletion protection.
+    Denied,
+    /// The handle was opened with `FILE_WRITE_ATTRIBUTES`.
+    Granted,
+}
+
 impl DeleteAccess {
     /// Requires delete authority for a namespace mutation.
     /// # Errors
@@ -2464,6 +2473,15 @@ impl DesiredAccess {
             DeleteAccess::Granted
         } else {
             DeleteAccess::Denied
+        }
+    }
+
+    /// Projects Windows `FILE_WRITE_ATTRIBUTES` into retained per-handle authority.
+    pub(crate) const fn file_attributes_write_access(self) -> FileAttributesWriteAccess {
+        if self.contains(wdk_sys::FILE_WRITE_ATTRIBUTES) {
+            FileAttributesWriteAccess::Granted
+        } else {
+            FileAttributesWriteAccess::Denied
         }
     }
 
@@ -5138,6 +5156,22 @@ mod tests {
             Err(crate::kernel::status::DriverError::AccessDenied)
         );
         assert_eq!(super::DeleteAccess::Granted.require(), Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when `FILE_WRITE_ATTRIBUTES` is not retained as an explicit handle authority.
+    #[test]
+    fn desired_access_projects_file_attributes_write_authority() {
+        assert_eq!(
+            super::DesiredAccess::from_raw(0).file_attributes_write_access(),
+            super::FileAttributesWriteAccess::Denied
+        );
+        assert_eq!(
+            super::DesiredAccess::from_raw(wdk_sys::FILE_WRITE_ATTRIBUTES)
+                .file_attributes_write_access(),
+            super::FileAttributesWriteAccess::Granted
+        );
     }
 
     /// # Panics
