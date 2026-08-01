@@ -19,13 +19,13 @@ pub(crate) use wdk_sys::ntddk::{
     FsRtlInitializeFileLock, FsRtlNotifyCleanup, FsRtlNotifyCleanupAll,
     FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange, FsRtlNotifyInitializeSync,
     FsRtlNotifyUninitializeSync, FsRtlProcessFileLock, FsRtlUninitializeFileLock,
-    IoAcquireVpbSpinLock, IoAllocateIrp, IoAllocateMdl, IoCsqInitialize, IoCsqInsertIrp,
-    IoCsqRemoveNextIrp, IoFreeIrp, IoFreeMdl, IoGetRequestorProcess,
-    IoRegisterShutdownNotification, IoReleaseVpbSpinLock, IoSetCompletionRoutineEx,
-    IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc,
-    KeInitializeEvent, KeInitializeSpinLock, KeReleaseSpinLock, KeSetEvent, KeWaitForSingleObject,
-    MmBuildMdlForNonPagedPool, MmUnlockPages, PsCreateSystemThread, PsTerminateSystemThread,
-    ZwClose, ZwWaitForSingleObject,
+    IoAcquireVpbSpinLock, IoAllocateIrp, IoAllocateMdl, IoAllocateWorkItem, IoCsqInitialize,
+    IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeIrp, IoFreeMdl, IoFreeWorkItem,
+    IoGetRequestorProcess, IoQueueWorkItem, IoRegisterShutdownNotification, IoReleaseVpbSpinLock,
+    IoSetCompletionRoutineEx, IoUnregisterShutdownNotification, IofCallDriver,
+    KeAcquireSpinLockRaiseToDpc, KeInitializeEvent, KeInitializeSpinLock, KeReleaseSpinLock,
+    KeSetEvent, KeWaitForSingleObject, MmBuildMdlForNonPagedPool, MmUnlockPages,
+    PsCreateSystemThread, PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
 };
 
 #[cfg(not(test))]

@@ -602,6 +602,8 @@ struct VolumeControlPlane {
     state: MountedVolumeState,
     /// Share claims for direct user volume opens.
     handles: VolumeHandleLedger,
+    /// Direct-volume FILE_OBJECT allocations retained until Close.
+    volume_file_objects: u32,
 }
 
 impl VolumeControlPlane {
@@ -610,6 +612,7 @@ impl VolumeControlPlane {
         Self {
             state: MountedVolumeState::Mounted,
             handles: VolumeHandleLedger::new(),
+            volume_file_objects: 0,
         }
     }
 }
@@ -629,6 +632,8 @@ enum MountedVolumeState {
         /// Prior lock owner allowed to release the lock after dismount.
         lock_owner: Option<KernelFileObject>,
     },
+    /// Last FILE_OBJECT closed and the preallocated retirement work item owns teardown.
+    Retiring,
 }
 
 impl MountedVolumeState {
@@ -640,7 +645,7 @@ impl MountedVolumeState {
         match self {
             Self::Mounted => Ok(Self::Locked { owner }),
             Self::Locked { .. } => Err(DriverError::AccessDenied),
-            Self::Dismounted { .. } => Err(DriverError::VolumeDismounted),
+            Self::Dismounted { .. } | Self::Retiring => Err(DriverError::VolumeDismounted),
         }
     }
 
@@ -656,7 +661,7 @@ impl MountedVolumeState {
             Self::Dismounted {
                 lock_owner: Some(current_owner),
             } if current_owner == owner => Ok(Self::Dismounted { lock_owner: None }),
-            Self::Mounted | Self::Locked { .. } | Self::Dismounted { .. } => {
+            Self::Mounted | Self::Locked { .. } | Self::Dismounted { .. } | Self::Retiring => {
                 Err(DriverError::NotLocked)
             }
         }
@@ -675,7 +680,7 @@ impl MountedVolumeState {
                 lock_owner: Some(owner),
             }),
             Self::Locked { .. } => Err(DriverError::AccessDenied),
-            Self::Dismounted { .. } => Err(DriverError::VolumeDismounted),
+            Self::Dismounted { .. } | Self::Retiring => Err(DriverError::VolumeDismounted),
         }
     }
 
@@ -694,6 +699,26 @@ impl MountedVolumeState {
             Self::Mounted | Self::Locked { .. } | Self::Dismounted { .. } => {
                 (self, VolumeHandleCleanup::Released)
             }
+            Self::Retiring => KernelWideInconsistency::mounted_volume_state_corruption().bugcheck(),
+        }
+    }
+
+    /// Selects the one physical-retirement transition after all FILE_OBJECTs close.
+    fn retire_if_unreferenced(
+        self,
+        namespace_empty: bool,
+        volume_file_objects: u32,
+    ) -> (Self, VolumeRetirement) {
+        match self {
+            Self::Dismounted { lock_owner: None }
+                if namespace_empty && volume_file_objects == 0 =>
+            {
+                (Self::Retiring, VolumeRetirement::Start)
+            }
+            Self::Retiring => KernelWideInconsistency::mounted_volume_state_corruption().bugcheck(),
+            Self::Mounted | Self::Locked { .. } | Self::Dismounted { .. } => {
+                (self, VolumeRetirement::Retained)
+            }
         }
     }
 
@@ -704,7 +729,7 @@ impl MountedVolumeState {
     fn ensure_mounted(self) -> DriverResult<()> {
         match self {
             Self::Mounted | Self::Locked { .. } => Ok(()),
-            Self::Dismounted { .. } => Err(DriverError::VolumeDismounted),
+            Self::Dismounted { .. } | Self::Retiring => Err(DriverError::VolumeDismounted),
         }
     }
 
@@ -716,7 +741,7 @@ impl MountedVolumeState {
         match self {
             Self::Mounted => Ok(()),
             Self::Locked { .. } => Err(DriverError::AccessDenied),
-            Self::Dismounted { .. } => Err(DriverError::VolumeDismounted),
+            Self::Dismounted { .. } | Self::Retiring => Err(DriverError::VolumeDismounted),
         }
     }
 
@@ -729,7 +754,7 @@ impl MountedVolumeState {
             Self::Mounted => Ok(()),
             Self::Locked { owner } if owner == file_object => Ok(()),
             Self::Locked { .. } => Err(DriverError::AccessDenied),
-            Self::Dismounted { .. } => Err(DriverError::VolumeDismounted),
+            Self::Dismounted { .. } | Self::Retiring => Err(DriverError::VolumeDismounted),
         }
     }
 }
@@ -914,6 +939,36 @@ pub(crate) enum VolumeHandleCleanup {
     Unlocked,
 }
 
+/// Physical-retirement decision produced by one actor-owned Close transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VolumeRetirement {
+    /// At least one FILE_OBJECT remains or the volume has not logically dismounted.
+    Retained,
+    /// The last FILE_OBJECT closed after dismount and teardown must be queued exactly once.
+    Start,
+}
+
+/// Direct-volume Close effects published after typed context release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VolumeCloseOutcome {
+    /// Whether a cancelled open also released the visible VPB lock.
+    cleanup: VolumeHandleCleanup,
+    /// Whether this Close owns the one physical-retirement transition.
+    retirement: VolumeRetirement,
+}
+
+impl VolumeCloseOutcome {
+    /// Returns the VPB-visible cleanup effect.
+    pub(crate) const fn cleanup(self) -> VolumeHandleCleanup {
+        self.cleanup
+    }
+
+    /// Returns the physical-retirement decision.
+    pub(crate) const fn retirement(self) -> VolumeRetirement {
+        self.retirement
+    }
+}
+
 impl VolumeOperationLease {
     /// Records one direct-volume FILE_OBJECT share claim.
     /// # Errors
@@ -929,15 +984,16 @@ impl VolumeOperationLease {
             // SAFETY: This non-cloneable actor lease uniquely owns volume-handle transitions.
             self.control.as_mut()
         };
-        match control.state {
-            MountedVolumeState::Mounted => {
-                control
-                    .handles
-                    .open(file_object, desired_access, share_access)
-            }
-            MountedVolumeState::Locked { .. } => Err(DriverError::AccessDenied),
-            MountedVolumeState::Dismounted { .. } => Err(DriverError::VolumeDismounted),
-        }
+        control.state.authorize_create()?;
+        let next_count = control
+            .volume_file_objects
+            .checked_add(1)
+            .ok_or(DriverError::InsufficientResources)?;
+        control
+            .handles
+            .open(file_object, desired_access, share_access)?;
+        control.volume_file_objects = next_count;
+        Ok(())
     }
 
     /// Removes one direct-volume FILE_OBJECT share claim.
@@ -953,6 +1009,63 @@ impl VolumeOperationLease {
         let (state, effect) = control.state.cleanup(file_object);
         control.state = state;
         effect
+    }
+
+    /// Releases one direct-volume FILE_OBJECT and selects terminal physical retirement.
+    pub(crate) fn close_volume_file_object(
+        &mut self,
+        file_object: KernelFileObject,
+        release_plan: CloseReleasePlan,
+    ) -> VolumeCloseOutcome {
+        let cleanup = {
+            let control = unsafe {
+                // SAFETY: This non-cloneable actor lease uniquely owns volume-handle transitions.
+                self.control.as_mut()
+            };
+            let cleanup = match release_plan {
+                CloseReleasePlan::CleanedHandle => VolumeHandleCleanup::Released,
+                CloseReleasePlan::CancelledOpen => {
+                    control.handles.cleanup(file_object);
+                    let (state, cleanup) = control.state.cleanup(file_object);
+                    control.state = state;
+                    cleanup
+                }
+            };
+            control.volume_file_objects = control
+                .volume_file_objects
+                .checked_sub(1)
+                .unwrap_or_else(|| {
+                    KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
+                });
+            cleanup
+        };
+        VolumeCloseOutcome {
+            cleanup,
+            retirement: self.begin_retirement(),
+        }
+    }
+
+    /// Rechecks physical retirement after one namespace FILE_OBJECT has closed.
+    pub(crate) fn close_node_file_object(&mut self) -> VolumeRetirement {
+        self.begin_retirement()
+    }
+
+    /// Atomically moves the actor-owned volume into its one physical-retirement transition.
+    fn begin_retirement(&mut self) -> VolumeRetirement {
+        let namespace_empty = unsafe {
+            // SAFETY: The VCB retains the synchronized ledger throughout this actor lease.
+            self.file_control_blocks.as_ref()
+        }
+        .is_empty();
+        let control = unsafe {
+            // SAFETY: This non-cloneable actor lease uniquely owns lifecycle transitions.
+            self.control.as_mut()
+        };
+        let (state, retirement) = control
+            .state
+            .retire_if_unreferenced(namespace_empty, control.volume_file_objects);
+        control.state = state;
+        retirement
     }
 
     /// Flushes and locks a volume whose caller is its only active handle.
@@ -1503,6 +1616,15 @@ impl FileControlBlockLedger {
             })
         })
     }
+
+    /// Returns whether every namespace FILE_OBJECT has released its FCB reference.
+    fn is_empty(&self) -> bool {
+        let _guard = self.lock.acquire();
+        unsafe {
+            // SAFETY: The executive resource serializes table observation.
+            (*self.table.get()).is_empty()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1633,7 +1755,7 @@ impl VolumeControlBlock {
     fn is_logically_dismounted(&self) -> bool {
         matches!(
             self.volume_control.state,
-            MountedVolumeState::Dismounted { .. }
+            MountedVolumeState::Dismounted { .. } | MountedVolumeState::Retiring
         )
     }
 }
@@ -2342,6 +2464,18 @@ pub(crate) struct MountedVolumeDeviceExtension {
     header: DeviceExtensionHeader,
     /// Heap-owned VCB for this mounted volume device.
     vcb: *mut VolumeControlBlock,
+    /// Mount-preallocated work item that performs actor-safe physical retirement.
+    retirement_work_item: wdk_sys::PIO_WORKITEM,
+}
+
+/// Owner that consumes mounted-device extension resources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MountedDeviceTeardown {
+    /// DriverUnload owns an unqueued retirement work item.
+    DriverUnload,
+    /// The queued retirement callback owns and later frees its executing work item.
+    #[cfg(not(test))]
+    RetirementWorkItem,
 }
 
 /// Mounted volume device object produced by a successful mount FSCTL.
@@ -2389,6 +2523,8 @@ impl MountedVolumeDevice {
                 .as_mut()
         }
         .ok_or(DriverError::InvalidParameter)?;
+        extension.vcb = core::ptr::null_mut();
+        extension.retirement_work_item = core::ptr::null_mut();
         let vpb = unsafe {
             // SAFETY: The VPB was supplied by the I/O Manager for this mount
             // request and is writable during successful mount completion.
@@ -2413,6 +2549,23 @@ impl MountedVolumeDevice {
             }
             return Err(error);
         }
+        #[cfg(not(test))]
+        let retirement_work_item = unsafe {
+            // SAFETY: The new mounted device remains live and unpublished during allocation.
+            ffi::IoAllocateWorkItem(device.as_ptr())
+        };
+        #[cfg(test)]
+        let retirement_work_item = NonNull::<wdk_sys::_IO_WORKITEM>::dangling().as_ptr();
+        if retirement_work_item.is_null() {
+            Self::unregister_shutdown_notification(device);
+            unsafe {
+                // SAFETY: Work-item allocation failed before publication; no request can race
+                // executor teardown.
+                DeviceExecutor::release_at(core::ptr::addr_of_mut!(extension.header.executor));
+            }
+            return Err(DriverError::InsufficientResources);
+        }
+        extension.retirement_work_item = retirement_work_item;
 
         device_object.Vpb = vpb;
         device_object.Flags |= DO_DIRECT_IO;
@@ -2470,7 +2623,7 @@ impl MountedVolumeDevice {
     ///
     /// New dispatch must be excluded. Every FILE_OBJECT must have completed Close, or teardown
     /// terminates at the VCB ownership boundary instead of freeing referenced state.
-    unsafe fn release(device: KernelDevice) {
+    unsafe fn release(device: KernelDevice, teardown: MountedDeviceTeardown) {
         let device_object = unsafe {
             // SAFETY: The caller owns terminal teardown of this mounted device.
             device.as_ptr().as_mut()
@@ -2484,6 +2637,10 @@ impl MountedVolumeDevice {
                 .as_mut()
         }
         .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+        let retirement_work_item =
+            NonNull::new(extension.retirement_work_item).unwrap_or_else(|| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            });
         unsafe {
             // SAFETY: Terminal teardown closes admission, drains IRPs, and joins the actor before
             // any VCB or VPB storage is released.
@@ -2502,11 +2659,59 @@ impl MountedVolumeDevice {
         }
         Self::detach_vpb(device);
         extension.vcb = core::ptr::null_mut();
+        extension.retirement_work_item = core::ptr::null_mut();
         unsafe {
             // SAFETY: Mount transferred this Box to the extension and terminal teardown takes it
             // exactly once after every actor access ended.
             drop(Box::from_raw(vcb.as_ptr()));
         }
+        if teardown == MountedDeviceTeardown::DriverUnload {
+            #[cfg(not(test))]
+            unsafe {
+                // SAFETY: DriverUnload owns the mount-preallocated item and it was never queued.
+                ffi::IoFreeWorkItem(retirement_work_item.as_ptr());
+            }
+            #[cfg(test)]
+            let _retirement_work_item = retirement_work_item;
+        }
+    }
+
+    /// Queues the preallocated work item that retires this device after its actor returns.
+    pub(crate) fn schedule_retirement(device: KernelDevice) {
+        let work_item = Self::retirement_work_item(device);
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Mount allocated this item for the device and Retiring makes this the unique
+            // queue operation. I/O work-item ownership pins the device until callback completion.
+            ffi::IoQueueWorkItem(
+                work_item.as_ptr(),
+                Some(mounted_volume_retirement),
+                wdk_sys::_WORK_QUEUE_TYPE::DelayedWorkQueue,
+                work_item.as_ptr().cast::<c_void>(),
+            );
+        }
+        #[cfg(test)]
+        let _work_item = work_item;
+    }
+
+    /// Returns the mount-preallocated retirement work item from a live mounted extension.
+    fn retirement_work_item(device: KernelDevice) -> NonNull<wdk_sys::_IO_WORKITEM> {
+        let device_object = unsafe {
+            // SAFETY: The caller retains the mounted device and its extension.
+            device.as_ptr().as_ref()
+        }
+        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+        let extension = unsafe {
+            // SAFETY: Retirement is emitted only by a mounted-volume actor.
+            device_object
+                .DeviceExtension
+                .cast::<MountedVolumeDeviceExtension>()
+                .as_ref()
+        }
+        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+        NonNull::new(extension.retirement_work_item).unwrap_or_else(|| {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+        })
     }
 
     /// Refreshes the VPB volume label after a successful label mutation.
@@ -2669,6 +2874,37 @@ impl MountedVolumeDevice {
             ffi::IoReleaseVpbSpinLock(irql);
         }
         result
+    }
+}
+
+/// PASSIVE_LEVEL work-item callback that joins the retiring actor and deletes its device.
+/// # Safety
+///
+/// `device` and `context` must be the unique pair queued by
+/// `MountedVolumeDevice::schedule_retirement`.
+#[cfg(not(test))]
+unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: wdk_sys::PVOID) {
+    let Some(device) = KernelDevice::from_raw(device) else {
+        KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
+    };
+    let work_item = NonNull::new(context.cast::<wdk_sys::_IO_WORKITEM>())
+        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+    if MountedVolumeDevice::retirement_work_item(device) != work_item {
+        KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
+    }
+    unsafe {
+        // SAFETY: Work-item ownership excludes driver unload and pins the device while release
+        // closes admission, drains the actor, and destroys extension-owned resources.
+        MountedVolumeDevice::release(device, MountedDeviceTeardown::RetirementWorkItem);
+    }
+    unsafe {
+        // SAFETY: All extension resources are gone and the work item still pins this device.
+        ffi::IoDeleteDevice(device.as_ptr());
+    }
+    unsafe {
+        // SAFETY: The system dequeued this item before invoking the callback. This final operation
+        // releases its device reference and may complete pending device deletion.
+        ffi::IoFreeWorkItem(work_item.as_ptr());
     }
 }
 
@@ -4296,38 +4532,60 @@ pub(crate) unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
     }) else {
         return;
     };
-    let mut next = driver.DeviceObject;
-    while let Some(device) = KernelDevice::from_raw(next) {
-        next = unsafe {
-            // SAFETY: Save the I/O Manager-owned chain link before deleting this device.
-            device.as_ptr().as_ref()
-        }
-        .map_or(core::ptr::null_mut(), |object| object.NextDevice);
-        let kind = driver_device_kind(device).unwrap_or_else(|_| {
+    let control = find_control_device(driver.DeviceObject)
+        .and_then(|device| device.ok_or(DriverError::InternalInvariantViolation))
+        .unwrap_or_else(|_| {
             KernelWideInconsistency::driver_device_teardown_corruption().bugcheck()
         });
-        match kind {
-            DriverDeviceKind::Control => {
-                unsafe {
-                    // SAFETY: Unload excludes new dispatch and this is the registered FSD device.
-                    ffi::IoUnregisterFileSystem(device.as_ptr());
-                }
-                unsafe {
-                    // SAFETY: Unregistration and unload exclude every executor user.
-                    ControlDeviceExtension::release(device);
-                }
-            }
-            DriverDeviceKind::MountedVolume => unsafe {
-                // SAFETY: Unload excludes new dispatch and all user handles by I/O Manager
-                // contract; mounted teardown drains its remaining actor work before release.
-                MountedVolumeDevice::release(device);
-            },
+    unsafe {
+        // SAFETY: Unregistration closes the I/O Manager's filesystem entry before actor teardown.
+        ffi::IoUnregisterFileSystem(control.as_ptr());
+    }
+    unsafe {
+        // SAFETY: Unregistration excludes new control requests. Joining this actor also completes
+        // any in-flight mount, stabilizing the complete driver device chain.
+        ControlDeviceExtension::release(control);
+    }
+    unsafe {
+        // SAFETY: Control extension resources were released exactly once above.
+        ffi::IoDeleteDevice(control.as_ptr());
+    }
+
+    while let Some(device) = KernelDevice::from_raw(driver.DeviceObject) {
+        if driver_device_kind(device) != Ok(DriverDeviceKind::MountedVolume) {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
         }
         unsafe {
-            // SAFETY: Concrete extension resources were released exactly once above.
+            // SAFETY: The control actor is gone, so the mounted-device set can no longer grow.
+            MountedVolumeDevice::release(device, MountedDeviceTeardown::DriverUnload);
+        }
+        unsafe {
+            // SAFETY: Mounted extension resources were released exactly once above.
             ffi::IoDeleteDevice(device.as_ptr());
         }
     }
+}
+
+/// Finds the unique control device before unload joins its mount-capable actor.
+/// # Errors
+///
+/// Returns an invariant error for an unknown extension or more than one control device.
+fn find_control_device(first: PDEVICE_OBJECT) -> DriverResult<Option<KernelDevice>> {
+    let mut found = None;
+    let mut next = first;
+    while let Some(device) = KernelDevice::from_raw(next) {
+        if driver_device_kind(device)? == DriverDeviceKind::Control
+            && found.replace(device).is_some()
+        {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        next = unsafe {
+            // SAFETY: This read-only traversal occurs before any chain member is deleted.
+            device.as_ptr().as_ref()
+        }
+        .map_or(core::ptr::null_mut(), |object| object.NextDevice);
+    }
+    Ok(found)
 }
 
 /// Decodes the common extension kind for one device in this driver's I/O Manager-owned chain.
@@ -4373,7 +4631,7 @@ mod tests {
         NoIntermediateTransfer, OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation,
         OpenedNodeMode, OpenedObject, OpenedRegularFile, OpenedVolumeHandle,
         TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
-        VolumeHandleCleanup, WriteCommitment, select_close_release_plan,
+        VolumeHandleCleanup, VolumeRetirement, WriteCommitment, select_close_release_plan,
         shutdown_registration_status,
     };
 
@@ -4497,6 +4755,30 @@ mod tests {
                 MountedVolumeState::Dismounted { lock_owner: None },
                 VolumeHandleCleanup::Unlocked
             )
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when physical retirement starts before every FILE_OBJECT is gone.
+    #[test]
+    fn dismounted_volume_retires_only_after_all_file_objects_close() {
+        let dismounted = MountedVolumeState::Dismounted { lock_owner: None };
+        assert_eq!(
+            dismounted.retire_if_unreferenced(false, 0),
+            (dismounted, VolumeRetirement::Retained)
+        );
+        assert_eq!(
+            dismounted.retire_if_unreferenced(true, 1),
+            (dismounted, VolumeRetirement::Retained)
+        );
+        assert_eq!(
+            dismounted.retire_if_unreferenced(true, 0),
+            (MountedVolumeState::Retiring, VolumeRetirement::Start)
+        );
+        assert_eq!(
+            MountedVolumeState::Mounted.retire_if_unreferenced(true, 0),
+            (MountedVolumeState::Mounted, VolumeRetirement::Retained)
         );
     }
 
