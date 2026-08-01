@@ -285,14 +285,6 @@ impl LiveInodeRecord {
         self.raw.set_ext4_times(times, timestamp_encoding)
     }
 
-    /// Updates file size fields.
-    /// # Errors
-    ///
-    /// Returns an error when the file size cannot be split across the low and high inode fields.
-    pub(super) fn set_size(&mut self, size: FileSize) -> Result<()> {
-        self.raw.set_size(size)
-    }
-
     /// Writes serialized extent root bytes.
     /// # Errors
     ///
@@ -300,15 +292,6 @@ impl LiveInodeRecord {
     /// storage.
     pub(super) fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> {
         self.raw.set_extent_root_bytes(root)
-    }
-
-    /// Writes allocated sector counts.
-    /// # Errors
-    ///
-    /// Returns an error when allocated blocks and block size cannot be converted to inode sector
-    /// counts.
-    pub(super) fn set_allocated_blocks(&mut self, blocks: u64, block_size: u64) -> Result<()> {
-        self.raw.set_allocated_blocks(blocks, block_size)
     }
 
     /// Returns the external xattr block referenced by this inode.
@@ -737,24 +720,6 @@ impl RawInodeRecord {
         )?))
     }
 
-    /// Splits a file size across low and high inode size fields.
-    /// # Errors
-    ///
-    /// Returns an error when either inode size field is not writable.
-    pub(super) fn set_size(&mut self, size: FileSize) -> Result<()> {
-        let size = size.bytes();
-        put_le_u32(
-            &mut self.bytes,
-            disk_offset(INODE_SIZE_LO_OFFSET),
-            u32::try_from(size & u64::from(u32::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-        put_le_u32(
-            &mut self.bytes,
-            disk_offset(INODE_SIZE_HIGH_OFFSET),
-            u32::try_from(size >> 32).map_err(|_| Error::ArithmeticOverflow)?,
-        )
-    }
-
     /// Updates access, change, and modification timestamps.
     /// # Errors
     ///
@@ -1001,33 +966,6 @@ impl RawInodeRecord {
             .get_mut(..target.len())
             .ok_or(Error::DeviceRange)?
             .copy_from_slice(target);
-        Ok(())
-    }
-
-    /// Writes allocated 512-byte sector counts from allocated data blocks.
-    /// # Errors
-    ///
-    /// Returns an error when byte or sector arithmetic overflows or the sector count fields are not
-    /// writable.
-    pub(super) fn set_allocated_blocks(&mut self, blocks: u64, block_size: u64) -> Result<()> {
-        let sectors = blocks
-            .checked_mul(block_size)
-            .ok_or(Error::ArithmeticOverflow)?
-            .checked_div(512)
-            .ok_or(Error::ArithmeticOverflow)?;
-        put_le_u32(
-            &mut self.bytes,
-            disk_offset(INODE_BLOCKS_LO_OFFSET),
-            u32::try_from(sectors & u64::from(u32::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-        if self.bytes.len() > INODE_BLOCKS_HIGH_OFFSET {
-            put_le_u16(
-                &mut self.bytes,
-                disk_offset(INODE_BLOCKS_HIGH_OFFSET),
-                u16::try_from((sectors >> 32) & u64::from(u16::MAX))
-                    .map_err(|_| Error::ArithmeticOverflow)?,
-            )?;
-        }
         Ok(())
     }
 
