@@ -31,6 +31,10 @@ pub(crate) enum DriverError {
     InsufficientResources,
     /// Access is denied by the current FSD policy.
     AccessDenied,
+    /// The target inode has entered the terminal delete-pending namespace state.
+    DeletePending,
+    /// The selected namespace link cannot be deleted.
+    CannotDelete,
     /// The mounted volume has entered its terminal logical dismount state.
     VolumeDismounted,
     /// The caller does not own a volume lock that can be released.
@@ -97,6 +101,8 @@ impl DriverError {
             Self::InternalInvariantViolation => STATUS_INTERNAL_ERROR,
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,
+            Self::DeletePending => ntstatus(0xC000_0056),
+            Self::CannotDelete => STATUS_CANNOT_DELETE,
             Self::VolumeDismounted => ntstatus(0xC000_026E),
             Self::NotLocked => ntstatus(0xC000_002A),
             Self::BufferTooSmall => STATUS_BUFFER_TOO_SMALL,
@@ -312,6 +318,21 @@ mod tests {
         assert_eq!(
             DriverError::from(Error::InvalidWriteRange).ntstatus(),
             STATUS_INVALID_PARAMETER
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when namespace deletion statuses lose their Windows identities.
+    #[test]
+    fn deletion_errors_use_exact_statuses() {
+        assert_eq!(
+            DriverError::DeletePending.ntstatus(),
+            super::ntstatus(0xC000_0056)
+        );
+        assert_eq!(
+            DriverError::CannotDelete.ntstatus(),
+            wdk_sys::STATUS_CANNOT_DELETE
         );
     }
 }
