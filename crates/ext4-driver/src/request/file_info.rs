@@ -11,11 +11,11 @@ use ext4_core::{
 use wdk_sys::LARGE_INTEGER;
 
 use crate::irp::{
-    ActiveFileObject, ActiveIrp, DataIoKind, DirectoryChangeFilter, DirectoryCursorPosition,
-    DirectoryEntryEmission, DirectoryEntryIndex, DirectoryInformationClass, DirectoryWatchScope,
-    IrpBufferLength, IrpCompletion, OwnedIrp, PendingIrpLease, PreparedDirectoryPattern,
-    QueryFileInformationClass, ReadStartingPoint, RegularFileWriteAccess, SetFileInformationClass,
-    SetFileStack, WriteStartingPoint,
+    ActiveFileObject, ActiveIrp, CreateDeletion, DataIoKind, DirectoryChangeFilter,
+    DirectoryCursorPosition, DirectoryEntryEmission, DirectoryEntryIndex,
+    DirectoryInformationClass, DirectoryWatchScope, IrpBufferLength, IrpCompletion, OwnedIrp,
+    PendingIrpLease, PreparedDirectoryPattern, QueryFileInformationClass, ReadStartingPoint,
+    RegularFileWriteAccess, SetFileInformationClass, SetFileStack, WriteStartingPoint,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
@@ -605,7 +605,7 @@ enum FileDispositionRequest {
 
 /// Read-only attribute policy selected by an extended disposition request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeleteReadonlyPolicy {
+pub(crate) enum DeleteReadonlyPolicy {
     /// A Windows read-only attribute prevents deletion.
     Enforce,
     /// `FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE` explicitly bypasses the attribute.
@@ -646,7 +646,9 @@ fn disposition_plan(
     };
     match request {
         FileDispositionRequest::Keep => {
-            opened.clear_delete_pending();
+            if opened.create_deletion() == CreateDeletion::Retain {
+                opened.clear_delete_pending();
+            }
             Ok(SetFilePlan::Complete)
         }
         FileDispositionRequest::Delete(readonly) => Ok(SetFilePlan::Disposition {
@@ -693,7 +695,7 @@ fn decode_extended_disposition(flags: wdk_sys::ULONG) -> DriverResult<FileDispos
 ///
 /// Returns cannot-delete when the link no longer identifies the opened inode or has the read-only
 /// attribute, directory-not-empty for a non-empty directory, or the underlying read error.
-async fn validate_pending_deletion(
+pub(crate) async fn validate_pending_deletion(
     operations: &mut VolumeOperationLane,
     node: NodeId,
     target: &FileDeleteTarget,
@@ -848,6 +850,8 @@ async fn set_rename_information(
     } = mutation;
     let (target_parent, target_name) =
         resolve_rename_target(operations.lane_mut(), &target).await?;
+    operations.ensure_node_openable(NodeId::Directory(source_parent))?;
+    operations.ensure_node_openable(NodeId::Directory(target_parent))?;
     let notifications = RenameDirectoryNameChanges::prepare(
         operations,
         source_parent,

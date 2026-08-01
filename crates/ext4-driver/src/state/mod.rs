@@ -28,9 +28,9 @@ use wdk_sys::{
 use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 
 use crate::irp::{
-    ActiveFileObject, ByteRangeLockKey, DataIoKind, DeleteAccess, DesiredAccess, DeviceExecutor,
-    DirectoryEntryIndex, DispatchTarget, ExistingOperationAccess, RegularFileWriteAccess,
-    RequestorProcess, ShareAccess,
+    ActiveFileObject, ByteRangeLockKey, CreateDeletion, DataIoKind, DeleteAccess, DesiredAccess,
+    DeviceExecutor, DirectoryEntryIndex, DispatchTarget, ExistingOperationAccess,
+    RegularFileWriteAccess, RequestorProcess, ShareAccess,
 };
 use crate::kernel::cng::CngFscryptNonceGenerator;
 use crate::kernel::fatal::KernelWideInconsistency;
@@ -3329,8 +3329,18 @@ impl FileControlBlockOpenState {
             )
     }
 
-    /// Replaces the shared delete-pending target and returns the previous allocation.
+    /// Publishes a shared delete-pending target and returns displaced storage.
+    ///
+    /// A create-time delete-on-close target is mandatory and therefore cannot be replaced by a
+    /// later, cancellable disposition request from another already-open handle.
     fn set_delete_pending(&mut self, pending: PendingFileDeletion) -> Option<PendingFileDeletion> {
+        if matches!(
+            &self.deletion,
+            FileDeletionState::Pending(existing)
+                if existing.cause() == FileDeletionCause::DeleteOnClose
+        ) {
+            return Some(pending);
+        }
         match core::mem::replace(&mut self.deletion, FileDeletionState::Pending(pending)) {
             FileDeletionState::Live => None,
             FileDeletionState::Pending(previous) => Some(previous),
@@ -3340,8 +3350,17 @@ impl FileControlBlockOpenState {
         }
     }
 
-    /// Cancels delete-pending before the final active cleanup.
+    /// Cancels a disposition-originated delete-pending before final active cleanup.
+    ///
+    /// Create-time delete-on-close is mandatory and is intentionally unaffected.
     fn clear_delete_pending(&mut self) -> Option<PendingFileDeletion> {
+        if matches!(
+            &self.deletion,
+            FileDeletionState::Pending(existing)
+                if existing.cause() == FileDeletionCause::DeleteOnClose
+        ) {
+            return None;
+        }
         match core::mem::replace(&mut self.deletion, FileDeletionState::Live) {
             FileDeletionState::Live => None,
             FileDeletionState::Pending(previous) => Some(previous),
@@ -3661,15 +3680,38 @@ impl FileDeleteTarget {
 pub(crate) struct PendingFileDeletion {
     /// Stable target storage referenced by an actor-local cleanup plan across suspension.
     target: Box<FileDeleteTarget>,
+    /// Whether the pending state may be cancelled by a later disposition request.
+    cause: FileDeletionCause,
 }
 
 impl PendingFileDeletion {
-    /// Copies a deletable handle location into stable FCB-owned storage.
+    /// Copies a normal disposition target into stable FCB-owned storage.
     /// # Errors
     ///
     /// Returns cannot-delete for root and file-reference handles, or an allocation error when the
     /// exact directory-entry name cannot be retained.
-    fn try_from_location(location: &OpenedLocation) -> DriverResult<Self> {
+    pub(crate) fn try_from_disposition(location: &OpenedLocation) -> DriverResult<Self> {
+        Self::try_from_location(location, FileDeletionCause::Disposition)
+    }
+
+    /// Copies a mandatory delete-on-close target into stable FCB-owned storage.
+    /// # Errors
+    ///
+    /// Returns cannot-delete for root and file-reference handles, or an allocation error when the
+    /// exact directory-entry name cannot be retained.
+    pub(crate) fn try_from_delete_on_close(location: &OpenedLocation) -> DriverResult<Self> {
+        Self::try_from_location(location, FileDeletionCause::DeleteOnClose)
+    }
+
+    /// Copies an exact location and deletion cause into stable storage.
+    /// # Errors
+    ///
+    /// Returns cannot-delete when the location has no deletable directory entry, or an allocation
+    /// error when the exact entry name cannot be retained.
+    fn try_from_location(
+        location: &OpenedLocation,
+        cause: FileDeletionCause,
+    ) -> DriverResult<Self> {
         let OpenedLocation::DirectoryEntry { parent, name } = location else {
             return Err(DriverError::CannotDelete);
         };
@@ -3681,6 +3723,7 @@ impl PendingFileDeletion {
                     name,
                 })
             })?,
+            cause,
         })
     }
 
@@ -3693,6 +3736,20 @@ impl PendingFileDeletion {
     pub(crate) fn target_ref(&self) -> &FileDeleteTarget {
         self.target.as_ref()
     }
+
+    /// Returns the cancellation semantics fixed when this pending target was created.
+    const fn cause(&self) -> FileDeletionCause {
+        self.cause
+    }
+}
+
+/// Origin of one shared FCB delete-pending state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileDeletionCause {
+    /// Set-information may later cancel this pending state.
+    Disposition,
+    /// Create-time delete-on-close cannot be cancelled by normal disposition.
+    DeleteOnClose,
 }
 
 /// Namespace deletion state shared by every FILE_OBJECT for one inode identity.
@@ -3980,6 +4037,56 @@ pub(crate) enum OpenedNodeMode {
     ReparsePoint,
 }
 
+/// Per-handle namespace deletion authority and create-time lifecycle.
+///
+/// Delete-on-close is a distinct variant because that lifecycle necessarily includes `DELETE`
+/// authority; an unauthorized delete-on-close handle is unrepresentable after create decoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HandleDeletion {
+    /// No create-time deletion was requested; later disposition requires the retained authority.
+    Retain(DeleteAccess),
+    /// The exact opened link must be removed after final active cleanup.
+    DeleteOnClose,
+}
+
+impl HandleDeletion {
+    /// Binds decoded create deletion to the handle's retained delete authority.
+    /// # Errors
+    ///
+    /// Returns access denied when delete-on-close is paired with missing `DELETE` authority.
+    pub(crate) fn from_create(
+        deletion: CreateDeletion,
+        delete_access: DeleteAccess,
+    ) -> DriverResult<Self> {
+        match deletion {
+            CreateDeletion::Retain => Ok(Self::Retain(delete_access)),
+            CreateDeletion::DeleteOnClose => {
+                delete_access.require()?;
+                Ok(Self::DeleteOnClose)
+            }
+        }
+    }
+
+    /// Requires delete authority retained by this handle lifecycle.
+    /// # Errors
+    ///
+    /// Returns access denied when a retained handle was not opened with `DELETE`.
+    fn require_delete_access(self) -> DriverResult<()> {
+        match self {
+            Self::Retain(delete_access) => delete_access.require(),
+            Self::DeleteOnClose => Ok(()),
+        }
+    }
+
+    /// Projects the create-time namespace deletion request.
+    pub(crate) const fn create_deletion(self) -> CreateDeletion {
+        match self {
+            Self::Retain(_) => CreateDeletion::Retain,
+            Self::DeleteOnClose => CreateDeletion::DeleteOnClose,
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 /// FsRtl directory-name descriptor lifecycle for one opened handle.
 enum DirectoryNotificationName {
@@ -3998,8 +4105,8 @@ struct OpenedHandleState {
     location: UnsafeCell<OpenedLocation>,
     /// One-way cleanup lifecycle shared with the synchronous control plane.
     lifecycle: HandleLifecycle,
-    /// Delete authority fixed when this handle was opened.
-    delete_access: DeleteAccess,
+    /// Delete authority and namespace lifecycle fixed when this handle was opened.
+    deletion: HandleDeletion,
     /// Write completion durability requested for this handle.
     write_commitment: WriteCommitment,
     /// Data transfer buffering policy requested for this handle.
@@ -4013,7 +4120,7 @@ impl OpenedHandleState {
     const fn new(
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
-        delete_access: DeleteAccess,
+        deletion: HandleDeletion,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
     ) -> Self {
@@ -4021,7 +4128,7 @@ impl OpenedHandleState {
             node_mode,
             location: UnsafeCell::new(location),
             lifecycle: HandleLifecycle::active(),
-            delete_access,
+            deletion,
             write_commitment,
             data_transfer_mode,
             directory_notification_name: UnsafeCell::new(DirectoryNotificationName::Unregistered),
@@ -4042,9 +4149,17 @@ impl OpenedHandleState {
         self.node_mode
     }
 
-    /// Returns delete authority retained by this handle.
-    const fn delete_access(&self) -> DeleteAccess {
-        self.delete_access
+    /// Requires delete authority retained by this handle.
+    /// # Errors
+    ///
+    /// Returns access denied when this retained handle was not opened with `DELETE`.
+    fn require_delete_access(&self) -> DriverResult<()> {
+        self.deletion.require_delete_access()
+    }
+
+    /// Returns the namespace deletion lifecycle selected at create/open.
+    const fn create_deletion(&self) -> CreateDeletion {
+        self.deletion.create_deletion()
     }
 
     /// Replaces the opened location after a successful rename.
@@ -4143,7 +4258,7 @@ impl OpenedHandle {
         node: NodeId,
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
-        delete_access: DeleteAccess,
+        deletion: HandleDeletion,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
@@ -4152,7 +4267,7 @@ impl OpenedHandle {
             node,
             node_mode,
             location,
-            delete_access,
+            deletion,
             write_commitment,
             data_transfer_mode,
             regular_file_write_access,
@@ -4164,7 +4279,7 @@ impl OpenedHandle {
         node: NodeId,
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
-        delete_access: DeleteAccess,
+        deletion: HandleDeletion,
         write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
@@ -4172,7 +4287,7 @@ impl OpenedHandle {
         let state = OpenedHandleState::new(
             node_mode,
             location,
-            delete_access,
+            deletion,
             write_commitment,
             data_transfer_mode,
         );
@@ -4208,9 +4323,17 @@ impl OpenedHandle {
         self.state.node_mode()
     }
 
-    /// Returns delete authority retained by this handle.
-    const fn delete_access(&self) -> DeleteAccess {
-        self.state.delete_access()
+    /// Requires delete authority retained by this handle.
+    /// # Errors
+    ///
+    /// Returns access denied when this retained handle was not opened with `DELETE`.
+    fn require_delete_access(&self) -> DriverResult<()> {
+        self.state.require_delete_access()
+    }
+
+    /// Returns the namespace deletion lifecycle selected at create/open.
+    const fn create_deletion(&self) -> CreateDeletion {
+        self.state.create_deletion()
     }
 
     /// Begins this handle's idempotent cleanup transition.
@@ -4340,7 +4463,12 @@ impl<'owner> OpenedObject<'owner> {
     ///
     /// Returns access denied when the create/open did not request `DELETE`.
     pub(crate) fn require_delete_access(&self) -> DriverResult<()> {
-        self.handle().delete_access().require()
+        self.handle().require_delete_access()
+    }
+
+    /// Returns the namespace deletion lifecycle selected when this handle was created.
+    pub(crate) fn create_deletion(&self) -> CreateDeletion {
+        self.handle().create_deletion()
     }
 
     /// Copies this handle's exact deletable location into stable FCB-owned storage.
@@ -4348,7 +4476,7 @@ impl<'owner> OpenedObject<'owner> {
     ///
     /// Returns cannot-delete for root or file-reference handles, or an allocation failure.
     pub(crate) fn prepare_pending_deletion(&self) -> DriverResult<PendingFileDeletion> {
-        PendingFileDeletion::try_from_location(self.location())
+        PendingFileDeletion::try_from_disposition(self.location())
     }
 
     /// Cancels delete-pending for the shared FCB.
@@ -4977,8 +5105,8 @@ mod tests {
     use ext4_core::{DirectoryNodeId, Ext4Name, FileOffset, NodeId};
 
     use crate::irp::{
-        ActiveFileObject, DataIoKind, DeleteAccess, DirectoryEntryIndex, ReceivedIrp,
-        RegularFileWriteAccess,
+        ActiveFileObject, CreateDeletion, DataIoKind, DeleteAccess, DirectoryEntryIndex,
+        ReceivedIrp, RegularFileWriteAccess,
     };
     use crate::kernel::status::DriverError;
 
@@ -4987,7 +5115,7 @@ mod tests {
         DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode, DeviceExtensionKind,
         DirectoryNameChange, DirectoryNameChangeAction, DriverDeviceKind, FileControlBlock,
         FileControlBlockLedger, FileControlBlockOpenState, FileControlBlockRelease,
-        FileObjectCloseKind, KernelDevice, KernelFileObject, MountedVolumeDevice,
+        FileObjectCloseKind, HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeDevice,
         MountedVolumeDeviceExtension, MountedVolumeState, NativeFileByteRange,
         NoIntermediateTransfer, OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation,
         OpenedNodeMode, OpenedObject, OpenedRegularFile, OpenedVolumeHandle,
@@ -5373,7 +5501,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            DeleteAccess::Denied,
+            HandleDeletion::Retain(DeleteAccess::Denied),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5412,7 +5540,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            DeleteAccess::Denied,
+            HandleDeletion::Retain(DeleteAccess::Denied),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5491,7 +5619,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            DeleteAccess::Denied,
+            HandleDeletion::Retain(DeleteAccess::Denied),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5520,7 +5648,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::ReparsePoint,
             OpenedLocation::Root,
-            DeleteAccess::Denied,
+            HandleDeletion::Retain(DeleteAccess::Denied),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5547,7 +5675,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            DeleteAccess::Denied,
+            HandleDeletion::Retain(DeleteAccess::Denied),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5574,7 +5702,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            DeleteAccess::Denied,
+            HandleDeletion::Retain(DeleteAccess::Denied),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5619,7 +5747,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            DeleteAccess::Denied,
+            HandleDeletion::Retain(DeleteAccess::Denied),
             WriteCommitment::FlushThrough,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5657,7 +5785,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            DeleteAccess::Denied,
+            HandleDeletion::Retain(DeleteAccess::Denied),
             WriteCommitment::CommitOnly,
             DataTransferMode::NoIntermediate(transfer),
             RegularFileWriteAccess::Denied,
@@ -5688,7 +5816,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            DeleteAccess::Denied,
+            HandleDeletion::Retain(DeleteAccess::Denied),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5752,7 +5880,7 @@ mod tests {
                 state: super::OpenedHandleState::new(
                     OpenedNodeMode::Direct,
                     OpenedLocation::Root,
-                    DeleteAccess::Denied,
+                    HandleDeletion::Retain(DeleteAccess::Denied),
                     WriteCommitment::CommitOnly,
                     DataTransferMode::IntermediateAllowed,
                 ),
@@ -5773,7 +5901,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            DeleteAccess::Denied,
+            HandleDeletion::Retain(DeleteAccess::Denied),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5836,7 +5964,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            DeleteAccess::Denied,
+            HandleDeletion::Retain(DeleteAccess::Denied),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5978,7 +6106,7 @@ mod tests {
         let Ok(location) = location else {
             return;
         };
-        let pending = super::PendingFileDeletion::try_from_location(&location);
+        let pending = super::PendingFileDeletion::try_from_disposition(&location);
         assert!(pending.is_ok());
         let Ok(pending) = pending else {
             return;
@@ -6015,15 +6143,34 @@ mod tests {
 
     /// # Panics
     ///
+    /// Panics when the CCB deletion domain can represent unauthorized delete-on-close.
+    #[test]
+    fn handle_deletion_requires_delete_authority_for_delete_on_close() {
+        assert_eq!(
+            HandleDeletion::from_create(CreateDeletion::DeleteOnClose, DeleteAccess::Denied),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            HandleDeletion::from_create(CreateDeletion::DeleteOnClose, DeleteAccess::Granted),
+            Ok(HandleDeletion::DeleteOnClose)
+        );
+        assert_eq!(
+            HandleDeletion::from_create(CreateDeletion::Retain, DeleteAccess::Denied),
+            Ok(HandleDeletion::Retain(DeleteAccess::Denied))
+        );
+    }
+
+    /// # Panics
+    ///
     /// Panics when cancellation or non-directory-entry deletion targets become ambiguous.
     #[test]
     fn pending_file_deletion_cancels_only_before_commit_and_requires_a_link() {
         assert_eq!(
-            super::PendingFileDeletion::try_from_location(&OpenedLocation::Root),
+            super::PendingFileDeletion::try_from_disposition(&OpenedLocation::Root),
             Err(DriverError::CannotDelete)
         );
         assert_eq!(
-            super::PendingFileDeletion::try_from_location(&OpenedLocation::FileReference),
+            super::PendingFileDeletion::try_from_disposition(&OpenedLocation::FileReference),
             Err(DriverError::CannotDelete)
         );
 
@@ -6037,7 +6184,7 @@ mod tests {
         let Ok(location) = location else {
             return;
         };
-        let pending = super::PendingFileDeletion::try_from_location(&location);
+        let pending = super::PendingFileDeletion::try_from_disposition(&location);
         assert!(pending.is_ok());
         let Ok(pending) = pending else {
             return;
@@ -6047,5 +6194,66 @@ mod tests {
         assert!(state.clear_delete_pending().is_some());
         assert_eq!(state.deletion.ensure_openable(), Ok(()));
         assert!(!state.delete_pending());
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a mandatory create-time delete target can be cancelled or replaced by a normal
+    /// disposition request.
+    #[test]
+    fn delete_on_close_pending_cannot_be_cancelled_or_replaced() {
+        let mandatory_name = Ext4Name::new(b"mandatory");
+        assert!(mandatory_name.is_ok());
+        let Ok(mandatory_name) = mandatory_name else {
+            return;
+        };
+        let mandatory_location =
+            OpenedLocation::try_directory_entry(DirectoryNodeId::ROOT, &mandatory_name);
+        assert!(mandatory_location.is_ok());
+        let Ok(mandatory_location) = mandatory_location else {
+            return;
+        };
+        let mandatory = super::PendingFileDeletion::try_from_delete_on_close(&mandatory_location);
+        assert!(mandatory.is_ok());
+        let Ok(mandatory) = mandatory else {
+            return;
+        };
+        let mandatory_target = mandatory.target();
+
+        let replacement_name = Ext4Name::new(b"replacement");
+        assert!(replacement_name.is_ok());
+        let Ok(replacement_name) = replacement_name else {
+            return;
+        };
+        let replacement_location =
+            OpenedLocation::try_directory_entry(DirectoryNodeId::ROOT, &replacement_name);
+        assert!(replacement_location.is_ok());
+        let Ok(replacement_location) = replacement_location else {
+            return;
+        };
+        let replacement = super::PendingFileDeletion::try_from_disposition(&replacement_location);
+        assert!(replacement.is_ok());
+        let Ok(replacement) = replacement else {
+            return;
+        };
+        let replacement_target = replacement.target();
+
+        let mut state = FileControlBlockOpenState::new();
+        assert!(state.set_delete_pending(mandatory).is_none());
+        assert!(state.clear_delete_pending().is_none());
+        assert_eq!(
+            state.cleanup_disposition(),
+            super::FileCleanupDisposition::Delete(mandatory_target)
+        );
+        let displaced = state.set_delete_pending(replacement);
+        assert!(displaced.is_some());
+        let Some(displaced) = displaced else {
+            return;
+        };
+        assert_eq!(displaced.target(), replacement_target);
+        assert_eq!(
+            state.cleanup_disposition(),
+            super::FileCleanupDisposition::Delete(mandatory_target)
+        );
     }
 }
