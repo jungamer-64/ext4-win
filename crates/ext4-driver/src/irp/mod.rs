@@ -2692,9 +2692,6 @@ impl CreateOptions {
         if raw_options & !ACCEPTED_CREATE_OPTIONS != 0 {
             return Err(DriverError::NotSupported);
         }
-        if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
-            return Err(DriverError::NotSupported);
-        }
         let transfer_buffering =
             if create_option_selected(options, wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING) {
                 CreateTransferBuffering::NoIntermediate
