@@ -165,34 +165,6 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         self.volume.superblock.xattr_mutation().require_supported()
     }
 
-    /// Verifies that an inode size is representable by the mounted profile.
-    /// # Errors
-    ///
-    /// Returns an error when `size` exceeds the active inode file-size encoding.
-    fn require_inode_size_supported(&self, size: FileSize) -> Result<()> {
-        self.volume
-            .superblock
-            .file_size_encoding()
-            .require_supported(size.bytes(), LEGACY_FILE_SIZE_LIMIT)
-    }
-
-    /// Verifies that an inode block charge is representable by the mounted profile.
-    /// # Errors
-    ///
-    /// Returns an error when `blocks` cannot be converted to sectors or exceeds the active
-    /// `i_blocks` encoding.
-    fn require_allocated_blocks_supported(&self, blocks: u64) -> Result<()> {
-        let sectors = blocks
-            .checked_mul(u64::from(self.volume.superblock.block_size().bytes()))
-            .ok_or(Error::ArithmeticOverflow)?
-            .checked_div(512)
-            .ok_or(Error::ArithmeticOverflow)?;
-        self.volume
-            .superblock
-            .inode_block_count_encoding()
-            .require_supported(sectors, LEGACY_I_BLOCKS_LIMIT)
-    }
-
     /// Selects any supported inode for POSIX metadata mutation.
     ///
     /// # Errors

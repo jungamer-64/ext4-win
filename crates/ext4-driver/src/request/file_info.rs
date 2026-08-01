@@ -2095,8 +2095,6 @@ struct FileMetadata {
     overlay_attributes: u32,
     /// Windows reparse metadata projected from a native symlink or private xattr.
     reparse_point: FileMetadataReparsePoint,
-    /// Mounted volume block size.
-    block_size: ext4_core::BlockSize,
 }
 
 /// Node kind projected to Windows information flags.
@@ -2423,30 +2421,6 @@ fn file_attributes(metadata: FileMetadata) -> wdk_sys::ULONG {
     } else {
         attributes
     }
-}
-
-/// Returns allocation size rounded to a volume allocation unit.
-/// # Errors
-///
-/// Returns an error when block-size rounding arithmetic overflows.
-fn allocation_size(metadata: FileMetadata) -> DriverResult<u64> {
-    let size = metadata.size.bytes();
-    if size == 0 {
-        return Ok(0);
-    }
-    let block_size = u64::from(metadata.block_size.bytes());
-    let adjustment = block_size
-        .checked_sub(1)
-        .ok_or(DriverError::InvalidParameter)?;
-    let adjusted = size
-        .checked_add(adjustment)
-        .ok_or(DriverError::InvalidParameter)?;
-    let blocks = adjusted
-        .checked_div(block_size)
-        .ok_or(DriverError::InvalidParameter)?;
-    blocks
-        .checked_mul(block_size)
-        .ok_or(DriverError::InvalidParameter)
 }
 
 /// Creates a signed LARGE_INTEGER from an unsigned byte count.
