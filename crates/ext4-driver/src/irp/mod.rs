@@ -2192,6 +2192,10 @@ pub(crate) enum SetFileInformationClass {
     Disposition,
     /// Windows `FileDispositionInformationEx`.
     DispositionEx,
+    /// Windows `FileLinkInformation`.
+    Link,
+    /// Windows `FileLinkInformationEx`.
+    LinkEx,
     /// Windows `FileRenameInformation`.
     Rename,
     /// Windows `FileRenameInformationEx`.
@@ -2213,6 +2217,8 @@ impl SetFileInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformationEx => {
                 Ok(Self::DispositionEx)
             }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformation => Ok(Self::Link),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformationEx => Ok(Self::LinkEx),
             wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation => Ok(Self::Rename),
             wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformationEx => Ok(Self::RenameEx),
             _ => Err(DriverError::InvalidInfoClass),
