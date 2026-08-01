@@ -553,54 +553,6 @@ async fn set_basic_information(
     Ok(())
 }
 
-/// Rejects FILE_DISPOSITION_INFORMATION deletion until identity-checked orphan lifecycle exists.
-/// # Errors
-///
-/// Returns an error when the input is truncated or requests deletion.
-fn set_disposition_information(active: &ActiveIrp<'_>, stack: SetFileStack) -> DriverResult<()> {
-    let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION>(
-        active,
-        stack.length(),
-    )?;
-    validate_disposition_delete_flag(info.DeleteFile)
-}
-
-/// Validates legacy disposition deletion while orphan lifecycle is unavailable.
-/// # Errors
-///
-/// Returns not supported when deletion is requested.
-fn validate_disposition_delete_flag(delete_file: wdk_sys::BOOLEAN) -> DriverResult<()> {
-    if delete_file == 0 {
-        Ok(())
-    } else {
-        Err(DriverError::NotSupported)
-    }
-}
-
-/// Rejects FILE_DISPOSITION_INFORMATION_EX deletion until safe orphan lifecycle exists.
-/// # Errors
-///
-/// Returns an error when the extended disposition input is truncated or carries unsupported flags.
-fn set_disposition_information_ex(active: &ActiveIrp<'_>, stack: SetFileStack) -> DriverResult<()> {
-    let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION_EX>(
-        active,
-        stack.length(),
-    )?;
-    validate_disposition_ex_flags(info.Flags)
-}
-
-/// Validates FILE_DISPOSITION_INFORMATION_EX while deletion is unsupported.
-/// # Errors
-///
-/// Returns not supported for every non-empty disposition request.
-fn validate_disposition_ex_flags(flags: wdk_sys::ULONG) -> DriverResult<()> {
-    if flags == 0 {
-        Ok(())
-    } else {
-        Err(DriverError::NotSupported)
-    }
-}
-
 /// Owned rename mutation decoded completely before the first suspension.
 #[derive(Debug)]
 struct RenameMutation {
@@ -3180,18 +3132,6 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when legacy disposition deletion can bypass orphan-lifecycle admission.
-    #[test]
-    fn disposition_delete_flag_rejects_deletion() {
-        assert_eq!(super::validate_disposition_delete_flag(0), Ok(()));
-        assert_eq!(
-            super::validate_disposition_delete_flag(1),
-            Err(DriverError::NotSupported)
-        );
-    }
-
-    /// # Panics
-    ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn flush_volume_rejects_unmounted_device_without_file_object() {
@@ -3527,24 +3467,6 @@ mod tests {
         assert_ne!(
             super::file_attributes(metadata) & wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT,
             0
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn disposition_ex_flags_reject_all_delete_semantics() {
-        assert_eq!(super::validate_disposition_ex_flags(0), Ok(()));
-        assert_eq!(
-            super::validate_disposition_ex_flags(
-                wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_ON_CLOSE
-            ),
-            Err(DriverError::NotSupported)
-        );
-        assert_eq!(
-            super::validate_disposition_ex_flags(wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS),
-            Err(DriverError::NotSupported)
         );
     }
 
