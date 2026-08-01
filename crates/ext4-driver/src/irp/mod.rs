@@ -2271,6 +2271,8 @@ pub(crate) struct CreateParameters {
     reparse_point_mode: CreateReparsePointMode,
     /// Interpretation of `FILE_OBJECT::FileName`.
     name_interpretation: CreateNameInterpretation,
+    /// Namespace deletion requested for the returned handle.
+    deletion: CreateDeletion,
     /// Extended-attribute input length supplied with create.
     ea_length: IrpBufferLength,
 }
@@ -2302,6 +2304,7 @@ impl CreateParameters {
             synchronization_mode: create_options.synchronization_mode(),
             reparse_point_mode: create_options.reparse_point_mode(),
             name_interpretation: create_options.name_interpretation(),
+            deletion: create_options.deletion(),
             ea_length,
         })
     }
@@ -2363,6 +2366,11 @@ impl CreateParameters {
     /// Returns how the create FILE_OBJECT name must be interpreted.
     pub(crate) const fn name_interpretation(self) -> CreateNameInterpretation {
         self.name_interpretation
+    }
+
+    /// Returns namespace deletion requested for the returned handle.
+    pub(crate) const fn deletion(self) -> CreateDeletion {
+        self.deletion
     }
 
     /// Returns the input EA length.
@@ -2637,6 +2645,30 @@ pub(crate) enum CreateNameInterpretation {
     FileReference,
 }
 
+/// Namespace deletion requested as part of create/open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateDeletion {
+    /// The returned handle does not implicitly publish delete-pending.
+    Retain,
+    /// Successful create/open must publish delete-pending for this exact link.
+    DeleteOnClose,
+}
+
+impl CreateDeletion {
+    /// Decodes `FILE_DELETE_ON_CLOSE` and its required handle authority.
+    /// # Errors
+    ///
+    /// Returns access denied when delete-on-close is requested without `DELETE`.
+    fn from_options(options: wdk_sys::ULONG, desired_access: DesiredAccess) -> DriverResult<Self> {
+        if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
+            desired_access.delete_access().require()?;
+            Ok(Self::DeleteOnClose)
+        } else {
+            Ok(Self::Retain)
+        }
+    }
+}
+
 impl CreateNameInterpretation {
     /// Decodes create-name interpretation options.
     const fn from_options(options: wdk_sys::ULONG) -> Self {
@@ -2680,6 +2712,8 @@ struct CreateOptions {
     reparse_point_mode: CreateReparsePointMode,
     /// Requested name interpretation.
     name_interpretation: CreateNameInterpretation,
+    /// Requested namespace deletion lifecycle.
+    deletion: CreateDeletion,
 }
 
 impl CreateOptions {
@@ -2702,6 +2736,7 @@ impl CreateOptions {
             CreateSynchronizationMode::from_options(options, desired_access)?;
         let reparse_point_mode = CreateReparsePointMode::from_options(options);
         let name_interpretation = CreateNameInterpretation::from_options(options);
+        let deletion = CreateDeletion::from_options(options, desired_access)?;
         let write_commitment = if create_option_selected(options, wdk_sys::FILE_WRITE_THROUGH)
             || matches!(transfer_buffering, CreateTransferBuffering::NoIntermediate)
         {
@@ -2716,6 +2751,7 @@ impl CreateOptions {
             synchronization_mode,
             reparse_point_mode,
             name_interpretation,
+            deletion,
         })
     }
 
@@ -2747,6 +2783,11 @@ impl CreateOptions {
     /// Returns decoded name interpretation.
     const fn name_interpretation(self) -> CreateNameInterpretation {
         self.name_interpretation
+    }
+
+    /// Returns requested namespace deletion lifecycle.
+    const fn deletion(self) -> CreateDeletion {
+        self.deletion
     }
 }
 
@@ -4245,7 +4286,7 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when the unsafe delete-on-close lifecycle is accepted.
+    /// Panics when delete-on-close bypasses its required `DELETE` authority.
     #[test]
     fn create_stack_rejects_delete_on_close_without_delete_access() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
@@ -4265,15 +4306,15 @@ mod tests {
         let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
-            assert_eq!(current.create().err(), Some(DriverError::NotSupported));
+            assert_eq!(current.create().err(), Some(DriverError::AccessDenied));
         }
     }
 
     /// # Panics
     ///
-    /// Panics when delete-on-close is accepted even when DELETE was requested.
+    /// Panics when delete-on-close is not retained as an explicit create domain value.
     #[test]
-    fn create_stack_rejects_delete_on_close_until_safe_orphan_lifecycle_exists() {
+    fn create_stack_decodes_authorized_delete_on_close() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
             DesiredAccess: wdk_sys::DELETE,
@@ -4295,7 +4336,14 @@ mod tests {
         let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
-            assert_eq!(current.create().err(), Some(DriverError::NotSupported));
+            let create = current.create();
+            assert!(create.is_ok());
+            if let Ok(create) = create {
+                assert_eq!(
+                    create.parameters().deletion(),
+                    super::CreateDeletion::DeleteOnClose
+                );
+            }
         }
     }
 

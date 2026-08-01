@@ -9,11 +9,11 @@ use wdk_sys::FILE_OBJECT;
 
 use crate::{
     irp::{
-        CreateAction, CreateCompletion, CreateDisposition, CreateNameInterpretation,
-        CreateParameters, CreateReparsePointMode, CreateSymlinkReparseBuffer,
-        CreateSynchronizationMode, CreateTargetRequirement, CreateTransferBuffering, DeleteAccess,
-        DesiredAccess, ExistingOperationAccess, PendingIrpLease, RegularFileWriteAccess,
-        ShareAccess,
+        CreateAction, CreateCompletion, CreateDeletion, CreateDisposition,
+        CreateNameInterpretation, CreateParameters, CreateReparsePointMode,
+        CreateSymlinkReparseBuffer, CreateSynchronizationMode, CreateTargetRequirement,
+        CreateTransferBuffering, DesiredAccess, ExistingOperationAccess, PendingIrpLease,
+        RegularFileWriteAccess, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
@@ -24,10 +24,11 @@ use crate::{
     },
     state::{
         ChildCreationTarget, DataTransferMode, DirectoryNameChange, DirectoryNameChangeAction,
-        FileControlBlock, KernelDevice, MountedVolumeDevice, NoIntermediateTransfer, OpenedHandle,
-        OpenedLocation, OpenedNodeMode, OpenedObject, OpenedVolumeHandle, PendingChildCreation,
-        UninitializedFileObject, VolumeControlBlock, VolumeOperationLane, VolumeOperationLease,
-        WriteCommitment, abandon_file_control_block,
+        FileControlBlock, HandleDeletion, KernelDevice, MountedVolumeDevice,
+        NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
+        OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion, UninitializedFileObject,
+        VolumeControlBlock, VolumeOperationLane, VolumeOperationLease, WriteCommitment,
+        abandon_file_control_block,
     },
 };
 
@@ -186,7 +187,9 @@ async fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<Crea
                 node,
                 node_mode,
                 location,
+                &mut operations,
             )
+            .await
             .map(CreateCompletion::Handle)
         }
         CreateTargetLookup::Missing { parent, name } => create_missing_node(
@@ -315,8 +318,8 @@ struct CreateHandlePolicy {
     data_transfer_mode: DataTransferMode,
     /// Regular-file write authority retained by the per-handle state.
     regular_file_write_access: RegularFileWriteAccess,
-    /// Delete authority retained by the per-handle state.
-    delete_access: DeleteAccess,
+    /// Delete authority and create-time namespace lifecycle retained by the handle.
+    deletion: HandleDeletion,
     /// FILE_OBJECT flags projected from create options.
     file_object_flags: CreateFileObjectFlags,
 }
@@ -342,7 +345,10 @@ impl CreateHandlePolicy {
                 }
             },
             regular_file_write_access: parameters.desired_access().regular_file_write_access(),
-            delete_access: parameters.desired_access().delete_access(),
+            deletion: HandleDeletion::from_create(
+                parameters.deletion(),
+                parameters.desired_access().delete_access(),
+            )?,
             file_object_flags,
         })
     }
@@ -372,9 +378,14 @@ impl CreateHandlePolicy {
         self.data_transfer_mode
     }
 
-    /// Returns retained delete authority.
-    const fn delete_access(self) -> DeleteAccess {
-        self.delete_access
+    /// Returns create-time namespace deletion requested for this handle.
+    const fn deletion(self) -> CreateDeletion {
+        self.deletion.create_deletion()
+    }
+
+    /// Returns the deletion authority and lifecycle stored in the opened handle.
+    const fn handle_deletion(self) -> HandleDeletion {
+        self.deletion
     }
 
     /// Returns the regular-file write authority selected by desired access.
@@ -655,22 +666,27 @@ impl CreatePathAnchor {
 ///
 /// Returns an error when existing-node options conflict, create-only disposition collides, share
 /// access fails, or an incomplete destructive disposition is requested.
-fn open_existing_node(
+async fn open_existing_node(
     request: &mut CreateCompletionOwner<'_>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
     node: NodeId,
     node_mode: OpenedNodeMode,
     location: OpenedLocation,
+    operations: &mut VolumeOperationLease,
 ) -> DriverResult<CreateAction> {
     let parameters = request.parameters();
     let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
-            request.with_file_object(|file_object| {
+            let pending = prepare_create_deletion(policy, node, &location, operations).await?;
+            let fcb = request.with_file_object(|file_object| {
                 initialize_file_object(file_object, vcb, node, node_mode, location, policy)
             })?;
+            if let Some(pending) = pending {
+                operations.set_file_delete_pending(fcb, pending);
+            }
             Ok(CreateAction::Opened)
         }
         CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
@@ -691,6 +707,31 @@ fn open_existing_node(
     }
 }
 
+/// Prepares and validates create-time delete-pending before FILE_OBJECT attachment.
+/// # Errors
+///
+/// Returns cannot-delete for an identity without a deletable link, read-only or non-empty targets,
+/// or an underlying metadata error.
+async fn prepare_create_deletion(
+    policy: CreateHandlePolicy,
+    node: NodeId,
+    location: &OpenedLocation,
+    operations: &mut VolumeOperationLease,
+) -> DriverResult<Option<PendingFileDeletion>> {
+    if policy.deletion() == CreateDeletion::Retain {
+        return Ok(None);
+    }
+    let pending = PendingFileDeletion::try_from_delete_on_close(location)?;
+    crate::request::file_info::validate_pending_deletion(
+        operations.lane_mut(),
+        node,
+        pending.target_ref(),
+        crate::request::file_info::DeleteReadonlyPolicy::Enforce,
+    )
+    .await?;
+    Ok(Some(pending))
+}
+
 /// Opens the mounted volume itself and publishes a typed volume FILE_OBJECT.
 /// # Errors
 ///
@@ -706,6 +747,9 @@ fn open_volume(
     }
     let parameters = request.parameters();
     let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
+    if policy.deletion() == CreateDeletion::DeleteOnClose {
+        return Err(DriverError::CannotDelete);
+    }
     let handle = memory::boxed_try_with(|| Ok(OpenedVolumeHandle::new()))?;
     let mut operations = unsafe {
         // SAFETY: This create runs as the mounted-device actor's unique active operation.
@@ -772,6 +816,12 @@ async fn create_missing_node(
     }
 
     let location = OpenedLocation::try_directory_entry(parent, name)?;
+    let pending_deletion = match policy.deletion() {
+        CreateDeletion::Retain => None,
+        CreateDeletion::DeleteOnClose => {
+            Some(PendingFileDeletion::try_from_delete_on_close(&location)?)
+        }
+    };
     let target = child_creation_target(parameters.target_requirement())?;
     let mut creation = operations
         .begin_child_creation(
@@ -789,7 +839,7 @@ async fn create_missing_node(
             node,
             OpenedNodeMode::Direct,
             location,
-            policy.delete_access(),
+            policy.handle_deletion(),
             policy.write_commitment(),
             policy.data_transfer_mode(),
             policy.regular_file_write_access(),
@@ -814,7 +864,10 @@ async fn create_missing_node(
             let Some(vcb) = MountedVolumeDevice::vcb(attachment.device()) else {
                 return Err(DriverError::InternalInvariantViolation);
             };
-            attachment.attach(handle, policy.file_object_flags())?;
+            let fcb = attachment.attach(handle, policy.file_object_flags())?;
+            if let Some(pending) = pending_deletion {
+                operations.set_file_delete_pending(fcb, pending);
+            }
             let vcb = unsafe {
                 // SAFETY: The mounted device still owns this heap-stable VCB while its create IRP
                 // is active; notification state is disjoint from the actor-owned operation lane.
@@ -1152,13 +1205,13 @@ fn initialize_file_object(
     node_mode: OpenedNodeMode,
     location: OpenedLocation,
     policy: CreateHandlePolicy,
-) -> DriverResult<()> {
+) -> DriverResult<NonNull<FileControlBlock>> {
     let handle = memory::boxed_try_with(|| {
         Ok(OpenedHandle::new(
             node,
             node_mode,
             location,
-            policy.delete_access(),
+            policy.handle_deletion(),
             policy.write_commitment(),
             policy.data_transfer_mode(),
             policy.regular_file_write_access(),
@@ -1173,7 +1226,7 @@ fn initialize_file_object(
         policy.share_access(),
     )?;
     attach_preallocated_file_object(file_object, fcb, handle, policy.file_object_flags());
-    Ok(())
+    Ok(fcb)
 }
 
 /// Opens the shared FCB for a node and records the create share-access claim.
@@ -1238,7 +1291,7 @@ impl PendingFileObjectAttachment<'_> {
         &mut self,
         handle: Box<OpenedHandle>,
         flags: CreateFileObjectFlags,
-    ) -> DriverResult<()> {
+    ) -> DriverResult<NonNull<FileControlBlock>> {
         let fcb = self.fcb.unwrap_or_else(|| {
             crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
                 .bugcheck()
@@ -1252,7 +1305,7 @@ impl PendingFileObjectAttachment<'_> {
             crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
                 .bugcheck();
         }
-        Ok(())
+        Ok(fcb)
     }
 }
 
