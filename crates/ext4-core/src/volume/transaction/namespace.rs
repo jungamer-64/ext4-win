@@ -117,7 +117,6 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 .superblock
                 .blocks_in_cluster(self.volume.superblock.cluster_of_block(block)?)?,
         );
-        self.require_allocated_blocks_supported(allocated_blocks)?;
         let mut raw_inode = allocated_inode.initialize_directory(
             metadata,
             self.now,
@@ -596,8 +595,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 .checked_add(block_size_u64)
                 .ok_or(Error::ArithmeticOverflow)?,
         );
-        self.require_inode_size_supported(new_parent_size)?;
-        raw_parent.set_size(new_parent_size)?;
+        let encoded_size = self
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_size(new_parent_size)?;
+        raw_parent.set_encoded_size(encoded_size)?;
         raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
         self.stage_extent_tree(&mut raw_parent, tree).await?;
         self.replace_live_inode(inode_index, raw_parent)?;
@@ -849,8 +852,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 .checked_mul(u64::from(block_size.bytes()))
                 .ok_or(Error::ArithmeticOverflow)?,
         );
-        self.require_inode_size_supported(rebuilt_size)?;
-        raw_parent.set_size(rebuilt_size)?;
+        let encoded_size = self
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_size(rebuilt_size)?;
+        raw_parent.set_encoded_size(encoded_size)?;
         raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
         self.stage_extent_tree(&mut raw_parent, tree).await?;
         self.replace_live_inode(inode_index, raw_parent)

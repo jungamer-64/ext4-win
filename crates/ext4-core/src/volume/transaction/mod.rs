@@ -442,32 +442,63 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         let inode = raw_inode.parse()?;
         let serialized = tree.serialize(block_size, self.volume.extent_tree_context(&inode))?;
         self.stage_serialized_extent_tree(raw_inode, &serialized)?;
-        let allocated_blocks = self.allocated_data_blocks(&tree)?;
-        self.require_allocated_blocks_supported(allocated_blocks)?;
-        raw_inode.set_allocated_blocks(allocated_blocks, u64::from(block_size.bytes()))
+        self.set_inode_allocation_size(raw_inode, Some(&tree))
     }
 
-    /// Counts physical blocks charged to an inode through allocation clusters.
+    /// Recomputes and writes the allocation charge for one inode.
     /// # Errors
     ///
-    /// Returns an error when extent block arithmetic overflows or a physical block cannot be mapped
-    /// to mounted cluster geometry.
-    fn allocated_data_blocks(&self, tree: &MutableExtentTree) -> Result<u64> {
+    /// Returns an error when inode-owned blocks cannot be mapped to allocation clusters or the
+    /// resulting charge cannot be represented by the mounted inode encoding.
+    fn set_inode_allocation_size(
+        &self,
+        raw_inode: &mut LiveInodeRecord,
+        tree: Option<&MutableExtentTree>,
+    ) -> Result<()> {
+        let allocation_size = self.inode_allocation_size(raw_inode, tree)?;
+        let encoded = self
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_allocation_size(allocation_size)?;
+        raw_inode.set_encoded_allocation_size(encoded)
+    }
+
+    /// Counts all allocation clusters owned by one inode.
+    /// # Errors
+    ///
+    /// Returns an error when extent block arithmetic overflows or an inode-owned block cannot be
+    /// mapped to mounted cluster geometry.
+    fn inode_allocation_size(
+        &self,
+        raw_inode: &LiveInodeRecord,
+        tree: Option<&MutableExtentTree>,
+    ) -> Result<FileAllocationSize> {
         let mut clusters = Vec::new();
-        for extent in tree.extents().iter().copied() {
-            for offset in 0..extent.len().as_u64() {
-                let cluster = self.volume.superblock.cluster_of_block(BlockAddress::new(
-                    extent
-                        .physical_start()
-                        .get()
-                        .checked_add(offset)
-                        .ok_or(Error::ArithmeticOverflow)?,
-                ))?;
-                if !clusters.contains(&cluster) {
-                    clusters.try_push(cluster)?;
+        if let Some(tree) = tree {
+            for extent in tree.extents().iter().copied() {
+                for offset in 0..extent.len().as_u64() {
+                    clusters.try_push(
+                        self.volume.superblock.cluster_of_block(BlockAddress::new(
+                            extent
+                                .physical_start()
+                                .get()
+                                .checked_add(offset)
+                                .ok_or(Error::ArithmeticOverflow)?,
+                        ))?,
+                    )?;
                 }
             }
+            for block in tree.metadata_blocks().iter().copied() {
+                clusters.try_push(self.volume.superblock.cluster_of_block(block)?)?;
+            }
         }
+        if let Some(block) = raw_inode.xattr_block()? {
+            clusters.try_push(self.volume.superblock.cluster_of_block(block)?)?;
+        }
+        clusters.sort_unstable();
+        clusters.dedup();
+
         let mut blocks = 0_u64;
         for cluster in clusters {
             blocks = blocks
@@ -476,7 +507,10 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 ))
                 .ok_or(Error::ArithmeticOverflow)?;
         }
-        Ok(blocks)
+        let bytes = blocks
+            .checked_mul(u64::from(self.volume.superblock.block_size().bytes()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(FileAllocationSize::from_bytes(bytes))
     }
 
     /// Copies a serialized extent tree into the inode and metadata block staging areas.

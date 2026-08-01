@@ -1397,6 +1397,7 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             id: inode_id,
             offset: inode_offset,
             bytes,
+            encoding: self.superblock.inode_data_encoding(),
         })
     }
 
@@ -1483,7 +1484,7 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
 fn extent_payload_end_bytes(extent_tree: &ExtentTree, block_size: BlockSize) -> Result<u64> {
     let mut end_blocks = 0_u64;
     for extent in extent_tree.extents().iter().copied() {
-        end_blocks = end_blocks.max(u64::from(extent.end_logical()?));
+        end_blocks = end_blocks.max(extent.end_logical());
     }
     end_blocks
         .checked_mul(u64::from(block_size.bytes()))

@@ -28,10 +28,17 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         let end_offset = offset.checked_add_len(bytes.len())?;
         let new_size = FileSize::from_bytes(end_offset.bytes());
         let extends_file = new_size > inode.size();
-        if extends_file {
+        let encoded_new_size = if extends_file {
             self.require_file_size_mutation(&inode).await?;
-            self.require_inode_size_supported(new_size)?;
-        }
+            Some(
+                self.volume
+                    .superblock
+                    .inode_data_encoding()
+                    .encode_size(new_size)?,
+            )
+        } else {
+            None
+        };
 
         let mut tree = self.mutable_extent_tree(&inode).await?;
         if tree.contains_uninitialized() {
@@ -49,8 +56,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 .await?;
         }
 
-        if extends_file {
-            raw_inode.set_size(new_size)?;
+        if let Some(encoded_new_size) = encoded_new_size {
+            raw_inode.set_encoded_size(encoded_new_size)?;
         }
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
         self.stage_extent_tree(&mut raw_inode, tree).await?;
@@ -507,8 +514,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         if new_size < inode.size() {
             return Err(Error::InvalidWriteRange);
         }
-        self.require_inode_size_supported(new_size)?;
-        raw_inode.set_size(new_size)?;
+        let encoded_size = self
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_size(new_size)?;
+        raw_inode.set_encoded_size(encoded_size)?;
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
@@ -527,7 +538,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         if new_size > inode.size() {
             return Err(Error::InvalidWriteRange);
         }
-        self.require_inode_size_supported(new_size)?;
+        let encoded_size = self
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_size(new_size)?;
         let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
         let mut tree = self.mutable_extent_tree(&inode).await?;
         if tree.contains_uninitialized() {
@@ -538,7 +553,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         let mut updated = Vec::new();
         for extent in extents {
             let start = extent.logical_start().as_u64();
-            let end = u64::from(extent.end_logical()?);
+            let end = extent.end_logical();
             if start >= keep_blocks {
                 self.free_extent(extent, 0).await?;
             } else if end > keep_blocks {
@@ -577,7 +592,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             }
         }
         tree.replace_extents(updated)?;
-        raw_inode.set_size(new_size)?;
+        raw_inode.set_encoded_size(encoded_size)?;
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
         self.stage_extent_tree(&mut raw_inode, tree).await?;
         self.replace_live_inode(inode_index, raw_inode)?;

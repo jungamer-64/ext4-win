@@ -5,8 +5,8 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Permissions,
-    Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileNodeId, FileOffset,
-    FileSize, NodeId, RenameTargetCollision, WindowsName, WindowsOverlay,
+    Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileAllocationSize, FileNodeId,
+    FileOffset, FileSize, NodeId, RenameTargetCollision, WindowsName, WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
@@ -1371,7 +1371,7 @@ fn pack_directory_record(
     )?;
     LittleEndianOutput::new(buffer).write_bytes(
         record_field_offset(start, DIRECTORY_ALLOCATION_SIZE_OFFSET)?,
-        &signed_i64(allocation_size(metadata)?)?.to_le_bytes(),
+        &signed_i64(metadata.allocation_size.bytes())?.to_le_bytes(),
     )?;
     LittleEndianOutput::new(buffer).write_u32(
         record_field_offset(start, DIRECTORY_FILE_ATTRIBUTES_OFFSET)?,
@@ -2085,6 +2085,8 @@ struct FileMetadata {
     kind: FileMetadataKind,
     /// Payload size in bytes.
     size: FileSize,
+    /// ext4 allocation charge in bytes.
+    allocation_size: FileAllocationSize,
     /// POSIX security metadata.
     security: Ext4Security,
     /// ext4 inode timestamps.
@@ -2149,7 +2151,6 @@ async fn metadata_from_node(
     };
 
     let file_index = node_id.file_index();
-    let block_size = operations.journaled().geometry().block_size();
     match node_id {
         NodeId::File(file_id) => {
             let file = operations.journaled_mut().load_file(file_id).await?;
@@ -2157,12 +2158,12 @@ async fn metadata_from_node(
                 file_index,
                 kind: FileMetadataKind::File,
                 size: file.size(),
+                allocation_size: file.allocation_size(),
                 security: file.security(),
                 times: file.times(),
                 links_count: file.links_count(),
                 overlay_attributes,
                 reparse_point,
-                block_size,
             })
         }
         NodeId::Directory(directory_id) => {
@@ -2174,12 +2175,12 @@ async fn metadata_from_node(
                 file_index,
                 kind: FileMetadataKind::Directory,
                 size: directory.size(),
+                allocation_size: directory.allocation_size(),
                 security: directory.security(),
                 times: directory.times(),
                 links_count: directory.links_count(),
                 overlay_attributes,
                 reparse_point,
-                block_size,
             })
         }
         NodeId::Symlink(symlink_id) => {
@@ -2188,12 +2189,12 @@ async fn metadata_from_node(
                 file_index,
                 kind: FileMetadataKind::Symlink,
                 size: symlink.size(),
+                allocation_size: symlink.allocation_size(),
                 security: symlink.security(),
                 times: symlink.times(),
                 links_count: symlink.links_count(),
                 overlay_attributes,
                 reparse_point,
-                block_size,
             })
         }
     }
@@ -2231,7 +2232,7 @@ fn pack_standard_information(
     write_fixed(
         output,
         wdk_sys::FILE_STANDARD_INFORMATION {
-            AllocationSize: large_integer_from_u64(allocation_size(metadata)?)?,
+            AllocationSize: large_integer_from_u64(metadata.allocation_size.bytes())?,
             EndOfFile: large_integer_from_u64(metadata.size.bytes())?,
             NumberOfLinks: wdk_sys::ULONG::from(metadata.links_count.get()),
             DeletePending: boolean(false),
@@ -2292,7 +2293,7 @@ fn pack_network_open_information(
             LastAccessTime: windows_time(metadata.times.accessed()),
             LastWriteTime: windows_time(metadata.times.modified()),
             ChangeTime: windows_time(metadata.times.changed()),
-            AllocationSize: large_integer_from_u64(allocation_size(metadata)?)?,
+            AllocationSize: large_integer_from_u64(metadata.allocation_size.bytes())?,
             EndOfFile: large_integer_from_u64(metadata.size.bytes())?,
             FileAttributes: file_attributes(metadata),
         },
@@ -2880,8 +2881,9 @@ mod tests {
     use crate::kernel::status::DriverError;
     use crate::state::OpenedLocation;
     use ext4_core::{
-        BlockSize, DirectoryNodeId, Ext4Gid, Ext4LinkCount, Ext4Name, Ext4Owner, Ext4Permissions,
-        Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileOffset, FileSize, WindowsName,
+        DirectoryNodeId, Ext4Gid, Ext4LinkCount, Ext4Name, Ext4Owner, Ext4Permissions,
+        Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, FileAllocationSize, FileOffset, FileSize,
+        WindowsName,
     };
 
     fn test_metadata(kind: super::FileMetadataKind) -> Option<super::FileMetadata> {
@@ -2898,6 +2900,7 @@ mod tests {
             file_index: 1,
             kind,
             size: FileSize::from_bytes(0),
+            allocation_size: FileAllocationSize::from_bytes(0),
             security: Ext4Security::new(
                 Ext4Owner::new(Ext4Uid::from_u32(0), Ext4Gid::from_u32(0)),
                 Ext4Permissions::new(permissions).ok()?,
@@ -2911,7 +2914,6 @@ mod tests {
                 }
                 super::FileMetadataKind::Symlink => super::FileMetadataReparsePoint::SymbolicLink,
             },
-            block_size: BlockSize::from_superblock_log(0).ok()?,
         })
     }
 

@@ -421,6 +421,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 0_u8,
                 usize::from(self.volume.superblock.inode_size().as_u16()),
             )?,
+            encoding: self.volume.superblock.inode_data_encoding(),
         }
         .into_allocated())
     }
