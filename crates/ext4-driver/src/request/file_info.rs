@@ -24,7 +24,7 @@ use crate::state::{
     DirectoryNameChangeAction, DirectoryNotificationRegistration, FileControlBlock,
     MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation, OpenedObject,
     OpenedRegularFile, VolumeControlBlock, VolumeHandleCleanup, VolumeOperationLane,
-    VolumeOperationLease, WriteCommitment, release_cancelled_file_control_block,
+    VolumeOperationLease, VolumeRetirement, WriteCommitment, release_cancelled_file_control_block,
     release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
@@ -45,7 +45,9 @@ pub(crate) fn cleanup(target: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion>
 /// Returns an error when the close stack has no FILE_OBJECT.
 pub(crate) fn close(target: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion> {
     let file_object = target.current_stack()?.file_object()?;
-    release_file_contexts(target.device(), file_object);
+    if release_file_contexts(target.device(), file_object) == VolumeRetirement::Start {
+        MountedVolumeDevice::schedule_retirement(target.device());
+    }
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -2841,9 +2843,12 @@ fn claim_volume_operation_lane(volume: NonNull<VolumeControlBlock>) -> VolumeOpe
 }
 
 /// Detaches and releases heap-owned FCB and CCB pointers stored on a FILE_OBJECT.
-fn release_file_contexts(device: crate::state::KernelDevice, file_object: ActiveFileObject<'_>) {
+fn release_file_contexts(
+    device: crate::state::KernelDevice,
+    file_object: ActiveFileObject<'_>,
+) -> VolumeRetirement {
     if file_object.has_no_file_system_contexts() {
-        return;
+        return VolumeRetirement::Retained;
     }
     let close_kind = file_object.close_kind_or_bugcheck();
     let opened = match OpenedFileObject::decode(file_object) {
@@ -2855,6 +2860,7 @@ fn release_file_contexts(device: crate::state::KernelDevice, file_object: Active
     };
     match opened {
         OpenedFileObject::Node(opened) => {
+            let volume = opened.volume();
             let release_plan = opened.close_release_plan(close_kind);
             let file_object_address = file_object.address();
             let (fcb, handle) = opened.detach_contexts();
@@ -2869,6 +2875,24 @@ fn release_file_contexts(device: crate::state::KernelDevice, file_object: Active
                 // detached the unique owning pointer before this terminal drop.
                 drop(Box::from_raw(handle.as_ptr()));
             }
+            let mut operations = claim_volume_operation_lane(volume);
+            operations.close_node_file_object()
+        }
+        OpenedFileObject::Volume(opened) => {
+            let release_plan = opened.close_release_plan(close_kind);
+            let file_object_address = opened.file_object();
+            let (volume, handle) = opened.detach_contexts();
+            let mut operations = claim_volume_operation_lane(volume);
+            let outcome = operations.close_volume_file_object(file_object_address, release_plan);
+            if outcome.cleanup() == VolumeHandleCleanup::Unlocked {
+                MountedVolumeDevice::publish_volume_lock(device, false);
+            }
+            unsafe {
+                // SAFETY: Successful volume create stores Box<OpenedVolumeHandle> in FsContext2.
+                // Close detached the unique owning pointer before this terminal drop.
+                drop(Box::from_raw(handle.as_ptr()));
+            }
+            outcome.retirement()
         }
     }
 }
