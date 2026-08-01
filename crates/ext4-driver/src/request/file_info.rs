@@ -13,9 +13,10 @@ use wdk_sys::LARGE_INTEGER;
 use crate::irp::{
     ActiveFileObject, ActiveIrp, CreateDeletion, DataIoKind, DirectoryChangeFilter,
     DirectoryCursorPosition, DirectoryEntryEmission, DirectoryEntryIndex,
-    DirectoryInformationClass, DirectoryWatchScope, IrpBufferLength, IrpCompletion, OwnedIrp,
-    PendingIrpLease, PreparedDirectoryPattern, QueryFileInformationClass, ReadStartingPoint,
-    RegularFileWriteAccess, SetFileInformationClass, SetFileStack, WriteStartingPoint,
+    DirectoryInformationClass, DirectoryWatchScope, FileAttributesWriteAccess, IrpBufferLength,
+    IrpCompletion, OwnedIrp, PendingIrpLease, PreparedDirectoryPattern, QueryFileInformationClass,
+    ReadStartingPoint, RegularFileWriteAccess, SetFileInformationClass, SetFileStack,
+    WriteStartingPoint,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
@@ -618,7 +619,7 @@ impl FileDispositionRequest {
     }
 
     /// Creates a request that validates deletion under one read-only policy.
-    const fn delete(target: FileDispositionTarget, readonly: DeleteReadonlyPolicy) -> Self {
+    const fn delete(target: FileDispositionTarget, readonly: DeleteReadonlyRequest) -> Self {
         Self {
             action: FileDispositionAction::Delete(readonly),
             target,
@@ -632,7 +633,7 @@ enum FileDispositionAction {
     /// Retain the link, cancelling only an ordinary mutable disposition state.
     Keep,
     /// Validate deletion, then publish or reaffirm the selected target state.
-    Delete(DeleteReadonlyPolicy),
+    Delete(DeleteReadonlyRequest),
 }
 
 /// Deletion state selected by extended `FILE_DISPOSITION_ON_CLOSE`.
@@ -669,11 +670,51 @@ enum DeletePendingPublication {
     AlreadyPublishedByCreate,
 }
 
-/// Read-only attribute policy selected by an extended disposition request.
+/// Raw read-only behavior selected before binding handle authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeleteReadonlyRequest {
+    /// A Windows read-only attribute prevents deletion.
+    Enforce,
+    /// The request asks to bypass read-only protection when its handle has authority.
+    Ignore,
+}
+
+impl DeleteReadonlyRequest {
+    /// Binds requested behavior to retained `FILE_WRITE_ATTRIBUTES` authority.
+    const fn bind(self, access: FileAttributesWriteAccess) -> DeleteReadonlyPolicy {
+        match self {
+            Self::Enforce => DeleteReadonlyPolicy::Enforce,
+            Self::Ignore => DeleteReadonlyPolicy::Ignore(access),
+        }
+    }
+}
+
+/// Read-only attribute policy with all required handle authority attached.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeleteReadonlyPolicy {
     /// A Windows read-only attribute prevents deletion.
     Enforce,
+    /// Bypass read-only protection only when `FILE_WRITE_ATTRIBUTES` was retained.
+    Ignore(FileAttributesWriteAccess),
+}
+
+impl DeleteReadonlyPolicy {
+    /// Validates the target attributes under the bound override authority.
+    /// # Errors
+    ///
+    /// Returns cannot-delete when a read-only target is protected or the requested override lacks
+    /// `FILE_WRITE_ATTRIBUTES`.
+    const fn validate_attributes(self, attributes: wdk_sys::ULONG) -> DriverResult<()> {
+        if attributes & wdk_sys::FILE_ATTRIBUTE_READONLY == 0 {
+            return Ok(());
+        }
+        match self {
+            Self::Enforce | Self::Ignore(FileAttributesWriteAccess::Denied) => {
+                Err(DriverError::CannotDelete)
+            }
+            Self::Ignore(FileAttributesWriteAccess::Granted) => Ok(()),
+        }
+    }
 }
 
 /// Builds a disposition plan from one fully decoded handle and buffered input.
@@ -699,7 +740,7 @@ fn disposition_plan(
             } else {
                 FileDispositionRequest::delete(
                     FileDispositionTarget::Mutable,
-                    DeleteReadonlyPolicy::Enforce,
+                    DeleteReadonlyRequest::Enforce,
                 )
             }
         }
@@ -722,6 +763,7 @@ fn disposition_plan(
             Ok(SetFilePlan::Complete)
         }
         FileDispositionAction::Delete(readonly) => {
+            let readonly = readonly.bind(opened.file_attributes_write_access());
             let (pending, publication) = match request.target {
                 FileDispositionTarget::Mutable => (
                     opened.prepare_pending_deletion()?,
@@ -776,9 +818,9 @@ fn decode_extended_disposition(flags: wdk_sys::ULONG) -> DriverResult<FileDispos
         return Ok(FileDispositionRequest::keep(target));
     }
     let readonly = if ignore_readonly {
-        DeleteReadonlyPolicy::Ignore
+        DeleteReadonlyRequest::Ignore
     } else {
-        DeleteReadonlyPolicy::Enforce
+        DeleteReadonlyRequest::Enforce
     };
     Ok(FileDispositionRequest::delete(target, readonly))
 }
@@ -807,11 +849,7 @@ pub(crate) async fn validate_pending_deletion(
         ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
     }
     let metadata = metadata_from_node(operations, node).await?;
-    if readonly == DeleteReadonlyPolicy::Enforce
-        && file_attributes(metadata) & wdk_sys::FILE_ATTRIBUTE_READONLY != 0
-    {
-        return Err(DriverError::CannotDelete);
-    }
+    readonly.validate_attributes(file_attributes(metadata))?;
     if let NodeId::Directory(directory_id) = node {
         let directory = operations
             .journaled_mut()
@@ -3203,8 +3241,8 @@ fn release_file_contexts(
 #[cfg(test)]
 mod tests {
     use crate::irp::{
-        CreateDeletion, DataIoKind, DirectoryInformationClass, ReadStartingPoint, ReceivedIrp,
-        RegularFileWriteAccess, WriteStartingPoint,
+        CreateDeletion, DataIoKind, DirectoryInformationClass, FileAttributesWriteAccess,
+        ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
     use crate::state::OpenedLocation;
@@ -3521,7 +3559,7 @@ mod tests {
             super::decode_extended_disposition(wdk_sys::FILE_DISPOSITION_DELETE),
             Ok(super::FileDispositionRequest::delete(
                 super::FileDispositionTarget::Mutable,
-                super::DeleteReadonlyPolicy::Enforce
+                super::DeleteReadonlyRequest::Enforce
             ))
         );
         assert_eq!(
@@ -3531,7 +3569,7 @@ mod tests {
             ),
             Ok(super::FileDispositionRequest::delete(
                 super::FileDispositionTarget::Mutable,
-                super::DeleteReadonlyPolicy::Ignore
+                super::DeleteReadonlyRequest::Ignore
             ))
         );
         assert_eq!(
@@ -3563,7 +3601,7 @@ mod tests {
             ),
             Ok(super::FileDispositionRequest::delete(
                 super::FileDispositionTarget::CreateDeleteOnClose,
-                super::DeleteReadonlyPolicy::Enforce
+                super::DeleteReadonlyRequest::Enforce
             ))
         );
         assert_eq!(
@@ -3574,7 +3612,7 @@ mod tests {
             ),
             Ok(super::FileDispositionRequest::delete(
                 super::FileDispositionTarget::CreateDeleteOnClose,
-                super::DeleteReadonlyPolicy::Ignore
+                super::DeleteReadonlyRequest::Ignore
             ))
         );
         for unsupported in [
@@ -3612,6 +3650,39 @@ mod tests {
         assert_eq!(
             super::FileDispositionTarget::CreateDeleteOnClose
                 .validate(CreateDeletion::DeleteOnClose),
+            Ok(())
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when read-only deletion can bypass `FILE_WRITE_ATTRIBUTES`.
+    #[test]
+    fn readonly_deletion_override_requires_file_attributes_write_access() {
+        let ordinary = wdk_sys::FILE_ATTRIBUTE_NORMAL;
+        let readonly = wdk_sys::FILE_ATTRIBUTE_READONLY;
+
+        assert_eq!(
+            super::DeleteReadonlyPolicy::Enforce.validate_attributes(ordinary),
+            Ok(())
+        );
+        assert_eq!(
+            super::DeleteReadonlyPolicy::Ignore(FileAttributesWriteAccess::Denied)
+                .validate_attributes(ordinary),
+            Ok(())
+        );
+        assert_eq!(
+            super::DeleteReadonlyPolicy::Enforce.validate_attributes(readonly),
+            Err(DriverError::CannotDelete)
+        );
+        assert_eq!(
+            super::DeleteReadonlyPolicy::Ignore(FileAttributesWriteAccess::Denied)
+                .validate_attributes(readonly),
+            Err(DriverError::CannotDelete)
+        );
+        assert_eq!(
+            super::DeleteReadonlyPolicy::Ignore(FileAttributesWriteAccess::Granted)
+                .validate_attributes(readonly),
             Ok(())
         );
     }

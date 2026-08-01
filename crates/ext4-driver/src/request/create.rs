@@ -348,6 +348,7 @@ impl CreateHandlePolicy {
             deletion: HandleDeletion::from_create(
                 parameters.deletion(),
                 parameters.desired_access().delete_access(),
+                parameters.desired_access().file_attributes_write_access(),
             )?,
             file_object_flags,
         })

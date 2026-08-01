@@ -30,7 +30,7 @@ use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 use crate::irp::{
     ActiveFileObject, ByteRangeLockKey, CreateDeletion, DataIoKind, DeleteAccess, DesiredAccess,
     DeviceExecutor, DirectoryEntryIndex, DispatchTarget, ExistingOperationAccess,
-    RegularFileWriteAccess, RequestorProcess, ShareAccess,
+    FileAttributesWriteAccess, RegularFileWriteAccess, RequestorProcess, ShareAccess,
 };
 use crate::kernel::cng::CngFscryptNonceGenerator;
 use crate::kernel::fatal::KernelWideInconsistency;
@@ -4043,10 +4043,18 @@ pub(crate) enum OpenedNodeMode {
 /// authority; an unauthorized delete-on-close handle is unrepresentable after create decoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HandleDeletion {
-    /// No create-time deletion was requested; later disposition requires the retained authority.
-    Retain(DeleteAccess),
+    /// No create-time deletion was requested; later disposition uses the retained authorities.
+    Retain {
+        /// Authority to change ordinary deletion disposition.
+        delete_access: DeleteAccess,
+        /// Authority to override a read-only attribute during extended disposition.
+        file_attributes_write_access: FileAttributesWriteAccess,
+    },
     /// The exact opened link must be removed after final active cleanup.
-    DeleteOnClose,
+    DeleteOnClose {
+        /// Authority to override a read-only attribute during extended disposition.
+        file_attributes_write_access: FileAttributesWriteAccess,
+    },
 }
 
 impl HandleDeletion {
@@ -4057,12 +4065,18 @@ impl HandleDeletion {
     pub(crate) fn from_create(
         deletion: CreateDeletion,
         delete_access: DeleteAccess,
+        file_attributes_write_access: FileAttributesWriteAccess,
     ) -> DriverResult<Self> {
         match deletion {
-            CreateDeletion::Retain => Ok(Self::Retain(delete_access)),
+            CreateDeletion::Retain => Ok(Self::Retain {
+                delete_access,
+                file_attributes_write_access,
+            }),
             CreateDeletion::DeleteOnClose => {
                 delete_access.require()?;
-                Ok(Self::DeleteOnClose)
+                Ok(Self::DeleteOnClose {
+                    file_attributes_write_access,
+                })
             }
         }
     }
@@ -4073,16 +4087,29 @@ impl HandleDeletion {
     /// Returns access denied when a retained handle was not opened with `DELETE`.
     fn require_delete_access(self) -> DriverResult<()> {
         match self {
-            Self::Retain(delete_access) => delete_access.require(),
-            Self::DeleteOnClose => Ok(()),
+            Self::Retain { delete_access, .. } => delete_access.require(),
+            Self::DeleteOnClose { .. } => Ok(()),
         }
     }
 
     /// Projects the create-time namespace deletion request.
     pub(crate) const fn create_deletion(self) -> CreateDeletion {
         match self {
-            Self::Retain(_) => CreateDeletion::Retain,
-            Self::DeleteOnClose => CreateDeletion::DeleteOnClose,
+            Self::Retain { .. } => CreateDeletion::Retain,
+            Self::DeleteOnClose { .. } => CreateDeletion::DeleteOnClose,
+        }
+    }
+
+    /// Returns retained `FILE_WRITE_ATTRIBUTES` authority.
+    const fn file_attributes_write_access(self) -> FileAttributesWriteAccess {
+        match self {
+            Self::Retain {
+                file_attributes_write_access,
+                ..
+            }
+            | Self::DeleteOnClose {
+                file_attributes_write_access,
+            } => file_attributes_write_access,
         }
     }
 }
@@ -4160,6 +4187,11 @@ impl OpenedHandleState {
     /// Returns the namespace deletion lifecycle selected at create/open.
     const fn create_deletion(&self) -> CreateDeletion {
         self.deletion.create_deletion()
+    }
+
+    /// Returns retained `FILE_WRITE_ATTRIBUTES` authority.
+    const fn file_attributes_write_access(&self) -> FileAttributesWriteAccess {
+        self.deletion.file_attributes_write_access()
     }
 
     /// Replaces the opened location after a successful rename.
@@ -4336,6 +4368,11 @@ impl OpenedHandle {
         self.state.create_deletion()
     }
 
+    /// Returns retained `FILE_WRITE_ATTRIBUTES` authority.
+    const fn file_attributes_write_access(&self) -> FileAttributesWriteAccess {
+        self.state.file_attributes_write_access()
+    }
+
     /// Begins this handle's idempotent cleanup transition.
     fn begin_cleanup(&self) -> CleanupStart {
         self.state.begin_cleanup()
@@ -4469,6 +4506,11 @@ impl<'owner> OpenedObject<'owner> {
     /// Returns the namespace deletion lifecycle selected when this handle was created.
     pub(crate) fn create_deletion(&self) -> CreateDeletion {
         self.handle().create_deletion()
+    }
+
+    /// Returns `FILE_WRITE_ATTRIBUTES` authority retained when this handle was created.
+    pub(crate) fn file_attributes_write_access(&self) -> FileAttributesWriteAccess {
+        self.handle().file_attributes_write_access()
     }
 
     /// Copies this handle's exact deletable location into stable FCB-owned storage.
@@ -5106,7 +5148,7 @@ mod tests {
 
     use crate::irp::{
         ActiveFileObject, CreateDeletion, DataIoKind, DeleteAccess, DirectoryEntryIndex,
-        ReceivedIrp, RegularFileWriteAccess,
+        FileAttributesWriteAccess, ReceivedIrp, RegularFileWriteAccess,
     };
     use crate::kernel::status::DriverError;
 
@@ -5123,6 +5165,14 @@ mod tests {
         VolumeHandleCleanup, VolumeRetirement, WriteCommitment, select_close_release_plan,
         shutdown_registration_status,
     };
+
+    /// Returns the common no-delete fixture policy for opened-handle tests.
+    const fn retained_handle_deletion() -> HandleDeletion {
+        HandleDeletion::Retain {
+            delete_access: DeleteAccess::Denied,
+            file_attributes_write_access: FileAttributesWriteAccess::Denied,
+        }
+    }
 
     fn file_object_with_contexts(
         fs_context: *mut core::ffi::c_void,
@@ -5501,7 +5551,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            HandleDeletion::Retain(DeleteAccess::Denied),
+            retained_handle_deletion(),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5540,7 +5590,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            HandleDeletion::Retain(DeleteAccess::Denied),
+            retained_handle_deletion(),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5619,7 +5669,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            HandleDeletion::Retain(DeleteAccess::Denied),
+            retained_handle_deletion(),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5648,7 +5698,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::ReparsePoint,
             OpenedLocation::Root,
-            HandleDeletion::Retain(DeleteAccess::Denied),
+            retained_handle_deletion(),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5675,7 +5725,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            HandleDeletion::Retain(DeleteAccess::Denied),
+            retained_handle_deletion(),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5702,7 +5752,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            HandleDeletion::Retain(DeleteAccess::Denied),
+            retained_handle_deletion(),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5747,7 +5797,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            HandleDeletion::Retain(DeleteAccess::Denied),
+            retained_handle_deletion(),
             WriteCommitment::FlushThrough,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5785,7 +5835,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            HandleDeletion::Retain(DeleteAccess::Denied),
+            retained_handle_deletion(),
             WriteCommitment::CommitOnly,
             DataTransferMode::NoIntermediate(transfer),
             RegularFileWriteAccess::Denied,
@@ -5816,7 +5866,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            HandleDeletion::Retain(DeleteAccess::Denied),
+            retained_handle_deletion(),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5880,7 +5930,7 @@ mod tests {
                 state: super::OpenedHandleState::new(
                     OpenedNodeMode::Direct,
                     OpenedLocation::Root,
-                    HandleDeletion::Retain(DeleteAccess::Denied),
+                    retained_handle_deletion(),
                     WriteCommitment::CommitOnly,
                     DataTransferMode::IntermediateAllowed,
                 ),
@@ -5901,7 +5951,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            HandleDeletion::Retain(DeleteAccess::Denied),
+            retained_handle_deletion(),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -5964,7 +6014,7 @@ mod tests {
             NodeId::Directory(DirectoryNodeId::ROOT),
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
-            HandleDeletion::Retain(DeleteAccess::Denied),
+            retained_handle_deletion(),
             WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
@@ -6147,16 +6197,33 @@ mod tests {
     #[test]
     fn handle_deletion_requires_delete_authority_for_delete_on_close() {
         assert_eq!(
-            HandleDeletion::from_create(CreateDeletion::DeleteOnClose, DeleteAccess::Denied),
+            HandleDeletion::from_create(
+                CreateDeletion::DeleteOnClose,
+                DeleteAccess::Denied,
+                FileAttributesWriteAccess::Denied,
+            ),
             Err(DriverError::AccessDenied)
         );
         assert_eq!(
-            HandleDeletion::from_create(CreateDeletion::DeleteOnClose, DeleteAccess::Granted),
-            Ok(HandleDeletion::DeleteOnClose)
+            HandleDeletion::from_create(
+                CreateDeletion::DeleteOnClose,
+                DeleteAccess::Granted,
+                FileAttributesWriteAccess::Granted,
+            ),
+            Ok(HandleDeletion::DeleteOnClose {
+                file_attributes_write_access: FileAttributesWriteAccess::Granted,
+            })
         );
         assert_eq!(
-            HandleDeletion::from_create(CreateDeletion::Retain, DeleteAccess::Denied),
-            Ok(HandleDeletion::Retain(DeleteAccess::Denied))
+            HandleDeletion::from_create(
+                CreateDeletion::Retain,
+                DeleteAccess::Denied,
+                FileAttributesWriteAccess::Granted,
+            ),
+            Ok(HandleDeletion::Retain {
+                delete_access: DeleteAccess::Denied,
+                file_attributes_write_access: FileAttributesWriteAccess::Granted,
+            })
         );
     }
 
