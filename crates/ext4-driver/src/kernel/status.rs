@@ -41,6 +41,8 @@ pub(crate) enum DriverError {
     NotLocked,
     /// Caller output buffer cannot hold the required fixed payload.
     BufferTooSmall,
+    /// Caller set-information input is shorter than its fixed structure.
+    InfoLengthMismatch,
     /// Caller output buffer holds a partial variable payload.
     BufferOverflow,
     /// Caller selected an unsupported information class.
@@ -106,6 +108,7 @@ impl DriverError {
             Self::VolumeDismounted => ntstatus(0xC000_026E),
             Self::NotLocked => ntstatus(0xC000_002A),
             Self::BufferTooSmall => STATUS_BUFFER_TOO_SMALL,
+            Self::InfoLengthMismatch => ntstatus(0xC000_0004),
             Self::BufferOverflow => STATUS_BUFFER_OVERFLOW,
             Self::InvalidInfoClass => STATUS_INVALID_INFO_CLASS,
             Self::NotAReparsePoint => ntstatus(0xC000_0275),
@@ -150,6 +153,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
     match error {
         Error::DirectoryEntryNotFound => STATUS_OBJECT_NAME_NOT_FOUND,
         Error::NameAlreadyExists | Error::AmbiguousWindowsName => STATUS_OBJECT_NAME_COLLISION,
+        Error::TooManyLinks => ntstatus(0xC000_0265),
         Error::WrongInodeKind => STATUS_OBJECT_TYPE_MISMATCH,
         Error::NoSpace | Error::NoFreeInode => STATUS_DISK_FULL,
         Error::DirectoryNotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
@@ -220,6 +224,10 @@ mod tests {
         assert_eq!(
             DriverError::from(Error::DirectoryNotEmpty).ntstatus(),
             STATUS_DIRECTORY_NOT_EMPTY
+        );
+        assert_eq!(
+            DriverError::from(Error::TooManyLinks).ntstatus(),
+            super::ntstatus(0xC000_0265)
         );
     }
 

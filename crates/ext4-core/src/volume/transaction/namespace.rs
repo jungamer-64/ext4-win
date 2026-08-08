@@ -93,6 +93,127 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         Ok(())
     }
 
+    /// Creates a hard link to a non-directory inode.
+    ///
+    /// # Errors
+    /// Returns an error when the destination state has changed, replacement selects a directory,
+    /// encryption policies differ, the source link count is saturated, or metadata cannot be
+    /// staged.
+    pub async fn create_hard_link(
+        &mut self,
+        source: TransactionHardLinkSource,
+        target_parent: TransactionDirectory,
+        target_name: &Ext4Name,
+        destination: HardLinkDestination<'_>,
+    ) -> Result<()> {
+        reject_reserved_directory_name(target_name)?;
+        let source_inode_id = source.inode();
+        let source_index = self.ensure_inode_update(source_inode_id).await?;
+        let mut raw_source = self.staged_live_inode(source_index)?;
+        let source_inode = raw_source.parse()?;
+        let _metadata = source_inode.metadata_mutation()?;
+        let target_parent_inode = self
+            .raw_inode_for_policy(target_parent.inode())
+            .await?
+            .parse()?;
+        self.require_hard_link_encryption_policy(&source_inode, &target_parent_inode)
+            .await?;
+
+        let mut add_link = true;
+        match destination {
+            HardLinkDestination::Vacant => {
+                self.ensure_child_absent(target_parent.inode(), target_name)
+                    .await?;
+            }
+            HardLinkDestination::Replace { existing_name } => {
+                let existing = self
+                    .find_child_entry(target_parent.inode(), existing_name)
+                    .await?;
+                if existing.inode() == source_inode_id {
+                    add_link = false;
+                    if existing_name != target_name {
+                        let renamed = self
+                            .rename_directory_entry(
+                                target_parent.inode(),
+                                existing_name,
+                                target_name,
+                                source_inode_id,
+                                source.entry_kind(),
+                            )
+                            .await?;
+                        if renamed.inode() != source_inode_id {
+                            return Err(Error::InvalidDirectoryEntry);
+                        }
+                    }
+                } else {
+                    let existing_kind = self
+                        .raw_inode_for_policy(existing.inode())
+                        .await?
+                        .parse()?
+                        .kind();
+                    match existing_kind {
+                        InodeKind::File => {
+                            self.unlink_file(target_parent, existing_name).await?;
+                        }
+                        InodeKind::Symlink => {
+                            self.remove_symlink(target_parent, existing_name).await?;
+                        }
+                        InodeKind::Directory => return Err(Error::WrongInodeKind),
+                    }
+                }
+            }
+        }
+
+        if add_link {
+            self.add_directory_entry(
+                target_parent.inode(),
+                target_name,
+                source_inode_id,
+                source.entry_kind(),
+            )
+            .await?;
+            raw_source.increment_links_count()?;
+        }
+        raw_source.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+        self.replace_live_inode(source_index, raw_source)?;
+        Ok(())
+    }
+
+    /// Requires a hard-link source and destination directory to share one fscrypt policy.
+    /// # Errors
+    ///
+    /// Returns an error when only one inode is encrypted, a context is missing, or policies differ.
+    async fn require_hard_link_encryption_policy(
+        &mut self,
+        source: &Inode,
+        target_parent: &Inode,
+    ) -> Result<()> {
+        match (
+            source.protection().is_encrypted(),
+            target_parent.protection().is_encrypted(),
+        ) {
+            (false, false) => Ok(()),
+            (true, true) => {
+                let source_context = self
+                    .volume
+                    .read_inode_fscrypt_context(source.id())
+                    .await?
+                    .ok_or(Error::InvalidEncryptionContext)?;
+                let target_context = self
+                    .volume
+                    .read_inode_fscrypt_context(target_parent.id())
+                    .await?
+                    .ok_or(Error::InvalidEncryptionContext)?;
+                if source_context.policy() == target_context.policy() {
+                    Ok(())
+                } else {
+                    Err(Error::UnsupportedEncryption)
+                }
+            }
+            (true, false) | (false, true) => Err(Error::UnsupportedEncryption),
+        }
+    }
+
     /// Creates an empty child directory.
     ///
     /// # Errors

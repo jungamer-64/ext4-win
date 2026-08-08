@@ -23,7 +23,7 @@ use crate::{
         reparse::{NodeSymlinkReparsePoint, UnparsedPathLength},
     },
     state::{
-        ChildCreationTarget, DataTransferMode, DirectoryNameChange, DirectoryNameChangeAction,
+        ChildCreationTarget, DataTransferMode, DirectoryChange, DirectoryChangeAction,
         FileControlBlock, HandleDeletion, KernelDevice, MountedVolumeDevice,
         NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
         OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion, UninitializedFileObject,
@@ -833,8 +833,7 @@ async fn create_missing_node(
         )
         .await?;
     let node = creation.node();
-    let notification =
-        DirectoryNameChange::new(parent, name, node, DirectoryNameChangeAction::Added)?;
+    let notification = DirectoryChange::new(parent, name, node, DirectoryChangeAction::Added)?;
     let handle = memory::boxed_try_with(|| {
         Ok(OpenedHandle::new(
             node,
@@ -874,7 +873,7 @@ async fn create_missing_node(
                 // is active; notification state is disjoint from the actor-owned operation lane.
                 vcb.as_ref()
             };
-            vcb.report_directory_name_change(notification);
+            vcb.report_directory_change(notification);
             Ok(CreateAction::Created)
         }
         Err(error) => Err(error),

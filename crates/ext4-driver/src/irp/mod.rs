@@ -5361,6 +5361,25 @@ mod tests {
 
     /// # Panics
     ///
+    /// Panics when hard-link information classes return to the invalid-class boundary.
+    #[test]
+    fn set_file_class_decodes_legacy_and_extended_hard_links() {
+        assert_eq!(
+            SetFileInformationClass::from_raw(
+                wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformation,
+            ),
+            Ok(SetFileInformationClass::Link)
+        );
+        assert_eq!(
+            SetFileInformationClass::from_raw(
+                wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformationEx,
+            ),
+            Ok(SetFileInformationClass::LinkEx)
+        );
+    }
+
+    /// # Panics
+    ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn file_information_stack_rejects_unsupported_class_before_handler() {
