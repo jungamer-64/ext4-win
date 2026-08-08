@@ -189,12 +189,6 @@ impl Ext4VerityMetadataLayout {
         self.descriptor_offset
     }
 
-    /// Descriptor plus optional signature byte count.
-    #[must_use]
-    pub const fn descriptor_bytes(self) -> u32 {
-        self.descriptor_bytes
-    }
-
     /// Descriptor-size tail byte offset.
     #[must_use]
     pub const fn descriptor_size_offset(self) -> u64 {
@@ -699,16 +693,287 @@ impl FsverityDescriptor {
         self.data_size
     }
 
-    /// Merkle tree root hash.
-    #[must_use]
-    pub const fn root_hash(&self) -> FsverityRootHash {
-        self.root_hash
+    /// Hashes one zero-padded data or Merkle block using this descriptor's algorithm and salt.
+    /// # Errors
+    ///
+    /// Returns an error when `block` is not exactly the descriptor block size or hashing cannot
+    /// allocate its bounded digest input.
+    fn hash_block(&self, block: &[u8]) -> Result<FsverityDigest> {
+        if block.len() != self.block_size.to_usize()? {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        hash_block(self.algorithm, &self.salt, block)
     }
 
-    /// Salt used by the Merkle tree.
+    /// Returns the descriptor root digest in the selected algorithm width.
+    /// # Errors
+    ///
+    /// Returns an error when the root field is inconsistent with the descriptor algorithm.
+    fn root_digest_bytes(&self) -> Result<&[u8]> {
+        self.root_hash.digest_bytes(self.algorithm)
+    }
+}
+
+/// One stored Merkle level, ordered from the data-adjacent leaf toward the root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FsverityMerkleLevel {
+    /// First serialized tree block occupied by this level.
+    start_block: u64,
+    /// Number of child digests represented by the level.
+    child_hashes: u64,
+    /// Number of serialized tree blocks occupied by the level.
+    blocks: u64,
+}
+
+/// Descriptor-derived tree geometry shared by metadata sizing and read verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FsverityTreeGeometry {
+    /// Merkle levels in leaf-to-root verification order.
+    levels: Vec<FsverityMerkleLevel>,
+    /// Number of digest slots in one Merkle block.
+    hashes_per_block: u64,
+    /// Number of data blocks covered by the descriptor.
+    data_blocks: u64,
+    /// Total serialized tree bytes.
+    tree_bytes: u64,
+}
+
+impl FsverityTreeGeometry {
+    /// Computes the one canonical Merkle topology for a descriptor.
+    ///
+    /// # Errors
+    /// Returns an error when level sizing or serialized offsets overflow.
+    fn from_descriptor(descriptor: &FsverityDescriptor) -> Result<Self> {
+        let block_bytes = u64::from(descriptor.block_size().bytes());
+        let digest_bytes = u64::try_from(descriptor.algorithm().digest_bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?;
+        let hashes_per_block = block_bytes
+            .checked_div(digest_bytes)
+            .ok_or(Error::InvalidVerityMetadata)?;
+        if hashes_per_block < 2 {
+            return Err(Error::InvalidVerityMetadata);
+        }
+
+        let data_blocks = round_up_div_u64(descriptor.data_size(), block_bytes)?;
+        let mut levels = Vec::new();
+        let mut child_hashes = data_blocks;
+        while child_hashes > 1 {
+            let blocks = round_up_div_u64(child_hashes, hashes_per_block)?;
+            levels.try_push(FsverityMerkleLevel {
+                start_block: 0,
+                child_hashes,
+                blocks,
+            })?;
+            child_hashes = blocks;
+        }
+
+        let mut tree_blocks = 0_u64;
+        for level in levels.iter_mut().rev() {
+            level.start_block = tree_blocks;
+            tree_blocks = tree_blocks
+                .checked_add(level.blocks)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        let tree_bytes = tree_blocks
+            .checked_mul(block_bytes)
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(Self {
+            levels,
+            hashes_per_block,
+            data_blocks,
+            tree_bytes,
+        })
+    }
+}
+
+/// Relative location of the next Merkle proof block selected by verification state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FsverityMerkleBlockLocation {
+    /// Byte offset from the beginning of the serialized Merkle tree.
+    tree_byte_offset: u64,
+}
+
+impl FsverityMerkleBlockLocation {
+    /// Byte offset from the beginning of the serialized Merkle tree.
     #[must_use]
-    pub const fn salt(&self) -> &FsveritySalt {
-        &self.salt
+    pub(crate) const fn tree_byte_offset(self) -> u64 {
+        self.tree_byte_offset
+    }
+}
+
+/// Descriptor and canonical geometry used to authenticate requested data blocks independently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FsverityVerifier {
+    /// Root, hash parameters, and covered data size.
+    descriptor: FsverityDescriptor,
+    /// Canonical Merkle topology.
+    geometry: FsverityTreeGeometry,
+}
+
+impl FsverityVerifier {
+    /// Creates a verifier without reading or retaining stored Merkle blocks.
+    ///
+    /// # Errors
+    /// Returns an error when descriptor-derived geometry is not representable.
+    pub(crate) fn new(descriptor: FsverityDescriptor) -> Result<Self> {
+        let geometry = FsverityTreeGeometry::from_descriptor(&descriptor)?;
+        Ok(Self {
+            descriptor,
+            geometry,
+        })
+    }
+
+    /// Merkle/data block size.
+    #[must_use]
+    pub(crate) const fn block_size(&self) -> FsverityBlockSize {
+        self.descriptor.block_size()
+    }
+
+    /// Covered file data size.
+    #[must_use]
+    pub(crate) const fn data_size(&self) -> u64 {
+        self.descriptor.data_size()
+    }
+
+    /// Total serialized Merkle tree bytes.
+    #[must_use]
+    pub(crate) const fn tree_bytes(&self) -> u64 {
+        self.geometry.tree_bytes
+    }
+
+    /// Begins authentication of one zero-padded data block.
+    ///
+    /// # Errors
+    /// Returns an error when the block index is outside the covered data, the block has the wrong
+    /// size, or hashing fails.
+    pub(crate) fn begin_data_block(
+        &self,
+        data_block: u64,
+        bytes: &[u8],
+    ) -> Result<FsverityDataBlockVerification<'_>> {
+        if data_block >= self.geometry.data_blocks {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        Ok(FsverityDataBlockVerification {
+            verifier: self,
+            child_index: data_block,
+            next_level: 0,
+            digest: self.descriptor.hash_block(bytes)?,
+        })
+    }
+}
+
+/// Leaf-to-root state machine authenticating one data block before it can be published.
+pub(crate) struct FsverityDataBlockVerification<'verifier> {
+    /// Descriptor and canonical topology.
+    verifier: &'verifier FsverityVerifier,
+    /// Child index selected in the next Merkle level.
+    child_index: u64,
+    /// Next leaf-to-root level to authenticate.
+    next_level: usize,
+    /// Digest of the data or Merkle block authenticated by the next level.
+    digest: FsverityDigest,
+}
+
+impl FsverityDataBlockVerification<'_> {
+    /// Locates the next proof block without advancing state.
+    ///
+    /// # Errors
+    /// Returns an error when the state contradicts descriptor-derived geometry.
+    pub(crate) fn next_merkle_block(&self) -> Result<Option<FsverityMerkleBlockLocation>> {
+        let Some(level) = self.verifier.geometry.levels.get(self.next_level) else {
+            return Ok(None);
+        };
+        let (block_index, _digest_offset) = self.location_within_level(*level, self.child_index)?;
+        let tree_block = level
+            .start_block
+            .checked_add(block_index)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let tree_byte_offset = tree_block
+            .checked_mul(u64::from(self.verifier.block_size().bytes()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(Some(FsverityMerkleBlockLocation { tree_byte_offset }))
+    }
+
+    /// Authenticates the next proof block and advances exactly one level toward the root.
+    ///
+    /// # Errors
+    /// Returns an error when no proof block remains, a digest slot or block is malformed, or the
+    /// child digest does not match.
+    pub(crate) fn verify_merkle_block(&mut self, block: &[u8]) -> Result<()> {
+        let level = self
+            .verifier
+            .geometry
+            .levels
+            .get(self.next_level)
+            .copied()
+            .ok_or(Error::InvalidVerityMetadata)?;
+        let (block_index, digest_offset) = self.location_within_level(level, self.child_index)?;
+        let digest_end = digest_offset
+            .checked_add(self.verifier.descriptor.algorithm().digest_bytes())
+            .ok_or(Error::ArithmeticOverflow)?;
+        if block
+            .get(digest_offset..digest_end)
+            .ok_or(Error::InvalidVerityMetadata)?
+            != self.digest.bytes()
+        {
+            return Err(Error::VerityMismatch);
+        }
+        self.digest = self.verifier.descriptor.hash_block(block)?;
+        self.child_index = block_index;
+        self.next_level = self
+            .next_level
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    /// Requires a complete proof and authenticates its final digest against the descriptor root.
+    ///
+    /// # Errors
+    /// Returns an error when one or more levels were skipped or the computed root differs.
+    pub(crate) fn finish(self) -> Result<()> {
+        if self.next_level != self.verifier.geometry.levels.len() {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        if self.digest.bytes() == self.verifier.descriptor.root_digest_bytes()? {
+            Ok(())
+        } else {
+            Err(Error::VerityMismatch)
+        }
+    }
+
+    /// Selects a Merkle block and digest slot within one validated level.
+    ///
+    /// # Errors
+    /// Returns an error when the child is outside the level or offset arithmetic overflows.
+    fn location_within_level(
+        &self,
+        level: FsverityMerkleLevel,
+        child_index: u64,
+    ) -> Result<(u64, usize)> {
+        if child_index >= level.child_hashes {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        let block_index = child_index
+            .checked_div(self.verifier.geometry.hashes_per_block)
+            .ok_or(Error::InvalidVerityMetadata)?;
+        if block_index >= level.blocks {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        let digest_slot = child_index
+            .checked_rem(self.verifier.geometry.hashes_per_block)
+            .ok_or(Error::InvalidVerityMetadata)?;
+        let digest_offset = digest_slot
+            .checked_mul(
+                u64::try_from(self.verifier.descriptor.algorithm().digest_bytes())
+                    .map_err(|_| Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok((
+            block_index,
+            usize::try_from(digest_offset).map_err(|_| Error::ArithmeticOverflow)?,
+        ))
     }
 }
 
@@ -767,61 +1032,12 @@ impl FsverityMerkleTree {
         })
     }
 
-    /// Creates a stored Merkle tree image already read from ext4 post-EOF
-    /// metadata.
-    ///
-    /// # Errors
-    /// Returns an error when the stored tree byte count does not match the
-    /// descriptor's data size, hash algorithm, and Merkle block geometry.
-    pub fn from_stored_blocks(descriptor: &FsverityDescriptor, blocks: Vec<u8>) -> Result<Self> {
-        if u64::try_from(blocks.len()).map_err(|_| Error::ArithmeticOverflow)?
-            != Self::stored_tree_bytes_for_descriptor(descriptor)?
-        {
-            return Err(Error::InvalidVerityMetadata);
-        }
-        Ok(Self {
-            algorithm: descriptor.algorithm(),
-            block_size: descriptor.block_size(),
-            root_hash: descriptor.root_hash(),
-            blocks,
-        })
-    }
-
     /// Returns the serialized Merkle tree byte count implied by a descriptor.
     ///
     /// # Errors
     /// Returns an error when the descriptor geometry overflows arithmetic.
     pub fn stored_tree_bytes_for_descriptor(descriptor: &FsverityDescriptor) -> Result<u64> {
-        stored_tree_bytes_for_data_size(
-            descriptor.algorithm(),
-            descriptor.block_size(),
-            descriptor.data_size(),
-        )
-    }
-
-    /// Verifies plaintext file data against a descriptor and stored tree bytes.
-    ///
-    /// # Errors
-    /// Returns `VerityMismatch` when either the data root hash or stored tree
-    /// bytes do not match the descriptor.
-    pub fn verify_data(&self, data: &[u8], descriptor: &FsverityDescriptor) -> Result<()> {
-        if self.algorithm != descriptor.algorithm()
-            || self.block_size != descriptor.block_size()
-            || u64::try_from(data.len()).map_err(|_| Error::ArithmeticOverflow)?
-                != descriptor.data_size()
-        {
-            return Err(Error::VerityMismatch);
-        }
-        let rebuilt = Self::build(
-            data,
-            descriptor.algorithm(),
-            descriptor.block_size(),
-            descriptor.salt(),
-        )?;
-        if rebuilt.root_hash != descriptor.root_hash() || rebuilt.blocks != self.blocks {
-            return Err(Error::VerityMismatch);
-        }
-        Ok(())
+        Ok(FsverityTreeGeometry::from_descriptor(descriptor)?.tree_bytes)
     }
 
     /// Root hash produced by this tree.
@@ -835,40 +1051,6 @@ impl FsverityMerkleTree {
     pub fn blocks(&self) -> &[u8] {
         &self.blocks
     }
-}
-
-/// Computes the serialized Merkle tree byte count for one file.
-/// # Errors
-///
-/// Returns an error when Merkle level sizing or accumulated tree byte counts overflow.
-fn stored_tree_bytes_for_data_size(
-    algorithm: FsverityHashAlgorithm,
-    block_size: FsverityBlockSize,
-    data_size: u64,
-) -> Result<u64> {
-    if data_size == 0 {
-        return Ok(0);
-    }
-    let block_bytes = u64::from(block_size.bytes());
-    let digest_bytes =
-        u64::try_from(algorithm.digest_bytes()).map_err(|_| Error::ArithmeticOverflow)?;
-    let mut hash_count = round_up_div_u64(data_size, block_bytes)?;
-    let mut tree_bytes = 0_u64;
-    while hash_count > 1 {
-        let level_input_bytes = hash_count
-            .checked_mul(digest_bytes)
-            .ok_or(Error::ArithmeticOverflow)?;
-        let level_blocks = round_up_div_u64(level_input_bytes, block_bytes)?;
-        tree_bytes = tree_bytes
-            .checked_add(
-                level_blocks
-                    .checked_mul(block_bytes)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .ok_or(Error::ArithmeticOverflow)?;
-        hash_count = level_blocks;
-    }
-    Ok(tree_bytes)
 }
 
 /// Parses salt and requires unused descriptor salt bytes to be zero.
@@ -1181,7 +1363,7 @@ mod tests {
         assert_eq!(layout.merkle_tree_offset(), 65_536);
         assert_eq!(layout.merkle_tree_bytes(), 8192);
         assert_eq!(layout.descriptor_offset(), 73_728);
-        assert_eq!(layout.descriptor_bytes(), 272);
+        assert_eq!(layout.descriptor_bytes, 272);
         assert_eq!(layout.descriptor_size_offset(), 77_820);
         assert_eq!(layout.metadata_end(), 77_824);
     }
@@ -1343,12 +1525,20 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
+    /// Panics when proof geometry, state transitions, or corruption detection diverge from the
+    /// tree image built by the same fs-verity domain.
     #[test]
-    fn fsverity_merkle_tree_verify_rejects_data_and_tree_corruption() {
+    fn fsverity_verifier_authenticates_only_one_requested_block_path() {
         let block_size = must!(FsverityBlockSize::new(1024));
+        let block_bytes = must!(block_size.to_usize());
         let salt = must!(FsveritySalt::new(&VECTOR_SALT));
-        let data = must!(repeating_data(3500));
+        let data_bytes = must!(
+            block_bytes
+                .checked_mul(130)
+                .and_then(|bytes| bytes.checked_sub(17))
+                .ok_or(Error::ArithmeticOverflow)
+        );
+        let data = must!(repeating_data(data_bytes));
         let tree = must!(FsverityMerkleTree::build(
             &data,
             FsverityHashAlgorithm::Sha256,
@@ -1360,22 +1550,56 @@ mod tests {
             block_size,
             must!(u64::try_from(data.len()).map_err(|_| Error::ArithmeticOverflow)),
             tree.root_hash(),
-            salt,
+            must!(salt.try_clone())
         ));
-
-        must!(tree.verify_data(&data, &descriptor));
-
-        let mut corrupt_data = data.clone();
-        must!(set_byte(&mut corrupt_data, 17, 0xff));
+        let verifier = must!(FsverityVerifier::new(descriptor));
         assert_eq!(
-            tree.verify_data(&corrupt_data, &descriptor),
-            Err(Error::VerityMismatch)
+            must!(u64::try_from(tree.blocks().len()).map_err(|_| Error::ArithmeticOverflow)),
+            verifier.tree_bytes()
         );
 
-        let mut corrupt_tree = tree.clone();
-        must!(set_byte(&mut corrupt_tree.blocks, 0, 0xff));
+        let data_block_index = 129_u64;
+        let block_start =
+            must!(usize::try_from(data_block_index).map_err(|_| Error::ArithmeticOverflow))
+                .checked_mul(block_bytes)
+                .ok_or(Error::ArithmeticOverflow);
+        let block_start = must!(block_start);
+        let mut data_block = must!(memory::repeated_vec(0_u8, block_bytes));
+        let tail = some!(data.get(block_start..));
+        some!(data_block.get_mut(..tail.len())).copy_from_slice(tail);
+
+        let mut verification = must!(verifier.begin_data_block(data_block_index, &data_block));
+        let first = some!(must!(verification.next_merkle_block()));
+        assert_eq!(first.tree_byte_offset(), 5120);
+        while let Some(location) = must!(verification.next_merkle_block()) {
+            let start = must!(
+                usize::try_from(location.tree_byte_offset()).map_err(|_| Error::ArithmeticOverflow)
+            );
+            let end = must!(
+                start
+                    .checked_add(block_bytes)
+                    .ok_or(Error::ArithmeticOverflow)
+            );
+            must!(verification.verify_merkle_block(some!(tree.blocks().get(start..end))));
+        }
+        assert_eq!(verification.finish(), Ok(()));
+
+        let incomplete = must!(verifier.begin_data_block(data_block_index, &data_block));
+        assert_eq!(incomplete.finish(), Err(Error::InvalidVerityMetadata));
+
+        *some!(data_block.get_mut(0)) ^= 0x80;
+        let mut corrupted = must!(verifier.begin_data_block(data_block_index, &data_block));
+        let location = some!(must!(corrupted.next_merkle_block()));
+        let start = must!(
+            usize::try_from(location.tree_byte_offset()).map_err(|_| Error::ArithmeticOverflow)
+        );
+        let end = must!(
+            start
+                .checked_add(block_bytes)
+                .ok_or(Error::ArithmeticOverflow)
+        );
         assert_eq!(
-            corrupt_tree.verify_data(&data, &descriptor),
+            corrupted.verify_merkle_block(some!(tree.blocks().get(start..end))),
             Err(Error::VerityMismatch)
         );
     }
@@ -1396,6 +1620,133 @@ mod tests {
 
         assert_eq!(tree.root_hash(), FsverityRootHash::zero());
         assert!(tree.blocks().is_empty());
+    }
+
+    /// # Panics
+    ///
+    /// Panics when requested-block authentication diverges from stored SHA-256 or SHA-512 trees.
+    #[test]
+    fn fsverity_requested_block_verifier_walks_only_its_authentication_path() {
+        let block_size = must!(FsverityBlockSize::new(1024));
+        let salt = must!(FsveritySalt::new(&VECTOR_SALT));
+        let data = must!(repeating_data(40 * 1024));
+
+        for algorithm in [FsverityHashAlgorithm::Sha256, FsverityHashAlgorithm::Sha512] {
+            let tree = must!(FsverityMerkleTree::build(
+                &data, algorithm, block_size, &salt
+            ));
+            let descriptor = must!(FsverityDescriptor::new(
+                algorithm,
+                block_size,
+                u64::try_from(data.len()).unwrap_or(u64::MAX),
+                tree.root_hash(),
+                salt.clone(),
+            ));
+            let verifier = must!(FsverityVerifier::new(descriptor));
+
+            assert_eq!(
+                verifier.tree_bytes(),
+                u64::try_from(tree.blocks().len()).unwrap_or(u64::MAX)
+            );
+            for data_block in [0_u64, 17, 39] {
+                assert_eq!(
+                    verify_stored_data_block(&verifier, &data, tree.blocks(), data_block),
+                    Ok(())
+                );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when data, leaf, parent, or descriptor-root corruption survives range verification.
+    #[test]
+    fn fsverity_requested_block_verifier_rejects_every_proof_layer_corruption() {
+        let algorithm = FsverityHashAlgorithm::Sha512;
+        let block_size = must!(FsverityBlockSize::new(1024));
+        let salt = must!(FsveritySalt::new(&VECTOR_SALT));
+        let data = must!(repeating_data(40 * 1024));
+        let tree = must!(FsverityMerkleTree::build(
+            &data, algorithm, block_size, &salt
+        ));
+        let descriptor = must!(FsverityDescriptor::new(
+            algorithm,
+            block_size,
+            u64::try_from(data.len()).unwrap_or(u64::MAX),
+            tree.root_hash(),
+            salt.clone(),
+        ));
+        let verifier = must!(FsverityVerifier::new(descriptor));
+
+        let mut corrupt_data = data.clone();
+        *some!(corrupt_data.get_mut(0)) ^= 0x80;
+        assert_eq!(
+            verify_stored_data_block(&verifier, &corrupt_data, tree.blocks(), 0),
+            Err(Error::VerityMismatch)
+        );
+
+        let mut corrupt_leaf = tree.blocks().to_vec();
+        *some!(corrupt_leaf.get_mut(1024)) ^= 0x80;
+        assert_eq!(
+            verify_stored_data_block(&verifier, &data, &corrupt_leaf, 0),
+            Err(Error::VerityMismatch)
+        );
+
+        let mut corrupt_parent = tree.blocks().to_vec();
+        *some!(corrupt_parent.get_mut(900)) ^= 0x80;
+        assert_eq!(
+            verify_stored_data_block(&verifier, &data, &corrupt_parent, 0),
+            Err(Error::VerityMismatch)
+        );
+
+        let wrong_root = must!(FsverityDescriptor::new(
+            algorithm,
+            block_size,
+            u64::try_from(data.len()).unwrap_or(u64::MAX),
+            FsverityRootHash::zero(),
+            salt,
+        ));
+        let wrong_root_verifier = must!(FsverityVerifier::new(wrong_root));
+        assert_eq!(
+            verify_stored_data_block(&wrong_root_verifier, &data, tree.blocks(), 0),
+            Err(Error::VerityMismatch)
+        );
+    }
+
+    /// Authenticates one stored data block through only the proof blocks selected by the verifier.
+    /// # Errors
+    ///
+    /// Returns an error when the selected data/proof range is absent or authentication fails.
+    fn verify_stored_data_block(
+        verifier: &FsverityVerifier,
+        data: &[u8],
+        tree: &[u8],
+        data_block: u64,
+    ) -> Result<()> {
+        let block_bytes = verifier.block_size().to_usize()?;
+        let start = usize::try_from(data_block)
+            .map_err(|_| Error::ArithmeticOverflow)?
+            .checked_mul(block_bytes)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let end = start
+            .checked_add(block_bytes)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let mut verification = verifier.begin_data_block(
+            data_block,
+            data.get(start..end).ok_or(Error::InvalidVerityMetadata)?,
+        )?;
+        while let Some(location) = verification.next_merkle_block()? {
+            let proof_start = usize::try_from(location.tree_byte_offset())
+                .map_err(|_| Error::ArithmeticOverflow)?;
+            let proof_end = proof_start
+                .checked_add(block_bytes)
+                .ok_or(Error::ArithmeticOverflow)?;
+            verification.verify_merkle_block(
+                tree.get(proof_start..proof_end)
+                    .ok_or(Error::InvalidVerityMetadata)?,
+            )?;
+        }
+        verification.finish()
     }
 
     /// Builds the single-block vector descriptor.

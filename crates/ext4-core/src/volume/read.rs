@@ -1,6 +1,23 @@
 //! Read-only traversal and metadata projection for mounted volumes.
 
+use core::num::NonZeroU64;
+
 use super::scope::*;
+
+/// Maximum bytes passed to one backing-device data read.
+const MAX_READ_WINDOW_BYTES: usize = 65_536;
+
+/// Fully validated protection and mapping state for one fs-verity range read.
+struct VerityReadPlan {
+    /// File payload and post-EOF metadata mapping.
+    extent_tree: ExtentTree,
+    /// Per-inode plaintext recovery key when fscrypt also protects this inode.
+    contents_key: Option<FscryptContentsKey>,
+    /// ext4 post-EOF placement of the serialized Merkle tree.
+    metadata: Ext4VerityMetadataLayout,
+    /// Descriptor-owned Merkle geometry and proof state factory.
+    verifier: FsverityVerifier,
+}
 
 #[cfg(test)]
 impl<D, N> ReadOnlyVolume<D, N>
@@ -707,6 +724,243 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
         Ok(target)
     }
 
+    /// Reads only the requested fs-verity data blocks and authenticates each Merkle proof to the
+    /// descriptor root before publishing bytes to `out`.
+    /// # Errors
+    ///
+    /// Returns an error when metadata layout, encrypted plaintext recovery, proof traversal, or a
+    /// data/Merkle digest is invalid.
+    pub(super) async fn read_verified_file(
+        &mut self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes> {
+        if out.is_empty() || offset.bytes() >= file.size().bytes() {
+            return Ok(ReadBytes::from_usize(0));
+        }
+        let block_size = self.superblock.block_size();
+        let extent_context = self.extent_tree_context(file.inode());
+        let extent_tree = ExtentTree::load_inode_tree(
+            file.inode().extent_root()?,
+            block_size,
+            &mut self.device,
+            extent_context,
+        )
+        .await?;
+        let contents_key = if file.protection().is_encrypted() {
+            Some(self.fscrypt_contents_key_for_inode(file.inode()).await?)
+        } else {
+            None
+        };
+        let (metadata, descriptor) = self
+            .read_verity_descriptor(file, &extent_tree, contents_key.as_ref())
+            .await?;
+        if descriptor.block_size().bytes() > block_size.bytes() {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        let verifier = FsverityVerifier::new(descriptor)?;
+        if verifier.tree_bytes() != metadata.merkle_tree_bytes() {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        let plan = VerityReadPlan {
+            extent_tree,
+            contents_key,
+            metadata,
+            verifier,
+        };
+        let readable = core::cmp::min(
+            u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?,
+            file.size().remaining_from(offset)?,
+        );
+        let request_end = offset
+            .bytes()
+            .checked_add(readable)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let block_bytes = plan.verifier.block_size().to_usize()?;
+        let block_bytes_u64 = u64::try_from(block_bytes).map_err(|_| Error::ArithmeticOverflow)?;
+        let first_block = offset
+            .bytes()
+            .checked_div(block_bytes_u64)
+            .ok_or(Error::InvalidVerityMetadata)?;
+        let final_byte = request_end
+            .checked_sub(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let final_block = final_byte
+            .checked_div(block_bytes_u64)
+            .ok_or(Error::InvalidVerityMetadata)?;
+        let mut data_block = memory::repeated_vec(0_u8, block_bytes)?;
+        let mut proof_block = memory::repeated_vec(0_u8, block_bytes)?;
+
+        for data_block_index in first_block..=final_block {
+            data_block.fill(0);
+            let block_start = data_block_index
+                .checked_mul(block_bytes_u64)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let data_bytes = core::cmp::min(
+                block_bytes_u64,
+                plan.verifier
+                    .data_size()
+                    .checked_sub(block_start)
+                    .ok_or(Error::InvalidVerityMetadata)?,
+            );
+            let data_bytes = usize::try_from(data_bytes).map_err(|_| Error::ArithmeticOverflow)?;
+            self.read_prepared_plaintext_stream_range(
+                plan.contents_key.as_ref(),
+                &plan.extent_tree,
+                block_start,
+                data_block.get_mut(..data_bytes).ok_or(Error::DeviceRange)?,
+            )
+            .await?;
+            self.verify_verity_data_block(&plan, data_block_index, &data_block, &mut proof_block)
+                .await?;
+
+            let copy_start = core::cmp::max(offset.bytes(), block_start);
+            let block_end = block_start
+                .checked_add(block_bytes_u64)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let copy_end = core::cmp::min(request_end, block_end);
+            let source_start = usize::try_from(
+                copy_start
+                    .checked_sub(block_start)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let destination_start = usize::try_from(
+                copy_start
+                    .checked_sub(offset.bytes())
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let copy_bytes = usize::try_from(
+                copy_end
+                    .checked_sub(copy_start)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let source_end = source_start
+                .checked_add(copy_bytes)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let destination_end = destination_start
+                .checked_add(copy_bytes)
+                .ok_or(Error::ArithmeticOverflow)?;
+            out.get_mut(destination_start..destination_end)
+                .ok_or(Error::DeviceRange)?
+                .copy_from_slice(
+                    data_block
+                        .get(source_start..source_end)
+                        .ok_or(Error::DeviceRange)?,
+                );
+        }
+        Ok(ReadBytes::from_usize(
+            usize::try_from(readable).map_err(|_| Error::ArithmeticOverflow)?,
+        ))
+    }
+
+    /// Reads and validates the fixed fs-verity descriptor without loading the stored Merkle tree.
+    /// # Errors
+    ///
+    /// Returns an error when the post-EOF tail, descriptor slot, or descriptor-derived layout is
+    /// malformed.
+    async fn read_verity_descriptor(
+        &mut self,
+        file: &FileNode,
+        extent_tree: &ExtentTree,
+        contents_key: Option<&FscryptContentsKey>,
+    ) -> Result<(Ext4VerityMetadataLayout, FsverityDescriptor)> {
+        let block_size = self.superblock.block_size();
+        let metadata_end = extent_payload_end_bytes(extent_tree, block_size)?;
+        if metadata_end <= file.size().bytes() {
+            return Err(Error::InvalidVerityMetadata);
+        }
+        let tail_offset = metadata_end
+            .checked_sub(4)
+            .ok_or(Error::InvalidVerityMetadata)?;
+        let mut descriptor_size_tail = [0_u8; 4];
+        self.read_prepared_plaintext_stream_range(
+            contents_key,
+            extent_tree,
+            tail_offset,
+            &mut descriptor_size_tail,
+        )
+        .await?;
+        let descriptor_bytes = u32::from_le_bytes(descriptor_size_tail);
+        let descriptor_offset = Ext4VerityMetadataLayout::descriptor_offset_from_metadata_end(
+            block_size,
+            metadata_end,
+            descriptor_bytes,
+        )?;
+        let mut descriptor_image = memory::repeated_vec(0_u8, FSVERITY_DESCRIPTOR_BYTES)?;
+        self.read_prepared_plaintext_stream_range(
+            contents_key,
+            extent_tree,
+            descriptor_offset,
+            &mut descriptor_image,
+        )
+        .await?;
+        let descriptor = FsverityDescriptor::parse(&descriptor_image)?;
+        let layout = Ext4VerityMetadataLayout::from_metadata_end(
+            file.size(),
+            block_size,
+            metadata_end,
+            descriptor_bytes,
+            &descriptor,
+        )?;
+        Ok((layout, descriptor))
+    }
+
+    /// Authenticates one zero-padded data block through every stored Merkle level.
+    /// # Errors
+    ///
+    /// Returns `VerityMismatch` for any data, proof-slot, proof-block, or root mismatch.
+    async fn verify_verity_data_block(
+        &mut self,
+        plan: &VerityReadPlan,
+        data_block_index: u64,
+        data_block: &[u8],
+        proof_block: &mut [u8],
+    ) -> Result<()> {
+        let mut verification = plan
+            .verifier
+            .begin_data_block(data_block_index, data_block)?;
+        while let Some(location) = verification.next_merkle_block()? {
+            let stream_offset = plan
+                .metadata
+                .merkle_tree_offset()
+                .checked_add(location.tree_byte_offset())
+                .ok_or(Error::ArithmeticOverflow)?;
+            self.read_prepared_plaintext_stream_range(
+                plan.contents_key.as_ref(),
+                &plan.extent_tree,
+                stream_offset,
+                proof_block,
+            )
+            .await?;
+            verification.verify_merkle_block(proof_block)?;
+        }
+        verification.finish()
+    }
+
+    /// Reads plaintext from a preloaded extent tree and optional pre-derived fscrypt contents key.
+    /// # Errors
+    ///
+    /// Returns an error when extent traversal, device I/O, or block decryption fails.
+    async fn read_prepared_plaintext_stream_range(
+        &mut self,
+        contents_key: Option<&FscryptContentsKey>,
+        extent_tree: &ExtentTree,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        match contents_key {
+            Some(key) => {
+                self.read_encrypted_inode_stream_range(key, extent_tree, offset, out)
+                    .await
+            }
+            None => self.read_inode_stream_range(extent_tree, offset, out).await,
+        }
+    }
+
     /// Enumerates directory entries from a typed directory node.
     ///
     /// # Errors
@@ -1127,6 +1381,7 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
         let block_size = u64::from(self.superblock.block_size().bytes());
         let block_bytes = usize::try_from(self.superblock.block_size().bytes())
             .map_err(|_| Error::ArithmeticOverflow)?;
+        let mut block = memory::repeated_vec(0_u8, block_bytes)?;
         let mut completed = 0_usize;
 
         while completed < out.len() {
@@ -1156,19 +1411,31 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
 
             match extent_tree.map_logical(LogicalBlock::try_from(logical_block)?) {
                 BlockMapping::Physical(physical_block) => {
-                    let mut block = memory::repeated_vec(0_u8, block_bytes)?;
-                    self.device
-                        .read_exact_at(
-                            self.superblock.block_size().offset_of(physical_block)?,
-                            &mut block,
-                        )
-                        .await?;
-                    contents_key.decrypt_block(logical_block, &mut block)?;
-                    let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
-                    let block_end = start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
-                    out.get_mut(completed..end)
-                        .ok_or(Error::DeviceRange)?
-                        .copy_from_slice(block.get(start..block_end).ok_or(Error::DeviceRange)?);
+                    let target = out.get_mut(completed..end).ok_or(Error::DeviceRange)?;
+                    if in_block == 0 && chunk == block_bytes {
+                        self.device
+                            .read_exact_at(
+                                self.superblock.block_size().offset_of(physical_block)?,
+                                target,
+                            )
+                            .await?;
+                        contents_key.decrypt_block(logical_block, target)?;
+                    } else {
+                        self.device
+                            .read_exact_at(
+                                self.superblock.block_size().offset_of(physical_block)?,
+                                &mut block,
+                            )
+                            .await?;
+                        contents_key.decrypt_block(logical_block, &mut block)?;
+                        let start =
+                            usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
+                        let block_end =
+                            start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
+                        target.copy_from_slice(
+                            block.get(start..block_end).ok_or(Error::DeviceRange)?,
+                        );
+                    }
                 }
                 BlockMapping::Uninitialized | BlockMapping::Hole => {
                     out.get_mut(completed..end)
@@ -1209,27 +1476,43 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             let in_block = position
                 .checked_rem(block_size)
                 .ok_or(Error::InvalidSuperblock)?;
-            let block_remaining = block_size
-                .checked_sub(in_block)
-                .ok_or(Error::ArithmeticOverflow)?;
             let total_remaining = u64::try_from(
                 out.len()
                     .checked_sub(completed)
                     .ok_or(Error::ArithmeticOverflow)?,
             )
             .map_err(|_| Error::ArithmeticOverflow)?;
-            let chunk_u64 = core::cmp::min(block_remaining, total_remaining);
+            let window = core::cmp::min(
+                total_remaining,
+                u64::try_from(MAX_READ_WINDOW_BYTES).map_err(|_| Error::ArithmeticOverflow)?,
+            );
+            let spanned = in_block
+                .checked_add(window)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let maximum_blocks = round_up_div(spanned, block_size)?;
+            let maximum_blocks =
+                NonZeroU64::new(maximum_blocks).ok_or(Error::ArithmeticOverflow)?;
+            let run =
+                extent_tree.map_run(LogicalBlock::try_from(logical_block)?, maximum_blocks)?;
+            let run_bytes = run
+                .blocks()
+                .get()
+                .checked_mul(block_size)
+                .ok_or(Error::ArithmeticOverflow)?
+                .checked_sub(in_block)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let chunk_u64 = core::cmp::min(window, run_bytes);
             let chunk = usize::try_from(chunk_u64).map_err(|_| Error::ArithmeticOverflow)?;
             let end = completed
                 .checked_add(chunk)
                 .ok_or(Error::ArithmeticOverflow)?;
 
-            match extent_tree.map_logical(LogicalBlock::try_from(logical_block)?) {
-                BlockMapping::Physical(physical_block) => {
+            match run {
+                ExtentBlockRun::Initialized { physical_start, .. } => {
                     let device_offset = self
                         .superblock
                         .block_size()
-                        .offset_of(physical_block)?
+                        .offset_of(physical_start)?
                         .get()
                         .checked_add(in_block)
                         .ok_or(Error::ArithmeticOverflow)?;
@@ -1240,7 +1523,7 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
                         )
                         .await?;
                 }
-                BlockMapping::Uninitialized | BlockMapping::Hole => {
+                ExtentBlockRun::Uninitialized { .. } | ExtentBlockRun::Hole { .. } => {
                     out.get_mut(completed..end)
                         .ok_or(Error::DeviceRange)?
                         .fill(0);

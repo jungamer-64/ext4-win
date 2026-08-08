@@ -1,4 +1,29 @@
 use super::*;
+use alloc::rc::Rc;
+use core::{cell::Cell, num::NonZeroU64};
+
+/// Read-only test source retaining maximum backing-read size outside the mounted volume.
+#[derive(Clone, Debug)]
+struct ObservedBlockSource<'a> {
+    bytes: &'a [u8],
+    maximum_read: Rc<Cell<usize>>,
+}
+
+impl BlockSource for ObservedBlockSource<'_> {
+    fn len(&self) -> DeviceLength {
+        DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
+    }
+
+    async fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
+        self.maximum_read
+            .set(self.maximum_read.get().max(out.len()));
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(out.len()).ok_or(Error::DeviceRange)?;
+        let source = self.bytes.get(start..end).ok_or(Error::DeviceRange)?;
+        out.copy_from_slice(source);
+        Ok(())
+    }
+}
 
 /// # Panics
 ///
@@ -56,6 +81,115 @@ fn extent_hole_mapping_is_explicit() {
     assert_eq!(
         tree.map_logical(LogicalBlock::from_u32(0)),
         BlockMapping::Hole
+    );
+}
+
+/// # Panics
+///
+/// Panics when typed extent runs do not preserve hole, physical, and unwritten boundaries.
+#[test]
+fn extent_run_mapping_stops_at_typed_boundaries() {
+    let mut raw = [0_u8; 60];
+    write_two_extent_root(&mut raw, 0, 2, 3, 10, 7, 2, 20);
+    put_u16(&mut raw, 28, 0x8002);
+    let root = InodeExtentRoot::from_bytes(raw);
+    let mut device = MemoryBlockSource::new(&[]);
+    let tree = must_run(ExtentTree::load_inode_tree(
+        &root,
+        must(BlockSize::from_superblock_log(0)),
+        &mut device,
+        ExtentTreeContext::none(),
+    ));
+    let maximum = NonZeroU64::new(10).unwrap_or(NonZeroU64::MIN);
+
+    assert_eq!(
+        must(tree.map_run(LogicalBlock::from_u32(0), maximum)),
+        crate::disk_format::extent::ExtentBlockRun::Hole {
+            blocks: NonZeroU64::new(2).unwrap_or(NonZeroU64::MIN),
+        }
+    );
+    assert_eq!(
+        must(tree.map_run(LogicalBlock::from_u32(3), maximum)),
+        crate::disk_format::extent::ExtentBlockRun::Initialized {
+            physical_start: BlockAddress::new(11),
+            blocks: NonZeroU64::new(2).unwrap_or(NonZeroU64::MIN),
+        }
+    );
+    assert_eq!(
+        must(tree.map_run(LogicalBlock::from_u32(5), maximum)),
+        crate::disk_format::extent::ExtentBlockRun::Hole {
+            blocks: NonZeroU64::new(2).unwrap_or(NonZeroU64::MIN),
+        }
+    );
+    assert_eq!(
+        must(tree.map_run(LogicalBlock::from_u32(7), maximum)),
+        crate::disk_format::extent::ExtentBlockRun::Uninitialized {
+            blocks: NonZeroU64::new(2).unwrap_or(NonZeroU64::MIN),
+        }
+    );
+}
+
+/// # Panics
+///
+/// Panics when a multi-megabyte request reaches the backing source in a window over 64 KiB.
+#[test]
+fn large_plain_read_bounds_each_backing_io_window() {
+    const DATA_BLOCKS: usize = 4096;
+    const DATA_START_BLOCK: u32 = 64;
+    let file_bytes = DATA_BLOCKS * BLOCK_SIZE;
+    let image_blocks = usize::try_from(DATA_START_BLOCK).unwrap_or(usize::MAX) + DATA_BLOCKS;
+    let mut image = modern_fixture_image();
+    image.resize(image_blocks * BLOCK_SIZE, 0);
+    put_u32(
+        &mut image,
+        1024 + 4,
+        u32::try_from(image_blocks).unwrap_or(u32::MAX),
+    );
+    let inode = modern_inode_offset(3);
+    put_u32(
+        &mut image,
+        inode + 4,
+        u32::try_from(file_bytes).unwrap_or(u32::MAX),
+    );
+    put_u32(
+        &mut image,
+        inode + 28,
+        u32::try_from(file_bytes / 512).unwrap_or(u32::MAX),
+    );
+    write_extent_root(
+        &mut image,
+        inode + 40,
+        0,
+        u16::try_from(DATA_BLOCKS).unwrap_or(u16::MAX),
+        DATA_START_BLOCK,
+    );
+    let data_start = block_offset(DATA_START_BLOCK);
+    for (index, byte) in image[data_start..data_start + file_bytes]
+        .iter_mut()
+        .enumerate()
+    {
+        *byte = u8::try_from(index % 251).unwrap_or(0);
+    }
+
+    let maximum_read = Rc::new(Cell::new(0));
+    let source = ObservedBlockSource {
+        bytes: &image,
+        maximum_read: Rc::clone(&maximum_read),
+    };
+    let mut volume = must_run(ReadOnlyVolume::mount(source, test_mount_context()));
+    let file = file_node(&mut volume, 3);
+    maximum_read.set(0);
+    let mut output = vec![0_u8; file_bytes];
+
+    assert_eq!(
+        must_run(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
+        file_bytes
+    );
+    assert_eq!(maximum_read.get(), 64 * 1024);
+    assert_eq!(&output[..251], &image[data_start..data_start + 251]);
+    assert_eq!(
+        &output[file_bytes - 251..],
+        &image[data_start + file_bytes - 251..data_start + file_bytes]
     );
 }
 

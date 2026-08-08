@@ -12,7 +12,7 @@ mod executor;
 
 pub(crate) use capture::{
     CapturedQuerySecurityOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
-    PreparedEaSelection, PreparedQueryDirectory, PreparedQueryEa, PreparedRequest,
+    PreparedEaSelection, PreparedQueryDirectory, PreparedQueryEa, PreparedRead, PreparedRequest,
 };
 use capture::{QueueContext, QueueContextOwnership};
 pub(crate) use executor::DeviceExecutor;
@@ -475,6 +475,17 @@ impl ActiveIrp<'_> {
         BufferedOutput::from_active(self.data_buffer_address(length)?, length.as_usize())
     }
 
+    /// Returns a read output address without creating a Rust reference before queue publication.
+    /// # Errors
+    ///
+    /// Returns an error when neither a system buffer nor a mapped MDL covers `length`.
+    pub(crate) fn data_output_address(
+        &self,
+        length: IrpBufferLength,
+    ) -> Result<NonNull<u8>, DriverError> {
+        self.data_buffer_address(length)
+    }
+
     /// Returns the current stack location tied to this active owner borrow.
     /// # Errors
     ///
@@ -725,6 +736,22 @@ impl<'a> PendingIrpLease<'a> {
     ) -> R {
         let mut active = self.owner.target.active();
         operation(&mut active)
+    }
+
+    /// Borrows the read payload captured before queue insertion.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this pending request is not a read.
+    pub(crate) fn prepared_read(&self) -> DriverResult<&PreparedRead> {
+        self.owner.context.read()
+    }
+
+    /// Mutably borrows the read payload captured before queue insertion.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this pending request is not a read.
+    pub(crate) fn prepared_read_mut(&mut self) -> DriverResult<&mut PreparedRead> {
+        self.owner.context.read_mut()
     }
 
     /// Borrows the opaque query-security output target for the lifetime of this pending request.
@@ -1726,11 +1753,6 @@ impl BufferedOutput<'_> {
     /// Returns output bytes.
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         self.bytes.as_mut_slice()
-    }
-
-    /// Returns the first output byte address.
-    pub(crate) const fn address(&self) -> NonNull<u8> {
-        self.bytes.address()
     }
 }
 
@@ -3093,13 +3115,7 @@ impl ByteRangeLockKey {
     }
 
     /// Returns the native key for FsRtl range checks.
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "native FsRtl byte-range checks are compiled out in unit tests"
-        )
-    )]
+    #[cfg(not(test))]
     pub(crate) const fn as_ulong(self) -> wdk_sys::ULONG {
         self.0
     }

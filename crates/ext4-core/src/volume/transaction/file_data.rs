@@ -623,6 +623,9 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         if inode.protection().is_verity() {
             return Err(Error::UnsupportedInodeMutation);
         }
+        if enable.block_size().bytes() > self.volume.superblock.block_size().bytes() {
+            return Err(Error::InvalidVerityMetadata);
+        }
         let _payload = inode.file_payload_mutation()?;
 
         let mut plaintext = memory::repeated_vec(0_u8, inode.size().to_usize()?)?;
