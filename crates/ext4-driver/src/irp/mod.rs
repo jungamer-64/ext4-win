@@ -2146,6 +2146,8 @@ pub(crate) enum QueryFileInformationClass {
     Basic,
     /// Windows `FileStandardInformation`.
     Standard,
+    /// Windows `FileStandardLinkInformation`.
+    StandardLink,
     /// Windows `FileInternalInformation`.
     Internal,
     /// Windows `FilePositionInformation`.
@@ -2167,6 +2169,7 @@ impl QueryFileInformationClass {
         match value {
             wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => Ok(Self::Basic),
             wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation => Ok(Self::Standard),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileStandardLinkInformation => Ok(Self::StandardLink),
             wdk_sys::_FILE_INFORMATION_CLASS::FileInternalInformation => Ok(Self::Internal),
             wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => Ok(Self::Position),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNetworkOpenInformation => Ok(Self::NetworkOpen),
@@ -5290,7 +5293,7 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn query_file_stack_decodes_name_and_attribute_tag_classes() {
+    fn query_file_stack_decodes_name_attribute_tag_and_standard_link_classes() {
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
         for (raw_class, expected) in [
             (
@@ -5300,6 +5303,10 @@ mod tests {
             (
                 wdk_sys::_FILE_INFORMATION_CLASS::FileAttributeTagInformation,
                 QueryFileInformationClass::AttributeTag,
+            ),
+            (
+                wdk_sys::_FILE_INFORMATION_CLASS::FileStandardLinkInformation,
+                QueryFileInformationClass::StandardLink,
             ),
         ] {
             let mut stack = wdk_sys::IO_STACK_LOCATION {
