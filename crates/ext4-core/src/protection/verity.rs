@@ -208,67 +208,6 @@ impl Ext4VerityMetadataLayout {
     }
 }
 
-/// Parsed ext4 post-EOF fs-verity metadata for one inode.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Ext4VerityMetadata {
-    /// Validated byte layout in the inode payload stream.
-    layout: Ext4VerityMetadataLayout,
-    /// Linux fs-verity descriptor.
-    descriptor: FsverityDescriptor,
-    /// Optional builtin signature bytes after the fixed descriptor.
-    signature: Vec<u8>,
-    /// Stored Merkle tree bytes in ext4 root-to-leaf order.
-    merkle_tree: FsverityMerkleTree,
-}
-
-impl Ext4VerityMetadata {
-    /// Creates parsed ext4 verity metadata from already-located inode payload
-    /// slices.
-    ///
-    /// # Errors
-    /// Returns an error when descriptor/signature sizes do not match the layout
-    /// or the stored Merkle tree size is inconsistent with the descriptor.
-    pub fn new(
-        layout: Ext4VerityMetadataLayout,
-        descriptor: FsverityDescriptor,
-        signature: Vec<u8>,
-        merkle_tree_bytes: Vec<u8>,
-    ) -> Result<Self> {
-        let descriptor_with_signature = u32::try_from(
-            FSVERITY_DESCRIPTOR_BYTES
-                .checked_add(signature.len())
-                .ok_or(Error::ArithmeticOverflow)?,
-        )
-        .map_err(|_| Error::ArithmeticOverflow)?;
-        if descriptor_with_signature != layout.descriptor_bytes() {
-            return Err(Error::InvalidVerityMetadata);
-        }
-        if u64::try_from(merkle_tree_bytes.len()).map_err(|_| Error::ArithmeticOverflow)?
-            != layout.merkle_tree_bytes()
-        {
-            return Err(Error::InvalidVerityMetadata);
-        }
-        let merkle_tree = FsverityMerkleTree::from_stored_blocks(&descriptor, merkle_tree_bytes)?;
-        Ok(Self {
-            layout,
-            descriptor,
-            signature,
-            merkle_tree,
-        })
-    }
-
-    /// Linux fs-verity descriptor.
-    #[must_use]
-    pub const fn descriptor(&self) -> &FsverityDescriptor {
-        &self.descriptor
-    }
-
-    /// Stored Merkle tree.
-    #[must_use]
-    pub const fn merkle_tree(&self) -> &FsverityMerkleTree {
-        &self.merkle_tree
-    }
-}
 /// fs-verity hash algorithm accepted by this driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsverityHashAlgorithm {

@@ -452,8 +452,6 @@ impl QueueContext {
 pub(crate) enum PreparedRequest {
     /// Create/open request.
     Create,
-    /// Read request.
-    Read,
     /// Write request.
     Write,
     /// File information query.
