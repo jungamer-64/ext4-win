@@ -11,7 +11,7 @@ mod transaction;
 pub use mount::{InternalJournal, JournaledVolume, MountContext, VolumeGeometry, VolumeIdentity};
 pub use node::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
-    FileNodeId, NodeId, SymlinkNode, SymlinkNodeId,
+    FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, NodeId, SymlinkNode, SymlinkNodeId,
 };
 pub use transaction::{
     HardLinkDestination, JournalTransaction, RenameTargetCollision, TransactionDirectory,

@@ -335,6 +335,15 @@ where
         self.volume.read_directory(directory).await
     }
 
+    /// Enumerates every reachable namespace link to one non-directory inode.
+    ///
+    /// # Errors
+    /// Returns an error when directory traversal fails or the namespace cardinality contradicts
+    /// the inode link count.
+    pub async fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
+        self.volume.read_hard_links(target).await
+    }
+
     /// Looks up an exact ext4 child name under a directory.
     ///
     /// # Errors
@@ -988,6 +997,62 @@ impl<D: BlockSource, State, N> MountedVolume<D, State, N> {
             entries
         };
         self.validate_directory_entries(entries).await
+    }
+
+    /// Enumerates the authoritative directory names of one hard-linkable inode.
+    ///
+    /// Traversal is iterative so the future cannot retain an unbounded async recursion chain. The
+    /// completed scan is checked against the inode link count before it becomes a [`HardLinks`].
+    ///
+    /// # Errors
+    /// Returns an error when the target is stale, a directory cannot be read, the directory graph
+    /// contains a non-special cycle, allocation fails, or fewer reachable links exist than the
+    /// inode advertises.
+    pub(super) async fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
+        let expected = match target {
+            HardLinkNodeId::File(file) => {
+                usize::from(self.load_file(file).await?.links_count().get())
+            }
+            HardLinkNodeId::Symlink(symlink) => {
+                usize::from(self.load_symlink(symlink).await?.links_count().get())
+            }
+        };
+        let target_node = NodeId::from(target);
+        let mut pending = Vec::new();
+        pending.try_push(DirectoryNodeId::ROOT)?;
+        let mut visited = Vec::new();
+        let mut links = Vec::new();
+        links
+            .try_reserve_exact(expected)
+            .map_err(|_| Error::OutOfMemory)?;
+
+        while let Some(directory_id) = pending.pop() {
+            if visited.contains(&directory_id) {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            visited.try_push(directory_id)?;
+            let directory = self.load_directory(directory_id).await?;
+            let entries = self.read_directory(&directory).await?;
+            for entry in entries {
+                if matches!(entry.name().bytes(), b"." | b"..") {
+                    continue;
+                }
+                match *entry.node() {
+                    NodeId::Directory(child) => {
+                        if visited.contains(&child) || pending.contains(&child) {
+                            return Err(Error::InvalidDirectoryEntry);
+                        }
+                        pending.try_push(child)?;
+                    }
+                    node if node == target_node => {
+                        links.try_push(HardLinkEntry::try_new(directory_id, entry.name())?)?;
+                    }
+                    NodeId::File(_) | NodeId::Symlink(_) => {}
+                }
+            }
+        }
+
+        HardLinks::try_from_entries(links, expected)
     }
 
     /// Decrypts directory-entry names for an unlocked encrypted directory.

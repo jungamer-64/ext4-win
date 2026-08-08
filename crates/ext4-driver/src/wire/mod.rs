@@ -250,7 +250,6 @@ impl<'a> LittleEndianOutput<'a> {
     /// # Errors
     ///
     /// Returns an error when the eight-byte little-endian wire field cannot be written at `offset`.
-    #[cfg(test)]
     pub(crate) fn write_u64(&mut self, offset: WireOffset, value: u64) -> DriverResult<()> {
         self.write_bytes(offset, value.to_le_bytes().as_slice())
     }

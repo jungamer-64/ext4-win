@@ -922,7 +922,7 @@ impl CapturedQuerySecurityOutput {
     ) -> Result<Self, IrpCompletion> {
         let required = selection.query_descriptor_length();
         if declared_length.as_usize() < required {
-            let completion = match IrpCompletion::security_buffer_overflow(required) {
+            let completion = match IrpCompletion::buffer_overflow(required) {
                 Ok(completion) => completion,
                 Err(error) => IrpCompletion::from_error(error),
             };
@@ -1519,7 +1519,7 @@ mod tests {
     /// Panics when query-security overflow or native capture failure loses its status payload.
     #[test]
     fn security_completion_statuses_preserve_required_information() {
-        let overflow = IrpCompletion::security_buffer_overflow(321);
+        let overflow = IrpCompletion::buffer_overflow(321);
         assert!(overflow.is_ok());
         if let Ok(overflow) = overflow {
             assert_eq!(overflow.status(), wdk_sys::STATUS_BUFFER_OVERFLOW);

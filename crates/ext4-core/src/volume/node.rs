@@ -1,10 +1,13 @@
 //! Typed mounted inode identities and loaded node projections.
 
+use alloc::vec::Vec;
+
 use crate::disk_format::dir::DirectoryEntryKind;
 use crate::disk_format::inode::{
     Ext4LinkCount, Ext4Security, Ext4Times, FileAllocationSize, FileSize, Inode, InodeId,
     InodeKind, InodeProtection,
 };
+use crate::error::{Error, Result};
 use crate::platform::name::Ext4Name;
 
 /// Typed regular-file inode identity.
@@ -98,6 +101,54 @@ impl NodeId {
     #[must_use]
     pub const fn file_index(self) -> u32 {
         self.inode().as_u32()
+    }
+}
+
+/// Typed identity of an inode that can own hard-link names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HardLinkNodeId {
+    /// Regular file inode.
+    File(FileNodeId),
+    /// Symbolic-link inode.
+    Symlink(SymlinkNodeId),
+}
+
+impl HardLinkNodeId {
+    /// Returns the raw inode for volume-internal traversal and mutation.
+    pub(super) const fn inode(self) -> InodeId {
+        match self {
+            Self::File(file) => file.inode(),
+            Self::Symlink(symlink) => symlink.inode(),
+        }
+    }
+
+    /// Returns the directory-entry kind used by every link to this inode.
+    pub(super) const fn entry_kind(self) -> DirectoryEntryKind {
+        match self {
+            Self::File(_) => DirectoryEntryKind::File,
+            Self::Symlink(_) => DirectoryEntryKind::Symlink,
+        }
+    }
+}
+
+impl TryFrom<NodeId> for HardLinkNodeId {
+    type Error = Error;
+
+    fn try_from(value: NodeId) -> Result<Self> {
+        match value {
+            NodeId::File(file) => Ok(Self::File(file)),
+            NodeId::Symlink(symlink) => Ok(Self::Symlink(symlink)),
+            NodeId::Directory(_) => Err(Error::WrongInodeKind),
+        }
+    }
+}
+
+impl From<HardLinkNodeId> for NodeId {
+    fn from(value: HardLinkNodeId) -> Self {
+        match value {
+            HardLinkNodeId::File(file) => Self::File(file),
+            HardLinkNodeId::Symlink(symlink) => Self::Symlink(symlink),
+        }
     }
 }
 
@@ -373,6 +424,66 @@ impl DirectoryEntry {
     #[cfg(test)]
     pub(crate) const fn entry_kind(&self) -> DirectoryEntryKind {
         self.entry_kind
+    }
+}
+
+/// One namespace name that links a parent directory to a non-directory inode.
+#[derive(Debug, Eq, PartialEq)]
+pub struct HardLinkEntry {
+    /// Directory containing the link name.
+    parent: DirectoryNodeId,
+    /// Exact ext4 name stored in the parent directory.
+    name: Ext4Name,
+}
+
+impl HardLinkEntry {
+    /// Copies one validated namespace entry into the hard-link result domain.
+    /// # Errors
+    ///
+    /// Returns an error when the exact ext4 name cannot be copied.
+    pub(super) fn try_new(parent: DirectoryNodeId, name: &Ext4Name) -> Result<Self> {
+        Ok(Self {
+            parent,
+            name: name.try_to_owned_name()?,
+        })
+    }
+
+    /// Parent directory containing this link.
+    #[must_use]
+    pub const fn parent(&self) -> DirectoryNodeId {
+        self.parent
+    }
+
+    /// Exact ext4 link name.
+    #[must_use]
+    pub const fn name(&self) -> &Ext4Name {
+        &self.name
+    }
+}
+
+/// Complete, non-empty namespace link set for one non-directory inode.
+#[derive(Debug, Eq, PartialEq)]
+pub struct HardLinks {
+    /// Every reachable link, with cardinality validated against the inode link count.
+    entries: Vec<HardLinkEntry>,
+}
+
+impl HardLinks {
+    /// Seals one complete link set after namespace traversal.
+    /// # Errors
+    ///
+    /// Returns an error when the set is empty or its cardinality contradicts the inode link count.
+    pub(super) fn try_from_entries(entries: Vec<HardLinkEntry>, expected: usize) -> Result<Self> {
+        if entries.is_empty() || entries.len() != expected {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        Ok(Self { entries })
+    }
+
+    /// Every namespace link in traversal order.
+    #[must_use]
+    pub fn entries(&self) -> &[HardLinkEntry] {
+        &self.entries
     }
 }
 
