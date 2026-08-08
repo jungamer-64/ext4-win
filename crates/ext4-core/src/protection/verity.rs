@@ -80,11 +80,7 @@ impl Ext4VerityMetadataLayout {
         merkle_tree_bytes: u64,
         descriptor_bytes: u32,
     ) -> Result<Self> {
-        if usize::try_from(descriptor_bytes).map_err(|_| Error::ArithmeticOverflow)?
-            < FSVERITY_DESCRIPTOR_BYTES
-        {
-            return Err(Error::InvalidVerityMetadata);
-        }
+        let descriptor_bytes_u64 = validated_descriptor_bytes(descriptor_bytes)?;
         let merkle_tree_offset =
             align_up_u64(file_size.bytes(), EXT4_VERITY_METADATA_ALIGNMENT_BYTES)?;
         let tree_end = merkle_tree_offset
@@ -92,7 +88,7 @@ impl Ext4VerityMetadataLayout {
             .ok_or(Error::ArithmeticOverflow)?;
         let descriptor_offset = align_up_u64(tree_end, u64::from(filesystem_block_size.bytes()))?;
         let descriptor_end = descriptor_offset
-            .checked_add(u64::from(descriptor_bytes))
+            .checked_add(descriptor_bytes_u64)
             .ok_or(Error::ArithmeticOverflow)?;
         let descriptor_size_offset = align_up_u64(
             descriptor_end
@@ -126,13 +122,9 @@ impl Ext4VerityMetadataLayout {
         metadata_end: u64,
         descriptor_bytes: u32,
     ) -> Result<u64> {
-        if usize::try_from(descriptor_bytes).map_err(|_| Error::ArithmeticOverflow)?
-            < FSVERITY_DESCRIPTOR_BYTES
-        {
-            return Err(Error::InvalidVerityMetadata);
-        }
+        let descriptor_bytes_u64 = validated_descriptor_bytes(descriptor_bytes)?;
         let slot_bytes = align_up_u64(
-            u64::from(descriptor_bytes)
+            descriptor_bytes_u64
                 .checked_add(4)
                 .ok_or(Error::ArithmeticOverflow)?,
             u64::from(filesystem_block_size.bytes()),
@@ -1053,6 +1045,23 @@ impl FsverityMerkleTree {
     }
 }
 
+/// Validates descriptor-plus-signature byte count and widens it for layout arithmetic.
+///
+/// # Errors
+/// Returns an error when the fixed descriptor is truncated or the signature exceeds the Linux
+/// UAPI limit.
+fn validated_descriptor_bytes(descriptor_bytes: u32) -> Result<u64> {
+    let descriptor_bytes_usize =
+        usize::try_from(descriptor_bytes).map_err(|_| Error::ArithmeticOverflow)?;
+    let maximum_descriptor_bytes = FSVERITY_DESCRIPTOR_BYTES
+        .checked_add(FSVERITY_MAX_SIGNATURE_BYTES)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if !(FSVERITY_DESCRIPTOR_BYTES..=maximum_descriptor_bytes).contains(&descriptor_bytes_usize) {
+        return Err(Error::InvalidVerityMetadata);
+    }
+    Ok(u64::from(descriptor_bytes))
+}
+
 /// Parses salt and requires unused descriptor salt bytes to be zero.
 /// # Errors
 ///
@@ -1373,6 +1382,15 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn ext4_verity_metadata_layout_rejects_bad_descriptor_and_overflow() {
+        let oversized_descriptor = must!(
+            FSVERITY_DESCRIPTOR_BYTES
+                .checked_add(FSVERITY_MAX_SIGNATURE_BYTES)
+                .and_then(|bytes| bytes.checked_add(1))
+                .ok_or(Error::ArithmeticOverflow)
+        );
+        let oversized_descriptor =
+            must!(u32::try_from(oversized_descriptor).map_err(|_| Error::ArithmeticOverflow));
+
         assert_eq!(
             Ext4VerityMetadataLayout::new(
                 FileSize::from_bytes(0),
@@ -1382,6 +1400,15 @@ mod tests {
                     u32::try_from(FSVERITY_DESCRIPTOR_BYTES - 1)
                         .map_err(|_| Error::ArithmeticOverflow)
                 ),
+            ),
+            Err(Error::InvalidVerityMetadata)
+        );
+        assert_eq!(
+            Ext4VerityMetadataLayout::new(
+                FileSize::from_bytes(0),
+                must!(BlockSize::from_superblock_log(0)),
+                0,
+                oversized_descriptor,
             ),
             Err(Error::InvalidVerityMetadata)
         );
