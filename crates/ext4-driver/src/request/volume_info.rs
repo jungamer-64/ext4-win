@@ -5,7 +5,7 @@ use wdk_sys::{
     FILE_CASE_PRESERVED_NAMES, FILE_CASE_SENSITIVE_SEARCH, FILE_FS_ATTRIBUTE_INFORMATION,
     FILE_FS_DEVICE_INFORMATION, FILE_FS_FULL_SIZE_INFORMATION, FILE_FS_LABEL_INFORMATION,
     FILE_FS_SIZE_INFORMATION, FILE_FS_VOLUME_INFORMATION, FILE_SUPPORTS_EXTENDED_ATTRIBUTES,
-    FILE_SUPPORTS_REPARSE_POINTS, FILE_UNICODE_ON_DISK, LARGE_INTEGER,
+    FILE_SUPPORTS_HARD_LINKS, FILE_SUPPORTS_REPARSE_POINTS, FILE_UNICODE_ON_DISK, LARGE_INTEGER,
 };
 
 use crate::{
@@ -288,7 +288,8 @@ fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> 
             | FILE_CASE_PRESERVED_NAMES
             | FILE_UNICODE_ON_DISK
             | FILE_SUPPORTS_REPARSE_POINTS
-            | FILE_SUPPORTS_EXTENDED_ATTRIBUTES,
+            | FILE_SUPPORTS_EXTENDED_ATTRIBUTES
+            | FILE_SUPPORTS_HARD_LINKS,
     )?;
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
@@ -367,7 +368,9 @@ mod tests {
         wire::{LittleEndianInput, WireOffset},
     };
 
-    use super::{pack_device_information, volume_label_from_file_fs_label};
+    use super::{
+        pack_attribute_information, pack_device_information, volume_label_from_file_fs_label,
+    };
 
     /// # Panics
     ///
@@ -434,6 +437,23 @@ mod tests {
                 Ok(wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM)
             );
             assert_eq!(output.read_u32(WireOffset::new(4)), Ok(0));
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the advertised filesystem capabilities omit hard-link creation.
+    #[test]
+    fn attribute_information_advertises_hard_links() {
+        let mut buffer = vec![0; 128];
+        let written = pack_attribute_information(buffer.as_mut_slice());
+        assert!(written.is_ok());
+        let attributes = LittleEndianInput::new(buffer.as_slice()).read_u32(WireOffset::new(
+            core::mem::offset_of!(wdk_sys::FILE_FS_ATTRIBUTE_INFORMATION, FileSystemAttributes),
+        ));
+        assert!(attributes.is_ok());
+        if let Ok(attributes) = attributes {
+            assert_ne!(attributes & wdk_sys::FILE_SUPPORTS_HARD_LINKS, 0);
         }
     }
 

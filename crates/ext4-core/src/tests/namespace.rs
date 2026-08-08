@@ -324,6 +324,170 @@ fn unlink_file_reports_missing_entry() {
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
+fn hard_link_adds_second_name_and_unlink_preserves_source() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = MemoryBlockStorage::new(&mut image);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let source_id = file_node_id(&mut volume, 3);
+        let alias = must(Ext4Name::new(b"alias"));
+
+        let mut link = volume.begin_transaction(NOW);
+        let source = must_run(link.hard_link_source(NodeId::File(source_id)));
+        let root = transaction_directory(&mut link, DirectoryNodeId::ROOT);
+        must_run(link.create_hard_link(source, root, &alias, HardLinkDestination::Vacant));
+        must_run(link.commit());
+
+        assert_eq!(
+            lookup_ext4_inode(&mut volume, InodeId::ROOT, b"alias"),
+            Some(inode(3))
+        );
+        assert_eq!(file_node(&mut volume, 3).links_count().get(), 2);
+
+        let mut unlink = volume.begin_transaction(NOW);
+        let root = transaction_directory(&mut unlink, DirectoryNodeId::ROOT);
+        must_run(unlink.unlink_file(root, &alias));
+        must_run(unlink.commit());
+
+        assert_eq!(
+            lookup_ext4_inode(&mut volume, InodeId::ROOT, b"alias"),
+            None
+        );
+        assert_eq!(
+            lookup_ext4_inode(&mut volume, InodeId::ROOT, b"file"),
+            Some(inode(3))
+        );
+        assert_eq!(file_node(&mut volume, 3).links_count().get(), 1);
+    }
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn hard_link_replaces_distinct_file_and_rejects_directory_source() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = MemoryBlockStorage::new(&mut image);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let source_id = file_node_id(&mut volume, 3);
+        let target_name = must(Ext4Name::new(b"target"));
+
+        let mut create = volume.begin_transaction(NOW);
+        let root = transaction_directory(&mut create, DirectoryNodeId::ROOT);
+        let target = must_run(create.create_file(root, &target_name, test_file_metadata()));
+        must_run(create.commit());
+
+        let mut link = volume.begin_transaction(NOW);
+        assert_eq!(
+            run(link.hard_link_source(NodeId::Directory(DirectoryNodeId::ROOT))),
+            Err(Error::WrongInodeKind)
+        );
+        let source = must_run(link.hard_link_source(NodeId::File(source_id)));
+        let root = transaction_directory(&mut link, DirectoryNodeId::ROOT);
+        must_run(link.create_hard_link(
+            source,
+            root,
+            &target_name,
+            HardLinkDestination::Replace {
+                existing_name: &target_name,
+            },
+        ));
+        must_run(link.commit());
+
+        assert_eq!(
+            lookup_ext4_inode(&mut volume, InodeId::ROOT, b"target"),
+            Some(inode(3))
+        );
+        assert_ne!(
+            lookup_ext4_inode(&mut volume, InodeId::ROOT, b"target"),
+            Some(target.id().inode())
+        );
+        assert_eq!(file_node(&mut volume, 3).links_count().get(), 2);
+    }
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn hard_link_same_inode_replacement_preserves_link_count_and_updates_case() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = MemoryBlockStorage::new(&mut image);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let source_id = file_node_id(&mut volume, 3);
+        let existing = must(Ext4Name::new(b"file"));
+        let requested = must(Ext4Name::new(b"FILE"));
+
+        let mut link = volume.begin_transaction(NOW);
+        let source = must_run(link.hard_link_source(NodeId::File(source_id)));
+        let root = transaction_directory(&mut link, DirectoryNodeId::ROOT);
+        must_run(link.create_hard_link(
+            source,
+            root,
+            &requested,
+            HardLinkDestination::Replace {
+                existing_name: &existing,
+            },
+        ));
+        must_run(link.commit());
+
+        assert_eq!(lookup_ext4_inode(&mut volume, InodeId::ROOT, b"file"), None);
+        assert_eq!(
+            lookup_ext4_inode(&mut volume, InodeId::ROOT, b"FILE"),
+            Some(inode(3))
+        );
+        assert_eq!(file_node(&mut volume, 3).links_count().get(), 1);
+    }
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn hard_link_supports_symbolic_link_inodes() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = MemoryBlockStorage::new(&mut image);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let original = must(Ext4Name::new(b"original-link"));
+        let alias = must(Ext4Name::new(b"link-alias"));
+        let target = must(SymlinkTarget::new(b"file"));
+
+        let mut create = volume.begin_transaction(NOW);
+        let root = transaction_directory(&mut create, DirectoryNodeId::ROOT);
+        let symlink =
+            must_run(create.create_symlink(root, &original, &target, test_symlink_metadata()));
+        must_run(create.commit());
+
+        let mut link = volume.begin_transaction(NOW);
+        let source = must_run(link.hard_link_source(NodeId::Symlink(symlink.id())));
+        let root = transaction_directory(&mut link, DirectoryNodeId::ROOT);
+        must_run(link.create_hard_link(source, root, &alias, HardLinkDestination::Vacant));
+        must_run(link.commit());
+
+        assert_eq!(
+            lookup_ext4_inode(&mut volume, InodeId::ROOT, b"link-alias"),
+            Some(symlink.id().inode())
+        );
+        assert_eq!(
+            symlink_node(&mut volume, symlink.id().inode().as_u32())
+                .links_count()
+                .get(),
+            2
+        );
+    }
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
 fn rename_file_updates_staged_directory_entry() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
 

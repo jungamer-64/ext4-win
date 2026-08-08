@@ -6,7 +6,8 @@ use core::ptr::NonNull;
 use ext4_core::{
     ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Permissions,
     Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileAllocationSize, FileNodeId,
-    FileOffset, FileSize, NodeId, RenameTargetCollision, WindowsName, WindowsOverlay,
+    FileOffset, FileSize, HardLinkDestination, NodeId, RenameTargetCollision, WindowsName,
+    WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
@@ -21,12 +22,12 @@ use crate::irp::{
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{
-    CleanupStart, CloseReleasePlan, DirectoryCursor, DirectoryNameChange,
-    DirectoryNameChangeAction, DirectoryNotificationRegistration, FileCleanupDisposition,
-    FileControlBlock, FileDeleteTarget, MountedVolumeDevice, OpenedDirectory, OpenedFileObject,
-    OpenedLocation, OpenedObject, OpenedRegularFile, PendingFileDeletion, VolumeControlBlock,
-    VolumeHandleCleanup, VolumeOperationLane, VolumeOperationLease, VolumeRetirement,
-    WriteCommitment, release_cancelled_file_control_block, release_file_control_block,
+    CleanupStart, CloseReleasePlan, DirectoryChange, DirectoryChangeAction, DirectoryCursor,
+    DirectoryNotificationRegistration, FileCleanupDisposition, FileControlBlock, FileDeleteTarget,
+    MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation, OpenedObject,
+    OpenedRegularFile, PendingFileDeletion, VolumeControlBlock, VolumeHandleCleanup,
+    VolumeOperationLane, VolumeOperationLease, VolumeRetirement, WriteCommitment,
+    release_cancelled_file_control_block, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -405,6 +406,13 @@ enum SetFilePlan {
         /// Exclusive mounted-volume operation capability.
         operations: VolumeOperationLease,
     },
+    /// Commit one fully owned hard-link creation.
+    Link {
+        /// Caller-independent hard-link domain values.
+        mutation: HardLinkMutation,
+        /// Exclusive mounted-volume operation capability.
+        operations: VolumeOperationLease,
+    },
     /// Commit one fully owned namespace rename.
     Rename {
         /// Caller-independent rename domain values.
@@ -471,6 +479,24 @@ async fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<
                 &opened_file,
                 DispositionInputFormat::Extended,
             )?,
+            SetFileInformationClass::Link => SetFilePlan::Link {
+                mutation: HardLinkMutation::decode(
+                    active,
+                    stack,
+                    &opened_file,
+                    HardLinkInformationFormat::ReplaceIfExistsByte,
+                )?,
+                operations: claim_file_operation_lane(opened_file.file_control_block()),
+            },
+            SetFileInformationClass::LinkEx => SetFilePlan::Link {
+                mutation: HardLinkMutation::decode(
+                    active,
+                    stack,
+                    &opened_file,
+                    HardLinkInformationFormat::Flags,
+                )?,
+                operations: claim_file_operation_lane(opened_file.file_control_block()),
+            },
             SetFileInformationClass::Rename => SetFilePlan::Rename {
                 mutation: RenameMutation::decode(
                     active,
@@ -530,6 +556,10 @@ async fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<
                 DeletePendingPublication::AlreadyPublishedByCreate => drop(pending),
             }
         }
+        SetFilePlan::Link {
+            mutation,
+            mut operations,
+        } => set_hard_link_information(mutation, &mut operations).await?,
         SetFilePlan::Rename {
             mutation,
             operations,
@@ -869,6 +899,284 @@ pub(crate) async fn validate_pending_deletion(
     Ok(())
 }
 
+/// Owned hard-link mutation decoded completely before the first suspension.
+#[derive(Debug)]
+struct HardLinkMutation {
+    /// Existing inode that receives the additional name.
+    source_node: NodeId,
+    /// Destination path with its explicit resolution base.
+    target: NamespaceTargetPath,
+    /// Existing-target behavior decoded from the link information class.
+    target_collision: HardLinkTargetCollision,
+}
+
+impl HardLinkMutation {
+    /// Copies every caller and handle-dependent hard-link field into owned domain values.
+    /// # Errors
+    ///
+    /// Returns an error when the source is a directory or deleted link, the handle has no parent
+    /// identity, or the input path/flags are invalid.
+    fn decode(
+        active: &ActiveIrp<'_>,
+        stack: SetFileStack,
+        opened_file: &OpenedObject<'_>,
+        format: HardLinkInformationFormat,
+    ) -> DriverResult<Self> {
+        if opened_file.delete_pending() {
+            return Err(DriverError::AccessDenied);
+        }
+        let source_node = opened_file.node();
+        if matches!(source_node, NodeId::Directory(_)) {
+            return Err(DriverError::FileIsDirectory);
+        }
+        let source_parent = match opened_file.location() {
+            OpenedLocation::DirectoryEntry { parent, .. } => *parent,
+            OpenedLocation::Root => return Err(DriverError::FileIsDirectory),
+            OpenedLocation::FileReference => return Err(DriverError::NotSupported),
+        };
+        let input = active.buffered_input(stack.length())?;
+        let target_collision = format.target_collision(input.as_slice())?;
+        let target = NamespaceTargetPath::decode(input.as_slice(), source_parent)?;
+        Ok(Self {
+            source_node,
+            target,
+            target_collision,
+        })
+    }
+}
+
+/// Prepared hard-link destination with the exact ext4 name selected for replacement.
+#[derive(Debug)]
+enum PreparedHardLinkDestination {
+    /// No Windows-visible target exists.
+    Vacant,
+    /// The caller authorized replacement of this exact existing entry.
+    Replace {
+        /// Existing case-preserving ext4 name.
+        existing_name: Ext4Name,
+    },
+}
+
+/// Source link-count transition implied by the prepared destination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HardLinkCountEffect {
+    /// Replacing another name for the same inode preserves the count.
+    Preserve,
+    /// Creating a new name or replacing a different inode increments the count.
+    Increase,
+}
+
+impl HardLinkCountEffect {
+    /// Enforces the Windows hard-link count boundary only when the count will increase.
+    /// # Errors
+    ///
+    /// Returns `TooManyLinks` once the source already has 1024 links.
+    fn validate(self, links: Ext4LinkCount) -> DriverResult<()> {
+        const WINDOWS_HARD_LINK_LIMIT: u16 = 1024;
+        match self {
+            Self::Preserve => Ok(()),
+            Self::Increase if links.get() < WINDOWS_HARD_LINK_LIMIT => Ok(()),
+            Self::Increase => Err(DriverError::from(ext4_core::Error::TooManyLinks)),
+        }
+    }
+}
+
+/// Ordered post-commit directory notifications for one hard-link mutation.
+#[derive(Debug)]
+struct HardLinkDirectoryChanges {
+    /// First and always-present notification.
+    first: DirectoryChange,
+    /// Second notification required only for a case-preserving spelling change.
+    second: Option<Box<DirectoryChange>>,
+}
+
+impl HardLinkDirectoryChanges {
+    /// Reports the committed notification sequence.
+    fn report(self, operations: &VolumeOperationLease) {
+        operations.report_directory_change(self.first);
+        if let Some(second) = self.second {
+            operations.report_directory_change(*second);
+        }
+    }
+}
+
+/// Applies one owned FILE_LINK_INFORMATION mutation to the ext4 namespace.
+/// # Errors
+///
+/// Returns an error when target resolution, replacement policy, link limits, metadata staging, or
+/// the journal transaction fails.
+async fn set_hard_link_information(
+    mutation: HardLinkMutation,
+    operations: &mut VolumeOperationLease,
+) -> DriverResult<()> {
+    let HardLinkMutation {
+        source_node,
+        target,
+        target_collision,
+    } = mutation;
+    let (target_parent, target_name) =
+        resolve_namespace_target(operations.lane_mut(), &target).await?;
+    operations.ensure_node_openable(NodeId::Directory(target_parent))?;
+    let source_metadata = metadata_from_node(operations.lane_mut(), source_node).await?;
+    let (destination, count_effect, changes) = prepare_hard_link_destination(
+        operations,
+        source_node,
+        target_parent,
+        &target_name,
+        target.target_name(),
+        target_collision,
+    )
+    .await?;
+    count_effect.validate(source_metadata.links_count)?;
+    let archive_overlay = hard_link_archive_overlay(source_metadata.overlay_attributes)?;
+
+    let mut transaction = operations
+        .lane_mut()
+        .journaled_mut()
+        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
+    let source = transaction.hard_link_source(source_node).await?;
+    let target_parent = transaction.directory(target_parent).await?;
+    if let Some(overlay) = archive_overlay {
+        let node = transaction.node(source_node).await?;
+        transaction.set_windows_overlay(node, overlay).await?;
+    }
+    match &destination {
+        PreparedHardLinkDestination::Vacant => {
+            transaction
+                .create_hard_link(
+                    source,
+                    target_parent,
+                    &target_name,
+                    HardLinkDestination::Vacant,
+                )
+                .await?;
+        }
+        PreparedHardLinkDestination::Replace { existing_name } => {
+            transaction
+                .create_hard_link(
+                    source,
+                    target_parent,
+                    &target_name,
+                    HardLinkDestination::Replace { existing_name },
+                )
+                .await?;
+        }
+    }
+    transaction.commit().await?;
+    changes.report(operations);
+    Ok(())
+}
+
+/// Resolves collision policy into one exact hard-link destination and notification plan.
+/// # Errors
+///
+/// Returns an error when a rejected collision exists, the target is a directory, read-only,
+/// delete-pending, or still has an active handle.
+async fn prepare_hard_link_destination(
+    operations: &mut VolumeOperationLease,
+    source_node: NodeId,
+    target_parent: DirectoryNodeId,
+    target_name: &Ext4Name,
+    target_windows_name: &WindowsName,
+    target_collision: HardLinkTargetCollision,
+) -> DriverResult<(
+    PreparedHardLinkDestination,
+    HardLinkCountEffect,
+    HardLinkDirectoryChanges,
+)> {
+    let parent = operations
+        .lane_mut()
+        .journaled_mut()
+        .load_directory(target_parent)
+        .await?;
+    let target = operations
+        .lane_mut()
+        .journaled_mut()
+        .lookup_windows_child(&parent, target_windows_name)
+        .await?;
+    let ChildLookup::Found(target) = target else {
+        return Ok((
+            PreparedHardLinkDestination::Vacant,
+            HardLinkCountEffect::Increase,
+            HardLinkDirectoryChanges {
+                first: DirectoryChange::new(
+                    target_parent,
+                    target_name,
+                    source_node,
+                    DirectoryChangeAction::Added,
+                )?,
+                second: None,
+            },
+        ));
+    };
+    if target_collision == HardLinkTargetCollision::Reject {
+        return Err(DriverError::ObjectNameCollision);
+    }
+    let target_node = *target.node();
+    if matches!(target_node, NodeId::Directory(_)) {
+        return Err(DriverError::CannotDelete);
+    }
+    operations.ensure_node_openable(target_node)?;
+    if target_node != source_node {
+        operations.ensure_node_replaceable(target_node)?;
+    }
+    let target_metadata = metadata_from_node(operations.lane_mut(), target_node).await?;
+    if file_attributes(target_metadata) & wdk_sys::FILE_ATTRIBUTE_READONLY != 0 {
+        return Err(DriverError::CannotDelete);
+    }
+
+    let existing_name = target.name().try_to_owned_name()?;
+    let changes = if target.name() == target_name {
+        HardLinkDirectoryChanges {
+            first: DirectoryChange::hard_link_replaced(target_parent, target_name)?,
+            second: None,
+        }
+    } else {
+        HardLinkDirectoryChanges {
+            first: DirectoryChange::new(
+                target_parent,
+                target.name(),
+                target_node,
+                DirectoryChangeAction::Removed,
+            )?,
+            second: Some(
+                Box::try_new(DirectoryChange::new(
+                    target_parent,
+                    target_name,
+                    source_node,
+                    DirectoryChangeAction::Added,
+                )?)
+                .map_err(|_| DriverError::InsufficientResources)?,
+            ),
+        }
+    };
+    let count_effect = if target_node == source_node {
+        HardLinkCountEffect::Preserve
+    } else {
+        HardLinkCountEffect::Increase
+    };
+    Ok((
+        PreparedHardLinkDestination::Replace { existing_name },
+        count_effect,
+        changes,
+    ))
+}
+
+/// Returns the archive overlay update required by successful hard-link creation.
+/// # Errors
+///
+/// Returns an error when the combined overlay cannot inhabit the ext4 Windows-attribute domain.
+fn hard_link_archive_overlay(
+    current_attributes: wdk_sys::ULONG,
+) -> DriverResult<Option<WindowsOverlay>> {
+    if current_attributes & Ext4WindowsAttributes::ARCHIVE != 0 {
+        return Ok(None);
+    }
+    Ok(Some(WindowsOverlay::new(Ext4WindowsAttributes::new(
+        current_attributes | Ext4WindowsAttributes::ARCHIVE,
+    )?)))
+}
+
 /// Owned rename mutation decoded completely before the first suspension.
 #[derive(Debug)]
 struct RenameMutation {
@@ -878,8 +1186,10 @@ struct RenameMutation {
     source_name: Ext4Name,
     /// Node being moved.
     source_node: NodeId,
-    /// Root-relative destination and collision policy.
-    target: RenameTargetPath,
+    /// Destination path with its explicit resolution base.
+    target: NamespaceTargetPath,
+    /// Existing-target behavior decoded from the rename information class.
+    target_collision: RenameTargetCollision,
 }
 
 impl RenameMutation {
@@ -896,7 +1206,6 @@ impl RenameMutation {
         if opened_file.delete_pending() {
             return Err(DriverError::DeletePending);
         }
-        let target = RenameTargetPath::parse(active, stack.length(), format)?;
         let (source_parent, source_name) = match opened_file.location() {
             OpenedLocation::DirectoryEntry { parent, name } => (*parent, name.try_to_owned_name()?),
             OpenedLocation::Root => {
@@ -904,11 +1213,15 @@ impl RenameMutation {
             }
             OpenedLocation::FileReference => return Err(DriverError::NotSupported),
         };
+        let input = active.buffered_input(stack.length())?;
+        let target_collision = format.target_collision(input.as_slice())?;
+        let target = NamespaceTargetPath::decode(input.as_slice(), source_parent)?;
         Ok(Self {
             source_parent,
             source_name,
             source_node: opened_file.node(),
             target,
+            target_collision,
         })
     }
 }
@@ -978,9 +1291,10 @@ async fn set_rename_information(
         source_name,
         source_node,
         target,
+        target_collision,
     } = mutation;
     let (target_parent, target_name) =
-        resolve_rename_target(operations.lane_mut(), &target).await?;
+        resolve_namespace_target(operations.lane_mut(), &target).await?;
     operations.ensure_node_openable(NodeId::Directory(source_parent))?;
     operations.ensure_node_openable(NodeId::Directory(target_parent))?;
     let notifications = RenameDirectoryNameChanges::prepare(
@@ -990,7 +1304,7 @@ async fn set_rename_information(
         source_node,
         target_parent,
         &target_name,
-        &target,
+        target_collision,
     )
     .await?;
     let notifications = notifications
@@ -1009,7 +1323,7 @@ async fn set_rename_information(
             &source_name,
             target_parent,
             &target_name,
-            target.target_collision(),
+            target_collision,
         )
         .await?;
     transaction.commit().await?;
@@ -1029,11 +1343,11 @@ async fn set_rename_information(
 #[derive(Clone, Copy, Debug)]
 struct RenameDirectoryNameChanges {
     /// Existing target entry removed by a replace-capable rename.
-    replaced_target: Option<DirectoryNameChange>,
+    replaced_target: Option<DirectoryChange>,
     /// Source entry under its former name.
-    old_source_name: DirectoryNameChange,
+    old_source_name: DirectoryChange,
     /// Source entry under its new name.
-    new_source_name: DirectoryNameChange,
+    new_source_name: DirectoryChange,
 }
 
 impl RenameDirectoryNameChanges {
@@ -1049,13 +1363,13 @@ impl RenameDirectoryNameChanges {
         source_node: NodeId,
         target_parent: DirectoryNodeId,
         target_name: &Ext4Name,
-        target: &RenameTargetPath,
+        target_collision: RenameTargetCollision,
     ) -> DriverResult<Option<Self>> {
         if source_parent == target_parent && source_name == target_name {
             return Ok(None);
         }
 
-        let replaced_target = match target.target_collision() {
+        let replaced_target = match target_collision {
             RenameTargetCollision::Reject => None,
             RenameTargetCollision::Replace => {
                 let parent = operations
@@ -1066,17 +1380,17 @@ impl RenameDirectoryNameChanges {
                 match operations
                     .lane_mut()
                     .journaled_mut()
-                    .lookup_windows_child(&parent, target.target_name())
+                    .lookup_windows_child(&parent, &WindowsName::from_ext4(target_name)?)
                     .await?
                 {
                     ChildLookup::Found(child) if *child.node() == source_node => return Ok(None),
                     ChildLookup::Found(child) => {
-                        operations.ensure_node_openable(*child.node())?;
-                        Some(DirectoryNameChange::new(
+                        operations.ensure_node_replaceable(*child.node())?;
+                        Some(DirectoryChange::new(
                             target_parent,
                             child.name(),
                             *child.node(),
-                            DirectoryNameChangeAction::Removed,
+                            DirectoryChangeAction::Removed,
                         )?)
                     }
                     ChildLookup::NotFound => None,
@@ -1086,17 +1400,17 @@ impl RenameDirectoryNameChanges {
 
         Ok(Some(Self {
             replaced_target,
-            old_source_name: DirectoryNameChange::new(
+            old_source_name: DirectoryChange::new(
                 source_parent,
                 source_name,
                 source_node,
-                DirectoryNameChangeAction::RenamedOldName,
+                DirectoryChangeAction::RenamedOldName,
             )?,
-            new_source_name: DirectoryNameChange::new(
+            new_source_name: DirectoryChange::new(
                 target_parent,
                 target_name,
                 source_node,
-                DirectoryNameChangeAction::RenamedNewName,
+                DirectoryChangeAction::RenamedNewName,
             )?,
         }))
     }
@@ -1104,10 +1418,10 @@ impl RenameDirectoryNameChanges {
     /// Reports every name transition after the corresponding ext4 transaction commits.
     fn report(self, vcb: &VolumeControlBlock) {
         if let Some(replaced_target) = self.replaced_target {
-            vcb.report_directory_name_change(replaced_target);
+            vcb.report_directory_change(replaced_target);
         }
-        vcb.report_directory_name_change(self.old_source_name);
-        vcb.report_directory_name_change(self.new_source_name);
+        vcb.report_directory_change(self.old_source_name);
+        vcb.report_directory_change(self.new_source_name);
     }
 }
 
@@ -1903,11 +2217,11 @@ async fn delete_after_final_cleanup(mut plan: PendingCleanupDeletion) -> DriverR
         ChildLookup::Found(child) if *child.node() == plan.node => {}
         ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
     }
-    let notification = DirectoryNameChange::new(
+    let notification = DirectoryChange::new(
         target.parent(),
         target.name(),
         plan.node,
-        DirectoryNameChangeAction::Removed,
+        DirectoryChangeAction::Removed,
     )?;
     let mut transaction = plan
         .operations
@@ -1926,7 +2240,7 @@ async fn delete_after_final_cleanup(mut plan: PendingCleanupDeletion) -> DriverR
     }
     transaction.commit().await?;
     plan.operations.complete_file_delete(plan.fcb, plan.target);
-    plan.operations.report_directory_name_change(notification);
+    plan.operations.report_directory_change(notification);
     Ok(())
 }
 
@@ -1981,43 +2295,67 @@ fn read_file_information_input<T: Copy>(
     active.buffered_input(length)?.read_unaligned()
 }
 
-/// Decoded FILE_RENAME_INFORMATION target path.
+/// Decoded variable-length namespace destination shared by rename and hard-link information.
 #[derive(Debug, Eq, PartialEq)]
-struct RenameTargetPath {
-    /// Root-relative target path.
+struct NamespaceTargetPath {
+    /// Directory from which the path starts.
+    base: NamespaceTargetBase,
+    /// Non-empty path below `base`.
     path: NonEmptyWindowsPath,
-    /// Target collision behavior requested by the Windows rename input.
-    target_collision: RenameTargetCollision,
 }
 
-impl RenameTargetPath {
-    /// Decodes a FILE_RENAME_INFORMATION variable-length input buffer.
+/// Starting directory selected by Windows namespace-target path syntax.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NamespaceTargetBase {
+    /// A single relative name starts in the source link's current parent.
+    OpenedParent(DirectoryNodeId),
+    /// A leading backslash starts at the mounted volume root.
+    VolumeRoot,
+}
+
+impl NamespaceTargetPath {
+    /// Decodes the common FILE_RENAME_INFORMATION / FILE_LINK_INFORMATION path layout.
     /// # Errors
     ///
-    /// Returns an error when the rename input buffer is truncated, uses unsupported flags or root
-    /// handles, has an invalid name length, or encodes an invalid target path.
-    fn parse(
-        active: &ActiveIrp<'_>,
-        length: IrpBufferLength,
-        format: RenameInformationFormat,
-    ) -> DriverResult<Self> {
-        let input = active.buffered_input(length)?;
-        let bytes = input.as_slice();
-        let target_collision = format.target_collision(bytes)?;
+    /// Returns an error when the input is truncated, carries an unsupported root handle, has an
+    /// invalid name length, or encodes a relative multi-component path.
+    fn decode(bytes: &[u8], opened_parent: DirectoryNodeId) -> DriverResult<Self> {
+        if bytes.len() < core::mem::size_of::<wdk_sys::FILE_LINK_INFORMATION>() {
+            return Err(DriverError::InfoLengthMismatch);
+        }
         reject_root_directory(bytes)?;
         let name_length = usize::try_from(
-            LittleEndianInput::new(bytes).read_u32(wire_offset(FILE_RENAME_NAME_LENGTH_OFFSET))?,
+            LittleEndianInput::new(bytes)
+                .read_u32(wire_offset(FILE_NAMESPACE_NAME_LENGTH_OFFSET))?,
         )
         .map_err(|_| DriverError::InvalidParameter)?;
         if name_length == 0 || name_length & 1 != 0 {
             return Err(DriverError::InvalidParameter);
         }
-        let name_bytes = input_range(bytes, FILE_RENAME_NAME_OFFSET, name_length)?;
+        let name_bytes = input_range(bytes, FILE_NAMESPACE_NAME_OFFSET, name_length)?;
         let units = utf16_units_from_le_bytes(name_bytes)?;
+        let (base, path_units) = match units.as_slice().split_first() {
+            Some((first, rest)) if *first == UTF16_BACKSLASH => {
+                (NamespaceTargetBase::VolumeRoot, rest)
+            }
+            Some(_) if units.as_slice().contains(&UTF16_BACKSLASH) => {
+                return Err(DriverError::InvalidParameter);
+            }
+            Some(_) => (
+                NamespaceTargetBase::OpenedParent(opened_parent),
+                units.as_slice(),
+            ),
+            None => return Err(DriverError::InvalidParameter),
+        };
         Ok(Self {
-            path: NonEmptyWindowsPath::from_utf16_path(units.as_slice())?,
-            target_collision,
+            base,
+            path: NonEmptyWindowsPath::from_utf16_path(path_units)?,
         })
+    }
+
+    /// Returns the directory from which resolution starts.
+    const fn base(&self) -> NamespaceTargetBase {
+        self.base
     }
 
     /// Returns parent components before the target name.
@@ -2029,10 +2367,53 @@ impl RenameTargetPath {
     fn target_name(&self) -> &WindowsName {
         self.path.target_name()
     }
+}
 
-    /// Returns the collision behavior selected at the Windows boundary.
-    const fn target_collision(&self) -> RenameTargetCollision {
-        self.target_collision
+/// Existing-target behavior decoded from a hard-link information class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HardLinkTargetCollision {
+    /// The Windows-visible destination must be vacant.
+    Reject,
+    /// One non-directory destination entry may be replaced.
+    Replace,
+}
+
+/// FILE_LINK_INFORMATION union arm selected by the information class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HardLinkInformationFormat {
+    /// `FileLinkInformation` exposes a BOOLEAN ReplaceIfExists field.
+    ReplaceIfExistsByte,
+    /// `FileLinkInformationEx` exposes a ULONG Flags field.
+    Flags,
+}
+
+impl HardLinkInformationFormat {
+    /// Decodes target-collision semantics from the selected hard-link input format.
+    /// # Errors
+    ///
+    /// Returns not-supported when extended semantics cannot be represented faithfully.
+    fn target_collision(self, bytes: &[u8]) -> DriverResult<HardLinkTargetCollision> {
+        match self {
+            Self::ReplaceIfExistsByte => match bytes
+                .get(FILE_NAMESPACE_REPLACE_IF_EXISTS_OFFSET)
+                .ok_or(DriverError::BufferTooSmall)?
+            {
+                0 => Ok(HardLinkTargetCollision::Reject),
+                _ => Ok(HardLinkTargetCollision::Replace),
+            },
+            Self::Flags => {
+                let flags = LittleEndianInput::new(bytes)
+                    .read_u32(wire_offset(FILE_NAMESPACE_FLAGS_OFFSET))?;
+                if flags & !wdk_sys::FILE_LINK_REPLACE_IF_EXISTS != 0 {
+                    return Err(DriverError::NotSupported);
+                }
+                if flags & wdk_sys::FILE_LINK_REPLACE_IF_EXISTS != 0 {
+                    Ok(HardLinkTargetCollision::Replace)
+                } else {
+                    Ok(HardLinkTargetCollision::Reject)
+                }
+            }
+        }
     }
 }
 
@@ -2053,7 +2434,7 @@ impl RenameInformationFormat {
     fn target_collision(self, bytes: &[u8]) -> DriverResult<RenameTargetCollision> {
         match self {
             Self::ReplaceIfExistsByte => match bytes
-                .get(FILE_RENAME_REPLACE_IF_EXISTS_OFFSET)
+                .get(FILE_NAMESPACE_REPLACE_IF_EXISTS_OFFSET)
                 .ok_or(DriverError::BufferTooSmall)?
             {
                 0 => Ok(RenameTargetCollision::Reject),
@@ -2061,7 +2442,7 @@ impl RenameInformationFormat {
             },
             Self::Flags => {
                 let flags = LittleEndianInput::new(bytes)
-                    .read_u32(wire_offset(FILE_RENAME_FLAGS_OFFSET))?;
+                    .read_u32(wire_offset(FILE_NAMESPACE_FLAGS_OFFSET))?;
                 if flags & !SUPPORTED_RENAME_EX_FLAGS != 0 {
                     return Err(DriverError::NotSupported);
                 }
@@ -2091,15 +2472,15 @@ impl NonEmptyWindowsPath {
     /// Returns an error when the path is empty after root separators are removed or any component is
     /// not a valid Windows name.
     fn from_utf16_path(units: &[u16]) -> DriverResult<Self> {
-        let mut trimmed = units;
-        while let Some(rest) = trimmed.strip_prefix(&[UTF16_BACKSLASH]) {
-            trimmed = rest;
-        }
-        if trimmed.is_empty() {
+        if units.is_empty()
+            || units
+                .split(|unit| *unit == UTF16_BACKSLASH)
+                .any(<[u16]>::is_empty)
+        {
             return Err(DriverError::InvalidParameter);
         }
         let mut components = DriverVec::new();
-        for component in trimmed.split(|unit| *unit == UTF16_BACKSLASH) {
+        for component in units.split(|unit| *unit == UTF16_BACKSLASH) {
             components
                 .try_push_owned(WindowsName::from_utf16(component)?)
                 .map_err(|error| error.into_parts().0)?;
@@ -2122,31 +2503,30 @@ impl NonEmptyWindowsPath {
     }
 }
 
-/// Offset of FILE_RENAME_INFORMATION ReplaceIfExists.
-const FILE_RENAME_REPLACE_IF_EXISTS_OFFSET: usize = 0;
-/// Offset of FILE_RENAME_INFORMATION_EX Flags.
-const FILE_RENAME_FLAGS_OFFSET: usize = 0;
-/// Offset of FILE_RENAME_INFORMATION RootDirectory.
-const FILE_RENAME_ROOT_DIRECTORY_OFFSET: usize = 8;
-/// Offset of FILE_RENAME_INFORMATION FileNameLength.
-const FILE_RENAME_NAME_LENGTH_OFFSET: usize = 16;
-/// Offset of FILE_RENAME_INFORMATION FileName.
-const FILE_RENAME_NAME_OFFSET: usize = 20;
-/// FILE_DISPOSITION_INFORMATION_EX flags handled by this driver.
+/// Offset of the legacy namespace-information ReplaceIfExists field.
+const FILE_NAMESPACE_REPLACE_IF_EXISTS_OFFSET: usize = 0;
+/// Offset of the extended namespace-information Flags field.
+const FILE_NAMESPACE_FLAGS_OFFSET: usize = 0;
+/// Offset of the namespace-information RootDirectory field.
+const FILE_NAMESPACE_ROOT_DIRECTORY_OFFSET: usize = 8;
+/// Offset of the namespace-information FileNameLength field.
+const FILE_NAMESPACE_NAME_LENGTH_OFFSET: usize = 16;
+/// Offset of the namespace-information FileName field.
+const FILE_NAMESPACE_NAME_OFFSET: usize = 20;
 /// FILE_RENAME_INFORMATION_EX flags handled by this driver.
 const SUPPORTED_RENAME_EX_FLAGS: wdk_sys::ULONG =
     wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE | wdk_sys::FILE_RENAME_REPLACE_IF_EXISTS;
 /// UTF-16 backslash separator.
 const UTF16_BACKSLASH: u16 = 0x005C;
 
-/// Rejects FILE_RENAME_INFORMATION payloads carrying an unsupported root handle.
+/// Rejects namespace-information payloads carrying an unsupported root handle.
 /// # Errors
 ///
 /// Returns an error when the root-directory handle field is present and nonzero.
 fn reject_root_directory(bytes: &[u8]) -> DriverResult<()> {
     if input_range(
         bytes,
-        FILE_RENAME_ROOT_DIRECTORY_OFFSET,
+        FILE_NAMESPACE_ROOT_DIRECTORY_OFFSET,
         core::mem::size_of::<wdk_sys::HANDLE>(),
     )?
     .iter()
@@ -2178,16 +2558,19 @@ fn utf16_units_from_le_bytes(bytes: &[u8]) -> DriverResult<DriverVec<u16>> {
     Ok(units)
 }
 
-/// Resolves the target parent directory and final ext4 name for a rename.
+/// Resolves the target parent directory and final ext4 name for a namespace mutation.
 /// # Errors
 ///
 /// Returns an error when any parent component is absent or not a directory, or the target Windows
 /// name cannot be converted to an ext4 name.
-async fn resolve_rename_target(
+async fn resolve_namespace_target(
     operations: &mut VolumeOperationLane,
-    target: &RenameTargetPath,
+    target: &NamespaceTargetPath,
 ) -> DriverResult<(DirectoryNodeId, Ext4Name)> {
-    let mut parent_id = DirectoryNodeId::ROOT;
+    let mut parent_id = match target.base() {
+        NamespaceTargetBase::OpenedParent(parent) => parent,
+        NamespaceTargetBase::VolumeRoot => DirectoryNodeId::ROOT,
+    };
     for component in target.parents() {
         let parent = operations
             .journaled_mut()
@@ -3240,6 +3623,8 @@ fn release_file_contexts(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use crate::irp::{
         CreateDeletion, DataIoKind, DirectoryInformationClass, FileAttributesWriteAccess,
         ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, WriteStartingPoint,
@@ -3281,6 +3666,33 @@ mod tests {
                 super::FileMetadataKind::Symlink => super::FileMetadataReparsePoint::SymbolicLink,
             },
         })
+    }
+
+    /// Builds one variable-length namespace information buffer.
+    fn namespace_information_input(units: &[u16]) -> Option<alloc::vec::Vec<u8>> {
+        let name_bytes = units.len().checked_mul(core::mem::size_of::<u16>())?;
+        let payload = super::FILE_NAMESPACE_NAME_OFFSET.checked_add(name_bytes)?;
+        let total = core::cmp::max(
+            payload,
+            core::mem::size_of::<wdk_sys::FILE_LINK_INFORMATION>(),
+        );
+        let mut input = vec![0_u8; total];
+        if !put_le_u32(
+            &mut input,
+            super::FILE_NAMESPACE_NAME_LENGTH_OFFSET,
+            u32::try_from(name_bytes).ok()?,
+        ) {
+            return None;
+        }
+        let name = input.get_mut(super::FILE_NAMESPACE_NAME_OFFSET..total)?;
+        let (outputs, remainder) = name.as_chunks_mut::<2>();
+        if !remainder.is_empty() {
+            return None;
+        }
+        for (output, unit) in outputs.iter_mut().zip(units.iter().copied()) {
+            output.copy_from_slice(&unit.to_le_bytes());
+        }
+        Some(input)
     }
 
     /// Reads one little-endian u32 from a test output buffer.
@@ -4041,10 +4453,10 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn rename_ex_flags_decode_collision_and_reject_unsupported_semantics() {
-        let mut input = [0_u8; super::FILE_RENAME_NAME_OFFSET + 2];
+        let mut input = [0_u8; super::FILE_NAMESPACE_NAME_OFFSET + 2];
         assert!(put_le_u32(
             &mut input,
-            super::FILE_RENAME_FLAGS_OFFSET,
+            super::FILE_NAMESPACE_FLAGS_OFFSET,
             wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE,
         ));
         assert_eq!(
@@ -4054,7 +4466,7 @@ mod tests {
 
         assert!(put_le_u32(
             &mut input,
-            super::FILE_RENAME_FLAGS_OFFSET,
+            super::FILE_NAMESPACE_FLAGS_OFFSET,
             wdk_sys::FILE_RENAME_REPLACE_IF_EXISTS,
         ));
         assert_eq!(
@@ -4064,7 +4476,7 @@ mod tests {
 
         assert!(put_le_u32(
             &mut input,
-            super::FILE_RENAME_FLAGS_OFFSET,
+            super::FILE_NAMESPACE_FLAGS_OFFSET,
             wdk_sys::FILE_RENAME_POSIX_SEMANTICS,
         ));
         assert_eq!(
@@ -4075,13 +4487,152 @@ mod tests {
 
     /// # Panics
     ///
+    /// Panics when hard-link legacy/extended collision semantics drift.
+    #[test]
+    fn hard_link_flags_decode_collision_and_reject_unimplemented_semantics() {
+        let mut input = [0_u8; super::FILE_NAMESPACE_NAME_OFFSET + 2];
+        assert_eq!(
+            super::HardLinkInformationFormat::ReplaceIfExistsByte.target_collision(&input),
+            Ok(super::HardLinkTargetCollision::Reject)
+        );
+        let Some(replace) = input.get_mut(super::FILE_NAMESPACE_REPLACE_IF_EXISTS_OFFSET) else {
+            return;
+        };
+        *replace = 1;
+        assert_eq!(
+            super::HardLinkInformationFormat::ReplaceIfExistsByte.target_collision(&input),
+            Ok(super::HardLinkTargetCollision::Replace)
+        );
+
+        assert!(put_le_u32(
+            &mut input,
+            super::FILE_NAMESPACE_FLAGS_OFFSET,
+            wdk_sys::FILE_LINK_REPLACE_IF_EXISTS,
+        ));
+        assert_eq!(
+            super::HardLinkInformationFormat::Flags.target_collision(&input),
+            Ok(super::HardLinkTargetCollision::Replace)
+        );
+        for unsupported in [
+            wdk_sys::FILE_LINK_POSIX_SEMANTICS,
+            wdk_sys::FILE_LINK_IGNORE_READONLY_ATTRIBUTE,
+        ] {
+            assert!(put_le_u32(
+                &mut input,
+                super::FILE_NAMESPACE_FLAGS_OFFSET,
+                unsupported,
+            ));
+            assert_eq!(
+                super::HardLinkInformationFormat::Flags.target_collision(&input),
+                Err(DriverError::NotSupported)
+            );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the Windows hard-link limit or archive transition drifts.
+    #[test]
+    fn hard_link_count_and_archive_boundaries_are_explicit() {
+        let below_limit = Ext4LinkCount::new(1023);
+        let at_limit = Ext4LinkCount::new(1024);
+        assert!(below_limit.is_ok());
+        assert!(at_limit.is_ok());
+        if let (Ok(below_limit), Ok(at_limit)) = (below_limit, at_limit) {
+            assert_eq!(
+                super::HardLinkCountEffect::Increase.validate(below_limit),
+                Ok(())
+            );
+            assert_eq!(
+                super::HardLinkCountEffect::Increase.validate(at_limit),
+                Err(DriverError::from(ext4_core::Error::TooManyLinks))
+            );
+            assert_eq!(
+                super::HardLinkCountEffect::Preserve.validate(at_limit),
+                Ok(())
+            );
+        }
+
+        let overlay = super::hard_link_archive_overlay(0);
+        assert!(overlay.is_ok());
+        if let Ok(Some(overlay)) = overlay {
+            assert_eq!(
+                overlay.attributes().bits(),
+                ext4_core::Ext4WindowsAttributes::ARCHIVE
+            );
+        }
+        assert_eq!(
+            super::hard_link_archive_overlay(ext4_core::Ext4WindowsAttributes::ARCHIVE),
+            Ok(None)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when namespace path bases or relative-path rejection drift.
+    #[test]
+    fn namespace_target_distinguishes_opened_parent_from_volume_root() {
+        let truncated = [0_u8; core::mem::size_of::<wdk_sys::FILE_LINK_INFORMATION>() - 1];
+        assert_eq!(
+            super::NamespaceTargetPath::decode(&truncated, DirectoryNodeId::ROOT),
+            Err(DriverError::InfoLengthMismatch)
+        );
+
+        let relative = namespace_information_input(&[u16::from(b'a')]);
+        assert!(relative.is_some());
+        if let Some(relative) = relative {
+            let decoded = super::NamespaceTargetPath::decode(&relative, DirectoryNodeId::ROOT);
+            assert!(decoded.is_ok());
+            if let Ok(decoded) = decoded {
+                assert_eq!(
+                    decoded.base(),
+                    super::NamespaceTargetBase::OpenedParent(DirectoryNodeId::ROOT)
+                );
+                assert!(decoded.parents().is_empty());
+            }
+        }
+
+        let absolute = namespace_information_input(&[
+            super::UTF16_BACKSLASH,
+            u16::from(b'd'),
+            u16::from(b'i'),
+            u16::from(b'r'),
+            super::UTF16_BACKSLASH,
+            u16::from(b'a'),
+        ]);
+        assert!(absolute.is_some());
+        if let Some(absolute) = absolute {
+            let decoded = super::NamespaceTargetPath::decode(&absolute, DirectoryNodeId::ROOT);
+            assert!(decoded.is_ok());
+            if let Ok(decoded) = decoded {
+                assert_eq!(decoded.base(), super::NamespaceTargetBase::VolumeRoot);
+                assert_eq!(decoded.parents().len(), 1);
+            }
+        }
+
+        let relative_path = namespace_information_input(&[
+            u16::from(b'd'),
+            super::UTF16_BACKSLASH,
+            u16::from(b'a'),
+        ]);
+        assert!(relative_path.is_some());
+        if let Some(relative_path) = relative_path {
+            assert_eq!(
+                super::NamespaceTargetPath::decode(&relative_path, DirectoryNodeId::ROOT),
+                Err(DriverError::InvalidParameter)
+            );
+        }
+    }
+
+    /// # Panics
+    ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn rename_root_directory_field_is_not_supported() {
-        let mut input = [0_u8; super::FILE_RENAME_ROOT_DIRECTORY_OFFSET + 8];
+        let mut input = [0_u8; super::FILE_NAMESPACE_ROOT_DIRECTORY_OFFSET + 8];
         let Some(root_directory) = input.get_mut(
-            super::FILE_RENAME_ROOT_DIRECTORY_OFFSET
-                ..super::FILE_RENAME_ROOT_DIRECTORY_OFFSET
+            super::FILE_NAMESPACE_ROOT_DIRECTORY_OFFSET
+                ..super::FILE_NAMESPACE_ROOT_DIRECTORY_OFFSET
                     + core::mem::size_of::<wdk_sys::HANDLE>(),
         ) else {
             return;
@@ -4101,14 +4652,15 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn rename_replace_flag_decode_boundary_selects_replace_collision() {
-        let mut input = [0_u8; super::FILE_RENAME_NAME_OFFSET + 2];
-        let Some(replace_flag) = input.get_mut(super::FILE_RENAME_REPLACE_IF_EXISTS_OFFSET) else {
+        let mut input = [0_u8; core::mem::size_of::<wdk_sys::FILE_RENAME_INFORMATION>()];
+        let Some(replace_flag) = input.get_mut(super::FILE_NAMESPACE_REPLACE_IF_EXISTS_OFFSET)
+        else {
             return;
         };
         *replace_flag = 1;
         let name_length = input.get_mut(
-            super::FILE_RENAME_NAME_LENGTH_OFFSET
-                ..super::FILE_RENAME_NAME_LENGTH_OFFSET + core::mem::size_of::<u32>(),
+            super::FILE_NAMESPACE_NAME_LENGTH_OFFSET
+                ..super::FILE_NAMESPACE_NAME_LENGTH_OFFSET + core::mem::size_of::<u32>(),
         );
         assert!(
             name_length.is_some(),
@@ -4119,7 +4671,7 @@ mod tests {
         };
         name_length.copy_from_slice(&2_u32.to_le_bytes());
         let name =
-            input.get_mut(super::FILE_RENAME_NAME_OFFSET..super::FILE_RENAME_NAME_OFFSET + 2);
+            input.get_mut(super::FILE_NAMESPACE_NAME_OFFSET..super::FILE_NAMESPACE_NAME_OFFSET + 2);
         assert!(
             name.is_some(),
             "test rename buffer contains the first UTF-16 code unit"
@@ -4160,17 +4712,20 @@ mod tests {
         if let Ok(target) = target.as_mut() {
             let parsed = target.with_active(|active| {
                 let stack = active.current_stack()?.set_file()?;
-                super::RenameTargetPath::parse(
-                    active,
-                    stack.length(),
-                    super::RenameInformationFormat::ReplaceIfExistsByte,
+                super::NamespaceTargetPath::decode(
+                    active.buffered_input(stack.length())?.as_slice(),
+                    ext4_core::DirectoryNodeId::ROOT,
                 )
             });
             assert!(parsed.is_ok());
             if let Ok(parsed) = parsed {
                 assert_eq!(
-                    parsed.target_collision(),
-                    ext4_core::RenameTargetCollision::Replace
+                    super::RenameInformationFormat::ReplaceIfExistsByte.target_collision(&input),
+                    Ok(ext4_core::RenameTargetCollision::Replace)
+                );
+                assert_eq!(
+                    parsed.base(),
+                    super::NamespaceTargetBase::OpenedParent(ext4_core::DirectoryNodeId::ROOT,)
                 );
             }
         }

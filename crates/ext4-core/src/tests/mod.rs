@@ -40,11 +40,11 @@ use crate::{
     Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4Uid, Ext4VolumeLabel,
     Ext4WindowsAttributes, FileNode, FileNodeId, FileOffset, FileSize, FscryptFileNonce,
     FscryptKeySet, FscryptMasterKey, FscryptNonceGenerator, FsverityBlockSize, FsverityEnable,
-    FsverityHashAlgorithm, FsveritySalt, FsveritySignature, JournalTransaction, JournaledVolume,
-    MountContext, NewDirectoryMetadata, NewFileMetadata, NewSymlinkMetadata, NodeId,
-    RenameTargetCollision, SymlinkNode, SymlinkTarget, TransactionDirectory, TransactionFile,
-    WindowsName, WindowsOverlay, WindowsSymlinkReparsePoint, XattrName, XattrNamespace, XattrSet,
-    XattrValue,
+    FsverityHashAlgorithm, FsveritySalt, FsveritySignature, HardLinkDestination,
+    JournalTransaction, JournaledVolume, MountContext, NewDirectoryMetadata, NewFileMetadata,
+    NewSymlinkMetadata, NodeId, RenameTargetCollision, SymlinkNode, SymlinkTarget,
+    TransactionDirectory, TransactionFile, WindowsName, WindowsOverlay, WindowsSymlinkReparsePoint,
+    XattrName, XattrNamespace, XattrSet, XattrValue,
 };
 
 const BLOCK_SIZE: usize = 1024;

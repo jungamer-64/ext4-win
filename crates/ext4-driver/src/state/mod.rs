@@ -1176,6 +1176,20 @@ impl VolumeOperationLease {
         }
     }
 
+    /// Requires an existing replacement target to have no active handles.
+    /// # Errors
+    ///
+    /// Returns delete-pending for a terminal target or sharing-violation while any active handle
+    /// could still reference an inode that replacement would unlink.
+    pub(crate) fn ensure_node_replaceable(&self, node: NodeId) -> DriverResult<()> {
+        let ledger = unsafe {
+            // SAFETY: The mounted VCB and its independently synchronized ledger remain live for
+            // this actor lease.
+            self.file_control_blocks.as_ref()
+        };
+        ledger.ensure_node_replaceable(node)
+    }
+
     /// Publishes successful removal of the exact FCB-owned delete target.
     pub(crate) fn complete_file_delete(
         &mut self,
@@ -1205,12 +1219,12 @@ impl VolumeOperationLease {
     }
 
     /// Reports one committed namespace mutation through the mounted VCB notifier.
-    pub(crate) fn report_directory_name_change(&self, change: DirectoryNameChange) {
+    pub(crate) fn report_directory_change(&self, change: DirectoryChange) {
         let volume = unsafe {
             // SAFETY: The actor lease retains the heap-stable mounted VCB for this request.
             self.owner.as_non_null().as_ref()
         };
-        volume.report_directory_name_change(change);
+        volume.report_directory_change(change);
     }
 
     /// Returns the actor-owned operation lane through this exclusive capability.
@@ -1763,6 +1777,30 @@ impl FileControlBlockLedger {
         };
         state.delete_pending()
     }
+
+    /// Requires a currently open inode to permit ordinary namespace replacement.
+    /// # Errors
+    ///
+    /// Returns delete-pending or sharing-violation when the open state rejects replacement.
+    fn ensure_node_replaceable(&self, node: NodeId) -> DriverResult<()> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table and open-state observation.
+            &*self.table.get()
+        };
+        let Some(fcb) = find_file_control_block_in_table(table, node) else {
+            return Ok(());
+        };
+        let fcb = unsafe {
+            // SAFETY: The table owns this FCB and the resource remains held for the observation.
+            fcb.as_ref()
+        };
+        let state = unsafe {
+            // SAFETY: The ledger resource serializes this FCB open-state observation.
+            &*fcb.open_state.get()
+        };
+        state.ensure_namespace_replaceable()
+    }
 }
 
 #[derive(Debug)]
@@ -1812,7 +1850,7 @@ impl VolumeControlBlock {
     }
 
     /// Reports one committed namespace name change to pending directory watchers.
-    pub(crate) fn report_directory_name_change(&self, change: DirectoryNameChange) {
+    pub(crate) fn report_directory_change(&self, change: DirectoryChange) {
         self.directory_change_notifier.report(change);
     }
 
@@ -1926,23 +1964,26 @@ impl DirectoryNotificationRegistration {
 
 /// Namespace name-change action exposed through directory notifications.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DirectoryNameChangeAction {
+pub(crate) enum DirectoryChangeAction {
     /// A child was created.
     Added,
     /// A child was removed.
     Removed,
+    /// An existing name now resolves to different file metadata.
+    Modified,
     /// A child is being reported under its former name.
     RenamedOldName,
     /// A child is being reported under its replacement name.
     RenamedNewName,
 }
 
-impl DirectoryNameChangeAction {
+impl DirectoryChangeAction {
     /// Returns the WDK FILE_ACTION payload for this namespace mutation.
     const fn as_ulong(self) -> wdk_sys::ULONG {
         match self {
             Self::Added => wdk_sys::FILE_ACTION_ADDED,
             Self::Removed => wdk_sys::FILE_ACTION_REMOVED,
+            Self::Modified => wdk_sys::FILE_ACTION_MODIFIED,
             Self::RenamedOldName => wdk_sys::FILE_ACTION_RENAMED_OLD_NAME,
             Self::RenamedNewName => wdk_sys::FILE_ACTION_RENAMED_NEW_NAME,
         }
@@ -1951,16 +1992,16 @@ impl DirectoryNameChangeAction {
 
 /// Committed namespace mutation prepared before its ext4 transaction is published.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DirectoryNameChange {
+pub(crate) struct DirectoryChange {
     /// Full synthetic target name used only by the FsRtl notifier package.
     target: DirectoryNotificationTarget,
     /// FILE_NOTIFY_CHANGE_FILE_NAME or FILE_NOTIFY_CHANGE_DIR_NAME.
     completion_filter: wdk_sys::ULONG,
     /// FILE_ACTION_* payload written to matching watcher buffers.
-    action: DirectoryNameChangeAction,
+    action: DirectoryChangeAction,
 }
 
-impl DirectoryNameChange {
+impl DirectoryChange {
     /// Builds a namespace change event for one parent/name/node tuple.
     /// # Errors
     ///
@@ -1970,7 +2011,7 @@ impl DirectoryNameChange {
         parent: DirectoryNodeId,
         name: &Ext4Name,
         node: NodeId,
-        action: DirectoryNameChangeAction,
+        action: DirectoryChangeAction,
     ) -> DriverResult<Self> {
         let completion_filter = if matches!(node, NodeId::Directory(_)) {
             wdk_sys::FILE_NOTIFY_CHANGE_DIR_NAME
@@ -1981,6 +2022,29 @@ impl DirectoryNameChange {
             target: DirectoryNotificationTarget::new(parent, name)?,
             completion_filter,
             action,
+        })
+    }
+
+    /// Builds the metadata-change event required when one exact file link is replaced in place.
+    /// # Errors
+    ///
+    /// Returns an error when the ext4 child name cannot be represented in the Windows notification
+    /// namespace.
+    pub(crate) fn hard_link_replaced(
+        parent: DirectoryNodeId,
+        name: &Ext4Name,
+    ) -> DriverResult<Self> {
+        const FILTER: wdk_sys::ULONG = wdk_sys::FILE_NOTIFY_CHANGE_ATTRIBUTES
+            | wdk_sys::FILE_NOTIFY_CHANGE_SIZE
+            | wdk_sys::FILE_NOTIFY_CHANGE_LAST_WRITE
+            | wdk_sys::FILE_NOTIFY_CHANGE_LAST_ACCESS
+            | wdk_sys::FILE_NOTIFY_CHANGE_CREATION
+            | wdk_sys::FILE_NOTIFY_CHANGE_SECURITY
+            | wdk_sys::FILE_NOTIFY_CHANGE_EA;
+        Ok(Self {
+            target: DirectoryNotificationTarget::new(parent, name)?,
+            completion_filter: FILTER,
+            action: DirectoryChangeAction::Modified,
         })
     }
 }
@@ -2142,7 +2206,7 @@ impl DirectoryChangeNotifier {
     }
 
     /// Reports one committed namespace name change to matching watcher IRPs.
-    fn report(&self, change: DirectoryNameChange) {
+    fn report(&self, change: DirectoryChange) {
         #[cfg(not(test))]
         {
             if !self.initialized {
@@ -3327,6 +3391,19 @@ impl FileControlBlockOpenState {
                 FileCleanupDisposition::Retained,
                 FileCleanupDisposition::Delete,
             )
+    }
+
+    /// Requires ordinary replacement to respect deletion state and open-inode lifetime.
+    /// # Errors
+    ///
+    /// Returns delete-pending or sharing-violation when the current open state rejects replacement.
+    fn ensure_namespace_replaceable(&self) -> DriverResult<()> {
+        self.deletion.ensure_openable()?;
+        if self.share_access.OpenCount == 0 {
+            Ok(())
+        } else {
+            Err(DriverError::ShareAccessConflict)
+        }
     }
 
     /// Publishes a shared delete-pending target and returns displaced storage.
@@ -5155,7 +5232,7 @@ mod tests {
     use super::{
         CleanupStart, CloseReleasePlan, ControlDeviceExtension,
         DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode, DeviceExtensionKind,
-        DirectoryNameChange, DirectoryNameChangeAction, DriverDeviceKind, FileControlBlock,
+        DirectoryChange, DirectoryChangeAction, DriverDeviceKind, FileControlBlock,
         FileControlBlockLedger, FileControlBlockOpenState, FileControlBlockRelease,
         FileObjectCloseKind, HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeDevice,
         MountedVolumeDeviceExtension, MountedVolumeState, NativeFileByteRange,
@@ -5620,17 +5697,17 @@ mod tests {
     ///
     /// Panics when a namespace change does not preserve its synthetic parent/name boundary.
     #[test]
-    fn directory_name_change_encodes_the_child_boundary_and_action() {
+    fn directory_change_encodes_the_child_boundary_and_action() {
         let name = Ext4Name::new(b"child");
         assert!(name.is_ok());
         let Ok(name) = name else {
             return;
         };
-        let change = DirectoryNameChange::new(
+        let change = DirectoryChange::new(
             DirectoryNodeId::ROOT,
             &name,
             NodeId::Directory(DirectoryNodeId::ROOT),
-            DirectoryNameChangeAction::Added,
+            DirectoryChangeAction::Added,
         );
         assert!(change.is_ok());
         let Ok(change) = change else {
@@ -5656,6 +5733,32 @@ mod tests {
         let target_name = change.target.unicode_string();
         assert_eq!(target_name.Buffer, change.target.units.as_ptr().cast_mut());
         assert_eq!(target_name.Length, change.target.byte_length);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when in-place hard-link replacement loses its metadata notification contract.
+    #[test]
+    fn hard_link_replacement_reports_modified_metadata_filters() {
+        let name = Ext4Name::new(b"child");
+        assert!(name.is_ok());
+        let Ok(name) = name else {
+            return;
+        };
+        let change = DirectoryChange::hard_link_replaced(DirectoryNodeId::ROOT, &name);
+        assert!(change.is_ok());
+        let Ok(change) = change else {
+            return;
+        };
+        assert_eq!(change.action.as_ulong(), wdk_sys::FILE_ACTION_MODIFIED);
+        assert_ne!(
+            change.completion_filter & wdk_sys::FILE_NOTIFY_CHANGE_ATTRIBUTES,
+            0
+        );
+        assert_ne!(
+            change.completion_filter & wdk_sys::FILE_NOTIFY_CHANGE_SECURITY,
+            0
+        );
     }
 
     /// # Panics
@@ -6139,6 +6242,25 @@ mod tests {
         assert_eq!(state.share_access.SharedRead, 0);
         assert_eq!(state.share_access.SharedWrite, 0);
         assert_eq!(state.share_access.SharedDelete, 0);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when ordinary namespace replacement can unlink an actively referenced inode.
+    #[test]
+    fn namespace_replacement_requires_no_active_handles() {
+        let mut state = FileControlBlockOpenState::new();
+        assert_eq!(state.ensure_namespace_replaceable(), Ok(()));
+
+        state.share_access.OpenCount = 2;
+        state.share_access.SharedDelete = 2;
+        assert_eq!(
+            state.ensure_namespace_replaceable(),
+            Err(DriverError::ShareAccessConflict)
+        );
+
+        state.share_access.OpenCount = 0;
+        assert_eq!(state.ensure_namespace_replaceable(), Ok(()));
     }
 
     /// # Panics

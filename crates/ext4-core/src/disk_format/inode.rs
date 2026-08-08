@@ -847,9 +847,9 @@ impl Ext4LinkCount {
     /// Returns the next representable live link count.
     ///
     /// # Errors
-    /// Returns an error when incrementing would overflow the ext4 field.
+    /// Returns an error when the ext4 link-count field is saturated.
     pub fn incremented(self) -> Result<Self> {
-        Self::new(self.get().checked_add(1).ok_or(Error::ArithmeticOverflow)?)
+        Self::new(self.get().checked_add(1).ok_or(Error::TooManyLinks)?)
     }
 
     /// Decrements this live link count and reports the live/deleted boundary.
@@ -1729,6 +1729,11 @@ mod tests {
     fn link_count_rejects_deleted_inode_zero() {
         assert_eq!(Ext4LinkCount::new(0), Err(Error::InvalidInode));
         assert_eq!(Ext4LinkCount::new(1), Ok(Ext4LinkCount::ONE));
+        let saturated = Ext4LinkCount::new(u16::MAX);
+        assert!(saturated.is_ok());
+        if let Ok(saturated) = saturated {
+            assert_eq!(saturated.incremented(), Err(Error::TooManyLinks));
+        }
     }
 
     /// # Panics

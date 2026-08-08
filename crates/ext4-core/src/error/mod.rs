@@ -70,6 +70,8 @@ pub enum Error {
     InvalidWriteRange,
     /// A directory already contains the requested child name.
     NameAlreadyExists,
+    /// The inode cannot receive another hard link.
+    TooManyLinks,
     /// A directory does not contain the requested child name.
     DirectoryEntryNotFound,
     /// A directory removal target still contains children.
@@ -134,6 +136,7 @@ impl fmt::Display for Error {
             Self::TransactionTooLarge => "ext4 transaction exceeds journal capacity",
             Self::InvalidWriteRange => "invalid ext4 write range",
             Self::NameAlreadyExists => "directory child name already exists",
+            Self::TooManyLinks => "inode cannot receive another hard link",
             Self::DirectoryEntryNotFound => "directory child name was not found",
             Self::DirectoryNotEmpty => "directory is not empty",
             Self::NoFreeInode => "ext4 volume has no free inodes",

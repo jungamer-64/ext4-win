@@ -14,8 +14,8 @@ pub use node::{
     FileNodeId, NodeId, SymlinkNode, SymlinkNodeId,
 };
 pub use transaction::{
-    JournalTransaction, RenameTargetCollision, TransactionDirectory, TransactionFile,
-    TransactionNode, TransactionSymlink,
+    HardLinkDestination, JournalTransaction, RenameTargetCollision, TransactionDirectory,
+    TransactionFile, TransactionHardLinkSource, TransactionNode, TransactionSymlink,
 };
 
 #[cfg(test)]
