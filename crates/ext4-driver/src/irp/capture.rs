@@ -604,8 +604,6 @@ pub(crate) enum PreparedRequest {
     Create,
     /// Read request with its complete output contract captured.
     Read(PreparedRead),
-    /// Write request.
-    Write,
     /// File information query.
     QueryInformation,
     /// File information mutation.
@@ -659,7 +657,6 @@ impl PreparedRequest {
                 Self::Read(PreparedRead::capture(target, stack)?),
                 generic_key(),
             )),
-            DispatchMajor::Write => Ok((Self::Write, generic_key())),
             DispatchMajor::QueryInformation => Ok((Self::QueryInformation, generic_key())),
             DispatchMajor::SetInformation => Ok((Self::SetInformation, generic_key())),
             DispatchMajor::QueryVolumeInformation => {
