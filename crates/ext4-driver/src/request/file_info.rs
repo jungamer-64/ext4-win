@@ -61,7 +61,7 @@ pub(crate) fn close(target: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion> {
 ///
 /// Returns an error when read stack decoding, output buffer mapping, or ext4 file reading fails.
 pub(crate) async fn read(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    read_regular_file(request).await
+    read_regular_file_direct(request).await
 }
 
 /// Executes regular file data writes.
@@ -3425,6 +3425,79 @@ async fn regular_file_end(
     let end = FileOffset::from_bytes(regular_file_size(operations, file_id).await?.bytes());
     let _signed_end = i64::try_from(end.bytes()).map_err(|_| DriverError::InvalidParameter)?;
     Ok(end)
+}
+
+/// Reads a regular file directly into the output mapping owned by the pending read IRP.
+/// # Errors
+///
+/// Returns an error when the captured read contract, opened FILE_OBJECT, transfer alignment,
+/// byte-range lock, or ext4 data stream is invalid.
+async fn read_regular_file_direct(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    let stack = request.prepared_read()?.stack();
+    let output_address = request.prepared_read()?.output_address();
+    let Some((file_id, kind, range, data_transfer_mode, mut operations)) =
+        request.with_active(|active| {
+            let kind = active.data_io_kind();
+            let file_object = active.current_stack()?.file_object()?;
+            let mut opened_file = OpenedRegularFile::decode(file_object)?;
+            let range = ResolvedFileRange::new(
+                resolve_read_start(&opened_file, kind, stack.starting_point())?,
+                stack.length().as_usize(),
+            )?;
+            let data_transfer_mode = opened_file.data_transfer_mode();
+            data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
+            if stack.length().is_empty() {
+                opened_file.update_current_file_position(kind, range.start(), 0)?;
+                return Ok(None);
+            }
+            data_transfer_mode
+                .validate_buffer(output_address.ok_or(DriverError::InternalInvariantViolation)?)?;
+            if kind == DataIoKind::Handle
+                && !opened_file.file_control_block().permits_byte_range_read(
+                    active.requestor_process()?,
+                    opened_file.file_object(),
+                    range.start(),
+                    range.length(),
+                    stack.key(),
+                )?
+            {
+                return Err(DriverError::FileLockConflict);
+            }
+            Ok(Some((
+                opened_file.id(),
+                kind,
+                range,
+                data_transfer_mode,
+                claim_file_operation_lane(opened_file.file_control_block()),
+            )))
+        })?
+    else {
+        return Ok(IrpCompletion::EMPTY);
+    };
+
+    let file = operations
+        .lane_mut()
+        .journaled_mut()
+        .load_file(file_id)
+        .await?;
+    let bytes_read = {
+        let output = request.prepared_read_mut()?.output_mut()?;
+        data_transfer_mode.validate_buffer(
+            NonNull::new(output.as_mut_ptr()).ok_or(DriverError::InternalInvariantViolation)?,
+        )?;
+        operations
+            .lane_mut()
+            .journaled_mut()
+            .read_file(&file, range.start(), output)
+            .await?
+            .as_usize()
+    };
+    request.with_active(|active| {
+        let file_object = active.current_stack()?.file_object()?;
+        let mut opened_file = OpenedRegularFile::decode(file_object)?;
+        opened_file.update_current_file_position(kind, range.start(), bytes_read)
+    })?;
+    IrpCompletion::from_usize(bytes_read)
 }
 
 /// Writes a regular file range through an ext4 journal transaction.

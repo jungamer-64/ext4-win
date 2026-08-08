@@ -358,7 +358,7 @@ pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
                 let result = crate::request::security::set(owned.request()).await;
                 owned.complete_result(result)
             }
-            PreparedRequest::Read => {
+            PreparedRequest::Read(_) => {
                 let result = crate::request::file_info::read(owned.request()).await;
                 owned.complete_result(result)
             }
@@ -415,7 +415,7 @@ fn actor_request_requires_handle_authorization(owned: &OwnedIrp) -> bool {
             PreparedRequest::DirectoryControl(_)
             | PreparedRequest::QuerySecurity { .. }
             | PreparedRequest::SetSecurity { .. }
-            | PreparedRequest::Read
+            | PreparedRequest::Read(_)
             | PreparedRequest::Write
             | PreparedRequest::QueryInformation
             | PreparedRequest::SetInformation

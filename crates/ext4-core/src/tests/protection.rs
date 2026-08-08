@@ -1,4 +1,54 @@
 use super::*;
+use core::cell::RefCell;
+
+/// Read-only fixture storage that records each exact lower-device request.
+struct ObservedBlockSource<'image, 'observations> {
+    /// Whole device image.
+    bytes: &'image [u8],
+    /// Exact `(offset, length)` requests issued by the core.
+    reads: &'observations RefCell<Vec<(u64, usize)>>,
+}
+
+impl BlockSource for ObservedBlockSource<'_, '_> {
+    fn len(&self) -> DeviceLength {
+        DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
+    }
+
+    async fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
+        self.reads.borrow_mut().push((offset.get(), out.len()));
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(out.len()).ok_or(Error::DeviceRange)?;
+        out.copy_from_slice(self.bytes.get(start..end).ok_or(Error::DeviceRange)?);
+        Ok(())
+    }
+}
+use alloc::rc::Rc;
+use core::{cell::Cell, ops::Range};
+
+/// Read source that can reject any access intersecting one armed physical byte range.
+#[derive(Clone, Debug)]
+struct GuardedBlockSource<'a> {
+    bytes: &'a [u8],
+    forbidden: Range<usize>,
+    armed: Rc<Cell<bool>>,
+}
+
+impl BlockSource for GuardedBlockSource<'_> {
+    fn len(&self) -> DeviceLength {
+        DeviceLength::from_bytes(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
+    }
+
+    async fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
+        let start = usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?;
+        let end = start.checked_add(out.len()).ok_or(Error::DeviceRange)?;
+        if self.armed.get() && start < self.forbidden.end && end > self.forbidden.start {
+            return Err(Error::DeviceRange);
+        }
+        let source = self.bytes.get(start..end).ok_or(Error::DeviceRange)?;
+        out.copy_from_slice(source);
+        Ok(())
+    }
+}
 
 /// # Panics
 ///
@@ -249,6 +299,67 @@ fn verity_file_read_verifies_post_eof_metadata() {
 
 /// # Panics
 ///
+/// Panics when a small read regresses to loading the full verity file or its complete Merkle tree.
+#[test]
+fn verity_file_read_fetches_only_requested_data_and_proof_blocks() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let file_size = BLOCK_SIZE_U64.saturating_mul(64);
+    let read_only_compat = get_u32(&image, 1024 + 100) | RO_COMPAT_VERITY;
+    put_u32(&mut image, 1024 + 100, read_only_compat);
+
+    {
+        let mut volume = must_run(JournaledVolume::mount(
+            MemoryBlockStorage::new(&mut image),
+            test_mount_context(),
+        ));
+        let file_id = file_node_id(&mut volume, 3);
+        let mut data = volume.begin_transaction(NOW);
+        extend_file(&mut data, file_id, file_size);
+        write_file(&mut data, file_id, file_size.saturating_sub(1), b"z");
+        must_run(data.commit());
+
+        let mut verity = volume.begin_transaction(NOW);
+        let file = transaction_file(&mut verity, file_id);
+        let enable = FsverityEnable::new(
+            FsverityHashAlgorithm::Sha256,
+            must(FsverityBlockSize::new(
+                u32::try_from(BLOCK_SIZE).unwrap_or(u32::MAX),
+            )),
+            FsveritySalt::empty(),
+            FsveritySignature::empty(),
+        );
+        must_run(verity.enable_verity(file, &enable));
+        must_run(verity.commit());
+    }
+
+    let reads = RefCell::new(Vec::new());
+    let source = ObservedBlockSource {
+        bytes: &image,
+        reads: &reads,
+    };
+    let mut volume = must_run(ReadOnlyVolume::mount(source, test_mount_context()));
+    let file = file_node(&mut volume, 3);
+    reads.borrow_mut().clear();
+
+    let mut output = [0_u8; 5];
+    assert_eq!(
+        must_run(volume.read_file(&file, FileOffset::ZERO, &mut output)).as_usize(),
+        output.len()
+    );
+    assert_eq!(&output, b"hello");
+    let lower_read_bytes = reads
+        .borrow()
+        .iter()
+        .map(|(_offset, length)| *length)
+        .sum::<usize>();
+    assert!(
+        lower_read_bytes < usize::try_from(file_size).unwrap_or(usize::MAX),
+        "requested {lower_read_bytes} lower bytes for a five-byte verified read"
+    );
+}
+
+/// # Panics
+///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn verity_file_read_rejects_corruption() {
@@ -276,6 +387,116 @@ fn verity_file_read_rejects_corruption() {
         run(volume.read_file(&file, FileOffset::ZERO, &mut output)),
         Err(Error::VerityMismatch)
     );
+}
+
+/// # Panics
+///
+/// Panics when a partial verified read scans data blocks outside its requested authentication path.
+#[test]
+fn verity_partial_read_does_not_scan_unrequested_data() {
+    for algorithm in [FsverityHashAlgorithm::Sha256, FsverityHashAlgorithm::Sha512] {
+        let (image, forbidden) = multi_level_verity_fixture(algorithm);
+        let armed = Rc::new(Cell::new(false));
+        let source = GuardedBlockSource {
+            bytes: &image,
+            forbidden,
+            armed: Rc::clone(&armed),
+        };
+        let mut volume = must_run(ReadOnlyVolume::mount(source, test_mount_context()));
+        let file = file_node(&mut volume, 3);
+        armed.set(true);
+        let mut output = [0xFF_u8; 37];
+
+        assert_eq!(
+            must_run(volume.read_file(&file, FileOffset::from_bytes(123), &mut output)).as_usize(),
+            output.len()
+        );
+        for (index, byte) in output.iter().copied().enumerate() {
+            assert_eq!(byte, u8::try_from((123 + index) % 251).unwrap_or(0));
+        }
+    }
+}
+
+/// Builds a two-level verity file and the physical range occupied only by unrequested data blocks.
+fn multi_level_verity_fixture(algorithm: FsverityHashAlgorithm) -> (Vec<u8>, Range<usize>) {
+    const DATA_BLOCKS: usize = 40;
+    const PHYSICAL_START_BLOCK: u32 = 64;
+    let data_bytes = DATA_BLOCKS * BLOCK_SIZE;
+    let mut plaintext = vec![0_u8; data_bytes];
+    for (index, byte) in plaintext.iter_mut().enumerate() {
+        *byte = u8::try_from(index % 251).unwrap_or(0);
+    }
+    let block_size = must(FsverityBlockSize::new(
+        u32::try_from(BLOCK_SIZE).unwrap_or(u32::MAX),
+    ));
+    let salt = FsveritySalt::empty();
+    let tree = must(FsverityMerkleTree::build(
+        &plaintext, algorithm, block_size, &salt,
+    ));
+    let descriptor = must(FsverityDescriptor::new(
+        algorithm,
+        block_size,
+        u64::try_from(data_bytes).unwrap_or(u64::MAX),
+        tree.root_hash(),
+        salt,
+    ));
+    let descriptor_bytes = must(descriptor.to_bytes());
+    let layout = must(Ext4VerityMetadataLayout::new(
+        FileSize::from_bytes(u64::try_from(data_bytes).unwrap_or(u64::MAX)),
+        must(BlockSize::from_superblock_log(0)),
+        u64::try_from(tree.blocks().len()).unwrap_or(u64::MAX),
+        u32::try_from(FSVERITY_DESCRIPTOR_BYTES).unwrap_or(u32::MAX),
+    ));
+    let stream_bytes = usize::try_from(layout.metadata_end()).unwrap_or(usize::MAX);
+    let stream_blocks = stream_bytes / BLOCK_SIZE;
+    let physical_start = block_offset(PHYSICAL_START_BLOCK);
+    let image_blocks = usize::try_from(PHYSICAL_START_BLOCK).unwrap_or(usize::MAX) + stream_blocks;
+    let mut image = modern_fixture_image();
+    image.resize(image_blocks * BLOCK_SIZE, 0);
+    put_u32(
+        &mut image,
+        1024 + 4,
+        u32::try_from(image_blocks).unwrap_or(u32::MAX),
+    );
+    let read_only_compat = get_u32(&image, 1024 + 100) | RO_COMPAT_VERITY;
+    put_u32(&mut image, 1024 + 100, read_only_compat);
+    let inode = modern_inode_offset(3);
+    put_u32(
+        &mut image,
+        inode + 4,
+        u32::try_from(data_bytes).unwrap_or(u32::MAX),
+    );
+    put_u32(
+        &mut image,
+        inode + 28,
+        u32::try_from(stream_bytes / 512).unwrap_or(u32::MAX),
+    );
+    let inode_flags = get_u32(&image, inode + 32) | EXT4_VERITY_FL;
+    put_u32(&mut image, inode + 32, inode_flags);
+    write_extent_root(
+        &mut image,
+        inode + 40,
+        0,
+        u16::try_from(stream_blocks).unwrap_or(u16::MAX),
+        PHYSICAL_START_BLOCK,
+    );
+    image[physical_start..physical_start + data_bytes].copy_from_slice(&plaintext);
+    let tree_start =
+        physical_start + usize::try_from(layout.merkle_tree_offset()).unwrap_or(usize::MAX);
+    image[tree_start..tree_start + tree.blocks().len()].copy_from_slice(tree.blocks());
+    let descriptor_start =
+        physical_start + usize::try_from(layout.descriptor_offset()).unwrap_or(usize::MAX);
+    image[descriptor_start..descriptor_start + descriptor_bytes.len()]
+        .copy_from_slice(&descriptor_bytes);
+    put_u32(
+        &mut image,
+        physical_start + usize::try_from(layout.descriptor_size_offset()).unwrap_or(usize::MAX),
+        u32::try_from(FSVERITY_DESCRIPTOR_BYTES).unwrap_or(u32::MAX),
+    );
+    refresh_primary_block_group_descriptor_checksum(&mut image);
+    let forbidden_start = physical_start + BLOCK_SIZE;
+    let forbidden_end = physical_start + data_bytes;
+    (image, forbidden_start..forbidden_end)
 }
 
 /// # Panics
@@ -319,6 +540,35 @@ fn enable_verity_commits_metadata_and_remount_verifies() {
         5
     );
     assert_eq!(&output, b"hello");
+}
+
+/// # Panics
+///
+/// Panics when enablement accepts Merkle blocks that ext4 cannot verify one filesystem block at a
+/// time.
+#[test]
+fn enable_verity_rejects_blocks_larger_than_the_filesystem_block() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let read_only_compat = get_u32(&image, 1024 + 100) | RO_COMPAT_VERITY;
+    put_u32(&mut image, 1024 + 100, read_only_compat);
+    let mut volume = must_run(JournaledVolume::mount(
+        MemoryBlockStorage::new(&mut image),
+        test_mount_context(),
+    ));
+    let file_id = file_node_id(&mut volume, 3);
+    let mut transaction = volume.begin_transaction(NOW);
+    let file = transaction_file(&mut transaction, file_id);
+    let enable = FsverityEnable::new(
+        FsverityHashAlgorithm::Sha256,
+        must(FsverityBlockSize::new(2048)),
+        FsveritySalt::empty(),
+        FsveritySignature::empty(),
+    );
+
+    assert_eq!(
+        run(transaction.enable_verity(file, &enable)),
+        Err(Error::InvalidVerityMetadata)
+    );
 }
 
 /// # Panics

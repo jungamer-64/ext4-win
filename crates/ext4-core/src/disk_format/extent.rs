@@ -1,6 +1,7 @@
 //! Extent tree parsing, mapping, and mutation serialization.
 
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 
 use crate::disk::block::{BlockAddress, BlockSize};
 use crate::disk::checksum::crc32c;
@@ -113,6 +114,40 @@ pub enum BlockMapping {
     Uninitialized,
     /// The logical block is a sparse hole.
     Hole,
+}
+
+/// Maximal homogeneous extent-tree run beginning at one logical block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtentBlockRun {
+    /// Initialized blocks backed by consecutive physical blocks.
+    Initialized {
+        /// First physical block corresponding to the requested logical start.
+        physical_start: BlockAddress,
+        /// Non-zero consecutive block count.
+        blocks: NonZeroU64,
+    },
+    /// Consecutive allocated blocks whose contents must read as zero.
+    Uninitialized {
+        /// Non-zero consecutive block count.
+        blocks: NonZeroU64,
+    },
+    /// Consecutive sparse logical blocks before the next allocated extent.
+    Hole {
+        /// Non-zero consecutive block count.
+        blocks: NonZeroU64,
+    },
+}
+
+impl ExtentBlockRun {
+    /// Number of logical blocks covered by this run.
+    #[must_use]
+    pub const fn blocks(self) -> NonZeroU64 {
+        match self {
+            Self::Initialized { blocks, .. }
+            | Self::Uninitialized { blocks }
+            | Self::Hole { blocks } => blocks,
+        }
+    }
 }
 
 /// Initialization state encoded in an ext4 leaf extent.
@@ -320,6 +355,18 @@ impl ExtentTree {
     #[must_use]
     pub fn map_logical(&self, logical_block: LogicalBlock) -> BlockMapping {
         map_extents(self.extents.as_slice(), logical_block)
+    }
+
+    /// Maps the longest homogeneous run beginning at `logical_block`, bounded by `maximum_blocks`.
+    ///
+    /// # Errors
+    /// Returns an error when normalized extent or physical-address arithmetic is inconsistent.
+    pub fn map_run(
+        &self,
+        logical_block: LogicalBlock,
+        maximum_blocks: NonZeroU64,
+    ) -> Result<ExtentBlockRun> {
+        map_extent_run(self.extents.as_slice(), logical_block, maximum_blocks)
     }
 
     /// Leaf extents in normalized logical order.
@@ -788,6 +835,58 @@ fn map_extents(extents: &[Extent], logical_block: LogicalBlock) -> BlockMapping 
         }
     }
     BlockMapping::Hole
+}
+
+/// Maps one bounded logical run through a normalized extent list.
+/// # Errors
+///
+/// Returns an error when normalized extent or physical-address arithmetic is inconsistent.
+fn map_extent_run(
+    extents: &[Extent],
+    logical_block: LogicalBlock,
+    maximum_blocks: NonZeroU64,
+) -> Result<ExtentBlockRun> {
+    let logical = logical_block.as_u64();
+    let maximum = maximum_blocks.get();
+    for extent in extents {
+        let start = extent.logical_start().as_u64();
+        if logical < start {
+            let gap = start
+                .checked_sub(logical)
+                .ok_or(Error::InvalidExtentTree)?
+                .min(maximum);
+            return Ok(ExtentBlockRun::Hole {
+                blocks: NonZeroU64::new(gap).ok_or(Error::InvalidExtentTree)?,
+            });
+        }
+        let end = extent.end_logical();
+        if logical >= end {
+            continue;
+        }
+        let offset = logical.checked_sub(start).ok_or(Error::InvalidExtentTree)?;
+        let blocks = end
+            .checked_sub(logical)
+            .ok_or(Error::InvalidExtentTree)?
+            .min(maximum);
+        let blocks = NonZeroU64::new(blocks).ok_or(Error::InvalidExtentTree)?;
+        return Ok(match extent.initialization() {
+            ExtentInitialization::Initialized => {
+                let physical = extent
+                    .physical_start()
+                    .get()
+                    .checked_add(offset)
+                    .ok_or(Error::InvalidExtentTree)?;
+                ExtentBlockRun::Initialized {
+                    physical_start: BlockAddress::new(physical),
+                    blocks,
+                }
+            }
+            ExtentInitialization::Uninitialized => ExtentBlockRun::Uninitialized { blocks },
+        });
+    }
+    Ok(ExtentBlockRun::Hole {
+        blocks: maximum_blocks,
+    })
 }
 
 /// Restores logical order, merges adjacent compatible extents, and rejects overlaps.

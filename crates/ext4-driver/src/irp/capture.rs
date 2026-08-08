@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     ActiveIrp, DirectoryControlMinorFunction, DispatchMajor, FileSystemControlMinorFunction,
-    IrpCompletion, QueryDirectoryStack, QueryEaStack,
+    IrpBufferLength, IrpCompletion, QueryDirectoryStack, QueryEaStack, ReadStack,
 };
 
 /// Maximum self-relative security descriptor accepted from one untrusted requestor.
@@ -83,6 +83,112 @@ pub(crate) struct PreparedQueryEa {
     stack: QueryEaStack,
     /// Requestor-owned EA selection.
     selection: PreparedEaSelection,
+}
+
+/// Complete read payload sealed before queue insertion.
+#[derive(Debug)]
+pub(crate) struct PreparedRead {
+    /// Scalar read parameters copied from the requestor's stack location.
+    stack: ReadStack,
+    /// Exact system-mapped output range kept live by the pending IRP.
+    output: CapturedReadOutput,
+}
+
+impl PreparedRead {
+    /// Captures a read stack and its system-addressable output range.
+    /// # Errors
+    ///
+    /// Returns a completion error when stack decoding or output mapping fails.
+    fn capture(
+        target: &ActiveIrp<'_>,
+        stack: super::CurrentIrpStackLocation<'_>,
+    ) -> Result<Self, IrpCompletion> {
+        let stack = stack.read().map_err(IrpCompletion::from_error)?;
+        let output = CapturedReadOutput::capture(target, stack.length())?;
+        Ok(Self { stack, output })
+    }
+
+    /// Returns the immutable scalar read parameters.
+    pub(crate) const fn stack(&self) -> ReadStack {
+        self.stack
+    }
+
+    /// Returns the first output byte for transfer-alignment validation.
+    pub(crate) const fn output_address(&self) -> Option<NonNull<u8>> {
+        self.output.address()
+    }
+
+    /// Borrows the exact caller output range for the duration of active read execution.
+    /// # Errors
+    ///
+    /// Returns an invariant error when captured output state contradicts its declared length.
+    pub(crate) fn output_mut(&mut self) -> DriverResult<&mut [u8]> {
+        self.output.as_mut_slice()
+    }
+}
+
+/// System-addressable read output whose validity is owned by the containing pending IRP.
+#[derive(Debug)]
+enum CapturedReadOutput {
+    /// A zero-byte read has no output mapping.
+    Empty,
+    /// Non-empty I/O Manager buffer or MDL system mapping.
+    Mapped {
+        /// First mapped output byte.
+        address: NonNull<u8>,
+        /// Exact mapped byte count.
+        length: IrpBufferLength,
+    },
+}
+
+// SAFETY: The I/O Manager keeps a read IRP's system buffer or locked MDL mapping valid until the
+// uniquely owned pending IRP completes. The pointer is exposed mutably only through the actor-owned
+// `PreparedRead`, so the queued payload may cross to its device actor.
+unsafe impl Send for CapturedReadOutput {}
+
+impl CapturedReadOutput {
+    /// Captures the output mapping without allowing a Rust reference to cross queue publication.
+    /// # Errors
+    ///
+    /// Returns a completion error when a non-empty request has no valid system mapping.
+    fn capture(target: &ActiveIrp<'_>, length: IrpBufferLength) -> Result<Self, IrpCompletion> {
+        if length.is_empty() {
+            return Ok(Self::Empty);
+        }
+        let address = target
+            .data_output_address(length)
+            .map_err(IrpCompletion::from_error)?;
+        Ok(Self::Mapped { address, length })
+    }
+
+    /// Returns the first mapped byte when this is a non-empty output.
+    const fn address(&self) -> Option<NonNull<u8>> {
+        match self {
+            Self::Empty => None,
+            Self::Mapped { address, .. } => Some(*address),
+        }
+    }
+
+    /// Borrows the complete captured output range.
+    /// # Errors
+    ///
+    /// Returns an invariant error when a mapped output unexpectedly has zero length.
+    fn as_mut_slice(&mut self) -> DriverResult<&mut [u8]> {
+        match self {
+            Self::Empty => Ok(&mut []),
+            Self::Mapped { address, length } => {
+                if length.is_empty() {
+                    return Err(DriverError::InternalInvariantViolation);
+                }
+                Ok(unsafe {
+                    // SAFETY: Capture validated this exact mapped range while the owning IRP was
+                    // live. `&mut self` proves unique actor access and the IRP cannot complete while
+                    // its `PendingIrpLease` is executing.
+                    core::slice::from_raw_parts_mut(address.as_ptr(), length.as_usize())
+                })
+            }
+        }
+    }
 }
 
 impl PreparedQueryEa {
@@ -291,6 +397,28 @@ pub(super) enum QueueContextOwnership {
 }
 
 impl QueueContextOwnership {
+    /// Borrows the complete read payload.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this is not a captured read request.
+    pub(super) fn read(&self) -> DriverResult<&PreparedRead> {
+        match self {
+            Self::Captured(context) => context.read(),
+            Self::Cleanup | Self::Close => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Mutably borrows the complete read payload.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this is not a captured read request.
+    pub(super) fn read_mut(&mut self) -> DriverResult<&mut PreparedRead> {
+        match self {
+            Self::Captured(context) => context.read_mut(),
+            Self::Cleanup | Self::Close => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
     /// Borrows the opaque query-security output target.
     /// # Errors
     ///
@@ -395,6 +523,28 @@ impl QueueContext {
         &self.prepared
     }
 
+    /// Borrows the complete read payload sealed before queue insertion.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this context is not a read request.
+    pub(super) fn read(&self) -> DriverResult<&PreparedRead> {
+        match &self.prepared {
+            PreparedRequest::Read(request) => Ok(request),
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Mutably borrows the complete read payload sealed before queue insertion.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this context is not a read request.
+    pub(super) fn read_mut(&mut self) -> DriverResult<&mut PreparedRead> {
+        match &mut self.prepared {
+            PreparedRequest::Read(request) => Ok(request),
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
     /// Borrows the complete QueryDirectory payload sealed before queue insertion.
     /// # Errors
     ///
@@ -452,6 +602,8 @@ impl QueueContext {
 pub(crate) enum PreparedRequest {
     /// Create/open request.
     Create,
+    /// Read request with its complete output contract captured.
+    Read(PreparedRead),
     /// Write request.
     Write,
     /// File information query.
@@ -503,7 +655,10 @@ impl PreparedRequest {
         let generic_key = || QueueCancellationKey::from_stack(stack);
         match major {
             DispatchMajor::Create => Ok((Self::Create, generic_key())),
-            DispatchMajor::Read => Ok((Self::Read, generic_key())),
+            DispatchMajor::Read => Ok((
+                Self::Read(PreparedRead::capture(target, stack)?),
+                generic_key(),
+            )),
             DispatchMajor::Write => Ok((Self::Write, generic_key())),
             DispatchMajor::QueryInformation => Ok((Self::QueryInformation, generic_key())),
             DispatchMajor::SetInformation => Ok((Self::SetInformation, generic_key())),
@@ -1090,7 +1245,7 @@ mod tests {
                 assert!(matches!(
                     context,
                     QueueContextOwnership::Captured(context)
-                        if matches!(context.prepared(), PreparedRequest::Read)
+                        if matches!(context.prepared(), PreparedRequest::Read(_))
                 ));
             }
         }
@@ -1156,6 +1311,65 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when queued read capture retains the mutable caller mapping or re-reads stack state.
+    #[test]
+    fn prepared_read_seals_stack_and_borrows_the_original_output_mapping() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut file_object = wdk_sys::FILE_OBJECT::default();
+        let mut output = [0xAA_u8; 32];
+        let mut irp = wdk_sys::IRP::default();
+        irp.AssociatedIrp.SystemBuffer = output.as_mut_ptr().cast::<c_void>();
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            MajorFunction: u8::try_from(wdk_sys::IRP_MJ_READ).unwrap_or_default(),
+            FileObject: core::ptr::addr_of_mut!(file_object),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
+            Length: u32::try_from(output.len()).unwrap_or_default(),
+            __bindgen_padding_0: 0,
+            Key: 41,
+            Flags: 0,
+            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 8192 },
+        };
+        let target = build_target(&mut device, &mut irp, &mut stack);
+        assert!(target.is_some());
+        if let Some(mut target) = target {
+            let context = capture_context(&mut target, DispatchMajor::Read);
+            assert!(context.is_ok());
+            if let Ok(mut context) = context {
+                stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
+                    Length: 1,
+                    __bindgen_padding_0: 0,
+                    Key: 0,
+                    Flags: 0,
+                    ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+                };
+                let rewritten_length = unsafe {
+                    // SAFETY: The test assigned the `Read` union arm immediately above.
+                    stack.Parameters.Read.Length
+                };
+                assert_eq!(rewritten_length, 1);
+                let prepared = context.read_mut();
+                assert!(prepared.is_ok());
+                if let Ok(prepared) = prepared {
+                    assert_eq!(prepared.stack().length().as_usize(), output.len());
+                    assert_eq!(
+                        prepared.stack().key(),
+                        crate::irp::ByteRangeLockKey::from_ulong(41)
+                    );
+                    let mapped = prepared.output_mut();
+                    assert!(mapped.is_ok());
+                    if let Ok(mapped) = mapped {
+                        mapped.fill(0x55);
+                    }
+                }
+            }
+        }
+        assert_eq!(output, [0x55; 32]);
     }
 
     /// # Panics

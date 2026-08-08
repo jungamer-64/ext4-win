@@ -15,8 +15,8 @@ pub(super) use crate::disk_format::dir::{
     DirectoryEntryKind, DirectoryLayout, build_htree_directory,
 };
 pub(super) use crate::disk_format::extent::{
-    BlockMapping, Extent, ExtentLength, ExtentTree, ExtentTreeContext, LogicalBlock,
-    MutableExtentTree, SerializedExtentTree,
+    BlockMapping, Extent, ExtentBlockRun, ExtentLength, ExtentTree, ExtentTreeContext,
+    LogicalBlock, MutableExtentTree, SerializedExtentTree,
 };
 pub(super) use crate::disk_format::group::BlockGroupDescriptor;
 pub(super) use crate::disk_format::inode::{
@@ -48,7 +48,7 @@ pub(super) use crate::protection::fscrypt::{
 };
 pub(super) use crate::protection::verity::{
     Ext4VerityMetadataLayout, FSVERITY_DESCRIPTOR_BYTES, FsverityDescriptor, FsverityEnable,
-    FsverityMerkleTree,
+    FsverityMerkleTree, FsverityVerifier,
 };
 
 pub(super) use super::block_group::{
