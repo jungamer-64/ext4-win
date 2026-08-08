@@ -131,14 +131,14 @@ impl IrpCompletion {
         }
     }
 
-    /// Builds the query-security compatibility result for an undersized output buffer.
+    /// Builds a buffer-overflow result that preserves the operation-specific information length.
     /// # Errors
     ///
-    /// Returns an error when `required` cannot be represented in the IRP information field.
-    pub(crate) fn security_buffer_overflow(required: usize) -> DriverResult<Self> {
+    /// Returns an error when `information` cannot be represented in the IRP information field.
+    pub(crate) fn buffer_overflow(information: usize) -> DriverResult<Self> {
         Ok(Self {
             status: DriverError::BufferOverflow.ntstatus(),
-            information: InformationLength::from_usize(required)?,
+            information: InformationLength::from_usize(information)?,
         })
     }
 
@@ -5312,7 +5312,7 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn query_file_stack_decodes_name_attribute_tag_and_standard_link_classes() {
+    fn query_file_stack_decodes_name_attribute_tag_and_link_classes() {
         let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
         for (raw_class, expected) in [
             (
@@ -5326,6 +5326,10 @@ mod tests {
             (
                 wdk_sys::_FILE_INFORMATION_CLASS::FileStandardLinkInformation,
                 QueryFileInformationClass::StandardLink,
+            ),
+            (
+                wdk_sys::_FILE_INFORMATION_CLASS::FileHardLinkInformation,
+                QueryFileInformationClass::HardLink,
             ),
         ] {
             let mut stack = wdk_sys::IO_STACK_LOCATION {

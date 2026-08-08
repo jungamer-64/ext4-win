@@ -6,8 +6,8 @@ use core::ptr::NonNull;
 use ext4_core::{
     ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Permissions,
     Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileAllocationSize, FileNodeId,
-    FileOffset, FileSize, HardLinkDestination, NodeId, RenameTargetCollision, WindowsName,
-    WindowsOverlay,
+    FileOffset, FileSize, HardLinkDestination, HardLinkNodeId, HardLinks, NodeId,
+    RenameTargetCollision, WindowsName, WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
@@ -262,6 +262,15 @@ enum QueryFilePlan {
         /// Exclusive mounted-volume operation capability.
         operations: VolumeOperationLease,
     },
+    /// Traverse the ext4 namespace for every name of one hard-linkable inode.
+    HardLinks {
+        /// Caller output capacity.
+        length: IrpBufferLength,
+        /// Non-directory target identity.
+        target: HardLinkNodeId,
+        /// Exclusive mounted-volume operation capability.
+        operations: VolumeOperationLease,
+    },
 }
 
 /// Packs one supported file information class.
@@ -294,6 +303,15 @@ async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResul
                     length,
                     output,
                     completion,
+                });
+            }
+            QueryFileInformationClass::HardLink => {
+                let target = HardLinkNodeId::try_from(opened_file.node())
+                    .map_err(|_| DriverError::FileIsDirectory)?;
+                return Ok(QueryFilePlan::HardLinks {
+                    length,
+                    target,
+                    operations: claim_file_operation_lane(opened_file.file_control_block()),
                 });
             }
             QueryFileInformationClass::Basic
@@ -333,6 +351,13 @@ async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResul
             })?;
             return Ok(completion);
         }
+        QueryFilePlan::HardLinks {
+            length,
+            target,
+            operations,
+        } => {
+            return query_hard_link_information(request, length, target, operations).await;
+        }
     };
     let metadata = {
         let mut operations = operations;
@@ -359,11 +384,275 @@ async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResul
             QueryFileInformationClass::AttributeTag => {
                 pack_attribute_tag_information(buffer.as_mut_slice(), metadata)
             }
-            QueryFileInformationClass::Position | QueryFileInformationClass::Name => {
-                Err(DriverError::InternalInvariantViolation)
-            }
+            QueryFileInformationClass::Position
+            | QueryFileInformationClass::Name
+            | QueryFileInformationClass::HardLink => Err(DriverError::InternalInvariantViolation),
         }
     })
+}
+
+/// Traverses and packs every Windows-visible hard-link name without retaining caller memory across
+/// suspension points.
+/// # Errors
+///
+/// Returns an error when namespace traversal, name projection, allocation, packing, or caller
+/// output capture fails.
+async fn query_hard_link_information(
+    mut request: PendingIrpLease<'_>,
+    length: IrpBufferLength,
+    target: HardLinkNodeId,
+    mut operations: VolumeOperationLease,
+) -> DriverResult<IrpCompletion> {
+    let links = operations
+        .lane_mut()
+        .journaled_mut()
+        .read_hard_links(target)
+        .await?;
+    let links = WindowsHardLinks::try_from_ext4(&links)?;
+    let mut packed = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
+    let result = pack_hard_link_information(packed.as_mut_slice(), &links)?;
+    request.with_active(|active| {
+        let mut output = active.buffered_output(length)?;
+        let destination = output
+            .as_mut_slice()
+            .get_mut(..result.information())
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        let source = packed
+            .as_slice()
+            .get(..result.information())
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        destination.copy_from_slice(source);
+        Ok::<_, DriverError>(())
+    })?;
+    result.completion()
+}
+
+/// Windows-representable projection of one complete ext4 hard-link set.
+#[derive(Debug, Eq, PartialEq)]
+struct WindowsHardLinks {
+    /// Names that can cross the Windows UTF-16 namespace boundary.
+    entries: DriverVec<WindowsHardLinkEntry>,
+}
+
+impl WindowsHardLinks {
+    /// Projects ext4 names without allowing an unrepresentable component to contaminate the
+    /// Windows domain.
+    /// # Errors
+    ///
+    /// Returns an error when allocation fails or no ext4 link can be represented by Windows.
+    fn try_from_ext4(links: &HardLinks) -> DriverResult<Self> {
+        let mut entries = DriverVec::try_with_capacity(links.entries().len())?;
+        for link in links.entries() {
+            let name = match WindowsName::from_ext4(link.name()) {
+                Ok(name) => name,
+                Err(ext4_core::Error::InvalidName) => continue,
+                Err(error) => return Err(DriverError::from(error)),
+            };
+            let entry = WindowsHardLinkEntry {
+                parent_file_id: u64::from(NodeId::Directory(link.parent()).file_index()),
+                name,
+            };
+            entries
+                .try_push_owned(entry)
+                .map_err(|error| error.into_parts().0)?;
+        }
+        if entries.is_empty() {
+            return Err(DriverError::NotSupported);
+        }
+        Ok(Self { entries })
+    }
+
+    /// Windows-visible entries in namespace traversal order.
+    fn entries(&self) -> &[WindowsHardLinkEntry] {
+        self.entries.as_slice()
+    }
+}
+
+/// One FILE_LINK_ENTRY_INFORMATION domain value before wire packing.
+#[derive(Debug, Eq, PartialEq)]
+struct WindowsHardLinkEntry {
+    /// Stable file id of the parent directory.
+    parent_file_id: u64,
+    /// Link name as a Windows component.
+    name: WindowsName,
+}
+
+/// Variable layout of one FILE_LINK_ENTRY_INFORMATION record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HardLinkRecordLayout {
+    /// Required fixed fields and UTF-16 name bytes.
+    unpadded_size: usize,
+    /// Offset to a following record on its required eight-byte boundary.
+    padded_size: usize,
+}
+
+impl HardLinkRecordLayout {
+    /// Computes one checked record layout.
+    /// # Errors
+    ///
+    /// Returns an error when the UTF-16 name size or aligned record size overflows.
+    fn new(name: &WindowsName) -> DriverResult<Self> {
+        let name_bytes = utf16_byte_len(name.utf16())?;
+        let unpadded_size = HARD_LINK_ENTRY_NAME_OFFSET
+            .checked_add(name_bytes)
+            .ok_or(DriverError::InvalidBufferSize)?;
+        Ok(Self {
+            unpadded_size,
+            padded_size: align_to_eight(unpadded_size)?,
+        })
+    }
+}
+
+/// Result of packing as many complete hard-link entries as fit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HardLinkInformationPacking {
+    /// Bytes initialized in the caller-visible prefix.
+    information: usize,
+    /// Whether every projected entry was returned.
+    all_entries_returned: bool,
+}
+
+impl HardLinkInformationPacking {
+    /// Caller-visible initialized prefix length.
+    const fn information(self) -> usize {
+        self.information
+    }
+
+    /// Converts packing state to the exact Windows completion contract.
+    /// # Errors
+    ///
+    /// Returns an error when the information length does not fit the IRP status block.
+    fn completion(self) -> DriverResult<IrpCompletion> {
+        if self.all_entries_returned {
+            IrpCompletion::from_usize(self.information)
+        } else {
+            IrpCompletion::buffer_overflow(self.information)
+        }
+    }
+}
+
+/// Bytes before the first FILE_LINK_ENTRY_INFORMATION record.
+const HARD_LINKS_HEADER_SIZE: usize = 8;
+/// Offset of BytesNeeded in FILE_LINKS_INFORMATION.
+const HARD_LINKS_BYTES_NEEDED_OFFSET: usize = 0;
+/// Offset of EntriesReturned in FILE_LINKS_INFORMATION.
+const HARD_LINKS_ENTRIES_RETURNED_OFFSET: usize = 4;
+/// Offset of NextEntryOffset in FILE_LINK_ENTRY_INFORMATION.
+const HARD_LINK_ENTRY_NEXT_OFFSET: usize = 0;
+/// Offset of ParentFileId in FILE_LINK_ENTRY_INFORMATION.
+const HARD_LINK_ENTRY_PARENT_ID_OFFSET: usize = 8;
+/// Offset of FileNameLength in FILE_LINK_ENTRY_INFORMATION.
+const HARD_LINK_ENTRY_NAME_LENGTH_OFFSET: usize = 16;
+/// Offset of FileName in FILE_LINK_ENTRY_INFORMATION.
+const HARD_LINK_ENTRY_NAME_OFFSET: usize = 20;
+
+/// Packs FILE_LINKS_INFORMATION and as many complete aligned entries as the output can hold.
+/// # Errors
+///
+/// Returns an error when the header is truncated, no entries were supplied, record arithmetic
+/// overflows, or a field cannot be written inside the output buffer.
+fn pack_hard_link_information(
+    output: &mut [u8],
+    links: &WindowsHardLinks,
+) -> DriverResult<HardLinkInformationPacking> {
+    let entries = links.entries();
+    if entries.is_empty() {
+        return Err(DriverError::InternalInvariantViolation);
+    }
+    if output.len() < HARD_LINKS_HEADER_SIZE {
+        return Err(DriverError::InfoLengthMismatch);
+    }
+
+    let mut bytes_needed = HARD_LINKS_HEADER_SIZE;
+    for (index, entry) in entries.iter().enumerate() {
+        let layout = HardLinkRecordLayout::new(&entry.name)?;
+        let size = if index.checked_add(1) == Some(entries.len()) {
+            layout.unpadded_size
+        } else {
+            layout.padded_size
+        };
+        bytes_needed = bytes_needed
+            .checked_add(size)
+            .ok_or(DriverError::InvalidBufferSize)?;
+    }
+    let bytes_needed = u32::try_from(bytes_needed).map_err(|_| DriverError::InvalidBufferSize)?;
+
+    clear_record(output, 0, HARD_LINKS_HEADER_SIZE)?;
+    LittleEndianOutput::new(output)
+        .write_u32(wire_offset(HARD_LINKS_BYTES_NEEDED_OFFSET), bytes_needed)?;
+    let mut written = HARD_LINKS_HEADER_SIZE;
+    let mut information = HARD_LINKS_HEADER_SIZE;
+    let mut entries_returned = 0_usize;
+    let mut previous_start = None;
+
+    for entry in entries {
+        let layout = HardLinkRecordLayout::new(&entry.name)?;
+        let required = written
+            .checked_add(layout.unpadded_size)
+            .ok_or(DriverError::InvalidBufferSize)?;
+        if required > output.len() {
+            break;
+        }
+        if let Some(previous_start) = previous_start {
+            let alignment_bytes = written
+                .checked_sub(information)
+                .ok_or(DriverError::InternalInvariantViolation)?;
+            clear_record(output, information, alignment_bytes)?;
+            let next = written
+                .checked_sub(previous_start)
+                .ok_or(DriverError::InternalInvariantViolation)?;
+            LittleEndianOutput::new(output).write_u32(
+                record_field_offset(previous_start, HARD_LINK_ENTRY_NEXT_OFFSET)?,
+                u32::try_from(next).map_err(|_| DriverError::InvalidBufferSize)?,
+            )?;
+        }
+        pack_hard_link_record(output, written, entry, layout)?;
+        previous_start = Some(written);
+        information = required;
+        entries_returned = entries_returned
+            .checked_add(1)
+            .ok_or(DriverError::InvalidBufferSize)?;
+        written = written
+            .checked_add(layout.padded_size)
+            .ok_or(DriverError::InvalidBufferSize)?;
+    }
+
+    LittleEndianOutput::new(output).write_u32(
+        wire_offset(HARD_LINKS_ENTRIES_RETURNED_OFFSET),
+        u32::try_from(entries_returned).map_err(|_| DriverError::InvalidBufferSize)?,
+    )?;
+    Ok(HardLinkInformationPacking {
+        information,
+        all_entries_returned: entries_returned == entries.len(),
+    })
+}
+
+/// Packs one FILE_LINK_ENTRY_INFORMATION record.
+/// # Errors
+///
+/// Returns an error when a fixed field or the UTF-16 link name falls outside the output buffer.
+fn pack_hard_link_record(
+    output: &mut [u8],
+    start: usize,
+    entry: &WindowsHardLinkEntry,
+    layout: HardLinkRecordLayout,
+) -> DriverResult<()> {
+    clear_record(output, start, layout.unpadded_size)?;
+    let mut writer = LittleEndianOutput::new(output);
+    writer.write_u32(record_field_offset(start, HARD_LINK_ENTRY_NEXT_OFFSET)?, 0)?;
+    writer.write_u64(
+        record_field_offset(start, HARD_LINK_ENTRY_PARENT_ID_OFFSET)?,
+        entry.parent_file_id,
+    )?;
+    writer.write_u32(
+        record_field_offset(start, HARD_LINK_ENTRY_NAME_LENGTH_OFFSET)?,
+        u32::try_from(entry.name.utf16().len()).map_err(|_| DriverError::InvalidBufferSize)?,
+    )?;
+    write_utf16(
+        output,
+        field_offset(start, HARD_LINK_ENTRY_NAME_OFFSET)?,
+        entry.name.utf16(),
+    )
 }
 
 /// Applies one supported set-file-information class.
@@ -907,7 +1196,7 @@ pub(crate) async fn validate_pending_deletion(
 #[derive(Debug)]
 struct HardLinkMutation {
     /// Existing inode that receives the additional name.
-    source_node: NodeId,
+    source: HardLinkNodeId,
     /// Destination path with its explicit resolution base.
     target: NamespaceTargetPath,
     /// Existing-target behavior decoded from the link information class.
@@ -929,10 +1218,8 @@ impl HardLinkMutation {
         if opened_file.delete_pending() {
             return Err(DriverError::AccessDenied);
         }
-        let source_node = opened_file.node();
-        if matches!(source_node, NodeId::Directory(_)) {
-            return Err(DriverError::FileIsDirectory);
-        }
+        let source = HardLinkNodeId::try_from(opened_file.node())
+            .map_err(|_| DriverError::FileIsDirectory)?;
         let source_parent = match opened_file.location() {
             OpenedLocation::DirectoryEntry { parent, .. } => *parent,
             OpenedLocation::Root => return Err(DriverError::FileIsDirectory),
@@ -942,7 +1229,7 @@ impl HardLinkMutation {
         let target_collision = format.target_collision(input.as_slice())?;
         let target = NamespaceTargetPath::decode(input.as_slice(), source_parent)?;
         Ok(Self {
-            source_node,
+            source,
             target,
             target_collision,
         })
@@ -1014,10 +1301,11 @@ async fn set_hard_link_information(
     operations: &mut VolumeOperationLease,
 ) -> DriverResult<()> {
     let HardLinkMutation {
-        source_node,
+        source,
         target,
         target_collision,
     } = mutation;
+    let source_node = NodeId::from(source);
     let (target_parent, target_name) =
         resolve_namespace_target(operations.lane_mut(), &target).await?;
     operations.ensure_node_openable(NodeId::Directory(target_parent))?;
@@ -1038,7 +1326,7 @@ async fn set_hard_link_information(
         .lane_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let source = transaction.hard_link_source(source_node).await?;
+    let source = transaction.hard_link_source(source).await?;
     let target_parent = transaction.directory(target_parent).await?;
     if let Some(overlay) = archive_overlay {
         let node = transaction.node(source_node).await?;
@@ -3750,6 +4038,27 @@ mod tests {
         Some(u32::from_le_bytes(bytes))
     }
 
+    /// Reads one little-endian u64 from a test output buffer.
+    fn le_u64(buffer: &[u8], offset: usize) -> Option<u64> {
+        let end = offset.checked_add(core::mem::size_of::<u64>())?;
+        let bytes = buffer.get(offset..end)?;
+        let bytes = <[u8; 8]>::try_from(bytes).ok()?;
+        Some(u64::from_le_bytes(bytes))
+    }
+
+    /// Builds a Windows hard-link set through the same fallible ownership boundary as production.
+    fn windows_hard_links(entries: &[(u64, &[u16])]) -> Option<super::WindowsHardLinks> {
+        let mut projected = crate::memory::DriverVec::try_with_capacity(entries.len()).ok()?;
+        for (parent_file_id, units) in entries {
+            let entry = super::WindowsHardLinkEntry {
+                parent_file_id: *parent_file_id,
+                name: WindowsName::from_utf16(units).ok()?,
+            };
+            projected.try_push_owned(entry).ok()?;
+        }
+        Some(super::WindowsHardLinks { entries: projected })
+    }
+
     /// Reads one byte from a test output buffer without panicking on a malformed layout.
     fn byte_at(buffer: &[u8], offset: usize) -> Option<u8> {
         buffer.get(offset).copied()
@@ -4680,6 +4989,153 @@ mod tests {
             Err(DriverError::BufferTooSmall)
         );
         assert!(output.iter().all(|byte| *byte == 0xA5));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when FILE_LINKS_INFORMATION loses its header, alignment, parent ids, character
+    /// counts, names, or exact completion length.
+    #[test]
+    fn hard_link_information_packs_complete_aligned_entries() {
+        let links =
+            windows_hard_links(&[(7, &[u16::from(b'a')]), (11, &[u16::from(b'b'), 0x00E9])]);
+        assert!(links.is_some());
+        let Some(links) = links else {
+            return;
+        };
+        let mut output = vec![0xA5_u8; 56];
+
+        let packed = super::pack_hard_link_information(&mut output, &links);
+        assert_eq!(
+            packed,
+            Ok(super::HardLinkInformationPacking {
+                information: 56,
+                all_entries_returned: true,
+            })
+        );
+        assert_eq!(
+            le_u32(&output, super::HARD_LINKS_BYTES_NEEDED_OFFSET),
+            Some(56)
+        );
+        assert_eq!(
+            le_u32(&output, super::HARD_LINKS_ENTRIES_RETURNED_OFFSET),
+            Some(2)
+        );
+
+        let first = super::HARD_LINKS_HEADER_SIZE;
+        assert_eq!(
+            le_u32(&output, first + super::HARD_LINK_ENTRY_NEXT_OFFSET),
+            Some(24)
+        );
+        assert_eq!(
+            le_u64(&output, first + super::HARD_LINK_ENTRY_PARENT_ID_OFFSET),
+            Some(7)
+        );
+        assert_eq!(
+            le_u32(&output, first + super::HARD_LINK_ENTRY_NAME_LENGTH_OFFSET),
+            Some(1)
+        );
+        assert_eq!(
+            output.get(
+                first + super::HARD_LINK_ENTRY_NAME_OFFSET
+                    ..first + super::HARD_LINK_ENTRY_NAME_OFFSET + 2
+            ),
+            Some([b'a', 0].as_slice())
+        );
+        let first_name_end = first + super::HARD_LINK_ENTRY_NAME_OFFSET + 2;
+        let second = first + 24;
+        assert_eq!(output.get(first_name_end..second), Some([0, 0].as_slice()));
+        assert_eq!(
+            le_u32(&output, second + super::HARD_LINK_ENTRY_NEXT_OFFSET),
+            Some(0)
+        );
+        assert_eq!(
+            le_u64(&output, second + super::HARD_LINK_ENTRY_PARENT_ID_OFFSET),
+            Some(11)
+        );
+        assert_eq!(
+            le_u32(&output, second + super::HARD_LINK_ENTRY_NAME_LENGTH_OFFSET),
+            Some(2)
+        );
+        assert_eq!(
+            output.get(
+                second + super::HARD_LINK_ENTRY_NAME_OFFSET
+                    ..second + super::HARD_LINK_ENTRY_NAME_OFFSET + 4
+            ),
+            Some([b'b', 0, 0xE9, 0].as_slice())
+        );
+        assert_eq!(
+            packed.and_then(super::HardLinkInformationPacking::completion),
+            IrpCompletion::from_usize(56)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when short hard-link output fails to report BytesNeeded, emits a partial record, or
+    /// returns the wrong overflow information length.
+    #[test]
+    fn hard_link_information_returns_only_complete_entries_on_overflow() {
+        let links =
+            windows_hard_links(&[(7, &[u16::from(b'a')]), (11, &[u16::from(b'b'), 0x00E9])]);
+        assert!(links.is_some());
+        let Some(links) = links else {
+            return;
+        };
+
+        let mut one_entry = vec![0xA5_u8; 30];
+        let packed = super::pack_hard_link_information(&mut one_entry, &links);
+        assert_eq!(
+            packed,
+            Ok(super::HardLinkInformationPacking {
+                information: 30,
+                all_entries_returned: false,
+            })
+        );
+        assert_eq!(
+            le_u32(&one_entry, super::HARD_LINKS_BYTES_NEEDED_OFFSET),
+            Some(56)
+        );
+        assert_eq!(
+            le_u32(&one_entry, super::HARD_LINKS_ENTRIES_RETURNED_OFFSET),
+            Some(1)
+        );
+        assert_eq!(
+            le_u32(
+                &one_entry,
+                super::HARD_LINKS_HEADER_SIZE + super::HARD_LINK_ENTRY_NEXT_OFFSET
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            packed.and_then(super::HardLinkInformationPacking::completion),
+            IrpCompletion::buffer_overflow(30)
+        );
+
+        let mut header_only = [0xA5_u8; super::HARD_LINKS_HEADER_SIZE];
+        let packed = super::pack_hard_link_information(&mut header_only, &links);
+        assert_eq!(
+            packed,
+            Ok(super::HardLinkInformationPacking {
+                information: super::HARD_LINKS_HEADER_SIZE,
+                all_entries_returned: false,
+            })
+        );
+        assert_eq!(
+            le_u32(&header_only, super::HARD_LINKS_BYTES_NEEDED_OFFSET),
+            Some(56)
+        );
+        assert_eq!(
+            le_u32(&header_only, super::HARD_LINKS_ENTRIES_RETURNED_OFFSET),
+            Some(0)
+        );
+
+        let mut truncated = [0xA5_u8; super::HARD_LINKS_HEADER_SIZE - 1];
+        assert_eq!(
+            super::pack_hard_link_information(&mut truncated, &links),
+            Err(DriverError::InfoLengthMismatch)
+        );
+        assert!(truncated.iter().all(|byte| *byte == 0xA5));
     }
 
     /// # Panics

@@ -43,10 +43,10 @@ pub use protection::verity::{
 };
 pub use volume::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
-    FileNodeId, HardLinkDestination, InternalJournal, JournalTransaction, JournaledVolume,
-    MountContext, NodeId, RenameTargetCollision, SymlinkNode, SymlinkNodeId, TransactionDirectory,
-    TransactionFile, TransactionHardLinkSource, TransactionNode, TransactionSymlink,
-    VolumeGeometry, VolumeIdentity,
+    FileNodeId, HardLinkDestination, HardLinkEntry, HardLinkNodeId, HardLinks, InternalJournal,
+    JournalTransaction, JournaledVolume, MountContext, NodeId, RenameTargetCollision, SymlinkNode,
+    SymlinkNodeId, TransactionDirectory, TransactionFile, TransactionHardLinkSource,
+    TransactionNode, TransactionSymlink, VolumeGeometry, VolumeIdentity,
 };
 
 #[cfg(test)]

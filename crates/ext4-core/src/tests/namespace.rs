@@ -334,7 +334,7 @@ fn hard_link_adds_second_name_and_unlink_preserves_source() {
         let alias = must(Ext4Name::new(b"alias"));
 
         let mut link = volume.begin_transaction(NOW);
-        let source = must_run(link.hard_link_source(NodeId::File(source_id)));
+        let source = must_run(link.hard_link_source(HardLinkNodeId::File(source_id)));
         let root = transaction_directory(&mut link, DirectoryNodeId::ROOT);
         must_run(link.create_hard_link(source, root, &alias, HardLinkDestination::Vacant));
         must_run(link.commit());
@@ -382,10 +382,10 @@ fn hard_link_replaces_distinct_file_and_rejects_directory_source() {
 
         let mut link = volume.begin_transaction(NOW);
         assert_eq!(
-            run(link.hard_link_source(NodeId::Directory(DirectoryNodeId::ROOT))),
+            HardLinkNodeId::try_from(NodeId::Directory(DirectoryNodeId::ROOT)),
             Err(Error::WrongInodeKind)
         );
-        let source = must_run(link.hard_link_source(NodeId::File(source_id)));
+        let source = must_run(link.hard_link_source(HardLinkNodeId::File(source_id)));
         let root = transaction_directory(&mut link, DirectoryNodeId::ROOT);
         must_run(link.create_hard_link(
             source,
@@ -424,7 +424,7 @@ fn hard_link_same_inode_replacement_preserves_link_count_and_updates_case() {
         let requested = must(Ext4Name::new(b"FILE"));
 
         let mut link = volume.begin_transaction(NOW);
-        let source = must_run(link.hard_link_source(NodeId::File(source_id)));
+        let source = must_run(link.hard_link_source(HardLinkNodeId::File(source_id)));
         let root = transaction_directory(&mut link, DirectoryNodeId::ROOT);
         must_run(link.create_hard_link(
             source,
@@ -466,7 +466,7 @@ fn hard_link_supports_symbolic_link_inodes() {
         must_run(create.commit());
 
         let mut link = volume.begin_transaction(NOW);
-        let source = must_run(link.hard_link_source(NodeId::Symlink(symlink.id())));
+        let source = must_run(link.hard_link_source(HardLinkNodeId::Symlink(symlink.id())));
         let root = transaction_directory(&mut link, DirectoryNodeId::ROOT);
         must_run(link.create_hard_link(source, root, &alias, HardLinkDestination::Vacant));
         must_run(link.commit());
@@ -480,6 +480,59 @@ fn hard_link_supports_symbolic_link_inodes() {
                 .links_count()
                 .get(),
             2
+        );
+        let links = must_run(volume.read_hard_links(HardLinkNodeId::Symlink(symlink.id())));
+        assert_eq!(links.entries().len(), 2);
+        assert!(links.entries().iter().any(|link| {
+            link.parent() == DirectoryNodeId::ROOT && link.name().bytes() == b"original-link"
+        }));
+        assert!(links.entries().iter().any(|link| {
+            link.parent() == DirectoryNodeId::ROOT && link.name().bytes() == b"link-alias"
+        }));
+    }
+}
+
+/// # Panics
+///
+/// Panics when hard-link traversal loses a root or nested namespace name.
+#[test]
+fn hard_link_enumeration_finds_root_and_nested_names() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+
+    {
+        let device = MemoryBlockStorage::new(&mut image);
+        let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+        let source_id = file_node_id(&mut volume, 3);
+        let directory_name = must(Ext4Name::new(b"nested"));
+        let alias = must(Ext4Name::new(b"alias"));
+
+        let mut create = volume.begin_transaction(NOW);
+        let root = transaction_directory(&mut create, DirectoryNodeId::ROOT);
+        let nested =
+            must_run(create.create_directory(root, &directory_name, test_directory_metadata()));
+        must_run(create.commit());
+
+        let mut link = volume.begin_transaction(NOW);
+        let source = must_run(link.hard_link_source(HardLinkNodeId::File(source_id)));
+        let nested_directory = transaction_directory(&mut link, nested.id());
+        must_run(link.create_hard_link(
+            source,
+            nested_directory,
+            &alias,
+            HardLinkDestination::Vacant,
+        ));
+        must_run(link.commit());
+
+        let links = must_run(volume.read_hard_links(HardLinkNodeId::File(source_id)));
+        assert_eq!(links.entries().len(), 2);
+        assert!(links.entries().iter().any(|entry| {
+            entry.parent() == DirectoryNodeId::ROOT && entry.name().bytes() == b"file"
+        }));
+        assert!(
+            links
+                .entries()
+                .iter()
+                .any(|entry| { entry.parent() == nested.id() && entry.name().bytes() == b"alias" })
         );
     }
 }

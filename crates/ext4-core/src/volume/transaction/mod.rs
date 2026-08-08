@@ -236,33 +236,18 @@ pub struct TransactionSymlink {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionHardLinkSource {
     /// Typed source kind; a directory cannot inhabit this state.
-    id: HardLinkSourceId,
-}
-
-/// Typed inode identities admitted by [`TransactionHardLinkSource`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HardLinkSourceId {
-    /// Regular file inode.
-    File(FileNodeId),
-    /// Symbolic-link inode.
-    Symlink(SymlinkNodeId),
+    id: HardLinkNodeId,
 }
 
 impl TransactionHardLinkSource {
     /// Raw inode backing this hard-link source.
     const fn inode(self) -> InodeId {
-        match self.id {
-            HardLinkSourceId::File(file) => file.inode(),
-            HardLinkSourceId::Symlink(symlink) => symlink.inode(),
-        }
+        self.id.inode()
     }
 
     /// Directory-entry kind stored for a new link to this source.
     const fn entry_kind(self) -> DirectoryEntryKind {
-        match self.id {
-            HardLinkSourceId::File(_) => DirectoryEntryKind::File,
-            HardLinkSourceId::Symlink(_) => DirectoryEntryKind::Symlink,
-        }
+        self.id.entry_kind()
     }
 }
 
@@ -439,19 +424,20 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// # Errors
     /// Returns an error when the typed identity does not match the inode or names a directory.
-    pub async fn hard_link_source(&mut self, id: NodeId) -> Result<TransactionHardLinkSource> {
+    pub async fn hard_link_source(
+        &mut self,
+        id: HardLinkNodeId,
+    ) -> Result<TransactionHardLinkSource> {
         let inode = self.volume.read_inode_record(id.inode()).await?;
         let _metadata = inode.metadata_mutation()?;
-        let id = match (id, inode.kind()) {
-            (NodeId::File(file), InodeKind::File) => HardLinkSourceId::File(file),
-            (NodeId::Symlink(symlink), InodeKind::Symlink) => HardLinkSourceId::Symlink(symlink),
-            (NodeId::Directory(_), InodeKind::Directory)
-            | (NodeId::File(_), InodeKind::Directory | InodeKind::Symlink)
-            | (NodeId::Directory(_), InodeKind::File | InodeKind::Symlink)
-            | (NodeId::Symlink(_), InodeKind::File | InodeKind::Directory) => {
+        match (id, inode.kind()) {
+            (HardLinkNodeId::File(_), InodeKind::File)
+            | (HardLinkNodeId::Symlink(_), InodeKind::Symlink) => {}
+            (HardLinkNodeId::File(_), InodeKind::Directory | InodeKind::Symlink)
+            | (HardLinkNodeId::Symlink(_), InodeKind::File | InodeKind::Directory) => {
                 return Err(Error::WrongInodeKind);
             }
-        };
+        }
         Ok(TransactionHardLinkSource { id })
     }
 
