@@ -2146,6 +2146,8 @@ pub(crate) enum QueryFileInformationClass {
     Basic,
     /// Windows `FileStandardInformation`.
     Standard,
+    /// Windows `FileHardLinkInformation`.
+    HardLink,
     /// Windows `FileStandardLinkInformation`.
     StandardLink,
     /// Windows `FileInternalInformation`.
@@ -2169,6 +2171,7 @@ impl QueryFileInformationClass {
         match value {
             wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => Ok(Self::Basic),
             wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation => Ok(Self::Standard),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileHardLinkInformation => Ok(Self::HardLink),
             wdk_sys::_FILE_INFORMATION_CLASS::FileStandardLinkInformation => Ok(Self::StandardLink),
             wdk_sys::_FILE_INFORMATION_CLASS::FileInternalInformation => Ok(Self::Internal),
             wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => Ok(Self::Position),
