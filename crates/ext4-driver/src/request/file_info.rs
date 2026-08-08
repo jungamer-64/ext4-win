@@ -298,6 +298,7 @@ async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResul
             }
             QueryFileInformationClass::Basic
             | QueryFileInformationClass::Standard
+            | QueryFileInformationClass::StandardLink
             | QueryFileInformationClass::Internal
             | QueryFileInformationClass::NetworkOpen
             | QueryFileInformationClass::AttributeTag => {}
@@ -345,6 +346,9 @@ async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResul
             }
             QueryFileInformationClass::Standard => {
                 pack_standard_information(buffer.as_mut_slice(), metadata, delete_pending)
+            }
+            QueryFileInformationClass::StandardLink => {
+                pack_standard_link_information(buffer.as_mut_slice(), metadata, delete_pending)
             }
             QueryFileInformationClass::Internal => {
                 pack_internal_information(buffer.as_mut_slice(), metadata)
@@ -2858,6 +2862,46 @@ enum FileMetadataKind {
     Symlink,
 }
 
+/// Windows-visible link state derived from one ext4 inode and its FCB lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsLinkInformation {
+    /// Links whose deletion has not been requested.
+    accessible_links: wdk_sys::ULONG,
+    /// All namespace links, including the one selected for deferred deletion.
+    total_links: wdk_sys::ULONG,
+    /// Whether the FCB has selected one exact link for deferred deletion.
+    delete_pending: bool,
+    /// Whether the inode is a directory rather than a file-like node.
+    directory: bool,
+}
+
+impl WindowsLinkInformation {
+    /// Projects ext4 link accounting into the Windows query-information contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a delete-pending FCB lacks the one selected namespace link that its
+    /// lifecycle guarantees.
+    fn from_metadata(metadata: FileMetadata, delete_pending: bool) -> DriverResult<Self> {
+        let directory = metadata.kind == FileMetadataKind::Directory;
+        let total_links = if directory {
+            1
+        } else {
+            wdk_sys::ULONG::from(metadata.links_count.get())
+        };
+        let pending_links = wdk_sys::ULONG::from(delete_pending);
+        let accessible_links = total_links
+            .checked_sub(pending_links)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        Ok(Self {
+            accessible_links,
+            total_links,
+            delete_pending,
+            directory,
+        })
+    }
+}
+
 /// Reparse metadata projected to Windows file-information records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileMetadataReparsePoint {
@@ -2978,14 +3022,37 @@ fn pack_standard_information(
     metadata: FileMetadata,
     delete_pending: bool,
 ) -> DriverResult<IrpCompletion> {
+    let links = WindowsLinkInformation::from_metadata(metadata, delete_pending)?;
     write_fixed(
         output,
         wdk_sys::FILE_STANDARD_INFORMATION {
             AllocationSize: large_integer_from_u64(metadata.allocation_size.bytes())?,
             EndOfFile: large_integer_from_u64(metadata.size.bytes())?,
-            NumberOfLinks: wdk_sys::ULONG::from(metadata.links_count.get()),
-            DeletePending: boolean(delete_pending),
-            Directory: boolean(metadata.kind == FileMetadataKind::Directory),
+            NumberOfLinks: links.total_links,
+            DeletePending: boolean(links.delete_pending),
+            Directory: boolean(links.directory),
+        },
+    )
+}
+
+/// Packs FILE_STANDARD_LINK_INFORMATION.
+/// # Errors
+///
+/// Returns an error when delete-pending state contradicts the selected link accounting or the
+/// output buffer is too small for `FILE_STANDARD_LINK_INFORMATION`.
+fn pack_standard_link_information(
+    output: &mut [u8],
+    metadata: FileMetadata,
+    delete_pending: bool,
+) -> DriverResult<IrpCompletion> {
+    let links = WindowsLinkInformation::from_metadata(metadata, delete_pending)?;
+    write_fixed(
+        output,
+        wdk_sys::FILE_STANDARD_LINK_INFORMATION {
+            NumberOfAccessibleLinks: links.accessible_links,
+            TotalNumberOfLinks: links.total_links,
+            DeletePending: boolean(links.delete_pending),
+            Directory: boolean(links.directory),
         },
     )
 }
@@ -3627,7 +3694,7 @@ mod tests {
 
     use crate::irp::{
         CreateDeletion, DataIoKind, DirectoryInformationClass, FileAttributesWriteAccess,
-        ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, WriteStartingPoint,
+        IrpCompletion, ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
     use crate::state::OpenedLocation;
@@ -3701,6 +3768,11 @@ mod tests {
         let bytes = buffer.get(offset..end)?;
         let bytes = <[u8; 4]>::try_from(bytes).ok()?;
         Some(u32::from_le_bytes(bytes))
+    }
+
+    /// Reads one byte from a test output buffer without panicking on a malformed layout.
+    fn byte_at(buffer: &[u8], offset: usize) -> Option<u8> {
+        buffer.get(offset).copied()
     }
 
     /// Reads one little-endian i64 from a test output buffer.
@@ -4423,6 +4495,211 @@ mod tests {
             }),
             Ok(FileSize::from_bytes(eof))
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when fixed-layout link information no longer preserves its Windows link lifecycle
+    /// contract.
+    #[test]
+    fn standard_link_information_projects_link_lifecycle_and_node_kind() {
+        let metadata = test_metadata(super::FileMetadataKind::File);
+        assert!(metadata.is_some());
+        let Some(mut metadata) = metadata else {
+            return;
+        };
+        let three_links = Ext4LinkCount::new(3);
+        assert!(three_links.is_ok());
+        let Ok(three_links) = three_links else {
+            return;
+        };
+        metadata.links_count = three_links;
+        let size = core::mem::size_of::<wdk_sys::FILE_STANDARD_LINK_INFORMATION>();
+
+        let mut live = vec![0_u8; size];
+        assert_eq!(
+            super::pack_standard_link_information(&mut live, metadata, false),
+            IrpCompletion::from_usize(size)
+        );
+        assert_eq!(
+            le_u32(
+                &live,
+                core::mem::offset_of!(
+                    wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+                    NumberOfAccessibleLinks
+                )
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            le_u32(
+                &live,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, TotalNumberOfLinks)
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            byte_at(
+                &live,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, DeletePending)
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            byte_at(
+                &live,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, Directory)
+            ),
+            Some(0)
+        );
+
+        let mut pending = vec![0_u8; size];
+        assert_eq!(
+            super::pack_standard_link_information(&mut pending, metadata, true),
+            IrpCompletion::from_usize(size)
+        );
+        assert_eq!(
+            le_u32(
+                &pending,
+                core::mem::offset_of!(
+                    wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+                    NumberOfAccessibleLinks
+                )
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            le_u32(
+                &pending,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, TotalNumberOfLinks)
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            byte_at(
+                &pending,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, DeletePending)
+            ),
+            Some(1)
+        );
+
+        metadata.links_count = Ext4LinkCount::ONE;
+        let mut single_pending = vec![0_u8; size];
+        assert_eq!(
+            super::pack_standard_link_information(&mut single_pending, metadata, true),
+            IrpCompletion::from_usize(size)
+        );
+        assert_eq!(
+            le_u32(
+                &single_pending,
+                core::mem::offset_of!(
+                    wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+                    NumberOfAccessibleLinks
+                )
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            le_u32(
+                &single_pending,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, TotalNumberOfLinks)
+            ),
+            Some(1)
+        );
+
+        metadata.kind = super::FileMetadataKind::Directory;
+        let five_links = Ext4LinkCount::new(5);
+        assert!(five_links.is_ok());
+        let Ok(five_links) = five_links else {
+            return;
+        };
+        metadata.links_count = five_links;
+        let mut directory = vec![0_u8; size];
+        assert_eq!(
+            super::pack_standard_link_information(&mut directory, metadata, false),
+            IrpCompletion::from_usize(size)
+        );
+        assert_eq!(
+            le_u32(
+                &directory,
+                core::mem::offset_of!(
+                    wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+                    NumberOfAccessibleLinks
+                )
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            le_u32(
+                &directory,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, TotalNumberOfLinks)
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            byte_at(
+                &directory,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, Directory)
+            ),
+            Some(1)
+        );
+
+        let mut standard = vec![0_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>()];
+        assert_eq!(
+            super::pack_standard_information(&mut standard, metadata, false),
+            IrpCompletion::from_usize(standard.len())
+        );
+        assert_eq!(
+            le_u32(
+                &standard,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, NumberOfLinks)
+            ),
+            Some(1)
+        );
+
+        metadata.kind = super::FileMetadataKind::Symlink;
+        metadata.links_count = three_links;
+        let mut symlink = vec![0_u8; size];
+        assert_eq!(
+            super::pack_standard_link_information(&mut symlink, metadata, false),
+            IrpCompletion::from_usize(size)
+        );
+        assert_eq!(
+            le_u32(
+                &symlink,
+                core::mem::offset_of!(
+                    wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+                    NumberOfAccessibleLinks
+                )
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            byte_at(
+                &symlink,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, Directory)
+            ),
+            Some(0)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when undersized fixed link-information output accepts or mutates a partial record.
+    #[test]
+    fn standard_link_information_rejects_short_output() {
+        let metadata = test_metadata(super::FileMetadataKind::File);
+        assert!(metadata.is_some());
+        let Some(metadata) = metadata else {
+            return;
+        };
+        let mut output =
+            vec![0xA5_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_LINK_INFORMATION>() - 1];
+        assert_eq!(
+            super::pack_standard_link_information(&mut output, metadata, false),
+            Err(DriverError::BufferTooSmall)
+        );
+        assert!(output.iter().all(|byte| *byte == 0xA5));
     }
 
     /// # Panics
