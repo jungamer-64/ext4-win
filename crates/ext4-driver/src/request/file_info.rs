@@ -229,33 +229,6 @@ pub(crate) fn write(
     write_regular_file_windowed(request, mutation)
 }
 
-/// Flushes cached or ordered file data.
-/// # Errors
-///
-/// Returns an error when the flush target cannot be resolved to a mounted ext4 volume or the
-/// lower storage flush fails.
-pub(crate) fn flush(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    let volume =
-        request.with_active(|active| FlushVolume::decode(active).map(FlushVolume::volume))?;
-    let mut operations = claim_volume_operation_lane(volume);
-    operations.runtime_mut().flush()?;
-    Ok(IrpCompletion::EMPTY)
-}
-
-/// Flushes one mounted volume during `IRP_MJ_SHUTDOWN`.
-/// # Errors
-///
-/// Returns an error when shutdown was not addressed to a mounted ext4 volume or the lower storage
-/// flush fails.
-pub(crate) fn shutdown(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    let volume = request.with_active(|active| {
-        FlushVolume::from_mounted_device(active.device()).map(FlushVolume::volume)
-    })?;
-    let mut operations = claim_volume_operation_lane(volume);
-    operations.runtime_mut().flush()?;
-    Ok(IrpCompletion::EMPTY)
-}
-
 /// Executes file information queries.
 /// # Errors
 ///
@@ -357,49 +330,6 @@ pub(crate) fn lock_control(target: &mut ActiveIrp<'_>) -> DriverResult<NonNull<F
     let file_object = target.current_stack()?.file_object()?;
     let opened = OpenedRegularFile::decode(file_object)?;
     Ok(NonNull::from(opened.file_control_block()))
-}
-
-/// Decoded mounted volume selected by a flush IRP.
-#[derive(Clone, Copy, Debug)]
-struct FlushVolume {
-    /// Mounted VCB whose backing device must be flushed.
-    volume: NonNull<VolumeControlBlock>,
-}
-
-impl FlushVolume {
-    /// Decodes a mounted volume device without consulting a FILE_OBJECT.
-    /// # Errors
-    ///
-    /// Returns an error when `device` is not a mounted ext4 volume device.
-    fn from_mounted_device(device: crate::state::KernelDevice) -> DriverResult<Self> {
-        let volume = MountedVolumeDevice::vcb(device).ok_or(DriverError::InvalidDeviceRequest)?;
-        Ok(Self { volume })
-    }
-
-    /// Decodes the mounted volume affected by a flush IRP.
-    /// # Errors
-    ///
-    /// Returns an error when the current stack is absent, the opened FILE_OBJECT context is invalid,
-    /// or a device-level flush is not directed at a mounted volume device.
-    fn decode(target: &mut ActiveIrp<'_>) -> DriverResult<Self> {
-        let stack = target.current_stack()?;
-        let volume = match stack.file_object() {
-            Ok(file_object) => match OpenedFileObject::decode(file_object)? {
-                OpenedFileObject::Node(opened) => opened.volume(),
-                OpenedFileObject::Volume(opened) => opened.volume(),
-            },
-            Err(DriverError::InvalidParameter) => {
-                Self::from_mounted_device(target.device())?.volume
-            }
-            Err(error) => return Err(error),
-        };
-        Ok(Self { volume })
-    }
-
-    /// Returns the mounted VCB pointer selected by the flush request.
-    const fn volume(self) -> NonNull<VolumeControlBlock> {
-        self.volume
-    }
 }
 
 /// Owned query-file work selected before the first suspension point.
@@ -4565,25 +4495,6 @@ mod tests {
                 .validate_attributes(readonly),
             Ok(())
         );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn flush_volume_rejects_unmounted_device_without_file_object() {
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let mut irp = wdk_sys::IRP::default();
-        let mut device = wdk_sys::DEVICE_OBJECT::default();
-        let target = target_from_stack(&mut stack, &mut irp, &mut device);
-        assert!(target.is_ok());
-
-        if let Ok(mut target) = target {
-            assert_eq!(
-                target.with_active(|active| super::FlushVolume::decode(active).err()),
-                Some(DriverError::InvalidDeviceRequest)
-            );
-        }
     }
 
     /// # Panics
