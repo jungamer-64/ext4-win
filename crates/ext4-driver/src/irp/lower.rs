@@ -649,6 +649,14 @@ pub struct PublishedLowerRequest<O> {
 }
 
 impl<O> PublishedLowerRequest<O> {
+    /// Returns whether this cancellation identity names the supplied envelope head.
+    ///
+    /// This compares only stable envelope addresses; it never searches for or dereferences an
+    /// operation generation.
+    pub fn identifies(&self, envelope: NonNull<LowerCompletionEnvelope<O>>) -> bool {
+        self.envelope.as_ptr() == envelope.as_ptr()
+    }
+
     /// Cancels one published lower request without taking IRP release authority.
     /// # Safety
     ///

@@ -28,8 +28,8 @@ use wdk_sys::{
 use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 
 use crate::irp::{
-    ActiveFileObject, ByteRangeLockKey, CreateDeletion, DataIoKind, DeleteAccess, DesiredAccess,
-    DeviceExecutor, DirectoryEntryIndex, DispatchTarget, ExistingOperationAccess,
+    ActiveFileObject, ByteRangeLockKey, CompletionReactor, CreateDeletion, DataIoKind,
+    DeleteAccess, DesiredAccess, DirectoryEntryIndex, DispatchTarget, ExistingOperationAccess,
     FileAttributesWriteAccess, RegularFileWriteAccess, RequestorProcess, ShareAccess,
 };
 use crate::kernel::cng::CngFscryptNonceGenerator;
@@ -47,7 +47,7 @@ pub(crate) struct KernelDevice {
 
 // SAFETY: WDM device objects are I/O Manager-owned, nonpaged objects that may be dispatched on any
 // processor. This boundary exposes only stable identity and immutable device properties; teardown
-// contracts require every executor task and lower completion to drain before deletion.
+// contracts require every reactor operation and lower completion to drain before deletion.
 unsafe impl Send for KernelDevice {}
 // SAFETY: Shared copies do not grant Rust mutation of the DEVICE_OBJECT.
 unsafe impl Sync for KernelDevice {}
@@ -446,9 +446,9 @@ impl DriverDeviceKind {
 /// Common prefix shared by all driver-owned device extensions.
 #[repr(C)]
 struct DeviceExtensionHeader {
-    /// Device-owned asynchronous request execution lane.
-    executor: DeviceExecutor,
-    /// Concrete extension kind following the executor prefix.
+    /// Device-owned completion-driven operation reactor.
+    reactor: CompletionReactor,
+    /// Concrete extension kind following the reactor prefix.
     kind: DeviceExtensionKind,
 }
 
@@ -463,7 +463,7 @@ impl ControlDeviceExtension {
     /// Initializes the extension attached to the control device.
     /// # Errors
     ///
-    /// Returns an error when the device has no extension or its executor cannot be initialized.
+    /// Returns an error when the device has no extension or its reactor cannot be initialized.
     fn initialize(device: KernelDevice) -> DriverResult<()> {
         let device_object = unsafe {
             // SAFETY: `device` is the newly created control device object.
@@ -482,8 +482,8 @@ impl ControlDeviceExtension {
         extension.header.kind = DeviceExtensionKind::CONTROL;
         unsafe {
             // SAFETY: The extension is stable device-owned storage.
-            DeviceExecutor::initialize_at(
-                core::ptr::addr_of_mut!(extension.header.executor),
+            CompletionReactor::initialize_at(
+                core::ptr::addr_of_mut!(extension.header.reactor),
                 device,
             )
         }
@@ -511,7 +511,7 @@ impl ControlDeviceExtension {
         };
         unsafe {
             // SAFETY: Teardown has exclusive access to the extension.
-            DeviceExecutor::release_at(core::ptr::addr_of_mut!(extension.header.executor));
+            CompletionReactor::release_at(core::ptr::addr_of_mut!(extension.header.reactor));
         }
     }
 }
@@ -580,7 +580,7 @@ pub(crate) struct VolumeControlBlock {
     file_control_blocks: FileControlBlockLedger,
     /// Actor-owned volume lifecycle and direct-open share accounting.
     volume_control: VolumeControlPlane,
-    /// Actor-owned journaled volume state used only by the serialized operation executor.
+    /// Mounted filesystem state accessed only through reactor-issued capabilities.
     operations: VolumeOperationLane,
 }
 
@@ -2738,8 +2738,8 @@ impl MountedVolumeDevice {
         unsafe {
             // SAFETY: The extension is stable device-owned storage for this
             // just-created mounted volume device.
-            DeviceExecutor::initialize_at(
-                core::ptr::addr_of_mut!(extension.header.executor),
+            CompletionReactor::initialize_at(
+                core::ptr::addr_of_mut!(extension.header.reactor),
                 device,
             )?;
         }
@@ -2747,7 +2747,7 @@ impl MountedVolumeDevice {
             unsafe {
                 // SAFETY: Shutdown registration failed before this device was
                 // published, so no actor continuation can still own the executor.
-                DeviceExecutor::release_at(core::ptr::addr_of_mut!(extension.header.executor));
+                CompletionReactor::release_at(core::ptr::addr_of_mut!(extension.header.reactor));
             }
             return Err(error);
         }
@@ -2763,7 +2763,7 @@ impl MountedVolumeDevice {
             unsafe {
                 // SAFETY: Work-item allocation failed before publication; no request can race
                 // executor teardown.
-                DeviceExecutor::release_at(core::ptr::addr_of_mut!(extension.header.executor));
+                CompletionReactor::release_at(core::ptr::addr_of_mut!(extension.header.reactor));
             }
             return Err(DriverError::InsufficientResources);
         }
@@ -2846,7 +2846,7 @@ impl MountedVolumeDevice {
         unsafe {
             // SAFETY: Terminal teardown closes admission, drains IRPs, and joins the actor before
             // any VCB or VPB storage is released.
-            DeviceExecutor::release_at(core::ptr::addr_of_mut!(extension.header.executor));
+            CompletionReactor::release_at(core::ptr::addr_of_mut!(extension.header.reactor));
         }
         let vcb = NonNull::new(extension.vcb).unwrap_or_else(|| {
             KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
