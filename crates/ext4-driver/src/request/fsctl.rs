@@ -12,6 +12,8 @@ use ext4_core::{
     FsverityHashAlgorithm, FsveritySalt, FsveritySignature,
 };
 
+use super::DriverMutationPass;
+
 /// Linux `FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER`.
 const FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER: u32 = 2;
 /// Linux `struct fscrypt_key_specifier` size.
@@ -112,8 +114,11 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 ///
 /// Returns an error when the enable payload is malformed, the FILE_OBJECT is not a regular file, or
 /// the fs-verity transaction fails.
-pub(crate) fn enable_verity(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    let (enable, file_id, mut operations) = {
+pub(crate) fn enable_verity(
+    mut request: PendingIrpLease<'_>,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<IrpCompletion> {
+    let (enable, file_id) = {
         request.with_active(|active| {
             let current = active.current_stack()?;
             let file_object = current.file_object()?;
@@ -121,21 +126,11 @@ pub(crate) fn enable_verity(mut request: PendingIrpLease<'_>) -> DriverResult<Ir
             let payload = read_input(active, stack)
                 .and_then(|input| FsverityEnablePayload::parse(input.as_slice()))?;
             let opened_file = OpenedRegularFile::decode(file_object)?;
-            let operations = unsafe {
-                // SAFETY: Enable-verity runs only as the mounted-device executor's unique active
-                // operation. The lease remains owned until the transaction completes.
-                VolumeControlBlock::operation_access(opened_file.volume())
-            };
-            Ok::<_, DriverError>((payload.into_core_enable(), opened_file.id(), operations))
+            Ok::<_, DriverError>((payload.into_core_enable(), opened_file.id()))
         })?
     };
-    let mut transaction = operations
-        .runtime_mut()
-        .journaled_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let file = transaction.file(file_id)?;
-    transaction.enable_verity(file, &enable)?;
-    transaction.commit()?;
+    let file = mutation.file(file_id)?;
+    mutation.enable_verity(file, &enable)?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -147,19 +142,13 @@ pub(crate) fn enable_verity(mut request: PendingIrpLease<'_>) -> DriverResult<Ir
 pub(crate) fn add_encryption_key(
     request: &mut PendingIrpLease<'_>,
     stack: FileSystemControlStack,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<IrpCompletion> {
     request.with_active(|active| {
         let input = read_input(active, stack)?;
         let payload = FscryptAddKeyPayload::parse(input.as_slice())?;
-        let volume = mounted_vcb(active)?;
-        let mut operations = unsafe {
-            // SAFETY: Add-key runs only as the mounted-device executor's unique active operation.
-            // The non-cloneable lease is consumed before this operation returns.
-            VolumeControlBlock::operation_access(volume)
-        };
-        operations
-            .runtime_mut()
-            .add_fscrypt_key(payload.into_master_key())?;
+        let _volume = mounted_vcb(active)?;
+        mutation.add_fscrypt_key(payload.into_master_key())?;
         Ok(IrpCompletion::EMPTY)
     })
 }
@@ -172,19 +161,13 @@ pub(crate) fn add_encryption_key(
 pub(crate) fn remove_encryption_key(
     request: &mut PendingIrpLease<'_>,
     stack: FileSystemControlStack,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<IrpCompletion> {
     request.with_active(|active| {
         let input = read_input(active, stack)?;
         let payload = FscryptRemoveKeyPayload::parse(input.as_slice())?;
-        let volume = mounted_vcb(active)?;
-        let mut operations = unsafe {
-            // SAFETY: Remove-key runs only as the mounted-device executor's unique active
-            // operation. The non-cloneable lease is consumed before this operation returns.
-            VolumeControlBlock::operation_access(volume)
-        };
-        let _removed = operations
-            .runtime_mut()
-            .remove_fscrypt_key(payload.identifier());
+        let _volume = mounted_vcb(active)?;
+        let _removed = mutation.remove_fscrypt_key(payload.identifier())?;
 
         let mut output = output_buffer(active, stack, FSCRYPT_REMOVE_KEY_BYTES)?;
         write_remove_key_output(output.as_mut_slice())?;

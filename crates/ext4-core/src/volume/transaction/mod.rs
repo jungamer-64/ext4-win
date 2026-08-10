@@ -329,6 +329,8 @@ pub struct MutationResolvePass<'storage, 'epoch, 'nonce, N> {
     free_inodes_delta: i64,
     /// Superblock volume label replacement staged by this transaction.
     volume_label_update: Option<Ext4VolumeLabel>,
+    /// Mount-scoped fscrypt key snapshot prepared during resolve.
+    fscrypt_keys_update: Option<FscryptKeySet>,
 }
 
 /// Fully resolved mutation with resource versions and provisional allocation choices.
@@ -348,6 +350,8 @@ pub struct ResolvedMutation {
     free_inodes_delta: i64,
     /// Optional label replacement merged at commit grant.
     volume_label_update: Option<Ext4VolumeLabel>,
+    /// Optional replacement for the mount-scoped fscrypt key snapshot.
+    fscrypt_keys_update: Option<FscryptKeySet>,
 }
 
 impl ResolvedMutation {
@@ -706,6 +710,7 @@ impl<'storage, 'epoch, 'nonce, N> MutationResolvePass<'storage, 'epoch, 'nonce, 
             free_clusters_delta: FreeClusterDelta::ZERO,
             free_inodes_delta: 0,
             volume_label_update: None,
+            fscrypt_keys_update: None,
         }
     }
 }
@@ -829,6 +834,34 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
     /// Replaces the ext4 volume label stored in the primary superblock.
     pub fn set_volume_label(&mut self, label: Ext4VolumeLabel) {
         self.volume_label_update = Some(label);
+    }
+
+    /// Adds one key to an operation-owned snapshot for allocation-free durable publication.
+    /// # Errors
+    ///
+    /// Returns an error when cloning key material fails or the identifier already exists.
+    pub fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> Result<()> {
+        let mut keys = match self.fscrypt_keys_update.take() {
+            Some(keys) => keys,
+            None => self.volume.fscrypt_keys.try_clone()?,
+        };
+        keys.insert(key)?;
+        self.fscrypt_keys_update = Some(keys);
+        Ok(())
+    }
+
+    /// Removes one key from an operation-owned snapshot for allocation-free publication.
+    /// # Errors
+    ///
+    /// Returns an error when cloning or rebuilding the key set fails.
+    pub fn remove_fscrypt_key(&mut self, identifier: FscryptKeyIdentifier) -> Result<bool> {
+        let mut keys = match self.fscrypt_keys_update.take() {
+            Some(keys) => keys,
+            None => self.volume.fscrypt_keys.try_clone()?,
+        };
+        let removed = keys.remove(identifier)?.is_some();
+        self.fscrypt_keys_update = Some(keys);
+        Ok(removed)
     }
 
     /// Computes mounted cluster state after a successful commit.
