@@ -173,7 +173,7 @@ impl MountedStorageDevices {
 
 /// Sector-aligned lower range covering one exact core request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CoveredTransfer {
+pub(crate) struct CoveredTransfer {
     /// Sector-aligned lower byte offset.
     lower_offset: ByteOffset,
     /// Whole-sector byte count.
@@ -198,7 +198,7 @@ impl CoveredTransfer {
 
 /// Current lower phase of a write command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WriteTransferPhase {
+pub(crate) enum WriteTransferPhase {
     /// Read the surrounding sectors before altering an unaligned subrange.
     ReadBeforeWrite,
     /// Write a complete-sector request image.

@@ -732,6 +732,7 @@ impl MountOperation {
             }
             super::OperationEvent::CancelRequested => Err(Error::OperationCancelled),
             super::OperationEvent::RetryElapsed(_)
+            | super::OperationEvent::DeviceLengthCompleted(_)
             | super::OperationEvent::IntentGranted(_)
             | super::OperationEvent::CommitGranted(_)
             | super::OperationEvent::VisibilityGranted(_)

@@ -949,7 +949,7 @@ impl RegisteredLowerRequest {
         unsafe {
             // SAFETY: Successful completion registration transferred all lifetime authority to
             // the callback. Synchronous completion may free the IRP inside this call.
-            ffi::IofCallDriver(self.target.as_ptr(), self.irp.as_ptr());
+            let _call_status = ffi::IofCallDriver(self.target.as_ptr(), self.irp.as_ptr());
         }
     }
 }

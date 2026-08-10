@@ -5,11 +5,12 @@ use core::ptr::NonNull;
 
 use ext4_core::{
     CleanJournalDurability, CommitDurability, CommitReadyMutation, DurableMutation,
-    EpochReadOperation, Error, HomeBlockDurability, JournalPayloadDurability,
-    MutationResolveOperation, MutationResolveTransition, OperationEvent, OrderedDataDurability,
-    ReadTransition, ReservedMutation, ResolvedMutation, StorageRequest, StorageRequestIdentity,
-    StorageRequestSequence, StorageRequestSequenceStep,
+    EpochReadOperation, Error, FscryptKeySet, HomeBlockDurability, JournalPayloadDurability,
+    MountOperation, MountTransition, MutationResolveOperation, MutationResolveTransition,
+    OperationEvent, OrderedDataDurability, ReadTransition, ReservedMutation, ResolvedMutation,
+    StorageRequest, StorageRequestIdentity, StorageRequestSequence, StorageRequestSequenceStep,
 };
+use wdk_sys::STATUS_SUCCESS;
 
 use crate::irp::reactor::{
     CompletionOperation, InfalliblePublication, IntentRequest, OperationTransition,
@@ -17,12 +18,14 @@ use crate::irp::reactor::{
 };
 use crate::irp::{CreateCompletion, IrpCompletion, OwnedIrp};
 use crate::kernel::cng::CngFscryptNonceGenerator;
+use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::kernel::storage::{MountedStorageDevices, StorageFailureClass};
+use crate::kernel::storage::{LowerStorageDevice, MountedStorageDevices, StorageFailureClass};
 use crate::memory;
+use crate::request::file_system_control::MountAdmission;
 use crate::state::{
     EpochLease, EpochPublicationSlot, EpochPublicationSlots, MountedVolumeDevice,
-    PendingCheckpoint, VolumeControlBlock,
+    MountedVolumeDeviceExtension, PendingCheckpoint, VolumeControlBlock,
 };
 
 /// Admission failure that preserves the unique top-level completion authority.
@@ -45,6 +48,214 @@ impl AdmitOperationError {
         (self.error, self.owned)
     }
 }
+
+/// Explicit ownership phase of one mount request.
+#[derive(Debug)]
+enum MountRequestState {
+    /// The mount IRP retains its VPB while a private length query is constructed.
+    QueryLength {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Stable kernel identities captured from the mount stack.
+        admission: MountAdmission,
+    },
+    /// Core mount resolution or recovery I/O owns the next concrete event.
+    Mounting {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Stable kernel identities captured from the mount stack.
+        admission: MountAdmission,
+        /// Concrete lower storage geometry used by core requests.
+        devices: MountedStorageDevices,
+        /// Suspended consuming core mount operation.
+        mount: MountOperation,
+    },
+    /// Terminal completion consumed the mount IRP.
+    Terminal,
+}
+
+/// Mount admission driven entirely by private-IRP completion events.
+#[derive(Debug)]
+struct MountRequestOperation {
+    /// Current consuming ownership phase.
+    state: MountRequestState,
+}
+
+impl MountRequestOperation {
+    /// Allocates one mount state machine without dropping the IRP on allocation failure.
+    fn try_new(
+        owned: OwnedIrp,
+        admission: MountAdmission,
+    ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+        match memory::boxed_try_map((owned, admission), |(owned, admission)| Self {
+            state: MountRequestState::QueryLength { owned, admission },
+        }) {
+            Ok(operation) => Ok(operation),
+            Err(error) => {
+                let (error, (owned, _admission)) = error.into_parts();
+                Err(AdmitOperationError::new(error, owned))
+            }
+        }
+    }
+
+    /// Completes and consumes the top-level mount IRP.
+    fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
+        let _status = owned.complete_result(result);
+        OperationTransition::Complete
+    }
+
+    /// Converts a core mount transition into its matching reactor action.
+    fn drive_mount(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        admission: MountAdmission,
+        devices: MountedStorageDevices,
+        transition: MountTransition,
+    ) -> OperationTransition {
+        match transition {
+            MountTransition::SubmitLower { request, suspended } => {
+                self.state = MountRequestState::Mounting {
+                    owned,
+                    admission,
+                    devices,
+                    mount: suspended,
+                };
+                OperationTransition::SubmitLower {
+                    devices,
+                    request,
+                    suspended: self,
+                }
+            }
+            MountTransition::Complete(Ok(completed)) => {
+                Self::complete(owned, Self::publish_mount(admission, devices, completed))
+            }
+            MountTransition::Complete(Err(Error::InvalidMagic | Error::InvalidSuperblock)) => {
+                Self::complete(owned, Err(DriverError::UnrecognizedVolume))
+            }
+            MountTransition::Complete(Err(error)) => {
+                Self::complete(owned, Err(DriverError::from(error)))
+            }
+        }
+    }
+
+    /// Publishes a fully mounted VCB and device after every core recovery action is complete.
+    fn publish_mount(
+        admission: MountAdmission,
+        devices: MountedStorageDevices,
+        completed: ext4_core::CompletedMount,
+    ) -> DriverResult<IrpCompletion> {
+        let _output_buffer_length = admission.output_buffer_length().as_usize();
+        let Some(driver_object) = admission.file_system_device().driver_object() else {
+            return Err(DriverError::InvalidParameter);
+        };
+        let mut vcb = memory::boxed_try_with(move || {
+            VolumeControlBlock::from_completed_mount(completed, devices)
+        })?;
+        vcb.initialize_directory_change_notifier()?;
+
+        let extension_size =
+            wdk_sys::ULONG::try_from(core::mem::size_of::<MountedVolumeDeviceExtension>())
+                .map_err(|_| DriverError::InvalidParameter)?;
+        let mut device = core::ptr::null_mut();
+        let status = unsafe {
+            // SAFETY: The control device's driver object creates one unpublished mounted device;
+            // `device` is writable out storage until this call returns.
+            ffi::IoCreateDevice(
+                driver_object,
+                extension_size,
+                core::ptr::null_mut(),
+                ffi::FILE_DEVICE_DISK_FILE_SYSTEM,
+                0,
+                0,
+                core::ptr::addr_of_mut!(device),
+            )
+        };
+        if status < STATUS_SUCCESS {
+            return Err(DriverError::InsufficientResources);
+        }
+
+        match MountedVolumeDevice::initialize(
+            device,
+            vcb,
+            admission.vpb().as_non_null(),
+            admission.target_device(),
+        ) {
+            Ok(_mounted_device) => Ok(IrpCompletion::EMPTY),
+            Err(error) => {
+                unsafe {
+                    // SAFETY: Initialization rejected the unpublished device and retained no VCB
+                    // ownership in its extension.
+                    ffi::IoDeleteDevice(device);
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+impl CompletionOperation for MountRequestOperation {
+    fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+        let state = core::mem::replace(&mut self.state, MountRequestState::Terminal);
+        match state {
+            MountRequestState::QueryLength { owned, admission } => match event {
+                OperationEvent::Admitted => {
+                    self.state = MountRequestState::QueryLength { owned, admission };
+                    OperationTransition::QueryDeviceLength {
+                        completion_owner: admission.file_system_device(),
+                        target: admission.target_device(),
+                        suspended: self,
+                    }
+                }
+                OperationEvent::DeviceLengthCompleted(Ok(length)) => {
+                    let filesystem =
+                        match LowerStorageDevice::from_device(admission.target_device(), length) {
+                            Ok(filesystem) => filesystem,
+                            Err(error) => return Self::complete(owned, Err(error)),
+                        };
+                    let devices = MountedStorageDevices::new(
+                        admission.file_system_device(),
+                        filesystem,
+                        None,
+                    );
+                    let mount = MountOperation::new(length, None, FscryptKeySet::empty());
+                    let transition = mount.advance(OperationEvent::Admitted);
+                    self.drive_mount(owned, admission, devices, transition)
+                }
+                OperationEvent::DeviceLengthCompleted(Err(error)) => {
+                    Self::complete(owned, Err(DriverError::from(error)))
+                }
+                OperationEvent::CancelRequested => {
+                    Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
+                }
+                OperationEvent::StorageCompleted(_)
+                | OperationEvent::RetryElapsed(_)
+                | OperationEvent::IntentGranted(_)
+                | OperationEvent::CommitGranted(_)
+                | OperationEvent::VisibilityGranted(_)
+                | OperationEvent::CheckpointGranted(_)
+                | OperationEvent::BarrierReleased(_) => {
+                    Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                }
+            },
+            MountRequestState::Mounting {
+                owned,
+                admission,
+                devices,
+                mount,
+            } => {
+                let transition = mount.advance(event);
+                self.drive_mount(owned, admission, devices, transition)
+            }
+            MountRequestState::Terminal => OperationTransition::Complete,
+        }
+    }
+
+    fn record_storage_failure(&mut self, _failure: StorageFailureClass) {}
+}
+
+// SAFETY: Stable kernel identities are pinned by the top-level mount IRP; the core operation and
+// IRP move only by value between the reactor and nonpaged completion envelopes.
+unsafe impl Send for MountRequestOperation {}
 
 /// Read-only request executed against one immutable epoch lease.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,6 +502,7 @@ impl CompletionOperation for ImmediateRequestOperation {
             },
             OperationEvent::CancelRequested => Err(DriverError::from(Error::OperationCancelled)),
             OperationEvent::StorageCompleted(_)
+            | OperationEvent::DeviceLengthCompleted(_)
             | OperationEvent::RetryElapsed(_)
             | OperationEvent::IntentGranted(_)
             | OperationEvent::CommitGranted(_)
@@ -444,6 +656,7 @@ impl CompletionOperation for FlushRequestOperation {
                     Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
                 OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -478,6 +691,7 @@ impl CompletionOperation for FlushRequestOperation {
                 }
                 OperationEvent::Admitted
                 | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -1563,6 +1777,7 @@ impl CompletionOperation for MutationRequestOperation {
                     self.drive_checkpoint_home(operation.start(checkpoint), publication, epoch)
                 }
                 OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::CancelRequested
                 | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
@@ -1717,6 +1932,14 @@ impl InfalliblePublication for MutationRequestOperation {
 // mutable access is confined to the sole reactor thread and completion envelopes move only owned
 // state.
 unsafe impl Send for MutationRequestOperation {}
+
+/// Allocates one completion-driven mount operation.
+pub(crate) fn mount(
+    owned: OwnedIrp,
+    admission: MountAdmission,
+) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+    MountRequestOperation::try_new(owned, admission)
+}
 
 /// Allocates one concrete read operation.
 pub(crate) fn read(

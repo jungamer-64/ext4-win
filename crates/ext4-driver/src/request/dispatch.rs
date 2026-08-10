@@ -345,6 +345,7 @@ pub(crate) fn admit_owned(
     mut owned: OwnedIrp,
 ) -> Result<alloc::boxed::Box<dyn crate::irp::reactor::CompletionOperation>, AdmitOperationError> {
     enum Admission {
+        Mount(super::file_system_control::MountAdmission),
         Read(ReadRequestKind),
         Mutation(MutationRequestKind),
         Flush(FlushRequestKind),
@@ -411,8 +412,10 @@ pub(crate) fn admit_owned(
                 Err(error) => return Err(AdmitOperationError::new(error, owned)),
             };
             match classified {
-                super::file_system_control::FsControlAdmission::Mount(_)
-                | super::file_system_control::FsControlAdmission::Unsupported => {
+                super::file_system_control::FsControlAdmission::Mount(mount) => {
+                    Admission::Mount(mount)
+                }
+                super::file_system_control::FsControlAdmission::Unsupported => {
                     Admission::Unsupported
                 }
                 super::file_system_control::FsControlAdmission::User(code) => match code {
@@ -448,6 +451,7 @@ pub(crate) fn admit_owned(
     };
 
     match admission {
+        Admission::Mount(admission) => super::operation::mount(owned, admission),
         Admission::Read(kind) => super::operation::read(owned, kind),
         Admission::Mutation(kind) => super::operation::mutation(owned, kind),
         Admission::Flush(kind) => super::operation::flush(owned, kind),
