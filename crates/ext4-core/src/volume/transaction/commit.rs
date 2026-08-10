@@ -389,7 +389,11 @@ impl ReservedMutation {
 impl CommitReadyMutation {
     /// Starts ordered data I/O while sealing all later commit and publication states.
     #[must_use]
-    pub fn start(self) -> StorageRequestSequence<OrderedDataDurability> {
+    pub fn start(
+        self,
+        commit: super::super::CommitLease,
+    ) -> StorageRequestSequence<OrderedDataDurability> {
+        let _ticket = commit.into_ticket();
         let durable = DurableMutation {
             durable_journal: self.durable_journal,
             durable_epoch: self.durable_epoch,
@@ -415,7 +419,12 @@ impl DurableMutation {
     ///
     /// This transition performs no allocation and cannot return an ordinary error.
     #[must_use]
-    pub fn publish(self, coordinator: &mut MutationCoordinatorState) -> PublishedMutation {
+    pub fn publish(
+        self,
+        coordinator: &mut MutationCoordinatorState,
+        visibility: super::super::VisibilityLease,
+    ) -> PublishedMutation {
+        let _ticket = visibility.into_ticket();
         let _durable_journal = self.durable_journal;
         coordinator.journal = JournalCoordinatorState::CheckpointPending;
         coordinator.publish_versions(self.version_publication);
@@ -429,7 +438,11 @@ impl DurableMutation {
 impl CheckpointOperation {
     /// Starts checkpoint home-block I/O while sealing clean publication state.
     #[must_use]
-    pub fn start(self) -> StorageRequestSequence<HomeBlockDurability> {
+    pub fn start(
+        self,
+        checkpoint: super::super::CheckpointLease,
+    ) -> StorageRequestSequence<HomeBlockDurability> {
+        let _epoch = checkpoint.into_epoch();
         let journal_target = self.clean_write.target();
         StorageRequestSequence::new(
             self.home_writes,

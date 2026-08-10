@@ -605,15 +605,6 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
     }
 }
 
-/// Event accepted by the completion-driven mount operation.
-#[derive(Debug)]
-pub enum MountEvent {
-    /// First admission into the filesystem reactor.
-    Admitted,
-    /// One lower-storage transfer whose buffer is no longer used by the lower stack.
-    StorageCompleted(crate::StorageCompletion),
-}
-
 /// Completed mount values installed independently in the driver VCB.
 #[derive(Debug)]
 pub struct CompletedMount {
@@ -728,15 +719,24 @@ impl MountOperation {
 
     /// Consumes one concrete event and runs until the next lower request or terminal result.
     #[must_use]
-    pub fn advance(mut self, event: MountEvent) -> MountTransition {
+    pub fn advance(mut self, event: super::OperationEvent) -> MountTransition {
         let accepted = match event {
-            MountEvent::Admitted => match &self.state {
+            super::OperationEvent::Admitted => match &self.state {
                 MountState::Resolving => Ok(()),
                 MountState::RecoveryIo(_)
                 | MountState::AwaitingRecoveryIo { .. }
                 | MountState::Indexing(_) => Err(Error::DeviceIo),
             },
-            MountEvent::StorageCompleted(completion) => self.accept_completion(completion),
+            super::OperationEvent::StorageCompleted(completion) => {
+                self.accept_completion(completion)
+            }
+            super::OperationEvent::CancelRequested => Err(Error::OperationCancelled),
+            super::OperationEvent::RetryElapsed(_)
+            | super::OperationEvent::IntentGranted(_)
+            | super::OperationEvent::CommitGranted(_)
+            | super::OperationEvent::VisibilityGranted(_)
+            | super::OperationEvent::CheckpointGranted(_)
+            | super::OperationEvent::BarrierReleased(_) => Err(Error::DeviceIo),
         };
         if let Err(error) = accepted {
             return MountTransition::Complete(Err(error));

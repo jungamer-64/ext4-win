@@ -98,6 +98,8 @@ pub enum Error {
     VerityMismatch,
     /// Memory allocation failed before the requested operation could complete.
     OutOfMemory,
+    /// The scheduler canceled an operation before its durability guard consumed cancellation.
+    OperationCancelled,
     /// Internal operation resolution suspended until one owned storage transfer completes.
     ///
     /// Public operation entry points consume this control result and expose a storage command;
@@ -155,6 +157,7 @@ impl fmt::Display for Error {
             Self::InvalidVerityMetadata => "invalid ext4 verity metadata",
             Self::VerityMismatch => "ext4 verity verification failed",
             Self::OutOfMemory => "memory allocation failed",
+            Self::OperationCancelled => "filesystem operation was canceled",
             Self::OperationSuspended => "filesystem operation is awaiting storage completion",
         })
     }

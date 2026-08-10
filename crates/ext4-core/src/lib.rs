@@ -44,18 +44,19 @@ pub use protection::verity::{
     FsverityBlockSize, FsverityEnable, FsverityHashAlgorithm, FsveritySalt, FsveritySignature,
 };
 pub use volume::{
-    CheckpointOperation, ChildLookup, CleanJournalDurability, CleanJournalRecordPhase,
-    CommitDurability, CommitReadyMutation, CommitRecordPhase, CommittedEpoch, CompletedMount,
-    DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, DurableMutation,
-    EpochReadOperation, EpochSequence, FileNode, FileNodeId, HardLinkDestination, HardLinkEntry,
-    HardLinkNodeId, HardLinks, HomeBlockDurability, JournalPayloadDurability, MountEvent,
-    MountOperation, MountTransition, MountedProfile, MutationCoordinatorState,
-    MutationResolveEvent, MutationResolveOperation, MutationResolvePass, MutationResolveReady,
-    MutationResolveTransition, MutationResource, NodeId, ObservedResourceVersionSet,
-    OrderedDataDurability, PublishedMutation, ReadEvent, ReadTransition, RenameTargetCollision,
-    ReservedMutation, ResolvedMutation, ResourceVersion, StorageRequestSequence,
+    BarrierPermit, CheckpointLease, CheckpointOperation, ChildLookup, CleanJournalDurability,
+    CleanJournalRecordPhase, CommitDurability, CommitLease, CommitReadyMutation, CommitRecordPhase,
+    CommittedEpoch, CompletedMount, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId,
+    DurableMutation, EpochReadOperation, EpochSequence, FileNode, FileNodeId, HardLinkDestination,
+    HardLinkEntry, HardLinkNodeId, HardLinks, HomeBlockDurability, JournalPayloadDurability,
+    MountOperation, MountTransition, MountedProfile, MutationCoordinatorState, MutationLease,
+    MutationResolveOperation, MutationResolvePass, MutationResolveReady, MutationResolveTransition,
+    MutationResource, NodeId, ObservedResourceVersionSet, OperationEvent, OperationId,
+    OrderedDataDurability, PublishedMutation, ReadTransition, RenameTargetCollision,
+    ReservedMutation, ResolvedMutation, ResourceVersion, RetryPermit, StorageRequestSequence,
     StorageRequestSequenceStep, SymlinkNode, SymlinkNodeId, TransactionDirectory, TransactionFile,
-    TransactionHardLinkSource, TransactionNode, TransactionSymlink, VolumeGeometry, VolumeIdentity,
+    TransactionHardLinkSource, TransactionNode, TransactionSymlink, VisibilityLease,
+    VolumeGeometry, VolumeIdentity,
 };
 
 #[cfg(test)]
