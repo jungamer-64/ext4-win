@@ -3,7 +3,7 @@
 use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u32};
-use crate::disk::io::{BlockSource, BlockStorage};
+use crate::disk::storage::OperationDevice;
 use crate::disk_format::inode::{
     FileSizeEncoding, InodeBlockCountEncoding, InodeDataEncoding, InodeId,
 };
@@ -462,6 +462,12 @@ impl FreeInodeCount {
     #[must_use]
     pub const fn new(value: u32) -> Self {
         Self(value)
+    }
+
+    /// Returns the raw free-inode count.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
     }
 }
 
@@ -1444,11 +1450,9 @@ impl Superblock {
     /// Returns an error when the primary superblock cannot be read or does not
     /// satisfy the clean v1 mount policy.
     #[cfg(test)]
-    pub async fn read_from(device: &mut impl BlockSource) -> Result<Self> {
+    pub fn read_from(device: &mut OperationDevice<'_>) -> Result<Self> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
-        device
-            .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)
-            .await?;
+        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
         Self::parse(&raw)
     }
 
@@ -1456,11 +1460,9 @@ impl Superblock {
     ///
     /// # Errors
     /// Returns an error when the superblock cannot support journaled writes.
-    pub async fn read_write_from(device: &mut impl BlockSource) -> Result<Self> {
+    pub fn read_write_from(device: &mut OperationDevice<'_>) -> Result<Self> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
-        device
-            .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)
-            .await?;
+        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
         Self::parse_read_write(&raw)
     }
 
@@ -1802,22 +1804,21 @@ impl Superblock {
         self.features.recovery_state()
     }
 
-    /// Clears the recovery-required incompat bit in the primary superblock.
+    /// Builds a primary-superblock image with the recovery-required bit cleared.
     ///
+    /// This function performs no write. The mount operation must persist the returned image and
+    /// flush it before publishing mounted state.
     /// # Errors
-    /// Returns an error when the primary superblock cannot be read or written.
-    pub async fn clear_recover_on_device(device: &mut impl BlockStorage) -> Result<()> {
+    /// Returns an error when the primary superblock cannot be read or rewritten.
+    pub(crate) fn prepare_clear_recover(
+        device: &mut OperationDevice<'_>,
+    ) -> Result<[u8; SUPERBLOCK_SIZE]> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
-        device
-            .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)
-            .await?;
+        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
         let incompat = le_u32(&raw, disk_offset(96))? & !INCOMPAT_RECOVER;
         put_le_u32(&mut raw, disk_offset(96), incompat)?;
         Self::refresh_checksum(&mut raw)?;
-        device
-            .write_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &raw)
-            .await?;
-        device.flush().await
+        Ok(raw)
     }
 
     /// Recomputes the primary superblock checksum when the on-disk checksum is present.
@@ -1995,6 +1996,34 @@ impl Superblock {
         }
         self.free_clusters_count = FreeClusterCount::new(updated);
         Ok(())
+    }
+
+    /// Applies one committed free-inode delta to this in-memory epoch image.
+    /// # Errors
+    ///
+    /// Returns an error when the delta underflows, overflows, or exceeds total inode count.
+    pub(crate) fn apply_free_inode_delta(&mut self, delta: i64) -> Result<()> {
+        let current = u64::from(self.free_inodes_count.as_u32());
+        let updated = if delta.is_negative() {
+            current
+                .checked_sub(delta.unsigned_abs())
+                .ok_or(Error::InvalidSuperblock)?
+        } else {
+            current
+                .checked_add(u64::try_from(delta).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?
+        };
+        if updated > u64::from(self.inode_count.as_u32()) {
+            return Err(Error::InvalidSuperblock);
+        }
+        self.free_inodes_count =
+            FreeInodeCount::new(u32::try_from(updated).map_err(|_| Error::ArithmeticOverflow)?);
+        Ok(())
+    }
+
+    /// Applies a committed volume-label replacement to this in-memory epoch image.
+    pub(crate) fn apply_volume_label(&mut self, label: Ext4VolumeLabel) {
+        self.volume_label = label;
     }
 
     /// Applies an allocation-cluster delta to the block-based superblock free-space fields.

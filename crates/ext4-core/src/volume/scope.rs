@@ -7,7 +7,7 @@ pub(super) use alloc::vec::Vec;
 pub(super) use crate::disk::block::{BlockAddress, BlockSize, ByteOffset, DeviceLength};
 pub(super) use crate::disk::checksum::ext4_crc32c;
 pub(super) use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
-pub(super) use crate::disk::io::{BlockSource, BlockStorage};
+pub(super) use crate::disk::storage::OperationDevice;
 #[cfg(test)]
 pub(super) use crate::disk_format::acl::{PosixAcl, PosixAclKind};
 pub(super) use crate::disk_format::dir::{
@@ -27,7 +27,9 @@ pub(super) use crate::disk_format::inode::{
     InodeKind, InodeMode, InodeStorage, LinkCountAfterDecrement, NewDirectoryMetadata,
     NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
-pub(super) use crate::disk_format::journal::{Journal, LoadedJournal, MetadataBlock};
+pub(super) use crate::disk_format::journal::{
+    CleanJournal, DirtyJournal, Journal, LoadedJournal, MetadataBlock,
+};
 pub(super) use crate::disk_format::superblock::{
     BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel, FreeClusterCount,
     FreeClusterDelta, InodeTimestampEncoding, JournalMode, MetadataChecksum, RecoveryState,
@@ -42,9 +44,9 @@ pub(super) use crate::platform::name::Ext4Name;
 pub(super) use crate::platform::name::WindowsName;
 pub(super) use crate::platform::windows::{WindowsOverlay, WindowsSymlinkReparsePoint};
 pub(super) use crate::protection::fscrypt::{
-    FscryptContentsKey, FscryptContextV2, FscryptFileNonce, FscryptFilenamePadding,
-    FscryptFilenamesKey, FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey,
-    FscryptNoKeyName, FscryptNonceGenerator,
+    FscryptContentsKey, FscryptContextV2, FscryptFilenamePadding, FscryptFilenamesKey,
+    FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, FscryptNoKeyName,
+    FscryptNonceGenerator,
 };
 pub(super) use crate::protection::verity::{
     Ext4VerityMetadataLayout, FSVERITY_DESCRIPTOR_BYTES, FsverityDescriptor, FsverityEnable,
@@ -60,11 +62,10 @@ pub(super) use super::inode_record::{
     AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord, ResizeInodeBlockMap,
     StagedInodeIndex, StagedInodeRecord,
 };
-#[cfg(test)]
-pub(super) use super::mount::ReadOnlyVolume;
 pub(super) use super::mount::{
-    ExternalJournal, InternalJournal, JournaledMount, JournaledVolume, MountedVolume,
-    VolumeGeometry, VolumeIdentity,
+    CommittedEpoch, EpochReadView, JournalCoordinatorState, MountedProfile,
+    MutationCoordinatorState, MutationResource, ObservedResourceVersionSet,
+    ResourceVersionPublication,
 };
 pub(super) use super::node::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,

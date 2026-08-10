@@ -16,22 +16,18 @@ use commit::{
 use staging::{BlockImage, EncryptedBlockBase, GroupDelta, RangeWrite};
 
 /// Extent-tree reader that overlays this transaction's staged metadata blocks on the device.
-struct TransactionExtentSource<'a, D> {
+struct TransactionExtentSource<'source, 'device> {
     /// Mounted storage containing committed extent metadata.
-    device: &'a mut D,
+    device: &'source mut OperationDevice<'device>,
     /// Newer extent metadata images staged by this transaction.
-    staged: &'a [BlockImage],
+    staged: &'source [BlockImage],
     /// Mounted filesystem block size used to locate staged images.
     block_size: BlockSize,
 }
 
-impl<D: BlockSource> BlockSource for TransactionExtentSource<'_, D> {
-    fn len(&self) -> DeviceLength {
-        self.device.len()
-    }
-
-    async fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
-        self.device.read_exact_at(offset, out).await?;
+impl crate::disk_format::extent::ExtentNodeReader for TransactionExtentSource<'_, '_> {
+    fn read_extent_bytes(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
+        self.device.read_exact_at(offset, out)?;
         let request_start = offset.get();
         let request_end = request_start
             .checked_add(u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?)
@@ -72,14 +68,14 @@ impl<D: BlockSource> BlockSource for TransactionExtentSource<'_, D> {
                     .ok_or(Error::ArithmeticOverflow)?,
             )
             .map_err(|_| Error::ArithmeticOverflow)?;
-            out.get_mut(target_start..target_end)
-                .ok_or(Error::DeviceRange)?
-                .copy_from_slice(
-                    image
-                        .bytes
-                        .get(source_start..source_end)
-                        .ok_or(Error::DeviceRange)?,
-                );
+            memory::copy_exact(
+                out.get_mut(target_start..target_end)
+                    .ok_or(Error::DeviceRange)?,
+                image
+                    .bytes
+                    .get(source_start..source_end)
+                    .ok_or(Error::DeviceRange)?,
+            )?;
         }
         Ok(())
     }
@@ -300,11 +296,13 @@ impl TransactionNode {
     }
 }
 
-/// In-progress ext4 write transaction.
+/// Restart-local mutation resolver that owns no committed or coordinator state.
 #[derive(Debug)]
-pub struct JournalTransaction<'a, D: BlockStorage, N, J = InternalJournal> {
-    /// Mounted read-write volume being mutated.
-    volume: &'a mut MountedVolume<D, JournaledMount<J>, N>,
+pub struct MutationResolvePass<'storage, 'epoch, 'nonce, N> {
+    /// Ephemeral view of the selected committed epoch and operation transcript.
+    volume: EpochReadView<'storage, 'epoch>,
+    /// Operation-owned nonce source, retained outside committed epoch state.
+    nonce_generator: &'nonce mut N,
     /// Timestamp applied consistently to staged inode updates.
     now: Ext4Timestamp,
     /// Inode records staged for rewrite at commit.
@@ -333,14 +331,363 @@ pub struct JournalTransaction<'a, D: BlockStorage, N, J = InternalJournal> {
     volume_label_update: Option<Ext4VolumeLabel>,
 }
 
-impl<'a, D: BlockStorage, N, J> JournalTransaction<'a, D, N, J> {
-    /// Starts an empty journal transaction for a mounted read-write volume.
+/// Fully resolved mutation with resource versions and provisional allocation choices.
+#[derive(Debug)]
+pub struct ResolvedMutation {
+    /// Resource set and versions observed by this resolve pass.
+    observed: ObservedResourceVersionSet,
+    /// Ordered data images that must be durable before journal metadata is written.
+    data_writes: Vec<RangeWrite>,
+    /// Complete metadata blocks supplied to JBD2 serialization.
+    metadata_blocks: Vec<MetadataBlock>,
+    /// Cluster-reference changes merged into the latest disjoint committed epoch at commit grant.
+    cluster_deltas: Vec<ClusterReferenceDelta>,
+    /// Free-cluster counter change merged at commit grant.
+    free_clusters_delta: FreeClusterDelta,
+    /// Free-inode counter change merged at commit grant.
+    free_inodes_delta: i64,
+    /// Optional label replacement merged at commit grant.
+    volume_label_update: Option<Ext4VolumeLabel>,
+}
+
+impl ResolvedMutation {
+    /// Resource/version snapshot used for intent acquisition and pre-reservation revalidation.
+    #[must_use]
+    pub const fn observed_resources(&self) -> &ObservedResourceVersionSet {
+        &self.observed
+    }
+
+    /// Consumes a version-revalidated mutation into the reservation typestate.
+    ///
+    /// Allocation choices remain provisional until this transition occurs while all listed
+    /// resource intents are held.
+    /// # Errors
+    ///
+    /// Returns an error when a resource version changed after resolution.
+    pub fn reserve(self, coordinator: &MutationCoordinatorState) -> Result<ReservedMutation> {
+        if !coordinator.revalidate(&self.observed) {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        Ok(ReservedMutation { resolved: self })
+    }
+}
+
+/// Mutation whose provisional block and inode choices are protected by held intents.
+#[derive(Debug)]
+pub struct ReservedMutation {
+    /// Version-revalidated resolved data.
+    resolved: ResolvedMutation,
+}
+
+/// All lower-write, epoch-publication, version, and checkpoint allocations prepared up front.
+#[derive(Debug)]
+pub struct CommitReadyMutation {
+    /// Ordered data writes before journal descriptor/data records.
+    ordered_data_writes: Vec<crate::StorageRequest>,
+    /// Dirty-superblock, descriptor, and journal payload writes.
+    journal_writes: Vec<crate::StorageRequest>,
+    /// Commit record written after the first journal durability flush.
+    commit_write: crate::StorageRequest,
+    /// Journal device whose flush establishes commit durability.
+    journal_target: crate::StorageTarget,
+    /// Dirty journal coordinator value moved at visibility publication.
+    durable_journal: Journal<DirtyJournal>,
+    /// Immutable overlay epoch moved at visibility publication.
+    durable_epoch: CommittedEpoch,
+    /// Preallocated checkpoint and overlay-free epoch detached from visibility.
+    checkpoint: CheckpointOperation,
+    /// Complete next resource-version table.
+    version_publication: ResourceVersionPublication,
+}
+
+/// Commit whose record and required flush are durable but not yet visible to readers.
+#[derive(Debug)]
+pub struct DurableMutation {
+    /// Dirty journal coordinator value.
+    durable_journal: Journal<DirtyJournal>,
+    /// Overlay epoch ready for an allocation-free swap.
+    durable_epoch: CommittedEpoch,
+    /// Independent checkpoint work and overlay-free epoch.
+    checkpoint: CheckpointOperation,
+    /// Resource versions moved into the coordinator during visibility publication.
+    version_publication: ResourceVersionPublication,
+}
+
+/// Visibility publication result containing the new epoch and detached checkpoint operation.
+#[derive(Debug)]
+pub struct PublishedMutation {
+    /// Committed overlay epoch swapped into the bounded epoch registry.
+    epoch: CommittedEpoch,
+    /// Checkpoint work that does not retain the visibility grant.
+    checkpoint: CheckpointOperation,
+}
+
+impl PublishedMutation {
+    /// Consumes publication into the new epoch and independent checkpoint operation.
+    #[must_use]
+    pub fn into_parts(self) -> (CommittedEpoch, CheckpointOperation) {
+        (self.epoch, self.checkpoint)
+    }
+}
+
+/// Home-block checkpoint and clean-journal publication prepared before the commit started.
+#[derive(Debug)]
+pub struct CheckpointOperation {
+    /// Preallocated filesystem home writes.
+    home_writes: Vec<crate::StorageRequest>,
+    /// Preallocated clean journal-superblock write.
+    clean_write: crate::StorageRequest,
+    /// Clean journal state installed after the final flush.
+    clean_journal: Journal<CleanJournal>,
+    /// Overlay-free epoch installed after the final flush.
+    checkpointed_epoch: CommittedEpoch,
+}
+
+/// Allocation-free iterator over one prebuilt storage-request sequence.
+#[derive(Debug)]
+pub struct StorageRequestSequence<Next> {
+    /// Remaining requests moved one at a time into lower-I/O ownership.
+    remaining: alloc::vec::IntoIter<crate::StorageRequest>,
+    /// Continuation revealed only after the sequence is exhausted.
+    next: Next,
+}
+
+/// Consuming transition from a prebuilt storage-request sequence.
+#[derive(Debug)]
+pub enum StorageRequestSequenceStep<Next> {
+    /// Submit one owned request and retain the remaining sequence as suspended operation state.
+    Submit {
+        /// Owned request transferred into the lower completion envelope.
+        request: crate::StorageRequest,
+        /// Suspended sequence resumed only by that request's completion.
+        suspended: StorageRequestSequence<Next>,
+    },
+    /// Every request completed and the next typestate is available.
+    Finished(Next),
+}
+
+impl<Next> StorageRequestSequence<Next> {
+    /// Builds a consuming sequence from fully preallocated requests.
+    fn new(requests: Vec<crate::StorageRequest>, next: Next) -> Self {
+        Self {
+            remaining: requests.into_iter(),
+            next,
+        }
+    }
+
+    /// Advances to one concrete request or the next phase without allocation.
+    #[must_use]
+    pub fn advance(mut self) -> StorageRequestSequenceStep<Next> {
+        if let Some(request) = self.remaining.next() {
+            StorageRequestSequenceStep::Submit {
+                request,
+                suspended: self,
+            }
+        } else {
+            StorageRequestSequenceStep::Finished(self.next)
+        }
+    }
+}
+
+/// Continuation that requires filesystem durability after ordered data writes.
+#[derive(Debug)]
+pub struct OrderedDataDurability {
+    /// Journal payload requests submitted after the filesystem flush.
+    journal_writes: Vec<crate::StorageRequest>,
+    /// State following journal payload writes.
+    next: JournalPayloadDurability,
+}
+
+impl OrderedDataDurability {
+    /// Filesystem flush required before journal metadata can be submitted.
+    #[must_use]
+    pub const fn flush_request(&self) -> crate::StorageRequest {
+        crate::StorageRequest::Flush {
+            target: crate::StorageTarget::Filesystem,
+        }
+    }
+
+    /// Consumes a successful filesystem flush into the journal-payload sequence.
+    #[must_use]
+    pub fn completed(self) -> StorageRequestSequence<JournalPayloadDurability> {
+        StorageRequestSequence::new(self.journal_writes, self.next)
+    }
+}
+
+/// Continuation that requires journal durability after descriptor and payload writes.
+#[derive(Debug)]
+pub struct JournalPayloadDurability {
+    /// Journal device flushed before the commit record is issued.
+    journal_target: crate::StorageTarget,
+    /// Preallocated commit record.
+    commit_write: crate::StorageRequest,
+    /// Sealed state revealed after commit durability.
+    durable: DurableMutation,
+}
+
+impl JournalPayloadDurability {
+    /// Flush required before the commit record can be submitted.
+    #[must_use]
+    pub const fn flush_request(&self) -> crate::StorageRequest {
+        crate::StorageRequest::Flush {
+            target: self.journal_target,
+        }
+    }
+
+    /// Consumes a successful payload flush into the single commit-record phase.
+    #[must_use]
+    pub fn completed(self) -> CommitRecordPhase {
+        CommitRecordPhase {
+            request: self.commit_write,
+            journal_target: self.journal_target,
+            durable: self.durable,
+        }
+    }
+}
+
+/// Single commit-record write preceding the commit durability flush.
+#[derive(Debug)]
+pub struct CommitRecordPhase {
+    /// Owned commit-record request.
+    request: crate::StorageRequest,
+    /// Journal device flushed after the commit record.
+    journal_target: crate::StorageTarget,
+    /// Sealed durable mutation state.
+    durable: DurableMutation,
+}
+
+impl CommitRecordPhase {
+    /// Moves the commit record into lower-I/O ownership and returns its suspended continuation.
+    #[must_use]
+    pub fn submit(self) -> (crate::StorageRequest, CommitDurability) {
+        (
+            self.request,
+            CommitDurability {
+                journal_target: self.journal_target,
+                durable: self.durable,
+            },
+        )
+    }
+}
+
+/// Continuation awaiting the flush that makes a commit record durable.
+#[derive(Debug)]
+pub struct CommitDurability {
+    /// Journal device selected for the final commit flush.
+    journal_target: crate::StorageTarget,
+    /// Mutation revealed only after the flush succeeds.
+    durable: DurableMutation,
+}
+
+impl CommitDurability {
+    /// Flush that establishes commit durability.
+    #[must_use]
+    pub const fn flush_request(&self) -> crate::StorageRequest {
+        crate::StorageRequest::Flush {
+            target: self.journal_target,
+        }
+    }
+
+    /// Reveals the durable mutation after a successful commit flush.
+    #[must_use]
+    pub fn completed(self) -> DurableMutation {
+        self.durable
+    }
+}
+
+/// Continuation requiring a filesystem flush after all home blocks complete.
+#[derive(Debug)]
+pub struct HomeBlockDurability {
+    /// Clean journal-superblock request issued after home-block durability.
+    clean_write: crate::StorageRequest,
+    /// Journal target flushed after the clean write.
+    journal_target: crate::StorageTarget,
+    /// Clean publication state.
+    clean_journal: Journal<CleanJournal>,
+    /// Overlay-free epoch publication state.
+    checkpointed_epoch: CommittedEpoch,
+}
+
+impl HomeBlockDurability {
+    /// Filesystem flush that makes every checkpointed home block durable.
+    #[must_use]
+    pub const fn flush_request(&self) -> crate::StorageRequest {
+        crate::StorageRequest::Flush {
+            target: crate::StorageTarget::Filesystem,
+        }
+    }
+
+    /// Consumes the successful home-block flush into the clean-record phase.
+    #[must_use]
+    pub fn completed(self) -> CleanJournalRecordPhase {
+        CleanJournalRecordPhase {
+            request: self.clean_write,
+            journal_target: self.journal_target,
+            clean_journal: self.clean_journal,
+            checkpointed_epoch: self.checkpointed_epoch,
+        }
+    }
+}
+
+/// Single clean-journal superblock write.
+#[derive(Debug)]
+pub struct CleanJournalRecordPhase {
+    /// Owned clean-superblock request.
+    request: crate::StorageRequest,
+    /// Journal device flushed after this request.
+    journal_target: crate::StorageTarget,
+    /// Clean journal coordinator state.
+    clean_journal: Journal<CleanJournal>,
+    /// Overlay-free committed epoch.
+    checkpointed_epoch: CommittedEpoch,
+}
+
+impl CleanJournalRecordPhase {
+    /// Moves the clean record into lower-I/O ownership and returns its continuation.
+    #[must_use]
+    pub fn submit(self) -> (crate::StorageRequest, CleanJournalDurability) {
+        (
+            self.request,
+            CleanJournalDurability {
+                journal_target: self.journal_target,
+                clean_journal: self.clean_journal,
+                checkpointed_epoch: self.checkpointed_epoch,
+            },
+        )
+    }
+}
+
+/// Continuation awaiting the flush that makes the clean journal state durable.
+#[derive(Debug)]
+pub struct CleanJournalDurability {
+    /// Journal device selected for the clean-state flush.
+    journal_target: crate::StorageTarget,
+    /// Clean journal coordinator state.
+    clean_journal: Journal<CleanJournal>,
+    /// Overlay-free epoch publication state.
+    checkpointed_epoch: CommittedEpoch,
+}
+
+impl CleanJournalDurability {
+    /// Flush that makes the clean journal superblock durable.
+    #[must_use]
+    pub const fn flush_request(&self) -> crate::StorageRequest {
+        crate::StorageRequest::Flush {
+            target: self.journal_target,
+        }
+    }
+}
+
+impl<'storage, 'epoch, 'nonce, N> MutationResolvePass<'storage, 'epoch, 'nonce, N> {
+    /// Starts an empty mutation resolve pass against one committed epoch.
     pub(super) fn begin(
-        volume: &'a mut MountedVolume<D, JournaledMount<J>, N>,
+        volume: EpochReadView<'storage, 'epoch>,
         now: Ext4Timestamp,
+        nonce_generator: &'nonce mut N,
     ) -> Self {
         Self {
             volume,
+            nonce_generator,
             now,
             inode_updates: Vec::new(),
             block_bitmap_updates: Vec::new(),
@@ -357,7 +704,7 @@ impl<'a, D: BlockStorage, N, J> JournalTransaction<'a, D, N, J> {
         }
     }
 }
-impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
+impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
     /// Verifies that the mounted profile admits xattr storage mutation.
     /// # Errors
     ///
@@ -371,8 +718,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the inode cannot be read or carries mutation
     /// semantics outside the write domain.
-    pub async fn node(&mut self, id: NodeId) -> Result<TransactionNode> {
-        let inode = self.volume.read_inode_record(id.inode()).await?;
+    pub fn node(&mut self, id: NodeId) -> Result<TransactionNode> {
+        let inode = self.volume.read_inode_record(id.inode())?;
         let _metadata = inode.metadata_mutation()?;
         match (id, inode.kind()) {
             (NodeId::File(_), InodeKind::File)
@@ -386,8 +733,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// # Errors
     /// Returns an error when the inode is not a regular file or cannot be read.
-    pub async fn file(&mut self, id: FileNodeId) -> Result<TransactionFile> {
-        let inode = self.volume.read_inode_record(id.inode()).await?;
+    pub fn file(&mut self, id: FileNodeId) -> Result<TransactionFile> {
+        let inode = self.volume.read_inode_record(id.inode())?;
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
@@ -398,8 +745,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// # Errors
     /// Returns an error when the inode is not a directory or cannot be read.
-    pub async fn directory(&mut self, id: DirectoryNodeId) -> Result<TransactionDirectory> {
-        let inode = self.volume.read_inode_record(id.inode()).await?;
+    pub fn directory(&mut self, id: DirectoryNodeId) -> Result<TransactionDirectory> {
+        let inode = self.volume.read_inode_record(id.inode())?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
@@ -411,12 +758,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the inode is not a symbolic link or carries
     /// mutation semantics outside the write domain.
-    pub async fn symlink(&mut self, id: SymlinkNodeId) -> Result<TransactionSymlink> {
-        let inode = self.volume.read_inode_record(id.inode()).await?;
+    pub fn symlink(&mut self, id: SymlinkNodeId) -> Result<TransactionSymlink> {
+        let inode = self.volume.read_inode_record(id.inode())?;
         if inode.kind() != InodeKind::Symlink {
             return Err(Error::WrongInodeKind);
         }
-        self.require_file_data_mutation(&inode).await?;
+        self.require_file_data_mutation(&inode)?;
         Ok(TransactionSymlink { id })
     }
 
@@ -424,11 +771,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// # Errors
     /// Returns an error when the typed identity does not match the inode or names a directory.
-    pub async fn hard_link_source(
-        &mut self,
-        id: HardLinkNodeId,
-    ) -> Result<TransactionHardLinkSource> {
-        let inode = self.volume.read_inode_record(id.inode()).await?;
+    pub fn hard_link_source(&mut self, id: HardLinkNodeId) -> Result<TransactionHardLinkSource> {
+        let inode = self.volume.read_inode_record(id.inode())?;
         let _metadata = inode.metadata_mutation()?;
         match (id, inode.kind()) {
             (HardLinkNodeId::File(_), InodeKind::File)
@@ -446,12 +790,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the inode leaves the mutable write domain or the
     /// inode record cannot be rewritten.
-    pub async fn set_posix_security(
+    pub fn set_posix_security(
         &mut self,
         node: TransactionNode,
         security: Ext4Security,
     ) -> Result<()> {
-        let inode_index = self.ensure_inode_update(node.inode()).await?;
+        let inode_index = self.ensure_inode_update(node.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         let _metadata = inode.metadata_mutation()?;
@@ -467,8 +811,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when the inode leaves the mutable write domain or the
     /// inode record cannot be rewritten.
-    pub async fn set_times(&mut self, node: TransactionNode, times: Ext4Times) -> Result<()> {
-        let inode_index = self.ensure_inode_update(node.inode()).await?;
+    pub fn set_times(&mut self, node: TransactionNode, times: Ext4Times) -> Result<()> {
+        let inode_index = self.ensure_inode_update(node.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         let _metadata = inode.metadata_mutation()?;
@@ -488,10 +832,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// Returns an error when staged cluster deltas conflict or the superblock free-cluster delta
     /// cannot be applied.
     fn committed_cluster_state(&self) -> Result<(ClusterReferenceIndex, Superblock)> {
-        let mut clusters = self.volume.state.clusters.try_clone()?;
+        let mut clusters = self.volume.committed_clusters()?.try_clone()?;
         clusters.apply_deltas(self.cluster_deltas.as_slice())?;
         let mut superblock = self.volume.superblock;
         superblock.apply_free_cluster_delta(self.free_clusters_delta)?;
+        superblock.apply_free_inode_delta(self.free_inodes_delta)?;
+        if let Some(label) = self.volume_label_update {
+            superblock.apply_volume_label(label);
+        }
         Ok((clusters, superblock))
     }
 
@@ -500,14 +848,13 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the parent inode cannot be loaded from staged/device state or does not
     /// permit directory-entry creation.
-    async fn require_directory_entry_create_mutation(
+    fn require_directory_entry_create_mutation(
         &mut self,
         inode_id: InodeId,
     ) -> Result<DirectoryEntryMutationCapability> {
-        let raw_inode = self.raw_inode_for_policy(inode_id).await?;
+        let raw_inode = self.raw_inode_for_policy(inode_id)?;
         let inode = raw_inode.parse()?;
         self.require_directory_entry_create_mutation_for_inode(&inode)
-            .await
     }
 
     /// Verifies directory-entry creation policy with mount-scoped fscrypt keys.
@@ -515,7 +862,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `inode` is not a directory, lacks a required fscrypt key, or its
     /// storage policy rejects entry creation.
-    async fn require_directory_entry_create_mutation_for_inode(
+    fn require_directory_entry_create_mutation_for_inode(
         &mut self,
         inode: &Inode,
     ) -> Result<DirectoryEntryMutationCapability> {
@@ -523,7 +870,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             return Err(Error::WrongInodeKind);
         }
         if inode.protection().is_encrypted() {
-            self.volume.require_encryption_key(inode).await?;
+            self.volume.require_encryption_key(inode)?;
         }
         inode.directory_entry_mutation()
     }
@@ -548,12 +895,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the source directory cannot satisfy entry creation-style mutation
     /// requirements for rename staging.
-    async fn require_directory_entry_rename_mutation_for_inode(
+    fn require_directory_entry_rename_mutation_for_inode(
         &mut self,
         inode: &Inode,
     ) -> Result<DirectoryEntryMutationCapability> {
         self.require_directory_entry_create_mutation_for_inode(inode)
-            .await
     }
 
     /// Verifies directory-entry replacement policy with mount-scoped fscrypt keys.
@@ -561,12 +907,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the target directory cannot satisfy entry creation-style mutation
     /// requirements for replacement staging.
-    async fn require_directory_entry_replace_mutation_for_inode(
+    fn require_directory_entry_replace_mutation_for_inode(
         &mut self,
         inode: &Inode,
     ) -> Result<DirectoryEntryMutationCapability> {
         self.require_directory_entry_create_mutation_for_inode(inode)
-            .await
     }
 
     /// Builds the fscrypt context inherited by a new child of this directory.
@@ -574,16 +919,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the encrypted parent has no mounted master key or a new file nonce
     /// cannot be generated.
-    async fn inherited_fscrypt_context(
-        &mut self,
-        parent: &Inode,
-    ) -> Result<Option<FscryptContextV2>> {
+    fn inherited_fscrypt_context(&mut self, parent: &Inode) -> Result<Option<FscryptContextV2>> {
         if !parent.protection().is_encrypted() {
             return Ok(None);
         }
-        let (parent_context, _master_key) =
-            self.volume.fscrypt_master_key_for_inode(parent).await?;
-        let nonce = self.volume.mount_context.next_fscrypt_file_nonce()?;
+        let (parent_context, _master_key) = self.volume.fscrypt_master_key_for_inode(parent)?;
+        let nonce = self.nonce_generator.next_file_nonce()?;
         Ok(Some(FscryptContextV2::new(parent_context.policy(), nonce)))
     }
 
@@ -592,7 +933,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when xattr mutation is unsupported, the encryption flag cannot be written,
     /// or the context cannot be stored in inode xattr storage.
-    async fn apply_fscrypt_context(
+    fn apply_fscrypt_context(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
         context: Option<FscryptContextV2>,
@@ -602,9 +943,9 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         };
         self.require_xattr_mutation()?;
         raw_inode.mark_encrypted()?;
-        let mut set = self.xattr_set_for_raw_inode(raw_inode).await?;
+        let mut set = self.xattr_set_for_raw_inode(raw_inode)?;
         set.set_encryption_context(XattrValue::new(&context.to_bytes())?);
-        self.store_xattr_set(raw_inode, &set).await
+        self.store_xattr_set(raw_inode, &set)
     }
 
     /// Returns the staged inode record when present, otherwise the device image.
@@ -612,7 +953,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when an existing staged record is deleted or the live inode cannot be read
     /// from the mounted device.
-    async fn raw_inode_for_policy(&mut self, inode_id: InodeId) -> Result<LiveInodeRecord> {
+    fn raw_inode_for_policy(&mut self, inode_id: InodeId) -> Result<LiveInodeRecord> {
         if let Some(raw_inode) = self
             .inode_updates
             .iter()
@@ -620,7 +961,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         {
             return raw_inode.clone_live();
         }
-        self.volume.read_live_inode_record(inode_id).await
+        self.volume.read_live_inode_record(inode_id)
     }
 
     /// Loads a mutable extent tree for an inode selected by this transaction.
@@ -628,7 +969,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the inode does not expose a supported extent root or its extent tree
     /// cannot be loaded.
-    async fn mutable_extent_tree(&mut self, inode: &Inode) -> Result<MutableExtentTree> {
+    fn mutable_extent_tree(&mut self, inode: &Inode) -> Result<MutableExtentTree> {
         let context = self.volume.extent_tree_context(inode);
         let block_size = self.volume.superblock.block_size();
         let mut source = TransactionExtentSource {
@@ -637,7 +978,6 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             block_size,
         };
         MutableExtentTree::load_inode_tree(inode.extent_root()?, block_size, &mut source, context)
-            .await
     }
 
     /// Stages an updated extent tree and adjusts its metadata block ownership.
@@ -645,7 +985,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when metadata block allocation or release fails, extent serialization fails,
     /// or the updated inode block charge cannot be represented.
-    async fn stage_extent_tree(
+    fn stage_extent_tree(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
         mut tree: MutableExtentTree,
@@ -654,11 +994,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         let required = tree.required_metadata_blocks(block_size)?;
         let mut metadata_blocks = memory::copied_slice(tree.metadata_blocks())?;
         while metadata_blocks.len() < required {
-            metadata_blocks.try_push(self.allocate_cluster().await?)?;
+            metadata_blocks.try_push(self.allocate_cluster()?)?;
         }
         while metadata_blocks.len() > required {
             let block = metadata_blocks.pop().ok_or(Error::InvalidExtentTree)?;
-            self.release_cluster_reference(block).await?;
+            self.release_cluster_reference(block)?;
         }
         tree.set_metadata_blocks(metadata_blocks);
 
@@ -759,8 +1099,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the directory inode cannot be staged, its link count is saturated, or
     /// timestamps cannot be written.
-    async fn increment_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
-        let inode_index = self.ensure_inode_update(inode_id).await?;
+    fn increment_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
+        let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         raw_inode.increment_links_count()?;
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
@@ -773,8 +1113,8 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the directory inode cannot be staged or the decremented link count and
     /// timestamps cannot be written.
-    async fn decrement_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
-        let inode_index = self.ensure_inode_update(inode_id).await?;
+    fn decrement_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
+        let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let _links = raw_inode.decrement_links_count()?;
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
@@ -787,7 +1127,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when `inode_id` cannot be read as a live inode or the staged index cannot be
     /// represented.
-    async fn ensure_inode_update(&mut self, inode_id: InodeId) -> Result<StagedInodeIndex> {
+    fn ensure_inode_update(&mut self, inode_id: InodeId) -> Result<StagedInodeIndex> {
         if let Some(index) = self
             .inode_updates
             .iter()
@@ -795,7 +1135,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         {
             return Ok(StagedInodeIndex::new(index));
         }
-        let raw_inode = self.volume.read_live_inode_record(inode_id).await?;
+        let raw_inode = self.volume.read_live_inode_record(inode_id)?;
         self.inode_updates.try_push(raw_inode.into())?;
         Ok(StagedInodeIndex::new(
             self.inode_updates

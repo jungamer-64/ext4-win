@@ -2,13 +2,13 @@
 
 use super::*;
 
-impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
+impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
     /// Serializes all staged metadata mutations into byte-range writes.
     /// # Errors
     ///
     /// Returns an error when staged bitmap, directory, extent, xattr, group, superblock, or inode
     /// metadata cannot be serialized to device byte ranges.
-    async fn metadata_writes(&mut self) -> Result<Vec<RangeWrite>> {
+    fn metadata_writes(&mut self) -> Result<Vec<RangeWrite>> {
         let mut writes = Vec::new();
         for bitmap in &self.block_bitmap_updates {
             writes.try_push(RangeWrite {
@@ -61,8 +61,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 &mut self.volume.device,
                 &self.volume.superblock,
                 delta.group,
-            )
-            .await?;
+            )?;
             if !delta.free_clusters_delta.is_zero() {
                 descriptor.apply_free_clusters_delta(
                     delta.free_clusters_delta,
@@ -117,7 +116,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         {
             writes.try_push(RangeWrite {
                 offset: ByteOffset::new(SUPERBLOCK_OFFSET),
-                bytes: self.updated_superblock_bytes().await?,
+                bytes: self.updated_superblock_bytes()?,
             })?;
         }
         for inode in &self.inode_updates {
@@ -136,14 +135,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when a metadata write does not fit within one block or an original metadata
     /// block cannot be read before patching.
-    async fn metadata_blocks(&mut self) -> Result<Vec<MetadataBlock>> {
+    fn metadata_blocks(&mut self) -> Result<Vec<MetadataBlock>> {
         let block_size = self.volume.superblock.block_size();
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
         let block_bytes_u64 = u64::from(block_size.bytes());
         let mut blocks = Vec::new();
 
-        for write in self.metadata_writes().await? {
+        for write in self.metadata_writes()? {
             let block = BlockAddress::new(
                 write
                     .offset
@@ -175,38 +174,25 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
                 self.volume
                     .device
-                    .read_exact_at(block_size.offset_of(block)?, &mut bytes)
-                    .await?;
+                    .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
                 blocks.try_push(MetadataBlock::new(block, bytes))?;
                 blocks
                     .len()
                     .checked_sub(1)
                     .ok_or(Error::ArithmeticOverflow)?
             };
-            blocks
-                .get_mut(index)
-                .ok_or(Error::InvalidSuperblock)?
-                .bytes_mut()
-                .get_mut(in_block..end)
-                .ok_or(Error::DeviceRange)?
-                .copy_from_slice(&write.bytes);
+            memory::copy_exact(
+                blocks
+                    .get_mut(index)
+                    .ok_or(Error::InvalidSuperblock)?
+                    .bytes_mut()
+                    .get_mut(in_block..end)
+                    .ok_or(Error::DeviceRange)?,
+                &write.bytes,
+            )?;
         }
 
         Ok(blocks)
-    }
-
-    /// Writes ordered file data before the metadata transaction is committed.
-    /// # Errors
-    ///
-    /// Returns an error when any ordered data write or the following device flush fails.
-    async fn write_ordered_data(&mut self) -> Result<()> {
-        for write in &self.data_writes {
-            self.volume
-                .device
-                .write_exact_at(write.offset, write.bytes.as_slice())
-                .await?;
-        }
-        self.volume.device.flush().await
     }
 
     /// Applies accumulated free-count deltas to a superblock image.
@@ -214,12 +200,11 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the primary superblock cannot be read, free counters underflow or
     /// overflow, the label cannot be written, or the checksum cannot be refreshed.
-    async fn updated_superblock_bytes(&mut self) -> Result<Vec<u8>> {
+    fn updated_superblock_bytes(&mut self) -> Result<Vec<u8>> {
         let mut bytes = memory::repeated_vec(0_u8, 1024)?;
         self.volume
             .device
-            .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut bytes)
-            .await?;
+            .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut bytes)?;
         self.volume
             .superblock
             .apply_free_cluster_delta_to_raw(&mut bytes, self.free_clusters_delta)?;
@@ -249,69 +234,223 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     }
 }
 
-impl<D: BlockStorage, N: FscryptNonceGenerator> JournalTransaction<'_, D, N, InternalJournal> {
-    /// Commits staged data and metadata through the internal journal.
-    ///
+impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
+    /// Completes a storage-resolved mutation without issuing any lower write.
     /// # Errors
-    /// Returns an error when the transaction exceeds journal capacity or any
-    /// backing device write/flush fails.
-    pub async fn commit(mut self) -> Result<()> {
-        let block_size = self.volume.superblock.block_size();
-        let metadata_blocks = self.metadata_blocks().await?;
-        let (clusters, superblock) = self.committed_cluster_state()?;
-        self.volume
-            .state
-            .journal
-            .journal
-            .ensure_transaction_capacity(metadata_blocks.len())?;
-        self.write_ordered_data().await?;
-
-        let volume = self.volume;
-        volume
-            .state
-            .journal
-            .journal
-            .commit_internal(&mut volume.device, block_size, &metadata_blocks)
-            .await?;
-        volume.state.clusters = clusters;
-        volume.superblock = superblock;
-        Ok(())
+    ///
+    /// Returns an error when metadata coalescing, staged allocation validation, resource discovery,
+    /// or any pre-write allocation fails.
+    pub fn resolve(
+        mut self,
+        ticket: u64,
+        coordinator: &MutationCoordinatorState,
+    ) -> Result<ResolvedMutation> {
+        let metadata_blocks = self.metadata_blocks()?;
+        let _validated_next_state = self.committed_cluster_state()?;
+        let mut observed = ObservedResourceVersionSet::new(ticket);
+        for inode in &self.inode_updates {
+            let resource = MutationResource::inode(inode.id());
+            observed.include(resource, coordinator.resource_version(resource))?;
+        }
+        for delta in &self.group_deltas {
+            let resource = MutationResource::block_group(delta.group);
+            observed.include(resource, coordinator.resource_version(resource))?;
+        }
+        if !self.free_clusters_delta.is_zero()
+            || self.free_inodes_delta != 0
+            || self.volume_label_update.is_some()
+        {
+            observed.include(
+                MutationResource::VOLUME_METADATA,
+                coordinator.resource_version(MutationResource::VOLUME_METADATA),
+            )?;
+        }
+        Ok(ResolvedMutation {
+            observed,
+            data_writes: core::mem::take(&mut self.data_writes),
+            metadata_blocks,
+            cluster_deltas: core::mem::take(&mut self.cluster_deltas),
+            free_clusters_delta: self.free_clusters_delta,
+            free_inodes_delta: self.free_inodes_delta,
+            volume_label_update: self.volume_label_update,
+        })
     }
 }
 
-impl<D: BlockStorage, N: FscryptNonceGenerator, J: BlockStorage>
-    JournalTransaction<'_, D, N, ExternalJournal<J>>
-{
-    /// Commits staged data and metadata through the external journal device.
+impl ReservedMutation {
+    /// Allocates the complete write plan, both epoch publications, and checkpoint before I/O.
     ///
+    /// This must run only while the mutation's resource intents and global commit grant are held.
     /// # Errors
-    /// Returns an error when the transaction exceeds journal capacity or any
-    /// backing device write/flush fails.
-    pub async fn commit(mut self) -> Result<()> {
-        let block_size = self.volume.superblock.block_size();
-        let metadata_blocks = self.metadata_blocks().await?;
-        let (clusters, superblock) = self.committed_cluster_state()?;
-        self.volume
-            .state
-            .journal
-            .journal
-            .ensure_transaction_capacity(metadata_blocks.len())?;
-        self.write_ordered_data().await?;
+    ///
+    /// Returns an error when versions changed, the journal is not clean, serialization fails, or
+    /// any pre-publication allocation fails.
+    pub fn prepare_commit(
+        self,
+        coordinator: &MutationCoordinatorState,
+        current_epoch: &CommittedEpoch,
+    ) -> Result<CommitReadyMutation> {
+        if !coordinator.revalidate(&self.resolved.observed) {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        let JournalCoordinatorState::Ready(journal) = &coordinator.journal else {
+            return Err(Error::JournalCorrupt);
+        };
+        let version_publication =
+            coordinator.prepare_version_publication(&self.resolved.observed)?;
 
-        let volume = self.volume;
-        let journal = &mut volume.state.journal;
-        journal
-            .journal
-            .commit_external(
-                &mut volume.device,
-                &mut journal.device,
-                block_size,
-                &metadata_blocks,
-            )
-            .await?;
-        volume.state.clusters = clusters;
-        volume.superblock = superblock;
-        Ok(())
+        let mut durable_clusters = current_epoch.clusters.try_clone()?;
+        durable_clusters.apply_deltas(&self.resolved.cluster_deltas)?;
+        let checkpoint_clusters = durable_clusters.try_clone()?;
+        let durable_keys = current_epoch.fscrypt_keys.try_clone()?;
+        let checkpoint_keys = current_epoch.fscrypt_keys.try_clone()?;
+        let mut superblock = current_epoch.superblock;
+        superblock.apply_free_cluster_delta(self.resolved.free_clusters_delta)?;
+        superblock.apply_free_inode_delta(self.resolved.free_inodes_delta)?;
+        if let Some(label) = self.resolved.volume_label_update {
+            superblock.apply_volume_label(label);
+        }
+
+        let mut ordered_data_writes = Vec::new();
+        ordered_data_writes
+            .try_reserve_exact(self.resolved.data_writes.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for write in self.resolved.data_writes {
+            ordered_data_writes.try_push(crate::StorageRequest::Write {
+                target: crate::StorageTarget::Filesystem,
+                offset: write.offset,
+                buffer: write.bytes,
+            })?;
+        }
+
+        let prepared = journal.prepare_commit(
+            current_epoch.superblock.block_size(),
+            self.resolved.metadata_blocks,
+        )?;
+        let (
+            planned_journal_writes,
+            planned_commit_write,
+            journal_target,
+            durable_journal,
+            overlay,
+            checkpoint,
+        ) = prepared.into_parts();
+        let mut journal_writes = Vec::new();
+        journal_writes
+            .try_reserve_exact(planned_journal_writes.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for write in planned_journal_writes {
+            journal_writes.try_push(write.into_request())?;
+        }
+        let commit_write = planned_commit_write.into_request();
+        let (planned_home_writes, planned_clean_write, clean_journal) = checkpoint.into_parts();
+        let mut home_writes = Vec::new();
+        home_writes
+            .try_reserve_exact(planned_home_writes.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for write in planned_home_writes {
+            home_writes.try_push(write.into_request())?;
+        }
+        let durable_sequence = current_epoch.sequence().next()?;
+        let checkpoint_sequence = durable_sequence.next()?;
+        let durable_epoch = CommittedEpoch::prepared(
+            durable_sequence,
+            superblock,
+            durable_keys,
+            durable_clusters,
+            overlay,
+        );
+        let checkpointed_epoch = CommittedEpoch::prepared(
+            checkpoint_sequence,
+            superblock,
+            checkpoint_keys,
+            checkpoint_clusters,
+            Vec::new(),
+        );
+        let checkpoint = CheckpointOperation {
+            home_writes,
+            clean_write: planned_clean_write.into_request(),
+            clean_journal,
+            checkpointed_epoch,
+        };
+        Ok(CommitReadyMutation {
+            ordered_data_writes,
+            journal_writes,
+            commit_write,
+            journal_target,
+            durable_journal,
+            durable_epoch,
+            checkpoint,
+            version_publication,
+        })
+    }
+}
+
+impl CommitReadyMutation {
+    /// Starts ordered data I/O while sealing all later commit and publication states.
+    #[must_use]
+    pub fn start(self) -> StorageRequestSequence<OrderedDataDurability> {
+        let durable = DurableMutation {
+            durable_journal: self.durable_journal,
+            durable_epoch: self.durable_epoch,
+            checkpoint: self.checkpoint,
+            version_publication: self.version_publication,
+        };
+        StorageRequestSequence::new(
+            self.ordered_data_writes,
+            OrderedDataDurability {
+                journal_writes: self.journal_writes,
+                next: JournalPayloadDurability {
+                    journal_target: self.journal_target,
+                    commit_write: self.commit_write,
+                    durable,
+                },
+            },
+        )
+    }
+}
+
+impl DurableMutation {
+    /// Publishes a durable commit using moves and fixed-table replacement only.
+    ///
+    /// This transition performs no allocation and cannot return an ordinary error.
+    #[must_use]
+    pub fn publish(self, coordinator: &mut MutationCoordinatorState) -> PublishedMutation {
+        let _durable_journal = self.durable_journal;
+        coordinator.journal = JournalCoordinatorState::CheckpointPending;
+        coordinator.publish_versions(self.version_publication);
+        PublishedMutation {
+            epoch: self.durable_epoch,
+            checkpoint: self.checkpoint,
+        }
+    }
+}
+
+impl CheckpointOperation {
+    /// Starts checkpoint home-block I/O while sealing clean publication state.
+    #[must_use]
+    pub fn start(self) -> StorageRequestSequence<HomeBlockDurability> {
+        let journal_target = self.clean_write.target();
+        StorageRequestSequence::new(
+            self.home_writes,
+            HomeBlockDurability {
+                clean_write: self.clean_write,
+                journal_target,
+                clean_journal: self.clean_journal,
+                checkpointed_epoch: self.checkpointed_epoch,
+            },
+        )
+    }
+}
+
+impl CleanJournalDurability {
+    /// Publishes prebuilt clean journal and overlay-free epoch after the final flush.
+    ///
+    /// This transition performs no allocation and cannot return an ordinary error.
+    #[must_use]
+    pub fn completed(self, coordinator: &mut MutationCoordinatorState) -> CommittedEpoch {
+        coordinator.journal = JournalCoordinatorState::Ready(self.clean_journal);
+        self.checkpointed_epoch
     }
 }
 

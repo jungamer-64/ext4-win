@@ -2,14 +2,14 @@
 
 use super::*;
 
-impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, J> {
+impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
     /// Writes bytes into a regular file and extends EOF when the range reaches beyond it.
     ///
     /// # Errors
     /// Returns an error when the inode is not a regular file, mutation policy rejects payload or
     /// size changes, the target size is unsupported, allocation fails, or the updated root extent
     /// set cannot fit in the inode.
-    pub async fn write_file_range(
+    pub fn write_file_range(
         &mut self,
         file: TransactionFile,
         offset: FileOffset,
@@ -25,42 +25,39 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             .superblock
             .inode_data_encoding()
             .encode_size(new_size)?;
-        let inode_index = self.ensure_inode_update(file.inode()).await?;
+        let inode_index = self.ensure_inode_update(file.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
-        self.require_file_data_mutation(&inode).await?;
+        self.require_file_data_mutation(&inode)?;
         let extends_file = new_size > inode.size();
         let encoded_new_size = if extends_file {
-            self.require_file_size_mutation(&inode).await?;
+            self.require_file_size_mutation(&inode)?;
             Some(encoded_size)
         } else {
             None
         };
 
-        let mut tree = self.mutable_extent_tree(&inode).await?;
+        let mut tree = self.mutable_extent_tree(&inode)?;
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
         if offset.bytes() > inode.size().bytes() {
-            self.stage_visible_extension_gap(&inode, &tree, inode.size(), offset)
-                .await?;
+            self.stage_visible_extension_gap(&inode, &tree, inode.size(), offset)?;
         }
         if inode.protection().is_encrypted() {
-            self.stage_encrypted_inode_stream_write(&inode, &mut tree, offset.bytes(), bytes)
-                .await?;
+            self.stage_encrypted_inode_stream_write(&inode, &mut tree, offset.bytes(), bytes)?;
         } else {
-            self.stage_inode_stream_write(&mut tree, offset.bytes(), bytes)
-                .await?;
+            self.stage_inode_stream_write(&mut tree, offset.bytes(), bytes)?;
         }
 
         if let Some(encoded_new_size) = encoded_new_size {
             raw_inode.set_encoded_size(encoded_new_size)?;
         }
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.stage_extent_tree(&mut raw_inode, tree).await?;
+        self.stage_extent_tree(&mut raw_inode, tree)?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
@@ -70,7 +67,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when extent arithmetic overflows, encryption fails, or zero writes cannot
     /// be staged.
-    async fn stage_visible_extension_gap(
+    fn stage_visible_extension_gap(
         &mut self,
         inode: &Inode,
         tree: &MutableExtentTree,
@@ -84,7 +81,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         }
         let block_size = u64::from(self.volume.superblock.block_size().bytes());
         let encrypted_contents_key = if inode.protection().is_encrypted() {
-            Some(self.volume.fscrypt_contents_key_for_inode(inode).await?)
+            Some(self.volume.fscrypt_contents_key_for_inode(inode)?)
         } else {
             None
         };
@@ -112,8 +109,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                     zero_end,
                     block_size,
                     encrypted_contents_key.as_ref(),
-                )
-                .await?;
+                )?;
             }
         }
         Ok(())
@@ -124,7 +120,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when logical block arithmetic overflows, the extent does not map the
     /// selected logical block, encryption fails, or zero writes cannot be staged.
-    async fn stage_zero_visible_extent_range(
+    fn stage_zero_visible_extent_range(
         &mut self,
         extent: Extent,
         start: u64,
@@ -162,8 +158,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 in_block,
                 len,
                 encrypted_contents_key,
-            )
-            .await?;
+            )?;
             position = range_end;
         }
         Ok(())
@@ -174,7 +169,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the physical offset overflows, allocation for zero bytes fails, or
     /// encrypted block staging fails.
-    async fn stage_zero_file_block_range(
+    fn stage_zero_file_block_range(
         &mut self,
         logical_block: LogicalBlock,
         physical: BlockAddress,
@@ -184,16 +179,14 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ) -> Result<()> {
         let zeroes = memory::repeated_vec(0_u8, len)?;
         if let Some(contents_key) = encrypted_contents_key {
-            return self
-                .stage_encrypted_file_block_update(
-                    contents_key,
-                    logical_block,
-                    physical,
-                    in_block,
-                    zeroes.as_slice(),
-                    EncryptedBlockBase::ExistingPlaintext,
-                )
-                .await;
+            return self.stage_encrypted_file_block_update(
+                contents_key,
+                logical_block,
+                physical,
+                in_block,
+                zeroes.as_slice(),
+                EncryptedBlockBase::ExistingPlaintext,
+            );
         }
         let write_offset = self
             .volume
@@ -215,7 +208,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when cluster geometry is invalid, a matching physical cluster cannot be
     /// referenced, or a new cluster cannot be allocated.
-    async fn physical_block_for_hole(
+    fn physical_block_for_hole(
         &mut self,
         tree: &MutableExtentTree,
         logical_block: LogicalBlock,
@@ -246,7 +239,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             return Ok(physical);
         }
 
-        let first_block = self.allocate_cluster().await?;
+        let first_block = self.allocate_cluster()?;
         let cluster = self.volume.superblock.cluster_of_block(first_block)?;
         self.physical_block_in_cluster(cluster, cluster_offset)
     }
@@ -256,7 +249,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the plaintext base block cannot be obtained, `bytes` do not fit at
     /// `in_block`, encryption fails, or the physical write offset overflows.
-    async fn stage_encrypted_file_block_update(
+    fn stage_encrypted_file_block_update(
         &mut self,
         contents_key: &FscryptContentsKey,
         logical_block: LogicalBlock,
@@ -267,8 +260,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ) -> Result<()> {
         let mut block = match block_base {
             EncryptedBlockBase::ExistingPlaintext => {
-                self.plaintext_file_block_for_update(contents_key, logical_block, physical)
-                    .await?
+                self.plaintext_file_block_for_update(contents_key, logical_block, physical)?
             }
             EncryptedBlockBase::ZeroedPlaintext => memory::repeated_vec(
                 0_u8,
@@ -297,7 +289,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the block cannot be read from staged/device data or fscrypt decryption
     /// fails.
-    async fn plaintext_file_block_for_update(
+    fn plaintext_file_block_for_update(
         &mut self,
         contents_key: &FscryptContentsKey,
         logical_block: LogicalBlock,
@@ -316,10 +308,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             memory::copied_slice(&staged.bytes)?
         } else {
             let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
-            self.volume
-                .device
-                .read_exact_at(block_offset, &mut bytes)
-                .await?;
+            self.volume.device.read_exact_at(block_offset, &mut bytes)?;
             bytes
         };
         contents_key.decrypt_block(logical_block.as_u64(), &mut block)?;
@@ -354,7 +343,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when logical range arithmetic fails, the stream contains uninitialized
     /// extents, allocation fails, or a staged write slice cannot be represented.
-    async fn stage_inode_stream_write(
+    fn stage_inode_stream_write(
         &mut self,
         tree: &mut MutableExtentTree,
         offset: u64,
@@ -412,7 +401,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 }
                 BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
                 BlockMapping::Hole => {
-                    let physical = self.physical_block_for_hole(tree, logical_block).await?;
+                    let physical = self.physical_block_for_hole(tree, logical_block)?;
                     tree.insert_or_extend_initialized(logical_block, physical)?;
                     let mut block = memory::repeated_vec(0_u8, block_size)?;
                     let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
@@ -437,7 +426,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the inode has no mounted contents key, range arithmetic fails, the
     /// stream contains uninitialized extents, allocation fails, or encryption fails.
-    async fn stage_encrypted_inode_stream_write(
+    fn stage_encrypted_inode_stream_write(
         &mut self,
         inode: &Inode,
         tree: &mut MutableExtentTree,
@@ -447,7 +436,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         if bytes.is_empty() {
             return Ok(());
         }
-        let contents_key = self.volume.fscrypt_contents_key_for_inode(inode).await?;
+        let contents_key = self.volume.fscrypt_contents_key_for_inode(inode)?;
         let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
         let mut completed = 0_usize;
         while completed < bytes.len() {
@@ -483,7 +472,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 }
                 BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
                 BlockMapping::Hole => {
-                    let physical = self.physical_block_for_hole(tree, logical_block).await?;
+                    let physical = self.physical_block_for_hole(tree, logical_block)?;
                     tree.insert_or_extend_initialized(logical_block, physical)?;
                     (physical, EncryptedBlockBase::ZeroedPlaintext)
                 }
@@ -495,8 +484,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 in_block,
                 bytes.get(completed..end).ok_or(Error::DeviceRange)?,
                 block_base,
-            )
-            .await?;
+            )?;
             completed = end;
         }
         Ok(())
@@ -506,16 +494,16 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// # Errors
     /// Returns an error when `new_size` would shrink the file.
-    pub async fn extend_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
+    pub fn extend_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
         let encoded_size = self
             .volume
             .superblock
             .inode_data_encoding()
             .encode_size(new_size)?;
-        let inode_index = self.ensure_inode_update(file.inode()).await?;
+        let inode_index = self.ensure_inode_update(file.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
-        self.require_file_size_mutation(&inode).await?;
+        self.require_file_size_mutation(&inode)?;
         if new_size < inode.size() {
             return Err(Error::InvalidWriteRange);
         }
@@ -530,21 +518,21 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// # Errors
     /// Returns an error when `new_size` would extend the file or root extent
     /// updates cannot fit in the inode.
-    pub async fn truncate_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
+    pub fn truncate_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
         let encoded_size = self
             .volume
             .superblock
             .inode_data_encoding()
             .encode_size(new_size)?;
-        let inode_index = self.ensure_inode_update(file.inode()).await?;
+        let inode_index = self.ensure_inode_update(file.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
-        self.require_file_size_mutation(&inode).await?;
+        self.require_file_size_mutation(&inode)?;
         if new_size > inode.size() {
             return Err(Error::InvalidWriteRange);
         }
         let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
-        let mut tree = self.mutable_extent_tree(&inode).await?;
+        let mut tree = self.mutable_extent_tree(&inode)?;
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
@@ -555,7 +543,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             let start = extent.logical_start().as_u64();
             let end = extent.end_logical();
             if start >= keep_blocks {
-                self.free_extent(extent, 0).await?;
+                self.free_extent(extent, 0)?;
             } else if end > keep_blocks {
                 let keep_len = u16::try_from(
                     keep_blocks
@@ -563,7 +551,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                         .ok_or(Error::ArithmeticOverflow)?,
                 )
                 .map_err(|_| Error::ArithmeticOverflow)?;
-                self.free_extent(extent, keep_len).await?;
+                self.free_extent(extent, keep_len)?;
                 updated.try_push(Extent::initialized(
                     extent.logical_start(),
                     ExtentLength::new(keep_len)?,
@@ -585,8 +573,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                     updated.as_slice(),
                     new_size,
                     block_size_u64,
-                )
-                .await?;
+                )?;
             } else {
                 self.zero_truncated_tail(updated.as_slice(), new_size, block_size_u64)?;
             }
@@ -594,7 +581,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         tree.replace_extents(updated)?;
         raw_inode.set_encoded_size(encoded_size)?;
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.stage_extent_tree(&mut raw_inode, tree).await?;
+        self.stage_extent_tree(&mut raw_inode, tree)?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
@@ -606,19 +593,15 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     /// Returns an error when the inode is not a plain regular file, the file
     /// cannot be read into the verification domain, metadata allocation fails,
     /// or the extent tree cannot represent the post-EOF metadata.
-    pub async fn enable_verity(
-        &mut self,
-        file: TransactionFile,
-        enable: &FsverityEnable,
-    ) -> Result<()> {
-        let inode_index = self.ensure_inode_update(file.inode()).await?;
+    pub fn enable_verity(&mut self, file: TransactionFile, enable: &FsverityEnable) -> Result<()> {
+        let inode_index = self.ensure_inode_update(file.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
         if inode.protection().is_encrypted() {
-            self.volume.require_encryption_key(&inode).await?;
+            self.volume.require_encryption_key(&inode)?;
         }
         if inode.protection().is_verity() {
             return Err(Error::UnsupportedInodeMutation);
@@ -629,10 +612,9 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         let _payload = inode.file_payload_mutation()?;
 
         let mut plaintext = memory::repeated_vec(0_u8, inode.size().to_usize()?)?;
-        let read = self
-            .volume
-            .read_inode_plaintext_data(&inode, FileOffset::ZERO, &mut plaintext)
-            .await?;
+        let read =
+            self.volume
+                .read_inode_plaintext_data(&inode, FileOffset::ZERO, &mut plaintext)?;
         if read.as_usize() != plaintext.len() {
             return Err(Error::InvalidVerityMetadata);
         }
@@ -664,7 +646,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             enable.signature().bytes(),
         )?;
 
-        let mut tree = self.mutable_extent_tree(&inode).await?;
+        let mut tree = self.mutable_extent_tree(&inode)?;
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
@@ -674,15 +656,13 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
                 &mut tree,
                 layout.merkle_tree_offset(),
                 &metadata,
-            )
-            .await?;
+            )?;
         } else {
-            self.stage_inode_stream_write(&mut tree, layout.merkle_tree_offset(), &metadata)
-                .await?;
+            self.stage_inode_stream_write(&mut tree, layout.merkle_tree_offset(), &metadata)?;
         }
         raw_inode.mark_verity()?;
         raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.stage_extent_tree(&mut raw_inode, tree).await?;
+        self.stage_extent_tree(&mut raw_inode, tree)?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
@@ -692,12 +672,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when an encrypted inode lacks a mounted key, encrypted mutation is not
     /// supported for the inode kind, or the inode storage policy rejects payload mutation.
-    pub(super) async fn require_file_data_mutation(
+    pub(super) fn require_file_data_mutation(
         &mut self,
         inode: &Inode,
     ) -> Result<FilePayloadMutationCapability> {
         if inode.protection().is_encrypted() {
-            self.volume.require_encryption_key(inode).await?;
+            self.volume.require_encryption_key(inode)?;
             if inode.kind() != InodeKind::File || inode.protection().is_verity() {
                 return Err(Error::UnsupportedEncryption);
             }
@@ -710,12 +690,12 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when an encrypted inode lacks a mounted key, encrypted size mutation is not
     /// supported for the inode kind, or the inode storage policy rejects size mutation.
-    pub(super) async fn require_file_size_mutation(
+    pub(super) fn require_file_size_mutation(
         &mut self,
         inode: &Inode,
     ) -> Result<FileSizeMutationCapability> {
         if inode.protection().is_encrypted() {
-            self.volume.require_encryption_key(inode).await?;
+            self.volume.require_encryption_key(inode)?;
             if inode.kind() != InodeKind::File || inode.protection().is_verity() {
                 return Err(Error::UnsupportedEncryption);
             }
@@ -773,7 +753,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
     ///
     /// Returns an error when the inode has no mounted contents key, tail length arithmetic fails, or
     /// the encrypted block update cannot be staged.
-    async fn zero_encrypted_truncated_tail(
+    fn zero_encrypted_truncated_tail(
         &mut self,
         inode: &Inode,
         extents: &[Extent],
@@ -793,7 +773,7 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
         else {
             return Ok(());
         };
-        let contents_key = self.volume.fscrypt_contents_key_for_inode(inode).await?;
+        let contents_key = self.volume.fscrypt_contents_key_for_inode(inode)?;
         let zero_len = usize::try_from(
             block_size
                 .checked_sub(in_block)
@@ -809,6 +789,5 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             &zeroes,
             EncryptedBlockBase::ExistingPlaintext,
         )
-        .await
     }
 }

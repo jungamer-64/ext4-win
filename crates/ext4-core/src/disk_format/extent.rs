@@ -3,10 +3,10 @@
 use alloc::vec::Vec;
 use core::num::NonZeroU64;
 
-use crate::disk::block::{BlockAddress, BlockSize};
+use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
-use crate::disk::io::BlockSource;
+use crate::disk::storage::OperationDevice;
 use crate::disk_format::inode::{InodeExtentRoot, InodeId};
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
@@ -15,6 +15,24 @@ use crate::memory::{self, FallibleVec};
 const EXTENT_MAGIC: u16 = 0xF30A;
 /// Size of an extent or index header in bytes.
 const EXTENT_HEADER_SIZE: usize = 12;
+
+/// Narrow synchronous reader used only while walking external extent-tree nodes.
+///
+/// The two concrete implementations are the operation device and a mutation-local view that
+/// overlays already staged extent blocks.
+pub(crate) trait ExtentNodeReader {
+    /// Reads one exact extent-node range.
+    /// # Errors
+    ///
+    /// Returns an error when the backing operation requests storage or the range is invalid.
+    fn read_extent_bytes(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()>;
+}
+
+impl ExtentNodeReader for OperationDevice<'_> {
+    fn read_extent_bytes(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
+        self.read_exact_at(offset, out)
+    }
+}
 /// Size of one extent leaf or index entry in bytes.
 const EXTENT_ENTRY_SIZE: usize = 12;
 /// Maximum initialized extent length and bias applied to uninitialized lengths in `ee_len`.
@@ -342,10 +360,10 @@ impl ExtentTree {
     /// # Errors
     /// Returns an error when the tree is malformed, too deep, has a bad
     /// metadata checksum, or an index block cannot be read.
-    pub async fn load_inode_tree(
+    pub fn load_inode_tree(
         root: &InodeExtentRoot,
         block_size: BlockSize,
-        reader: &mut impl BlockSource,
+        reader: &mut impl ExtentNodeReader,
         context: ExtentTreeContext,
     ) -> Result<Self> {
         let mut extents = Vec::new();
@@ -357,8 +375,7 @@ impl ExtentTree {
             context,
             &mut extents,
             &mut metadata_blocks,
-        )
-        .await?;
+        )?;
         normalize_extents(&mut extents)?;
         Ok(Self {
             extents,
@@ -423,13 +440,13 @@ impl MutableExtentTree {
     ///
     /// # Errors
     /// Returns an error when loading the backing immutable tree fails.
-    pub async fn load_inode_tree(
+    pub fn load_inode_tree(
         root: &InodeExtentRoot,
         block_size: BlockSize,
-        reader: &mut impl BlockSource,
+        reader: &mut impl ExtentNodeReader,
         context: ExtentTreeContext,
     ) -> Result<Self> {
-        let tree = ExtentTree::load_inode_tree(root, block_size, reader, context).await?;
+        let tree = ExtentTree::load_inode_tree(root, block_size, reader, context)?;
         Ok(Self {
             extents: tree.extents,
             metadata_blocks: tree.metadata_blocks,
@@ -674,10 +691,10 @@ struct PendingExtentNode {
 ///
 /// Returns an error when the current node is malformed, an index child cannot be read, a child
 /// checksum fails, or recursive parsing rejects a child node.
-async fn load_external_extent_nodes(
+fn load_external_extent_nodes(
     raw: &[u8],
     block_size: BlockSize,
-    reader: &mut impl BlockSource,
+    reader: &mut impl ExtentNodeReader,
     context: ExtentTreeContext,
     extents: &mut Vec<Extent>,
     metadata_blocks: &mut Vec<BlockAddress>,
@@ -697,9 +714,7 @@ async fn load_external_extent_nodes(
             0_u8,
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        reader
-            .read_exact_at(block_size.offset_of(child.block)?, &mut bytes)
-            .await?;
+        reader.read_extent_bytes(block_size.offset_of(child.block)?, &mut bytes)?;
         verify_external_extent_block_checksum(context, bytes.as_slice())?;
         let child_depth = parse_node(bytes.as_slice(), Some(child.expected_depth), extents)?;
         if child_depth > 0 {

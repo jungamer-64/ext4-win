@@ -14,16 +14,16 @@ impl MountedAllocationSnapshot {
     /// # Errors
     ///
     /// Returns an error when group geometry is invalid or any descriptor or bitmap cannot be read.
-    async fn load(reader: &mut impl BlockSource, superblock: &Superblock) -> Result<Self> {
+    fn load(reader: &mut OperationDevice<'_>, superblock: &Superblock) -> Result<Self> {
         let group_count = superblock.block_group_count()?;
         let mut groups = Vec::new();
         for group in 0..group_count.as_u32() {
             let group = BlockGroupId::from_u32(group);
-            let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group).await?;
+            let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
             let block_bitmap =
-                read_allocation_bitmap(reader, superblock, descriptor.block_bitmap()).await?;
+                read_allocation_bitmap(reader, superblock, descriptor.block_bitmap())?;
             let inode_bitmap =
-                read_allocation_bitmap(reader, superblock, descriptor.inode_bitmap()).await?;
+                read_allocation_bitmap(reader, superblock, descriptor.inode_bitmap())?;
             groups.try_push(GroupAllocationSnapshot {
                 group,
                 descriptor,
@@ -104,18 +104,15 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when static metadata or live inode block references cannot be validated
     /// against allocation bitmaps.
-    pub(super) async fn load<D: BlockSource, State, N>(
-        volume: &mut MountedVolume<D, State, N>,
-    ) -> Result<Self> {
-        let allocation =
-            MountedAllocationSnapshot::load(&mut volume.device, &volume.superblock).await?;
+    pub(super) fn load(volume: &mut EpochReadView<'_, '_>) -> Result<Self> {
+        let allocation = MountedAllocationSnapshot::load(&mut volume.device, &volume.superblock)?;
         let mut index = Self {
             refs: Vec::new(),
             exclusive_blocks: Vec::new(),
             xattr_blocks: Vec::new(),
         };
         index.add_static_metadata(&volume.superblock, &allocation)?;
-        index.add_live_inodes(volume, &allocation).await?;
+        index.add_live_inodes(volume, &allocation)?;
         Ok(index)
     }
 
@@ -264,9 +261,9 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when inode bitmaps, raw inode records, external xattr blocks, or extent tree
     /// blocks cannot be read or validated as allocated.
-    async fn add_live_inodes<D: BlockSource, State, N>(
+    fn add_live_inodes(
         &mut self,
-        volume: &mut MountedVolume<D, State, N>,
+        volume: &mut EpochReadView<'_, '_>,
         allocation: &MountedAllocationSnapshot,
     ) -> Result<()> {
         for group in &allocation.groups {
@@ -277,7 +274,7 @@ impl ClusterReferenceIndex {
                     continue;
                 }
                 let inode_id = position.inode_id(&volume.superblock)?;
-                let raw_inode = read_group_inode_record(volume, group, position).await?;
+                let raw_inode = read_group_inode_record(volume, group, position)?;
                 if raw_inode.mode()? == 0 {
                     continue;
                 }
@@ -286,8 +283,7 @@ impl ClusterReferenceIndex {
                         volume,
                         allocation,
                         raw_inode.resize_inode_block_map()?,
-                    )
-                    .await?;
+                    )?;
                     continue;
                 }
                 if let Some(block) = raw_inode.xattr_block()? {
@@ -310,8 +306,7 @@ impl ClusterReferenceIndex {
                     volume.superblock.block_size(),
                     &mut volume.device,
                     context,
-                )
-                .await?;
+                )?;
                 for extent in tree.extents().iter().copied() {
                     self.add_extent_references(&volume.superblock, allocation, extent)?;
                 }
@@ -328,18 +323,18 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when pointer blocks cannot be read, contain invalid block addresses, or
     /// reference blocks that are not allocated exclusively.
-    async fn add_resize_inode_references<D: BlockSource, State, N>(
+    fn add_resize_inode_references(
         &mut self,
-        volume: &mut MountedVolume<D, State, N>,
+        volume: &mut EpochReadView<'_, '_>,
         allocation: &MountedAllocationSnapshot,
         block_map: ResizeInodeBlockMap,
     ) -> Result<()> {
         let double_indirect = block_map.double_indirect();
         self.add_exclusive_reference(&volume.superblock, allocation, double_indirect)?;
-        let indirect_blocks = read_resize_pointer_block(volume, double_indirect).await?;
+        let indirect_blocks = read_resize_pointer_block(volume, double_indirect)?;
         for indirect in indirect_blocks {
             self.add_exclusive_reference(&volume.superblock, allocation, indirect)?;
-            let reserved_blocks = read_resize_pointer_block(volume, indirect).await?;
+            let reserved_blocks = read_resize_pointer_block(volume, indirect)?;
             for reserved in reserved_blocks {
                 self.add_exclusive_reference(&volume.superblock, allocation, reserved)?;
             }
@@ -426,8 +421,8 @@ impl ClusterReferenceIndex {
 /// # Errors
 ///
 /// Returns an error when the bitmap byte count cannot be represented or the block cannot be read.
-async fn read_allocation_bitmap(
-    reader: &mut impl BlockSource,
+fn read_allocation_bitmap(
+    reader: &mut OperationDevice<'_>,
     superblock: &Superblock,
     block: BlockAddress,
 ) -> Result<Vec<u8>> {
@@ -435,9 +430,7 @@ async fn read_allocation_bitmap(
         0_u8,
         usize::try_from(superblock.block_size().bytes()).map_err(|_| Error::ArithmeticOverflow)?,
     )?;
-    reader
-        .read_exact_at(superblock.block_size().offset_of(block)?, &mut bytes)
-        .await?;
+    reader.read_exact_at(superblock.block_size().offset_of(block)?, &mut bytes)?;
     Ok(bytes)
 }
 
@@ -446,8 +439,8 @@ async fn read_allocation_bitmap(
 ///
 /// Returns an error when the group-local inode position is inconsistent, offset arithmetic
 /// overflows, allocation fails, or the record cannot be read.
-async fn read_group_inode_record<D: BlockSource, State, N>(
-    volume: &mut MountedVolume<D, State, N>,
+fn read_group_inode_record(
+    volume: &mut EpochReadView<'_, '_>,
     group: &GroupAllocationSnapshot,
     position: InodeBitmapPosition,
 ) -> Result<RawInodeRecord> {
@@ -470,7 +463,7 @@ async fn read_group_inode_record<D: BlockSource, State, N>(
     let offset = ByteOffset::new(offset);
     let mut bytes =
         memory::repeated_vec(0_u8, usize::from(volume.superblock.inode_size().as_u16()))?;
-    volume.device.read_exact_at(offset, &mut bytes).await?;
+    volume.device.read_exact_at(offset, &mut bytes)?;
     Ok(RawInodeRecord {
         id: inode_id,
         offset,
@@ -483,8 +476,8 @@ async fn read_group_inode_record<D: BlockSource, State, N>(
 /// # Errors
 ///
 /// Returns an error when the block cannot be read or its length is not a whole number of pointers.
-async fn read_resize_pointer_block<D: BlockSource, State, N>(
-    volume: &mut MountedVolume<D, State, N>,
+fn read_resize_pointer_block(
+    volume: &mut EpochReadView<'_, '_>,
     block: BlockAddress,
 ) -> Result<Vec<BlockAddress>> {
     let block_size = volume.superblock.block_size();
@@ -494,8 +487,7 @@ async fn read_resize_pointer_block<D: BlockSource, State, N>(
     )?;
     volume
         .device
-        .read_exact_at(block_size.offset_of(block)?, bytes.as_mut_slice())
-        .await?;
+        .read_exact_at(block_size.offset_of(block)?, bytes.as_mut_slice())?;
     parse_resize_pointer_block(bytes.as_slice())
 }
 
@@ -888,14 +880,14 @@ pub(super) fn inode_table_blocks(superblock: &Superblock, group: BlockGroupId) -
 ///
 /// Returns an error when `inode_id` cannot be mapped to a group, the descriptor cannot be read, or
 /// inode-table offset arithmetic overflows.
-pub(super) async fn inode_offset_on_device(
-    reader: &mut impl BlockSource,
+pub(super) fn inode_offset_on_device(
+    reader: &mut OperationDevice<'_>,
     superblock: &Superblock,
     inode_id: InodeId,
 ) -> Result<ByteOffset> {
     let position = InodeBitmapPosition::from_inode(superblock, inode_id)?;
     let group = position.group();
-    let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group).await?;
+    let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
     let inode_size = u64::from(superblock.inode_size().as_u16());
     let offset = superblock
         .block_size()
