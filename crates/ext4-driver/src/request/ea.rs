@@ -7,8 +7,7 @@ use crate::irp::{
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::state::{
-    OpenedObject, PendingChildCreation, VolumeControlBlock, VolumeOperationLane,
-    VolumeOperationLease,
+    OpenedObject, PendingChildCreation, VolumeAccess, VolumeControlBlock, VolumeOperationLane,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{XattrName, XattrNamespace, XattrValue};
@@ -51,7 +50,7 @@ pub(crate) fn query(mut request_irp: PendingIrpLease<'_>) -> DriverResult<IrpCom
     })?;
     let operations = unsafe {
         // SAFETY: Query-EA runs only as the mounted-device executor's unique active operation.
-        VolumeControlBlock::claim_operation_lane(volume)
+        VolumeControlBlock::operation_access(volume)
     };
     let request = QueryEaRequest {
         request: request_irp,
@@ -86,7 +85,7 @@ struct QueryEaRequest<'a> {
     /// ext4 node selected by the opened FILE_OBJECT.
     node: ext4_core::NodeId,
     /// Exclusive actor-owned mounted-volume operation capability.
-    operations: VolumeOperationLease,
+    operations: VolumeAccess,
 }
 
 /// Decoded set-EA request.
@@ -96,7 +95,7 @@ struct SetEaRequest {
     /// ext4 node selected by the opened FILE_OBJECT.
     node: ext4_core::NodeId,
     /// Exclusive actor-owned mounted-volume operation capability.
-    operations: VolumeOperationLease,
+    operations: VolumeAccess,
 }
 
 impl SetEaRequest {
@@ -120,7 +119,7 @@ impl SetEaRequest {
         let operations = unsafe {
             // SAFETY: Set-EA runs only as the mounted-device executor's unique active operation.
             // The lease is moved into this request and lives until that operation completes.
-            VolumeControlBlock::claim_operation_lane(volume)
+            VolumeControlBlock::operation_access(volume)
         };
         Ok(Self {
             entries,
@@ -322,7 +321,7 @@ enum WindowsEaSelection {
 /// Returns an error when selected EAs cannot be loaded, no EAs match, the output buffer is too
 /// small, or packed EA records cannot be emitted.
 fn query_ea(mut request: QueryEaRequest<'_>) -> DriverResult<IrpCompletion> {
-    let entries = load_windows_eas(request.operations.lane_mut(), request.node)?;
+    let entries = load_windows_eas(request.operations.runtime_mut(), request.node)?;
     let entries = collect_query_entries(entries, request.selection)?;
     let entries = if matches!(request.entry_emission, EaEntryEmission::Single) {
         entries.as_slice().get(..entries.len().min(1))
@@ -352,7 +351,7 @@ fn query_ea(mut request: QueryEaRequest<'_>) -> DriverResult<IrpCompletion> {
 /// Returns an error when the set-EA input list is malformed or the xattr update transaction fails.
 fn set_ea(mut request: SetEaRequest) -> DriverResult<IrpCompletion> {
     apply_set_ea_entries(
-        request.operations.lane_mut(),
+        request.operations.runtime_mut(),
         request.node,
         request.entries.as_slice(),
     )?;

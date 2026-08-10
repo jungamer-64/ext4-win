@@ -27,7 +27,7 @@ use crate::{
         FileControlBlock, HandleDeletion, KernelDevice, MountedVolumeDevice,
         NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
         OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion, UninitializedFileObject,
-        VolumeControlBlock, VolumeOperationLane, VolumeOperationLease, WriteCommitment,
+        VolumeAccess, VolumeControlBlock, VolumeOperationLane, WriteCommitment,
         abandon_file_control_block,
     },
 };
@@ -163,7 +163,7 @@ fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<CreateComp
     let mut operations = unsafe {
         // SAFETY: Create requests are queued through the mounted-device executor, which polls one
         // active filesystem operation at a time and therefore grants this request the unique lane.
-        VolumeControlBlock::claim_operation_lane(mounted_volume)
+        VolumeControlBlock::operation_access(mounted_volume)
     };
     operations.authorize_create()?;
     match resolve_target(
@@ -201,7 +201,7 @@ fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<CreateComp
         CreateTargetLookup::ReparseSymlink {
             point,
             unparsed_path,
-        } => create_symlink_reparse_completion(operations.lane_mut(), point, unparsed_path),
+        } => create_symlink_reparse_completion(operations.runtime_mut(), point, unparsed_path),
     }
 }
 
@@ -670,7 +670,7 @@ fn open_existing_node(
     node: NodeId,
     node_mode: OpenedNodeMode,
     location: OpenedLocation,
-    operations: &mut VolumeOperationLease,
+    operations: &mut VolumeAccess,
 ) -> DriverResult<CreateAction> {
     let parameters = request.parameters();
     let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
@@ -713,14 +713,14 @@ fn prepare_create_deletion(
     policy: CreateHandlePolicy,
     node: NodeId,
     location: &OpenedLocation,
-    operations: &mut VolumeOperationLease,
+    operations: &mut VolumeAccess,
 ) -> DriverResult<Option<PendingFileDeletion>> {
     if policy.deletion() == CreateDeletion::Retain {
         return Ok(None);
     }
     let pending = PendingFileDeletion::try_from_delete_on_close(location)?;
     crate::request::file_info::validate_pending_deletion(
-        operations.lane_mut(),
+        operations.runtime_mut(),
         node,
         pending.target_ref(),
         crate::request::file_info::DeleteReadonlyPolicy::Enforce,
@@ -749,7 +749,7 @@ fn open_volume(
     let handle = memory::boxed_try_with(|| Ok(OpenedVolumeHandle::new()))?;
     let mut operations = unsafe {
         // SAFETY: This create runs as the mounted-device actor's unique active operation.
-        VolumeControlBlock::claim_operation_lane(volume)
+        VolumeControlBlock::operation_access(volume)
     };
     request.with_file_object(move |file_object| {
         operations.open_volume_handle(
@@ -795,7 +795,7 @@ fn destructive_directory_error(directory: DirectoryNodeId) -> DriverError {
 fn create_missing_node(
     mut request: CreateCompletionOwner<'_>,
     create_ea: CreateEa,
-    operations: &mut VolumeOperationLease,
+    operations: &mut VolumeAccess,
     disposition: CreateDisposition,
     parent: DirectoryNodeId,
     name: &Ext4Name,
@@ -917,7 +917,7 @@ fn validate_existing_node_options(
 /// Returns an error when path or file-reference resolution fails.
 fn resolve_target(
     target: CreateTargetSpecifier,
-    operations: &mut VolumeOperationLease,
+    operations: &mut VolumeAccess,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
     match target {
@@ -927,7 +927,7 @@ fn resolve_target(
         }
         CreateTargetSpecifier::FileReference(reference) => {
             let target =
-                resolve_file_reference(reference, operations.lane_mut(), reparse_point_mode)?;
+                resolve_file_reference(reference, operations.runtime_mut(), reparse_point_mode)?;
             if let CreateTargetLookup::Existing { node, .. } = &target {
                 operations.ensure_node_openable(*node)?;
             }
@@ -991,7 +991,7 @@ fn file_reference_lookup_error(error: ext4_core::Error) -> DriverError {
 fn resolve_path(
     name: CreatePathName,
     anchor: CreatePathAnchor,
-    operations: &mut VolumeOperationLease,
+    operations: &mut VolumeAccess,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
     let mut parent_id = anchor.directory();
@@ -1005,7 +1005,7 @@ fn resolve_path(
         };
         operations.ensure_node_openable(NodeId::Directory(parent_id))?;
         let parent = match operations
-            .lane_mut()
+            .runtime_mut()
             .journaled_mut()
             .load_directory(parent_id)
         {
@@ -1013,7 +1013,7 @@ fn resolve_path(
             Err(error) => return Err(DriverError::from(error)),
         };
         let child = match operations
-            .lane_mut()
+            .runtime_mut()
             .journaled_mut()
             .lookup_windows_child(&parent, component.name())
         {
@@ -1029,7 +1029,7 @@ fn resolve_path(
         };
         let child_node = *child.node();
         operations.ensure_node_openable(child_node)?;
-        let reparse_point = NodeSymlinkReparsePoint::load(operations.lane_mut(), child_node)?;
+        let reparse_point = NodeSymlinkReparsePoint::load(operations.runtime_mut(), child_node)?;
         if let Some(point) = reparse_point {
             match reparse_point_encounter(position, reparse_point_mode) {
                 ReparsePointEncounter::Redirect => {

@@ -25,9 +25,9 @@ use crate::state::{
     CleanupStart, CloseReleasePlan, DirectoryChange, DirectoryChangeAction, DirectoryCursor,
     DirectoryNotificationRegistration, FileCleanupDisposition, FileControlBlock, FileDeleteTarget,
     MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation, OpenedObject,
-    OpenedRegularFile, PendingFileDeletion, VolumeControlBlock, VolumeHandleCleanup,
-    VolumeOperationLane, VolumeOperationLease, VolumeRetirement, WriteCommitment,
-    release_cancelled_file_control_block, release_file_control_block,
+    OpenedRegularFile, PendingFileDeletion, VolumeAccess, VolumeControlBlock, VolumeHandleCleanup,
+    VolumeOperationLane, VolumeRetirement, WriteCommitment, release_cancelled_file_control_block,
+    release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -163,7 +163,7 @@ pub(crate) fn flush(mut request: PendingIrpLease<'_>) -> DriverResult<IrpComplet
     let volume =
         request.with_active(|active| FlushVolume::decode(active).map(FlushVolume::volume))?;
     let mut operations = claim_volume_operation_lane(volume);
-    operations.lane_mut().flush()?;
+    operations.runtime_mut().flush()?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -177,7 +177,7 @@ pub(crate) fn shutdown(mut request: PendingIrpLease<'_>) -> DriverResult<IrpComp
         FlushVolume::from_mounted_device(active.device()).map(FlushVolume::volume)
     })?;
     let mut operations = claim_volume_operation_lane(volume);
-    operations.lane_mut().flush()?;
+    operations.runtime_mut().flush()?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -342,7 +342,7 @@ enum QueryFilePlan {
         /// Shared FCB deletion state captured before metadata I/O.
         delete_pending: bool,
         /// Exclusive mounted-volume operation capability.
-        operations: VolumeOperationLease,
+        operations: VolumeAccess,
     },
     /// Traverse the ext4 namespace for every name of one hard-linkable inode.
     HardLinks {
@@ -351,7 +351,7 @@ enum QueryFilePlan {
         /// Non-directory target identity.
         target: HardLinkNodeId,
         /// Exclusive mounted-volume operation capability.
-        operations: VolumeOperationLease,
+        operations: VolumeAccess,
     },
 }
 
@@ -443,7 +443,7 @@ fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpC
     };
     let metadata = {
         let mut operations = operations;
-        metadata_from_node(operations.lane_mut(), node)?
+        metadata_from_node(operations.runtime_mut(), node)?
     };
     request.with_active(|active| {
         let mut buffer = active.buffered_output(length)?;
@@ -483,10 +483,10 @@ fn query_hard_link_information(
     mut request: PendingIrpLease<'_>,
     length: IrpBufferLength,
     target: HardLinkNodeId,
-    mut operations: VolumeOperationLease,
+    mut operations: VolumeAccess,
 ) -> DriverResult<IrpCompletion> {
     let links = operations
-        .lane_mut()
+        .runtime_mut()
         .journaled_mut()
         .read_hard_links(target)?;
     let links = WindowsHardLinks::try_from_ext4(&links)?;
@@ -747,7 +747,7 @@ enum SetFilePlan {
         /// Target ext4 node.
         node: NodeId,
         /// Exclusive mounted-volume operation capability.
-        operations: VolumeOperationLease,
+        operations: VolumeAccess,
     },
     /// Set the exact logical end of file.
     EndOfFile {
@@ -756,7 +756,7 @@ enum SetFilePlan {
         /// Requested logical size.
         size: FileSize,
         /// Exclusive mounted-volume operation capability.
-        operations: VolumeOperationLease,
+        operations: VolumeAccess,
     },
     /// Shrink allocation when the requested sparse-model size is below EOF.
     Allocation {
@@ -765,7 +765,7 @@ enum SetFilePlan {
         /// Requested allocation bound.
         size: FileSize,
         /// Exclusive mounted-volume operation capability.
-        operations: VolumeOperationLease,
+        operations: VolumeAccess,
     },
     /// Validate and publish one identity-bound delete-pending target.
     Disposition {
@@ -778,21 +778,21 @@ enum SetFilePlan {
         /// Whether the extended request bypasses the read-only Windows attribute.
         readonly: DeleteReadonlyPolicy,
         /// Exclusive mounted-volume operation capability.
-        operations: VolumeOperationLease,
+        operations: VolumeAccess,
     },
     /// Commit one fully owned hard-link creation.
     Link {
         /// Caller-independent hard-link domain values.
         mutation: HardLinkMutation,
         /// Exclusive mounted-volume operation capability.
-        operations: VolumeOperationLease,
+        operations: VolumeAccess,
     },
     /// Commit one fully owned namespace rename.
     Rename {
         /// Caller-independent rename domain values.
         mutation: RenameMutation,
         /// Exclusive mounted-volume operation capability.
-        operations: VolumeOperationLease,
+        operations: VolumeAccess,
     },
 }
 
@@ -898,20 +898,20 @@ fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCom
             info,
             node,
             mut operations,
-        } => set_basic_information(info, node, operations.lane_mut())?,
+        } => set_basic_information(info, node, operations.runtime_mut())?,
         SetFilePlan::EndOfFile {
             file,
             size,
             mut operations,
-        } => set_regular_file_size(operations.lane_mut(), file, size)?,
+        } => set_regular_file_size(operations.runtime_mut(), file, size)?,
         SetFilePlan::Allocation {
             file,
             size,
             mut operations,
         } => {
-            let current = regular_file_size(operations.lane_mut(), file)?;
+            let current = regular_file_size(operations.runtime_mut(), file)?;
             if size < current {
-                set_regular_file_size(operations.lane_mut(), file, size)?;
+                set_regular_file_size(operations.runtime_mut(), file, size)?;
             }
         }
         SetFilePlan::Disposition {
@@ -921,7 +921,12 @@ fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCom
             readonly,
             mut operations,
         } => {
-            validate_pending_deletion(operations.lane_mut(), node, pending.target_ref(), readonly)?;
+            validate_pending_deletion(
+                operations.runtime_mut(),
+                node,
+                pending.target_ref(),
+                readonly,
+            )?;
             match publication {
                 DeletePendingPublication::Publish { fcb } => {
                     operations.set_file_delete_pending(fcb, pending);
@@ -1353,7 +1358,7 @@ struct HardLinkDirectoryChanges {
 
 impl HardLinkDirectoryChanges {
     /// Reports the committed notification sequence.
-    fn report(self, operations: &VolumeOperationLease) {
+    fn report(self, operations: &VolumeAccess) {
         operations.report_directory_change(self.first);
         if let Some(second) = self.second {
             operations.report_directory_change(*second);
@@ -1368,7 +1373,7 @@ impl HardLinkDirectoryChanges {
 /// the journal transaction fails.
 fn set_hard_link_information(
     mutation: HardLinkMutation,
-    operations: &mut VolumeOperationLease,
+    operations: &mut VolumeAccess,
 ) -> DriverResult<()> {
     let HardLinkMutation {
         source,
@@ -1376,9 +1381,9 @@ fn set_hard_link_information(
         target_collision,
     } = mutation;
     let source_node = NodeId::from(source);
-    let (target_parent, target_name) = resolve_namespace_target(operations.lane_mut(), &target)?;
+    let (target_parent, target_name) = resolve_namespace_target(operations.runtime_mut(), &target)?;
     operations.ensure_node_openable(NodeId::Directory(target_parent))?;
-    let source_metadata = metadata_from_node(operations.lane_mut(), source_node)?;
+    let source_metadata = metadata_from_node(operations.runtime_mut(), source_node)?;
     let (destination, count_effect, changes) = prepare_hard_link_destination(
         operations,
         source_node,
@@ -1391,7 +1396,7 @@ fn set_hard_link_information(
     let archive_overlay = hard_link_archive_overlay(source_metadata.overlay_attributes)?;
 
     let mut transaction = operations
-        .lane_mut()
+        .runtime_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let source = transaction.hard_link_source(source)?;
@@ -1429,7 +1434,7 @@ fn set_hard_link_information(
 /// Returns an error when a rejected collision exists, the target is a directory, read-only,
 /// delete-pending, or still has an active handle.
 fn prepare_hard_link_destination(
-    operations: &mut VolumeOperationLease,
+    operations: &mut VolumeAccess,
     source_node: NodeId,
     target_parent: DirectoryNodeId,
     target_name: &Ext4Name,
@@ -1441,11 +1446,11 @@ fn prepare_hard_link_destination(
     HardLinkDirectoryChanges,
 )> {
     let parent = operations
-        .lane_mut()
+        .runtime_mut()
         .journaled_mut()
         .load_directory(target_parent)?;
     let target = operations
-        .lane_mut()
+        .runtime_mut()
         .journaled_mut()
         .lookup_windows_child(&parent, target_windows_name)?;
     let ChildLookup::Found(target) = target else {
@@ -1474,7 +1479,7 @@ fn prepare_hard_link_destination(
     if target_node != source_node {
         operations.ensure_node_replaceable(target_node)?;
     }
-    let target_metadata = metadata_from_node(operations.lane_mut(), target_node)?;
+    let target_metadata = metadata_from_node(operations.runtime_mut(), target_node)?;
     if file_attributes(target_metadata) & wdk_sys::FILE_ATTRIBUTE_READONLY != 0 {
         return Err(DriverError::CannotDelete);
     }
@@ -1601,7 +1606,7 @@ enum CommittedRename {
 fn rename_file_information(
     request: &mut PendingIrpLease<'_>,
     mutation: RenameMutation,
-    operations: VolumeOperationLease,
+    operations: VolumeAccess,
 ) -> DriverResult<IrpCompletion> {
     let committed = {
         let mut operations = operations;
@@ -1638,7 +1643,7 @@ fn rename_file_information(
 /// fails.
 fn set_rename_information(
     mutation: RenameMutation,
-    operations: &mut VolumeOperationLease,
+    operations: &mut VolumeAccess,
 ) -> DriverResult<CommittedRename> {
     let RenameMutation {
         source_parent,
@@ -1647,7 +1652,7 @@ fn set_rename_information(
         target,
         target_collision,
     } = mutation;
-    let (target_parent, target_name) = resolve_namespace_target(operations.lane_mut(), &target)?;
+    let (target_parent, target_name) = resolve_namespace_target(operations.runtime_mut(), &target)?;
     operations.ensure_node_openable(NodeId::Directory(source_parent))?;
     operations.ensure_node_openable(NodeId::Directory(target_parent))?;
     let notifications = RenameDirectoryNameChanges::prepare(
@@ -1664,7 +1669,7 @@ fn set_rename_information(
         .transpose()
         .map_err(|_| DriverError::InsufficientResources)?;
     let mut transaction = operations
-        .lane_mut()
+        .runtime_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let source_parent = transaction.directory(source_parent)?;
@@ -1707,7 +1712,7 @@ impl RenameDirectoryNameChanges {
     /// Returns an error when a replace-capable target cannot be read or a visible child name
     /// cannot be represented in the Windows notification namespace.
     fn prepare(
-        operations: &mut VolumeOperationLease,
+        operations: &mut VolumeAccess,
         source_parent: DirectoryNodeId,
         source_name: &Ext4Name,
         source_node: NodeId,
@@ -1723,11 +1728,11 @@ impl RenameDirectoryNameChanges {
             RenameTargetCollision::Reject => None,
             RenameTargetCollision::Replace => {
                 let parent = operations
-                    .lane_mut()
+                    .runtime_mut()
                     .journaled_mut()
                     .load_directory(target_parent)?;
                 match operations
-                    .lane_mut()
+                    .runtime_mut()
                     .journaled_mut()
                     .lookup_windows_child(&parent, &WindowsName::from_ext4(target_name)?)?
                 {
@@ -1839,16 +1844,16 @@ pub(crate) fn query_directory(mut request: PendingIrpLease<'_>) -> DriverResult<
     let (cursor, packed, result) = {
         let mut operations = operations;
         let directory = operations
-            .lane_mut()
+            .runtime_mut()
             .journaled_mut()
             .load_directory(directory_id)?;
         let entries = operations
-            .lane_mut()
+            .runtime_mut()
             .journaled_mut()
             .read_directory(&directory)?;
         let mut packed = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
         let result = emit_directory_entries(
-            operations.lane_mut(),
+            operations.runtime_mut(),
             &mut cursor,
             entry_emission,
             class,
@@ -2471,7 +2476,7 @@ struct PendingCleanupDeletion {
     /// Stable FCB-owned target allocation.
     target: NonNull<FileDeleteTarget>,
     /// Exclusive mounted-volume operation capability.
-    operations: VolumeOperationLease,
+    operations: VolumeAccess,
 }
 
 /// Releases resources owned by one FILE_OBJECT handle lifecycle.
@@ -2546,12 +2551,12 @@ fn delete_after_final_cleanup(mut plan: PendingCleanupDeletion) -> DriverResult<
     };
     let parent = plan
         .operations
-        .lane_mut()
+        .runtime_mut()
         .journaled_mut()
         .load_directory(target.parent())?;
     match plan
         .operations
-        .lane_mut()
+        .runtime_mut()
         .journaled_mut()
         .lookup_child(&parent, target.name())?
     {
@@ -2566,7 +2571,7 @@ fn delete_after_final_cleanup(mut plan: PendingCleanupDeletion) -> DriverResult<
     )?;
     let mut transaction = plan
         .operations
-        .lane_mut()
+        .runtime_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let parent = transaction.directory(target.parent())?;
@@ -3802,14 +3807,17 @@ fn read_regular_file_direct(mut request: PendingIrpLease<'_>) -> DriverResult<Ir
         return Ok(IrpCompletion::EMPTY);
     };
 
-    let file = operations.lane_mut().journaled_mut().load_file(file_id)?;
+    let file = operations
+        .runtime_mut()
+        .journaled_mut()
+        .load_file(file_id)?;
     let bytes_read = {
         let output = request.prepared_read_mut()?.output_mut();
         data_transfer_mode.validate_buffer(
             NonNull::new(output.as_mut_ptr()).ok_or(DriverError::InternalInvariantViolation)?,
         )?;
         operations
-            .lane_mut()
+            .runtime_mut()
             .journaled_mut()
             .read_file(&file, range.start(), output)?
             .as_usize()
@@ -3851,7 +3859,7 @@ fn write_regular_file_windowed(mut request: PendingIrpLease<'_>) -> DriverResult
         })?;
 
     let range = ResolvedFileRange::new(
-        resolve_write_start(operations.lane_mut(), file_id, anchor)?,
+        resolve_write_start(operations.runtime_mut(), file_id, anchor)?,
         stack.length().as_usize(),
     )?;
     request.with_active(|active| {
@@ -3891,7 +3899,7 @@ fn write_regular_file_windowed(mut request: PendingIrpLease<'_>) -> DriverResult
         let mut windows = WriteSnapshotWindows::new(total);
         let mut snapshot = DriverVec::try_repeated_copy(0_u8, windows.snapshot_capacity())?;
         let mut transaction = operations
-            .lane_mut()
+            .runtime_mut()
             .journaled_mut()
             .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
         let file = transaction.file(file_id)?;
@@ -3908,7 +3916,7 @@ fn write_regular_file_windowed(mut request: PendingIrpLease<'_>) -> DriverResult
         }
         transaction.commit()?;
         if matches!(write_commitment, WriteCommitment::FlushThrough) {
-            operations.lane_mut().flush()?;
+            operations.runtime_mut().flush()?;
         }
         windows.completed()
     };
@@ -3921,17 +3929,17 @@ fn write_regular_file_windowed(mut request: PendingIrpLease<'_>) -> DriverResult
 }
 
 /// Claims the actor-owned operation lane referenced by one live FCB.
-fn claim_file_operation_lane(fcb: &FileControlBlock) -> VolumeOperationLease {
+fn claim_file_operation_lane(fcb: &FileControlBlock) -> VolumeAccess {
     claim_volume_operation_lane(fcb.volume())
 }
 
 /// Claims the actor-owned operation lane for one serialized mounted-device request.
-fn claim_volume_operation_lane(volume: NonNull<VolumeControlBlock>) -> VolumeOperationLease {
+fn claim_volume_operation_lane(volume: NonNull<VolumeControlBlock>) -> VolumeAccess {
     unsafe {
         // SAFETY: Every caller runs as the mounted-device executor's sole active data-plane
         // request and returns the non-cloneable lease by value, so a second lane claim cannot be
         // constructed before this request releases the first.
-        VolumeControlBlock::claim_operation_lane(volume)
+        VolumeControlBlock::operation_access(volume)
     }
 }
 

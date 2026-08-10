@@ -32,13 +32,13 @@ pub(crate) fn query(mut request: PendingIrpLease<'_>) -> DriverResult<IrpComplet
     })?;
     let operations = unsafe {
         // SAFETY: Query-volume runs only as the mounted-device executor's unique active operation.
-        VolumeControlBlock::claim_operation_lane(volume)
+        VolumeControlBlock::operation_access(volume)
     };
     request.with_active(|active| {
         let length = stack.length();
         let mut buffer = active.buffered_output(length)?;
         let output = buffer.as_mut_slice();
-        let operations = operations.lane();
+        let operations = operations.runtime();
         match stack.information_class() {
             QueryVolumeInformationClass::Volume => pack_volume_information(operations, output),
             QueryVolumeInformationClass::Size => pack_size_information(operations, output),
@@ -68,19 +68,19 @@ pub(crate) fn set(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletio
     })?;
     let mut operations = unsafe {
         // SAFETY: Set-volume runs only as the mounted-device executor's unique active operation.
-        VolumeControlBlock::claim_operation_lane(volume)
+        VolumeControlBlock::operation_access(volume)
     };
-    if operations.lane().volume_label() == label {
+    if operations.runtime().volume_label() == label {
         return Ok(IrpCompletion::EMPTY);
     }
 
     let mut transaction = operations
-        .lane_mut()
+        .runtime_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     transaction.set_volume_label(label);
     transaction.commit()?;
-    MountedVolumeDevice::refresh_vpb_label(device, operations.lane().volume_label())?;
+    MountedVolumeDevice::refresh_vpb_label(device, operations.runtime().volume_label())?;
     Ok(IrpCompletion::EMPTY)
 }
 
