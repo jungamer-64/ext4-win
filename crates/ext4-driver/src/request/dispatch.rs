@@ -362,6 +362,10 @@ pub(crate) async fn execute_owned(mut owned: OwnedIrp) {
                 let result = crate::request::file_info::read(owned.request()).await;
                 owned.complete_result(result)
             }
+            PreparedRequest::Write(_) => {
+                let result = crate::request::file_info::write(owned.request()).await;
+                owned.complete_result(result)
+            }
             PreparedRequest::QueryInformation => {
                 let result = crate::request::file_info::query(owned.request()).await;
                 owned.complete_result(result)
@@ -412,6 +416,7 @@ fn actor_request_requires_handle_authorization(owned: &OwnedIrp) -> bool {
             | PreparedRequest::QuerySecurity { .. }
             | PreparedRequest::SetSecurity { .. }
             | PreparedRequest::Read(_)
+            | PreparedRequest::Write(_)
             | PreparedRequest::QueryInformation
             | PreparedRequest::SetInformation
             | PreparedRequest::QueryVolumeInformation

@@ -1,7 +1,7 @@
 //! File object IRP handlers and file information packing boundary.
 
 use alloc::boxed::Box;
-use core::ptr::NonNull;
+use core::{num::NonZeroUsize, ptr::NonNull};
 
 use ext4_core::{
     ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Permissions,
@@ -30,6 +30,88 @@ use crate::state::{
     release_cancelled_file_control_block, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
+
+/// Maximum requestor write bytes snapshotted into Rust-owned memory at one time.
+const MAX_WRITE_SNAPSHOT_BYTES: usize = 65_536;
+
+/// One non-empty, bounded source interval selected from a pending write IRP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WriteSnapshotWindow {
+    /// Byte displacement from the start of the captured request input.
+    input_offset: usize,
+    /// Exact non-zero byte count copied before the next suspension point.
+    length: NonZeroUsize,
+}
+
+impl WriteSnapshotWindow {
+    /// Byte displacement from the start of the captured request input.
+    const fn input_offset(self) -> usize {
+        self.input_offset
+    }
+
+    /// Exact byte count in this window.
+    const fn length(self) -> usize {
+        self.length.get()
+    }
+}
+
+/// Monotonic state machine partitioning one non-empty write into bounded snapshots.
+#[derive(Debug)]
+struct WriteSnapshotWindows {
+    /// Exact request byte count.
+    total: NonZeroUsize,
+    /// Prefix already selected for transfer.
+    completed: usize,
+}
+
+impl WriteSnapshotWindows {
+    /// Starts at the first byte of one non-empty request.
+    const fn new(total: NonZeroUsize) -> Self {
+        Self {
+            total,
+            completed: 0,
+        }
+    }
+
+    /// Required reusable snapshot allocation size.
+    const fn snapshot_capacity(&self) -> usize {
+        if self.total.get() < MAX_WRITE_SNAPSHOT_BYTES {
+            self.total.get()
+        } else {
+            MAX_WRITE_SNAPSHOT_BYTES
+        }
+    }
+
+    /// Selects and advances past the next non-empty input window.
+    /// # Errors
+    ///
+    /// Returns an invariant error if internal progress no longer describes a prefix of `total`.
+    fn next_window(&mut self) -> DriverResult<Option<WriteSnapshotWindow>> {
+        let remaining = self
+            .total
+            .get()
+            .checked_sub(self.completed)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        let Some(length) = NonZeroUsize::new(core::cmp::min(remaining, MAX_WRITE_SNAPSHOT_BYTES))
+        else {
+            return Ok(None);
+        };
+        let window = WriteSnapshotWindow {
+            input_offset: self.completed,
+            length,
+        };
+        self.completed = self
+            .completed
+            .checked_add(length.get())
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        Ok(Some(window))
+    }
+
+    /// Exact prefix selected so far.
+    const fn completed(&self) -> usize {
+        self.completed
+    }
+}
 
 /// Executes cleanup IRPs, including final-active-handle deferred deletion.
 /// # Errors
@@ -69,7 +151,7 @@ pub(crate) async fn read(request: PendingIrpLease<'_>) -> DriverResult<IrpComple
 ///
 /// Returns an error when write stack decoding, input buffer mapping, or ext4 file mutation fails.
 pub(crate) async fn write(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    write_regular_file(request).await
+    write_regular_file_windowed(request).await
 }
 
 /// Flushes cached or ordered file data.
@@ -3769,7 +3851,7 @@ async fn read_regular_file_direct(mut request: PendingIrpLease<'_>) -> DriverRes
         .load_file(file_id)
         .await?;
     let bytes_read = {
-        let output = request.prepared_read_mut()?.output_mut()?;
+        let output = request.prepared_read_mut()?.output_mut();
         data_transfer_mode.validate_buffer(
             NonNull::new(output.as_mut_ptr()).ok_or(DriverError::InternalInvariantViolation)?,
         )?;
@@ -3786,6 +3868,108 @@ async fn read_regular_file_direct(mut request: PendingIrpLease<'_>) -> DriverRes
         opened_file.update_current_file_position(kind, range.start(), bytes_read)
     })?;
     IrpCompletion::from_usize(bytes_read)
+}
+
+/// Writes a regular file from bounded snapshots of the pending write IRP's input mapping.
+/// # Errors
+///
+/// Returns an error when the captured write contract, opened FILE_OBJECT, transfer alignment,
+/// byte-range lock, or ext4 journal transaction is invalid.
+async fn write_regular_file_windowed(
+    mut request: PendingIrpLease<'_>,
+) -> DriverResult<IrpCompletion> {
+    let stack = request.prepared_write()?.stack();
+    let input_address = request.prepared_write()?.input_address();
+    let (file_id, kind, anchor, write_commitment, data_transfer_mode, mut operations) = request
+        .with_active(|active| {
+            let file_object = active.current_stack()?.file_object()?;
+            let opened_file = OpenedRegularFile::decode(file_object)?;
+            let kind = active.data_io_kind();
+            let selected_start =
+                select_write_start(opened_file.write_access(), kind, stack.starting_point())?;
+            let anchor =
+                selected_start.bind_current_position(|| opened_file.current_file_position())?;
+            let data_transfer_mode = opened_file.data_transfer_mode();
+            Ok::<_, DriverError>((
+                opened_file.id(),
+                kind,
+                anchor,
+                opened_file.write_commitment(),
+                data_transfer_mode,
+                claim_file_operation_lane(opened_file.file_control_block()),
+            ))
+        })?;
+
+    let range = ResolvedFileRange::new(
+        resolve_write_start(operations.lane_mut(), file_id, anchor).await?,
+        stack.length().as_usize(),
+    )?;
+    request.with_active(|active| {
+        let file_object = active.current_stack()?.file_object()?;
+        let opened_file = OpenedRegularFile::decode(file_object)?;
+        data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
+        if stack.length().is_empty() {
+            return Ok(());
+        }
+        data_transfer_mode
+            .validate_buffer(input_address.ok_or(DriverError::InternalInvariantViolation)?)?;
+        if kind == DataIoKind::Handle
+            && !opened_file.file_control_block().permits_byte_range_write(
+                active.requestor_process()?,
+                opened_file.file_object(),
+                range.start(),
+                range.length(),
+                stack.key(),
+            )?
+        {
+            return Err(DriverError::FileLockConflict);
+        }
+        Ok(())
+    })?;
+    if stack.length().is_empty() {
+        request.with_active(|active| {
+            let file_object = active.current_stack()?.file_object()?;
+            let mut opened_file = OpenedRegularFile::decode(file_object)?;
+            opened_file.update_current_file_position(kind, range.start(), 0)
+        })?;
+        return Ok(IrpCompletion::EMPTY);
+    }
+
+    let bytes_written = {
+        let total = NonZeroUsize::new(stack.length().as_usize())
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        let mut windows = WriteSnapshotWindows::new(total);
+        let mut snapshot = DriverVec::try_repeated_copy(0_u8, windows.snapshot_capacity())?;
+        let mut transaction = operations
+            .lane_mut()
+            .journaled_mut()
+            .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
+        let file = transaction.file(file_id).await?;
+        while let Some(window) = windows.next_window()? {
+            let chunk = snapshot
+                .as_mut_slice()
+                .get_mut(..window.length())
+                .ok_or(DriverError::InternalInvariantViolation)?;
+            request
+                .prepared_write()?
+                .copy_window(window.input_offset(), chunk)?;
+            let chunk_offset = range.start().checked_add_len(window.input_offset())?;
+            transaction
+                .write_file_range(file, chunk_offset, chunk)
+                .await?;
+        }
+        transaction.commit().await?;
+        if matches!(write_commitment, WriteCommitment::FlushThrough) {
+            operations.lane_mut().flush().await?;
+        }
+        windows.completed()
+    };
+    request.with_active(|active| {
+        let file_object = active.current_stack()?.file_object()?;
+        let mut opened_file = OpenedRegularFile::decode(file_object)?;
+        opened_file.update_current_file_position(kind, range.start(), bytes_written)
+    })?;
+    IrpCompletion::from_usize(bytes_written)
 }
 
 /// Claims the actor-owned operation lane referenced by one live FCB.
@@ -3984,6 +4168,55 @@ mod tests {
         };
         target.copy_from_slice(&value.to_le_bytes());
         true
+    }
+
+    /// # Panics
+    ///
+    /// Panics when non-empty write progress is not exhaustive, ordered, or snapshot-bounded.
+    #[test]
+    fn write_snapshot_windows_partition_the_exact_request() {
+        let total_value = super::MAX_WRITE_SNAPSHOT_BYTES
+            .saturating_mul(2)
+            .saturating_add(17);
+        let Some(total) = core::num::NonZeroUsize::new(total_value) else {
+            return;
+        };
+        let mut windows = super::WriteSnapshotWindows::new(total);
+        assert_eq!(windows.snapshot_capacity(), super::MAX_WRITE_SNAPSHOT_BYTES);
+
+        for (expected_offset, expected_length) in [
+            (0, super::MAX_WRITE_SNAPSHOT_BYTES),
+            (
+                super::MAX_WRITE_SNAPSHOT_BYTES,
+                super::MAX_WRITE_SNAPSHOT_BYTES,
+            ),
+            (super::MAX_WRITE_SNAPSHOT_BYTES.saturating_mul(2), 17),
+        ] {
+            let window = windows.next_window();
+            assert!(window.is_ok());
+            if let Ok(Some(window)) = window {
+                assert_eq!(window.input_offset(), expected_offset);
+                assert_eq!(window.length(), expected_length);
+            } else {
+                return;
+            }
+        }
+        assert_eq!(windows.next_window(), Ok(None));
+        assert_eq!(windows.completed(), total_value);
+
+        let Some(one_byte) = core::num::NonZeroUsize::new(1) else {
+            return;
+        };
+        let mut minimum = super::WriteSnapshotWindows::new(one_byte);
+        assert_eq!(minimum.snapshot_capacity(), 1);
+        assert_eq!(
+            minimum.next_window(),
+            Ok(Some(super::WriteSnapshotWindow {
+                input_offset: 0,
+                length: one_byte,
+            }))
+        );
+        assert_eq!(minimum.next_window(), Ok(None));
     }
 
     /// # Panics

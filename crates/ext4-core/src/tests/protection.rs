@@ -173,7 +173,7 @@ fn encrypted_file_read_with_key_decrypts_plaintext() {
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
-fn encrypted_file_write_roundtrips_ciphertext() {
+fn encrypted_write_windows_compose_before_commit() {
     let mut image = modern_fixture_image_with_journal_blocks(16);
     let master_key = must(FscryptMasterKey::from_raw(&[0x7B; 32]));
     let context_bytes = fscrypt_v2_context_bytes_with_identifier(master_key.identifier().bytes());
@@ -187,7 +187,8 @@ fn encrypted_file_write_roundtrips_ciphertext() {
         ));
         let file_id = file_node_id(&mut volume, 3);
         let mut transaction = volume.begin_transaction(NOW);
-        write_file(&mut transaction, file_id, 1, b"EL");
+        write_file(&mut transaction, file_id, 1, b"E");
+        write_file(&mut transaction, file_id, 2, b"L");
         must_run(transaction.commit());
     }
 

@@ -269,6 +269,43 @@ fn write_extends_created_empty_file() {
 
 /// # Panics
 ///
+/// Panics when adjacent write windows in one transaction fail to compose across a shared block.
+#[test]
+fn adjacent_write_windows_compose_inside_one_transaction() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let device = MemoryBlockStorage::new(&mut image);
+    let mut volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+
+    let prefix = vec![0x41_u8; BLOCK_SIZE + 17];
+    let suffix = b"tail";
+    let gap = 7_usize;
+    let suffix_offset = gap.saturating_add(prefix.len());
+    let mut transaction = volume.begin_transaction(NOW);
+    let root = transaction_directory(&mut transaction, crate::DirectoryNodeId::ROOT);
+    let name = must(Ext4Name::new(b"windowed"));
+    let file = must_run(transaction.create_file(root, &name, test_file_metadata()));
+    must_run(transaction.write_file_range(
+        file,
+        FileOffset::from_bytes(u64::try_from(gap).unwrap_or(u64::MAX)),
+        &prefix,
+    ));
+    must_run(transaction.write_file_range(
+        file,
+        FileOffset::from_bytes(u64::try_from(suffix_offset).unwrap_or(u64::MAX)),
+        suffix,
+    ));
+    must_run(transaction.commit());
+
+    let output_length = suffix_offset.saturating_add(suffix.len());
+    let mut output = vec![0xAA_u8; output_length];
+    assert_eq!(read_file(&mut volume, 11, 0, &mut output), output_length);
+    assert_eq!(&output[..gap], &[0_u8; 7]);
+    assert_eq!(&output[gap..suffix_offset], prefix.as_slice());
+    assert_eq!(&output[suffix_offset..], suffix);
+}
+
+/// # Panics
+///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn extending_write_zeroes_visible_gap_inside_allocated_block() {
