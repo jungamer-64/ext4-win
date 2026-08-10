@@ -83,3 +83,14 @@ unsafe extern "system" {
     /// Releases one purpose-specific requestor-input capture.
     pub(crate) fn ext4win_release_captured_requestor_input(snapshot: wdk_sys::PVOID);
 }
+
+unsafe extern "system" {
+    /// Copies one checked write-input window into driver-owned storage.
+    pub(crate) fn ext4win_copy_write_input_window(
+        source: *const core::ffi::c_void,
+        source_length: wdk_sys::ULONG,
+        source_offset: wdk_sys::ULONG,
+        destination: wdk_sys::PVOID,
+        destination_length: wdk_sys::ULONG,
+    ) -> wdk_sys::NTSTATUS;
+}

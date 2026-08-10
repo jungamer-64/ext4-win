@@ -3,11 +3,10 @@
 use alloc::boxed::Box;
 use core::{ffi::c_void, num::NonZeroUsize, ptr::NonNull};
 
-use wdk_sys::PVOID;
 #[cfg(not(test))]
-use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
+use wdk_sys::NTSTATUS;
+use wdk_sys::{PVOID, STATUS_SUCCESS};
 
-#[cfg(not(test))]
 use crate::kernel::ffi;
 use crate::{
     kernel::status::{DriverError, DriverResult},
@@ -19,7 +18,7 @@ use crate::{
 
 use super::{
     ActiveIrp, DirectoryControlMinorFunction, DispatchMajor, FileSystemControlMinorFunction,
-    IrpBufferLength, IrpCompletion, QueryDirectoryStack, QueryEaStack, ReadStack,
+    IrpBufferLength, IrpCompletion, QueryDirectoryStack, QueryEaStack, ReadStack, WriteStack,
 };
 
 /// Maximum self-relative security descriptor accepted from one untrusted requestor.
@@ -85,7 +84,7 @@ pub(crate) struct PreparedQueryEa {
     selection: PreparedEaSelection,
 }
 
-/// Complete read payload sealed before queue insertion.
+/// Read parameters and system mapping captured before queue insertion.
 #[derive(Debug)]
 pub(crate) struct PreparedRead {
     /// Scalar read parameters copied from the requestor's stack location.
@@ -119,11 +118,39 @@ impl PreparedRead {
     }
 
     /// Borrows the exact caller output range for the duration of active read execution.
-    /// # Errors
-    ///
-    /// Returns an invariant error when captured output state contradicts its declared length.
-    pub(crate) fn output_mut(&mut self) -> DriverResult<&mut [u8]> {
+    pub(crate) fn output_mut(&mut self) -> &mut [u8] {
         self.output.as_mut_slice()
+    }
+}
+
+/// Non-empty system mapping retained by one pending data-transfer IRP.
+#[derive(Debug)]
+struct CapturedDataMapping {
+    /// First mapped byte.
+    address: NonNull<u8>,
+    /// Exact non-zero mapped byte count.
+    length: NonZeroUsize,
+}
+
+// SAFETY: The I/O Manager keeps the system buffer or locked MDL mapping valid until the owning IRP
+// completes. Direction-specific ownership controls whether the mapping becomes a Rust slice or is
+// consumed only through a native copy boundary.
+unsafe impl Send for CapturedDataMapping {}
+
+impl CapturedDataMapping {
+    /// Binds one validated address to a non-empty IRP range.
+    const fn new(address: NonNull<u8>, length: NonZeroUsize) -> Self {
+        Self { address, length }
+    }
+
+    /// Returns the first mapped byte.
+    const fn address(&self) -> NonNull<u8> {
+        self.address
+    }
+
+    /// Returns the exact mapped byte count.
+    const fn len(&self) -> usize {
+        self.length.get()
     }
 }
 
@@ -133,18 +160,8 @@ enum CapturedReadOutput {
     /// A zero-byte read has no output mapping.
     Empty,
     /// Non-empty I/O Manager buffer or MDL system mapping.
-    Mapped {
-        /// First mapped output byte.
-        address: NonNull<u8>,
-        /// Exact mapped byte count.
-        length: IrpBufferLength,
-    },
+    Mapped(CapturedDataMapping),
 }
-
-// SAFETY: The I/O Manager keeps a read IRP's system buffer or locked MDL mapping valid until the
-// uniquely owned pending IRP completes. The pointer is exposed mutably only through the actor-owned
-// `PreparedRead`, so the queued payload may cross to its device actor.
-unsafe impl Send for CapturedReadOutput {}
 
 impl CapturedReadOutput {
     /// Captures the output mapping without allowing a Rust reference to cross queue publication.
@@ -152,40 +169,159 @@ impl CapturedReadOutput {
     ///
     /// Returns a completion error when a non-empty request has no valid system mapping.
     fn capture(target: &ActiveIrp<'_>, length: IrpBufferLength) -> Result<Self, IrpCompletion> {
-        if length.is_empty() {
+        let Some(mapped_length) = NonZeroUsize::new(length.as_usize()) else {
             return Ok(Self::Empty);
-        }
+        };
         let address = target
             .data_output_address(length)
             .map_err(IrpCompletion::from_error)?;
-        Ok(Self::Mapped { address, length })
+        Ok(Self::Mapped(CapturedDataMapping::new(
+            address,
+            mapped_length,
+        )))
     }
 
     /// Returns the first mapped byte when this is a non-empty output.
     const fn address(&self) -> Option<NonNull<u8>> {
         match self {
             Self::Empty => None,
-            Self::Mapped { address, .. } => Some(*address),
+            Self::Mapped(mapping) => Some(mapping.address()),
         }
     }
 
     /// Borrows the complete captured output range.
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Empty => &mut [],
+            Self::Mapped(mapping) => unsafe {
+                // SAFETY: Capture validated this exact non-empty mapping while the owning IRP was
+                // live. `&mut self` proves unique actor access and the IRP cannot complete while
+                // its `PendingIrpLease` is executing.
+                core::slice::from_raw_parts_mut(mapping.address().as_ptr(), mapping.len())
+            },
+        }
+    }
+}
+
+/// Write parameters and system mapping captured before queue insertion.
+#[derive(Debug)]
+pub(crate) struct PreparedWrite {
+    /// Scalar write parameters copied from the requestor's stack location.
+    stack: WriteStack,
+    /// Exact system-mapped input range kept live by the pending IRP.
+    input: CapturedWriteInput,
+}
+
+impl PreparedWrite {
+    /// Captures a write stack and its system-addressable input range.
     /// # Errors
     ///
-    /// Returns an invariant error when a mapped output unexpectedly has zero length.
-    fn as_mut_slice(&mut self) -> DriverResult<&mut [u8]> {
+    /// Returns a completion error when stack decoding or input mapping fails.
+    fn capture(
+        target: &ActiveIrp<'_>,
+        stack: super::CurrentIrpStackLocation<'_>,
+    ) -> Result<Self, IrpCompletion> {
+        let stack = stack.write().map_err(IrpCompletion::from_error)?;
+        let input = CapturedWriteInput::capture(target, stack.length())?;
+        Ok(Self { stack, input })
+    }
+
+    /// Returns the immutable scalar write parameters.
+    pub(crate) const fn stack(&self) -> WriteStack {
+        self.stack
+    }
+
+    /// Returns the first input byte for transfer-alignment validation.
+    pub(crate) const fn input_address(&self) -> Option<NonNull<u8>> {
+        self.input.address()
+    }
+
+    /// Snapshots one checked caller-input window into driver-owned storage.
+    /// # Errors
+    ///
+    /// Returns an invariant error when the selected range exceeds the captured write input or the
+    /// native copy boundary rejects it.
+    pub(crate) fn copy_window(&self, offset: usize, destination: &mut [u8]) -> DriverResult<()> {
+        self.input.copy_window(offset, destination)
+    }
+}
+
+/// System-addressable write input whose validity is owned by the containing pending IRP.
+#[derive(Debug)]
+enum CapturedWriteInput {
+    /// A zero-byte write has no input mapping.
+    Empty,
+    /// Non-empty I/O Manager buffer or MDL system mapping.
+    Mapped(CapturedDataMapping),
+}
+
+impl CapturedWriteInput {
+    /// Captures the input mapping without allowing a Rust reference to cross queue publication.
+    /// # Errors
+    ///
+    /// Returns a completion error when a non-empty request has no valid system mapping.
+    fn capture(target: &ActiveIrp<'_>, length: IrpBufferLength) -> Result<Self, IrpCompletion> {
+        let Some(mapped_length) = NonZeroUsize::new(length.as_usize()) else {
+            return Ok(Self::Empty);
+        };
+        let address = target
+            .data_input_address(length)
+            .map_err(IrpCompletion::from_error)?;
+        Ok(Self::Mapped(CapturedDataMapping::new(
+            address,
+            mapped_length,
+        )))
+    }
+
+    /// Returns the first mapped byte when this is a non-empty input.
+    const fn address(&self) -> Option<NonNull<u8>> {
         match self {
-            Self::Empty => Ok(&mut []),
-            Self::Mapped { address, length } => {
-                if length.is_empty() {
+            Self::Empty => None,
+            Self::Mapped(mapping) => Some(mapping.address()),
+        }
+    }
+
+    /// Snapshots one checked range without admitting requestor memory into Rust's aliasing model.
+    /// # Errors
+    ///
+    /// Returns an invariant error when `offset..offset + destination.len()` exceeds the captured
+    /// input or the native copy boundary rejects the range.
+    fn copy_window(&self, offset: usize, destination: &mut [u8]) -> DriverResult<()> {
+        match self {
+            Self::Empty if offset == 0 && destination.is_empty() => Ok(()),
+            Self::Empty => Err(DriverError::InternalInvariantViolation),
+            Self::Mapped(mapping) => {
+                let end = offset
+                    .checked_add(destination.len())
+                    .ok_or(DriverError::InternalInvariantViolation)?;
+                if end > mapping.len() {
                     return Err(DriverError::InternalInvariantViolation);
                 }
-                Ok(unsafe {
-                    // SAFETY: Capture validated this exact mapped range while the owning IRP was
-                    // live. `&mut self` proves unique actor access and the IRP cannot complete while
-                    // its `PendingIrpLease` is executing.
-                    core::slice::from_raw_parts_mut(address.as_ptr(), length.as_usize())
-                })
+                if destination.is_empty() {
+                    return Ok(());
+                }
+                let source_length = wdk_sys::ULONG::try_from(mapping.len())
+                    .map_err(|_| DriverError::InternalInvariantViolation)?;
+                let source_offset = wdk_sys::ULONG::try_from(offset)
+                    .map_err(|_| DriverError::InternalInvariantViolation)?;
+                let destination_length = wdk_sys::ULONG::try_from(destination.len())
+                    .map_err(|_| DriverError::InternalInvariantViolation)?;
+                let status = unsafe {
+                    // SAFETY: The pending IRP retains `mapping`; checked arithmetic proves the
+                    // selected source window is in range, and `destination` is a distinct,
+                    // initialized driver-owned mutable range for the native copy.
+                    ffi::ext4win_copy_write_input_window(
+                        mapping.address().as_ptr().cast(),
+                        source_length,
+                        source_offset,
+                        destination.as_mut_ptr().cast(),
+                        destination_length,
+                    )
+                };
+                if status < STATUS_SUCCESS {
+                    return Err(DriverError::InternalInvariantViolation);
+                }
+                Ok(())
             }
         }
     }
@@ -397,7 +533,7 @@ pub(super) enum QueueContextOwnership {
 }
 
 impl QueueContextOwnership {
-    /// Borrows the complete read payload.
+    /// Borrows the read contract captured before queue insertion.
     /// # Errors
     ///
     /// Returns an invariant error when this is not a captured read request.
@@ -408,13 +544,24 @@ impl QueueContextOwnership {
         }
     }
 
-    /// Mutably borrows the complete read payload.
+    /// Mutably borrows the read contract captured before queue insertion.
     /// # Errors
     ///
     /// Returns an invariant error when this is not a captured read request.
     pub(super) fn read_mut(&mut self) -> DriverResult<&mut PreparedRead> {
         match self {
             Self::Captured(context) => context.read_mut(),
+            Self::Cleanup | Self::Close => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Borrows the write contract captured before queue insertion.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this is not a captured write request.
+    pub(super) fn write(&self) -> DriverResult<&PreparedWrite> {
+        match self {
+            Self::Captured(context) => context.write(),
             Self::Cleanup | Self::Close => Err(DriverError::InternalInvariantViolation),
         }
     }
@@ -523,7 +670,7 @@ impl QueueContext {
         &self.prepared
     }
 
-    /// Borrows the complete read payload sealed before queue insertion.
+    /// Borrows the read contract captured before queue insertion.
     /// # Errors
     ///
     /// Returns an invariant error when this context is not a read request.
@@ -534,13 +681,24 @@ impl QueueContext {
         }
     }
 
-    /// Mutably borrows the complete read payload sealed before queue insertion.
+    /// Mutably borrows the read contract captured before queue insertion.
     /// # Errors
     ///
     /// Returns an invariant error when this context is not a read request.
     pub(super) fn read_mut(&mut self) -> DriverResult<&mut PreparedRead> {
         match &mut self.prepared {
             PreparedRequest::Read(request) => Ok(request),
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Borrows the write contract captured before queue insertion.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this context is not a write request.
+    pub(super) fn write(&self) -> DriverResult<&PreparedWrite> {
+        match &self.prepared {
+            PreparedRequest::Write(request) => Ok(request),
             _ => Err(DriverError::InternalInvariantViolation),
         }
     }
@@ -604,6 +762,8 @@ pub(crate) enum PreparedRequest {
     Create,
     /// Read request with its complete output contract captured.
     Read(PreparedRead),
+    /// Write request with scalar parameters and input mapping captured.
+    Write(PreparedWrite),
     /// File information query.
     QueryInformation,
     /// File information mutation.
@@ -655,6 +815,10 @@ impl PreparedRequest {
             DispatchMajor::Create => Ok((Self::Create, generic_key())),
             DispatchMajor::Read => Ok((
                 Self::Read(PreparedRead::capture(target, stack)?),
+                generic_key(),
+            )),
+            DispatchMajor::Write => Ok((
+                Self::Write(PreparedWrite::capture(target, stack)?),
                 generic_key(),
             )),
             DispatchMajor::QueryInformation => Ok((Self::QueryInformation, generic_key())),
@@ -1358,15 +1522,198 @@ mod tests {
                         prepared.stack().key(),
                         crate::irp::ByteRangeLockKey::from_ulong(41)
                     );
-                    let mapped = prepared.output_mut();
-                    assert!(mapped.is_ok());
-                    if let Ok(mapped) = mapped {
-                        mapped.fill(0x55);
-                    }
+                    prepared.output_mut().fill(0x55);
                 }
             }
         }
         assert_eq!(output, [0x55; 32]);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when queued write capture copies caller data or re-reads mutable stack state.
+    #[test]
+    fn prepared_write_seals_stack_and_borrows_the_original_input_mapping() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut file_object = wdk_sys::FILE_OBJECT::default();
+        let mut input = [0xAA_u8; 32];
+        let mut irp = wdk_sys::IRP::default();
+        irp.AssociatedIrp.SystemBuffer = input.as_mut_ptr().cast::<c_void>();
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            MajorFunction: u8::try_from(wdk_sys::IRP_MJ_WRITE).unwrap_or_default(),
+            FileObject: core::ptr::addr_of_mut!(file_object),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
+            Length: u32::try_from(input.len()).unwrap_or_default(),
+            __bindgen_padding_0: 0,
+            Key: 73,
+            Flags: 0,
+            ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 16_384 },
+        };
+        let target = build_target(&mut device, &mut irp, &mut stack);
+        assert!(target.is_some());
+        if let Some(mut target) = target {
+            let context = capture_context(&mut target, DispatchMajor::Write);
+            assert!(context.is_ok());
+            if let Ok(context) = context {
+                stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
+                    Length: 1,
+                    __bindgen_padding_0: 0,
+                    Key: 0,
+                    Flags: 0,
+                    ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+                };
+                input[0] = 0x55;
+                let rewritten_length = unsafe {
+                    // SAFETY: The test assigned the `Write` union arm immediately above.
+                    stack.Parameters.Write.Length
+                };
+                assert_eq!(rewritten_length, 1);
+                let prepared = context.write();
+                assert!(prepared.is_ok());
+                if let Ok(prepared) = prepared {
+                    assert_eq!(prepared.stack().length().as_usize(), input.len());
+                    assert_eq!(
+                        prepared.stack().starting_point(),
+                        crate::irp::WriteStartingPoint::Absolute(
+                            ext4_core::FileOffset::from_bytes(16_384)
+                        )
+                    );
+                    assert_eq!(
+                        prepared.stack().key(),
+                        crate::irp::ByteRangeLockKey::from_ulong(73)
+                    );
+                    let mut snapshot = [0_u8; 32];
+                    assert_eq!(prepared.copy_window(0, &mut snapshot), Ok(()));
+                    assert_eq!(snapshot.first().copied(), Some(0x55));
+                    assert_eq!(snapshot.len(), input.len());
+                    let mut middle = [0_u8; 5];
+                    assert_eq!(prepared.copy_window(7, &mut middle), Ok(()));
+                    assert_eq!(middle.as_slice(), &input[7..12]);
+                    assert_eq!(prepared.copy_window(input.len(), &mut []), Ok(()));
+                    let mut outside = [0_u8; 1];
+                    assert_eq!(
+                        prepared.copy_window(input.len(), &mut outside),
+                        Err(crate::kernel::status::DriverError::InternalInvariantViolation)
+                    );
+                }
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when direct-I/O capture ignores the MDL byte count or loses its mapped address.
+    #[test]
+    fn prepared_write_requires_an_exactly_covering_mdl_mapping() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut file_object = wdk_sys::FILE_OBJECT::default();
+        let mut input = [0x3C_u8; 16];
+
+        for (byte_count, expected_status) in [
+            (
+                u32::try_from(input.len().saturating_sub(1)).unwrap_or_default(),
+                Some(wdk_sys::STATUS_INVALID_PARAMETER),
+            ),
+            (u32::try_from(input.len()).unwrap_or_default(), None),
+        ] {
+            let mut mdl = wdk_sys::MDL {
+                MappedSystemVa: input.as_mut_ptr().cast::<c_void>(),
+                ByteCount: byte_count,
+                MdlFlags: i16::try_from(wdk_sys::MDL_MAPPED_TO_SYSTEM_VA).unwrap_or_default(),
+                ..wdk_sys::MDL::default()
+            };
+            let mut irp = wdk_sys::IRP {
+                MdlAddress: core::ptr::addr_of_mut!(mdl),
+                ..wdk_sys::IRP::default()
+            };
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                MajorFunction: u8::try_from(wdk_sys::IRP_MJ_WRITE).unwrap_or_default(),
+                FileObject: core::ptr::addr_of_mut!(file_object),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
+                Length: u32::try_from(input.len()).unwrap_or_default(),
+                __bindgen_padding_0: 0,
+                Key: 0,
+                Flags: 0,
+                ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+            };
+            let target = build_target(&mut device, &mut irp, &mut stack);
+            assert!(target.is_some());
+            if let Some(mut target) = target {
+                let context = capture_context(&mut target, DispatchMajor::Write);
+                match expected_status {
+                    Some(expected_status) => {
+                        assert!(context.is_err());
+                        if let Err(completion) = context {
+                            assert_eq!(completion.status(), expected_status);
+                        }
+                    }
+                    None => {
+                        assert!(context.is_ok());
+                        if let Ok(context) = context {
+                            let prepared = context.write();
+                            assert!(prepared.is_ok());
+                            if let Ok(prepared) = prepared {
+                                let mut snapshot = [0_u8; 4];
+                                assert_eq!(prepared.copy_window(6, &mut snapshot), Ok(()));
+                                assert_eq!(snapshot, [0x3C; 4]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when zero-byte write capture requires a mapping or a non-empty write accepts none.
+    #[test]
+    fn prepared_write_mapping_is_required_exactly_for_nonempty_input() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut file_object = wdk_sys::FILE_OBJECT::default();
+
+        for (length, expected_status) in [(0, None), (1, Some(wdk_sys::STATUS_INVALID_PARAMETER))] {
+            let mut irp = wdk_sys::IRP::default();
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                MajorFunction: u8::try_from(wdk_sys::IRP_MJ_WRITE).unwrap_or_default(),
+                FileObject: core::ptr::addr_of_mut!(file_object),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
+                Length: length,
+                __bindgen_padding_0: 0,
+                Key: 0,
+                Flags: 0,
+                ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+            };
+            let target = build_target(&mut device, &mut irp, &mut stack);
+            assert!(target.is_some());
+            if let Some(mut target) = target {
+                let context = capture_context(&mut target, DispatchMajor::Write);
+                match expected_status {
+                    None => {
+                        assert!(context.is_ok());
+                        if let Ok(context) = context {
+                            let prepared = context.write();
+                            assert!(prepared.is_ok());
+                            if let Ok(prepared) = prepared {
+                                assert_eq!(prepared.copy_window(0, &mut []), Ok(()));
+                            }
+                        }
+                    }
+                    Some(expected_status) => {
+                        assert!(context.is_err());
+                        if let Err(completion) = context {
+                            assert_eq!(completion.status(), expected_status);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// # Panics

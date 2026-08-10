@@ -13,6 +13,7 @@ mod executor;
 pub(crate) use capture::{
     CapturedQuerySecurityOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
     PreparedEaSelection, PreparedQueryDirectory, PreparedQueryEa, PreparedRead, PreparedRequest,
+    PreparedWrite,
 };
 use capture::{QueueContext, QueueContextOwnership};
 pub(crate) use executor::DeviceExecutor;
@@ -464,6 +465,14 @@ impl ActiveIrp<'_> {
         BufferedInput::from_active(self.data_buffer_address(length)?, length.as_usize())
     }
 
+    /// Returns a write input address without creating a Rust reference before queue publication.
+    /// # Errors
+    ///
+    /// Returns an error when neither a system buffer nor a mapped MDL covers `length`.
+    fn data_input_address(&self, length: IrpBufferLength) -> Result<NonNull<u8>, DriverError> {
+        self.data_buffer_address(length)
+    }
+
     /// Returns write-like IRP data bytes tied to this active owner borrow.
     /// # Errors
     ///
@@ -479,10 +488,7 @@ impl ActiveIrp<'_> {
     /// # Errors
     ///
     /// Returns an error when neither a system buffer nor a mapped MDL covers `length`.
-    pub(crate) fn data_output_address(
-        &self,
-        length: IrpBufferLength,
-    ) -> Result<NonNull<u8>, DriverError> {
+    fn data_output_address(&self, length: IrpBufferLength) -> Result<NonNull<u8>, DriverError> {
         self.data_buffer_address(length)
     }
 
@@ -752,6 +758,14 @@ impl<'a> PendingIrpLease<'a> {
     /// Returns an invariant error when this pending request is not a read.
     pub(crate) fn prepared_read_mut(&mut self) -> DriverResult<&mut PreparedRead> {
         self.owner.context.read_mut()
+    }
+
+    /// Borrows the write contract captured before queue insertion.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this pending request is not a write.
+    pub(crate) fn prepared_write(&self) -> DriverResult<&PreparedWrite> {
+        self.owner.context.write()
     }
 
     /// Borrows the opaque query-security output target for the lifetime of this pending request.
@@ -1650,11 +1664,6 @@ impl IrpByteBuffer {
         Ok(Self { address, length })
     }
 
-    /// Returns the first byte address.
-    const fn address(&self) -> NonNull<u8> {
-        self.address
-    }
-
     /// Returns the buffer as a byte slice.
     fn as_slice(&self) -> &[u8] {
         unsafe {
@@ -1715,11 +1724,6 @@ impl BufferedInput<'_> {
         self.bytes.as_slice()
     }
 
-    /// Returns the first input byte address.
-    pub(crate) const fn address(&self) -> NonNull<u8> {
-        self.bytes.address()
-    }
-
     /// Copies an unaligned fixed-size input payload.
     /// # Errors
     ///
@@ -1766,8 +1770,8 @@ fn mdl_data_buffer_address(
     length: IrpBufferLength,
 ) -> Result<NonNull<u8>, DriverError> {
     let mdl_ref = unsafe {
-        // SAFETY: The IRP's MdlAddress is non-null and owned by the I/O
-        // Manager for the lifetime of this dispatch callback.
+        // SAFETY: The IRP's MdlAddress is non-null and retained by the I/O Manager until the
+        // completion owner completes this IRP.
         mdl.as_ref()
     };
     let mdl_len = usize::try_from(mdl_ref.ByteCount).map_err(|_| DriverError::InvalidParameter)?;
