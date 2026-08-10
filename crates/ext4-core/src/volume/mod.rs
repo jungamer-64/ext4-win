@@ -8,14 +8,14 @@ mod read;
 mod scope;
 mod transaction;
 
-pub use mount::{InternalJournal, JournaledVolume, MountContext, VolumeGeometry, VolumeIdentity};
+pub use mount::{InternalJournal, MountContext, VolumeGeometry, VolumeIdentity};
 pub use node::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
     FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, NodeId, SymlinkNode, SymlinkNodeId,
 };
 pub use transaction::{
-    HardLinkDestination, JournalTransaction, RenameTargetCollision, TransactionDirectory,
-    TransactionFile, TransactionHardLinkSource, TransactionNode, TransactionSymlink,
+    HardLinkDestination, RenameTargetCollision, TransactionDirectory, TransactionFile,
+    TransactionHardLinkSource, TransactionNode, TransactionSymlink,
 };
 
 #[cfg(test)]

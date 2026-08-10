@@ -21,7 +21,6 @@ mod protection;
 mod volume;
 
 pub use disk::block::{BlockSize, ByteOffset, DeviceLength};
-pub use disk::io::{BlockSource, BlockStorage};
 pub use disk_format::inode::{
     Ext4Gid, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
     Ext4Uid, FileAllocationSize, FileOffset, FileSize, NewDirectoryMetadata, NewFileMetadata,
@@ -44,9 +43,9 @@ pub use protection::verity::{
 pub use volume::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
     FileNodeId, HardLinkDestination, HardLinkEntry, HardLinkNodeId, HardLinks, InternalJournal,
-    JournalTransaction, JournaledVolume, MountContext, NodeId, RenameTargetCollision, SymlinkNode,
-    SymlinkNodeId, TransactionDirectory, TransactionFile, TransactionHardLinkSource,
-    TransactionNode, TransactionSymlink, VolumeGeometry, VolumeIdentity,
+    MountContext, NodeId, RenameTargetCollision, SymlinkNode, SymlinkNodeId, TransactionDirectory,
+    TransactionFile, TransactionHardLinkSource, TransactionNode, TransactionSymlink,
+    VolumeGeometry, VolumeIdentity,
 };
 
 #[cfg(test)]
