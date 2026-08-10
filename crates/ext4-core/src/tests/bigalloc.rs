@@ -1,5 +1,18 @@
 use super::*;
 
+fn superblock_free_blocks(image: &[u8]) -> u32 {
+    get_u32(image, 1024 + 12)
+}
+
+fn bigalloc_free_clusters(image: &[u8]) -> u32 {
+    superblock_free_blocks(image) / BIGALLOC_BLOCKS_PER_CLUSTER
+}
+
+fn primary_group_free_clusters(image: &[u8]) -> u32 {
+    let descriptor = block_offset(2);
+    u32::from(get_u16(image, descriptor + 12)) | (u32::from(get_u16(image, descriptor + 44)) << 16)
+}
+
 /// # Panics
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
@@ -15,6 +28,7 @@ fn write_mount_accepts_bigalloc() {
     assert_eq!(superblock.clusters_per_group().as_u32(), 2048);
     assert_eq!(volume.geometry().cluster_count().as_u64(), 16);
     assert_eq!(volume.geometry().free_cluster_count().as_u64(), 9);
+    assert_eq!(superblock_free_blocks(&image), 36);
 }
 
 /// # Panics
@@ -31,6 +45,13 @@ fn bigalloc_geometry_rejections_are_targeted() {
 
     let mut image = bigalloc_fixture_image();
     put_u32(&mut image, 1024 + 36, 8192);
+    assert_eq!(
+        Superblock::parse_read_write(&image[1024..2048]),
+        Err(Error::InvalidClusterGeometry)
+    );
+
+    let mut image = bigalloc_fixture_image();
+    put_u32(&mut image, 1024 + 12, 35);
     assert_eq!(
         Superblock::parse_read_write(&image[1024..2048]),
         Err(Error::InvalidClusterGeometry)
@@ -57,7 +78,8 @@ fn bigalloc_geometry_rejections_are_targeted() {
 #[test]
 fn bigalloc_hole_write_reuses_logical_cluster() {
     let mut image = bigalloc_fixture_image();
-    let initial_free = get_u32(&image, 1024 + 12);
+    let initial_free_blocks = superblock_free_blocks(&image);
+    let initial_free_clusters = bigalloc_free_clusters(&image);
     let file_cluster = bigalloc_cluster_for_block(MODERN_FILE_DATA_BLOCK);
 
     {
@@ -70,7 +92,7 @@ fn bigalloc_hole_write_reuses_logical_cluster() {
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
-            u64::from(initial_free)
+            u64::from(initial_free_clusters)
         );
         assert_eq!(
             file_node(&mut volume, 3).allocation_size().bytes(),
@@ -81,7 +103,7 @@ fn bigalloc_hole_write_reuses_logical_cluster() {
         assert_eq!(&output, b"hole");
     }
 
-    assert_eq!(get_u32(&image, 1024 + 12), initial_free);
+    assert_eq!(superblock_free_blocks(&image), initial_free_blocks);
     assert!(bigalloc_cluster_is_used(&image, file_cluster));
     assert_eq!(
         &image[block_offset(MODERN_FILE_DATA_BLOCK + 1)
@@ -96,7 +118,9 @@ fn bigalloc_hole_write_reuses_logical_cluster() {
 #[test]
 fn bigalloc_sparse_extension_allocates_one_cluster() {
     let mut image = bigalloc_fixture_image();
-    let initial_free = get_u32(&image, 1024 + 12);
+    let initial_free_blocks = superblock_free_blocks(&image);
+    let initial_free_clusters = bigalloc_free_clusters(&image);
+    let initial_group_free_clusters = primary_group_free_clusters(&image);
 
     {
         let device = MemoryBlockStorage::new(&mut image);
@@ -118,7 +142,7 @@ fn bigalloc_sparse_extension_allocates_one_cluster() {
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
-            u64::from(initial_free - 1)
+            u64::from(initial_free_clusters - 1)
         );
         assert_eq!(
             file_node(&mut volume, 3).allocation_size().bytes(),
@@ -137,7 +161,14 @@ fn bigalloc_sparse_extension_allocates_one_cluster() {
         assert_eq!(&output, b"next");
     }
 
-    assert_eq!(get_u32(&image, 1024 + 12), initial_free - 1);
+    assert_eq!(
+        superblock_free_blocks(&image),
+        initial_free_blocks - BIGALLOC_BLOCKS_PER_CLUSTER
+    );
+    assert_eq!(
+        primary_group_free_clusters(&image),
+        initial_group_free_clusters - 1
+    );
 }
 
 /// # Panics
@@ -150,7 +181,8 @@ fn bigalloc_partial_truncate_preserves_referenced_cluster() {
     write_extent_root(&mut image, inode_base + 40, 0, 2, MODERN_FILE_DATA_BLOCK);
     image[block_offset(MODERN_FILE_DATA_BLOCK + 1)..block_offset(MODERN_FILE_DATA_BLOCK + 1) + 4]
         .copy_from_slice(b"tail");
-    let initial_free = get_u32(&image, 1024 + 12);
+    let initial_free_blocks = superblock_free_blocks(&image);
+    let initial_free_clusters = bigalloc_free_clusters(&image);
     let file_cluster = bigalloc_cluster_for_block(MODERN_FILE_DATA_BLOCK);
 
     {
@@ -167,7 +199,7 @@ fn bigalloc_partial_truncate_preserves_referenced_cluster() {
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
-            u64::from(initial_free)
+            u64::from(initial_free_clusters)
         );
         assert_eq!(
             file_node(&mut volume, 3).allocation_size().bytes(),
@@ -175,7 +207,7 @@ fn bigalloc_partial_truncate_preserves_referenced_cluster() {
         );
     }
 
-    assert_eq!(get_u32(&image, 1024 + 12), initial_free);
+    assert_eq!(superblock_free_blocks(&image), initial_free_blocks);
     assert!(bigalloc_cluster_is_used(&image, file_cluster));
 }
 
@@ -185,7 +217,8 @@ fn bigalloc_partial_truncate_preserves_referenced_cluster() {
 #[test]
 fn bigalloc_full_truncate_frees_last_cluster_reference() {
     let mut image = bigalloc_fixture_image();
-    let initial_free = get_u32(&image, 1024 + 12);
+    let initial_free_blocks = superblock_free_blocks(&image);
+    let initial_free_clusters = bigalloc_free_clusters(&image);
     let file_cluster = bigalloc_cluster_for_block(MODERN_FILE_DATA_BLOCK);
 
     {
@@ -198,11 +231,14 @@ fn bigalloc_full_truncate_frees_last_cluster_reference() {
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
-            u64::from(initial_free + 1)
+            u64::from(initial_free_clusters + 1)
         );
     }
 
-    assert_eq!(get_u32(&image, 1024 + 12), initial_free + 1);
+    assert_eq!(
+        superblock_free_blocks(&image),
+        initial_free_blocks + BIGALLOC_BLOCKS_PER_CLUSTER
+    );
     assert!(!bigalloc_cluster_is_used(&image, file_cluster));
 }
 
@@ -213,7 +249,8 @@ fn bigalloc_full_truncate_frees_last_cluster_reference() {
 fn bigalloc_unlink_file_frees_last_cluster_reference() {
     let mut image = bigalloc_fixture_image_with_journal_blocks(16);
     put_u16(&mut image, modern_inode_offset(3) + 26, 1);
-    let initial_free = get_u32(&image, 1024 + 12);
+    let initial_free_blocks = superblock_free_blocks(&image);
+    let initial_free_clusters = bigalloc_free_clusters(&image);
     let file_cluster = bigalloc_cluster_for_block(MODERN_FILE_DATA_BLOCK);
 
     {
@@ -226,11 +263,14 @@ fn bigalloc_unlink_file_frees_last_cluster_reference() {
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
-            u64::from(initial_free + 1)
+            u64::from(initial_free_clusters + 1)
         );
     }
 
-    assert_eq!(get_u32(&image, 1024 + 12), initial_free + 1);
+    assert_eq!(
+        superblock_free_blocks(&image),
+        initial_free_blocks + BIGALLOC_BLOCKS_PER_CLUSTER
+    );
     assert!(!bigalloc_cluster_is_used(&image, file_cluster));
 }
 
@@ -256,7 +296,7 @@ fn bigalloc_two_extents_in_same_physical_cluster_are_indexed() {
         1,
         MODERN_FILE_DATA_BLOCK + 2,
     );
-    let initial_free = get_u32(&image, 1024 + 12);
+    let initial_free_clusters = bigalloc_free_clusters(&image);
     let file_cluster = bigalloc_cluster_for_block(MODERN_FILE_DATA_BLOCK);
 
     {
@@ -273,7 +313,7 @@ fn bigalloc_two_extents_in_same_physical_cluster_are_indexed() {
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
-            u64::from(initial_free)
+            u64::from(initial_free_clusters)
         );
     }
 
@@ -333,10 +373,11 @@ fn bigalloc_allocated_unreferenced_cluster_remains_unavailable() {
     let mut image = bigalloc_fixture_image();
     let reserved_cluster = 7_u32;
     set_bigalloc_cluster_used(&mut image, reserved_cluster, true);
-    let initial_free = get_u32(&image, 1024 + 12) - 1;
+    let free_blocks = superblock_free_blocks(&image) - BIGALLOC_BLOCKS_PER_CLUSTER;
+    let free_clusters = bigalloc_free_clusters(&image) - 1;
     let free_inodes = get_u32(&image, 1024 + 16);
-    put_u32(&mut image, 1024 + 12, initial_free);
-    write_modern_block_group_descriptor(&mut image, initial_free, free_inodes);
+    put_u32(&mut image, 1024 + 12, free_blocks);
+    write_modern_block_group_descriptor(&mut image, free_clusters, free_inodes);
     refresh_primary_block_group_descriptor_checksum(&mut image);
 
     {
@@ -369,7 +410,8 @@ fn bigalloc_allocated_unreferenced_cluster_remains_unavailable() {
 #[test]
 fn bigalloc_directory_create_remove_returns_cluster_count() {
     let mut image = bigalloc_fixture_image_with_journal_blocks(16);
-    let initial_free = get_u32(&image, 1024 + 12);
+    let initial_free_blocks = superblock_free_blocks(&image);
+    let initial_free_clusters = bigalloc_free_clusters(&image);
 
     {
         let device = MemoryBlockStorage::new(&mut image);
@@ -387,11 +429,11 @@ fn bigalloc_directory_create_remove_returns_cluster_count() {
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
-            u64::from(initial_free)
+            u64::from(initial_free_clusters)
         );
     }
 
-    assert_eq!(get_u32(&image, 1024 + 12), initial_free);
+    assert_eq!(superblock_free_blocks(&image), initial_free_blocks);
 }
 
 /// # Panics
@@ -400,7 +442,7 @@ fn bigalloc_directory_create_remove_returns_cluster_count() {
 #[test]
 fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
     let mut image = bigalloc_fixture_image_with_journal_blocks(16);
-    let initial_free = get_u32(&image, 1024 + 12);
+    let initial_free_clusters = bigalloc_free_clusters(&image);
 
     {
         let device = MemoryBlockStorage::new(&mut image);
@@ -424,7 +466,7 @@ fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
-            u64::from(initial_free - 3)
+            u64::from(initial_free_clusters - 3)
         );
         assert_eq!(
             file_node(&mut volume, 3).allocation_size().bytes(),
@@ -449,7 +491,8 @@ fn bigalloc_extent_metadata_allocation_uses_cluster_accounting() {
 #[test]
 fn bigalloc_external_xattr_allocation_uses_cluster_accounting() {
     let mut image = bigalloc_fixture_image_with_journal_blocks(16);
-    let initial_free = get_u32(&image, 1024 + 12);
+    let initial_free_blocks = superblock_free_blocks(&image);
+    let initial_free_clusters = bigalloc_free_clusters(&image);
     let name = must(XattrName::new(XattrNamespace::User, b"large"));
     let payload = vec![0xAB; 700];
     let value = must(XattrValue::new(&payload));
@@ -465,7 +508,7 @@ fn bigalloc_external_xattr_allocation_uses_cluster_accounting() {
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
-            u64::from(initial_free - 1)
+            u64::from(initial_free_clusters - 1)
         );
     }
     let xattr_block = get_u32(&image, modern_inode_offset(3) + 104);
@@ -486,11 +529,11 @@ fn bigalloc_external_xattr_allocation_uses_cluster_accounting() {
 
         assert_eq!(
             volume.geometry().free_cluster_count().as_u64(),
-            u64::from(initial_free)
+            u64::from(initial_free_clusters)
         );
     }
 
-    assert_eq!(get_u32(&image, 1024 + 12), initial_free);
+    assert_eq!(superblock_free_blocks(&image), initial_free_blocks);
     assert!(!bigalloc_cluster_is_used(
         &image,
         bigalloc_cluster_for_block(xattr_block)

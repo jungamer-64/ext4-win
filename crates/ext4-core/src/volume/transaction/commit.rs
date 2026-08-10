@@ -220,39 +220,9 @@ impl<D: BlockStorage, N: FscryptNonceGenerator, J> JournalTransaction<'_, D, N, 
             .device
             .read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut bytes)
             .await?;
-        let current = u64::from(le_u32(
-            &bytes,
-            disk_offset(SUPERBLOCK_FREE_BLOCKS_LO_OFFSET),
-        )?) | if self.volume.superblock.descriptor_layout().has_high_fields() {
-            u64::from(le_u32(
-                &bytes,
-                disk_offset(SUPERBLOCK_FREE_BLOCKS_HI_OFFSET),
-            )?) << 32
-        } else {
-            0
-        };
-        let raw_delta = self.free_clusters_delta.as_i64();
-        let updated = if raw_delta.is_negative() {
-            current
-                .checked_sub(raw_delta.unsigned_abs())
-                .ok_or(Error::InvalidSuperblock)?
-        } else {
-            current
-                .checked_add(u64::try_from(raw_delta).map_err(|_| Error::ArithmeticOverflow)?)
-                .ok_or(Error::ArithmeticOverflow)?
-        };
-        put_le_u32(
-            &mut bytes,
-            disk_offset(SUPERBLOCK_FREE_BLOCKS_LO_OFFSET),
-            u32::try_from(updated & u64::from(u32::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-        if self.volume.superblock.descriptor_layout().has_high_fields() {
-            put_le_u32(
-                &mut bytes,
-                disk_offset(SUPERBLOCK_FREE_BLOCKS_HI_OFFSET),
-                u32::try_from(updated >> 32).map_err(|_| Error::ArithmeticOverflow)?,
-            )?;
-        }
+        self.volume
+            .superblock
+            .apply_free_cluster_delta_to_raw(&mut bytes, self.free_clusters_delta)?;
         if self.free_inodes_delta != 0 {
             let current = u64::from(le_u32(&bytes, disk_offset(SUPERBLOCK_FREE_INODES_OFFSET))?);
             let raw_delta = self.free_inodes_delta;

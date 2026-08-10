@@ -45,7 +45,10 @@ pub(super) fn bigalloc_fixture_image_with_journal_blocks(journal_blocks: u16) ->
     let mut image = vec![0_u8; BLOCK_SIZE * MODERN_IMAGE_BLOCKS];
     let free_clusters = write_bigalloc_block_bitmap(&mut image, journal_blocks);
     let free_inodes = write_modern_inode_bitmap(&mut image);
-    write_modern_superblock(&mut image, free_clusters, free_inodes, journal_blocks);
+    let free_blocks = free_clusters
+        .checked_mul(BIGALLOC_BLOCKS_PER_CLUSTER)
+        .unwrap_or(u32::MAX);
+    write_modern_superblock(&mut image, free_blocks, free_inodes, journal_blocks);
     put_u32(&mut image, 1024 + 28, BIGALLOC_LOG_CLUSTER_SIZE);
     put_u32(&mut image, 1024 + 36, 8192 / BIGALLOC_BLOCKS_PER_CLUSTER);
     put_u32(
@@ -270,7 +273,7 @@ pub(super) fn write_superblock(image: &mut [u8]) {
 
 pub(super) fn write_modern_superblock(
     image: &mut [u8],
-    free_clusters: u32,
+    free_blocks: u32,
     free_inodes: u32,
     journal_blocks: u16,
 ) {
@@ -281,7 +284,7 @@ pub(super) fn write_modern_superblock(
         base + 4,
         u32::try_from(MODERN_IMAGE_BLOCKS).unwrap_or(u32::MAX),
     );
-    put_u32(image, base + 12, free_clusters);
+    put_u32(image, base + 12, free_blocks);
     put_u32(image, base + 16, free_inodes);
     put_u32(image, base + 20, 1);
     put_u32(image, base + 24, 0);

@@ -15,6 +15,10 @@ use crate::error::{Error, Result};
 const SUPERBLOCK_OFFSET: u64 = 1024;
 /// Fixed byte length of an ext4 superblock.
 const SUPERBLOCK_SIZE: usize = 1024;
+/// Byte offset of `s_free_blocks_count_lo` inside the superblock.
+const FREE_BLOCKS_COUNT_LO_OFFSET: usize = 12;
+/// Byte offset of `s_free_blocks_count_hi` inside the superblock.
+const FREE_BLOCKS_COUNT_HI_OFFSET: usize = 344;
 /// Magic value stored in `s_magic`.
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 /// Clean filesystem bit stored in `s_state`.
@@ -322,10 +326,89 @@ impl FreeClusterCount {
 struct OnDiskFreeBlockCount(u64);
 
 impl OnDiskFreeBlockCount {
-    /// Creates a free-block count decoded from the superblock fields.
-    #[must_use]
-    const fn new(value: u64) -> Self {
-        Self(value)
+    /// Decodes the low and optional high free-block fields.
+    /// # Errors
+    ///
+    /// Returns an error when either selected field lies outside the supplied superblock bytes.
+    fn parse(raw: &[u8], has_high_field: bool) -> Result<Self> {
+        let low = u64::from(le_u32(raw, disk_offset(FREE_BLOCKS_COUNT_LO_OFFSET))?);
+        let high = if has_high_field {
+            u64::from(le_u32(raw, disk_offset(FREE_BLOCKS_COUNT_HI_OFFSET))?) << 32
+        } else {
+            0
+        };
+        Ok(Self(low | high))
+    }
+
+    /// Converts the on-disk block count into the allocation-domain cluster count.
+    /// # Errors
+    ///
+    /// Returns an error when the block count is not cluster-aligned or exceeds the mounted cluster
+    /// count.
+    fn into_free_cluster_count(
+        self,
+        blocks_per_cluster: BlocksPerCluster,
+        cluster_count: ClusterCount,
+    ) -> Result<FreeClusterCount> {
+        let blocks_per_cluster = u64::from(blocks_per_cluster.as_u32());
+        let clusters = self
+            .0
+            .checked_div(blocks_per_cluster)
+            .ok_or(Error::InvalidClusterGeometry)?;
+        if self.0.checked_rem(blocks_per_cluster) != Some(0) || clusters > cluster_count.as_u64() {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        Ok(FreeClusterCount::new(clusters))
+    }
+
+    /// Applies a cluster-domain delta while preserving the superblock's block unit.
+    /// # Errors
+    ///
+    /// Returns an error when the converted block delta overflows, underflows the current count, or
+    /// produces a count outside the mounted cluster geometry.
+    fn apply_cluster_delta(
+        self,
+        delta: FreeClusterDelta,
+        blocks_per_cluster: BlocksPerCluster,
+        cluster_count: ClusterCount,
+    ) -> Result<Self> {
+        let block_delta = delta
+            .as_i64()
+            .checked_mul(i64::from(blocks_per_cluster.as_u32()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let updated = if block_delta.is_negative() {
+            self.0
+                .checked_sub(block_delta.unsigned_abs())
+                .ok_or(Error::InvalidClusterGeometry)?
+        } else {
+            self.0
+                .checked_add(u64::try_from(block_delta).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?
+        };
+        let updated = Self(updated);
+        updated.into_free_cluster_count(blocks_per_cluster, cluster_count)?;
+        Ok(updated)
+    }
+
+    /// Writes the low and optional high free-block fields.
+    /// # Errors
+    ///
+    /// Returns an error when either selected field cannot be represented or lies outside the
+    /// supplied superblock bytes.
+    fn write_to(self, raw: &mut [u8], has_high_field: bool) -> Result<()> {
+        put_le_u32(
+            raw,
+            disk_offset(FREE_BLOCKS_COUNT_LO_OFFSET),
+            u32::try_from(self.0 & u64::from(u32::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        if has_high_field {
+            put_le_u32(
+                raw,
+                disk_offset(FREE_BLOCKS_COUNT_HI_OFFSET),
+                u32::try_from(self.0 >> 32).map_err(|_| Error::ArithmeticOverflow)?,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1395,7 +1478,6 @@ impl Superblock {
 
         let inode_count = InodeCount::new(le_u32(raw, disk_offset(0))?)?;
         let block_count_lo = le_u32(raw, disk_offset(4))?;
-        let free_blocks_count_lo = le_u32(raw, disk_offset(12))?;
         let free_inodes_count = FreeInodeCount::new(le_u32(raw, disk_offset(16))?);
         let first_data_block = BlockAddress::new(u64::from(le_u32(raw, disk_offset(20))?));
         let log_block_size = le_u32(raw, disk_offset(24))?;
@@ -1430,14 +1512,7 @@ impl Superblock {
                     0
                 },
         )?;
-        let free_blocks_count = OnDiskFreeBlockCount::new(
-            u64::from(free_blocks_count_lo)
-                | if features.has_64bit() {
-                    u64::from(le_u32(raw, disk_offset(344))?) << 32
-                } else {
-                    0
-                },
-        );
+        let free_blocks_count = OnDiskFreeBlockCount::parse(raw, features.has_64bit())?;
         let geometry = ClusterGeometry::new(RawClusterGeometry {
             block_count,
             first_data_block,
@@ -1448,9 +1523,8 @@ impl Superblock {
             clusters_per_group: raw_clusters_per_group,
             allocation_bitmap_domain: features.allocation_bitmap_domain(),
         })?;
-        if free_clusters_count.as_u64() > geometry.cluster_count.as_u64() {
-            return Err(Error::InvalidClusterGeometry);
-        }
+        let free_clusters_count = free_blocks_count
+            .into_free_cluster_count(geometry.blocks_per_cluster, geometry.cluster_count)?;
         match features.metadata_checksum() {
             MetadataChecksum::None => {}
             MetadataChecksum::Crc32c => {
@@ -1883,6 +1957,22 @@ impl Superblock {
         }
         self.free_clusters_count = FreeClusterCount::new(updated);
         Ok(())
+    }
+
+    /// Applies an allocation-cluster delta to the block-based superblock free-space fields.
+    /// # Errors
+    ///
+    /// Returns an error when the raw count is not cluster-aligned, the converted delta overflows,
+    /// or the updated count exceeds the mounted allocation geometry.
+    pub(crate) fn apply_free_cluster_delta_to_raw(
+        self,
+        raw: &mut [u8],
+        delta: FreeClusterDelta,
+    ) -> Result<()> {
+        let current = OnDiskFreeBlockCount::parse(raw, self.descriptor_layout().has_high_fields())?;
+        let updated =
+            current.apply_cluster_delta(delta, self.blocks_per_cluster, self.cluster_count)?;
+        updated.write_to(raw, self.descriptor_layout().has_high_fields())
     }
 }
 

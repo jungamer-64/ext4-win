@@ -155,11 +155,7 @@ pub(super) const INODE_GID_HI_OFFSET: usize = 122;
 pub(super) const INODE_CHECKSUM_HI_OFFSET: usize = 130;
 /// Minimum ext4 extra inode size required for checksum and creation-time fields.
 pub(super) const EXT4_INODE_MIN_EXTRA_ISIZE: u16 = 32;
-/// Offset of `s_free_blocks_count_lo` in the superblock.
-pub(super) const SUPERBLOCK_FREE_BLOCKS_LO_OFFSET: usize = 12;
 /// Offset of `s_free_inodes_count` in the superblock.
 pub(super) const SUPERBLOCK_FREE_INODES_OFFSET: usize = 16;
-/// Offset of `s_free_blocks_count_hi` in the superblock.
-pub(super) const SUPERBLOCK_FREE_BLOCKS_HI_OFFSET: usize = 344;
 /// Byte offset of the primary ext4 superblock.
 pub(super) const SUPERBLOCK_OFFSET: u64 = 1024;
