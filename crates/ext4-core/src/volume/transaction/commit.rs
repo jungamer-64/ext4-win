@@ -289,8 +289,11 @@ impl ReservedMutation {
         self,
         coordinator: &MutationCoordinatorState,
         current_epoch: &CommittedEpoch,
+        commit: super::super::CommitLease,
     ) -> Result<CommitReadyMutation> {
-        if !coordinator.revalidate(&self.resolved.observed) {
+        if commit.into_ticket() != self.resolved.observed.ticket()
+            || !coordinator.revalidate(&self.resolved.observed)
+        {
             return Err(Error::ClusterReferenceConflict);
         }
         let JournalCoordinatorState::Ready(journal) = &coordinator.journal else {
@@ -389,11 +392,7 @@ impl ReservedMutation {
 impl CommitReadyMutation {
     /// Starts ordered data I/O while sealing all later commit and publication states.
     #[must_use]
-    pub fn start(
-        self,
-        commit: super::super::CommitLease,
-    ) -> StorageRequestSequence<OrderedDataDurability> {
-        let _ticket = commit.into_ticket();
+    pub fn start(self) -> StorageRequestSequence<OrderedDataDurability> {
         let durable = DurableMutation {
             durable_journal: self.durable_journal,
             durable_epoch: self.durable_epoch,
