@@ -179,6 +179,8 @@ pub enum OperationEvent {
     Admitted,
     /// One lower-storage transfer whose IRP and buffer are no longer used by the lower stack.
     StorageCompleted(StorageCompletion),
+    /// Mount-time lower device-length query completed through its private IRP envelope.
+    DeviceLengthCompleted(crate::Result<crate::DeviceLength>),
     /// Top-level cancellation observed by the active-operation lane.
     CancelRequested,
     /// One operation-specific retry timer fired.

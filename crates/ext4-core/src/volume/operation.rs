@@ -505,6 +505,7 @@ impl EpochReadOperation {
                 return ReadTransition::Complete(Err(Error::OperationCancelled));
             }
             super::OperationEvent::RetryElapsed(_)
+            | super::OperationEvent::DeviceLengthCompleted(_)
             | super::OperationEvent::IntentGranted(_)
             | super::OperationEvent::CommitGranted(_)
             | super::OperationEvent::VisibilityGranted(_)
@@ -588,6 +589,7 @@ impl<N> MutationResolveOperation<N> {
             }
             super::OperationEvent::CancelRequested => return Err(Error::OperationCancelled),
             super::OperationEvent::RetryElapsed(_)
+            | super::OperationEvent::DeviceLengthCompleted(_)
             | super::OperationEvent::IntentGranted(_)
             | super::OperationEvent::CommitGranted(_)
             | super::OperationEvent::VisibilityGranted(_)
