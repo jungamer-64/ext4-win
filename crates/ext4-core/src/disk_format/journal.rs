@@ -11,7 +11,7 @@ use core::future::Future;
 use core::marker::PhantomData;
 
 use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
-use crate::disk::checksum::crc32c;
+use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, be_u16, be_u32, be_u64, put_be_u16, put_be_u32};
 use crate::disk::io::{BlockSource, BlockStorage};
 use crate::disk_format::extent::{ExtentTree, ExtentTreeContext};
@@ -1243,9 +1243,9 @@ impl<State> Journal<State> {
     fn tag_checksum(&self, sequence: JournalSequence, data: &[u8]) -> Result<u32> {
         let mut sequence_bytes = [0_u8; 4];
         put_be_u32(&mut sequence_bytes, disk_offset(0), sequence.get())?;
-        let seed = crc32c(0, self.superblock.uuid());
-        let seed = crc32c(seed, &sequence_bytes);
-        Ok(crc32c(seed, data))
+        let seed = ext4_crc32c(u32::MAX, self.superblock.uuid());
+        let seed = ext4_crc32c(seed, &sequence_bytes);
+        Ok(ext4_crc32c(seed, data))
     }
 
     /// Verifies the optional checksum stored at the end of a control block.
@@ -1309,7 +1309,10 @@ impl<State> Journal<State> {
             .get_mut(checksum_offset..end)
             .ok_or(Error::TruncatedStructure)?
             .fill(0);
-        Ok(crc32c(crc32c(0, self.superblock.uuid()), &checked))
+        Ok(ext4_crc32c(
+            ext4_crc32c(u32::MAX, self.superblock.uuid()),
+            &checked,
+        ))
     }
 }
 
@@ -2326,7 +2329,7 @@ fn journal_superblock_checksum(block: &[u8]) -> Result<u32> {
         .get_mut(0xFC..0x100)
         .ok_or(Error::TruncatedStructure)?
         .fill(0);
-    Ok(crc32c(0, &checked))
+    Ok(ext4_crc32c(u32::MAX, &checked))
 }
 
 /// Returns whether a later revoke cancels replay of a home block.
@@ -2341,4 +2344,20 @@ fn is_revoked_after(
             && (revoked.sequence.is_after(sequence)
                 || (revoked.sequence == sequence && revoked.order > order))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JOURNAL_SUPERBLOCK_BYTES, journal_superblock_checksum};
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn journal_superblock_checksum_starts_from_the_kernel_crc_state() {
+        assert_eq!(
+            journal_superblock_checksum(&[0_u8; JOURNAL_SUPERBLOCK_BYTES]),
+            Ok(0x1151_2183)
+        );
+    }
 }

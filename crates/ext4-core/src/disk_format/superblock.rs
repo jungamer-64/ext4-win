@@ -1,7 +1,7 @@
 //! Superblock parsing and mount-policy validation.
 
 use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
-use crate::disk::checksum::{crc32c, verify_crc32c};
+use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u32};
 use crate::disk::io::{BlockSource, BlockStorage};
 use crate::disk_format::inode::{
@@ -19,10 +19,14 @@ const SUPERBLOCK_SIZE: usize = 1024;
 const FREE_BLOCKS_COUNT_LO_OFFSET: usize = 12;
 /// Byte offset of `s_free_blocks_count_hi` inside the superblock.
 const FREE_BLOCKS_COUNT_HI_OFFSET: usize = 344;
+/// Byte offset of `s_checksum` and exclusive end of the superblock checksum input.
+const SUPERBLOCK_CHECKSUM_OFFSET: usize = 1020;
 /// Magic value stored in `s_magic`.
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 /// Clean filesystem bit stored in `s_state`.
 const EXT4_VALID_FS: u16 = 0x0001;
+/// Fixed inode number assigned to online-resize metadata by ext4.
+const EXT4_RESIZE_INODE_ID: u32 = 7;
 /// Byte offset of `s_volume_name` inside the superblock.
 const VOLUME_LABEL_OFFSET: usize = 120;
 /// Fixed byte width of `s_volume_name`.
@@ -1039,7 +1043,7 @@ impl ChecksumSeedSource {
     fn seed(self, raw: &[u8], uuid: &[u8; 16]) -> Result<ChecksumSeed> {
         match self {
             Self::Zero => Ok(ChecksumSeed::from_u32(0)),
-            Self::FilesystemUuid => Ok(ChecksumSeed::from_u32(crc32c(u32::MAX, uuid))),
+            Self::FilesystemUuid => Ok(ChecksumSeed::from_u32(ext4_crc32c(u32::MAX, uuid))),
             Self::SuperblockField => Ok(ChecksumSeed::from_u32(le_u32(raw, disk_offset(624))?)),
         }
     }
@@ -1076,6 +1080,15 @@ pub(crate) enum InodeTimestampEncoding {
     ExtraFields,
 }
 
+/// Presence of the reserved resize inode selected by `COMPAT_RESIZE_INODE`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResizeInodeFeature {
+    /// No reserved resize inode is defined by the feature profile.
+    Absent,
+    /// Inode 7 owns the reserved online-resize metadata block map.
+    Present,
+}
+
 /// Validated ext4 capabilities accepted by a mount policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FeatureSet {
@@ -1105,6 +1118,8 @@ pub(crate) struct FeatureSet {
     inode_block_count_encoding: InodeBlockCountEncoding,
     /// Timestamp encoding supported by inode records.
     inode_timestamp_encoding: InodeTimestampEncoding,
+    /// Reserved online-resize metadata inode presence.
+    resize_inode: ResizeInodeFeature,
 }
 
 impl FeatureSet {
@@ -1291,6 +1306,11 @@ impl FeatureSet {
             } else {
                 InodeTimestampEncoding::LegacySeconds
             },
+            resize_inode: if compat & COMPAT_RESIZE_INODE != 0 {
+                ResizeInodeFeature::Present
+            } else {
+                ResizeInodeFeature::Absent
+            },
         }
     }
 
@@ -1360,6 +1380,11 @@ impl FeatureSet {
     /// Returns the journal recovery state.
     pub(crate) const fn recovery_state(self) -> RecoveryState {
         self.recovery_state
+    }
+
+    /// Returns whether the reserved online-resize metadata inode is present.
+    pub(crate) const fn has_resize_inode(self) -> bool {
+        matches!(self.resize_inode, ResizeInodeFeature::Present)
     }
 }
 
@@ -1528,8 +1553,14 @@ impl Superblock {
         match features.metadata_checksum() {
             MetadataChecksum::None => {}
             MetadataChecksum::Crc32c => {
-                if le_u32(raw, disk_offset(1020))? != 0 {
-                    verify_crc32c(0, raw, disk_offset(1020))?;
+                let expected = le_u32(raw, disk_offset(SUPERBLOCK_CHECKSUM_OFFSET))?;
+                if expected != 0 {
+                    let checksum_input = raw
+                        .get(..SUPERBLOCK_CHECKSUM_OFFSET)
+                        .ok_or(Error::TruncatedStructure)?;
+                    if ext4_crc32c(u32::MAX, checksum_input) != expected {
+                        return Err(Error::ChecksumMismatch);
+                    }
                 }
             }
         }
@@ -1669,6 +1700,11 @@ impl Superblock {
         self.first_inode
     }
 
+    /// Returns whether `inode` is the reserved online-resize metadata inode.
+    pub(crate) const fn is_resize_inode(self, inode: InodeId) -> bool {
+        self.features.has_resize_inode() && inode.as_u32() == EXT4_RESIZE_INODE_ID
+    }
+
     /// Block group descriptor size in bytes.
     #[must_use]
     pub const fn descriptor_size(self) -> BlockGroupDescriptorSize {
@@ -1789,12 +1825,14 @@ impl Superblock {
     ///
     /// Returns an error when the checksum field cannot be read, zeroed, or rewritten.
     pub(crate) fn refresh_checksum(raw: &mut [u8]) -> Result<()> {
-        if le_u32(raw, disk_offset(1020))? == 0 {
+        if le_u32(raw, disk_offset(SUPERBLOCK_CHECKSUM_OFFSET))? == 0 {
             return Ok(());
         }
-        put_le_u32(raw, disk_offset(1020), 0)?;
-        let checksum = crc32c(0, raw);
-        put_le_u32(raw, disk_offset(1020), checksum)
+        let checksum_input = raw
+            .get(..SUPERBLOCK_CHECKSUM_OFFSET)
+            .ok_or(Error::TruncatedStructure)?;
+        let checksum = ext4_crc32c(u32::MAX, checksum_input);
+        put_le_u32(raw, disk_offset(SUPERBLOCK_CHECKSUM_OFFSET), checksum)
     }
 
     /// Number of block groups implied by the superblock.

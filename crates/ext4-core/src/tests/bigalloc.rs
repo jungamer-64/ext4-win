@@ -1,4 +1,50 @@
 use super::*;
+use core::cell::Cell;
+
+#[derive(Debug)]
+/// Mutable fixture storage that observes mount-time allocation bitmap reads.
+struct AllocationBitmapObservedStorage<'image, 'counts> {
+    /// Backing in-memory ext4 image.
+    inner: MemoryBlockStorage<'image>,
+    /// Reads beginning at the block allocation bitmap.
+    block_bitmap_reads: &'counts Cell<u32>,
+    /// Reads beginning at the inode allocation bitmap.
+    inode_bitmap_reads: &'counts Cell<u32>,
+}
+
+impl BlockSource for AllocationBitmapObservedStorage<'_, '_> {
+    fn len(&self) -> DeviceLength {
+        self.inner.len()
+    }
+
+    async fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
+        if offset.get()
+            == u64::try_from(block_offset(MODERN_BLOCK_BITMAP_BLOCK))
+                .map_err(|_| Error::ArithmeticOverflow)?
+        {
+            self.block_bitmap_reads
+                .set(self.block_bitmap_reads.get() + 1);
+        }
+        if offset.get()
+            == u64::try_from(block_offset(MODERN_INODE_BITMAP_BLOCK))
+                .map_err(|_| Error::ArithmeticOverflow)?
+        {
+            self.inode_bitmap_reads
+                .set(self.inode_bitmap_reads.get() + 1);
+        }
+        self.inner.read_exact_at(offset, out).await
+    }
+}
+
+impl BlockStorage for AllocationBitmapObservedStorage<'_, '_> {
+    async fn write_exact_at(&mut self, offset: ByteOffset, bytes: &[u8]) -> crate::Result<()> {
+        self.inner.write_exact_at(offset, bytes).await
+    }
+
+    async fn flush(&mut self) -> crate::Result<()> {
+        self.inner.flush().await
+    }
+}
 
 fn superblock_free_blocks(image: &[u8]) -> u32 {
     get_u32(image, 1024 + 12)
@@ -29,6 +75,26 @@ fn write_mount_accepts_bigalloc() {
     assert_eq!(volume.geometry().cluster_count().as_u64(), 16);
     assert_eq!(volume.geometry().free_cluster_count().as_u64(), 9);
     assert_eq!(superblock_free_blocks(&image), 36);
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn write_mount_captures_each_allocation_bitmap_once() {
+    let mut image = bigalloc_fixture_image();
+    let block_bitmap_reads = Cell::new(0);
+    let inode_bitmap_reads = Cell::new(0);
+    let device = AllocationBitmapObservedStorage {
+        inner: MemoryBlockStorage::new(&mut image),
+        block_bitmap_reads: &block_bitmap_reads,
+        inode_bitmap_reads: &inode_bitmap_reads,
+    };
+
+    let _volume = must_run(JournaledVolume::mount(device, test_mount_context()));
+
+    assert_eq!(block_bitmap_reads.get(), 1);
+    assert_eq!(inode_bitmap_reads.get(), 1);
 }
 
 /// # Panics

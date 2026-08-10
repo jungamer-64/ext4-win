@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use crate::disk::block::BlockAddress;
-use crate::disk::checksum::crc32c;
+use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::disk_format::superblock::{MetadataChecksum, Superblock};
 use crate::error::{Error, Result};
@@ -934,11 +934,11 @@ fn validate_external_xattr_block(
         let expected = le_u32(bytes, disk_offset(16))?;
         let mut checksum_bytes = memory::copied_slice(bytes)?;
         put_le_u32(&mut checksum_bytes, disk_offset(16), 0)?;
-        let seed = crc32c(
+        let seed = ext4_crc32c(
             superblock.checksum_seed().as_u32(),
             &block.get().to_le_bytes(),
         );
-        if crc32c(seed, &checksum_bytes) != expected {
+        if ext4_crc32c(seed, &checksum_bytes) != expected {
             return Err(Error::ChecksumMismatch);
         }
     }
@@ -956,11 +956,11 @@ fn refresh_external_xattr_checksum(
 ) -> Result<()> {
     put_le_u32(bytes, disk_offset(16), 0)?;
     if superblock.metadata_checksum() == MetadataChecksum::Crc32c {
-        let seed = crc32c(
+        let seed = ext4_crc32c(
             superblock.checksum_seed().as_u32(),
             &block.get().to_le_bytes(),
         );
-        let checksum = crc32c(seed, bytes);
+        let checksum = ext4_crc32c(seed, bytes);
         put_le_u32(bytes, disk_offset(16), checksum)?;
     }
     Ok(())

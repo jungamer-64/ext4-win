@@ -45,9 +45,7 @@ pub(super) fn bigalloc_fixture_image_with_journal_blocks(journal_blocks: u16) ->
     let mut image = vec![0_u8; BLOCK_SIZE * MODERN_IMAGE_BLOCKS];
     let free_clusters = write_bigalloc_block_bitmap(&mut image, journal_blocks);
     let free_inodes = write_modern_inode_bitmap(&mut image);
-    let free_blocks = free_clusters
-        .checked_mul(BIGALLOC_BLOCKS_PER_CLUSTER)
-        .unwrap_or(u32::MAX);
+    let free_blocks = free_clusters.saturating_mul(BIGALLOC_BLOCKS_PER_CLUSTER);
     write_modern_superblock(&mut image, free_blocks, free_inodes, journal_blocks);
     put_u32(&mut image, 1024 + 28, BIGALLOC_LOG_CLUSTER_SIZE);
     put_u32(&mut image, 1024 + 36, 8192 / BIGALLOC_BLOCKS_PER_CLUSTER);
@@ -788,7 +786,7 @@ pub(super) fn refresh_jbd2_superblock_checksum(image: &mut [u8], base: usize) {
 pub(super) fn jbd2_superblock_checksum(image: &[u8], base: usize) -> u32 {
     let mut block = image[base..base + 1024].to_vec();
     block[0xFC..0x100].fill(0);
-    crate::disk::checksum::crc32c(0, &block)
+    crate::disk::checksum::ext4_crc32c(u32::MAX, &block)
 }
 
 pub(super) fn jbd2_block_checksum(
@@ -800,13 +798,13 @@ pub(super) fn jbd2_block_checksum(
     let base = journal_log_offset(logical);
     let mut block = image[base..base + BLOCK_SIZE].to_vec();
     block[checksum_offset..checksum_offset + 4].fill(0);
-    crate::disk::checksum::crc32c(crate::disk::checksum::crc32c(0, &uuid), &block)
+    crate::disk::checksum::ext4_crc32c(crate::disk::checksum::ext4_crc32c(u32::MAX, &uuid), &block)
 }
 
 pub(super) fn jbd2_tag_checksum(sequence: u32, data: &[u8], uuid: [u8; 16]) -> u32 {
-    let seed = crate::disk::checksum::crc32c(0, &uuid);
-    let seed = crate::disk::checksum::crc32c(seed, &sequence.to_be_bytes());
-    crate::disk::checksum::crc32c(seed, data)
+    let seed = crate::disk::checksum::ext4_crc32c(u32::MAX, &uuid);
+    let seed = crate::disk::checksum::ext4_crc32c(seed, &sequence.to_be_bytes());
+    crate::disk::checksum::ext4_crc32c(seed, data)
 }
 
 pub(super) fn journal_log_offset(logical: u32) -> usize {
@@ -1052,10 +1050,12 @@ pub(super) fn refresh_extent_block_checksum(image: &mut [u8], inode: u32, block:
     put_u32(image, base + BLOCK_SIZE - 4, 0);
     let inode_offset = modern_inode_offset(inode);
     let generation = get_u32(image, inode_offset + 100);
-    let mut checksum =
-        crate::disk::checksum::crc32c(superblock.checksum_seed().as_u32(), &inode.to_le_bytes());
-    checksum = crate::disk::checksum::crc32c(checksum, &generation.to_le_bytes());
-    checksum = crate::disk::checksum::crc32c(checksum, &image[base..base + BLOCK_SIZE]);
+    let mut checksum = crate::disk::checksum::ext4_crc32c(
+        superblock.checksum_seed().as_u32(),
+        &inode.to_le_bytes(),
+    );
+    checksum = crate::disk::checksum::ext4_crc32c(checksum, &generation.to_le_bytes());
+    checksum = crate::disk::checksum::ext4_crc32c(checksum, &image[base..base + BLOCK_SIZE]);
     put_u32(image, base + BLOCK_SIZE - 4, checksum);
 }
 

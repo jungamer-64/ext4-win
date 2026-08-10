@@ -89,20 +89,6 @@ impl DiskRange {
         })
     }
 
-    /// Builds a checked disk byte range from start and end offsets.
-    /// # Errors
-    ///
-    /// Returns an error when the end offset precedes the start offset.
-    pub fn span(start: DiskOffset, end: DiskOffset) -> Result<Self> {
-        if end.as_usize() < start.as_usize() {
-            return Err(Error::TruncatedStructure);
-        }
-        Ok(Self {
-            start: start.as_usize(),
-            end: end.as_usize(),
-        })
-    }
-
     /// Borrows this range from an on-disk input structure.
     /// # Errors
     ///
@@ -236,17 +222,6 @@ mod tests {
         assert_eq!(
             DiskRange::new(DiskOffset::new(usize::MAX), DiskByteLen::new(1)),
             Err(Error::ArithmeticOverflow)
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn disk_range_rejects_end_before_start() {
-        assert_eq!(
-            DiskRange::span(DiskOffset::new(8), DiskOffset::new(4)),
-            Err(Error::TruncatedStructure)
         );
     }
 

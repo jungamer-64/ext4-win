@@ -7,7 +7,7 @@
 use alloc::vec::Vec;
 
 use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
-use crate::disk::checksum::{crc16, crc32c};
+use crate::disk::checksum::{crc16, ext4_crc32c};
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16};
 use crate::disk::io::BlockSource;
 use crate::disk_format::superblock::{
@@ -442,16 +442,16 @@ fn metadata_checksum(superblock: &Superblock, group: BlockGroupId, bytes: &[u8])
         .ok_or(Error::ArithmeticOverflow)?;
     let group_bytes = group.as_u32().to_le_bytes();
     let zero_checksum = [0_u8; BG_CHECKSUM_SIZE];
-    let mut checksum = crc32c(superblock.checksum_seed().as_u32(), &group_bytes);
-    checksum = crc32c(
+    let mut checksum = ext4_crc32c(superblock.checksum_seed().as_u32(), &group_bytes);
+    checksum = ext4_crc32c(
         checksum,
         bytes
             .get(..BG_CHECKSUM_OFFSET)
             .ok_or(Error::TruncatedStructure)?,
     );
-    checksum = crc32c(checksum, &zero_checksum);
+    checksum = ext4_crc32c(checksum, &zero_checksum);
     if checksum_end < bytes.len() {
-        checksum = crc32c(
+        checksum = ext4_crc32c(
             checksum,
             bytes.get(checksum_end..).ok_or(Error::TruncatedStructure)?,
         );
@@ -572,6 +572,6 @@ fn apply_u32_delta(current: u32, delta: i64) -> Result<u32> {
 /// Computes the metadata_csum checksum for a group bitmap payload.
 fn bitmap_checksum(superblock: &Superblock, group: BlockGroupId, bitmap: &[u8]) -> u32 {
     let group_bytes = group.as_u32().to_le_bytes();
-    let checksum = crc32c(superblock.checksum_seed().as_u32(), &group_bytes);
-    crc32c(checksum, bitmap)
+    let checksum = ext4_crc32c(superblock.checksum_seed().as_u32(), &group_bytes);
+    ext4_crc32c(checksum, bitmap)
 }
