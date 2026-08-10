@@ -517,6 +517,11 @@ impl VolumeRuntime {
         self.failure
     }
 
+    /// Whether journal space has no granted commit or published overlay awaiting checkpoint.
+    pub(crate) const fn journal_is_clean(&self) -> bool {
+        matches!(self.commit_gate, CommitGateState::Ready)
+    }
+
     /// Acquires one current immutable epoch for a read or resolve operation.
     pub(crate) fn acquire_epoch(&mut self) -> DriverResult<EpochLease> {
         self.failure.authorize_read()?;

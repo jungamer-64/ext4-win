@@ -141,6 +141,16 @@ pub(crate) enum WaitCondition {
         /// Visible overlay epoch.
         epoch: ext4_core::EpochSequence,
     },
+    /// Ordinary flush waits for every already granted or queued commit to become durable.
+    VolumeDurability {
+        /// Mounted volume whose commit lane must drain.
+        volume: NonNull<crate::state::VolumeControlBlock>,
+    },
+    /// Shutdown/clean-dismount waits until checkpoint has released journal space.
+    JournalClean {
+        /// Mounted volume whose journal must return to the clean ready state.
+        volume: NonNull<crate::state::VolumeControlBlock>,
+    },
     /// A per-handle terminal or durability barrier has not drained earlier work.
     Barrier { identity: u64 },
 }
@@ -1185,6 +1195,7 @@ impl CompletionReactor {
                 );
                 self.grant_available_intents();
                 self.grant_available_commit();
+                self.grant_all_available_waits();
             }
             OperationTransition::Complete => {
                 self.release_intent(index);
@@ -1193,6 +1204,7 @@ impl CompletionReactor {
                 release_operation_reservation(&self.admitted);
                 self.grant_available_intents();
                 self.grant_available_commit();
+                self.grant_all_available_waits();
             }
         }
     }
@@ -1600,6 +1612,14 @@ impl CompletionReactor {
         self.grant_wait_if_ready(index);
     }
 
+    /// Rechecks every concrete gate after commit/checkpoint ownership changes.
+    #[cfg(not(test))]
+    fn grant_all_available_waits(&self) {
+        for index in 0..MAX_OPERATIONS {
+            self.grant_wait_if_ready(index);
+        }
+    }
+
     /// Grants every resource request that is conflict-free without bypassing an earlier
     /// conflicting FIFO ticket.
     #[cfg(not(test))]
@@ -1770,6 +1790,31 @@ impl CompletionReactor {
                     .try_grant_checkpoint(epoch)
                     .map(OperationEvent::CheckpointGranted)
             }
+            WaitCondition::VolumeDurability { volume } => {
+                let slots = unsafe {
+                    // SAFETY: Only the reactor thread observes scheduler commit ownership.
+                    &*self.active.get()
+                };
+                (!volume_has_commit_work(slots, volume))
+                    .then(|| OperationEvent::BarrierReleased(ext4_core::BarrierPermit::released(0)))
+            }
+            WaitCondition::JournalClean { volume } => {
+                let slots = unsafe {
+                    // SAFETY: Only the reactor thread observes scheduler commit ownership.
+                    &*self.active.get()
+                };
+                if volume_has_commit_work(slots, volume) {
+                    None
+                } else {
+                    let access = unsafe {
+                        // SAFETY: Journal cleanliness is observed only for this reactor transition.
+                        crate::state::VolumeControlBlock::operation_access(volume)
+                    };
+                    access.runtime().journal_is_clean().then(|| {
+                        OperationEvent::BarrierReleased(ext4_core::BarrierPermit::released(1))
+                    })
+                }
+            }
             WaitCondition::Barrier { identity } => Some(OperationEvent::BarrierReleased(
                 ext4_core::BarrierPermit::released(identity),
             )),
@@ -1790,6 +1835,17 @@ impl CompletionReactor {
         };
         slot.phase = ActivePhase::Ready { operation, event };
     }
+}
+
+/// Returns whether one volume still has a queued or granted commit that is not yet visible.
+fn volume_has_commit_work(
+    slots: &[ActiveSlot; MAX_OPERATIONS],
+    volume: NonNull<crate::state::VolumeControlBlock>,
+) -> bool {
+    slots.iter().any(|slot| {
+        matches!(slot.commit, Some(HeldCommit { volume: held, .. }) if held == volume)
+            || matches!(slot.phase, ActivePhase::Commit { volume: queued, .. } if queued == volume)
+    })
 }
 
 /// Whether two complete resource sets overlap.

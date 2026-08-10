@@ -295,6 +295,210 @@ impl CompletionOperation for ImmediateRequestOperation {
 // SAFETY: Unique IRP authority is moved only by the reactor thread.
 unsafe impl Send for ImmediateRequestOperation {}
 
+/// Durability barrier semantics selected by the top-level major function.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FlushRequestKind {
+    /// Ordinary file/volume flush: commit durability plus filesystem device flush.
+    FlushBuffers,
+    /// Shutdown: clean checkpointed journal plus filesystem device flush.
+    Shutdown,
+}
+
+/// Explicit ownership phase of one flush request.
+#[derive(Debug)]
+enum FlushOperationState {
+    /// IRP target has not yet been validated on the reactor thread.
+    Ready(OwnedIrp),
+    /// IRP waits behind the selected volume durability barrier.
+    Waiting(OwnedIrp),
+    /// One filesystem flush is owned by a lower completion envelope.
+    InFlight {
+        owned: OwnedIrp,
+        expected: StorageRequestIdentity,
+    },
+    /// Terminal completion consumed the IRP.
+    Terminal,
+}
+
+/// One non-retrying-at-the-domain-level device flush operation.
+#[derive(Debug)]
+struct FlushRequestOperation {
+    /// Stable mounted VCB selected from the receiving mounted device.
+    volume: NonNull<VolumeControlBlock>,
+    /// Mounted lower devices.
+    devices: MountedStorageDevices,
+    /// Barrier semantics.
+    kind: FlushRequestKind,
+    /// Current consuming state.
+    state: FlushOperationState,
+}
+
+impl FlushRequestOperation {
+    /// Allocates one flush operation while preserving the top-level IRP on OOM.
+    fn try_new(
+        owned: OwnedIrp,
+        kind: FlushRequestKind,
+    ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+        let volume = match MountedVolumeDevice::vcb(owned.device()) {
+            Some(volume) => volume,
+            None => {
+                return Err(AdmitOperationError::new(
+                    DriverError::InvalidDeviceRequest,
+                    owned,
+                ));
+            }
+        };
+        let devices = {
+            let access = unsafe {
+                // SAFETY: Admission projects immutable storage geometry from the stable VCB.
+                VolumeControlBlock::operation_access(volume)
+            };
+            access.runtime().storage()
+        };
+        match memory::boxed_try_map(owned, |owned| Self {
+            volume,
+            devices,
+            kind,
+            state: FlushOperationState::Ready(owned),
+        }) {
+            Ok(operation) => Ok(operation),
+            Err(error) => {
+                let (error, owned) = error.into_parts();
+                Err(AdmitOperationError::new(error, owned))
+            }
+        }
+    }
+
+    /// Validates the FILE_OBJECT or device-level flush target without retaining a raw pointer.
+    fn validate_target(&self, owned: &mut OwnedIrp) -> DriverResult<()> {
+        let selected = owned.request().with_active(|active| {
+            if self.kind == FlushRequestKind::Shutdown {
+                return MountedVolumeDevice::vcb(active.device())
+                    .ok_or(DriverError::InvalidDeviceRequest);
+            }
+            let stack = active.current_stack()?;
+            match stack.file_object() {
+                Ok(file_object) => match crate::state::OpenedFileObject::decode(file_object)? {
+                    crate::state::OpenedFileObject::Node(opened) => Ok(opened.volume()),
+                    crate::state::OpenedFileObject::Volume(opened) => Ok(opened.volume()),
+                },
+                Err(DriverError::InvalidParameter) => MountedVolumeDevice::vcb(active.device())
+                    .ok_or(DriverError::InvalidDeviceRequest),
+                Err(error) => Err(error),
+            }
+        })?;
+        if selected == self.volume {
+            Ok(())
+        } else {
+            Err(DriverError::InvalidDeviceRequest)
+        }
+    }
+
+    /// Completes and consumes the top-level flush IRP.
+    fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
+        let _status = owned.complete_result(result);
+        OperationTransition::Complete
+    }
+}
+
+impl CompletionOperation for FlushRequestOperation {
+    fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+        let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
+        match state {
+            FlushOperationState::Ready(mut owned) => match event {
+                OperationEvent::Admitted => {
+                    if let Err(error) = self.validate_target(&mut owned) {
+                        return Self::complete(owned, Err(error));
+                    }
+                    let condition = match self.kind {
+                        FlushRequestKind::FlushBuffers => WaitCondition::VolumeDurability {
+                            volume: self.volume,
+                        },
+                        FlushRequestKind::Shutdown => WaitCondition::JournalClean {
+                            volume: self.volume,
+                        },
+                    };
+                    self.state = FlushOperationState::Waiting(owned);
+                    OperationTransition::Wait {
+                        condition,
+                        suspended: self,
+                    }
+                }
+                OperationEvent::CancelRequested => {
+                    Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
+                }
+                OperationEvent::StorageCompleted(_)
+                | OperationEvent::RetryElapsed(_)
+                | OperationEvent::IntentGranted(_)
+                | OperationEvent::CommitGranted(_)
+                | OperationEvent::VisibilityGranted(_)
+                | OperationEvent::CheckpointGranted(_)
+                | OperationEvent::BarrierReleased(_) => {
+                    Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                }
+            },
+            FlushOperationState::Waiting(owned) => match event {
+                OperationEvent::BarrierReleased(permit) => {
+                    let expected_identity = match self.kind {
+                        FlushRequestKind::FlushBuffers => 0,
+                        FlushRequestKind::Shutdown => 1,
+                    };
+                    if permit.into_identity() != expected_identity {
+                        return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
+                    }
+                    let request = StorageRequest::Flush {
+                        target: ext4_core::StorageTarget::Filesystem,
+                    };
+                    let expected = StorageRequestIdentity::from_request(&request);
+                    self.state = FlushOperationState::InFlight { owned, expected };
+                    OperationTransition::SubmitLower {
+                        devices: self.devices,
+                        request,
+                        suspended: self,
+                    }
+                }
+                OperationEvent::CancelRequested => {
+                    Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
+                }
+                OperationEvent::Admitted
+                | OperationEvent::StorageCompleted(_)
+                | OperationEvent::RetryElapsed(_)
+                | OperationEvent::IntentGranted(_)
+                | OperationEvent::CommitGranted(_)
+                | OperationEvent::VisibilityGranted(_)
+                | OperationEvent::CheckpointGranted(_) => {
+                    Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                }
+            },
+            FlushOperationState::InFlight { owned, expected } => {
+                let OperationEvent::StorageCompleted(completion) = event else {
+                    return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
+                };
+                match expected.complete(completion) {
+                    Ok(()) => Self::complete(owned, Ok(IrpCompletion::EMPTY)),
+                    Err(error) => Self::complete(owned, Err(DriverError::from(error))),
+                }
+            }
+            FlushOperationState::Terminal => OperationTransition::Complete,
+        }
+    }
+
+    fn record_storage_failure(&mut self, failure: StorageFailureClass) {
+        if failure != StorageFailureClass::DurabilityUnknown {
+            return;
+        }
+        let mut access = unsafe {
+            // SAFETY: Failure publication executes on the sole reactor thread after lower release.
+            VolumeControlBlock::operation_access(self.volume)
+        };
+        access.runtime_mut().record_durability_unknown();
+    }
+}
+
+// SAFETY: The mounted VCB and top-level IRP remain live through reactor drain; the operation moves
+// only by value between the reactor and stable completion envelopes.
+unsafe impl Send for FlushRequestOperation {}
+
 /// Mutation request semantics selected entirely from captured queue metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MutationRequestKind {
@@ -1464,4 +1668,12 @@ pub(crate) fn mutation(
     kind: MutationRequestKind,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
     MutationRequestOperation::try_new(owned, kind)
+}
+
+/// Allocates one concrete durability-barrier and lower-flush operation.
+pub(crate) fn flush(
+    owned: OwnedIrp,
+    kind: FlushRequestKind,
+) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+    FlushRequestOperation::try_new(owned, kind)
 }
