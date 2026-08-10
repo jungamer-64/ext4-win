@@ -313,6 +313,22 @@ impl FreeClusterCount {
     }
 }
 
+/// Free filesystem-block count encoded in the ext4 superblock.
+///
+/// This is deliberately distinct from [`FreeClusterCount`]: bigalloc keeps
+/// `s_free_blocks_count` in filesystem blocks even though allocation bitmaps
+/// and block-group descriptor counters use clusters.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct OnDiskFreeBlockCount(u64);
+
+impl OnDiskFreeBlockCount {
+    /// Creates a free-block count decoded from the superblock fields.
+    #[must_use]
+    const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// Signed free-cluster count delta.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FreeClusterDelta(i64);
@@ -1414,7 +1430,7 @@ impl Superblock {
                     0
                 },
         )?;
-        let free_clusters_count = FreeClusterCount::new(
+        let free_blocks_count = OnDiskFreeBlockCount::new(
             u64::from(free_blocks_count_lo)
                 | if features.has_64bit() {
                     u64::from(le_u32(raw, disk_offset(344))?) << 32
