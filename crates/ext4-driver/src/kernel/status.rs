@@ -3,6 +3,7 @@
 use ext4_core::Error;
 use wdk_sys::{
     NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
+    STATUS_CANCELLED,
     STATUS_CANNOT_DELETE, STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL,
     STATUS_EA_LIST_INCONSISTENT, STATUS_EA_TOO_LARGE, STATUS_FILE_CORRUPT_ERROR,
     STATUS_INSUFFICIENT_RESOURCES, STATUS_INTERNAL_ERROR, STATUS_INVALID_BUFFER_SIZE,
@@ -161,6 +162,8 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::MissingEncryptionKey => STATUS_ACCESS_DENIED,
         Error::DirtyVolume => STATUS_VOLUME_DIRTY,
         Error::OutOfMemory => STATUS_INSUFFICIENT_RESOURCES,
+        Error::OperationCancelled => STATUS_CANCELLED,
+        Error::OperationSuspended => STATUS_INTERNAL_ERROR,
         Error::DeviceIo => STATUS_IO_DEVICE_ERROR,
         Error::VerityMismatch => STATUS_IO_DEVICE_ERROR,
         Error::UnsupportedBlockSize

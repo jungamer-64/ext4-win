@@ -4,7 +4,7 @@ use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP};
 
 use crate::{
     irp::{
-        ActorRequest, DeviceExecutor, DispatchMajor, IrpCompletion, OwnedIrp,
+        ActorRequest, CompletionReactor, DispatchMajor, IrpCompletion, OwnedIrp,
         PreparedDirectoryControl, PreparedRequest, ReceivedIrp,
     },
     kernel::status::{DriverError, DriverResult},
@@ -255,7 +255,7 @@ fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS
 
     match dispatch_policy(major) {
         DispatchPolicy::Immediate => received.complete_result(execute_immediate(major)),
-        DispatchPolicy::Queued => DeviceExecutor::receive(received, major),
+        DispatchPolicy::Queued => CompletionReactor::receive(received, major),
         DispatchPolicy::FsRtlFileLock => dispatch_file_lock(received),
     }
 }
@@ -304,7 +304,7 @@ fn dispatch_file_lock(mut received: ReceivedIrp) -> NTSTATUS {
     }
 }
 
-/// Executes and terminally completes or delegates one IRP owned by the device executor.
+/// Executes and terminally completes or delegates one legacy request body during migration.
 #[cfg_attr(
     test,
     expect(

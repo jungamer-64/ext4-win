@@ -287,6 +287,11 @@ pub struct PreparedStorageCommand<O> {
 }
 
 impl<O> PreparedStorageCommand<O> {
+    /// Recovers the command when teardown closes completion rundown before IRP construction.
+    pub(crate) fn into_command(self) -> StorageCommand<O> {
+        self.command
+    }
+
     /// Allocates and prepares one command without exposing it to a lower driver.
     pub fn try_new(
         devices: MountedStorageDevices,
@@ -526,7 +531,7 @@ impl<O> StorageCommand<O> {
     }
 
     /// Consumes the command into its original operation and request.
-    fn into_parts(self) -> (O, StorageRequest) {
+    pub(crate) fn into_parts(self) -> (O, StorageRequest) {
         match self {
             Self::Read {
                 request, suspended, ..

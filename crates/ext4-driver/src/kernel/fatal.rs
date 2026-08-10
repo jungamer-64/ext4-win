@@ -55,6 +55,11 @@ impl KernelWideInconsistency {
         Self::without_location(FatalReason::AsyncExecutorStateCorruption)
     }
 
+    /// Constructs a fatal state for impossible completion-reactor ownership or lifecycle.
+    pub(crate) const fn completion_reactor_state_corruption() -> Self {
+        Self::without_location(FatalReason::CompletionReactorStateCorruption)
+    }
+
     /// Constructs a fatal state for an impossible mounted-volume/VPB lifecycle.
     pub(crate) const fn mounted_volume_state_corruption() -> Self {
         Self::without_location(FatalReason::MountedVolumeStateCorruption)
@@ -125,6 +130,8 @@ enum FatalReason {
     FileControlBlockOwnershipCorruption,
     /// A mailbox, wake, or actor transition violated the executor state machine.
     AsyncExecutorStateCorruption,
+    /// The event-driven reactor violated an intrusive queue, slot, or ownership invariant.
+    CompletionReactorStateCorruption,
     /// Actor-owned mounted-volume state and its kernel-visible VPB diverged.
     MountedVolumeStateCorruption,
     /// The driver device chain no longer matches its typed extension ownership.
@@ -142,9 +149,10 @@ impl FatalReason {
             Self::FileControlBlockOwnershipCorruption => 3,
             Self::FileObjectLifecycleCorruption => 4,
             Self::AsyncExecutorStateCorruption => 5,
-            Self::MountedVolumeStateCorruption => 6,
-            Self::DriverDeviceTeardownCorruption => 7,
-            Self::LowerCompletionOwnershipCorruption => 8,
+            Self::CompletionReactorStateCorruption => 6,
+            Self::MountedVolumeStateCorruption => 7,
+            Self::DriverDeviceTeardownCorruption => 8,
+            Self::LowerCompletionOwnershipCorruption => 9,
         }
     }
 }
@@ -186,14 +194,15 @@ mod tests {
         );
         assert_eq!(FatalReason::FileObjectLifecycleCorruption.as_parameter(), 4);
         assert_eq!(FatalReason::AsyncExecutorStateCorruption.as_parameter(), 5);
-        assert_eq!(FatalReason::MountedVolumeStateCorruption.as_parameter(), 6);
+        assert_eq!(FatalReason::CompletionReactorStateCorruption.as_parameter(), 6);
+        assert_eq!(FatalReason::MountedVolumeStateCorruption.as_parameter(), 7);
         assert_eq!(
             FatalReason::DriverDeviceTeardownCorruption.as_parameter(),
-            7
+            8
         );
         assert_eq!(
             FatalReason::LowerCompletionOwnershipCorruption.as_parameter(),
-            8
+            9
         );
     }
 
@@ -217,6 +226,10 @@ mod tests {
         assert_eq!(
             KernelWideInconsistency::async_executor_state_corruption().reason,
             FatalReason::AsyncExecutorStateCorruption
+        );
+        assert_eq!(
+            KernelWideInconsistency::completion_reactor_state_corruption().reason,
+            FatalReason::CompletionReactorStateCorruption
         );
         assert_eq!(
             KernelWideInconsistency::mounted_volume_state_corruption().reason,

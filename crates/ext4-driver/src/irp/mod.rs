@@ -9,6 +9,9 @@ use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_PENDING
 
 mod capture;
 pub(crate) mod lower;
+pub(crate) mod reactor;
+
+pub(crate) use reactor::CompletionReactor;
 
 pub(crate) use capture::{
     CapturedQuerySecurityOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
