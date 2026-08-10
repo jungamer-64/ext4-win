@@ -259,6 +259,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
         if !self.free_clusters_delta.is_zero()
             || self.free_inodes_delta != 0
             || self.volume_label_update.is_some()
+            || self.fscrypt_keys_update.is_some()
         {
             observed.include(
                 MutationResource::VOLUME_METADATA,
@@ -273,6 +274,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
             free_clusters_delta: self.free_clusters_delta,
             free_inodes_delta: self.free_inodes_delta,
             volume_label_update: self.volume_label_update,
+            fscrypt_keys_update: self.fscrypt_keys_update,
         })
     }
 }
@@ -305,8 +307,11 @@ impl ReservedMutation {
         let mut durable_clusters = current_epoch.clusters.try_clone()?;
         durable_clusters.apply_deltas(&self.resolved.cluster_deltas)?;
         let checkpoint_clusters = durable_clusters.try_clone()?;
-        let durable_keys = current_epoch.fscrypt_keys.try_clone()?;
-        let checkpoint_keys = current_epoch.fscrypt_keys.try_clone()?;
+        let durable_keys = match self.resolved.fscrypt_keys_update {
+            Some(keys) => keys,
+            None => current_epoch.fscrypt_keys.try_clone()?,
+        };
+        let checkpoint_keys = durable_keys.try_clone()?;
         let mut superblock = current_epoch.superblock;
         superblock.apply_free_cluster_delta(self.resolved.free_clusters_delta)?;
         superblock.apply_free_inode_delta(self.resolved.free_inodes_delta)?;
