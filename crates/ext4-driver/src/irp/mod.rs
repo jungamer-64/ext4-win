@@ -834,6 +834,11 @@ impl OwnedIrp {
         PendingIrpLease { owner: self }
     }
 
+    /// Device object that admitted this top-level request.
+    pub(crate) const fn device(&self) -> KernelDevice {
+        self.target.device
+    }
+
     /// Returns the exhaustive actor-local request classification.
     pub(crate) fn actor_request(&self) -> ActorRequest<'_> {
         match &self.context {
@@ -905,6 +910,11 @@ impl OwnedIrp {
         self.complete(IrpCompletion::cancelled())
     }
 }
+
+// SAFETY: After CSQ removal, this unique completion authority moves only between the sole reactor
+// thread and an ext4win-owned lower completion envelope. No requestor-context access occurs while
+// the lower stack owns that envelope.
+unsafe impl Send for OwnedIrp {}
 
 /// Non-null IRP pointer kept private to the typed dispatch boundary.
 #[derive(Clone, Copy, Debug)]

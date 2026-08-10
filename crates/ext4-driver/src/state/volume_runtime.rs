@@ -454,6 +454,17 @@ enum CommitGateState {
     CommitGranted { ticket: u64 },
     /// A visible overlay is awaiting independent checkpoint and journal-space release.
     CheckpointPending { epoch: EpochSequence },
+    /// The detached checkpoint operation owns journal-space release authority.
+    CheckpointGranted { epoch: EpochSequence },
+}
+
+/// Short allocation-free visibility gate, separate from checkpoint ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisibilityGateState {
+    /// No durable epoch is being installed.
+    Ready,
+    /// One durable mutation owns the sole epoch-swap transition.
+    Granted { ticket: u64 },
 }
 
 /// Driver-local mounted runtime split into immutable profile, immutable epochs, and mutable
@@ -472,6 +483,8 @@ pub(crate) struct VolumeRuntime {
     failure: VolumeFailureState,
     /// Serialized commit/checkpoint ownership.
     commit_gate: CommitGateState,
+    /// Short epoch-swap gate independent from checkpoint I/O.
+    visibility_gate: VisibilityGateState,
 }
 
 impl VolumeRuntime {
@@ -485,6 +498,7 @@ impl VolumeRuntime {
             storage,
             failure: VolumeFailureState::Operational,
             commit_gate: CommitGateState::Ready,
+            visibility_gate: VisibilityGateState::Ready,
         }
     }
 
@@ -519,6 +533,12 @@ impl VolumeRuntime {
         &self.coordinator
     }
 
+    /// Allocates one stable FIFO mutation ticket before resolve begins.
+    pub(crate) fn admit_mutation(&mut self) -> DriverResult<u64> {
+        self.failure.authorize_mutation()?;
+        self.coordinator.admit_mutation().map_err(DriverError::from)
+    }
+
     /// Mutable coordinator used only by infallible visibility/checkpoint publication.
     fn coordinator_mut(&mut self) -> &mut MutationCoordinatorState {
         &mut self.coordinator
@@ -548,10 +568,40 @@ impl VolumeRuntime {
                 self.commit_gate = CommitGateState::CommitGranted { ticket };
                 Some(ext4_core::CommitLease::granted(ticket))
             }
-            CommitGateState::CommitGranted { .. } | CommitGateState::CheckpointPending { .. } => {
-                None
-            }
+            CommitGateState::CommitGranted { .. }
+            | CommitGateState::CheckpointPending { .. }
+            | CommitGateState::CheckpointGranted { .. } => None,
         }
+    }
+
+    /// Releases a commit grant before the first lower write was issued.
+    pub(crate) fn abandon_commit(&mut self, ticket: u64) {
+        if self.commit_gate == (CommitGateState::CommitGranted { ticket }) {
+            self.commit_gate = CommitGateState::Ready;
+        }
+    }
+
+    /// Grants the short visibility swap independently of checkpoint I/O.
+    pub(crate) fn try_grant_visibility(&mut self, ticket: u64) -> Option<VisibilityLease> {
+        if self.commit_gate != (CommitGateState::CommitGranted { ticket })
+            || self.visibility_gate != VisibilityGateState::Ready
+        {
+            return None;
+        }
+        self.visibility_gate = VisibilityGateState::Granted { ticket };
+        Some(VisibilityLease::granted(ticket))
+    }
+
+    /// Grants the detached checkpoint operation after durable visibility publication.
+    pub(crate) fn try_grant_checkpoint(
+        &mut self,
+        epoch: EpochSequence,
+    ) -> Option<ext4_core::CheckpointLease> {
+        if self.commit_gate != (CommitGateState::CheckpointPending { epoch }) {
+            return None;
+        }
+        self.commit_gate = CommitGateState::CheckpointGranted { epoch };
+        Some(ext4_core::CheckpointLease::granted(epoch))
     }
 
     /// Allocation-free durable epoch publication after a matching visibility grant.
@@ -566,11 +616,15 @@ impl VolumeRuntime {
         if self.commit_gate != (CommitGateState::CommitGranted { ticket }) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
+        if self.visibility_gate != (VisibilityGateState::Granted { ticket }) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
         let published: PublishedMutation = mutation.publish(self.coordinator_mut(), visibility);
         let (epoch, checkpoint) = published.into_parts();
         let sequence = epoch.sequence();
         durable_slot.publish(epoch);
         self.commit_gate = CommitGateState::CheckpointPending { epoch: sequence };
+        self.visibility_gate = VisibilityGateState::Ready;
         PendingCheckpoint {
             epoch: sequence,
             operation: checkpoint,
@@ -585,7 +639,7 @@ impl VolumeRuntime {
         publication: EpochPublicationSlot,
         epoch: EpochSequence,
     ) {
-        if self.commit_gate != (CommitGateState::CheckpointPending { epoch }) {
+        if self.commit_gate != (CommitGateState::CheckpointGranted { epoch }) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
         let checkpointed = durability.completed(self.coordinator_mut());
