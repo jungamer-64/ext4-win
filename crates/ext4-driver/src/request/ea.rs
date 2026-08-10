@@ -41,7 +41,7 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 /// # Errors
 ///
 /// Returns an error when query-EA stack decoding, EA selection, or output packing fails.
-pub(crate) async fn query(mut request_irp: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn query(mut request_irp: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let prepared = request_irp.prepared_query_ea()?;
     let stack = prepared.stack();
     let selection = requested_eas(prepared.selection())?;
@@ -61,16 +61,16 @@ pub(crate) async fn query(mut request_irp: PendingIrpLease<'_>) -> DriverResult<
         node,
         operations,
     };
-    query_ea(request).await
+    query_ea(request)
 }
 
 /// Executes IRP_MJ_SET_EA.
 /// # Errors
 ///
 /// Returns an error when set-EA stack decoding or ext4 EA mutation fails.
-pub(crate) async fn set(mut request_irp: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn set(mut request_irp: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let request = SetEaRequest::decode(&mut request_irp)?;
-    set_ea(request).await
+    set_ea(request)
 }
 
 /// Decoded query-EA request.
@@ -164,12 +164,12 @@ impl CreateEa {
     ///
     /// Returns an error when any EA name cannot be mapped to an ext4 xattr or the pending child
     /// rejects the xattr mutation.
-    pub(crate) async fn apply_to_pending_child(
+    pub(crate) fn apply_to_pending_child(
         &self,
         creation: &mut PendingChildCreation<'_>,
     ) -> DriverResult<()> {
         for entry in self.entries.iter() {
-            apply_ea_record_to_pending_child(creation, entry).await?;
+            apply_ea_record_to_pending_child(creation, entry)?;
         }
         Ok(())
     }
@@ -321,8 +321,8 @@ enum WindowsEaSelection {
 ///
 /// Returns an error when selected EAs cannot be loaded, no EAs match, the output buffer is too
 /// small, or packed EA records cannot be emitted.
-async fn query_ea(mut request: QueryEaRequest<'_>) -> DriverResult<IrpCompletion> {
-    let entries = load_windows_eas(request.operations.lane_mut(), request.node).await?;
+fn query_ea(mut request: QueryEaRequest<'_>) -> DriverResult<IrpCompletion> {
+    let entries = load_windows_eas(request.operations.lane_mut(), request.node)?;
     let entries = collect_query_entries(entries, request.selection)?;
     let entries = if matches!(request.entry_emission, EaEntryEmission::Single) {
         entries.as_slice().get(..entries.len().min(1))
@@ -350,13 +350,12 @@ async fn query_ea(mut request: QueryEaRequest<'_>) -> DriverResult<IrpCompletion
 /// # Errors
 ///
 /// Returns an error when the set-EA input list is malformed or the xattr update transaction fails.
-async fn set_ea(mut request: SetEaRequest) -> DriverResult<IrpCompletion> {
+fn set_ea(mut request: SetEaRequest) -> DriverResult<IrpCompletion> {
     apply_set_ea_entries(
         request.operations.lane_mut(),
         request.node,
         request.entries.as_slice(),
-    )
-    .await?;
+    )?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -390,11 +389,11 @@ fn collect_query_entries(
 ///
 /// Returns an error when node xattrs cannot be read or any stored ext4win EA name/value no longer
 /// fits the Windows EA record domain.
-async fn load_windows_eas(
+fn load_windows_eas(
     operations: &mut VolumeOperationLane,
     node: ext4_core::NodeId,
 ) -> DriverResult<DriverVec<WindowsEaRecord>> {
-    let xattrs = operations.journaled_mut().read_xattrs(node).await?;
+    let xattrs = operations.journaled_mut().read_xattrs(node)?;
     let mut entries = DriverVec::new();
     for (name, value) in xattrs.entries() {
         if name.namespace() != XattrNamespace::User {
@@ -418,7 +417,7 @@ async fn load_windows_eas(
 ///
 /// Returns an error when EA names cannot be mapped to xattrs or the journaled xattr set/remove
 /// operation fails.
-async fn apply_set_ea_entries(
+fn apply_set_ea_entries(
     operations: &mut VolumeOperationLane,
     node_id: ext4_core::NodeId,
     entries: &[WindowsEaRecord],
@@ -429,18 +428,16 @@ async fn apply_set_ea_entries(
     let mut transaction = operations
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let node = transaction.node(node_id).await?;
+    let node = transaction.node(node_id)?;
     for entry in entries {
         let name = xattr_name_from_ea_name(&entry.name)?;
         if entry.value.is_empty() {
-            transaction.remove_xattr(node, &name).await?;
+            transaction.remove_xattr(node, &name)?;
         } else {
-            transaction
-                .set_xattr(node, name, XattrValue::new(entry.value.as_bytes())?)
-                .await?;
+            transaction.set_xattr(node, name, XattrValue::new(entry.value.as_bytes())?)?;
         }
     }
-    transaction.commit().await?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -449,17 +446,15 @@ async fn apply_set_ea_entries(
 ///
 /// Returns an error when the EA name cannot be mapped to an xattr or the pending child rejects the
 /// xattr mutation.
-async fn apply_ea_record_to_pending_child(
+fn apply_ea_record_to_pending_child(
     creation: &mut PendingChildCreation<'_>,
     entry: &WindowsEaRecord,
 ) -> DriverResult<()> {
     let name = xattr_name_from_ea_name(&entry.name)?;
     if entry.value.is_empty() {
-        creation.remove_xattr(&name).await
+        creation.remove_xattr(&name)
     } else {
-        creation
-            .set_xattr(name, XattrValue::new(entry.value.as_bytes())?)
-            .await
+        creation.set_xattr(name, XattrValue::new(entry.value.as_bytes())?)
     }
 }
 

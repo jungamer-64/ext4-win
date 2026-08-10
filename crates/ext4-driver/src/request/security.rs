@@ -36,18 +36,18 @@ const POSIX_RWX_BITS: u16 = 0o777;
 /// # Errors
 ///
 /// Returns an error when security stack decoding or descriptor packing fails.
-pub(crate) async fn query(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn query(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let request = QuerySecurityRequest::decode(request)?;
-    query_security(request).await
+    query_security(request)
 }
 
 /// Executes IRP_MJ_SET_SECURITY.
 /// # Errors
 ///
 /// Returns an error when security stack decoding or descriptor mutation fails.
-pub(crate) async fn set(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn set(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let request = SetSecurityRequest::decode(request)?;
-    set_security(request).await
+    set_security(request)
 }
 
 /// Decoded query-security request.
@@ -352,8 +352,8 @@ impl DaclPermissionBuilder {
 ///
 /// Returns an error when ext4 security metadata cannot be loaded, the requested descriptor cannot
 /// be built, or the user output buffer is too small.
-async fn query_security(mut request: QuerySecurityRequest<'_>) -> DriverResult<IrpCompletion> {
-    let security = load_ext4_security(request.operations.lane_mut(), request.node).await?;
+fn query_security(mut request: QuerySecurityRequest<'_>) -> DriverResult<IrpCompletion> {
+    let security = load_ext4_security(request.operations.lane_mut(), request.node)?;
     let descriptor = security_descriptor(security, request.selection)?;
     let required = descriptor.len();
     request.output.copy_from_owned(descriptor.as_slice())?;
@@ -365,8 +365,8 @@ async fn query_security(mut request: QuerySecurityRequest<'_>) -> DriverResult<I
 ///
 /// Returns an error when the input descriptor cannot be copied or mapped to ext4 owner/permissions,
 /// or the journaled security update fails.
-async fn set_security(mut request: SetSecurityRequest<'_>) -> DriverResult<IrpCompletion> {
-    let current = load_ext4_security(request.operations.lane_mut(), request.node).await?;
+fn set_security(mut request: SetSecurityRequest<'_>) -> DriverResult<IrpCompletion> {
+    let current = load_ext4_security(request.operations.lane_mut(), request.node)?;
     let security = security_from_descriptor(request.descriptor, request.selection, current)?;
     if security == current {
         return Ok(IrpCompletion::EMPTY);
@@ -377,9 +377,9 @@ async fn set_security(mut request: SetSecurityRequest<'_>) -> DriverResult<IrpCo
         .lane_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let node = transaction.node(request.node).await?;
-    transaction.set_posix_security(node, security).await?;
-    transaction.commit().await?;
+    let node = transaction.node(request.node)?;
+    transaction.set_posix_security(node, security)?;
+    transaction.commit()?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -387,33 +387,30 @@ async fn set_security(mut request: SetSecurityRequest<'_>) -> DriverResult<IrpCo
 /// # Errors
 ///
 /// Returns an error when the opened node cannot be loaded from ext4 metadata.
-async fn load_ext4_security(
+fn load_ext4_security(
     operations: &mut VolumeOperationLane,
     node: NodeId,
 ) -> DriverResult<Ext4Security> {
-    security_from_node(operations, node).await
+    security_from_node(operations, node)
 }
 
 /// Extracts security metadata after validating FCB kind against core metadata.
 /// # Errors
 ///
 /// Returns an error when `identity` cannot be loaded as its typed ext4 node.
-async fn security_from_node(
+fn security_from_node(
     operations: &mut VolumeOperationLane,
     identity: NodeId,
 ) -> DriverResult<Ext4Security> {
     match identity {
-        NodeId::File(file) => Ok(operations.journaled_mut().load_file(file).await?.security()),
+        NodeId::File(file) => Ok(operations.journaled_mut().load_file(file)?.security()),
         NodeId::Directory(directory) => Ok(operations
             .journaled_mut()
-            .load_directory(directory)
-            .await?
+            .load_directory(directory)?
             .security()),
-        NodeId::Symlink(symlink) => Ok(operations
-            .journaled_mut()
-            .load_symlink(symlink)
-            .await?
-            .security()),
+        NodeId::Symlink(symlink) => {
+            Ok(operations.journaled_mut().load_symlink(symlink)?.security())
+        }
     }
 }
 

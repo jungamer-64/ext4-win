@@ -118,10 +118,10 @@ impl WriteSnapshotWindows {
 ///
 /// Returns an error when the IRP stack has no opened FILE_OBJECT, cleanup state is invalid, or a
 /// pending namespace deletion cannot be committed.
-pub(crate) async fn cleanup(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn cleanup(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let plan = request.with_active(begin_cleanup_file_object)?;
     if let CleanupPlan::Delete(plan) = plan {
-        delete_after_final_cleanup(plan).await?;
+        delete_after_final_cleanup(plan)?;
     }
     Ok(IrpCompletion::EMPTY)
 }
@@ -142,16 +142,16 @@ pub(crate) fn close(target: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion> {
 /// # Errors
 ///
 /// Returns an error when read stack decoding, output buffer mapping, or ext4 file reading fails.
-pub(crate) async fn read(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    read_regular_file_direct(request).await
+pub(crate) fn read(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    read_regular_file_direct(request)
 }
 
 /// Executes regular file data writes.
 /// # Errors
 ///
 /// Returns an error when write stack decoding, input buffer mapping, or ext4 file mutation fails.
-pub(crate) async fn write(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    write_regular_file_windowed(request).await
+pub(crate) fn write(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    write_regular_file_windowed(request)
 }
 
 /// Flushes cached or ordered file data.
@@ -159,11 +159,11 @@ pub(crate) async fn write(request: PendingIrpLease<'_>) -> DriverResult<IrpCompl
 ///
 /// Returns an error when the flush target cannot be resolved to a mounted ext4 volume or the
 /// lower storage flush fails.
-pub(crate) async fn flush(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn flush(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let volume =
         request.with_active(|active| FlushVolume::decode(active).map(FlushVolume::volume))?;
     let mut operations = claim_volume_operation_lane(volume);
-    operations.lane_mut().flush().await?;
+    operations.lane_mut().flush()?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -172,12 +172,12 @@ pub(crate) async fn flush(mut request: PendingIrpLease<'_>) -> DriverResult<IrpC
 ///
 /// Returns an error when shutdown was not addressed to a mounted ext4 volume or the lower storage
 /// flush fails.
-pub(crate) async fn shutdown(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn shutdown(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let volume = request.with_active(|active| {
         FlushVolume::from_mounted_device(active.device()).map(FlushVolume::volume)
     })?;
     let mut operations = claim_volume_operation_lane(volume);
-    operations.lane_mut().flush().await?;
+    operations.lane_mut().flush()?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -185,16 +185,16 @@ pub(crate) async fn shutdown(mut request: PendingIrpLease<'_>) -> DriverResult<I
 /// # Errors
 ///
 /// Returns an error when query stack decoding or information packing fails.
-pub(crate) async fn query(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    query_file_information(request).await
+pub(crate) fn query(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    query_file_information(request)
 }
 
 /// Executes file information mutations.
 /// # Errors
 ///
 /// Returns an error when set stack decoding or the requested file mutation fails.
-pub(crate) async fn set(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    set_file_information(request).await
+pub(crate) fn set(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    set_file_information(request)
 }
 
 /// Transfers one queued directory-change IRP to the VCB's FsRtl notification list.
@@ -360,7 +360,7 @@ enum QueryFilePlan {
 ///
 /// Returns an error when metadata cannot be loaded, the output buffer is too small, or the requested
 /// information class cannot be packed into its Windows layout.
-async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let plan = request.with_active(|active| {
         let current = active.current_stack()?;
         let file_object = current.file_object()?;
@@ -438,12 +438,12 @@ async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResul
             target,
             operations,
         } => {
-            return query_hard_link_information(request, length, target, operations).await;
+            return query_hard_link_information(request, length, target, operations);
         }
     };
     let metadata = {
         let mut operations = operations;
-        metadata_from_node(operations.lane_mut(), node).await?
+        metadata_from_node(operations.lane_mut(), node)?
     };
     request.with_active(|active| {
         let mut buffer = active.buffered_output(length)?;
@@ -479,7 +479,7 @@ async fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResul
 ///
 /// Returns an error when namespace traversal, name projection, allocation, packing, or caller
 /// output capture fails.
-async fn query_hard_link_information(
+fn query_hard_link_information(
     mut request: PendingIrpLease<'_>,
     length: IrpBufferLength,
     target: HardLinkNodeId,
@@ -488,8 +488,7 @@ async fn query_hard_link_information(
     let links = operations
         .lane_mut()
         .journaled_mut()
-        .read_hard_links(target)
-        .await?;
+        .read_hard_links(target)?;
     let links = WindowsHardLinks::try_from_ext4(&links)?;
     let mut packed = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
     let result = pack_hard_link_information(packed.as_mut_slice(), &links)?;
@@ -802,7 +801,7 @@ enum SetFilePlan {
 ///
 /// Returns an error when the selected set-information class has invalid input or its ext4 metadata
 /// mutation cannot be committed.
-async fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let plan = request.with_active(|active| {
         let current = active.current_stack()?;
         let file_object = current.file_object()?;
@@ -899,20 +898,20 @@ async fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<
             info,
             node,
             mut operations,
-        } => set_basic_information(info, node, operations.lane_mut()).await?,
+        } => set_basic_information(info, node, operations.lane_mut())?,
         SetFilePlan::EndOfFile {
             file,
             size,
             mut operations,
-        } => set_regular_file_size(operations.lane_mut(), file, size).await?,
+        } => set_regular_file_size(operations.lane_mut(), file, size)?,
         SetFilePlan::Allocation {
             file,
             size,
             mut operations,
         } => {
-            let current = regular_file_size(operations.lane_mut(), file).await?;
+            let current = regular_file_size(operations.lane_mut(), file)?;
             if size < current {
-                set_regular_file_size(operations.lane_mut(), file, size).await?;
+                set_regular_file_size(operations.lane_mut(), file, size)?;
             }
         }
         SetFilePlan::Disposition {
@@ -922,8 +921,7 @@ async fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<
             readonly,
             mut operations,
         } => {
-            validate_pending_deletion(operations.lane_mut(), node, pending.target_ref(), readonly)
-                .await?;
+            validate_pending_deletion(operations.lane_mut(), node, pending.target_ref(), readonly)?;
             match publication {
                 DeletePendingPublication::Publish { fcb } => {
                     operations.set_file_delete_pending(fcb, pending);
@@ -934,11 +932,11 @@ async fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<
         SetFilePlan::Link {
             mutation,
             mut operations,
-        } => set_hard_link_information(mutation, &mut operations).await?,
+        } => set_hard_link_information(mutation, &mut operations)?,
         SetFilePlan::Rename {
             mutation,
             operations,
-        } => return rename_file_information(&mut request, mutation, operations).await,
+        } => return rename_file_information(&mut request, mutation, operations),
     }
     Ok(IrpCompletion::EMPTY)
 }
@@ -967,12 +965,12 @@ fn set_position_information(
 ///
 /// Returns an error when the input structure is truncated, timestamps or attributes are invalid, or
 /// the resulting ext4 metadata transaction fails.
-async fn set_basic_information(
+fn set_basic_information(
     info: wdk_sys::FILE_BASIC_INFORMATION,
     node_id: NodeId,
     operations: &mut VolumeOperationLane,
 ) -> DriverResult<()> {
-    let metadata = metadata_from_node(operations, node_id).await?;
+    let metadata = metadata_from_node(operations, node_id)?;
     let times = set_basic_times(metadata.times, info)?;
     let attributes = set_basic_attributes(metadata, info.FileAttributes)?;
     if times == metadata.times && attributes.is_empty() {
@@ -982,17 +980,17 @@ async fn set_basic_information(
     let mut transaction = operations
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let node = transaction.node(node_id).await?;
+    let node = transaction.node(node_id)?;
     if times != metadata.times {
-        transaction.set_times(node, times).await?;
+        transaction.set_times(node, times)?;
     }
     if let Some(security) = attributes.security() {
-        transaction.set_posix_security(node, security).await?;
+        transaction.set_posix_security(node, security)?;
     }
     if let Some(overlay) = attributes.overlay() {
-        transaction.set_windows_overlay(node, overlay).await?;
+        transaction.set_windows_overlay(node, overlay)?;
     }
-    transaction.commit().await?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1235,35 +1233,25 @@ fn decode_extended_disposition(flags: wdk_sys::ULONG) -> DriverResult<FileDispos
 ///
 /// Returns cannot-delete when the link no longer identifies the opened inode or has the read-only
 /// attribute, directory-not-empty for a non-empty directory, or the underlying read error.
-pub(crate) async fn validate_pending_deletion(
+pub(crate) fn validate_pending_deletion(
     operations: &mut VolumeOperationLane,
     node: NodeId,
     target: &FileDeleteTarget,
     readonly: DeleteReadonlyPolicy,
 ) -> DriverResult<()> {
-    let parent = operations
-        .journaled_mut()
-        .load_directory(target.parent())
-        .await?;
+    let parent = operations.journaled_mut().load_directory(target.parent())?;
     match operations
         .journaled_mut()
-        .lookup_child(&parent, target.name())
-        .await?
+        .lookup_child(&parent, target.name())?
     {
         ChildLookup::Found(child) if *child.node() == node => {}
         ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
     }
-    let metadata = metadata_from_node(operations, node).await?;
+    let metadata = metadata_from_node(operations, node)?;
     readonly.validate_attributes(file_attributes(metadata))?;
     if let NodeId::Directory(directory_id) = node {
-        let directory = operations
-            .journaled_mut()
-            .load_directory(directory_id)
-            .await?;
-        let entries = operations
-            .journaled_mut()
-            .read_directory(&directory)
-            .await?;
+        let directory = operations.journaled_mut().load_directory(directory_id)?;
+        let entries = operations.journaled_mut().read_directory(&directory)?;
         if entries
             .iter()
             .any(|entry| !matches!(entry.name().bytes(), b"." | b".."))
@@ -1378,7 +1366,7 @@ impl HardLinkDirectoryChanges {
 ///
 /// Returns an error when target resolution, replacement policy, link limits, metadata staging, or
 /// the journal transaction fails.
-async fn set_hard_link_information(
+fn set_hard_link_information(
     mutation: HardLinkMutation,
     operations: &mut VolumeOperationLease,
 ) -> DriverResult<()> {
@@ -1388,10 +1376,9 @@ async fn set_hard_link_information(
         target_collision,
     } = mutation;
     let source_node = NodeId::from(source);
-    let (target_parent, target_name) =
-        resolve_namespace_target(operations.lane_mut(), &target).await?;
+    let (target_parent, target_name) = resolve_namespace_target(operations.lane_mut(), &target)?;
     operations.ensure_node_openable(NodeId::Directory(target_parent))?;
-    let source_metadata = metadata_from_node(operations.lane_mut(), source_node).await?;
+    let source_metadata = metadata_from_node(operations.lane_mut(), source_node)?;
     let (destination, count_effect, changes) = prepare_hard_link_destination(
         operations,
         source_node,
@@ -1399,8 +1386,7 @@ async fn set_hard_link_information(
         &target_name,
         target.target_name(),
         target_collision,
-    )
-    .await?;
+    )?;
     count_effect.validate(source_metadata.links_count)?;
     let archive_overlay = hard_link_archive_overlay(source_metadata.overlay_attributes)?;
 
@@ -1408,35 +1394,31 @@ async fn set_hard_link_information(
         .lane_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let source = transaction.hard_link_source(source).await?;
-    let target_parent = transaction.directory(target_parent).await?;
+    let source = transaction.hard_link_source(source)?;
+    let target_parent = transaction.directory(target_parent)?;
     if let Some(overlay) = archive_overlay {
-        let node = transaction.node(source_node).await?;
-        transaction.set_windows_overlay(node, overlay).await?;
+        let node = transaction.node(source_node)?;
+        transaction.set_windows_overlay(node, overlay)?;
     }
     match &destination {
         PreparedHardLinkDestination::Vacant => {
-            transaction
-                .create_hard_link(
-                    source,
-                    target_parent,
-                    &target_name,
-                    HardLinkDestination::Vacant,
-                )
-                .await?;
+            transaction.create_hard_link(
+                source,
+                target_parent,
+                &target_name,
+                HardLinkDestination::Vacant,
+            )?;
         }
         PreparedHardLinkDestination::Replace { existing_name } => {
-            transaction
-                .create_hard_link(
-                    source,
-                    target_parent,
-                    &target_name,
-                    HardLinkDestination::Replace { existing_name },
-                )
-                .await?;
+            transaction.create_hard_link(
+                source,
+                target_parent,
+                &target_name,
+                HardLinkDestination::Replace { existing_name },
+            )?;
         }
     }
-    transaction.commit().await?;
+    transaction.commit()?;
     changes.report(operations);
     Ok(())
 }
@@ -1446,7 +1428,7 @@ async fn set_hard_link_information(
 ///
 /// Returns an error when a rejected collision exists, the target is a directory, read-only,
 /// delete-pending, or still has an active handle.
-async fn prepare_hard_link_destination(
+fn prepare_hard_link_destination(
     operations: &mut VolumeOperationLease,
     source_node: NodeId,
     target_parent: DirectoryNodeId,
@@ -1461,13 +1443,11 @@ async fn prepare_hard_link_destination(
     let parent = operations
         .lane_mut()
         .journaled_mut()
-        .load_directory(target_parent)
-        .await?;
+        .load_directory(target_parent)?;
     let target = operations
         .lane_mut()
         .journaled_mut()
-        .lookup_windows_child(&parent, target_windows_name)
-        .await?;
+        .lookup_windows_child(&parent, target_windows_name)?;
     let ChildLookup::Found(target) = target else {
         return Ok((
             PreparedHardLinkDestination::Vacant,
@@ -1494,7 +1474,7 @@ async fn prepare_hard_link_destination(
     if target_node != source_node {
         operations.ensure_node_replaceable(target_node)?;
     }
-    let target_metadata = metadata_from_node(operations.lane_mut(), target_node).await?;
+    let target_metadata = metadata_from_node(operations.lane_mut(), target_node)?;
     if file_attributes(target_metadata) & wdk_sys::FILE_ATTRIBUTE_READONLY != 0 {
         return Err(DriverError::CannotDelete);
     }
@@ -1618,14 +1598,14 @@ enum CommittedRename {
 ///
 /// Returns an error when the namespace transaction fails or post-commit handle decoding detects
 /// an invalid pending-IRP state.
-async fn rename_file_information(
+fn rename_file_information(
     request: &mut PendingIrpLease<'_>,
     mutation: RenameMutation,
     operations: VolumeOperationLease,
 ) -> DriverResult<IrpCompletion> {
     let committed = {
         let mut operations = operations;
-        set_rename_information(mutation, &mut operations).await?
+        set_rename_information(mutation, &mut operations)?
     };
     if let CommittedRename::Changed {
         location,
@@ -1656,7 +1636,7 @@ async fn rename_file_information(
 ///
 /// Returns an error when target resolution, notification preparation, or the rename transaction
 /// fails.
-async fn set_rename_information(
+fn set_rename_information(
     mutation: RenameMutation,
     operations: &mut VolumeOperationLease,
 ) -> DriverResult<CommittedRename> {
@@ -1667,8 +1647,7 @@ async fn set_rename_information(
         target,
         target_collision,
     } = mutation;
-    let (target_parent, target_name) =
-        resolve_namespace_target(operations.lane_mut(), &target).await?;
+    let (target_parent, target_name) = resolve_namespace_target(operations.lane_mut(), &target)?;
     operations.ensure_node_openable(NodeId::Directory(source_parent))?;
     operations.ensure_node_openable(NodeId::Directory(target_parent))?;
     let notifications = RenameDirectoryNameChanges::prepare(
@@ -1679,8 +1658,7 @@ async fn set_rename_information(
         target_parent,
         &target_name,
         target_collision,
-    )
-    .await?;
+    )?;
     let notifications = notifications
         .map(Box::try_new)
         .transpose()
@@ -1689,18 +1667,16 @@ async fn set_rename_information(
         .lane_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let source_parent = transaction.directory(source_parent).await?;
-    let target_parent = transaction.directory(target_parent).await?;
-    transaction
-        .rename_child(
-            source_parent,
-            &source_name,
-            target_parent,
-            &target_name,
-            target_collision,
-        )
-        .await?;
-    transaction.commit().await?;
+    let source_parent = transaction.directory(source_parent)?;
+    let target_parent = transaction.directory(target_parent)?;
+    transaction.rename_child(
+        source_parent,
+        &source_name,
+        target_parent,
+        &target_name,
+        target_collision,
+    )?;
+    transaction.commit()?;
     match notifications {
         Some(notifications) => Ok(CommittedRename::Changed {
             location: OpenedLocation::DirectoryEntry {
@@ -1730,7 +1706,7 @@ impl RenameDirectoryNameChanges {
     ///
     /// Returns an error when a replace-capable target cannot be read or a visible child name
     /// cannot be represented in the Windows notification namespace.
-    async fn prepare(
+    fn prepare(
         operations: &mut VolumeOperationLease,
         source_parent: DirectoryNodeId,
         source_name: &Ext4Name,
@@ -1749,13 +1725,11 @@ impl RenameDirectoryNameChanges {
                 let parent = operations
                     .lane_mut()
                     .journaled_mut()
-                    .load_directory(target_parent)
-                    .await?;
+                    .load_directory(target_parent)?;
                 match operations
                     .lane_mut()
                     .journaled_mut()
-                    .lookup_windows_child(&parent, &WindowsName::from_ext4(target_name)?)
-                    .await?
+                    .lookup_windows_child(&parent, &WindowsName::from_ext4(target_name)?)?
                 {
                     ChildLookup::Found(child) if *child.node() == source_node => return Ok(None),
                     ChildLookup::Found(child) => {
@@ -1804,12 +1778,12 @@ impl RenameDirectoryNameChanges {
 ///
 /// Returns an error when the current file size cannot be loaded or the ext4 resize transaction
 /// fails.
-async fn set_regular_file_size(
+fn set_regular_file_size(
     operations: &mut VolumeOperationLane,
     file_id: FileNodeId,
     new_size: FileSize,
 ) -> DriverResult<()> {
-    let current = regular_file_size(operations, file_id).await?;
+    let current = regular_file_size(operations, file_id)?;
     if new_size == current {
         return Ok(());
     }
@@ -1817,13 +1791,13 @@ async fn set_regular_file_size(
     let mut transaction = operations
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let file = transaction.file(file_id).await?;
+    let file = transaction.file(file_id)?;
     if new_size > current {
-        transaction.extend_file(file, new_size).await?;
+        transaction.extend_file(file, new_size)?;
     } else {
-        transaction.truncate_file(file, new_size).await?;
+        transaction.truncate_file(file, new_size)?;
     }
-    transaction.commit().await?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1832,9 +1806,7 @@ async fn set_regular_file_size(
 ///
 /// Returns an error when the directory query stack, pattern, output buffer, opened directory, or
 /// emitted directory record layout is invalid.
-pub(crate) async fn query_directory(
-    mut request: PendingIrpLease<'_>,
-) -> DriverResult<IrpCompletion> {
+pub(crate) fn query_directory(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let (prepared_stack, pattern) = {
         let prepared = request.prepared_query_directory()?;
         (
@@ -1869,13 +1841,11 @@ pub(crate) async fn query_directory(
         let directory = operations
             .lane_mut()
             .journaled_mut()
-            .load_directory(directory_id)
-            .await?;
+            .load_directory(directory_id)?;
         let entries = operations
             .lane_mut()
             .journaled_mut()
-            .read_directory(&directory)
-            .await?;
+            .read_directory(&directory)?;
         let mut packed = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
         let result = emit_directory_entries(
             operations.lane_mut(),
@@ -1885,8 +1855,7 @@ pub(crate) async fn query_directory(
             &pattern,
             &entries,
             packed.as_mut_slice(),
-        )
-        .await;
+        );
         (cursor, packed, result)
     };
 
@@ -2210,7 +2179,7 @@ fn initialize_directory_cursor(cursor: &mut DirectoryCursor, position: Directory
 ///
 /// Returns an error when cursor arithmetic overflows, a matching entry cannot fit in an empty
 /// output buffer, metadata loading fails, or a directory record cannot be packed.
-async fn emit_directory_entries(
+fn emit_directory_entries(
     operations: &mut VolumeOperationLane,
     cursor: &mut DirectoryCursor,
     entry_emission: DirectoryEntryEmission,
@@ -2240,7 +2209,7 @@ async fn emit_directory_entries(
             continue;
         }
 
-        let metadata = metadata_from_node(operations, *entry.node()).await?;
+        let metadata = metadata_from_node(operations, *entry.node())?;
         let layout = DirectoryRecordLayout::new(class, &name)?;
         let required = written
             .checked_add(layout.unpadded_size)
@@ -2568,7 +2537,7 @@ fn cleanup_opened_node(
 ///
 /// Returns an error when the target name no longer identifies the FCB inode, the directory is no
 /// longer empty, or the ext4 transaction cannot be committed.
-async fn delete_after_final_cleanup(mut plan: PendingCleanupDeletion) -> DriverResult<()> {
+fn delete_after_final_cleanup(mut plan: PendingCleanupDeletion) -> DriverResult<()> {
     let target = unsafe {
         // SAFETY: The cleanup FILE_OBJECT retains `fcb` until its later Close IRP. The FCB owns this
         // stable allocation in Pending state, and the device actor cannot mutate that state until
@@ -2579,14 +2548,12 @@ async fn delete_after_final_cleanup(mut plan: PendingCleanupDeletion) -> DriverR
         .operations
         .lane_mut()
         .journaled_mut()
-        .load_directory(target.parent())
-        .await?;
+        .load_directory(target.parent())?;
     match plan
         .operations
         .lane_mut()
         .journaled_mut()
-        .lookup_child(&parent, target.name())
-        .await?
+        .lookup_child(&parent, target.name())?
     {
         ChildLookup::Found(child) if *child.node() == plan.node => {}
         ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
@@ -2602,17 +2569,15 @@ async fn delete_after_final_cleanup(mut plan: PendingCleanupDeletion) -> DriverR
         .lane_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let parent = transaction.directory(target.parent()).await?;
+    let parent = transaction.directory(target.parent())?;
     match plan.node {
-        NodeId::File(_) => transaction.unlink_file(parent, target.name()).await?,
+        NodeId::File(_) => transaction.unlink_file(parent, target.name())?,
         NodeId::Directory(_) => {
-            transaction
-                .remove_empty_directory(parent, target.name())
-                .await?;
+            transaction.remove_empty_directory(parent, target.name())?;
         }
-        NodeId::Symlink(_) => transaction.remove_symlink(parent, target.name()).await?,
+        NodeId::Symlink(_) => transaction.remove_symlink(parent, target.name())?,
     }
-    transaction.commit().await?;
+    transaction.commit()?;
     plan.operations.complete_file_delete(plan.fcb, plan.target);
     plan.operations.report_directory_change(notification);
     Ok(())
@@ -2937,7 +2902,7 @@ fn utf16_units_from_le_bytes(bytes: &[u8]) -> DriverResult<DriverVec<u16>> {
 ///
 /// Returns an error when any parent component is absent or not a directory, or the target Windows
 /// name cannot be converted to an ext4 name.
-async fn resolve_namespace_target(
+fn resolve_namespace_target(
     operations: &mut VolumeOperationLane,
     target: &NamespaceTargetPath,
 ) -> DriverResult<(DirectoryNodeId, Ext4Name)> {
@@ -2949,12 +2914,10 @@ async fn resolve_namespace_target(
         let parent = operations
             .journaled_mut()
             .load_directory(parent_id)
-            .await
             .map_err(|_| DriverError::ObjectPathNotFound)?;
         let child = operations
             .journaled_mut()
-            .lookup_windows_child(&parent, component)
-            .await?;
+            .lookup_windows_child(&parent, component)?;
         match child {
             ChildLookup::Found(child) => {
                 let NodeId::Directory(directory_id) = *child.node() else {
@@ -2962,8 +2925,7 @@ async fn resolve_namespace_target(
                 };
                 if operations
                     .journaled_mut()
-                    .read_windows_symlink_reparse_point(NodeId::Directory(directory_id))
-                    .await?
+                    .read_windows_symlink_reparse_point(NodeId::Directory(directory_id))?
                     .is_some()
                 {
                     return Err(DriverError::NotSupported);
@@ -3182,11 +3144,11 @@ fn file_offset_from_large_integer(value: LARGE_INTEGER) -> DriverResult<FileOffs
 /// # Errors
 ///
 /// Returns an error when `file_id` cannot be loaded as a regular file.
-async fn regular_file_size(
+fn regular_file_size(
     operations: &mut VolumeOperationLane,
     file_id: FileNodeId,
 ) -> DriverResult<FileSize> {
-    Ok(operations.journaled_mut().load_file(file_id).await?.size())
+    Ok(operations.journaled_mut().load_file(file_id)?.size())
 }
 
 /// Returns the signed payload of a LARGE_INTEGER.
@@ -3286,14 +3248,13 @@ enum FileMetadataReparsePoint {
 ///
 /// Returns an error when `node_id` cannot be loaded as its typed ext4 node or its Windows overlay
 /// xattr is malformed.
-async fn metadata_from_node(
+fn metadata_from_node(
     operations: &mut VolumeOperationLane,
     node_id: NodeId,
 ) -> DriverResult<FileMetadata> {
     let overlay_attributes = operations
         .journaled_mut()
-        .read_windows_overlay(node_id)
-        .await?
+        .read_windows_overlay(node_id)?
         .map(|overlay| overlay.attributes().bits())
         .unwrap_or(0);
     let reparse_point = match node_id {
@@ -3301,8 +3262,7 @@ async fn metadata_from_node(
         NodeId::File(_) | NodeId::Directory(_) => {
             if operations
                 .journaled_mut()
-                .read_windows_symlink_reparse_point(node_id)
-                .await?
+                .read_windows_symlink_reparse_point(node_id)?
                 .is_some()
             {
                 FileMetadataReparsePoint::SymbolicLink
@@ -3315,7 +3275,7 @@ async fn metadata_from_node(
     let file_index = node_id.file_index();
     match node_id {
         NodeId::File(file_id) => {
-            let file = operations.journaled_mut().load_file(file_id).await?;
+            let file = operations.journaled_mut().load_file(file_id)?;
             Ok(FileMetadata {
                 file_index,
                 kind: FileMetadataKind::File,
@@ -3329,10 +3289,7 @@ async fn metadata_from_node(
             })
         }
         NodeId::Directory(directory_id) => {
-            let directory = operations
-                .journaled_mut()
-                .load_directory(directory_id)
-                .await?;
+            let directory = operations.journaled_mut().load_directory(directory_id)?;
             Ok(FileMetadata {
                 file_index,
                 kind: FileMetadataKind::Directory,
@@ -3346,7 +3303,7 @@ async fn metadata_from_node(
             })
         }
         NodeId::Symlink(symlink_id) => {
-            let symlink = operations.journaled_mut().load_symlink(symlink_id).await?;
+            let symlink = operations.journaled_mut().load_symlink(symlink_id)?;
             Ok(FileMetadata {
                 file_index,
                 kind: FileMetadataKind::Symlink,
@@ -3773,14 +3730,14 @@ fn select_write_start(
 ///
 /// Returns an error when the latest committed end of file is outside the signed Windows offset
 /// domain.
-async fn resolve_write_start(
+fn resolve_write_start(
     operations: &mut VolumeOperationLane,
     file_id: FileNodeId,
     anchor: WriteRangeAnchor,
 ) -> DriverResult<FileOffset> {
     match anchor {
         WriteRangeAnchor::Fixed(offset) => Ok(offset),
-        WriteRangeAnchor::LatestEndOfFile => regular_file_end(operations, file_id).await,
+        WriteRangeAnchor::LatestEndOfFile => regular_file_end(operations, file_id),
     }
 }
 
@@ -3788,11 +3745,11 @@ async fn resolve_write_start(
 /// # Errors
 ///
 /// Returns an error when the file cannot be loaded or EOF exceeds `i64::MAX`.
-async fn regular_file_end(
+fn regular_file_end(
     operations: &mut VolumeOperationLane,
     file_id: FileNodeId,
 ) -> DriverResult<FileOffset> {
-    let end = FileOffset::from_bytes(regular_file_size(operations, file_id).await?.bytes());
+    let end = FileOffset::from_bytes(regular_file_size(operations, file_id)?.bytes());
     let _signed_end = i64::try_from(end.bytes()).map_err(|_| DriverError::InvalidParameter)?;
     Ok(end)
 }
@@ -3802,7 +3759,7 @@ async fn regular_file_end(
 ///
 /// Returns an error when the captured read contract, opened FILE_OBJECT, transfer alignment,
 /// byte-range lock, or ext4 data stream is invalid.
-async fn read_regular_file_direct(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+fn read_regular_file_direct(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let stack = request.prepared_read()?.stack();
     let output_address = request.prepared_read()?.output_address();
     let Some((file_id, kind, range, data_transfer_mode, mut operations)) =
@@ -3845,11 +3802,7 @@ async fn read_regular_file_direct(mut request: PendingIrpLease<'_>) -> DriverRes
         return Ok(IrpCompletion::EMPTY);
     };
 
-    let file = operations
-        .lane_mut()
-        .journaled_mut()
-        .load_file(file_id)
-        .await?;
+    let file = operations.lane_mut().journaled_mut().load_file(file_id)?;
     let bytes_read = {
         let output = request.prepared_read_mut()?.output_mut();
         data_transfer_mode.validate_buffer(
@@ -3858,8 +3811,7 @@ async fn read_regular_file_direct(mut request: PendingIrpLease<'_>) -> DriverRes
         operations
             .lane_mut()
             .journaled_mut()
-            .read_file(&file, range.start(), output)
-            .await?
+            .read_file(&file, range.start(), output)?
             .as_usize()
     };
     request.with_active(|active| {
@@ -3875,9 +3827,7 @@ async fn read_regular_file_direct(mut request: PendingIrpLease<'_>) -> DriverRes
 ///
 /// Returns an error when the captured write contract, opened FILE_OBJECT, transfer alignment,
 /// byte-range lock, or ext4 journal transaction is invalid.
-async fn write_regular_file_windowed(
-    mut request: PendingIrpLease<'_>,
-) -> DriverResult<IrpCompletion> {
+fn write_regular_file_windowed(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let stack = request.prepared_write()?.stack();
     let input_address = request.prepared_write()?.input_address();
     let (file_id, kind, anchor, write_commitment, data_transfer_mode, mut operations) = request
@@ -3901,7 +3851,7 @@ async fn write_regular_file_windowed(
         })?;
 
     let range = ResolvedFileRange::new(
-        resolve_write_start(operations.lane_mut(), file_id, anchor).await?,
+        resolve_write_start(operations.lane_mut(), file_id, anchor)?,
         stack.length().as_usize(),
     )?;
     request.with_active(|active| {
@@ -3944,7 +3894,7 @@ async fn write_regular_file_windowed(
             .lane_mut()
             .journaled_mut()
             .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-        let file = transaction.file(file_id).await?;
+        let file = transaction.file(file_id)?;
         while let Some(window) = windows.next_window()? {
             let chunk = snapshot
                 .as_mut_slice()
@@ -3954,13 +3904,11 @@ async fn write_regular_file_windowed(
                 .prepared_write()?
                 .copy_window(window.input_offset(), chunk)?;
             let chunk_offset = range.start().checked_add_len(window.input_offset())?;
-            transaction
-                .write_file_range(file, chunk_offset, chunk)
-                .await?;
+            transaction.write_file_range(file, chunk_offset, chunk)?;
         }
-        transaction.commit().await?;
+        transaction.commit()?;
         if matches!(write_commitment, WriteCommitment::FlushThrough) {
-            operations.lane_mut().flush().await?;
+            operations.lane_mut().flush()?;
         }
         windows.completed()
     };

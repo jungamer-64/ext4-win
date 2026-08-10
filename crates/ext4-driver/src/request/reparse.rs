@@ -36,7 +36,7 @@ impl NodeSymlinkReparsePoint {
     /// # Errors
     ///
     /// Returns an error when driver-owned Windows reparse metadata is malformed or cannot be read.
-    pub(crate) async fn load(
+    pub(crate) fn load(
         operations: &mut VolumeOperationLane,
         node: NodeId,
     ) -> DriverResult<Option<Self>> {
@@ -44,8 +44,7 @@ impl NodeSymlinkReparsePoint {
             NodeId::Symlink(symlink) => Ok(Some(Self::NativeSymlink(symlink))),
             NodeId::File(_) | NodeId::Directory(_) => Ok(operations
                 .journaled_mut()
-                .read_windows_symlink_reparse_point(node)
-                .await?
+                .read_windows_symlink_reparse_point(node)?
                 .map(Self::WindowsSymlink)),
         }
     }
@@ -56,7 +55,7 @@ impl NodeSymlinkReparsePoint {
     ///
     /// Returns an error when a native target cannot be read, the target is not UTF-8, allocation
     /// fails, or the resulting Windows reparse buffer would exceed 16 KiB.
-    pub(crate) async fn into_symlink_data(
+    pub(crate) fn into_symlink_data(
         self,
         operations: &mut VolumeOperationLane,
     ) -> DriverResult<SymlinkReparseData> {
@@ -65,7 +64,7 @@ impl NodeSymlinkReparsePoint {
                 SymlinkReparseData::from_windows_reparse_point(&reparse_point)
             }
             Self::NativeSymlink(symlink) => {
-                let target = read_core_symlink(operations, symlink).await?;
+                let target = read_core_symlink(operations, symlink)?;
                 SymlinkReparseData::from_native_ext4_target(target.as_slice())
             }
         }
@@ -139,9 +138,7 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 ///
 /// Returns an error when the opened object is not a reparse point, its target cannot be read, or
 /// the output buffer cannot hold the reparse data.
-pub(crate) async fn get_reparse_point(
-    mut request: PendingIrpLease<'_>,
-) -> DriverResult<IrpCompletion> {
+pub(crate) fn get_reparse_point(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let (length, node, operations) = {
         request.with_active(|active| {
             let current = active.current_stack()?;
@@ -159,7 +156,7 @@ pub(crate) async fn get_reparse_point(
     };
     let data = {
         let mut operations = operations;
-        load_node_reparse_data(operations.lane_mut(), node).await?
+        load_node_reparse_data(operations.lane_mut(), node)?
     };
     let written = request.with_active(|active| {
         let mut output = active.buffered_output(length)?;
@@ -173,9 +170,7 @@ pub(crate) async fn get_reparse_point(
 ///
 /// Returns an error when the input is malformed, the opened node is a native symbolic link, or
 /// the reparse xattr cannot be committed.
-pub(crate) async fn set_reparse_point(
-    mut request: PendingIrpLease<'_>,
-) -> DriverResult<IrpCompletion> {
+pub(crate) fn set_reparse_point(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let (reparse_point, node, mut operations) = {
         request.with_active(|active| {
             let current = active.current_stack()?;
@@ -194,7 +189,7 @@ pub(crate) async fn set_reparse_point(
             Ok::<_, DriverError>((reparse_point, node, operations))
         })?
     };
-    set_node_reparse_point(operations.lane_mut(), node, reparse_point).await?;
+    set_node_reparse_point(operations.lane_mut(), node, reparse_point)?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -203,7 +198,7 @@ pub(crate) async fn set_reparse_point(
 ///
 /// Returns an error when the input is malformed, the opened object is not a driver-owned reparse
 /// point, or the xattr mutation cannot be committed.
-pub(crate) async fn delete_reparse_point(
+pub(crate) fn delete_reparse_point(
     mut request: PendingIrpLease<'_>,
 ) -> DriverResult<IrpCompletion> {
     let (node, mut operations) = {
@@ -224,7 +219,7 @@ pub(crate) async fn delete_reparse_point(
             Ok::<_, DriverError>((node, operations))
         })?
     };
-    delete_node_reparse_point(operations.lane_mut(), node).await?;
+    delete_node_reparse_point(operations.lane_mut(), node)?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -233,14 +228,13 @@ pub(crate) async fn delete_reparse_point(
 ///
 /// Returns an error when the object has no reparse metadata, the target cannot be read, or the
 /// output cannot hold the symbolic-link reparse buffer.
-async fn load_node_reparse_data(
+fn load_node_reparse_data(
     operations: &mut VolumeOperationLane,
     node: NodeId,
 ) -> DriverResult<SymlinkReparseData> {
-    let reparse_point = NodeSymlinkReparsePoint::load(operations, node)
-        .await?
-        .ok_or(DriverError::NotAReparsePoint)?;
-    reparse_point.into_symlink_data(operations).await
+    let reparse_point =
+        NodeSymlinkReparsePoint::load(operations, node)?.ok_or(DriverError::NotAReparsePoint)?;
+    reparse_point.into_symlink_data(operations)
 }
 
 /// Validates that an opened object can carry driver-owned Windows reparse metadata.
@@ -261,7 +255,7 @@ fn validate_mutable_reparse_node(location: &OpenedLocation, node: NodeId) -> Dri
 /// # Errors
 ///
 /// Returns an error when the reparse xattr mutation cannot be committed.
-async fn set_node_reparse_point(
+fn set_node_reparse_point(
     operations: &mut VolumeOperationLane,
     node: NodeId,
     reparse_point: WindowsSymlinkReparsePoint,
@@ -269,11 +263,9 @@ async fn set_node_reparse_point(
     let mut transaction = operations
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let node = transaction.node(node).await?;
-    transaction
-        .set_windows_symlink_reparse_point(node, reparse_point)
-        .await?;
-    transaction.commit().await?;
+    let node = transaction.node(node)?;
+    transaction.set_windows_symlink_reparse_point(node, reparse_point)?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -282,22 +274,21 @@ async fn set_node_reparse_point(
 ///
 /// Returns an error when the node has no driver-owned reparse metadata or the xattr mutation
 /// cannot be committed.
-async fn delete_node_reparse_point(
+fn delete_node_reparse_point(
     operations: &mut VolumeOperationLane,
     node: NodeId,
 ) -> DriverResult<()> {
     let mut transaction = operations
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let node = transaction.node(node).await?;
+    let node = transaction.node(node)?;
     if transaction
-        .remove_windows_symlink_reparse_point(node)
-        .await?
+        .remove_windows_symlink_reparse_point(node)?
         .is_none()
     {
         return Err(DriverError::NotAReparsePoint);
     }
-    transaction.commit().await?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -305,12 +296,12 @@ async fn delete_node_reparse_point(
 /// # Errors
 ///
 /// Returns an error when `symlink_id` cannot be loaded or its target bytes cannot be read.
-async fn read_core_symlink(
+fn read_core_symlink(
     operations: &mut VolumeOperationLane,
     symlink_id: SymlinkNodeId,
 ) -> DriverResult<Vec<u8>> {
-    let symlink = operations.journaled_mut().load_symlink(symlink_id).await?;
-    Ok(operations.journaled_mut().read_symlink(&symlink).await?)
+    let symlink = operations.journaled_mut().load_symlink(symlink_id)?;
+    Ok(operations.journaled_mut().read_symlink(&symlink)?)
 }
 
 impl SymlinkReparseData {

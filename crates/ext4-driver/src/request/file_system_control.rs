@@ -27,15 +27,15 @@ use crate::{
 ///
 /// Returns an error when FSCTL stack decoding, mount, reparse, encryption-key, or verity handling
 /// rejects the request.
-pub(crate) async fn execute(
+pub(crate) fn execute(
     request: PendingIrpLease<'_>,
     minor: FileSystemControlMinorFunction,
 ) -> DriverResult<IrpCompletion> {
     match FileSystemControlRequest::decode(request, minor)? {
         FileSystemControlRequest::MountVolume(request) => {
-            mount_volume(request).await.map(|()| IrpCompletion::EMPTY)
+            mount_volume(request).map(|()| IrpCompletion::EMPTY)
         }
-        FileSystemControlRequest::UserFsControl(request) => user_fs_control(request).await,
+        FileSystemControlRequest::UserFsControl(request) => user_fs_control(request),
         FileSystemControlRequest::Unsupported => Err(DriverError::NotSupported),
     }
 }
@@ -168,17 +168,15 @@ impl<'a> MountVolumeRequest<'a> {
 ///
 /// Returns an error when the target device cannot be queried or mounted, the filesystem device has
 /// no driver object, or mounted-device/VPB initialization fails.
-async fn mount_volume(request: MountVolumeRequest<'_>) -> DriverResult<()> {
+fn mount_volume(request: MountVolumeRequest<'_>) -> DriverResult<()> {
     let completion_owner = request.file_system_device();
-    let length = query_device_length(completion_owner, request.target_device()).await?;
+    let length = query_device_length(completion_owner, request.target_device())?;
     let candidate = MountCandidate::new(request.target_device(), length);
     let vcb = match VolumeControlBlock::mount_journaled(
         completion_owner,
         candidate.target_device(),
         candidate.length(),
-    )
-    .await
-    {
+    ) {
         Ok(vcb) => vcb,
         Err(DriverError::Core(
             ext4_core::Error::InvalidMagic | ext4_core::Error::InvalidSuperblock,
@@ -242,7 +240,7 @@ async fn mount_volume(request: MountVolumeRequest<'_>) -> DriverResult<()> {
 ///
 /// Returns an error when the requested reparse, encryption-key, or verity operation rejects its
 /// buffers, file object, or mounted-volume state.
-async fn user_fs_control(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
+fn user_fs_control(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
     let control_code = request.fs_control_code();
     if !matches!(
         control_code,
@@ -254,13 +252,13 @@ async fn user_fs_control(mut request: UserFsControlRequest<'_>) -> DriverResult<
         authorize_fs_control_handle(&mut request.request)?;
     }
     match control_code {
-        FsControlCode::LockVolume => lock_volume(request).await,
+        FsControlCode::LockVolume => lock_volume(request),
         FsControlCode::UnlockVolume => unlock_volume(request),
-        FsControlCode::DismountVolume => dismount_volume(request).await,
+        FsControlCode::DismountVolume => dismount_volume(request),
         FsControlCode::IsVolumeMounted => is_volume_mounted(request),
-        FsControlCode::GetReparsePoint => reparse::get_reparse_point(request.request).await,
-        FsControlCode::SetReparsePoint => reparse::set_reparse_point(request.request).await,
-        FsControlCode::DeleteReparsePoint => reparse::delete_reparse_point(request.request).await,
+        FsControlCode::GetReparsePoint => reparse::get_reparse_point(request.request),
+        FsControlCode::SetReparsePoint => reparse::set_reparse_point(request.request),
+        FsControlCode::DeleteReparsePoint => reparse::delete_reparse_point(request.request),
         FsControlCode::AddEncryptionKey => {
             fsctl::add_encryption_key(&mut request.request, request.stack)
         }
@@ -270,7 +268,7 @@ async fn user_fs_control(mut request: UserFsControlRequest<'_>) -> DriverResult<
         FsControlCode::GetEncryptionKeyStatus => {
             fsctl::get_encryption_key_status(&mut request.request, request.stack)
         }
-        FsControlCode::EnableVerity => fsctl::enable_verity(request.request).await,
+        FsControlCode::EnableVerity => fsctl::enable_verity(request.request),
     }
 }
 
@@ -289,7 +287,7 @@ struct DirectVolumeTarget {
 /// # Errors
 ///
 /// Returns an error for invalid buffers or handles, competing opens, dismount, or flush failure.
-async fn lock_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
+fn lock_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
     let target = direct_volume_target(&mut request)?;
     let _request_owner = request.request;
     let mut operations = unsafe {
@@ -297,7 +295,7 @@ async fn lock_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpC
         // unique operation lease until terminal completion.
         VolumeControlBlock::claim_operation_lane(target.volume)
     };
-    operations.lock_volume(target.owner).await?;
+    operations.lock_volume(target.owner)?;
     MountedVolumeDevice::publish_volume_lock(target.device, true);
     Ok(IrpCompletion::EMPTY)
 }
@@ -324,7 +322,7 @@ fn unlock_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompl
 ///
 /// Returns an error for invalid buffers or handles, a competing lock owner, repeated dismount, or
 /// flush failure.
-async fn dismount_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
+fn dismount_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompletion> {
     let target = direct_volume_target(&mut request)?;
     let _request_owner = request.request;
     let mut operations = unsafe {
@@ -332,7 +330,7 @@ async fn dismount_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<
         // transitions for this VCB.
         VolumeControlBlock::claim_operation_lane(target.volume)
     };
-    operations.dismount_volume(target.owner).await?;
+    operations.dismount_volume(target.owner)?;
     MountedVolumeDevice::publish_direct_writes_allowed(target.device);
     MountedVolumeDevice::unregister_shutdown_notification(target.device);
     MountedVolumeDevice::complete_dismount(target.device);

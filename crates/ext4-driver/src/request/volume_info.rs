@@ -23,7 +23,7 @@ const FILE_SYSTEM_NAME: &[u16] = &[0x0045, 0x0058, 0x0054, 0x0034, 0x0057, 0x004
 /// # Errors
 ///
 /// Returns an error when volume stack decoding or information packing fails.
-pub(crate) async fn query(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn query(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let (stack, volume) = request.with_active(|active| {
         Ok::<_, DriverError>((
             active.current_stack()?.query_volume()?,
@@ -53,7 +53,7 @@ pub(crate) async fn query(mut request: PendingIrpLease<'_>) -> DriverResult<IrpC
 /// # Errors
 ///
 /// Returns an error when volume stack decoding or label mutation fails.
-pub(crate) async fn set(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn set(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let (device, volume, label) = request.with_active(|active| {
         let stack = active.current_stack()?.set_volume()?;
         let volume =
@@ -79,7 +79,7 @@ pub(crate) async fn set(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCom
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     transaction.set_volume_label(label);
-    transaction.commit().await?;
+    transaction.commit()?;
     MountedVolumeDevice::refresh_vpb_label(device, operations.lane().volume_label())?;
     Ok(IrpCompletion::EMPTY)
 }
