@@ -351,6 +351,7 @@ pub(crate) fn admit_owned(
         Flush(FlushRequestKind),
         Immediate(ImmediateRequestKind),
         Notification,
+        VolumeControl(super::operation::VolumeControlRequestKind),
         FsControl(crate::irp::FileSystemControlMinorFunction),
         Unsupported,
     }
@@ -441,10 +442,18 @@ pub(crate) fn admit_owned(
                     crate::irp::FsControlCode::GetEncryptionKeyStatus => {
                         Admission::Immediate(ImmediateRequestKind::GetEncryptionKeyStatus)
                     }
-                    crate::irp::FsControlCode::LockVolume
-                    | crate::irp::FsControlCode::UnlockVolume
-                    | crate::irp::FsControlCode::DismountVolume
-                    | crate::irp::FsControlCode::IsVolumeMounted => Admission::Unsupported,
+                    crate::irp::FsControlCode::LockVolume => {
+                        Admission::VolumeControl(super::operation::VolumeControlRequestKind::Lock)
+                    }
+                    crate::irp::FsControlCode::UnlockVolume => {
+                        Admission::VolumeControl(super::operation::VolumeControlRequestKind::Unlock)
+                    }
+                    crate::irp::FsControlCode::DismountVolume => Admission::VolumeControl(
+                        super::operation::VolumeControlRequestKind::Dismount,
+                    ),
+                    crate::irp::FsControlCode::IsVolumeMounted => Admission::VolumeControl(
+                        super::operation::VolumeControlRequestKind::IsMounted,
+                    ),
                 },
             }
         }
@@ -458,6 +467,7 @@ pub(crate) fn admit_owned(
         Admission::Flush(kind) => super::operation::flush(owned, kind),
         Admission::Immediate(kind) => super::operation::immediate(owned, kind),
         Admission::Notification => super::operation::notification(owned),
+        Admission::VolumeControl(kind) => super::operation::volume_control(owned, kind),
         Admission::FsControl(_) => Err(AdmitOperationError::new(
             DriverError::InternalInvariantViolation,
             owned,
