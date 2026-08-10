@@ -1,5 +1,12 @@
 //! Driver-local lifecycle and open-object state.
 
+mod volume_runtime;
+
+pub(crate) use volume_runtime::{
+    EpochLease, EpochPublicationSlot, EpochPublicationSlots, PendingCheckpoint, VolumeFailureState,
+    VolumeRuntime,
+};
+
 use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;

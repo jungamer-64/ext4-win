@@ -60,6 +60,12 @@ impl MutationLease {
         Self { ticket }
     }
 
+    /// Observes the scheduler ticket without duplicating the one-shot lease.
+    #[must_use]
+    pub const fn ticket(&self) -> u64 {
+        self.ticket
+    }
+
     /// Consumes the lease into its stable FIFO ticket.
     #[must_use]
     pub const fn into_ticket(self) -> u64 {
@@ -81,6 +87,12 @@ impl CommitLease {
         Self { ticket }
     }
 
+    /// Observes the scheduler ticket without duplicating the one-shot lease.
+    #[must_use]
+    pub const fn ticket(&self) -> u64 {
+        self.ticket
+    }
+
     /// Consumes the lease into its FIFO mutation ticket.
     #[must_use]
     pub const fn into_ticket(self) -> u64 {
@@ -100,6 +112,12 @@ impl VisibilityLease {
     #[must_use]
     pub const fn granted(ticket: u64) -> Self {
         Self { ticket }
+    }
+
+    /// Observes the scheduler ticket without duplicating the one-shot lease.
+    #[must_use]
+    pub const fn ticket(&self) -> u64 {
+        self.ticket
     }
 
     /// Consumes the lease into its FIFO mutation ticket.
