@@ -364,8 +364,13 @@ impl ResolvedMutation {
     /// # Errors
     ///
     /// Returns an error when a resource version changed after resolution.
-    pub fn reserve(self, coordinator: &MutationCoordinatorState) -> Result<ReservedMutation> {
-        if !coordinator.revalidate(&self.observed) {
+    pub fn reserve(
+        self,
+        coordinator: &MutationCoordinatorState,
+        intent: super::MutationLease,
+    ) -> Result<ReservedMutation> {
+        if intent.into_ticket() != self.observed.ticket() || !coordinator.revalidate(&self.observed)
+        {
             return Err(Error::ClusterReferenceConflict);
         }
         Ok(ReservedMutation { resolved: self })

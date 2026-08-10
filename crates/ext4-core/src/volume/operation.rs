@@ -4,15 +4,6 @@ use super::scope::*;
 use super::transaction::{MutationResolvePass, ResolvedMutation};
 use crate::disk::storage::{StorageTarget, StorageTranscript};
 
-/// Event accepted by one committed-epoch read operation.
-#[derive(Debug)]
-pub enum ReadEvent {
-    /// First admission into a scheduler lane.
-    Admitted,
-    /// Matching lower-storage completion.
-    StorageCompleted(crate::StorageCompletion),
-}
-
 /// One consuming transition of a committed-epoch read operation.
 #[derive(Debug)]
 pub enum ReadTransition<T> {
@@ -53,7 +44,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn load_file(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         id: FileNodeId,
     ) -> ReadTransition<FileNode> {
@@ -64,7 +55,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn load_directory(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         id: DirectoryNodeId,
     ) -> ReadTransition<DirectoryNode> {
@@ -75,7 +66,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn load_symlink(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         id: SymlinkNodeId,
     ) -> ReadTransition<SymlinkNode> {
@@ -86,7 +77,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn load_node_by_file_index(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         file_index: u32,
     ) -> ReadTransition<NodeId> {
@@ -99,7 +90,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn read_xattrs(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         node: NodeId,
     ) -> ReadTransition<XattrSet> {
@@ -112,7 +103,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn read_xattr(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         node: NodeId,
         name: &XattrName,
@@ -126,7 +117,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn read_windows_overlay(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         node: NodeId,
     ) -> ReadTransition<Option<WindowsOverlay>> {
@@ -139,7 +130,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn read_windows_symlink_reparse_point(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         node: NodeId,
     ) -> ReadTransition<Option<WindowsSymlinkReparsePoint>> {
@@ -152,7 +143,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn read_file(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         file: &FileNode,
         offset: FileOffset,
@@ -165,7 +156,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn read_symlink(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         symlink: &SymlinkNode,
     ) -> ReadTransition<Vec<u8>> {
@@ -176,7 +167,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn read_directory(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         directory: &DirectoryNode,
     ) -> ReadTransition<Vec<DirectoryEntry>> {
@@ -187,7 +178,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn read_hard_links(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         target: HardLinkNodeId,
     ) -> ReadTransition<HardLinks> {
@@ -198,7 +189,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn lookup_child(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         parent: &DirectoryNode,
         name: &Ext4Name,
@@ -210,7 +201,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn lookup_windows_child(
         self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         parent: &DirectoryNode,
         requested: &WindowsName,
@@ -223,13 +214,27 @@ impl EpochReadOperation {
     /// Integrates an event and executes one restartable synchronous resolve pass.
     fn resolve<T>(
         mut self,
-        event: ReadEvent,
+        event: super::OperationEvent,
         epoch: &CommittedEpoch,
         resolve: impl FnOnce(&mut EpochReadView<'_, '_>) -> Result<T>,
     ) -> ReadTransition<T> {
-        if let ReadEvent::StorageCompleted(completion) = event {
-            if let Err(error) = self.filesystem.complete(completion) {
-                return ReadTransition::Complete(Err(error));
+        match event {
+            super::OperationEvent::Admitted => {}
+            super::OperationEvent::StorageCompleted(completion) => {
+                if let Err(error) = self.filesystem.complete(completion) {
+                    return ReadTransition::Complete(Err(error));
+                }
+            }
+            super::OperationEvent::CancelRequested => {
+                return ReadTransition::Complete(Err(Error::OperationCancelled));
+            }
+            super::OperationEvent::RetryElapsed(_)
+            | super::OperationEvent::IntentGranted(_)
+            | super::OperationEvent::CommitGranted(_)
+            | super::OperationEvent::VisibilityGranted(_)
+            | super::OperationEvent::CheckpointGranted(_)
+            | super::OperationEvent::BarrierReleased(_) => {
+                return ReadTransition::Complete(Err(Error::DeviceIo));
             }
         }
         let result = {
@@ -248,15 +253,6 @@ impl EpochReadOperation {
             result => ReadTransition::Complete(result),
         }
     }
-}
-
-/// Event accepted while resolving a mutation before any lower write exists.
-#[derive(Debug)]
-pub enum MutationResolveEvent {
-    /// First admission under one stable FIFO ticket.
-    Admitted,
-    /// Matching lower read completion.
-    StorageCompleted(crate::StorageCompletion),
 }
 
 /// Owned mutation resolver after its event has been integrated and before one synchronous pass.
@@ -308,9 +304,19 @@ impl<N> MutationResolveOperation<N> {
     /// # Errors
     ///
     /// Returns an error for a failed, short, duplicate, or mismatched completion.
-    pub fn accept(mut self, event: MutationResolveEvent) -> Result<MutationResolveReady<N>> {
-        if let MutationResolveEvent::StorageCompleted(completion) = event {
-            self.filesystem.complete(completion)?;
+    pub fn accept(mut self, event: super::OperationEvent) -> Result<MutationResolveReady<N>> {
+        match event {
+            super::OperationEvent::Admitted => {}
+            super::OperationEvent::StorageCompleted(completion) => {
+                self.filesystem.complete(completion)?;
+            }
+            super::OperationEvent::CancelRequested => return Err(Error::OperationCancelled),
+            super::OperationEvent::RetryElapsed(_)
+            | super::OperationEvent::IntentGranted(_)
+            | super::OperationEvent::CommitGranted(_)
+            | super::OperationEvent::VisibilityGranted(_)
+            | super::OperationEvent::CheckpointGranted(_)
+            | super::OperationEvent::BarrierReleased(_) => return Err(Error::DeviceIo),
         }
         Ok(MutationResolveReady {
             filesystem: self.filesystem,
