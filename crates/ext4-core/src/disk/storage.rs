@@ -198,7 +198,7 @@ impl StorageCompletion {
 
 /// Allocation-free identity retained while one owned request is in the lower stack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StorageRequestIdentity {
+pub struct StorageRequestIdentity {
     /// Device selected for the request.
     target: StorageTarget,
     /// Data-transfer offset, absent for flushes.
@@ -209,7 +209,7 @@ pub(crate) struct StorageRequestIdentity {
 
 impl StorageRequestIdentity {
     /// Captures the fields required to validate the matching completion.
-    pub(crate) fn from_request(request: &StorageRequest) -> Self {
+    pub fn from_request(request: &StorageRequest) -> Self {
         Self {
             target: request.target(),
             offset: request.offset(),
@@ -222,7 +222,7 @@ impl StorageRequestIdentity {
     ///
     /// Returns an error for a failed, short, wrong-device, wrong-offset, or wrong-kind
     /// completion.
-    pub(crate) fn complete(self, completion: StorageCompletion) -> Result<()> {
+    pub fn complete(self, completion: StorageCompletion) -> Result<()> {
         let (transfer, information, result) = completion.into_parts();
         result?;
         let (target, offset, byte_count) = match transfer {

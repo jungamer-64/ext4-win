@@ -22,7 +22,8 @@ mod volume;
 
 pub use disk::block::{BlockSize, ByteOffset, DeviceLength};
 pub use disk::storage::{
-    CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageTarget,
+    CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageRequestIdentity,
+    StorageTarget,
 };
 pub use disk_format::inode::{
     Ext4Gid, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,

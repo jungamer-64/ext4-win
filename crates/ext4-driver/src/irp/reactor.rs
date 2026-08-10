@@ -1,7 +1,6 @@
 //! Bounded completion-driven filesystem operation reactor.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::fmt;
@@ -32,6 +31,7 @@ use crate::kernel::storage::{
     MountedStorageDevices, PreparedStorageCommand, RetryingStorageCommand, StorageCommand,
     StorageCommandStep, StorageFailureClass, StorageRetryDelay, failed_unsubmitted_request,
 };
+use crate::memory::DriverVec;
 
 /// Operation representation moved through storage-command envelopes.
 type SuspendedOperation = Box<dyn CompletionOperation>;
@@ -91,7 +91,7 @@ pub(crate) struct IntentRequest {
     /// Stable FIFO mutation ticket.
     ticket: u64,
     /// Complete resource set acquired atomically or not at all.
-    resources: Vec<MutationResource>,
+    resources: DriverVec<MutationResource>,
 }
 
 impl IntentRequest {
@@ -99,7 +99,7 @@ impl IntentRequest {
     pub(crate) const fn new(
         volume: NonNull<crate::state::VolumeControlBlock>,
         ticket: u64,
-        resources: Vec<MutationResource>,
+        resources: DriverVec<MutationResource>,
     ) -> Self {
         Self {
             volume,
@@ -120,7 +120,7 @@ impl IntentRequest {
 
     /// Complete opaque resource set.
     pub(crate) fn resources(&self) -> &[MutationResource] {
-        &self.resources
+        self.resources.as_slice()
     }
 }
 
@@ -533,7 +533,7 @@ struct HeldIntent {
     /// Stable FIFO ticket.
     ticket: u64,
     /// Complete atomically acquired resource set.
-    resources: Vec<MutationResource>,
+    resources: DriverVec<MutationResource>,
 }
 
 /// Serialized commit ownership retained by one active slot.

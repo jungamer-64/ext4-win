@@ -3,8 +3,7 @@
 mod volume_runtime;
 
 pub(crate) use volume_runtime::{
-    EpochLease, EpochPublicationSlot, EpochPublicationSlots, PendingCheckpoint, VolumeFailureState,
-    VolumeRuntime,
+    EpochLease, EpochPublicationSlot, EpochPublicationSlots, PendingCheckpoint, VolumeRuntime,
 };
 
 use alloc::boxed::Box;
@@ -22,7 +21,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ext4_core::{
-    CompletedMount, DeviceLength, DirectoryNodeId, Ext4Name, Ext4Timestamp, FileNodeId, FileOffset,
+    CompletedMount, DeviceLength, DirectoryNodeId, Ext4Name, FileNodeId, FileOffset,
     MutationResolvePass, NewDirectoryMetadata, NewFileMetadata, NodeId, WindowsName, XattrName,
     XattrValue,
 };
