@@ -2603,7 +2603,7 @@ pub(crate) struct VolumeSerialNumber {
 
 impl VolumeSerialNumber {
     /// Builds a serial number from little-endian UUID bytes.
-    const fn from_le_bytes(bytes: [u8; 4]) -> Self {
+    pub(crate) const fn from_le_bytes(bytes: [u8; 4]) -> Self {
         Self {
             value: u32::from_le_bytes(bytes),
         }
@@ -2643,6 +2643,32 @@ pub(crate) struct MountedVolumeDevice {
     device: KernelDevice,
 }
 
+/// Prevalidated VPB label update consumed only after journal commit visibility.
+#[derive(Debug)]
+pub(crate) struct PreparedVpbLabelPublication {
+    /// Stable VPB retained by the mounted device until reactor drain.
+    vpb: NonNull<wdk_sys::VPB>,
+    /// Fully encoded fixed-capacity VPB label.
+    label: VpbLabel,
+}
+
+impl PreparedVpbLabelPublication {
+    /// Publishes the already encoded label without allocation or ordinary failure.
+    pub(crate) fn publish(self) {
+        let vpb = unsafe {
+            // SAFETY: The mounted device retains this VPB through every admitted operation, and
+            // the token is consumed on the sole reactor thread before device retirement.
+            self.vpb.as_ptr().as_mut()
+        }
+        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+        self.label.write_to(vpb);
+    }
+}
+
+// SAFETY: The VPB is I/O Manager-owned stable mounted state and publication remains serialized by
+// the device reactor.
+unsafe impl Send for PreparedVpbLabelPublication {}
+
 impl MountedVolumeDevice {
     /// Initializes an IoCreateDevice-created mounted device and takes ownership
     /// of the VCB.
@@ -2664,8 +2690,10 @@ impl MountedVolumeDevice {
             .ok_or(DriverError::InvalidParameter)?;
         let transfer_alignment = real_device.transfer_buffer_alignment()?;
         let mounted_flag = u16::try_from(VPB_MOUNTED).map_err(|_| DriverError::InvalidParameter)?;
-        let serial_number = vcb.operations.serial_number().as_u32();
-        let volume_label = VpbLabel::encode(vcb.operations.volume_label())?;
+        let identity = vcb.runtime.identity();
+        let [a, b, c, d, ..] = identity.uuid().bytes();
+        let serial_number = VolumeSerialNumber::from_le_bytes([a, b, c, d]).as_u32();
+        let volume_label = VpbLabel::encode(identity.label())?;
         let device_object = unsafe {
             // SAFETY: The device was just created by this driver and remains
             // valid during mount initialization.
@@ -2872,28 +2900,24 @@ impl MountedVolumeDevice {
         })
     }
 
-    /// Refreshes the VPB volume label after a successful label mutation.
+    /// Prevalidates the complete VPB volume-label publication before a mutation writes storage.
     /// # Errors
     ///
     /// Returns an error when the mounted device or its VPB pointer is absent, or the ext4 label does
     /// not fit in the VPB label field.
-    pub(crate) fn refresh_vpb_label(
+    pub(crate) fn prepare_vpb_label_publication(
         device: KernelDevice,
         volume_label: ext4_core::Ext4VolumeLabel,
-    ) -> DriverResult<()> {
+    ) -> DriverResult<PreparedVpbLabelPublication> {
         let device_object = unsafe {
             // SAFETY: `device` is a mounted volume device owned by this driver
             // and is read only for its current VPB pointer.
             device.as_ptr().as_ref()
         }
         .ok_or(DriverError::InvalidParameter)?;
-        let vpb = unsafe {
-            // SAFETY: The VPB pointer belongs to the mounted device and stays
-            // valid while the volume remains mounted.
-            device_object.Vpb.as_mut()
-        }
-        .ok_or(DriverError::InvalidParameter)?;
-        VpbLabel::encode(volume_label).map(|label| label.write_to(vpb))
+        let vpb = NonNull::new(device_object.Vpb).ok_or(DriverError::InvalidParameter)?;
+        let label = VpbLabel::encode(volume_label)?;
+        Ok(PreparedVpbLabelPublication { vpb, label })
     }
 
     /// Publishes whether the mounted VPB rejects creates for a volume lock.

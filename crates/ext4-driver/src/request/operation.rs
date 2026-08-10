@@ -308,6 +308,8 @@ pub(crate) enum MutationRequestKind {
     SetEa,
     /// Security-descriptor mutation.
     SetSecurity,
+    /// Volume-label mutation.
+    SetVolumeInformation,
     /// Cleanup-time namespace deletion after the terminal handle barrier.
     Cleanup,
 }
@@ -332,6 +334,8 @@ enum PendingDriverPublication {
     SetFile(crate::request::file_info::SetFilePublication),
     /// Cleanup deletion notification and target were fully prepared by resolve.
     Cleanup(crate::request::file_info::PreparedCleanupPublication),
+    /// Prevalidated VPB label publication.
+    VolumeLabel(crate::request::volume_info::PreparedVolumeLabelPublication),
     /// Mutation has no additional driver state to publish.
     Normal(IrpCompletion),
 }
@@ -347,6 +351,8 @@ enum PreparedDriverPublication {
     SetFile(crate::request::file_info::SetFilePublication),
     /// Cleanup deletion publication.
     Cleanup(crate::request::file_info::PreparedCleanupPublication),
+    /// Volume-label publication.
+    VolumeLabel(crate::request::volume_info::PreparedVolumeLabelPublication),
     /// No driver-side mutation publication.
     Normal(IrpCompletion),
 }
@@ -359,6 +365,7 @@ impl PendingDriverPublication {
             Self::Write(publication) => PreparedDriverPublication::Write(publication),
             Self::SetFile(publication) => PreparedDriverPublication::SetFile(publication),
             Self::Cleanup(publication) => PreparedDriverPublication::Cleanup(publication),
+            Self::VolumeLabel(publication) => PreparedDriverPublication::VolumeLabel(publication),
             Self::Normal(completion) => PreparedDriverPublication::Normal(completion),
         })
     }
@@ -378,6 +385,10 @@ impl PreparedDriverPublication {
             }
             Self::Cleanup(publication) => {
                 TopLevelCompletion::Normal(publication.publish(operations))
+            }
+            Self::VolumeLabel(publication) => {
+                publication.publish();
+                TopLevelCompletion::Normal(IrpCompletion::EMPTY)
             }
             Self::Normal(completion) => TopLevelCompletion::Normal(completion),
         }
@@ -680,6 +691,18 @@ impl MutationRequestOperation {
                 Ok(DriverResolveDisposition::Mutation(
                     PendingDriverPublication::Normal(completion),
                 ))
+            }
+            MutationRequestKind::SetVolumeInformation => {
+                match crate::request::volume_info::set(owned.request(), mutation)? {
+                    crate::request::volume_info::SetVolumeResolution::Complete(completion) => Ok(
+                        DriverResolveDisposition::Complete(TopLevelCompletion::Normal(completion)),
+                    ),
+                    crate::request::volume_info::SetVolumeResolution::Mutation(publication) => {
+                        Ok(DriverResolveDisposition::Mutation(
+                            PendingDriverPublication::VolumeLabel(publication),
+                        ))
+                    }
+                }
             }
             MutationRequestKind::Cleanup => {
                 if self.cleanup_deletion.is_none() {
