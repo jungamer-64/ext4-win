@@ -6,7 +6,7 @@ use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::fmt;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use ext4_core::{MutationResource, OperationEvent, OperationId, StorageRequest};
 use wdk_sys::{LIST_ENTRY, NTSTATUS, PIRP, PLIST_ENTRY, PVOID};
@@ -30,7 +30,7 @@ use super::{
 };
 use crate::kernel::storage::{
     MountedStorageDevices, PreparedStorageCommand, RetryingStorageCommand, StorageCommand,
-    StorageCommandStep, StorageFailureClass, failed_unsubmitted_request,
+    StorageCommandStep, StorageFailureClass, StorageRetryDelay, failed_unsubmitted_request,
 };
 
 /// Operation representation moved through storage-command envelopes.
@@ -455,6 +455,76 @@ struct ActiveSlot {
     phase: ActivePhase,
 }
 
+/// Address-stable timer/DPC envelope for one bounded retry slot.
+#[repr(C)]
+struct RetryTimerEnvelope {
+    /// Native one-shot timer.
+    timer: UnsafeCell<wdk_sys::KTIMER>,
+    /// Native DPC publishing only a slot-generation event.
+    dpc: UnsafeCell<wdk_sys::KDPC>,
+    /// Stable owning reactor, null only before final-address initialization.
+    reactor: AtomicPtr<CompletionReactor>,
+    /// Fixed bounded slot index.
+    index: usize,
+    /// Active slot generation captured when the timer was armed.
+    generation: AtomicU64,
+}
+
+impl RetryTimerEnvelope {
+    /// Creates inert storage completed by final-address initialization.
+    fn inert(index: usize) -> Self {
+        Self {
+            timer: UnsafeCell::new(wdk_sys::KTIMER::default()),
+            dpc: UnsafeCell::new(wdk_sys::KDPC::default()),
+            reactor: AtomicPtr::new(core::ptr::null_mut()),
+            index,
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Initializes native timer state and binds this envelope to its stable reactor.
+    #[cfg(not(test))]
+    unsafe fn initialize(&self, reactor: NonNull<CompletionReactor>) {
+        unsafe {
+            // SAFETY: The containing device extension is at its final address before publication.
+            ffi::KeInitializeTimer(self.timer.get());
+            ffi::KeInitializeDpc(
+                self.dpc.get(),
+                Some(storage_retry_timer_dpc),
+                core::ptr::from_ref(self).cast_mut().cast::<c_void>(),
+            );
+        }
+        self.reactor.store(reactor.as_ptr(), Ordering::Release);
+    }
+
+    /// Arms one concrete fixed-delay retry for the current slot generation.
+    #[cfg(not(test))]
+    fn arm(&self, generation: u64, delay: StorageRetryDelay) {
+        self.generation.store(generation, Ordering::Release);
+        let hundred_nanoseconds = match delay {
+            StorageRetryDelay::TenMilliseconds => -100_000_i64,
+            StorageRetryDelay::HundredMilliseconds => -1_000_000_i64,
+        };
+        let already_armed = unsafe {
+            // SAFETY: This one-shot timer is armed only while its slot is in `Retry`.
+            ffi::KeSetTimer(
+                self.timer.get(),
+                wdk_sys::LARGE_INTEGER {
+                    QuadPart: hundred_nanoseconds,
+                },
+                self.dpc.get(),
+            )
+        };
+        if already_armed != 0 {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+    }
+}
+
+// SAFETY: Native timer/DPC state is initialized once at a stable address; callbacks publish only
+// atomics and the reactor thread exclusively owns operation payloads.
+unsafe impl Sync for RetryTimerEnvelope {}
+
 /// Resource ownership retained outside the suspended operation payload.
 #[derive(Debug)]
 struct HeldIntent {
@@ -506,6 +576,8 @@ pub(crate) struct CompletionReactor {
     admitted: AtomicUsize,
     /// Auto-reset event signaled only when a concrete event is published.
     wake_event: wdk_sys::KEVENT,
+    /// Bitset of retry timer events published by DPC callbacks.
+    retry_ready: AtomicU64,
     /// Running/draining/stopped lifecycle.
     lifecycle: AtomicU8,
     /// Capture-to-CSQ insertion teardown gate.
@@ -516,6 +588,8 @@ pub(crate) struct CompletionReactor {
     thread_handle: wdk_sys::HANDLE,
     /// Fixed operation registry; callbacks never dereference operation payloads.
     active: UnsafeCell<[ActiveSlot; MAX_OPERATIONS]>,
+    /// One address-stable native timer envelope per bounded active slot.
+    retry_timers: [RetryTimerEnvelope; MAX_OPERATIONS],
     /// Device object owning this stable extension.
     device: KernelDevice,
 }
@@ -567,11 +641,13 @@ impl CompletionReactor {
                     completion_head: UnsafeCell::new(LIST_ENTRY::default()),
                     admitted: AtomicUsize::new(0),
                     wake_event: wdk_sys::KEVENT::default(),
+                    retry_ready: AtomicU64::new(0),
                     lifecycle: AtomicU8::new(ReactorState::Running.as_raw()),
                     admission: AdmissionRundown::new(),
                     completion_rundown: CompletionRundown::new(),
                     thread_handle: core::ptr::null_mut(),
                     active: UnsafeCell::new(core::array::from_fn(|_| ActiveSlot::vacant())),
+                    retry_timers: core::array::from_fn(RetryTimerEnvelope::inert),
                     device,
                 },
             );
@@ -587,6 +663,13 @@ impl CompletionReactor {
         unsafe {
             // SAFETY: The embedded gate is now at its final device-extension address.
             reactor.completion_rundown.initialize();
+        }
+        #[cfg(not(test))]
+        for timer in &reactor.retry_timers {
+            unsafe {
+                // SAFETY: Every timer and the reactor itself are now at their final addresses.
+                timer.initialize(NonNull::from(reactor));
+            }
         }
 
         #[cfg(not(test))]
@@ -945,6 +1028,7 @@ impl CompletionReactor {
     fn run(&self) {
         loop {
             let mut progressed = self.drain_storage_completions();
+            progressed |= self.drain_retry_events();
             progressed |= self.admit_pending_requests();
             progressed |= self.drive_ready_operations();
             if self.state() == ReactorState::Draining
@@ -1430,8 +1514,72 @@ impl CompletionReactor {
     /// Retains one retry command until its concrete fixed-delay timer event arrives.
     #[cfg(not(test))]
     fn arm_retry(&self, index: usize, retry: RetryingStorageCommand<SuspendedOperation>) {
+        let delay = retry.delay();
         self.set_phase(index, ActivePhase::Retry(retry));
-        crate::kernel::time::arm_storage_retry(self, index);
+        let generation = {
+            let slots = unsafe {
+                // SAFETY: Only this reactor thread observes active slot generations.
+                &*self.active.get()
+            };
+            let Some(slot) = slots.get(index) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            slot.generation
+        };
+        let Some(timer) = self.retry_timers.get(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        timer.arm(generation, delay);
+    }
+
+    /// Consumes timer events published by DPC callbacks and builds a fresh private IRP attempt.
+    #[cfg(not(test))]
+    fn drain_retry_events(&self) -> bool {
+        let mut ready = self.retry_ready.swap(0, Ordering::AcqRel);
+        if ready == 0 {
+            return false;
+        }
+        while ready != 0 {
+            let index = match usize::try_from(ready.trailing_zeros()) {
+                Ok(index) => index,
+                Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+            };
+            let shift = match u32::try_from(index) {
+                Ok(shift) => shift,
+                Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+            };
+            let Some(mask) = 1_u64.checked_shl(shift) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            ready &= !mask;
+            let generation = match self.retry_timers.get(index) {
+                Some(timer) => timer.generation.load(Ordering::Acquire),
+                None => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+            };
+            let retry = {
+                let slots = unsafe {
+                    // SAFETY: Only this reactor thread moves retry command payloads.
+                    &mut *self.active.get()
+                };
+                let Some(slot) = slots.get_mut(index) else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                if slot.generation != generation {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
+                let phase = core::mem::replace(&mut slot.phase, ActivePhase::Vacant);
+                let ActivePhase::Retry(retry) = phase else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                retry
+            };
+            let prepared = match retry.permitted() {
+                Ok(prepared) => prepared,
+                Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+            };
+            self.submit_prepared_storage(index, prepared);
+        }
+        true
     }
 
     /// Grants newly unblocked resource sets in stable FIFO order.
@@ -1703,6 +1851,44 @@ unsafe fn enqueue_storage_completion(
         // SAFETY: The completion callback transfers its unique unlinked node to this inbox.
         reactor.enqueue_storage(envelope);
     }
+}
+
+/// DPC callback publishing one concrete retry-timer event without touching operation state.
+/// # Safety
+///
+/// `context` must point to the address-stable [`RetryTimerEnvelope`] installed in the reactor.
+#[cfg(not(test))]
+unsafe extern "C" fn storage_retry_timer_dpc(
+    _dpc: *mut wdk_sys::KDPC,
+    context: PVOID,
+    _argument_one: PVOID,
+    _argument_two: PVOID,
+) {
+    let Some(timer) = NonNull::new(context.cast::<RetryTimerEnvelope>()) else {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    };
+    let timer = unsafe {
+        // SAFETY: Native DPC context was bound to this stable envelope during initialization.
+        timer.as_ref()
+    };
+    let Some(reactor) = NonNull::new(timer.reactor.load(Ordering::Acquire)) else {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    };
+    let shift = match u32::try_from(timer.index) {
+        Ok(shift) => shift,
+        Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+    };
+    let Some(mask) = 1_u64.checked_shl(shift) else {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    };
+    let reactor = unsafe {
+        // SAFETY: Device teardown joins the reactor after every active timer has fired.
+        reactor.as_ref()
+    };
+    if reactor.retry_ready.fetch_or(mask, Ordering::AcqRel) & mask != 0 {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    }
+    reactor.wake();
 }
 
 /// Dedicated PASSIVE_LEVEL reactor thread entry.
