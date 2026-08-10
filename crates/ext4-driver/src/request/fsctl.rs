@@ -124,13 +124,13 @@ pub(crate) fn enable_verity(mut request: PendingIrpLease<'_>) -> DriverResult<Ir
             let operations = unsafe {
                 // SAFETY: Enable-verity runs only as the mounted-device executor's unique active
                 // operation. The lease remains owned until the transaction completes.
-                VolumeControlBlock::claim_operation_lane(opened_file.volume())
+                VolumeControlBlock::operation_access(opened_file.volume())
             };
             Ok::<_, DriverError>((payload.into_core_enable(), opened_file.id(), operations))
         })?
     };
     let mut transaction = operations
-        .lane_mut()
+        .runtime_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let file = transaction.file(file_id)?;
@@ -155,10 +155,10 @@ pub(crate) fn add_encryption_key(
         let mut operations = unsafe {
             // SAFETY: Add-key runs only as the mounted-device executor's unique active operation.
             // The non-cloneable lease is consumed before this operation returns.
-            VolumeControlBlock::claim_operation_lane(volume)
+            VolumeControlBlock::operation_access(volume)
         };
         operations
-            .lane_mut()
+            .runtime_mut()
             .add_fscrypt_key(payload.into_master_key())?;
         Ok(IrpCompletion::EMPTY)
     })
@@ -180,10 +180,10 @@ pub(crate) fn remove_encryption_key(
         let mut operations = unsafe {
             // SAFETY: Remove-key runs only as the mounted-device executor's unique active
             // operation. The non-cloneable lease is consumed before this operation returns.
-            VolumeControlBlock::claim_operation_lane(volume)
+            VolumeControlBlock::operation_access(volume)
         };
         let _removed = operations
-            .lane_mut()
+            .runtime_mut()
             .remove_fscrypt_key(payload.identifier());
 
         let mut output = output_buffer(active, stack, FSCRYPT_REMOVE_KEY_BYTES)?;
@@ -208,9 +208,11 @@ pub(crate) fn get_encryption_key_status(
         let operations = unsafe {
             // SAFETY: Key-status runs only as the mounted-device executor's unique active
             // operation. The non-cloneable lease is consumed before this operation returns.
-            VolumeControlBlock::claim_operation_lane(volume)
+            VolumeControlBlock::operation_access(volume)
         };
-        let presence = operations.lane().fscrypt_key_presence(payload.identifier());
+        let presence = operations
+            .runtime()
+            .fscrypt_key_presence(payload.identifier());
 
         let mut output = output_buffer(active, stack, FSCRYPT_GET_KEY_STATUS_BYTES)?;
         write_key_status_output(output.as_mut_slice(), presence)?;

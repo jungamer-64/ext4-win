@@ -293,7 +293,7 @@ fn lock_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpComplet
     let mut operations = unsafe {
         // SAFETY: User FSCTLs execute on the mounted-device actor, which grants this request the
         // unique operation lease until terminal completion.
-        VolumeControlBlock::claim_operation_lane(target.volume)
+        VolumeControlBlock::operation_access(target.volume)
     };
     operations.lock_volume(target.owner)?;
     MountedVolumeDevice::publish_volume_lock(target.device, true);
@@ -310,7 +310,7 @@ fn unlock_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCompl
     let mut operations = unsafe {
         // SAFETY: User FSCTLs execute on the mounted-device actor, which uniquely owns lifecycle
         // transitions for this VCB.
-        VolumeControlBlock::claim_operation_lane(target.volume)
+        VolumeControlBlock::operation_access(target.volume)
     };
     operations.unlock_volume(target.owner)?;
     MountedVolumeDevice::publish_volume_lock(target.device, false);
@@ -328,7 +328,7 @@ fn dismount_volume(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpCom
     let mut operations = unsafe {
         // SAFETY: User FSCTLs execute on the mounted-device actor, which uniquely owns lifecycle
         // transitions for this VCB.
-        VolumeControlBlock::claim_operation_lane(target.volume)
+        VolumeControlBlock::operation_access(target.volume)
     };
     operations.dismount_volume(target.owner)?;
     MountedVolumeDevice::publish_direct_writes_allowed(target.device);
@@ -347,7 +347,7 @@ fn is_volume_mounted(mut request: UserFsControlRequest<'_>) -> DriverResult<IrpC
     let operations = unsafe {
         // SAFETY: User FSCTLs execute on the mounted-device actor, which uniquely observes this
         // VCB's lifecycle state.
-        VolumeControlBlock::claim_operation_lane(target.volume)
+        VolumeControlBlock::operation_access(target.volume)
     };
     operations.ensure_mounted()?;
     Ok(IrpCompletion::EMPTY)
@@ -409,7 +409,7 @@ fn authorize_fs_control_handle(request: &mut PendingIrpLease<'_>) -> DriverResul
         let operations = unsafe {
             // SAFETY: User FSCTLs execute on the mounted-device actor and this synchronous policy
             // check does not retain the lease beyond the active IRP borrow.
-            VolumeControlBlock::claim_operation_lane(volume)
+            VolumeControlBlock::operation_access(volume)
         };
         operations.authorize_handle(file_object)
     })

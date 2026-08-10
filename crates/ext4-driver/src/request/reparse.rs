@@ -149,14 +149,14 @@ pub(crate) fn get_reparse_point(mut request: PendingIrpLease<'_>) -> DriverResul
             let operations = unsafe {
                 // SAFETY: Queued filesystem-control requests run one at a time on the
                 // mounted-device executor, so this request owns the unique operation lane.
-                VolumeControlBlock::claim_operation_lane(opened.volume())
+                VolumeControlBlock::operation_access(opened.volume())
             };
             Ok::<_, DriverError>((stack.output_buffer_length(), node, operations))
         })?
     };
     let data = {
         let mut operations = operations;
-        load_node_reparse_data(operations.lane_mut(), node)?
+        load_node_reparse_data(operations.runtime_mut(), node)?
     };
     let written = request.with_active(|active| {
         let mut output = active.buffered_output(length)?;
@@ -184,12 +184,12 @@ pub(crate) fn set_reparse_point(mut request: PendingIrpLease<'_>) -> DriverResul
             let operations = unsafe {
                 // SAFETY: Queued filesystem-control requests run one at a time on the
                 // mounted-device executor, so this request owns the unique operation lane.
-                VolumeControlBlock::claim_operation_lane(opened.volume())
+                VolumeControlBlock::operation_access(opened.volume())
             };
             Ok::<_, DriverError>((reparse_point, node, operations))
         })?
     };
-    set_node_reparse_point(operations.lane_mut(), node, reparse_point)?;
+    set_node_reparse_point(operations.runtime_mut(), node, reparse_point)?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -214,12 +214,12 @@ pub(crate) fn delete_reparse_point(
             let operations = unsafe {
                 // SAFETY: Queued filesystem-control requests run one at a time on the
                 // mounted-device executor, so this request owns the unique operation lane.
-                VolumeControlBlock::claim_operation_lane(opened.volume())
+                VolumeControlBlock::operation_access(opened.volume())
             };
             Ok::<_, DriverError>((node, operations))
         })?
     };
-    delete_node_reparse_point(operations.lane_mut(), node)?;
+    delete_node_reparse_point(operations.runtime_mut(), node)?;
     Ok(IrpCompletion::EMPTY)
 }
 

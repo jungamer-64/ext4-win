@@ -7,7 +7,7 @@ use crate::security_descriptor::{
     ACCESS_ALLOWED_ACE_PREFIX_BYTES, ACL_HEADER_BYTES, SECURITY_DESCRIPTOR_RELATIVE_BYTES,
     SID_PREFIX_BYTES, SecurityComponentSelection, SecuritySelection,
 };
-use crate::state::{OpenedObject, VolumeControlBlock, VolumeOperationLane, VolumeOperationLease};
+use crate::state::{OpenedObject, VolumeAccess, VolumeControlBlock, VolumeOperationLane};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, NodeId};
 
@@ -59,7 +59,7 @@ struct QuerySecurityRequest<'a> {
     /// ext4 node selected by the opened FILE_OBJECT.
     node: NodeId,
     /// Exclusive actor-owned mounted-volume operation capability.
-    operations: VolumeOperationLease,
+    operations: VolumeAccess,
 }
 
 impl<'a> QuerySecurityRequest<'a> {
@@ -78,7 +78,7 @@ impl<'a> QuerySecurityRequest<'a> {
         let operations = unsafe {
             // SAFETY: Query-security runs only as the mounted-device executor's unique active
             // operation. The lease is moved into this request until that operation completes.
-            VolumeControlBlock::claim_operation_lane(volume)
+            VolumeControlBlock::operation_access(volume)
         };
         Ok(Self {
             output,
@@ -98,7 +98,7 @@ struct SetSecurityRequest<'a> {
     /// ext4 node selected by the opened FILE_OBJECT.
     node: NodeId,
     /// Exclusive actor-owned mounted-volume operation capability.
-    operations: VolumeOperationLease,
+    operations: VolumeAccess,
 }
 
 impl<'a> SetSecurityRequest<'a> {
@@ -117,7 +117,7 @@ impl<'a> SetSecurityRequest<'a> {
         let operations = unsafe {
             // SAFETY: Set-security runs only as the mounted-device executor's unique active
             // operation. The lease is moved into this request until that operation completes.
-            VolumeControlBlock::claim_operation_lane(volume)
+            VolumeControlBlock::operation_access(volume)
         };
         Ok(Self {
             selection,
@@ -353,7 +353,7 @@ impl DaclPermissionBuilder {
 /// Returns an error when ext4 security metadata cannot be loaded, the requested descriptor cannot
 /// be built, or the user output buffer is too small.
 fn query_security(mut request: QuerySecurityRequest<'_>) -> DriverResult<IrpCompletion> {
-    let security = load_ext4_security(request.operations.lane_mut(), request.node)?;
+    let security = load_ext4_security(request.operations.runtime_mut(), request.node)?;
     let descriptor = security_descriptor(security, request.selection)?;
     let required = descriptor.len();
     request.output.copy_from_owned(descriptor.as_slice())?;
@@ -366,7 +366,7 @@ fn query_security(mut request: QuerySecurityRequest<'_>) -> DriverResult<IrpComp
 /// Returns an error when the input descriptor cannot be copied or mapped to ext4 owner/permissions,
 /// or the journaled security update fails.
 fn set_security(mut request: SetSecurityRequest<'_>) -> DriverResult<IrpCompletion> {
-    let current = load_ext4_security(request.operations.lane_mut(), request.node)?;
+    let current = load_ext4_security(request.operations.runtime_mut(), request.node)?;
     let security = security_from_descriptor(request.descriptor, request.selection, current)?;
     if security == current {
         return Ok(IrpCompletion::EMPTY);
@@ -374,7 +374,7 @@ fn set_security(mut request: SetSecurityRequest<'_>) -> DriverResult<IrpCompleti
 
     let mut transaction = request
         .operations
-        .lane_mut()
+        .runtime_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let node = transaction.node(request.node)?;
