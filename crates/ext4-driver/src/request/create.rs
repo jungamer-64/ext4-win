@@ -39,8 +39,8 @@ const UTF16_BACKSLASH: u16 = 0x005C;
 /// # Errors
 ///
 /// Returns an error when create stack decoding or ext4 open/create handling rejects the request.
-pub(crate) async fn execute(request: PendingIrpLease<'_>) -> DriverResult<CreateCompletion> {
-    open_or_create(PreparedCreateRequest::decode(request)?).await
+pub(crate) fn execute(request: PendingIrpLease<'_>) -> DriverResult<CreateCompletion> {
+    open_or_create(PreparedCreateRequest::decode(request)?)
 }
 
 /// Create request whose pointer-bearing inputs have all become owned domain values.
@@ -142,7 +142,7 @@ impl CreateCompletionOwner<'_> {
 ///
 /// Returns an error when EA create input is supplied, the device is not mounted, path resolution
 /// fails, or the selected open/create disposition cannot be satisfied.
-async fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<CreateCompletion> {
+fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<CreateCompletion> {
     let PreparedCreateRequest {
         mut owner,
         target,
@@ -170,9 +170,7 @@ async fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<Crea
         target,
         &mut operations,
         owner.parameters().reparse_point_mode(),
-    )
-    .await?
-    {
+    )? {
         CreateTargetLookup::Existing {
             node,
             node_mode,
@@ -189,7 +187,6 @@ async fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<Crea
                 location,
                 &mut operations,
             )
-            .await
             .map(CreateCompletion::Handle)
         }
         CreateTargetLookup::Missing { parent, name } => create_missing_node(
@@ -200,12 +197,11 @@ async fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<Crea
             parent,
             &name,
         )
-        .await
         .map(CreateCompletion::Handle),
         CreateTargetLookup::ReparseSymlink {
             point,
             unparsed_path,
-        } => create_symlink_reparse_completion(operations.lane_mut(), point, unparsed_path).await,
+        } => create_symlink_reparse_completion(operations.lane_mut(), point, unparsed_path),
     }
 }
 
@@ -214,12 +210,12 @@ async fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<Crea
 ///
 /// Returns an error when the node target cannot be converted to the Windows symbolic-link wire
 /// form, its exact output buffer cannot be allocated, or packing violates the derived size.
-async fn create_symlink_reparse_completion(
+fn create_symlink_reparse_completion(
     operations: &mut VolumeOperationLane,
     point: NodeSymlinkReparsePoint,
     unparsed_path: UnparsedPathLength,
 ) -> DriverResult<CreateCompletion> {
-    let data = point.into_symlink_data(operations).await?;
+    let data = point.into_symlink_data(operations)?;
     let required_length = data.required_length()?;
     let buffer = CreateSymlinkReparseBuffer::try_pack_exact(required_length, |output| {
         data.pack_create_redirect(unparsed_path, output)
@@ -667,7 +663,7 @@ impl CreatePathAnchor {
 ///
 /// Returns an error when existing-node options conflict, create-only disposition collides, share
 /// access fails, or an incomplete destructive disposition is requested.
-async fn open_existing_node(
+fn open_existing_node(
     request: &mut CreateCompletionOwner<'_>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
@@ -681,7 +677,7 @@ async fn open_existing_node(
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
-            let pending = prepare_create_deletion(policy, node, &location, operations).await?;
+            let pending = prepare_create_deletion(policy, node, &location, operations)?;
             let fcb = request.with_file_object(|file_object| {
                 initialize_file_object(file_object, vcb, node, node_mode, location, policy)
             })?;
@@ -713,7 +709,7 @@ async fn open_existing_node(
 ///
 /// Returns cannot-delete for an identity without a deletable link, read-only or non-empty targets,
 /// or an underlying metadata error.
-async fn prepare_create_deletion(
+fn prepare_create_deletion(
     policy: CreateHandlePolicy,
     node: NodeId,
     location: &OpenedLocation,
@@ -728,8 +724,7 @@ async fn prepare_create_deletion(
         node,
         pending.target_ref(),
         crate::request::file_info::DeleteReadonlyPolicy::Enforce,
-    )
-    .await?;
+    )?;
     Ok(Some(pending))
 }
 
@@ -797,7 +792,7 @@ fn destructive_directory_error(directory: DirectoryNodeId) -> DriverError {
 ///
 /// Returns an error when the disposition requires an existing name, missing-child creation cannot
 /// be staged or committed, or the new file object cannot be initialized.
-async fn create_missing_node(
+fn create_missing_node(
     mut request: CreateCompletionOwner<'_>,
     create_ea: CreateEa,
     operations: &mut VolumeOperationLease,
@@ -824,14 +819,12 @@ async fn create_missing_node(
         }
     };
     let target = child_creation_target(parameters.target_requirement())?;
-    let mut creation = operations
-        .begin_child_creation(
-            parent,
-            name,
-            target,
-            crate::kernel::time::current_ext4_timestamp()?,
-        )
-        .await?;
+    let mut creation = operations.begin_child_creation(
+        parent,
+        name,
+        target,
+        crate::kernel::time::current_ext4_timestamp()?,
+    )?;
     let node = creation.node();
     let notification = DirectoryChange::new(parent, name, node, DirectoryChangeAction::Added)?;
     let handle = memory::boxed_try_with(|| {
@@ -845,7 +838,7 @@ async fn create_missing_node(
             policy.regular_file_write_access(),
         ))
     })?;
-    create_ea.apply_to_pending_child(&mut creation).await?;
+    create_ea.apply_to_pending_child(&mut creation)?;
     let attachment = request.with_file_object(|file_object| {
         open_pending_child_file_control_block(
             &creation,
@@ -859,7 +852,7 @@ async fn create_missing_node(
         request,
     };
 
-    match creation.commit().await {
+    match creation.commit() {
         Ok(()) => {
             let Some(vcb) = MountedVolumeDevice::vcb(attachment.device()) else {
                 return Err(DriverError::InternalInvariantViolation);
@@ -922,7 +915,7 @@ fn validate_existing_node_options(
 /// # Errors
 ///
 /// Returns an error when path or file-reference resolution fails.
-async fn resolve_target(
+fn resolve_target(
     target: CreateTargetSpecifier,
     operations: &mut VolumeOperationLease,
     reparse_point_mode: CreateReparsePointMode,
@@ -930,12 +923,11 @@ async fn resolve_target(
     match target {
         CreateTargetSpecifier::Volume => Err(DriverError::InternalInvariantViolation),
         CreateTargetSpecifier::Path { name, anchor } => {
-            resolve_path(name, anchor, operations, reparse_point_mode).await
+            resolve_path(name, anchor, operations, reparse_point_mode)
         }
         CreateTargetSpecifier::FileReference(reference) => {
             let target =
-                resolve_file_reference(reference, operations.lane_mut(), reparse_point_mode)
-                    .await?;
+                resolve_file_reference(reference, operations.lane_mut(), reparse_point_mode)?;
             if let CreateTargetLookup::Existing { node, .. } = &target {
                 operations.ensure_node_openable(*node)?;
             }
@@ -965,7 +957,7 @@ fn validate_file_reference_create(disposition: CreateDisposition) -> DriverResul
 /// # Errors
 ///
 /// Returns an error when the file-reference name is malformed or no live inode exists for it.
-async fn resolve_file_reference(
+fn resolve_file_reference(
     reference: CreateFileReference,
     operations: &mut VolumeOperationLane,
     reparse_point_mode: CreateReparsePointMode,
@@ -973,7 +965,6 @@ async fn resolve_file_reference(
     let node = operations
         .journaled_mut()
         .load_node_by_file_index(reference.file_index())
-        .await
         .map_err(file_reference_lookup_error)?;
     resolve_final_node(
         operations,
@@ -982,7 +973,6 @@ async fn resolve_file_reference(
         reparse_point_mode,
         UnparsedPathLength::ZERO,
     )
-    .await
 }
 
 /// Maps file-reference lookup failures to create/open status.
@@ -998,7 +988,7 @@ fn file_reference_lookup_error(error: ext4_core::Error) -> DriverError {
 ///
 /// Returns an error when relative FILE_OBJECT opens are requested, a path component is invalid, an
 /// intermediate component is missing or not a directory, or lookup fails.
-async fn resolve_path(
+fn resolve_path(
     name: CreatePathName,
     anchor: CreatePathAnchor,
     operations: &mut VolumeOperationLease,
@@ -1018,7 +1008,6 @@ async fn resolve_path(
             .lane_mut()
             .journaled_mut()
             .load_directory(parent_id)
-            .await
         {
             Ok(directory) => directory,
             Err(error) => return Err(DriverError::from(error)),
@@ -1027,7 +1016,6 @@ async fn resolve_path(
             .lane_mut()
             .journaled_mut()
             .lookup_windows_child(&parent, component.name())
-            .await
         {
             Ok(ChildLookup::Found(child)) => child,
             Ok(ChildLookup::NotFound) if position == PathComponentPosition::Final => {
@@ -1041,8 +1029,7 @@ async fn resolve_path(
         };
         let child_node = *child.node();
         operations.ensure_node_openable(child_node)?;
-        let reparse_point =
-            NodeSymlinkReparsePoint::load(operations.lane_mut(), child_node).await?;
+        let reparse_point = NodeSymlinkReparsePoint::load(operations.lane_mut(), child_node)?;
         if let Some(point) = reparse_point {
             match reparse_point_encounter(position, reparse_point_mode) {
                 ReparsePointEncounter::Redirect => {
@@ -1128,14 +1115,14 @@ const fn reparse_point_encounter(
 /// # Errors
 ///
 /// Returns an error when reparse metadata cannot be loaded.
-async fn resolve_final_node(
+fn resolve_final_node(
     operations: &mut VolumeOperationLane,
     node: NodeId,
     location: OpenedLocation,
     reparse_point_mode: CreateReparsePointMode,
     unparsed_path: UnparsedPathLength,
 ) -> DriverResult<CreateTargetLookup> {
-    let Some(point) = NodeSymlinkReparsePoint::load(operations, node).await? else {
+    let Some(point) = NodeSymlinkReparsePoint::load(operations, node)? else {
         return Ok(CreateTargetLookup::Existing {
             node,
             node_mode: OpenedNodeMode::Direct,

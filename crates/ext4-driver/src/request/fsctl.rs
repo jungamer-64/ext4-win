@@ -112,7 +112,7 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 ///
 /// Returns an error when the enable payload is malformed, the FILE_OBJECT is not a regular file, or
 /// the fs-verity transaction fails.
-pub(crate) async fn enable_verity(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn enable_verity(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
     let (enable, file_id, mut operations) = {
         request.with_active(|active| {
             let current = active.current_stack()?;
@@ -133,9 +133,9 @@ pub(crate) async fn enable_verity(mut request: PendingIrpLease<'_>) -> DriverRes
         .lane_mut()
         .journaled_mut()
         .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let file = transaction.file(file_id).await?;
-    transaction.enable_verity(file, &enable).await?;
-    transaction.commit().await?;
+    let file = transaction.file(file_id)?;
+    transaction.enable_verity(file, &enable)?;
+    transaction.commit()?;
     Ok(IrpCompletion::EMPTY)
 }
 

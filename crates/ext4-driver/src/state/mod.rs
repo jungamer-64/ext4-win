@@ -854,8 +854,8 @@ impl VolumeOperationLane {
     /// # Errors
     ///
     /// Returns an error when journal or lower-device flush fails.
-    pub(crate) async fn flush(&mut self) -> ext4_core::Result<()> {
-        self.journaled.flush().await
+    pub(crate) fn flush(&mut self) -> ext4_core::Result<()> {
+        self.journaled.flush()
     }
 
     /// Returns a stable serial number derived from the ext4 filesystem UUID.
@@ -1069,7 +1069,7 @@ impl VolumeOperationLease {
     ///
     /// Returns access denied while any other handle is active, volume dismounted after terminal
     /// dismount, or the lower flush error.
-    pub(crate) async fn lock_volume(&mut self, owner: KernelFileObject) -> DriverResult<()> {
+    pub(crate) fn lock_volume(&mut self, owner: KernelFileObject) -> DriverResult<()> {
         let control = unsafe {
             // SAFETY: This non-cloneable actor lease uniquely owns volume lifecycle transitions.
             self.control.as_ref()
@@ -1083,7 +1083,7 @@ impl VolumeOperationLease {
         if namespace_handles != 0 || control.handles.active_handle_count() != 1 {
             return Err(DriverError::AccessDenied);
         }
-        self.lane_mut().flush().await?;
+        self.lane_mut().flush()?;
         unsafe {
             // SAFETY: No other actor operation can change the state across this awaited flush.
             self.control.as_mut()
@@ -1110,14 +1110,14 @@ impl VolumeOperationLease {
     ///
     /// Returns access denied when another FILE_OBJECT owns the volume lock, volume dismounted for
     /// a repeated request, or the lower flush error.
-    pub(crate) async fn dismount_volume(&mut self, owner: KernelFileObject) -> DriverResult<()> {
+    pub(crate) fn dismount_volume(&mut self, owner: KernelFileObject) -> DriverResult<()> {
         let next_state = unsafe {
             // SAFETY: This non-cloneable actor lease uniquely observes volume lifecycle state.
             self.control.as_ref()
         }
         .state
         .dismount(owner)?;
-        self.lane_mut().flush().await?;
+        self.lane_mut().flush()?;
         unsafe {
             // SAFETY: No other actor operation can change the state across this awaited flush.
             self.control.as_mut()
@@ -1256,7 +1256,7 @@ impl VolumeOperationLease {
     /// # Errors
     ///
     /// Returns an error when the parent cannot be loaded or child creation cannot be staged.
-    pub(crate) async fn begin_child_creation(
+    pub(crate) fn begin_child_creation(
         &mut self,
         parent: DirectoryNodeId,
         name: &Ext4Name,
@@ -1275,17 +1275,14 @@ impl VolumeOperationLease {
             &*file_control_blocks
         };
         let mut transaction = self.lane_mut().journaled_mut().begin_transaction(now);
-        let parent = transaction.directory(parent).await?;
+        let parent = transaction.directory(parent)?;
         let node = match target {
             ChildCreationTarget::File(metadata) => {
-                NodeId::File(transaction.create_file(parent, name, metadata).await?.id())
+                NodeId::File(transaction.create_file(parent, name, metadata)?.id())
             }
-            ChildCreationTarget::Directory(metadata) => NodeId::Directory(
-                transaction
-                    .create_directory(parent, name, metadata)
-                    .await?
-                    .id(),
-            ),
+            ChildCreationTarget::Directory(metadata) => {
+                NodeId::Directory(transaction.create_directory(parent, name, metadata)?.id())
+            }
         };
         Ok(PendingChildCreation {
             transaction,
@@ -1824,7 +1821,7 @@ impl VolumeControlBlock {
     /// # Errors
     ///
     /// Returns an error when the lower device cannot be mounted as a journaled ext4 volume.
-    pub(crate) async fn mount_journaled(
+    pub(crate) fn mount_journaled(
         completion_owner: KernelDevice,
         target_device: KernelDevice,
         length: DeviceLength,
@@ -1833,8 +1830,7 @@ impl VolumeControlBlock {
         let volume = JournaledVolume::<_, CngFscryptNonceGenerator>::mount(
             block_device,
             MountContext::new(FscryptKeySet::empty(), CngFscryptNonceGenerator),
-        )
-        .await?;
+        )?;
         Ok(Self {
             directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
             file_control_blocks: FileControlBlockLedger::try_new()?,
@@ -2515,13 +2511,9 @@ impl PendingChildCreation<'_> {
     /// # Errors
     ///
     /// Returns an error when the staged node rejects xattr mutation.
-    pub(crate) async fn set_xattr(
-        &mut self,
-        name: XattrName,
-        value: XattrValue,
-    ) -> DriverResult<()> {
-        let node = self.transaction.node(self.node).await?;
-        self.transaction.set_xattr(node, name, value).await?;
+    pub(crate) fn set_xattr(&mut self, name: XattrName, value: XattrValue) -> DriverResult<()> {
+        let node = self.transaction.node(self.node)?;
+        self.transaction.set_xattr(node, name, value)?;
         Ok(())
     }
 
@@ -2529,9 +2521,9 @@ impl PendingChildCreation<'_> {
     /// # Errors
     ///
     /// Returns an error when the staged node rejects xattr mutation.
-    pub(crate) async fn remove_xattr(&mut self, name: &XattrName) -> DriverResult<()> {
-        let node = self.transaction.node(self.node).await?;
-        self.transaction.remove_xattr(node, name).await?;
+    pub(crate) fn remove_xattr(&mut self, name: &XattrName) -> DriverResult<()> {
+        let node = self.transaction.node(self.node)?;
+        self.transaction.remove_xattr(node, name)?;
         Ok(())
     }
 
@@ -2539,8 +2531,8 @@ impl PendingChildCreation<'_> {
     /// # Errors
     ///
     /// Returns an error when the journal cannot durably commit the staged mutation.
-    pub(crate) async fn commit(self) -> DriverResult<()> {
-        self.transaction.commit().await?;
+    pub(crate) fn commit(self) -> DriverResult<()> {
+        self.transaction.commit()?;
         Ok(())
     }
 }
