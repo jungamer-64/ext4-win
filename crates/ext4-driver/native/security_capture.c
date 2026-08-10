@@ -667,62 +667,6 @@ ext4win_capture_ea_name_list(
         length_out);
 }
 
-_IRQL_requires_max_(APC_LEVEL)
-_Must_inspect_result_
-NTSTATUS
-NTAPI
-ext4win_capture_directory_pattern(
-    _In_ PCUNICODE_STRING source,
-    _In_ KPROCESSOR_MODE requestor_mode,
-    _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
-    _Out_ PULONG length_out)
-{
-    UNICODE_STRING header = {0};
-    NTSTATUS status;
-
-    if (snapshot_out != NULL) {
-        *snapshot_out = NULL;
-    }
-    if (length_out != NULL) {
-        *length_out = 0;
-    }
-    if ((snapshot_out == NULL) || (length_out == NULL) ||
-        !ext4win_is_requestor_mode_valid(requestor_mode)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if (source == NULL) {
-        return STATUS_INVALID_USER_BUFFER;
-    }
-
-    status = STATUS_SUCCESS;
-    __try {
-        /* The I/O manager owns the stack-resident UNICODE_STRING descriptor. */
-        RtlCopyMemory(&header, source, sizeof(header));
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = ext4win_normalize_user_buffer_exception(GetExceptionCode());
-    }
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-    if ((header.Length > header.MaximumLength) ||
-        ((header.Length & (sizeof(WCHAR) - 1)) != 0) ||
-        ((header.MaximumLength & (sizeof(WCHAR) - 1)) != 0) ||
-        (header.Length > EXT4WIN_MAX_DIRECTORY_PATTERN_SIZE) ||
-        ((header.Length != 0) && (header.Buffer == NULL))) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    return ext4win_capture_requestor_input(
-        header.Buffer,
-        header.Length,
-        EXT4WIN_MAX_DIRECTORY_PATTERN_SIZE,
-        TYPE_ALIGNMENT(WCHAR),
-        requestor_mode,
-        snapshot_out,
-        length_out);
-}
-
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 NTAPI

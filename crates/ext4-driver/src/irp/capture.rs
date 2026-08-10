@@ -434,18 +434,14 @@ impl CapturedRequestorInput {
     ) -> Result<Option<Self>, IrpCompletion> {
         #[cfg(not(test))]
         {
-            let requestor_mode = unsafe {
-                // SAFETY: Dispatch retains the received IRP until capture returns.
-                target.irp.as_ref().RequestorMode
-            };
+            let _: &ActiveIrp<'_> = target;
             let mut snapshot = core::ptr::null_mut();
             let mut captured_length = 0;
             let status = unsafe {
-                // SAFETY: The native boundary captures and validates the string header and then
-                // copies its bounded buffer under SEH protection.
-                ffi::ext4win_capture_directory_pattern(
+                // SAFETY: The native boundary captures and validates the I/O-manager-owned string
+                // header and payload under SEH protection.
+                ffi::ext4win_capture_io_manager_directory_pattern(
                     source.as_ptr(),
-                    requestor_mode,
                     core::ptr::addr_of_mut!(snapshot),
                     core::ptr::addr_of_mut!(captured_length),
                 )
