@@ -342,13 +342,14 @@ fn execute_immediate(major: DispatchMajor) -> DriverResult<IrpCompletion> {
 /// Classification is copied out before `owned` moves so no pointer into queue metadata can enter
 /// an operation or lower completion envelope.
 pub(crate) fn admit_owned(
-    owned: OwnedIrp,
+    mut owned: OwnedIrp,
 ) -> Result<alloc::boxed::Box<dyn crate::irp::reactor::CompletionOperation>, AdmitOperationError> {
     enum Admission {
         Read(ReadRequestKind),
         Mutation(MutationRequestKind),
         Flush(FlushRequestKind),
         Immediate(ImmediateRequestKind),
+        FsControl(crate::irp::FileSystemControlMinorFunction),
         Unsupported,
     }
 
@@ -395,10 +396,55 @@ pub(crate) fn admit_owned(
             Admission::Flush(FlushRequestKind::Shutdown)
         }
         ActorRequest::Close => Admission::Immediate(ImmediateRequestKind::Close),
-        ActorRequest::Captured(
-            PreparedRequest::DirectoryControl(PreparedDirectoryControl::NotifyChangeDirectory)
-            | PreparedRequest::FileSystemControl(_),
-        ) => Admission::Unsupported,
+        ActorRequest::Captured(PreparedRequest::DirectoryControl(
+            PreparedDirectoryControl::NotifyChangeDirectory,
+        )) => Admission::Unsupported,
+        ActorRequest::Captured(PreparedRequest::FileSystemControl(minor)) => {
+            Admission::FsControl(*minor)
+        }
+    };
+
+    let admission = match admission {
+        Admission::FsControl(minor) => {
+            let classified = match super::file_system_control::classify(owned.request(), minor) {
+                Ok(classified) => classified,
+                Err(error) => return Err(AdmitOperationError::new(error, owned)),
+            };
+            match classified {
+                super::file_system_control::FsControlAdmission::Mount(_)
+                | super::file_system_control::FsControlAdmission::Unsupported => {
+                    Admission::Unsupported
+                }
+                super::file_system_control::FsControlAdmission::User(code) => match code {
+                    crate::irp::FsControlCode::GetReparsePoint => {
+                        Admission::Read(ReadRequestKind::GetReparsePoint)
+                    }
+                    crate::irp::FsControlCode::SetReparsePoint => {
+                        Admission::Mutation(MutationRequestKind::SetReparsePoint)
+                    }
+                    crate::irp::FsControlCode::DeleteReparsePoint => {
+                        Admission::Mutation(MutationRequestKind::DeleteReparsePoint)
+                    }
+                    crate::irp::FsControlCode::EnableVerity => {
+                        Admission::Mutation(MutationRequestKind::EnableVerity)
+                    }
+                    crate::irp::FsControlCode::AddEncryptionKey => {
+                        Admission::Mutation(MutationRequestKind::AddEncryptionKey)
+                    }
+                    crate::irp::FsControlCode::RemoveEncryptionKey => {
+                        Admission::Mutation(MutationRequestKind::RemoveEncryptionKey)
+                    }
+                    crate::irp::FsControlCode::GetEncryptionKeyStatus => {
+                        Admission::Immediate(ImmediateRequestKind::GetEncryptionKeyStatus)
+                    }
+                    crate::irp::FsControlCode::LockVolume
+                    | crate::irp::FsControlCode::UnlockVolume
+                    | crate::irp::FsControlCode::DismountVolume
+                    | crate::irp::FsControlCode::IsVolumeMounted => Admission::Unsupported,
+                },
+            }
+        }
+        admission => admission,
     };
 
     match admission {
@@ -406,6 +452,10 @@ pub(crate) fn admit_owned(
         Admission::Mutation(kind) => super::operation::mutation(owned, kind),
         Admission::Flush(kind) => super::operation::flush(owned, kind),
         Admission::Immediate(kind) => super::operation::immediate(owned, kind),
+        Admission::FsControl(_) => Err(AdmitOperationError::new(
+            DriverError::InternalInvariantViolation,
+            owned,
+        )),
         Admission::Unsupported => Err(AdmitOperationError::new(
             DriverError::InvalidDeviceRequest,
             owned,
