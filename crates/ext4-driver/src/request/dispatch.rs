@@ -350,6 +350,7 @@ pub(crate) fn admit_owned(
         Mutation(MutationRequestKind),
         Flush(FlushRequestKind),
         Immediate(ImmediateRequestKind),
+        Notification,
         FsControl(crate::irp::FileSystemControlMinorFunction),
         Unsupported,
     }
@@ -399,7 +400,7 @@ pub(crate) fn admit_owned(
         ActorRequest::Close => Admission::Immediate(ImmediateRequestKind::Close),
         ActorRequest::Captured(PreparedRequest::DirectoryControl(
             PreparedDirectoryControl::NotifyChangeDirectory,
-        )) => Admission::Unsupported,
+        )) => Admission::Notification,
         ActorRequest::Captured(PreparedRequest::FileSystemControl(minor)) => {
             Admission::FsControl(*minor)
         }
@@ -456,6 +457,7 @@ pub(crate) fn admit_owned(
         Admission::Mutation(kind) => super::operation::mutation(owned, kind),
         Admission::Flush(kind) => super::operation::flush(owned, kind),
         Admission::Immediate(kind) => super::operation::immediate(owned, kind),
+        Admission::Notification => super::operation::notification(owned),
         Admission::FsControl(_) => Err(AdmitOperationError::new(
             DriverError::InternalInvariantViolation,
             owned,
