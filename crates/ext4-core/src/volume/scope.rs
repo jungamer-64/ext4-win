@@ -5,7 +5,7 @@ pub(super) use alloc::vec;
 pub(super) use alloc::vec::Vec;
 
 pub(super) use crate::disk::block::{BlockAddress, BlockSize, ByteOffset, DeviceLength};
-pub(super) use crate::disk::checksum::crc32c;
+pub(super) use crate::disk::checksum::ext4_crc32c;
 pub(super) use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 pub(super) use crate::disk::io::{BlockSource, BlockStorage};
 #[cfg(test)]
@@ -57,8 +57,8 @@ pub(super) use super::block_group::{
     round_up_div, set_cluster_bitmap_bit, set_inode_bitmap_bit,
 };
 pub(super) use super::inode_record::{
-    AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord, StagedInodeIndex,
-    StagedInodeRecord,
+    AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord, ResizeInodeBlockMap,
+    StagedInodeIndex, StagedInodeRecord,
 };
 #[cfg(test)]
 pub(super) use super::mount::ReadOnlyVolume;

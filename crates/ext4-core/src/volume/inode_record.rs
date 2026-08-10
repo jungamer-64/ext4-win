@@ -15,6 +15,20 @@ pub(super) struct RawInodeRecord {
     pub(super) encoding: InodeDataEncoding,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Legacy double-indirect root owned specifically by ext4's reserved resize inode.
+pub(super) struct ResizeInodeBlockMap {
+    /// Block containing pointers to the resize inode's indirect pointer blocks.
+    double_indirect: BlockAddress,
+}
+
+impl ResizeInodeBlockMap {
+    /// Returns the double-indirect pointer block.
+    pub(super) const fn double_indirect(self) -> BlockAddress {
+        self.double_indirect
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Newly allocated zeroed inode record before an inode kind has been written.
 pub(super) struct AllocatedInodeRecord {
@@ -515,6 +529,43 @@ impl RawInodeRecord {
     /// Returns an error when `i_flags` is truncated before the extent-tree bit can be read.
     pub(super) fn has_extent_tree(&self) -> Result<bool> {
         Ok(self.flags()?.has_extent_tree())
+    }
+
+    /// Parses the fixed legacy block-map shape used by ext4's reserved resize inode.
+    /// # Errors
+    ///
+    /// Returns an error when any direct, single-indirect, or triple-indirect slot is nonzero, or the
+    /// required double-indirect slot is zero or truncated.
+    pub(super) fn resize_inode_block_map(&self) -> Result<ResizeInodeBlockMap> {
+        const DOUBLE_INDIRECT_INDEX: usize = 13;
+        const TRIPLE_INDIRECT_INDEX: usize = 14;
+        for index in 0..DOUBLE_INDIRECT_INDEX {
+            if self.legacy_block_pointer(index)?.get() != 0 {
+                return Err(Error::UnsupportedBlockMap);
+            }
+        }
+        let double_indirect = self.legacy_block_pointer(DOUBLE_INDIRECT_INDEX)?;
+        if double_indirect.get() == 0
+            || self.legacy_block_pointer(TRIPLE_INDIRECT_INDEX)?.get() != 0
+        {
+            return Err(Error::UnsupportedBlockMap);
+        }
+        Ok(ResizeInodeBlockMap { double_indirect })
+    }
+
+    /// Reads one legacy `i_block` pointer by slot index.
+    /// # Errors
+    ///
+    /// Returns an error when slot offset arithmetic overflows or the inode block field is truncated.
+    fn legacy_block_pointer(&self, index: usize) -> Result<BlockAddress> {
+        let offset = index
+            .checked_mul(core::mem::size_of::<u32>())
+            .and_then(|value| value.checked_add(INODE_BLOCK_OFFSET))
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(BlockAddress::new(u64::from(le_u32(
+            &self.bytes,
+            disk_offset(offset),
+        )?)))
     }
 
     /// Parses the raw bytes as a validated inode.
@@ -1076,15 +1127,15 @@ impl RawInodeRecord {
         if self.bytes.len() > INODE_CHECKSUM_HI_OFFSET {
             put_le_u16(&mut self.bytes, disk_offset(INODE_CHECKSUM_HI_OFFSET), 0)?;
         }
-        let seed = crc32c(
+        let seed = ext4_crc32c(
             superblock.checksum_seed().as_u32(),
             &self.id.as_u32().to_le_bytes(),
         );
-        let seed = crc32c(
+        let seed = ext4_crc32c(
             seed,
             &le_u32(&self.bytes, disk_offset(INODE_GENERATION_OFFSET))?.to_le_bytes(),
         );
-        let checksum = crc32c(seed, &self.bytes);
+        let checksum = ext4_crc32c(seed, &self.bytes);
         put_le_u16(
             &mut self.bytes,
             disk_offset(INODE_CHECKSUM_LO_OFFSET),
@@ -1347,6 +1398,42 @@ mod tests {
         assert_eq!(
             le_u16(record.bytes(), disk_offset(INODE_BLOCKS_HIGH_OFFSET)),
             Ok(0)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn resize_inode_block_map_accepts_only_the_reserved_double_indirect_shape() {
+        const DOUBLE_INDIRECT_OFFSET: usize = 92;
+        let record = raw_record(7);
+        assert!(record.is_ok());
+        let Ok(mut record) = record else {
+            return;
+        };
+        assert_eq!(
+            put_le_u32(
+                &mut record.bytes,
+                disk_offset(DOUBLE_INDIRECT_OFFSET),
+                17_432,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            record.resize_inode_block_map(),
+            Ok(ResizeInodeBlockMap {
+                double_indirect: BlockAddress::new(17_432),
+            })
+        );
+
+        assert_eq!(
+            put_le_u32(&mut record.bytes, disk_offset(INODE_BLOCK_OFFSET), 1),
+            Ok(())
+        );
+        assert_eq!(
+            record.resize_inode_block_map(),
+            Err(Error::UnsupportedBlockMap)
         );
     }
 }

@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::num::NonZeroU64;
 
 use crate::disk::block::{BlockAddress, BlockSize};
-use crate::disk::checksum::crc32c;
+use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::disk::io::BlockSource;
 use crate::disk_format::inode::{InodeExtentRoot, InodeId};
@@ -17,8 +17,12 @@ const EXTENT_MAGIC: u16 = 0xF30A;
 const EXTENT_HEADER_SIZE: usize = 12;
 /// Size of one extent leaf or index entry in bytes.
 const EXTENT_ENTRY_SIZE: usize = 12;
-/// High bit of `ee_len` marking uninitialized extents.
-const EXTENT_LEN_UNINITIALIZED: u16 = 0x8000;
+/// Maximum initialized extent length and bias applied to uninitialized lengths in `ee_len`.
+const EXTENT_LEN_INITIALIZED_MAX: u16 = 0x8000;
+/// Maximum initialized extent length widened for normalization arithmetic.
+const EXTENT_LEN_INITIALIZED_MAX_U32: u32 = 0x8000;
+/// Maximum uninitialized extent length widened for normalization arithmetic.
+const EXTENT_LEN_UNINITIALIZED_MAX_U32: u32 = 0x7FFF;
 /// Bytes available in an inode `i_block` extent root.
 const INODE_ROOT_BYTES: usize = 60;
 /// Maximum entries that fit in the inode root.
@@ -77,9 +81,10 @@ impl ExtentLength {
     /// Creates an extent length.
     ///
     /// # Errors
-    /// Returns an error when the extent length is zero.
+    /// Returns an error when the extent length is zero or exceeds ext4's initialized-extent
+    /// maximum.
     pub fn new(value: u16) -> Result<Self> {
-        if value == 0 {
+        if value == 0 || value > EXTENT_LEN_INITIALIZED_MAX {
             Err(Error::InvalidExtentTree)
         } else {
             Ok(Self(value))
@@ -157,6 +162,16 @@ pub enum ExtentInitialization {
     Initialized,
     /// Extent payload is allocated but must read as zero until initialized.
     Uninitialized,
+}
+
+impl ExtentInitialization {
+    /// Largest block count encodable for this initialization state.
+    const fn maximum_length(self) -> u32 {
+        match self {
+            Self::Initialized => EXTENT_LEN_INITIALIZED_MAX_U32,
+            Self::Uninitialized => EXTENT_LEN_UNINITIALIZED_MAX_U32,
+        }
+    }
 }
 
 /// Checksum context required for external extent blocks.
@@ -775,12 +790,7 @@ fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
         raw,
         disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
     )?;
-    let len = ExtentLength::new(raw_len & !EXTENT_LEN_UNINITIALIZED)?;
-    let initialization = if raw_len & EXTENT_LEN_UNINITIALIZED == 0 {
-        ExtentInitialization::Initialized
-    } else {
-        ExtentInitialization::Uninitialized
-    };
+    let (len, initialization) = parse_extent_length(raw_len)?;
     let start_hi = u64::from(le_u16(
         raw,
         disk_offset(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?),
@@ -798,6 +808,24 @@ fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
             Extent::uninitialized(logical_start, len, physical_start)
         }
     })
+}
+
+/// Decodes ext4's asymmetric initialized/uninitialized `ee_len` domain.
+/// # Errors
+///
+/// Returns an error when the on-disk length is zero.
+fn parse_extent_length(raw: u16) -> Result<(ExtentLength, ExtentInitialization)> {
+    if raw <= EXTENT_LEN_INITIALIZED_MAX {
+        Ok((ExtentLength::new(raw)?, ExtentInitialization::Initialized))
+    } else {
+        let length = raw
+            .checked_sub(EXTENT_LEN_INITIALIZED_MAX)
+            .ok_or(Error::InvalidExtentTree)?;
+        Ok((
+            ExtentLength::new(length)?,
+            ExtentInitialization::Uninitialized,
+        ))
+    }
 }
 
 /// Reads the extent-header entry count after validating header size.
@@ -920,16 +948,18 @@ fn normalize_extents(extents: &mut Vec<Extent>) -> Result<()> {
                     .as_u32()
                     .checked_add(extent.len().as_u32())
                     .ok_or(Error::ArithmeticOverflow)?;
-                let len = ExtentLength::new(
-                    u16::try_from(combined).map_err(|_| Error::ArithmeticOverflow)?,
-                )?;
-                *last = Extent::from_parts(
-                    last.logical_start(),
-                    len,
-                    last.physical_start(),
-                    last.initialization(),
-                );
-                continue;
+                if combined <= last.initialization().maximum_length() {
+                    let len = ExtentLength::new(
+                        u16::try_from(combined).map_err(|_| Error::ArithmeticOverflow)?,
+                    )?;
+                    *last = Extent::from_parts(
+                        last.logical_start(),
+                        len,
+                        last.physical_start(),
+                        last.initialization(),
+                    );
+                    continue;
+                }
             }
         }
         normalized.try_push(extent)?;
@@ -1117,7 +1147,11 @@ fn write_extent_entry(raw: &mut [u8], offset: usize, extent: Extent) -> Result<(
     }
     let len = match extent.initialization() {
         ExtentInitialization::Initialized => extent.len().as_u16(),
-        ExtentInitialization::Uninitialized => extent.len().as_u16() | EXTENT_LEN_UNINITIALIZED,
+        ExtentInitialization::Uninitialized => extent
+            .len()
+            .as_u16()
+            .checked_add(EXTENT_LEN_INITIALIZED_MAX)
+            .ok_or(Error::InvalidExtentTree)?,
     };
     put_le_u32(raw, disk_offset(offset), extent.logical_start().as_u32())?;
     put_le_u16(
@@ -1223,22 +1257,60 @@ fn extent_block_checksum(
     checksum_offset: usize,
 ) -> Result<u32> {
     let zero_checksum = [0_u8; EXTENT_TAIL_SIZE];
-    let mut seed = crc32c(checksum.seed, &checksum.inode_id.as_u32().to_le_bytes());
-    seed = crc32c(seed, &checksum.generation.to_le_bytes());
-    let mut value = crc32c(
+    let mut seed = ext4_crc32c(checksum.seed, &checksum.inode_id.as_u32().to_le_bytes());
+    seed = ext4_crc32c(seed, &checksum.generation.to_le_bytes());
+    let mut value = ext4_crc32c(
         seed,
         raw.get(..checksum_offset)
             .ok_or(Error::TruncatedStructure)?,
     );
-    value = crc32c(value, &zero_checksum);
+    value = ext4_crc32c(value, &zero_checksum);
     let checksum_end = checksum_offset
         .checked_add(EXTENT_TAIL_SIZE)
         .ok_or(Error::ArithmeticOverflow)?;
     if checksum_end < raw.len() {
-        value = crc32c(
+        value = ext4_crc32c(
             value,
             raw.get(checksum_end..).ok_or(Error::TruncatedStructure)?,
         );
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EXTENT_LEN_INITIALIZED_MAX, ExtentInitialization, ExtentLength, parse_extent_length,
+    };
+    use crate::error::Error;
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn extent_length_decodes_initialized_maximum_and_uninitialized_minimum() {
+        assert_eq!(
+            parse_extent_length(EXTENT_LEN_INITIALIZED_MAX),
+            Ok((
+                ExtentLength(EXTENT_LEN_INITIALIZED_MAX),
+                ExtentInitialization::Initialized,
+            ))
+        );
+        assert_eq!(
+            parse_extent_length(EXTENT_LEN_INITIALIZED_MAX.saturating_add(1)),
+            Ok((ExtentLength(1), ExtentInitialization::Uninitialized,))
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn extent_length_rejects_zero_and_values_above_the_ext4_domain() {
+        assert_eq!(parse_extent_length(0), Err(Error::InvalidExtentTree));
+        assert_eq!(
+            ExtentLength::new(EXTENT_LEN_INITIALIZED_MAX.saturating_add(1)),
+            Err(Error::InvalidExtentTree)
+        );
+    }
 }

@@ -172,8 +172,26 @@ fn file_offset_addition_rejects_overflow() {
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
-fn crc32c_known_vector_matches_castagnoli() {
-    assert_eq!(crate::disk::checksum::crc32c(0, b"123456789"), 0xE306_9283);
+fn ext4_crc32c_known_vector_keeps_the_running_kernel_state() {
+    assert_eq!(
+        crate::disk::checksum::ext4_crc32c(u32::MAX, b"123456789"),
+        0x1CF9_6D7C
+    );
+}
+
+/// # Panics
+///
+/// Panics when assertions or fixed test fixture assumptions fail.
+#[test]
+fn superblock_checksum_covers_only_the_bytes_before_its_field() {
+    let mut image = modern_fixture_image_with_journal_blocks(16);
+    let raw = &mut image[1024..2048];
+    put_u32(raw, 1020, 1);
+    must(Superblock::refresh_checksum(raw));
+    let expected = crate::disk::checksum::ext4_crc32c(u32::MAX, &raw[..1020]);
+
+    assert_eq!(get_u32(raw, 1020), expected);
+    assert!(Superblock::parse(raw).is_ok());
 }
 
 /// # Panics

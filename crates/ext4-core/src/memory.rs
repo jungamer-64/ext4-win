@@ -41,6 +41,12 @@ pub(crate) trait FallibleVec<T> {
     /// Returns [`Error::OutOfMemory`] when reserving room for the new element fails.
     fn try_push(&mut self, value: T) -> Result<()>;
 
+    /// Inserts one value after reserving capacity for it.
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] when reserving room for the new element fails.
+    fn try_insert(&mut self, index: usize, value: T) -> Result<()>;
+
     /// Extends from a copyable slice after reserving the exact additional length.
     /// # Errors
     ///
@@ -54,6 +60,12 @@ impl<T> FallibleVec<T> for Vec<T> {
     fn try_push(&mut self, value: T) -> Result<()> {
         self.try_reserve(1).map_err(allocation_failed)?;
         self.push(value);
+        Ok(())
+    }
+
+    fn try_insert(&mut self, index: usize, value: T) -> Result<()> {
+        self.try_reserve(1).map_err(allocation_failed)?;
+        self.insert(index, value);
         Ok(())
     }
 

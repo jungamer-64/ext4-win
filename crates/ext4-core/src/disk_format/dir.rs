@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use crate::disk::checksum::crc32c;
+use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::disk_format::inode::{DirectoryStorageKind, InodeId};
 use crate::disk_format::superblock::{
@@ -366,8 +366,8 @@ impl DirectoryChecksum {
         inode_id: InodeId,
         generation: u32,
     ) -> Self {
-        let mut seed = crc32c(checksum_seed.as_u32(), &inode_id.as_u32().to_le_bytes());
-        seed = crc32c(seed, &generation.to_le_bytes());
+        let mut seed = ext4_crc32c(checksum_seed.as_u32(), &inode_id.as_u32().to_le_bytes());
+        seed = ext4_crc32c(seed, &generation.to_le_bytes());
         Self::Crc32c { inode_seed: seed }
     }
 
@@ -421,7 +421,7 @@ impl DirectoryChecksum {
         put_le_u32(
             bytes,
             disk_offset(tail_offset).checked_add_bytes(8)?,
-            crc32c(
+            ext4_crc32c(
                 inode_seed,
                 bytes
                     .get(..tail_offset)
@@ -467,7 +467,7 @@ impl DirectoryChecksum {
         {
             return Err(Error::InvalidDirectoryEntry);
         }
-        let expected = crc32c(
+        let expected = ext4_crc32c(
             inode_seed,
             bytes
                 .get(..tail_offset)
@@ -521,17 +521,17 @@ impl DirectoryChecksum {
                     .ok_or(Error::ArithmeticOverflow)?,
             )
             .ok_or(Error::ArithmeticOverflow)?;
-        let mut checksum = crc32c(
+        let mut checksum = ext4_crc32c(
             inode_seed,
             bytes.get(..table_end).ok_or(Error::InvalidDirectoryEntry)?,
         );
-        checksum = crc32c(
+        checksum = ext4_crc32c(
             checksum,
             bytes
                 .get(tail_offset..checksum_offset)
                 .ok_or(Error::InvalidDirectoryEntry)?,
         );
-        checksum = crc32c(checksum, &0_u32.to_le_bytes());
+        checksum = ext4_crc32c(checksum, &0_u32.to_le_bytes());
         put_le_u32(bytes, disk_offset(checksum_offset), checksum)
     }
 
@@ -577,17 +577,17 @@ impl DirectoryChecksum {
                     .ok_or(Error::ArithmeticOverflow)?,
             )
             .ok_or(Error::ArithmeticOverflow)?;
-        let mut checksum = crc32c(
+        let mut checksum = ext4_crc32c(
             inode_seed,
             bytes.get(..table_end).ok_or(Error::InvalidDirectoryEntry)?,
         );
-        checksum = crc32c(
+        checksum = ext4_crc32c(
             checksum,
             bytes
                 .get(tail_offset..checksum_offset)
                 .ok_or(Error::InvalidDirectoryEntry)?,
         );
-        checksum = crc32c(checksum, &0_u32.to_le_bytes());
+        checksum = ext4_crc32c(checksum, &0_u32.to_le_bytes());
         if le_u32(bytes, disk_offset(checksum_offset))? != checksum {
             return Err(Error::ChecksumMismatch);
         }
