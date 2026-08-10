@@ -59,6 +59,8 @@ pub(crate) enum ReadRequestKind {
     QueryEa,
     /// Security descriptor query.
     QuerySecurity,
+    /// Reparse-point FSCTL query.
+    GetReparsePoint,
 }
 
 /// Explicit ownership phase of one top-level read operation.
@@ -152,6 +154,11 @@ impl ReadRequestOperation {
             ReadRequestKind::QuerySecurity => {
                 crate::request::security::query(owned.request(), read)
             }
+            ReadRequestKind::GetReparsePoint => {
+                let mut request = owned.request();
+                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                crate::request::reparse::get_reparse_point(request, read)
+            }
         }
     }
 
@@ -218,6 +225,8 @@ pub(crate) enum ImmediateRequestKind {
     QueryVolumeInformation,
     /// Terminal FILE_OBJECT close.
     Close,
+    /// Fscrypt key-status query from the committed epoch snapshot.
+    GetEncryptionKeyStatus,
 }
 
 /// Explicit state of one immediate top-level operation.
@@ -272,6 +281,13 @@ impl CompletionOperation for ImmediateRequestOperation {
                 ImmediateRequestKind::Close => owned
                     .request()
                     .with_active(crate::request::file_info::close),
+                ImmediateRequestKind::GetEncryptionKeyStatus => (|| {
+                    let mut request = owned.request();
+                    crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                    let stack = request
+                        .with_active(|active| active.current_stack()?.file_system_control())?;
+                    crate::request::fsctl::get_encryption_key_status(&mut request, stack)
+                })(),
             },
             OperationEvent::CancelRequested => Err(DriverError::from(Error::OperationCancelled)),
             OperationEvent::StorageCompleted(_)
@@ -514,6 +530,16 @@ pub(crate) enum MutationRequestKind {
     SetSecurity,
     /// Volume-label mutation.
     SetVolumeInformation,
+    /// Store a Windows reparse point.
+    SetReparsePoint,
+    /// Delete a Windows reparse point.
+    DeleteReparsePoint,
+    /// Enable fs-verity metadata.
+    EnableVerity,
+    /// Add one mount-scoped fscrypt key snapshot.
+    AddEncryptionKey,
+    /// Remove one mount-scoped fscrypt key snapshot.
+    RemoveEncryptionKey,
     /// Cleanup-time namespace deletion after the terminal handle barrier.
     Cleanup,
 }
@@ -907,6 +933,52 @@ impl MutationRequestOperation {
                         ))
                     }
                 }
+            }
+            MutationRequestKind::SetReparsePoint => {
+                let mut request = owned.request();
+                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                let completion = crate::request::reparse::set_reparse_point(request, mutation)?;
+                Ok(DriverResolveDisposition::Mutation(
+                    PendingDriverPublication::Normal(completion),
+                ))
+            }
+            MutationRequestKind::DeleteReparsePoint => {
+                let mut request = owned.request();
+                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                let completion = crate::request::reparse::delete_reparse_point(request, mutation)?;
+                Ok(DriverResolveDisposition::Mutation(
+                    PendingDriverPublication::Normal(completion),
+                ))
+            }
+            MutationRequestKind::EnableVerity => {
+                let mut request = owned.request();
+                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                let completion = crate::request::fsctl::enable_verity(request, mutation)?;
+                Ok(DriverResolveDisposition::Mutation(
+                    PendingDriverPublication::Normal(completion),
+                ))
+            }
+            MutationRequestKind::AddEncryptionKey => {
+                let mut request = owned.request();
+                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                let stack =
+                    request.with_active(|active| active.current_stack()?.file_system_control())?;
+                let completion =
+                    crate::request::fsctl::add_encryption_key(&mut request, stack, mutation)?;
+                Ok(DriverResolveDisposition::Mutation(
+                    PendingDriverPublication::Normal(completion),
+                ))
+            }
+            MutationRequestKind::RemoveEncryptionKey => {
+                let mut request = owned.request();
+                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                let stack =
+                    request.with_active(|active| active.current_stack()?.file_system_control())?;
+                let completion =
+                    crate::request::fsctl::remove_encryption_key(&mut request, stack, mutation)?;
+                Ok(DriverResolveDisposition::Mutation(
+                    PendingDriverPublication::Normal(completion),
+                ))
             }
             MutationRequestKind::Cleanup => {
                 if self.cleanup_deletion.is_none() {
