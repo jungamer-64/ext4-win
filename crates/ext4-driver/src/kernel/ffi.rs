@@ -72,10 +72,9 @@ unsafe extern "system" {
         length_out: *mut wdk_sys::ULONG,
     ) -> wdk_sys::NTSTATUS;
 
-    /// Copies one validated query-directory filename pattern into nonpaged native memory.
-    pub(crate) fn ext4win_capture_directory_pattern(
+    /// Copies one validated I/O-manager-owned query pattern into nonpaged native memory.
+    pub(crate) fn ext4win_capture_io_manager_directory_pattern(
         source: *const wdk_sys::UNICODE_STRING,
-        requestor_mode: wdk_sys::KPROCESSOR_MODE,
         snapshot_out: *mut wdk_sys::PVOID,
         length_out: *mut wdk_sys::ULONG,
     ) -> wdk_sys::NTSTATUS;
