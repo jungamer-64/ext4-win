@@ -8,10 +8,7 @@ use core::fmt;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-use ext4_core::{
-    CleanJournalDurability, DurableMutation, MutationResource, OperationEvent, OperationId,
-    StorageRequest, VisibilityLease,
-};
+use ext4_core::{MutationResource, OperationEvent, OperationId, StorageRequest};
 use wdk_sys::{LIST_ENTRY, NTSTATUS, PIRP, PLIST_ENTRY, PVOID};
 #[cfg(not(test))]
 use wdk_sys::{PIO_CSQ, STATUS_SUCCESS};
@@ -53,11 +50,44 @@ pub(crate) const MAX_OPERATIONS: usize = 64;
 pub(crate) trait CompletionOperation: fmt::Debug + Send + 'static {
     /// Consumes this operation and its one concrete event into exactly one scheduler action.
     fn advance(self: Box<Self>, event: OperationEvent) -> OperationTransition;
+
+    /// Records a terminal lower-storage classification before the matching completion event.
+    fn record_storage_failure(&mut self, failure: StorageFailureClass);
+}
+
+/// Authority consumed by one allocation-free reactor publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationAuthority {
+    /// Durable visibility releases resource intents and the serialized commit grant.
+    Durable {
+        /// Stable mounted VCB receiving publication.
+        volume: NonNull<crate::state::VolumeControlBlock>,
+        /// FIFO mutation ticket whose grants are consumed.
+        ticket: u64,
+    },
+    /// Checkpoint publication releases journal space but owns no resource intent.
+    Checkpoint {
+        /// Stable mounted VCB receiving overlay removal.
+        volume: NonNull<crate::state::VolumeControlBlock>,
+        /// Overlay epoch being retired.
+        epoch: ext4_core::EpochSequence,
+    },
+}
+
+/// Prebuilt publication that reuses its existing operation allocation.
+pub(crate) trait InfalliblePublication: fmt::Debug + Send + 'static {
+    /// Scheduler authority consumed by this publication.
+    fn authority(&self) -> PublicationAuthority;
+
+    /// Publishes prepared values and returns the same box in its next operation phase.
+    fn publish(self: Box<Self>) -> Box<dyn CompletionOperation>;
 }
 
 /// Resource-intent request prepared before a mutation can reserve allocation.
 #[derive(Debug)]
 pub(crate) struct IntentRequest {
+    /// Stable mounted VCB whose resources are named by this request.
+    volume: NonNull<crate::state::VolumeControlBlock>,
     /// Stable FIFO mutation ticket.
     ticket: u64,
     /// Complete resource set acquired atomically or not at all.
@@ -66,8 +96,21 @@ pub(crate) struct IntentRequest {
 
 impl IntentRequest {
     /// Builds a fallibly allocated intent request before any lower write exists.
-    pub(crate) const fn new(ticket: u64, resources: Vec<MutationResource>) -> Self {
-        Self { ticket, resources }
+    pub(crate) const fn new(
+        volume: NonNull<crate::state::VolumeControlBlock>,
+        ticket: u64,
+        resources: Vec<MutationResource>,
+    ) -> Self {
+        Self {
+            volume,
+            ticket,
+            resources,
+        }
+    }
+
+    /// Mounted volume whose resource namespace this request uses.
+    pub(crate) const fn volume(&self) -> NonNull<crate::state::VolumeControlBlock> {
+        self.volume
     }
 
     /// Stable FIFO ticket.
@@ -85,32 +128,21 @@ impl IntentRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WaitCondition {
     /// Durable values are waiting for the short epoch visibility gate.
-    Visibility { ticket: u64 },
+    Visibility {
+        /// Mounted runtime whose epoch gate is requested.
+        volume: NonNull<crate::state::VolumeControlBlock>,
+        /// Durable mutation ticket.
+        ticket: u64,
+    },
     /// Published overlay work is waiting for the independent checkpoint slot.
-    Checkpoint { epoch: ext4_core::EpochSequence },
+    Checkpoint {
+        /// Mounted runtime whose checkpoint gate is requested.
+        volume: NonNull<crate::state::VolumeControlBlock>,
+        /// Visible overlay epoch.
+        epoch: ext4_core::EpochSequence,
+    },
     /// A per-handle terminal or durability barrier has not drained earlier work.
     Barrier { identity: u64 },
-}
-
-/// Infallible publication selected only after its required grant was consumed.
-#[derive(Debug)]
-pub(crate) enum Publication {
-    /// Install one durable overlay epoch and detach checkpoint work.
-    Durable {
-        /// Stable mounted VCB receiving the epoch swap.
-        volume: NonNull<crate::state::VolumeControlBlock>,
-        /// Values fully prepared before the first lower write.
-        mutation: DurableMutation,
-        /// Consumed short visibility authority.
-        visibility: VisibilityLease,
-    },
-    /// Install one overlay-free epoch and release journal space.
-    Checkpoint {
-        /// Stable mounted VCB receiving the clean epoch.
-        volume: NonNull<crate::state::VolumeControlBlock>,
-        /// Prebuilt clean journal and overlay-free epoch.
-        durability: CleanJournalDurability,
-    },
 }
 
 /// One consuming action emitted by an event-driven operation.
@@ -134,6 +166,8 @@ pub(crate) enum OperationTransition {
     },
     /// Wait for the serialized journal commit slot.
     RequestCommit {
+        /// Mounted runtime whose journal gate is requested.
+        volume: NonNull<crate::state::VolumeControlBlock>,
         /// FIFO mutation ticket.
         ticket: u64,
         /// Operation resumed only by its commit grant.
@@ -153,10 +187,8 @@ pub(crate) enum OperationTransition {
     },
     /// Apply a prebuilt allocation-free publication and continue one operation.
     Publish {
-        /// Publication values prepared before durable I/O.
-        publication: Publication,
-        /// Operation resumed after the reactor installs the values.
-        suspended: Box<dyn CompletionOperation>,
+        /// Publication values and continuation prepared before durable I/O.
+        publication: Box<dyn InfalliblePublication>,
     },
     /// Operation has consumed every terminal authority it owned.
     Complete,
@@ -373,6 +405,8 @@ enum ActivePhase {
     },
     /// Journal commit grant is queued.
     Commit {
+        /// Mounted runtime whose commit gate is queued.
+        volume: NonNull<crate::state::VolumeControlBlock>,
         /// FIFO mutation ticket.
         ticket: u64,
         /// Suspended state machine.
@@ -413,8 +447,32 @@ impl fmt::Debug for ActivePhase {
 struct ActiveSlot {
     /// Monotonic generation encoded into external timer/grant identities.
     generation: u64,
+    /// Resource set held from intent grant through durable visibility publication.
+    intent: Option<HeldIntent>,
+    /// Commit grant retained until durable publication or harmless pre-write abandonment.
+    commit: Option<HeldCommit>,
     /// Current ownership phase.
     phase: ActivePhase,
+}
+
+/// Resource ownership retained outside the suspended operation payload.
+#[derive(Debug)]
+struct HeldIntent {
+    /// Mounted resource namespace.
+    volume: NonNull<crate::state::VolumeControlBlock>,
+    /// Stable FIFO ticket.
+    ticket: u64,
+    /// Complete atomically acquired resource set.
+    resources: Vec<MutationResource>,
+}
+
+/// Serialized commit ownership retained by one active slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeldCommit {
+    /// Mounted runtime whose gate was granted.
+    volume: NonNull<crate::state::VolumeControlBlock>,
+    /// Stable FIFO ticket.
+    ticket: u64,
 }
 
 impl ActiveSlot {
@@ -422,6 +480,8 @@ impl ActiveSlot {
     const fn vacant() -> Self {
         Self {
             generation: 0,
+            intent: None,
+            commit: None,
             phase: ActivePhase::Vacant,
         }
     }
@@ -988,6 +1048,7 @@ impl CompletionReactor {
                 suspended,
             } => self.submit_storage(index, devices, request, suspended),
             OperationTransition::RequestIntent { request, suspended } => {
+                self.release_intent(index);
                 self.set_phase(
                     index,
                     ActivePhase::Intent {
@@ -997,10 +1058,15 @@ impl CompletionReactor {
                 );
                 self.grant_available_intents();
             }
-            OperationTransition::RequestCommit { ticket, suspended } => {
+            OperationTransition::RequestCommit {
+                volume,
+                ticket,
+                suspended,
+            } => {
                 self.set_phase(
                     index,
                     ActivePhase::Commit {
+                        volume,
                         ticket,
                         operation: suspended,
                     },
@@ -1023,20 +1089,22 @@ impl CompletionReactor {
                 );
                 self.grant_available_wait(index);
             }
-            OperationTransition::Publish {
-                publication,
-                suspended,
-            } => {
-                crate::state::publish_prebuilt(publication);
+            OperationTransition::Publish { publication } => {
+                self.consume_publication_authority(index, publication.authority());
+                let operation = publication.publish();
                 self.set_phase(
                     index,
                     ActivePhase::Ready {
-                        operation: suspended,
+                        operation,
                         event: OperationEvent::Admitted,
                     },
                 );
+                self.grant_available_intents();
+                self.grant_available_commit();
             }
             OperationTransition::Complete => {
+                self.release_intent(index);
+                self.abandon_commit(index);
                 self.set_phase(index, ActivePhase::Vacant);
                 release_operation_reservation(&self.admitted);
                 self.grant_available_intents();
@@ -1059,6 +1127,82 @@ impl CompletionReactor {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
         slot.phase = phase;
+    }
+
+    /// Releases any resource set retained by one slot.
+    #[cfg(not(test))]
+    fn release_intent(&self, index: usize) {
+        let slots = unsafe {
+            // SAFETY: Resource ownership is mutated only by the reactor thread.
+            &mut *self.active.get()
+        };
+        let Some(slot) = slots.get_mut(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        drop(slot.intent.take());
+    }
+
+    /// Returns a pre-write commit grant to its mounted runtime.
+    #[cfg(not(test))]
+    fn abandon_commit(&self, index: usize) {
+        let commit = {
+            let slots = unsafe {
+                // SAFETY: Commit ownership is mutated only by the reactor thread.
+                &mut *self.active.get()
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            slot.commit.take()
+        };
+        if let Some(commit) = commit {
+            let mut access = unsafe {
+                // SAFETY: The mounted VCB is stable and this reactor transition is non-suspending.
+                crate::state::VolumeControlBlock::operation_access(commit.volume)
+            };
+            access.runtime_mut().abandon_commit(commit.ticket);
+        }
+    }
+
+    /// Consumes exactly the grants required by one infallible publication.
+    #[cfg(not(test))]
+    fn consume_publication_authority(&self, index: usize, authority: PublicationAuthority) {
+        match authority {
+            PublicationAuthority::Durable { volume, ticket } => {
+                let slots = unsafe {
+                    // SAFETY: Publication runs only on the sole reactor thread.
+                    &mut *self.active.get()
+                };
+                let Some(slot) = slots.get_mut(index) else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                let intent = slot.intent.take();
+                let commit = slot.commit.take();
+                if !matches!(
+                    intent,
+                    Some(HeldIntent {
+                        volume: held_volume,
+                        ticket: held_ticket,
+                        ..
+                    }) if held_volume == volume && held_ticket == ticket
+                ) || commit != Some(HeldCommit { volume, ticket })
+                {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
+            }
+            PublicationAuthority::Checkpoint { .. } => {
+                let slots = unsafe {
+                    // SAFETY: Publication runs only on the sole reactor thread.
+                    &mut *self.active.get()
+                };
+                let Some(slot) = slots.get(index) else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                if slot.intent.is_some() || slot.commit.is_some() {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
+            }
+        }
     }
 
     /// Builds, registers, and submits one lower storage command with ownership-preserving errors.
@@ -1245,10 +1389,8 @@ impl CompletionReactor {
                 Ok(StorageCommandStep::Failed(failed)) => match failed.into_retry() {
                     Ok(retry) => self.arm_retry(index, retry),
                     Err(failed) => {
-                        let (suspended, request, class) = failed.into_failure();
-                        if class == StorageFailureClass::DurabilityUnknown {
-                            crate::state::record_durability_unknown(&suspended);
-                        }
+                        let (mut suspended, request, class) = failed.into_failure();
+                        suspended.record_storage_failure(class);
                         self.set_phase(
                             index,
                             ActivePhase::Ready {
@@ -1260,10 +1402,8 @@ impl CompletionReactor {
                         );
                     }
                 },
-                Err(error) => {
-                    crate::state::record_reactor_storage_invariant(error);
-                    self.set_phase(index, ActivePhase::Vacant);
-                    release_operation_reservation(&self.admitted);
+                Err(_error) => {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }
             }
         }
@@ -1297,20 +1437,248 @@ impl CompletionReactor {
     /// Grants newly unblocked resource sets in stable FIFO order.
     #[cfg(not(test))]
     fn grant_available_intents(&self) {
-        crate::state::grant_available_intents(self);
+        self.grant_intents_in_fifo_order();
     }
 
     /// Grants the sole commit slot when checkpoint/journal-space state permits it.
     #[cfg(not(test))]
     fn grant_available_commit(&self) {
-        crate::state::grant_available_commit(self);
+        self.grant_next_commit();
     }
 
     /// Grants an already-satisfied visibility/checkpoint/barrier wait without probing its operation.
     #[cfg(not(test))]
     fn grant_available_wait(&self, index: usize) {
-        crate::state::grant_available_wait(self, index);
+        self.grant_wait_if_ready(index);
     }
+
+    /// Grants every resource request that is conflict-free without bypassing an earlier
+    /// conflicting FIFO ticket.
+    #[cfg(not(test))]
+    fn grant_intents_in_fifo_order(&self) {
+        loop {
+            let candidate = {
+                let slots = unsafe {
+                    // SAFETY: Only this reactor thread observes scheduler-owned intent state.
+                    &*self.active.get()
+                };
+                slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, slot)| {
+                        let ActivePhase::Intent { request, .. } = &slot.phase else {
+                            return None;
+                        };
+                        if intent_conflicts_with_held(slots, request)
+                            || earlier_queued_intent_conflicts(slots, request)
+                        {
+                            return None;
+                        }
+                        Some((request.ticket(), index))
+                    })
+                    .min_by_key(|candidate| *candidate)
+                    .map(|(_, index)| index)
+            };
+            let Some(index) = candidate else {
+                return;
+            };
+            let slots = unsafe {
+                // SAFETY: Only this reactor thread moves scheduler-owned intent state.
+                &mut *self.active.get()
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            let phase = core::mem::replace(&mut slot.phase, ActivePhase::Vacant);
+            let ActivePhase::Intent { request, operation } = phase else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            let ticket = request.ticket();
+            slot.intent = Some(HeldIntent {
+                volume: request.volume(),
+                ticket,
+                resources: request.resources,
+            });
+            slot.phase = ActivePhase::Ready {
+                operation,
+                event: OperationEvent::IntentGranted(ext4_core::MutationLease::granted(ticket)),
+            };
+        }
+    }
+
+    /// Attempts every queued per-volume commit in FIFO order without blocking other volumes.
+    #[cfg(not(test))]
+    fn grant_next_commit(&self) {
+        let mut attempted = [false; MAX_OPERATIONS];
+        loop {
+            let candidate = {
+                let slots = unsafe {
+                    // SAFETY: Only this reactor thread observes commit queues.
+                    &*self.active.get()
+                };
+                slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, slot)| {
+                        if attempted[index] {
+                            return None;
+                        }
+                        let ActivePhase::Commit { ticket, .. } = slot.phase else {
+                            return None;
+                        };
+                        Some((ticket, index))
+                    })
+                    .min_by_key(|candidate| *candidate)
+                    .map(|(_, index)| index)
+            };
+            let Some(index) = candidate else {
+                return;
+            };
+            attempted[index] = true;
+            let (volume, ticket) = {
+                let slots = unsafe {
+                    // SAFETY: Only this reactor thread observes commit queues.
+                    &*self.active.get()
+                };
+                let Some(slot) = slots.get(index) else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                let ActivePhase::Commit { volume, ticket, .. } = slot.phase else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                (volume, ticket)
+            };
+            let grant = {
+                let mut access = unsafe {
+                    // SAFETY: Commit arbitration is one non-suspending reactor transition.
+                    crate::state::VolumeControlBlock::operation_access(volume)
+                };
+                access.runtime_mut().try_grant_commit(ticket)
+            };
+            let Some(grant) = grant else {
+                continue;
+            };
+            let slots = unsafe {
+                // SAFETY: Only this reactor thread moves commit queues.
+                &mut *self.active.get()
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            let phase = core::mem::replace(&mut slot.phase, ActivePhase::Vacant);
+            let ActivePhase::Commit {
+                volume: queued_volume,
+                ticket: queued_ticket,
+                operation,
+            } = phase
+            else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            if queued_volume != volume || queued_ticket != ticket || slot.commit.is_some() {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            }
+            slot.commit = Some(HeldCommit { volume, ticket });
+            slot.phase = ActivePhase::Ready {
+                operation,
+                event: OperationEvent::CommitGranted(grant),
+            };
+        }
+    }
+
+    /// Grants one already-satisfied non-I/O gate without probing its operation.
+    #[cfg(not(test))]
+    fn grant_wait_if_ready(&self, index: usize) {
+        let condition = {
+            let slots = unsafe {
+                // SAFETY: Only this reactor thread observes wait phases.
+                &*self.active.get()
+            };
+            let Some(slot) = slots.get(index) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            let ActivePhase::Waiting { condition, .. } = slot.phase else {
+                return;
+            };
+            condition
+        };
+        let event = match condition {
+            WaitCondition::Visibility { volume, ticket } => {
+                let mut access = unsafe {
+                    // SAFETY: Visibility arbitration is a non-suspending reactor transition.
+                    crate::state::VolumeControlBlock::operation_access(volume)
+                };
+                access
+                    .runtime_mut()
+                    .try_grant_visibility(ticket)
+                    .map(OperationEvent::VisibilityGranted)
+            }
+            WaitCondition::Checkpoint { volume, epoch } => {
+                let mut access = unsafe {
+                    // SAFETY: Checkpoint arbitration is a non-suspending reactor transition.
+                    crate::state::VolumeControlBlock::operation_access(volume)
+                };
+                access
+                    .runtime_mut()
+                    .try_grant_checkpoint(epoch)
+                    .map(OperationEvent::CheckpointGranted)
+            }
+            WaitCondition::Barrier { identity } => Some(OperationEvent::BarrierReleased(
+                ext4_core::BarrierPermit::released(identity),
+            )),
+        };
+        let Some(event) = event else {
+            return;
+        };
+        let slots = unsafe {
+            // SAFETY: Only this reactor thread moves wait phases.
+            &mut *self.active.get()
+        };
+        let Some(slot) = slots.get_mut(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        let phase = core::mem::replace(&mut slot.phase, ActivePhase::Vacant);
+        let ActivePhase::Waiting { operation, .. } = phase else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        slot.phase = ActivePhase::Ready { operation, event };
+    }
+}
+
+/// Whether two complete resource sets overlap.
+fn resource_sets_overlap(left: &[MutationResource], right: &[MutationResource]) -> bool {
+    left.iter().any(|resource| right.contains(resource))
+}
+
+/// Tests a queued request against every currently held set on the same volume.
+fn intent_conflicts_with_held(
+    slots: &[ActiveSlot; MAX_OPERATIONS],
+    request: &IntentRequest,
+) -> bool {
+    slots.iter().any(|slot| {
+        let Some(held) = &slot.intent else {
+            return false;
+        };
+        held.volume == request.volume()
+            && resource_sets_overlap(held.resources.as_slice(), request.resources())
+    })
+}
+
+/// Prevents a later ticket from bypassing an earlier queued request for an overlapping resource.
+fn earlier_queued_intent_conflicts(
+    slots: &[ActiveSlot; MAX_OPERATIONS],
+    request: &IntentRequest,
+) -> bool {
+    slots.iter().any(|slot| {
+        let ActivePhase::Intent {
+            request: earlier, ..
+        } = &slot.phase
+        else {
+            return false;
+        };
+        earlier.volume() == request.volume()
+            && earlier.ticket() < request.ticket()
+            && resource_sets_overlap(earlier.resources(), request.resources())
+    })
 }
 
 // SAFETY: Stable device placement and documented spin-lock/reactor-thread disciplines serialize
