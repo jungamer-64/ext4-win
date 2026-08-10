@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::{ChildLookup, DirectoryNodeId, Ext4Name, NodeId, WindowsName};
+use ext4_core::{ChildLookup, CommittedReadPass, DirectoryNodeId, Ext4Name, NodeId, WindowsName};
 use wdk_sys::FILE_OBJECT;
 
 use crate::{
@@ -24,13 +24,14 @@ use crate::{
     },
     state::{
         ChildCreationTarget, DataTransferMode, DirectoryChange, DirectoryChangeAction,
-        FileControlBlock, HandleDeletion, KernelDevice, MountedVolumeDevice,
+        FileControlBlock, HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeDevice,
         NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
         OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion, UninitializedFileObject,
-        VolumeAccess, VolumeControlBlock, VolumeOperationLane, WriteCommitment,
-        abandon_file_control_block,
+        VolumeAccess, VolumeControlBlock, WriteCommitment, abandon_file_control_block,
     },
 };
+
+use super::DriverMutationPass;
 
 /// UTF-16 backslash separator.
 const UTF16_BACKSLASH: u16 = 0x005C;
@@ -39,8 +40,25 @@ const UTF16_BACKSLASH: u16 = 0x005C;
 /// # Errors
 ///
 /// Returns an error when create stack decoding or ext4 open/create handling rejects the request.
-pub(crate) fn execute(request: PendingIrpLease<'_>) -> DriverResult<CreateCompletion> {
-    open_or_create(PreparedCreateRequest::decode(request)?)
+pub(crate) fn execute(
+    request: PendingIrpLease<'_>,
+    operations: &mut VolumeAccess,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<CreateResolution> {
+    open_or_create(
+        PreparedCreateRequest::decode(request)?,
+        operations,
+        mutation,
+    )
+}
+
+/// Driver-visible result of one restartable create resolve pass.
+#[derive(Debug)]
+pub(crate) enum CreateResolution {
+    /// No filesystem mutation was staged and the create may complete immediately.
+    Complete(CreateCompletion),
+    /// A missing child was staged and every driver publication value was preallocated.
+    Mutation(PendingCreatePublication),
 }
 
 /// Create request whose pointer-bearing inputs have all become owned domain values.
@@ -142,7 +160,11 @@ impl CreateCompletionOwner<'_> {
 ///
 /// Returns an error when EA create input is supplied, the device is not mounted, path resolution
 /// fails, or the selected open/create disposition cannot be satisfied.
-fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<CreateCompletion> {
+fn open_or_create(
+    request: PreparedCreateRequest<'_>,
+    operations: &mut VolumeAccess,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<CreateResolution> {
     let PreparedCreateRequest {
         mut owner,
         target,
@@ -154,21 +176,19 @@ fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<CreateComp
     let disposition = owner.parameters().disposition();
     let target = match target {
         CreateTargetSpecifier::Volume => {
-            return open_volume(owner, create_ea, mounted_volume).map(CreateCompletion::Handle);
+            return open_volume(owner, create_ea, mounted_volume, operations)
+                .map(CreateCompletion::Handle)
+                .map(CreateResolution::Complete);
         }
         target @ (CreateTargetSpecifier::Path { .. } | CreateTargetSpecifier::FileReference(_)) => {
             target
         }
     };
-    let mut operations = unsafe {
-        // SAFETY: Create requests are queued through the mounted-device executor, which polls one
-        // active filesystem operation at a time and therefore grants this request the unique lane.
-        VolumeControlBlock::operation_access(mounted_volume)
-    };
     operations.authorize_create()?;
     match resolve_target(
         target,
-        &mut operations,
+        operations,
+        mutation,
         owner.parameters().reparse_point_mode(),
     )? {
         CreateTargetLookup::Existing {
@@ -185,23 +205,27 @@ fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<CreateComp
                 node,
                 node_mode,
                 location,
-                &mut operations,
+                operations,
+                mutation,
             )
             .map(CreateCompletion::Handle)
+            .map(CreateResolution::Complete)
         }
         CreateTargetLookup::Missing { parent, name } => create_missing_node(
             owner,
             create_ea,
-            &mut operations,
+            operations,
+            mutation,
             disposition,
             parent,
             &name,
         )
-        .map(CreateCompletion::Handle),
+        .map(CreateResolution::Mutation),
         CreateTargetLookup::ReparseSymlink {
             point,
             unparsed_path,
-        } => create_symlink_reparse_completion(operations.runtime_mut(), point, unparsed_path),
+        } => create_symlink_reparse_completion(mutation, point, unparsed_path)
+            .map(CreateResolution::Complete),
     }
 }
 
@@ -211,11 +235,11 @@ fn open_or_create(request: PreparedCreateRequest<'_>) -> DriverResult<CreateComp
 /// Returns an error when the node target cannot be converted to the Windows symbolic-link wire
 /// form, its exact output buffer cannot be allocated, or packing violates the derived size.
 fn create_symlink_reparse_completion(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     point: NodeSymlinkReparsePoint,
     unparsed_path: UnparsedPathLength,
 ) -> DriverResult<CreateCompletion> {
-    let data = point.into_symlink_data(operations)?;
+    let data = point.into_symlink_data(read)?;
     let required_length = data.required_length()?;
     let buffer = CreateSymlinkReparseBuffer::try_pack_exact(required_length, |output| {
         data.pack_create_redirect(unparsed_path, output)
@@ -671,13 +695,14 @@ fn open_existing_node(
     node_mode: OpenedNodeMode,
     location: OpenedLocation,
     operations: &mut VolumeAccess,
+    read: &mut impl CommittedReadPass,
 ) -> DriverResult<CreateAction> {
     let parameters = request.parameters();
     let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
-            let pending = prepare_create_deletion(policy, node, &location, operations)?;
+            let pending = prepare_create_deletion(policy, node, &location, read)?;
             let fcb = request.with_file_object(|file_object| {
                 initialize_file_object(file_object, vcb, node, node_mode, location, policy)
             })?;
@@ -713,14 +738,14 @@ fn prepare_create_deletion(
     policy: CreateHandlePolicy,
     node: NodeId,
     location: &OpenedLocation,
-    operations: &mut VolumeAccess,
+    read: &mut impl CommittedReadPass,
 ) -> DriverResult<Option<PendingFileDeletion>> {
     if policy.deletion() == CreateDeletion::Retain {
         return Ok(None);
     }
     let pending = PendingFileDeletion::try_from_delete_on_close(location)?;
     crate::request::file_info::validate_pending_deletion(
-        operations.runtime_mut(),
+        read,
         node,
         pending.target_ref(),
         crate::request::file_info::DeleteReadonlyPolicy::Enforce,
@@ -737,6 +762,7 @@ fn open_volume(
     mut request: CreateCompletionOwner<'_>,
     create_ea: CreateEa,
     volume: NonNull<VolumeControlBlock>,
+    operations: &mut VolumeAccess,
 ) -> DriverResult<CreateAction> {
     if !create_ea.is_empty() {
         return Err(DriverError::InvalidParameter);
@@ -747,10 +773,6 @@ fn open_volume(
         return Err(DriverError::CannotDelete);
     }
     let handle = memory::boxed_try_with(|| Ok(OpenedVolumeHandle::new()))?;
-    let mut operations = unsafe {
-        // SAFETY: This create runs as the mounted-device actor's unique active operation.
-        VolumeControlBlock::operation_access(volume)
-    };
     request.with_file_object(move |file_object| {
         operations.open_volume_handle(
             file_object.kernel_file_object(),
@@ -796,10 +818,11 @@ fn create_missing_node(
     mut request: CreateCompletionOwner<'_>,
     create_ea: CreateEa,
     operations: &mut VolumeAccess,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
     disposition: CreateDisposition,
     parent: DirectoryNodeId,
     name: &Ext4Name,
-) -> DriverResult<CreateAction> {
+) -> DriverResult<PendingCreatePublication> {
     let parameters = request.parameters();
     let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
     match disposition {
@@ -819,12 +842,7 @@ fn create_missing_node(
         }
     };
     let target = child_creation_target(parameters.target_requirement())?;
-    let mut creation = operations.begin_child_creation(
-        parent,
-        name,
-        target,
-        crate::kernel::time::current_ext4_timestamp()?,
-    )?;
+    let mut creation = operations.begin_child_creation(mutation, parent, name, target)?;
     let node = creation.node();
     let notification = DirectoryChange::new(parent, name, node, DirectoryChangeAction::Added)?;
     let handle = memory::boxed_try_with(|| {
@@ -838,39 +856,19 @@ fn create_missing_node(
             policy.regular_file_write_access(),
         ))
     })?;
-    create_ea.apply_to_pending_child(&mut creation)?;
-    let attachment = request.with_file_object(|file_object| {
-        open_pending_child_file_control_block(
-            &creation,
-            file_object,
-            policy.desired_access(),
-            policy.share_access(),
-        )
-    })?;
-    let mut attachment = PendingFileObjectAttachment {
-        fcb: Some(attachment),
-        request,
-    };
-
-    match creation.commit() {
-        Ok(()) => {
-            let Some(vcb) = MountedVolumeDevice::vcb(attachment.device()) else {
-                return Err(DriverError::InternalInvariantViolation);
-            };
-            let fcb = attachment.attach(handle, policy.file_object_flags())?;
-            if let Some(pending) = pending_deletion {
-                operations.set_file_delete_pending(fcb, pending);
-            }
-            let vcb = unsafe {
-                // SAFETY: The mounted device still owns this heap-stable VCB while its create IRP
-                // is active; notification state is disjoint from the actor-owned operation lane.
-                vcb.as_ref()
-            };
-            vcb.report_directory_change(notification);
-            Ok(CreateAction::Created)
-        }
-        Err(error) => Err(error),
-    }
+    create_ea.apply_to_pending_child(&mut creation, mutation)?;
+    let file_object =
+        request.with_file_object(|file_object| Ok(file_object.kernel_file_object()))?;
+    Ok(PendingCreatePublication {
+        creation,
+        file_object,
+        desired_access: policy.desired_access(),
+        share_access: policy.share_access(),
+        handle,
+        flags: policy.file_object_flags(),
+        pending_deletion,
+        notification,
+    })
 }
 
 /// Maps create options to the concrete child kind used for missing-name creation.
@@ -918,16 +916,16 @@ fn validate_existing_node_options(
 fn resolve_target(
     target: CreateTargetSpecifier,
     operations: &mut VolumeAccess,
+    read: &mut impl CommittedReadPass,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
     match target {
         CreateTargetSpecifier::Volume => Err(DriverError::InternalInvariantViolation),
         CreateTargetSpecifier::Path { name, anchor } => {
-            resolve_path(name, anchor, operations, reparse_point_mode)
+            resolve_path(name, anchor, operations, read, reparse_point_mode)
         }
         CreateTargetSpecifier::FileReference(reference) => {
-            let target =
-                resolve_file_reference(reference, operations.runtime_mut(), reparse_point_mode)?;
+            let target = resolve_file_reference(reference, read, reparse_point_mode)?;
             if let CreateTargetLookup::Existing { node, .. } = &target {
                 operations.ensure_node_openable(*node)?;
             }
@@ -959,15 +957,14 @@ fn validate_file_reference_create(disposition: CreateDisposition) -> DriverResul
 /// Returns an error when the file-reference name is malformed or no live inode exists for it.
 fn resolve_file_reference(
     reference: CreateFileReference,
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
-    let node = operations
-        .journaled_mut()
+    let node = read
         .load_node_by_file_index(reference.file_index())
         .map_err(file_reference_lookup_error)?;
     resolve_final_node(
-        operations,
+        read,
         node,
         OpenedLocation::FileReference,
         reparse_point_mode,
@@ -992,6 +989,7 @@ fn resolve_path(
     name: CreatePathName,
     anchor: CreatePathAnchor,
     operations: &mut VolumeAccess,
+    read: &mut impl CommittedReadPass,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
     let mut parent_id = anchor.directory();
@@ -1004,19 +1002,11 @@ fn resolve_path(
             PathComponentPosition::Intermediate
         };
         operations.ensure_node_openable(NodeId::Directory(parent_id))?;
-        let parent = match operations
-            .runtime_mut()
-            .journaled_mut()
-            .load_directory(parent_id)
-        {
+        let parent = match read.load_directory(parent_id) {
             Ok(directory) => directory,
             Err(error) => return Err(DriverError::from(error)),
         };
-        let child = match operations
-            .runtime_mut()
-            .journaled_mut()
-            .lookup_windows_child(&parent, component.name())
-        {
+        let child = match read.lookup_windows_child(&parent, component.name()) {
             Ok(ChildLookup::Found(child)) => child,
             Ok(ChildLookup::NotFound) if position == PathComponentPosition::Final => {
                 return Ok(CreateTargetLookup::Missing {
@@ -1029,7 +1019,7 @@ fn resolve_path(
         };
         let child_node = *child.node();
         operations.ensure_node_openable(child_node)?;
-        let reparse_point = NodeSymlinkReparsePoint::load(operations.runtime_mut(), child_node)?;
+        let reparse_point = NodeSymlinkReparsePoint::load(read, child_node)?;
         if let Some(point) = reparse_point {
             match reparse_point_encounter(position, reparse_point_mode) {
                 ReparsePointEncounter::Redirect => {
@@ -1116,13 +1106,13 @@ const fn reparse_point_encounter(
 ///
 /// Returns an error when reparse metadata cannot be loaded.
 fn resolve_final_node(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     node: NodeId,
     location: OpenedLocation,
     reparse_point_mode: CreateReparsePointMode,
     unparsed_path: UnparsedPathLength,
 ) -> DriverResult<CreateTargetLookup> {
-    let Some(point) = NodeSymlinkReparsePoint::load(operations, node)? else {
+    let Some(point) = NodeSymlinkReparsePoint::load(read, node)? else {
         return Ok(CreateTargetLookup::Existing {
             node,
             node_mode: OpenedNodeMode::Direct,
@@ -1244,84 +1234,155 @@ fn open_shared_file_control_block(
 ///
 /// Returns an error when FCB creation fails or Windows share-access checking rejects the new handle.
 fn open_pending_child_file_control_block(
-    creation: &PendingChildCreation<'_>,
-    file_object: UninitializedFileObject<'_>,
+    creation: &PendingChildCreation,
+    file_object: KernelFileObject,
     desired_access: DesiredAccess,
     share_access: ShareAccess,
 ) -> DriverResult<NonNull<FileControlBlock>> {
-    creation.open_file_control_block(
-        file_object.kernel_file_object(),
-        desired_access,
-        share_access,
-    )
+    creation.open_file_control_block(file_object, desired_access, share_access)
 }
 
-/// Pre-attachment share/FCB claim that rolls back unless a committed create consumes it.
-struct PendingFileObjectAttachment<'a> {
-    /// FCB reference and share claim owned until attachment.
-    fcb: Option<NonNull<FileControlBlock>>,
-    /// Completion owner that pins and exclusively exposes the FILE_OBJECT.
-    request: CreateCompletionOwner<'a>,
+/// Driver publication seed built during a restartable mutation resolve pass.
+#[derive(Debug)]
+pub(crate) struct PendingCreatePublication {
+    /// Staged child identity and stable VCB/FCB-ledger capability.
+    creation: PendingChildCreation,
+    /// Create-owned FILE_OBJECT identity retained by the top-level IRP.
+    file_object: KernelFileObject,
+    /// Share-accounting access mask.
+    desired_access: DesiredAccess,
+    /// Share-accounting share mask.
+    share_access: ShareAccess,
+    /// Fully allocated per-handle context.
+    handle: Box<OpenedHandle>,
+    /// FILE_OBJECT flags fixed by create options.
+    flags: CreateFileObjectFlags,
+    /// Optional delete-on-close publication.
+    pending_deletion: Option<PendingFileDeletion>,
+    /// Preallocated directory notification payload.
+    notification: DirectoryChange,
 }
 
-impl PendingFileObjectAttachment<'_> {
-    /// Returns the mounted device whose create IRP pins the pending FILE_OBJECT.
-    const fn device(&self) -> KernelDevice {
-        self.request.device()
-    }
-
-    /// Consumes the pending claim into one successfully committed FILE_OBJECT attachment.
+impl PendingCreatePublication {
+    /// Acquires every fallible driver-side resource required by post-commit publication.
+    ///
+    /// This is called after mutation resolution and before the first lower write. A returned value
+    /// contains no allocation or validation work for its durable publication path.
     /// # Errors
     ///
-    /// Returns an error when the completion-owned FILE_OBJECT can no longer accept the attachment.
-    fn attach(
-        &mut self,
-        handle: Box<OpenedHandle>,
-        flags: CreateFileObjectFlags,
-    ) -> DriverResult<NonNull<FileControlBlock>> {
-        let fcb = self.fcb.unwrap_or_else(|| {
-            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
-                .bugcheck()
-        });
-        self.request.with_file_object(|file_object| {
-            attach_preallocated_file_object(file_object, fcb, handle, flags);
-            Ok(())
-        })?;
-        let detached = self.fcb.take();
-        if detached != Some(fcb) {
-            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
-                .bugcheck();
-        }
-        Ok(fcb)
+    /// Returns an error when FCB allocation, reference accounting, or share validation fails.
+    pub(crate) fn prepare(self) -> DriverResult<PreparedCreatePublication> {
+        let Self {
+            creation,
+            file_object,
+            desired_access,
+            share_access,
+            handle,
+            flags,
+            pending_deletion,
+            notification,
+        } = self;
+        let fcb = open_pending_child_file_control_block(
+            &creation,
+            file_object,
+            desired_access,
+            share_access,
+        )?;
+        Ok(PreparedCreatePublication {
+            claim: PendingFileControlBlockClaim { fcb, file_object },
+            handle,
+            flags,
+            pending_deletion,
+            notification,
+        })
     }
 }
 
-impl Drop for PendingFileObjectAttachment<'_> {
-    fn drop(&mut self) {
-        if let Some(fcb) = self.fcb.take() {
-            let result = self.request.with_file_object(|file_object| {
-                abandon_file_control_block(fcb, file_object.kernel_file_object());
-                Ok(())
-            });
-            if result.is_err() {
-                crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
-                    .bugcheck();
-            }
+/// Fully prepared post-commit create publication.
+#[derive(Debug)]
+pub(crate) struct PreparedCreatePublication {
+    /// Rollback-owning FCB/share claim consumed only by durable attachment.
+    claim: PendingFileControlBlockClaim,
+    /// Fully allocated per-handle context.
+    handle: Box<OpenedHandle>,
+    /// Prevalidated FILE_OBJECT flags.
+    flags: CreateFileObjectFlags,
+    /// Optional preallocated delete-on-close target.
+    pending_deletion: Option<PendingFileDeletion>,
+    /// Preallocated directory notification payload.
+    notification: DirectoryChange,
+}
+
+impl PreparedCreatePublication {
+    /// Publishes a committed child using pointer writes and prepared-value moves only.
+    pub(crate) fn publish(self, operations: &mut VolumeAccess) -> CreateCompletion {
+        let Self {
+            claim,
+            handle,
+            flags,
+            pending_deletion,
+            notification,
+        } = self;
+        let (fcb, file_object) = claim.consume();
+        attach_preallocated_file_object_raw(file_object, fcb, handle, flags);
+        if let Some(pending) = pending_deletion {
+            operations.set_file_delete_pending(fcb, pending);
         }
+        operations.report_directory_change(notification);
+        CreateCompletion::Handle(CreateAction::Created)
     }
 }
+
+/// FCB reference and share claim that rolls back unless durable publication consumes it.
+#[derive(Debug)]
+struct PendingFileControlBlockClaim {
+    /// Open FCB reference and share claim.
+    fcb: NonNull<FileControlBlock>,
+    /// Exact create FILE_OBJECT used for share accounting.
+    file_object: KernelFileObject,
+}
+
+impl PendingFileControlBlockClaim {
+    /// Disarms rollback and returns the exact attachment values.
+    fn consume(self) -> (NonNull<FileControlBlock>, KernelFileObject) {
+        let claim = core::mem::ManuallyDrop::new(self);
+        (claim.fcb, claim.file_object)
+    }
+}
+
+impl Drop for PendingFileControlBlockClaim {
+    fn drop(&mut self) {
+        abandon_file_control_block(self.fcb, self.file_object);
+    }
+}
+
+// SAFETY: The top-level create IRP pins the FILE_OBJECT, and the mounted VCB pins the FCB ledger;
+// only the reactor thread consumes or drops this claim.
+unsafe impl Send for PendingFileControlBlockClaim {}
 
 /// Stores already-opened FCB and preallocated CCB context pointers in the FILE_OBJECT.
 fn attach_preallocated_file_object(
-    mut file_object: UninitializedFileObject<'_>,
+    file_object: UninitializedFileObject<'_>,
+    fcb: NonNull<FileControlBlock>,
+    handle: Box<OpenedHandle>,
+    file_object_flags: CreateFileObjectFlags,
+) {
+    let kernel_file_object = file_object.kernel_file_object();
+    attach_preallocated_file_object_raw(kernel_file_object, fcb, handle, file_object_flags);
+}
+
+/// Stores prepared contexts through the stable FILE_OBJECT identity captured before the commit.
+fn attach_preallocated_file_object_raw(
+    file_object: KernelFileObject,
     fcb: NonNull<FileControlBlock>,
     handle: Box<OpenedHandle>,
     file_object_flags: CreateFileObjectFlags,
 ) {
     let file_object = unsafe {
         // SAFETY: `file_object` comes from the active create stack and is
-        // writable during successful create processing.
-        file_object.as_mut()
+        // exclusively owned by this uncompleted create operation. Preparation validated both
+        // filesystem context slots before any lower write and no other path can publish them.
+        &mut *file_object.as_ptr()
     };
     file_object_flags.apply_to(file_object);
     file_object.FsContext = fcb.as_ptr().cast::<c_void>();
