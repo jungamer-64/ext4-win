@@ -8,7 +8,6 @@ use ext4_core::FileOffset;
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_PENDING, STATUS_SUCCESS};
 
 mod capture;
-mod executor;
 
 pub(crate) use capture::{
     CapturedQuerySecurityOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
@@ -16,7 +15,6 @@ pub(crate) use capture::{
     PreparedWrite,
 };
 use capture::{QueueContext, QueueContextOwnership};
-pub(crate) use executor::DeviceExecutor;
 
 #[cfg(not(test))]
 use crate::kernel::ffi;
