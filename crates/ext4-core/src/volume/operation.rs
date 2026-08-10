@@ -18,6 +18,146 @@ pub enum ReadTransition<T> {
     Complete(Result<T>),
 }
 
+/// Ephemeral synchronous read pass reconstructed from one operation transcript and epoch.
+///
+/// The pass may be borrowed only while one concrete event is being advanced. It cannot be stored
+/// in a completion context, and an incomplete storage access returns
+/// [`Error::OperationSuspended`] so the owning [`EpochReadOperation`] can move the resulting owned
+/// request into lower-I/O ownership.
+#[derive(Debug)]
+pub struct EpochReadPass<'pass, 'storage, 'epoch> {
+    /// Internal committed-epoch view used only for this restartable pass.
+    view: &'pass mut EpochReadView<'storage, 'epoch>,
+}
+
+impl EpochReadPass<'_, '_, '_> {
+    /// Loads a regular file by validated identity.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or the inode is not a regular file.
+    pub fn load_file(&mut self, id: FileNodeId) -> Result<FileNode> {
+        self.view.load_file(id)
+    }
+
+    /// Loads a directory by validated identity.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or the inode is not a directory.
+    pub fn load_directory(&mut self, id: DirectoryNodeId) -> Result<DirectoryNode> {
+        self.view.load_directory(id)
+    }
+
+    /// Loads a symbolic link by validated identity.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or the inode is not a symbolic link.
+    pub fn load_symlink(&mut self, id: SymlinkNodeId) -> Result<SymlinkNode> {
+        self.view.load_symlink(id)
+    }
+
+    /// Loads and classifies one Windows-facing file index.
+    /// # Errors
+    ///
+    /// Returns an error when the index does not identify a live inode.
+    pub fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId> {
+        self.view.load_node_by_file_index(file_index)
+    }
+
+    /// Reads every extended attribute attached to one typed node.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or the xattr representation is invalid.
+    pub fn read_xattrs(&mut self, node: NodeId) -> Result<XattrSet> {
+        self.view.read_inode_xattrs(node.inode())
+    }
+
+    /// Reads one extended attribute attached to one typed node.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or the xattr representation is invalid.
+    pub fn read_xattr(&mut self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>> {
+        self.view.read_inode_xattr(node.inode(), name)
+    }
+
+    /// Reads Windows overlay metadata from the ext4 xattr boundary.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or the overlay is invalid.
+    pub fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>> {
+        self.view.read_inode_windows_overlay(node.inode())
+    }
+
+    /// Reads Windows symbolic-link reparse metadata from the ext4 xattr boundary.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or the payload is invalid.
+    pub fn read_windows_symlink_reparse_point(
+        &mut self,
+        node: NodeId,
+    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
+        self.view
+            .read_inode_windows_symlink_reparse_point(node.inode())
+    }
+
+    /// Reads regular-file bytes into an exact caller-owned range.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or the file mapping is invalid.
+    pub fn read_file(
+        &mut self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes> {
+        self.view.read_file(file, offset, out)
+    }
+
+    /// Reads one symbolic-link target into an owned byte vector.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or the target is invalid.
+    pub fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
+        self.view.read_symlink(symlink)
+    }
+
+    /// Enumerates validated directory entries.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or the directory is invalid.
+    pub fn read_directory(&mut self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
+        self.view.read_directory(directory)
+    }
+
+    /// Enumerates every reachable hard link to a non-directory inode.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or namespace invariants fail.
+    pub fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
+        self.view.read_hard_links(target)
+    }
+
+    /// Looks up one exact ext4 child name.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or the directory is invalid.
+    pub fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup> {
+        self.view.lookup_child(parent, name)
+    }
+
+    /// Looks up one unambiguous Windows-visible child name.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete, the directory is invalid, or the projected
+    /// name is ambiguous.
+    pub fn lookup_windows_child(
+        &mut self,
+        parent: &DirectoryNode,
+        requested: &WindowsName,
+    ) -> Result<ChildLookup> {
+        self.view.lookup_windows_child(parent, requested)
+    }
+}
+
 /// Operation-owned transcript for one logical read against an immutable epoch.
 ///
 /// The caller retains the immutable epoch lease and logical request arguments. This value retains
@@ -38,6 +178,24 @@ impl EpochReadOperation {
                 profile.filesystem_length(),
             ),
         }
+    }
+
+    /// Runs one arbitrary restartable read pass after consuming the supplied concrete event.
+    ///
+    /// The closure is invoked at most once for this event and receives only an ephemeral pass. A
+    /// lower-storage miss suspends the owning operation by value; unrelated operations are never
+    /// probed.
+    #[must_use]
+    pub fn run<T>(
+        self,
+        event: super::OperationEvent,
+        epoch: &CommittedEpoch,
+        resolve: impl FnOnce(&mut EpochReadPass<'_, '_, '_>) -> Result<T>,
+    ) -> ReadTransition<T> {
+        self.resolve(event, epoch, |view| {
+            let mut pass = EpochReadPass { view };
+            resolve(&mut pass)
+        })
     }
 
     /// Loads a regular file identity from the selected immutable epoch.
