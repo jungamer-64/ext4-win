@@ -7,9 +7,13 @@ use crate::security_descriptor::{
     ACCESS_ALLOWED_ACE_PREFIX_BYTES, ACL_HEADER_BYTES, SECURITY_DESCRIPTOR_RELATIVE_BYTES,
     SID_PREFIX_BYTES, SecurityComponentSelection, SecuritySelection,
 };
-use crate::state::{OpenedObject, VolumeAccess, VolumeControlBlock, VolumeOperationLane};
+use crate::state::OpenedObject;
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
-use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, NodeId};
+use ext4_core::{
+    CommittedReadPass, Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, NodeId,
+};
+
+use super::DriverMutationPass;
 
 /// SECURITY_DESCRIPTOR_RELATIVE owner SID offset.
 const SECURITY_DESCRIPTOR_OWNER_OFFSET: usize = 4;
@@ -36,18 +40,24 @@ const POSIX_RWX_BITS: u16 = 0o777;
 /// # Errors
 ///
 /// Returns an error when security stack decoding or descriptor packing fails.
-pub(crate) fn query(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn query(
+    request: PendingIrpLease<'_>,
+    read: &mut impl CommittedReadPass,
+) -> DriverResult<IrpCompletion> {
     let request = QuerySecurityRequest::decode(request)?;
-    query_security(request)
+    query_security(request, read)
 }
 
 /// Executes IRP_MJ_SET_SECURITY.
 /// # Errors
 ///
 /// Returns an error when security stack decoding or descriptor mutation fails.
-pub(crate) fn set(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn set(
+    request: PendingIrpLease<'_>,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<IrpCompletion> {
     let request = SetSecurityRequest::decode(request)?;
-    set_security(request)
+    set_security(request, mutation)
 }
 
 /// Decoded query-security request.
@@ -58,8 +68,6 @@ struct QuerySecurityRequest<'a> {
     selection: SecuritySelection,
     /// ext4 node selected by the opened FILE_OBJECT.
     node: NodeId,
-    /// Exclusive actor-owned mounted-volume operation capability.
-    operations: VolumeAccess,
 }
 
 impl<'a> QuerySecurityRequest<'a> {
@@ -69,22 +77,16 @@ impl<'a> QuerySecurityRequest<'a> {
     /// Returns an error when the current stack is not a query-security stack or its FILE_OBJECT has
     /// no opened ext4 context.
     fn decode(mut request: PendingIrpLease<'a>) -> Result<Self, DriverError> {
-        let (volume, node) = request.with_active(|active| {
+        let node = request.with_active(|active| {
             let file_object = active.current_stack()?.file_object()?;
             let opened_file = OpenedObject::decode(file_object)?;
-            Ok::<_, DriverError>((opened_file.volume(), opened_file.node()))
+            Ok::<_, DriverError>(opened_file.node())
         })?;
         let (selection, output) = request.query_security_parts()?;
-        let operations = unsafe {
-            // SAFETY: Query-security runs only as the mounted-device executor's unique active
-            // operation. The lease is moved into this request until that operation completes.
-            VolumeControlBlock::operation_access(volume)
-        };
         Ok(Self {
             output,
             selection,
             node,
-            operations,
         })
     }
 }
@@ -97,8 +99,6 @@ struct SetSecurityRequest<'a> {
     descriptor: &'a [u8],
     /// ext4 node selected by the opened FILE_OBJECT.
     node: NodeId,
-    /// Exclusive actor-owned mounted-volume operation capability.
-    operations: VolumeAccess,
 }
 
 impl<'a> SetSecurityRequest<'a> {
@@ -108,22 +108,16 @@ impl<'a> SetSecurityRequest<'a> {
     /// Returns an error when the current stack is not a set-security stack or its FILE_OBJECT has no
     /// opened ext4 context.
     fn decode(mut request: PendingIrpLease<'a>) -> Result<Self, DriverError> {
-        let (volume, node) = request.with_active(|active| {
+        let node = request.with_active(|active| {
             let file_object = active.current_stack()?.file_object()?;
             let opened_file = OpenedObject::decode(file_object)?;
-            Ok::<_, DriverError>((opened_file.volume(), opened_file.node()))
+            Ok::<_, DriverError>(opened_file.node())
         })?;
         let (selection, descriptor) = request.set_security_parts()?;
-        let operations = unsafe {
-            // SAFETY: Set-security runs only as the mounted-device executor's unique active
-            // operation. The lease is moved into this request until that operation completes.
-            VolumeControlBlock::operation_access(volume)
-        };
         Ok(Self {
             selection,
             descriptor,
             node,
-            operations,
         })
     }
 }
@@ -352,8 +346,11 @@ impl DaclPermissionBuilder {
 ///
 /// Returns an error when ext4 security metadata cannot be loaded, the requested descriptor cannot
 /// be built, or the user output buffer is too small.
-fn query_security(mut request: QuerySecurityRequest<'_>) -> DriverResult<IrpCompletion> {
-    let security = load_ext4_security(request.operations.runtime_mut(), request.node)?;
+fn query_security(
+    request: QuerySecurityRequest<'_>,
+    read: &mut impl CommittedReadPass,
+) -> DriverResult<IrpCompletion> {
+    let security = load_ext4_security(read, request.node)?;
     let descriptor = security_descriptor(security, request.selection)?;
     let required = descriptor.len();
     request.output.copy_from_owned(descriptor.as_slice())?;
@@ -365,21 +362,18 @@ fn query_security(mut request: QuerySecurityRequest<'_>) -> DriverResult<IrpComp
 ///
 /// Returns an error when the input descriptor cannot be copied or mapped to ext4 owner/permissions,
 /// or the journaled security update fails.
-fn set_security(mut request: SetSecurityRequest<'_>) -> DriverResult<IrpCompletion> {
-    let current = load_ext4_security(request.operations.runtime_mut(), request.node)?;
+fn set_security(
+    request: SetSecurityRequest<'_>,
+    transaction: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<IrpCompletion> {
+    let current = load_ext4_security(transaction, request.node)?;
     let security = security_from_descriptor(request.descriptor, request.selection, current)?;
     if security == current {
         return Ok(IrpCompletion::EMPTY);
     }
 
-    let mut transaction = request
-        .operations
-        .runtime_mut()
-        .journaled_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let node = transaction.node(request.node)?;
     transaction.set_posix_security(node, security)?;
-    transaction.commit()?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -388,10 +382,10 @@ fn set_security(mut request: SetSecurityRequest<'_>) -> DriverResult<IrpCompleti
 ///
 /// Returns an error when the opened node cannot be loaded from ext4 metadata.
 fn load_ext4_security(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     node: NodeId,
 ) -> DriverResult<Ext4Security> {
-    security_from_node(operations, node)
+    security_from_node(read, node)
 }
 
 /// Extracts security metadata after validating FCB kind against core metadata.
@@ -399,18 +393,13 @@ fn load_ext4_security(
 ///
 /// Returns an error when `identity` cannot be loaded as its typed ext4 node.
 fn security_from_node(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     identity: NodeId,
 ) -> DriverResult<Ext4Security> {
     match identity {
-        NodeId::File(file) => Ok(operations.journaled_mut().load_file(file)?.security()),
-        NodeId::Directory(directory) => Ok(operations
-            .journaled_mut()
-            .load_directory(directory)?
-            .security()),
-        NodeId::Symlink(symlink) => {
-            Ok(operations.journaled_mut().load_symlink(symlink)?.security())
-        }
+        NodeId::File(file) => Ok(read.load_file(file)?.security()),
+        NodeId::Directory(directory) => Ok(read.load_directory(directory)?.security()),
+        NodeId::Symlink(symlink) => Ok(read.load_symlink(symlink)?.security()),
     }
 }
 
