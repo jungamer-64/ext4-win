@@ -28,6 +28,20 @@ fn reserve_failed(error: TryReserveError) -> DriverError {
     }
 }
 
+/// Copies exactly equal byte slices without invoking a bounds-panicking copy intrinsic.
+/// # Errors
+///
+/// Returns an invariant error when source and destination lengths differ.
+pub(crate) fn copy_exact(destination: &mut [u8], source: &[u8]) -> DriverResult<()> {
+    if destination.len() != source.len() {
+        return Err(DriverError::InternalInvariantViolation);
+    }
+    for (target, byte) in destination.iter_mut().zip(source.iter().copied()) {
+        *target = byte;
+    }
+    Ok(())
+}
+
 /// Error returned by owned push operations.
 ///
 /// This preserves ownership of the value on failure. The helper itself does not drop the value on

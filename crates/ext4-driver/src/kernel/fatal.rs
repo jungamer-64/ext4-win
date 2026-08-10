@@ -65,6 +65,11 @@ impl KernelWideInconsistency {
         Self::without_location(FatalReason::DriverDeviceTeardownCorruption)
     }
 
+    /// Constructs a fatal state for impossible private lower-IRP ownership.
+    pub(crate) const fn lower_completion_ownership_corruption() -> Self {
+        Self::without_location(FatalReason::LowerCompletionOwnershipCorruption)
+    }
+
     /// Constructs a fatal state without source location context.
     const fn without_location(reason: FatalReason) -> Self {
         Self {
@@ -124,6 +129,8 @@ enum FatalReason {
     MountedVolumeStateCorruption,
     /// The driver device chain no longer matches its typed extension ownership.
     DriverDeviceTeardownCorruption,
+    /// A private lower IRP, MDL, envelope, or release authority was consumed inconsistently.
+    LowerCompletionOwnershipCorruption,
 }
 
 impl FatalReason {
@@ -137,6 +144,7 @@ impl FatalReason {
             Self::AsyncExecutorStateCorruption => 5,
             Self::MountedVolumeStateCorruption => 6,
             Self::DriverDeviceTeardownCorruption => 7,
+            Self::LowerCompletionOwnershipCorruption => 8,
         }
     }
 }
@@ -183,6 +191,10 @@ mod tests {
             FatalReason::DriverDeviceTeardownCorruption.as_parameter(),
             7
         );
+        assert_eq!(
+            FatalReason::LowerCompletionOwnershipCorruption.as_parameter(),
+            8
+        );
     }
 
     /// # Panics
@@ -213,6 +225,10 @@ mod tests {
         assert_eq!(
             KernelWideInconsistency::driver_device_teardown_corruption().reason,
             FatalReason::DriverDeviceTeardownCorruption
+        );
+        assert_eq!(
+            KernelWideInconsistency::lower_completion_ownership_corruption().reason,
+            FatalReason::LowerCompletionOwnershipCorruption
         );
     }
 }

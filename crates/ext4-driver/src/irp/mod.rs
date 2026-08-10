@@ -8,6 +8,7 @@ use ext4_core::FileOffset;
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_PENDING, STATUS_SUCCESS};
 
 mod capture;
+pub(crate) mod lower;
 
 pub(crate) use capture::{
     CapturedQuerySecurityOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
