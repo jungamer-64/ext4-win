@@ -194,7 +194,10 @@ mod tests {
         );
         assert_eq!(FatalReason::FileObjectLifecycleCorruption.as_parameter(), 4);
         assert_eq!(FatalReason::AsyncExecutorStateCorruption.as_parameter(), 5);
-        assert_eq!(FatalReason::CompletionReactorStateCorruption.as_parameter(), 6);
+        assert_eq!(
+            FatalReason::CompletionReactorStateCorruption.as_parameter(),
+            6
+        );
         assert_eq!(FatalReason::MountedVolumeStateCorruption.as_parameter(), 7);
         assert_eq!(
             FatalReason::DriverDeviceTeardownCorruption.as_parameter(),
