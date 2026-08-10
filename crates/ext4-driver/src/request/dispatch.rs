@@ -382,11 +382,13 @@ pub(crate) fn admit_owned(
         ActorRequest::Captured(PreparedRequest::SetSecurity { .. }) => {
             Admission::Mutation(MutationRequestKind::SetSecurity)
         }
+        ActorRequest::Captured(PreparedRequest::SetVolumeInformation) => {
+            Admission::Mutation(MutationRequestKind::SetVolumeInformation)
+        }
         ActorRequest::Cleanup => Admission::Mutation(MutationRequestKind::Cleanup),
         ActorRequest::Close => Admission::Immediate(ImmediateRequestKind::Close),
         ActorRequest::Captured(
-            PreparedRequest::SetVolumeInformation
-            | PreparedRequest::DirectoryControl(PreparedDirectoryControl::NotifyChangeDirectory)
+            PreparedRequest::DirectoryControl(PreparedDirectoryControl::NotifyChangeDirectory)
             | PreparedRequest::FileSystemControl(_)
             | PreparedRequest::FlushBuffers
             | PreparedRequest::Shutdown,

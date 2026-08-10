@@ -13,11 +13,13 @@ use crate::{
     kernel::status::{DriverError, DriverResult},
     memory::DriverVec,
     state::{
-        MountedVolumeDevice, TransferSectorSize, VolumeControlBlock, VolumeRuntime,
-        VolumeSerialNumber,
+        MountedVolumeDevice, PreparedVpbLabelPublication, TransferSectorSize, VolumeControlBlock,
+        VolumeRuntime, VolumeSerialNumber,
     },
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
+
+use super::DriverMutationPass;
 
 /// Filesystem name exposed through `FileFsAttributeInformation`.
 const FILE_SYSTEM_NAME: &[u16] = &[0x0045, 0x0058, 0x0054, 0x0034, 0x0057, 0x0049, 0x004E];
@@ -56,7 +58,10 @@ pub(crate) fn query(mut request: PendingIrpLease<'_>) -> DriverResult<IrpComplet
 /// # Errors
 ///
 /// Returns an error when volume stack decoding or label mutation fails.
-pub(crate) fn set(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn set(
+    mut request: PendingIrpLease<'_>,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<SetVolumeResolution> {
     let (device, volume, label) = request.with_active(|active| {
         let stack = active.current_stack()?.set_volume()?;
         let volume =
@@ -69,22 +74,41 @@ pub(crate) fn set(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletio
         };
         Ok::<_, DriverError>((active.device(), volume, label))
     })?;
-    let mut operations = unsafe {
+    let operations = unsafe {
         // SAFETY: Set-volume runs only as the mounted-device executor's unique active operation.
         VolumeControlBlock::operation_access(volume)
     };
-    if operations.runtime().volume_label() == label {
-        return Ok(IrpCompletion::EMPTY);
+    if operations.runtime().identity().label() == label {
+        return Ok(SetVolumeResolution::Complete(IrpCompletion::EMPTY));
     }
+    mutation.set_volume_label(label);
+    let publication = MountedVolumeDevice::prepare_vpb_label_publication(device, label)?;
+    Ok(SetVolumeResolution::Mutation(
+        PreparedVolumeLabelPublication { publication },
+    ))
+}
 
-    let mut transaction = operations
-        .runtime_mut()
-        .journaled_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    transaction.set_volume_label(label);
-    transaction.commit()?;
-    MountedVolumeDevice::refresh_vpb_label(device, operations.runtime().volume_label())?;
-    Ok(IrpCompletion::EMPTY)
+/// Result of one restartable volume-label resolve pass.
+#[derive(Debug)]
+pub(crate) enum SetVolumeResolution {
+    /// The requested label was already committed.
+    Complete(IrpCompletion),
+    /// Label storage and VPB publication require journal commit.
+    Mutation(PreparedVolumeLabelPublication),
+}
+
+/// Allocation-free VPB publication paired with the committed ext4 label.
+#[derive(Debug)]
+pub(crate) struct PreparedVolumeLabelPublication {
+    /// Prevalidated mounted VPB update.
+    publication: PreparedVpbLabelPublication,
+}
+
+impl PreparedVolumeLabelPublication {
+    /// Publishes the pre-encoded VPB label without allocation or ordinary failure.
+    pub(crate) fn publish(self) {
+        self.publication.publish();
+    }
 }
 
 /// Decodes a Windows label information buffer into an ext4 volume label.
