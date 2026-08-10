@@ -4,7 +4,12 @@ use crate::irp::{
     FileSystemControlMinorFunction, FsControlCode, IrpBufferLength, IrpCompletion, PendingIrpLease,
 };
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::state::{KernelDevice, KernelVpb, OpenedFileObject, VolumeControlBlock};
+use core::ptr::NonNull;
+
+use crate::state::{
+    KernelDevice, KernelFileObject, KernelVpb, MountedVolumeDevice, OpenedFileObject, OpenedVolume,
+    VolumeControlBlock,
+};
 
 /// Owned classification copied from an FSCTL stack before operation allocation.
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +57,34 @@ impl MountAdmission {
     }
 }
 
+/// Stable direct-volume identities selected from a lifecycle FSCTL.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirectVolumeTarget {
+    /// Mounted device receiving the request.
+    device: KernelDevice,
+    /// Mounted VCB named by the direct-volume FILE_OBJECT.
+    volume: NonNull<VolumeControlBlock>,
+    /// Direct-volume FILE_OBJECT owning the lifecycle authority.
+    owner: KernelFileObject,
+}
+
+impl DirectVolumeTarget {
+    /// Mounted device receiving the lifecycle request.
+    pub(crate) const fn device(self) -> KernelDevice {
+        self.device
+    }
+
+    /// Mounted VCB selected by the direct-volume handle.
+    pub(crate) const fn volume(self) -> NonNull<VolumeControlBlock> {
+        self.volume
+    }
+
+    /// FILE_OBJECT identity owning lock/dismount authority.
+    pub(crate) const fn owner(self) -> KernelFileObject {
+        self.owner
+    }
+}
+
 /// Classifies one captured filesystem-control request without retaining an IRP-internal pointer.
 /// # Errors
 ///
@@ -96,6 +129,33 @@ pub(crate) fn authorize_path_handle(request: &mut PendingIrpLease<'_>) -> Driver
         VolumeControlBlock::operation_access(volume)
     };
     operations.authorize_handle(file_object)
+}
+
+/// Decodes one payload-free volume lifecycle request into stable typed identities.
+/// # Errors
+///
+/// Returns an error for nonempty buffers, a non-volume FILE_OBJECT, or a VCB/device mismatch.
+pub(crate) fn direct_volume_target(
+    request: &mut PendingIrpLease<'_>,
+) -> DriverResult<DirectVolumeTarget> {
+    request.with_active(|active| {
+        let stack = active.current_stack()?.file_system_control()?;
+        if !stack.input_buffer_length().is_empty() || !stack.output_buffer_length().is_empty() {
+            return Err(DriverError::InvalidParameter);
+        }
+        let device = active.device();
+        let opened = OpenedVolume::decode(active.current_stack()?.file_object()?)?;
+        let volume = opened.volume();
+        if MountedVolumeDevice::vcb(device) != Some(volume) {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                .bugcheck();
+        }
+        Ok(DirectVolumeTarget {
+            device,
+            volume,
+            owner: opened.file_object(),
+        })
+    })
 }
 
 /// Executes device control requests addressed to this FSD.

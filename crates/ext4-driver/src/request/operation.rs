@@ -25,7 +25,8 @@ use crate::memory;
 use crate::request::file_system_control::MountAdmission;
 use crate::state::{
     EpochLease, EpochPublicationSlot, EpochPublicationSlots, MountedVolumeDevice,
-    MountedVolumeDeviceExtension, PendingCheckpoint, VolumeControlBlock,
+    MountedVolumeDeviceExtension, PendingCheckpoint, PreparedVolumeStateTransition,
+    VolumeControlBlock,
 };
 
 /// Admission failure that preserves the unique top-level completion authority.
@@ -592,6 +593,265 @@ impl CompletionOperation for NotificationOperation {
 // SAFETY: Unique IRP authority moves only on the sole reactor thread until it is consumed by the
 // FsRtl notification package.
 unsafe impl Send for NotificationOperation {}
+
+/// Volume lifecycle semantics selected from one payload-free standard FSCTL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VolumeControlRequestKind {
+    /// Flushes a clean journal before publishing an exclusive volume lock.
+    Lock,
+    /// Releases a lock already owned by this direct-volume handle.
+    Unlock,
+    /// Flushes a clean journal before terminal logical dismount publication.
+    Dismount,
+    /// Observes whether the volume remains logically mounted.
+    IsMounted,
+}
+
+/// Explicit ownership phase of one direct-volume lifecycle request.
+#[derive(Debug)]
+enum VolumeControlOperationState {
+    /// IRP target and lifecycle transition have not yet been decoded.
+    Ready(OwnedIrp),
+    /// A prevalidated state transition waits until checkpointing leaves a clean journal.
+    Waiting {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Stable direct-volume identities.
+        target: crate::request::file_system_control::DirectVolumeTarget,
+        /// State publication prepared before suspension.
+        transition: PreparedVolumeStateTransition,
+        /// Concrete lower devices already selected from the mounted runtime.
+        devices: MountedStorageDevices,
+    },
+    /// The clean-journal barrier released and one lower device flush is in flight.
+    Flushing {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Stable direct-volume identities.
+        target: crate::request::file_system_control::DirectVolumeTarget,
+        /// State publication prepared before suspension.
+        transition: PreparedVolumeStateTransition,
+        /// Exact lower completion identity.
+        expected: StorageRequestIdentity,
+    },
+    /// Terminal completion consumed the IRP.
+    Terminal,
+}
+
+/// Barrier-driven direct-volume lifecycle operation.
+#[derive(Debug)]
+struct VolumeControlOperation {
+    /// Requested lifecycle semantics.
+    kind: VolumeControlRequestKind,
+    /// Current consuming ownership phase.
+    state: VolumeControlOperationState,
+}
+
+impl VolumeControlOperation {
+    /// Allocates one lifecycle operation while preserving IRP completion ownership on OOM.
+    fn try_new(
+        owned: OwnedIrp,
+        kind: VolumeControlRequestKind,
+    ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+        match memory::boxed_try_map((owned, kind), |(owned, kind)| Self {
+            kind,
+            state: VolumeControlOperationState::Ready(owned),
+        }) {
+            Ok(operation) => Ok(operation),
+            Err(error) => {
+                let (error, (owned, _kind)) = error.into_parts();
+                Err(AdmitOperationError::new(error, owned))
+            }
+        }
+    }
+
+    /// Completes and consumes the lifecycle IRP.
+    fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
+        let _status = owned.complete_result(result);
+        OperationTransition::Complete
+    }
+
+    /// Publishes the prevalidated lock or dismount transition after successful lower flush.
+    fn publish(
+        kind: VolumeControlRequestKind,
+        owned: OwnedIrp,
+        target: crate::request::file_system_control::DirectVolumeTarget,
+        transition: PreparedVolumeStateTransition,
+    ) -> OperationTransition {
+        {
+            let mut access = unsafe {
+                // SAFETY: The lifecycle request runs on the sole mounted-device reactor and the
+                // top-level IRP retains the VCB/FILE_OBJECT identities through publication.
+                VolumeControlBlock::operation_access(target.volume())
+            };
+            access.publish_volume_state_transition(transition);
+        }
+        match kind {
+            VolumeControlRequestKind::Lock => {
+                MountedVolumeDevice::publish_volume_lock(target.device(), true);
+            }
+            VolumeControlRequestKind::Dismount => {
+                MountedVolumeDevice::publish_direct_writes_allowed(target.device());
+                MountedVolumeDevice::unregister_shutdown_notification(target.device());
+                MountedVolumeDevice::complete_dismount(target.device());
+            }
+            VolumeControlRequestKind::Unlock | VolumeControlRequestKind::IsMounted => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
+                )
+                .bugcheck();
+            }
+        }
+        Self::complete(owned, Ok(IrpCompletion::EMPTY))
+    }
+}
+
+impl CompletionOperation for VolumeControlOperation {
+    fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+        let state = core::mem::replace(&mut self.state, VolumeControlOperationState::Terminal);
+        match state {
+            VolumeControlOperationState::Ready(mut owned) => match event {
+                OperationEvent::Admitted => {
+                    let target = match crate::request::file_system_control::direct_volume_target(
+                        &mut owned.request(),
+                    ) {
+                        Ok(target) => target,
+                        Err(error) => return Self::complete(owned, Err(error)),
+                    };
+                    let mut access = unsafe {
+                        // SAFETY: The target is decoded from this live IRP and no reference escapes
+                        // this reactor-thread transition.
+                        VolumeControlBlock::operation_access(target.volume())
+                    };
+                    match self.kind {
+                        VolumeControlRequestKind::Unlock => {
+                            let result = access.unlock_volume(target.owner());
+                            drop(access);
+                            if result.is_ok() {
+                                MountedVolumeDevice::publish_volume_lock(target.device(), false);
+                            }
+                            Self::complete(owned, result.map(|()| IrpCompletion::EMPTY))
+                        }
+                        VolumeControlRequestKind::IsMounted => {
+                            let result = access.ensure_mounted();
+                            Self::complete(owned, result.map(|()| IrpCompletion::EMPTY))
+                        }
+                        VolumeControlRequestKind::Lock | VolumeControlRequestKind::Dismount => {
+                            let transition = if self.kind == VolumeControlRequestKind::Lock {
+                                access.prepare_lock_volume(target.owner())
+                            } else {
+                                access.prepare_dismount_volume(target.owner())
+                            };
+                            let transition = match transition {
+                                Ok(transition) => transition,
+                                Err(error) => return Self::complete(owned, Err(error)),
+                            };
+                            let devices = access.runtime().storage();
+                            drop(access);
+                            self.state = VolumeControlOperationState::Waiting {
+                                owned,
+                                target,
+                                transition,
+                                devices,
+                            };
+                            OperationTransition::Wait {
+                                condition: WaitCondition::JournalClean {
+                                    volume: target.volume(),
+                                },
+                                suspended: self,
+                            }
+                        }
+                    }
+                }
+                OperationEvent::CancelRequested => {
+                    Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
+                }
+                OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceLengthCompleted(_)
+                | OperationEvent::RetryElapsed(_)
+                | OperationEvent::IntentGranted(_)
+                | OperationEvent::CommitGranted(_)
+                | OperationEvent::VisibilityGranted(_)
+                | OperationEvent::CheckpointGranted(_)
+                | OperationEvent::BarrierReleased(_) => {
+                    Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                }
+            },
+            VolumeControlOperationState::Waiting {
+                owned,
+                target,
+                transition,
+                devices,
+            } => match event {
+                OperationEvent::BarrierReleased(permit) => {
+                    if permit.into_identity() != 1 {
+                        return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
+                    }
+                    let request = StorageRequest::Flush {
+                        target: ext4_core::StorageTarget::Filesystem,
+                    };
+                    let expected = StorageRequestIdentity::from_request(&request);
+                    self.state = VolumeControlOperationState::Flushing {
+                        owned,
+                        target,
+                        transition,
+                        expected,
+                    };
+                    OperationTransition::SubmitLower {
+                        devices,
+                        request,
+                        suspended: self,
+                    }
+                }
+                OperationEvent::CancelRequested => {
+                    Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
+                }
+                OperationEvent::Admitted
+                | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceLengthCompleted(_)
+                | OperationEvent::RetryElapsed(_)
+                | OperationEvent::IntentGranted(_)
+                | OperationEvent::CommitGranted(_)
+                | OperationEvent::VisibilityGranted(_)
+                | OperationEvent::CheckpointGranted(_) => {
+                    Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                }
+            },
+            VolumeControlOperationState::Flushing {
+                owned,
+                target,
+                transition,
+                expected,
+            } => {
+                let OperationEvent::StorageCompleted(completion) = event else {
+                    return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
+                };
+                match expected.complete(completion) {
+                    Ok(()) => Self::publish(self.kind, owned, target, transition),
+                    Err(error) => Self::complete(owned, Err(DriverError::from(error))),
+                }
+            }
+            VolumeControlOperationState::Terminal => OperationTransition::Complete,
+        }
+    }
+
+    fn record_storage_failure(&mut self, failure: StorageFailureClass) {
+        if failure != StorageFailureClass::DurabilityUnknown {
+            return;
+        }
+        let VolumeControlOperationState::Flushing { target, .. } = &self.state else {
+            return;
+        };
+        let mut access = unsafe {
+            // SAFETY: Failure publication executes on the sole reactor thread after lower release.
+            VolumeControlBlock::operation_access(target.volume())
+        };
+        access.runtime_mut().record_durability_unknown();
+    }
+}
+
+// SAFETY: Stable VCB/FILE_OBJECT identities remain pinned by the IRP and mounted device; state
+// moves only by value between the sole reactor thread and stable lower envelopes.
+unsafe impl Send for VolumeControlOperation {}
 
 /// Durability barrier semantics selected by the top-level major function.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2016,6 +2276,14 @@ pub(crate) fn notification(
     owned: OwnedIrp,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
     NotificationOperation::try_new(owned)
+}
+
+/// Allocates one barrier-driven direct-volume lifecycle operation.
+pub(crate) fn volume_control(
+    owned: OwnedIrp,
+    kind: VolumeControlRequestKind,
+) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+    VolumeControlOperation::try_new(owned, kind)
 }
 
 /// Allocates one concrete read operation.
