@@ -98,6 +98,11 @@ pub enum Error {
     VerityMismatch,
     /// Memory allocation failed before the requested operation could complete.
     OutOfMemory,
+    /// Internal operation resolution suspended until one owned storage transfer completes.
+    ///
+    /// Public operation entry points consume this control result and expose a storage command;
+    /// callers must never receive it as a terminal filesystem error.
+    OperationSuspended,
 }
 
 impl fmt::Display for Error {
@@ -150,6 +155,7 @@ impl fmt::Display for Error {
             Self::InvalidVerityMetadata => "invalid ext4 verity metadata",
             Self::VerityMismatch => "ext4 verity verification failed",
             Self::OutOfMemory => "memory allocation failed",
+            Self::OperationSuspended => "filesystem operation is awaiting storage completion",
         })
     }
 }

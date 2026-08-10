@@ -476,7 +476,7 @@ impl FscryptNonceGenerator for FscryptNoNonceGenerator {
 }
 
 /// Raw fscrypt master key material supplied at the mount boundary.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct FscryptMasterKey {
     /// Stable fscrypt v2 identifier derived from the raw key.
     identifier: FscryptKeyIdentifier,
@@ -485,6 +485,17 @@ pub struct FscryptMasterKey {
 }
 
 impl FscryptMasterKey {
+    /// Copies this key using an explicit fallible allocation boundary.
+    /// # Errors
+    ///
+    /// Returns an error when key-byte storage cannot be allocated.
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            identifier: self.identifier,
+            bytes: memory::copied_slice(&self.bytes)?,
+        })
+    }
+
     /// Creates a mount-scoped fscrypt master key from raw software key bytes.
     ///
     /// # Errors
@@ -550,10 +561,10 @@ impl fmt::Debug for FscryptMasterKey {
     }
 }
 
-/// Sorted unique mount-scoped fscrypt master-key set.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Unique mount-scoped fscrypt master-key set.
+#[derive(Debug, Eq, PartialEq)]
 pub struct FscryptKeySet {
-    /// Keys sorted by fscrypt v2 identifier.
+    /// Keys retained in insertion order.
     keys: Vec<FscryptMasterKey>,
 }
 
@@ -564,17 +575,28 @@ impl FscryptKeySet {
         Self { keys: Vec::new() }
     }
 
-    /// Creates a sorted key set from mount-supplied keys.
+    /// Creates a unique key set from mount-supplied keys.
     ///
     /// # Errors
     /// Returns an error when two keys have the same v2 identifier.
-    pub fn from_keys(mut keys: Vec<FscryptMasterKey>) -> Result<Self> {
-        keys.sort_by_key(FscryptMasterKey::identifier);
-        if keys
-            .windows(2)
-            .any(|pair| matches!(pair, [left, right] if left.identifier() == right.identifier()))
-        {
-            return Err(Error::InvalidEncryptionContext);
+    pub fn from_keys(keys: Vec<FscryptMasterKey>) -> Result<Self> {
+        let mut set = Self::empty();
+        for key in keys {
+            set.insert(key)?;
+        }
+        Ok(set)
+    }
+
+    /// Copies this key set using explicit fallible key-byte allocations.
+    /// # Errors
+    ///
+    /// Returns an error when any destination allocation fails.
+    pub fn try_clone(&self) -> Result<Self> {
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(self.keys.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for key in &self.keys {
+            keys.try_push(key.try_clone()?)?;
         }
         Ok(Self { keys })
     }
@@ -590,25 +612,29 @@ impl FscryptKeySet {
     /// # Errors
     /// Returns an error when a key with the same identifier is already present.
     pub fn insert(&mut self, key: FscryptMasterKey) -> Result<()> {
-        match self
-            .keys
-            .binary_search_by_key(&key.identifier(), FscryptMasterKey::identifier)
-        {
-            Ok(_) => Err(Error::InvalidEncryptionContext),
-            Err(index) => {
-                self.keys.insert(index, key);
-                Ok(())
-            }
+        if self.contains(key.identifier()) {
+            return Err(Error::InvalidEncryptionContext);
         }
+        self.keys.try_push(key)
     }
 
     /// Removes a key by identifier.
-    #[must_use]
-    pub fn remove(&mut self, identifier: FscryptKeyIdentifier) -> Option<FscryptMasterKey> {
-        self.keys
-            .binary_search_by_key(&identifier, FscryptMasterKey::identifier)
-            .ok()
-            .map(|index| self.keys.remove(index))
+    pub fn remove(&mut self, identifier: FscryptKeyIdentifier) -> Result<Option<FscryptMasterKey>> {
+        let previous = core::mem::take(&mut self.keys);
+        let mut retained = Vec::new();
+        retained
+            .try_reserve_exact(previous.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        let mut removed = None;
+        for key in previous {
+            if removed.is_none() && key.identifier() == identifier {
+                removed = Some(key);
+            } else {
+                retained.try_push(key)?;
+            }
+        }
+        self.keys = retained;
+        Ok(removed)
     }
 
     /// Returns whether a key with the identifier is present.
@@ -617,7 +643,7 @@ impl FscryptKeySet {
         self.get(identifier).is_some()
     }
 
-    /// Returns keys in stable identifier order.
+    /// Returns keys in stable insertion order.
     #[must_use]
     pub fn keys(&self) -> &[FscryptMasterKey] {
         &self.keys
@@ -626,10 +652,7 @@ impl FscryptKeySet {
     /// Looks up a key by v2 identifier.
     #[must_use]
     pub fn get(&self, identifier: FscryptKeyIdentifier) -> Option<&FscryptMasterKey> {
-        self.keys
-            .binary_search_by_key(&identifier, FscryptMasterKey::identifier)
-            .ok()
-            .and_then(|index| self.keys.get(index))
+        self.keys.iter().find(|key| key.identifier() == identifier)
     }
 }
 

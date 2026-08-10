@@ -21,6 +21,9 @@ mod protection;
 mod volume;
 
 pub use disk::block::{BlockSize, ByteOffset, DeviceLength};
+pub use disk::storage::{
+    CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageTarget,
+};
 pub use disk_format::inode::{
     Ext4Gid, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
     Ext4Uid, FileAllocationSize, FileOffset, FileSize, NewDirectoryMetadata, NewFileMetadata,
@@ -41,11 +44,18 @@ pub use protection::verity::{
     FsverityBlockSize, FsverityEnable, FsverityHashAlgorithm, FsveritySalt, FsveritySignature,
 };
 pub use volume::{
-    ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
-    FileNodeId, HardLinkDestination, HardLinkEntry, HardLinkNodeId, HardLinks, InternalJournal,
-    MountContext, NodeId, RenameTargetCollision, SymlinkNode, SymlinkNodeId, TransactionDirectory,
-    TransactionFile, TransactionHardLinkSource, TransactionNode, TransactionSymlink,
-    VolumeGeometry, VolumeIdentity,
+    CheckpointOperation, ChildLookup, CleanJournalDurability, CleanJournalRecordPhase,
+    CommitDurability, CommitReadyMutation, CommitRecordPhase, CommittedEpoch, CompletedMount,
+    DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, DurableMutation,
+    EpochReadOperation, EpochSequence, FileNode, FileNodeId, HardLinkDestination, HardLinkEntry,
+    HardLinkNodeId, HardLinks, HomeBlockDurability, JournalPayloadDurability, MountEvent,
+    MountOperation, MountTransition, MountedProfile, MutationCoordinatorState,
+    MutationResolveEvent, MutationResolveOperation, MutationResolvePass, MutationResolveReady,
+    MutationResolveTransition, MutationResource, NodeId, ObservedResourceVersionSet,
+    OrderedDataDurability, PublishedMutation, ReadEvent, ReadTransition, RenameTargetCollision,
+    ReservedMutation, ResolvedMutation, ResourceVersion, StorageRequestSequence,
+    StorageRequestSequenceStep, SymlinkNode, SymlinkNodeId, TransactionDirectory, TransactionFile,
+    TransactionHardLinkSource, TransactionNode, TransactionSymlink, VolumeGeometry, VolumeIdentity,
 };
 
 #[cfg(test)]

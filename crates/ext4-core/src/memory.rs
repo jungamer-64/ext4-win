@@ -33,6 +33,20 @@ pub(crate) fn copied_slice<T: Copy>(source: &[T]) -> Result<Vec<T>> {
     Ok(output)
 }
 
+/// Copies between equal-length slices without calling the panicking slice copy intrinsic.
+/// # Errors
+///
+/// Returns [`Error::InvalidWriteRange`] when the lengths differ.
+pub(crate) fn copy_exact<T: Copy>(destination: &mut [T], source: &[T]) -> Result<()> {
+    if destination.len() != source.len() {
+        return Err(Error::InvalidWriteRange);
+    }
+    for (destination, source) in destination.iter_mut().zip(source.iter().copied()) {
+        *destination = source;
+    }
+    Ok(())
+}
+
 /// Fallible growth operations for vectors in production code paths.
 pub(crate) trait FallibleVec<T> {
     /// Pushes one value after reserving capacity for it.
