@@ -15,6 +15,7 @@ pub(crate) mod file_info;
 pub(crate) mod file_system_control;
 pub(crate) mod fsctl;
 pub(crate) mod metadata;
+pub(crate) mod operation;
 pub(crate) mod reparse;
 pub(crate) mod security;
 pub(crate) mod volume_info;
