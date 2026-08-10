@@ -10,9 +10,9 @@
 
 /*
  * This translation unit is the only boundary that touches neither-I/O security
- * buffers supplied by an untrusted requestor. Rust receives only an opaque
- * output target or an owned, validated byte snapshot; requestor mappings never
- * enter Rust's aliasing model.
+ * buffers supplied by an untrusted requestor or I/O-manager-owned auxiliary
+ * input. Rust receives only an opaque output target or an owned, validated byte
+ * snapshot; external mappings never enter Rust's aliasing model.
  */
 
 typedef struct _EXT4WIN_SID_PREFIX {
@@ -38,7 +38,7 @@ ext4win_is_requestor_mode_valid(_In_ KPROCESSOR_MODE requestor_mode)
 }
 
 static NTSTATUS
-ext4win_normalize_user_buffer_exception(_In_ LONG exception_code)
+ext4win_normalize_buffer_exception(_In_ LONG exception_code)
 {
     const NTSTATUS status = (NTSTATUS)exception_code;
 
@@ -386,7 +386,7 @@ ext4win_capture_query_security_output(
         MmProbeAndLockPages(output->Mdl, requestor_mode, IoWriteAccess);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = ext4win_normalize_user_buffer_exception(GetExceptionCode());
+        status = ext4win_normalize_buffer_exception(GetExceptionCode());
     }
     if (!NT_SUCCESS(status)) {
         IoFreeMdl(output->Mdl);
@@ -501,7 +501,7 @@ ext4win_capture_set_security_descriptor(
             &candidate_length);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = ext4win_normalize_user_buffer_exception(GetExceptionCode());
+        status = ext4win_normalize_buffer_exception(GetExceptionCode());
     }
     if (!NT_SUCCESS(status)) {
         return status;
@@ -528,7 +528,7 @@ ext4win_capture_set_security_descriptor(
         RtlCopyMemory(snapshot, source, candidate_length);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = ext4win_normalize_user_buffer_exception(GetExceptionCode());
+        status = ext4win_normalize_buffer_exception(GetExceptionCode());
     }
     if (!NT_SUCCESS(status)) {
         RtlSecureZeroMemory(snapshot, candidate_length);
@@ -578,20 +578,21 @@ ext4win_release_set_security_descriptor(_Frees_ptr_opt_ PVOID snapshot)
     }
 }
 
-#define EXT4WIN_REQUESTOR_INPUT_POOL_TAG ((ULONG)0x43573445UL)
+#define EXT4WIN_AUXILIARY_INPUT_POOL_TAG ((ULONG)0x43573445UL)
 
 /*
- * These purpose-specific captures run while dispatch still owns the
- * requestor process context. The common helper is private: callers must choose
- * the contract whose bound matches the actual queued input.
+ * These purpose-specific captures run before queue publication. Requestor
+ * buffers use their originating access mode; I/O-manager-owned inputs use
+ * KernelMode. The common helper is private so provenance stays in each public
+ * contract instead of entering Rust as a loosely typed policy.
  */
 static NTSTATUS
-ext4win_capture_requestor_input(
+ext4win_capture_bounded_input(
     _In_reads_bytes_(length) const VOID *source,
     _In_ ULONG length,
     _In_ ULONG maximum_length,
     _In_ ULONG alignment,
-    _In_ KPROCESSOR_MODE requestor_mode,
+    _In_ KPROCESSOR_MODE access_mode,
     _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
     _Out_ PULONG length_out)
 {
@@ -605,7 +606,7 @@ ext4win_capture_requestor_input(
         *length_out = 0;
     }
     if ((snapshot_out == NULL) || (length_out == NULL) ||
-        !ext4win_is_requestor_mode_valid(requestor_mode)) {
+        !ext4win_is_requestor_mode_valid(access_mode)) {
         return STATUS_INVALID_PARAMETER;
     }
     if (length > maximum_length) {
@@ -621,23 +622,23 @@ ext4win_capture_requestor_input(
     snapshot = ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         length,
-        EXT4WIN_REQUESTOR_INPUT_POOL_TAG);
+        EXT4WIN_AUXILIARY_INPUT_POOL_TAG);
     if (snapshot == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     status = STATUS_SUCCESS;
     __try {
-        if (requestor_mode == UserMode) {
+        if (access_mode == UserMode) {
             ProbeForRead(source, length, alignment);
         }
         RtlCopyMemory(snapshot, source, length);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = ext4win_normalize_user_buffer_exception(GetExceptionCode());
+        status = ext4win_normalize_buffer_exception(GetExceptionCode());
     }
     if (!NT_SUCCESS(status)) {
-        ExFreePoolWithTag(snapshot, EXT4WIN_REQUESTOR_INPUT_POOL_TAG);
+        ExFreePoolWithTag(snapshot, EXT4WIN_AUXILIARY_INPUT_POOL_TAG);
         return status;
     }
 
@@ -657,12 +658,67 @@ ext4win_capture_ea_name_list(
     _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
     _Out_ PULONG length_out)
 {
-    return ext4win_capture_requestor_input(
+    return ext4win_capture_bounded_input(
         source,
         length,
         EXT4WIN_MAX_EA_NAME_LIST_SIZE,
         TYPE_ALIGNMENT(UCHAR),
         requestor_mode,
+        snapshot_out,
+        length_out);
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_capture_io_manager_directory_pattern(
+    _In_ PCUNICODE_STRING source,
+    _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
+    _Out_ PULONG length_out)
+{
+    UNICODE_STRING header = {0};
+    NTSTATUS status;
+
+    if (snapshot_out != NULL) {
+        *snapshot_out = NULL;
+    }
+    if (length_out != NULL) {
+        *length_out = 0;
+    }
+    if ((snapshot_out == NULL) || (length_out == NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (source == NULL) {
+        return STATUS_INVALID_USER_BUFFER;
+    }
+
+    status = STATUS_SUCCESS;
+    __try {
+        /* NtQueryDirectoryFile has already captured this descriptor for the IRP. */
+        RtlCopyMemory(&header, source, sizeof(header));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = ext4win_normalize_buffer_exception(GetExceptionCode());
+    }
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    if ((header.Length > header.MaximumLength) ||
+        ((header.Length & (sizeof(WCHAR) - 1)) != 0) ||
+        ((header.MaximumLength & (sizeof(WCHAR) - 1)) != 0) ||
+        (header.Length > EXT4WIN_MAX_DIRECTORY_PATTERN_SIZE) ||
+        ((header.Length != 0) && (header.Buffer == NULL))) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /* The I/O manager owns both the descriptor and its captured payload. */
+    return ext4win_capture_bounded_input(
+        header.Buffer,
+        header.Length,
+        EXT4WIN_MAX_DIRECTORY_PATTERN_SIZE,
+        TYPE_ALIGNMENT(WCHAR),
+        KernelMode,
         snapshot_out,
         length_out);
 }
@@ -673,6 +729,6 @@ NTAPI
 ext4win_release_captured_requestor_input(_Frees_ptr_opt_ PVOID snapshot)
 {
     if (snapshot != NULL) {
-        ExFreePoolWithTag(snapshot, EXT4WIN_REQUESTOR_INPUT_POOL_TAG);
+        ExFreePoolWithTag(snapshot, EXT4WIN_AUXILIARY_INPUT_POOL_TAG);
     }
 }
