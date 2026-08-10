@@ -295,6 +295,15 @@ impl KernelFileObject {
     pub(crate) const fn as_ptr(self) -> *mut FILE_OBJECT {
         self.file_object.as_ptr()
     }
+
+    /// Publishes one already range-checked current-byte offset.
+    fn write_current_byte_offset(self, position: i64) {
+        unsafe {
+            // SAFETY: The owning active-operation token retains this FILE_OBJECT and prevalidated
+            // the signed position before constructing its publication value.
+            (*self.as_ptr()).CurrentByteOffset = LARGE_INTEGER { QuadPart: position };
+        }
+    }
 }
 
 impl ActiveFileObject<'_> {
@@ -4466,6 +4475,62 @@ pub(crate) struct OpenedObject<'owner> {
     handle: NonNull<OpenedHandle>,
 }
 
+/// Prevalidated, allocation-free update to one stable per-handle namespace location.
+#[derive(Debug)]
+pub(crate) struct PreparedOpenedLocationPublication {
+    /// Stable CCB allocated at create and retained until CLOSE.
+    handle: NonNull<OpenedHandle>,
+    /// Fully owned location prepared before the first lower write.
+    location: OpenedLocation,
+}
+
+impl PreparedOpenedLocationPublication {
+    /// Moves the prepared location into the live CCB without allocation or validation.
+    pub(crate) fn publish(self) {
+        let handle = unsafe {
+            // SAFETY: The originating top-level IRP retains the FILE_OBJECT/CCB through commit,
+            // and CLOSE is ordered behind that operation by the per-handle lane.
+            self.handle.as_ref()
+        };
+        handle.replace_location(self.location);
+    }
+}
+
+// SAFETY: This token moves only through the reactor and completion envelopes. Its CCB is stable
+// from successful CREATE publication until the ordered CLOSE transition.
+unsafe impl Send for PreparedOpenedLocationPublication {}
+
+/// Prevalidated FILE_OBJECT position update published after successful data I/O.
+#[derive(Debug)]
+pub(crate) enum PreparedFilePositionPublication {
+    /// Paging or asynchronous I/O does not update the user-visible cursor.
+    Unchanged,
+    /// Exact signed position ready for one infallible field write.
+    Set {
+        /// Stable FILE_OBJECT retained by the active operation lane.
+        file_object: KernelFileObject,
+        /// Checked Windows current-byte-offset value.
+        position: i64,
+    },
+}
+
+impl PreparedFilePositionPublication {
+    /// Applies the prevalidated position without allocation or ordinary failure.
+    pub(crate) fn publish(self) {
+        if let Self::Set {
+            file_object,
+            position,
+        } = self
+        {
+            file_object.write_current_byte_offset(position);
+        }
+    }
+}
+
+// SAFETY: The FILE_OBJECT is kept live through the per-handle active-operation lane and the token
+// is moved only through reactor-owned operation state.
+unsafe impl Send for PreparedFilePositionPublication {}
+
 impl<'owner> OpenedObject<'owner> {
     /// Decodes an initialized FILE_OBJECT context pair.
     ///
@@ -4576,6 +4641,17 @@ impl<'owner> OpenedObject<'owner> {
         self.handle().replace_location(location);
     }
 
+    /// Prepares a post-commit handle-location update without retaining an active IRP borrow.
+    pub(crate) fn prepare_location_publication(
+        &self,
+        location: OpenedLocation,
+    ) -> PreparedOpenedLocationPublication {
+        PreparedOpenedLocationPublication {
+            handle: self.handle,
+            location,
+        }
+    }
+
     /// Returns write completion durability requested for this opened handle.
     pub(crate) fn write_commitment(&self) -> WriteCommitment {
         self.handle().write_commitment()
@@ -4630,6 +4706,23 @@ impl<'owner> OpenedObject<'owner> {
             return Ok(());
         }
         self.write_current_file_position(start.checked_add_len(transferred)?)
+    }
+
+    /// Precomputes a post-I/O cursor update while failures are still harmless.
+    pub(crate) fn prepare_current_file_position_update(
+        &self,
+        kind: DataIoKind,
+        start: FileOffset,
+        transferred: usize,
+    ) -> DriverResult<PreparedFilePositionPublication> {
+        if kind == DataIoKind::Paging || !self.has_synchronous_file_position() {
+            return Ok(PreparedFilePositionPublication::Unchanged);
+        }
+        let position = start.checked_add_len(transferred)?;
+        Ok(PreparedFilePositionPublication::Set {
+            file_object: self.file_object(),
+            position: i64::try_from(position.bytes()).map_err(|_| DriverError::InvalidParameter)?,
+        })
     }
 
     /// Returns whether this FILE_OBJECT owns a synchronized current-position field.
@@ -4940,6 +5033,17 @@ impl<'owner> OpenedRegularFile<'owner> {
     ) -> DriverResult<()> {
         self.opened
             .update_current_file_position(kind, start, transferred)
+    }
+
+    /// Precomputes an infallible post-I/O position publication.
+    pub(crate) fn prepare_current_file_position_update(
+        &self,
+        kind: DataIoKind,
+        start: FileOffset,
+        transferred: usize,
+    ) -> DriverResult<PreparedFilePositionPublication> {
+        self.opened
+            .prepare_current_file_position_update(kind, start, transferred)
     }
 
     /// Returns write completion durability requested for this regular-file handle.

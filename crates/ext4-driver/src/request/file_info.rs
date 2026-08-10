@@ -25,7 +25,8 @@ use crate::state::{
     CleanupStart, CloseReleasePlan, DirectoryChange, DirectoryChangeAction, DirectoryCursor,
     DirectoryNotificationRegistration, FileCleanupDisposition, FileControlBlock, FileDeleteTarget,
     MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation, OpenedObject,
-    OpenedRegularFile, PendingFileDeletion, VolumeAccess, VolumeControlBlock, VolumeHandleCleanup,
+    OpenedRegularFile, PendingFileDeletion, PreparedFilePositionPublication,
+    PreparedOpenedLocationPublication, VolumeAccess, VolumeControlBlock, VolumeHandleCleanup,
     VolumeRetirement, WriteCommitment, release_cancelled_file_control_block,
     release_file_control_block,
 };
@@ -64,6 +65,39 @@ struct WriteSnapshotWindows {
     total: NonZeroUsize,
     /// Prefix already selected for transfer.
     completed: usize,
+}
+
+/// Driver-visible values prepared before a write mutation issues lower I/O.
+#[derive(Debug)]
+pub(crate) struct PreparedWritePublication {
+    /// Checked completion byte count.
+    completion: IrpCompletion,
+    /// Infallible FILE_OBJECT cursor publication.
+    position: PreparedFilePositionPublication,
+    /// Durability requested by the opened handle.
+    commitment: WriteCommitment,
+}
+
+/// Result of one restartable write resolve pass.
+#[derive(Debug)]
+pub(crate) enum WriteResolution {
+    /// Empty write completed without staging a filesystem mutation.
+    Complete(IrpCompletion),
+    /// Non-empty write staged data and metadata for journal commit.
+    Mutation(PreparedWritePublication),
+}
+
+impl PreparedWritePublication {
+    /// Durability policy that may require one post-commit device flush.
+    pub(crate) const fn commitment(&self) -> WriteCommitment {
+        self.commitment
+    }
+
+    /// Publishes the prepared cursor and reveals terminal IRP completion.
+    pub(crate) fn publish(self) -> IrpCompletion {
+        self.position.publish();
+        self.completion
+    }
 }
 
 impl WriteSnapshotWindows {
@@ -120,13 +154,46 @@ impl WriteSnapshotWindows {
 ///
 /// Returns an error when the IRP stack has no opened FILE_OBJECT, cleanup state is invalid, or a
 /// pending namespace deletion cannot be committed.
-pub(crate) fn cleanup(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn cleanup(mut request: PendingIrpLease<'_>) -> DriverResult<CleanupResolution> {
     let plan = request.with_active(begin_cleanup_file_object)?;
-    if let CleanupPlan::Delete(plan) = plan {
-        delete_after_final_cleanup(plan)?;
-    }
-    Ok(IrpCompletion::EMPTY)
+    Ok(match plan {
+        CleanupPlan::Complete => CleanupResolution::Complete(IrpCompletion::EMPTY),
+        CleanupPlan::Delete(plan) => CleanupResolution::Delete(plan),
+    })
 }
+
+/// Result of entering one per-handle terminal cleanup barrier.
+#[derive(Debug)]
+pub(crate) enum CleanupResolution {
+    /// Cleanup released every handle-owned resource without a namespace mutation.
+    Complete(IrpCompletion),
+    /// The final handle requires one journaled deletion before cleanup completes.
+    Delete(PendingCleanupDeletion),
+}
+
+/// Allocation-free driver publication paired with a committed cleanup deletion.
+#[derive(Debug)]
+pub(crate) struct PreparedCleanupPublication {
+    /// Shared FCB whose stable pending target becomes complete.
+    fcb: NonNull<FileControlBlock>,
+    /// FCB-owned target allocation consumed by the publication.
+    target: NonNull<FileDeleteTarget>,
+    /// Preallocated namespace notification.
+    notification: DirectoryChange,
+}
+
+impl PreparedCleanupPublication {
+    /// Publishes the completed deletion and notification without allocation or ordinary failure.
+    pub(crate) fn publish(self, operations: &mut VolumeAccess) -> IrpCompletion {
+        operations.complete_file_delete(self.fcb, self.target);
+        operations.report_directory_change(self.notification);
+        IrpCompletion::EMPTY
+    }
+}
+
+// SAFETY: FCB/target lifetime is protected by the cleanup barrier through publication, and the
+// token is moved only through reactor-owned operation state.
+unsafe impl Send for PreparedCleanupPublication {}
 
 /// Executes close IRPs and releases FILE_OBJECT contexts.
 /// # Errors
@@ -155,8 +222,11 @@ pub(crate) fn read(
 /// # Errors
 ///
 /// Returns an error when write stack decoding, input buffer mapping, or ext4 file mutation fails.
-pub(crate) fn write(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    write_regular_file_windowed(request)
+pub(crate) fn write(
+    request: PendingIrpLease<'_>,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<WriteResolution> {
+    write_regular_file_windowed(request, mutation)
 }
 
 /// Flushes cached or ordered file data.
@@ -201,8 +271,12 @@ pub(crate) fn query(
 /// # Errors
 ///
 /// Returns an error when set stack decoding or the requested file mutation fails.
-pub(crate) fn set(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    set_file_information(request)
+pub(crate) fn set(
+    request: PendingIrpLease<'_>,
+    operations: &mut VolumeAccess,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<SetFileResolution> {
+    set_file_information(request, operations, mutation)
 }
 
 /// Transfers one queued directory-change IRP to the VCB's FsRtl notification list.
@@ -737,8 +811,6 @@ enum SetFilePlan {
         info: wdk_sys::FILE_BASIC_INFORMATION,
         /// Target ext4 node.
         node: NodeId,
-        /// Exclusive mounted-volume operation capability.
-        operations: VolumeAccess,
     },
     /// Set the exact logical end of file.
     EndOfFile {
@@ -746,8 +818,6 @@ enum SetFilePlan {
         file: FileNodeId,
         /// Requested logical size.
         size: FileSize,
-        /// Exclusive mounted-volume operation capability.
-        operations: VolumeAccess,
     },
     /// Shrink allocation when the requested sparse-model size is below EOF.
     Allocation {
@@ -755,8 +825,6 @@ enum SetFilePlan {
         file: FileNodeId,
         /// Requested allocation bound.
         size: FileSize,
-        /// Exclusive mounted-volume operation capability.
-        operations: VolumeAccess,
     },
     /// Validate and publish one identity-bound delete-pending target.
     Disposition {
@@ -768,23 +836,61 @@ enum SetFilePlan {
         publication: DeletePendingPublication,
         /// Whether the extended request bypasses the read-only Windows attribute.
         readonly: DeleteReadonlyPolicy,
-        /// Exclusive mounted-volume operation capability.
-        operations: VolumeAccess,
     },
     /// Commit one fully owned hard-link creation.
     Link {
         /// Caller-independent hard-link domain values.
         mutation: HardLinkMutation,
-        /// Exclusive mounted-volume operation capability.
-        operations: VolumeAccess,
     },
     /// Commit one fully owned namespace rename.
     Rename {
         /// Caller-independent rename domain values.
         mutation: RenameMutation,
-        /// Exclusive mounted-volume operation capability.
-        operations: VolumeAccess,
+        /// Stable CCB receiving the new location only after durable commit.
+        file_object: crate::state::KernelFileObject,
     },
+}
+
+/// Result of one restartable set-information resolve pass.
+#[derive(Debug)]
+pub(crate) enum SetFileResolution {
+    /// No ext4 mutation was staged; all requested control-plane work is complete.
+    Complete(IrpCompletion),
+    /// Ext4 mutation requires commit and the driver publication is fully prepared.
+    Mutation(SetFilePublication),
+}
+
+/// Allocation-free driver publication paired with a set-information mutation.
+#[derive(Debug)]
+pub(crate) enum SetFilePublication {
+    /// No driver-visible state changes after commit.
+    None,
+    /// Ordered namespace notifications for a committed hard-link mutation.
+    HardLink(HardLinkDirectoryChanges),
+    /// Handle-location and notification moves for a committed rename.
+    Rename {
+        /// Stable CCB update prepared before the first write.
+        location: PreparedOpenedLocationPublication,
+        /// Fully allocated notification sequence.
+        notifications: Box<RenameDirectoryNameChanges>,
+    },
+}
+
+impl SetFilePublication {
+    /// Publishes prepared driver state without allocation or ordinary failure.
+    pub(crate) fn publish(self, operations: &VolumeAccess) {
+        match self {
+            Self::None => {}
+            Self::HardLink(changes) => changes.report(operations),
+            Self::Rename {
+                location,
+                notifications,
+            } => {
+                location.publish();
+                notifications.report(operations);
+            }
+        }
+    }
 }
 
 /// Applies one supported set-file-information class.
@@ -792,7 +898,11 @@ enum SetFilePlan {
 ///
 /// Returns an error when the selected set-information class has invalid input or its ext4 metadata
 /// mutation cannot be committed.
-fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+fn set_file_information(
+    mut request: PendingIrpLease<'_>,
+    operations: &mut VolumeAccess,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<SetFileResolution> {
     let plan = request.with_active(|active| {
         let current = active.current_stack()?;
         let file_object = current.file_object()?;
@@ -805,7 +915,6 @@ fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCom
                     stack.length(),
                 )?,
                 node: opened_file.node(),
-                operations: claim_file_operation_lane(opened_file.file_control_block()),
             },
             SetFileInformationClass::Position => {
                 set_position_information(active, stack, &mut opened_file)?;
@@ -820,7 +929,6 @@ fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCom
                 SetFilePlan::EndOfFile {
                     file: regular_file.id(),
                     size: file_size_from_large_integer(info.EndOfFile)?,
-                    operations: claim_file_operation_lane(opened_file.file_control_block()),
                 }
             }
             SetFileInformationClass::Allocation => {
@@ -832,7 +940,6 @@ fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCom
                 SetFilePlan::Allocation {
                     file: regular_file.id(),
                     size: file_size_from_large_integer(info.AllocationSize)?,
-                    operations: claim_file_operation_lane(opened_file.file_control_block()),
                 }
             }
             SetFileInformationClass::Disposition => {
@@ -851,7 +958,6 @@ fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCom
                     &opened_file,
                     HardLinkInformationFormat::ReplaceIfExistsByte,
                 )?,
-                operations: claim_file_operation_lane(opened_file.file_control_block()),
             },
             SetFileInformationClass::LinkEx => SetFilePlan::Link {
                 mutation: HardLinkMutation::decode(
@@ -860,7 +966,6 @@ fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCom
                     &opened_file,
                     HardLinkInformationFormat::Flags,
                 )?,
-                operations: claim_file_operation_lane(opened_file.file_control_block()),
             },
             SetFileInformationClass::Rename => SetFilePlan::Rename {
                 mutation: RenameMutation::decode(
@@ -869,7 +974,7 @@ fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCom
                     &opened_file,
                     RenameInformationFormat::ReplaceIfExistsByte,
                 )?,
-                operations: claim_file_operation_lane(opened_file.file_control_block()),
+                file_object: opened_file.file_object(),
             },
             SetFileInformationClass::RenameEx => SetFilePlan::Rename {
                 mutation: RenameMutation::decode(
@@ -878,31 +983,21 @@ fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCom
                     &opened_file,
                     RenameInformationFormat::Flags,
                 )?,
-                operations: claim_file_operation_lane(opened_file.file_control_block()),
+                file_object: opened_file.file_object(),
             },
         };
         Ok::<_, DriverError>(plan)
     })?;
     match plan {
-        SetFilePlan::Complete => {}
-        SetFilePlan::Basic {
-            info,
-            node,
-            mut operations,
-        } => set_basic_information(info, node, operations.runtime_mut())?,
-        SetFilePlan::EndOfFile {
-            file,
-            size,
-            mut operations,
-        } => set_regular_file_size(operations.runtime_mut(), file, size)?,
-        SetFilePlan::Allocation {
-            file,
-            size,
-            mut operations,
-        } => {
-            let current = regular_file_size(operations.runtime_mut(), file)?;
+        SetFilePlan::Complete => {
+            return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
+        }
+        SetFilePlan::Basic { info, node } => set_basic_information(info, node, mutation)?,
+        SetFilePlan::EndOfFile { file, size } => set_regular_file_size(mutation, file, size)?,
+        SetFilePlan::Allocation { file, size } => {
+            let current = regular_file_size(mutation, file)?;
             if size < current {
-                set_regular_file_size(operations.runtime_mut(), file, size)?;
+                set_regular_file_size(mutation, file, size)?;
             }
         }
         SetFilePlan::Disposition {
@@ -910,31 +1005,62 @@ fn set_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCom
             pending,
             publication,
             readonly,
-            mut operations,
         } => {
-            validate_pending_deletion(
-                operations.runtime_mut(),
-                node,
-                pending.target_ref(),
-                readonly,
-            )?;
+            validate_pending_deletion(mutation, node, pending.target_ref(), readonly)?;
             match publication {
                 DeletePendingPublication::Publish { fcb } => {
                     operations.set_file_delete_pending(fcb, pending);
                 }
                 DeletePendingPublication::AlreadyPublishedByCreate => drop(pending),
             }
+            return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
         }
-        SetFilePlan::Link {
-            mutation,
-            mut operations,
-        } => set_hard_link_information(mutation, &mut operations)?,
+        SetFilePlan::Link { mutation: request } => {
+            let changes = set_hard_link_information(request, operations, mutation)?;
+            return Ok(SetFileResolution::Mutation(SetFilePublication::HardLink(
+                changes,
+            )));
+        }
         SetFilePlan::Rename {
-            mutation,
-            operations,
-        } => return rename_file_information(&mut request, mutation, operations),
+            mutation: rename,
+            file_object,
+        } => {
+            let publication = set_rename_information(rename, operations, mutation)?;
+            return Ok(SetFileResolution::Mutation(match publication {
+                PreparedRename::Unchanged => SetFilePublication::None,
+                PreparedRename::Changed {
+                    location,
+                    notifications,
+                } => {
+                    let location =
+                        request_location_publication(&mut request, file_object, location)?;
+                    SetFilePublication::Rename {
+                        location,
+                        notifications,
+                    }
+                }
+            }));
+        }
     }
-    Ok(IrpCompletion::EMPTY)
+    Ok(SetFileResolution::Mutation(SetFilePublication::None))
+}
+
+/// Binds a preallocated rename location to the exact CCB retained by the pending request.
+fn request_location_publication(
+    request: &mut PendingIrpLease<'_>,
+    expected: crate::state::KernelFileObject,
+    location: OpenedLocation,
+) -> DriverResult<PreparedOpenedLocationPublication> {
+    request.with_active(|active| {
+        let current = active.current_stack()?;
+        let file_object = current.file_object()?;
+        let _stack = current.set_file()?;
+        let opened = OpenedObject::decode(file_object)?;
+        if opened.file_object() != expected {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        Ok(opened.prepare_location_publication(location))
+    })
 }
 
 /// Applies FILE_POSITION_INFORMATION to the synchronous FILE_OBJECT position.
@@ -1176,7 +1302,6 @@ fn disposition_plan(
                 pending,
                 publication,
                 readonly,
-                operations: claim_file_operation_lane(opened.file_control_block()),
             })
         }
     }
@@ -1333,7 +1458,7 @@ impl HardLinkCountEffect {
 
 /// Ordered post-commit directory notifications for one hard-link mutation.
 #[derive(Debug)]
-struct HardLinkDirectoryChanges {
+pub(crate) struct HardLinkDirectoryChanges {
     /// First and always-present notification.
     first: DirectoryChange,
     /// Second notification required only for a case-preserving spelling change.
@@ -1356,20 +1481,22 @@ impl HardLinkDirectoryChanges {
 /// Returns an error when target resolution, replacement policy, link limits, metadata staging, or
 /// the journal transaction fails.
 fn set_hard_link_information(
-    mutation: HardLinkMutation,
+    request: HardLinkMutation,
     operations: &mut VolumeAccess,
-) -> DriverResult<()> {
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<HardLinkDirectoryChanges> {
     let HardLinkMutation {
         source,
         target,
         target_collision,
-    } = mutation;
+    } = request;
     let source_node = NodeId::from(source);
-    let (target_parent, target_name) = resolve_namespace_target(operations.runtime_mut(), &target)?;
+    let (target_parent, target_name) = resolve_namespace_target(mutation, &target)?;
     operations.ensure_node_openable(NodeId::Directory(target_parent))?;
-    let source_metadata = metadata_from_node(operations.runtime_mut(), source_node)?;
+    let source_metadata = metadata_from_node(mutation, source_node)?;
     let (destination, count_effect, changes) = prepare_hard_link_destination(
         operations,
+        mutation,
         source_node,
         target_parent,
         &target_name,
@@ -1379,19 +1506,15 @@ fn set_hard_link_information(
     count_effect.validate(source_metadata.links_count)?;
     let archive_overlay = hard_link_archive_overlay(source_metadata.overlay_attributes)?;
 
-    let mut transaction = operations
-        .runtime_mut()
-        .journaled_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let source = transaction.hard_link_source(source)?;
-    let target_parent = transaction.directory(target_parent)?;
+    let source = mutation.hard_link_source(source)?;
+    let target_parent = mutation.directory(target_parent)?;
     if let Some(overlay) = archive_overlay {
-        let node = transaction.node(source_node)?;
-        transaction.set_windows_overlay(node, overlay)?;
+        let node = mutation.node(source_node)?;
+        mutation.set_windows_overlay(node, overlay)?;
     }
     match &destination {
         PreparedHardLinkDestination::Vacant => {
-            transaction.create_hard_link(
+            mutation.create_hard_link(
                 source,
                 target_parent,
                 &target_name,
@@ -1399,7 +1522,7 @@ fn set_hard_link_information(
             )?;
         }
         PreparedHardLinkDestination::Replace { existing_name } => {
-            transaction.create_hard_link(
+            mutation.create_hard_link(
                 source,
                 target_parent,
                 &target_name,
@@ -1407,9 +1530,7 @@ fn set_hard_link_information(
             )?;
         }
     }
-    transaction.commit()?;
-    changes.report(operations);
-    Ok(())
+    Ok(changes)
 }
 
 /// Resolves collision policy into one exact hard-link destination and notification plan.
@@ -1419,6 +1540,7 @@ fn set_hard_link_information(
 /// delete-pending, or still has an active handle.
 fn prepare_hard_link_destination(
     operations: &mut VolumeAccess,
+    read: &mut impl CommittedReadPass,
     source_node: NodeId,
     target_parent: DirectoryNodeId,
     target_name: &Ext4Name,
@@ -1429,14 +1551,8 @@ fn prepare_hard_link_destination(
     HardLinkCountEffect,
     HardLinkDirectoryChanges,
 )> {
-    let parent = operations
-        .runtime_mut()
-        .journaled_mut()
-        .load_directory(target_parent)?;
-    let target = operations
-        .runtime_mut()
-        .journaled_mut()
-        .lookup_windows_child(&parent, target_windows_name)?;
+    let parent = read.load_directory(target_parent)?;
+    let target = read.lookup_windows_child(&parent, target_windows_name)?;
     let ChildLookup::Found(target) = target else {
         return Ok((
             PreparedHardLinkDestination::Vacant,
@@ -1463,7 +1579,7 @@ fn prepare_hard_link_destination(
     if target_node != source_node {
         operations.ensure_node_replaceable(target_node)?;
     }
-    let target_metadata = metadata_from_node(operations.runtime_mut(), target_node)?;
+    let target_metadata = metadata_from_node(read, target_node)?;
     if file_attributes(target_metadata) & wdk_sys::FILE_ATTRIBUTE_READONLY != 0 {
         return Err(DriverError::CannotDelete);
     }
@@ -1570,7 +1686,7 @@ impl RenameMutation {
 }
 
 /// Result of a committed rename with mutually exclusive no-op and changed states.
-enum CommittedRename {
+enum PreparedRename {
     /// The transaction preserved the existing handle location and emitted no notifications.
     Unchanged,
     /// The committed namespace move requires one handle-location update and exact notifications.
@@ -1582,65 +1698,29 @@ enum CommittedRename {
     },
 }
 
-/// Executes one owned rename and applies its post-commit control-plane effects.
-/// # Errors
-///
-/// Returns an error when the namespace transaction fails or post-commit handle decoding detects
-/// an invalid pending-IRP state.
-fn rename_file_information(
-    request: &mut PendingIrpLease<'_>,
-    mutation: RenameMutation,
-    operations: VolumeAccess,
-) -> DriverResult<IrpCompletion> {
-    let committed = {
-        let mut operations = operations;
-        set_rename_information(mutation, &mut operations)?
-    };
-    if let CommittedRename::Changed {
-        location,
-        notifications,
-    } = committed
-    {
-        request.with_active(|active| {
-            let current = active.current_stack()?;
-            let file_object = current.file_object()?;
-            let _stack = current.set_file()?;
-            let mut opened = OpenedObject::decode(file_object)?;
-            opened.replace_location(location);
-            let volume = opened.volume();
-            let vcb = unsafe {
-                // SAFETY: The pending IRP retains the opened FCB and VCB. The operation lease was
-                // dropped before projecting this disjoint notifier control plane.
-                volume.as_ref()
-            };
-            notifications.report(vcb);
-            Ok::<_, DriverError>(())
-        })?;
-    }
-    Ok(IrpCompletion::EMPTY)
-}
-
 /// Applies one owned FILE_RENAME_INFORMATION mutation to the ext4 namespace.
 /// # Errors
 ///
 /// Returns an error when target resolution, notification preparation, or the rename transaction
 /// fails.
 fn set_rename_information(
-    mutation: RenameMutation,
+    request: RenameMutation,
     operations: &mut VolumeAccess,
-) -> DriverResult<CommittedRename> {
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<PreparedRename> {
     let RenameMutation {
         source_parent,
         source_name,
         source_node,
         target,
         target_collision,
-    } = mutation;
-    let (target_parent, target_name) = resolve_namespace_target(operations.runtime_mut(), &target)?;
+    } = request;
+    let (target_parent, target_name) = resolve_namespace_target(mutation, &target)?;
     operations.ensure_node_openable(NodeId::Directory(source_parent))?;
     operations.ensure_node_openable(NodeId::Directory(target_parent))?;
     let notifications = RenameDirectoryNameChanges::prepare(
         operations,
+        mutation,
         source_parent,
         &source_name,
         source_node,
@@ -1652,35 +1732,30 @@ fn set_rename_information(
         .map(Box::try_new)
         .transpose()
         .map_err(|_| DriverError::InsufficientResources)?;
-    let mut transaction = operations
-        .runtime_mut()
-        .journaled_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let source_parent = transaction.directory(source_parent)?;
-    let target_parent = transaction.directory(target_parent)?;
-    transaction.rename_child(
+    let source_parent = mutation.directory(source_parent)?;
+    let target_parent = mutation.directory(target_parent)?;
+    mutation.rename_child(
         source_parent,
         &source_name,
         target_parent,
         &target_name,
         target_collision,
     )?;
-    transaction.commit()?;
     match notifications {
-        Some(notifications) => Ok(CommittedRename::Changed {
+        Some(notifications) => Ok(PreparedRename::Changed {
             location: OpenedLocation::DirectoryEntry {
                 parent: target_parent.id(),
                 name: target_name,
             },
             notifications,
         }),
-        None => Ok(CommittedRename::Unchanged),
+        None => Ok(PreparedRename::Unchanged),
     }
 }
 
 /// Committed directory-name changes caused by one non-no-op rename operation.
 #[derive(Clone, Copy, Debug)]
-struct RenameDirectoryNameChanges {
+pub(crate) struct RenameDirectoryNameChanges {
     /// Existing target entry removed by a replace-capable rename.
     replaced_target: Option<DirectoryChange>,
     /// Source entry under its former name.
@@ -1697,6 +1772,7 @@ impl RenameDirectoryNameChanges {
     /// cannot be represented in the Windows notification namespace.
     fn prepare(
         operations: &mut VolumeAccess,
+        read: &mut impl CommittedReadPass,
         source_parent: DirectoryNodeId,
         source_name: &Ext4Name,
         source_node: NodeId,
@@ -1711,15 +1787,8 @@ impl RenameDirectoryNameChanges {
         let replaced_target = match target_collision {
             RenameTargetCollision::Reject => None,
             RenameTargetCollision::Replace => {
-                let parent = operations
-                    .runtime_mut()
-                    .journaled_mut()
-                    .load_directory(target_parent)?;
-                match operations
-                    .runtime_mut()
-                    .journaled_mut()
-                    .lookup_windows_child(&parent, &WindowsName::from_ext4(target_name)?)?
-                {
+                let parent = read.load_directory(target_parent)?;
+                match read.lookup_windows_child(&parent, &WindowsName::from_ext4(target_name)?)? {
                     ChildLookup::Found(child) if *child.node() == source_node => return Ok(None),
                     ChildLookup::Found(child) => {
                         operations.ensure_node_replaceable(*child.node())?;
@@ -1753,12 +1822,12 @@ impl RenameDirectoryNameChanges {
     }
 
     /// Reports every name transition after the corresponding ext4 transaction commits.
-    fn report(self, vcb: &VolumeControlBlock) {
+    fn report(self, operations: &VolumeAccess) {
         if let Some(replaced_target) = self.replaced_target {
-            vcb.report_directory_change(replaced_target);
+            operations.report_directory_change(replaced_target);
         }
-        vcb.report_directory_change(self.old_source_name);
-        vcb.report_directory_change(self.new_source_name);
+        operations.report_directory_change(self.old_source_name);
+        operations.report_directory_change(self.new_source_name);
     }
 }
 
@@ -2435,16 +2504,28 @@ enum CleanupPlan {
 }
 
 /// Actor-local deferred deletion plan whose FCB remains pinned by the cleanup FILE_OBJECT.
-struct PendingCleanupDeletion {
+#[derive(Debug)]
+pub(crate) struct PendingCleanupDeletion {
     /// Shared FCB retained until the later Close IRP.
     fcb: NonNull<FileControlBlock>,
     /// Immutable opened inode identity.
     node: NodeId,
     /// Stable FCB-owned target allocation.
     target: NonNull<FileDeleteTarget>,
-    /// Exclusive mounted-volume operation capability.
-    operations: VolumeAccess,
+    /// Stable mounted VCB that retains the FCB until ordered CLOSE.
+    volume: NonNull<VolumeControlBlock>,
 }
+
+impl PendingCleanupDeletion {
+    /// Mounted volume whose reactor must execute this deletion.
+    pub(crate) const fn volume(&self) -> NonNull<VolumeControlBlock> {
+        self.volume
+    }
+}
+
+// SAFETY: The per-handle terminal barrier retains the FCB, target, and VCB until this value is
+// consumed; it moves only between the sole reactor thread and lower completion envelopes.
+unsafe impl Send for PendingCleanupDeletion {}
 
 /// Releases resources owned by one FILE_OBJECT handle lifecycle.
 /// # Errors
@@ -2499,7 +2580,7 @@ fn cleanup_opened_node(
             fcb,
             node,
             target,
-            operations: claim_volume_operation_lane(volume),
+            volume,
         }),
     })
 }
@@ -2509,24 +2590,18 @@ fn cleanup_opened_node(
 ///
 /// Returns an error when the target name no longer identifies the FCB inode, the directory is no
 /// longer empty, or the ext4 transaction cannot be committed.
-fn delete_after_final_cleanup(mut plan: PendingCleanupDeletion) -> DriverResult<()> {
+pub(crate) fn stage_cleanup_deletion(
+    plan: &PendingCleanupDeletion,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<PreparedCleanupPublication> {
     let target = unsafe {
         // SAFETY: The cleanup FILE_OBJECT retains `fcb` until its later Close IRP. The FCB owns this
         // stable allocation in Pending state, and the device actor cannot mutate that state until
         // this function calls `complete_file_delete` after the final await.
         plan.target.as_ref()
     };
-    let parent = plan
-        .operations
-        .runtime_mut()
-        .journaled_mut()
-        .load_directory(target.parent())?;
-    match plan
-        .operations
-        .runtime_mut()
-        .journaled_mut()
-        .lookup_child(&parent, target.name())?
-    {
+    let parent = mutation.load_directory(target.parent())?;
+    match mutation.lookup_child(&parent, target.name())? {
         ChildLookup::Found(child) if *child.node() == plan.node => {}
         ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
     }
@@ -2536,23 +2611,19 @@ fn delete_after_final_cleanup(mut plan: PendingCleanupDeletion) -> DriverResult<
         plan.node,
         DirectoryChangeAction::Removed,
     )?;
-    let mut transaction = plan
-        .operations
-        .runtime_mut()
-        .journaled_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-    let parent = transaction.directory(target.parent())?;
+    let parent = mutation.directory(target.parent())?;
     match plan.node {
-        NodeId::File(_) => transaction.unlink_file(parent, target.name())?,
+        NodeId::File(_) => mutation.unlink_file(parent, target.name())?,
         NodeId::Directory(_) => {
-            transaction.remove_empty_directory(parent, target.name())?;
+            mutation.remove_empty_directory(parent, target.name())?;
         }
-        NodeId::Symlink(_) => transaction.remove_symlink(parent, target.name())?,
+        NodeId::Symlink(_) => mutation.remove_symlink(parent, target.name())?,
     }
-    transaction.commit()?;
-    plan.operations.complete_file_delete(plan.fcb, plan.target);
-    plan.operations.report_directory_change(notification);
-    Ok(())
+    Ok(PreparedCleanupPublication {
+        fcb: plan.fcb,
+        target: plan.target,
+        notification,
+    })
 }
 
 /// Removes one direct-volume share claim during its cleanup barrier.
@@ -3782,11 +3853,14 @@ fn read_regular_file_direct(
 ///
 /// Returns an error when the captured write contract, opened FILE_OBJECT, transfer alignment,
 /// byte-range lock, or ext4 journal transaction is invalid.
-fn write_regular_file_windowed(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+fn write_regular_file_windowed(
+    mut request: PendingIrpLease<'_>,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<WriteResolution> {
     let stack = request.prepared_write()?.stack();
     let input_address = request.prepared_write()?.input_address();
-    let (file_id, kind, anchor, write_commitment, data_transfer_mode, mut operations) = request
-        .with_active(|active| {
+    let (file_id, kind, anchor, write_commitment, data_transfer_mode) =
+        request.with_active(|active| {
             let file_object = active.current_stack()?.file_object()?;
             let opened_file = OpenedRegularFile::decode(file_object)?;
             let kind = active.data_io_kind();
@@ -3801,12 +3875,11 @@ fn write_regular_file_windowed(mut request: PendingIrpLease<'_>) -> DriverResult
                 anchor,
                 opened_file.write_commitment(),
                 data_transfer_mode,
-                claim_file_operation_lane(opened_file.file_control_block()),
             ))
         })?;
 
     let range = ResolvedFileRange::new(
-        resolve_write_start(operations.runtime_mut(), file_id, anchor)?,
+        resolve_write_start(mutation, file_id, anchor)?,
         stack.length().as_usize(),
     )?;
     request.with_active(|active| {
@@ -3837,7 +3910,7 @@ fn write_regular_file_windowed(mut request: PendingIrpLease<'_>) -> DriverResult
             let mut opened_file = OpenedRegularFile::decode(file_object)?;
             opened_file.update_current_file_position(kind, range.start(), 0)
         })?;
-        return Ok(IrpCompletion::EMPTY);
+        return Ok(WriteResolution::Complete(IrpCompletion::EMPTY));
     }
 
     let bytes_written = {
@@ -3845,11 +3918,7 @@ fn write_regular_file_windowed(mut request: PendingIrpLease<'_>) -> DriverResult
             .ok_or(DriverError::InternalInvariantViolation)?;
         let mut windows = WriteSnapshotWindows::new(total);
         let mut snapshot = DriverVec::try_repeated_copy(0_u8, windows.snapshot_capacity())?;
-        let mut transaction = operations
-            .runtime_mut()
-            .journaled_mut()
-            .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
-        let file = transaction.file(file_id)?;
+        let file = mutation.file(file_id)?;
         while let Some(window) = windows.next_window()? {
             let chunk = snapshot
                 .as_mut_slice()
@@ -3859,20 +3928,20 @@ fn write_regular_file_windowed(mut request: PendingIrpLease<'_>) -> DriverResult
                 .prepared_write()?
                 .copy_window(window.input_offset(), chunk)?;
             let chunk_offset = range.start().checked_add_len(window.input_offset())?;
-            transaction.write_file_range(file, chunk_offset, chunk)?;
-        }
-        transaction.commit()?;
-        if matches!(write_commitment, WriteCommitment::FlushThrough) {
-            operations.runtime_mut().flush()?;
+            mutation.write_file_range(file, chunk_offset, chunk)?;
         }
         windows.completed()
     };
-    request.with_active(|active| {
+    let position = request.with_active(|active| {
         let file_object = active.current_stack()?.file_object()?;
-        let mut opened_file = OpenedRegularFile::decode(file_object)?;
-        opened_file.update_current_file_position(kind, range.start(), bytes_written)
+        let opened_file = OpenedRegularFile::decode(file_object)?;
+        opened_file.prepare_current_file_position_update(kind, range.start(), bytes_written)
     })?;
-    IrpCompletion::from_usize(bytes_written)
+    Ok(WriteResolution::Mutation(PreparedWritePublication {
+        completion: IrpCompletion::from_usize(bytes_written)?,
+        position,
+        commitment: write_commitment,
+    }))
 }
 
 /// Claims the actor-owned operation lane referenced by one live FCB.
