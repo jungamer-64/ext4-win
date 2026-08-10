@@ -10,9 +10,9 @@ license = "MIT"
 
 [workspace.dependencies]
 cc = "1"
-wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "66223e9310a2fd1e9755c064228f4abd62a8c21f" }
-wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "66223e9310a2fd1e9755c064228f4abd62a8c21f" }
-wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "66223e9310a2fd1e9755c064228f4abd62a8c21f" }
+wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
+wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
+wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
 
 [profile.dev]
 panic = "abort"
