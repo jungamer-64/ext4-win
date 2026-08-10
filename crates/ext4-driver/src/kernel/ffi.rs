@@ -23,9 +23,10 @@ pub(crate) use wdk_sys::ntddk::{
     IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeIrp, IoFreeMdl, IoFreeWorkItem,
     IoGetRequestorProcess, IoQueueWorkItem, IoRegisterShutdownNotification, IoReleaseVpbSpinLock,
     IoSetCompletionRoutineEx, IoUnregisterShutdownNotification, IofCallDriver,
-    KeAcquireSpinLockRaiseToDpc, KeInitializeEvent, KeInitializeSpinLock, KeReleaseSpinLock,
-    KeSetEvent, KeWaitForSingleObject, MmBuildMdlForNonPagedPool, MmUnlockPages,
-    PsCreateSystemThread, PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
+    KeAcquireSpinLockRaiseToDpc, KeInitializeDpc, KeInitializeEvent, KeInitializeSpinLock,
+    KeInitializeTimer, KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject,
+    MmBuildMdlForNonPagedPool, MmUnlockPages, PsCreateSystemThread, PsTerminateSystemThread,
+    ZwClose, ZwWaitForSingleObject,
 };
 
 #[cfg(not(test))]
