@@ -1193,3 +1193,74 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
         Ok(())
     }
 }
+
+impl<N: FscryptNonceGenerator> super::CommittedReadPass for MutationResolvePass<'_, '_, '_, N> {
+    fn load_file(&mut self, id: FileNodeId) -> Result<FileNode> {
+        self.volume.load_file(id)
+    }
+
+    fn load_directory(&mut self, id: DirectoryNodeId) -> Result<DirectoryNode> {
+        self.volume.load_directory(id)
+    }
+
+    fn load_symlink(&mut self, id: SymlinkNodeId) -> Result<SymlinkNode> {
+        self.volume.load_symlink(id)
+    }
+
+    fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId> {
+        self.volume.load_node_by_file_index(file_index)
+    }
+
+    fn read_xattrs(&mut self, node: NodeId) -> Result<XattrSet> {
+        self.volume.read_inode_xattrs(node.inode())
+    }
+
+    fn read_xattr(&mut self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>> {
+        self.volume.read_inode_xattr(node.inode(), name)
+    }
+
+    fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>> {
+        self.volume.read_inode_windows_overlay(node.inode())
+    }
+
+    fn read_windows_symlink_reparse_point(
+        &mut self,
+        node: NodeId,
+    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
+        self.volume
+            .read_inode_windows_symlink_reparse_point(node.inode())
+    }
+
+    fn read_file(
+        &mut self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes> {
+        self.volume.read_file(file, offset, out)
+    }
+
+    fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
+        self.volume.read_symlink(symlink)
+    }
+
+    fn read_directory(&mut self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
+        self.volume.read_directory(directory)
+    }
+
+    fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
+        self.volume.read_hard_links(target)
+    }
+
+    fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup> {
+        self.volume.lookup_child(parent, name)
+    }
+
+    fn lookup_windows_child(
+        &mut self,
+        parent: &DirectoryNode,
+        requested: &WindowsName,
+    ) -> Result<ChildLookup> {
+        self.volume.lookup_windows_child(parent, requested)
+    }
+}

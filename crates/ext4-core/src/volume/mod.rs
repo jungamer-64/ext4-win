@@ -24,8 +24,8 @@ pub use node::{
     FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, NodeId, SymlinkNode, SymlinkNodeId,
 };
 pub use operation::{
-    EpochReadOperation, EpochReadPass, MutationResolveOperation, MutationResolveReady,
-    MutationResolveTransition, ReadTransition,
+    CommittedReadPass, EpochReadOperation, EpochReadPass, MutationResolveOperation,
+    MutationResolveReady, MutationResolveTransition, ReadTransition,
 };
 pub use transaction::{
     CheckpointOperation, CleanJournalDurability, CleanJournalRecordPhase, CommitDurability,

@@ -18,6 +18,54 @@ pub enum ReadTransition<T> {
     Complete(Result<T>),
 }
 
+/// Read surface shared by immutable read passes and mutation resolve passes.
+///
+/// These are the two concrete restart-local contexts that may inspect committed state. Neither
+/// implementation can survive suspension: all storage and continuation ownership remains in its
+/// enclosing operation.
+pub trait CommittedReadPass {
+    /// Loads a regular file by validated identity.
+    fn load_file(&mut self, id: FileNodeId) -> Result<FileNode>;
+    /// Loads a directory by validated identity.
+    fn load_directory(&mut self, id: DirectoryNodeId) -> Result<DirectoryNode>;
+    /// Loads a symbolic link by validated identity.
+    fn load_symlink(&mut self, id: SymlinkNodeId) -> Result<SymlinkNode>;
+    /// Loads and classifies one Windows-facing file index.
+    fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId>;
+    /// Reads every extended attribute attached to a typed node.
+    fn read_xattrs(&mut self, node: NodeId) -> Result<XattrSet>;
+    /// Reads one extended attribute attached to a typed node.
+    fn read_xattr(&mut self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>>;
+    /// Reads Windows overlay metadata.
+    fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>>;
+    /// Reads Windows symbolic-link reparse metadata.
+    fn read_windows_symlink_reparse_point(
+        &mut self,
+        node: NodeId,
+    ) -> Result<Option<WindowsSymlinkReparsePoint>>;
+    /// Reads regular-file bytes into an exact caller-owned range.
+    fn read_file(
+        &mut self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes>;
+    /// Reads one symbolic-link target into an owned byte vector.
+    fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>>;
+    /// Enumerates validated directory entries.
+    fn read_directory(&mut self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>>;
+    /// Enumerates every reachable hard link to a non-directory inode.
+    fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks>;
+    /// Looks up one exact ext4 child name.
+    fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup>;
+    /// Looks up one unambiguous Windows-visible child name.
+    fn lookup_windows_child(
+        &mut self,
+        parent: &DirectoryNode,
+        requested: &WindowsName,
+    ) -> Result<ChildLookup>;
+}
+
 /// Ephemeral synchronous read pass reconstructed from one operation transcript and epoch.
 ///
 /// The pass may be borrowed only while one concrete event is being advanced. It cannot be stored
@@ -155,6 +203,76 @@ impl EpochReadPass<'_, '_, '_> {
         requested: &WindowsName,
     ) -> Result<ChildLookup> {
         self.view.lookup_windows_child(parent, requested)
+    }
+}
+
+impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
+    fn load_file(&mut self, id: FileNodeId) -> Result<FileNode> {
+        self.load_file(id)
+    }
+
+    fn load_directory(&mut self, id: DirectoryNodeId) -> Result<DirectoryNode> {
+        self.load_directory(id)
+    }
+
+    fn load_symlink(&mut self, id: SymlinkNodeId) -> Result<SymlinkNode> {
+        self.load_symlink(id)
+    }
+
+    fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId> {
+        self.load_node_by_file_index(file_index)
+    }
+
+    fn read_xattrs(&mut self, node: NodeId) -> Result<XattrSet> {
+        self.read_xattrs(node)
+    }
+
+    fn read_xattr(&mut self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>> {
+        self.read_xattr(node, name)
+    }
+
+    fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>> {
+        self.read_windows_overlay(node)
+    }
+
+    fn read_windows_symlink_reparse_point(
+        &mut self,
+        node: NodeId,
+    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
+        self.read_windows_symlink_reparse_point(node)
+    }
+
+    fn read_file(
+        &mut self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes> {
+        self.read_file(file, offset, out)
+    }
+
+    fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
+        self.read_symlink(symlink)
+    }
+
+    fn read_directory(&mut self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
+        self.read_directory(directory)
+    }
+
+    fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
+        self.read_hard_links(target)
+    }
+
+    fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup> {
+        self.lookup_child(parent, name)
+    }
+
+    fn lookup_windows_child(
+        &mut self,
+        parent: &DirectoryNode,
+        requested: &WindowsName,
+    ) -> Result<ChildLookup> {
+        self.lookup_windows_child(parent, requested)
     }
 }
 
