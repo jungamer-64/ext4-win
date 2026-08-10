@@ -523,6 +523,76 @@ impl CompletionOperation for ImmediateRequestOperation {
 // SAFETY: Unique IRP authority is moved only by the reactor thread.
 unsafe impl Send for ImmediateRequestOperation {}
 
+/// Explicit ownership phase of a directory-change delegation.
+#[derive(Debug)]
+enum NotificationOperationState {
+    /// The IRP remains ext4win-owned until its admitted event transfers it to FsRtl.
+    Ready(OwnedIrp),
+    /// FsRtl or terminal completion owns the IRP.
+    Terminal,
+}
+
+/// One directory notification whose terminal ownership is delegated exactly once.
+#[derive(Debug)]
+struct NotificationOperation {
+    /// Current IRP authority phase.
+    state: NotificationOperationState,
+}
+
+impl NotificationOperation {
+    /// Allocates the delegation state without dropping the unique IRP on OOM.
+    fn try_new(owned: OwnedIrp) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+        match memory::boxed_try_map(owned, |owned| Self {
+            state: NotificationOperationState::Ready(owned),
+        }) {
+            Ok(operation) => Ok(operation),
+            Err(error) => {
+                let (error, owned) = error.into_parts();
+                Err(AdmitOperationError::new(error, owned))
+            }
+        }
+    }
+}
+
+impl CompletionOperation for NotificationOperation {
+    fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+        let state = core::mem::replace(&mut self.state, NotificationOperationState::Terminal);
+        let NotificationOperationState::Ready(owned) = state else {
+            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                .bugcheck();
+        };
+        match event {
+            OperationEvent::Admitted => {
+                let _status = crate::request::file_info::notify_change_directory(owned);
+            }
+            OperationEvent::CancelRequested => {
+                let _status =
+                    owned.complete_result(Err(DriverError::from(Error::OperationCancelled)));
+            }
+            OperationEvent::StorageCompleted(_)
+            | OperationEvent::DeviceLengthCompleted(_)
+            | OperationEvent::RetryElapsed(_)
+            | OperationEvent::IntentGranted(_)
+            | OperationEvent::CommitGranted(_)
+            | OperationEvent::VisibilityGranted(_)
+            | OperationEvent::CheckpointGranted(_)
+            | OperationEvent::BarrierReleased(_) => {
+                let _status = owned.complete_result(Err(DriverError::InternalInvariantViolation));
+            }
+        }
+        OperationTransition::Complete
+    }
+
+    fn record_storage_failure(&mut self, _failure: StorageFailureClass) {
+        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+            .bugcheck();
+    }
+}
+
+// SAFETY: Unique IRP authority moves only on the sole reactor thread until it is consumed by the
+// FsRtl notification package.
+unsafe impl Send for NotificationOperation {}
+
 /// Durability barrier semantics selected by the top-level major function.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FlushRequestKind {
@@ -1939,6 +2009,13 @@ pub(crate) fn mount(
     admission: MountAdmission,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
     MountRequestOperation::try_new(owned, admission)
+}
+
+/// Allocates one directory-change notification delegation.
+pub(crate) fn notification(
+    owned: OwnedIrp,
+) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+    NotificationOperation::try_new(owned)
 }
 
 /// Allocates one concrete read operation.
