@@ -696,9 +696,7 @@ ext4win_capture_directory_pattern(
 
     status = STATUS_SUCCESS;
     __try {
-        if (requestor_mode == UserMode) {
-            ProbeForRead(source, sizeof(header), TYPE_ALIGNMENT(USHORT));
-        }
+        /* The I/O manager owns the stack-resident UNICODE_STRING descriptor. */
         RtlCopyMemory(&header, source, sizeof(header));
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
