@@ -6,11 +6,11 @@ use crate::irp::{
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
-use crate::state::{
-    OpenedObject, PendingChildCreation, VolumeAccess, VolumeControlBlock, VolumeOperationLane,
-};
+use crate::state::{OpenedObject, PendingChildCreation};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
-use ext4_core::{XattrName, XattrNamespace, XattrValue};
+use ext4_core::{CommittedReadPass, XattrName, XattrNamespace, XattrValue};
+
+use super::DriverMutationPass;
 
 /// Local xattr prefix used to store Windows EA records under `user.*`.
 const EA_XATTR_PREFIX: &[u8] = b"ext4win.ea.";
@@ -40,36 +40,37 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 /// # Errors
 ///
 /// Returns an error when query-EA stack decoding, EA selection, or output packing fails.
-pub(crate) fn query(mut request_irp: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn query(
+    mut request_irp: PendingIrpLease<'_>,
+    read: &mut impl CommittedReadPass,
+) -> DriverResult<IrpCompletion> {
     let prepared = request_irp.prepared_query_ea()?;
     let stack = prepared.stack();
     let selection = requested_eas(prepared.selection())?;
-    let (volume, node) = request_irp.with_active(|active| {
+    let node = request_irp.with_active(|active| {
         let opened_file = OpenedObject::decode(active.current_stack()?.file_object()?)?;
-        Ok::<_, DriverError>((opened_file.volume(), opened_file.node()))
+        Ok::<_, DriverError>(opened_file.node())
     })?;
-    let operations = unsafe {
-        // SAFETY: Query-EA runs only as the mounted-device executor's unique active operation.
-        VolumeControlBlock::operation_access(volume)
-    };
     let request = QueryEaRequest {
         request: request_irp,
         length: stack.length(),
         entry_emission: stack.entry_emission(),
         selection,
         node,
-        operations,
     };
-    query_ea(request)
+    query_ea(request, read)
 }
 
 /// Executes IRP_MJ_SET_EA.
 /// # Errors
 ///
 /// Returns an error when set-EA stack decoding or ext4 EA mutation fails.
-pub(crate) fn set(mut request_irp: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn set(
+    mut request_irp: PendingIrpLease<'_>,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<IrpCompletion> {
     let request = SetEaRequest::decode(&mut request_irp)?;
-    set_ea(request)
+    set_ea(request, mutation)
 }
 
 /// Decoded query-EA request.
@@ -84,8 +85,6 @@ struct QueryEaRequest<'a> {
     selection: WindowsEaSelection,
     /// ext4 node selected by the opened FILE_OBJECT.
     node: ext4_core::NodeId,
-    /// Exclusive actor-owned mounted-volume operation capability.
-    operations: VolumeAccess,
 }
 
 /// Decoded set-EA request.
@@ -94,8 +93,6 @@ struct SetEaRequest {
     entries: DriverVec<WindowsEaRecord>,
     /// ext4 node selected by the opened FILE_OBJECT.
     node: ext4_core::NodeId,
-    /// Exclusive actor-owned mounted-volume operation capability.
-    operations: VolumeAccess,
 }
 
 impl SetEaRequest {
@@ -105,27 +102,14 @@ impl SetEaRequest {
     /// Returns an error when the current stack is not a set-EA stack or its FILE_OBJECT has no
     /// opened ext4 context.
     fn decode(request: &mut PendingIrpLease<'_>) -> Result<Self, DriverError> {
-        let (entries, volume, node) = request.with_active(|active| {
+        let (entries, node) = request.with_active(|active| {
             let current = active.current_stack()?;
             let file_object = current.file_object()?;
             let stack = current.set_ea()?;
             let opened_file = OpenedObject::decode(file_object)?;
-            Ok::<_, DriverError>((
-                parse_set_ea_entries(active, stack)?,
-                opened_file.volume(),
-                opened_file.node(),
-            ))
+            Ok::<_, DriverError>((parse_set_ea_entries(active, stack)?, opened_file.node()))
         })?;
-        let operations = unsafe {
-            // SAFETY: Set-EA runs only as the mounted-device executor's unique active operation.
-            // The lease is moved into this request and lives until that operation completes.
-            VolumeControlBlock::operation_access(volume)
-        };
-        Ok(Self {
-            entries,
-            node,
-            operations,
-        })
+        Ok(Self { entries, node })
     }
 }
 
@@ -165,10 +149,11 @@ impl CreateEa {
     /// rejects the xattr mutation.
     pub(crate) fn apply_to_pending_child(
         &self,
-        creation: &mut PendingChildCreation<'_>,
+        creation: &mut PendingChildCreation,
+        mutation: &mut DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<()> {
         for entry in self.entries.iter() {
-            apply_ea_record_to_pending_child(creation, entry)?;
+            apply_ea_record_to_pending_child(creation, mutation, entry)?;
         }
         Ok(())
     }
@@ -320,8 +305,11 @@ enum WindowsEaSelection {
 ///
 /// Returns an error when selected EAs cannot be loaded, no EAs match, the output buffer is too
 /// small, or packed EA records cannot be emitted.
-fn query_ea(mut request: QueryEaRequest<'_>) -> DriverResult<IrpCompletion> {
-    let entries = load_windows_eas(request.operations.runtime_mut(), request.node)?;
+fn query_ea(
+    mut request: QueryEaRequest<'_>,
+    read: &mut impl CommittedReadPass,
+) -> DriverResult<IrpCompletion> {
+    let entries = load_windows_eas(read, request.node)?;
     let entries = collect_query_entries(entries, request.selection)?;
     let entries = if matches!(request.entry_emission, EaEntryEmission::Single) {
         entries.as_slice().get(..entries.len().min(1))
@@ -349,12 +337,11 @@ fn query_ea(mut request: QueryEaRequest<'_>) -> DriverResult<IrpCompletion> {
 /// # Errors
 ///
 /// Returns an error when the set-EA input list is malformed or the xattr update transaction fails.
-fn set_ea(mut request: SetEaRequest) -> DriverResult<IrpCompletion> {
-    apply_set_ea_entries(
-        request.operations.runtime_mut(),
-        request.node,
-        request.entries.as_slice(),
-    )?;
+fn set_ea(
+    request: SetEaRequest,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<IrpCompletion> {
+    apply_set_ea_entries(mutation, request.node, request.entries.as_slice())?;
     Ok(IrpCompletion::EMPTY)
 }
 
@@ -389,10 +376,10 @@ fn collect_query_entries(
 /// Returns an error when node xattrs cannot be read or any stored ext4win EA name/value no longer
 /// fits the Windows EA record domain.
 fn load_windows_eas(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     node: ext4_core::NodeId,
 ) -> DriverResult<DriverVec<WindowsEaRecord>> {
-    let xattrs = operations.journaled_mut().read_xattrs(node)?;
+    let xattrs = read.read_xattrs(node)?;
     let mut entries = DriverVec::new();
     for (name, value) in xattrs.entries() {
         if name.namespace() != XattrNamespace::User {
@@ -417,16 +404,13 @@ fn load_windows_eas(
 /// Returns an error when EA names cannot be mapped to xattrs or the journaled xattr set/remove
 /// operation fails.
 fn apply_set_ea_entries(
-    operations: &mut VolumeOperationLane,
+    transaction: &mut DriverMutationPass<'_, '_, '_>,
     node_id: ext4_core::NodeId,
     entries: &[WindowsEaRecord],
 ) -> DriverResult<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    let mut transaction = operations
-        .journaled_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let node = transaction.node(node_id)?;
     for entry in entries {
         let name = xattr_name_from_ea_name(&entry.name)?;
@@ -436,7 +420,6 @@ fn apply_set_ea_entries(
             transaction.set_xattr(node, name, XattrValue::new(entry.value.as_bytes())?)?;
         }
     }
-    transaction.commit()?;
     Ok(())
 }
 
@@ -446,14 +429,15 @@ fn apply_set_ea_entries(
 /// Returns an error when the EA name cannot be mapped to an xattr or the pending child rejects the
 /// xattr mutation.
 fn apply_ea_record_to_pending_child(
-    creation: &mut PendingChildCreation<'_>,
+    creation: &mut PendingChildCreation,
+    transaction: &mut DriverMutationPass<'_, '_, '_>,
     entry: &WindowsEaRecord,
 ) -> DriverResult<()> {
     let name = xattr_name_from_ea_name(&entry.name)?;
     if entry.value.is_empty() {
-        creation.remove_xattr(&name)
+        creation.remove_xattr(transaction, &name)
     } else {
-        creation.set_xattr(name, XattrValue::new(entry.value.as_bytes())?)
+        creation.set_xattr(transaction, name, XattrValue::new(entry.value.as_bytes())?)
     }
 }
 

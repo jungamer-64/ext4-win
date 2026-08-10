@@ -4,10 +4,10 @@ use alloc::boxed::Box;
 use core::{num::NonZeroUsize, ptr::NonNull};
 
 use ext4_core::{
-    ChildLookup, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Permissions,
-    Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileAllocationSize, FileNodeId,
-    FileOffset, FileSize, HardLinkDestination, HardLinkNodeId, HardLinks, NodeId,
-    RenameTargetCollision, WindowsName, WindowsOverlay,
+    ChildLookup, CommittedReadPass, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name,
+    Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes,
+    FileAllocationSize, FileNodeId, FileOffset, FileSize, HardLinkDestination, HardLinkNodeId,
+    HardLinks, NodeId, RenameTargetCollision, WindowsName, WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
@@ -26,10 +26,12 @@ use crate::state::{
     DirectoryNotificationRegistration, FileCleanupDisposition, FileControlBlock, FileDeleteTarget,
     MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation, OpenedObject,
     OpenedRegularFile, PendingFileDeletion, VolumeAccess, VolumeControlBlock, VolumeHandleCleanup,
-    VolumeOperationLane, VolumeRetirement, WriteCommitment, release_cancelled_file_control_block,
+    VolumeRetirement, WriteCommitment, release_cancelled_file_control_block,
     release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
+
+use super::DriverMutationPass;
 
 /// Maximum requestor write bytes snapshotted into Rust-owned memory at one time.
 const MAX_WRITE_SNAPSHOT_BYTES: usize = 65_536;
@@ -142,8 +144,11 @@ pub(crate) fn close(target: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion> {
 /// # Errors
 ///
 /// Returns an error when read stack decoding, output buffer mapping, or ext4 file reading fails.
-pub(crate) fn read(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    read_regular_file_direct(request)
+pub(crate) fn read(
+    request: PendingIrpLease<'_>,
+    read: &mut impl CommittedReadPass,
+) -> DriverResult<IrpCompletion> {
+    read_regular_file_direct(request, read)
 }
 
 /// Executes regular file data writes.
@@ -185,8 +190,11 @@ pub(crate) fn shutdown(mut request: PendingIrpLease<'_>) -> DriverResult<IrpComp
 /// # Errors
 ///
 /// Returns an error when query stack decoding or information packing fails.
-pub(crate) fn query(request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    query_file_information(request)
+pub(crate) fn query(
+    request: PendingIrpLease<'_>,
+    read: &mut impl CommittedReadPass,
+) -> DriverResult<IrpCompletion> {
+    query_file_information(request, read)
 }
 
 /// Executes file information mutations.
@@ -341,8 +349,6 @@ enum QueryFilePlan {
         node: NodeId,
         /// Shared FCB deletion state captured before metadata I/O.
         delete_pending: bool,
-        /// Exclusive mounted-volume operation capability.
-        operations: VolumeAccess,
     },
     /// Traverse the ext4 namespace for every name of one hard-linkable inode.
     HardLinks {
@@ -350,8 +356,6 @@ enum QueryFilePlan {
         length: IrpBufferLength,
         /// Non-directory target identity.
         target: HardLinkNodeId,
-        /// Exclusive mounted-volume operation capability.
-        operations: VolumeAccess,
     },
 }
 
@@ -360,7 +364,10 @@ enum QueryFilePlan {
 ///
 /// Returns an error when metadata cannot be loaded, the output buffer is too small, or the requested
 /// information class cannot be packed into its Windows layout.
-fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+fn query_file_information(
+    mut request: PendingIrpLease<'_>,
+    read: &mut impl CommittedReadPass,
+) -> DriverResult<IrpCompletion> {
     let plan = request.with_active(|active| {
         let current = active.current_stack()?;
         let file_object = current.file_object()?;
@@ -390,11 +397,7 @@ fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpC
             QueryFileInformationClass::HardLink => {
                 let target = HardLinkNodeId::try_from(opened_file.node())
                     .map_err(|_| DriverError::FileIsDirectory)?;
-                return Ok(QueryFilePlan::HardLinks {
-                    length,
-                    target,
-                    operations: claim_file_operation_lane(opened_file.file_control_block()),
-                });
+                return Ok(QueryFilePlan::HardLinks { length, target });
             }
             QueryFileInformationClass::Basic
             | QueryFileInformationClass::Standard
@@ -408,17 +411,15 @@ fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpC
             information_class,
             node: opened_file.node(),
             delete_pending: opened_file.delete_pending(),
-            operations: claim_file_operation_lane(opened_file.file_control_block()),
         })
     })?;
-    let (length, information_class, node, delete_pending, operations) = match plan {
+    let (length, information_class, node, delete_pending) = match plan {
         QueryFilePlan::Metadata {
             length,
             information_class,
             node,
             delete_pending,
-            operations,
-        } => (length, information_class, node, delete_pending, operations),
+        } => (length, information_class, node, delete_pending),
         QueryFilePlan::Complete {
             length,
             output,
@@ -433,18 +434,11 @@ fn query_file_information(mut request: PendingIrpLease<'_>) -> DriverResult<IrpC
             })?;
             return Ok(completion);
         }
-        QueryFilePlan::HardLinks {
-            length,
-            target,
-            operations,
-        } => {
-            return query_hard_link_information(request, length, target, operations);
+        QueryFilePlan::HardLinks { length, target } => {
+            return query_hard_link_information(request, length, target, read);
         }
     };
-    let metadata = {
-        let mut operations = operations;
-        metadata_from_node(operations.runtime_mut(), node)?
-    };
+    let metadata = metadata_from_node(read, node)?;
     request.with_active(|active| {
         let mut buffer = active.buffered_output(length)?;
         match information_class {
@@ -483,12 +477,9 @@ fn query_hard_link_information(
     mut request: PendingIrpLease<'_>,
     length: IrpBufferLength,
     target: HardLinkNodeId,
-    mut operations: VolumeAccess,
+    read: &mut impl CommittedReadPass,
 ) -> DriverResult<IrpCompletion> {
-    let links = operations
-        .runtime_mut()
-        .journaled_mut()
-        .read_hard_links(target)?;
+    let links = read.read_hard_links(target)?;
     let links = WindowsHardLinks::try_from_ext4(&links)?;
     let mut packed = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
     let result = pack_hard_link_information(packed.as_mut_slice(), &links)?;
@@ -973,18 +964,15 @@ fn set_position_information(
 fn set_basic_information(
     info: wdk_sys::FILE_BASIC_INFORMATION,
     node_id: NodeId,
-    operations: &mut VolumeOperationLane,
+    transaction: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<()> {
-    let metadata = metadata_from_node(operations, node_id)?;
+    let metadata = metadata_from_node(transaction, node_id)?;
     let times = set_basic_times(metadata.times, info)?;
     let attributes = set_basic_attributes(metadata, info.FileAttributes)?;
     if times == metadata.times && attributes.is_empty() {
         return Ok(());
     }
 
-    let mut transaction = operations
-        .journaled_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let node = transaction.node(node_id)?;
     if times != metadata.times {
         transaction.set_times(node, times)?;
@@ -995,7 +983,6 @@ fn set_basic_information(
     if let Some(overlay) = attributes.overlay() {
         transaction.set_windows_overlay(node, overlay)?;
     }
-    transaction.commit()?;
     Ok(())
 }
 
@@ -1239,24 +1226,21 @@ fn decode_extended_disposition(flags: wdk_sys::ULONG) -> DriverResult<FileDispos
 /// Returns cannot-delete when the link no longer identifies the opened inode or has the read-only
 /// attribute, directory-not-empty for a non-empty directory, or the underlying read error.
 pub(crate) fn validate_pending_deletion(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     node: NodeId,
     target: &FileDeleteTarget,
     readonly: DeleteReadonlyPolicy,
 ) -> DriverResult<()> {
-    let parent = operations.journaled_mut().load_directory(target.parent())?;
-    match operations
-        .journaled_mut()
-        .lookup_child(&parent, target.name())?
-    {
+    let parent = read.load_directory(target.parent())?;
+    match read.lookup_child(&parent, target.name())? {
         ChildLookup::Found(child) if *child.node() == node => {}
         ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
     }
-    let metadata = metadata_from_node(operations, node)?;
+    let metadata = metadata_from_node(read, node)?;
     readonly.validate_attributes(file_attributes(metadata))?;
     if let NodeId::Directory(directory_id) = node {
-        let directory = operations.journaled_mut().load_directory(directory_id)?;
-        let entries = operations.journaled_mut().read_directory(&directory)?;
+        let directory = read.load_directory(directory_id)?;
+        let entries = read.read_directory(&directory)?;
         if entries
             .iter()
             .any(|entry| !matches!(entry.name().bytes(), b"." | b".."))
@@ -1784,25 +1768,21 @@ impl RenameDirectoryNameChanges {
 /// Returns an error when the current file size cannot be loaded or the ext4 resize transaction
 /// fails.
 fn set_regular_file_size(
-    operations: &mut VolumeOperationLane,
+    transaction: &mut DriverMutationPass<'_, '_, '_>,
     file_id: FileNodeId,
     new_size: FileSize,
 ) -> DriverResult<()> {
-    let current = regular_file_size(operations, file_id)?;
+    let current = regular_file_size(transaction, file_id)?;
     if new_size == current {
         return Ok(());
     }
 
-    let mut transaction = operations
-        .journaled_mut()
-        .begin_transaction(crate::kernel::time::current_ext4_timestamp()?);
     let file = transaction.file(file_id)?;
     if new_size > current {
         transaction.extend_file(file, new_size)?;
     } else {
         transaction.truncate_file(file, new_size)?;
     }
-    transaction.commit()?;
     Ok(())
 }
 
@@ -1811,7 +1791,10 @@ fn set_regular_file_size(
 ///
 /// Returns an error when the directory query stack, pattern, output buffer, opened directory, or
 /// emitted directory record layout is invalid.
-pub(crate) fn query_directory(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn query_directory(
+    mut request: PendingIrpLease<'_>,
+    read: &mut impl CommittedReadPass,
+) -> DriverResult<IrpCompletion> {
     let (prepared_stack, pattern) = {
         let prepared = request.prepared_query_directory()?;
         (
@@ -1819,7 +1802,7 @@ pub(crate) fn query_directory(mut request: PendingIrpLease<'_>) -> DriverResult<
             DirectoryPattern::from_prepared(prepared.pattern())?,
         )
     };
-    let (class, pattern, length, entry_emission, directory_id, mut cursor, operations) = {
+    let (class, pattern, length, entry_emission, directory_id, mut cursor) = {
         request.with_active(|active| {
             let file_object = active.current_stack()?.file_object()?;
             let mut opened_file = OpenedDirectory::decode(file_object)?;
@@ -1829,31 +1812,15 @@ pub(crate) fn query_directory(mut request: PendingIrpLease<'_>) -> DriverResult<
             let directory_id = opened_file.id();
             let mut cursor = *opened_file.cursor_mut();
             initialize_directory_cursor(&mut cursor, prepared_stack.cursor_position());
-            let operations = claim_volume_operation_lane(opened_file.volume());
-            Ok::<_, DriverError>((
-                class,
-                pattern,
-                length,
-                entry_emission,
-                directory_id,
-                cursor,
-                operations,
-            ))
+            Ok::<_, DriverError>((class, pattern, length, entry_emission, directory_id, cursor))
         })?
     };
     let (cursor, packed, result) = {
-        let mut operations = operations;
-        let directory = operations
-            .runtime_mut()
-            .journaled_mut()
-            .load_directory(directory_id)?;
-        let entries = operations
-            .runtime_mut()
-            .journaled_mut()
-            .read_directory(&directory)?;
+        let directory = read.load_directory(directory_id)?;
+        let entries = read.read_directory(&directory)?;
         let mut packed = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
         let result = emit_directory_entries(
-            operations.runtime_mut(),
+            read,
             &mut cursor,
             entry_emission,
             class,
@@ -2185,7 +2152,7 @@ fn initialize_directory_cursor(cursor: &mut DirectoryCursor, position: Directory
 /// Returns an error when cursor arithmetic overflows, a matching entry cannot fit in an empty
 /// output buffer, metadata loading fails, or a directory record cannot be packed.
 fn emit_directory_entries(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     cursor: &mut DirectoryCursor,
     entry_emission: DirectoryEntryEmission,
     class: DirectoryInformationClass,
@@ -2214,7 +2181,7 @@ fn emit_directory_entries(
             continue;
         }
 
-        let metadata = metadata_from_node(operations, *entry.node())?;
+        let metadata = metadata_from_node(read, *entry.node())?;
         let layout = DirectoryRecordLayout::new(class, &name)?;
         let required = written
             .checked_add(layout.unpadded_size)
@@ -2908,7 +2875,7 @@ fn utf16_units_from_le_bytes(bytes: &[u8]) -> DriverResult<DriverVec<u16>> {
 /// Returns an error when any parent component is absent or not a directory, or the target Windows
 /// name cannot be converted to an ext4 name.
 fn resolve_namespace_target(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     target: &NamespaceTargetPath,
 ) -> DriverResult<(DirectoryNodeId, Ext4Name)> {
     let mut parent_id = match target.base() {
@@ -2916,20 +2883,16 @@ fn resolve_namespace_target(
         NamespaceTargetBase::VolumeRoot => DirectoryNodeId::ROOT,
     };
     for component in target.parents() {
-        let parent = operations
-            .journaled_mut()
+        let parent = read
             .load_directory(parent_id)
             .map_err(|_| DriverError::ObjectPathNotFound)?;
-        let child = operations
-            .journaled_mut()
-            .lookup_windows_child(&parent, component)?;
+        let child = read.lookup_windows_child(&parent, component)?;
         match child {
             ChildLookup::Found(child) => {
                 let NodeId::Directory(directory_id) = *child.node() else {
                     return Err(DriverError::ObjectPathNotFound);
                 };
-                if operations
-                    .journaled_mut()
+                if read
                     .read_windows_symlink_reparse_point(NodeId::Directory(directory_id))?
                     .is_some()
                 {
@@ -3150,10 +3113,10 @@ fn file_offset_from_large_integer(value: LARGE_INTEGER) -> DriverResult<FileOffs
 ///
 /// Returns an error when `file_id` cannot be loaded as a regular file.
 fn regular_file_size(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     file_id: FileNodeId,
 ) -> DriverResult<FileSize> {
-    Ok(operations.journaled_mut().load_file(file_id)?.size())
+    Ok(read.load_file(file_id)?.size())
 }
 
 /// Returns the signed payload of a LARGE_INTEGER.
@@ -3254,22 +3217,17 @@ enum FileMetadataReparsePoint {
 /// Returns an error when `node_id` cannot be loaded as its typed ext4 node or its Windows overlay
 /// xattr is malformed.
 fn metadata_from_node(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     node_id: NodeId,
 ) -> DriverResult<FileMetadata> {
-    let overlay_attributes = operations
-        .journaled_mut()
+    let overlay_attributes = read
         .read_windows_overlay(node_id)?
         .map(|overlay| overlay.attributes().bits())
         .unwrap_or(0);
     let reparse_point = match node_id {
         NodeId::Symlink(_) => FileMetadataReparsePoint::SymbolicLink,
         NodeId::File(_) | NodeId::Directory(_) => {
-            if operations
-                .journaled_mut()
-                .read_windows_symlink_reparse_point(node_id)?
-                .is_some()
-            {
+            if read.read_windows_symlink_reparse_point(node_id)?.is_some() {
                 FileMetadataReparsePoint::SymbolicLink
             } else {
                 FileMetadataReparsePoint::None
@@ -3280,7 +3238,7 @@ fn metadata_from_node(
     let file_index = node_id.file_index();
     match node_id {
         NodeId::File(file_id) => {
-            let file = operations.journaled_mut().load_file(file_id)?;
+            let file = read.load_file(file_id)?;
             Ok(FileMetadata {
                 file_index,
                 kind: FileMetadataKind::File,
@@ -3294,7 +3252,7 @@ fn metadata_from_node(
             })
         }
         NodeId::Directory(directory_id) => {
-            let directory = operations.journaled_mut().load_directory(directory_id)?;
+            let directory = read.load_directory(directory_id)?;
             Ok(FileMetadata {
                 file_index,
                 kind: FileMetadataKind::Directory,
@@ -3308,7 +3266,7 @@ fn metadata_from_node(
             })
         }
         NodeId::Symlink(symlink_id) => {
-            let symlink = operations.journaled_mut().load_symlink(symlink_id)?;
+            let symlink = read.load_symlink(symlink_id)?;
             Ok(FileMetadata {
                 file_index,
                 kind: FileMetadataKind::Symlink,
@@ -3736,13 +3694,13 @@ fn select_write_start(
 /// Returns an error when the latest committed end of file is outside the signed Windows offset
 /// domain.
 fn resolve_write_start(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     file_id: FileNodeId,
     anchor: WriteRangeAnchor,
 ) -> DriverResult<FileOffset> {
     match anchor {
         WriteRangeAnchor::Fixed(offset) => Ok(offset),
-        WriteRangeAnchor::LatestEndOfFile => regular_file_end(operations, file_id),
+        WriteRangeAnchor::LatestEndOfFile => regular_file_end(read, file_id),
     }
 }
 
@@ -3751,10 +3709,10 @@ fn resolve_write_start(
 ///
 /// Returns an error when the file cannot be loaded or EOF exceeds `i64::MAX`.
 fn regular_file_end(
-    operations: &mut VolumeOperationLane,
+    read: &mut impl CommittedReadPass,
     file_id: FileNodeId,
 ) -> DriverResult<FileOffset> {
-    let end = FileOffset::from_bytes(regular_file_size(operations, file_id)?.bytes());
+    let end = FileOffset::from_bytes(regular_file_size(read, file_id)?.bytes());
     let _signed_end = i64::try_from(end.bytes()).map_err(|_| DriverError::InvalidParameter)?;
     Ok(end)
 }
@@ -3764,63 +3722,52 @@ fn regular_file_end(
 ///
 /// Returns an error when the captured read contract, opened FILE_OBJECT, transfer alignment,
 /// byte-range lock, or ext4 data stream is invalid.
-fn read_regular_file_direct(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+fn read_regular_file_direct(
+    mut request: PendingIrpLease<'_>,
+    read: &mut impl CommittedReadPass,
+) -> DriverResult<IrpCompletion> {
     let stack = request.prepared_read()?.stack();
     let output_address = request.prepared_read()?.output_address();
-    let Some((file_id, kind, range, data_transfer_mode, mut operations)) =
-        request.with_active(|active| {
-            let kind = active.data_io_kind();
-            let file_object = active.current_stack()?.file_object()?;
-            let mut opened_file = OpenedRegularFile::decode(file_object)?;
-            let range = ResolvedFileRange::new(
-                resolve_read_start(&opened_file, kind, stack.starting_point())?,
-                stack.length().as_usize(),
-            )?;
-            let data_transfer_mode = opened_file.data_transfer_mode();
-            data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
-            if stack.length().is_empty() {
-                opened_file.update_current_file_position(kind, range.start(), 0)?;
-                return Ok(None);
-            }
-            data_transfer_mode
-                .validate_buffer(output_address.ok_or(DriverError::InternalInvariantViolation)?)?;
-            if kind == DataIoKind::Handle
-                && !opened_file.file_control_block().permits_byte_range_read(
-                    active.requestor_process()?,
-                    opened_file.file_object(),
-                    range.start(),
-                    range.length(),
-                    stack.key(),
-                )?
-            {
-                return Err(DriverError::FileLockConflict);
-            }
-            Ok(Some((
-                opened_file.id(),
-                kind,
-                range,
-                data_transfer_mode,
-                claim_file_operation_lane(opened_file.file_control_block()),
-            )))
-        })?
+    let Some((file_id, kind, range, data_transfer_mode)) = request.with_active(|active| {
+        let kind = active.data_io_kind();
+        let file_object = active.current_stack()?.file_object()?;
+        let mut opened_file = OpenedRegularFile::decode(file_object)?;
+        let range = ResolvedFileRange::new(
+            resolve_read_start(&opened_file, kind, stack.starting_point())?,
+            stack.length().as_usize(),
+        )?;
+        let data_transfer_mode = opened_file.data_transfer_mode();
+        data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
+        if stack.length().is_empty() {
+            opened_file.update_current_file_position(kind, range.start(), 0)?;
+            return Ok(None);
+        }
+        data_transfer_mode
+            .validate_buffer(output_address.ok_or(DriverError::InternalInvariantViolation)?)?;
+        if kind == DataIoKind::Handle
+            && !opened_file.file_control_block().permits_byte_range_read(
+                active.requestor_process()?,
+                opened_file.file_object(),
+                range.start(),
+                range.length(),
+                stack.key(),
+            )?
+        {
+            return Err(DriverError::FileLockConflict);
+        }
+        Ok(Some((opened_file.id(), kind, range, data_transfer_mode)))
+    })?
     else {
         return Ok(IrpCompletion::EMPTY);
     };
 
-    let file = operations
-        .runtime_mut()
-        .journaled_mut()
-        .load_file(file_id)?;
+    let file = read.load_file(file_id)?;
     let bytes_read = {
         let output = request.prepared_read_mut()?.output_mut();
         data_transfer_mode.validate_buffer(
             NonNull::new(output.as_mut_ptr()).ok_or(DriverError::InternalInvariantViolation)?,
         )?;
-        operations
-            .runtime_mut()
-            .journaled_mut()
-            .read_file(&file, range.start(), output)?
-            .as_usize()
+        read.read_file(&file, range.start(), output)?.as_usize()
     };
     request.with_active(|active| {
         let file_object = active.current_stack()?.file_object()?;

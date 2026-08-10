@@ -12,7 +12,10 @@ use crate::{
     irp::{IrpCompletion, PendingIrpLease, QueryVolumeInformationClass, SetVolumeInformationClass},
     kernel::status::{DriverError, DriverResult},
     memory::DriverVec,
-    state::{MountedVolumeDevice, TransferSectorSize, VolumeControlBlock, VolumeOperationLane},
+    state::{
+        MountedVolumeDevice, TransferSectorSize, VolumeControlBlock, VolumeRuntime,
+        VolumeSerialNumber,
+    },
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
 
@@ -124,10 +127,13 @@ fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel
 ///
 /// Returns an error when the UTF-16 label byte count overflows or the output buffer is too small.
 fn pack_volume_information(
-    operations: &VolumeOperationLane,
+    operations: &VolumeRuntime,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let label = operations.volume_label();
+    let identity = operations.identity();
+    let label = identity.label();
+    let [a, b, c, d, ..] = identity.uuid().bytes();
+    let serial_number = VolumeSerialNumber::from_le_bytes([a, b, c, d]);
     let label_bytes = label.bytes();
     let header = core::mem::offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
     let label_len = label_bytes
@@ -157,7 +163,7 @@ fn pack_volume_information(
             FILE_FS_VOLUME_INFORMATION,
             VolumeSerialNumber
         )),
-        operations.serial_number().as_u32(),
+        serial_number.as_u32(),
     )?;
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
@@ -194,10 +200,10 @@ fn pack_volume_information(
 /// Returns an error when ext4 cluster geometry cannot be represented in `FILE_FS_SIZE_INFORMATION`
 /// or the output buffer is too small.
 fn pack_size_information(
-    operations: &VolumeOperationLane,
+    operations: &VolumeRuntime,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let geometry = operations.journaled().geometry();
+    let geometry = operations.current_epoch().geometry();
     write_fixed(
         output,
         FILE_FS_SIZE_INFORMATION {
@@ -235,10 +241,10 @@ fn pack_device_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
 /// Returns an error when ext4 cluster geometry cannot be represented in
 /// `FILE_FS_FULL_SIZE_INFORMATION` or the output buffer is too small.
 fn pack_full_size_information(
-    operations: &VolumeOperationLane,
+    operations: &VolumeRuntime,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let geometry = operations.journaled().geometry();
+    let geometry = operations.current_epoch().geometry();
     let available = LARGE_INTEGER {
         QuadPart: i64::try_from(geometry.free_cluster_count().as_u64())
             .map_err(|_| DriverError::InvalidParameter)?,
