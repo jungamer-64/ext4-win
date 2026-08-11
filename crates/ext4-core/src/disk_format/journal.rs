@@ -1520,7 +1520,9 @@ impl InternalJournalLayout {
                 len,
             )?)?;
         }
-        mapped.sort_by_key(|extent| extent.logical_start);
+        memory::heap_sort_by(&mut mapped, |left, right| {
+            left.logical_start.cmp(&right.logical_start)
+        })?;
         Ok(Self {
             extents: mapped,
             capacity_blocks,

@@ -1090,7 +1090,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
         if let Some(block) = raw_inode.xattr_block()? {
             ranges.try_push(InodeAllocationClusterRange::from_block(superblock, block)?)?;
         }
-        ranges.sort_unstable_by_key(|range| range.start);
+        memory::heap_sort_by(&mut ranges, |left, right| left.start.cmp(&right.start))?;
 
         let mut merged_ranges: Vec<InodeAllocationClusterRange> = Vec::new();
         for range in ranges {
