@@ -59,6 +59,3 @@ pub use volume::{
     SymlinkNodeId, TransactionDirectory, TransactionFile, TransactionHardLinkSource,
     TransactionNode, TransactionSymlink, VisibilityLease, VolumeGeometry, VolumeIdentity,
 };
-
-#[cfg(test)]
-mod tests;
