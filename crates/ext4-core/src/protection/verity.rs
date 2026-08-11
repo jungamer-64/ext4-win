@@ -2,8 +2,6 @@
 
 use alloc::vec::Vec;
 
-use sha2::{Digest, Sha256, Sha512};
-
 use crate::disk::block::BlockSize;
 use crate::disk_format::inode::FileSize;
 use crate::error::{Error, Result};
@@ -1207,17 +1205,6 @@ fn hash_block(
     }
     input.try_extend_from_slice(block)?;
     FsverityDigest::new(algorithm, hash_bytes(algorithm, &input)?)
-}
-
-/// Hashes an arbitrary byte slice with the selected algorithm.
-/// # Errors
-///
-/// Returns an error when allocating the owned digest bytes fails.
-fn hash_bytes(algorithm: FsverityHashAlgorithm, bytes: &[u8]) -> Result<Vec<u8>> {
-    match algorithm {
-        FsverityHashAlgorithm::Sha256 => memory::copied_slice(&Sha256::digest(bytes)),
-        FsverityHashAlgorithm::Sha512 => memory::copied_slice(&Sha512::digest(bytes)),
-    }
 }
 
 /// Requires an exact serialized structure length.
