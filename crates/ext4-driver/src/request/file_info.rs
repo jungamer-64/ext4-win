@@ -4024,7 +4024,7 @@ mod tests {
             return None;
         }
         for (output, unit) in outputs.iter_mut().zip(units.iter().copied()) {
-            output.copy_from_slice(&unit.to_le_bytes());
+            crate::memory::copy_exact(output, &unit.to_le_bytes()).ok()?;
         }
         Some(input)
     }
@@ -4079,8 +4079,7 @@ mod tests {
         let Some(target) = buffer.get_mut(offset..end) else {
             return false;
         };
-        target.copy_from_slice(&value.to_le_bytes());
-        true
+        crate::memory::copy_exact(target, &value.to_le_bytes()).is_ok()
     }
 
     /// # Panics
@@ -5391,7 +5390,10 @@ mod tests {
         let Some(name_length) = name_length else {
             return;
         };
-        name_length.copy_from_slice(&2_u32.to_le_bytes());
+        assert_eq!(
+            crate::memory::copy_exact(name_length, &2_u32.to_le_bytes()),
+            Ok(())
+        );
         let name =
             input.get_mut(super::FILE_NAMESPACE_NAME_OFFSET..super::FILE_NAMESPACE_NAME_OFFSET + 2);
         assert!(
@@ -5401,7 +5403,10 @@ mod tests {
         let Some(name) = name else {
             return;
         };
-        name.copy_from_slice(&u16::from(b'a').to_le_bytes());
+        assert_eq!(
+            crate::memory::copy_exact(name, &u16::from(b'a').to_le_bytes()),
+            Ok(())
+        );
 
         let mut file_object = wdk_sys::FILE_OBJECT::default();
         let mut stack = wdk_sys::IO_STACK_LOCATION {

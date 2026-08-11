@@ -78,7 +78,9 @@ impl WindowsOverlay {
     /// Returns an error when the value cannot be represented as an xattr.
     pub fn to_xattr_value(self) -> Result<XattrValue> {
         let mut bytes = [0_u8; 8];
-        let (version, attributes) = bytes.split_at_mut(4);
+        let (version, attributes) = bytes
+            .split_at_mut_checked(4)
+            .ok_or(Error::InvalidWriteRange)?;
         memory::copy_exact(version, &Self::ATTRIBUTES_VERSION.to_le_bytes())?;
         memory::copy_exact(attributes, &self.attributes.bits().to_le_bytes())?;
         XattrValue::new(&bytes)

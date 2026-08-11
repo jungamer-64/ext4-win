@@ -213,8 +213,9 @@ impl XattrSet {
         let mut entries = converted;
         memory::heap_sort_by(&mut entries, |left, right| left.name.cmp(&right.name))?;
         if entries
-            .windows(2)
-            .any(|pair| matches!(pair, [left, right] if left.name == right.name))
+            .iter()
+            .zip(entries.iter().skip(1))
+            .any(|(left, right)| left.name == right.name)
         {
             return Err(Error::InvalidXattr);
         }

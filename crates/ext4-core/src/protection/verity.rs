@@ -1637,7 +1637,8 @@ mod tests {
         let block_start = must!(block_start);
         let mut data_block = must!(memory::repeated_vec(0_u8, block_bytes));
         let tail = some!(data.get(block_start..));
-        some!(data_block.get_mut(..tail.len())).copy_from_slice(tail);
+        let destination = some!(data_block.get_mut(..tail.len()));
+        must!(memory::copy_exact(destination, tail));
 
         let mut verification =
             must!(verifier.begin_data_block(data_block_index, &data_block, &mut crypto));

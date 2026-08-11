@@ -1337,7 +1337,29 @@ fn display_path(
             .ok_or_else(|| GateError::InvalidIr(format!("path predecessor missing for {symbol}")))?
             .as_deref();
     }
-    reversed.reverse();
+    let mut lower = 0_usize;
+    let mut upper = reversed.len();
+    while lower < upper {
+        upper = upper
+            .checked_sub(1)
+            .ok_or_else(|| GateError::InvalidIr("path reversal index underflowed".to_owned()))?;
+        if lower >= upper {
+            break;
+        }
+        let (lower_values, upper_values) = reversed
+            .split_at_mut_checked(upper)
+            .ok_or_else(|| GateError::InvalidIr("path reversal split is invalid".to_owned()))?;
+        let lower_value = lower_values.get_mut(lower).ok_or_else(|| {
+            GateError::InvalidIr("path reversal lower index is invalid".to_owned())
+        })?;
+        let upper_value = upper_values.first_mut().ok_or_else(|| {
+            GateError::InvalidIr("path reversal upper index is invalid".to_owned())
+        })?;
+        core::mem::swap(lower_value, upper_value);
+        lower = lower
+            .checked_add(1)
+            .ok_or_else(|| GateError::InvalidIr("path reversal index overflowed".to_owned()))?;
+    }
     Ok(reversed)
 }
 

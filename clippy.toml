@@ -35,6 +35,7 @@ disallowed-methods = [
     { path = "slice::rchunks_exact", reason = "a zero chunk width must be represented as an error before iteration" },
     { path = "slice::rchunks_exact_mut", reason = "a zero chunk width must be represented as an error before iteration" },
     { path = "slice::windows", reason = "a zero window width must be represented as an error before iteration" },
+    { path = "slice::swap", reason = "both swap indices must be checked before mutation" },
     { path = "slice::reverse", reason = "use the checked project primitive audited by the production reachability gate", replacement = "ext4_core::memory::reverse_checked" },
     { path = "slice::sort", reason = "standard sorting retains allocator and panic edges", replacement = "ext4_core::memory::heap_sort_by" },
     { path = "slice::sort_by", reason = "standard sorting retains comparator panic edges", replacement = "ext4_core::memory::heap_sort_by" },

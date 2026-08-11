@@ -289,8 +289,17 @@ impl MutationResolvePass<'_, '_, '_> {
             )?;
             let block_bytes =
                 usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+            if block_bytes == 0 {
+                return Err(Error::UnsupportedBlockSize);
+            }
             let mut tree = MutableExtentTree::from_extents(Vec::new())?;
-            for (logical, chunk) in target.bytes().chunks(block_bytes).enumerate() {
+            let mut logical = 0_u64;
+            let mut remaining = target.bytes();
+            while !remaining.is_empty() {
+                let chunk_len = core::cmp::min(block_bytes, remaining.len());
+                let (chunk, remainder) = remaining
+                    .split_at_checked(chunk_len)
+                    .ok_or(Error::InvalidWriteRange)?;
                 let block = self.allocate_cluster()?;
                 let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
                 memory::copy_exact(
@@ -301,12 +310,11 @@ impl MutationResolvePass<'_, '_, '_> {
                     offset: block_size.offset_of(block)?,
                     bytes,
                 })?;
-                tree.insert_or_extend_initialized(
-                    LogicalBlock::try_from(
-                        u64::try_from(logical).map_err(|_| Error::ArithmeticOverflow)?,
-                    )?,
-                    block,
-                )?;
+                tree.insert_or_extend_initialized(LogicalBlock::try_from(logical)?, block)?;
+                remaining = remainder;
+                if !remaining.is_empty() {
+                    logical = logical.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                }
             }
             self.stage_extent_tree(&mut raw_inode, tree)?;
             raw_inode

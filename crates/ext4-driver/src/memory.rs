@@ -328,11 +328,16 @@ where
     ///
     /// Returns `None` instead of panicking when `index` is outside the current length.
     pub(crate) fn swap_remove(&mut self, index: usize) -> Option<T> {
-        if index < self.inner.len() {
-            Some(self.inner.swap_remove(index))
-        } else {
-            None
+        let last_index = self.inner.len().checked_sub(1)?;
+        if index > last_index {
+            return None;
         }
+        let last = self.inner.pop()?;
+        if index == last_index {
+            return Some(last);
+        }
+        let slot = self.inner.get_mut(index)?;
+        Some(core::mem::replace(slot, last))
     }
 
     /// Copies a slice into a newly allocated vector using the provided allocator.
