@@ -516,10 +516,12 @@ pub(super) fn verity_metadata_image(
     .map_err(|_| Error::ArithmeticOverflow)?;
     let mut image = memory::repeated_vec(0_u8, metadata_bytes)?;
     let tree_end = merkle_tree.len();
-    image
-        .get_mut(..tree_end)
-        .ok_or(Error::InvalidVerityMetadata)?
-        .copy_from_slice(merkle_tree);
+    memory::copy_exact(
+        image
+            .get_mut(..tree_end)
+            .ok_or(Error::InvalidVerityMetadata)?,
+        merkle_tree,
+    )?;
     let descriptor_offset = usize::try_from(
         layout
             .descriptor_offset()
@@ -530,17 +532,21 @@ pub(super) fn verity_metadata_image(
     let descriptor_end = descriptor_offset
         .checked_add(FSVERITY_DESCRIPTOR_BYTES)
         .ok_or(Error::ArithmeticOverflow)?;
-    image
-        .get_mut(descriptor_offset..descriptor_end)
-        .ok_or(Error::InvalidVerityMetadata)?
-        .copy_from_slice(descriptor);
+    memory::copy_exact(
+        image
+            .get_mut(descriptor_offset..descriptor_end)
+            .ok_or(Error::InvalidVerityMetadata)?,
+        descriptor,
+    )?;
     let signature_end = descriptor_end
         .checked_add(signature.len())
         .ok_or(Error::ArithmeticOverflow)?;
-    image
-        .get_mut(descriptor_end..signature_end)
-        .ok_or(Error::InvalidVerityMetadata)?
-        .copy_from_slice(signature);
+    memory::copy_exact(
+        image
+            .get_mut(descriptor_end..signature_end)
+            .ok_or(Error::InvalidVerityMetadata)?,
+        signature,
+    )?;
     let tail_offset = usize::try_from(
         layout
             .descriptor_size_offset()

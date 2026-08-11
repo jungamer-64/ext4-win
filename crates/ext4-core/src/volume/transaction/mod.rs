@@ -982,7 +982,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
         self.require_xattr_mutation()?;
         raw_inode.mark_encrypted()?;
         let mut set = self.xattr_set_for_raw_inode(raw_inode)?;
-        set.set_encryption_context(XattrValue::new(&context.to_bytes())?);
+        set.set_encryption_context(XattrValue::new(&context.to_bytes()?)?);
         self.store_xattr_set(raw_inode, &set)
     }
 

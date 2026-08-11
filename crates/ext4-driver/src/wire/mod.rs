@@ -1,6 +1,9 @@
 //! Checked byte-range and little-endian wire helpers for external payloads.
 
-use crate::kernel::status::{DriverError, DriverResult};
+use crate::{
+    kernel::status::{DriverError, DriverResult},
+    memory,
+};
 
 /// Byte offset inside one decoded wire payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,7 +148,10 @@ impl<'a> LittleEndianInput<'a> {
     /// Returns an error when the `N`-byte range starting at `offset` is not present.
     pub(crate) fn fixed<const N: usize>(self, offset: WireOffset) -> DriverResult<[u8; N]> {
         let mut bytes = [0_u8; N];
-        bytes.copy_from_slice(self.range(WireRange::new(offset, WireByteLen::new(N))?)?);
+        memory::copy_exact(
+            &mut bytes,
+            self.range(WireRange::new(offset, WireByteLen::new(N))?)?,
+        )?;
         Ok(bytes)
     }
 
@@ -213,9 +219,10 @@ impl<'a> LittleEndianOutput<'a> {
     ///
     /// Returns an error when the destination range for `bytes` is not fully present.
     pub(crate) fn write_bytes(&mut self, offset: WireOffset, bytes: &[u8]) -> DriverResult<()> {
-        self.range_mut(WireRange::new(offset, WireByteLen::new(bytes.len()))?)?
-            .copy_from_slice(bytes);
-        Ok(())
+        memory::copy_exact(
+            self.range_mut(WireRange::new(offset, WireByteLen::new(bytes.len()))?)?,
+            bytes,
+        )
     }
 
     /// Writes a little-endian `u16` into the payload.

@@ -359,12 +359,8 @@ pub struct DirectoryChild {
 
 impl DirectoryChild {
     /// Creates a typed directory child after validating the referenced inode.
-    pub(super) fn new(parent: DirectoryNodeId, name: &Ext4Name, node: NodeId) -> Self {
-        Self {
-            parent,
-            name: name.clone(),
-            node,
-        }
+    pub(super) const fn new(parent: DirectoryNodeId, name: Ext4Name, node: NodeId) -> Self {
+        Self { parent, name, node }
     }
 
     /// Parent directory containing the child.
@@ -399,11 +395,21 @@ pub struct DirectoryEntry {
 
 impl DirectoryEntry {
     /// Creates a listed entry after validating the referenced inode.
-    pub(super) fn new(name: &Ext4Name, node: NodeId, entry_kind: DirectoryEntryKind) -> Self {
+    pub(super) const fn new(name: Ext4Name, node: NodeId, entry_kind: DirectoryEntryKind) -> Self {
         Self {
-            name: name.clone(),
+            name,
             node,
             entry_kind,
+        }
+    }
+
+    /// Consumes this validated entry into a typed child without copying its owned name.
+    #[must_use]
+    pub(super) fn into_child(self, parent: DirectoryNodeId) -> DirectoryChild {
+        DirectoryChild {
+            parent,
+            name: self.name,
+            node: self.node,
         }
     }
 

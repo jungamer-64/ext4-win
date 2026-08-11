@@ -1,10 +1,9 @@
 //! Windows metadata projected onto ext4 domain types.
 
-use alloc::vec::Vec;
-
 use crate::disk_format::inode::SymlinkTarget;
 use crate::disk_format::xattr::{XattrName, XattrNamespace, XattrValue};
 use crate::error::{Error, Result};
+use crate::memory;
 
 /// File attributes that cannot be represented by POSIX mode bits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,8 +79,8 @@ impl WindowsOverlay {
     pub fn to_xattr_value(self) -> Result<XattrValue> {
         let mut bytes = [0_u8; 8];
         let (version, attributes) = bytes.split_at_mut(4);
-        version.copy_from_slice(&Self::ATTRIBUTES_VERSION.to_le_bytes());
-        attributes.copy_from_slice(&self.attributes.bits().to_le_bytes());
+        memory::copy_exact(version, &Self::ATTRIBUTES_VERSION.to_le_bytes())?;
+        memory::copy_exact(attributes, &self.attributes.bits().to_le_bytes())?;
         XattrValue::new(&bytes)
     }
 
@@ -174,19 +173,30 @@ impl WindowsSymlinkReparsePoint {
         if total_length > XattrValue::MAX_BYTES {
             return Err(Error::InvalidXattr);
         }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(total_length)
-            .map_err(|_| Error::OutOfMemory)?;
-        bytes.extend_from_slice(&Self::VERSION.to_le_bytes());
+        let mut bytes = memory::repeated_vec(0_u8, total_length)?;
+        memory::copy_exact(
+            bytes.get_mut(0..4).ok_or(Error::InvalidXattr)?,
+            &Self::VERSION.to_le_bytes(),
+        )?;
         let flags = if self.relative {
             Self::RELATIVE_FLAG
         } else {
             0
         };
-        bytes.extend_from_slice(&flags.to_le_bytes());
-        bytes.extend_from_slice(&target_length.to_le_bytes());
-        bytes.extend_from_slice(target);
+        memory::copy_exact(
+            bytes.get_mut(4..8).ok_or(Error::InvalidXattr)?,
+            &flags.to_le_bytes(),
+        )?;
+        memory::copy_exact(
+            bytes.get_mut(8..12).ok_or(Error::InvalidXattr)?,
+            &target_length.to_le_bytes(),
+        )?;
+        memory::copy_exact(
+            bytes
+                .get_mut(Self::XATTR_HEADER_SIZE..total_length)
+                .ok_or(Error::InvalidXattr)?,
+            target,
+        )?;
         XattrValue::new(&bytes)
     }
 

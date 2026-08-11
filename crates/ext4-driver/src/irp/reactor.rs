@@ -2445,7 +2445,11 @@ impl CompletionReactor {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, slot)| {
-                        if attempted[index] {
+                        let Some(was_attempted) = attempted.get(index) else {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck();
+                        };
+                        if *was_attempted {
                             return None;
                         }
                         let ActivePhase::Commit { ticket, .. } = slot.phase else {
@@ -2459,7 +2463,10 @@ impl CompletionReactor {
             let Some(index) = candidate else {
                 return;
             };
-            attempted[index] = true;
+            let Some(was_attempted) = attempted.get_mut(index) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            *was_attempted = true;
             let (volume, ticket) = {
                 let slots = unsafe {
                     // SAFETY: Only this reactor thread observes commit queues.

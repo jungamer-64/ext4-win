@@ -188,8 +188,9 @@ impl<T> FallibleVec<T> for Vec<T> {
     fn try_push(&mut self, value: T) -> Result<()> {
         let _updated_len = self.len().checked_add(1).ok_or(Error::ArithmeticOverflow)?;
         self.try_reserve(1).map_err(allocation_failed)?;
-        self.push(value);
-        Ok(())
+        self.push_within_capacity(value)
+            .map(|_inserted| ())
+            .map_err(|_value| Error::OutOfMemory)
     }
 
     fn try_insert(&mut self, index: usize, value: T) -> Result<()> {
@@ -201,7 +202,8 @@ impl<T> FallibleVec<T> for Vec<T> {
             .checked_add(1)
             .ok_or(Error::ArithmeticOverflow)?;
         self.try_reserve(1).map_err(allocation_failed)?;
-        self.push(value);
+        self.push_within_capacity(value)
+            .map_err(|_value| Error::OutOfMemory)?;
 
         let inserted_tail = self.get_mut(index..).ok_or(Error::InvalidWriteRange)?;
         inserted_tail.reverse();

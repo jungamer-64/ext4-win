@@ -272,10 +272,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
         let end = start
             .checked_add(bytes.len())
             .ok_or(Error::ArithmeticOverflow)?;
-        block
-            .get_mut(start..end)
-            .ok_or(Error::DeviceRange)?
-            .copy_from_slice(bytes);
+        memory::copy_exact(block.get_mut(start..end).ok_or(Error::DeviceRange)?, bytes)?;
         contents_key.encrypt_block(logical_block.as_u64(), &mut block)?;
         self.data_writes.try_push(RangeWrite {
             offset: self.volume.superblock.block_size().offset_of(physical)?,
@@ -406,10 +403,10 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
                     let mut block = memory::repeated_vec(0_u8, block_size)?;
                     let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
                     let block_end = start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
-                    block
-                        .get_mut(start..block_end)
-                        .ok_or(Error::DeviceRange)?
-                        .copy_from_slice(bytes.get(completed..end).ok_or(Error::DeviceRange)?);
+                    memory::copy_exact(
+                        block.get_mut(start..block_end).ok_or(Error::DeviceRange)?,
+                        bytes.get(completed..end).ok_or(Error::DeviceRange)?,
+                    )?;
                     self.data_writes.try_push(RangeWrite {
                         offset: self.volume.superblock.block_size().offset_of(physical)?,
                         bytes: block,

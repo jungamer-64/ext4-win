@@ -423,13 +423,13 @@ impl EpochReadView<'_, '_> {
             let destination_end = destination_start
                 .checked_add(copy_bytes)
                 .ok_or(Error::ArithmeticOverflow)?;
-            out.get_mut(destination_start..destination_end)
-                .ok_or(Error::DeviceRange)?
-                .copy_from_slice(
-                    data_block
-                        .get(source_start..source_end)
-                        .ok_or(Error::DeviceRange)?,
-                );
+            memory::copy_exact(
+                out.get_mut(destination_start..destination_end)
+                    .ok_or(Error::DeviceRange)?,
+                data_block
+                    .get(source_start..source_end)
+                    .ok_or(Error::DeviceRange)?,
+            )?;
         }
         Ok(ReadBytes::from_usize(
             usize::try_from(readable).map_err(|_| Error::ArithmeticOverflow)?,
@@ -702,11 +702,7 @@ impl EpochReadView<'_, '_> {
         requested: &WindowsName,
     ) -> Result<ChildLookup> {
         match self.lookup_windows_child_entry(parent, requested)? {
-            Some(entry) => Ok(ChildLookup::Found(DirectoryChild::new(
-                parent.id(),
-                entry.name(),
-                *entry.node(),
-            ))),
+            Some(entry) => Ok(ChildLookup::Found(entry.into_child(parent.id()))),
             None => Ok(ChildLookup::NotFound),
         }
     }
@@ -775,8 +771,9 @@ impl EpochReadView<'_, '_> {
         parent: &DirectoryNode,
         entry: RawDirectoryEntry,
     ) -> Result<DirectoryChild> {
-        let node = self.load_inode_node(entry.inode())?.id();
-        Ok(DirectoryChild::new(parent.id(), entry.name(), node))
+        let (inode, name, _kind) = entry.into_parts();
+        let node = self.load_inode_node(inode)?.id();
+        Ok(DirectoryChild::new(parent.id(), name, node))
     }
 
     /// Converts raw directory entries into public entries with validated node identity.
@@ -793,8 +790,9 @@ impl EpochReadView<'_, '_> {
             .try_reserve_exact(entries.len())
             .map_err(|_| Error::OutOfMemory)?;
         for entry in entries {
-            let node = self.load_inode_node(entry.inode())?.id();
-            validated.try_push(DirectoryEntry::new(entry.name(), node, entry.kind()))?;
+            let (inode, name, kind) = entry.into_parts();
+            let node = self.load_inode_node(inode)?.id();
+            validated.try_push(DirectoryEntry::new(name, node, kind))?;
         }
         Ok(validated)
     }
@@ -809,7 +807,11 @@ impl EpochReadView<'_, '_> {
         visible_name: &Ext4Name,
     ) -> Result<DirectoryEntry> {
         let node = self.load_inode_node(entry.inode())?.id();
-        Ok(DirectoryEntry::new(visible_name, node, entry.kind()))
+        Ok(DirectoryEntry::new(
+            visible_name.try_to_owned_name()?,
+            node,
+            entry.kind(),
+        ))
     }
 
     /// Loads and validates the directory layout selected by an inode.
@@ -1029,9 +1031,10 @@ impl EpochReadView<'_, '_> {
                             usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
                         let block_end =
                             start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
-                        target.copy_from_slice(
+                        memory::copy_exact(
+                            target,
                             block.get(start..block_end).ok_or(Error::DeviceRange)?,
-                        );
+                        )?;
                     }
                 }
                 BlockMapping::Uninitialized | BlockMapping::Hole => {

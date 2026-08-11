@@ -275,22 +275,22 @@ impl XattrSet {
                 }
             }
             Err(index) => {
-                self.entries
-                    .try_reserve(1)
-                    .map_err(|_| Error::OutOfMemory)?;
-                self.entries.insert(index, XattrEntry { name, value });
+                self.entries.try_insert(index, XattrEntry { name, value })?;
             }
         }
         Ok(())
     }
 
-    /// Removes one value.
-    #[must_use]
-    pub fn remove(&mut self, name: &XattrName) -> Option<XattrValue> {
-        self.entries
-            .binary_search_by(|entry| entry.name.cmp(name))
-            .ok()
-            .map(|index| self.entries.remove(index).value)
+    /// Removes one value with checked vector compaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the located vector position cannot be removed.
+    pub fn remove(&mut self, name: &XattrName) -> Result<Option<XattrValue>> {
+        let Ok(index) = self.entries.binary_search_by(|entry| entry.name.cmp(name)) else {
+            return Ok(None);
+        };
+        Ok(Some(self.entries.try_remove_at(index)?.value))
     }
 
     /// Returns entries in stable xattr name order.
@@ -778,10 +778,12 @@ fn serialize_xattr_entries(
         let value_end = value_start
             .checked_add(value.len())
             .ok_or(Error::ArithmeticOverflow)?;
-        storage
-            .get_mut(value_start..value_end)
-            .ok_or(Error::NoSpace)?
-            .copy_from_slice(value);
+        memory::copy_exact(
+            storage
+                .get_mut(value_start..value_end)
+                .ok_or(Error::NoSpace)?,
+            value,
+        )?;
         *value_offsets
             .get_mut(index)
             .ok_or(Error::ArithmeticOverflow)? = value_start
@@ -820,10 +822,12 @@ fn serialize_xattr_entries(
         let name_end = name_start
             .checked_add(name_len)
             .ok_or(Error::ArithmeticOverflow)?;
-        storage
-            .get_mut(name_start..name_end)
-            .ok_or(Error::NoSpace)?
-            .copy_from_slice(&entry.key.local);
+        memory::copy_exact(
+            storage
+                .get_mut(name_start..name_end)
+                .ok_or(Error::NoSpace)?,
+            &entry.key.local,
+        )?;
         cursor = align_up(name_end)?;
     }
 

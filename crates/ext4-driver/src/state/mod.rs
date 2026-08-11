@@ -2347,7 +2347,7 @@ impl DirectoryNotificationTarget {
         let directory_source = directory_units
             .get(..DIRECTORY_NOTIFICATION_DIRECTORY_UNITS)
             .ok_or(DriverError::InvalidBufferSize)?;
-        directory_destination.copy_from_slice(directory_source);
+        memory::copy_exact(directory_destination, directory_source)?;
         let separator = units
             .get_mut(DIRECTORY_NOTIFICATION_DIRECTORY_UNITS)
             .ok_or(DriverError::InvalidBufferSize)?;
@@ -2355,7 +2355,7 @@ impl DirectoryNotificationTarget {
         let child_destination = units
             .get_mut(prefix_length..length)
             .ok_or(DriverError::InvalidBufferSize)?;
-        child_destination.copy_from_slice(name.utf16());
+        memory::copy_exact(child_destination, name.utf16())?;
         let byte_length = u16::try_from(
             length
                 .checked_mul(core::mem::size_of::<u16>())
