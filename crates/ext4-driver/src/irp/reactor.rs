@@ -1659,6 +1659,32 @@ impl CompletionReactor {
                     drop(request);
                     return;
                 };
+                let retained = {
+                    let slots = unsafe {
+                        // SAFETY: Only this reactor thread observes scheduler-owned intent state.
+                        &*self.active.get()
+                    };
+                    let Some(slot) = slots.get(index) else {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    };
+                    slot.intent
+                        .as_ref()
+                        .is_some_and(|held| held_intent_matches_request(held, &request))
+                };
+                if retained {
+                    let ticket = request.ticket();
+                    drop(request);
+                    self.set_phase(
+                        index,
+                        ActivePhase::Ready {
+                            operation: suspended,
+                            event: OperationEvent::IntentGranted(
+                                ext4_core::MutationLease::granted(ticket),
+                            ),
+                        },
+                    );
+                    return;
+                }
                 self.release_intent(index);
                 self.set_phase(
                     index,
@@ -2726,6 +2752,24 @@ fn intent_conflicts_with_held(
     })
 }
 
+/// Returns whether a re-resolved mutation requests the exact resource set it already owns.
+fn held_intent_matches_request(held: &HeldIntent, request: &IntentRequest) -> bool {
+    held.volume == request.volume()
+        && held.ticket == request.ticket()
+        && mutation_resource_sets_equal(held.resources.as_slice(), request.resources())
+}
+
+/// Compares mutation resource sets without relying on discovery order or allocating.
+fn mutation_resource_sets_equal(left: &[MutationResource], right: &[MutationResource]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .all(|resource| right.iter().any(|candidate| candidate == resource))
+        && right
+            .iter()
+            .all(|resource| left.iter().any(|candidate| candidate == resource))
+}
+
 /// Prevents a later ticket from bypassing an earlier queued request for an overlapping resource.
 fn earlier_queued_intent_conflicts(
     slots: &[ActiveSlot; MAX_OPERATIONS],
@@ -3199,10 +3243,10 @@ mod tests {
         HeldCommit, HeldIntent, InfalliblePublication, IntentRequest, MAX_OPERATIONS,
         OperationAdmission, OperationTransition, PendingIrpSelection, PostCleanupRequest,
         PublicationAuthority, SuspendedOperation, WaitCondition, active_predecessor_is_live,
-        driver_error_to_core, earlier_queued_intent_conflicts, initialize_list_head,
-        insert_tail_list, intent_conflicts_with_held, latest_handle_predecessor, list_is_empty,
-        remove_head_list, resource_sets_overlap, slot_bit, terminal_barrier_is_releasable,
-        volume_has_commit_work,
+        driver_error_to_core, earlier_queued_intent_conflicts, held_intent_matches_request,
+        initialize_list_head, insert_tail_list, intent_conflicts_with_held,
+        latest_handle_predecessor, list_is_empty, mutation_resource_sets_equal, remove_head_list,
+        resource_sets_overlap, slot_bit, terminal_barrier_is_releasable, volume_has_commit_work,
     };
 
     #[derive(Debug)]
@@ -3506,6 +3550,58 @@ mod tests {
         assert!(earlier_queued_intent_conflicts(&slots, &candidate));
         assert!(!earlier_queued_intent_conflicts(&slots, &disjoint));
         slots[1].phase = ActivePhase::Vacant;
+    }
+
+    /// # Panics
+    ///
+    /// Panics if stale-plan re-resolution releases an unchanged intent set or retains a changed
+    /// volume, ticket, or resource set.
+    #[test]
+    fn stale_resolution_retains_only_the_exact_held_intent() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let mut other_storage = MaybeUninit::<VolumeControlBlock>::uninit();
+        let other = NonNull::from(&mut other_storage).cast::<VolumeControlBlock>();
+        let original = [MutationResource::VOLUME_METADATA, MutationResource::KEY_SET];
+        let reordered = [MutationResource::KEY_SET, MutationResource::VOLUME_METADATA];
+        let duplicated = [
+            MutationResource::VOLUME_METADATA,
+            MutationResource::VOLUME_METADATA,
+        ];
+        assert!(mutation_resource_sets_equal(&original, &reordered));
+        assert!(!mutation_resource_sets_equal(&duplicated, &original));
+
+        let Ok(held_resources) = DriverVec::try_copied_from_slice(&original) else {
+            return;
+        };
+        let held = HeldIntent {
+            volume,
+            ticket: 17,
+            resources: held_resources,
+        };
+        let Ok(reordered_resources) = DriverVec::try_copied_from_slice(&reordered) else {
+            return;
+        };
+        let matching = IntentRequest::new(volume, 17, reordered_resources);
+        assert!(held_intent_matches_request(&held, &matching));
+
+        let changed_set = [MutationResource::VOLUME_METADATA];
+        let Ok(changed_resources) = DriverVec::try_copied_from_slice(&changed_set) else {
+            return;
+        };
+        let changed = IntentRequest::new(volume, 17, changed_resources);
+        assert!(!held_intent_matches_request(&held, &changed));
+
+        let Ok(ticket_resources) = DriverVec::try_copied_from_slice(&original) else {
+            return;
+        };
+        let changed_ticket = IntentRequest::new(volume, 18, ticket_resources);
+        assert!(!held_intent_matches_request(&held, &changed_ticket));
+
+        let Ok(volume_resources) = DriverVec::try_copied_from_slice(&original) else {
+            return;
+        };
+        let changed_volume = IntentRequest::new(other, 17, volume_resources);
+        assert!(!held_intent_matches_request(&held, &changed_volume));
     }
 
     /// # Panics
