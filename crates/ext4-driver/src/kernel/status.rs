@@ -33,6 +33,8 @@ pub(crate) enum DriverError {
     AccessDenied,
     /// The target inode has entered the terminal delete-pending namespace state.
     DeletePending,
+    /// CLEANUP closed ordinary admission for this FILE_OBJECT.
+    FileClosed,
     /// The selected namespace link cannot be deleted.
     CannotDelete,
     /// The mounted volume has entered its terminal logical dismount state.
@@ -104,6 +106,7 @@ impl DriverError {
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,
             Self::DeletePending => ntstatus(0xC000_0056),
+            Self::FileClosed => ntstatus(0xC000_0128),
             Self::CannotDelete => STATUS_CANNOT_DELETE,
             Self::VolumeDismounted => ntstatus(0xC000_026E),
             Self::NotLocked => ntstatus(0xC000_002A),

@@ -26,8 +26,8 @@ use crate::state::{
     DirectoryNotificationRegistration, FileCleanupDisposition, FileControlBlock, FileDeleteTarget,
     MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation, OpenedObject,
     OpenedRegularFile, PendingFileDeletion, PreparedFilePositionPublication,
-    PreparedOpenedLocationPublication, VolumeAccess, VolumeControlBlock, VolumeHandleCleanup,
-    VolumeRetirement, WriteCommitment, release_cancelled_file_control_block,
+    PreparedHandleAdmission, PreparedOpenedLocationPublication, VolumeAccess, VolumeControlBlock,
+    VolumeHandleCleanup, VolumeRetirement, release_cancelled_file_control_block,
     release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
@@ -36,6 +36,24 @@ use super::DriverMutationPass;
 
 /// Maximum requestor write bytes snapshotted into Rust-owned memory at one time.
 const MAX_WRITE_SNAPSHOT_BYTES: usize = 65_536;
+
+/// Captures one opened-handle lifecycle capability while the top-level IRP retains its contexts.
+/// # Errors
+///
+/// Returns an error when a non-empty filesystem context pair is malformed.
+pub(crate) fn prepare_handle_admission(
+    mut request: PendingIrpLease<'_>,
+) -> DriverResult<Option<PreparedHandleAdmission>> {
+    request.with_active(|active| {
+        let file_object = active.current_stack()?.file_object()?;
+        if file_object.has_no_file_system_contexts() {
+            return Ok(None);
+        }
+        OpenedFileObject::decode(file_object)
+            .map(OpenedFileObject::prepare_admission)
+            .map(Some)
+    })
+}
 
 /// One non-empty, bounded source interval selected from a pending write IRP.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,8 +92,6 @@ pub(crate) struct PreparedWritePublication {
     completion: IrpCompletion,
     /// Infallible FILE_OBJECT cursor publication.
     position: PreparedFilePositionPublication,
-    /// Durability requested by the opened handle.
-    commitment: WriteCommitment,
 }
 
 /// Result of one restartable write resolve pass.
@@ -88,11 +104,6 @@ pub(crate) enum WriteResolution {
 }
 
 impl PreparedWritePublication {
-    /// Durability policy that may require one post-commit device flush.
-    pub(crate) const fn commitment(&self) -> WriteCommitment {
-        self.commitment
-    }
-
     /// Publishes the prepared cursor and reveals terminal IRP completion.
     pub(crate) fn publish(self) -> IrpCompletion {
         self.position.publish();
@@ -2442,15 +2453,6 @@ pub(crate) struct PendingCleanupDeletion {
     node: NodeId,
     /// Stable FCB-owned target allocation.
     target: NonNull<FileDeleteTarget>,
-    /// Stable mounted VCB that retains the FCB until ordered CLOSE.
-    volume: NonNull<VolumeControlBlock>,
-}
-
-impl PendingCleanupDeletion {
-    /// Mounted volume whose reactor must execute this deletion.
-    pub(crate) const fn volume(&self) -> NonNull<VolumeControlBlock> {
-        self.volume
-    }
 }
 
 // SAFETY: The per-handle terminal barrier retains the FCB, target, and VCB until this value is
@@ -2501,17 +2503,13 @@ fn cleanup_opened_node(
     let cleanup = opened_file.release_share_access_for_cleanup();
     let fcb = opened_file.file_control_block_address();
     let node = opened_file.node();
-    let volume = opened_file.volume();
     opened_file.finish_cleanup();
     file_object.mark_cleanup_complete();
     Ok(match cleanup {
         FileCleanupDisposition::Retained => CleanupPlan::Complete,
-        FileCleanupDisposition::Delete(target) => CleanupPlan::Delete(PendingCleanupDeletion {
-            fcb,
-            node,
-            target,
-            volume,
-        }),
+        FileCleanupDisposition::Delete(target) => {
+            CleanupPlan::Delete(PendingCleanupDeletion { fcb, node, target })
+        }
     })
 }
 
@@ -3789,24 +3787,17 @@ fn write_regular_file_windowed(
 ) -> DriverResult<WriteResolution> {
     let stack = request.prepared_write()?.stack();
     let input_address = request.prepared_write()?.input_address();
-    let (file_id, kind, anchor, write_commitment, data_transfer_mode) =
-        request.with_active(|active| {
-            let file_object = active.current_stack()?.file_object()?;
-            let opened_file = OpenedRegularFile::decode(file_object)?;
-            let kind = active.data_io_kind();
-            let selected_start =
-                select_write_start(opened_file.write_access(), kind, stack.starting_point())?;
-            let anchor =
-                selected_start.bind_current_position(|| opened_file.current_file_position())?;
-            let data_transfer_mode = opened_file.data_transfer_mode();
-            Ok::<_, DriverError>((
-                opened_file.id(),
-                kind,
-                anchor,
-                opened_file.write_commitment(),
-                data_transfer_mode,
-            ))
-        })?;
+    let (file_id, kind, anchor, data_transfer_mode) = request.with_active(|active| {
+        let file_object = active.current_stack()?.file_object()?;
+        let opened_file = OpenedRegularFile::decode(file_object)?;
+        let kind = active.data_io_kind();
+        let selected_start =
+            select_write_start(opened_file.write_access(), kind, stack.starting_point())?;
+        let anchor =
+            selected_start.bind_current_position(|| opened_file.current_file_position())?;
+        let data_transfer_mode = opened_file.data_transfer_mode();
+        Ok::<_, DriverError>((opened_file.id(), kind, anchor, data_transfer_mode))
+    })?;
 
     let range = ResolvedFileRange::new(
         resolve_write_start(mutation, file_id, anchor)?,
@@ -3870,13 +3861,7 @@ fn write_regular_file_windowed(
     Ok(WriteResolution::Mutation(PreparedWritePublication {
         completion: IrpCompletion::from_usize(bytes_written)?,
         position,
-        commitment: write_commitment,
     }))
-}
-
-/// Claims the actor-owned operation lane referenced by one live FCB.
-fn claim_file_operation_lane(fcb: &FileControlBlock) -> VolumeAccess {
-    claim_volume_operation_lane(fcb.volume())
 }
 
 /// Claims the actor-owned operation lane for one serialized mounted-device request.

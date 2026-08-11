@@ -7,7 +7,7 @@ use core::fmt;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-use ext4_core::{MutationResource, OperationEvent, OperationId, StorageRequest};
+use ext4_core::{MutationResource, OperationEvent, StorageRequest};
 use wdk_sys::{LIST_ENTRY, NTSTATUS, PIRP, PLIST_ENTRY, PVOID};
 #[cfg(not(test))]
 use wdk_sys::{PIO_CSQ, STATUS_SUCCESS};
@@ -21,7 +21,8 @@ use crate::kernel::{
 use crate::state::{KernelDevice, KernelFileObject};
 
 use super::{
-    DispatchMajor, KernelIrp, OwnedIrp, PendingIrp, QueueContext, ReceivedIrp,
+    ActiveCancelDestination, ActiveCancelEnvelope, DispatchMajor, KernelIrp, OwnedIrp, PendingIrp,
+    QueueContext, ReceivedIrp,
     lower::{
         CompletionRundown, LowerCompletionDestination, LowerCompletionEnvelope,
         PublishedLowerRequest,
@@ -62,8 +63,144 @@ impl fmt::Debug for PublishedReactorLower {
     }
 }
 
+impl PublishedReactorLower {
+    /// Propagates cancellation to the published lower IRP without taking release authority.
+    /// # Safety
+    ///
+    /// The active slot must still retain this exact published lower identity.
+    unsafe fn cancel(&self) {
+        match self {
+            Self::Storage(lower) => unsafe {
+                // SAFETY: The active slot retains the storage envelope identity through this call.
+                lower.cancel();
+            },
+            Self::Length(lower) => unsafe {
+                // SAFETY: The active slot retains the length envelope identity through this call.
+                lower.cancel();
+            },
+        }
+    }
+}
+
 /// Hard bound shared by pending and active filesystem operations on one device.
 pub(crate) const MAX_OPERATIONS: usize = 64;
+
+/// Synchronous selector borrowed only for one `IoCsqRemoveNextIrp` traversal.
+#[repr(C)]
+struct PendingIrpSelection {
+    /// FILE_OBJECT whose not-yet-started requests are considered.
+    file_object: KernelFileObject,
+    /// Whether paging/internal requests and terminal markers must remain queued.
+    ordinary_cleanup_only: bool,
+}
+
+impl PendingIrpSelection {
+    /// Selects only ordinary requests that CLEANUP is authorized to cancel.
+    const fn cleanup(file_object: KernelFileObject) -> Self {
+        Self {
+            file_object,
+            ordinary_cleanup_only: true,
+        }
+    }
+}
+
+/// Requests whose FILE_OBJECT lifetime legally continues after CLEANUP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PostCleanupRequest {
+    /// Paging read captured from `IRP_PAGING_IO`.
+    PagingRead,
+    /// Paging write captured from `IRP_PAGING_IO`.
+    PagingWrite,
+    /// Explicit device flush that accesses no user-visible handle authority.
+    FlushBuffers,
+    /// Terminal context release after every earlier post-cleanup request drains.
+    Close,
+}
+
+/// Exact per-handle scheduler lane selected at operation admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HandleOperationLane {
+    /// Normal request admitted only while the handle is open.
+    Ordinary,
+    /// Terminal cleanup barrier that closes ordinary admission.
+    Cleanup,
+    /// Explicitly legal post-cleanup request.
+    PostCleanup(PostCleanupRequest),
+}
+
+/// Scheduler identity retained independently from operation payloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationAdmission {
+    /// Device-wide request with no FILE_OBJECT serialization requirement.
+    Device,
+    /// Request serialized in one stable FILE_OBJECT lane.
+    Handle {
+        /// Stable FILE_OBJECT identity retained until CLOSE consumes the lane.
+        file_object: KernelFileObject,
+        /// Typed lifecycle lane.
+        lane: HandleOperationLane,
+    },
+}
+
+impl OperationAdmission {
+    /// Returns the per-handle identity, if this is not a device-wide request.
+    const fn file_object(self) -> Option<KernelFileObject> {
+        match self {
+            Self::Device => None,
+            Self::Handle { file_object, .. } => Some(file_object),
+        }
+    }
+
+    /// Returns whether CLEANUP may cancel this active ordinary request.
+    const fn is_ordinary_handle(self) -> bool {
+        matches!(
+            self,
+            Self::Handle {
+                lane: HandleOperationLane::Ordinary,
+                ..
+            }
+        )
+    }
+
+    /// Returns whether cancellation must not preempt this terminal lifecycle operation.
+    const fn is_terminal_handle_barrier(self) -> bool {
+        matches!(
+            self,
+            Self::Handle {
+                lane: HandleOperationLane::Cleanup
+                    | HandleOperationLane::PostCleanup(PostCleanupRequest::Close),
+                ..
+            }
+        )
+    }
+}
+
+/// Fallibly allocated operation paired with its allocation-free scheduler admission identity.
+#[derive(Debug)]
+pub(crate) struct AdmittedOperation {
+    /// Consuming operation state machine.
+    operation: Box<dyn CompletionOperation>,
+    /// Independent handle/device lane identity.
+    admission: OperationAdmission,
+}
+
+impl AdmittedOperation {
+    /// Binds a successfully allocated operation to its scheduler lane.
+    pub(crate) const fn new(
+        operation: Box<dyn CompletionOperation>,
+        admission: OperationAdmission,
+    ) -> Self {
+        Self {
+            operation,
+            admission,
+        }
+    }
+
+    /// Separates operation ownership from its independent lane identity.
+    fn into_parts(self) -> (Box<dyn CompletionOperation>, OperationAdmission) {
+        (self.operation, self.admission)
+    }
+}
 
 /// One concrete operation advanced only by a matching scheduler event.
 ///
@@ -437,6 +574,11 @@ enum ActivePhase {
         /// Concrete event that made this slot ready.
         event: OperationEvent,
     },
+    /// Operation is retained until its exact earlier FILE_OBJECT predecessor terminates.
+    HandleTurn {
+        /// Owned state machine that has not yet received its admission event.
+        operation: Box<dyn CompletionOperation>,
+    },
     /// Resource intents are queued under FIFO arbitration.
     Intent {
         /// Complete request retained for atomic acquisition.
@@ -473,6 +615,7 @@ impl fmt::Debug for ActivePhase {
         match self {
             Self::Vacant => formatter.write_str("Vacant"),
             Self::Ready { .. } => formatter.write_str("Ready"),
+            Self::HandleTurn { .. } => formatter.write_str("HandleTurn"),
             Self::Intent { .. } => formatter.write_str("Intent"),
             Self::Commit { .. } => formatter.write_str("Commit"),
             Self::Waiting { .. } => formatter.write_str("Waiting"),
@@ -492,8 +635,25 @@ struct ActiveSlot {
     intent: Option<HeldIntent>,
     /// Commit grant retained until durable publication or harmless pre-write abandonment.
     commit: Option<HeldCommit>,
+    /// A top-level cancel has been published but not yet consumed by the operation.
+    cancel_pending: bool,
+    /// Lower cancellation remains legal until the first effect-bearing write/flush submission.
+    cancel_enabled: bool,
+    /// Device or exact FILE_OBJECT lane retained independently from the operation allocation.
+    admission: Option<OperationAdmission>,
+    /// Exact earlier same-handle slot that must terminate before admission is delivered.
+    predecessor: Option<ActiveSlotIdentity>,
     /// Current ownership phase.
     phase: ActivePhase,
+}
+
+/// Generation-checked active-slot identity used only by bounded per-handle predecessor chains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveSlotIdentity {
+    /// Fixed registry index.
+    index: usize,
+    /// Monotonic reuse generation at that index.
+    generation: u64,
 }
 
 /// Address-stable timer/DPC envelope for one bounded retry slot.
@@ -593,6 +753,10 @@ impl ActiveSlot {
             generation: 0,
             intent: None,
             commit: None,
+            cancel_pending: false,
+            cancel_enabled: false,
+            admission: None,
+            predecessor: None,
             phase: ActivePhase::Vacant,
         }
     }
@@ -621,6 +785,8 @@ pub(crate) struct CompletionReactor {
     wake_event: wdk_sys::KEVENT,
     /// Bitset of retry timer events published by DPC callbacks.
     retry_ready: AtomicU64,
+    /// Bitset of active top-level cancel events published by cancel routines.
+    cancel_ready: AtomicU64,
     /// Running/draining/stopped lifecycle.
     lifecycle: AtomicU8,
     /// Capture-to-CSQ insertion teardown gate.
@@ -633,6 +799,8 @@ pub(crate) struct CompletionReactor {
     active: UnsafeCell<[ActiveSlot; MAX_OPERATIONS]>,
     /// One address-stable native timer envelope per bounded active slot.
     retry_timers: [RetryTimerEnvelope; MAX_OPERATIONS],
+    /// One address-stable top-level cancel envelope per bounded active slot.
+    cancel_envelopes: [ActiveCancelEnvelope; MAX_OPERATIONS],
     /// Device object owning this stable extension.
     device: KernelDevice,
 }
@@ -686,12 +854,14 @@ impl CompletionReactor {
                     admitted: AtomicUsize::new(0),
                     wake_event: wdk_sys::KEVENT::default(),
                     retry_ready: AtomicU64::new(0),
+                    cancel_ready: AtomicU64::new(0),
                     lifecycle: AtomicU8::new(ReactorState::Running.as_raw()),
                     admission: AdmissionRundown::new(),
                     completion_rundown: CompletionRundown::new(),
                     thread_handle: core::ptr::null_mut(),
                     active: UnsafeCell::new(core::array::from_fn(|_| ActiveSlot::vacant())),
                     retry_timers: core::array::from_fn(RetryTimerEnvelope::inert),
+                    cancel_envelopes: core::array::from_fn(ActiveCancelEnvelope::inert),
                     device,
                 },
             );
@@ -714,6 +884,20 @@ impl CompletionReactor {
             unsafe {
                 // SAFETY: Every timer and the reactor itself are now at their final addresses.
                 timer.initialize(NonNull::from(reactor));
+            }
+        }
+        #[cfg(not(test))]
+        for envelope in &reactor.cancel_envelopes {
+            let destination = unsafe {
+                // SAFETY: Reactor storage is now final-address and remains live through drain.
+                ActiveCancelDestination::new(
+                    NonNull::from(reactor).cast::<c_void>(),
+                    publish_active_cancel,
+                )
+            };
+            unsafe {
+                // SAFETY: Each fixed envelope is initialized exactly once before device exposure.
+                envelope.initialize(destination);
             }
         }
 
@@ -794,20 +978,6 @@ impl CompletionReactor {
         if reactor.state() != ReactorState::Running {
             return received.complete_result(Err(DriverError::InvalidDeviceRequest));
         }
-        if major == DispatchMajor::Cleanup {
-            let file_object = match received.with_active(|active| {
-                active
-                    .current_stack()?
-                    .file_object()
-                    .map(|file_object| file_object.address())
-            }) {
-                Ok(file_object) => file_object,
-                Err(error) => return received.complete_result(Err(error)),
-            };
-            if let Err(error) = Self::cancel_file_object(received.device(), file_object) {
-                return received.complete_result(Err(error));
-            }
-        }
         let reservation = match OperationReservation::acquire(&reactor.admitted) {
             Ok(reservation) => reservation,
             Err(error) => return received.complete_result(Err(error)),
@@ -822,24 +992,16 @@ impl CompletionReactor {
         status
     }
 
-    /// Cancels every not-yet-started ordinary IRP for one FILE_OBJECT.
-    pub(crate) fn cancel_file_object(
-        device: KernelDevice,
-        file_object: KernelFileObject,
-    ) -> DriverResult<()> {
-        let reactor = Self::from_device(device)?;
-        let reactor = unsafe {
-            // SAFETY: Cleanup keeps the mounted device extension live.
-            reactor.as_ref()
-        };
-        let context = file_object.as_ptr().cast::<c_void>();
+    /// Removes and completes every queued ordinary request for one FILE_OBJECT.
+    fn cancel_pending_ordinary(&self, file_object: KernelFileObject) {
+        let selection = PendingIrpSelection::cleanup(file_object);
         loop {
-            let irp = reactor.remove_next_irp(context);
+            let irp = self.remove_next_irp(Some(&selection));
             if irp.is_null() {
-                return Ok(());
+                return;
             }
-            let owned = OwnedIrp::from_queued_raw(reactor.device, irp);
-            release_operation_reservation(&reactor.admitted);
+            let owned = OwnedIrp::from_queued_raw(self.device, irp);
+            release_operation_reservation(&self.admitted);
             let _status = owned.complete_cancelled();
         }
     }
@@ -884,8 +1046,11 @@ impl CompletionReactor {
         }
     }
 
-    /// Removes the next queued IRP matching an optional FILE_OBJECT identity.
-    fn remove_next_irp(&self, context: PVOID) -> PIRP {
+    /// Removes the next queued IRP matching an optional synchronous selection.
+    fn remove_next_irp(&self, selection: Option<&PendingIrpSelection>) -> PIRP {
+        let context = selection.map_or(core::ptr::null_mut(), |selection| {
+            core::ptr::from_ref(selection).cast_mut().cast::<c_void>()
+        });
         #[cfg(not(test))]
         unsafe {
             // SAFETY: The CSQ serializes removal with insertion and cancellation.
@@ -947,11 +1112,8 @@ impl CompletionReactor {
         core::ptr::null_mut()
     }
 
-    /// Allocates one vacant active slot and installs its admission event.
-    fn install_admitted(
-        &self,
-        operation: Box<dyn CompletionOperation>,
-    ) -> DriverResult<OperationId> {
+    /// Reserves one vacant slot before its stable active-cancel envelope becomes visible.
+    fn reserve_active_slot(&self) -> DriverResult<usize> {
         let slots = unsafe {
             // SAFETY: Only the dedicated reactor thread installs or advances operation payloads.
             &mut *self.active.get()
@@ -967,20 +1129,253 @@ impl CompletionReactor {
             .generation
             .checked_add(1)
             .ok_or(DriverError::InternalInvariantViolation)?;
-        let generation = slot.generation;
-        let index = u64::try_from(index).map_err(|_| DriverError::InternalInvariantViolation)?;
-        let raw = generation
-            .checked_mul(
-                u64::try_from(MAX_OPERATIONS)
-                    .map_err(|_| DriverError::InternalInvariantViolation)?,
-            )
-            .and_then(|base| base.checked_add(index))
-            .ok_or(DriverError::InternalInvariantViolation)?;
-        slot.phase = ActivePhase::Ready {
-            operation,
-            event: OperationEvent::Admitted,
+        slot.cancel_pending = false;
+        slot.cancel_enabled = true;
+        slot.admission = None;
+        slot.predecessor = None;
+        Ok(index)
+    }
+
+    /// Installs an operation after cancellation was bound to its reserved fixed slot.
+    #[cfg(not(test))]
+    fn install_admitted_at(&self, index: usize, admitted: AdmittedOperation) {
+        let (operation, admission) = admitted.into_parts();
+        let cancelled = self.take_cancel_bit(index);
+        let slots = unsafe {
+            // SAFETY: Only the reactor thread installs the operation payload.
+            &mut *self.active.get()
         };
-        Ok(OperationId::from_raw(raw))
+        let Some(slot) = slots.get_mut(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        if !matches!(slot.phase, ActivePhase::Vacant)
+            || slot.intent.is_some()
+            || slot.commit.is_some()
+            || slot.admission.is_some()
+            || slot.predecessor.is_some()
+        {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        let terminal_barrier = admission.is_terminal_handle_barrier();
+        let predecessor = admission
+            .file_object()
+            .and_then(|file_object| latest_handle_predecessor(slots, index, file_object));
+        let Some(slot) = slots.get_mut(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        slot.cancel_enabled = !terminal_barrier;
+        slot.cancel_pending = cancelled && !terminal_barrier;
+        slot.admission = Some(admission);
+        slot.predecessor = predecessor;
+        slot.phase = if slot.cancel_pending {
+            ActivePhase::Ready {
+                operation,
+                event: OperationEvent::CancelRequested,
+            }
+        } else if predecessor.is_some() {
+            ActivePhase::HandleTurn { operation }
+        } else {
+            ActivePhase::Ready {
+                operation,
+                event: OperationEvent::Admitted,
+            }
+        };
+
+        if let OperationAdmission::Handle {
+            file_object,
+            lane: HandleOperationLane::Cleanup,
+        } = admission
+        {
+            self.cancel_active_ordinary_for_cleanup(index, file_object);
+            self.cancel_pending_ordinary(file_object);
+        }
+    }
+
+    /// Publishes cancellation to every active ordinary operation preceding one CLEANUP barrier.
+    #[cfg(not(test))]
+    fn cancel_active_ordinary_for_cleanup(
+        &self,
+        cleanup_index: usize,
+        file_object: KernelFileObject,
+    ) {
+        let mut targets = 0_u64;
+        {
+            let slots = unsafe {
+                // SAFETY: Only the reactor thread observes independent admission metadata.
+                &*self.active.get()
+            };
+            for (index, slot) in slots.iter().enumerate() {
+                if index != cleanup_index
+                    && slot.admission.is_some_and(|admission| {
+                        admission.file_object() == Some(file_object)
+                            && admission.is_ordinary_handle()
+                    })
+                {
+                    targets |= slot_bit(index);
+                }
+            }
+        }
+        while targets != 0 {
+            let index = match usize::try_from(targets.trailing_zeros()) {
+                Ok(index) => index,
+                Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+            };
+            targets &= !slot_bit(index);
+            self.request_active_cancel(index);
+        }
+    }
+
+    /// Clears cancellation bookkeeping after terminal IRP authority has been consumed.
+    fn retire_cancel_slot(&self, index: usize) {
+        let _was_pending = self.take_cancel_bit(index);
+        let slots = unsafe {
+            // SAFETY: Only the reactor thread retires slot-local cancellation state.
+            &mut *self.active.get()
+        };
+        let Some(slot) = slots.get_mut(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        slot.cancel_pending = false;
+        slot.cancel_enabled = false;
+    }
+
+    /// Replaces the operation's next action with its already-published cancel event when legal.
+    fn resume_cancel_if_requested(
+        &self,
+        index: usize,
+        suspended: SuspendedOperation,
+    ) -> Option<SuspendedOperation> {
+        let slots = unsafe {
+            // SAFETY: Only the reactor thread observes slot-local cancellation state.
+            &mut *self.active.get()
+        };
+        let Some(slot) = slots.get_mut(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        if slot.cancel_enabled && slot.cancel_pending {
+            if !matches!(slot.phase, ActivePhase::Vacant) {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            }
+            slot.phase = ActivePhase::Ready {
+                operation: suspended,
+                event: OperationEvent::CancelRequested,
+            };
+            None
+        } else {
+            Some(suspended)
+        }
+    }
+
+    /// Consumes lower-cancel authority before the first effect-bearing write or flush.
+    fn disable_cancellation(&self, index: usize) {
+        let _was_pending = self.take_cancel_bit(index);
+        let slots = unsafe {
+            // SAFETY: Only the reactor thread consumes slot-local cancel authority.
+            &mut *self.active.get()
+        };
+        let Some(slot) = slots.get_mut(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        slot.cancel_pending = false;
+        slot.cancel_enabled = false;
+    }
+
+    /// Returns whether one legal cancel event remains pending for this operation.
+    fn cancellation_is_pending(&self, index: usize) -> bool {
+        let slots = unsafe {
+            // SAFETY: Only the reactor thread reads slot-local cancellation state here.
+            &*self.active.get()
+        };
+        let Some(slot) = slots.get(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        slot.cancel_enabled && slot.cancel_pending
+    }
+
+    /// Installs one resumed event, giving an already-published legal cancel precedence.
+    fn set_ready_operation_event(
+        &self,
+        index: usize,
+        operation: SuspendedOperation,
+        event: OperationEvent,
+    ) {
+        let event = if self.cancellation_is_pending(index) {
+            OperationEvent::CancelRequested
+        } else {
+            event
+        };
+        self.set_phase(index, ActivePhase::Ready { operation, event });
+    }
+
+    /// Atomically consumes this fixed slot's callback-published cancel bit.
+    fn take_cancel_bit(&self, index: usize) -> bool {
+        let mask = slot_bit(index);
+        self.cancel_ready.fetch_and(!mask, Ordering::AcqRel) & mask != 0
+    }
+
+    /// Consumes callback-published active cancels without touching unrelated operations.
+    #[cfg(not(test))]
+    fn drain_active_cancels(&self) -> bool {
+        let mut ready = self.cancel_ready.swap(0, Ordering::AcqRel);
+        if ready == 0 {
+            return false;
+        }
+        while ready != 0 {
+            let index = match usize::try_from(ready.trailing_zeros()) {
+                Ok(index) => index,
+                Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+            };
+            let mask = slot_bit(index);
+            ready &= !mask;
+            self.request_active_cancel(index);
+        }
+        true
+    }
+
+    /// Publishes cancellation into one active slot or its exact published lower request.
+    #[cfg(not(test))]
+    fn request_active_cancel(&self, index: usize) {
+        let slots = unsafe {
+            // SAFETY: Only the reactor thread mutates active phases and cancellation state.
+            &mut *self.active.get()
+        };
+        let Some(slot) = slots.get_mut(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        if !slot.cancel_enabled {
+            slot.cancel_pending = false;
+            return;
+        }
+        slot.cancel_pending = true;
+        let phase = core::mem::replace(&mut slot.phase, ActivePhase::Vacant);
+        slot.phase = match phase {
+            ActivePhase::Ready { operation, .. } => ActivePhase::Ready {
+                operation,
+                event: OperationEvent::CancelRequested,
+            },
+            ActivePhase::HandleTurn { operation } => ActivePhase::Ready {
+                operation,
+                event: OperationEvent::CancelRequested,
+            },
+            ActivePhase::Intent { operation, .. }
+            | ActivePhase::Commit { operation, .. }
+            | ActivePhase::Waiting { operation, .. } => ActivePhase::Ready {
+                operation,
+                event: OperationEvent::CancelRequested,
+            },
+            ActivePhase::Lower(lower) => {
+                unsafe {
+                    // SAFETY: This active phase retains the exact published lower identity.
+                    lower.cancel();
+                }
+                ActivePhase::Lower(lower)
+            }
+            ActivePhase::Retry(retry) => ActivePhase::Retry(retry),
+            ActivePhase::Registering => ActivePhase::Registering,
+            ActivePhase::Vacant => {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            }
+        };
     }
 
     /// Returns whether any active slot still owns work.
@@ -1010,7 +1405,7 @@ impl CompletionReactor {
         reactor.begin_drain();
         reactor.admission.close_and_wait();
         loop {
-            let irp = reactor.remove_next_irp(core::ptr::null_mut());
+            let irp = reactor.remove_next_irp(None);
             if irp.is_null() {
                 break;
             }
@@ -1075,6 +1470,7 @@ impl CompletionReactor {
         loop {
             let mut progressed = self.drain_storage_completions();
             progressed |= self.drain_length_completions();
+            progressed |= self.drain_active_cancels();
             progressed |= self.drain_retry_events();
             progressed |= self.admit_pending_requests();
             progressed |= self.drive_ready_operations();
@@ -1119,22 +1515,31 @@ impl CompletionReactor {
     fn admit_pending_requests(&self) -> bool {
         let mut admitted_any = false;
         loop {
-            let irp = self.remove_next_irp(core::ptr::null_mut());
+            let irp = self.remove_next_irp(None);
             if irp.is_null() {
                 return admitted_any;
             }
             admitted_any = true;
-            let owned = OwnedIrp::from_queued_raw(self.device, irp);
+            let mut owned = OwnedIrp::from_queued_raw(self.device, irp);
+            let index = match self.reserve_active_slot() {
+                Ok(index) => index,
+                Err(_) => {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
+            };
+            let Some(envelope) = self.cancel_envelopes.get(index) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            owned.install_active_cancellation(NonNull::from(envelope));
             match crate::request::dispatch::admit_owned(owned) {
                 Ok(operation) => {
-                    if self.install_admitted(operation).is_err() {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    }
+                    self.install_admitted_at(index, operation);
                 }
                 Err(error) => {
                     let (error, owned) = error.into_parts();
                     release_operation_reservation(&self.admitted);
                     let _status = owned.complete_result(Err(error));
+                    self.retire_cancel_slot(index);
                 }
             }
         }
@@ -1178,13 +1583,34 @@ impl CompletionReactor {
                 completion_owner,
                 target,
                 suspended,
-            } => self.submit_device_length(index, completion_owner, target, suspended),
+            } => {
+                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                    return;
+                };
+                self.submit_device_length(index, completion_owner, target, suspended);
+            }
             OperationTransition::SubmitLower {
                 devices,
                 request,
                 suspended,
-            } => self.submit_storage(index, devices, request, suspended),
+            } => {
+                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                    drop(request);
+                    return;
+                };
+                if matches!(
+                    request,
+                    StorageRequest::Write { .. } | StorageRequest::Flush { .. }
+                ) {
+                    self.disable_cancellation(index);
+                }
+                self.submit_storage(index, devices, request, suspended);
+            }
             OperationTransition::RequestIntent { request, suspended } => {
+                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                    drop(request);
+                    return;
+                };
                 self.release_intent(index);
                 self.set_phase(
                     index,
@@ -1200,6 +1626,9 @@ impl CompletionReactor {
                 ticket,
                 suspended,
             } => {
+                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                    return;
+                };
                 self.set_phase(
                     index,
                     ActivePhase::Commit {
@@ -1217,6 +1646,9 @@ impl CompletionReactor {
                 condition,
                 suspended,
             } => {
+                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                    return;
+                };
                 self.set_phase(
                     index,
                     ActivePhase::Waiting {
@@ -1227,8 +1659,13 @@ impl CompletionReactor {
                 self.grant_available_wait(index);
             }
             OperationTransition::Publish { publication } => {
-                self.consume_publication_authority(index, publication.authority());
+                let authority = publication.authority();
+                self.consume_publication_authority(index, authority);
                 let operation = publication.publish();
+                if matches!(authority, PublicationAuthority::Durable { .. }) {
+                    self.retire_cancel_slot(index);
+                    self.release_handle_lane(index);
+                }
                 self.set_phase(
                     index,
                     ActivePhase::Ready {
@@ -1239,15 +1676,19 @@ impl CompletionReactor {
                 self.grant_available_intents();
                 self.grant_available_commit();
                 self.grant_all_available_waits();
+                self.grant_all_handle_turns();
             }
             OperationTransition::Complete => {
                 self.release_intent(index);
                 self.abandon_commit(index);
                 self.set_phase(index, ActivePhase::Vacant);
+                self.release_handle_lane(index);
+                self.retire_cancel_slot(index);
                 release_operation_reservation(&self.admitted);
                 self.grant_available_intents();
                 self.grant_available_commit();
                 self.grant_all_available_waits();
+                self.grant_all_handle_turns();
             }
         }
     }
@@ -1266,6 +1707,59 @@ impl CompletionReactor {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
         slot.phase = phase;
+    }
+
+    /// Detaches one top-level FILE_OBJECT lane while a post-publication checkpoint may continue.
+    #[cfg(not(test))]
+    fn release_handle_lane(&self, index: usize) {
+        let slots = unsafe {
+            // SAFETY: Only the reactor thread mutates scheduler admission metadata.
+            &mut *self.active.get()
+        };
+        let Some(slot) = slots.get_mut(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        slot.admission = None;
+        slot.predecessor = None;
+    }
+
+    /// Delivers admission only to handle operations whose exact predecessor has terminated.
+    #[cfg(not(test))]
+    fn grant_all_handle_turns(&self) {
+        for index in 0..MAX_OPERATIONS {
+            let ready = {
+                let slots = unsafe {
+                    // SAFETY: Only the reactor thread observes the fixed predecessor registry.
+                    &*self.active.get()
+                };
+                let Some(slot) = slots.get(index) else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                matches!(slot.phase, ActivePhase::HandleTurn { .. })
+                    && slot
+                        .predecessor
+                        .is_none_or(|predecessor| !active_predecessor_is_live(slots, predecessor))
+            };
+            if !ready {
+                continue;
+            }
+            let slots = unsafe {
+                // SAFETY: Only the reactor thread moves the now-unblocked operation payload.
+                &mut *self.active.get()
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            let phase = core::mem::replace(&mut slot.phase, ActivePhase::Vacant);
+            let ActivePhase::HandleTurn { operation } = phase else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            slot.predecessor = None;
+            slot.phase = ActivePhase::Ready {
+                operation,
+                event: OperationEvent::Admitted,
+            };
+        }
     }
 
     /// Releases any resource set retained by one slot.
@@ -1439,6 +1933,14 @@ impl CompletionReactor {
         index: usize,
         prepared: PreparedStorageCommand<SuspendedOperation>,
     ) {
+        if prepared.is_effect_bearing() {
+            if self.cancellation_is_pending(index) {
+                let (suspended, _request) = prepared.into_command().into_parts();
+                self.set_ready_operation_event(index, suspended, OperationEvent::CancelRequested);
+                return;
+            }
+            self.disable_cancellation(index);
+        }
         let Some(rundown) = self.completion_rundown.acquire() else {
             let command = prepared.into_command();
             let (suspended, request) = command.into_parts();
@@ -1590,33 +2092,42 @@ impl CompletionReactor {
             };
             match completed.advance() {
                 Ok(StorageCommandStep::SubmitNext(prepared)) => {
-                    self.submit_prepared_storage(index, prepared);
+                    if self.cancellation_is_pending(index) {
+                        let (suspended, _request) = prepared.into_command().into_parts();
+                        self.set_ready_operation_event(
+                            index,
+                            suspended,
+                            OperationEvent::CancelRequested,
+                        );
+                    } else {
+                        self.disable_cancellation(index);
+                        self.submit_prepared_storage(index, prepared);
+                    }
                 }
                 Ok(StorageCommandStep::Complete {
                     suspended,
                     completion,
                 }) => {
-                    self.set_phase(
+                    self.set_ready_operation_event(
                         index,
-                        ActivePhase::Ready {
-                            operation: suspended,
-                            event: OperationEvent::StorageCompleted(completion),
-                        },
+                        suspended,
+                        OperationEvent::StorageCompleted(completion),
                     );
                 }
                 Ok(StorageCommandStep::Failed(failed)) => match failed.into_retry() {
-                    Ok(retry) => self.arm_retry(index, retry),
+                    Ok(retry) => {
+                        self.apply_transition(index, OperationTransition::ArmRetry { retry })
+                    }
                     Err(failed) => {
                         let (mut suspended, request, class) = failed.into_failure();
                         suspended.record_storage_failure(class);
-                        self.set_phase(
+                        self.set_ready_operation_event(
                             index,
-                            ActivePhase::Ready {
-                                operation: suspended,
-                                event: OperationEvent::StorageCompleted(
-                                    failed_unsubmitted_request(request, ext4_core::Error::DeviceIo),
-                                ),
-                            },
+                            suspended,
+                            OperationEvent::StorageCompleted(failed_unsubmitted_request(
+                                request,
+                                ext4_core::Error::DeviceIo,
+                            )),
                         );
                     }
                 },
@@ -1680,12 +2191,10 @@ impl CompletionReactor {
                 LowerCompletionEnvelope::reclaim(envelope)
             };
             match completed.finish() {
-                Ok((suspended, length)) => self.set_phase(
+                Ok((suspended, length)) => self.set_ready_operation_event(
                     index,
-                    ActivePhase::Ready {
-                        operation: suspended,
-                        event: OperationEvent::DeviceLengthCompleted(Ok(length)),
-                    },
+                    suspended,
+                    OperationEvent::DeviceLengthCompleted(Ok(length)),
                 ),
                 Err((suspended, error)) => {
                     self.set_ready_length_failure(index, suspended, error);
@@ -1740,6 +2249,11 @@ impl CompletionReactor {
     /// Retains one retry command until its concrete fixed-delay timer event arrives.
     #[cfg(not(test))]
     fn arm_retry(&self, index: usize, retry: RetryingStorageCommand<SuspendedOperation>) {
+        if self.cancellation_is_pending(index) {
+            let (suspended, _request) = retry.into_parts();
+            self.set_ready_operation_event(index, suspended, OperationEvent::CancelRequested);
+            return;
+        }
         let delay = retry.delay();
         self.set_phase(index, ActivePhase::Retry(retry));
         let generation = {
@@ -1799,6 +2313,11 @@ impl CompletionReactor {
                 };
                 retry
             };
+            if self.cancellation_is_pending(index) {
+                let (suspended, _request) = retry.into_parts();
+                self.set_ready_operation_event(index, suspended, OperationEvent::CancelRequested);
+                continue;
+            }
             let prepared = match retry.permitted() {
                 Ok(prepared) => prepared,
                 Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
@@ -2062,6 +2581,57 @@ fn volume_has_commit_work(
     })
 }
 
+/// Returns whether a generation-checked predecessor still retains any active phase.
+fn active_predecessor_is_live(
+    slots: &[ActiveSlot; MAX_OPERATIONS],
+    predecessor: ActiveSlotIdentity,
+) -> bool {
+    let Some(slot) = slots.get(predecessor.index) else {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    };
+    slot.generation == predecessor.generation && !matches!(slot.phase, ActivePhase::Vacant)
+}
+
+/// Finds the unique tail of one bounded FILE_OBJECT predecessor chain.
+fn latest_handle_predecessor(
+    slots: &[ActiveSlot; MAX_OPERATIONS],
+    reserved_index: usize,
+    file_object: KernelFileObject,
+) -> Option<ActiveSlotIdentity> {
+    let mut tail = None;
+    for (index, slot) in slots.iter().enumerate() {
+        if index == reserved_index
+            || matches!(slot.phase, ActivePhase::Vacant)
+            || slot.admission.and_then(OperationAdmission::file_object) != Some(file_object)
+        {
+            continue;
+        }
+        let identity = ActiveSlotIdentity {
+            index,
+            generation: slot.generation,
+        };
+        let has_successor = slots
+            .iter()
+            .enumerate()
+            .any(|(successor_index, successor)| {
+                successor_index != reserved_index
+                    && !matches!(successor.phase, ActivePhase::Vacant)
+                    && successor
+                        .admission
+                        .and_then(OperationAdmission::file_object)
+                        == Some(file_object)
+                    && successor.predecessor == Some(identity)
+            });
+        if has_successor {
+            continue;
+        }
+        if tail.replace(identity).is_some() {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+    }
+    tail
+}
+
 /// Whether two complete resource sets overlap.
 fn resource_sets_overlap(left: &[MutationResource], right: &[MutationResource]) -> bool {
     left.iter().any(|resource| right.contains(resource))
@@ -2102,6 +2672,33 @@ fn earlier_queued_intent_conflicts(
 // SAFETY: Stable device placement and documented spin-lock/reactor-thread disciplines serialize
 // every interior field.
 unsafe impl Sync for CompletionReactor {}
+
+/// Returns the single bit assigned to one validated bounded slot index.
+fn slot_bit(index: usize) -> u64 {
+    let shift = match u32::try_from(index) {
+        Ok(shift) => shift,
+        Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+    };
+    match 1_u64.checked_shl(shift) {
+        Some(mask) => mask,
+        None => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+    }
+}
+
+/// Cancel-routine destination that publishes one fixed-slot event and wakes the reactor.
+/// # Safety
+///
+/// `context` must identify the live final-address reactor owning `index`'s cancel envelope.
+#[cfg(not(test))]
+unsafe fn publish_active_cancel(context: NonNull<c_void>, index: usize) {
+    let reactor = unsafe {
+        // SAFETY: Active top-level IRP ownership retains the reactor through token removal.
+        context.cast::<CompletionReactor>().as_ref()
+    };
+    let mask = slot_bit(index);
+    reactor.cancel_ready.fetch_or(mask, Ordering::AcqRel);
+    reactor.wake();
+}
 
 /// Completion destination invoked after the private IRP/MDL release protocol has published data.
 /// # Safety
@@ -2425,14 +3022,27 @@ fn irp_from_list_entry(entry: PLIST_ENTRY) -> PIRP {
         .cast::<wdk_sys::IRP>()
 }
 
-/// Tests one queued IRP's captured FILE_OBJECT cancellation key under the CSQ lock.
+/// Tests one queued IRP against the synchronous selector under the CSQ lock.
 fn queued_irp_matches_context(irp: PIRP, context: PVOID) -> bool {
     let Some(irp) = KernelIrp::from_raw(irp) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
+    if context.is_null() {
+        return unsafe {
+            // SAFETY: Queue membership retains the published context throughout this comparison.
+            irp.published_queue_context_matches(core::ptr::null_mut(), false)
+        };
+    }
+    let selection = unsafe {
+        // SAFETY: `remove_next_irp` lends this exact selector for the synchronous CSQ traversal.
+        &*context.cast::<PendingIrpSelection>()
+    };
     unsafe {
         // SAFETY: Queue membership retains the published context throughout this comparison.
-        irp.published_queue_context_matches(context)
+        irp.published_queue_context_matches(
+            selection.file_object.as_ptr().cast::<c_void>(),
+            selection.ordinary_cleanup_only,
+        )
     }
 }
 
