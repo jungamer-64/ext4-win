@@ -346,11 +346,6 @@ impl EpochLease {
             _ => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
         }
     }
-
-    /// Epoch identity retained by this lease.
-    pub(crate) fn sequence(&self) -> EpochSequence {
-        self.epoch().sequence()
-    }
 }
 
 impl fmt::Debug for EpochLease {
@@ -510,11 +505,6 @@ impl VolumeRuntime {
     /// Validated mounted lower devices.
     pub(crate) const fn storage(&self) -> MountedStorageDevices {
         self.storage
-    }
-
-    /// Current failure state.
-    pub(crate) const fn failure(&self) -> VolumeFailureState {
-        self.failure
     }
 
     /// Whether journal space has no granted commit or published overlay awaiting checkpoint.

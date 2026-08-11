@@ -13,8 +13,7 @@ use crate::irp::lower::{
 };
 #[cfg(not(test))]
 use crate::irp::lower::{
-    CompletionRundownLease, LowerBuildError, LowerCompletionDestination, LowerRegistrationError,
-    PreparedLowerIrp,
+    CompletionRundownLease, LowerBuildError, LowerCompletionDestination, PreparedLowerIrp,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory;
@@ -28,6 +27,14 @@ const STATUS_RETRY: NTSTATUS = i32::from_ne_bytes(0xC000_022D_u32.to_ne_bytes())
 const STATUS_DEVICE_NOT_READY: NTSTATUS = i32::from_ne_bytes(0xC000_00A3_u32.to_ne_bytes());
 /// Read-retryable but write-ambiguous status `STATUS_IO_TIMEOUT`.
 const STATUS_IO_TIMEOUT: NTSTATUS = i32::from_ne_bytes(0xC000_00B5_u32.to_ne_bytes());
+/// Lower medium returned a CRC failure.
+const STATUS_CRC_ERROR: NTSTATUS = i32::from_ne_bytes(0xC000_003F_u32.to_ne_bytes());
+/// Lower medium reported data it cannot reliably recover.
+const STATUS_DEVICE_DATA_ERROR: NTSTATUS = i32::from_ne_bytes(0xC000_009C_u32.to_ne_bytes());
+/// Lower device stack reported a terminal I/O device failure.
+const STATUS_IO_DEVICE_ERROR: NTSTATUS = i32::from_ne_bytes(0xC000_0185_u32.to_ne_bytes());
+/// Requested medium sector no longer exists.
+const STATUS_NONEXISTENT_SECTOR: NTSTATUS = i32::from_ne_bytes(0xC000_0015_u32.to_ne_bytes());
 
 /// Initial try plus two delayed retries.
 const MAX_STORAGE_ATTEMPTS: u8 = 3;
@@ -290,6 +297,14 @@ impl<O> PreparedStorageCommand<O> {
     /// Recovers the command when teardown closes completion rundown before IRP construction.
     pub(crate) fn into_command(self) -> StorageCommand<O> {
         self.command
+    }
+
+    /// Whether submission may mutate device durability state.
+    pub(crate) const fn is_effect_bearing(&self) -> bool {
+        matches!(
+            self.operation,
+            LowerOperation::Write | LowerOperation::Flush
+        )
     }
 
     /// Allocates and prepares one command without exposing it to a lower driver.
@@ -560,6 +575,8 @@ pub enum StorageRetryDelay {
 pub enum StorageFailureClass {
     /// Read/preparation failure with no durable ambiguity.
     Terminal,
+    /// A lower read reported a medium/device failure that invalidates future committed reads.
+    ReadUnreliable,
     /// A write or flush may have taken effect and journal abort/recovery is required.
     DurabilityUnknown,
 }
@@ -578,18 +595,23 @@ pub struct FailedStorageCommand<O> {
 }
 
 impl<O> FailedStorageCommand<O> {
-    /// Raw terminal lower status for volume diagnostics.
-    pub const fn status(&self) -> NTSTATUS {
-        self.status
-    }
-
     /// Converts a non-retryable failure into its operation, request, and durability class.
     pub fn into_failure(self) -> (O, StorageRequest, StorageFailureClass) {
         let effect_free_write_failure = matches!(
             self.status,
             STATUS_DEVICE_BUSY | STATUS_RETRY | STATUS_DEVICE_NOT_READY
         ) && self.information == 0;
-        let class = if self.command.read_retry_policy() || effect_free_write_failure {
+        let read_unreliable = self.command.read_retry_policy()
+            && matches!(
+                self.status,
+                STATUS_CRC_ERROR
+                    | STATUS_DEVICE_DATA_ERROR
+                    | STATUS_IO_DEVICE_ERROR
+                    | STATUS_NONEXISTENT_SECTOR
+            );
+        let class = if read_unreliable {
+            StorageFailureClass::ReadUnreliable
+        } else if self.command.read_retry_policy() || effect_free_write_failure {
             StorageFailureClass::Terminal
         } else {
             StorageFailureClass::DurabilityUnknown
@@ -645,6 +667,11 @@ impl<O> RetryingStorageCommand<O> {
     /// Timer delay to arm.
     pub const fn delay(&self) -> StorageRetryDelay {
         self.delay
+    }
+
+    /// Cancels an unsubmitted retry while preserving the suspended operation.
+    pub(crate) fn into_parts(self) -> (O, StorageRequest) {
+        self.command.into_parts()
     }
 
     /// Consumes a scheduler retry permit and prepares a fresh private IRP attempt.
@@ -865,14 +892,6 @@ impl<O> CompletedLowerIrp<DeviceLengthProbe<O>> {
         };
         Ok((probe.suspended, length))
     }
-}
-
-/// Registers one prepared storage lower IRP while preserving its command on registration failure.
-#[cfg(not(test))]
-pub fn register_storage_command<O: Send + 'static>(
-    prepared: PreparedLowerIrp<StorageCommand<O>>,
-) -> Result<(), LowerRegistrationError<StorageCommand<O>>> {
-    prepared.register_and_submit()
 }
 
 /// Converts one never-submitted core request into a normal core completion.

@@ -17,8 +17,9 @@ use crate::{
 };
 
 use super::{
-    ActiveIrp, DirectoryControlMinorFunction, DispatchMajor, FileSystemControlMinorFunction,
-    IrpBufferLength, IrpCompletion, QueryDirectoryStack, QueryEaStack, ReadStack, WriteStack,
+    ActiveIrp, DataIoKind, DirectoryControlMinorFunction, DispatchMajor,
+    FileSystemControlMinorFunction, IrpBufferLength, IrpCompletion, QueryDirectoryStack,
+    QueryEaStack, ReadStack, WriteStack,
 };
 
 /// Maximum self-relative security descriptor accepted from one untrusted requestor.
@@ -87,6 +88,8 @@ pub(crate) struct PreparedQueryEa {
 /// Read parameters and system mapping captured before queue insertion.
 #[derive(Debug)]
 pub(crate) struct PreparedRead {
+    /// Handle or paging origin sealed before the IRP can leave requestor context.
+    kind: DataIoKind,
     /// Scalar read parameters copied from the requestor's stack location.
     stack: ReadStack,
     /// Exact system-mapped output range kept live by the pending IRP.
@@ -102,9 +105,19 @@ impl PreparedRead {
         target: &ActiveIrp<'_>,
         stack: super::CurrentIrpStackLocation<'_>,
     ) -> Result<Self, IrpCompletion> {
+        let kind = target.data_io_kind();
         let stack = stack.read().map_err(IrpCompletion::from_error)?;
         let output = CapturedReadOutput::capture(target, stack.length())?;
-        Ok(Self { stack, output })
+        Ok(Self {
+            kind,
+            stack,
+            output,
+        })
+    }
+
+    /// Returns the request origin sealed at capture.
+    pub(crate) const fn kind(&self) -> DataIoKind {
+        self.kind
     }
 
     /// Returns the immutable scalar read parameters.
@@ -206,6 +219,8 @@ impl CapturedReadOutput {
 /// Write parameters and system mapping captured before queue insertion.
 #[derive(Debug)]
 pub(crate) struct PreparedWrite {
+    /// Handle or paging origin sealed before the IRP can leave requestor context.
+    kind: DataIoKind,
     /// Scalar write parameters copied from the requestor's stack location.
     stack: WriteStack,
     /// Exact system-mapped input range kept live by the pending IRP.
@@ -221,9 +236,15 @@ impl PreparedWrite {
         target: &ActiveIrp<'_>,
         stack: super::CurrentIrpStackLocation<'_>,
     ) -> Result<Self, IrpCompletion> {
+        let kind = target.data_io_kind();
         let stack = stack.write().map_err(IrpCompletion::from_error)?;
         let input = CapturedWriteInput::capture(target, stack.length())?;
-        Ok(Self { stack, input })
+        Ok(Self { kind, stack, input })
+    }
+
+    /// Returns the request origin sealed at capture.
+    pub(crate) const fn kind(&self) -> DataIoKind {
+        self.kind
     }
 
     /// Returns the immutable scalar write parameters.
@@ -659,6 +680,17 @@ impl QueueContext {
     /// Returns whether this queued request belongs to a cleanup cancellation identity.
     pub(super) fn matches_cancellation_context(&self, context: PVOID) -> bool {
         context.is_null() || self.cancellation_key.matches(context)
+    }
+
+    /// Returns whether CLEANUP may cancel this not-yet-started ordinary request.
+    pub(super) fn cleanup_cancel_eligible(&self) -> bool {
+        !matches!(
+            &self.prepared,
+            PreparedRequest::Read(read) if read.kind() == DataIoKind::Paging
+        ) && !matches!(
+            &self.prepared,
+            PreparedRequest::Write(write) if write.kind() == DataIoKind::Paging
+        )
     }
 
     /// Returns the request variant sealed before the IRP entered the queue.

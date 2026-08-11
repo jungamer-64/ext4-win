@@ -21,9 +21,8 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ext4_core::{
-    CompletedMount, DeviceLength, DirectoryNodeId, Ext4Name, FileNodeId, FileOffset,
-    MutationResolvePass, NewDirectoryMetadata, NewFileMetadata, NodeId, WindowsName, XattrName,
-    XattrValue,
+    CompletedMount, DirectoryNodeId, Ext4Name, FileNodeId, FileOffset, MutationResolvePass,
+    NewDirectoryMetadata, NewFileMetadata, NodeId, WindowsName, XattrName, XattrValue,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, LARGE_INTEGER, PDEVICE_OBJECT,
@@ -552,35 +551,6 @@ impl ControlDevice {
     /// Returns the raw WDK device pointer for FFI calls.
     pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
         self.device.as_ptr()
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-/// Target device selected by mount FSCTL validation before VCB creation.
-pub(crate) struct MountCandidate {
-    /// Device object that will back the mounted ext4 volume.
-    target_device: KernelDevice,
-    /// Valid byte length reported by the storage stack.
-    length: DeviceLength,
-}
-
-impl MountCandidate {
-    /// Creates a mount candidate after storage length validation.
-    pub(crate) const fn new(target_device: KernelDevice, length: DeviceLength) -> Self {
-        Self {
-            target_device,
-            length,
-        }
-    }
-
-    /// Returns the target storage device.
-    pub(crate) const fn target_device(self) -> KernelDevice {
-        self.target_device
-    }
-
-    /// Returns the validated storage length.
-    pub(crate) const fn length(self) -> DeviceLength {
-        self.length
     }
 }
 
@@ -2638,10 +2608,7 @@ enum MountedDeviceTeardown {
 
 /// Mounted volume device object produced by a successful mount FSCTL.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MountedVolumeDevice {
-    /// Mounted volume device object.
-    device: KernelDevice,
-}
+pub(crate) struct MountedVolumeDevice;
 
 /// Prevalidated VPB label update consumed only after journal commit visibility.
 #[derive(Debug)]
@@ -2681,7 +2648,7 @@ impl MountedVolumeDevice {
         vcb: Box<VolumeControlBlock>,
         vpb: NonNull<wdk_sys::VPB>,
         real_device: KernelDevice,
-    ) -> DriverResult<Self> {
+    ) -> DriverResult<()> {
         let device = KernelDevice::from_raw(device).ok_or(DriverError::InvalidParameter)?;
         let stack_size = real_device
             .stack_size()
@@ -2766,12 +2733,7 @@ impl MountedVolumeDevice {
 
         extension.vcb = Box::into_raw(vcb);
         device_object.Flags &= !DO_DEVICE_INITIALIZING;
-        Ok(Self { device })
-    }
-
-    /// Returns the mounted volume device object pointer.
-    pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
-        self.device.as_ptr()
+        Ok(())
     }
 
     /// Returns the mounted VCB pointer stored in a mounted device extension.
@@ -3903,22 +3865,43 @@ impl OpenedLocation {
 /// Cleanup lifecycle of one successfully opened FILE_OBJECT.
 enum HandleLifecycleState {
     /// The share claim and cleanup-owned resources are active.
-    Active,
+    OpenHandle,
     /// Cleanup owns the one-way release transition.
-    Cleaning,
+    CleanupDraining,
     /// Cleanup has consumed the share claim and cleanup-owned resources.
-    Cleaned,
+    CleanedHandle,
+    /// Close owns the terminal context-detachment transition.
+    ClosingHandle,
+    /// Close has consumed the context pair immediately before its allocation is released.
+    ClosedHandle,
 }
 
 impl HandleLifecycleState {
     /// Encodes the state in the atomic storage representation.
     const fn as_raw(self) -> u8 {
         match self {
-            Self::Active => 0,
-            Self::Cleaning => 1,
-            Self::Cleaned => 2,
+            Self::OpenHandle => 0,
+            Self::CleanupDraining => 1,
+            Self::CleanedHandle => 2,
+            Self::ClosingHandle => 3,
+            Self::ClosedHandle => 4,
         }
     }
+}
+
+/// Admission-visible projection of one FILE_OBJECT lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HandleAdmissionState {
+    /// Ordinary handle requests remain legal.
+    OpenHandle,
+    /// CLEANUP closed ordinary admission and waits for terminal release effects.
+    CleanupDraining,
+    /// CLEANUP completed; only typed post-cleanup requests and CLOSE remain legal.
+    CleanedHandle,
+    /// CLOSE owns terminal context detachment.
+    ClosingHandle,
+    /// CLOSE consumed the handle; no further request is legal.
+    ClosedHandle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3939,17 +3922,14 @@ pub(crate) enum CloseReleasePlan {
     CancelledOpen,
 }
 
-/// Selects a legal close release from the filesystem lifecycle and Windows cleanup state.
+/// Selects a legal close release from the Windows cleanup state and close reason.
 const fn select_close_release_plan(
-    lifecycle: HandleLifecycleState,
     cleanup_complete: bool,
     close_kind: FileObjectCloseKind,
 ) -> Option<CloseReleasePlan> {
-    match (lifecycle, cleanup_complete, close_kind) {
-        (HandleLifecycleState::Cleaned, true, _) => Some(CloseReleasePlan::CleanedHandle),
-        (HandleLifecycleState::Active, false, FileObjectCloseKind::CancelledOpen) => {
-            Some(CloseReleasePlan::CancelledOpen)
-        }
+    match (cleanup_complete, close_kind) {
+        (true, _) => Some(CloseReleasePlan::CleanedHandle),
+        (false, FileObjectCloseKind::CancelledOpen) => Some(CloseReleasePlan::CancelledOpen),
         _ => None,
     }
 }
@@ -3964,37 +3944,72 @@ impl HandleLifecycle {
     /// Creates an active handle lifecycle.
     const fn active() -> Self {
         Self {
-            state: AtomicU8::new(HandleLifecycleState::Active.as_raw()),
+            state: AtomicU8::new(HandleLifecycleState::OpenHandle.as_raw()),
         }
     }
 
     /// Loads the current typed lifecycle state.
     fn state(&self) -> HandleLifecycleState {
         match self.state.load(Ordering::Acquire) {
-            value if value == HandleLifecycleState::Active.as_raw() => HandleLifecycleState::Active,
-            value if value == HandleLifecycleState::Cleaning.as_raw() => {
-                HandleLifecycleState::Cleaning
+            value if value == HandleLifecycleState::OpenHandle.as_raw() => {
+                HandleLifecycleState::OpenHandle
             }
-            value if value == HandleLifecycleState::Cleaned.as_raw() => {
-                HandleLifecycleState::Cleaned
+            value if value == HandleLifecycleState::CleanupDraining.as_raw() => {
+                HandleLifecycleState::CleanupDraining
+            }
+            value if value == HandleLifecycleState::CleanedHandle.as_raw() => {
+                HandleLifecycleState::CleanedHandle
+            }
+            value if value == HandleLifecycleState::ClosingHandle.as_raw() => {
+                HandleLifecycleState::ClosingHandle
+            }
+            value if value == HandleLifecycleState::ClosedHandle.as_raw() => {
+                HandleLifecycleState::ClosedHandle
             }
             _ => KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck(),
         }
     }
 
-    /// Enters cleanup once while making a completed retry idempotent.
-    fn begin_cleanup(&self) -> CleanupStart {
+    /// Closes ordinary request admission at CLEANUP dispatch entry.
+    fn begin_cleanup_admission(&self) -> HandleAdmissionState {
         match self.state.compare_exchange(
-            HandleLifecycleState::Active.as_raw(),
-            HandleLifecycleState::Cleaning.as_raw(),
+            HandleLifecycleState::OpenHandle.as_raw(),
+            HandleLifecycleState::CleanupDraining.as_raw(),
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => CleanupStart::First,
-            Err(value) if value == HandleLifecycleState::Cleaned.as_raw() => {
-                CleanupStart::AlreadyComplete
+            Ok(_) => HandleAdmissionState::CleanupDraining,
+            Err(value) if value == HandleLifecycleState::CleanupDraining.as_raw() => {
+                HandleAdmissionState::CleanupDraining
+            }
+            Err(value) if value == HandleLifecycleState::CleanedHandle.as_raw() => {
+                HandleAdmissionState::CleanedHandle
             }
             Err(_) => KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck(),
+        }
+    }
+
+    /// Returns the lifecycle projection used by ordinary/post-cleanup admission.
+    fn admission_state(&self) -> HandleAdmissionState {
+        match self.state() {
+            HandleLifecycleState::OpenHandle => HandleAdmissionState::OpenHandle,
+            HandleLifecycleState::CleanupDraining => HandleAdmissionState::CleanupDraining,
+            HandleLifecycleState::CleanedHandle => HandleAdmissionState::CleanedHandle,
+            HandleLifecycleState::ClosingHandle => HandleAdmissionState::ClosingHandle,
+            HandleLifecycleState::ClosedHandle => HandleAdmissionState::ClosedHandle,
+        }
+    }
+
+    /// Claims cleanup effects after dispatch has already closed ordinary admission.
+    fn begin_cleanup(&self) -> CleanupStart {
+        match self.state() {
+            HandleLifecycleState::CleanupDraining => CleanupStart::First,
+            HandleLifecycleState::CleanedHandle => CleanupStart::AlreadyComplete,
+            HandleLifecycleState::OpenHandle
+            | HandleLifecycleState::ClosingHandle
+            | HandleLifecycleState::ClosedHandle => {
+                KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
+            }
         }
     }
 
@@ -4003,8 +4018,8 @@ impl HandleLifecycle {
         if self
             .state
             .compare_exchange(
-                HandleLifecycleState::Cleaning.as_raw(),
-                HandleLifecycleState::Cleaned.as_raw(),
+                HandleLifecycleState::CleanupDraining.as_raw(),
+                HandleLifecycleState::CleanedHandle.as_raw(),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -4014,15 +4029,60 @@ impl HandleLifecycle {
         }
     }
 
-    /// Selects the only legal terminal release for the observed Windows close reason.
+    /// Closes all post-cleanup admission before the CLOSE request enters the active registry.
+    fn begin_close_admission(&self, close_kind: FileObjectCloseKind, cleanup_complete: bool) {
+        let current = self.state();
+        let legal = matches!(
+            (current, cleanup_complete, close_kind),
+            (HandleLifecycleState::CleanedHandle, true, _)
+                | (
+                    HandleLifecycleState::OpenHandle,
+                    false,
+                    FileObjectCloseKind::CancelledOpen
+                )
+        );
+        if !legal {
+            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
+        }
+        if self
+            .state
+            .compare_exchange(
+                current.as_raw(),
+                HandleLifecycleState::ClosingHandle.as_raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
+        }
+    }
+
+    /// Consumes the close release plan and publishes the final typed lifecycle state.
     fn close_release_plan(
         &self,
         close_kind: FileObjectCloseKind,
         cleanup_complete: bool,
     ) -> CloseReleasePlan {
-        select_close_release_plan(self.state(), cleanup_complete, close_kind).unwrap_or_else(|| {
-            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
-        })
+        if self.state() != HandleLifecycleState::ClosingHandle {
+            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
+        }
+        let Some(plan) = select_close_release_plan(cleanup_complete, close_kind) else {
+            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
+        };
+        if self
+            .state
+            .compare_exchange(
+                HandleLifecycleState::ClosingHandle.as_raw(),
+                HandleLifecycleState::ClosedHandle.as_raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
+        }
+        plan
     }
 }
 
@@ -4055,6 +4115,16 @@ impl OpenedVolumeHandle {
         }
     }
 
+    /// Closes ordinary admission before cleanup joins the active handle lane.
+    fn begin_cleanup_admission(&self) -> HandleAdmissionState {
+        self.lifecycle.begin_cleanup_admission()
+    }
+
+    /// Returns the admission-visible handle lifecycle.
+    fn admission_state(&self) -> HandleAdmissionState {
+        self.lifecycle.admission_state()
+    }
+
     /// Begins this volume handle's idempotent cleanup transition.
     fn begin_cleanup(&self) -> CleanupStart {
         self.lifecycle.begin_cleanup()
@@ -4063,6 +4133,12 @@ impl OpenedVolumeHandle {
     /// Publishes completion after its share claim has been removed.
     fn finish_cleanup(&self) {
         self.lifecycle.finish_cleanup();
+    }
+
+    /// Closes post-cleanup admission before close joins the active handle lane.
+    fn begin_close_admission(&self, close_kind: FileObjectCloseKind, cleanup_complete: bool) {
+        self.lifecycle
+            .begin_close_admission(close_kind, cleanup_complete);
     }
 
     /// Selects the legal terminal close release.
@@ -4191,8 +4267,6 @@ struct OpenedHandleState {
     lifecycle: HandleLifecycle,
     /// Delete authority and namespace lifecycle fixed when this handle was opened.
     deletion: HandleDeletion,
-    /// Write completion durability requested for this handle.
-    write_commitment: WriteCommitment,
     /// Data transfer buffering policy requested for this handle.
     data_transfer_mode: DataTransferMode,
     /// Stable FsRtl directory-name descriptor, retained even if the opened node changes kind.
@@ -4205,7 +4279,6 @@ impl OpenedHandleState {
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
         deletion: HandleDeletion,
-        write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
     ) -> Self {
         Self {
@@ -4213,7 +4286,6 @@ impl OpenedHandleState {
             location: UnsafeCell::new(location),
             lifecycle: HandleLifecycle::active(),
             deletion,
-            write_commitment,
             data_transfer_mode,
             directory_notification_name: UnsafeCell::new(DirectoryNotificationName::Unregistered),
         }
@@ -4260,14 +4332,19 @@ impl OpenedHandleState {
         }
     }
 
-    /// Returns write completion durability requested for this handle.
-    const fn write_commitment(&self) -> WriteCommitment {
-        self.write_commitment
-    }
-
     /// Returns data transfer buffering policy requested at create/open.
     const fn data_transfer_mode(&self) -> DataTransferMode {
         self.data_transfer_mode
+    }
+
+    /// Closes ordinary admission before cleanup joins the active handle lane.
+    fn begin_cleanup_admission(&self) -> HandleAdmissionState {
+        self.lifecycle.begin_cleanup_admission()
+    }
+
+    /// Returns the admission-visible handle lifecycle.
+    fn admission_state(&self) -> HandleAdmissionState {
+        self.lifecycle.admission_state()
     }
 
     /// Begins the idempotent cleanup transition.
@@ -4278,6 +4355,12 @@ impl OpenedHandleState {
     /// Publishes completion after every cleanup-owned release has finished.
     fn finish_cleanup(&self) {
         self.lifecycle.finish_cleanup();
+    }
+
+    /// Closes post-cleanup admission before close joins the active handle lane.
+    fn begin_close_admission(&self, close_kind: FileObjectCloseKind, cleanup_complete: bool) {
+        self.lifecycle
+            .begin_close_admission(close_kind, cleanup_complete);
     }
 
     /// Selects the legal terminal release for close.
@@ -4348,7 +4431,6 @@ impl OpenedHandle {
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
         deletion: HandleDeletion,
-        write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
     ) -> Self {
@@ -4357,7 +4439,6 @@ impl OpenedHandle {
             node_mode,
             location,
             deletion,
-            write_commitment,
             data_transfer_mode,
             regular_file_write_access,
         )
@@ -4369,17 +4450,10 @@ impl OpenedHandle {
         node_mode: OpenedNodeMode,
         location: OpenedLocation,
         deletion: HandleDeletion,
-        write_commitment: WriteCommitment,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
     ) -> Self {
-        let state = OpenedHandleState::new(
-            node_mode,
-            location,
-            deletion,
-            write_commitment,
-            data_transfer_mode,
-        );
+        let state = OpenedHandleState::new(node_mode, location, deletion, data_transfer_mode);
         let kind = match node {
             NodeId::File(_) => OpenedHandleKind::File {
                 write_access: regular_file_write_access,
@@ -4390,11 +4464,6 @@ impl OpenedHandle {
             NodeId::Symlink(_) => OpenedHandleKind::Symlink,
         };
         Self { state, kind }
-    }
-
-    /// Returns write completion durability requested for this handle.
-    const fn write_commitment(&self) -> WriteCommitment {
-        self.state.write_commitment()
     }
 
     /// Returns data transfer buffering policy requested for this handle.
@@ -4430,6 +4499,16 @@ impl OpenedHandle {
         self.state.file_attributes_write_access()
     }
 
+    /// Closes ordinary admission before cleanup joins the active handle lane.
+    fn begin_cleanup_admission(&self) -> HandleAdmissionState {
+        self.state.begin_cleanup_admission()
+    }
+
+    /// Returns the admission-visible handle lifecycle.
+    fn admission_state(&self) -> HandleAdmissionState {
+        self.state.admission_state()
+    }
+
     /// Begins this handle's idempotent cleanup transition.
     fn begin_cleanup(&self) -> CleanupStart {
         self.state.begin_cleanup()
@@ -4438,6 +4517,12 @@ impl OpenedHandle {
     /// Publishes cleanup completion after every release has finished.
     fn finish_cleanup(&self) {
         self.state.finish_cleanup();
+    }
+
+    /// Closes post-cleanup admission before close joins the active handle lane.
+    fn begin_close_admission(&self, close_kind: FileObjectCloseKind, cleanup_complete: bool) {
+        self.state
+            .begin_close_admission(close_kind, cleanup_complete);
     }
 
     /// Selects the legal terminal release for close.
@@ -4659,11 +4744,6 @@ impl<'owner> OpenedObject<'owner> {
         self.fcb
     }
 
-    /// Replaces the opened location after a successful rename.
-    pub(crate) fn replace_location(&mut self, location: OpenedLocation) {
-        self.handle().replace_location(location);
-    }
-
     /// Prepares a post-commit handle-location update without retaining an active IRP borrow.
     pub(crate) fn prepare_location_publication(
         &self,
@@ -4673,11 +4753,6 @@ impl<'owner> OpenedObject<'owner> {
             handle: self.handle,
             location,
         }
-    }
-
-    /// Returns write completion durability requested for this opened handle.
-    pub(crate) fn write_commitment(&self) -> WriteCommitment {
-        self.handle().write_commitment()
     }
 
     /// Returns data transfer buffering policy requested for this opened handle.
@@ -4882,6 +4957,107 @@ impl<'owner> OpenedFileObject<'owner> {
             OpenedObject::decode(file_object).map(Self::Node)
         }
     }
+
+    /// Seals the short-lived handle lifecycle capability used around fallible operation allocation.
+    pub(crate) fn prepare_admission(self) -> PreparedHandleAdmission {
+        match self {
+            Self::Node(opened) => PreparedHandleAdmission {
+                file_object: opened.file_object(),
+                target: PreparedHandleAdmissionTarget::Node(opened.handle),
+                cleanup_complete: opened.file_object.cleanup_complete(),
+                close_kind: opened.file_object.close_kind_or_bugcheck(),
+            },
+            Self::Volume(opened) => PreparedHandleAdmission {
+                file_object: opened.file_object(),
+                target: PreparedHandleAdmissionTarget::Volume(opened.handle),
+                cleanup_complete: opened.file_object.cleanup_complete(),
+                close_kind: opened.file_object.close_kind_or_bugcheck(),
+            },
+        }
+    }
+}
+
+/// Address-stable handle context selected while its top-level IRP still retains FILE_OBJECT life.
+#[derive(Debug)]
+enum PreparedHandleAdmissionTarget {
+    /// Namespace-node CCB.
+    Node(NonNull<OpenedHandle>),
+    /// Direct-volume CCB.
+    Volume(NonNull<OpenedVolumeHandle>),
+}
+
+/// Short-lived capability that publishes a lifecycle transition only after operation allocation.
+///
+/// This value must not enter an operation or completion envelope. Its caller retains the unique
+/// top-level IRP until a successfully allocated operation has taken that ownership.
+#[derive(Debug)]
+pub(crate) struct PreparedHandleAdmission {
+    /// Stable FILE_OBJECT identity used by the per-handle reactor lane.
+    file_object: KernelFileObject,
+    /// Exact CCB type selected from the FILE_OBJECT flag and context pair.
+    target: PreparedHandleAdmissionTarget,
+    /// Windows cleanup publication observed while the active IRP retained the FILE_OBJECT.
+    cleanup_complete: bool,
+    /// Windows close reason observed at the same boundary.
+    close_kind: FileObjectCloseKind,
+}
+
+impl PreparedHandleAdmission {
+    /// Returns the stable FILE_OBJECT identity without exposing the CCB pointer.
+    pub(crate) const fn file_object(&self) -> KernelFileObject {
+        self.file_object
+    }
+
+    /// Returns the current admission-visible lifecycle.
+    pub(crate) fn state(&self) -> HandleAdmissionState {
+        match self.target {
+            PreparedHandleAdmissionTarget::Node(handle) => unsafe {
+                // SAFETY: The caller still owns the IRP retaining this exact FILE_OBJECT context.
+                handle.as_ref()
+            }
+            .admission_state(),
+            PreparedHandleAdmissionTarget::Volume(handle) => unsafe {
+                // SAFETY: The caller still owns the IRP retaining this exact FILE_OBJECT context.
+                handle.as_ref()
+            }
+            .admission_state(),
+        }
+    }
+
+    /// Closes ordinary admission after the cleanup operation allocation succeeded.
+    pub(crate) fn begin_cleanup(self) {
+        let state = match self.target {
+            PreparedHandleAdmissionTarget::Node(handle) => unsafe {
+                // SAFETY: The allocated cleanup operation now retains the FILE_OBJECT and CCB.
+                handle.as_ref()
+            }
+            .begin_cleanup_admission(),
+            PreparedHandleAdmissionTarget::Volume(handle) => unsafe {
+                // SAFETY: The allocated cleanup operation now retains the FILE_OBJECT and CCB.
+                handle.as_ref()
+            }
+            .begin_cleanup_admission(),
+        };
+        if state != HandleAdmissionState::CleanupDraining {
+            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
+        }
+    }
+
+    /// Closes every remaining admission after the close operation allocation succeeded.
+    pub(crate) fn begin_close(self) {
+        match self.target {
+            PreparedHandleAdmissionTarget::Node(handle) => unsafe {
+                // SAFETY: The allocated close operation now retains the FILE_OBJECT and CCB.
+                handle.as_ref()
+            }
+            .begin_close_admission(self.close_kind, self.cleanup_complete),
+            PreparedHandleAdmissionTarget::Volume(handle) => unsafe {
+                // SAFETY: The allocated close operation now retains the FILE_OBJECT and CCB.
+                handle.as_ref()
+            }
+            .begin_close_admission(self.close_kind, self.cleanup_complete),
+        }
+    }
 }
 
 /// Direct user volume open decoded from its typed FILE_OBJECT context pair.
@@ -5013,11 +5189,6 @@ impl<'owner> OpenedRegularFile<'owner> {
         self.id
     }
 
-    /// Returns the mounted VCB pointer owning this opened file.
-    pub(crate) fn volume(&self) -> NonNull<VolumeControlBlock> {
-        self.opened.volume()
-    }
-
     /// Returns the shared FCB that owns this regular file's byte-range locks.
     pub(crate) fn file_control_block(&self) -> &FileControlBlock {
         self.opened.file_control_block()
@@ -5067,11 +5238,6 @@ impl<'owner> OpenedRegularFile<'owner> {
     ) -> DriverResult<PreparedFilePositionPublication> {
         self.opened
             .prepare_current_file_position_update(kind, start, transferred)
-    }
-
-    /// Returns write completion durability requested for this regular-file handle.
-    pub(crate) fn write_commitment(&self) -> WriteCommitment {
-        self.opened.write_commitment()
     }
 
     /// Returns data transfer buffering policy requested for this regular-file handle.

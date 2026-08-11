@@ -7,10 +7,12 @@ use core::ptr::NonNull;
 use ext4_core::FileOffset;
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_PENDING, STATUS_SUCCESS};
 
+mod cancel;
 mod capture;
 pub(crate) mod lower;
 pub(crate) mod reactor;
 
+pub(crate) use cancel::{ActiveCancelDestination, ActiveCancelEnvelope};
 pub(crate) use reactor::CompletionReactor;
 
 pub(crate) use capture::{
@@ -717,6 +719,9 @@ pub(crate) struct OwnedIrp {
     target: DispatchTarget,
     /// Request capture removed exactly once from `DriverContext[0]` with queue ownership.
     context: QueueContextOwnership,
+    /// Active cancel-routine ownership after exclusive CSQ removal.
+    #[cfg(not(test))]
+    active_cancellation: Option<cancel::ActiveCancellation>,
 }
 
 /// Actor-local request classification after queue metadata ownership is recovered.
@@ -816,6 +821,8 @@ impl OwnedIrp {
         Self {
             target: DispatchTarget { device, irp },
             context,
+            #[cfg(not(test))]
+            active_cancellation: None,
         }
     }
 
@@ -839,6 +846,20 @@ impl OwnedIrp {
         self.target.device
     }
 
+    /// Installs the active cancellation token after this IRP leaves the CSQ.
+    #[cfg(not(test))]
+    pub(crate) fn install_active_cancellation(&mut self, envelope: NonNull<ActiveCancelEnvelope>) {
+        if self.active_cancellation.is_some() {
+            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                .bugcheck();
+        }
+        self.active_cancellation = Some(unsafe {
+            // SAFETY: Exclusive CSQ removal grants this owner the sole right to install a cancel
+            // routine, and the selected envelope is stable until this token is dropped.
+            cancel::ActiveCancellation::install(self.target.irp.as_ptr(), envelope)
+        });
+    }
+
     /// Returns the exhaustive actor-local request classification.
     pub(crate) fn actor_request(&self) -> ActorRequest<'_> {
         match &self.context {
@@ -850,7 +871,14 @@ impl OwnedIrp {
 
     /// Completes the IRP through the I/O Manager.
     pub(crate) fn complete(self, completion: IrpCompletion) -> NTSTATUS {
-        let Self { target, context } = self;
+        let Self {
+            target,
+            context,
+            #[cfg(not(test))]
+            active_cancellation,
+        } = self;
+        #[cfg(not(test))]
+        drop(active_cancellation);
         drop(context);
         target.irp.complete(completion)
     }
@@ -875,7 +903,14 @@ impl OwnedIrp {
     /// A successful reparse transfers the auxiliary buffer to the I/O Manager immediately before
     /// completing with `STATUS_REPARSE`. Failed results never transfer an allocation.
     pub(crate) fn complete_create_result(self, result: DriverResult<CreateCompletion>) -> NTSTATUS {
-        let Self { target, context } = self;
+        let Self {
+            target,
+            context,
+            #[cfg(not(test))]
+            active_cancellation,
+        } = self;
+        #[cfg(not(test))]
+        drop(active_cancellation);
         drop(context);
         match result {
             Ok(CreateCompletion::Handle(action)) => target.irp.complete_create_action(action),
@@ -892,7 +927,14 @@ impl OwnedIrp {
         notifier: NonNull<DirectoryChangeNotifier>,
         registration: DirectoryNotificationRegistration,
     ) -> NTSTATUS {
-        let Self { target, context } = self;
+        let Self {
+            target,
+            context,
+            #[cfg(not(test))]
+            active_cancellation,
+        } = self;
+        #[cfg(not(test))]
+        drop(active_cancellation);
         drop(context);
         let notifier = unsafe {
             // SAFETY: Registration decoded the notifier from the mounted VCB kept live by this
@@ -1010,7 +1052,11 @@ impl KernelIrp {
     /// # Safety
     /// The caller must hold the owning cancel-safe queue lock so removal cannot take or free the
     /// context until this method returns.
-    unsafe fn published_queue_context_matches(self, cancellation: *mut c_void) -> bool {
+    unsafe fn published_queue_context_matches(
+        self,
+        cancellation: *mut c_void,
+        ordinary_cleanup_only: bool,
+    ) -> bool {
         let irp = unsafe {
             // SAFETY: The caller's CSQ lock contract keeps the queued IRP and context live.
             self.irp.as_ref()
@@ -1034,14 +1080,15 @@ impl KernelIrp {
             context.as_ptr().cast_const(),
             queue_context_marker(CLOSE_QUEUE_CONTEXT_MARKER).cast_const(),
         ) {
-            return cancellation.is_null();
+            return cancellation.is_null() && !ordinary_cleanup_only;
         }
         let context = context.cast::<QueueContext>();
-        unsafe {
+        let context = unsafe {
             // SAFETY: The CSQ lock keeps this published Box allocation live for the call.
             context.as_ref()
-        }
-        .matches_cancellation_context(cancellation)
+        };
+        context.matches_cancellation_context(cancellation)
+            && (!ordinary_cleanup_only || context.cleanup_cancel_eligible())
     }
 
     /// Returns the raw IRP pointer for writes to the WDK completion fields.

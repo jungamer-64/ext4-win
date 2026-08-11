@@ -30,6 +30,9 @@ pub(crate) use wdk_sys::ntddk::{
 };
 
 #[cfg(not(test))]
+pub(crate) use wdk_sys::ntddk::{IoAcquireCancelSpinLock, IoReleaseCancelSpinLock};
+
+#[cfg(not(test))]
 unsafe extern "system" {
     /// Captures an exact-length query-security output as an opaque native target.
     pub(crate) fn ext4win_capture_query_security_output(
@@ -82,6 +85,15 @@ unsafe extern "system" {
 
     /// Releases one purpose-specific requestor-input capture.
     pub(crate) fn ext4win_release_captured_requestor_input(snapshot: wdk_sys::PVOID);
+}
+
+#[cfg(not(test))]
+unsafe extern "C" {
+    /// Atomically replaces `IRP.CancelRoutine` under the caller-held cancel spin lock.
+    pub(crate) fn ext4win_set_cancel_routine(
+        irp: wdk_sys::PIRP,
+        routine: wdk_sys::PDRIVER_CANCEL,
+    ) -> wdk_sys::PDRIVER_CANCEL;
 }
 
 unsafe extern "system" {

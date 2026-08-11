@@ -332,8 +332,6 @@ struct CreateHandlePolicy {
     existing_operation_access: ExistingOperationAccess,
     /// Share mask used for Windows share-access accounting.
     share_access: ShareAccess,
-    /// Write completion durability requested by create options.
-    write_commitment: WriteCommitment,
     /// Data transfer buffering policy stored on the opened handle.
     data_transfer_mode: DataTransferMode,
     /// Regular-file write authority retained by the per-handle state.
@@ -355,7 +353,6 @@ impl CreateHandlePolicy {
             desired_access: parameters.desired_access(),
             existing_operation_access: parameters.existing_operation_access(),
             share_access: parameters.share_access(),
-            write_commitment: parameters.write_commitment(),
             data_transfer_mode: match parameters.transfer_buffering() {
                 CreateTransferBuffering::IntermediateAllowed => {
                     DataTransferMode::IntermediateAllowed
@@ -387,11 +384,6 @@ impl CreateHandlePolicy {
     /// Returns the share access mask.
     const fn share_access(self) -> ShareAccess {
         self.share_access
-    }
-
-    /// Returns write completion durability.
-    const fn write_commitment(self) -> WriteCommitment {
-        self.write_commitment
     }
 
     /// Returns data transfer buffering policy.
@@ -851,7 +843,6 @@ fn create_missing_node(
             OpenedNodeMode::Direct,
             location,
             policy.handle_deletion(),
-            policy.write_commitment(),
             policy.data_transfer_mode(),
             policy.regular_file_write_access(),
         ))
@@ -1189,7 +1180,6 @@ fn initialize_file_object(
             node_mode,
             location,
             policy.handle_deletion(),
-            policy.write_commitment(),
             policy.data_transfer_mode(),
             policy.regular_file_write_access(),
         ))

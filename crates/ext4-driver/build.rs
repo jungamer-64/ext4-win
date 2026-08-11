@@ -3,9 +3,11 @@
 fn main() -> Result<(), wdk_build::ConfigError> {
     const SECURITY_CAPTURE_SOURCE: &str = "native/security_capture.c";
     const DATA_TRANSFER_SOURCE: &str = "native/data_transfer.c";
+    const CANCEL_SOURCE: &str = "native/cancel.c";
 
     println!("cargo:rerun-if-changed={SECURITY_CAPTURE_SOURCE}");
     println!("cargo:rerun-if-changed={DATA_TRANSFER_SOURCE}");
+    println!("cargo:rerun-if-changed={CANCEL_SOURCE}");
     println!("cargo:rustc-link-lib=Cng");
 
     let config = wdk_build::Config::from_env_auto()?;
@@ -22,7 +24,8 @@ fn main() -> Result<(), wdk_build::ConfigError> {
     native
         .includes(config.include_paths()?)
         .file(SECURITY_CAPTURE_SOURCE)
-        .file(DATA_TRANSFER_SOURCE);
+        .file(DATA_TRANSFER_SOURCE)
+        .file(CANCEL_SOURCE);
 
     if is_msvc {
         native.flag("/kernel").flag("/W4").flag("/WX");

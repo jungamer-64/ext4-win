@@ -29,6 +29,11 @@ use crate::state::{
     VolumeControlBlock,
 };
 
+/// Scheduler-local identity for the per-handle CLEANUP terminal barrier.
+const CLEANUP_HANDLE_BARRIER: u64 = 2;
+/// Scheduler-local identity for the terminal CLOSE drain.
+const CLOSE_HANDLE_BARRIER: u64 = 3;
+
 /// Admission failure that preserves the unique top-level completion authority.
 #[derive(Debug)]
 pub(crate) struct AdmitOperationError {
@@ -181,7 +186,7 @@ impl MountRequestOperation {
             admission.vpb().as_non_null(),
             admission.target_device(),
         ) {
-            Ok(_mounted_device) => Ok(IrpCompletion::EMPTY),
+            Ok(()) => Ok(IrpCompletion::EMPTY),
             Err(error) => {
                 unsafe {
                     // SAFETY: Initialization rejected the unpublished device and retained no VCB
@@ -415,13 +420,24 @@ impl CompletionOperation for ReadRequestOperation {
     }
 
     fn record_storage_failure(&mut self, failure: StorageFailureClass) {
-        if failure == StorageFailureClass::DurabilityUnknown {
+        if matches!(
+            failure,
+            StorageFailureClass::DurabilityUnknown | StorageFailureClass::ReadUnreliable
+        ) {
             let mut access = unsafe {
                 // SAFETY: Failure classification executes on the sole reactor thread while this
                 // operation retains the mounted VCB lifetime.
                 VolumeControlBlock::operation_access(self.volume)
             };
-            access.runtime_mut().record_durability_unknown();
+            match failure {
+                StorageFailureClass::ReadUnreliable => {
+                    access.runtime_mut().record_read_unreliable();
+                }
+                StorageFailureClass::DurabilityUnknown => {
+                    access.runtime_mut().record_durability_unknown();
+                }
+                StorageFailureClass::Terminal => {}
+            }
         }
     }
 }
@@ -457,6 +473,8 @@ struct ImmediateRequestOperation {
     kind: ImmediateRequestKind,
     /// Explicit ownership phase.
     state: ImmediateOperationState,
+    /// CLOSE alone consumes one terminal barrier before touching FILE_OBJECT contexts.
+    close_barrier_released: bool,
 }
 
 impl ImmediateRequestOperation {
@@ -468,6 +486,7 @@ impl ImmediateRequestOperation {
         match memory::boxed_try_map(owned, |owned| Self {
             kind,
             state: ImmediateOperationState::Ready(owned),
+            close_barrier_released: false,
         }) {
             Ok(operation) => Ok(operation),
             Err(error) => {
@@ -484,6 +503,33 @@ impl CompletionOperation for ImmediateRequestOperation {
         let ImmediateOperationState::Ready(mut owned) = state else {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                 .bugcheck();
+        };
+        let event = if self.kind == ImmediateRequestKind::Close && !self.close_barrier_released {
+            match event {
+                OperationEvent::Admitted => {
+                    self.state = ImmediateOperationState::Ready(owned);
+                    return OperationTransition::Wait {
+                        condition: WaitCondition::Barrier {
+                            identity: CLOSE_HANDLE_BARRIER,
+                        },
+                        suspended: self,
+                    };
+                }
+                OperationEvent::BarrierReleased(permit) => {
+                    if permit.into_identity() != CLOSE_HANDLE_BARRIER {
+                        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                            .bugcheck();
+                    }
+                    self.close_barrier_released = true;
+                    OperationEvent::Admitted
+                }
+                _ => {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                        .bugcheck()
+                }
+            }
+        } else {
+            event
         };
         let result = match event {
             OperationEvent::Admitted => match self.kind {
@@ -1315,6 +1361,8 @@ struct MutationRequestOperation {
     cleanup_deletion: Option<crate::request::file_info::PendingCleanupDeletion>,
     /// Whether a successful pre-commit write has made abort/replay relevant.
     write_effect_observed: bool,
+    /// CLEANUP alone must consume its per-handle terminal barrier before releasing handle state.
+    cleanup_barrier_released: bool,
     /// Current consuming state.
     state: MutationOperationState,
 }
@@ -1373,6 +1421,7 @@ impl MutationRequestOperation {
             kind,
             cleanup_deletion: None,
             write_effect_observed: false,
+            cleanup_barrier_released: false,
             state: MutationOperationState::Resolving {
                 owned,
                 epoch,
@@ -1920,6 +1969,9 @@ impl MutationRequestOperation {
         };
         match failure {
             StorageFailureClass::Terminal => access.runtime_mut().record_durable_abort(),
+            StorageFailureClass::ReadUnreliable => {
+                access.runtime_mut().record_read_unreliable();
+            }
             StorageFailureClass::DurabilityUnknown => {
                 access.runtime_mut().record_durability_unknown();
             }
@@ -1982,6 +2034,32 @@ impl MutationRequestOperation {
 
 impl CompletionOperation for MutationRequestOperation {
     fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+        let event = if self.kind == MutationRequestKind::Cleanup && !self.cleanup_barrier_released {
+            match event {
+                OperationEvent::Admitted => {
+                    return OperationTransition::Wait {
+                        condition: WaitCondition::Barrier {
+                            identity: CLEANUP_HANDLE_BARRIER,
+                        },
+                        suspended: self,
+                    };
+                }
+                OperationEvent::BarrierReleased(permit) => {
+                    if permit.into_identity() != CLEANUP_HANDLE_BARRIER {
+                        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                            .bugcheck();
+                    }
+                    self.cleanup_barrier_released = true;
+                    OperationEvent::Admitted
+                }
+                _ => {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                        .bugcheck()
+                }
+            }
+        } else {
+            event
+        };
         let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
         match state {
             MutationOperationState::Resolving {
@@ -2137,6 +2215,9 @@ impl CompletionOperation for MutationRequestOperation {
             VolumeControlBlock::operation_access(self.volume)
         };
         match (&self.state, failure) {
+            (_, StorageFailureClass::ReadUnreliable) => {
+                access.runtime_mut().record_read_unreliable();
+            }
             (MutationOperationState::CommitIo { .. }, StorageFailureClass::DurabilityUnknown) => {
                 access.runtime_mut().record_durability_unknown();
             }
