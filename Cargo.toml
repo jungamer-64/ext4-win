@@ -11,6 +11,8 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 cc = "1"
+hkdf = { version = "0.13", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
 wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
 wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }

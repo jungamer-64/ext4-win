@@ -88,6 +88,27 @@ static BLOCK_LENGTH_PROPERTY: [u16; 12] = [
     b'h' as u16,
     0,
 ];
+static MESSAGE_BLOCK_LENGTH_PROPERTY: [u16; 19] = [
+    b'M' as u16,
+    b'e' as u16,
+    b's' as u16,
+    b's' as u16,
+    b'a' as u16,
+    b'g' as u16,
+    b'e' as u16,
+    b'B' as u16,
+    b'l' as u16,
+    b'o' as u16,
+    b'c' as u16,
+    b'k' as u16,
+    b'L' as u16,
+    b'e' as u16,
+    b'n' as u16,
+    b'g' as u16,
+    b't' as u16,
+    b'h' as u16,
+    0,
+];
 static CHAINING_MODE_PROPERTY: [u16; 13] = [
     b'C' as u16,
     b'h' as u16,
@@ -199,7 +220,8 @@ struct BCryptBufferDesc {
     buffers: *mut BCryptBuffer,
 }
 
-#[link(name = "Cng")]
+#[cfg_attr(not(test), link(name = "Cng"))]
+#[cfg_attr(test, link(name = "Bcrypt"))]
 unsafe extern "system" {
     fn BCryptOpenAlgorithmProvider(
         algorithm: *mut *mut c_void,
@@ -829,10 +851,13 @@ fn crypt_xts(
         return Err(Error::InvalidWriteRange);
     }
     let generated = generate_key(execution, key_object, key)?;
-    let mut tweak = [0_u8; AES_BLOCK_BYTES];
-    for (destination, source) in tweak.iter_mut().zip(data_unit.to_le_bytes()) {
-        *destination = source;
-    }
+    let data_unit_bytes = u32::try_from(buffer.len()).map_err(|_| Error::ArithmeticOverflow)?;
+    set_u32_property_core(
+        generated.as_raw(),
+        &MESSAGE_BLOCK_LENGTH_PROPERTY,
+        data_unit_bytes,
+    )?;
+    let mut tweak = data_unit.to_le_bytes();
     crypt_in_place(&generated, buffer, Some(&mut tweak), direction)
 }
 
@@ -1130,6 +1155,24 @@ fn set_wide_property_core(object: *mut c_void, property: &[u16], value: &[u16]) 
     cng_status_to_core(status)
 }
 
+/// Sets one `ULONG` key property in the ext4-core failure domain.
+fn set_u32_property_core(object: *mut c_void, property: &[u16], mut value: u32) -> Ext4Result<()> {
+    let value_bytes =
+        u32::try_from(core::mem::size_of::<u32>()).map_err(|_| Error::ArithmeticOverflow)?;
+    let status = unsafe {
+        // SAFETY: `property` is NUL-terminated and `value` is live aligned ULONG storage consumed
+        // synchronously while the generated key remains valid.
+        BCryptSetProperty(
+            object,
+            property.as_ptr(),
+            core::ptr::addr_of_mut!(value).cast(),
+            value_bytes,
+            0,
+        )
+    };
+    cng_status_to_core(status)
+}
+
 /// Converts CNG NTSTATUS into a fallible mount-construction result.
 fn cng_status_to_driver(status: NTSTATUS) -> DriverResult<()> {
     if NT_SUCCESS(status) {
@@ -1155,7 +1198,23 @@ mod tests {
     use ext4_core::{CryptographicOperation, Error};
     use wdk_sys::{STATUS_SUCCESS, STATUS_UNSUCCESSFUL};
 
-    use super::{CngProvider, cng_status_to_core};
+    use super::{CngProvider, cng_status_to_core, decrypt_cbc_cs3, encrypt_cbc_cs3, generate_key};
+
+    macro_rules! must {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    let unexpected_error: Option<()> = None;
+                    assert!(
+                        unexpected_error.is_some(),
+                        "unexpected CNG test error: {error:?}"
+                    );
+                    return;
+                }
+            }
+        };
+    }
 
     /// # Panics
     ///
@@ -1174,12 +1233,10 @@ mod tests {
     /// Panics when CNG rejects standard SHA vectors or reusable-hash reset semantics.
     #[test]
     fn reusable_cng_hashes_match_standard_vectors() {
-        let provider = CngProvider::try_open().expect("CNG providers must be available");
-        let mut operation = provider
-            .try_new_operation()
-            .expect("CNG operation objects must be constructible");
-        let sha256 = operation.sha256(b"abc").expect("SHA-256 must succeed");
-        let sha512 = operation.sha512(b"abc").expect("SHA-512 must succeed");
+        let provider = must!(CngProvider::try_open());
+        let mut operation = must!(provider.try_new_operation());
+        let sha256 = must!(operation.sha256(b"abc"));
+        let sha512 = must!(operation.sha512(b"abc"));
         assert_eq!(
             sha256,
             [
@@ -1199,5 +1256,135 @@ mod tests {
             ]
         );
         assert_eq!(operation.sha256(b"abc"), Ok(sha256));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when CNG HKDF-SHA512 diverges from Linux fscrypt v2 derivation vectors.
+    #[test]
+    fn cng_hkdf_sha512_matches_fscrypt_v2_vectors() {
+        let provider = must!(CngProvider::try_open());
+        let mut operation = must!(provider.try_new_operation());
+        let mut master_key = [0_u8; 32];
+        for (byte, value) in master_key.iter_mut().zip(0_u8..32) {
+            *byte = value;
+        }
+
+        let mut identifier = [0_u8; 16];
+        must!(operation.hkdf_sha512(&master_key, b"fscrypt\0\x01", &mut identifier));
+        assert_eq!(
+            identifier,
+            [
+                0x37, 0xd7, 0xd7, 0x6a, 0x59, 0x40, 0x00, 0x83, 0x28, 0x9c, 0x18, 0x55, 0x26, 0x73,
+                0x0d, 0x34,
+            ]
+        );
+
+        let info = b"fscrypt\0\x02\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf";
+        let mut contents_key = [0_u8; 64];
+        must!(operation.hkdf_sha512(&master_key, info, &mut contents_key));
+        assert_eq!(
+            contents_key,
+            [
+                0xe0, 0x80, 0x03, 0x95, 0x2a, 0x49, 0xa8, 0xfe, 0x90, 0x56, 0x87, 0x3d, 0x11, 0xe4,
+                0xcb, 0x82, 0xe0, 0xa5, 0x21, 0x90, 0x20, 0x96, 0x0c, 0x35, 0x38, 0x71, 0x30, 0xa2,
+                0xa1, 0x93, 0x82, 0x3e, 0xda, 0x7f, 0xd6, 0x41, 0xa7, 0xeb, 0x36, 0x5a, 0x44, 0xa3,
+                0x90, 0xc1, 0x8e, 0x3c, 0x69, 0xf4, 0xa7, 0x73, 0x9a, 0xe4, 0x13, 0xdc, 0xc2, 0x0a,
+                0x2d, 0x42, 0x66, 0xe2, 0xd2, 0x4c, 0x7f, 0x2a,
+            ]
+        );
+        let mut filename_key = [0_u8; 32];
+        must!(operation.hkdf_sha512(&master_key, info, &mut filename_key));
+        assert_eq!(filename_key, contents_key[..32]);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when CNG AES-256-XTS diverges from the IEEE 1619 vector used by Linux.
+    #[test]
+    fn cng_aes_256_xts_matches_linux_vector() {
+        let provider = must!(CngProvider::try_open());
+        let mut operation = must!(provider.try_new_operation());
+        let key = [
+            0x27, 0x18, 0x28, 0x18, 0x28, 0x45, 0x90, 0x45, 0x23, 0x53, 0x60, 0x28, 0x74, 0x71,
+            0x35, 0x26, 0x62, 0x49, 0x77, 0x57, 0x24, 0x70, 0x93, 0x69, 0x99, 0x59, 0x57, 0x49,
+            0x66, 0x96, 0x76, 0x27, 0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93, 0x23, 0x84,
+            0x62, 0x64, 0x33, 0x83, 0x27, 0x95, 0x02, 0x88, 0x41, 0x97, 0x16, 0x93, 0x99, 0x37,
+            0x51, 0x05, 0x82, 0x09, 0x74, 0x94, 0x45, 0x92,
+        ];
+        let mut plaintext = [0_u8; 64];
+        for (byte, value) in plaintext.iter_mut().zip(0_u8..64) {
+            *byte = value;
+        }
+        let original = plaintext;
+
+        must!(operation.encrypt_aes_256_xts(&key, 0xff, &mut plaintext));
+        assert_eq!(
+            plaintext,
+            [
+                0x1c, 0x3b, 0x3a, 0x10, 0x2f, 0x77, 0x03, 0x86, 0xe4, 0x83, 0x6c, 0x99, 0xe3, 0x70,
+                0xcf, 0x9b, 0xea, 0x00, 0x80, 0x3f, 0x5e, 0x48, 0x23, 0x57, 0xa4, 0xae, 0x12, 0xd4,
+                0x14, 0xa3, 0xe6, 0x3b, 0x5d, 0x31, 0xe2, 0x76, 0xf8, 0xfe, 0x4a, 0x8d, 0x66, 0xb3,
+                0x17, 0xf9, 0xac, 0x68, 0x3f, 0x44, 0x68, 0x0a, 0x86, 0xac, 0x35, 0xad, 0xfc, 0x33,
+                0x45, 0xbe, 0xfe, 0xcb, 0x4b, 0xb1, 0x88, 0xfd,
+            ]
+        );
+        must!(operation.decrypt_aes_256_xts(&key, 0xff, &mut plaintext));
+        assert_eq!(plaintext, original);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when manual CBC-CS3 diverges from Linux's RFC 3962 vectors, including the exact
+    /// one-block CBC rule and swapped exact-block tails.
+    #[test]
+    fn cng_cbc_cs3_matches_linux_rfc3962_vectors() {
+        let provider = must!(CngProvider::try_open());
+        let mut operation = must!(provider.try_new_operation());
+        let key = *b"chicken teriyaki";
+        let generated = must!(generate_key(
+            operation.aes_ecb,
+            operation.key_object.as_mut_slice(),
+            &key
+        ));
+        let plaintext = b"I would like the General Gau's Chicken, please, and wonton soup.";
+        let vectors: &[(&[u8], &[u8])] = &[
+            (
+                b"I would like the",
+                b"\x97\x68\x72\x68\xd6\xec\xcc\xc0\xc0\x7b\x25\xe2\x5e\xcf\xe5\x84",
+            ),
+            (
+                b"I would like the ",
+                b"\xc6\x35\x35\x68\xf2\xbf\x8c\xb4\xd8\xa5\x80\x36\x2d\xa7\xff\x7f\x97",
+            ),
+            (
+                b"I would like the General Gau's ",
+                b"\xfc\x00\x78\x3e\x0e\xfd\xb2\xc1\xd4\x45\xd4\xc8\xef\xf7\xed\x22\x97\x68\x72\x68\xd6\xec\xcc\xc0\xc0\x7b\x25\xe2\x5e\xcf\xe5",
+            ),
+            (
+                b"I would like the General Gau's C",
+                b"\x39\x31\x25\x23\xa7\x86\x62\xd5\xbe\x7f\xcb\xcc\x98\xeb\xf5\xa8\x97\x68\x72\x68\xd6\xec\xcc\xc0\xc0\x7b\x25\xe2\x5e\xcf\xe5\x84",
+            ),
+            (
+                b"I would like the General Gau's Chicken, please,",
+                b"\x97\x68\x72\x68\xd6\xec\xcc\xc0\xc0\x7b\x25\xe2\x5e\xcf\xe5\x84\xb3\xff\xfd\x94\x0c\x16\xa1\x8c\x1b\x55\x49\xd2\xf8\x38\x02\x9e\x39\x31\x25\x23\xa7\x86\x62\xd5\xbe\x7f\xcb\xcc\x98\xeb\xf5",
+            ),
+            (
+                b"I would like the General Gau's Chicken, please, ",
+                b"\x97\x68\x72\x68\xd6\xec\xcc\xc0\xc0\x7b\x25\xe2\x5e\xcf\xe5\x84\x9d\xad\x8b\xbb\x96\xc4\xcd\xc0\x3b\xc1\x03\xe1\xa1\x94\xbb\xd8\x39\x31\x25\x23\xa7\x86\x62\xd5\xbe\x7f\xcb\xcc\x98\xeb\xf5\xa8",
+            ),
+            (
+                plaintext,
+                b"\x97\x68\x72\x68\xd6\xec\xcc\xc0\xc0\x7b\x25\xe2\x5e\xcf\xe5\x84\x39\x31\x25\x23\xa7\x86\x62\xd5\xbe\x7f\xcb\xcc\x98\xeb\xf5\xa8\x48\x07\xef\xe8\x36\xee\x89\xa5\x26\x73\x0d\xbc\x2f\x7b\xc8\x40\x9d\xad\x8b\xbb\x96\xc4\xcd\xc0\x3b\xc1\x03\xe1\xa1\x94\xbb\xd8",
+            ),
+        ];
+
+        for (cleartext, expected) in vectors {
+            let mut ciphertext = cleartext.to_vec();
+            must!(encrypt_cbc_cs3(&generated, &mut ciphertext));
+            assert_eq!(&ciphertext, expected);
+            must!(decrypt_cbc_cs3(&generated, &mut ciphertext));
+            assert_eq!(&ciphertext, cleartext);
+        }
     }
 }
