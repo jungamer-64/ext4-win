@@ -1778,7 +1778,10 @@ impl JournalSuperblock {
             return Err(Error::UnsupportedJournal);
         }
         let mut uuid = [0_u8; 16];
-        uuid.copy_from_slice(bytes.get(0x30..0x40).ok_or(Error::TruncatedStructure)?);
+        memory::copy_exact(
+            &mut uuid,
+            bytes.get(0x30..0x40).ok_or(Error::TruncatedStructure)?,
+        )?;
         if be_u32(bytes, disk_offset(0xFC))? != 0 {
             verify_journal_superblock_checksum(bytes)?;
         }

@@ -297,12 +297,14 @@ impl FscryptPolicyV2 {
     }
 
     /// Serializes this policy as Linux `struct fscrypt_policy_v2` bytes.
-    #[must_use]
+    /// # Errors
+    ///
+    /// Returns an error if the fixed-size policy image cannot contain one of its fields.
     #[cfg(test)]
-    pub fn to_bytes(self) -> [u8; FSCRYPT_POLICY_V2_BYTES] {
+    pub fn to_bytes(self) -> Result<[u8; FSCRYPT_POLICY_V2_BYTES]> {
         let mut bytes = [0_u8; FSCRYPT_POLICY_V2_BYTES];
-        write_policy_fields(&mut bytes, FSCRYPT_POLICY_V2, self);
-        bytes
+        write_policy_fields(&mut bytes, FSCRYPT_POLICY_V2, self)?;
+        Ok(bytes)
     }
 
     /// Contents encryption mode.
@@ -365,13 +367,22 @@ impl FscryptContextV2 {
     }
 
     /// Serializes this context as Linux `struct fscrypt_context_v2` bytes.
-    #[must_use]
-    pub fn to_bytes(self) -> [u8; FSCRYPT_CONTEXT_V2_BYTES] {
+    /// # Errors
+    ///
+    /// Returns an error if the fixed-size context image cannot contain one of its fields.
+    pub fn to_bytes(self) -> Result<[u8; FSCRYPT_CONTEXT_V2_BYTES]> {
         let mut bytes = [0_u8; FSCRYPT_CONTEXT_V2_BYTES];
-        write_policy_fields(&mut bytes, FSCRYPT_CONTEXT_V2, self.policy);
-        bytes[FSCRYPT_NONCE_OFFSET..FSCRYPT_NONCE_OFFSET + FSCRYPT_FILE_NONCE_BYTES]
-            .copy_from_slice(&self.nonce.bytes());
-        bytes
+        write_policy_fields(&mut bytes, FSCRYPT_CONTEXT_V2, self.policy)?;
+        let nonce_end = FSCRYPT_NONCE_OFFSET
+            .checked_add(FSCRYPT_FILE_NONCE_BYTES)
+            .ok_or(Error::ArithmeticOverflow)?;
+        memory::copy_exact(
+            bytes
+                .get_mut(FSCRYPT_NONCE_OFFSET..nonce_end)
+                .ok_or(Error::InvalidEncryptionContext)?,
+            &self.nonce.bytes(),
+        )?;
+        Ok(bytes)
     }
 
     /// Policy fields from this context.
@@ -725,10 +736,12 @@ impl FscryptFilenamesKey {
     ) -> Result<Vec<u8>> {
         let padded_len = padded_filename_len(plaintext.len(), padding)?;
         let mut ciphertext = memory::repeated_vec(0_u8, padded_len)?;
-        ciphertext
-            .get_mut(..plaintext.len())
-            .ok_or(Error::InvalidName)?
-            .copy_from_slice(plaintext);
+        memory::copy_exact(
+            ciphertext
+                .get_mut(..plaintext.len())
+                .ok_or(Error::InvalidName)?,
+            plaintext,
+        )?;
         aes_256_cbc_cts(self.bytes)
             .encrypt(&mut ciphertext)
             .map_err(|_| Error::InvalidName)?;
@@ -1012,50 +1025,55 @@ fn parse_policy_fields(bytes: &[u8], version: u8) -> Result<FscryptPolicyV2> {
 }
 
 /// Writes policy fields shared by v2 policies and contexts.
-fn write_policy_fields(bytes: &mut [u8], version: u8, policy: FscryptPolicyV2) {
-    put_byte(bytes, FSCRYPT_VERSION_OFFSET, version);
+fn write_policy_fields(bytes: &mut [u8], version: u8, policy: FscryptPolicyV2) -> Result<()> {
+    put_byte(bytes, FSCRYPT_VERSION_OFFSET, version)?;
     put_byte(
         bytes,
         FSCRYPT_CONTENTS_MODE_OFFSET,
         policy.contents_mode().mode_number(),
-    );
+    )?;
     put_byte(
         bytes,
         FSCRYPT_FILENAMES_MODE_OFFSET,
         policy.filenames_mode().mode_number(),
-    );
+    )?;
     put_byte(
         bytes,
         FSCRYPT_FLAGS_OFFSET,
         policy.filename_padding().flags(),
-    );
+    )?;
     put_byte(
         bytes,
         FSCRYPT_LOG2_DATA_UNIT_SIZE_OFFSET,
         policy.data_unit_size().log2_value(),
-    );
+    )?;
     put_bytes(
         bytes,
         FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET,
         &policy.master_key_identifier().bytes(),
-    );
+    )?;
+    Ok(())
 }
 
 /// Writes one byte at a compile-time fscrypt structure offset.
-fn put_byte(bytes: &mut [u8], offset: usize, value: u8) {
-    if let Some(slot) = bytes.get_mut(offset) {
-        *slot = value;
-    }
+fn put_byte(bytes: &mut [u8], offset: usize, value: u8) -> Result<()> {
+    *bytes
+        .get_mut(offset)
+        .ok_or(Error::InvalidEncryptionContext)? = value;
+    Ok(())
 }
 
 /// Writes a byte slice at a compile-time fscrypt structure offset.
-fn put_bytes(bytes: &mut [u8], offset: usize, value: &[u8]) {
-    let Some(end) = offset.checked_add(value.len()) else {
-        return;
-    };
-    if let Some(slot) = bytes.get_mut(offset..end) {
-        slot.copy_from_slice(value);
-    }
+fn put_bytes(bytes: &mut [u8], offset: usize, value: &[u8]) -> Result<()> {
+    let end = offset
+        .checked_add(value.len())
+        .ok_or(Error::ArithmeticOverflow)?;
+    memory::copy_exact(
+        bytes
+            .get_mut(offset..end)
+            .ok_or(Error::InvalidEncryptionContext)?,
+        value,
+    )
 }
 
 /// Expands an fscrypt v2 HKDF output for one namespace and info value.
@@ -1151,7 +1169,7 @@ fn fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
     let end = offset.checked_add(N).ok_or(Error::ArithmeticOverflow)?;
     let slice = bytes.get(offset..end).ok_or(Error::TruncatedStructure)?;
     let mut output = [0_u8; N];
-    output.copy_from_slice(slice);
+    memory::copy_exact(&mut output, slice)?;
     Ok(output)
 }
 
@@ -1267,11 +1285,11 @@ mod tests {
     fn fscrypt_v2_context_serializes_linux_layout() {
         let parsed = must!(FscryptContextV2::parse(&valid_context_bytes()));
 
-        assert_eq!(parsed.policy().to_bytes(), valid_policy_bytes());
-        assert_eq!(parsed.to_bytes(), valid_context_bytes());
+        assert_eq!(parsed.policy().to_bytes(), Ok(valid_policy_bytes()));
+        assert_eq!(parsed.to_bytes(), Ok(valid_context_bytes()));
         assert_eq!(
             FscryptContextV2::new(parsed.policy(), parsed.nonce()).to_bytes(),
-            valid_context_bytes()
+            Ok(valid_context_bytes())
         );
     }
 

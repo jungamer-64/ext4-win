@@ -11,7 +11,7 @@ use wdk_sys::{
 use crate::{
     irp::{IrpCompletion, PendingIrpLease, QueryVolumeInformationClass, SetVolumeInformationClass},
     kernel::status::{DriverError, DriverResult},
-    memory::DriverVec,
+    memory::{self, DriverVec},
     state::{
         MountedVolumeDevice, PreparedVpbLabelPublication, TransferSectorSize, VolumeControlBlock,
         VolumeRuntime, VolumeSerialNumber,
@@ -213,7 +213,7 @@ fn pack_volume_information(
         return Err(DriverError::InvalidParameter);
     }
     for (chunk, byte) in chunks.iter_mut().zip(label_bytes.iter().copied()) {
-        chunk.copy_from_slice(&u16::from(byte).to_le_bytes());
+        memory::copy_exact(chunk, &u16::from(byte).to_le_bytes())?;
     }
     information_length(required)
 }
@@ -345,7 +345,7 @@ fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> 
         return Err(DriverError::InvalidParameter);
     }
     for (chunk, unit) in chunks.iter_mut().zip(FILE_SYSTEM_NAME.iter().copied()) {
-        chunk.copy_from_slice(&unit.to_le_bytes());
+        memory::copy_exact(chunk, &unit.to_le_bytes())?;
     }
     information_length(required)
 }

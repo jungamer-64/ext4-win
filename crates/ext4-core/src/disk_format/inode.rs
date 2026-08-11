@@ -1242,7 +1242,7 @@ impl Inode {
         let generation = InodeGeneration::from_u32(le_u32(raw, disk_offset(100))?);
         let block_slice = raw.get(40..100).ok_or(Error::TruncatedStructure)?;
         let mut block = [0_u8; 60];
-        block.copy_from_slice(block_slice);
+        memory::copy_exact(&mut block, block_slice)?;
         let storage = if flags.has_extent_tree() {
             InodeStorage::Extents(InodeExtentRoot::from_bytes(block))
         } else if mode.kind() == InodeKind::Symlink && size.to_usize()? <= block.len() {

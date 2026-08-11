@@ -20,7 +20,7 @@ use crate::irp::{
     WriteStartingPoint,
 };
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::DriverVec;
+use crate::memory::{self, DriverVec};
 use crate::state::{
     CleanupStart, CloseReleasePlan, DirectoryChange, DirectoryChangeAction, DirectoryCursor,
     DirectoryNotificationRegistration, FileCleanupDisposition, FileControlBlock, FileDeleteTarget,
@@ -441,10 +441,10 @@ fn query_file_information(
             completion,
         } => {
             request.with_active(|active| {
-                active
-                    .buffered_output(length)?
-                    .as_mut_slice()
-                    .copy_from_slice(output.as_slice());
+                memory::copy_exact(
+                    active.buffered_output(length)?.as_mut_slice(),
+                    output.as_slice(),
+                )?;
                 Ok::<_, DriverError>(())
             })?;
             return Ok(completion);
@@ -508,7 +508,7 @@ fn query_hard_link_information(
             .as_slice()
             .get(..result.information())
             .ok_or(DriverError::InternalInvariantViolation)?;
-        destination.copy_from_slice(source);
+        memory::copy_exact(destination, source)?;
         Ok::<_, DriverError>(())
     })?;
     result.completion()
@@ -1853,7 +1853,7 @@ pub(crate) fn query_directory(
                 .as_slice()
                 .get(..information)
                 .ok_or(DriverError::InternalInvariantViolation)?;
-            destination.copy_from_slice(source);
+            memory::copy_exact(destination, source)?;
         }
         let file_object = active.current_stack()?.file_object()?;
         let mut opened_file = OpenedDirectory::decode(file_object)?;

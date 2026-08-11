@@ -3,7 +3,10 @@
 //! All callers go through these helpers so truncation and offset overflow map to
 //! the same domain errors instead of becoming unchecked indexing.
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    memory,
+};
 
 /// Byte offset inside one on-disk ext4/JBD2 structure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,7 +198,7 @@ fn fixed<const N: usize>(bytes: &[u8], offset: DiskOffset) -> Result<[u8; N]> {
     let range = DiskRange::new(offset, DiskByteLen::new(N))?;
     let slice = range.read_from(bytes)?;
     let mut raw = [0_u8; N];
-    raw.copy_from_slice(slice);
+    memory::copy_exact(&mut raw, slice)?;
     Ok(raw)
 }
 
@@ -205,8 +208,7 @@ fn fixed<const N: usize>(bytes: &[u8], offset: DiskOffset) -> Result<[u8; N]> {
 /// Returns an error when the source-width range overflows or is outside the output bytes.
 fn put_fixed(bytes: &mut [u8], offset: DiskOffset, source: &[u8]) -> Result<()> {
     let target = DiskRange::new(offset, DiskByteLen::new(source.len()))?.write_to(bytes)?;
-    target.copy_from_slice(source);
-    Ok(())
+    memory::copy_exact(target, source)
 }
 
 #[cfg(test)]

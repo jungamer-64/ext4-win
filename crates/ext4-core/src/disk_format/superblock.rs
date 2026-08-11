@@ -8,6 +8,7 @@ use crate::disk_format::inode::{
     FileSizeEncoding, InodeBlockCountEncoding, InodeDataEncoding, InodeId,
 };
 use crate::error::{Error, Result};
+use crate::memory;
 
 // ext4 superblock and feature-policy constants. Feature masks stay here so the
 // mount boundary is the only place where unsupported on-disk formats enter.
@@ -641,10 +642,12 @@ impl Ext4VolumeLabel {
         }
         let mut label = [0_u8; VOLUME_LABEL_BYTES];
         let len = u8::try_from(bytes.len()).map_err(|_| Error::ArithmeticOverflow)?;
-        label
-            .get_mut(..bytes.len())
-            .ok_or(Error::ArithmeticOverflow)?
-            .copy_from_slice(bytes);
+        memory::copy_exact(
+            label
+                .get_mut(..bytes.len())
+                .ok_or(Error::ArithmeticOverflow)?,
+            bytes,
+        )?;
         Ok(Self { bytes: label, len })
     }
 
@@ -676,11 +679,10 @@ impl Ext4VolumeLabel {
         field.fill(0);
         let len = usize::from(self.len);
         let source = self.bytes.get(..len).ok_or(Error::InvalidName)?;
-        field
-            .get_mut(..len)
-            .ok_or(Error::TruncatedStructure)?
-            .copy_from_slice(source);
-        Ok(())
+        memory::copy_exact(
+            field.get_mut(..len).ok_or(Error::TruncatedStructure)?,
+            source,
+        )
     }
 
     /// Returns the non-padding bytes of this label.
@@ -1502,10 +1504,16 @@ impl Superblock {
         }
         let journal_inode = le_u32(raw, disk_offset(224))?;
         let mut uuid = [0_u8; 16];
-        uuid.copy_from_slice(raw.get(104..120).ok_or(Error::TruncatedStructure)?);
+        memory::copy_exact(
+            &mut uuid,
+            raw.get(104..120).ok_or(Error::TruncatedStructure)?,
+        )?;
         let volume_label = Ext4VolumeLabel::parse(raw)?;
         let mut journal_uuid = [0_u8; 16];
-        journal_uuid.copy_from_slice(raw.get(208..224).ok_or(Error::TruncatedStructure)?);
+        memory::copy_exact(
+            &mut journal_uuid,
+            raw.get(208..224).ok_or(Error::TruncatedStructure)?,
+        )?;
         let journal_uuid = JournalUuid::from_bytes(journal_uuid);
         let journal_mode = if features.has_journal() {
             if features.has_external_journal() {

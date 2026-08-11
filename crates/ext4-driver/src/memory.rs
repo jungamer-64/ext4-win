@@ -28,16 +28,16 @@ fn reserve_failed(error: TryReserveError) -> DriverError {
     }
 }
 
-/// Copies exactly equal byte slices without invoking a bounds-panicking copy intrinsic.
+/// Copies exactly equal slices without invoking a bounds-panicking copy intrinsic.
 /// # Errors
 ///
 /// Returns an invariant error when source and destination lengths differ.
-pub(crate) fn copy_exact(destination: &mut [u8], source: &[u8]) -> DriverResult<()> {
+pub(crate) fn copy_exact<T: Copy>(destination: &mut [T], source: &[T]) -> DriverResult<()> {
     if destination.len() != source.len() {
         return Err(DriverError::InternalInvariantViolation);
     }
-    for (target, byte) in destination.iter_mut().zip(source.iter().copied()) {
-        *target = byte;
+    for (target, source) in destination.iter_mut().zip(source.iter().copied()) {
+        *target = source;
     }
     Ok(())
 }

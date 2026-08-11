@@ -293,10 +293,10 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
             for (logical, chunk) in target.bytes().chunks(block_bytes).enumerate() {
                 let block = self.allocate_cluster()?;
                 let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
-                bytes
-                    .get_mut(..chunk.len())
-                    .ok_or(Error::DeviceRange)?
-                    .copy_from_slice(chunk);
+                memory::copy_exact(
+                    bytes.get_mut(..chunk.len()).ok_or(Error::DeviceRange)?,
+                    chunk,
+                )?;
                 self.data_writes.try_push(RangeWrite {
                     offset: block_size.offset_of(block)?,
                     bytes,
@@ -693,7 +693,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
             let Some(position) = entries.iter().position(|entry| entry.name() == &disk_name) else {
                 return Err(Error::DirectoryEntryNotFound);
             };
-            let removed = entries.remove(position);
+            let removed = entries.try_remove_at(position)?;
             self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
             return Ok(removed);
         }

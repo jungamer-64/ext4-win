@@ -215,6 +215,12 @@ impl DirectoryEntry {
     pub const fn kind(&self) -> DirectoryEntryKind {
         self.kind
     }
+
+    /// Consumes this entry into its validated components without copying its owned name.
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (InodeId, Ext4Name, DirectoryEntryKind) {
+        (self.inode, self.name, self.kind)
+    }
 }
 
 /// One logical directory file block supplied by the volume layer.
@@ -2276,10 +2282,12 @@ fn write_entry(
     let name_end = name_start
         .checked_add(name.len())
         .ok_or(Error::ArithmeticOverflow)?;
-    bytes
-        .get_mut(name_start..name_end)
-        .ok_or(Error::InvalidDirectoryEntry)?
-        .copy_from_slice(name);
+    memory::copy_exact(
+        bytes
+            .get_mut(name_start..name_end)
+            .ok_or(Error::InvalidDirectoryEntry)?,
+        name,
+    )?;
     if name_end
         < offset
             .checked_add(rec_len_usize)

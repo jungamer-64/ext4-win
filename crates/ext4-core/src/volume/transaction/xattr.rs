@@ -39,7 +39,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
     ) -> Result<Option<XattrValue>> {
         let mut removed = None;
         self.update_xattrs(node, |set| {
-            removed = set.remove(name);
+            removed = set.remove(name)?;
             Ok(())
         })?;
         Ok(removed)
@@ -207,9 +207,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
             let inline_capacity = raw_inode.writable_inline_xattr_region()?.len();
             match xattr_storage::serialize_inline_xattrs(set, inline_capacity) {
                 Ok(bytes) => {
-                    raw_inode
-                        .writable_inline_xattr_region()?
-                        .copy_from_slice(&bytes);
+                    memory::copy_exact(raw_inode.writable_inline_xattr_region()?, &bytes)?;
                     if let Some(block) = old_block {
                         self.release_xattr_block_ref(block)?;
                     }

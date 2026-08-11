@@ -510,7 +510,7 @@ impl FsverityRootHash {
         let target = bytes
             .get_mut(..digest.bytes().len())
             .ok_or(Error::InvalidVerityMetadata)?;
-        target.copy_from_slice(digest.bytes());
+        memory::copy_exact(target, digest.bytes())?;
         Ok(Self { bytes })
     }
 
@@ -1136,10 +1136,12 @@ fn hash_data_blocks(
     let mut hashes = Vec::new();
     for chunk in data.chunks(block_bytes) {
         let mut block = memory::repeated_vec(0_u8, block_bytes)?;
-        block
-            .get_mut(..chunk.len())
-            .ok_or(Error::InvalidVerityMetadata)?
-            .copy_from_slice(chunk);
+        memory::copy_exact(
+            block
+                .get_mut(..chunk.len())
+                .ok_or(Error::InvalidVerityMetadata)?,
+            chunk,
+        )?;
         hashes.try_push(hash_block(algorithm, salt, &block)?)?;
     }
     Ok(hashes)
@@ -1196,10 +1198,12 @@ fn hash_block(
     if !salt.is_empty() {
         let padded_salt_bytes = algorithm.compression_input_bytes();
         input = memory::repeated_vec(0_u8, padded_salt_bytes)?;
-        input
-            .get_mut(..salt.bytes().len())
-            .ok_or(Error::InvalidVerityMetadata)?
-            .copy_from_slice(salt.bytes());
+        memory::copy_exact(
+            input
+                .get_mut(..salt.bytes().len())
+                .ok_or(Error::InvalidVerityMetadata)?,
+            salt.bytes(),
+        )?;
     }
     input.try_extend_from_slice(block)?;
     FsverityDigest::new(algorithm, hash_bytes(algorithm, &input)?)
@@ -1279,7 +1283,7 @@ fn fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
     let end = offset.checked_add(N).ok_or(Error::ArithmeticOverflow)?;
     let slice = bytes.get(offset..end).ok_or(Error::TruncatedStructure)?;
     let mut output = [0_u8; N];
-    output.copy_from_slice(slice);
+    memory::copy_exact(&mut output, slice)?;
     Ok(output)
 }
 
@@ -1291,11 +1295,12 @@ fn copy_into(target: &mut [u8], offset: usize, source: &[u8]) -> Result<()> {
     let end = offset
         .checked_add(source.len())
         .ok_or(Error::ArithmeticOverflow)?;
-    target
-        .get_mut(offset..end)
-        .ok_or(Error::TruncatedStructure)?
-        .copy_from_slice(source);
-    Ok(())
+    memory::copy_exact(
+        target
+            .get_mut(offset..end)
+            .ok_or(Error::TruncatedStructure)?,
+        source,
+    )
 }
 
 #[cfg(test)]

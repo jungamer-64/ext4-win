@@ -943,11 +943,12 @@ impl RawInodeRecord {
         let end = INODE_BLOCK_OFFSET
             .checked_add(root.len())
             .ok_or(Error::ArithmeticOverflow)?;
-        self.bytes
-            .get_mut(INODE_BLOCK_OFFSET..end)
-            .ok_or(Error::TruncatedStructure)?
-            .copy_from_slice(root);
-        Ok(())
+        memory::copy_exact(
+            self.bytes
+                .get_mut(INODE_BLOCK_OFFSET..end)
+                .ok_or(Error::TruncatedStructure)?,
+            root,
+        )
     }
 
     /// Writes explicit ext4 inode timestamps.
@@ -1103,11 +1104,10 @@ impl RawInodeRecord {
             .get_mut(INODE_BLOCK_OFFSET..end)
             .ok_or(Error::TruncatedStructure)?;
         block.fill(0);
-        block
-            .get_mut(..target.len())
-            .ok_or(Error::DeviceRange)?
-            .copy_from_slice(target);
-        Ok(())
+        memory::copy_exact(
+            block.get_mut(..target.len()).ok_or(Error::DeviceRange)?,
+            target,
+        )
     }
 
     /// Recomputes inode checksum fields when metadata checksums are enabled.
