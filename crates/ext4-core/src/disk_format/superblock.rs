@@ -88,14 +88,6 @@ const INCOMPAT_INLINE_DATA: u32 = 0x8000;
 const INCOMPAT_ENCRYPT: u32 = 0x0001_0000;
 /// Incompatible feature bit for casefolded directory lookup.
 const INCOMPAT_CASEFOLD: u32 = 0x0002_0000;
-/// Incompatible feature mask accepted for read-only traversal.
-#[cfg(test)]
-const SUPPORTED_READ_INCOMPAT: u32 = INCOMPAT_FILETYPE
-    | INCOMPAT_EXTENTS
-    | INCOMPAT_64BIT
-    | INCOMPAT_FLEX_BG
-    | INCOMPAT_CSUM_SEED
-    | INCOMPAT_ENCRYPT;
 // Read-only compatible feature bits are safe for read traversal but still need
 // write-domain screening before metadata can be changed.
 /// Read-only compatible feature bit for sparse superblock backups.
@@ -124,20 +116,6 @@ const RO_COMPAT_PROJECT: u32 = 0x2000;
 const RO_COMPAT_VERITY: u32 = 0x8000;
 /// Read-only compatible feature bit indicating orphan cleanup is required.
 const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
-/// Read-only compatible feature mask accepted for read-only traversal.
-#[cfg(test)]
-const SUPPORTED_READ_RO_COMPAT: u32 = RO_COMPAT_SPARSE_SUPER
-    | RO_COMPAT_LARGE_FILE
-    | RO_COMPAT_HUGE_FILE
-    | RO_COMPAT_GDT_CSUM
-    | RO_COMPAT_DIR_NLINK
-    | RO_COMPAT_EXTRA_ISIZE
-    | RO_COMPAT_QUOTA
-    | RO_COMPAT_BIGALLOC
-    | RO_COMPAT_METADATA_CSUM
-    | RO_COMPAT_READONLY
-    | RO_COMPAT_PROJECT
-    | RO_COMPAT_VERITY;
 /// Descriptor size implied by ext4 64-bit group descriptors when not explicit.
 const DEFAULT_64BIT_DESCRIPTOR_SIZE: u16 = 64;
 
@@ -1129,28 +1107,6 @@ pub(crate) struct FeatureSet {
 }
 
 impl FeatureSet {
-    /// Validates raw superblock feature flags for read-only traversal.
-    ///
-    /// # Errors
-    /// Returns an error when the advertised feature set is outside the
-    /// read-only mount policy.
-    #[cfg(test)]
-    pub(crate) fn read_only(compat: u32, incompat: u32, read_only_compat: u32) -> Result<Self> {
-        if incompat & !SUPPORTED_READ_INCOMPAT != 0 {
-            return Err(Error::UnsupportedIncompatFeature);
-        }
-        if read_only_compat & !SUPPORTED_READ_RO_COMPAT != 0 {
-            return Err(Error::UnsupportedReadOnlyFeature);
-        }
-        if incompat & INCOMPAT_CSUM_SEED != 0 && read_only_compat & RO_COMPAT_METADATA_CSUM == 0 {
-            return Err(Error::UnsupportedIncompatFeature);
-        }
-        if incompat & INCOMPAT_EXTENTS == 0 {
-            return Err(Error::UnsupportedIncompatFeature);
-        }
-        Ok(Self::from_raw(compat, incompat, read_only_compat))
-    }
-
     /// Validates raw superblock feature flags for journaled read-write mode.
     ///
     /// # Errors
@@ -1444,18 +1400,6 @@ pub struct Superblock {
 }
 
 impl Superblock {
-    /// Reads and validates the primary ext4 superblock from a block device for read-only mode.
-    ///
-    /// # Errors
-    /// Returns an error when the primary superblock cannot be read or does not
-    /// satisfy the clean v1 mount policy.
-    #[cfg(test)]
-    pub fn read_from(device: &mut OperationDevice<'_>) -> Result<Self> {
-        let mut raw = [0_u8; SUPERBLOCK_SIZE];
-        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
-        Self::parse(&raw)
-    }
-
     /// Reads and validates the primary ext4 superblock for read-write mode.
     ///
     /// # Errors
@@ -1464,16 +1408,6 @@ impl Superblock {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
         device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
         Self::parse_read_write(&raw)
-    }
-
-    /// Parses and validates a 1024-byte superblock payload.
-    ///
-    /// # Errors
-    /// Returns an error when the payload is truncated, has invalid ext4 magic,
-    /// is dirty, advertises unsupported features, or contains invalid geometry.
-    #[cfg(test)]
-    pub fn parse(raw: &[u8]) -> Result<Self> {
-        Self::parse_with_policy(raw, FeatureSet::read_only)
     }
 
     /// Parses and validates a 1024-byte superblock payload for read-write mode.

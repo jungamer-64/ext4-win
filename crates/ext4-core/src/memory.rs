@@ -245,3 +245,54 @@ impl<T> FallibleVec<T> for Vec<T> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::{FallibleVec, heap_sort_by};
+
+    /// # Panics
+    ///
+    /// Panics when checked insertion does not preserve stable element order.
+    #[test]
+    fn checked_insert_preserves_order_at_every_boundary() {
+        let mut values = vec![2_u8, 4];
+        assert_eq!(values.try_insert(0, 1), Ok(()));
+        assert_eq!(values.try_insert(2, 3), Ok(()));
+        assert_eq!(values.try_insert(4, 5), Ok(()));
+        assert_eq!(values, [1, 2, 3, 4, 5]);
+        assert!(values.try_insert(6, 9).is_err());
+    }
+
+    /// # Panics
+    ///
+    /// Panics when checked removal returns the wrong value or changes order.
+    #[test]
+    fn checked_remove_preserves_remaining_order() {
+        let mut values = vec![1_u8, 2, 3, 4, 5];
+        assert_eq!(values.try_remove_at(2), Ok(3));
+        assert_eq!(values, [1, 2, 4, 5]);
+        assert_eq!(values.try_remove_at(0), Ok(1));
+        assert_eq!(values.try_remove_at(1), Ok(4));
+        assert_eq!(values, [2, 5]);
+        assert!(values.try_remove_at(2).is_err());
+    }
+
+    /// # Panics
+    ///
+    /// Panics when heap ordering differs from the complete comparison key.
+    #[test]
+    fn checked_heap_sort_orders_empty_singleton_and_duplicate_values() {
+        let mut empty: [i32; 0] = [];
+        assert_eq!(heap_sort_by(&mut empty, i32::cmp), Ok(()));
+
+        let mut singleton = [7_i32];
+        assert_eq!(heap_sort_by(&mut singleton, i32::cmp), Ok(()));
+        assert_eq!(singleton, [7]);
+
+        let mut values = [5_i32, -1, 4, 4, 0, 9, -3, 2];
+        assert_eq!(heap_sort_by(&mut values, i32::cmp), Ok(()));
+        assert_eq!(values, [-3, -1, 0, 2, 4, 4, 5, 9]);
+    }
+}

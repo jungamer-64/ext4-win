@@ -1,7 +1,5 @@
 //! ext4 on-disk structures and format-specific state machines.
 
-#[cfg(test)]
-pub(crate) mod acl;
 pub(crate) mod dir;
 pub(crate) mod extent;
 pub(crate) mod group;

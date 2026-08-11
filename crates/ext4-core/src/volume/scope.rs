@@ -8,8 +8,6 @@ pub(super) use crate::disk::block::{BlockAddress, BlockSize, ByteOffset, DeviceL
 pub(super) use crate::disk::checksum::ext4_crc32c;
 pub(super) use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 pub(super) use crate::disk::storage::OperationDevice;
-#[cfg(test)]
-pub(super) use crate::disk_format::acl::{PosixAcl, PosixAclKind};
 pub(super) use crate::disk_format::dir::{
     DirectoryBlock, DirectoryBlockData, DirectoryChecksum, DirectoryEntry as RawDirectoryEntry,
     DirectoryEntryKind, DirectoryLayout, build_htree_directory,
