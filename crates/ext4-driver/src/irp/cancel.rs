@@ -242,12 +242,17 @@ mod tests {
 
     use super::{ActiveCancelDestination, ActiveCancelEnvelope};
 
+    /// Records one published slot in the test destination.
+    /// # Safety
+    ///
+    /// `context` must point to a live, uniquely writable `AtomicUsize` for this call.
     unsafe fn record_cancel(context: NonNull<c_void>, index: usize) {
         let counter = unsafe {
             // SAFETY: The test destination points to this live `AtomicUsize` for the whole call.
             context.cast::<AtomicUsize>().as_ref()
         };
-        counter.store(index + 1, Ordering::Release);
+        let recorded = index.saturating_add(1);
+        counter.store(recorded, Ordering::Release);
     }
 
     /// # Panics

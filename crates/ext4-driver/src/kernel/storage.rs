@@ -13,7 +13,8 @@ use crate::irp::lower::{
 };
 #[cfg(not(test))]
 use crate::irp::lower::{
-    CompletionRundownLease, LowerBuildError, LowerCompletionDestination, PreparedLowerIrp,
+    CompletionRundownLease, LowerBuildError, LowerCompletionDestination, LowerIrpTransfer,
+    PreparedLowerIrp,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory;
@@ -88,6 +89,10 @@ impl LowerStorageDevice {
     }
 
     /// Covers one arbitrary core byte range with whole physical sectors.
+    /// # Errors
+    ///
+    /// Returns an error when the requested or covering range overflows, exceeds the device, or
+    /// cannot be represented in the host length domain.
     fn cover(self, offset: ByteOffset, byte_count: usize) -> DriverResult<CoveredTransfer> {
         let byte_count = u64::try_from(byte_count).map_err(|_| DriverError::InvalidBufferSize)?;
         let requested_end = offset
@@ -308,6 +313,10 @@ impl<O> PreparedStorageCommand<O> {
     }
 
     /// Allocates and prepares one command without exposing it to a lower driver.
+    /// # Errors
+    ///
+    /// Returns the owned operation and request when target selection, sector coverage, aligned
+    /// transfer allocation, or exact-copy preparation fails.
     pub fn try_new(
         devices: MountedStorageDevices,
         request: StorageRequest,
@@ -438,6 +447,10 @@ impl<O> PreparedStorageCommand<O> {
     }
 
     /// Builds every private-IRP resource while preserving the command on failure.
+    /// # Errors
+    ///
+    /// Returns the suspended command when IRP, MDL, envelope, or completion-rundown preparation
+    /// fails before registration.
     #[cfg(not(test))]
     pub fn build_lower(
         self,
@@ -450,11 +463,7 @@ impl<O> PreparedStorageCommand<O> {
         let (completion_owner, device, offset, method) = self.command.lower_contract();
         PreparedLowerIrp::try_new(
             completion_owner,
-            device.device,
-            self.operation,
-            method,
-            offset,
-            self.transfer,
+            LowerIrpTransfer::new(device.device, self.operation, method, offset, self.transfer),
             self.command,
             destination,
             rundown,
@@ -533,6 +542,9 @@ impl<O> StorageCommand<O> {
     }
 
     /// Mutably increments the attempt for a timer-granted retry.
+    /// # Errors
+    ///
+    /// Returns an invariant error when the bounded attempt counter overflows.
     fn advance_attempt(&mut self) -> DriverResult<()> {
         let attempt = match self {
             Self::Read { attempt, .. }
@@ -620,8 +632,8 @@ impl<O> FailedStorageCommand<O> {
         (suspended, request, class)
     }
 
-    /// Selects and owns the next fixed retry timer, if policy permits one.
-    pub fn into_retry(mut self) -> Result<RetryingStorageCommand<O>, Self> {
+    /// Selects and owns the next fixed retry timer, or preserves terminal failure ownership.
+    pub fn into_retry(mut self) -> StorageRetryDecision<O> {
         let status_retryable = if self.command.read_retry_policy() {
             matches!(
                 self.status,
@@ -634,22 +646,31 @@ impl<O> FailedStorageCommand<O> {
             ) && self.information == 0
         };
         if !status_retryable || self.command.attempt() >= MAX_STORAGE_ATTEMPTS {
-            return Err(self);
+            return StorageRetryDecision::Terminal(self);
         }
         let delay = match self.command.attempt() {
             1 => StorageRetryDelay::TenMilliseconds,
             2 => StorageRetryDelay::HundredMilliseconds,
-            _ => return Err(self),
+            _ => return StorageRetryDecision::Terminal(self),
         };
         if self.command.read_retry_policy() {
             self.transfer.as_mut_slice().fill(0);
         }
-        Ok(RetryingStorageCommand {
+        StorageRetryDecision::Retry(RetryingStorageCommand {
             command: self.command,
             transfer: self.transfer,
             delay,
         })
     }
+}
+
+/// Explicit retry-policy outcome retaining exactly one command owner.
+#[derive(Debug)]
+pub enum StorageRetryDecision<O> {
+    /// A fixed timer must issue one permit before a fresh private IRP can be built.
+    Retry(RetryingStorageCommand<O>),
+    /// Retry is forbidden or exhausted; failure classification owns the command.
+    Terminal(FailedStorageCommand<O>),
 }
 
 /// Storage command waiting for its one-use retry timer permit.
@@ -675,6 +696,9 @@ impl<O> RetryingStorageCommand<O> {
     }
 
     /// Consumes a scheduler retry permit and prepares a fresh private IRP attempt.
+    /// # Errors
+    ///
+    /// Returns an invariant error when the bounded attempt counter cannot advance.
     pub fn permitted(mut self) -> DriverResult<PreparedStorageCommand<O>> {
         self.command.advance_attempt()?;
         let operation = match &self.command {
@@ -713,6 +737,10 @@ pub enum StorageCommandStep<O> {
 
 impl<O> CompletedLowerIrp<StorageCommand<O>> {
     /// Validates one lower completion and advances its storage command without allocation.
+    /// # Errors
+    ///
+    /// Returns an error only when a successful read-modify-write completion cannot be copied into
+    /// its prepared write buffer or command invariants are inconsistent.
     pub fn advance(self) -> DriverResult<StorageCommandStep<O>> {
         let Self {
             suspended: command,
@@ -825,6 +853,10 @@ pub struct DeviceLengthProbe<O> {
 
 impl<O> DeviceLengthProbe<O> {
     /// Builds a private length-query IRP through the same stable-envelope registration boundary.
+    /// # Errors
+    ///
+    /// Returns the suspended probe when transfer, IRP, MDL, envelope, or rundown preparation
+    /// fails before registration.
     #[cfg(not(test))]
     pub fn prepare(
         completion_owner: KernelDevice,
@@ -846,11 +878,13 @@ impl<O> DeviceLengthProbe<O> {
             };
         PreparedLowerIrp::try_new(
             completion_owner,
-            target,
-            LowerOperation::QueryLength,
-            LowerTransferMethod::Buffered,
-            ByteOffset::new(0),
-            transfer,
+            LowerIrpTransfer::new(
+                target,
+                LowerOperation::QueryLength,
+                LowerTransferMethod::Buffered,
+                ByteOffset::new(0),
+                transfer,
+            ),
             Self { suspended },
             destination,
             rundown,
@@ -865,6 +899,10 @@ impl<O> DeviceLengthProbe<O> {
 
 impl<O> CompletedLowerIrp<DeviceLengthProbe<O>> {
     /// Validates and decodes one completed `GET_LENGTH_INFORMATION` payload.
+    /// # Errors
+    ///
+    /// Returns the suspended operation with a driver error for a failed, short, malformed, or
+    /// non-positive device-length result.
     pub fn finish(self) -> Result<(O, DeviceLength), (O, DriverError)> {
         let Self {
             suspended: probe,
@@ -908,10 +946,11 @@ mod tests {
         DeviceLengthProbe, FailedStorageCommand, LowerStorageDevice, MountedStorageDevices,
         PreparedStorageCommand, STATUS_CRC_ERROR, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY,
         STATUS_IO_TIMEOUT, STATUS_RETRY, StorageCommandStep, StorageFailureClass,
-        StorageRetryDelay, WriteTransferPhase, failed_unsubmitted_request,
+        StorageRetryDecision, StorageRetryDelay, WriteTransferPhase, failed_unsubmitted_request,
     };
     use crate::irp::lower::CompletedLowerIrp;
     use crate::kernel::status::DriverError;
+    use crate::memory;
     use crate::state::KernelDevice;
     use ext4_core::{ByteOffset, DeviceLength, Error, StorageRequest, StorageTarget};
 
@@ -922,12 +961,18 @@ mod tests {
     }
 
     fn storage_fixture() -> Option<StorageFixture> {
-        let mut owner = Box::new(wdk_sys::DEVICE_OBJECT::default());
-        let mut lower = Box::new(wdk_sys::DEVICE_OBJECT {
-            SectorSize: 512,
-            AlignmentRequirement: wdk_sys::FILE_512_BYTE_ALIGNMENT,
-            ..wdk_sys::DEVICE_OBJECT::default()
-        });
+        let Ok(mut owner) = memory::boxed_try_with(|| Ok(wdk_sys::DEVICE_OBJECT::default())) else {
+            return None;
+        };
+        let Ok(mut lower) = memory::boxed_try_with(|| {
+            Ok(wdk_sys::DEVICE_OBJECT {
+                SectorSize: 512,
+                AlignmentRequirement: wdk_sys::FILE_512_BYTE_ALIGNMENT,
+                ..wdk_sys::DEVICE_OBJECT::default()
+            })
+        }) else {
+            return None;
+        };
         let completion_owner = KernelDevice::from_raw(core::ptr::from_mut(owner.as_mut()))?;
         let target = KernelDevice::from_raw(core::ptr::from_mut(lower.as_mut()))?;
         let filesystem =
@@ -1032,8 +1077,8 @@ mod tests {
             return;
         };
         let first = failed.into_retry();
-        assert!(first.is_ok());
-        let Ok(first) = first else {
+        assert!(matches!(&first, StorageRetryDecision::Retry(_)));
+        let StorageRetryDecision::Retry(first) = first else {
             return;
         };
         assert_eq!(first.delay(), StorageRetryDelay::TenMilliseconds);
@@ -1047,8 +1092,8 @@ mod tests {
             return;
         };
         let second = failed.into_retry();
-        assert!(second.is_ok());
-        let Ok(second) = second else {
+        assert!(matches!(&second, StorageRetryDecision::Retry(_)));
+        let StorageRetryDecision::Retry(second) = second else {
             return;
         };
         assert_eq!(second.delay(), StorageRetryDelay::HundredMilliseconds);
@@ -1062,8 +1107,8 @@ mod tests {
             return;
         };
         let terminal = failed.into_retry();
-        assert!(terminal.is_err());
-        let Err(terminal) = terminal else {
+        assert!(matches!(&terminal, StorageRetryDecision::Terminal(_)));
+        let StorageRetryDecision::Terminal(terminal) = terminal else {
             return;
         };
         let (suspended, request, class) = terminal.into_failure();
@@ -1116,8 +1161,8 @@ mod tests {
             return;
         };
         let timeout = timeout.into_retry();
-        assert!(timeout.is_err());
-        let Err(timeout) = timeout else {
+        assert!(matches!(&timeout, StorageRetryDecision::Terminal(_)));
+        let StorageRetryDecision::Terminal(timeout) = timeout else {
             return;
         };
         let (_, _, class) = timeout.into_failure();
@@ -1148,8 +1193,8 @@ mod tests {
             return;
         };
         let timeout = timeout.into_retry();
-        assert!(timeout.is_err());
-        let Err(timeout) = timeout else {
+        assert!(matches!(&timeout, StorageRetryDecision::Terminal(_)));
+        let StorageRetryDecision::Terminal(timeout) = timeout else {
             return;
         };
         let (_, _, class) = timeout.into_failure();
@@ -1177,8 +1222,8 @@ mod tests {
             return;
         };
         let retry = failed.into_retry();
-        assert!(retry.is_ok());
-        let Ok(retry) = retry else {
+        assert!(matches!(&retry, StorageRetryDecision::Retry(_)));
+        let StorageRetryDecision::Retry(retry) = retry else {
             return;
         };
         assert_eq!(retry.delay(), StorageRetryDelay::TenMilliseconds);

@@ -345,6 +345,10 @@ fn execute_immediate(major: DispatchMajor) -> DriverResult<IrpCompletion> {
 ///
 /// Classification is copied out before `owned` moves so no pointer into queue metadata can enter
 /// an operation or lower completion envelope.
+/// # Errors
+///
+/// Returns the still-owned IRP when lifecycle admission, request decoding, operation allocation,
+/// or mounted-state validation fails.
 pub(crate) fn admit_owned(mut owned: OwnedIrp) -> Result<AdmittedOperation, AdmitOperationError> {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum HandleRequestClass {

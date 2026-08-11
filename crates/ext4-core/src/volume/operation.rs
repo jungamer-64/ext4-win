@@ -25,25 +25,53 @@ pub enum ReadTransition<T> {
 /// enclosing operation.
 pub trait CommittedReadPass {
     /// Loads a regular file by validated identity.
+    /// # Errors
+    ///
+    /// Returns an error when the inode cannot be read or does not describe the requested file.
     fn load_file(&mut self, id: FileNodeId) -> Result<FileNode>;
     /// Loads a directory by validated identity.
+    /// # Errors
+    ///
+    /// Returns an error when the inode cannot be read or does not describe a directory.
     fn load_directory(&mut self, id: DirectoryNodeId) -> Result<DirectoryNode>;
     /// Loads a symbolic link by validated identity.
+    /// # Errors
+    ///
+    /// Returns an error when the inode cannot be read or does not describe a symbolic link.
     fn load_symlink(&mut self, id: SymlinkNodeId) -> Result<SymlinkNode>;
     /// Loads and classifies one Windows-facing file index.
+    /// # Errors
+    ///
+    /// Returns an error when the index is invalid or its inode cannot be loaded and classified.
     fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId>;
     /// Reads every extended attribute attached to a typed node.
+    /// # Errors
+    ///
+    /// Returns an error when the inode or external attribute block is invalid or unavailable.
     fn read_xattrs(&mut self, node: NodeId) -> Result<XattrSet>;
     /// Reads one extended attribute attached to a typed node.
+    /// # Errors
+    ///
+    /// Returns an error when attributes cannot be read or the selected value cannot be copied.
     fn read_xattr(&mut self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>>;
     /// Reads Windows overlay metadata.
+    /// # Errors
+    ///
+    /// Returns an error when the overlay attribute is malformed or cannot be read.
     fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>>;
     /// Reads Windows symbolic-link reparse metadata.
+    /// # Errors
+    ///
+    /// Returns an error when the reparse attribute is malformed or cannot be read.
     fn read_windows_symlink_reparse_point(
         &mut self,
         node: NodeId,
     ) -> Result<Option<WindowsSymlinkReparsePoint>>;
     /// Reads regular-file bytes into an exact caller-owned range.
+    /// # Errors
+    ///
+    /// Returns an error when the range, extent mapping, encryption, verity proof, or storage read
+    /// cannot be completed.
     fn read_file(
         &mut self,
         file: &FileNode,
@@ -51,14 +79,30 @@ pub trait CommittedReadPass {
         out: &mut [u8],
     ) -> Result<ReadBytes>;
     /// Reads one symbolic-link target into an owned byte vector.
+    /// # Errors
+    ///
+    /// Returns an error when the target is malformed, cannot be read, or cannot be allocated.
     fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>>;
     /// Enumerates validated directory entries.
+    /// # Errors
+    ///
+    /// Returns an error when directory storage is invalid, encrypted names cannot be decoded, or
+    /// result allocation fails.
     fn read_directory(&mut self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>>;
     /// Enumerates every reachable hard link to a non-directory inode.
+    /// # Errors
+    ///
+    /// Returns an error when directory traversal or result allocation fails.
     fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks>;
     /// Looks up one exact ext4 child name.
+    /// # Errors
+    ///
+    /// Returns an error when the directory is invalid or its storage cannot be searched.
     fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup>;
     /// Looks up one unambiguous Windows-visible child name.
+    /// # Errors
+    ///
+    /// Returns an error when directory traversal, name decoding, or ambiguity validation fails.
     fn lookup_windows_child(
         &mut self,
         parent: &DirectoryNode,

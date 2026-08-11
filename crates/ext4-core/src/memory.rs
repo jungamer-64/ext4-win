@@ -1,5 +1,6 @@
 //! Fallible allocation helpers for the ext4 domain.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
@@ -8,6 +9,14 @@ use crate::{Error, Result};
 /// Converts allocation reservation failure into the ext4 error domain.
 fn allocation_failed(_: alloc::collections::TryReserveError) -> Error {
     Error::OutOfMemory
+}
+
+/// Moves one value into independently owned heap storage through a fallible allocation boundary.
+/// # Errors
+///
+/// Returns [`Error::OutOfMemory`] when the box storage cannot be allocated.
+pub(crate) fn try_box<T>(value: T) -> Result<Box<T>> {
+    Box::try_new(value).map_err(|_| Error::OutOfMemory)
 }
 
 /// Builds a vector filled with `len` copies after reserving its allocation.

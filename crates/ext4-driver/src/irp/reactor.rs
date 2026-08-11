@@ -33,7 +33,7 @@ use super::{
 #[cfg(not(test))]
 use crate::kernel::storage::{
     DeviceLengthProbe, PreparedStorageCommand, RetryingStorageCommand, StorageCommand,
-    StorageCommandStep, StorageRetryDelay, failed_unsubmitted_request,
+    StorageCommandStep, StorageRetryDecision, StorageRetryDelay, failed_unsubmitted_request,
 };
 use crate::kernel::storage::{MountedStorageDevices, StorageFailureClass};
 use crate::memory::DriverVec;
@@ -327,7 +327,10 @@ pub(crate) enum WaitCondition {
         volume: NonNull<crate::state::VolumeControlBlock>,
     },
     /// A per-handle terminal or durability barrier has not drained earlier work.
-    Barrier { identity: u64 },
+    Barrier {
+        /// Stable barrier identity resumed by one matching release event.
+        identity: u64,
+    },
 }
 
 /// One consuming action emitted by an event-driven operation.
@@ -545,6 +548,9 @@ struct OperationReservation {
 
 impl OperationReservation {
     /// Reserves one of the device's fixed operation slots.
+    /// # Errors
+    ///
+    /// Returns [`DriverError::InsufficientResources`] when all bounded operation slots are in use.
     fn acquire(admitted: &AtomicUsize) -> DriverResult<Self> {
         admitted
             .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -707,11 +713,18 @@ impl RetryTimerEnvelope {
     }
 
     /// Initializes native timer state and binds this envelope to its stable reactor.
+    /// # Safety
+    ///
+    /// The envelope and `reactor` must both be at their final nonpaged addresses and remain live
+    /// until every armed timer and DPC has drained.
     #[cfg(not(test))]
     unsafe fn initialize(&self, reactor: NonNull<CompletionReactor>) {
         unsafe {
-            // SAFETY: The containing device extension is at its final address before publication.
+            // SAFETY: The timer field is in final-address nonpaged device-extension storage.
             ffi::KeInitializeTimer(self.timer.get());
+        }
+        unsafe {
+            // SAFETY: The DPC context points to this final-address envelope until teardown drains.
             ffi::KeInitializeDpc(
                 self.dpc.get(),
                 Some(storage_retry_timer_dpc),
@@ -860,6 +873,10 @@ impl CompletionReactor {
     /// # Safety
     ///
     /// `reactor` must remain at this address through [`Self::release_at`].
+    /// # Errors
+    ///
+    /// Returns an error when native queue, event, timer, cancel, or worker-thread initialization
+    /// cannot be completed.
     pub(crate) unsafe fn initialize_at(
         reactor: *mut Self,
         device: KernelDevice,
@@ -1030,6 +1047,10 @@ impl CompletionReactor {
     }
 
     /// Returns the reactor prefix of a driver-owned device extension.
+    /// # Errors
+    ///
+    /// Returns [`DriverError::InvalidParameter`] when either the device object or its extension is
+    /// null.
     fn from_device(device: KernelDevice) -> DriverResult<NonNull<Self>> {
         let object = unsafe {
             // SAFETY: Dispatch owns a live typed device pointer.
@@ -1136,6 +1157,9 @@ impl CompletionReactor {
     }
 
     /// Reserves one vacant slot before its stable active-cancel envelope becomes visible.
+    /// # Errors
+    ///
+    /// Returns an invariant error when no slot is vacant or the selected generation overflows.
     fn reserve_active_slot(&self) -> DriverResult<usize> {
         let slots = unsafe {
             // SAFETY: Only the dedicated reactor thread installs or advances operation payloads.
@@ -2064,6 +2088,10 @@ impl CompletionReactor {
     }
 
     /// Links one completed envelope into the allocation-free storage inbox.
+    /// # Safety
+    ///
+    /// `envelope` must be uniquely completion-owned, unlinked, nonpaged, and protected by this
+    /// reactor's completion rundown lease.
     #[cfg(not(test))]
     unsafe fn enqueue_storage(&self, envelope: NonNull<ReactorStorageEnvelope>) {
         let old_irql = unsafe {
@@ -2139,10 +2167,10 @@ impl CompletionReactor {
                     );
                 }
                 Ok(StorageCommandStep::Failed(failed)) => match failed.into_retry() {
-                    Ok(retry) => {
+                    StorageRetryDecision::Retry(retry) => {
                         self.apply_transition(index, OperationTransition::ArmRetry { retry })
                     }
-                    Err(failed) => {
+                    StorageRetryDecision::Terminal(failed) => {
                         let (mut suspended, request, class) = failed.into_failure();
                         suspended.record_storage_failure(class);
                         self.set_ready_operation_event(
@@ -2164,6 +2192,10 @@ impl CompletionReactor {
     }
 
     /// Links one completed length-query envelope into its type-separated inbox.
+    /// # Safety
+    ///
+    /// `envelope` must be uniquely completion-owned, unlinked, nonpaged, and protected by this
+    /// reactor's completion rundown lease.
     #[cfg(not(test))]
     unsafe fn enqueue_length(&self, envelope: NonNull<ReactorLengthEnvelope>) {
         let old_irql = unsafe {
@@ -3033,8 +3065,11 @@ fn remove_entry_list(entry: PLIST_ENTRY) {
     let previous = entry_ref.Blink;
     let next = entry_ref.Flink;
     unsafe {
-        // SAFETY: Both neighbors remain live in the same locked list.
+        // SAFETY: Previous remains live in the same locked list.
         (*previous).Flink = next;
+    }
+    unsafe {
+        // SAFETY: Next remains live in the same locked list.
         (*next).Blink = previous;
     }
     initialize_list_head(entry);
@@ -3155,7 +3190,7 @@ mod tests {
 
     use crate::kernel::status::DriverError;
     use crate::kernel::storage::StorageFailureClass;
-    use crate::memory::DriverVec;
+    use crate::memory::{self, DriverVec};
     use crate::state::{KernelDevice, KernelFileObject, VolumeControlBlock};
 
     use super::{
@@ -3181,8 +3216,16 @@ mod tests {
         fn record_storage_failure(&mut self, _failure: StorageFailureClass) {}
     }
 
-    fn test_operation() -> SuspendedOperation {
-        Box::new(TestOperation)
+    macro_rules! test_operation {
+        () => {
+            match memory::boxed_try_with(|| Ok(TestOperation)) {
+                Ok(operation) => {
+                    let operation: SuspendedOperation = operation;
+                    operation
+                }
+                Err(_) => return,
+            }
+        };
     }
 
     fn advance_concrete_event(
@@ -3204,40 +3247,38 @@ mod tests {
     fn consume_transition(transition: OperationTransition) {
         match transition {
             OperationTransition::QueryDeviceLength {
-                completion_owner,
-                target,
+                completion_owner: _completion_owner,
+                target: _target,
                 suspended,
             } => {
-                let _ = (completion_owner, target);
                 drop(suspended);
             }
             OperationTransition::SubmitLower {
-                devices,
+                devices: _devices,
                 request,
                 suspended,
             } => {
-                let _ = devices;
                 drop(request);
                 drop(suspended);
             }
             OperationTransition::RequestIntent { request, suspended } => {
-                let _ = (request.volume(), request.ticket(), request.resources());
+                let _volume = request.volume();
+                let _ticket = request.ticket();
+                let _resources = request.resources();
                 drop(request);
                 drop(suspended);
             }
             OperationTransition::RequestCommit {
-                volume,
-                ticket,
+                volume: _volume,
+                ticket: _ticket,
                 suspended,
             } => {
-                let _ = (volume, ticket);
                 drop(suspended);
             }
             OperationTransition::Wait {
-                condition,
+                condition: _condition,
                 suspended,
             } => {
-                let _ = condition;
                 drop(suspended);
             }
             OperationTransition::Publish { publication } => drop(publication),
@@ -3248,8 +3289,10 @@ mod tests {
     fn consume_active_phase(phase: ActivePhase) {
         match phase {
             ActivePhase::Vacant => {}
-            ActivePhase::Ready { operation, event } => {
-                let _ = event;
+            ActivePhase::Ready {
+                operation,
+                event: _,
+            } => {
                 drop(operation);
             }
             ActivePhase::HandleTurn { operation } => drop(operation),
@@ -3258,18 +3301,16 @@ mod tests {
                 drop(operation);
             }
             ActivePhase::Commit {
-                volume,
-                ticket,
+                volume: _volume,
+                ticket: _ticket,
                 operation,
             } => {
-                let _ = (volume, ticket);
                 drop(operation);
             }
             ActivePhase::Waiting {
-                condition,
+                condition: _condition,
                 operation,
             } => {
-                let _ = condition;
                 drop(operation);
             }
         }
@@ -3283,17 +3324,16 @@ mod tests {
     /// concrete event or durable publication gains a second construction path.
     #[test]
     fn consuming_operation_boundaries_remain_linked() {
-        let advance: fn(
+        let _advance: fn(
             SuspendedOperation,
             StorageFailureClass,
             OperationEvent,
         ) -> OperationTransition = advance_concrete_event;
-        let publish: fn(
+        let _publish: fn(
             alloc::boxed::Box<dyn InfalliblePublication>,
         ) -> (PublicationAuthority, SuspendedOperation) = publish_prebuilt_value;
-        let consume: fn(OperationTransition) = consume_transition;
-        let consume_phase: fn(ActivePhase) = consume_active_phase;
-        let _ = (advance, publish, consume, consume_phase);
+        let _consume: fn(OperationTransition) = consume_transition;
+        let _consume_phase: fn(ActivePhase) = consume_active_phase;
     }
 
     /// # Panics
@@ -3330,7 +3370,7 @@ mod tests {
         assert_eq!(selection.file_object, file_object);
         assert!(selection.ordinary_cleanup_only);
 
-        let admitted = AdmittedOperation::new(test_operation(), cleanup);
+        let admitted = AdmittedOperation::new(test_operation!(), cleanup);
         let (operation, admission) = admitted.into_parts();
         assert_eq!(admission, cleanup);
         assert!(matches!(
@@ -3360,7 +3400,7 @@ mod tests {
             condition: WaitCondition::Barrier {
                 identity: CLOSE_HANDLE_BARRIER,
             },
-            operation: test_operation(),
+            operation: test_operation!(),
         });
     }
 
@@ -3385,7 +3425,7 @@ mod tests {
             lane: HandleOperationLane::Ordinary,
         });
         slots[0].phase = ActivePhase::Ready {
-            operation: test_operation(),
+            operation: test_operation!(),
             event: OperationEvent::Admitted,
         };
         let first = ActiveSlotIdentity {
@@ -3403,7 +3443,7 @@ mod tests {
         });
         slots[1].predecessor = Some(first);
         slots[1].phase = ActivePhase::HandleTurn {
-            operation: test_operation(),
+            operation: test_operation!(),
         };
         let tail = ActiveSlotIdentity {
             index: 1,
@@ -3461,7 +3501,7 @@ mod tests {
         };
         slots[1].phase = ActivePhase::Intent {
             request: IntentRequest::new(volume, 2, earlier_resources),
-            operation: test_operation(),
+            operation: test_operation!(),
         };
         assert!(earlier_queued_intent_conflicts(&slots, &candidate));
         assert!(!earlier_queued_intent_conflicts(&slots, &disjoint));
@@ -3485,7 +3525,7 @@ mod tests {
         slots[1].phase = ActivePhase::Commit {
             volume,
             ticket: 10,
-            operation: test_operation(),
+            operation: test_operation!(),
         };
         assert!(volume_has_commit_work(&slots, volume));
         slots[1].phase = ActivePhase::Vacant;
@@ -3529,20 +3569,35 @@ mod tests {
             // SAFETY: This isolated test is the sole owner of reactor-thread state.
             &mut *reactor.active.get()
         };
-        slots[index].cancel_enabled = true;
-        slots[index].cancel_pending = true;
+        {
+            let Some(slot) = slots.get_mut(index) else {
+                return;
+            };
+            slot.cancel_enabled = true;
+            slot.cancel_pending = true;
+        }
         assert!(reactor.cancellation_is_pending(index));
-        let resumed = reactor.resume_cancel_if_requested(index, test_operation());
+        let resumed = reactor.resume_cancel_if_requested(index, test_operation!());
         assert!(resumed.is_none());
-        let phase = core::mem::replace(&mut slots[index].phase, ActivePhase::Vacant);
+        let phase = {
+            let Some(slot) = slots.get_mut(index) else {
+                return;
+            };
+            core::mem::replace(&mut slot.phase, ActivePhase::Vacant)
+        };
         let ActivePhase::Ready { operation, event } = phase else {
             return;
         };
         assert!(matches!(event, OperationEvent::CancelRequested));
         drop(operation);
 
-        slots[index].cancel_enabled = true;
-        slots[index].cancel_pending = true;
+        {
+            let Some(slot) = slots.get_mut(index) else {
+                return;
+            };
+            slot.cancel_enabled = true;
+            slot.cancel_pending = true;
+        }
         reactor.disable_cancellation(index);
         assert!(!reactor.cancellation_is_pending(index));
         reactor.retire_cancel_slot(index);
