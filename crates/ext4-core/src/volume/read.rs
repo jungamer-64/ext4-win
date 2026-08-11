@@ -79,22 +79,6 @@ impl EpochReadView<'_, '_> {
             .transpose()
     }
 
-    /// Reads a POSIX ACL from its ext4 xattr slot.
-    ///
-    /// # Errors
-    /// Returns an error when the backing xattr or ACL payload is malformed.
-    #[cfg(test)]
-    pub(super) fn read_inode_posix_acl(
-        &mut self,
-        inode_id: InodeId,
-        kind: PosixAclKind,
-    ) -> Result<Option<PosixAcl>> {
-        let Some(value) = self.read_inode_xattr(inode_id, &PosixAcl::xattr_name(kind)?)? else {
-            return Ok(None);
-        };
-        Ok(Some(PosixAcl::parse(&value)?))
-    }
-
     /// Reads Windows overlay metadata isolated in `user.ext4win.*` xattrs.
     ///
     /// # Errors

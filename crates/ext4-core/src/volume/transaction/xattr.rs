@@ -45,20 +45,6 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
         Ok(removed)
     }
 
-    /// Sets a POSIX ACL in the requested ACL xattr slot.
-    ///
-    /// # Errors
-    /// Returns an error when the ACL cannot be serialized or stored.
-    #[cfg(test)]
-    pub(crate) fn set_posix_acl(
-        &mut self,
-        node: TransactionNode,
-        kind: PosixAclKind,
-        acl: PosixAcl,
-    ) -> Result<()> {
-        self.set_xattr(node, PosixAcl::xattr_name(kind)?, acl.to_xattr_value()?)
-    }
-
     /// Sets Windows overlay metadata in `user.ext4win.*` xattrs.
     ///
     /// # Errors

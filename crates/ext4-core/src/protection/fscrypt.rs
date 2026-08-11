@@ -463,18 +463,6 @@ pub trait FscryptNonceGenerator {
     fn next_file_nonce(&mut self) -> Result<FscryptFileNonce>;
 }
 
-/// Mount nonce source used when encrypted inode creation is unavailable.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg(test)]
-pub struct FscryptNoNonceGenerator;
-
-#[cfg(test)]
-impl FscryptNonceGenerator for FscryptNoNonceGenerator {
-    fn next_file_nonce(&mut self) -> Result<FscryptFileNonce> {
-        Err(Error::UnsupportedEncryption)
-    }
-}
-
 /// Raw fscrypt master key material supplied at the mount boundary.
 #[derive(Eq, PartialEq)]
 pub struct FscryptMasterKey {
@@ -1429,9 +1417,9 @@ mod tests {
 
         assert!(set.contains(identifier));
         assert_eq!(set.insert(duplicate), Err(Error::InvalidEncryptionContext));
-        assert!(set.remove(identifier).is_some());
+        assert!(must!(set.remove(identifier)).is_some());
         assert!(!set.contains(identifier));
-        assert!(set.remove(identifier).is_none());
+        assert!(must!(set.remove(identifier)).is_none());
     }
 
     /// # Panics

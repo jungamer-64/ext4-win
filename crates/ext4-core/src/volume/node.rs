@@ -418,13 +418,6 @@ impl DirectoryEntry {
     pub const fn node(&self) -> &NodeId {
         &self.node
     }
-
-    /// File type recorded in the directory entry.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) const fn entry_kind(&self) -> DirectoryEntryKind {
-        self.entry_kind
-    }
 }
 
 /// One namespace name that links a parent directory to a non-directory inode.
