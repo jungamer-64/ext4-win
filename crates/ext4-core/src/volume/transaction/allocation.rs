@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
+impl MutationResolvePass<'_, '_, '_> {
     /// Allocates the first free allocation cluster visible in group bitmaps.
     /// # Errors
     ///

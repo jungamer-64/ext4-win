@@ -36,7 +36,6 @@ use crate::irp::{
     DeleteAccess, DesiredAccess, DirectoryEntryIndex, DispatchTarget, ExistingOperationAccess,
     FileAttributesWriteAccess, RegularFileWriteAccess, RequestorProcess, ShareAccess,
 };
-use crate::kernel::cng::CngFscryptNonceGenerator;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
@@ -1194,7 +1193,7 @@ impl VolumeAccess {
     /// Returns an error when the parent cannot be loaded or child creation cannot be staged.
     pub(crate) fn begin_child_creation(
         &self,
-        transaction: &mut MutationResolvePass<'_, '_, '_, CngFscryptNonceGenerator>,
+        transaction: &mut MutationResolvePass<'_, '_, '_>,
         parent: DirectoryNodeId,
         name: &Ext4Name,
         target: ChildCreationTarget,
@@ -1762,7 +1761,7 @@ impl VolumeControlBlock {
             directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
             file_control_blocks: FileControlBlockLedger::try_new()?,
             volume_control: VolumeControlPlane::mounted(),
-            runtime: VolumeRuntime::new(mount, storage),
+            runtime: VolumeRuntime::try_new(mount, storage)?,
         })
     }
 
@@ -2440,7 +2439,7 @@ impl PendingChildCreation {
     /// Returns an error when the staged node rejects xattr mutation.
     pub(crate) fn set_xattr(
         &mut self,
-        transaction: &mut MutationResolvePass<'_, '_, '_, CngFscryptNonceGenerator>,
+        transaction: &mut MutationResolvePass<'_, '_, '_>,
         name: XattrName,
         value: XattrValue,
     ) -> DriverResult<()> {
@@ -2455,7 +2454,7 @@ impl PendingChildCreation {
     /// Returns an error when the staged node rejects xattr mutation.
     pub(crate) fn remove_xattr(
         &mut self,
-        transaction: &mut MutationResolvePass<'_, '_, '_, CngFscryptNonceGenerator>,
+        transaction: &mut MutationResolvePass<'_, '_, '_>,
         name: &XattrName,
     ) -> DriverResult<()> {
         let node = transaction.node(self.node)?;

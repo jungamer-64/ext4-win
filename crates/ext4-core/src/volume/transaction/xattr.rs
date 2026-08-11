@@ -13,7 +13,7 @@ fn require_windows_reparse_storage_node(node: TransactionNode) -> Result<()> {
     }
 }
 
-impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
+impl MutationResolvePass<'_, '_, '_> {
     /// Sets or replaces one ext4 extended attribute.
     ///
     /// # Errors

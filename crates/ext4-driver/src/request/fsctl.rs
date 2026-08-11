@@ -8,7 +8,7 @@ use crate::memory::DriverVec;
 use crate::state::{OpenedObject, OpenedRegularFile, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{
-    FscryptKeyIdentifier, FscryptKeyPresence, FscryptMasterKey, FsverityBlockSize, FsverityEnable,
+    FscryptKeyIdentifier, FscryptKeyPresence, FsverityBlockSize, FsverityEnable,
     FsverityHashAlgorithm, FsveritySalt, FsveritySignature,
 };
 
@@ -148,7 +148,8 @@ pub(crate) fn add_encryption_key(
         let input = read_input(active, stack)?;
         let payload = FscryptAddKeyPayload::parse(input.as_slice())?;
         let _volume = mounted_vcb(active)?;
-        mutation.add_fscrypt_key(payload.into_master_key())?;
+        let (identifier, raw_key) = payload.into_parts();
+        mutation.add_fscrypt_key(identifier, raw_key.as_slice())?;
         Ok(IrpCompletion::EMPTY)
     })
 }
@@ -265,8 +266,10 @@ const fn key_presence_user_count(presence: FscryptKeyPresence) -> u32 {
 /// Parsed fscrypt add-key payload.
 #[derive(Debug, Eq, PartialEq)]
 struct FscryptAddKeyPayload {
-    /// Mount-scoped master key validated against its v2 identifier.
-    master_key: FscryptMasterKey,
+    /// Identifier supplied by the Linux-compatible key specifier.
+    identifier: FscryptKeyIdentifier,
+    /// Raw key copied out of the transient IRP input mapping before domain validation.
+    raw_key: DriverVec<u8>,
 }
 
 impl FscryptAddKeyPayload {
@@ -300,16 +303,16 @@ impl FscryptAddKeyPayload {
         if raw.len() != raw_size {
             return Err(DriverError::InvalidParameter);
         }
-        let master_key = FscryptMasterKey::from_raw(raw)?;
-        if master_key.identifier() != identifier {
-            return Err(DriverError::InvalidParameter);
-        }
-        Ok(Self { master_key })
+        let raw_key = DriverVec::try_copied_from_slice(raw)?;
+        Ok(Self {
+            identifier,
+            raw_key,
+        })
     }
 
     /// Consumes this payload into the validated mount key.
-    fn into_master_key(self) -> FscryptMasterKey {
-        self.master_key
+    fn into_parts(self) -> (FscryptKeyIdentifier, DriverVec<u8>) {
+        (self.identifier, self.raw_key)
     }
 }
 

@@ -72,10 +72,19 @@ pub trait CommittedReadPass {
 /// in a completion context, and an incomplete storage access returns
 /// [`Error::OperationSuspended`] so the owning [`EpochReadOperation`] can move the resulting owned
 /// request into lower-I/O ownership.
-#[derive(Debug)]
 pub struct EpochReadPass<'pass, 'storage, 'epoch> {
     /// Internal committed-epoch view used only for this restartable pass.
     view: &'pass mut EpochReadView<'storage, 'epoch>,
+    /// Mutable provider objects owned by the enclosing top-level operation.
+    crypto: &'pass mut dyn CryptographicOperation,
+}
+
+impl core::fmt::Debug for EpochReadPass<'_, '_, '_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("EpochReadPass")
+            .finish_non_exhaustive()
+    }
 }
 
 impl EpochReadPass<'_, '_, '_> {
@@ -157,7 +166,7 @@ impl EpochReadPass<'_, '_, '_> {
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
-        self.view.read_file(file, offset, out)
+        self.view.read_file(file, offset, out, self.crypto)
     }
 
     /// Reads one symbolic-link target into an owned byte vector.
@@ -173,7 +182,7 @@ impl EpochReadPass<'_, '_, '_> {
     ///
     /// Returns an error when storage is incomplete or the directory is invalid.
     pub fn read_directory(&mut self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
-        self.view.read_directory(directory)
+        self.view.read_directory(directory, self.crypto)
     }
 
     /// Enumerates every reachable hard link to a non-directory inode.
@@ -181,7 +190,7 @@ impl EpochReadPass<'_, '_, '_> {
     ///
     /// Returns an error when storage is incomplete or namespace invariants fail.
     pub fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
-        self.view.read_hard_links(target)
+        self.view.read_hard_links(target, self.crypto)
     }
 
     /// Looks up one exact ext4 child name.
@@ -202,7 +211,8 @@ impl EpochReadPass<'_, '_, '_> {
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> Result<ChildLookup> {
-        self.view.lookup_windows_child(parent, requested)
+        self.view
+            .lookup_windows_child(parent, requested, self.crypto)
     }
 }
 
@@ -305,194 +315,11 @@ impl EpochReadOperation {
     /// probed.
     #[must_use]
     pub fn run<T>(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        resolve: impl FnOnce(&mut EpochReadPass<'_, '_, '_>) -> Result<T>,
-    ) -> ReadTransition<T> {
-        self.resolve(event, epoch, |view| {
-            let mut pass = EpochReadPass { view };
-            resolve(&mut pass)
-        })
-    }
-
-    /// Loads a regular file identity from the selected immutable epoch.
-    #[must_use]
-    pub fn load_file(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        id: FileNodeId,
-    ) -> ReadTransition<FileNode> {
-        self.resolve(event, epoch, |volume| volume.load_file(id))
-    }
-
-    /// Loads a directory identity from the selected immutable epoch.
-    #[must_use]
-    pub fn load_directory(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        id: DirectoryNodeId,
-    ) -> ReadTransition<DirectoryNode> {
-        self.resolve(event, epoch, |volume| volume.load_directory(id))
-    }
-
-    /// Loads a symbolic-link identity from the selected immutable epoch.
-    #[must_use]
-    pub fn load_symlink(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        id: SymlinkNodeId,
-    ) -> ReadTransition<SymlinkNode> {
-        self.resolve(event, epoch, |volume| volume.load_symlink(id))
-    }
-
-    /// Loads and classifies one Windows-facing file index.
-    #[must_use]
-    pub fn load_node_by_file_index(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        file_index: u32,
-    ) -> ReadTransition<NodeId> {
-        self.resolve(event, epoch, |volume| {
-            volume.load_node_by_file_index(file_index)
-        })
-    }
-
-    /// Reads every public extended attribute attached to a typed node.
-    #[must_use]
-    pub fn read_xattrs(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        node: NodeId,
-    ) -> ReadTransition<XattrSet> {
-        self.resolve(event, epoch, |volume| {
-            volume.read_inode_xattrs(node.inode())
-        })
-    }
-
-    /// Reads one public extended attribute by name.
-    #[must_use]
-    pub fn read_xattr(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        node: NodeId,
-        name: &XattrName,
-    ) -> ReadTransition<Option<XattrValue>> {
-        self.resolve(event, epoch, |volume| {
-            volume.read_inode_xattr(node.inode(), name)
-        })
-    }
-
-    /// Reads Windows overlay metadata isolated in the ext4 xattr boundary.
-    #[must_use]
-    pub fn read_windows_overlay(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        node: NodeId,
-    ) -> ReadTransition<Option<WindowsOverlay>> {
-        self.resolve(event, epoch, |volume| {
-            volume.read_inode_windows_overlay(node.inode())
-        })
-    }
-
-    /// Reads a Windows symbolic-link reparse payload from the ext4 xattr boundary.
-    #[must_use]
-    pub fn read_windows_symlink_reparse_point(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        node: NodeId,
-    ) -> ReadTransition<Option<WindowsSymlinkReparsePoint>> {
-        self.resolve(event, epoch, |volume| {
-            volume.read_inode_windows_symlink_reparse_point(node.inode())
-        })
-    }
-
-    /// Reads a bounded regular-file range into the caller-owned top-level buffer.
-    #[must_use]
-    pub fn read_file(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        file: &FileNode,
-        offset: FileOffset,
-        out: &mut [u8],
-    ) -> ReadTransition<ReadBytes> {
-        self.resolve(event, epoch, |volume| volume.read_file(file, offset, out))
-    }
-
-    /// Reads a symbolic-link target into a fallibly allocated owned byte vector.
-    #[must_use]
-    pub fn read_symlink(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        symlink: &SymlinkNode,
-    ) -> ReadTransition<Vec<u8>> {
-        self.resolve(event, epoch, |volume| volume.read_symlink(symlink))
-    }
-
-    /// Enumerates validated directory entries.
-    #[must_use]
-    pub fn read_directory(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        directory: &DirectoryNode,
-    ) -> ReadTransition<Vec<DirectoryEntry>> {
-        self.resolve(event, epoch, |volume| volume.read_directory(directory))
-    }
-
-    /// Enumerates every reachable namespace link to one non-directory inode.
-    #[must_use]
-    pub fn read_hard_links(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        target: HardLinkNodeId,
-    ) -> ReadTransition<HardLinks> {
-        self.resolve(event, epoch, |volume| volume.read_hard_links(target))
-    }
-
-    /// Looks up one exact ext4 child name.
-    #[must_use]
-    pub fn lookup_child(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        parent: &DirectoryNode,
-        name: &Ext4Name,
-    ) -> ReadTransition<ChildLookup> {
-        self.resolve(event, epoch, |volume| volume.lookup_child(parent, name))
-    }
-
-    /// Looks up one Windows-visible child name with ambiguity rejection.
-    #[must_use]
-    pub fn lookup_windows_child(
-        self,
-        event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        parent: &DirectoryNode,
-        requested: &WindowsName,
-    ) -> ReadTransition<ChildLookup> {
-        self.resolve(event, epoch, |volume| {
-            volume.lookup_windows_child(parent, requested)
-        })
-    }
-
-    /// Integrates an event and executes one restartable synchronous resolve pass.
-    fn resolve<T>(
         mut self,
         event: super::OperationEvent,
         epoch: &CommittedEpoch,
-        resolve: impl FnOnce(&mut EpochReadView<'_, '_>) -> Result<T>,
+        crypto: &mut dyn CryptographicOperation,
+        resolve: impl FnOnce(&mut EpochReadPass<'_, '_, '_>) -> Result<T>,
     ) -> ReadTransition<T> {
         match event {
             super::OperationEvent::Admitted => {}
@@ -516,8 +343,12 @@ impl EpochReadOperation {
         }
         let result = {
             let device = OperationDevice::with_overlay(&mut self.filesystem, epoch);
-            let mut volume = EpochReadView::committed(device, epoch);
-            resolve(&mut volume)
+            let mut view = EpochReadView::committed(device, epoch);
+            let mut pass = EpochReadPass {
+                view: &mut view,
+                crypto,
+            };
+            resolve(&mut pass)
         };
         match result {
             Err(Error::OperationSuspended) => match self.filesystem.take_pending_request() {
@@ -534,46 +365,41 @@ impl EpochReadOperation {
 
 /// Owned mutation resolver after its event has been integrated and before one synchronous pass.
 #[derive(Debug)]
-pub struct MutationResolveReady<N> {
+pub struct MutationResolveReady {
     /// Operation-owned filesystem transcript.
     filesystem: StorageTranscript,
-    /// Operation-owned nonce object; it never enters committed epoch state.
-    nonce_generator: N,
 }
 
 /// Owned mutation resolver suspended only on concrete storage completions.
 #[derive(Debug)]
-pub struct MutationResolveOperation<N> {
+pub struct MutationResolveOperation {
     /// Operation-owned filesystem transcript.
     filesystem: StorageTranscript,
-    /// Operation-owned nonce object.
-    nonce_generator: N,
 }
 
 /// Terminal or lower-submit transition after one mutation resolve pass.
 #[derive(Debug)]
-pub enum MutationResolveTransition<N> {
+pub enum MutationResolveTransition {
     /// Submit the pass's sole owned read and suspend all resolver state by value.
     SubmitLower {
         /// Request moved into the lower completion envelope.
         request: crate::StorageRequest,
         /// Resolver resumed only by the matching completion.
-        suspended: MutationResolveOperation<N>,
+        suspended: MutationResolveOperation,
     },
     /// Resolution terminated before any lower write was issued.
     Complete(Result<ResolvedMutation>),
 }
 
-impl<N> MutationResolveOperation<N> {
-    /// Creates an empty mutation read transcript and takes ownership of its nonce object.
+impl MutationResolveOperation {
+    /// Creates an empty mutation read transcript.
     #[must_use]
-    pub const fn new(profile: &MountedProfile, nonce_generator: N) -> Self {
+    pub const fn new(profile: &MountedProfile) -> Self {
         Self {
             filesystem: StorageTranscript::new(
                 StorageTarget::Filesystem,
                 profile.filesystem_length(),
             ),
-            nonce_generator,
         }
     }
 
@@ -581,7 +407,7 @@ impl<N> MutationResolveOperation<N> {
     /// # Errors
     ///
     /// Returns an error for a failed, short, duplicate, or mismatched completion.
-    pub fn accept(mut self, event: super::OperationEvent) -> Result<MutationResolveReady<N>> {
+    pub fn accept(mut self, event: super::OperationEvent) -> Result<MutationResolveReady> {
         match event {
             super::OperationEvent::Admitted => {}
             super::OperationEvent::StorageCompleted(completion) => {
@@ -598,12 +424,11 @@ impl<N> MutationResolveOperation<N> {
         }
         Ok(MutationResolveReady {
             filesystem: self.filesystem,
-            nonce_generator: self.nonce_generator,
         })
     }
 }
 
-impl<N: FscryptNonceGenerator> MutationResolveReady<N> {
+impl MutationResolveReady {
     /// Borrows an ephemeral synchronous resolve pass.
     ///
     /// The returned pass cannot enter a completion envelope. It must be consumed by
@@ -613,25 +438,21 @@ impl<N: FscryptNonceGenerator> MutationResolveReady<N> {
         &'pass mut self,
         epoch: &'pass CommittedEpoch,
         now: Ext4Timestamp,
-    ) -> MutationResolvePass<'pass, 'pass, 'pass, N> {
+        crypto: &'pass mut dyn CryptographicOperation,
+    ) -> MutationResolvePass<'pass, 'pass, 'pass> {
         let device = OperationDevice::with_overlay(&mut self.filesystem, epoch);
-        MutationResolvePass::begin(
-            EpochReadView::committed(device, epoch),
-            now,
-            &mut self.nonce_generator,
-        )
+        MutationResolvePass::begin(EpochReadView::committed(device, epoch), now, crypto)
     }
 
     /// Converts one consumed pass result into a lower submit or terminal resolved mutation.
     #[must_use]
-    pub fn finish(mut self, result: Result<ResolvedMutation>) -> MutationResolveTransition<N> {
+    pub fn finish(mut self, result: Result<ResolvedMutation>) -> MutationResolveTransition {
         if matches!(result, Err(Error::OperationSuspended)) {
             return match self.filesystem.take_pending_request() {
                 Ok(request) => MutationResolveTransition::SubmitLower {
                     request,
                     suspended: MutationResolveOperation {
                         filesystem: self.filesystem,
-                        nonce_generator: self.nonce_generator,
                     },
                 },
                 Err(error) => MutationResolveTransition::Complete(Err(error)),

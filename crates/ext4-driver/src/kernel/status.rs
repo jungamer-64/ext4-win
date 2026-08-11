@@ -166,7 +166,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::OutOfMemory => STATUS_INSUFFICIENT_RESOURCES,
         Error::OperationCancelled => STATUS_CANCELLED,
         Error::OperationSuspended => STATUS_INTERNAL_ERROR,
-        Error::DeviceIo => STATUS_IO_DEVICE_ERROR,
+        Error::DeviceIo | Error::CryptographicFailure => STATUS_IO_DEVICE_ERROR,
         Error::VerityMismatch => STATUS_IO_DEVICE_ERROR,
         Error::UnsupportedBlockSize
         | Error::UnsupportedIncompatFeature

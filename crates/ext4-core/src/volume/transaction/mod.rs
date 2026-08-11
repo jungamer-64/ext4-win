@@ -297,12 +297,11 @@ impl TransactionNode {
 }
 
 /// Restart-local mutation resolver that owns no committed or coordinator state.
-#[derive(Debug)]
-pub struct MutationResolvePass<'storage, 'epoch, 'nonce, N> {
+pub struct MutationResolvePass<'storage, 'epoch, 'crypto> {
     /// Ephemeral view of the selected committed epoch and operation transcript.
     volume: EpochReadView<'storage, 'epoch>,
-    /// Operation-owned nonce source, retained outside committed epoch state.
-    nonce_generator: &'nonce mut N,
+    /// Mutable provider objects owned by the enclosing top-level operation.
+    crypto: &'crypto mut dyn CryptographicOperation,
     /// Timestamp applied consistently to staged inode updates.
     now: Ext4Timestamp,
     /// Inode records staged for rewrite at commit.
@@ -331,6 +330,14 @@ pub struct MutationResolvePass<'storage, 'epoch, 'nonce, N> {
     volume_label_update: Option<Ext4VolumeLabel>,
     /// Mount-scoped fscrypt key snapshot prepared during resolve.
     fscrypt_keys_update: Option<FscryptKeySet>,
+}
+
+impl core::fmt::Debug for MutationResolvePass<'_, '_, '_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("MutationResolvePass")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Fully resolved mutation with resource versions and provisional allocation choices.
@@ -687,16 +694,16 @@ impl CleanJournalDurability {
     }
 }
 
-impl<'storage, 'epoch, 'nonce, N> MutationResolvePass<'storage, 'epoch, 'nonce, N> {
+impl<'storage, 'epoch, 'crypto> MutationResolvePass<'storage, 'epoch, 'crypto> {
     /// Starts an empty mutation resolve pass against one committed epoch.
     pub(super) fn begin(
         volume: EpochReadView<'storage, 'epoch>,
         now: Ext4Timestamp,
-        nonce_generator: &'nonce mut N,
+        crypto: &'crypto mut dyn CryptographicOperation,
     ) -> Self {
         Self {
             volume,
-            nonce_generator,
+            crypto,
             now,
             inode_updates: Vec::new(),
             block_bitmap_updates: Vec::new(),
@@ -714,7 +721,7 @@ impl<'storage, 'epoch, 'nonce, N> MutationResolvePass<'storage, 'epoch, 'nonce, 
         }
     }
 }
-impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
+impl MutationResolvePass<'_, '_, '_> {
     /// Verifies that the mounted profile admits xattr storage mutation.
     /// # Errors
     ///
@@ -840,7 +847,15 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
     /// # Errors
     ///
     /// Returns an error when cloning key material fails or the identifier already exists.
-    pub fn add_fscrypt_key(&mut self, key: FscryptMasterKey) -> Result<()> {
+    pub fn add_fscrypt_key(
+        &mut self,
+        expected_identifier: FscryptKeyIdentifier,
+        raw_key: &[u8],
+    ) -> Result<()> {
+        let key = FscryptMasterKey::from_raw(raw_key, self.crypto)?;
+        if key.identifier() != expected_identifier {
+            return Err(Error::InvalidEncryptionContext);
+        }
         let mut keys = match self.fscrypt_keys_update.take() {
             Some(keys) => keys,
             None => self.volume.fscrypt_keys.try_clone()?,
@@ -962,7 +977,9 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
             return Ok(None);
         }
         let (parent_context, _master_key) = self.volume.fscrypt_master_key_for_inode(parent)?;
-        let nonce = self.nonce_generator.next_file_nonce()?;
+        let mut nonce = [0_u8; 16];
+        self.crypto.fill_random(&mut nonce)?;
+        let nonce = FscryptFileNonce::new(nonce);
         Ok(Some(FscryptContextV2::new(parent_context.policy(), nonce)))
     }
 
@@ -1227,7 +1244,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
     }
 }
 
-impl<N: FscryptNonceGenerator> super::CommittedReadPass for MutationResolvePass<'_, '_, '_, N> {
+impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
     fn load_file(&mut self, id: FileNodeId) -> Result<FileNode> {
         self.volume.load_file(id)
     }
@@ -1270,7 +1287,7 @@ impl<N: FscryptNonceGenerator> super::CommittedReadPass for MutationResolvePass<
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
-        self.volume.read_file(file, offset, out)
+        self.volume.read_file(file, offset, out, self.crypto)
     }
 
     fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
@@ -1278,11 +1295,11 @@ impl<N: FscryptNonceGenerator> super::CommittedReadPass for MutationResolvePass<
     }
 
     fn read_directory(&mut self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
-        self.volume.read_directory(directory)
+        self.volume.read_directory(directory, self.crypto)
     }
 
     fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
-        self.volume.read_hard_links(target)
+        self.volume.read_hard_links(target, self.crypto)
     }
 
     fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup> {
@@ -1294,6 +1311,7 @@ impl<N: FscryptNonceGenerator> super::CommittedReadPass for MutationResolvePass<
         parent: &DirectoryNode,
         requested: &WindowsName,
     ) -> Result<ChildLookup> {
-        self.volume.lookup_windows_child(parent, requested)
+        self.volume
+            .lookup_windows_child(parent, requested, self.crypto)
     }
 }

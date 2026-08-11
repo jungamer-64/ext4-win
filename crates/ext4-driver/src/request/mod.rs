@@ -1,12 +1,8 @@
 //! Windows request dispatch implementations.
 
-/// Concrete driver mutation pass with an operation-owned CNG nonce source.
-pub(crate) type DriverMutationPass<'storage, 'epoch, 'nonce> = ext4_core::MutationResolvePass<
-    'storage,
-    'epoch,
-    'nonce,
-    crate::kernel::cng::CngFscryptNonceGenerator,
->;
+/// Concrete driver mutation pass borrowing one operation-owned CNG execution context.
+pub(crate) type DriverMutationPass<'storage, 'epoch, 'crypto> =
+    ext4_core::MutationResolvePass<'storage, 'epoch, 'crypto>;
 
 pub(crate) mod create;
 pub(crate) mod dispatch;
