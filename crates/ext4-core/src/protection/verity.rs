@@ -1021,7 +1021,7 @@ impl FsverityMerkleTree {
             hashes = parent_hashes;
         }
         let root_digest = hashes.pop().ok_or(Error::InvalidVerityMetadata)?;
-        levels.reverse();
+        memory::reverse_checked(&mut levels)?;
         let mut blocks = Vec::new();
         for level in levels {
             blocks.try_extend_from_slice(&level)?;
@@ -1144,8 +1144,16 @@ fn hash_data_blocks(
     salt: &FsveritySalt,
     crypto: &mut dyn CryptographicOperation,
 ) -> Result<Vec<FsverityDigest>> {
+    if block_bytes == 0 {
+        return Err(Error::InvalidVerityMetadata);
+    }
     let mut hashes = Vec::new();
-    for chunk in data.chunks(block_bytes) {
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        let chunk_bytes = core::cmp::min(remaining.len(), block_bytes);
+        let (chunk, tail) = remaining
+            .split_at_checked(chunk_bytes)
+            .ok_or(Error::InvalidVerityMetadata)?;
         let mut block = memory::repeated_vec(0_u8, block_bytes)?;
         memory::copy_exact(
             block
@@ -1154,6 +1162,7 @@ fn hash_data_blocks(
             chunk,
         )?;
         hashes.try_push(hash_block(algorithm, salt, &block, crypto)?)?;
+        remaining = tail;
     }
     Ok(hashes)
 }
@@ -1179,7 +1188,12 @@ fn hash_level(
     }
     let mut level_blocks = Vec::new();
     let mut parent_hashes = Vec::new();
-    for hash_group in hashes.chunks(hashes_per_block) {
+    let mut remaining = hashes;
+    while !remaining.is_empty() {
+        let group_len = core::cmp::min(remaining.len(), hashes_per_block);
+        let (hash_group, tail) = remaining
+            .split_at_checked(group_len)
+            .ok_or(Error::InvalidVerityMetadata)?;
         let mut block = memory::repeated_vec(0_u8, block_bytes)?;
         for (index, hash) in hash_group.iter().enumerate() {
             if hash.algorithm() != algorithm {
@@ -1192,6 +1206,7 @@ fn hash_level(
         }
         parent_hashes.try_push(hash_block(algorithm, salt, &block, crypto)?)?;
         level_blocks.try_extend_from_slice(&block)?;
+        remaining = tail;
     }
     Ok((level_blocks, parent_hashes))
 }

@@ -63,6 +63,26 @@ pub(crate) fn copy_exact<T: Copy>(destination: &mut [T], source: &[T]) -> Result
     Ok(())
 }
 
+/// Reverses a slice through checked pair access only.
+///
+/// # Errors
+///
+/// Returns [`Error::ArithmeticOverflow`] when index arithmetic overflows, or
+/// [`Error::InvalidWriteRange`] if a checked position is unexpectedly absent.
+pub(crate) fn reverse_checked<T>(values: &mut [T]) -> Result<()> {
+    let mut lower = 0_usize;
+    let mut upper = values.len();
+    while lower < upper {
+        upper = upper.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+        if lower >= upper {
+            break;
+        }
+        swap_checked(values, lower, upper)?;
+        lower = lower.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+    }
+    Ok(())
+}
+
 /// Sorts a slice in place with a non-allocating binary heap and checked access.
 ///
 /// The ordering is intentionally unstable. Callers must provide a complete
@@ -215,11 +235,9 @@ impl<T> FallibleVec<T> for Vec<T> {
             .map_err(|_value| Error::OutOfMemory)?;
 
         let inserted_tail = self.get_mut(index..).ok_or(Error::InvalidWriteRange)?;
-        inserted_tail.reverse();
-        inserted_tail
-            .get_mut(1..)
-            .ok_or(Error::InvalidWriteRange)?
-            .reverse();
+        reverse_checked(inserted_tail)?;
+        let preserved_tail = inserted_tail.get_mut(1..).ok_or(Error::InvalidWriteRange)?;
+        reverse_checked(preserved_tail)?;
         Ok(())
     }
 
@@ -233,11 +251,11 @@ impl<T> FallibleVec<T> for Vec<T> {
             .ok_or(Error::InvalidWriteRange)?;
         let preserved_len = tail_len.checked_sub(1).ok_or(Error::InvalidWriteRange)?;
         let removal_tail = self.get_mut(index..).ok_or(Error::InvalidWriteRange)?;
-        removal_tail.reverse();
-        removal_tail
+        reverse_checked(removal_tail)?;
+        let preserved_tail = removal_tail
             .get_mut(..preserved_len)
-            .ok_or(Error::InvalidWriteRange)?
-            .reverse();
+            .ok_or(Error::InvalidWriteRange)?;
+        reverse_checked(preserved_tail)?;
         self.pop().ok_or(Error::InvalidWriteRange)
     }
 
@@ -261,7 +279,7 @@ impl<T> FallibleVec<T> for Vec<T> {
 mod tests {
     use alloc::vec;
 
-    use super::{FallibleVec, heap_sort_by};
+    use super::{FallibleVec, heap_sort_by, reverse_checked};
 
     /// # Panics
     ///
@@ -305,5 +323,22 @@ mod tests {
         let mut values = [5_i32, -1, 4, 4, 0, 9, -3, 2];
         assert_eq!(heap_sort_by(&mut values, i32::cmp), Ok(()));
         assert_eq!(values, [-3, -1, 0, 2, 4, 4, 5, 9]);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when checked reversal mishandles an empty, odd, or even-length slice.
+    #[test]
+    fn checked_reverse_handles_every_parity() {
+        let mut empty: [u8; 0] = [];
+        assert_eq!(reverse_checked(&mut empty), Ok(()));
+
+        let mut odd = [1_u8, 2, 3, 4, 5];
+        assert_eq!(reverse_checked(&mut odd), Ok(()));
+        assert_eq!(odd, [5, 4, 3, 2, 1]);
+
+        let mut even = [1_u8, 2, 3, 4];
+        assert_eq!(reverse_checked(&mut even), Ok(()));
+        assert_eq!(even, [4, 3, 2, 1]);
     }
 }
