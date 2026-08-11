@@ -13,7 +13,7 @@ enum ExistingRenameTarget {
     SameInode,
 }
 
-impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
+impl MutationResolvePass<'_, '_, '_> {
     /// Creates an empty regular file under a directory.
     ///
     /// # Errors
@@ -552,7 +552,10 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
     /// Returns an error when the encrypted lookup name cannot be derived and no locked-directory
     /// ciphertext fallback can represent `name`.
     fn directory_lookup_name(&mut self, directory: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
-        match self.volume.encrypt_directory_child_name(directory, name) {
+        match self
+            .volume
+            .encrypt_directory_child_name(directory, name, self.crypto)
+        {
             Err(Error::MissingEncryptionKey) => {
                 if let Some(ciphertext) = EpochReadView::locked_directory_ciphertext_name(name)? {
                     Ok(ciphertext)
@@ -583,9 +586,9 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
             return Err(Error::WrongInodeKind);
         }
         self.require_directory_entry_create_mutation_for_inode(&parent_inode)?;
-        let disk_name = self
-            .volume
-            .encrypt_directory_child_name(&parent_inode, name)?;
+        let disk_name =
+            self.volume
+                .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
         if self
             .directory_layout(&parent_inode)?
             .find(&disk_name)?
@@ -729,12 +732,12 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
             return Err(Error::WrongInodeKind);
         }
         self.require_directory_entry_rename_mutation_for_inode(&parent_inode)?;
-        let old_disk_name = self
-            .volume
-            .encrypt_directory_child_name(&parent_inode, old_name)?;
-        let new_disk_name = self
-            .volume
-            .encrypt_directory_child_name(&parent_inode, new_name)?;
+        let old_disk_name =
+            self.volume
+                .encrypt_directory_child_name(&parent_inode, old_name, self.crypto)?;
+        let new_disk_name =
+            self.volume
+                .encrypt_directory_child_name(&parent_inode, new_name, self.crypto)?;
         if matches!(
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
@@ -801,9 +804,9 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
             return Err(Error::WrongInodeKind);
         }
         self.require_directory_entry_replace_mutation_for_inode(&parent_inode)?;
-        let disk_name = self
-            .volume
-            .encrypt_directory_child_name(&parent_inode, name)?;
+        let disk_name =
+            self.volume
+                .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
         if matches!(
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree

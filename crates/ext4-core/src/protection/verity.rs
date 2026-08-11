@@ -6,6 +6,7 @@ use crate::disk::block::BlockSize;
 use crate::disk_format::inode::FileSize;
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
+use crate::protection::crypto::CryptographicOperation;
 
 /// Serialized Linux `struct fsverity_descriptor` size without signature bytes.
 pub const FSVERITY_DESCRIPTOR_BYTES: usize = 256;
@@ -688,11 +689,15 @@ impl FsverityDescriptor {
     ///
     /// Returns an error when `block` is not exactly the descriptor block size or hashing cannot
     /// allocate its bounded digest input.
-    fn hash_block(&self, block: &[u8]) -> Result<FsverityDigest> {
+    fn hash_block(
+        &self,
+        block: &[u8],
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<FsverityDigest> {
         if block.len() != self.block_size.to_usize()? {
             return Err(Error::InvalidVerityMetadata);
         }
-        hash_block(self.algorithm, &self.salt, block)
+        hash_block(self.algorithm, &self.salt, block, crypto)
     }
 
     /// Returns the descriptor root digest in the selected algorithm width.
@@ -840,6 +845,7 @@ impl FsverityVerifier {
         &self,
         data_block: u64,
         bytes: &[u8],
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<FsverityDataBlockVerification<'_>> {
         if data_block >= self.geometry.data_blocks {
             return Err(Error::InvalidVerityMetadata);
@@ -848,7 +854,7 @@ impl FsverityVerifier {
             verifier: self,
             child_index: data_block,
             next_level: 0,
-            digest: self.descriptor.hash_block(bytes)?,
+            digest: self.descriptor.hash_block(bytes, crypto)?,
         })
     }
 }
@@ -890,7 +896,11 @@ impl FsverityDataBlockVerification<'_> {
     /// # Errors
     /// Returns an error when no proof block remains, a digest slot or block is malformed, or the
     /// child digest does not match.
-    pub(crate) fn verify_merkle_block(&mut self, block: &[u8]) -> Result<()> {
+    pub(crate) fn verify_merkle_block(
+        &mut self,
+        block: &[u8],
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<()> {
         let level = self
             .verifier
             .geometry
@@ -909,7 +919,7 @@ impl FsverityDataBlockVerification<'_> {
         {
             return Err(Error::VerityMismatch);
         }
-        self.digest = self.verifier.descriptor.hash_block(block)?;
+        self.digest = self.verifier.descriptor.hash_block(block, crypto)?;
         self.child_index = block_index;
         self.next_level = self
             .next_level
@@ -990,6 +1000,7 @@ impl FsverityMerkleTree {
         algorithm: FsverityHashAlgorithm,
         block_size: FsverityBlockSize,
         salt: &FsveritySalt,
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<Self> {
         if data.is_empty() {
             return Ok(Self {
@@ -1001,10 +1012,11 @@ impl FsverityMerkleTree {
         }
 
         let block_bytes = block_size.to_usize()?;
-        let mut hashes = hash_data_blocks(data, algorithm, block_bytes, salt)?;
+        let mut hashes = hash_data_blocks(data, algorithm, block_bytes, salt, crypto)?;
         let mut levels = Vec::new();
         while hashes.len() > 1 {
-            let (level_blocks, parent_hashes) = hash_level(&hashes, algorithm, block_bytes, salt)?;
+            let (level_blocks, parent_hashes) =
+                hash_level(&hashes, algorithm, block_bytes, salt, crypto)?;
             levels.try_push(level_blocks)?;
             hashes = parent_hashes;
         }
@@ -1130,6 +1142,7 @@ fn hash_data_blocks(
     algorithm: FsverityHashAlgorithm,
     block_bytes: usize,
     salt: &FsveritySalt,
+    crypto: &mut dyn CryptographicOperation,
 ) -> Result<Vec<FsverityDigest>> {
     let mut hashes = Vec::new();
     for chunk in data.chunks(block_bytes) {
@@ -1140,7 +1153,7 @@ fn hash_data_blocks(
                 .ok_or(Error::InvalidVerityMetadata)?,
             chunk,
         )?;
-        hashes.try_push(hash_block(algorithm, salt, &block)?)?;
+        hashes.try_push(hash_block(algorithm, salt, &block, crypto)?)?;
     }
     Ok(hashes)
 }
@@ -1155,6 +1168,7 @@ fn hash_level(
     algorithm: FsverityHashAlgorithm,
     block_bytes: usize,
     salt: &FsveritySalt,
+    crypto: &mut dyn CryptographicOperation,
 ) -> Result<(Vec<u8>, Vec<FsverityDigest>)> {
     let digest_bytes = algorithm.digest_bytes();
     let hashes_per_block = block_bytes
@@ -1176,7 +1190,7 @@ fn hash_level(
                 .ok_or(Error::ArithmeticOverflow)?;
             copy_into(&mut block, offset, hash.bytes())?;
         }
-        parent_hashes.try_push(hash_block(algorithm, salt, &block)?)?;
+        parent_hashes.try_push(hash_block(algorithm, salt, &block, crypto)?)?;
         level_blocks.try_extend_from_slice(&block)?;
     }
     Ok((level_blocks, parent_hashes))
@@ -1191,6 +1205,7 @@ fn hash_block(
     algorithm: FsverityHashAlgorithm,
     salt: &FsveritySalt,
     block: &[u8],
+    crypto: &mut dyn CryptographicOperation,
 ) -> Result<FsverityDigest> {
     let mut input = Vec::new();
     if !salt.is_empty() {
@@ -1204,7 +1219,22 @@ fn hash_block(
         )?;
     }
     input.try_extend_from_slice(block)?;
-    FsverityDigest::new(algorithm, hash_bytes(algorithm, &input)?)
+    FsverityDigest::new(algorithm, hash_bytes(algorithm, &input, crypto)?)
+}
+
+/// Hashes an arbitrary byte slice through the operation-owned provider.
+/// # Errors
+///
+/// Returns an error when digest allocation or provider execution fails.
+fn hash_bytes(
+    algorithm: FsverityHashAlgorithm,
+    bytes: &[u8],
+    crypto: &mut dyn CryptographicOperation,
+) -> Result<Vec<u8>> {
+    match algorithm {
+        FsverityHashAlgorithm::Sha256 => memory::copied_slice(&crypto.sha256(bytes)?),
+        FsverityHashAlgorithm::Sha512 => memory::copied_slice(&crypto.sha512(bytes)?),
+    }
 }
 
 /// Requires an exact serialized structure length.

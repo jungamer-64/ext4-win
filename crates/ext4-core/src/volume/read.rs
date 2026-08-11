@@ -170,9 +170,10 @@ impl EpochReadView<'_, '_> {
     pub(super) fn fscrypt_contents_key_for_inode(
         &mut self,
         inode: &Inode,
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<FscryptContentsKey> {
         let (context, master_key) = self.fscrypt_master_key_for_inode(inode)?;
-        master_key.derive_contents_key(context.nonce())
+        master_key.derive_contents_key(context.nonce(), crypto)
     }
 
     /// Derives the per-directory filename key and padding policy.
@@ -183,10 +184,11 @@ impl EpochReadView<'_, '_> {
     pub(super) fn fscrypt_filenames_key_for_inode(
         &mut self,
         inode: &Inode,
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<(FscryptFilenamesKey, FscryptFilenamePadding)> {
         let (context, master_key) = self.fscrypt_master_key_for_inode(inode)?;
         Ok((
-            master_key.derive_filenames_key(context.nonce())?,
+            master_key.derive_filenames_key(context.nonce(), crypto)?,
             context.policy().filename_padding(),
         ))
     }
@@ -200,12 +202,13 @@ impl EpochReadView<'_, '_> {
         &mut self,
         parent: &Inode,
         name: &Ext4Name,
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<Ext4Name> {
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
             return Ext4Name::new(name.bytes());
         }
-        let (key, padding) = self.fscrypt_filenames_key_for_inode(parent)?;
-        Ext4Name::from_disk(&key.encrypt_filename(name.bytes(), padding)?)
+        let (key, padding) = self.fscrypt_filenames_key_for_inode(parent, crypto)?;
+        Ext4Name::from_disk(&key.encrypt_filename(name.bytes(), padding, crypto)?)
     }
 
     /// Converts an on-disk child name to plaintext for a directory.
@@ -217,12 +220,13 @@ impl EpochReadView<'_, '_> {
         &mut self,
         parent: &Inode,
         name: &Ext4Name,
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<Ext4Name> {
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
             return Ext4Name::new(name.bytes());
         }
-        let (key, _padding) = self.fscrypt_filenames_key_for_inode(parent)?;
-        Ext4Name::new(&key.decrypt_filename(name.bytes())?)
+        let (key, _padding) = self.fscrypt_filenames_key_for_inode(parent, crypto)?;
+        Ext4Name::new(&key.decrypt_filename(name.bytes(), crypto)?)
     }
 
     /// Rejects protected plaintext data access until crypto and verification paths exist.
@@ -285,11 +289,12 @@ impl EpochReadView<'_, '_> {
         file: &FileNode,
         offset: FileOffset,
         out: &mut [u8],
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<ReadBytes> {
         if file.protection().is_verity() {
-            return self.read_verified_file(file, offset, out);
+            return self.read_verified_file(file, offset, out, crypto);
         }
-        self.read_inode_plaintext_data(file.inode(), offset, out)
+        self.read_inode_plaintext_data(file.inode(), offset, out, crypto)
     }
 
     /// Reads a typed symlink target as bytes.
@@ -318,6 +323,7 @@ impl EpochReadView<'_, '_> {
         file: &FileNode,
         offset: FileOffset,
         out: &mut [u8],
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<ReadBytes> {
         if out.is_empty() || offset.bytes() >= file.size().bytes() {
             return Ok(ReadBytes::from_usize(0));
@@ -331,12 +337,12 @@ impl EpochReadView<'_, '_> {
             extent_context,
         )?;
         let contents_key = if file.protection().is_encrypted() {
-            Some(self.fscrypt_contents_key_for_inode(file.inode())?)
+            Some(self.fscrypt_contents_key_for_inode(file.inode(), crypto)?)
         } else {
             None
         };
         let (metadata, descriptor) =
-            self.read_verity_descriptor(file, &extent_tree, contents_key.as_ref())?;
+            self.read_verity_descriptor(file, &extent_tree, contents_key.as_ref(), crypto)?;
         if descriptor.block_size().bytes() > block_size.bytes() {
             return Err(Error::InvalidVerityMetadata);
         }
@@ -391,8 +397,15 @@ impl EpochReadView<'_, '_> {
                 &plan.extent_tree,
                 block_start,
                 data_block.get_mut(..data_bytes).ok_or(Error::DeviceRange)?,
+                crypto,
             )?;
-            self.verify_verity_data_block(&plan, data_block_index, &data_block, &mut proof_block)?;
+            self.verify_verity_data_block(
+                &plan,
+                data_block_index,
+                &data_block,
+                &mut proof_block,
+                crypto,
+            )?;
 
             let copy_start = core::cmp::max(offset.bytes(), block_start);
             let block_end = block_start
@@ -446,6 +459,7 @@ impl EpochReadView<'_, '_> {
         file: &FileNode,
         extent_tree: &ExtentTree,
         contents_key: Option<&FscryptContentsKey>,
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<(Ext4VerityMetadataLayout, FsverityDescriptor)> {
         let block_size = self.superblock.block_size();
         let metadata_end = extent_payload_end_bytes(extent_tree, block_size)?;
@@ -461,6 +475,7 @@ impl EpochReadView<'_, '_> {
             extent_tree,
             tail_offset,
             &mut descriptor_size_tail,
+            crypto,
         )?;
         let descriptor_bytes = u32::from_le_bytes(descriptor_size_tail);
         let descriptor_offset = Ext4VerityMetadataLayout::descriptor_offset_from_metadata_end(
@@ -474,6 +489,7 @@ impl EpochReadView<'_, '_> {
             extent_tree,
             descriptor_offset,
             &mut descriptor_image,
+            crypto,
         )?;
         let descriptor = FsverityDescriptor::parse(&descriptor_image)?;
         let layout = Ext4VerityMetadataLayout::from_metadata_end(
@@ -496,10 +512,11 @@ impl EpochReadView<'_, '_> {
         data_block_index: u64,
         data_block: &[u8],
         proof_block: &mut [u8],
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<()> {
-        let mut verification = plan
-            .verifier
-            .begin_data_block(data_block_index, data_block)?;
+        let mut verification =
+            plan.verifier
+                .begin_data_block(data_block_index, data_block, crypto)?;
         while let Some(location) = verification.next_merkle_block()? {
             let stream_offset = plan
                 .metadata
@@ -511,8 +528,9 @@ impl EpochReadView<'_, '_> {
                 &plan.extent_tree,
                 stream_offset,
                 proof_block,
+                crypto,
             )?;
-            verification.verify_merkle_block(proof_block)?;
+            verification.verify_merkle_block(proof_block, crypto)?;
         }
         verification.finish()
     }
@@ -527,9 +545,12 @@ impl EpochReadView<'_, '_> {
         extent_tree: &ExtentTree,
         offset: u64,
         out: &mut [u8],
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<()> {
         match contents_key {
-            Some(key) => self.read_encrypted_inode_stream_range(key, extent_tree, offset, out),
+            Some(key) => {
+                self.read_encrypted_inode_stream_range(key, extent_tree, offset, out, crypto)
+            }
             None => self.read_inode_stream_range(extent_tree, offset, out),
         }
     }
@@ -542,10 +563,11 @@ impl EpochReadView<'_, '_> {
     pub(super) fn read_directory(
         &mut self,
         directory: &DirectoryNode,
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<Vec<DirectoryEntry>> {
         let entries = self.read_directory_layout(directory.inode())?.entries()?;
         let entries = if directory.protection().is_encrypted() {
-            match self.decrypt_directory_entries(directory.inode(), &entries) {
+            match self.decrypt_directory_entries(directory.inode(), &entries, crypto) {
                 Err(Error::MissingEncryptionKey) => {
                     Self::project_locked_directory_entries(entries)?
                 }
@@ -566,7 +588,11 @@ impl EpochReadView<'_, '_> {
     /// Returns an error when the target is stale, a directory cannot be read, the directory graph
     /// contains a non-special cycle, allocation fails, or fewer reachable links exist than the
     /// inode advertises.
-    pub(super) fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
+    pub(super) fn read_hard_links(
+        &mut self,
+        target: HardLinkNodeId,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<HardLinks> {
         let expected = match target {
             HardLinkNodeId::File(file) => usize::from(self.load_file(file)?.links_count().get()),
             HardLinkNodeId::Symlink(symlink) => {
@@ -588,7 +614,7 @@ impl EpochReadView<'_, '_> {
             }
             visited.try_push(directory_id)?;
             let directory = self.load_directory(directory_id)?;
-            let entries = self.read_directory(&directory)?;
+            let entries = self.read_directory(&directory, crypto)?;
             for entry in entries {
                 if matches!(entry.name().bytes(), b"." | b"..") {
                     continue;
@@ -620,13 +646,14 @@ impl EpochReadView<'_, '_> {
         &mut self,
         directory: &Inode,
         entries: &[RawDirectoryEntry],
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<Vec<RawDirectoryEntry>> {
         let mut decrypted = Vec::new();
         decrypted
             .try_reserve_exact(entries.len())
             .map_err(|_| Error::OutOfMemory)?;
         for entry in entries {
-            let name = self.decrypt_directory_child_name(directory, entry.name())?;
+            let name = self.decrypt_directory_child_name(directory, entry.name(), crypto)?;
             decrypted.try_push(RawDirectoryEntry::new(entry.inode(), &name, entry.kind())?)?;
         }
         Ok(decrypted)
@@ -700,8 +727,9 @@ impl EpochReadView<'_, '_> {
         &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<ChildLookup> {
-        match self.lookup_windows_child_entry(parent, requested)? {
+        match self.lookup_windows_child_entry(parent, requested, crypto)? {
             Some(entry) => Ok(ChildLookup::Found(entry.into_child(parent.id()))),
             None => Ok(ChildLookup::NotFound),
         }
@@ -716,21 +744,23 @@ impl EpochReadView<'_, '_> {
         &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<Option<DirectoryEntry>> {
         if parent.protection().is_encrypted() {
             let visible_name = requested.to_ext4()?;
-            let ciphertext = match self.encrypt_directory_child_name(parent.inode(), &visible_name)
-            {
-                Ok(ciphertext) => ciphertext,
-                Err(Error::MissingEncryptionKey) => {
-                    let Some(ciphertext) = Self::locked_directory_ciphertext_name(&visible_name)?
-                    else {
-                        return Err(Error::MissingEncryptionKey);
-                    };
-                    ciphertext
-                }
-                Err(error) => return Err(error),
-            };
+            let ciphertext =
+                match self.encrypt_directory_child_name(parent.inode(), &visible_name, crypto) {
+                    Ok(ciphertext) => ciphertext,
+                    Err(Error::MissingEncryptionKey) => {
+                        let Some(ciphertext) =
+                            Self::locked_directory_ciphertext_name(&visible_name)?
+                        else {
+                            return Err(Error::MissingEncryptionKey);
+                        };
+                        ciphertext
+                    }
+                    Err(error) => return Err(error),
+                };
             let entry = self
                 .read_directory_layout(parent.inode())?
                 .find(&ciphertext)?;
@@ -744,7 +774,7 @@ impl EpochReadView<'_, '_> {
         }
         let mut folded = None;
 
-        for entry in self.read_directory(parent)? {
+        for entry in self.read_directory(parent, crypto)? {
             let Ok(name) = WindowsName::from_ext4(entry.name()) else {
                 continue;
             };
@@ -883,6 +913,7 @@ impl EpochReadView<'_, '_> {
         inode: &Inode,
         offset: FileOffset,
         out: &mut [u8],
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<ReadBytes> {
         if !inode.protection().is_encrypted() {
             return self.read_inode_data(inode, offset, out);
@@ -908,6 +939,7 @@ impl EpochReadView<'_, '_> {
             &extent_tree,
             offset.bytes(),
             out.get_mut(..readable_len).ok_or(Error::DeviceRange)?,
+            crypto,
         )?;
         Ok(ReadBytes::from_usize(readable_len))
     }
@@ -957,10 +989,11 @@ impl EpochReadView<'_, '_> {
         extent_tree: &ExtentTree,
         offset: u64,
         out: &mut [u8],
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<()> {
         if inode.protection().is_encrypted() {
-            let contents_key = self.fscrypt_contents_key_for_inode(inode)?;
-            self.read_encrypted_inode_stream_range(&contents_key, extent_tree, offset, out)
+            let contents_key = self.fscrypt_contents_key_for_inode(inode, crypto)?;
+            self.read_encrypted_inode_stream_range(&contents_key, extent_tree, offset, out, crypto)
         } else {
             self.read_inode_stream_range(extent_tree, offset, out)
         }
@@ -977,6 +1010,7 @@ impl EpochReadView<'_, '_> {
         extent_tree: &ExtentTree,
         offset: u64,
         out: &mut [u8],
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<()> {
         if out.is_empty() {
             return Ok(());
@@ -1020,13 +1054,13 @@ impl EpochReadView<'_, '_> {
                             self.superblock.block_size().offset_of(physical_block)?,
                             target,
                         )?;
-                        contents_key.decrypt_block(logical_block, target)?;
+                        contents_key.decrypt_block(logical_block, target, crypto)?;
                     } else {
                         self.device.read_exact_at(
                             self.superblock.block_size().offset_of(physical_block)?,
                             &mut block,
                         )?;
-                        contents_key.decrypt_block(logical_block, &mut block)?;
+                        contents_key.decrypt_block(logical_block, &mut block, crypto)?;
                         let start =
                             usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
                         let block_end =

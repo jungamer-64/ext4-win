@@ -41,10 +41,11 @@ pub(super) use crate::memory::{self, FallibleVec};
 pub(super) use crate::platform::name::Ext4Name;
 pub(super) use crate::platform::name::WindowsName;
 pub(super) use crate::platform::windows::{WindowsOverlay, WindowsSymlinkReparsePoint};
+pub(super) use crate::protection::crypto::CryptographicOperation;
 pub(super) use crate::protection::fscrypt::{
-    FscryptContentsKey, FscryptContextV2, FscryptFilenamePadding, FscryptFilenamesKey,
-    FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, FscryptNoKeyName,
-    FscryptNonceGenerator,
+    FscryptContentsKey, FscryptContextV2, FscryptFileNonce, FscryptFilenamePadding,
+    FscryptFilenamesKey, FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey,
+    FscryptNoKeyName,
 };
 pub(super) use crate::protection::verity::{
     Ext4VerityMetadataLayout, FSVERITY_DESCRIPTOR_BYTES, FsverityDescriptor, FsverityEnable,

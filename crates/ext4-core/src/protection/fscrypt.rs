@@ -5,6 +5,7 @@ use core::fmt;
 
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
+use crate::protection::crypto::CryptographicOperation;
 
 /// Serialized fscrypt v2 policy size.
 #[cfg(test)]
@@ -79,6 +80,27 @@ impl FscryptKeyIdentifier {
     #[must_use]
     pub const fn new(bytes: [u8; FSCRYPT_KEY_IDENTIFIER_BYTES]) -> Self {
         Self(bytes)
+    }
+
+    /// Derives the fscrypt v2 identifier for a raw software master key.
+    ///
+    /// # Errors
+    /// Returns an error when the raw key length is outside the supported AES-256 fscrypt v2 range
+    /// or the operation-owned crypto provider cannot complete HKDF-SHA512.
+    pub fn for_raw_master_key(
+        bytes: &[u8],
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<Self> {
+        validate_raw_master_key(bytes)?;
+        let mut identifier = [0_u8; FSCRYPT_KEY_IDENTIFIER_BYTES];
+        fscrypt_hkdf_expand(
+            crypto,
+            bytes,
+            FscryptHkdfContext::KeyIdentifierForRawKey,
+            &[],
+            &mut identifier,
+        )?;
+        Ok(Self(identifier))
     }
 
     /// Returns the raw key identifier bytes.
@@ -440,15 +462,6 @@ impl FscryptNoKeyName {
     }
 }
 
-/// Source of fresh fscrypt per-file nonces for new encrypted inodes.
-pub trait FscryptNonceGenerator {
-    /// Returns the next nonce to store in a newly-created fscrypt context.
-    ///
-    /// # Errors
-    /// Returns an error when the mount cannot create a fresh encrypted inode.
-    fn next_file_nonce(&mut self) -> Result<FscryptFileNonce>;
-}
-
 /// Raw fscrypt master key material supplied at the mount boundary.
 #[derive(Eq, PartialEq)]
 pub struct FscryptMasterKey {
@@ -470,10 +483,68 @@ impl FscryptMasterKey {
         })
     }
 
+    /// Creates a mount-scoped fscrypt master key from raw software key bytes.
+    ///
+    /// # Errors
+    /// Returns an error when key validation, identifier derivation, or owned key allocation fails.
+    pub fn from_raw(bytes: &[u8], crypto: &mut dyn CryptographicOperation) -> Result<Self> {
+        let identifier = FscryptKeyIdentifier::for_raw_master_key(bytes, crypto)?;
+        Ok(Self {
+            identifier,
+            bytes: memory::copied_slice(bytes)?,
+        })
+    }
+
     /// Stable fscrypt v2 identifier.
     #[must_use]
     pub const fn identifier(&self) -> FscryptKeyIdentifier {
         self.identifier
+    }
+
+    /// Derives the AES-256-XTS per-file contents key for a regular file.
+    ///
+    /// # Errors
+    /// Returns an error when operation-owned HKDF-SHA512 execution fails.
+    pub(crate) fn derive_contents_key(
+        &self,
+        nonce: FscryptFileNonce,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<FscryptContentsKey> {
+        let mut bytes = [0_u8; FSCRYPT_AES_256_XTS_KEY_BYTES];
+        fscrypt_hkdf_expand(
+            crypto,
+            &self.bytes,
+            FscryptHkdfContext::PerFileEncryptionKey,
+            &nonce.bytes(),
+            &mut bytes,
+        )?;
+        Ok(FscryptContentsKey { bytes })
+    }
+
+    /// Derives the AES-256-CBC-CS3 per-file filename key for a directory.
+    ///
+    /// # Errors
+    /// Returns an error when operation-owned HKDF-SHA512 execution fails.
+    pub(crate) fn derive_filenames_key(
+        &self,
+        nonce: FscryptFileNonce,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<FscryptFilenamesKey> {
+        let mut bytes = [0_u8; FSCRYPT_AES_256_CBC_CTS_KEY_BYTES];
+        fscrypt_hkdf_expand(
+            crypto,
+            &self.bytes,
+            FscryptHkdfContext::PerFileEncryptionKey,
+            &nonce.bytes(),
+            &mut bytes,
+        )?;
+        Ok(FscryptFilenamesKey { bytes })
+    }
+}
+
+impl Drop for FscryptMasterKey {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
     }
 }
 
@@ -589,10 +660,42 @@ pub struct FscryptContentsKey {
 }
 
 impl FscryptContentsKey {
-    /// Returns raw AES-256-XTS key bytes.
-    #[must_use]
-    pub const fn bytes(&self) -> &[u8; FSCRYPT_AES_256_XTS_KEY_BYTES] {
-        &self.bytes
+    /// Encrypts one fscrypt contents data unit in place.
+    ///
+    /// # Errors
+    /// Returns an error when the data unit is smaller than one AES block or CNG rejects it.
+    pub(crate) fn encrypt_block(
+        &self,
+        logical_block: u64,
+        block: &mut [u8],
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<()> {
+        if block.len() < 16 {
+            return Err(Error::InvalidWriteRange);
+        }
+        crypto.encrypt_aes_256_xts(&self.bytes, logical_block, block)
+    }
+
+    /// Decrypts one fscrypt contents data unit in place.
+    ///
+    /// # Errors
+    /// Returns an error when the data unit is smaller than one AES block or CNG rejects it.
+    pub(crate) fn decrypt_block(
+        &self,
+        logical_block: u64,
+        block: &mut [u8],
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<()> {
+        if block.len() < 16 {
+            return Err(Error::InvalidWriteRange);
+        }
+        crypto.decrypt_aes_256_xts(&self.bytes, logical_block, block)
+    }
+}
+
+impl Drop for FscryptContentsKey {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
     }
 }
 
@@ -612,10 +715,58 @@ pub struct FscryptFilenamesKey {
 }
 
 impl FscryptFilenamesKey {
-    /// Returns raw AES-256-CBC-CTS key bytes.
-    #[must_use]
-    pub const fn bytes(&self) -> &[u8; FSCRYPT_AES_256_CBC_CTS_KEY_BYTES] {
-        &self.bytes
+    /// Encrypts a plaintext filename using fscrypt AES-256-CBC-CS3.
+    ///
+    /// # Errors
+    /// Returns an error when the name, allocation, or CNG operation fails.
+    pub(crate) fn encrypt_filename(
+        &self,
+        plaintext: &[u8],
+        padding: FscryptFilenamePadding,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<Vec<u8>> {
+        let padded_len = padded_filename_len(plaintext.len(), padding)?;
+        let mut ciphertext = memory::repeated_vec(0_u8, padded_len)?;
+        memory::copy_exact(
+            ciphertext
+                .get_mut(..plaintext.len())
+                .ok_or(Error::InvalidName)?,
+            plaintext,
+        )?;
+        crypto.encrypt_aes_256_cbc_cs3(&self.bytes, &mut ciphertext)?;
+        Ok(ciphertext)
+    }
+
+    /// Decrypts a ciphertext filename using fscrypt AES-256-CBC-CS3.
+    ///
+    /// # Errors
+    /// Returns an error when the ciphertext, allocation, CNG operation, or recovered padding is
+    /// invalid.
+    pub(crate) fn decrypt_filename(
+        &self,
+        ciphertext: &[u8],
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<Vec<u8>> {
+        if ciphertext.len() < 16 || ciphertext.len() > 255 {
+            return Err(Error::InvalidName);
+        }
+        let mut plaintext = memory::copied_slice(ciphertext)?;
+        crypto.decrypt_aes_256_cbc_cs3(&self.bytes, &mut plaintext)?;
+        let Some(last) = plaintext.iter().rposition(|byte| *byte != 0) else {
+            return Err(Error::InvalidName);
+        };
+        let len = last.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        if plaintext.get(..len).ok_or(Error::InvalidName)?.contains(&0) {
+            return Err(Error::InvalidName);
+        }
+        plaintext.truncate(len);
+        Ok(plaintext)
+    }
+}
+
+impl Drop for FscryptFilenamesKey {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
     }
 }
 
@@ -914,6 +1065,32 @@ fn put_bytes(bytes: &mut [u8], offset: usize, value: &[u8]) -> Result<()> {
             .ok_or(Error::InvalidEncryptionContext)?,
         value,
     )
+}
+
+/// Expands an fscrypt v2 HKDF-SHA512 output for one namespace and info value.
+/// # Errors
+///
+/// Returns an error when info construction, allocation, or provider execution fails.
+fn fscrypt_hkdf_expand(
+    crypto: &mut dyn CryptographicOperation,
+    master_key: &[u8],
+    context: FscryptHkdfContext,
+    info: &[u8],
+    output: &mut [u8],
+) -> Result<()> {
+    let info_len = FSCRYPT_HKDF_INFO_PREFIX
+        .len()
+        .checked_add(1)
+        .and_then(|len| len.checked_add(info.len()))
+        .ok_or(Error::ArithmeticOverflow)?;
+    let mut prefixed_info = Vec::new();
+    prefixed_info
+        .try_reserve_exact(info_len)
+        .map_err(|_| Error::OutOfMemory)?;
+    prefixed_info.try_extend_from_slice(FSCRYPT_HKDF_INFO_PREFIX)?;
+    prefixed_info.try_push(context.value())?;
+    prefixed_info.try_extend_from_slice(info)?;
+    crypto.hkdf_sha512(master_key, &prefixed_info, output)
 }
 
 /// Returns the padded filename length accepted by fscrypt AES-CBC-CTS.

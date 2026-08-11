@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
+impl MutationResolvePass<'_, '_, '_> {
     /// Writes bytes into a regular file and extends EOF when the range reaches beyond it.
     ///
     /// # Errors
@@ -81,7 +81,10 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
         }
         let block_size = u64::from(self.volume.superblock.block_size().bytes());
         let encrypted_contents_key = if inode.protection().is_encrypted() {
-            Some(self.volume.fscrypt_contents_key_for_inode(inode)?)
+            Some(
+                self.volume
+                    .fscrypt_contents_key_for_inode(inode, self.crypto)?,
+            )
         } else {
             None
         };
@@ -273,7 +276,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
             .checked_add(bytes.len())
             .ok_or(Error::ArithmeticOverflow)?;
         memory::copy_exact(block.get_mut(start..end).ok_or(Error::DeviceRange)?, bytes)?;
-        contents_key.encrypt_block(logical_block.as_u64(), &mut block)?;
+        contents_key.encrypt_block(logical_block.as_u64(), &mut block, self.crypto)?;
         self.data_writes.try_push(RangeWrite {
             offset: self.volume.superblock.block_size().offset_of(physical)?,
             bytes: block,
@@ -308,7 +311,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
             self.volume.device.read_exact_at(block_offset, &mut bytes)?;
             bytes
         };
-        contents_key.decrypt_block(logical_block.as_u64(), &mut block)?;
+        contents_key.decrypt_block(logical_block.as_u64(), &mut block, self.crypto)?;
         Ok(block)
     }
 
@@ -433,7 +436,9 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
         if bytes.is_empty() {
             return Ok(());
         }
-        let contents_key = self.volume.fscrypt_contents_key_for_inode(inode)?;
+        let contents_key = self
+            .volume
+            .fscrypt_contents_key_for_inode(inode, self.crypto)?;
         let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
         let mut completed = 0_usize;
         while completed < bytes.len() {
@@ -609,9 +614,12 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
         let _payload = inode.file_payload_mutation()?;
 
         let mut plaintext = memory::repeated_vec(0_u8, inode.size().to_usize()?)?;
-        let read =
-            self.volume
-                .read_inode_plaintext_data(&inode, FileOffset::ZERO, &mut plaintext)?;
+        let read = self.volume.read_inode_plaintext_data(
+            &inode,
+            FileOffset::ZERO,
+            &mut plaintext,
+            self.crypto,
+        )?;
         if read.as_usize() != plaintext.len() {
             return Err(Error::InvalidVerityMetadata);
         }
@@ -620,6 +628,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
             enable.algorithm(),
             enable.block_size(),
             enable.salt(),
+            self.crypto,
         )?;
         let descriptor = FsverityDescriptor::new(
             enable.algorithm(),
@@ -770,7 +779,9 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
         else {
             return Ok(());
         };
-        let contents_key = self.volume.fscrypt_contents_key_for_inode(inode)?;
+        let contents_key = self
+            .volume
+            .fscrypt_contents_key_for_inode(inode, self.crypto)?;
         let zero_len = usize::try_from(
             block_size
                 .checked_sub(in_block)

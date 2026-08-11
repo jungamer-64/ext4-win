@@ -17,7 +17,7 @@ use crate::irp::reactor::{
     IntentRequest, OperationTransition, PublicationAuthority, WaitCondition,
 };
 use crate::irp::{CreateCompletion, IrpCompletion, OwnedIrp};
-use crate::kernel::cng::CngFscryptNonceGenerator;
+use crate::kernel::cng::CngOperation;
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::storage::{LowerStorageDevice, MountedStorageDevices, StorageFailureClass};
@@ -300,6 +300,8 @@ struct ReadRequestOperation {
     devices: MountedStorageDevices,
     /// Request semantics selected from captured queue metadata.
     kind: ReadRequestKind,
+    /// Mutable CNG objects and work buffers owned across every read suspension.
+    crypto: CngOperation,
     /// Explicit operation phase.
     state: ReadOperationState,
 }
@@ -319,11 +321,15 @@ impl ReadRequestOperation {
                 ));
             }
         };
-        let (epoch, devices, read) = {
+        let (epoch, devices, read, crypto) = {
             let mut access = unsafe {
                 // SAFETY: Admission executes on the sole reactor thread and the mounted VCB is
                 // stable until its reactor has drained every admitted operation.
                 VolumeControlBlock::operation_access(volume)
+            };
+            let crypto = match access.runtime().crypto().try_new_operation() {
+                Ok(crypto) => crypto,
+                Err(error) => return Err(AdmitOperationError::new(error, owned)),
             };
             let read = EpochReadOperation::new(access.runtime().profile());
             let devices = access.runtime().storage();
@@ -331,18 +337,19 @@ impl ReadRequestOperation {
                 Ok(epoch) => epoch,
                 Err(error) => return Err(AdmitOperationError::new(error, owned)),
             };
-            (epoch, devices, read)
+            (epoch, devices, read, crypto)
         };
-        match memory::boxed_try_map((owned, epoch), |(owned, epoch)| Self {
+        match memory::boxed_try_map((owned, epoch, crypto), |(owned, epoch, crypto)| Self {
             volume,
             epoch,
             devices,
             kind,
+            crypto,
             state: ReadOperationState::Running { owned, read },
         }) {
             Ok(operation) => Ok(operation),
             Err(error) => {
-                let (error, (owned, _epoch)) = error.into_parts();
+                let (error, (owned, _epoch, _crypto)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
             }
         }
@@ -389,12 +396,18 @@ impl CompletionOperation for ReadRequestOperation {
                 .bugcheck();
         };
         let kind = self.kind;
-        let transition = read.run(event, self.epoch.epoch(), |pass| {
-            match Self::execute_pass(kind, &mut owned, pass) {
-                Err(DriverError::Core(Error::OperationSuspended)) => Err(Error::OperationSuspended),
-                result => Ok(result),
-            }
-        });
+        let transition =
+            read.run(
+                event,
+                self.epoch.epoch(),
+                &mut self.crypto,
+                |pass| match Self::execute_pass(kind, &mut owned, pass) {
+                    Err(DriverError::Core(Error::OperationSuspended)) => {
+                        Err(Error::OperationSuspended)
+                    }
+                    result => Ok(result),
+                },
+            );
         match transition {
             ReadTransition::SubmitLower { request, suspended } => {
                 self.state = ReadOperationState::Running {
@@ -1290,7 +1303,7 @@ enum MutationOperationState {
     Resolving {
         owned: OwnedIrp,
         epoch: EpochLease,
-        resolve: MutationResolveOperation<CngFscryptNonceGenerator>,
+        resolve: MutationResolveOperation,
     },
     /// Resolved resources await atomic intent acquisition.
     AwaitingIntent {
@@ -1352,6 +1365,8 @@ struct MutationRequestOperation {
     now: ext4_core::Ext4Timestamp,
     /// Captured request semantics.
     kind: MutationRequestKind,
+    /// Mutable CNG objects and work buffers retained through resolve and commit.
+    crypto: CngOperation,
     /// Cleanup deletion plan retained across resolve suspension.
     cleanup_deletion: Option<crate::request::file_info::PendingCleanupDeletion>,
     /// Whether a successful pre-commit write has made abort/replay relevant.
@@ -1389,11 +1404,15 @@ impl MutationRequestOperation {
             Ok(now) => now,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
-        let (ticket, devices, epoch, resolve) = {
+        let (ticket, devices, epoch, resolve, crypto) = {
             let mut access = unsafe {
                 // SAFETY: Admission executes on the sole reactor thread and every returned token
                 // is owned by the operation before that access projection ends.
                 VolumeControlBlock::operation_access(volume)
+            };
+            let crypto = match access.runtime().crypto().try_new_operation() {
+                Ok(crypto) => crypto,
+                Err(error) => return Err(AdmitOperationError::new(error, owned)),
             };
             let ticket = match access.runtime_mut().admit_mutation() {
                 Ok(ticket) => ticket,
@@ -1404,16 +1423,16 @@ impl MutationRequestOperation {
                 Err(error) => return Err(AdmitOperationError::new(error, owned)),
             };
             let devices = access.runtime().storage();
-            let resolve =
-                MutationResolveOperation::new(access.runtime().profile(), CngFscryptNonceGenerator);
-            (ticket, devices, epoch, resolve)
+            let resolve = MutationResolveOperation::new(access.runtime().profile());
+            (ticket, devices, epoch, resolve, crypto)
         };
-        match memory::boxed_try_map((owned, epoch), |(owned, epoch)| Self {
+        match memory::boxed_try_map((owned, epoch, crypto), |(owned, epoch, crypto)| Self {
             volume,
             devices,
             ticket,
             now,
             kind,
+            crypto,
             cleanup_deletion: None,
             write_effect_observed: false,
             cleanup_barrier_released: false,
@@ -1425,7 +1444,7 @@ impl MutationRequestOperation {
         }) {
             Ok(operation) => Ok(operation),
             Err(error) => {
-                let (error, (owned, _epoch)) = error.into_parts();
+                let (error, (owned, _epoch, _crypto)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
             }
         }
@@ -1456,12 +1475,13 @@ impl MutationRequestOperation {
 
     /// Runs the concrete driver mutation surface inside one restart-local core pass.
     fn execute_resolve(
-        &mut self,
+        kind: MutationRequestKind,
+        cleanup_deletion: &mut Option<crate::request::file_info::PendingCleanupDeletion>,
         owned: &mut OwnedIrp,
         operations: &mut crate::state::VolumeAccess,
         mutation: &mut crate::request::DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<DriverResolveDisposition> {
-        match self.kind {
+        match kind {
             MutationRequestKind::Create => {
                 match crate::request::create::execute(owned.request(), operations, mutation)? {
                     crate::request::create::CreateResolution::Complete(completion) => Ok(
@@ -1569,7 +1589,7 @@ impl MutationRequestOperation {
                 ))
             }
             MutationRequestKind::Cleanup => {
-                if self.cleanup_deletion.is_none() {
+                if cleanup_deletion.is_none() {
                     match crate::request::file_info::cleanup(owned.request())? {
                         crate::request::file_info::CleanupResolution::Complete(completion) => {
                             return Ok(DriverResolveDisposition::Complete(
@@ -1577,11 +1597,11 @@ impl MutationRequestOperation {
                             ));
                         }
                         crate::request::file_info::CleanupResolution::Delete(deletion) => {
-                            self.cleanup_deletion = Some(deletion);
+                            *cleanup_deletion = Some(deletion);
                         }
                     }
                 }
-                let Some(deletion) = self.cleanup_deletion.as_ref() else {
+                let Some(deletion) = cleanup_deletion.as_ref() else {
                     return Err(DriverError::InternalInvariantViolation);
                 };
                 let publication =
@@ -1605,8 +1625,7 @@ impl MutationRequestOperation {
                 Ok(epoch) => epoch,
                 Err(error) => return self.complete_error(owned, error),
             };
-            let resolve =
-                MutationResolveOperation::new(access.runtime().profile(), CngFscryptNonceGenerator);
+            let resolve = MutationResolveOperation::new(access.runtime().profile());
             (epoch, resolve)
         };
         self.advance_resolution(owned, epoch, resolve, OperationEvent::Admitted)
@@ -1617,7 +1636,7 @@ impl MutationRequestOperation {
         mut self: Box<Self>,
         mut owned: OwnedIrp,
         epoch: EpochLease,
-        resolve: MutationResolveOperation<CngFscryptNonceGenerator>,
+        resolve: MutationResolveOperation,
         event: OperationEvent,
     ) -> OperationTransition {
         let mut ready = match resolve.accept(event) {
@@ -1631,8 +1650,15 @@ impl MutationRequestOperation {
                 // the transition or enters a completion envelope.
                 VolumeControlBlock::operation_access(self.volume)
             };
-            let mut pass = ready.begin_pass(epoch.epoch(), self.now);
-            match self.execute_resolve(&mut owned, &mut operations, &mut pass) {
+            let kind = self.kind;
+            let mut pass = ready.begin_pass(epoch.epoch(), self.now, &mut self.crypto);
+            match Self::execute_resolve(
+                kind,
+                &mut self.cleanup_deletion,
+                &mut owned,
+                &mut operations,
+                &mut pass,
+            ) {
                 Ok(DriverResolveDisposition::Complete(completion)) => {
                     return Self::complete_success(owned, completion);
                 }

@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
+impl MutationResolvePass<'_, '_, '_> {
     /// Serializes all staged metadata mutations into byte-range writes.
     /// # Errors
     ///
@@ -234,7 +234,7 @@ impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
     }
 }
 
-impl<N: FscryptNonceGenerator> MutationResolvePass<'_, '_, '_, N> {
+impl MutationResolvePass<'_, '_, '_> {
     /// Completes a storage-resolved mutation without issuing any lower write.
     /// # Errors
     ///

@@ -10,6 +10,7 @@ use ext4_core::{
 };
 
 use crate::irp::reactor::MAX_OPERATIONS;
+use crate::kernel::cng::CngProvider;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::storage::MountedStorageDevices;
@@ -474,6 +475,8 @@ pub(crate) struct VolumeRuntime {
     coordinator: MutationCoordinatorState,
     /// Validated lower-device geometry and completion owner.
     storage: MountedStorageDevices,
+    /// Immutable mount-scoped CNG algorithm providers.
+    crypto: CngProvider,
     /// Current read/write reliability state.
     failure: VolumeFailureState,
     /// Serialized commit/checkpoint ownership.
@@ -484,17 +487,22 @@ pub(crate) struct VolumeRuntime {
 
 impl VolumeRuntime {
     /// Separates one completed mount into the runtime's independent state domains.
-    pub(crate) fn new(mount: CompletedMount, storage: MountedStorageDevices) -> Self {
+    pub(crate) fn try_new(
+        mount: CompletedMount,
+        storage: MountedStorageDevices,
+    ) -> DriverResult<Self> {
         let (profile, epoch, coordinator) = mount.into_parts();
-        Self {
+        let crypto = CngProvider::try_open()?;
+        Ok(Self {
             profile,
             epochs: EpochRegistry::new(epoch),
             coordinator,
             storage,
+            crypto,
             failure: VolumeFailureState::Operational,
             commit_gate: CommitGateState::Ready,
             visibility_gate: VisibilityGateState::Ready,
-        }
+        })
     }
 
     /// Immutable mount profile.
@@ -505,6 +513,11 @@ impl VolumeRuntime {
     /// Validated mounted lower devices.
     pub(crate) const fn storage(&self) -> MountedStorageDevices {
         self.storage
+    }
+
+    /// Mount-scoped algorithm providers used to prebuild operation-owned CNG objects.
+    pub(crate) const fn crypto(&self) -> &CngProvider {
+        &self.crypto
     }
 
     /// Whether journal space has no granted commit or published overlay awaiting checkpoint.

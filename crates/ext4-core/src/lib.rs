@@ -38,9 +38,9 @@ pub use disk_format::xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 pub use error::{Error, Result};
 pub use platform::name::{Ext4Name, WindowsName};
 pub use platform::windows::{Ext4WindowsAttributes, WindowsOverlay, WindowsSymlinkReparsePoint};
+pub use protection::crypto::CryptographicOperation;
 pub use protection::fscrypt::{
     FscryptFileNonce, FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey,
-    FscryptNonceGenerator,
 };
 pub use protection::verity::{
     FsverityBlockSize, FsverityEnable, FsverityHashAlgorithm, FsveritySalt, FsveritySignature,

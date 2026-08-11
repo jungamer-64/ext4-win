@@ -12,6 +12,8 @@ pub enum Error {
     DeviceRange,
     /// The backing device failed an in-range I/O request.
     DeviceIo,
+    /// The platform cryptographic provider rejected a valid operation request.
+    CryptographicFailure,
     /// The requested byte range overflowed integer arithmetic.
     ArithmeticOverflow,
     /// A fixed-size on-disk structure was truncated.
@@ -112,6 +114,7 @@ impl fmt::Display for Error {
         f.write_str(match self {
             Self::DeviceRange => "block read is outside the backing device",
             Self::DeviceIo => "backing device I/O request failed",
+            Self::CryptographicFailure => "platform cryptographic operation failed",
             Self::ArithmeticOverflow => "arithmetic overflow while mapping ext4 data",
             Self::TruncatedStructure => "on-disk structure is truncated",
             Self::InvalidMagic => "invalid ext4 superblock magic",
