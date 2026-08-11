@@ -2,6 +2,7 @@
 members = [
     "crates/ext4-core",
     "crates/ext4-driver",
+    "tools/production-reachability",
 ]
 resolver = "3"
 
