@@ -1322,6 +1322,7 @@ fn copy_into(target: &mut [u8], offset: usize, source: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::TestCryptographicOperation;
     use super::*;
 
     /// Salt used by fs-verity vector tests.
@@ -1530,6 +1531,7 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_merkle_tree_matches_sha256_single_block_vector() {
+        let mut crypto = TestCryptographicOperation;
         let block_size = must!(FsverityBlockSize::new(1024));
         let salt = must!(FsveritySalt::new(&VECTOR_SALT));
         let tree = must!(FsverityMerkleTree::build(
@@ -1537,6 +1539,7 @@ mod tests {
             FsverityHashAlgorithm::Sha256,
             block_size,
             &salt,
+            &mut crypto,
         ));
 
         assert_eq!(
@@ -1551,6 +1554,7 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_merkle_tree_matches_sha256_multi_block_vector() {
+        let mut crypto = TestCryptographicOperation;
         let block_size = must!(FsverityBlockSize::new(1024));
         let salt = must!(FsveritySalt::new(&VECTOR_SALT));
         let data = must!(repeating_data(3500));
@@ -1558,7 +1562,8 @@ mod tests {
             &data,
             FsverityHashAlgorithm::Sha256,
             block_size,
-            &salt
+            &salt,
+            &mut crypto
         ));
 
         assert_eq!(
@@ -1578,6 +1583,7 @@ mod tests {
     /// tree image built by the same fs-verity domain.
     #[test]
     fn fsverity_verifier_authenticates_only_one_requested_block_path() {
+        let mut crypto = TestCryptographicOperation;
         let block_size = must!(FsverityBlockSize::new(1024));
         let block_bytes = must!(block_size.to_usize());
         let salt = must!(FsveritySalt::new(&VECTOR_SALT));
@@ -1592,7 +1598,8 @@ mod tests {
             &data,
             FsverityHashAlgorithm::Sha256,
             block_size,
-            &salt
+            &salt,
+            &mut crypto
         ));
         let descriptor = must!(FsverityDescriptor::new(
             FsverityHashAlgorithm::Sha256,
@@ -1617,7 +1624,8 @@ mod tests {
         let tail = some!(data.get(block_start..));
         some!(data_block.get_mut(..tail.len())).copy_from_slice(tail);
 
-        let mut verification = must!(verifier.begin_data_block(data_block_index, &data_block));
+        let mut verification =
+            must!(verifier.begin_data_block(data_block_index, &data_block, &mut crypto));
         let first = some!(must!(verification.next_merkle_block()));
         assert_eq!(first.tree_byte_offset(), 5120);
         while let Some(location) = must!(verification.next_merkle_block()) {
@@ -1629,15 +1637,19 @@ mod tests {
                     .checked_add(block_bytes)
                     .ok_or(Error::ArithmeticOverflow)
             );
-            must!(verification.verify_merkle_block(some!(tree.blocks().get(start..end))));
+            must!(
+                verification.verify_merkle_block(some!(tree.blocks().get(start..end)), &mut crypto)
+            );
         }
         assert_eq!(verification.finish(), Ok(()));
 
-        let incomplete = must!(verifier.begin_data_block(data_block_index, &data_block));
+        let incomplete =
+            must!(verifier.begin_data_block(data_block_index, &data_block, &mut crypto));
         assert_eq!(incomplete.finish(), Err(Error::InvalidVerityMetadata));
 
         *some!(data_block.get_mut(0)) ^= 0x80;
-        let mut corrupted = must!(verifier.begin_data_block(data_block_index, &data_block));
+        let mut corrupted =
+            must!(verifier.begin_data_block(data_block_index, &data_block, &mut crypto));
         let location = some!(must!(corrupted.next_merkle_block()));
         let start = must!(
             usize::try_from(location.tree_byte_offset()).map_err(|_| Error::ArithmeticOverflow)
@@ -1648,7 +1660,7 @@ mod tests {
                 .ok_or(Error::ArithmeticOverflow)
         );
         assert_eq!(
-            corrupted.verify_merkle_block(some!(tree.blocks().get(start..end))),
+            corrupted.verify_merkle_block(some!(tree.blocks().get(start..end)), &mut crypto),
             Err(Error::VerityMismatch)
         );
     }
@@ -1658,13 +1670,15 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_empty_file_has_zero_root_and_no_tree_blocks() {
+        let mut crypto = TestCryptographicOperation;
         let block_size = must!(FsverityBlockSize::new(1024));
         let salt = FsveritySalt::empty();
         let tree = must!(FsverityMerkleTree::build(
             &[],
             FsverityHashAlgorithm::Sha512,
             block_size,
-            &salt
+            &salt,
+            &mut crypto
         ));
 
         assert_eq!(tree.root_hash(), FsverityRootHash::zero());
@@ -1676,13 +1690,18 @@ mod tests {
     /// Panics when requested-block authentication diverges from stored SHA-256 or SHA-512 trees.
     #[test]
     fn fsverity_requested_block_verifier_walks_only_its_authentication_path() {
+        let mut crypto = TestCryptographicOperation;
         let block_size = must!(FsverityBlockSize::new(1024));
         let salt = must!(FsveritySalt::new(&VECTOR_SALT));
         let data = must!(repeating_data(40 * 1024));
 
         for algorithm in [FsverityHashAlgorithm::Sha256, FsverityHashAlgorithm::Sha512] {
             let tree = must!(FsverityMerkleTree::build(
-                &data, algorithm, block_size, &salt
+                &data,
+                algorithm,
+                block_size,
+                &salt,
+                &mut crypto
             ));
             let descriptor = must!(FsverityDescriptor::new(
                 algorithm,
@@ -1699,7 +1718,13 @@ mod tests {
             );
             for data_block in [0_u64, 17, 39] {
                 assert_eq!(
-                    verify_stored_data_block(&verifier, &data, tree.blocks(), data_block),
+                    verify_stored_data_block(
+                        &verifier,
+                        &data,
+                        tree.blocks(),
+                        data_block,
+                        &mut crypto
+                    ),
                     Ok(())
                 );
             }
@@ -1711,12 +1736,17 @@ mod tests {
     /// Panics when data, leaf, parent, or descriptor-root corruption survives range verification.
     #[test]
     fn fsverity_requested_block_verifier_rejects_every_proof_layer_corruption() {
+        let mut crypto = TestCryptographicOperation;
         let algorithm = FsverityHashAlgorithm::Sha512;
         let block_size = must!(FsverityBlockSize::new(1024));
         let salt = must!(FsveritySalt::new(&VECTOR_SALT));
         let data = must!(repeating_data(40 * 1024));
         let tree = must!(FsverityMerkleTree::build(
-            &data, algorithm, block_size, &salt
+            &data,
+            algorithm,
+            block_size,
+            &salt,
+            &mut crypto
         ));
         let descriptor = must!(FsverityDescriptor::new(
             algorithm,
@@ -1730,21 +1760,21 @@ mod tests {
         let mut corrupt_data = data.clone();
         *some!(corrupt_data.get_mut(0)) ^= 0x80;
         assert_eq!(
-            verify_stored_data_block(&verifier, &corrupt_data, tree.blocks(), 0),
+            verify_stored_data_block(&verifier, &corrupt_data, tree.blocks(), 0, &mut crypto),
             Err(Error::VerityMismatch)
         );
 
         let mut corrupt_leaf = tree.blocks().to_vec();
         *some!(corrupt_leaf.get_mut(1024)) ^= 0x80;
         assert_eq!(
-            verify_stored_data_block(&verifier, &data, &corrupt_leaf, 0),
+            verify_stored_data_block(&verifier, &data, &corrupt_leaf, 0, &mut crypto),
             Err(Error::VerityMismatch)
         );
 
         let mut corrupt_parent = tree.blocks().to_vec();
         *some!(corrupt_parent.get_mut(900)) ^= 0x80;
         assert_eq!(
-            verify_stored_data_block(&verifier, &data, &corrupt_parent, 0),
+            verify_stored_data_block(&verifier, &data, &corrupt_parent, 0, &mut crypto),
             Err(Error::VerityMismatch)
         );
 
@@ -1757,7 +1787,7 @@ mod tests {
         ));
         let wrong_root_verifier = must!(FsverityVerifier::new(wrong_root));
         assert_eq!(
-            verify_stored_data_block(&wrong_root_verifier, &data, tree.blocks(), 0),
+            verify_stored_data_block(&wrong_root_verifier, &data, tree.blocks(), 0, &mut crypto),
             Err(Error::VerityMismatch)
         );
     }
@@ -1771,6 +1801,7 @@ mod tests {
         data: &[u8],
         tree: &[u8],
         data_block: u64,
+        crypto: &mut TestCryptographicOperation,
     ) -> Result<()> {
         let block_bytes = verifier.block_size().to_usize()?;
         let start = usize::try_from(data_block)
@@ -1783,6 +1814,7 @@ mod tests {
         let mut verification = verifier.begin_data_block(
             data_block,
             data.get(start..end).ok_or(Error::InvalidVerityMetadata)?,
+            crypto,
         )?;
         while let Some(location) = verification.next_merkle_block()? {
             let proof_start = usize::try_from(location.tree_byte_offset())
@@ -1793,6 +1825,7 @@ mod tests {
             verification.verify_merkle_block(
                 tree.get(proof_start..proof_end)
                     .ok_or(Error::InvalidVerityMetadata)?,
+                crypto,
             )?;
         }
         verification.finish()

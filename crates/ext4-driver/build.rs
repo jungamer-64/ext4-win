@@ -8,8 +8,6 @@ fn main() -> Result<(), wdk_build::ConfigError> {
     println!("cargo:rerun-if-changed={SECURITY_CAPTURE_SOURCE}");
     println!("cargo:rerun-if-changed={DATA_TRANSFER_SOURCE}");
     println!("cargo:rerun-if-changed={CANCEL_SOURCE}");
-    println!("cargo:rustc-link-lib=Cng");
-
     let config = wdk_build::Config::from_env_auto()?;
     config.configure_binary_build()?;
 

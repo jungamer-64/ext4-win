@@ -576,6 +576,11 @@ mod tests {
 
     /// Deterministic raw key used by fscrypt FSCTL tests.
     const RAW_KEY: [u8; 32] = [7_u8; 32];
+    /// Linux fscrypt v2 HKDF identifier for `RAW_KEY`.
+    const RAW_KEY_IDENTIFIER: FscryptKeyIdentifier = FscryptKeyIdentifier::new([
+        0x11, 0x01, 0x42, 0x0d, 0x49, 0x92, 0x90, 0xb0, 0x05, 0xfc, 0x68, 0x15, 0x27, 0x25, 0x71,
+        0x59,
+    ]);
 
     macro_rules! must {
         ($result:expr) => {
@@ -611,31 +616,30 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_add_key_payload_decodes_linux_layout() {
-        let payload = must!(add_key_payload(&RAW_KEY));
+        let payload = must!(add_key_payload(&RAW_KEY, RAW_KEY_IDENTIFIER));
 
         let decoded = must!(FscryptAddKeyPayload::parse(&payload));
+        let (identifier, raw_key) = decoded.into_parts();
 
-        assert_eq!(
-            decoded.into_master_key().identifier(),
-            must!(FscryptMasterKey::from_raw(&RAW_KEY)).identifier()
-        );
+        assert_eq!(identifier, RAW_KEY_IDENTIFIER);
+        assert_eq!(raw_key.as_slice(), RAW_KEY);
     }
 
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn fscrypt_add_key_payload_rejects_mismatched_identifier() {
-        let mut payload = must!(add_key_payload(&RAW_KEY));
+    fn fscrypt_add_key_payload_preserves_identifier_for_domain_validation() {
+        let mut payload = must!(add_key_payload(&RAW_KEY, RAW_KEY_IDENTIFIER));
         let identifier_byte = FSCRYPT_KEY_SPEC_UNION_OFFSET;
         if let Some(byte) = payload.get_mut(identifier_byte) {
             *byte ^= 0xff;
         }
 
-        assert_eq!(
-            FscryptAddKeyPayload::parse(&payload),
-            Err(DriverError::InvalidParameter)
-        );
+        let decoded = must!(FscryptAddKeyPayload::parse(&payload));
+        let (identifier, raw_key) = decoded.into_parts();
+        assert_ne!(identifier, RAW_KEY_IDENTIFIER);
+        assert_eq!(raw_key.as_slice(), RAW_KEY);
     }
 
     /// # Panics
@@ -643,7 +647,7 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_add_key_payload_rejects_v1_descriptor_and_hw_wrapped_keys() {
-        let mut descriptor = must!(add_key_payload(&RAW_KEY));
+        let mut descriptor = must!(add_key_payload(&RAW_KEY, RAW_KEY_IDENTIFIER));
         {
             let mut output = LittleEndianOutput::new(&mut descriptor);
             must!(output.write_u32(wire_offset(FSCRYPT_KEY_SPEC_TYPE_OFFSET), 1));
@@ -653,7 +657,7 @@ mod tests {
             Err(DriverError::NotSupported)
         );
 
-        let mut hw_wrapped = must!(add_key_payload(&RAW_KEY));
+        let mut hw_wrapped = must!(add_key_payload(&RAW_KEY, RAW_KEY_IDENTIFIER));
         {
             let mut output = LittleEndianOutput::new(&mut hw_wrapped);
             must!(output.write_u32(wire_offset(FSCRYPT_ADD_KEY_FLAGS_OFFSET), 1));
@@ -669,7 +673,7 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_remove_and_status_payloads_decode_identifier() {
-        let identifier = must!(FscryptMasterKey::from_raw(&RAW_KEY)).identifier();
+        let identifier = RAW_KEY_IDENTIFIER;
         let remove = must!(remove_key_payload(identifier));
         let status = must!(key_status_payload(identifier));
 
@@ -823,8 +827,7 @@ mod tests {
     ///
     /// Returns an error when `raw_key` is not a valid fscrypt master key or the serialized payload
     /// cannot hold its identifier or length.
-    fn add_key_payload(raw_key: &[u8]) -> DriverResult<Vec<u8>> {
-        let identifier = FscryptMasterKey::from_raw(raw_key)?.identifier();
+    fn add_key_payload(raw_key: &[u8], identifier: FscryptKeyIdentifier) -> DriverResult<Vec<u8>> {
         let mut payload = vec![0_u8; FSCRYPT_ADD_KEY_FIXED_BYTES];
         write_key_identifier(&mut payload, identifier)?;
         {

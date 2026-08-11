@@ -1153,6 +1153,7 @@ fn fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
 mod tests {
     use alloc::vec;
 
+    use super::super::TestCryptographicOperation;
     use super::*;
 
     /// Master key used by fscrypt HKDF vector tests.
@@ -1334,17 +1335,18 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_master_key_derives_identifier_and_per_file_keys() {
-        let master_key = must!(FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY));
+        let mut crypto = TestCryptographicOperation;
+        let master_key = must!(FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY, &mut crypto));
         let nonce = FscryptFileNonce::new(VECTOR_NONCE);
 
         assert_eq!(master_key.identifier().bytes(), VECTOR_IDENTIFIER);
         assert_eq!(
-            must!(master_key.derive_contents_key(nonce)).bytes(),
-            &VECTOR_CONTENTS_KEY
+            must!(master_key.derive_contents_key(nonce, &mut crypto)).bytes,
+            VECTOR_CONTENTS_KEY
         );
         assert_eq!(
-            must!(master_key.derive_filenames_key(nonce)).bytes(),
-            &VECTOR_FILENAMES_KEY
+            must!(master_key.derive_filenames_key(nonce, &mut crypto)).bytes,
+            VECTOR_FILENAMES_KEY
         );
     }
 
@@ -1353,12 +1355,13 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_master_key_rejects_invalid_raw_key_sizes() {
+        let mut crypto = TestCryptographicOperation;
         assert_eq!(
-            FscryptMasterKey::from_raw(&[0_u8; 31]),
+            FscryptMasterKey::from_raw(&[0_u8; 31], &mut crypto),
             Err(Error::InvalidEncryptionContext)
         );
         assert_eq!(
-            FscryptMasterKey::from_raw(&[0_u8; 65]),
+            FscryptMasterKey::from_raw(&[0_u8; 65], &mut crypto),
             Err(Error::InvalidEncryptionContext)
         );
     }
@@ -1368,8 +1371,9 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_key_set_is_sorted_unique_by_identifier() {
-        let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
-        let second = must!(FscryptMasterKey::from_raw(&[2_u8; 32]));
+        let mut crypto = TestCryptographicOperation;
+        let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32], &mut crypto));
+        let second = must!(FscryptMasterKey::from_raw(&[2_u8; 32], &mut crypto));
         let second_identifier = second.identifier();
 
         let set = must!(FscryptKeySet::from_keys(vec![second, first]));
@@ -1388,8 +1392,9 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_key_set_rejects_duplicate_identifiers() {
-        let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
-        let duplicate = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
+        let mut crypto = TestCryptographicOperation;
+        let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32], &mut crypto));
+        let duplicate = must!(FscryptMasterKey::from_raw(&[1_u8; 32], &mut crypto));
 
         assert_eq!(
             FscryptKeySet::from_keys(vec![first, duplicate]),
@@ -1402,8 +1407,9 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_key_set_insert_and_remove_update_mount_state() {
-        let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
-        let duplicate = must!(FscryptMasterKey::from_raw(&[1_u8; 32]));
+        let mut crypto = TestCryptographicOperation;
+        let first = must!(FscryptMasterKey::from_raw(&[1_u8; 32], &mut crypto));
+        let duplicate = must!(FscryptMasterKey::from_raw(&[1_u8; 32], &mut crypto));
         let identifier = first.identifier();
 
         let mut set = FscryptKeySet::empty();
@@ -1421,14 +1427,21 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fscrypt_filename_key_encrypts_and_decrypts_padded_name() {
-        let master_key = must!(FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY));
-        let key = must!(master_key.derive_filenames_key(FscryptFileNonce::new(VECTOR_NONCE)));
+        let mut crypto = TestCryptographicOperation;
+        let master_key = must!(FscryptMasterKey::from_raw(&VECTOR_MASTER_KEY, &mut crypto));
+        let key = must!(
+            master_key.derive_filenames_key(FscryptFileNonce::new(VECTOR_NONCE), &mut crypto)
+        );
 
-        let ciphertext = must!(key.encrypt_filename(b"secret.txt", FscryptFilenamePadding::Pad32));
+        let ciphertext =
+            must!(key.encrypt_filename(b"secret.txt", FscryptFilenamePadding::Pad32, &mut crypto));
 
         assert_eq!(ciphertext.len(), 32);
         assert_ne!(&ciphertext, b"secret.txt");
-        assert_eq!(must!(key.decrypt_filename(&ciphertext)), b"secret.txt");
+        assert_eq!(
+            must!(key.decrypt_filename(&ciphertext, &mut crypto)),
+            b"secret.txt"
+        );
     }
 
     /// # Panics
