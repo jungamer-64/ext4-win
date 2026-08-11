@@ -12,7 +12,9 @@ mod capture;
 pub(crate) mod lower;
 pub(crate) mod reactor;
 
-pub(crate) use cancel::{ActiveCancelDestination, ActiveCancelEnvelope};
+#[cfg(not(test))]
+pub(crate) use cancel::ActiveCancelDestination;
+pub(crate) use cancel::ActiveCancelEnvelope;
 pub(crate) use reactor::CompletionReactor;
 
 pub(crate) use capture::{
@@ -884,13 +886,6 @@ impl OwnedIrp {
     }
 
     /// Completes the IRP from a fallible request result.
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "kernel device-actor completion is compiled out in unit tests"
-        )
-    )]
     pub(crate) fn complete_result(self, result: DriverResult<IrpCompletion>) -> NTSTATUS {
         self.complete(match result {
             Ok(completion) => completion,
@@ -3387,15 +3382,14 @@ mod tests {
         ActiveFileObject, CREATE_DISPOSITION_SHIFT, CreateAction, CreateCompletion,
         CreateDisposition, CreateNameInterpretation, CreateReparsePointMode,
         CreateSymlinkReparseBuffer, CreateSynchronizationMode, CreateTargetRequirement,
-        CreateTransferBuffering, CurrentIrpStackLocation, DataIoKind, DeviceExecutor,
-        DirectoryChangeFilter, DirectoryControlMinorFunction, DirectoryCursorPosition,
-        DirectoryEntryEmission, DirectoryInformationClass, DirectoryWatchScope, DispatchMajor,
-        DispatchTarget, EaEntryEmission, EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION,
-        FILE_OPEN_IF_DISPOSITION, FILE_OVERWRITE_DISPOSITION, FILE_OVERWRITE_IF_DISPOSITION,
-        FILE_SUPERSEDE_DISPOSITION, FileSystemControlMinorFunction, FsControlCode,
-        InformationLength, IrpBufferLength, IrpCompletion, KernelIrp, OwnedIrp,
-        QueryFileInformationClass, QueryVolumeInformationClass, ReadStartingPoint, ReceivedIrp,
-        RegularFileWriteAccess, STATUS_CANCELLED, SetFileInformationClass,
+        CreateTransferBuffering, CurrentIrpStackLocation, DataIoKind, DirectoryChangeFilter,
+        DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
+        DirectoryInformationClass, DirectoryWatchScope, DispatchTarget, EaEntryEmission,
+        EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
+        FILE_OVERWRITE_DISPOSITION, FILE_OVERWRITE_IF_DISPOSITION, FILE_SUPERSEDE_DISPOSITION,
+        FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
+        IrpCompletion, KernelIrp, OwnedIrp, QueryFileInformationClass, QueryVolumeInformationClass,
+        ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, SetFileInformationClass,
         SetVolumeInformationClass, WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
@@ -3419,29 +3413,6 @@ mod tests {
             // it through IRP completion helpers.
             irp.IoStatus.__bindgen_anon_1.Status
         }
-    }
-
-    /// Builds unlinked executor storage for a device-owned extension.
-    fn executor_storage(device: KernelDevice) -> DeviceExecutor {
-        DeviceExecutor::test_storage(device)
-    }
-
-    /// Initializes executor links after the storage has reached its stable stack address.
-    fn initialize_executor_links(executor: &DeviceExecutor) {
-        executor.initialize_test_links();
-    }
-
-    /// Publishes executor storage as the device extension used by dispatch lookup.
-    fn attach_executor_extension(
-        device: &mut wdk_sys::DEVICE_OBJECT,
-        executor: &mut DeviceExecutor,
-    ) {
-        device.DeviceExtension = core::ptr::from_mut(executor).cast::<c_void>();
-    }
-
-    /// Returns whether the current stack control byte contains the pending-returned bit.
-    fn stack_has_pending_returned(stack: &wdk_sys::IO_STACK_LOCATION) -> bool {
-        u32::from(stack.Control) & wdk_sys::SL_PENDING_RETURNED == wdk_sys::SL_PENDING_RETURNED
     }
 
     /// Builds a lifetime-bound stack view from one live unit-test fixture.
@@ -3723,288 +3694,6 @@ mod tests {
         assert!(auxiliary.is_null());
         assert_eq!(irp_status(&irp), wdk_sys::STATUS_INVALID_PARAMETER);
         assert_eq!(irp.IoStatus.Information, 0);
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn device_executor_receive_marks_current_stack_pending() {
-        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
-        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
-        assert!(device.is_some());
-        let Some(device) = device else {
-            return;
-        };
-        let mut executor = executor_storage(device);
-        initialize_executor_links(&executor);
-        attach_executor_extension(&mut kernel_device, &mut executor);
-
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let mut irp = wdk_sys::IRP::default();
-        irp.Tail
-            .Overlay
-            .__bindgen_anon_2
-            .__bindgen_anon_1
-            .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
-
-        let received = ReceivedIrp::decode(
-            core::ptr::addr_of_mut!(kernel_device),
-            core::ptr::addr_of_mut!(irp),
-        );
-        assert!(received.is_ok());
-        if let Ok(received) = received {
-            assert_eq!(
-                DeviceExecutor::receive(received, DispatchMajor::Create),
-                wdk_sys::STATUS_PENDING
-            );
-            assert!(stack_has_pending_returned(&stack));
-            assert!(executor.test_wake_is_requested());
-            assert_eq!(
-                executor.test_remove_next_irp(core::ptr::null_mut()),
-                core::ptr::addr_of_mut!(irp)
-            );
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn device_executor_receive_completes_without_pending_when_extension_is_absent() {
-        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let mut irp = wdk_sys::IRP::default();
-        irp.IoStatus.Information = 99;
-        irp.Tail
-            .Overlay
-            .__bindgen_anon_2
-            .__bindgen_anon_1
-            .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
-
-        let received = ReceivedIrp::decode(
-            core::ptr::addr_of_mut!(kernel_device),
-            core::ptr::addr_of_mut!(irp),
-        );
-        assert!(received.is_ok());
-        if let Ok(received) = received {
-            assert_eq!(
-                DeviceExecutor::receive(received, DispatchMajor::Create),
-                STATUS_INVALID_PARAMETER
-            );
-        }
-
-        assert!(!stack_has_pending_returned(&stack));
-        assert_eq!(irp_status(&irp), STATUS_INVALID_PARAMETER);
-        assert_eq!(irp.IoStatus.Information, 0);
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn device_executor_receive_completes_when_pending_mark_fails() {
-        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
-        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
-        assert!(device.is_some());
-        let Some(device) = device else {
-            return;
-        };
-        let mut executor = executor_storage(device);
-        initialize_executor_links(&executor);
-        attach_executor_extension(&mut kernel_device, &mut executor);
-
-        let mut irp = wdk_sys::IRP::default();
-        irp.IoStatus.Information = 99;
-        let received = ReceivedIrp::decode(
-            core::ptr::addr_of_mut!(kernel_device),
-            core::ptr::addr_of_mut!(irp),
-        );
-        assert!(received.is_ok());
-        if let Ok(received) = received {
-            assert_eq!(
-                DeviceExecutor::receive(received, DispatchMajor::Create),
-                STATUS_INVALID_PARAMETER
-            );
-        }
-
-        assert_eq!(irp_status(&irp), STATUS_INVALID_PARAMETER);
-        assert_eq!(irp.IoStatus.Information, 0);
-        assert!(executor.test_has_no_pending_wake());
-        assert!(
-            executor
-                .test_remove_next_irp(core::ptr::null_mut())
-                .is_null()
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn device_executor_removes_irps_in_fifo_order() {
-        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
-        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
-        assert!(device.is_some());
-        let Some(device) = device else {
-            return;
-        };
-        let mut executor = executor_storage(device);
-        initialize_executor_links(&executor);
-        attach_executor_extension(&mut kernel_device, &mut executor);
-
-        let mut stack_a = wdk_sys::IO_STACK_LOCATION::default();
-        let mut stack_b = wdk_sys::IO_STACK_LOCATION::default();
-        let mut stack_c = wdk_sys::IO_STACK_LOCATION::default();
-        let mut irp_a = wdk_sys::IRP::default();
-        let mut irp_b = wdk_sys::IRP::default();
-        let mut irp_c = wdk_sys::IRP::default();
-        irp_a
-            .Tail
-            .Overlay
-            .__bindgen_anon_2
-            .__bindgen_anon_1
-            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_a);
-        irp_b
-            .Tail
-            .Overlay
-            .__bindgen_anon_2
-            .__bindgen_anon_1
-            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_b);
-        irp_c
-            .Tail
-            .Overlay
-            .__bindgen_anon_2
-            .__bindgen_anon_1
-            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_c);
-
-        for irp in [
-            core::ptr::addr_of_mut!(irp_a),
-            core::ptr::addr_of_mut!(irp_b),
-            core::ptr::addr_of_mut!(irp_c),
-        ] {
-            let received = ReceivedIrp::decode(core::ptr::addr_of_mut!(kernel_device), irp);
-            assert!(received.is_ok());
-            if let Ok(received) = received {
-                assert_eq!(
-                    DeviceExecutor::receive(received, DispatchMajor::Create),
-                    wdk_sys::STATUS_PENDING
-                );
-            }
-        }
-
-        assert_eq!(
-            executor.test_remove_next_irp(core::ptr::null_mut()),
-            core::ptr::addr_of_mut!(irp_a)
-        );
-        assert_eq!(
-            executor.test_remove_next_irp(core::ptr::null_mut()),
-            core::ptr::addr_of_mut!(irp_b)
-        );
-        assert_eq!(
-            executor.test_remove_next_irp(core::ptr::null_mut()),
-            core::ptr::addr_of_mut!(irp_c)
-        );
-        assert!(
-            executor
-                .test_remove_next_irp(core::ptr::null_mut())
-                .is_null()
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn device_executor_cancels_only_matching_file_object() {
-        let mut kernel_device = wdk_sys::DEVICE_OBJECT::default();
-        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(kernel_device));
-        assert!(device.is_some());
-        let Some(device) = device else {
-            return;
-        };
-        let mut executor = executor_storage(device);
-        initialize_executor_links(&executor);
-        attach_executor_extension(&mut kernel_device, &mut executor);
-
-        let mut file_a = wdk_sys::FILE_OBJECT::default();
-        let mut file_b = wdk_sys::FILE_OBJECT::default();
-        let mut stack_a1 = wdk_sys::IO_STACK_LOCATION {
-            FileObject: core::ptr::addr_of_mut!(file_a),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        let mut stack_b = wdk_sys::IO_STACK_LOCATION {
-            FileObject: core::ptr::addr_of_mut!(file_b),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        let mut stack_a2 = wdk_sys::IO_STACK_LOCATION {
-            FileObject: core::ptr::addr_of_mut!(file_a),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        let mut irp_a1 = wdk_sys::IRP::default();
-        let mut irp_b = wdk_sys::IRP::default();
-        let mut irp_a2 = wdk_sys::IRP::default();
-        irp_a1.IoStatus.Information = 99;
-        irp_b.IoStatus.Information = 99;
-        irp_a2.IoStatus.Information = 99;
-        irp_a1
-            .Tail
-            .Overlay
-            .__bindgen_anon_2
-            .__bindgen_anon_1
-            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_a1);
-        irp_b
-            .Tail
-            .Overlay
-            .__bindgen_anon_2
-            .__bindgen_anon_1
-            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_b);
-        irp_a2
-            .Tail
-            .Overlay
-            .__bindgen_anon_2
-            .__bindgen_anon_1
-            .CurrentStackLocation = core::ptr::addr_of_mut!(stack_a2);
-
-        for irp in [
-            core::ptr::addr_of_mut!(irp_a1),
-            core::ptr::addr_of_mut!(irp_b),
-            core::ptr::addr_of_mut!(irp_a2),
-        ] {
-            let received = ReceivedIrp::decode(core::ptr::addr_of_mut!(kernel_device), irp);
-            assert!(received.is_ok());
-            if let Ok(received) = received {
-                assert_eq!(
-                    DeviceExecutor::receive(received, DispatchMajor::Create),
-                    wdk_sys::STATUS_PENDING
-                );
-            }
-        }
-
-        let file_object = KernelFileObject::from_raw(core::ptr::addr_of_mut!(file_a));
-        assert!(file_object.is_some());
-        if let Some(file_object) = file_object {
-            assert_eq!(
-                DeviceExecutor::cancel_file_object(device, file_object),
-                Ok(())
-            );
-        }
-
-        assert_eq!(irp_status(&irp_a1), STATUS_CANCELLED);
-        assert_eq!(irp_a1.IoStatus.Information, 0);
-        assert_eq!(irp_status(&irp_a2), STATUS_CANCELLED);
-        assert_eq!(irp_a2.IoStatus.Information, 0);
-        assert_eq!(irp_status(&irp_b), wdk_sys::STATUS_SUCCESS);
-        assert_eq!(irp_b.IoStatus.Information, 99);
-        assert_eq!(
-            executor.test_remove_next_irp(core::ptr::null_mut()),
-            core::ptr::addr_of_mut!(irp_b)
-        );
-        assert!(
-            executor
-                .test_remove_next_irp(core::ptr::null_mut())
-                .is_null()
-        );
     }
 
     /// # Panics

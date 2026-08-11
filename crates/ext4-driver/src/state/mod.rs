@@ -5475,12 +5475,12 @@ mod tests {
         DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode, DeviceExtensionKind,
         DirectoryChange, DirectoryChangeAction, DriverDeviceKind, FileControlBlock,
         FileControlBlockLedger, FileControlBlockOpenState, FileControlBlockRelease,
-        FileObjectCloseKind, HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeDevice,
-        MountedVolumeDeviceExtension, MountedVolumeState, NativeFileByteRange,
+        FileObjectCloseKind, HandleAdmissionState, HandleDeletion, KernelDevice, KernelFileObject,
+        MountedVolumeDevice, MountedVolumeDeviceExtension, MountedVolumeState, NativeFileByteRange,
         NoIntermediateTransfer, OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation,
         OpenedNodeMode, OpenedObject, OpenedRegularFile, OpenedVolumeHandle,
         TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
-        VolumeHandleCleanup, VolumeRetirement, WriteCommitment, select_close_release_plan,
+        VolumeHandleCleanup, VolumeRetirement, select_close_release_plan,
         shutdown_registration_status,
     };
 
@@ -5870,7 +5870,6 @@ mod tests {
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
             retained_handle_deletion(),
-            WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
         );
@@ -5909,7 +5908,6 @@ mod tests {
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
             retained_handle_deletion(),
-            WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
         );
@@ -6014,7 +6012,6 @@ mod tests {
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
             retained_handle_deletion(),
-            WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
         );
@@ -6043,7 +6040,6 @@ mod tests {
             OpenedNodeMode::ReparsePoint,
             OpenedLocation::Root,
             retained_handle_deletion(),
-            WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
         );
@@ -6070,21 +6066,30 @@ mod tests {
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
             retained_handle_deletion(),
-            WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
+        );
+        assert_eq!(
+            handle.begin_cleanup_admission(),
+            HandleAdmissionState::CleanupDraining
         );
         assert_eq!(handle.begin_cleanup(), CleanupStart::First);
         handle.finish_cleanup();
         assert_eq!(handle.begin_cleanup(), CleanupStart::AlreadyComplete);
         assert_eq!(
+            handle.admission_state(),
+            HandleAdmissionState::CleanedHandle
+        );
+        handle.begin_close_admission(FileObjectCloseKind::Ordinary, true);
+        assert_eq!(
+            handle.admission_state(),
+            HandleAdmissionState::ClosingHandle
+        );
+        assert_eq!(
             handle.close_release_plan(FileObjectCloseKind::Ordinary, true),
             CloseReleasePlan::CleanedHandle
         );
-        assert_eq!(
-            handle.close_release_plan(FileObjectCloseKind::CancelledOpen, true),
-            CloseReleasePlan::CleanedHandle
-        );
+        assert_eq!(handle.admission_state(), HandleAdmissionState::ClosedHandle);
     }
 
     /// # Panics
@@ -6097,10 +6102,10 @@ mod tests {
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
             retained_handle_deletion(),
-            WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
         );
+        handle.begin_close_admission(FileObjectCloseKind::CancelledOpen, false);
         assert_eq!(
             handle.close_release_plan(FileObjectCloseKind::CancelledOpen, false),
             CloseReleasePlan::CancelledOpen
@@ -6113,49 +6118,13 @@ mod tests {
     #[test]
     fn ordinary_close_before_cleanup_has_no_release_plan() {
         assert_eq!(
-            select_close_release_plan(
-                super::HandleLifecycleState::Active,
-                false,
-                FileObjectCloseKind::Ordinary,
-            ),
+            select_close_release_plan(false, FileObjectCloseKind::Ordinary),
             None
         );
         assert_eq!(
-            select_close_release_plan(
-                super::HandleLifecycleState::Cleaned,
-                false,
-                FileObjectCloseKind::Ordinary,
-            ),
-            None
+            select_close_release_plan(true, FileObjectCloseKind::Ordinary),
+            Some(CloseReleasePlan::CleanedHandle)
         );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn opened_object_preserves_write_commitment() {
-        let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
-            OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            retained_handle_deletion(),
-            WriteCommitment::FlushThrough,
-            DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
-        let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
-            core::ptr::addr_of_mut!(handle).cast(),
-        );
-        let result = with_active_file_object(&mut file, |file_object| {
-            let opened = OpenedObject::decode(file_object)?;
-            assert_eq!(opened.write_commitment(), WriteCommitment::FlushThrough);
-            Ok(())
-        });
-        assert_eq!(result, Ok(()));
     }
 
     /// # Panics
@@ -6180,7 +6149,6 @@ mod tests {
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
             retained_handle_deletion(),
-            WriteCommitment::CommitOnly,
             DataTransferMode::NoIntermediate(transfer),
             RegularFileWriteAccess::Denied,
         );
@@ -6211,7 +6179,6 @@ mod tests {
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
             retained_handle_deletion(),
-            WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
         );
@@ -6275,7 +6242,6 @@ mod tests {
                     OpenedNodeMode::Direct,
                     OpenedLocation::Root,
                     retained_handle_deletion(),
-                    WriteCommitment::CommitOnly,
                     DataTransferMode::IntermediateAllowed,
                 ),
                 kind: super::OpenedHandleKind::File { write_access },
@@ -6296,7 +6262,6 @@ mod tests {
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
             retained_handle_deletion(),
-            WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
         );
@@ -6359,7 +6324,6 @@ mod tests {
             OpenedNodeMode::Direct,
             OpenedLocation::Root,
             retained_handle_deletion(),
-            WriteCommitment::CommitOnly,
             DataTransferMode::IntermediateAllowed,
             RegularFileWriteAccess::Denied,
         );

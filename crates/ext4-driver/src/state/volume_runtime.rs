@@ -696,7 +696,7 @@ impl PendingCheckpoint {
 
 #[cfg(test)]
 mod tests {
-    use super::VolumeFailureState;
+    use super::{VolumeFailureState, VolumeRuntime};
 
     /// # Panics
     ///
@@ -719,5 +719,27 @@ mod tests {
             VolumeFailureState::Operational.read_unreliable(),
             VolumeFailureState::Failed
         );
+    }
+
+    /// Keeps serialized commit, visibility, and checkpoint grants in the unit-test production
+    /// graph even though constructing a mounted runtime belongs to mount integration tests.
+    ///
+    /// # Panics
+    ///
+    /// This test has no runtime failure path. Compilation fails if these gates cease to be one
+    /// explicit state-machine boundary.
+    #[test]
+    fn durability_gate_boundaries_remain_linked() {
+        let clean: fn(&VolumeRuntime) -> bool = VolumeRuntime::journal_is_clean;
+        let commit: fn(&mut VolumeRuntime, u64) -> Option<ext4_core::CommitLease> =
+            VolumeRuntime::try_grant_commit;
+        let abandon: fn(&mut VolumeRuntime, u64) = VolumeRuntime::abandon_commit;
+        let visibility: fn(&mut VolumeRuntime, u64) -> Option<ext4_core::VisibilityLease> =
+            VolumeRuntime::try_grant_visibility;
+        let checkpoint: fn(
+            &mut VolumeRuntime,
+            ext4_core::EpochSequence,
+        ) -> Option<ext4_core::CheckpointLease> = VolumeRuntime::try_grant_checkpoint;
+        let _ = (clean, commit, abandon, visibility, checkpoint);
     }
 }

@@ -644,6 +644,18 @@ mod tests {
 
     use super::{DispatchPolicy, dispatch_policy};
 
+    /// Keeps the production operation-construction graph inside the unit-test reachability set.
+    ///
+    /// # Panics
+    ///
+    /// This test has no runtime failure path. Compilation fails if the concrete admission boundary
+    /// is removed or changes into a compatibility facade.
+    #[test]
+    fn operation_admission_boundary_remains_linked() {
+        let boundary = super::admit_owned;
+        let _ = boundary;
+    }
+
     /// # Panics
     ///
     /// Panics when the shutdown request stops using the passive-level queue.
