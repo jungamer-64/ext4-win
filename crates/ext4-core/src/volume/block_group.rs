@@ -390,7 +390,7 @@ impl ClusterReferenceIndex {
                 .checked_add(delta)
                 .ok_or(Error::ArithmeticOverflow)?;
             if updated <= 0 {
-                self.refs.remove(index);
+                let _removed = self.refs.try_remove_at(index)?;
             } else {
                 self.refs
                     .get_mut(index)

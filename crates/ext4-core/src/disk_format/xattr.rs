@@ -211,7 +211,7 @@ impl XattrSet {
             converted.try_push(XattrEntry { name, value })?;
         }
         let mut entries = converted;
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        memory::heap_sort_by(&mut entries, |left, right| left.name.cmp(&right.name))?;
         if entries
             .windows(2)
             .any(|pair| matches!(pair, [left, right] if left.name == right.name))
@@ -754,7 +754,7 @@ fn serialize_xattr_entries(
             value: value.try_clone()?,
         })?;
     }
-    entries.sort_by(|left, right| left.key.cmp_disk(&right.key));
+    memory::heap_sort_by(&mut entries, |left, right| left.key.cmp_disk(&right.key))?;
 
     let entries_end = serialized_entries_end(entry_offset, &entries)?;
     if entries_end > storage.len() {

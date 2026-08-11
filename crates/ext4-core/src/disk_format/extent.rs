@@ -938,7 +938,9 @@ fn map_extent_run(
 /// Returns an error when extents overlap, adjacency calculations overflow, or a merged length cannot
 /// be represented as an ext4 extent length.
 fn normalize_extents(extents: &mut Vec<Extent>) -> Result<()> {
-    extents.sort_by_key(|extent| extent.logical_start());
+    memory::heap_sort_by(extents, |left, right| {
+        left.logical_start().cmp(&right.logical_start())
+    })?;
     let mut normalized: Vec<Extent> = Vec::new();
     for extent in extents.iter().copied() {
         if extent.end_logical() > LOGICAL_BLOCK_EXCLUSIVE_END {

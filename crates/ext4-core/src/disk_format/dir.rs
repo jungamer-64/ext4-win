@@ -653,13 +653,13 @@ pub(crate) fn build_htree_directory(
             entry: entry.try_clone()?,
         })?;
     }
-    hashed.sort_by(|left, right| {
+    memory::heap_sort_by(&mut hashed, |left, right| {
         left.hash
             .major
             .cmp(&right.hash.major)
             .then(left.hash.minor.cmp(&right.hash.minor))
             .then(left.entry.name().bytes().cmp(right.entry.name().bytes()))
-    });
+    })?;
 
     let leaves = pack_htree_leaves(hashed, block_size, checksum)?;
     let root_limit = dx_capacity(block_size, DX_ROOT_COUNT_OFFSET, checksum)?;
