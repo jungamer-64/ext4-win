@@ -24,6 +24,13 @@ const DRIVER_ENTRY: &str = "DriverEntry";
 const FATAL_BUGCHECK_ALLOWLIST: &[&str] =
     &["<ext4win::kernel::fatal::KernelWideInconsistency>::bugcheck"];
 
+/// Release boundary whose complete reachable graph must remain allocation-free after durability.
+const DURABLE_PUBLISH_ROOT: &str =
+    "<ext4win::state::volume_runtime::VolumeRuntime>::publish_durable";
+
+/// The only legal terminal status for an ext4win-created lower IRP completion routine.
+const MORE_PROCESSING_REQUIRED_RETURN: &str = "ret i32 -1073741802";
+
 /// Maximum number of independent violation paths printed by one run.
 const MAX_REPORTED_VIOLATIONS: usize = 64;
 
@@ -118,8 +125,12 @@ struct Function {
     signature: FunctionSignature,
     /// Direct calls and callback-address flows.
     edges: BTreeSet<String>,
+    /// Direct call targets in LLVM instruction order.
+    direct_calls: Vec<String>,
     /// Indirect call sites in the function body.
     indirect_calls: Vec<IndirectCall>,
+    /// Normalized LLVM return instructions in the function body.
+    returns: Vec<String>,
     /// Whether LLVM exposes the definition outside the module.
     externally_visible: bool,
 }
@@ -382,7 +393,9 @@ impl IrModule {
                     display,
                     signature,
                     edges: BTreeSet::new(),
+                    direct_calls: Vec::new(),
                     indirect_calls: Vec::new(),
+                    returns: Vec::new(),
                     externally_visible,
                 },
             );
@@ -488,8 +501,16 @@ impl IrModule {
         let caller_node = self.functions.get_mut(caller).ok_or_else(|| {
             GateError::InvalidIr(format!("body found for unknown function {caller}"))
         })?;
+        let trimmed = line.trim();
+        if trimmed.starts_with("ret ") {
+            let return_instruction = trimmed
+                .split_once(',')
+                .map_or(trimmed, |(instruction, _metadata)| instruction);
+            caller_node.returns.push(return_instruction.to_owned());
+        }
         for reference in known_references {
             if direct_target == Some(&reference) {
+                caller_node.direct_calls.push(reference.clone());
                 caller_node.edges.insert(reference);
             } else {
                 caller_node.edges.insert(reference.clone());
@@ -621,12 +642,263 @@ impl IrModule {
             }
         }
 
+        self.audit_release_contracts(&mut violations)?;
+
         Ok(AnalysisReport {
             function_count: self.functions.len(),
             reachable_count: predecessors.len(),
             address_taken_count: self.address_taken.len(),
             violations,
         })
+    }
+
+    /// Applies lower-IRP and post-durability contracts that are stricter than general root
+    /// reachability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-IR error when a contract path cannot be reconstructed.
+    fn audit_release_contracts(&self, violations: &mut Vec<Violation>) -> GateResult<()> {
+        if !self.functions.contains_key("IoSetCompletionRoutineEx")
+            || !self.functions.contains_key("ExAllocatePool2")
+        {
+            return Ok(());
+        }
+
+        self.audit_lower_submission(violations);
+        self.audit_lower_completion_returns(violations);
+        self.audit_nonallocating_callbacks(violations)?;
+        self.audit_durable_publication(violations)
+    }
+
+    /// Requires every release monomorphization that registers lower completion to call the lower
+    /// driver later in the same sealed boundary.
+    fn audit_lower_submission(&self, violations: &mut Vec<Violation>) {
+        let mut registration_sites = 0_usize;
+        for function in self.functions.values() {
+            let registrations: Vec<usize> = function
+                .direct_calls
+                .iter()
+                .enumerate()
+                .filter_map(|(index, target)| {
+                    (target == "IoSetCompletionRoutineEx").then_some(index)
+                })
+                .collect();
+            if registrations.is_empty() {
+                continue;
+            }
+            registration_sites = registration_sites.saturating_add(registrations.len());
+            let submissions: Vec<usize> = function
+                .direct_calls
+                .iter()
+                .enumerate()
+                .filter_map(|(index, target)| (target == "IofCallDriver").then_some(index))
+                .collect();
+            let paired = registrations.len() == submissions.len()
+                && registrations
+                    .iter()
+                    .zip(&submissions)
+                    .all(|(registration, submission)| registration < submission);
+            if !paired && violations.len() < MAX_REPORTED_VIOLATIONS {
+                violations.push(Violation {
+                    category: "lower submission protocol",
+                    path: vec![
+                        function.display.clone(),
+                        "IoSetCompletionRoutineEx must pair with a later IofCallDriver".to_owned(),
+                    ],
+                });
+            }
+        }
+        if registration_sites == 0 && violations.len() < MAX_REPORTED_VIOLATIONS {
+            violations.push(Violation {
+                category: "lower submission protocol",
+                path: vec!["release module has no lower completion registration site".to_owned()],
+            });
+        }
+    }
+
+    /// Requires every concrete private-lower-IRP completion to stop I/O Manager processing.
+    fn audit_lower_completion_returns(&self, violations: &mut Vec<Violation>) {
+        let completions: Vec<&Function> = self
+            .functions
+            .values()
+            .filter(|function| {
+                function
+                    .display
+                    .starts_with("ext4win::irp::lower::lower_request_completed::<")
+            })
+            .collect();
+        if completions.is_empty() && violations.len() < MAX_REPORTED_VIOLATIONS {
+            violations.push(Violation {
+                category: "lower completion protocol",
+                path: vec!["release module has no private lower completion routine".to_owned()],
+            });
+            return;
+        }
+        for completion in completions {
+            if !completion.returns.is_empty()
+                && completion
+                    .returns
+                    .iter()
+                    .all(|instruction| instruction == MORE_PROCESSING_REQUIRED_RETURN)
+            {
+                continue;
+            }
+            if violations.len() >= MAX_REPORTED_VIOLATIONS {
+                return;
+            }
+            violations.push(Violation {
+                category: "lower completion protocol",
+                path: vec![
+                    completion.display.clone(),
+                    "every return must be STATUS_MORE_PROCESSING_REQUIRED".to_owned(),
+                ],
+            });
+        }
+    }
+
+    /// Rejects allocation and blocking waits reachable from lower completion, active cancel, or
+    /// retry-timer callbacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-IR error when a callback path cannot be reconstructed.
+    fn audit_nonallocating_callbacks(&self, violations: &mut Vec<Violation>) -> GateResult<()> {
+        let roots: BTreeSet<String> = self
+            .functions
+            .iter()
+            .filter_map(|(symbol, function)| {
+                is_nonallocating_callback(&function.display).then_some(symbol.clone())
+            })
+            .collect();
+        let predecessors = self.direct_predecessors_from(&roots)?;
+        for symbol in predecessors.keys() {
+            if violations.len() >= MAX_REPORTED_VIOLATIONS {
+                break;
+            }
+            let function = self.functions.get(symbol).ok_or_else(|| {
+                GateError::InvalidIr(format!("callback symbol {symbol} has no function node"))
+            })?;
+            if !is_callback_forbidden_sink(symbol, &function.display) {
+                continue;
+            }
+            violations.push(Violation {
+                category: "callback allocation/blocking",
+                path: display_path(symbol, &predecessors, &self.functions)?,
+            });
+        }
+        Ok(())
+    }
+
+    /// Computes direct-call-only paths for callback IRQL auditing.
+    ///
+    /// Typed envelope destinations are indirect calls whose provenance is enforced by their Rust
+    /// construction boundary. The general production analysis remains fail-closed for those
+    /// calls; this narrower closure avoids attributing every signature-compatible callback body to
+    /// the current IRQL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-IR error when a directly reachable function node is absent.
+    fn direct_predecessors_from(
+        &self,
+        roots: &BTreeSet<String>,
+    ) -> GateResult<BTreeMap<String, Option<String>>> {
+        let mut predecessors = BTreeMap::<String, Option<String>>::new();
+        let mut queue = VecDeque::<String>::new();
+        for root in roots {
+            if self.functions.contains_key(root) && !predecessors.contains_key(root) {
+                predecessors.insert(root.clone(), None);
+                queue.push_back(root.clone());
+            }
+        }
+        while let Some(caller) = queue.pop_front() {
+            let function = self.functions.get(&caller).ok_or_else(|| {
+                GateError::InvalidIr(format!("callback audit function {caller} disappeared"))
+            })?;
+            for callee in &function.direct_calls {
+                if !predecessors.contains_key(callee) {
+                    predecessors.insert(callee.clone(), Some(caller.clone()));
+                    queue.push_back(callee.clone());
+                }
+            }
+        }
+        Ok(predecessors)
+    }
+
+    /// Rejects allocation, collection growth, or mutable CNG object creation reachable from the
+    /// durable visibility publication boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-IR error when an allocation path cannot be reconstructed.
+    fn audit_durable_publication(&self, violations: &mut Vec<Violation>) -> GateResult<()> {
+        let roots: BTreeSet<String> = self
+            .functions
+            .iter()
+            .filter_map(|(symbol, function)| {
+                (function.display == DURABLE_PUBLISH_ROOT).then_some(symbol.clone())
+            })
+            .collect();
+        if roots.is_empty() {
+            if violations.len() < MAX_REPORTED_VIOLATIONS {
+                violations.push(Violation {
+                    category: "post-commit allocation",
+                    path: vec![format!(
+                        "required release audit root is absent: {DURABLE_PUBLISH_ROOT}"
+                    )],
+                });
+            }
+            return Ok(());
+        }
+        let predecessors = self.predecessors_from(&roots)?;
+        for symbol in predecessors.keys() {
+            if violations.len() >= MAX_REPORTED_VIOLATIONS {
+                break;
+            }
+            let function = self.functions.get(symbol).ok_or_else(|| {
+                GateError::InvalidIr(format!("publication symbol {symbol} has no function node"))
+            })?;
+            if !is_publication_allocation_sink(symbol, &function.display) {
+                continue;
+            }
+            violations.push(Violation {
+                category: "post-commit allocation",
+                path: display_path(symbol, &predecessors, &self.functions)?,
+            });
+        }
+        Ok(())
+    }
+
+    /// Computes shortest call paths from an explicit audit root set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-IR error when a reachable function node is absent.
+    fn predecessors_from(
+        &self,
+        roots: &BTreeSet<String>,
+    ) -> GateResult<BTreeMap<String, Option<String>>> {
+        let mut predecessors = BTreeMap::<String, Option<String>>::new();
+        let mut queue = VecDeque::<String>::new();
+        for root in roots {
+            if self.functions.contains_key(root) && !predecessors.contains_key(root) {
+                predecessors.insert(root.clone(), None);
+                queue.push_back(root.clone());
+            }
+        }
+        while let Some(caller) = queue.pop_front() {
+            let function = self.functions.get(&caller).ok_or_else(|| {
+                GateError::InvalidIr(format!("audit function {caller} disappeared"))
+            })?;
+            for callee in &function.edges {
+                if !predecessors.contains_key(callee) {
+                    predecessors.insert(callee.clone(), Some(caller.clone()));
+                    queue.push_back(callee.clone());
+                }
+            }
+        }
+        Ok(predecessors)
     }
 
     /// Groups address-taken functions by normalized LLVM signature.
@@ -971,6 +1243,31 @@ fn classify_sink(symbol: &str, display: &str) -> Option<Sink> {
     None
 }
 
+/// Recognizes operations forbidden after commit durability and before visibility publication.
+fn is_publication_allocation_sink(symbol: &str, display: &str) -> bool {
+    let identity = format!("{display}\n{symbol}").to_ascii_lowercase();
+    identity.contains("exallocatepool2")
+        || identity.contains("bcryptopenalgorithmprovider")
+        || identity.contains("bcryptcreatehash")
+        || identity.contains("bcryptgeneratesymmetrickey")
+}
+
+/// Selects callbacks whose IRQL contract permits neither allocation nor blocking.
+fn is_nonallocating_callback(display: &str) -> bool {
+    display.starts_with("ext4win::irp::lower::lower_request_completed::<")
+        || display == "ext4win::irp::cancel::active_irp_cancelled"
+        || display == "ext4win::irp::reactor::storage_retry_timer_dpc"
+}
+
+/// Recognizes allocation, CNG construction, and blocking wait calls forbidden in callbacks.
+fn is_callback_forbidden_sink(symbol: &str, display: &str) -> bool {
+    if is_publication_allocation_sink(symbol, display) {
+        return true;
+    }
+    let identity = format!("{display}\n{symbol}").to_ascii_lowercase();
+    identity.contains("kewaitforsingleobject") || identity.contains("kedelayexecutionthread")
+}
+
 /// Returns whether the selected shortest path already crossed a forbidden sink.
 fn predecessor_contains_forbidden_sink(
     symbol: &str,
@@ -1047,6 +1344,27 @@ fn display_path(
 #[cfg(test)]
 mod tests {
     use super::{IrModule, Sink, classify_sink};
+
+    /// Builds a minimal driver-shaped LLVM fixture that activates every release contract audit.
+    fn release_contract_fixture(
+        submit_body: &str,
+        completion_return: &str,
+        publish_body: &str,
+    ) -> String {
+        format!(
+            "; root\n\
+             define void @DriverEntry() {{\n  call void @submit()\n  call void @publish()\n  ret void\n}}\n\
+             ; submit\n\
+             define internal void @submit() {{\n{submit_body}\n  ret void\n}}\n\
+             ; ext4win::irp::lower::lower_request_completed::<fixture>\n\
+             define internal i32 @complete(ptr %device, ptr %irp, ptr %context) {{\n  {completion_return}\n}}\n\
+             ; <ext4win::state::volume_runtime::VolumeRuntime>::publish_durable\n\
+             define internal void @publish() {{\n{publish_body}\n  ret void\n}}\n\
+             declare i32 @IoSetCompletionRoutineEx(ptr, ptr, ptr, ptr, i8, i8, i8)\n\
+             declare i32 @IofCallDriver(ptr, ptr)\n\
+             declare ptr @ExAllocatePool2(i64, i64, i32)\n"
+        )
+    }
 
     /// Converts a failed test invariant into the analyzer's structured error.
     ///
@@ -1245,6 +1563,90 @@ mod tests {
                     .first()
                     .is_some_and(|violation| violation.category == Sink::Sort.category()),
             "nested sinks were not collapsed to the frontier",
+        )
+    }
+
+    /// The release lower protocol accepts one paired registration/submission and only the private
+    /// completion stop status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the valid fixture is rejected or either protocol regression is missed.
+    #[test]
+    fn lower_release_protocol_is_artifact_checked() -> Result<(), super::GateError> {
+        let valid = release_contract_fixture(
+            "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)\n  %submitted = call i32 @IofCallDriver(ptr null, ptr null)",
+            "ret i32 -1073741802",
+            "",
+        );
+        require(
+            IrModule::parse(&valid)?.analyze()?.violations.is_empty(),
+            "valid lower release protocol was rejected",
+        )?;
+
+        let missing_submit = release_contract_fixture(
+            "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)",
+            "ret i32 -1073741802",
+            "",
+        );
+        let missing_submit = IrModule::parse(&missing_submit)?.analyze()?;
+        require(
+            missing_submit
+                .violations
+                .iter()
+                .any(|violation| violation.category == "lower submission protocol"),
+            "registration without lower submission was accepted",
+        )?;
+
+        let wrong_completion = release_contract_fixture(
+            "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)\n  %submitted = call i32 @IofCallDriver(ptr null, ptr null)",
+            "ret i32 0",
+            "",
+        );
+        let wrong_completion = IrModule::parse(&wrong_completion)?.analyze()?;
+        require(
+            wrong_completion
+                .violations
+                .iter()
+                .any(|violation| violation.category == "lower completion protocol"),
+            "completion status other than MORE_PROCESSING_REQUIRED was accepted",
+        )?;
+
+        let allocating_completion = release_contract_fixture(
+            "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)\n  %submitted = call i32 @IofCallDriver(ptr null, ptr null)",
+            "%allocation = call ptr @ExAllocatePool2(i64 64, i64 32, i32 1)\n  ret i32 -1073741802",
+            "",
+        );
+        let allocating_completion = IrModule::parse(&allocating_completion)?.analyze()?;
+        require(
+            allocating_completion
+                .violations
+                .iter()
+                .any(|violation| violation.category == "callback allocation/blocking"),
+            "allocating completion callback was accepted",
+        )
+    }
+
+    /// Durable publication may move and release prepared values but cannot allocate or construct
+    /// mutable CNG state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if allocator reachability from durable publication is not rejected.
+    #[test]
+    fn durable_publication_rejects_allocator_reachability() -> Result<(), super::GateError> {
+        let fixture = release_contract_fixture(
+            "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)\n  %submitted = call i32 @IofCallDriver(ptr null, ptr null)",
+            "ret i32 -1073741802",
+            "  %allocation = call ptr @ExAllocatePool2(i64 64, i64 32, i32 1)",
+        );
+        let report = IrModule::parse(&fixture)?.analyze()?;
+        require(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.category == "post-commit allocation"),
+            "durable publication allocator path was accepted",
         )
     }
 }
