@@ -17,6 +17,40 @@ check-private-items = true
 disallowed-methods = [
     { path = "alloc::boxed::Box::new", reason = "kernel allocations must cross an explicit fallible allocation boundary" },
     { path = "alloc::vec::Vec::with_capacity", reason = "kernel allocations must reserve through try_reserve and return OutOfMemory" },
+
+    # These standard slice operations retain implicit panic or abort edges in
+    # optimized kernel code.  Keep all production callers on checked,
+    # domain-specific primitives so the reachability gate cannot regress.
+    { path = "slice::copy_from_slice", reason = "length equality must be checked and reported as a domain error", replacement = "ext4_core::memory::copy_exact" },
+    { path = "slice::clone_from_slice", reason = "length equality and element cloning must not introduce a panic edge" },
+    { path = "slice::copy_within", reason = "source and destination ranges must be checked before copying" },
+    { path = "slice::split_at", reason = "the split point must be checked", replacement = "split_at_checked" },
+    { path = "slice::split_at_mut", reason = "the split point must be checked", replacement = "split_at_mut_checked" },
+    { path = "slice::chunks", reason = "a zero chunk width must be represented as an error before iteration" },
+    { path = "slice::chunks_mut", reason = "a zero chunk width must be represented as an error before iteration" },
+    { path = "slice::chunks_exact", reason = "a zero chunk width must be represented as an error before iteration" },
+    { path = "slice::chunks_exact_mut", reason = "a zero chunk width must be represented as an error before iteration" },
+    { path = "slice::rchunks", reason = "a zero chunk width must be represented as an error before iteration" },
+    { path = "slice::rchunks_mut", reason = "a zero chunk width must be represented as an error before iteration" },
+    { path = "slice::rchunks_exact", reason = "a zero chunk width must be represented as an error before iteration" },
+    { path = "slice::rchunks_exact_mut", reason = "a zero chunk width must be represented as an error before iteration" },
+    { path = "slice::windows", reason = "a zero window width must be represented as an error before iteration" },
+    { path = "slice::reverse", reason = "use the checked project primitive audited by the production reachability gate", replacement = "ext4_core::memory::reverse_checked" },
+    { path = "slice::sort", reason = "standard sorting retains allocator and panic edges", replacement = "ext4_core::memory::heap_sort_by" },
+    { path = "slice::sort_by", reason = "standard sorting retains comparator panic edges", replacement = "ext4_core::memory::heap_sort_by" },
+    { path = "slice::sort_by_key", reason = "standard sorting retains comparator panic edges", replacement = "ext4_core::memory::heap_sort_by_key" },
+    { path = "slice::sort_by_cached_key", reason = "standard sorting retains allocation and comparator panic edges" },
+    { path = "slice::sort_unstable", reason = "standard sorting retains panic edges", replacement = "ext4_core::memory::heap_sort_by" },
+    { path = "slice::sort_unstable_by", reason = "standard sorting retains comparator panic edges", replacement = "ext4_core::memory::heap_sort_by" },
+    { path = "slice::sort_unstable_by_key", reason = "standard sorting retains comparator panic edges", replacement = "ext4_core::memory::heap_sort_by_key" },
+
+    # Vec index/range mutation has no checked standard-library counterpart.
+    { path = "alloc::vec::Vec::insert", reason = "the insertion index must be checked and allocation must remain fallible", replacement = "ext4_core::memory::FallibleVecExt::try_insert" },
+    { path = "alloc::vec::Vec::remove", reason = "the removal index must be checked", replacement = "ext4_core::memory::FallibleVecExt::try_remove_at" },
+    { path = "alloc::vec::Vec::swap_remove", reason = "the removal index must be checked" },
+    { path = "alloc::vec::Vec::split_off", reason = "the split index and allocation must be checked" },
+    { path = "alloc::vec::Vec::drain", reason = "the drained range must be checked before mutation" },
+    { path = "alloc::vec::Vec::splice", reason = "the replacement range and allocation must be checked before mutation" },
 ]
 
 disallowed-macros = [
