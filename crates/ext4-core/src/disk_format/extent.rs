@@ -545,7 +545,12 @@ impl MutableExtentTree {
         let mut external_blocks = Vec::new();
         let mut nodes = Vec::new();
 
-        for chunk in self.extents.chunks(capacity) {
+        let mut remaining_extents = self.extents.as_slice();
+        while !remaining_extents.is_empty() {
+            let chunk_len = core::cmp::min(capacity, remaining_extents.len());
+            let (chunk, remainder) = remaining_extents
+                .split_at_checked(chunk_len)
+                .ok_or(Error::InvalidExtentTree)?;
             let block = *self
                 .metadata_blocks
                 .get(block_index)
@@ -568,6 +573,7 @@ impl MutableExtentTree {
                 block,
                 bytes,
             })?;
+            remaining_extents = remainder;
         }
 
         while nodes.len() > INODE_ROOT_ENTRY_CAPACITY {
@@ -579,7 +585,12 @@ impl MutableExtentTree {
                 return Err(Error::UnsupportedExtentDepth);
             }
             let mut parents = Vec::new();
-            for chunk in nodes.chunks(capacity) {
+            let mut remaining_nodes = nodes.as_slice();
+            while !remaining_nodes.is_empty() {
+                let chunk_len = core::cmp::min(capacity, remaining_nodes.len());
+                let (chunk, remainder) = remaining_nodes
+                    .split_at_checked(chunk_len)
+                    .ok_or(Error::InvalidExtentTree)?;
                 let block = *self
                     .metadata_blocks
                     .get(block_index)
@@ -600,6 +611,7 @@ impl MutableExtentTree {
                     block,
                     bytes,
                 })?;
+                remaining_nodes = remainder;
             }
             nodes = parents;
         }

@@ -3532,7 +3532,7 @@ mod tests {
             0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00,
         ];
         let invalid_tag = CreateSymlinkReparseBuffer::try_pack_exact(VALID.len(), |output| {
-            output.copy_from_slice(&VALID);
+            crate::memory::copy_exact(output, &VALID)?;
             if let Some(tag) = output.first_mut() {
                 *tag = 0;
             }
@@ -3544,7 +3544,7 @@ mod tests {
         );
         let invalid_declared_length =
             CreateSymlinkReparseBuffer::try_pack_exact(VALID.len(), |output| {
-                output.copy_from_slice(&VALID);
+                crate::memory::copy_exact(output, &VALID)?;
                 if let Some(length) = output.get_mut(4) {
                     *length = 0;
                 }
@@ -3555,7 +3555,7 @@ mod tests {
             Some(crate::kernel::status::DriverError::InternalInvariantViolation)
         );
         let incomplete_write = CreateSymlinkReparseBuffer::try_pack_exact(VALID.len(), |output| {
-            output.copy_from_slice(&VALID);
+            crate::memory::copy_exact(output, &VALID)?;
             Ok(VALID.len() - 1)
         });
         assert_eq!(
@@ -3589,7 +3589,7 @@ mod tests {
         };
 
         let buffer = CreateSymlinkReparseBuffer::try_pack_exact(EXPECTED.len(), |output| {
-            output.copy_from_slice(&EXPECTED);
+            crate::memory::copy_exact(output, &EXPECTED)?;
             Ok(EXPECTED.len())
         });
         assert!(buffer.is_ok());

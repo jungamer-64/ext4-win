@@ -1257,8 +1257,10 @@ mod tests {
     #[test]
     fn fscrypt_v2_context_parses_nonce_and_policy() {
         let mut context = [0_u8; FSCRYPT_CONTEXT_V2_BYTES];
-        context[..FSCRYPT_POLICY_V2_BYTES].copy_from_slice(&valid_policy_bytes());
-        context[FSCRYPT_NONCE_OFFSET..FSCRYPT_CONTEXT_V2_BYTES].copy_from_slice(&VECTOR_NONCE);
+        let policy = some!(context.get_mut(..FSCRYPT_POLICY_V2_BYTES));
+        must!(memory::copy_exact(policy, &valid_policy_bytes()));
+        let nonce = some!(context.get_mut(FSCRYPT_NONCE_OFFSET..FSCRYPT_CONTEXT_V2_BYTES));
+        must!(memory::copy_exact(nonce, &VECTOR_NONCE));
 
         let parsed = must!(FscryptContextV2::parse(&context));
 
@@ -1395,9 +1397,10 @@ mod tests {
         assert!(set.get(second_identifier).is_some());
         assert_eq!(set.keys().len(), 2);
         assert!(
-            set.keys().windows(2).all(
-                |pair| matches!(pair, [left, right] if left.identifier() < right.identifier())
-            )
+            set.keys()
+                .iter()
+                .zip(set.keys().iter().skip(1))
+                .all(|(left, right)| left.identifier() < right.identifier())
         );
     }
 
@@ -1506,17 +1509,35 @@ mod tests {
         bytes[FSCRYPT_CONTENTS_MODE_OFFSET] = FSCRYPT_MODE_AES_256_XTS;
         bytes[FSCRYPT_FILENAMES_MODE_OFFSET] = FSCRYPT_MODE_AES_256_CTS;
         bytes[FSCRYPT_FLAGS_OFFSET] = FscryptFilenamePadding::Pad32.flags();
-        bytes[FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET
-            ..FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET + FSCRYPT_KEY_IDENTIFIER_BYTES]
-            .copy_from_slice(&[0x42; 16]);
+        for (destination, source) in bytes
+            .iter_mut()
+            .skip(FSCRYPT_MASTER_KEY_IDENTIFIER_OFFSET)
+            .take(FSCRYPT_KEY_IDENTIFIER_BYTES)
+            .zip([0x42; 16])
+        {
+            *destination = source;
+        }
         bytes
     }
 
     /// Builds a supported fscrypt v2 context byte image.
     fn valid_context_bytes() -> [u8; FSCRYPT_CONTEXT_V2_BYTES] {
         let mut bytes = [0_u8; FSCRYPT_CONTEXT_V2_BYTES];
-        bytes[..FSCRYPT_POLICY_V2_BYTES].copy_from_slice(&valid_policy_bytes());
-        bytes[FSCRYPT_NONCE_OFFSET..FSCRYPT_CONTEXT_V2_BYTES].copy_from_slice(&VECTOR_NONCE);
+        for (destination, source) in bytes
+            .iter_mut()
+            .take(FSCRYPT_POLICY_V2_BYTES)
+            .zip(valid_policy_bytes())
+        {
+            *destination = source;
+        }
+        for (destination, source) in bytes
+            .iter_mut()
+            .skip(FSCRYPT_NONCE_OFFSET)
+            .take(FSCRYPT_FILE_NONCE_BYTES)
+            .zip(VECTOR_NONCE)
+        {
+            *destination = source;
+        }
         bytes
     }
 }

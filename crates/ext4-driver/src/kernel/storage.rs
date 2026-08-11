@@ -1254,7 +1254,10 @@ mod tests {
         let Some(destination) = prepared.transfer.as_mut_slice().get_mut(1..3) else {
             return;
         };
-        destination.copy_from_slice(&[0x11, 0x22]);
+        assert_eq!(
+            crate::memory::copy_exact(destination, &[0x11, 0x22]),
+            Ok(())
+        );
         let PreparedStorageCommand {
             command,
             transfer,
@@ -1333,9 +1336,10 @@ mod tests {
         let Ok(mut transfer) = transfer else {
             return;
         };
-        transfer
-            .as_mut_slice()
-            .copy_from_slice(&4096_i64.to_ne_bytes());
+        assert_eq!(
+            crate::memory::copy_exact(transfer.as_mut_slice(), &4096_i64.to_ne_bytes()),
+            Ok(())
+        );
         let completed = CompletedLowerIrp {
             suspended: DeviceLengthProbe { suspended: 77_u64 },
             transfer,
