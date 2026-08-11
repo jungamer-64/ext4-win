@@ -4172,26 +4172,6 @@ mod tests {
         }
     }
 
-    /// Builds a dispatch target whose IRP points at the supplied current stack.
-    /// # Errors
-    ///
-    /// Returns an error when the local test device or IRP pointer cannot be decoded.
-    fn target_from_stack(
-        stack: &mut wdk_sys::IO_STACK_LOCATION,
-        irp: &mut wdk_sys::IRP,
-        device: &mut wdk_sys::DEVICE_OBJECT,
-    ) -> Result<ReceivedIrp, DriverError> {
-        irp.Tail
-            .Overlay
-            .__bindgen_anon_2
-            .__bindgen_anon_1
-            .CurrentStackLocation = core::ptr::addr_of_mut!(*stack);
-        ReceivedIrp::decode(
-            core::ptr::addr_of_mut!(*device),
-            core::ptr::addr_of_mut!(*irp),
-        )
-    }
-
     /// # Panics
     ///
     /// Panics when paging read policy accepts a FILE_OBJECT current-position dependency.

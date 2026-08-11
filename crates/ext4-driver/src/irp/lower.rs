@@ -7,10 +7,13 @@ use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::fmt;
 use core::marker::PhantomPinned;
-use core::mem::{ManuallyDrop, MaybeUninit};
+use core::mem::ManuallyDrop;
+#[cfg(not(test))]
+use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
+#[cfg(not(test))]
 use ext4_core::{ByteOffset, Error};
 use wdk_sys::{IRP_MJ_DEVICE_CONTROL, IRP_MJ_FLUSH_BUFFERS, IRP_MJ_READ, IRP_MJ_WRITE, NTSTATUS};
 #[cfg(not(test))]
@@ -20,7 +23,9 @@ use crate::kernel::fatal::KernelWideInconsistency;
 #[cfg(not(test))]
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
+#[cfg(not(test))]
 use crate::memory;
+#[cfg(not(test))]
 use crate::state::KernelDevice;
 
 /// `TRUE` represented as a WDK `BOOLEAN`.
@@ -1205,7 +1210,33 @@ unsafe extern "C" fn lower_request_completed<O: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::{CompletionRundown, LowerOperation, LowerTransferMethod};
+    use alloc::boxed::Box;
+    use core::ffi::c_void;
+    use core::ptr::NonNull;
+    use core::sync::atomic::Ordering;
+
+    use crate::kernel::status::DriverError;
+
+    use super::{
+        AlignedTransferBuffer, CompletionRundown, IOCTL_DISK_GET_LENGTH_INFO, LOWER_CANCEL_CALLING,
+        LOWER_COMPLETED_DURING_CANCEL, LOWER_COMPLETED_QUEUED, LOWER_DEFERRED_QUEUED,
+        LOWER_SUBMITTED, LowerBuildError, LowerCompletionDestination, LowerCompletionEnvelope,
+        LowerOperation, LowerRegistrationError, LowerTransferMethod, PublishedLowerRequest,
+        STATUS_MORE_PROCESSING_REQUIRED,
+    };
+
+    unsafe fn record_completed_u64(
+        context: NonNull<c_void>,
+        envelope: NonNull<LowerCompletionEnvelope<u64>>,
+    ) {
+        let destination = unsafe {
+            // SAFETY: The test context is an address-stable `Option` with this exact type.
+            context
+                .cast::<Option<NonNull<LowerCompletionEnvelope<u64>>>>()
+                .as_mut()
+        };
+        *destination = Some(envelope);
+    }
 
     /// # Panics
     ///
@@ -1220,6 +1251,30 @@ mod tests {
             LowerOperation::Read.major_function(),
             LowerOperation::Write.major_function()
         );
+        assert_eq!(
+            LowerOperation::Read.irp_flags(),
+            wdk_sys::IRP_READ_OPERATION
+        );
+        assert_eq!(
+            LowerOperation::Write.irp_flags(),
+            wdk_sys::IRP_WRITE_OPERATION
+        );
+        assert_eq!(LowerOperation::Flush.irp_flags(), 0);
+        assert_eq!(IOCTL_DISK_GET_LENGTH_INFO, 0x0007_405C);
+        assert_eq!(
+            STATUS_MORE_PROCESSING_REQUIRED,
+            i32::from_ne_bytes(0xC000_0016_u32.to_ne_bytes())
+        );
+        let lifecycle = [
+            LOWER_SUBMITTED,
+            LOWER_CANCEL_CALLING,
+            LOWER_COMPLETED_QUEUED,
+            LOWER_COMPLETED_DURING_CANCEL,
+            LOWER_DEFERRED_QUEUED,
+        ];
+        for (index, state) in lifecycle.iter().enumerate() {
+            assert!(lifecycle.iter().skip(index + 1).all(|other| other != state));
+        }
     }
 
     /// # Panics
@@ -1255,5 +1310,116 @@ mod tests {
             rundown.close_and_wait();
         }
         assert!(rundown.acquire().is_none());
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the completion context stops being the envelope head or reclaim duplicates any
+    /// owned payload.
+    #[test]
+    fn stable_envelope_head_round_trips_owned_payload_once() {
+        let rundown = CompletionRundown::new();
+        let Some(lease) = rundown.acquire() else {
+            return;
+        };
+        let Ok(transfer) = AlignedTransferBuffer::try_zeroed(16, 16) else {
+            return;
+        };
+        assert!(!transfer.as_void_ptr().is_null());
+        let mut inbox: Option<NonNull<LowerCompletionEnvelope<u64>>> = None;
+        let destination = unsafe {
+            // SAFETY: `inbox` remains address-stable until the synchronous publication returns.
+            LowerCompletionDestination::new(NonNull::from(&mut inbox).cast(), record_completed_u64)
+        };
+        let mut envelope = Box::new(LowerCompletionEnvelope::new(
+            0x5A_u64,
+            transfer,
+            destination,
+            lease,
+        ));
+        let address = NonNull::from(envelope.as_mut());
+        let Some(node) = NonNull::new(envelope.node_ptr()) else {
+            return;
+        };
+        let recovered = unsafe {
+            // SAFETY: `node` is the live first field of this exact envelope.
+            LowerCompletionEnvelope::<u64>::from_node(node)
+        };
+        assert_eq!(address, recovered);
+
+        envelope
+            .status
+            .store(wdk_sys::STATUS_SUCCESS, Ordering::Relaxed);
+        envelope.information.store(16, Ordering::Relaxed);
+        envelope
+            .lifecycle
+            .store(LOWER_COMPLETED_QUEUED, Ordering::Release);
+        unsafe {
+            // SAFETY: This publishes the one live envelope to the type-matched local inbox.
+            destination.publish(address);
+        }
+        let Some(published) = inbox else {
+            return;
+        };
+        let cancellation = PublishedLowerRequest {
+            envelope: published,
+        };
+        assert!(cancellation.identifies(address));
+
+        let completed = unsafe {
+            // SAFETY: The local inbox owns this completed envelope exactly once.
+            LowerCompletionEnvelope::reclaim(envelope)
+        };
+        assert_eq!(completed.suspended, 0x5A);
+        assert_eq!(completed.transfer.len(), 16);
+        assert_eq!(completed.status, wdk_sys::STATUS_SUCCESS);
+        assert_eq!(completed.information, 16);
+        unsafe {
+            // SAFETY: Reclaim released the envelope's sole lease.
+            rundown.close_and_wait();
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if pre-submit failures lose the operation or publish the envelope.
+    #[test]
+    fn unsubmitted_failures_preserve_operation_ownership() {
+        let rundown = CompletionRundown::new();
+        let Some(lease) = rundown.acquire() else {
+            return;
+        };
+        let Ok(transfer) = AlignedTransferBuffer::try_zeroed(0, 1) else {
+            return;
+        };
+        assert!(transfer.as_void_ptr().is_null());
+        let mut inbox: Option<NonNull<LowerCompletionEnvelope<u64>>> = None;
+        let destination = unsafe {
+            // SAFETY: The context remains live and publication is not invoked in this test.
+            LowerCompletionDestination::new(NonNull::from(&mut inbox).cast(), record_completed_u64)
+        };
+        let envelope = Box::new(LowerCompletionEnvelope::new(
+            41_u64,
+            transfer,
+            destination,
+            lease,
+        ));
+        assert_eq!(LowerCompletionEnvelope::reclaim_unsubmitted(envelope), 41);
+        assert!(inbox.is_none());
+
+        let build = LowerBuildError::from_unsubmitted(DriverError::InvalidParameter, 42_u64);
+        assert_eq!(build.into_parts(), (DriverError::InvalidParameter, 42));
+        let registration = LowerRegistrationError {
+            error: DriverError::InsufficientResources,
+            suspended: 43_u64,
+        };
+        assert_eq!(
+            registration.into_parts(),
+            (DriverError::InsufficientResources, 43)
+        );
+        unsafe {
+            // SAFETY: Reclaim released the envelope's sole lease.
+            rundown.close_and_wait();
+        }
     }
 }

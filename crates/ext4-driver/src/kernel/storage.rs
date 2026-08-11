@@ -901,12 +901,65 @@ pub fn failed_unsubmitted_request(request: StorageRequest, error: Error) -> Stor
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
+    use alloc::vec;
+
     use super::{
-        LowerStorageDevice, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY, STATUS_IO_TIMEOUT,
-        STATUS_RETRY,
+        DeviceLengthProbe, FailedStorageCommand, LowerStorageDevice, MountedStorageDevices,
+        PreparedStorageCommand, STATUS_CRC_ERROR, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY,
+        STATUS_IO_TIMEOUT, STATUS_RETRY, StorageCommandStep, StorageFailureClass,
+        StorageRetryDelay, WriteTransferPhase, failed_unsubmitted_request,
     };
+    use crate::irp::lower::CompletedLowerIrp;
+    use crate::kernel::status::DriverError;
     use crate::state::KernelDevice;
-    use ext4_core::DeviceLength;
+    use ext4_core::{ByteOffset, DeviceLength, Error, StorageRequest, StorageTarget};
+
+    struct StorageFixture {
+        _owner: Box<wdk_sys::DEVICE_OBJECT>,
+        _lower: Box<wdk_sys::DEVICE_OBJECT>,
+        devices: MountedStorageDevices,
+    }
+
+    fn storage_fixture() -> Option<StorageFixture> {
+        let mut owner = Box::new(wdk_sys::DEVICE_OBJECT::default());
+        let mut lower = Box::new(wdk_sys::DEVICE_OBJECT {
+            SectorSize: 512,
+            AlignmentRequirement: wdk_sys::FILE_512_BYTE_ALIGNMENT,
+            ..wdk_sys::DEVICE_OBJECT::default()
+        });
+        let completion_owner = KernelDevice::from_raw(core::ptr::from_mut(owner.as_mut()))?;
+        let target = KernelDevice::from_raw(core::ptr::from_mut(lower.as_mut()))?;
+        let filesystem =
+            LowerStorageDevice::from_device(target, DeviceLength::from_bytes(4096)).ok()?;
+        Some(StorageFixture {
+            _owner: owner,
+            _lower: lower,
+            devices: MountedStorageDevices::new(completion_owner, filesystem, None),
+        })
+    }
+
+    fn failed_command(
+        prepared: PreparedStorageCommand<u64>,
+        status: wdk_sys::NTSTATUS,
+        information: usize,
+    ) -> Option<FailedStorageCommand<u64>> {
+        let PreparedStorageCommand {
+            command,
+            transfer,
+            operation: _,
+        } = prepared;
+        let completed = CompletedLowerIrp {
+            suspended: command,
+            transfer,
+            status,
+            information,
+        };
+        match completed.advance().ok()? {
+            StorageCommandStep::Failed(failed) => Some(failed),
+            StorageCommandStep::SubmitNext(_) | StorageCommandStep::Complete { .. } => None,
+        }
+    }
 
     /// # Panics
     ///
@@ -950,5 +1003,349 @@ mod tests {
         for (index, status) in statuses.iter().enumerate() {
             assert!(statuses.iter().skip(index + 1).all(|other| other != status));
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if reads gain polling retries, lose their two fixed delays, or stop classifying
+    /// medium failures as read-unreliable.
+    #[test]
+    fn reads_retry_only_on_two_explicit_timer_permits() {
+        let Some(fixture) = storage_fixture() else {
+            return;
+        };
+        let request = StorageRequest::Read {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(0),
+            buffer: vec![0_u8; 512],
+        };
+        let prepared = PreparedStorageCommand::try_new(fixture.devices, request, 7_u64);
+        assert!(prepared.is_ok());
+        let Ok(prepared) = prepared else {
+            return;
+        };
+        assert!(!prepared.is_effect_bearing());
+        let (_, _, offset, _) = prepared.command.lower_contract();
+        assert_eq!(offset, ByteOffset::new(0));
+
+        let Some(failed) = failed_command(prepared, STATUS_IO_TIMEOUT, 0) else {
+            return;
+        };
+        let first = failed.into_retry();
+        assert!(first.is_ok());
+        let Ok(first) = first else {
+            return;
+        };
+        assert_eq!(first.delay(), StorageRetryDelay::TenMilliseconds);
+        let second_attempt = first.permitted();
+        assert!(second_attempt.is_ok());
+        let Ok(second_attempt) = second_attempt else {
+            return;
+        };
+
+        let Some(failed) = failed_command(second_attempt, STATUS_IO_TIMEOUT, 0) else {
+            return;
+        };
+        let second = failed.into_retry();
+        assert!(second.is_ok());
+        let Ok(second) = second else {
+            return;
+        };
+        assert_eq!(second.delay(), StorageRetryDelay::HundredMilliseconds);
+        let third_attempt = second.permitted();
+        assert!(third_attempt.is_ok());
+        let Ok(third_attempt) = third_attempt else {
+            return;
+        };
+
+        let Some(failed) = failed_command(third_attempt, STATUS_IO_TIMEOUT, 0) else {
+            return;
+        };
+        let terminal = failed.into_retry();
+        assert!(terminal.is_err());
+        let Err(terminal) = terminal else {
+            return;
+        };
+        let (suspended, request, class) = terminal.into_failure();
+        assert_eq!(suspended, 7);
+        assert!(matches!(request, StorageRequest::Read { .. }));
+        assert_eq!(class, StorageFailureClass::Terminal);
+
+        let crc_request = StorageRequest::Read {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(0),
+            buffer: vec![0_u8; 512],
+        };
+        let Ok(crc_prepared) = PreparedStorageCommand::try_new(fixture.devices, crc_request, 8_u64)
+        else {
+            return;
+        };
+        let Some(crc_failure) = failed_command(crc_prepared, STATUS_CRC_ERROR, 0) else {
+            return;
+        };
+        let (_, _, class) = crc_failure.into_failure();
+        assert_eq!(class, StorageFailureClass::ReadUnreliable);
+    }
+
+    /// # Panics
+    ///
+    /// Panics if write or flush timeout is retried, or if a short/effect-unknown completion avoids
+    /// the durability-unknown path.
+    #[test]
+    fn write_and_flush_timeout_abort_without_retry() {
+        let Some(fixture) = storage_fixture() else {
+            return;
+        };
+        let write = StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(0),
+            buffer: vec![0xA5_u8; 512],
+        };
+        let Ok(write) = PreparedStorageCommand::try_new(fixture.devices, write, 11_u64) else {
+            return;
+        };
+        assert!(write.is_effect_bearing());
+        assert!(matches!(
+            write.command,
+            super::StorageCommand::Write {
+                phase: WriteTransferPhase::DirectWrite,
+                ..
+            }
+        ));
+        let Some(timeout) = failed_command(write, STATUS_IO_TIMEOUT, 0) else {
+            return;
+        };
+        let timeout = timeout.into_retry();
+        assert!(timeout.is_err());
+        let Err(timeout) = timeout else {
+            return;
+        };
+        let (_, _, class) = timeout.into_failure();
+        assert_eq!(class, StorageFailureClass::DurabilityUnknown);
+
+        let short = StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(0),
+            buffer: vec![0x5A_u8; 512],
+        };
+        let Ok(short) = PreparedStorageCommand::try_new(fixture.devices, short, 12_u64) else {
+            return;
+        };
+        let Some(short) = failed_command(short, wdk_sys::STATUS_SUCCESS, 511) else {
+            return;
+        };
+        let (_, _, class) = short.into_failure();
+        assert_eq!(class, StorageFailureClass::DurabilityUnknown);
+
+        let flush = StorageRequest::Flush {
+            target: StorageTarget::Filesystem,
+        };
+        let Ok(flush) = PreparedStorageCommand::try_new(fixture.devices, flush, 13_u64) else {
+            return;
+        };
+        assert!(flush.is_effect_bearing());
+        let Some(timeout) = failed_command(flush, STATUS_IO_TIMEOUT, 0) else {
+            return;
+        };
+        let timeout = timeout.into_retry();
+        assert!(timeout.is_err());
+        let Err(timeout) = timeout else {
+            return;
+        };
+        let (_, _, class) = timeout.into_failure();
+        assert_eq!(class, StorageFailureClass::DurabilityUnknown);
+    }
+
+    /// # Panics
+    ///
+    /// Panics if an effect-free busy write cannot be cancelled while awaiting its explicit retry
+    /// permit.
+    #[test]
+    fn effect_free_write_retry_retains_owned_request() {
+        let Some(fixture) = storage_fixture() else {
+            return;
+        };
+        let request = StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(0),
+            buffer: vec![0xC3_u8; 512],
+        };
+        let Ok(prepared) = PreparedStorageCommand::try_new(fixture.devices, request, 23_u64) else {
+            return;
+        };
+        let Some(failed) = failed_command(prepared, STATUS_DEVICE_BUSY, 0) else {
+            return;
+        };
+        let retry = failed.into_retry();
+        assert!(retry.is_ok());
+        let Ok(retry) = retry else {
+            return;
+        };
+        assert_eq!(retry.delay(), StorageRetryDelay::TenMilliseconds);
+        let (suspended, request) = retry.into_parts();
+        assert_eq!(suspended, 23);
+        assert!(matches!(request, StorageRequest::Write { .. }));
+    }
+
+    /// # Panics
+    ///
+    /// Panics if sector-covered read/write completion loses the exact core subrange.
+    #[test]
+    fn unaligned_transfers_complete_through_owned_buffers() {
+        let Some(fixture) = storage_fixture() else {
+            return;
+        };
+        let read = StorageRequest::Read {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(513),
+            buffer: vec![0_u8; 2],
+        };
+        let Ok(mut prepared) = PreparedStorageCommand::try_new(fixture.devices, read, 31_u64)
+        else {
+            return;
+        };
+        let range = prepared.command.expected_information();
+        assert_eq!(range, 512);
+        let Some(destination) = prepared.transfer.as_mut_slice().get_mut(1..3) else {
+            return;
+        };
+        destination.copy_from_slice(&[0x11, 0x22]);
+        let PreparedStorageCommand {
+            command,
+            transfer,
+            operation: _,
+        } = prepared;
+        let completed = CompletedLowerIrp {
+            suspended: command,
+            transfer,
+            status: wdk_sys::STATUS_SUCCESS,
+            information: 512,
+        };
+        let Ok(StorageCommandStep::Complete {
+            suspended,
+            completion,
+        }) = completed.advance()
+        else {
+            return;
+        };
+        assert_eq!(suspended, 31);
+        let (transfer, information, result) = completion.into_parts();
+        assert_eq!(information, 2);
+        assert!(result.is_ok());
+        let ext4_core::CompletedStorageTransfer::Read { buffer, .. } = transfer else {
+            return;
+        };
+        assert_eq!(buffer, [0x11, 0x22]);
+
+        let write = StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(513),
+            buffer: vec![0x33, 0x44],
+        };
+        let Ok(prepared) = PreparedStorageCommand::try_new(fixture.devices, write, 32_u64) else {
+            return;
+        };
+        assert!(matches!(
+            prepared.command,
+            super::StorageCommand::Write {
+                phase: WriteTransferPhase::ReadBeforeWrite,
+                ..
+            }
+        ));
+        let PreparedStorageCommand {
+            command,
+            transfer,
+            operation: _,
+        } = prepared;
+        let read_half = CompletedLowerIrp {
+            suspended: command,
+            transfer,
+            status: wdk_sys::STATUS_SUCCESS,
+            information: 512,
+        };
+        let Ok(StorageCommandStep::SubmitNext(write_half)) = read_half.advance() else {
+            return;
+        };
+        assert!(matches!(
+            write_half.command,
+            super::StorageCommand::Write {
+                phase: WriteTransferPhase::WriteAfterRead,
+                ..
+            }
+        ));
+    }
+
+    /// # Panics
+    ///
+    /// Panics if mount-length decoding or never-submitted failure conversion loses ownership.
+    #[test]
+    fn mount_probe_and_unsubmitted_failure_are_owned_completions() {
+        let transfer = crate::irp::lower::AlignedTransferBuffer::try_zeroed(
+            core::mem::size_of::<i64>(),
+            core::mem::align_of::<i64>(),
+        );
+        assert!(transfer.is_ok());
+        let Ok(mut transfer) = transfer else {
+            return;
+        };
+        transfer
+            .as_mut_slice()
+            .copy_from_slice(&4096_i64.to_ne_bytes());
+        let completed = CompletedLowerIrp {
+            suspended: DeviceLengthProbe { suspended: 77_u64 },
+            transfer,
+            status: wdk_sys::STATUS_SUCCESS,
+            information: core::mem::size_of::<i64>(),
+        };
+        let result = completed.finish();
+        assert_eq!(result, Ok((77, DeviceLength::from_bytes(4096))));
+
+        let probe = DeviceLengthProbe { suspended: 78_u64 };
+        assert_eq!(probe.into_suspended(), 78);
+
+        let request = StorageRequest::Flush {
+            target: StorageTarget::Filesystem,
+        };
+        let completion = failed_unsubmitted_request(request, Error::DeviceIo);
+        let (_, information, result) = completion.into_parts();
+        assert_eq!(information, 0);
+        assert_eq!(result, Err(Error::DeviceIo));
+    }
+
+    /// # Panics
+    ///
+    /// Panics if a missing external journal drops either the operation or the original request.
+    #[test]
+    fn preparation_failure_preserves_both_owned_values() {
+        let Some(fixture) = storage_fixture() else {
+            return;
+        };
+        let request = StorageRequest::Flush {
+            target: StorageTarget::ExternalJournal,
+        };
+        let result = PreparedStorageCommand::try_new(fixture.devices, request, 91_u64);
+        assert!(result.is_err());
+        let Err(error) = result else {
+            return;
+        };
+        let (driver_error, suspended, request) = error.into_parts();
+        assert_eq!(driver_error, DriverError::InvalidParameter);
+        assert_eq!(suspended, 91);
+        assert!(matches!(
+            request,
+            StorageRequest::Flush {
+                target: StorageTarget::ExternalJournal
+            }
+        ));
+
+        let request = StorageRequest::Flush {
+            target: StorageTarget::Filesystem,
+        };
+        let Ok(prepared) = PreparedStorageCommand::try_new(fixture.devices, request, 92_u64) else {
+            return;
+        };
+        let (suspended, request) = prepared.into_command().into_parts();
+        assert_eq!(suspended, 92);
+        assert!(matches!(request, StorageRequest::Flush { .. }));
     }
 }

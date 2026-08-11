@@ -20,33 +20,41 @@ use crate::kernel::{
 };
 use crate::state::{KernelDevice, KernelFileObject};
 
+#[cfg(not(test))]
+use super::ActiveCancelDestination;
+#[cfg(not(test))]
+use super::lower::LowerCompletionDestination;
+#[cfg(not(test))]
+use super::lower::{LowerCompletionEnvelope, PublishedLowerRequest};
 use super::{
-    ActiveCancelDestination, ActiveCancelEnvelope, DispatchMajor, KernelIrp, OwnedIrp, PendingIrp,
-    QueueContext, ReceivedIrp,
-    lower::{
-        CompletionRundown, LowerCompletionDestination, LowerCompletionEnvelope,
-        PublishedLowerRequest,
-    },
+    ActiveCancelEnvelope, DispatchMajor, KernelIrp, OwnedIrp, PendingIrp, QueueContext,
+    ReceivedIrp, lower::CompletionRundown,
 };
+#[cfg(not(test))]
 use crate::kernel::storage::{
-    DeviceLengthProbe, MountedStorageDevices, PreparedStorageCommand, RetryingStorageCommand,
-    StorageCommand, StorageCommandStep, StorageFailureClass, StorageRetryDelay,
-    failed_unsubmitted_request,
+    DeviceLengthProbe, PreparedStorageCommand, RetryingStorageCommand, StorageCommand,
+    StorageCommandStep, StorageRetryDelay, failed_unsubmitted_request,
 };
+use crate::kernel::storage::{MountedStorageDevices, StorageFailureClass};
 use crate::memory::DriverVec;
 
 /// Operation representation moved through storage-command envelopes.
 type SuspendedOperation = Box<dyn CompletionOperation>;
 /// One concrete storage command captured by a private lower IRP.
+#[cfg(not(test))]
 type ReactorStorageCommand = StorageCommand<SuspendedOperation>;
 /// Stable completion envelope type linked into this reactor's storage inbox.
+#[cfg(not(test))]
 type ReactorStorageEnvelope = LowerCompletionEnvelope<ReactorStorageCommand>;
 /// Driver-specific length query retaining one suspended mount operation.
+#[cfg(not(test))]
 type ReactorLengthProbe = DeviceLengthProbe<SuspendedOperation>;
 /// Stable completion envelope linked into the separate length-query inbox.
+#[cfg(not(test))]
 type ReactorLengthEnvelope = LowerCompletionEnvelope<ReactorLengthProbe>;
 
 /// Published lower cancellation identity without erasing the concrete envelope payload type.
+#[cfg(not(test))]
 enum PublishedReactorLower {
     /// Core read/write/flush request.
     Storage(PublishedLowerRequest<ReactorStorageCommand>),
@@ -54,6 +62,7 @@ enum PublishedReactorLower {
     Length(PublishedLowerRequest<ReactorLengthProbe>),
 }
 
+#[cfg(not(test))]
 impl fmt::Debug for PublishedReactorLower {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -63,11 +72,13 @@ impl fmt::Debug for PublishedReactorLower {
     }
 }
 
+#[cfg(not(test))]
 impl PublishedReactorLower {
     /// Propagates cancellation to the published lower IRP without taking release authority.
     /// # Safety
     ///
     /// The active slot must still retain this exact published lower identity.
+    #[cfg(not(test))]
     unsafe fn cancel(&self) {
         match self {
             Self::Storage(lower) => unsafe {
@@ -84,6 +95,11 @@ impl PublishedReactorLower {
 
 /// Hard bound shared by pending and active filesystem operations on one device.
 pub(crate) const MAX_OPERATIONS: usize = 64;
+
+/// Scheduler-local identity for the per-handle CLEANUP terminal barrier.
+pub(crate) const CLEANUP_HANDLE_BARRIER: u64 = 2;
+/// Scheduler-local identity for the terminal CLOSE drain.
+pub(crate) const CLOSE_HANDLE_BARRIER: u64 = 3;
 
 /// Synchronous selector borrowed only for one `IoCsqRemoveNextIrp` traversal.
 #[repr(C)]
@@ -352,6 +368,7 @@ pub(crate) enum OperationTransition {
         suspended: Box<dyn CompletionOperation>,
     },
     /// Arm one fixed storage retry timer.
+    #[cfg(not(test))]
     ArmRetry {
         /// Failed command retaining the original suspended operation.
         retry: RetryingStorageCommand<Box<dyn CompletionOperation>>,
@@ -603,10 +620,13 @@ enum ActivePhase {
         operation: Box<dyn CompletionOperation>,
     },
     /// One retry timer is armed; the original operation remains inside the command.
+    #[cfg(not(test))]
     Retry(RetryingStorageCommand<Box<dyn CompletionOperation>>),
     /// Lower IRP registration/call is executing on the reactor thread.
+    #[cfg(not(test))]
     Registering,
     /// Completion envelope owns the operation and lower lifetime.
+    #[cfg(not(test))]
     Lower(PublishedReactorLower),
 }
 
@@ -619,8 +639,11 @@ impl fmt::Debug for ActivePhase {
             Self::Intent { .. } => formatter.write_str("Intent"),
             Self::Commit { .. } => formatter.write_str("Commit"),
             Self::Waiting { .. } => formatter.write_str("Waiting"),
+            #[cfg(not(test))]
             Self::Retry(_) => formatter.write_str("Retry"),
+            #[cfg(not(test))]
             Self::Registering => formatter.write_str("Registering"),
+            #[cfg(not(test))]
             Self::Lower(_) => formatter.write_str("Lower"),
         }
     }
@@ -1293,6 +1316,7 @@ impl CompletionReactor {
     }
 
     /// Installs one resumed event, giving an already-published legal cancel precedence.
+    #[cfg(not(test))]
     fn set_ready_operation_event(
         &self,
         index: usize,
@@ -2548,9 +2572,21 @@ impl CompletionReactor {
                     })
                 }
             }
-            WaitCondition::Barrier { identity } => Some(OperationEvent::BarrierReleased(
-                ext4_core::BarrierPermit::released(identity),
-            )),
+            WaitCondition::Barrier { identity } => {
+                let slots = unsafe {
+                    // SAFETY: Only the reactor thread observes terminal lane metadata.
+                    &*self.active.get()
+                };
+                let Some(slot) = slots.get(index) else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                if !terminal_barrier_is_releasable(slot, identity) {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
+                Some(OperationEvent::BarrierReleased(
+                    ext4_core::BarrierPermit::released(identity),
+                ))
+            }
         };
         let Some(event) = event else {
             return;
@@ -3076,4 +3112,477 @@ fn mark_pending_for_csq_test(irp: KernelIrp) {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
     stack.Control |= pending_bit;
+}
+
+/// Validates that only an admitted terminal lane with no predecessor can receive its barrier.
+fn terminal_barrier_is_releasable(slot: &ActiveSlot, identity: u64) -> bool {
+    if slot.predecessor.is_some() {
+        return false;
+    }
+    matches!(
+        (slot.admission, identity),
+        (
+            Some(OperationAdmission::Handle {
+                lane: HandleOperationLane::Cleanup,
+                ..
+            }),
+            CLEANUP_HANDLE_BARRIER
+        ) | (
+            Some(OperationAdmission::Handle {
+                lane: HandleOperationLane::PostCleanup(PostCleanupRequest::Close),
+                ..
+            }),
+            CLOSE_HANDLE_BARRIER
+        )
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::boxed::Box;
+    use core::mem::MaybeUninit;
+    use core::ptr::NonNull;
+    use core::sync::atomic::Ordering;
+
+    use ext4_core::{MutationResource, OperationEvent};
+
+    use crate::kernel::status::DriverError;
+    use crate::kernel::storage::StorageFailureClass;
+    use crate::memory::DriverVec;
+    use crate::state::{KernelDevice, KernelFileObject, VolumeControlBlock};
+
+    use super::{
+        ActivePhase, ActiveSlot, ActiveSlotIdentity, AdmittedOperation, CLEANUP_HANDLE_BARRIER,
+        CLOSE_HANDLE_BARRIER, CompletionOperation, CompletionReactor, HandleOperationLane,
+        HeldCommit, HeldIntent, InfalliblePublication, IntentRequest, MAX_OPERATIONS,
+        OperationAdmission, OperationTransition, PendingIrpSelection, PostCleanupRequest,
+        PublicationAuthority, SuspendedOperation, WaitCondition, active_predecessor_is_live,
+        driver_error_to_core, earlier_queued_intent_conflicts, initialize_list_head,
+        insert_tail_list, intent_conflicts_with_held, latest_handle_predecessor, list_is_empty,
+        remove_head_list, resource_sets_overlap, slot_bit, terminal_barrier_is_releasable,
+        volume_has_commit_work,
+    };
+
+    #[derive(Debug)]
+    struct TestOperation;
+
+    impl CompletionOperation for TestOperation {
+        fn advance(self: Box<Self>, _event: OperationEvent) -> OperationTransition {
+            OperationTransition::Complete
+        }
+
+        fn record_storage_failure(&mut self, _failure: StorageFailureClass) {}
+    }
+
+    fn test_operation() -> SuspendedOperation {
+        Box::new(TestOperation)
+    }
+
+    fn advance_concrete_event(
+        mut operation: SuspendedOperation,
+        failure: StorageFailureClass,
+        event: OperationEvent,
+    ) -> OperationTransition {
+        operation.record_storage_failure(failure);
+        operation.advance(event)
+    }
+
+    fn publish_prebuilt_value(
+        publication: alloc::boxed::Box<dyn InfalliblePublication>,
+    ) -> (PublicationAuthority, SuspendedOperation) {
+        let authority = publication.authority();
+        (authority, publication.publish())
+    }
+
+    fn consume_transition(transition: OperationTransition) {
+        match transition {
+            OperationTransition::QueryDeviceLength {
+                completion_owner,
+                target,
+                suspended,
+            } => {
+                let _ = (completion_owner, target);
+                drop(suspended);
+            }
+            OperationTransition::SubmitLower {
+                devices,
+                request,
+                suspended,
+            } => {
+                let _ = devices;
+                drop(request);
+                drop(suspended);
+            }
+            OperationTransition::RequestIntent { request, suspended } => {
+                let _ = (request.volume(), request.ticket(), request.resources());
+                drop(request);
+                drop(suspended);
+            }
+            OperationTransition::RequestCommit {
+                volume,
+                ticket,
+                suspended,
+            } => {
+                let _ = (volume, ticket);
+                drop(suspended);
+            }
+            OperationTransition::Wait {
+                condition,
+                suspended,
+            } => {
+                let _ = condition;
+                drop(suspended);
+            }
+            OperationTransition::Publish { publication } => drop(publication),
+            OperationTransition::Complete => {}
+        }
+    }
+
+    fn consume_active_phase(phase: ActivePhase) {
+        match phase {
+            ActivePhase::Vacant => {}
+            ActivePhase::Ready { operation, event } => {
+                let _ = event;
+                drop(operation);
+            }
+            ActivePhase::HandleTurn { operation } => drop(operation),
+            ActivePhase::Intent { request, operation } => {
+                drop(request);
+                drop(operation);
+            }
+            ActivePhase::Commit {
+                volume,
+                ticket,
+                operation,
+            } => {
+                let _ = (volume, ticket);
+                drop(operation);
+            }
+            ActivePhase::Waiting {
+                condition,
+                operation,
+            } => {
+                let _ = condition;
+                drop(operation);
+            }
+        }
+    }
+
+    /// Keeps both consuming trait-object transitions in the unit-test production graph.
+    ///
+    /// # Panics
+    ///
+    /// This test has no runtime failure path. Compilation fails if operations stop consuming one
+    /// concrete event or durable publication gains a second construction path.
+    #[test]
+    fn consuming_operation_boundaries_remain_linked() {
+        let advance: fn(
+            SuspendedOperation,
+            StorageFailureClass,
+            OperationEvent,
+        ) -> OperationTransition = advance_concrete_event;
+        let publish: fn(
+            alloc::boxed::Box<dyn InfalliblePublication>,
+        ) -> (PublicationAuthority, SuspendedOperation) = publish_prebuilt_value;
+        let consume: fn(OperationTransition) = consume_transition;
+        let consume_phase: fn(ActivePhase) = consume_active_phase;
+        let _ = (advance, publish, consume, consume_phase);
+    }
+
+    /// # Panics
+    ///
+    /// Panics if typed handle lanes lose their admission, cancellation, or terminal-barrier
+    /// distinctions.
+    #[test]
+    fn handle_admission_and_terminal_barriers_are_typed() {
+        let mut raw_file = wdk_sys::FILE_OBJECT::default();
+        let Some(file_object) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(raw_file))
+        else {
+            return;
+        };
+        let ordinary = OperationAdmission::Handle {
+            file_object,
+            lane: HandleOperationLane::Ordinary,
+        };
+        assert_eq!(ordinary.file_object(), Some(file_object));
+        assert!(ordinary.is_ordinary_handle());
+        assert!(!ordinary.is_terminal_handle_barrier());
+
+        let cleanup = OperationAdmission::Handle {
+            file_object,
+            lane: HandleOperationLane::Cleanup,
+        };
+        assert!(cleanup.is_terminal_handle_barrier());
+        let close = OperationAdmission::Handle {
+            file_object,
+            lane: HandleOperationLane::PostCleanup(PostCleanupRequest::Close),
+        };
+        assert!(close.is_terminal_handle_barrier());
+
+        let selection = PendingIrpSelection::cleanup(file_object);
+        assert_eq!(selection.file_object, file_object);
+        assert!(selection.ordinary_cleanup_only);
+
+        let admitted = AdmittedOperation::new(test_operation(), cleanup);
+        let (operation, admission) = admitted.into_parts();
+        assert_eq!(admission, cleanup);
+        assert!(matches!(
+            operation.advance(OperationEvent::Admitted),
+            OperationTransition::Complete
+        ));
+
+        let mut slot = ActiveSlot::vacant();
+        slot.admission = Some(cleanup);
+        assert!(terminal_barrier_is_releasable(
+            &slot,
+            CLEANUP_HANDLE_BARRIER
+        ));
+        assert!(!terminal_barrier_is_releasable(&slot, CLOSE_HANDLE_BARRIER));
+        slot.predecessor = Some(ActiveSlotIdentity {
+            index: 1,
+            generation: 1,
+        });
+        assert!(!terminal_barrier_is_releasable(
+            &slot,
+            CLEANUP_HANDLE_BARRIER
+        ));
+        slot.predecessor = None;
+        slot.admission = Some(close);
+        assert!(terminal_barrier_is_releasable(&slot, CLOSE_HANDLE_BARRIER));
+        consume_active_phase(ActivePhase::Waiting {
+            condition: WaitCondition::Barrier {
+                identity: CLOSE_HANDLE_BARRIER,
+            },
+            operation: test_operation(),
+        });
+    }
+
+    /// # Panics
+    ///
+    /// Panics if same-handle requests stop chaining to the exact tail or if another handle is
+    /// serialized accidentally.
+    #[test]
+    fn handle_predecessors_chain_only_within_one_file_object() {
+        let mut raw_a = wdk_sys::FILE_OBJECT::default();
+        let mut raw_b = wdk_sys::FILE_OBJECT::default();
+        let Some(file_a) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(raw_a)) else {
+            return;
+        };
+        let Some(file_b) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(raw_b)) else {
+            return;
+        };
+        let mut slots = core::array::from_fn(|_| ActiveSlot::vacant());
+        slots[0].generation = 1;
+        slots[0].admission = Some(OperationAdmission::Handle {
+            file_object: file_a,
+            lane: HandleOperationLane::Ordinary,
+        });
+        slots[0].phase = ActivePhase::Ready {
+            operation: test_operation(),
+            event: OperationEvent::Admitted,
+        };
+        let first = ActiveSlotIdentity {
+            index: 0,
+            generation: 1,
+        };
+        assert_eq!(latest_handle_predecessor(&slots, 1, file_a), Some(first));
+        assert_eq!(latest_handle_predecessor(&slots, 1, file_b), None);
+        assert!(active_predecessor_is_live(&slots, first));
+
+        slots[1].generation = 4;
+        slots[1].admission = Some(OperationAdmission::Handle {
+            file_object: file_a,
+            lane: HandleOperationLane::PostCleanup(PostCleanupRequest::PagingRead),
+        });
+        slots[1].predecessor = Some(first);
+        slots[1].phase = ActivePhase::HandleTurn {
+            operation: test_operation(),
+        };
+        let tail = ActiveSlotIdentity {
+            index: 1,
+            generation: 4,
+        };
+        assert_eq!(latest_handle_predecessor(&slots, 2, file_a), Some(tail));
+
+        slots[0].phase = ActivePhase::Vacant;
+        assert!(!active_predecessor_is_live(&slots, first));
+        slots[1].phase = ActivePhase::Vacant;
+    }
+
+    /// # Panics
+    ///
+    /// Panics if disjoint resource intents conflict or an overlapping later FIFO ticket bypasses
+    /// an earlier request.
+    #[test]
+    fn intent_arbitration_is_overlap_scoped_and_fifo() {
+        let volume = NonNull::<VolumeControlBlock>::dangling();
+        let metadata = [MutationResource::VOLUME_METADATA];
+        let keys = [MutationResource::KEY_SET];
+        assert!(resource_sets_overlap(&metadata, &metadata));
+        assert!(!resource_sets_overlap(&metadata, &keys));
+
+        let Ok(held_resources) = DriverVec::try_copied_from_slice(&metadata) else {
+            return;
+        };
+        let mut slots = core::array::from_fn(|_| ActiveSlot::vacant());
+        slots[0].intent = Some(HeldIntent {
+            volume,
+            ticket: 1,
+            resources: held_resources,
+        });
+        let Ok(candidate_resources) = DriverVec::try_copied_from_slice(&metadata) else {
+            return;
+        };
+        let candidate = IntentRequest::new(volume, 3, candidate_resources);
+        assert_eq!(candidate.volume(), volume);
+        assert_eq!(candidate.ticket(), 3);
+        assert_eq!(candidate.resources(), metadata);
+        assert!(intent_conflicts_with_held(&slots, &candidate));
+        assert_eq!(
+            slots[0].intent.as_ref().map(|intent| intent.ticket),
+            Some(1)
+        );
+
+        let Ok(disjoint_resources) = DriverVec::try_copied_from_slice(&keys) else {
+            return;
+        };
+        let disjoint = IntentRequest::new(volume, 4, disjoint_resources);
+        assert!(!intent_conflicts_with_held(&slots, &disjoint));
+
+        let Ok(earlier_resources) = DriverVec::try_copied_from_slice(&metadata) else {
+            return;
+        };
+        slots[1].phase = ActivePhase::Intent {
+            request: IntentRequest::new(volume, 2, earlier_resources),
+            operation: test_operation(),
+        };
+        assert!(earlier_queued_intent_conflicts(&slots, &candidate));
+        assert!(!earlier_queued_intent_conflicts(&slots, &disjoint));
+        slots[1].phase = ActivePhase::Vacant;
+    }
+
+    /// # Panics
+    ///
+    /// Panics if commit visibility accounting ignores either a granted or queued commit.
+    #[test]
+    fn commit_work_tracks_granted_and_queued_slots() {
+        let mut volume_storage = MaybeUninit::<VolumeControlBlock>::uninit();
+        let mut other_storage = MaybeUninit::<VolumeControlBlock>::uninit();
+        let volume = NonNull::from(&mut volume_storage).cast::<VolumeControlBlock>();
+        let other = NonNull::from(&mut other_storage).cast::<VolumeControlBlock>();
+        let mut slots = core::array::from_fn(|_| ActiveSlot::vacant());
+        slots[0].commit = Some(HeldCommit { volume, ticket: 9 });
+        assert!(volume_has_commit_work(&slots, volume));
+        assert!(!volume_has_commit_work(&slots, other));
+        slots[0].commit = None;
+        slots[1].phase = ActivePhase::Commit {
+            volume,
+            ticket: 10,
+            operation: test_operation(),
+        };
+        assert!(volume_has_commit_work(&slots, volume));
+        slots[1].phase = ActivePhase::Vacant;
+    }
+
+    /// # Panics
+    ///
+    /// Panics if slot-local cancellation leaks to another operation or remains legal after an
+    /// effect-bearing write boundary.
+    #[test]
+    fn active_cancel_is_consumed_by_one_exact_slot() {
+        let mut raw_device = wdk_sys::DEVICE_OBJECT::default();
+        let Some(device) = KernelDevice::from_raw(core::ptr::addr_of_mut!(raw_device)) else {
+            return;
+        };
+        let mut storage = MaybeUninit::<CompletionReactor>::uninit();
+        let initialized = unsafe {
+            // SAFETY: Stack storage stays fixed until `release_at` destroys the reactor in place.
+            CompletionReactor::initialize_at(storage.as_mut_ptr(), device)
+        };
+        assert!(initialized.is_ok());
+        if initialized.is_err() {
+            return;
+        }
+        let reactor = unsafe {
+            // SAFETY: Initialization wrote a complete reactor value.
+            &*storage.as_ptr()
+        };
+        let index = reactor.reserve_active_slot();
+        assert_eq!(index, Ok(0));
+        let Ok(index) = index else {
+            return;
+        };
+        reactor
+            .cancel_ready
+            .store(slot_bit(index), Ordering::Release);
+        assert!(reactor.take_cancel_bit(index));
+        assert!(!reactor.take_cancel_bit(index));
+
+        let slots = unsafe {
+            // SAFETY: This isolated test is the sole owner of reactor-thread state.
+            &mut *reactor.active.get()
+        };
+        slots[index].cancel_enabled = true;
+        slots[index].cancel_pending = true;
+        assert!(reactor.cancellation_is_pending(index));
+        let resumed = reactor.resume_cancel_if_requested(index, test_operation());
+        assert!(resumed.is_none());
+        let phase = core::mem::replace(&mut slots[index].phase, ActivePhase::Vacant);
+        let ActivePhase::Ready { operation, event } = phase else {
+            return;
+        };
+        assert!(matches!(event, OperationEvent::CancelRequested));
+        drop(operation);
+
+        slots[index].cancel_enabled = true;
+        slots[index].cancel_pending = true;
+        reactor.disable_cancellation(index);
+        assert!(!reactor.cancellation_is_pending(index));
+        reactor.retire_cancel_slot(index);
+
+        let mut raw_file = wdk_sys::FILE_OBJECT::default();
+        let Some(file_object) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(raw_file))
+        else {
+            return;
+        };
+        reactor.cancel_pending_ordinary(file_object);
+        unsafe {
+            // SAFETY: No pending, active, or completion-owned work remains.
+            CompletionReactor::release_at(storage.as_mut_ptr());
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if intrusive completion inbox removal or error-domain mapping changes silently.
+    #[test]
+    fn intrusive_inbox_and_error_mapping_are_exact() {
+        let mut head = wdk_sys::LIST_ENTRY::default();
+        let mut first = wdk_sys::LIST_ENTRY::default();
+        let mut second = wdk_sys::LIST_ENTRY::default();
+        initialize_list_head(core::ptr::addr_of_mut!(head));
+        insert_tail_list(
+            core::ptr::addr_of_mut!(head),
+            core::ptr::addr_of_mut!(first),
+        );
+        insert_tail_list(
+            core::ptr::addr_of_mut!(head),
+            core::ptr::addr_of_mut!(second),
+        );
+        let removed = remove_head_list(core::ptr::addr_of_mut!(head));
+        assert_eq!(removed, NonNull::new(core::ptr::addr_of_mut!(first)));
+        let removed = remove_head_list(core::ptr::addr_of_mut!(head));
+        assert_eq!(removed, NonNull::new(core::ptr::addr_of_mut!(second)));
+        assert!(list_is_empty(core::ptr::addr_of_mut!(head)));
+
+        assert_eq!(
+            driver_error_to_core(DriverError::InsufficientResources),
+            ext4_core::Error::OutOfMemory
+        );
+        assert_eq!(
+            driver_error_to_core(DriverError::InvalidParameter),
+            ext4_core::Error::DeviceIo
+        );
+        assert_eq!(slot_bit(MAX_OPERATIONS - 1), 1_u64 << 63);
+    }
 }

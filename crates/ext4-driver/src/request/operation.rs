@@ -13,8 +13,8 @@ use ext4_core::{
 use wdk_sys::STATUS_SUCCESS;
 
 use crate::irp::reactor::{
-    CompletionOperation, InfalliblePublication, IntentRequest, OperationTransition,
-    PublicationAuthority, WaitCondition,
+    CLEANUP_HANDLE_BARRIER, CLOSE_HANDLE_BARRIER, CompletionOperation, InfalliblePublication,
+    IntentRequest, OperationTransition, PublicationAuthority, WaitCondition,
 };
 use crate::irp::{CreateCompletion, IrpCompletion, OwnedIrp};
 use crate::kernel::cng::CngFscryptNonceGenerator;
@@ -28,11 +28,6 @@ use crate::state::{
     MountedVolumeDeviceExtension, PendingCheckpoint, PreparedVolumeStateTransition,
     VolumeControlBlock,
 };
-
-/// Scheduler-local identity for the per-handle CLEANUP terminal barrier.
-const CLEANUP_HANDLE_BARRIER: u64 = 2;
-/// Scheduler-local identity for the terminal CLOSE drain.
-const CLOSE_HANDLE_BARRIER: u64 = 3;
 
 /// Admission failure that preserves the unique top-level completion authority.
 #[derive(Debug)]
@@ -2397,4 +2392,28 @@ pub(crate) fn flush(
     kind: FlushRequestKind,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
     FlushRequestOperation::try_new(owned, kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::irp::OwnedIrp;
+    use crate::kernel::status::DriverError;
+
+    use super::AdmitOperationError;
+
+    fn split_admission_error(error: AdmitOperationError) -> (DriverError, OwnedIrp) {
+        error.into_parts()
+    }
+
+    /// Keeps the ownership-preserving admission error consumer in the unit-test production graph.
+    ///
+    /// # Panics
+    ///
+    /// This test has no runtime failure path. Compilation fails if admission errors stop returning
+    /// the sole top-level IRP completion authority.
+    #[test]
+    fn admission_error_boundary_remains_linked() {
+        let split: fn(AdmitOperationError) -> (DriverError, OwnedIrp) = split_admission_error;
+        let _ = split;
+    }
 }

@@ -7,7 +7,9 @@ use core::ptr::NonNull;
 #[cfg(not(test))]
 use wdk_sys::{PDEVICE_OBJECT, PIRP};
 
-use crate::kernel::{fatal::KernelWideInconsistency, ffi};
+use crate::kernel::fatal::KernelWideInconsistency;
+#[cfg(not(test))]
+use crate::kernel::ffi;
 
 /// Allocation-free callback destination installed before an active cancel routine is visible.
 #[derive(Clone, Copy)]
@@ -229,5 +231,41 @@ unsafe extern "C" fn active_irp_cancelled(_device: PDEVICE_OBJECT, irp: PIRP) {
     unsafe {
         // SAFETY: Cancel routines must release the I/O Manager-held lock using this IRP's IRQL.
         ffi::IoReleaseCancelSpinLock(irp_ref.CancelIrql);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ffi::c_void;
+    use core::ptr::NonNull;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{ActiveCancelDestination, ActiveCancelEnvelope};
+
+    unsafe fn record_cancel(context: NonNull<c_void>, index: usize) {
+        let counter = unsafe {
+            // SAFETY: The test destination points to this live `AtomicUsize` for the whole call.
+            context.cast::<AtomicUsize>().as_ref()
+        };
+        counter.store(index + 1, Ordering::Release);
+    }
+
+    /// # Panics
+    ///
+    /// Panics if an address-stable cancel envelope publishes anything except its fixed slot.
+    #[test]
+    fn stable_envelope_publishes_exact_slot_without_allocation() {
+        let observed = AtomicUsize::new(0);
+        let envelope = ActiveCancelEnvelope::inert(17);
+        let destination = unsafe {
+            // SAFETY: `observed` remains live and address-stable until publication returns.
+            ActiveCancelDestination::new(NonNull::from(&observed).cast(), record_cancel)
+        };
+        unsafe {
+            // SAFETY: This is the envelope's sole initialization before publication.
+            envelope.initialize(destination);
+        }
+        envelope.publish();
+        assert_eq!(observed.load(Ordering::Acquire), 18);
     }
 }
