@@ -1,5 +1,6 @@
 //! Immutable mount profile, committed epochs, and mutation coordinator state.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::scope::*;
@@ -72,6 +73,9 @@ impl ResourceVersion {
     const INITIAL: Self = Self(0);
 
     /// Computes the next committed version before the first lower write.
+    /// # Errors
+    ///
+    /// Returns [`Error::ArithmeticOverflow`] when the version space is exhausted.
     fn next(self) -> Result<Self> {
         self.0
             .checked_add(1)
@@ -108,6 +112,9 @@ impl ObservedResourceVersionSet {
     }
 
     /// Adds one unique resource and its current version without infallible growth.
+    /// # Errors
+    ///
+    /// Returns an allocation or capacity error when the observed set cannot retain the resource.
     pub(crate) fn include(
         &mut self,
         resource: MutationResource,
@@ -152,48 +159,65 @@ struct ResourceVersionEntry {
     version: ResourceVersion,
 }
 
-/// Fixed-capacity table copied before commit so post-durability publication cannot fail.
-#[derive(Clone, Copy, Debug)]
+/// Bounded table cloned before commit so post-durability publication cannot fail.
+#[derive(Debug)]
 struct ResourceVersionTable {
-    /// Populated entries followed by empty capacity.
-    entries: [Option<ResourceVersionEntry>; MAX_TRACKED_RESOURCES],
+    /// Populated entries, bounded independently of allocator capacity.
+    entries: Vec<ResourceVersionEntry>,
 }
 
 impl ResourceVersionTable {
-    /// Builds an empty version table without allocation.
+    /// Builds an empty version table without allocation or a large stack object.
     const fn empty() -> Self {
         Self {
-            entries: [None; MAX_TRACKED_RESOURCES],
+            entries: Vec::new(),
         }
+    }
+
+    /// Fallibly copies the current table before the first lower write.
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] when the independent publication table cannot be allocated.
+    fn try_clone(&self) -> Result<Self> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for entry in self.entries.iter().copied() {
+            entries.try_push(entry)?;
+        }
+        Ok(Self { entries })
     }
 
     /// Looks up one resource, treating absent entries as the initial version.
     fn version(&self, resource: MutationResource) -> ResourceVersion {
         self.entries
             .iter()
-            .flatten()
             .find(|entry| entry.resource == resource)
             .map_or(ResourceVersion::INITIAL, |entry| entry.version)
     }
 
     /// Advances one resource in this private pre-publication table.
+    /// # Errors
+    ///
+    /// Returns an error when the version overflows, the table bound is exhausted, or storage for
+    /// a new entry cannot be allocated.
     fn advance(&mut self, resource: MutationResource) -> Result<()> {
         if let Some(entry) = self
             .entries
             .iter_mut()
-            .flatten()
             .find(|entry| entry.resource == resource)
         {
             entry.version = entry.version.next()?;
             return Ok(());
         }
-        let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) else {
+        if self.entries.len() >= MAX_TRACKED_RESOURCES {
             return Err(Error::OutOfMemory);
-        };
-        *slot = Some(ResourceVersionEntry {
+        }
+        self.entries.try_push(ResourceVersionEntry {
             resource,
             version: ResourceVersion::INITIAL.next()?,
-        });
+        })?;
         Ok(())
     }
 }
@@ -276,6 +300,9 @@ impl EpochSequence {
     pub(crate) const INITIAL: Self = Self(0);
 
     /// Returns the next sequence, or an invariant error on exhaustion.
+    /// # Errors
+    ///
+    /// Returns [`Error::ArithmeticOverflow`] when the epoch sequence is exhausted.
     pub(crate) fn next(self) -> Result<Self> {
         self.0
             .checked_add(1)
@@ -508,6 +535,9 @@ impl MutationCoordinatorState {
     }
 
     /// Allocates one stable FIFO ticket without wrapping.
+    /// # Errors
+    ///
+    /// Returns [`Error::ArithmeticOverflow`] when the FIFO ticket space is exhausted.
     pub fn admit_mutation(&mut self) -> Result<u64> {
         let ticket = self.next_ticket;
         self.next_ticket = self
@@ -542,7 +572,7 @@ impl MutationCoordinatorState {
         if !self.revalidate(observed) {
             return Err(Error::ClusterReferenceConflict);
         }
-        let mut next = self.resource_versions;
+        let mut next = self.resource_versions.try_clone()?;
         for entry in &observed.entries {
             next.advance(entry.resource)?;
         }
@@ -600,6 +630,10 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
     }
 
     /// Returns the committed allocation ownership required by mutation resolution.
+    /// # Errors
+    ///
+    /// Returns [`Error::ClusterReferenceConflict`] when called from a mount-time view that has no
+    /// committed allocation index.
     pub(super) fn committed_clusters(&self) -> Result<&ClusterReferenceIndex> {
         self.clusters.ok_or(Error::ClusterReferenceConflict)
     }
@@ -632,10 +666,10 @@ pub enum MountTransition {
         /// Request moved into the lower completion envelope.
         request: crate::StorageRequest,
         /// Mount state resumed only by the matching completion.
-        suspended: MountOperation,
+        suspended: Box<MountOperation>,
     },
     /// Mount terminated with either fully separated mounted state or a normal error.
-    Complete(Result<CompletedMount>),
+    Complete(Result<Box<CompletedMount>>),
 }
 
 /// Completion-driven journaled mount operation.
@@ -719,7 +753,7 @@ impl MountOperation {
 
     /// Consumes one concrete event and runs until the next lower request or terminal result.
     #[must_use]
-    pub fn advance(mut self, event: super::OperationEvent) -> MountTransition {
+    pub fn advance(mut self: Box<Self>, event: super::OperationEvent) -> MountTransition {
         let accepted = match event {
             super::OperationEvent::Admitted => match &self.state {
                 MountState::Resolving => Ok(()),
@@ -746,6 +780,9 @@ impl MountOperation {
     }
 
     /// Routes one completion exclusively to the phase that submitted it.
+    /// # Errors
+    ///
+    /// Returns an error when the completion does not match the suspended phase or transfer.
     fn accept_completion(&mut self, completion: crate::StorageCompletion) -> Result<()> {
         match core::mem::replace(&mut self.state, MountState::Resolving) {
             MountState::Resolving => {
@@ -771,7 +808,7 @@ impl MountOperation {
     }
 
     /// Advances internal phases without polling unrelated operations.
-    fn drive(mut self) -> MountTransition {
+    fn drive(mut self: Box<Self>) -> MountTransition {
         loop {
             match core::mem::replace(&mut self.state, MountState::Resolving) {
                 MountState::Resolving => match self.prepare_recovery() {
@@ -826,7 +863,7 @@ impl MountOperation {
                                 external_journal: _,
                                 fscrypt_keys,
                                 state: _,
-                            } = self;
+                            } = *self;
                             let profile = MountedProfile::new(
                                 publication.superblock,
                                 filesystem.len(),
@@ -838,11 +875,12 @@ impl MountOperation {
                                 clusters,
                             );
                             let coordinator = MutationCoordinatorState::new(publication.journal);
-                            return MountTransition::Complete(Ok(CompletedMount {
+                            let completed = CompletedMount {
                                 profile,
                                 epoch,
                                 coordinator,
-                            }));
+                            };
+                            return MountTransition::Complete(memory::try_box(completed));
                         }
                         Err(Error::OperationSuspended) => {
                             self.state = MountState::Indexing(publication);
@@ -857,6 +895,10 @@ impl MountOperation {
 
     /// Resolves journal placement, scans replay records, and allocates the entire recovery I/O
     /// program before its first write.
+    /// # Errors
+    ///
+    /// Returns an error when device metadata is invalid or unsupported, a lower read must be
+    /// submitted, or recovery/publication preparation fails.
     fn prepare_recovery(&mut self) -> Result<(Vec<crate::StorageRequest>, MountPublicationSeed)> {
         let superblock = {
             let mut filesystem = OperationDevice::new(&mut self.filesystem);
@@ -980,7 +1022,7 @@ impl MountOperation {
     }
 
     /// Moves the current resolve pass's sole pending read into lower ownership.
-    fn submit_pending_read(mut self) -> MountTransition {
+    fn submit_pending_read(mut self: Box<Self>) -> MountTransition {
         let request = if self.filesystem.has_pending_request() {
             self.filesystem.take_pending_request()
         } else if let Some(journal) = self.external_journal.as_mut() {
@@ -1002,6 +1044,10 @@ impl MountOperation {
     }
 
     /// Integrates one read completion into its operation-owned transcript.
+    /// # Errors
+    ///
+    /// Returns an error when the completion does not match either mount transcript or reports an
+    /// invalid transfer.
     fn complete_read(&mut self, completion: crate::StorageCompletion) -> Result<()> {
         match completion.target() {
             StorageTarget::Filesystem => self.filesystem.complete(completion),

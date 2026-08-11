@@ -807,7 +807,7 @@ pub(crate) enum SetFilePublication {
     /// No driver-visible state changes after commit.
     None,
     /// Ordered namespace notifications for a committed hard-link mutation.
-    HardLink(HardLinkDirectoryChanges),
+    HardLink(Box<HardLinkDirectoryChanges>),
     /// Handle-location and notification moves for a committed rename.
     Rename {
         /// Stable CCB update prepared before the first write.
@@ -822,7 +822,7 @@ impl SetFilePublication {
     pub(crate) fn publish(self, operations: &VolumeAccess) {
         match self {
             Self::None => {}
-            Self::HardLink(changes) => changes.report(operations),
+            Self::HardLink(changes) => (*changes).report(operations),
             Self::Rename {
                 location,
                 notifications,
@@ -958,6 +958,7 @@ fn set_file_information(
         }
         SetFilePlan::Link { mutation: request } => {
             let changes = set_hard_link_information(request, operations, mutation)?;
+            let changes = memory::boxed_try_with(move || Ok(changes))?;
             return Ok(SetFileResolution::Mutation(SetFilePublication::HardLink(
                 changes,
             )));
@@ -987,6 +988,9 @@ fn set_file_information(
 }
 
 /// Binds a preallocated rename location to the exact CCB retained by the pending request.
+/// # Errors
+///
+/// Returns an error when the active IRP stack or opened FILE_OBJECT identity is invalid.
 fn request_location_publication(
     request: &mut PendingIrpLease<'_>,
     expected: crate::state::KernelFileObject,
@@ -1662,12 +1666,14 @@ fn set_rename_information(
     let notifications = RenameDirectoryNameChanges::prepare(
         operations,
         mutation,
-        source_parent,
-        &source_name,
-        source_node,
-        target_parent,
-        &target_name,
-        target_collision,
+        RenameNotificationRequest {
+            source_parent,
+            source_name: &source_name,
+            source_node,
+            target_parent,
+            target_name: &target_name,
+            target_collision,
+        },
     )?;
     let notifications = notifications
         .map(Box::try_new)
@@ -1705,6 +1711,23 @@ pub(crate) struct RenameDirectoryNameChanges {
     new_source_name: DirectoryChange,
 }
 
+/// Fully resolved namespace identities used to prepare rename notifications.
+#[derive(Debug)]
+struct RenameNotificationRequest<'name> {
+    /// Source directory before the rename.
+    source_parent: DirectoryNodeId,
+    /// Source ext4 name before the rename.
+    source_name: &'name Ext4Name,
+    /// Typed node being renamed.
+    source_node: NodeId,
+    /// Destination directory after the rename.
+    target_parent: DirectoryNodeId,
+    /// Destination ext4 name after the rename.
+    target_name: &'name Ext4Name,
+    /// Validated collision policy.
+    target_collision: RenameTargetCollision,
+}
+
 impl RenameDirectoryNameChanges {
     /// Prepares the exact name-change events that a successful rename will publish.
     /// # Errors
@@ -1714,13 +1737,16 @@ impl RenameDirectoryNameChanges {
     fn prepare(
         operations: &mut VolumeAccess,
         read: &mut impl CommittedReadPass,
-        source_parent: DirectoryNodeId,
-        source_name: &Ext4Name,
-        source_node: NodeId,
-        target_parent: DirectoryNodeId,
-        target_name: &Ext4Name,
-        target_collision: RenameTargetCollision,
+        request: RenameNotificationRequest<'_>,
     ) -> DriverResult<Option<Self>> {
+        let RenameNotificationRequest {
+            source_parent,
+            source_name,
+            source_node,
+            target_parent,
+            target_name,
+            target_collision,
+        } = request;
         if source_parent == target_parent && source_name == target_name {
             return Ok(None);
         }

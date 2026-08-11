@@ -69,7 +69,7 @@ enum MountRequestState {
         /// Concrete lower storage geometry used by core requests.
         devices: MountedStorageDevices,
         /// Suspended consuming core mount operation.
-        mount: MountOperation,
+        mount: Box<MountOperation>,
     },
     /// Terminal completion consumed the mount IRP.
     Terminal,
@@ -84,6 +84,9 @@ struct MountRequestOperation {
 
 impl MountRequestOperation {
     /// Allocates one mount state machine without dropping the IRP on allocation failure.
+    /// # Errors
+    ///
+    /// Returns the still-owned IRP when operation storage cannot be allocated.
     fn try_new(
         owned: OwnedIrp,
         admission: MountAdmission,
@@ -140,17 +143,21 @@ impl MountRequestOperation {
     }
 
     /// Publishes a fully mounted VCB and device after every core recovery action is complete.
+    /// # Errors
+    ///
+    /// Returns an error when VCB/provider allocation, notifier or device initialization, or WDK
+    /// publication fails.
     fn publish_mount(
         admission: MountAdmission,
         devices: MountedStorageDevices,
-        completed: ext4_core::CompletedMount,
+        completed: Box<ext4_core::CompletedMount>,
     ) -> DriverResult<IrpCompletion> {
         let _output_buffer_length = admission.output_buffer_length().as_usize();
         let Some(driver_object) = admission.file_system_device().driver_object() else {
             return Err(DriverError::InvalidParameter);
         };
         let mut vcb = memory::boxed_try_with(move || {
-            VolumeControlBlock::from_completed_mount(completed, devices)
+            VolumeControlBlock::from_completed_mount(*completed, devices)
         })?;
         vcb.initialize_directory_change_notifier()?;
 
@@ -218,7 +225,12 @@ impl CompletionOperation for MountRequestOperation {
                         filesystem,
                         None,
                     );
-                    let mount = MountOperation::new(length, None, FscryptKeySet::empty());
+                    let mount = match memory::boxed_try_with(move || {
+                        Ok(MountOperation::new(length, None, FscryptKeySet::empty()))
+                    }) {
+                        Ok(mount) => mount,
+                        Err(error) => return Self::complete(owned, Err(error)),
+                    };
                     let transition = mount.advance(OperationEvent::Admitted);
                     self.drive_mount(owned, admission, devices, transition)
                 }
@@ -308,6 +320,10 @@ struct ReadRequestOperation {
 
 impl ReadRequestOperation {
     /// Allocates and initializes one read operation while preserving IRP ownership on failure.
+    /// # Errors
+    ///
+    /// Returns the still-owned IRP when mounted-state lookup, crypto/epoch acquisition, or
+    /// operation allocation fails.
     fn try_new(
         owned: OwnedIrp,
         kind: ReadRequestKind,
@@ -356,6 +372,10 @@ impl ReadRequestOperation {
     }
 
     /// Executes the driver read surface for one ephemeral committed pass.
+    /// # Errors
+    ///
+    /// Returns an error from request decoding, ext4 reads, output serialization, or control-plane
+    /// validation for the selected request kind.
     fn execute_pass(
         kind: ReadRequestKind,
         owned: &mut OwnedIrp,
@@ -487,6 +507,9 @@ struct ImmediateRequestOperation {
 
 impl ImmediateRequestOperation {
     /// Allocates an immediate operation without losing IRP completion authority on OOM.
+    /// # Errors
+    ///
+    /// Returns the still-owned IRP when operation storage cannot be allocated.
     fn try_new(
         owned: OwnedIrp,
         kind: ImmediateRequestKind,
@@ -596,6 +619,9 @@ struct NotificationOperation {
 
 impl NotificationOperation {
     /// Allocates the delegation state without dropping the unique IRP on OOM.
+    /// # Errors
+    ///
+    /// Returns the still-owned IRP when operation storage cannot be allocated.
     fn try_new(owned: OwnedIrp) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
         match memory::boxed_try_map(owned, |owned| Self {
             state: NotificationOperationState::Ready(owned),
@@ -703,6 +729,9 @@ struct VolumeControlOperation {
 
 impl VolumeControlOperation {
     /// Allocates one lifecycle operation while preserving IRP completion ownership on OOM.
+    /// # Errors
+    ///
+    /// Returns the still-owned IRP when operation storage cannot be allocated.
     fn try_new(
         owned: OwnedIrp,
         kind: VolumeControlRequestKind,
@@ -779,7 +808,6 @@ impl CompletionOperation for VolumeControlOperation {
                     match self.kind {
                         VolumeControlRequestKind::Unlock => {
                             let result = access.unlock_volume(target.owner());
-                            drop(access);
                             if result.is_ok() {
                                 MountedVolumeDevice::publish_volume_lock(target.device(), false);
                             }
@@ -800,7 +828,6 @@ impl CompletionOperation for VolumeControlOperation {
                                 Err(error) => return Self::complete(owned, Err(error)),
                             };
                             let devices = access.runtime().storage();
-                            drop(access);
                             self.state = VolumeControlOperationState::Waiting {
                                 owned,
                                 target,
@@ -925,7 +952,9 @@ enum FlushOperationState {
     Waiting(OwnedIrp),
     /// One filesystem flush is owned by a lower completion envelope.
     InFlight {
+        /// Unique top-level completion authority.
         owned: OwnedIrp,
+        /// Identity of the exact lower flush.
         expected: StorageRequestIdentity,
     },
     /// Terminal completion consumed the IRP.
@@ -947,6 +976,9 @@ struct FlushRequestOperation {
 
 impl FlushRequestOperation {
     /// Allocates one flush operation while preserving the top-level IRP on OOM.
+    /// # Errors
+    ///
+    /// Returns the still-owned IRP when mounted-state lookup or operation allocation fails.
     fn try_new(
         owned: OwnedIrp,
         kind: FlushRequestKind,
@@ -982,6 +1014,10 @@ impl FlushRequestOperation {
     }
 
     /// Validates the FILE_OBJECT or device-level flush target without retaining a raw pointer.
+    /// # Errors
+    ///
+    /// Returns an error when the active stack, FILE_OBJECT lifecycle, or selected mounted volume
+    /// does not authorize this flush.
     fn validate_target(&self, owned: &mut OwnedIrp) -> DriverResult<()> {
         let selected = owned.request().with_active(|active| {
             if self.kind == FlushRequestKind::Shutdown {
@@ -1155,13 +1191,13 @@ enum TopLevelCompletion {
 #[derive(Debug)]
 enum PendingDriverPublication {
     /// Create must acquire its FCB/share claim before the first write.
-    Create(crate::request::create::PendingCreatePublication),
+    Create(Box<crate::request::create::PendingCreatePublication>),
     /// Write position was fully validated and prepared by resolve.
     Write(crate::request::file_info::PreparedWritePublication),
     /// Set-information driver state was fully allocated by resolve.
     SetFile(crate::request::file_info::SetFilePublication),
     /// Cleanup deletion notification and target were fully prepared by resolve.
-    Cleanup(crate::request::file_info::PreparedCleanupPublication),
+    Cleanup(Box<crate::request::file_info::PreparedCleanupPublication>),
     /// Prevalidated VPB label publication.
     VolumeLabel(crate::request::volume_info::PreparedVolumeLabelPublication),
     /// Mutation has no additional driver state to publish.
@@ -1172,13 +1208,13 @@ enum PendingDriverPublication {
 #[derive(Debug)]
 enum PreparedDriverPublication {
     /// Fully claimed create handle state.
-    Create(crate::request::create::PreparedCreatePublication),
+    Create(Box<crate::request::create::PreparedCreatePublication>),
     /// Checked write cursor and completion.
     Write(crate::request::file_info::PreparedWritePublication),
     /// Set-information publication.
     SetFile(crate::request::file_info::SetFilePublication),
     /// Cleanup deletion publication.
-    Cleanup(crate::request::file_info::PreparedCleanupPublication),
+    Cleanup(Box<crate::request::file_info::PreparedCleanupPublication>),
     /// Volume-label publication.
     VolumeLabel(crate::request::volume_info::PreparedVolumeLabelPublication),
     /// No driver-side mutation publication.
@@ -1187,9 +1223,15 @@ enum PreparedDriverPublication {
 
 impl PendingDriverPublication {
     /// Completes every fallible driver-side acquisition before commit I/O can start.
+    /// # Errors
+    ///
+    /// Returns an error when create publication cannot pre-acquire its FCB/share/handle state.
     fn prepare(self) -> DriverResult<PreparedDriverPublication> {
         Ok(match self {
-            Self::Create(publication) => PreparedDriverPublication::Create(publication.prepare()?),
+            Self::Create(publication) => {
+                let publication = (*publication).prepare()?;
+                PreparedDriverPublication::Create(memory::boxed_try_with(move || Ok(publication))?)
+            }
             Self::Write(publication) => PreparedDriverPublication::Write(publication),
             Self::SetFile(publication) => PreparedDriverPublication::SetFile(publication),
             Self::Cleanup(publication) => PreparedDriverPublication::Cleanup(publication),
@@ -1204,7 +1246,7 @@ impl PreparedDriverPublication {
     fn publish(self, operations: &mut crate::state::VolumeAccess) -> TopLevelCompletion {
         match self {
             Self::Create(publication) => {
-                TopLevelCompletion::Create(publication.publish(operations))
+                TopLevelCompletion::Create((*publication).publish(operations))
             }
             Self::Write(publication) => TopLevelCompletion::Normal(publication.publish()),
             Self::SetFile(publication) => {
@@ -1212,7 +1254,7 @@ impl PreparedDriverPublication {
                 TopLevelCompletion::Normal(IrpCompletion::EMPTY)
             }
             Self::Cleanup(publication) => {
-                TopLevelCompletion::Normal(publication.publish(operations))
+                TopLevelCompletion::Normal((*publication).publish(operations))
             }
             Self::VolumeLabel(publication) => {
                 publication.publish();
@@ -1241,32 +1283,44 @@ struct CommitContext {
 enum CommitIoPhase {
     /// One ordered data write is in flight; `remaining` owns the rest.
     OrderedWrite {
+        /// Identity of the exact in-flight lower write.
         expected: StorageRequestIdentity,
+        /// Remaining ordered writes and their durability continuation.
         remaining: StorageRequestSequence<OrderedDataDurability>,
     },
     /// Filesystem flush after every ordered data write.
     OrderedFlush {
+        /// Identity of the in-flight filesystem flush.
         expected: StorageRequestIdentity,
+        /// Continuation revealed after ordered-data durability.
         next: OrderedDataDurability,
     },
     /// One journal descriptor/payload write is in flight.
     JournalWrite {
+        /// Identity of the exact in-flight journal write.
         expected: StorageRequestIdentity,
+        /// Remaining journal writes and their durability continuation.
         remaining: StorageRequestSequence<JournalPayloadDurability>,
     },
     /// Journal payload durability flush preceding the commit record.
     JournalFlush {
+        /// Identity of the in-flight journal-device flush.
         expected: StorageRequestIdentity,
+        /// Commit-record continuation revealed after the flush.
         next: JournalPayloadDurability,
     },
     /// Single commit record write.
     CommitWrite {
+        /// Identity of the in-flight commit-record write.
         expected: StorageRequestIdentity,
+        /// Commit durability continuation retained through the write.
         next: CommitDurability,
     },
     /// Flush that establishes commit durability.
     CommitFlush {
+        /// Identity of the in-flight commit durability flush.
         expected: StorageRequestIdentity,
+        /// Durable mutation revealed only by successful completion.
         next: CommitDurability,
     },
 }
@@ -1276,22 +1330,30 @@ enum CommitIoPhase {
 enum CheckpointIoPhase {
     /// One home-block write is in flight.
     HomeWrite {
+        /// Identity of the exact in-flight home-block write.
         expected: StorageRequestIdentity,
+        /// Remaining home writes and clean-journal continuation.
         remaining: StorageRequestSequence<HomeBlockDurability>,
     },
     /// Filesystem durability flush after home-block writes.
     HomeFlush {
+        /// Identity of the in-flight home-block durability flush.
         expected: StorageRequestIdentity,
+        /// Clean-journal continuation revealed after the flush.
         next: HomeBlockDurability,
     },
     /// Clean journal-superblock write.
     CleanWrite {
+        /// Identity of the in-flight clean journal write.
         expected: StorageRequestIdentity,
+        /// Clean journal durability continuation retained through the write.
         next: CleanJournalDurability,
     },
     /// Flush that makes the clean journal state durable.
     CleanFlush {
+        /// Identity of the in-flight clean journal flush.
         expected: StorageRequestIdentity,
+        /// Overlay-free epoch publication revealed by successful completion.
         next: CleanJournalDurability,
     },
 }
@@ -1301,51 +1363,74 @@ enum CheckpointIoPhase {
 enum MutationOperationState {
     /// Read-only resolution against one immutable epoch.
     Resolving {
+        /// Unique top-level completion authority.
         owned: OwnedIrp,
+        /// Immutable epoch pinned for this resolve attempt.
         epoch: EpochLease,
+        /// Restartable core resolve state.
         resolve: MutationResolveOperation,
     },
     /// Resolved resources await atomic intent acquisition.
     AwaitingIntent {
+        /// Unique top-level completion authority.
         owned: OwnedIrp,
+        /// Resource-version-bearing resolved mutation.
         resolved: ResolvedMutation,
+        /// Driver publication values prepared by resolve.
         publication: PendingDriverPublication,
     },
     /// Revalidated reservation and all publication allocations await commit serialization.
     AwaitingCommit {
+        /// Unique top-level completion authority.
         owned: OwnedIrp,
+        /// Intent-protected core mutation.
         reserved: ReservedMutation,
+        /// Fully fallible-prepared driver publication.
         publication: PreparedDriverPublication,
+        /// Both epoch storage reservations allocated before the first write.
         slots: EpochPublicationSlots,
     },
     /// Commit writes and durability flushes are in progress.
     CommitIo {
+        /// Top-level and publication ownership retained through durability.
         context: CommitContext,
+        /// Exact in-flight commit I/O phase.
         phase: CommitIoPhase,
     },
     /// Durable mutation waits only for the short visibility gate.
     AwaitingVisibility {
+        /// Top-level and publication ownership retained until visibility.
         context: CommitContext,
+        /// Core state proven durable but not yet reader-visible.
         durable: DurableMutation,
     },
     /// Durable values plus the consumed visibility grant await infallible publication.
     PublishingDurable {
+        /// Top-level and publication ownership consumed by the publish transition.
         context: CommitContext,
+        /// Core durable mutation moved into the committed epoch.
         durable: DurableMutation,
+        /// One-use short visibility capability.
         visibility: ext4_core::VisibilityLease,
     },
     /// Detached checkpoint waits independently of reader visibility.
     AwaitingCheckpoint(PendingCheckpoint),
     /// Checkpoint lower I/O is in progress.
     CheckpointIo {
+        /// Exact in-flight checkpoint I/O phase.
         phase: CheckpointIoPhase,
+        /// Pre-reserved overlay-free epoch storage.
         publication: EpochPublicationSlot,
+        /// Visible overlay epoch being checkpointed.
         epoch: ext4_core::EpochSequence,
     },
     /// Clean journal and overlay-free epoch await infallible publication.
     PublishingCheckpoint {
+        /// Core clean-journal durability state.
         durability: CleanJournalDurability,
+        /// Pre-reserved overlay-free epoch storage.
         publication: EpochPublicationSlot,
+        /// Visible overlay epoch whose checkpoint is complete.
         epoch: ext4_core::EpochSequence,
     },
     /// Every authority has been consumed.
@@ -1387,6 +1472,10 @@ enum DriverResolveDisposition {
 
 impl MutationRequestOperation {
     /// Allocates one mutation operation after acquiring its stable ticket and epoch lease.
+    /// # Errors
+    ///
+    /// Returns the still-owned IRP when mounted state, time, crypto, ticket, epoch, or operation
+    /// allocation cannot be acquired.
     fn try_new(
         owned: OwnedIrp,
         kind: MutationRequestKind,
@@ -1474,6 +1563,10 @@ impl MutationRequestOperation {
     }
 
     /// Runs the concrete driver mutation surface inside one restart-local core pass.
+    /// # Errors
+    ///
+    /// Returns an error from request decoding, mutation staging, pre-commit publication
+    /// preparation, or cleanup lifecycle validation.
     fn execute_resolve(
         kind: MutationRequestKind,
         cleanup_deletion: &mut Option<crate::request::file_info::PendingCleanupDeletion>,
@@ -1606,6 +1699,7 @@ impl MutationRequestOperation {
                 };
                 let publication =
                     crate::request::file_info::stage_cleanup_deletion(deletion, mutation)?;
+                let publication = memory::boxed_try_with(move || Ok(publication))?;
                 Ok(DriverResolveDisposition::Mutation(
                     PendingDriverPublication::Cleanup(publication),
                 ))
@@ -2125,7 +2219,12 @@ impl CompletionOperation for MutationRequestOperation {
                         // operation-owned until publish or pre-write rollback.
                         VolumeControlBlock::operation_access(self.volume)
                     };
-                    match unsafe { access.runtime_mut().reserve_epoch_publication() } {
+                    let reservations = unsafe {
+                        // SAFETY: This mounted runtime remains at its final VCB address until the
+                        // operation publishes or drops both returned reservations.
+                        access.runtime_mut().reserve_epoch_publication()
+                    };
+                    match reservations {
                         Ok(slots) => slots,
                         Err(error) => return self.complete_error(owned, error),
                     }
@@ -2366,6 +2465,9 @@ impl InfalliblePublication for MutationRequestOperation {
 unsafe impl Send for MutationRequestOperation {}
 
 /// Allocates one completion-driven mount operation.
+/// # Errors
+///
+/// Returns the still-owned IRP when mount operation allocation fails.
 pub(crate) fn mount(
     owned: OwnedIrp,
     admission: MountAdmission,
@@ -2374,6 +2476,9 @@ pub(crate) fn mount(
 }
 
 /// Allocates one directory-change notification delegation.
+/// # Errors
+///
+/// Returns the still-owned IRP when notification operation allocation fails.
 pub(crate) fn notification(
     owned: OwnedIrp,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
@@ -2381,6 +2486,9 @@ pub(crate) fn notification(
 }
 
 /// Allocates one barrier-driven direct-volume lifecycle operation.
+/// # Errors
+///
+/// Returns the still-owned IRP when lifecycle operation allocation fails.
 pub(crate) fn volume_control(
     owned: OwnedIrp,
     kind: VolumeControlRequestKind,
@@ -2389,6 +2497,9 @@ pub(crate) fn volume_control(
 }
 
 /// Allocates one concrete read operation.
+/// # Errors
+///
+/// Returns the still-owned IRP when read admission or operation allocation fails.
 pub(crate) fn read(
     owned: OwnedIrp,
     kind: ReadRequestKind,
@@ -2397,6 +2508,9 @@ pub(crate) fn read(
 }
 
 /// Allocates one concrete single-transition operation.
+/// # Errors
+///
+/// Returns the still-owned IRP when immediate operation allocation fails.
 pub(crate) fn immediate(
     owned: OwnedIrp,
     kind: ImmediateRequestKind,
@@ -2405,6 +2519,9 @@ pub(crate) fn immediate(
 }
 
 /// Allocates one concrete journaled mutation operation.
+/// # Errors
+///
+/// Returns the still-owned IRP when mutation admission or operation allocation fails.
 pub(crate) fn mutation(
     owned: OwnedIrp,
     kind: MutationRequestKind,
@@ -2413,6 +2530,9 @@ pub(crate) fn mutation(
 }
 
 /// Allocates one concrete durability-barrier and lower-flush operation.
+/// # Errors
+///
+/// Returns the still-owned IRP when flush admission or operation allocation fails.
 pub(crate) fn flush(
     owned: OwnedIrp,
     kind: FlushRequestKind,
@@ -2439,7 +2559,6 @@ mod tests {
     /// the sole top-level IRP completion authority.
     #[test]
     fn admission_error_boundary_remains_linked() {
-        let split: fn(AdmitOperationError) -> (DriverError, OwnedIrp) = split_admission_error;
-        let _ = split;
+        let _split: fn(AdmitOperationError) -> (DriverError, OwnedIrp) = split_admission_error;
     }
 }

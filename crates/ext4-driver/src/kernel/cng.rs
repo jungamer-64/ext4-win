@@ -9,180 +9,43 @@ use wdk_sys::{NT_SUCCESS, NTSTATUS, STATUS_INSUFFICIENT_RESOURCES};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 
-/// CNG algorithm identifiers and property names are NUL-terminated UTF-16 strings.
-static XTS_AES_ALGORITHM: [u16; 8] = [
-    b'X' as u16,
-    b'T' as u16,
-    b'S' as u16,
-    b'-' as u16,
-    b'A' as u16,
-    b'E' as u16,
-    b'S' as u16,
-    0,
-];
-static AES_ALGORITHM: [u16; 4] = [b'A' as u16, b'E' as u16, b'S' as u16, 0];
-static HKDF_ALGORITHM: [u16; 5] = [b'H' as u16, b'K' as u16, b'D' as u16, b'F' as u16, 0];
-static SHA256_ALGORITHM: [u16; 7] = [
-    b'S' as u16,
-    b'H' as u16,
-    b'A' as u16,
-    b'2' as u16,
-    b'5' as u16,
-    b'6' as u16,
-    0,
-];
-static SHA512_ALGORITHM: [u16; 7] = [
-    b'S' as u16,
-    b'H' as u16,
-    b'A' as u16,
-    b'5' as u16,
-    b'1' as u16,
-    b'2' as u16,
-    0,
-];
-static OBJECT_LENGTH_PROPERTY: [u16; 13] = [
-    b'O' as u16,
-    b'b' as u16,
-    b'j' as u16,
-    b'e' as u16,
-    b'c' as u16,
-    b't' as u16,
-    b'L' as u16,
-    b'e' as u16,
-    b'n' as u16,
-    b'g' as u16,
-    b't' as u16,
-    b'h' as u16,
-    0,
-];
+/// NUL-terminated UTF-16 CNG identifier for the kernel XTS-AES provider.
+static XTS_AES_ALGORITHM: [u16; 8] = [88, 84, 83, 45, 65, 69, 83, 0];
+/// NUL-terminated UTF-16 CNG identifier for the AES provider.
+static AES_ALGORITHM: [u16; 4] = [65, 69, 83, 0];
+/// NUL-terminated UTF-16 CNG identifier for the HKDF provider.
+static HKDF_ALGORITHM: [u16; 5] = [72, 75, 68, 70, 0];
+/// NUL-terminated UTF-16 CNG identifier for the SHA-256 provider.
+static SHA256_ALGORITHM: [u16; 7] = [83, 72, 65, 50, 53, 54, 0];
+/// NUL-terminated UTF-16 CNG identifier for the SHA-512 provider.
+static SHA512_ALGORITHM: [u16; 7] = [83, 72, 65, 53, 49, 50, 0];
+/// NUL-terminated UTF-16 CNG property name for provider object length.
+static OBJECT_LENGTH_PROPERTY: [u16; 13] =
+    [79, 98, 106, 101, 99, 116, 76, 101, 110, 103, 116, 104, 0];
+/// NUL-terminated UTF-16 CNG property name for hash digest length.
 static HASH_LENGTH_PROPERTY: [u16; 17] = [
-    b'H' as u16,
-    b'a' as u16,
-    b's' as u16,
-    b'h' as u16,
-    b'D' as u16,
-    b'i' as u16,
-    b'g' as u16,
-    b'e' as u16,
-    b's' as u16,
-    b't' as u16,
-    b'L' as u16,
-    b'e' as u16,
-    b'n' as u16,
-    b'g' as u16,
-    b't' as u16,
-    b'h' as u16,
-    0,
+    72, 97, 115, 104, 68, 105, 103, 101, 115, 116, 76, 101, 110, 103, 116, 104, 0,
 ];
-static BLOCK_LENGTH_PROPERTY: [u16; 12] = [
-    b'B' as u16,
-    b'l' as u16,
-    b'o' as u16,
-    b'c' as u16,
-    b'k' as u16,
-    b'L' as u16,
-    b'e' as u16,
-    b'n' as u16,
-    b'g' as u16,
-    b't' as u16,
-    b'h' as u16,
-    0,
-];
+/// NUL-terminated UTF-16 CNG property name for cipher block length.
+static BLOCK_LENGTH_PROPERTY: [u16; 12] = [66, 108, 111, 99, 107, 76, 101, 110, 103, 116, 104, 0];
+/// NUL-terminated UTF-16 CNG property name for an XTS data-unit length.
 static MESSAGE_BLOCK_LENGTH_PROPERTY: [u16; 19] = [
-    b'M' as u16,
-    b'e' as u16,
-    b's' as u16,
-    b's' as u16,
-    b'a' as u16,
-    b'g' as u16,
-    b'e' as u16,
-    b'B' as u16,
-    b'l' as u16,
-    b'o' as u16,
-    b'c' as u16,
-    b'k' as u16,
-    b'L' as u16,
-    b'e' as u16,
-    b'n' as u16,
-    b'g' as u16,
-    b't' as u16,
-    b'h' as u16,
-    0,
+    77, 101, 115, 115, 97, 103, 101, 66, 108, 111, 99, 107, 76, 101, 110, 103, 116, 104, 0,
 ];
-static CHAINING_MODE_PROPERTY: [u16; 13] = [
-    b'C' as u16,
-    b'h' as u16,
-    b'a' as u16,
-    b'i' as u16,
-    b'n' as u16,
-    b'i' as u16,
-    b'n' as u16,
-    b'g' as u16,
-    b'M' as u16,
-    b'o' as u16,
-    b'd' as u16,
-    b'e' as u16,
-    0,
-];
+/// NUL-terminated UTF-16 CNG property name for a provider chaining mode.
+static CHAINING_MODE_PROPERTY: [u16; 13] =
+    [67, 104, 97, 105, 110, 105, 110, 103, 77, 111, 100, 101, 0];
+/// NUL-terminated UTF-16 CNG chaining-mode value selecting ECB.
 static CHAINING_MODE_ECB: [u16; 16] = [
-    b'C' as u16,
-    b'h' as u16,
-    b'a' as u16,
-    b'i' as u16,
-    b'n' as u16,
-    b'i' as u16,
-    b'n' as u16,
-    b'g' as u16,
-    b'M' as u16,
-    b'o' as u16,
-    b'd' as u16,
-    b'e' as u16,
-    b'E' as u16,
-    b'C' as u16,
-    b'B' as u16,
-    0,
+    67, 104, 97, 105, 110, 105, 110, 103, 77, 111, 100, 101, 69, 67, 66, 0,
 ];
+/// NUL-terminated UTF-16 CNG HKDF property selecting the underlying hash.
 static HKDF_HASH_ALGORITHM_PROPERTY: [u16; 18] = [
-    b'H' as u16,
-    b'k' as u16,
-    b'd' as u16,
-    b'f' as u16,
-    b'H' as u16,
-    b'a' as u16,
-    b's' as u16,
-    b'h' as u16,
-    b'A' as u16,
-    b'l' as u16,
-    b'g' as u16,
-    b'o' as u16,
-    b'r' as u16,
-    b'i' as u16,
-    b't' as u16,
-    b'h' as u16,
-    b'm' as u16,
-    0,
+    72, 107, 100, 102, 72, 97, 115, 104, 65, 108, 103, 111, 114, 105, 116, 104, 109, 0,
 ];
+/// NUL-terminated UTF-16 CNG HKDF property supplying salt and finalizing extraction.
 static HKDF_SALT_AND_FINALIZE_PROPERTY: [u16; 20] = [
-    b'H' as u16,
-    b'k' as u16,
-    b'd' as u16,
-    b'f' as u16,
-    b'S' as u16,
-    b'a' as u16,
-    b'l' as u16,
-    b't' as u16,
-    b'A' as u16,
-    b'n' as u16,
-    b'd' as u16,
-    b'F' as u16,
-    b'i' as u16,
-    b'n' as u16,
-    b'a' as u16,
-    b'l' as u16,
-    b'i' as u16,
-    b'z' as u16,
-    b'e' as u16,
-    0,
+    72, 107, 100, 102, 83, 97, 108, 116, 65, 110, 100, 70, 105, 110, 97, 108, 105, 122, 101, 0,
 ];
 
 /// Ask CNG to use the system-preferred RNG without opening an algorithm handle.
@@ -332,6 +195,9 @@ struct OwnedAlgorithmHandle(AlgorithmHandle);
 
 impl OwnedAlgorithmHandle {
     /// Opens one default CNG primitive provider at PASSIVE_LEVEL.
+    /// # Errors
+    ///
+    /// Returns an error when CNG cannot open the provider or returns a null handle.
     fn open(identifier: &[u16]) -> DriverResult<Self> {
         let mut raw = core::ptr::null_mut();
         let status = unsafe {
@@ -382,6 +248,9 @@ struct SymmetricProvider {
 
 impl SymmetricProvider {
     /// Opens one caller-buffered key algorithm.
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot be opened or its object length is invalid.
     fn open(identifier: &[u16]) -> DriverResult<Self> {
         let algorithm = OwnedAlgorithmHandle::open(identifier)?;
         let key_object_bytes = query_usize_property(algorithm.borrowed(), &OBJECT_LENGTH_PROPERTY)?;
@@ -395,6 +264,9 @@ impl SymmetricProvider {
     }
 
     /// Opens one AES-family provider and verifies its fixed block geometry.
+    /// # Errors
+    ///
+    /// Returns an error when provider construction fails or CNG reports a non-AES block length.
     fn open_aes(identifier: &[u16]) -> DriverResult<Self> {
         let provider = Self::open(identifier)?;
         let block_bytes =
@@ -436,6 +308,10 @@ struct HashProvider {
 
 impl HashProvider {
     /// Opens and validates one fixed-output hash provider.
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot be opened or reports inconsistent object or
+    /// digest geometry.
     fn open(identifier: &[u16], expected_digest_bytes: usize) -> DriverResult<Self> {
         let algorithm = OwnedAlgorithmHandle::open(identifier)?;
         let object_bytes = query_usize_property(algorithm.borrowed(), &OBJECT_LENGTH_PROPERTY)?;
@@ -531,6 +407,10 @@ struct ReusableHash {
 
 impl ReusableHash {
     /// Allocates and constructs one reusable unkeyed hash object.
+    /// # Errors
+    ///
+    /// Returns an error when the stable object allocation, ABI conversion, CNG construction, or
+    /// returned handle validation fails.
     fn try_new(provider: &HashProvider) -> DriverResult<Self> {
         let mut object = DriverVec::try_repeated_copy(0_u8, provider.object_bytes)?;
         let object_bytes =
@@ -559,6 +439,10 @@ impl ReusableHash {
     }
 
     /// Hashes one input and lets CNG reset this reusable object after finalization.
+    /// # Errors
+    ///
+    /// Returns an error when the requested digest size differs from the mounted provider, an ABI
+    /// length overflows, or CNG hashing/finalization fails.
     fn digest<const N: usize>(&mut self, input: &[u8]) -> Ext4Result<[u8; N]> {
         if self.digest_bytes != N {
             return Err(Error::CryptographicFailure);
@@ -801,6 +685,10 @@ enum CipherDirection {
 }
 
 /// Generates one key into a checked prefix of the operation-owned object buffer.
+/// # Errors
+///
+/// Returns an error when the object prefix or ABI lengths are invalid, or CNG cannot construct a
+/// non-null key handle.
 fn generate_key<'object>(
     execution: SymmetricExecution,
     key_object: &'object mut [u8],
@@ -839,6 +727,10 @@ fn generate_key<'object>(
 }
 
 /// Applies AES-256-XTS in place with the Linux little-endian data-unit tweak.
+/// # Errors
+///
+/// Returns an error for an invalid data-unit length, key construction/property failure, or CNG
+/// encryption/decryption failure.
 fn crypt_xts(
     execution: SymmetricExecution,
     key_object: &mut [u8],
@@ -862,6 +754,10 @@ fn crypt_xts(
 }
 
 /// Applies one CNG symmetric key to the same caller-owned input/output range.
+/// # Errors
+///
+/// Returns an error when a length is not representable, CNG rejects the operation, or the provider
+/// reports a short result.
 fn crypt_in_place(
     key: &GeneratedKey<'_>,
     buffer: &mut [u8],
@@ -877,12 +773,11 @@ fn crypt_in_place(
         None => (core::ptr::null_mut(), 0),
     };
     let mut result_bytes = 0_u32;
-    let status = unsafe {
-        // SAFETY: CNG permits in-place symmetric encryption/decryption. `buffer` and the optional
-        // IV are exclusively writable for their declared lengths, and `key` retains the backing
-        // key-object buffer for the entire call.
-        match direction {
-            CipherDirection::Encrypt => BCryptEncrypt(
+    let status = match direction {
+        CipherDirection::Encrypt => unsafe {
+            // SAFETY: CNG permits in-place encryption. `buffer` and the optional IV are
+            // exclusively writable, and `key` retains the backing object for the entire call.
+            BCryptEncrypt(
                 key.as_raw(),
                 buffer.as_mut_ptr(),
                 buffer_bytes,
@@ -893,8 +788,12 @@ fn crypt_in_place(
                 buffer_bytes,
                 core::ptr::addr_of_mut!(result_bytes),
                 0,
-            ),
-            CipherDirection::Decrypt => BCryptDecrypt(
+            )
+        },
+        CipherDirection::Decrypt => unsafe {
+            // SAFETY: CNG permits in-place decryption. `buffer` and the optional IV are
+            // exclusively writable, and `key` retains the backing object for the entire call.
+            BCryptDecrypt(
                 key.as_raw(),
                 buffer.as_mut_ptr(),
                 buffer_bytes,
@@ -905,8 +804,8 @@ fn crypt_in_place(
                 buffer_bytes,
                 core::ptr::addr_of_mut!(result_bytes),
                 0,
-            ),
-        }
+            )
+        },
     };
     cng_status_to_core(status)?;
     if result_bytes != buffer_bytes {
@@ -916,16 +815,26 @@ fn crypt_in_place(
 }
 
 /// Encrypts one exact AES block with the operation's ECB key.
+/// # Errors
+///
+/// Returns an error when CNG cannot encrypt the block exactly in place.
 fn encrypt_block(key: &GeneratedKey<'_>, block: &mut [u8; AES_BLOCK_BYTES]) -> Ext4Result<()> {
     crypt_in_place(key, block, None, CipherDirection::Encrypt)
 }
 
 /// Decrypts one exact AES block with the operation's ECB key.
+/// # Errors
+///
+/// Returns an error when CNG cannot decrypt the block exactly in place.
 fn decrypt_block(key: &GeneratedKey<'_>, block: &mut [u8; AES_BLOCK_BYTES]) -> Ext4Result<()> {
     crypt_in_place(key, block, None, CipherDirection::Decrypt)
 }
 
 /// Linux `cts(cbc(aes))` encryption, equivalent to CBC-CS3 with a zero IV.
+/// # Errors
+///
+/// Returns an error when the input is too short, checked partition arithmetic fails, or an AES
+/// block cannot be transformed.
 fn encrypt_cbc_cs3(key: &GeneratedKey<'_>, buffer: &mut [u8]) -> Ext4Result<()> {
     if buffer.len() < AES_BLOCK_BYTES {
         return Err(Error::InvalidName);
@@ -936,7 +845,11 @@ fn encrypt_cbc_cs3(key: &GeneratedKey<'_>, buffer: &mut [u8]) -> Ext4Result<()> 
     let (full, tail) = buffer
         .split_at_mut_checked(full_bytes)
         .ok_or(Error::CryptographicFailure)?;
-    for chunk in full.chunks_exact_mut(AES_BLOCK_BYTES) {
+    let (blocks, unexpected_tail) = full.as_chunks_mut::<AES_BLOCK_BYTES>();
+    if !unexpected_tail.is_empty() {
+        return Err(Error::CryptographicFailure);
+    }
+    for chunk in blocks {
         let mut block = [0_u8; AES_BLOCK_BYTES];
         copy_equal(&mut block, chunk)?;
         xor_block(&mut block, &previous);
@@ -986,6 +899,10 @@ fn encrypt_cbc_cs3(key: &GeneratedKey<'_>, buffer: &mut [u8]) -> Ext4Result<()> 
 }
 
 /// Linux `cts(cbc(aes))` decryption, equivalent to CBC-CS3 with a zero IV.
+/// # Errors
+///
+/// Returns an error when the input is too short, checked partition arithmetic fails, or an AES
+/// block cannot be transformed.
 fn decrypt_cbc_cs3(key: &GeneratedKey<'_>, buffer: &mut [u8]) -> Ext4Result<()> {
     if buffer.len() < AES_BLOCK_BYTES {
         return Err(Error::InvalidName);
@@ -1010,7 +927,11 @@ fn decrypt_cbc_cs3(key: &GeneratedKey<'_>, buffer: &mut [u8]) -> Ext4Result<()> 
     let main = buffer
         .get_mut(..main_bytes)
         .ok_or(Error::CryptographicFailure)?;
-    for chunk in main.chunks_exact_mut(AES_BLOCK_BYTES) {
+    let (blocks, unexpected_tail) = main.as_chunks_mut::<AES_BLOCK_BYTES>();
+    if !unexpected_tail.is_empty() {
+        return Err(Error::CryptographicFailure);
+    }
+    for chunk in blocks {
         let mut ciphertext = [0_u8; AES_BLOCK_BYTES];
         copy_equal(&mut ciphertext, chunk)?;
         let mut plaintext = ciphertext;
@@ -1075,6 +996,9 @@ fn xor_block(destination: &mut [u8; AES_BLOCK_BYTES], source: &[u8; AES_BLOCK_BY
 }
 
 /// Copies only equal-length ranges and returns an error instead of invoking slice-copy panics.
+/// # Errors
+///
+/// Returns [`Error::CryptographicFailure`] when the ranges have different lengths.
 fn copy_equal(destination: &mut [u8], source: &[u8]) -> Ext4Result<()> {
     if destination.len() != source.len() {
         return Err(Error::CryptographicFailure);
@@ -1086,6 +1010,10 @@ fn copy_equal(destination: &mut [u8], source: &[u8]) -> Ext4Result<()> {
 }
 
 /// Queries one `ULONG` CNG property and converts it to the host collection length domain.
+/// # Errors
+///
+/// Returns an error when ABI conversion or CNG lookup fails, or the provider returns a value with
+/// an unexpected byte length.
 fn query_usize_property(algorithm: AlgorithmHandle, property: &[u16]) -> DriverResult<usize> {
     let mut value = 0_u32;
     let mut result_bytes = 0_u32;
@@ -1111,6 +1039,9 @@ fn query_usize_property(algorithm: AlgorithmHandle, property: &[u16]) -> DriverR
 }
 
 /// Sets one NUL-terminated UTF-16 algorithm property during mount construction.
+/// # Errors
+///
+/// Returns an error when the property byte length is not representable or CNG rejects the value.
 fn set_wide_property(
     algorithm: AlgorithmHandle,
     property: &[u16],
@@ -1135,6 +1066,9 @@ fn set_wide_property(
 }
 
 /// Sets one NUL-terminated UTF-16 key property in the ext4-core failure domain.
+/// # Errors
+///
+/// Returns an error when the property byte length is not representable or CNG rejects the value.
 fn set_wide_property_core(object: *mut c_void, property: &[u16], value: &[u16]) -> Ext4Result<()> {
     let value_bytes = value
         .len()
@@ -1156,6 +1090,9 @@ fn set_wide_property_core(object: *mut c_void, property: &[u16], value: &[u16]) 
 }
 
 /// Sets one `ULONG` key property in the ext4-core failure domain.
+/// # Errors
+///
+/// Returns an error when the ABI length is not representable or CNG rejects the value.
 fn set_u32_property_core(object: *mut c_void, property: &[u16], mut value: u32) -> Ext4Result<()> {
     let value_bytes =
         u32::try_from(core::mem::size_of::<u32>()).map_err(|_| Error::ArithmeticOverflow)?;
@@ -1174,6 +1111,9 @@ fn set_u32_property_core(object: *mut c_void, property: &[u16], mut value: u32) 
 }
 
 /// Converts CNG NTSTATUS into a fallible mount-construction result.
+/// # Errors
+///
+/// Returns a resource or cryptographic driver error for any unsuccessful CNG status.
 fn cng_status_to_driver(status: NTSTATUS) -> DriverResult<()> {
     if NT_SUCCESS(status) {
         Ok(())
@@ -1185,6 +1125,9 @@ fn cng_status_to_driver(status: NTSTATUS) -> DriverResult<()> {
 }
 
 /// Converts CNG NTSTATUS into the ext4 cryptographic failure domain.
+/// # Errors
+///
+/// Returns [`Error::CryptographicFailure`] for any unsuccessful CNG status.
 fn cng_status_to_core(status: NTSTATUS) -> Ext4Result<()> {
     if NT_SUCCESS(status) {
         Ok(())

@@ -615,6 +615,10 @@ impl FscryptKeySet {
     }
 
     /// Removes a key by identifier.
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] when the replacement bounded key snapshot cannot be
+    /// allocated.
     pub fn remove(&mut self, identifier: FscryptKeyIdentifier) -> Result<Option<FscryptMasterKey>> {
         let previous = core::mem::take(&mut self.keys);
         let mut retained = Vec::new();
@@ -1016,6 +1020,9 @@ fn parse_policy_fields(bytes: &[u8], version: u8) -> Result<FscryptPolicyV2> {
 }
 
 /// Writes policy fields shared by v2 policies and contexts.
+/// # Errors
+///
+/// Returns an error when a field range is absent or its end offset overflows.
 fn write_policy_fields(bytes: &mut [u8], version: u8, policy: FscryptPolicyV2) -> Result<()> {
     put_byte(bytes, FSCRYPT_VERSION_OFFSET, version)?;
     put_byte(
@@ -1047,6 +1054,9 @@ fn write_policy_fields(bytes: &mut [u8], version: u8, policy: FscryptPolicyV2) -
 }
 
 /// Writes one byte at a compile-time fscrypt structure offset.
+/// # Errors
+///
+/// Returns [`Error::InvalidEncryptionContext`] when `offset` is outside `bytes`.
 fn put_byte(bytes: &mut [u8], offset: usize, value: u8) -> Result<()> {
     *bytes
         .get_mut(offset)
@@ -1055,6 +1065,10 @@ fn put_byte(bytes: &mut [u8], offset: usize, value: u8) -> Result<()> {
 }
 
 /// Writes a byte slice at a compile-time fscrypt structure offset.
+/// # Errors
+///
+/// Returns an error when the destination end overflows, the range is absent, or exact copying
+/// cannot be completed.
 fn put_bytes(bytes: &mut [u8], offset: usize, value: &[u8]) -> Result<()> {
     let end = offset
         .checked_add(value.len())

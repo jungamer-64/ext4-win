@@ -375,6 +375,10 @@ impl<O> LowerCompletionDestination<O> {
     }
 
     /// Publishes one completed envelope without allocation or blocking.
+    /// # Safety
+    ///
+    /// `envelope` must be the uniquely completion-owned allocation associated with this
+    /// destination and must not have been published before.
     unsafe fn publish(self, envelope: NonNull<LowerCompletionEnvelope<O>>) {
         unsafe {
             // SAFETY: Construction ties this function to the stable, type-correct inbox context.
@@ -499,6 +503,10 @@ impl<O> LowerCompletionEnvelope<O> {
     }
 
     /// Installs completion-side IRP release authority after successful registration.
+    /// # Safety
+    ///
+    /// The slot must be uninitialized, completion registration must have succeeded, and the
+    /// caller must proceed directly to `IoCallDriver` without exposing the envelope elsewhere.
     #[cfg(not(test))]
     unsafe fn install_release_authority(&self, authority: LowerIrpReleaseAuthority) {
         unsafe {
@@ -510,28 +518,44 @@ impl<O> LowerCompletionEnvelope<O> {
     }
 
     /// Reads the still-owned IRP address while serialized against completion release.
+    /// # Safety
+    ///
+    /// The caller must own the cancel-calling lifecycle state, excluding completion-side release
+    /// until the matching `IoCancelIrp` call returns.
     #[cfg(not(test))]
     unsafe fn irp_for_cancel(&self) -> PIRP {
         if !self.release_authority_ready.load(Ordering::Acquire) {
             KernelWideInconsistency::lower_completion_ownership_corruption().bugcheck();
         }
-        unsafe {
-            // SAFETY: The ready bit publishes the initialized authority, and CANCEL_CALLING
-            // excludes completion-side extraction until `IoCancelIrp` returns.
-            (*self.release_authority.get()).assume_init_ref().as_ptr()
-        }
+        let authority_slot = unsafe {
+            // SAFETY: The envelope allocation remains live while cancellation owns its lifecycle.
+            &*self.release_authority.get()
+        };
+        let authority = unsafe {
+            // SAFETY: The ready bit publishes initialization and CANCEL_CALLING excludes removal.
+            authority_slot.assume_init_ref()
+        };
+        authority.as_ptr()
     }
 
     /// Consumes and drops completion-side IRP release authority.
+    /// # Safety
+    ///
+    /// Lower completion must uniquely own release for `completed_irp`, or deferred reclaim must
+    /// own the lifecycle state published after the cancel caller returned.
     #[cfg(not(test))]
     unsafe fn release_private_irp(&self, completed_irp: PIRP) {
         if !self.release_authority_ready.swap(false, Ordering::AcqRel) {
             KernelWideInconsistency::lower_completion_ownership_corruption().bugcheck();
         }
+        let authority_slot = unsafe {
+            // SAFETY: The envelope remains live while the successful swap grants unique access.
+            &*self.release_authority.get()
+        };
         let authority = unsafe {
-            // SAFETY: The successful ready-bit swap grants unique extraction of the initialized
+            // SAFETY: The successful ready-bit swap grants unique extraction of this initialized
             // authority slot.
-            (*self.release_authority.get()).assume_init_read()
+            authority_slot.assume_init_read()
         };
         if authority.as_ptr() != completed_irp {
             KernelWideInconsistency::lower_completion_ownership_corruption().bugcheck();
@@ -548,9 +572,15 @@ impl<O> LowerCompletionEnvelope<O> {
         let lifecycle = envelope.lifecycle.load(Ordering::Acquire);
         if lifecycle == LOWER_DEFERRED_QUEUED {
             #[cfg(not(test))]
-            unsafe {
-                // SAFETY: Deferred queue publication occurs only after `IoCancelIrp` returned.
-                envelope.release_private_irp(envelope.irp_for_cancel());
+            {
+                let irp = unsafe {
+                    // SAFETY: Deferred publication occurs only after `IoCancelIrp` returned.
+                    envelope.irp_for_cancel()
+                };
+                unsafe {
+                    // SAFETY: Inbox reclaim now uniquely owns the deferred release authority.
+                    envelope.release_private_irp(irp);
+                }
             }
         } else if lifecycle != LOWER_COMPLETED_QUEUED {
             KernelWideInconsistency::lower_completion_ownership_corruption().bugcheck();
@@ -586,8 +616,11 @@ impl<O> LowerCompletionEnvelope<O> {
             ManuallyDrop::take(&mut envelope.suspended)
         };
         unsafe {
-            // SAFETY: The transfer never reached a lower stack and the rundown lease is local.
+            // SAFETY: The transfer never reached a lower stack and remains locally owned.
             ManuallyDrop::drop(&mut envelope.transfer);
+        }
+        unsafe {
+            // SAFETY: Registration failed, so the rundown lease remains locally owned.
             ManuallyDrop::drop(&mut envelope.rundown);
         }
         envelope.payload_taken = true;
@@ -611,17 +644,27 @@ impl<O> Drop for LowerCompletionEnvelope<O> {
     fn drop(&mut self) {
         #[cfg(not(test))]
         if self.release_authority_ready.swap(false, Ordering::AcqRel) {
+            let authority_slot = unsafe {
+                // SAFETY: Unique envelope drop owns the unpublished authority slot.
+                &*self.release_authority.get()
+            };
             let authority = unsafe {
-                // SAFETY: Unique envelope drop owns an initialized unpublished authority slot.
-                (*self.release_authority.get()).assume_init_read()
+                // SAFETY: The ready bit proves this uniquely owned slot is initialized.
+                authority_slot.assume_init_read()
             };
             drop(authority);
         }
         if !self.payload_taken {
             unsafe {
-                // SAFETY: No extraction occurred, so all three fields remain initialized.
+                // SAFETY: No extraction occurred, so suspended remains initialized.
                 ManuallyDrop::drop(&mut self.suspended);
+            }
+            unsafe {
+                // SAFETY: No extraction occurred, so transfer remains initialized.
                 ManuallyDrop::drop(&mut self.transfer);
+            }
+            unsafe {
+                // SAFETY: No extraction occurred, so rundown remains initialized.
                 ManuallyDrop::drop(&mut self.rundown);
             }
         }
@@ -777,6 +820,42 @@ struct UnregisteredEnvelope<O> {
     rundown: CompletionRundownLease,
 }
 
+/// One concrete lower-stack transfer contract with its owned stable buffer.
+#[cfg(not(test))]
+#[derive(Debug)]
+pub struct LowerIrpTransfer {
+    /// Target lower device.
+    target: KernelDevice,
+    /// Major operation and stack-union interpretation.
+    operation: LowerOperation,
+    /// Buffer representation required by the target stack.
+    method: LowerTransferMethod,
+    /// Starting byte offset for transfers, zero for non-range operations.
+    offset: ByteOffset,
+    /// Stable nonpaged bytes retained through lower completion.
+    transfer: AlignedTransferBuffer,
+}
+
+#[cfg(not(test))]
+impl LowerIrpTransfer {
+    /// Seals the complete lower-stack transfer contract before IRP construction.
+    pub const fn new(
+        target: KernelDevice,
+        operation: LowerOperation,
+        method: LowerTransferMethod,
+        offset: ByteOffset,
+        transfer: AlignedTransferBuffer,
+    ) -> Self {
+        Self {
+            target,
+            operation,
+            method,
+            offset,
+            transfer,
+        }
+    }
+}
+
 /// Fully prepared pre-registration private IRP and stable completion envelope.
 #[cfg(not(test))]
 pub struct PreparedLowerIrp<O> {
@@ -806,15 +885,18 @@ impl<O: Send + 'static> PreparedLowerIrp<O> {
     /// pre-submit setup fails. All partially built resources are released locally.
     pub fn try_new(
         completion_owner: KernelDevice,
-        target: KernelDevice,
-        operation: LowerOperation,
-        transfer_method: LowerTransferMethod,
-        offset: ByteOffset,
-        transfer: AlignedTransferBuffer,
+        lower: LowerIrpTransfer,
         suspended: O,
         destination: LowerCompletionDestination<O>,
         rundown: CompletionRundownLease,
     ) -> Result<Self, LowerBuildError<O>> {
+        let LowerIrpTransfer {
+            target,
+            operation,
+            method,
+            offset,
+            transfer,
+        } = lower;
         let source = UnregisteredEnvelope {
             suspended,
             transfer,
@@ -822,8 +904,7 @@ impl<O: Send + 'static> PreparedLowerIrp<O> {
             rundown,
         };
         let authority =
-            match prepare_private_irp(target, operation, transfer_method, offset, &source.transfer)
-            {
+            match prepare_private_irp(target, operation, method, offset, &source.transfer) {
                 Ok(authority) => authority,
                 Err(error) => {
                     return Err(LowerBuildError {
@@ -913,6 +994,10 @@ impl<O: Send + 'static> PreparedLowerIrp<O> {
     }
 
     /// Irreversibly transfers envelope and IRP release ownership to completion.
+    /// # Safety
+    ///
+    /// Completion registration must have succeeded for `envelope_address`, which must identify
+    /// `self.envelope`; the caller must invoke the returned request immediately and exactly once.
     unsafe fn into_registered(
         self,
         envelope_address: NonNull<LowerCompletionEnvelope<O>>,
@@ -924,10 +1009,13 @@ impl<O: Send + 'static> PreparedLowerIrp<O> {
             envelope,
         } = self;
         let irp_address = irp.irp;
+        let envelope_ref = unsafe {
+            // SAFETY: The address was obtained from the still-live boxed envelope above.
+            envelope_address.as_ref()
+        };
         unsafe {
-            // SAFETY: Registration succeeded and the immediate caller submits without any
-            // intervening fallible work or early return.
-            envelope_address.as_ref().install_release_authority(irp);
+            // SAFETY: Registration succeeded and the caller submits without intervening work.
+            envelope_ref.install_release_authority(irp);
         }
         let raw_envelope = Box::into_raw(envelope);
         let _completion_owned_envelope = raw_envelope;
@@ -962,6 +1050,10 @@ impl RegisteredLowerRequest {
 #[cfg(not(test))]
 /// Builds the private IRP and optional MDL while the ownership-bearing envelope source remains
 /// untouched.
+/// # Errors
+///
+/// Returns an error when the transfer contract is inconsistent, target geometry is invalid, an
+/// IRP or MDL cannot be allocated, or an ABI field cannot represent the request.
 fn prepare_private_irp(
     target: KernelDevice,
     operation: LowerOperation,
@@ -1210,12 +1302,12 @@ unsafe extern "C" fn lower_request_completed<O: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use alloc::boxed::Box;
     use core::ffi::c_void;
     use core::ptr::NonNull;
     use core::sync::atomic::Ordering;
 
     use crate::kernel::status::DriverError;
+    use crate::memory;
 
     use super::{
         AlignedTransferBuffer, CompletionRundown, IOCTL_DISK_GET_LENGTH_INFO, LOWER_CANCEL_CALLING,
@@ -1225,6 +1317,10 @@ mod tests {
         STATUS_MORE_PROCESSING_REQUIRED,
     };
 
+    /// Records one completed envelope in the synchronous test inbox.
+    /// # Safety
+    ///
+    /// `context` must point to a live, uniquely writable inbox of the exact envelope type.
     unsafe fn record_completed_u64(
         context: NonNull<c_void>,
         envelope: NonNull<LowerCompletionEnvelope<u64>>,
@@ -1331,12 +1427,16 @@ mod tests {
             // SAFETY: `inbox` remains address-stable until the synchronous publication returns.
             LowerCompletionDestination::new(NonNull::from(&mut inbox).cast(), record_completed_u64)
         };
-        let mut envelope = Box::new(LowerCompletionEnvelope::new(
-            0x5A_u64,
-            transfer,
-            destination,
-            lease,
-        ));
+        let Ok(mut envelope) = memory::boxed_try_with(move || {
+            Ok(LowerCompletionEnvelope::new(
+                0x5A_u64,
+                transfer,
+                destination,
+                lease,
+            ))
+        }) else {
+            return;
+        };
         let address = NonNull::from(envelope.as_mut());
         let Some(node) = NonNull::new(envelope.node_ptr()) else {
             return;
@@ -1398,12 +1498,16 @@ mod tests {
             // SAFETY: The context remains live and publication is not invoked in this test.
             LowerCompletionDestination::new(NonNull::from(&mut inbox).cast(), record_completed_u64)
         };
-        let envelope = Box::new(LowerCompletionEnvelope::new(
-            41_u64,
-            transfer,
-            destination,
-            lease,
-        ));
+        let Ok(envelope) = memory::boxed_try_with(move || {
+            Ok(LowerCompletionEnvelope::new(
+                41_u64,
+                transfer,
+                destination,
+                lease,
+            ))
+        }) else {
+            return;
+        };
         assert_eq!(LowerCompletionEnvelope::reclaim_unsubmitted(envelope), 41);
         assert!(inbox.is_none());
 

@@ -4806,6 +4806,9 @@ impl<'owner> OpenedObject<'owner> {
     }
 
     /// Precomputes a post-I/O cursor update while failures are still harmless.
+    /// # Errors
+    ///
+    /// Returns an error when the transferred range or signed Windows position overflows.
     pub(crate) fn prepare_current_file_position_update(
         &self,
         kind: DataIoKind,
@@ -5229,6 +5232,9 @@ impl<'owner> OpenedRegularFile<'owner> {
     }
 
     /// Precomputes an infallible post-I/O position publication.
+    /// # Errors
+    ///
+    /// Returns an error when the transferred range or signed Windows position overflows.
     pub(crate) fn prepare_current_file_position_update(
         &self,
         kind: DataIoKind,

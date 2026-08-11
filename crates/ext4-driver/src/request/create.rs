@@ -58,7 +58,7 @@ pub(crate) enum CreateResolution {
     /// No filesystem mutation was staged and the create may complete immediately.
     Complete(CreateCompletion),
     /// A missing child was staged and every driver publication value was preallocated.
-    Mutation(PendingCreatePublication),
+    Mutation(Box<PendingCreatePublication>),
 }
 
 /// Create request whose pointer-bearing inputs have all become owned domain values.
@@ -200,27 +200,31 @@ fn open_or_create(
                 .ok_or(DriverError::InvalidDeviceRequest)?;
             open_existing_node(
                 &mut owner,
-                mounted_volume,
                 disposition,
-                node,
-                node_mode,
-                location,
+                ExistingNodeTarget {
+                    volume: mounted_volume,
+                    node,
+                    node_mode,
+                    location,
+                },
                 operations,
                 mutation,
             )
             .map(CreateCompletion::Handle)
             .map(CreateResolution::Complete)
         }
-        CreateTargetLookup::Missing { parent, name } => create_missing_node(
-            owner,
-            create_ea,
-            operations,
-            mutation,
-            disposition,
-            parent,
-            &name,
-        )
-        .map(CreateResolution::Mutation),
+        CreateTargetLookup::Missing { parent, name } => {
+            let publication = create_missing_node(
+                owner,
+                create_ea,
+                operations,
+                mutation,
+                disposition,
+                parent,
+                &name,
+            )?;
+            memory::boxed_try_with(move || Ok(publication)).map(CreateResolution::Mutation)
+        }
         CreateTargetLookup::ReparseSymlink {
             point,
             unparsed_path,
@@ -674,6 +678,19 @@ impl CreatePathAnchor {
     }
 }
 
+/// One fully resolved existing target passed into create/open policy.
+#[derive(Debug)]
+struct ExistingNodeTarget {
+    /// Mounted volume owning the resolved identity.
+    volume: NonNull<crate::state::VolumeControlBlock>,
+    /// Typed ext4 identity.
+    node: NodeId,
+    /// Whether the caller opened the link itself or its resolved target.
+    node_mode: OpenedNodeMode,
+    /// Stable namespace location captured during lookup.
+    location: OpenedLocation,
+}
+
 /// Opens an existing path according to the requested disposition and options.
 /// # Errors
 ///
@@ -681,14 +698,17 @@ impl CreatePathAnchor {
 /// access fails, or an incomplete destructive disposition is requested.
 fn open_existing_node(
     request: &mut CreateCompletionOwner<'_>,
-    vcb: NonNull<crate::state::VolumeControlBlock>,
     disposition: CreateDisposition,
-    node: NodeId,
-    node_mode: OpenedNodeMode,
-    location: OpenedLocation,
+    target: ExistingNodeTarget,
     operations: &mut VolumeAccess,
     read: &mut impl CommittedReadPass,
 ) -> DriverResult<CreateAction> {
+    let ExistingNodeTarget {
+        volume,
+        node,
+        node_mode,
+        location,
+    } = target;
     let parameters = request.parameters();
     let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
     match disposition {
@@ -696,7 +716,7 @@ fn open_existing_node(
             validate_existing_node_options(node, parameters.target_requirement())?;
             let pending = prepare_create_deletion(policy, node, &location, read)?;
             let fcb = request.with_file_object(|file_object| {
-                initialize_file_object(file_object, vcb, node, node_mode, location, policy)
+                initialize_file_object(file_object, volume, node, node_mode, location, policy)
             })?;
             if let Some(pending) = pending {
                 operations.set_file_delete_pending(fcb, pending);

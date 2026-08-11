@@ -1,6 +1,8 @@
 //! Mounted profile, bounded epoch leases, mutation coordination, and volume failure state.
 
+use alloc::boxed::Box;
 use core::fmt;
+use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 
 use ext4_core::{
@@ -14,6 +16,7 @@ use crate::kernel::cng::CngProvider;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::storage::MountedStorageDevices;
+use crate::memory;
 
 /// Current epoch plus one distinct retained epoch per operation and two pre-commit publication
 /// reservations.
@@ -34,6 +37,9 @@ pub(crate) enum VolumeFailureState {
 
 impl VolumeFailureState {
     /// Rejects a new mutation unless the runtime is fully operational.
+    /// # Errors
+    ///
+    /// Returns [`DriverError::VolumeDismounted`] after any read-only or terminal volume failure.
     pub(crate) fn authorize_mutation(self) -> DriverResult<()> {
         match self {
             Self::Operational => Ok(()),
@@ -44,6 +50,9 @@ impl VolumeFailureState {
     }
 
     /// Rejects reads only after read reliability itself has been lost.
+    /// # Errors
+    ///
+    /// Returns [`DriverError::VolumeDismounted`] when recovery is required or reads are failed.
     pub(crate) fn authorize_read(self) -> DriverResult<()> {
         match self {
             Self::Operational | Self::DegradedReadOnly => Ok(()),
@@ -84,13 +93,15 @@ enum EpochSlot {
     Reserved {
         /// Generation uniquely identifying this reservation.
         generation: u64,
+        /// Fallibly allocated storage initialized only by infallible publication.
+        storage: Box<MaybeUninit<CommittedEpoch>>,
     },
     /// Immutable epoch retained by the current pointer or outstanding leases.
     Occupied {
         /// Generation checked by every lease.
         generation: u64,
         /// Immutable committed state.
-        epoch: CommittedEpoch,
+        epoch: Box<CommittedEpoch>,
         /// Number of outstanding operation leases.
         leases: u8,
         /// Whether new reads acquire this slot.
@@ -105,7 +116,10 @@ impl fmt::Debug for EpochSlot {
                 .debug_struct("Vacant")
                 .field("generation", generation)
                 .finish(),
-            Self::Reserved { generation } => formatter
+            Self::Reserved {
+                generation,
+                storage: _,
+            } => formatter
                 .debug_struct("Reserved")
                 .field("generation", generation)
                 .finish(),
@@ -125,7 +139,7 @@ impl fmt::Debug for EpochSlot {
     }
 }
 
-/// Fixed, allocation-free registry retaining committed epochs without `Arc`.
+/// Bounded registry retaining committed epochs without reference-counted ownership.
 #[derive(Debug)]
 pub(crate) struct EpochRegistry {
     /// Current and retained epoch slots.
@@ -135,16 +149,23 @@ pub(crate) struct EpochRegistry {
 }
 
 impl EpochRegistry {
-    /// Installs the initial mount epoch without allocation.
-    pub(crate) fn new(initial: CommittedEpoch) -> Self {
+    /// Fallibly installs the initial mount epoch in heap-stable storage.
+    /// # Errors
+    ///
+    /// Returns an error when storage for the initial immutable epoch cannot be allocated.
+    pub(crate) fn try_new(initial: CommittedEpoch) -> DriverResult<Self> {
+        let initial = memory::boxed_try_with(move || Ok(initial))?;
         let mut slots = core::array::from_fn(|_| EpochSlot::Vacant { generation: 0 });
-        slots[0] = EpochSlot::Occupied {
+        let first = slots
+            .first_mut()
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        *first = EpochSlot::Occupied {
             generation: 1,
             epoch: initial,
             leases: 0,
             current: true,
         };
-        Self { slots, current: 0 }
+        Ok(Self { slots, current: 0 })
     }
 
     /// Acquires one non-cloneable lease on the current immutable epoch.
@@ -185,7 +206,7 @@ impl EpochRegistry {
                 epoch,
                 current: true,
                 ..
-            }) => epoch,
+            }) => epoch.as_ref(),
             _ => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
         }
     }
@@ -216,11 +237,23 @@ impl EpochRegistry {
                 .get(checkpoint_index)
                 .ok_or(DriverError::InternalInvariantViolation)?,
         )?;
-        self.slots[durable_index] = EpochSlot::Reserved {
+        let durable_storage = memory::boxed_try_with(|| Ok(MaybeUninit::uninit()))?;
+        let checkpoint_storage = memory::boxed_try_with(|| Ok(MaybeUninit::uninit()))?;
+        let durable_slot = self
+            .slots
+            .get_mut(durable_index)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        *durable_slot = EpochSlot::Reserved {
             generation: durable_generation,
+            storage: durable_storage,
         };
-        self.slots[checkpoint_index] = EpochSlot::Reserved {
+        let checkpoint_slot = self
+            .slots
+            .get_mut(checkpoint_index)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        *checkpoint_slot = EpochSlot::Reserved {
             generation: checkpoint_generation,
+            storage: checkpoint_storage,
         };
         let registry = NonNull::from(self);
         Ok(EpochPublicationSlots {
@@ -256,21 +289,35 @@ impl EpochRegistry {
         if *current_generation != generation || *leases == 0 {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
-        *leases -= 1;
+        *leases = match leases.checked_sub(1) {
+            Some(remaining) => remaining,
+            None => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+        };
         if *leases == 0 && !*current {
-            *slot = EpochSlot::Vacant { generation };
+            let released = core::mem::replace(slot, EpochSlot::Vacant { generation });
+            drop(released);
         }
     }
 
     /// Publishes one pre-reserved immutable epoch by moves and fixed-slot replacement only.
     fn publish(&mut self, index: usize, generation: u64, epoch: CommittedEpoch) {
-        let Some(target) = self.slots.get(index) else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        let storage = {
+            let Some(target) = self.slots.get_mut(index) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            let reserved = core::mem::replace(target, EpochSlot::Vacant { generation });
+            match reserved {
+                EpochSlot::Reserved {
+                    generation: current,
+                    storage,
+                } if current == generation => storage,
+                EpochSlot::Vacant { .. }
+                | EpochSlot::Reserved { .. }
+                | EpochSlot::Occupied { .. } => {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                }
+            }
         };
-        if !matches!(target, EpochSlot::Reserved { generation: current } if *current == generation)
-        {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
         let previous = self.current;
         let Some(previous_slot) = self.slots.get_mut(previous) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -285,14 +332,20 @@ impl EpochRegistry {
                 *current = false;
                 if *leases == 0 {
                     let generation = *generation;
-                    *previous_slot = EpochSlot::Vacant { generation };
+                    let released =
+                        core::mem::replace(previous_slot, EpochSlot::Vacant { generation });
+                    drop(released);
                 }
             }
             EpochSlot::Vacant { .. } | EpochSlot::Reserved { .. } | EpochSlot::Occupied { .. } => {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             }
         }
-        self.slots[index] = EpochSlot::Occupied {
+        let epoch = Box::write(storage, epoch);
+        let Some(target) = self.slots.get_mut(index) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        *target = EpochSlot::Occupied {
             generation,
             epoch,
             leases: 0,
@@ -306,14 +359,20 @@ impl EpochRegistry {
         let Some(slot) = self.slots.get_mut(index) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        if !matches!(slot, EpochSlot::Reserved { generation: current } if *current == generation) {
+        if !matches!(slot, EpochSlot::Reserved { generation: current, .. } if *current == generation)
+        {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
-        *slot = EpochSlot::Vacant { generation };
+        let released = core::mem::replace(slot, EpochSlot::Vacant { generation });
+        drop(released);
     }
 }
 
 /// Returns the next reservation generation for one vacant slot.
+/// # Errors
+///
+/// Returns an invariant error for a non-vacant slot or insufficient resources on generation
+/// exhaustion.
 fn next_slot_generation(slot: &EpochSlot) -> DriverResult<u64> {
     let EpochSlot::Vacant { generation } = slot else {
         return Err(DriverError::InternalInvariantViolation);
@@ -343,7 +402,7 @@ impl EpochLease {
         match registry.slots.get(self.index) {
             Some(EpochSlot::Occupied {
                 generation, epoch, ..
-            }) if *generation == self.generation => epoch,
+            }) if *generation == self.generation => epoch.as_ref(),
             _ => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
         }
     }
@@ -447,11 +506,20 @@ enum CommitGateState {
     /// Journal space is clean and one commit may be granted.
     Ready,
     /// One mutation owns commit authority through durable visibility publication.
-    CommitGranted { ticket: u64 },
+    CommitGranted {
+        /// Mutation ticket owning commit authority.
+        ticket: u64,
+    },
     /// A visible overlay is awaiting independent checkpoint and journal-space release.
-    CheckpointPending { epoch: EpochSequence },
+    CheckpointPending {
+        /// Visible overlay epoch awaiting checkpoint admission.
+        epoch: EpochSequence,
+    },
     /// The detached checkpoint operation owns journal-space release authority.
-    CheckpointGranted { epoch: EpochSequence },
+    CheckpointGranted {
+        /// Visible overlay epoch whose detached checkpoint owns the journal lane.
+        epoch: EpochSequence,
+    },
 }
 
 /// Short allocation-free visibility gate, separate from checkpoint ownership.
@@ -460,7 +528,10 @@ enum VisibilityGateState {
     /// No durable epoch is being installed.
     Ready,
     /// One durable mutation owns the sole epoch-swap transition.
-    Granted { ticket: u64 },
+    Granted {
+        /// Durable mutation ticket owning the short publication gate.
+        ticket: u64,
+    },
 }
 
 /// Driver-local mounted runtime split into immutable profile, immutable epochs, and mutable
@@ -487,6 +558,10 @@ pub(crate) struct VolumeRuntime {
 
 impl VolumeRuntime {
     /// Separates one completed mount into the runtime's independent state domains.
+    /// # Errors
+    ///
+    /// Returns an error when the initial epoch registry or mount-scoped CNG providers cannot be
+    /// allocated and initialized.
     pub(crate) fn try_new(
         mount: CompletedMount,
         storage: MountedStorageDevices,
@@ -495,7 +570,7 @@ impl VolumeRuntime {
         let crypto = CngProvider::try_open()?;
         Ok(Self {
             profile,
-            epochs: EpochRegistry::new(epoch),
+            epochs: EpochRegistry::try_new(epoch)?,
             coordinator,
             storage,
             crypto,
@@ -526,6 +601,10 @@ impl VolumeRuntime {
     }
 
     /// Acquires one current immutable epoch for a read or resolve operation.
+    /// # Errors
+    ///
+    /// Returns an error when reads are no longer authorized or the bounded lease count cannot
+    /// advance.
     pub(crate) fn acquire_epoch(&mut self) -> DriverResult<EpochLease> {
         self.failure.authorize_read()?;
         self.epochs.acquire_current()
@@ -542,6 +621,9 @@ impl VolumeRuntime {
     }
 
     /// Allocates one stable FIFO mutation ticket before resolve begins.
+    /// # Errors
+    ///
+    /// Returns an error when mutations are no longer authorized or ticket allocation overflows.
     pub(crate) fn admit_mutation(&mut self) -> DriverResult<u64> {
         self.failure.authorize_mutation()?;
         self.coordinator.admit_mutation().map_err(DriverError::from)
@@ -553,6 +635,10 @@ impl VolumeRuntime {
     }
 
     /// Reserves both post-commit epoch slots while allocation failure remains harmless.
+    /// # Errors
+    ///
+    /// Returns an error when mutations are not authorized, registry slots are exhausted, a slot
+    /// generation overflows, or stable epoch storage cannot be allocated.
     /// # Safety
     ///
     /// This runtime must already reside inside its final heap-stable VCB.
@@ -743,16 +829,15 @@ mod tests {
     /// explicit state-machine boundary.
     #[test]
     fn durability_gate_boundaries_remain_linked() {
-        let clean: fn(&VolumeRuntime) -> bool = VolumeRuntime::journal_is_clean;
-        let commit: fn(&mut VolumeRuntime, u64) -> Option<ext4_core::CommitLease> =
+        let _clean: fn(&VolumeRuntime) -> bool = VolumeRuntime::journal_is_clean;
+        let _commit: fn(&mut VolumeRuntime, u64) -> Option<ext4_core::CommitLease> =
             VolumeRuntime::try_grant_commit;
-        let abandon: fn(&mut VolumeRuntime, u64) = VolumeRuntime::abandon_commit;
-        let visibility: fn(&mut VolumeRuntime, u64) -> Option<ext4_core::VisibilityLease> =
+        let _abandon: fn(&mut VolumeRuntime, u64) = VolumeRuntime::abandon_commit;
+        let _visibility: fn(&mut VolumeRuntime, u64) -> Option<ext4_core::VisibilityLease> =
             VolumeRuntime::try_grant_visibility;
-        let checkpoint: fn(
+        let _checkpoint: fn(
             &mut VolumeRuntime,
             ext4_core::EpochSequence,
         ) -> Option<ext4_core::CheckpointLease> = VolumeRuntime::try_grant_checkpoint;
-        let _ = (clean, commit, abandon, visibility, checkpoint);
     }
 }

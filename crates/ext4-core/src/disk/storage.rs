@@ -190,7 +190,6 @@ impl StorageCompletion {
     }
 
     /// Consumes the completion into its owned parts.
-    #[must_use]
     pub fn into_parts(self) -> (CompletedStorageTransfer, usize, Result<()>) {
         (self.transfer, self.information, self.result)
     }
@@ -310,6 +309,10 @@ impl StorageTranscript {
     }
 
     /// Reads an exact range from the retained transcript or requests one owned lower transfer.
+    /// # Errors
+    ///
+    /// Returns an error when the range is invalid, storage allocation fails, another request is
+    /// already outstanding, or the caller must suspend for the newly prepared lower read.
     pub(crate) fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
         validate_device_range(self.length, offset, out.len())?;
         if out.is_empty() {
@@ -427,6 +430,10 @@ impl<'transcript> OperationDevice<'transcript> {
     }
 
     /// Reads one exact range or suspends the surrounding resolve pass.
+    /// # Errors
+    ///
+    /// Returns an error from the transcript read or when the committed overlay cannot be applied
+    /// to the requested range.
     pub(crate) fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
         self.transcript.read_exact_at(offset, out)?;
         if let Some(overlay) = self.overlay {
@@ -437,6 +444,10 @@ impl<'transcript> OperationDevice<'transcript> {
 }
 
 /// Validates one byte range against a concrete device length.
+/// # Errors
+///
+/// Returns [`Error::ArithmeticOverflow`] when the range end is not representable, or
+/// [`Error::DeviceRange`] when the range extends beyond the device.
 fn validate_device_range(
     length: DeviceLength,
     offset: ByteOffset,
