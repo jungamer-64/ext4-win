@@ -691,28 +691,10 @@ pub struct MountOperation {
 /// Internal mount phase with no independently inspectable flags.
 #[derive(Debug)]
 enum MountState {
-    /// Parse, validate, scan, and prebuild recovery work.
+    /// Parse, validate, and drive recovery work.
     Resolving,
-    /// Execute the prebuilt recovery program in order.
-    RecoveryIo(RecoveryIoProgram),
-    /// Exactly one recovery request is owned by the lower stack.
-    AwaitingRecoveryIo {
-        /// Identity captured before request ownership moved lower.
-        expected: StorageRequestIdentity,
-        /// Remaining prebuilt program.
-        program: RecoveryIoProgram,
-    },
     /// Build the allocation ownership index from the recovered filesystem image.
     Indexing(MountPublicationSeed),
-}
-
-/// Fully preallocated mount recovery requests and their publication seed.
-#[derive(Debug)]
-struct RecoveryIoProgram {
-    /// Requests in required home-write, flush, clean-journal, and clear-recover order.
-    requests: alloc::vec::IntoIter<crate::StorageRequest>,
-    /// Values retained until recovery I/O has completed.
-    publication: MountPublicationSeed,
 }
 
 /// Mount values retained while the recovered allocation index is constructed.
@@ -757,9 +739,7 @@ impl MountOperation {
         let accepted = match event {
             super::OperationEvent::Admitted => match &self.state {
                 MountState::Resolving => Ok(()),
-                MountState::RecoveryIo(_)
-                | MountState::AwaitingRecoveryIo { .. }
-                | MountState::Indexing(_) => Err(Error::DeviceIo),
+                MountState::Indexing(_) => Err(Error::DeviceIo),
             },
             super::OperationEvent::StorageCompleted(completion) => {
                 self.accept_completion(completion)
@@ -795,15 +775,6 @@ impl MountOperation {
                 self.state = MountState::Indexing(publication);
                 Ok(())
             }
-            MountState::AwaitingRecoveryIo { expected, program } => {
-                expected.complete(completion)?;
-                self.state = MountState::RecoveryIo(program);
-                Ok(())
-            }
-            MountState::RecoveryIo(program) => {
-                self.state = MountState::RecoveryIo(program);
-                Err(Error::DeviceIo)
-            }
         }
     }
 
@@ -811,41 +782,14 @@ impl MountOperation {
     fn drive(mut self: Box<Self>) -> MountTransition {
         loop {
             match core::mem::replace(&mut self.state, MountState::Resolving) {
-                MountState::Resolving => match self.prepare_recovery() {
-                    Ok((requests, publication)) => {
-                        if requests.is_empty() {
-                            self.state = MountState::Indexing(publication);
-                        } else {
-                            self.state = MountState::RecoveryIo(RecoveryIoProgram {
-                                requests: requests.into_iter(),
-                                publication,
-                            });
-                        }
-                    }
+                MountState::Resolving => match self.drive_recovery() {
+                    Ok(publication) => self.state = MountState::Indexing(publication),
                     Err(Error::OperationSuspended) => {
                         self.state = MountState::Resolving;
                         return self.submit_pending_read();
                     }
                     Err(error) => return MountTransition::Complete(Err(error)),
                 },
-                MountState::RecoveryIo(mut program) => {
-                    if let Some(request) = program.requests.next() {
-                        let expected = StorageRequestIdentity::from_request(&request);
-                        self.state = MountState::AwaitingRecoveryIo { expected, program };
-                        return MountTransition::SubmitLower {
-                            request,
-                            suspended: self,
-                        };
-                    }
-                    let filesystem_length = self.filesystem.len();
-                    self.filesystem =
-                        StorageTranscript::new(StorageTarget::Filesystem, filesystem_length);
-                    self.state = MountState::Indexing(program.publication);
-                }
-                MountState::AwaitingRecoveryIo { expected, program } => {
-                    self.state = MountState::AwaitingRecoveryIo { expected, program };
-                    return MountTransition::Complete(Err(Error::DeviceIo));
-                }
                 MountState::Indexing(publication) => {
                     let clusters = {
                         let device = OperationDevice::new(&mut self.filesystem);
@@ -891,134 +835,6 @@ impl MountOperation {
                 }
             }
         }
-    }
-
-    /// Resolves journal placement, scans replay records, and allocates the entire recovery I/O
-    /// program before its first write.
-    /// # Errors
-    ///
-    /// Returns an error when device metadata is invalid or unsupported, a lower read must be
-    /// submitted, or recovery/publication preparation fails.
-    fn prepare_recovery(&mut self) -> Result<(Vec<crate::StorageRequest>, MountPublicationSeed)> {
-        let superblock = {
-            let mut filesystem = OperationDevice::new(&mut self.filesystem);
-            Superblock::read_write_from(&mut filesystem)?
-        };
-        let recovery_state = superblock.recovery_state();
-        let (loaded, journal_target) = match superblock.journal_mode() {
-            JournalMode::Internal(journal_inode_id) => {
-                if self.external_journal.is_some() {
-                    return Err(Error::UnsupportedJournal);
-                }
-                let journal_inode = {
-                    let filesystem = OperationDevice::new(&mut self.filesystem);
-                    let mut volume =
-                        EpochReadView::mounting(filesystem, superblock, &self.fscrypt_keys);
-                    volume.read_inode_record(journal_inode_id)?
-                };
-                let loaded = {
-                    let mut filesystem = OperationDevice::new(&mut self.filesystem);
-                    Journal::<LoadedJournal>::from_inode(
-                        &journal_inode,
-                        superblock.block_size(),
-                        superblock.block_count().as_u64(),
-                        &mut filesystem,
-                    )?
-                };
-                (loaded, StorageTarget::Filesystem)
-            }
-            JournalMode::External(expected_uuid) => {
-                let journal = self
-                    .external_journal
-                    .as_mut()
-                    .ok_or(Error::UnsupportedJournal)?;
-                let mut journal = OperationDevice::new(journal);
-                let loaded = Journal::<LoadedJournal>::from_external_device(
-                    &mut journal,
-                    superblock.block_size(),
-                    expected_uuid.bytes(),
-                    superblock.block_count().as_u64(),
-                )?;
-                (loaded, StorageTarget::ExternalJournal)
-            }
-            JournalMode::None => return Err(Error::UnsupportedJournal),
-        };
-        let recovery = match journal_target {
-            StorageTarget::Filesystem => {
-                let mut filesystem = OperationDevice::new(&mut self.filesystem);
-                loaded.prepare_recovery(&mut filesystem, superblock.block_size(), recovery_state)?
-            }
-            StorageTarget::ExternalJournal => {
-                let journal = self
-                    .external_journal
-                    .as_mut()
-                    .ok_or(Error::UnsupportedJournal)?;
-                let mut journal = OperationDevice::new(journal);
-                loaded.prepare_recovery(&mut journal, superblock.block_size(), recovery_state)?
-            }
-        };
-        let (home_writes, clean_write, clean_journal) = recovery.into_parts();
-        let home_write_count = home_writes.len();
-        let clean_write_count = usize::from(clean_write.is_some());
-        let clear_recover = if recovery_state == RecoveryState::NeedsRecovery {
-            let raw = {
-                let mut filesystem = OperationDevice::new(&mut self.filesystem);
-                Superblock::prepare_clear_recover(&mut filesystem)?
-            };
-            Some(raw)
-        } else {
-            None
-        };
-        let clear_write_count = usize::from(clear_recover.is_some());
-        let flush_count = usize::from(home_write_count != 0)
-            .checked_add(clean_write_count)
-            .and_then(|count| count.checked_add(clear_write_count))
-            .ok_or(Error::ArithmeticOverflow)?;
-        let capacity = home_write_count
-            .checked_add(clean_write_count)
-            .and_then(|count| count.checked_add(clear_write_count))
-            .and_then(|count| count.checked_add(flush_count))
-            .ok_or(Error::ArithmeticOverflow)?;
-        let mut requests = Vec::new();
-        requests
-            .try_reserve_exact(capacity)
-            .map_err(|_| Error::OutOfMemory)?;
-        for write in home_writes {
-            requests.try_push(write.into_request())?;
-        }
-        if home_write_count != 0 {
-            requests.try_push(crate::StorageRequest::Flush {
-                target: StorageTarget::Filesystem,
-            })?;
-        }
-        if let Some(write) = clean_write {
-            requests.try_push(write.into_request())?;
-            requests.try_push(crate::StorageRequest::Flush {
-                target: journal_target,
-            })?;
-        }
-        let clean_superblock = if let Some(raw) = clear_recover {
-            let parsed = Superblock::parse_read_write(&raw)?;
-            requests.try_push(crate::StorageRequest::Write {
-                target: StorageTarget::Filesystem,
-                offset: ByteOffset::new(1024),
-                buffer: memory::copied_slice(&raw)?,
-            })?;
-            requests.try_push(crate::StorageRequest::Flush {
-                target: StorageTarget::Filesystem,
-            })?;
-            parsed
-        } else {
-            superblock
-        };
-        Ok((
-            requests,
-            MountPublicationSeed {
-                superblock: clean_superblock,
-                journal: clean_journal,
-                journal_target,
-            },
-        ))
     }
 
     /// Moves the current resolve pass's sole pending read into lower ownership.
