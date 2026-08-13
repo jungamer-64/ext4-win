@@ -21,6 +21,15 @@ mod wire;
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_SUCCESS};
 
+/// Build identity shared by the audited LLVM IR, link map, and signed PE image.
+///
+/// The build script forces this symbol into the linked image. Ordinary builds
+/// receive an all-zero identity, which the production artifact gate rejects.
+#[used]
+#[unsafe(no_mangle)]
+static EXT4WIN_PRODUCTION_ARTIFACT_ID: &[u8] =
+    concat!("EXT4WIN_ARTIFACT_ID=", env!("EXT4WIN_ARTIFACT_ID")).as_bytes();
+
 #[cfg(not(test))]
 #[global_allocator]
 /// Kernel allocator used by WDK-backed driver builds.

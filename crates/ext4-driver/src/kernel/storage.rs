@@ -13,7 +13,7 @@ use crate::irp::lower::{
 };
 #[cfg(not(test))]
 use crate::irp::lower::{
-    CompletionRundownLease, LowerBuildError, LowerCompletionDestination, LowerIrpTransfer,
+    CompletionRundownLease, LowerBuildError, LowerCompletionRoute, LowerIrpTransfer,
     PreparedLowerIrp,
 };
 use crate::kernel::status::{DriverError, DriverResult};
@@ -452,13 +452,14 @@ impl<O> PreparedStorageCommand<O> {
     /// Returns the suspended command when IRP, MDL, envelope, or completion-rundown preparation
     /// fails before registration.
     #[cfg(not(test))]
-    pub fn build_lower(
+    pub fn build_lower<R>(
         self,
-        destination: LowerCompletionDestination<StorageCommand<O>>,
+        destination: R,
         rundown: CompletionRundownLease,
-    ) -> Result<PreparedLowerIrp<StorageCommand<O>>, LowerBuildError<StorageCommand<O>>>
+    ) -> Result<PreparedLowerIrp<StorageCommand<O>, R>, LowerBuildError<StorageCommand<O>>>
     where
         O: Send + 'static,
+        R: LowerCompletionRoute<StorageCommand<O>>,
     {
         let (completion_owner, device, offset, method) = self.command.lower_contract();
         PreparedLowerIrp::try_new(
@@ -858,15 +859,16 @@ impl<O> DeviceLengthProbe<O> {
     /// Returns the suspended probe when transfer, IRP, MDL, envelope, or rundown preparation
     /// fails before registration.
     #[cfg(not(test))]
-    pub fn prepare(
+    pub fn prepare<R>(
         completion_owner: KernelDevice,
         target: KernelDevice,
         suspended: O,
-        destination: LowerCompletionDestination<Self>,
+        destination: R,
         rundown: CompletionRundownLease,
-    ) -> Result<PreparedLowerIrp<Self>, LowerBuildError<Self>>
+    ) -> Result<PreparedLowerIrp<Self, R>, LowerBuildError<Self>>
     where
         O: Send + 'static,
+        R: LowerCompletionRoute<Self>,
     {
         let transfer =
             match AlignedTransferBuffer::try_zeroed(size_of::<i64>(), core::mem::align_of::<i64>())

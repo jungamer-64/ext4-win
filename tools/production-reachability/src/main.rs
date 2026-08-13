@@ -10,12 +10,7 @@ use alloc::{
     vec::Vec,
 };
 use core::fmt;
-use std::{
-    env, fs, io,
-    path::{Path, PathBuf},
-    process::ExitCode,
-    time::SystemTime,
-};
+use std::{env, fs, io, path::PathBuf, process::ExitCode};
 
 /// The exported driver entry point.
 const DRIVER_ENTRY: &str = "DriverEntry";
@@ -27,6 +22,56 @@ const FATAL_BUGCHECK_ALLOWLIST: &[&str] =
 /// Release boundary whose complete reachable graph must remain allocation-free after durability.
 const DURABLE_PUBLISH_ROOT: &str =
     "<ext4win::state::volume_runtime::VolumeRuntime>::publish_durable";
+
+/// Required active top-level IRP cancellation callback.
+const ACTIVE_CANCEL_CALLBACK: &str = "ext4win::irp::cancel::active_irp_cancelled";
+
+/// Required fixed-slot storage retry timer callback.
+const STORAGE_RETRY_CALLBACK: &str = "ext4win::irp::reactor::storage_retry_timer_dpc";
+
+/// Prefix retained in both the audited LLVM IR and linked PE image.
+const ARTIFACT_ID_MARKER: &str = "EXT4WIN_ARTIFACT_ID=";
+
+/// Entire marker record length: the fixed prefix followed by 32 hexadecimal digits.
+const ARTIFACT_ID_RECORD_LENGTH: usize = 52;
+
+/// Sentinel emitted for developer builds that are not production artifact bundles.
+const UNVERIFIED_ARTIFACT_ID: &str = "00000000000000000000000000000000";
+
+/// Linker symbol forcing the artifact marker into the final image.
+const ARTIFACT_ID_SYMBOL: &str = "EXT4WIN_PRODUCTION_ARTIFACT_ID";
+
+/// Linked production roots and protocol boundaries required in the final image map.
+const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
+    ("active cancellation callback", "active_irp_cancelled"),
+    ("storage retry timer callback", "storage_retry_timer_dpc"),
+    ("lower completion routine", "lower_request_completed"),
+    ("durable publication boundary", "publish_durable"),
+    ("completion registration import", "IoSetCompletionRoutineEx"),
+    ("lower submission import", "IofCallDriver"),
+    ("artifact identity", ARTIFACT_ID_SYMBOL),
+];
+
+/// AMD64 COFF machine identifier.
+const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+
+/// PE32+ optional-header magic.
+const PE32_PLUS_MAGIC: u16 = 0x020b;
+
+/// Native subsystem identifier used by kernel drivers.
+const IMAGE_SUBSYSTEM_NATIVE: u16 = 1;
+
+/// Minimum PE32+ optional-header size through the certificate directory entry.
+const REQUIRED_OPTIONAL_HEADER_SIZE: usize = 152;
+
+/// Current `WIN_CERTIFICATE` revision emitted by Authenticode tooling.
+const WIN_CERT_REVISION_2_0: u16 = 0x0200;
+
+/// PKCS#7 signed-data certificate type used by Authenticode.
+const WIN_CERT_TYPE_PKCS_SIGNED_DATA: u16 = 0x0002;
+
+/// Fixed header bytes preceding a `WIN_CERTIFICATE` payload.
+const WIN_CERTIFICATE_HEADER_SIZE: usize = 8;
 
 /// The only legal terminal status for an ext4win-created lower IRP completion routine.
 const MORE_PROCESSING_REQUIRED_RETURN: &str = "ret i32 -1073741802";
@@ -49,10 +94,10 @@ enum GateError {
         /// Underlying operating-system error.
         source: io::Error,
     },
-    /// The LLVM IR is not structurally usable by the gate.
+    /// The LLVM IR is not structurally usable by the graph gate.
     InvalidIr(String),
-    /// No release LLVM IR artifact was found.
-    ArtifactNotFound(PathBuf),
+    /// The release artifacts do not form one verified production bundle.
+    InvalidArtifact(String),
     /// The command-line arguments do not match the gate contract.
     InvalidArguments,
 }
@@ -66,14 +111,12 @@ impl fmt::Display for GateError {
                 source,
             } => write!(formatter, "{operation} {}: {source}", path.display()),
             Self::InvalidIr(detail) => write!(formatter, "invalid LLVM IR: {detail}"),
-            Self::ArtifactNotFound(root) => write!(
-                formatter,
-                "release ext4win.ll was not found below {}",
-                root.display()
-            ),
+            Self::InvalidArtifact(detail) => {
+                write!(formatter, "invalid release artifact: {detail}")
+            }
             Self::InvalidArguments => write!(
                 formatter,
-                "usage: production-reachability [path-to-release-ext4win.ll]"
+                "usage: production-reachability <release-ext4win.ll> <release-ext4win.map> <signed-ext4win.sys>"
             ),
         }
     }
@@ -127,6 +170,8 @@ struct Function {
     edges: BTreeSet<String>,
     /// Direct call targets in LLVM instruction order.
     direct_calls: Vec<String>,
+    /// Normalized body instructions and basic-block labels in source order.
+    body: Vec<String>,
     /// Indirect call sites in the function body.
     indirect_calls: Vec<IndirectCall>,
     /// Normalized LLVM return instructions in the function body.
@@ -166,6 +211,56 @@ struct AnalysisReport {
     address_taken_count: usize,
     /// Forbidden or unresolved paths.
     violations: Vec<Violation>,
+}
+
+/// Explicit paths for one production artifact bundle.
+#[derive(Debug)]
+struct ArtifactPaths {
+    /// Release LLVM IR emitted by the driver compilation.
+    ir: PathBuf,
+    /// Link map emitted by the same driver compilation.
+    link_map: PathBuf,
+    /// Signed package driver copied from that link.
+    driver: PathBuf,
+}
+
+/// Validated one-build identifier retained in compilation and link outputs.
+#[derive(Debug, Eq, PartialEq)]
+struct ArtifactIdentity(String);
+
+/// Identity-bearing release inputs loaded from disk.
+#[derive(Debug)]
+struct ArtifactBundle {
+    /// Validated paths supplied on the command line.
+    paths: ArtifactPaths,
+    /// UTF-8 LLVM IR text.
+    ir: String,
+    /// Parsed final-image link map.
+    link_map: LinkMap,
+    /// Shared non-sentinel artifact identity.
+    identity: ArtifactIdentity,
+}
+
+/// Final-link facts recovered from the MSVC map file.
+#[derive(Debug)]
+struct LinkMap {
+    /// COFF timestamp recorded by the linker.
+    timestamp: u32,
+    /// Preferred image base recorded by the linker.
+    image_base: u64,
+    /// Absolute linked address of `DriverEntry`.
+    driver_entry: u64,
+}
+
+/// Final PE facts required to bind the map and signed image.
+#[derive(Debug)]
+struct PeImage {
+    /// COFF timestamp from the image file header.
+    timestamp: u32,
+    /// Preferred image base from the optional header.
+    image_base: u64,
+    /// Entry-point relative virtual address.
+    entry_rva: u32,
 }
 
 /// Classification for a forbidden production sink.
@@ -219,23 +314,24 @@ fn main() -> ExitCode {
     }
 }
 
-/// Executes artifact discovery, parsing, analysis, and reporting.
+/// Executes artifact binding, parsing, analysis, and reporting.
 ///
 /// # Errors
 ///
-/// Returns an artifact, I/O, or LLVM parsing error before a verdict can be
-/// produced.
+/// Returns an artifact, I/O, or LLVM parsing error before a verdict can be produced.
 fn run() -> GateResult<bool> {
-    let ir_path = command_line_ir_path()?;
-    let ir = fs::read_to_string(&ir_path).map_err(|source| GateError::Io {
-        operation: "read",
-        path: ir_path.clone(),
-        source,
-    })?;
-    let module = IrModule::parse(&ir)?;
-    let report = module.analyze()?;
+    let bundle = ArtifactBundle::load(command_line_artifacts()?)?;
+    let module = IrModule::parse(&bundle.ir)?;
+    let report = module.analyze_release()?;
 
-    println!("production reachability artifact: {}", ir_path.display());
+    println!("production artifact identity: {}", bundle.identity.0);
+    println!("release LLVM IR: {}", bundle.paths.ir.display());
+    println!("release link map: {}", bundle.paths.link_map.display());
+    println!("signed driver: {}", bundle.paths.driver.display());
+    println!(
+        "linked image: timestamp {:08x}, base {:016x}, DriverEntry {:016x}",
+        bundle.link_map.timestamp, bundle.link_map.image_base, bundle.link_map.driver_entry
+    );
     println!(
         "functions: {}, reachable: {}, address-taken: {}",
         report.function_count, report.reachable_count, report.address_taken_count
@@ -256,91 +352,450 @@ fn run() -> GateResult<bool> {
     Ok(false)
 }
 
-/// Resolves an explicit IR argument or discovers the newest release artifact.
+/// Resolves the three explicit members of a production artifact bundle.
 ///
 /// # Errors
 ///
-/// Returns an error for an invalid argument count, current-directory failure,
-/// or artifact-discovery failure.
-fn command_line_ir_path() -> GateResult<PathBuf> {
+/// Returns an error unless LLVM IR, link-map, and signed-driver paths are supplied exactly once.
+fn command_line_artifacts() -> GateResult<ArtifactPaths> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
-    let explicit = arguments.next();
+    let ir = arguments.next().ok_or(GateError::InvalidArguments)?;
+    let link_map = arguments.next().ok_or(GateError::InvalidArguments)?;
+    let driver = arguments.next().ok_or(GateError::InvalidArguments)?;
     if arguments.next().is_some() {
         return Err(GateError::InvalidArguments);
     }
-    if let Some(path) = explicit {
-        return Ok(PathBuf::from(path));
-    }
-
-    let current = env::current_dir().map_err(|source| GateError::Io {
-        operation: "resolve current directory",
-        path: PathBuf::from("."),
-        source,
-    })?;
-    discover_release_ir(
-        &current
-            .join("target")
-            .join("release")
-            .join("build")
-            .join("ext4win"),
-    )
+    Ok(ArtifactPaths {
+        ir: PathBuf::from(ir),
+        link_map: PathBuf::from(link_map),
+        driver: PathBuf::from(driver),
+    })
 }
 
-/// Finds the newest `ext4win.ll` below the WDK release output root.
+impl ArtifactBundle {
+    /// Loads and binds LLVM IR, link map, and signed PE by independent identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O or artifact error when any input is absent, malformed, unsigned, or belongs
+    /// to another compilation.
+    fn load(paths: ArtifactPaths) -> GateResult<Self> {
+        let ir = fs::read_to_string(&paths.ir).map_err(|source| GateError::Io {
+            operation: "read LLVM IR",
+            path: paths.ir.clone(),
+            source,
+        })?;
+        let link_map_text =
+            fs::read_to_string(&paths.link_map).map_err(|source| GateError::Io {
+                operation: "read link map",
+                path: paths.link_map.clone(),
+                source,
+            })?;
+        let driver = fs::read(&paths.driver).map_err(|source| GateError::Io {
+            operation: "read signed driver",
+            path: paths.driver.clone(),
+            source,
+        })?;
+
+        let ir_identity = ArtifactIdentity::parse(ir.as_bytes(), "LLVM IR")?;
+        let driver_identity = ArtifactIdentity::parse(&driver, "signed driver")?;
+        if ir_identity != driver_identity {
+            return Err(GateError::InvalidArtifact(format!(
+                "LLVM IR identity {} does not match signed-driver identity {}",
+                ir_identity.0, driver_identity.0
+            )));
+        }
+
+        let link_map = LinkMap::parse(&link_map_text)?;
+        let image = PeImage::parse(&driver)?;
+        link_map.verify_image(&image)?;
+
+        Ok(Self {
+            paths,
+            ir,
+            link_map,
+            identity: ir_identity,
+        })
+    }
+}
+
+impl ArtifactIdentity {
+    /// Extracts the sole valid non-sentinel build identity from artifact bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact error when the marker is absent, malformed, ambiguous, or unverified.
+    fn parse(bytes: &[u8], artifact: &'static str) -> GateResult<Self> {
+        let mut identities = BTreeSet::new();
+        let mut offset = 0_usize;
+        while let Some(remaining) = bytes.get(offset..) {
+            let Some(record) = remaining.get(..ARTIFACT_ID_RECORD_LENGTH) else {
+                break;
+            };
+            let Some(candidate) = record.strip_prefix(ARTIFACT_ID_MARKER.as_bytes()) else {
+                offset = checked_offset(offset, 1, "artifact identity scan")?;
+                continue;
+            };
+            if candidate.iter().all(u8::is_ascii_hexdigit) {
+                let identity = core::str::from_utf8(candidate).map_err(|error| {
+                    GateError::InvalidArtifact(format!(
+                        "{artifact} artifact identity is not UTF-8: {error}"
+                    ))
+                })?;
+                identities.insert(identity.to_ascii_lowercase());
+            }
+            offset = checked_offset(offset, 1, "artifact identity scan")?;
+        }
+
+        if identities.len() != 1 {
+            return Err(GateError::InvalidArtifact(format!(
+                "{artifact} must contain exactly one 32-digit artifact identity; found {}",
+                identities.len()
+            )));
+        }
+        let identity = identities.into_iter().next().ok_or_else(|| {
+            GateError::InvalidArtifact(format!("{artifact} artifact identity disappeared"))
+        })?;
+        if identity == UNVERIFIED_ARTIFACT_ID {
+            return Err(GateError::InvalidArtifact(format!(
+                "{artifact} carries the unverified developer-build identity"
+            )));
+        }
+        Ok(Self(identity))
+    }
+}
+
+impl LinkMap {
+    /// Parses final-link identity fields and required production symbols.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact error when a header field, entry point, or required linked symbol is
+    /// absent or malformed.
+    fn parse(map: &str) -> GateResult<Self> {
+        for (role, symbol) in REQUIRED_LINKED_SYMBOLS {
+            if !map.lines().any(|line| line.contains(symbol)) {
+                return Err(GateError::InvalidArtifact(format!(
+                    "link map omits {role} symbol containing {symbol}"
+                )));
+            }
+        }
+
+        let timestamp = map
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("Timestamp is ")
+                    .and_then(|value| value.split_whitespace().next())
+            })
+            .ok_or_else(|| {
+                GateError::InvalidArtifact("link map omits its COFF timestamp".to_owned())
+            })?;
+        let timestamp = parse_hex_u32(timestamp, "link-map timestamp")?;
+
+        let image_base = map
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Preferred load address is "))
+            .ok_or_else(|| {
+                GateError::InvalidArtifact("link map omits its preferred image base".to_owned())
+            })?;
+        let image_base = parse_hex_u64(image_base.trim(), "link-map image base")?;
+
+        let driver_entry = map.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _section_offset = fields.next()?;
+            if fields.next()? != DRIVER_ENTRY {
+                return None;
+            }
+            fields.next()
+        });
+        let driver_entry = driver_entry.ok_or_else(|| {
+            GateError::InvalidArtifact("link map omits the DriverEntry public symbol".to_owned())
+        })?;
+        let driver_entry = parse_hex_u64(driver_entry, "linked DriverEntry address")?;
+
+        Ok(Self {
+            timestamp,
+            image_base,
+            driver_entry,
+        })
+    }
+
+    /// Verifies that this map describes the supplied final signed image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact error on any timestamp, base-address, or entry-point mismatch.
+    fn verify_image(&self, image: &PeImage) -> GateResult<()> {
+        if self.timestamp != image.timestamp {
+            return Err(GateError::InvalidArtifact(format!(
+                "link-map timestamp {:08x} does not match PE timestamp {:08x}",
+                self.timestamp, image.timestamp
+            )));
+        }
+        if self.image_base != image.image_base {
+            return Err(GateError::InvalidArtifact(format!(
+                "link-map image base {:016x} does not match PE image base {:016x}",
+                self.image_base, image.image_base
+            )));
+        }
+        let image_entry = image
+            .image_base
+            .checked_add(u64::from(image.entry_rva))
+            .ok_or_else(|| {
+                GateError::InvalidArtifact("PE entry-point address overflows u64".to_owned())
+            })?;
+        if self.driver_entry != image_entry {
+            return Err(GateError::InvalidArtifact(format!(
+                "linked DriverEntry address {:016x} does not match PE entry point {:016x}",
+                self.driver_entry, image_entry
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl PeImage {
+    /// Parses and validates the final AMD64 native signed PE image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact error for truncated headers, a non-driver image, or an absent embedded
+    /// Authenticode certificate table.
+    fn parse(image: &[u8]) -> GateResult<Self> {
+        if !image.starts_with(b"MZ") {
+            return Err(GateError::InvalidArtifact(
+                "signed driver has no DOS MZ header".to_owned(),
+            ));
+        }
+        let pe_offset =
+            usize::try_from(read_u32(image, 0x3c, "PE header offset")?).map_err(|error| {
+                GateError::InvalidArtifact(format!("PE header offset does not fit usize: {error}"))
+            })?;
+        let signature_end = checked_offset(pe_offset, 4, "PE signature")?;
+        let signature = image.get(pe_offset..signature_end).ok_or_else(|| {
+            GateError::InvalidArtifact("signed driver has a truncated PE signature".to_owned())
+        })?;
+        if signature != b"PE\0\0" {
+            return Err(GateError::InvalidArtifact(
+                "signed driver has an invalid PE signature".to_owned(),
+            ));
+        }
+
+        let coff = signature_end;
+        if read_u16(image, coff, "COFF machine")? != IMAGE_FILE_MACHINE_AMD64 {
+            return Err(GateError::InvalidArtifact(
+                "signed driver is not an AMD64 image".to_owned(),
+            ));
+        }
+        let timestamp_offset = checked_offset(coff, 4, "COFF timestamp")?;
+        let timestamp = read_u32(image, timestamp_offset, "COFF timestamp")?;
+        let optional_size_offset = checked_offset(coff, 16, "optional-header size")?;
+        let optional_size = usize::from(read_u16(
+            image,
+            optional_size_offset,
+            "optional-header size",
+        )?);
+        if optional_size < REQUIRED_OPTIONAL_HEADER_SIZE {
+            return Err(GateError::InvalidArtifact(format!(
+                "PE32+ optional header is too short for the certificate directory: {optional_size} bytes"
+            )));
+        }
+        let optional = checked_offset(coff, 20, "optional header")?;
+        let optional_end = checked_offset(optional, optional_size, "optional header")?;
+        if image.get(optional..optional_end).is_none() {
+            return Err(GateError::InvalidArtifact(
+                "signed driver has a truncated optional header".to_owned(),
+            ));
+        }
+        if read_u16(image, optional, "optional-header magic")? != PE32_PLUS_MAGIC {
+            return Err(GateError::InvalidArtifact(
+                "signed driver is not PE32+".to_owned(),
+            ));
+        }
+
+        let entry_offset = checked_offset(optional, 16, "entry-point RVA")?;
+        let entry_rva = read_u32(image, entry_offset, "entry-point RVA")?;
+        let image_base_offset = checked_offset(optional, 24, "image base")?;
+        let image_base = read_u64(image, image_base_offset, "image base")?;
+        let subsystem_offset = checked_offset(optional, 68, "subsystem")?;
+        if read_u16(image, subsystem_offset, "subsystem")? != IMAGE_SUBSYSTEM_NATIVE {
+            return Err(GateError::InvalidArtifact(
+                "signed driver does not use the native subsystem".to_owned(),
+            ));
+        }
+
+        let certificate_offset_field = checked_offset(optional, 144, "certificate offset")?;
+        let certificate_size_field = checked_offset(optional, 148, "certificate size")?;
+        let certificate_size_field_end = checked_offset(
+            certificate_size_field,
+            core::mem::size_of::<u32>(),
+            "certificate directory",
+        )?;
+        if certificate_size_field_end > optional_end {
+            return Err(GateError::InvalidArtifact(
+                "optional header omits the certificate data directory".to_owned(),
+            ));
+        }
+        let certificate_offset = usize::try_from(read_u32(
+            image,
+            certificate_offset_field,
+            "certificate offset",
+        )?)
+        .map_err(|error| {
+            GateError::InvalidArtifact(format!("certificate offset does not fit usize: {error}"))
+        })?;
+        let certificate_size = usize::try_from(read_u32(
+            image,
+            certificate_size_field,
+            "certificate size",
+        )?)
+        .map_err(|error| {
+            GateError::InvalidArtifact(format!("certificate size does not fit usize: {error}"))
+        })?;
+        if certificate_offset == 0 || certificate_size == 0 {
+            return Err(GateError::InvalidArtifact(
+                "signed driver has no embedded Authenticode certificate table".to_owned(),
+            ));
+        }
+        if certificate_offset.checked_rem(8) != Some(0)
+            || certificate_size < WIN_CERTIFICATE_HEADER_SIZE
+        {
+            return Err(GateError::InvalidArtifact(
+                "Authenticode certificate table has invalid alignment or length".to_owned(),
+            ));
+        }
+        let certificate_end = checked_offset(
+            certificate_offset,
+            certificate_size,
+            "Authenticode certificate table",
+        )?;
+        if image
+            .get(certificate_offset..certificate_end)
+            .is_none_or(<[u8]>::is_empty)
+        {
+            return Err(GateError::InvalidArtifact(
+                "Authenticode certificate table lies outside the driver image".to_owned(),
+            ));
+        }
+        let certificate_length = usize::try_from(read_u32(
+            image,
+            certificate_offset,
+            "WIN_CERTIFICATE length",
+        )?)
+        .map_err(|error| {
+            GateError::InvalidArtifact(format!(
+                "WIN_CERTIFICATE length does not fit usize: {error}"
+            ))
+        })?;
+        if certificate_length < WIN_CERTIFICATE_HEADER_SIZE || certificate_length > certificate_size
+        {
+            return Err(GateError::InvalidArtifact(
+                "WIN_CERTIFICATE length lies outside its directory entry".to_owned(),
+            ));
+        }
+        let certificate_revision_offset =
+            checked_offset(certificate_offset, 4, "WIN_CERTIFICATE revision")?;
+        if read_u16(
+            image,
+            certificate_revision_offset,
+            "WIN_CERTIFICATE revision",
+        )? != WIN_CERT_REVISION_2_0
+        {
+            return Err(GateError::InvalidArtifact(
+                "WIN_CERTIFICATE revision is not 2.0".to_owned(),
+            ));
+        }
+        let certificate_type_offset =
+            checked_offset(certificate_offset, 6, "WIN_CERTIFICATE type")?;
+        if read_u16(image, certificate_type_offset, "WIN_CERTIFICATE type")?
+            != WIN_CERT_TYPE_PKCS_SIGNED_DATA
+        {
+            return Err(GateError::InvalidArtifact(
+                "WIN_CERTIFICATE is not PKCS signed data".to_owned(),
+            ));
+        }
+
+        Ok(Self {
+            timestamp,
+            image_base,
+            entry_rva,
+        })
+    }
+}
+
+/// Parses one hexadecimal `u32` artifact field.
 ///
 /// # Errors
 ///
-/// Returns an I/O error when the artifact tree cannot be enumerated, or an
-/// artifact-not-found error when no release IR exists below `root`.
-fn discover_release_ir(root: &Path) -> GateResult<PathBuf> {
-    let mut pending = vec![root.to_path_buf()];
-    let mut newest: Option<(SystemTime, PathBuf)> = None;
+/// Returns an artifact error when `value` is not representable hexadecimal `u32` text.
+fn parse_hex_u32(value: &str, field: &'static str) -> GateResult<u32> {
+    u32::from_str_radix(value, 16)
+        .map_err(|error| GateError::InvalidArtifact(format!("{field} is not hexadecimal: {error}")))
+}
 
-    while let Some(directory) = pending.pop() {
-        let entries = fs::read_dir(&directory).map_err(|source| GateError::Io {
-            operation: "enumerate",
-            path: directory.clone(),
-            source,
-        })?;
-        for entry_result in entries {
-            let entry = entry_result.map_err(|source| GateError::Io {
-                operation: "read directory entry below",
-                path: directory.clone(),
-                source,
-            })?;
-            let file_type = entry.file_type().map_err(|source| GateError::Io {
-                operation: "inspect",
-                path: entry.path(),
-                source,
-            })?;
-            if file_type.is_dir() {
-                pending.push(entry.path());
-                continue;
-            }
-            if entry.file_name() != "ext4win.ll" {
-                continue;
-            }
-            let modified = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .map_err(|source| GateError::Io {
-                    operation: "read modification time for",
-                    path: entry.path(),
-                    source,
-                })?;
-            let replace = newest
-                .as_ref()
-                .is_none_or(|(current_modified, _)| modified > *current_modified);
-            if replace {
-                newest = Some((modified, entry.path()));
-            }
-        }
-    }
+/// Parses one hexadecimal `u64` artifact field.
+///
+/// # Errors
+///
+/// Returns an artifact error when `value` is not representable hexadecimal `u64` text.
+fn parse_hex_u64(value: &str, field: &'static str) -> GateResult<u64> {
+    u64::from_str_radix(value, 16)
+        .map_err(|error| GateError::InvalidArtifact(format!("{field} is not hexadecimal: {error}")))
+}
 
-    newest
-        .map(|(_, path)| path)
-        .ok_or_else(|| GateError::ArtifactNotFound(root.to_path_buf()))
+/// Adds a PE offset without permitting wraparound.
+///
+/// # Errors
+///
+/// Returns an artifact error when the sum is not representable as `usize`.
+fn checked_offset(base: usize, additional: usize, field: &'static str) -> GateResult<usize> {
+    base.checked_add(additional).ok_or_else(|| {
+        GateError::InvalidArtifact(format!("{field} offset overflows address space"))
+    })
+}
+
+/// Reads a little-endian `u16` from a checked PE byte range.
+///
+/// # Errors
+///
+/// Returns an artifact error when the offset overflows or the field is truncated.
+fn read_u16(bytes: &[u8], offset: usize, field: &'static str) -> GateResult<u16> {
+    let end = checked_offset(offset, core::mem::size_of::<u16>(), field)?;
+    let value: &[u8; 2] = bytes
+        .get(offset..end)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| GateError::InvalidArtifact(format!("{field} is truncated")))?;
+    Ok(u16::from_le_bytes(*value))
+}
+
+/// Reads a little-endian `u32` from a checked PE byte range.
+///
+/// # Errors
+///
+/// Returns an artifact error when the offset overflows or the field is truncated.
+fn read_u32(bytes: &[u8], offset: usize, field: &'static str) -> GateResult<u32> {
+    let end = checked_offset(offset, core::mem::size_of::<u32>(), field)?;
+    let value: &[u8; 4] = bytes
+        .get(offset..end)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| GateError::InvalidArtifact(format!("{field} is truncated")))?;
+    Ok(u32::from_le_bytes(*value))
+}
+
+/// Reads a little-endian `u64` from a checked PE byte range.
+///
+/// # Errors
+///
+/// Returns an artifact error when the offset overflows or the field is truncated.
+fn read_u64(bytes: &[u8], offset: usize, field: &'static str) -> GateResult<u64> {
+    let end = checked_offset(offset, core::mem::size_of::<u64>(), field)?;
+    let value: &[u8; 8] = bytes
+        .get(offset..end)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| GateError::InvalidArtifact(format!("{field} is truncated")))?;
+    Ok(u64::from_le_bytes(*value))
 }
 
 impl IrModule {
@@ -394,6 +849,7 @@ impl IrModule {
                     signature,
                     edges: BTreeSet::new(),
                     direct_calls: Vec::new(),
+                    body: Vec::new(),
                     indirect_calls: Vec::new(),
                     returns: Vec::new(),
                     externally_visible,
@@ -502,6 +958,7 @@ impl IrModule {
             GateError::InvalidIr(format!("body found for unknown function {caller}"))
         })?;
         let trimmed = line.trim();
+        caller_node.body.push(trimmed.to_owned());
         if trimmed.starts_with("ret ") {
             let return_instruction = trimmed
                 .split_once(',')
@@ -538,13 +995,24 @@ impl IrModule {
         }
     }
 
+    /// Applies the complete ext4win release contract to a resolved production graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-IR error if graph construction or a release boundary audit fails.
+    fn analyze_release(mut self) -> GateResult<AnalysisReport> {
+        let mut report = self.analyze_root_reachability()?;
+        self.audit_release_contracts(&mut report.violations)?;
+        Ok(report)
+    }
+
     /// Resolves indirect calls and computes root-to-sink paths.
     ///
     /// # Errors
     ///
     /// Returns an invalid-IR error if graph construction produced a missing or
     /// cyclic function node.
-    fn analyze(mut self) -> GateResult<AnalysisReport> {
+    fn analyze_root_reachability(&mut self) -> GateResult<AnalysisReport> {
         let address_taken_by_signature = self.address_taken_by_signature();
         let mut unresolved = BTreeMap::<String, Vec<IndirectCall>>::new();
 
@@ -642,8 +1110,6 @@ impl IrModule {
             }
         }
 
-        self.audit_release_contracts(&mut violations)?;
-
         Ok(AnalysisReport {
             function_count: self.functions.len(),
             reachable_count: predecessors.len(),
@@ -659,12 +1125,6 @@ impl IrModule {
     ///
     /// Returns an invalid-IR error when a contract path cannot be reconstructed.
     fn audit_release_contracts(&self, violations: &mut Vec<Violation>) -> GateResult<()> {
-        if !self.functions.contains_key("IoSetCompletionRoutineEx")
-            || !self.functions.contains_key("ExAllocatePool2")
-        {
-            return Ok(());
-        }
-
         self.audit_lower_submission(violations);
         self.audit_lower_completion_returns(violations);
         self.audit_nonallocating_callbacks(violations)?;
@@ -672,39 +1132,38 @@ impl IrModule {
     }
 
     /// Requires every release monomorphization that registers lower completion to call the lower
-    /// driver later in the same sealed boundary.
+    /// driver in the immediate registration-success block of the same sealed boundary.
     fn audit_lower_submission(&self, violations: &mut Vec<Violation>) {
         let mut registration_sites = 0_usize;
         for function in self.functions.values() {
             let registrations: Vec<usize> = function
-                .direct_calls
+                .body
                 .iter()
                 .enumerate()
-                .filter_map(|(index, target)| {
-                    (target == "IoSetCompletionRoutineEx").then_some(index)
+                .filter_map(|(index, instruction)| {
+                    instruction_calls(instruction, "IoSetCompletionRoutineEx").then_some(index)
                 })
                 .collect();
             if registrations.is_empty() {
                 continue;
             }
             registration_sites = registration_sites.saturating_add(registrations.len());
-            let submissions: Vec<usize> = function
-                .direct_calls
+            let submissions = function
+                .body
                 .iter()
-                .enumerate()
-                .filter_map(|(index, target)| (target == "IofCallDriver").then_some(index))
-                .collect();
-            let paired = registrations.len() == submissions.len()
-                && registrations
-                    .iter()
-                    .zip(&submissions)
-                    .all(|(registration, submission)| registration < submission);
+                .filter(|instruction| instruction_calls(instruction, "IofCallDriver"))
+                .count();
+            let paired = registrations.len() == submissions
+                && registrations.iter().copied().all(|registration| {
+                    registration_success_calls_driver(&function.body, registration)
+                });
             if !paired && violations.len() < MAX_REPORTED_VIOLATIONS {
                 violations.push(Violation {
                     category: "lower submission protocol",
                     path: vec![
                         function.display.clone(),
-                        "IoSetCompletionRoutineEx must pair with a later IofCallDriver".to_owned(),
+                        "IoSetCompletionRoutineEx success must flow directly to one IofCallDriver"
+                            .to_owned(),
                     ],
                 });
             }
@@ -771,7 +1230,22 @@ impl IrModule {
                 is_nonallocating_callback(&function.display).then_some(symbol.clone())
             })
             .collect();
-        let predecessors = self.direct_predecessors_from(&roots)?;
+        for required in [ACTIVE_CANCEL_CALLBACK, STORAGE_RETRY_CALLBACK] {
+            if self
+                .functions
+                .values()
+                .any(|function| function.display == required)
+            {
+                continue;
+            }
+            if violations.len() < MAX_REPORTED_VIOLATIONS {
+                violations.push(Violation {
+                    category: "callback protocol",
+                    path: vec![format!("required release callback is absent: {required}")],
+                });
+            }
+        }
+        let predecessors = self.predecessors_from(&roots)?;
         for symbol in predecessors.keys() {
             if violations.len() >= MAX_REPORTED_VIOLATIONS {
                 break;
@@ -788,42 +1262,6 @@ impl IrModule {
             });
         }
         Ok(())
-    }
-
-    /// Computes direct-call-only paths for callback IRQL auditing.
-    ///
-    /// Typed envelope destinations are indirect calls whose provenance is enforced by their Rust
-    /// construction boundary. The general production analysis remains fail-closed for those
-    /// calls; this narrower closure avoids attributing every signature-compatible callback body to
-    /// the current IRQL.
-    ///
-    /// # Errors
-    ///
-    /// Returns an invalid-IR error when a directly reachable function node is absent.
-    fn direct_predecessors_from(
-        &self,
-        roots: &BTreeSet<String>,
-    ) -> GateResult<BTreeMap<String, Option<String>>> {
-        let mut predecessors = BTreeMap::<String, Option<String>>::new();
-        let mut queue = VecDeque::<String>::new();
-        for root in roots {
-            if self.functions.contains_key(root) && !predecessors.contains_key(root) {
-                predecessors.insert(root.clone(), None);
-                queue.push_back(root.clone());
-            }
-        }
-        while let Some(caller) = queue.pop_front() {
-            let function = self.functions.get(&caller).ok_or_else(|| {
-                GateError::InvalidIr(format!("callback audit function {caller} disappeared"))
-            })?;
-            for callee in &function.direct_calls {
-                if !predecessors.contains_key(callee) {
-                    predecessors.insert(callee.clone(), Some(caller.clone()));
-                    queue.push_back(callee.clone());
-                }
-            }
-        }
-        Ok(predecessors)
     }
 
     /// Rejects allocation, collection growth, or mutable CNG object creation reachable from the
@@ -1246,7 +1684,12 @@ fn classify_sink(symbol: &str, display: &str) -> Option<Sink> {
 /// Recognizes operations forbidden after commit durability and before visibility publication.
 fn is_publication_allocation_sink(symbol: &str, display: &str) -> bool {
     let identity = format!("{display}\n{symbol}").to_ascii_lowercase();
-    identity.contains("exallocatepool2")
+    identity.contains("exallocatepool")
+        || identity.contains("ioallocateirp")
+        || identity.contains("ioallocatemdl")
+        || identity.contains("ioallocateworkitem")
+        || identity.contains("mmallocatepagesformdl")
+        || identity.contains("mmallocatecontiguousmemory")
         || identity.contains("bcryptopenalgorithmprovider")
         || identity.contains("bcryptcreatehash")
         || identity.contains("bcryptgeneratesymmetrickey")
@@ -1265,7 +1708,116 @@ fn is_callback_forbidden_sink(symbol: &str, display: &str) -> bool {
         return true;
     }
     let identity = format!("{display}\n{symbol}").to_ascii_lowercase();
-    identity.contains("kewaitforsingleobject") || identity.contains("kedelayexecutionthread")
+    identity.contains("kewaitforsingleobject")
+        || identity.contains("kewaitformultipleobjects")
+        || identity.contains("zwwaitforsingleobject")
+        || identity.contains("kedelayexecutionthread")
+}
+
+/// Returns whether one LLVM instruction directly invokes `target`.
+fn instruction_calls(instruction: &str, target: &str) -> bool {
+    parse_call_site(instruction)
+        .and_then(|site| site.direct_target)
+        .is_some_and(|callee| callee == target)
+}
+
+/// Verifies the fail/success typestate shape emitted by the sealed lower-registration boundary.
+fn registration_success_calls_driver(body: &[String], registration: usize) -> bool {
+    let Some(registration_instruction) = body.get(registration) else {
+        return false;
+    };
+    let Some(registration_status) = assigned_ssa_value(registration_instruction) else {
+        return false;
+    };
+    let Some(comparison) = body.get(registration.saturating_add(1)) else {
+        return false;
+    };
+    let Some(comparison_result) = assigned_ssa_value(comparison) else {
+        return false;
+    };
+    let Some((_, comparison_body)) = comparison.split_once('=') else {
+        return false;
+    };
+    if comparison_body.trim() != format!("icmp slt i32 {registration_status}, 0") {
+        return false;
+    }
+    let Some(branch) = body.get(registration.saturating_add(2)) else {
+        return false;
+    };
+    let Some((_failure, success)) = conditional_branch_targets(branch, comparison_result) else {
+        return false;
+    };
+    let Some(success_label) = body
+        .iter()
+        .enumerate()
+        .skip(registration.saturating_add(3))
+        .find_map(|(index, instruction)| {
+            (basic_block_label(instruction) == Some(success)).then_some(index)
+        })
+    else {
+        return false;
+    };
+
+    let mut submissions = 0_usize;
+    for instruction in body.iter().skip(success_label.saturating_add(1)) {
+        if basic_block_label(instruction).is_some() {
+            return false;
+        }
+        if instruction_calls(instruction, "IofCallDriver") {
+            submissions = submissions.saturating_add(1);
+        }
+        if is_terminator_instruction(instruction) {
+            return submissions == 1;
+        }
+    }
+    false
+}
+
+/// Extracts an SSA assignment name, including its leading percent sign.
+fn assigned_ssa_value(instruction: &str) -> Option<&str> {
+    let (assignment, _value) = instruction.split_once('=')?;
+    let assignment = assignment.trim();
+    assignment.starts_with('%').then_some(assignment)
+}
+
+/// Extracts the true and false labels from one conditional branch on `condition`.
+fn conditional_branch_targets<'line>(
+    instruction: &'line str,
+    condition: &str,
+) -> Option<(&'line str, &'line str)> {
+    let prefix = format!("br i1 {condition}, label %");
+    let targets = instruction.strip_prefix(&prefix)?;
+    let (true_target, false_target) = targets.split_once(", label %")?;
+    let false_target = false_target
+        .split_once(',')
+        .map_or(false_target, |(label, _)| label);
+    Some((true_target.trim(), false_target.trim()))
+}
+
+/// Extracts a basic-block label without its LLVM predecessor comment.
+fn basic_block_label(instruction: &str) -> Option<&str> {
+    let (label, _suffix) = instruction.split_once(':')?;
+    let label = label.trim();
+    (!label.is_empty() && !label.chars().any(char::is_whitespace)).then_some(label)
+}
+
+/// Recognizes control-flow terminators that end the immediate registration-success block.
+fn is_terminator_instruction(instruction: &str) -> bool {
+    [
+        "ret ",
+        "br ",
+        "switch ",
+        "indirectbr ",
+        "invoke ",
+        "resume ",
+        "unreachable",
+        "callbr ",
+        "catchswitch ",
+        "catchret ",
+        "cleanupret ",
+    ]
+    .iter()
+    .any(|prefix| instruction.starts_with(prefix))
 }
 
 /// Returns whether the selected shortest path already crossed a forbidden sink.
@@ -1365,7 +1917,10 @@ fn display_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{IrModule, Sink, classify_sink};
+    use super::{
+        ACTIVE_CANCEL_CALLBACK, ARTIFACT_ID_MARKER, AnalysisReport, ArtifactIdentity,
+        DURABLE_PUBLISH_ROOT, GateError, IrModule, LinkMap, PeImage, Sink, classify_sink,
+    };
 
     /// Builds a minimal driver-shaped LLVM fixture that activates every release contract audit.
     fn release_contract_fixture(
@@ -1377,15 +1932,69 @@ mod tests {
             "; root\n\
              define void @DriverEntry() {{\n  call void @submit()\n  call void @publish()\n  ret void\n}}\n\
              ; submit\n\
-             define internal void @submit() {{\n{submit_body}\n  ret void\n}}\n\
+             define internal void @submit() {{\n{submit_body}\n}}\n\
              ; ext4win::irp::lower::lower_request_completed::<fixture>\n\
              define internal i32 @complete(ptr %device, ptr %irp, ptr %context) {{\n  {completion_return}\n}}\n\
+             ; ext4win::irp::cancel::active_irp_cancelled\n\
+             define internal void @active_cancel(ptr %device, ptr %irp) {{\n  ret void\n}}\n\
+             ; ext4win::irp::reactor::storage_retry_timer_dpc\n\
+             define internal void @retry_timer(ptr %dpc, ptr %context, ptr %arg1, ptr %arg2) {{\n  ret void\n}}\n\
              ; <ext4win::state::volume_runtime::VolumeRuntime>::publish_durable\n\
              define internal void @publish() {{\n{publish_body}\n  ret void\n}}\n\
              declare i32 @IoSetCompletionRoutineEx(ptr, ptr, ptr, ptr, i8, i8, i8)\n\
              declare i32 @IofCallDriver(ptr, ptr)\n\
-             declare ptr @ExAllocatePool2(i64, i64, i32)\n"
+             declare ptr @ExAllocatePool2(i64, i64, i32)\n\
+             declare ptr @IoAllocateIrp(i8, i8)\n"
         )
+    }
+
+    /// Emits the exact registration-failure/success split accepted by the release contract.
+    fn successful_lower_submission() -> &'static str {
+        "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)\n\
+           %failed = icmp slt i32 %registered, 0\n\
+           br i1 %failed, label %registration_failed, label %registration_succeeded\n\
+         registration_failed:\n\
+           ret void\n\
+         registration_succeeded:\n\
+           %submitted = call i32 @IofCallDriver(ptr null, ptr null)\n\
+           ret void"
+    }
+
+    /// Emits a malformed success branch that returns without submitting the registered request.
+    fn missing_lower_submission() -> &'static str {
+        "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)\n\
+           %failed = icmp slt i32 %registered, 0\n\
+           br i1 %failed, label %registration_failed, label %registration_succeeded\n\
+         registration_failed:\n\
+           ret void\n\
+         registration_succeeded:\n\
+           ret void"
+    }
+
+    /// Emits one textual submit call that remains bypassable from the registration-success block.
+    fn bypassable_lower_submission() -> &'static str {
+        "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)\n\
+           %failed = icmp slt i32 %registered, 0\n\
+           br i1 %failed, label %registration_failed, label %registration_succeeded\n\
+         registration_failed:\n\
+           ret void\n\
+         registration_succeeded:\n\
+           br i1 true, label %submit, label %escape\n\
+         submit:\n\
+           %submitted = call i32 @IofCallDriver(ptr null, ptr null)\n\
+           ret void\n\
+         escape:\n\
+           ret void"
+    }
+
+    /// Parses and runs only the reusable production-root graph analysis for focused fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parser or graph-analysis failure for `fixture`.
+    fn analyze_root_fixture(fixture: &str) -> Result<AnalysisReport, super::GateError> {
+        let mut module = IrModule::parse(fixture)?;
+        module.analyze_root_reachability()
     }
 
     /// Converts a failed test invariant into the analyzer's structured error.
@@ -1401,6 +2010,152 @@ mod tests {
         }
     }
 
+    /// Produces a minimal MSVC map containing every production symbol required by the gate.
+    fn link_map_fixture(timestamp: u32, image_base: u64, driver_entry: u64) -> String {
+        format!(
+            " ext4win\n Timestamp is {timestamp:08x} (fixture)\n\
+             Preferred load address is {image_base:016x}\n\
+             0001:00001000 DriverEntry {driver_entry:016x} f ext4win.o\n\
+             active_irp_cancelled\n\
+             storage_retry_timer_dpc\n\
+             lower_request_completed\n\
+             publish_durable\n\
+             IoSetCompletionRoutineEx\n\
+             IofCallDriver\n\
+             EXT4WIN_PRODUCTION_ARTIFACT_ID\n"
+        )
+    }
+
+    /// Writes one byte range without unchecked indexing or slice-copy panics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact error when the fixture range is not representable or exceeds the image.
+    fn write_bytes(destination: &mut [u8], offset: usize, value: &[u8]) -> Result<(), GateError> {
+        let end = offset.checked_add(value.len()).ok_or_else(|| {
+            GateError::InvalidArtifact("fixture write offset overflowed".to_owned())
+        })?;
+        let output = destination.get_mut(offset..end).ok_or_else(|| {
+            GateError::InvalidArtifact("fixture write exceeded the PE image".to_owned())
+        })?;
+        for (output_byte, value_byte) in output.iter_mut().zip(value) {
+            *output_byte = *value_byte;
+        }
+        Ok(())
+    }
+
+    /// Produces a minimal AMD64 native PE candidate with an optional certificate table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact error if a fixture field cannot be placed in its fixed image buffer.
+    fn pe_fixture(has_certificate: bool) -> Result<Vec<u8>, GateError> {
+        let mut image = vec![0_u8; 0x380];
+        write_bytes(&mut image, 0, b"MZ")?;
+        write_bytes(&mut image, 0x3c, &0x80_u32.to_le_bytes())?;
+        write_bytes(&mut image, 0x80, b"PE\0\0")?;
+        write_bytes(&mut image, 0x84, &0x8664_u16.to_le_bytes())?;
+        write_bytes(&mut image, 0x88, &0x1234_5678_u32.to_le_bytes())?;
+        write_bytes(&mut image, 0x94, &0x00f0_u16.to_le_bytes())?;
+        write_bytes(&mut image, 0x98, &0x020b_u16.to_le_bytes())?;
+        write_bytes(&mut image, 0xa8, &0x1000_u32.to_le_bytes())?;
+        write_bytes(&mut image, 0xb0, &0x0000_0001_8000_0000_u64.to_le_bytes())?;
+        write_bytes(&mut image, 0xdc, &1_u16.to_le_bytes())?;
+        if has_certificate {
+            write_bytes(&mut image, 0x128, &0x300_u32.to_le_bytes())?;
+            write_bytes(&mut image, 0x12c, &0x40_u32.to_le_bytes())?;
+            write_bytes(&mut image, 0x300, &0x20_u32.to_le_bytes())?;
+            write_bytes(&mut image, 0x304, &0x0200_u16.to_le_bytes())?;
+            write_bytes(&mut image, 0x306, &0x0002_u16.to_le_bytes())?;
+            write_bytes(&mut image, 0x308, b"certificate-table-fixture")?;
+        }
+        Ok(image)
+    }
+
+    /// The build identity must be unique, hexadecimal, and non-sentinel in every artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a valid marker is rejected or invalid identities are accepted.
+    #[test]
+    fn artifact_identity_is_fail_closed() -> Result<(), GateError> {
+        let valid = format!("{ARTIFACT_ID_MARKER}0123456789abcdef0123456789ABCDEF");
+        let parsed = ArtifactIdentity::parse(valid.as_bytes(), "fixture")?;
+        require(
+            parsed.0 == "0123456789abcdef0123456789abcdef",
+            "valid artifact identity was not normalized",
+        )?;
+
+        let sentinel = format!("{ARTIFACT_ID_MARKER}00000000000000000000000000000000");
+        require(
+            ArtifactIdentity::parse(sentinel.as_bytes(), "fixture").is_err(),
+            "unverified artifact identity was accepted",
+        )?;
+
+        let ambiguous = format!(
+            "{ARTIFACT_ID_MARKER}0123456789abcdef0123456789abcdef\n\
+             {ARTIFACT_ID_MARKER}fedcba9876543210fedcba9876543210"
+        );
+        require(
+            ArtifactIdentity::parse(ambiguous.as_bytes(), "fixture").is_err(),
+            "ambiguous artifact identities were accepted",
+        )
+    }
+
+    /// Map timestamp, image base, and `DriverEntry` must identify the supplied signed PE.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matching pair is rejected or a mismatched entry point is accepted.
+    #[test]
+    fn link_map_is_bound_to_signed_pe() -> Result<(), GateError> {
+        let image = PeImage::parse(&pe_fixture(true)?)?;
+        let matching = LinkMap::parse(&link_map_fixture(
+            0x1234_5678,
+            0x0000_0001_8000_0000,
+            0x0000_0001_8000_1000,
+        ))?;
+        matching.verify_image(&image)?;
+
+        let mismatched = LinkMap::parse(&link_map_fixture(
+            0x1234_5678,
+            0x0000_0001_8000_0000,
+            0x0000_0001_8000_2000,
+        ))?;
+        require(
+            mismatched.verify_image(&image).is_err(),
+            "mismatched DriverEntry address was accepted",
+        )
+    }
+
+    /// The final map must retain every production callback and protocol boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if removing a required linked callback is not detected.
+    #[test]
+    fn link_map_requires_production_roots() -> Result<(), GateError> {
+        let map = link_map_fixture(0x1234_5678, 0x0000_0001_8000_0000, 0x0000_0001_8000_1000)
+            .replace("active_irp_cancelled", "missing_cancel_callback");
+        require(
+            LinkMap::parse(&map).is_err(),
+            "link map without active cancellation callback was accepted",
+        )
+    }
+
+    /// A native PE without an embedded Authenticode certificate table is not a production input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsigned candidate is accepted.
+    #[test]
+    fn unsigned_pe_is_rejected() -> Result<(), GateError> {
+        require(
+            PeImage::parse(&pe_fixture(false)?).is_err(),
+            "PE without certificate table was accepted",
+        )
+    }
+
     /// Unreachable language-item sinks must not fail the production graph.
     ///
     /// # Errors
@@ -1408,11 +2163,10 @@ mod tests {
     /// Returns an error if the fixture cannot be parsed or the invariant fails.
     #[test]
     fn unreachable_panic_is_allowed() -> Result<(), super::GateError> {
-        let report = IrModule::parse(
+        let report = analyze_root_fixture(
             "; root\ndefine void @DriverEntry() {\n  ret void\n}\n\
              ; core::panicking::panic_fmt\ndefine internal void @panic_sink() {\n  ret void\n}\n",
-        )?
-        .analyze()?;
+        )?;
         require(
             report.violations.is_empty(),
             "unreachable panic was reported",
@@ -1427,12 +2181,11 @@ mod tests {
     /// absent.
     #[test]
     fn reachable_panic_reports_path() -> Result<(), super::GateError> {
-        let report = IrModule::parse(
+        let report = analyze_root_fixture(
             "; root\ndefine void @DriverEntry() {\n  call void @work()\n  ret void\n}\n\
              ; work\ndefine internal void @work() {\n  call void @panic_sink()\n  ret void\n}\n\
              ; core::panicking::panic_fmt\ndefine internal void @panic_sink() {\n  ret void\n}\n",
-        )?
-        .analyze()?;
+        )?;
         let Some(violation) = report.violations.first() else {
             return Err(super::GateError::InvalidIr(
                 "expected a reachable panic violation".to_owned(),
@@ -1452,12 +2205,11 @@ mod tests {
     /// not reported exactly once.
     #[test]
     fn address_store_roots_callback() -> Result<(), super::GateError> {
-        let report = IrModule::parse(
+        let report = analyze_root_fixture(
             "; root\ndefine void @DriverEntry(ptr %slot) {\n  store ptr @callback, ptr %slot\n  ret void\n}\n\
              ; callback\ndefine internal void @callback() {\n  call void @panic_sink()\n  ret void\n}\n\
              ; core::panicking::panic_fmt\ndefine internal void @panic_sink() {\n  ret void\n}\n",
-        )?
-        .analyze()?;
+        )?;
         require(
             report.violations.len() == 1,
             "stored callback did not produce one violation",
@@ -1472,10 +2224,9 @@ mod tests {
     /// is not rejected.
     #[test]
     fn unresolved_indirect_call_fails_closed() -> Result<(), super::GateError> {
-        let report = IrModule::parse(
+        let report = analyze_root_fixture(
             "; root\ndefine void @DriverEntry(ptr %callback) {\n  call i32 %callback(i64 1)\n  ret void\n}\n",
-        )?
-        .analyze()?;
+        )?;
         let Some(violation) = report.violations.first() else {
             return Err(super::GateError::InvalidIr(
                 "expected an unresolved indirect violation".to_owned(),
@@ -1495,12 +2246,11 @@ mod tests {
     /// not connected.
     #[test]
     fn indirect_call_reaches_typed_address_target() -> Result<(), super::GateError> {
-        let report = IrModule::parse(
+        let report = analyze_root_fixture(
             "; root\ndefine void @DriverEntry(ptr %slot, ptr %callback) {\n  store ptr @typed, ptr %slot\n  call void %callback(ptr null)\n  ret void\n}\n\
              ; typed\ndefine internal void @typed(ptr %value) {\n  call void @panic_sink()\n  ret void\n}\n\
              ; core::panicking::panic_fmt\ndefine internal void @panic_sink() {\n  ret void\n}\n",
-        )?
-        .analyze()?;
+        )?;
         require(
             report
                 .violations
@@ -1518,24 +2268,22 @@ mod tests {
     /// admits the wrong caller.
     #[test]
     fn bugcheck_requires_enumerated_caller() -> Result<(), super::GateError> {
-        let allowed = IrModule::parse(
+        let allowed = analyze_root_fixture(
             "; root\ndefine void @DriverEntry() {\n  call void @fatal()\n  ret void\n}\n\
              ; <ext4win::kernel::fatal::KernelWideInconsistency>::bugcheck\n\
              define internal void @fatal() {\n  call void @KeBugCheckEx()\n  ret void\n}\n\
              declare void @KeBugCheckEx()\n",
-        )?
-        .analyze()?;
+        )?;
         require(
             allowed.violations.is_empty(),
             "enumerated fatal caller was rejected",
         )?;
 
-        let rejected = IrModule::parse(
+        let rejected = analyze_root_fixture(
             "; root\ndefine void @DriverEntry() {\n  call void @wrong()\n  ret void\n}\n\
              ; wrong\ndefine internal void @wrong() {\n  call void @KeBugCheckEx()\n  ret void\n}\n\
              declare void @KeBugCheckEx()\n",
-        )?
-        .analyze()?;
+        )?;
         require(
             rejected.violations.len() == 1,
             "non-fatal bugcheck caller was accepted",
@@ -1571,13 +2319,12 @@ mod tests {
     /// machinery produces redundant paths.
     #[test]
     fn nested_sinks_report_frontier_only() -> Result<(), super::GateError> {
-        let report = IrModule::parse(
+        let report = analyze_root_fixture(
             "; root\ndefine void @DriverEntry() {\n  call void @sort_entry()\n  ret void\n}\n\
              ; core::slice::sort::stable::driftsort_main\n\
              define internal void @sort_entry() {\n  call void @panic_sink()\n  ret void\n}\n\
              ; core::panicking::panic_fmt\ndefine internal void @panic_sink() {\n  ret void\n}\n",
-        )?
-        .analyze()?;
+        )?;
         require(
             report.violations.len() == 1
                 && report
@@ -1596,22 +2343,19 @@ mod tests {
     /// Returns an error if the valid fixture is rejected or either protocol regression is missed.
     #[test]
     fn lower_release_protocol_is_artifact_checked() -> Result<(), super::GateError> {
-        let valid = release_contract_fixture(
-            "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)\n  %submitted = call i32 @IofCallDriver(ptr null, ptr null)",
-            "ret i32 -1073741802",
-            "",
-        );
+        let valid =
+            release_contract_fixture(successful_lower_submission(), "ret i32 -1073741802", "");
         require(
-            IrModule::parse(&valid)?.analyze()?.violations.is_empty(),
+            IrModule::parse(&valid)?
+                .analyze_release()?
+                .violations
+                .is_empty(),
             "valid lower release protocol was rejected",
         )?;
 
-        let missing_submit = release_contract_fixture(
-            "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)",
-            "ret i32 -1073741802",
-            "",
-        );
-        let missing_submit = IrModule::parse(&missing_submit)?.analyze()?;
+        let missing_submit =
+            release_contract_fixture(missing_lower_submission(), "ret i32 -1073741802", "");
+        let missing_submit = IrModule::parse(&missing_submit)?.analyze_release()?;
         require(
             missing_submit
                 .violations
@@ -1620,12 +2364,20 @@ mod tests {
             "registration without lower submission was accepted",
         )?;
 
-        let wrong_completion = release_contract_fixture(
-            "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)\n  %submitted = call i32 @IofCallDriver(ptr null, ptr null)",
-            "ret i32 0",
-            "",
-        );
-        let wrong_completion = IrModule::parse(&wrong_completion)?.analyze()?;
+        let bypassable_submit =
+            release_contract_fixture(bypassable_lower_submission(), "ret i32 -1073741802", "");
+        let bypassable_submit = IrModule::parse(&bypassable_submit)?.analyze_release()?;
+        require(
+            bypassable_submit
+                .violations
+                .iter()
+                .any(|violation| violation.category == "lower submission protocol"),
+            "a registration-success path that bypasses lower submission was accepted",
+        )?;
+
+        let wrong_completion =
+            release_contract_fixture(successful_lower_submission(), "ret i32 0", "");
+        let wrong_completion = IrModule::parse(&wrong_completion)?.analyze_release()?;
         require(
             wrong_completion
                 .violations
@@ -1635,17 +2387,114 @@ mod tests {
         )?;
 
         let allocating_completion = release_contract_fixture(
-            "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)\n  %submitted = call i32 @IofCallDriver(ptr null, ptr null)",
+            successful_lower_submission(),
             "%allocation = call ptr @ExAllocatePool2(i64 64, i64 32, i32 1)\n  ret i32 -1073741802",
             "",
         );
-        let allocating_completion = IrModule::parse(&allocating_completion)?.analyze()?;
+        let allocating_completion = IrModule::parse(&allocating_completion)?.analyze_release()?;
         require(
             allocating_completion
                 .violations
                 .iter()
                 .any(|violation| violation.category == "callback allocation/blocking"),
             "allocating completion callback was accepted",
+        )?;
+
+        let private_irp_allocating_completion = release_contract_fixture(
+            successful_lower_submission(),
+            "%allocation = call ptr @IoAllocateIrp(i8 1, i8 0)\n  ret i32 -1073741802",
+            "",
+        );
+        let private_irp_allocating_completion =
+            IrModule::parse(&private_irp_allocating_completion)?.analyze_release()?;
+        require(
+            private_irp_allocating_completion
+                .violations
+                .iter()
+                .any(|violation| violation.category == "callback allocation/blocking"),
+            "private IRP allocation from a completion callback was accepted",
+        )
+    }
+
+    /// Callback auditing must conservatively follow every resolved indirect target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an allocation reachable only through an indirect callback call is
+    /// omitted from the callback-specific report.
+    #[test]
+    fn callback_audit_follows_resolved_indirect_targets() -> Result<(), super::GateError> {
+        let mut fixture = release_contract_fixture(
+            successful_lower_submission(),
+            "call void %context()\n  ret i32 -1073741802",
+            "",
+        );
+        fixture.push_str(
+            "@destination = internal global ptr @allocating_destination\n\
+             ; fixture::allocating_destination\n\
+             define internal void @allocating_destination() {\n\
+               %allocation = call ptr @ExAllocatePool2(i64 64, i64 32, i32 1)\n\
+               ret void\n\
+             }\n",
+        );
+        let report = IrModule::parse(&fixture)?.analyze_release()?;
+        require(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.category == "callback allocation/blocking"),
+            "allocation through a resolved indirect callback target was accepted",
+        )
+    }
+
+    /// Release audits must not disappear when an unrelated allocator import is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the malformed lower protocol is accepted after removing the allocator
+    /// declaration that previously acted as a fail-open activation sentinel.
+    #[test]
+    fn release_contracts_do_not_depend_on_allocator_imports() -> Result<(), super::GateError> {
+        let fixture =
+            release_contract_fixture(missing_lower_submission(), "ret i32 -1073741802", "")
+                .replace("declare ptr @ExAllocatePool2(i64, i64, i32)\n", "");
+        let report = IrModule::parse(&fixture)?.analyze_release()?;
+        require(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.category == "lower submission protocol"),
+            "allocator import removal disabled lower protocol auditing",
+        )
+    }
+
+    /// Required callback and durable-publication roots are part of the release artifact contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either missing root is silently accepted.
+    #[test]
+    fn release_contracts_require_specialized_roots() -> Result<(), super::GateError> {
+        let fixture =
+            release_contract_fixture(successful_lower_submission(), "ret i32 -1073741802", "");
+        let missing_cancel = fixture.replace(ACTIVE_CANCEL_CALLBACK, "fixture::missing_cancel");
+        let missing_cancel = IrModule::parse(&missing_cancel)?.analyze_release()?;
+        require(
+            missing_cancel
+                .violations
+                .iter()
+                .any(|violation| violation.category == "callback protocol"),
+            "missing active-cancel callback root was accepted",
+        )?;
+
+        let missing_publish = fixture.replace(DURABLE_PUBLISH_ROOT, "fixture::missing_publish");
+        let missing_publish = IrModule::parse(&missing_publish)?.analyze_release()?;
+        require(
+            missing_publish
+                .violations
+                .iter()
+                .any(|violation| violation.category == "post-commit allocation"),
+            "missing durable-publication root was accepted",
         )
     }
 
@@ -1658,11 +2507,11 @@ mod tests {
     #[test]
     fn durable_publication_rejects_allocator_reachability() -> Result<(), super::GateError> {
         let fixture = release_contract_fixture(
-            "  %registered = call i32 @IoSetCompletionRoutineEx(ptr null, ptr null, ptr @complete, ptr null, i8 1, i8 1, i8 1)\n  %submitted = call i32 @IofCallDriver(ptr null, ptr null)",
+            successful_lower_submission(),
             "ret i32 -1073741802",
             "  %allocation = call ptr @ExAllocatePool2(i64 64, i64 32, i32 1)",
         );
-        let report = IrModule::parse(&fixture)?.analyze()?;
+        let report = IrModule::parse(&fixture)?.analyze_release()?;
         require(
             report
                 .violations
