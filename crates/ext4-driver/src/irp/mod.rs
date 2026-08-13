@@ -2323,6 +2323,18 @@ pub(crate) enum DirectoryInformationClass {
     Both,
     /// Windows `FileNamesInformation`.
     Names,
+    /// Windows `FileIdFullDirectoryInformation`.
+    IdFull,
+    /// Windows `FileIdBothDirectoryInformation`.
+    IdBoth,
+    /// Windows `FileIdExtdDirectoryInformation`.
+    IdExtd,
+    /// Windows `FileIdExtdBothDirectoryInformation`.
+    IdExtdBoth,
+    /// Windows `FileId64ExtdDirectoryInformation`.
+    Id64Extd,
+    /// Windows `FileId64ExtdBothDirectoryInformation`.
+    Id64ExtdBoth,
 }
 
 impl DirectoryInformationClass {
@@ -2337,6 +2349,18 @@ impl DirectoryInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileFullDirectoryInformation => Ok(Self::Full),
             wdk_sys::_FILE_INFORMATION_CLASS::FileBothDirectoryInformation => Ok(Self::Both),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNamesInformation => Ok(Self::Names),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileIdFullDirectoryInformation => Ok(Self::IdFull),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileIdBothDirectoryInformation => Ok(Self::IdBoth),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileIdExtdDirectoryInformation => Ok(Self::IdExtd),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileIdExtdBothDirectoryInformation => {
+                Ok(Self::IdExtdBoth)
+            }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileId64ExtdDirectoryInformation => {
+                Ok(Self::Id64Extd)
+            }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileId64ExtdBothDirectoryInformation => {
+                Ok(Self::Id64ExtdBoth)
+            }
             _ => Err(DriverError::InvalidInfoClass),
         }
     }
@@ -5251,6 +5275,64 @@ mod tests {
             assert!(query.is_ok());
             if let Ok(query) = query {
                 assert_eq!(query.information_class(), DirectoryInformationClass::Names);
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when an identity-bearing directory class no longer enters its exact wire domain.
+    #[test]
+    fn query_directory_stack_decodes_identity_classes() {
+        for (raw, expected) in [
+            (
+                wdk_sys::_FILE_INFORMATION_CLASS::FileIdFullDirectoryInformation,
+                DirectoryInformationClass::IdFull,
+            ),
+            (
+                wdk_sys::_FILE_INFORMATION_CLASS::FileIdBothDirectoryInformation,
+                DirectoryInformationClass::IdBoth,
+            ),
+            (
+                wdk_sys::_FILE_INFORMATION_CLASS::FileIdExtdDirectoryInformation,
+                DirectoryInformationClass::IdExtd,
+            ),
+            (
+                wdk_sys::_FILE_INFORMATION_CLASS::FileIdExtdBothDirectoryInformation,
+                DirectoryInformationClass::IdExtdBoth,
+            ),
+            (
+                wdk_sys::_FILE_INFORMATION_CLASS::FileId64ExtdDirectoryInformation,
+                DirectoryInformationClass::Id64Extd,
+            ),
+            (
+                wdk_sys::_FILE_INFORMATION_CLASS::FileId64ExtdBothDirectoryInformation,
+                DirectoryInformationClass::Id64ExtdBoth,
+            ),
+        ] {
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.QueryDirectory =
+                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_6 {
+                    Length: 128,
+                    FileName: core::ptr::null_mut(),
+                    FileInformationClass: raw,
+                    __bindgen_padding_0: 0,
+                    FileIndex: 0,
+                };
+
+            let current = current_stack_fixture(&mut stack);
+            assert!(current.is_ok());
+            if let Ok(current) = current {
+                assert_eq!(
+                    current
+                        .query_directory()
+                        .ok()
+                        .map(|query| query.information_class()),
+                    Some(expected)
+                );
             }
         }
     }
