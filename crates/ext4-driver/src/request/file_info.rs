@@ -1897,8 +1897,90 @@ impl DirectoryInformationClass {
             Self::Full => FULL_DIRECTORY_INFORMATION_NAME_OFFSET,
             Self::Both => BOTH_DIRECTORY_INFORMATION_NAME_OFFSET,
             Self::Names => NAMES_INFORMATION_NAME_OFFSET,
+            Self::IdFull => ID_FULL_DIRECTORY_INFORMATION_NAME_OFFSET,
+            Self::IdBoth => ID_BOTH_DIRECTORY_INFORMATION_NAME_OFFSET,
+            Self::IdExtd => ID_EXTD_DIRECTORY_INFORMATION_NAME_OFFSET,
+            Self::IdExtdBoth => ID_EXTD_BOTH_DIRECTORY_INFORMATION_NAME_OFFSET,
+            Self::Id64Extd => ID_64_EXTD_DIRECTORY_INFORMATION_NAME_OFFSET,
+            Self::Id64ExtdBoth => ID_64_EXTD_BOTH_DIRECTORY_INFORMATION_NAME_OFFSET,
         }
     }
+
+    /// Returns the byte offset of the EA-size field when the wire class carries one.
+    const fn ea_size_offset(self) -> Option<usize> {
+        match self {
+            Self::Directory | Self::Names => None,
+            Self::Full
+            | Self::Both
+            | Self::IdFull
+            | Self::IdBoth
+            | Self::IdExtd
+            | Self::IdExtdBoth
+            | Self::Id64Extd
+            | Self::Id64ExtdBoth => Some(DIRECTORY_EA_SIZE_OFFSET),
+        }
+    }
+
+    /// Returns the byte offset of the short-name-length field when the class carries one.
+    const fn short_name_length_offset(self) -> Option<usize> {
+        match self {
+            Self::Both => Some(BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET),
+            Self::IdBoth => Some(ID_BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET),
+            Self::IdExtdBoth => Some(ID_EXTD_BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET),
+            Self::Id64ExtdBoth => Some(ID_64_EXTD_BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET),
+            Self::Directory
+            | Self::Full
+            | Self::Names
+            | Self::IdFull
+            | Self::IdExtd
+            | Self::Id64Extd => None,
+        }
+    }
+
+    /// Returns the byte offset of the reparse-tag field when the class carries one.
+    const fn reparse_tag_offset(self) -> Option<usize> {
+        match self {
+            Self::IdExtd | Self::IdExtdBoth | Self::Id64Extd | Self::Id64ExtdBoth => {
+                Some(DIRECTORY_REPARSE_TAG_OFFSET)
+            }
+            Self::Directory
+            | Self::Full
+            | Self::Both
+            | Self::Names
+            | Self::IdFull
+            | Self::IdBoth => None,
+        }
+    }
+
+    /// Returns the file-identity field carried by the wire class.
+    const fn file_id_layout(self) -> Option<DirectoryFileIdLayout> {
+        match self {
+            Self::IdFull => Some(DirectoryFileIdLayout::U64(ID_FULL_DIRECTORY_FILE_ID_OFFSET)),
+            Self::IdBoth => Some(DirectoryFileIdLayout::U64(ID_BOTH_DIRECTORY_FILE_ID_OFFSET)),
+            Self::IdExtd => Some(DirectoryFileIdLayout::U128(
+                ID_EXTD_DIRECTORY_FILE_ID_OFFSET,
+            )),
+            Self::IdExtdBoth => Some(DirectoryFileIdLayout::U128(
+                ID_EXTD_BOTH_DIRECTORY_FILE_ID_OFFSET,
+            )),
+            Self::Id64Extd => Some(DirectoryFileIdLayout::U64(
+                ID_64_EXTD_DIRECTORY_FILE_ID_OFFSET,
+            )),
+            Self::Id64ExtdBoth => Some(DirectoryFileIdLayout::U64(
+                ID_64_EXTD_BOTH_DIRECTORY_FILE_ID_OFFSET,
+            )),
+            Self::Directory | Self::Full | Self::Both | Self::Names => None,
+        }
+    }
+}
+
+/// File-identity field carried by one directory-record wire class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectoryFileIdLayout {
+    /// Eight-byte `LARGE_INTEGER` identity.
+    U64(usize),
+    /// Sixteen-byte `FILE_ID_128` identity whose high half remains zero.
+    U128(usize),
 }
 
 /// Caller-supplied directory filename pattern.
@@ -2124,13 +2206,35 @@ impl DirectoryRecordLayout {
 }
 
 /// Bytes before FileName in FILE_DIRECTORY_INFORMATION.
-const DIRECTORY_INFORMATION_NAME_OFFSET: usize = 64;
+const DIRECTORY_INFORMATION_NAME_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_DIRECTORY_INFORMATION, FileName);
 /// Bytes before FileName in FILE_FULL_DIR_INFORMATION.
-const FULL_DIRECTORY_INFORMATION_NAME_OFFSET: usize = 68;
+const FULL_DIRECTORY_INFORMATION_NAME_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_FULL_DIR_INFORMATION, FileName);
 /// Bytes before FileName in FILE_BOTH_DIR_INFORMATION.
-const BOTH_DIRECTORY_INFORMATION_NAME_OFFSET: usize = 94;
+const BOTH_DIRECTORY_INFORMATION_NAME_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_BOTH_DIR_INFORMATION, FileName);
 /// Bytes before FileName in FILE_NAMES_INFORMATION.
-const NAMES_INFORMATION_NAME_OFFSET: usize = 12;
+const NAMES_INFORMATION_NAME_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_NAMES_INFORMATION, FileName);
+/// Bytes before FileName in FILE_ID_FULL_DIR_INFORMATION.
+const ID_FULL_DIRECTORY_INFORMATION_NAME_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_FULL_DIR_INFORMATION, FileName);
+/// Bytes before FileName in FILE_ID_BOTH_DIR_INFORMATION.
+const ID_BOTH_DIRECTORY_INFORMATION_NAME_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_BOTH_DIR_INFORMATION, FileName);
+/// Bytes before FileName in FILE_ID_EXTD_DIR_INFORMATION.
+const ID_EXTD_DIRECTORY_INFORMATION_NAME_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_EXTD_DIR_INFORMATION, FileName);
+/// Bytes before FileName in FILE_ID_EXTD_BOTH_DIR_INFORMATION.
+const ID_EXTD_BOTH_DIRECTORY_INFORMATION_NAME_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_EXTD_BOTH_DIR_INFORMATION, FileName);
+/// Bytes before FileName in FILE_ID_64_EXTD_DIR_INFORMATION.
+const ID_64_EXTD_DIRECTORY_INFORMATION_NAME_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_64_EXTD_DIR_INFORMATION, FileName);
+/// Bytes before FileName in FILE_ID_64_EXTD_BOTH_DIR_INFORMATION.
+const ID_64_EXTD_BOTH_DIRECTORY_INFORMATION_NAME_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_64_EXTD_BOTH_DIR_INFORMATION, FileName);
 /// Offset of the common NextEntryOffset field.
 const DIRECTORY_NEXT_ENTRY_OFFSET: usize = 0;
 /// Offset of the common FileIndex field.
@@ -2157,6 +2261,38 @@ const NAMES_INFORMATION_FILE_NAME_LENGTH_OFFSET: usize = 8;
 const DIRECTORY_EA_SIZE_OFFSET: usize = 64;
 /// Offset of ShortNameLength in FILE_BOTH_DIR_INFORMATION.
 const BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET: usize = 68;
+/// Offset of ShortNameLength in FILE_ID_BOTH_DIR_INFORMATION.
+const ID_BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_BOTH_DIR_INFORMATION, ShortNameLength);
+/// Offset of ShortNameLength in FILE_ID_EXTD_BOTH_DIR_INFORMATION.
+const ID_EXTD_BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_EXTD_BOTH_DIR_INFORMATION, ShortNameLength);
+/// Offset of ShortNameLength in FILE_ID_64_EXTD_BOTH_DIR_INFORMATION.
+const ID_64_EXTD_BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET: usize = core::mem::offset_of!(
+    wdk_sys::FILE_ID_64_EXTD_BOTH_DIR_INFORMATION,
+    ShortNameLength
+);
+/// Offset of ReparsePointTag in extended file-id directory classes.
+const DIRECTORY_REPARSE_TAG_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_EXTD_DIR_INFORMATION, ReparsePointTag);
+/// Offset of FileId in FILE_ID_FULL_DIR_INFORMATION.
+const ID_FULL_DIRECTORY_FILE_ID_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_FULL_DIR_INFORMATION, FileId);
+/// Offset of FileId in FILE_ID_BOTH_DIR_INFORMATION.
+const ID_BOTH_DIRECTORY_FILE_ID_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_BOTH_DIR_INFORMATION, FileId);
+/// Offset of FileId in FILE_ID_EXTD_DIR_INFORMATION.
+const ID_EXTD_DIRECTORY_FILE_ID_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_EXTD_DIR_INFORMATION, FileId);
+/// Offset of FileId in FILE_ID_EXTD_BOTH_DIR_INFORMATION.
+const ID_EXTD_BOTH_DIRECTORY_FILE_ID_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_EXTD_BOTH_DIR_INFORMATION, FileId);
+/// Offset of FileId in FILE_ID_64_EXTD_DIR_INFORMATION.
+const ID_64_EXTD_DIRECTORY_FILE_ID_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_64_EXTD_DIR_INFORMATION, FileId);
+/// Offset of FileId in FILE_ID_64_EXTD_BOTH_DIR_INFORMATION.
+const ID_64_EXTD_BOTH_DIRECTORY_FILE_ID_OFFSET: usize =
+    core::mem::offset_of!(wdk_sys::FILE_ID_64_EXTD_BOTH_DIR_INFORMATION, FileId);
 /// Windows directory query entry alignment.
 const DIRECTORY_ENTRY_ALIGNMENT: usize = 8;
 /// UTF-16 `*`.
@@ -2326,19 +2462,37 @@ fn pack_directory_record(
         record_field_offset(start, DIRECTORY_FILE_NAME_LENGTH_OFFSET)?,
         u32::try_from(utf16_byte_len(name.utf16())?).map_err(|_| DriverError::InvalidParameter)?,
     )?;
-    match class {
-        DirectoryInformationClass::Directory | DirectoryInformationClass::Names => {}
-        DirectoryInformationClass::Full => {
-            LittleEndianOutput::new(buffer)
-                .write_u32(record_field_offset(start, DIRECTORY_EA_SIZE_OFFSET)?, 0)?;
-        }
-        DirectoryInformationClass::Both => {
-            LittleEndianOutput::new(buffer)
-                .write_u32(record_field_offset(start, DIRECTORY_EA_SIZE_OFFSET)?, 0)?;
-            LittleEndianOutput::new(buffer).write_u8(
-                record_field_offset(start, BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET)?,
-                0,
-            )?;
+    if let Some(offset) = class.ea_size_offset() {
+        LittleEndianOutput::new(buffer).write_u32(record_field_offset(start, offset)?, 0)?;
+    }
+    if let Some(offset) = class.short_name_length_offset() {
+        LittleEndianOutput::new(buffer).write_u8(record_field_offset(start, offset)?, 0)?;
+    }
+    if let Some(offset) = class.reparse_tag_offset() {
+        LittleEndianOutput::new(buffer).write_u32(
+            record_field_offset(start, offset)?,
+            reparse_tag(metadata.reparse_point),
+        )?;
+    }
+    if let Some(layout) = class.file_id_layout() {
+        match layout {
+            DirectoryFileIdLayout::U64(offset) => {
+                LittleEndianOutput::new(buffer).write_u64(
+                    record_field_offset(start, offset)?,
+                    u64::from(metadata.file_index),
+                )?;
+            }
+            DirectoryFileIdLayout::U128(offset) => {
+                let high_offset = offset
+                    .checked_add(core::mem::size_of::<u64>())
+                    .ok_or(DriverError::InvalidParameter)?;
+                LittleEndianOutput::new(buffer).write_u64(
+                    record_field_offset(start, offset)?,
+                    u64::from(metadata.file_index),
+                )?;
+                LittleEndianOutput::new(buffer)
+                    .write_u64(record_field_offset(start, high_offset)?, 0)?;
+            }
         }
     }
     write_utf16(
@@ -4717,6 +4871,111 @@ mod tests {
         };
         let expected_name: &[u8] = &[b'a', 0];
         assert_eq!(name_bytes.get(..2), Some(expected_name));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when an identity-bearing directory record loses its inode identity, reparse tag,
+    /// short-name emptiness, or class-specific file-name offset.
+    #[test]
+    fn identity_directory_records_preserve_exact_windows_layouts() {
+        let name = WindowsName::from_utf16(&[u16::from(b'a')]);
+        assert!(name.is_ok());
+        let Ok(name) = name else {
+            return;
+        };
+        let metadata = test_metadata(super::FileMetadataKind::Symlink);
+        assert!(metadata.is_some());
+        let Some(mut metadata) = metadata else {
+            return;
+        };
+        metadata.file_index = 0x1234_5678;
+
+        for (class, name_offset, file_id_offset, file_id_width, reparse_offset, short_offset) in [
+            (
+                DirectoryInformationClass::IdFull,
+                super::ID_FULL_DIRECTORY_INFORMATION_NAME_OFFSET,
+                super::ID_FULL_DIRECTORY_FILE_ID_OFFSET,
+                8,
+                None,
+                None,
+            ),
+            (
+                DirectoryInformationClass::IdBoth,
+                super::ID_BOTH_DIRECTORY_INFORMATION_NAME_OFFSET,
+                super::ID_BOTH_DIRECTORY_FILE_ID_OFFSET,
+                8,
+                None,
+                Some(super::ID_BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET),
+            ),
+            (
+                DirectoryInformationClass::IdExtd,
+                super::ID_EXTD_DIRECTORY_INFORMATION_NAME_OFFSET,
+                super::ID_EXTD_DIRECTORY_FILE_ID_OFFSET,
+                16,
+                Some(super::DIRECTORY_REPARSE_TAG_OFFSET),
+                None,
+            ),
+            (
+                DirectoryInformationClass::IdExtdBoth,
+                super::ID_EXTD_BOTH_DIRECTORY_INFORMATION_NAME_OFFSET,
+                super::ID_EXTD_BOTH_DIRECTORY_FILE_ID_OFFSET,
+                16,
+                Some(super::DIRECTORY_REPARSE_TAG_OFFSET),
+                Some(super::ID_EXTD_BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET),
+            ),
+            (
+                DirectoryInformationClass::Id64Extd,
+                super::ID_64_EXTD_DIRECTORY_INFORMATION_NAME_OFFSET,
+                super::ID_64_EXTD_DIRECTORY_FILE_ID_OFFSET,
+                8,
+                Some(super::DIRECTORY_REPARSE_TAG_OFFSET),
+                None,
+            ),
+            (
+                DirectoryInformationClass::Id64ExtdBoth,
+                super::ID_64_EXTD_BOTH_DIRECTORY_INFORMATION_NAME_OFFSET,
+                super::ID_64_EXTD_BOTH_DIRECTORY_FILE_ID_OFFSET,
+                8,
+                Some(super::DIRECTORY_REPARSE_TAG_OFFSET),
+                Some(super::ID_64_EXTD_BOTH_DIRECTORY_SHORT_NAME_LENGTH_OFFSET),
+            ),
+        ] {
+            let layout = super::DirectoryRecordLayout::new(class, &name);
+            assert!(layout.is_ok());
+            let Ok(layout) = layout else {
+                continue;
+            };
+            assert_eq!(layout.name_offset, name_offset);
+            let mut buffer = vec![0xFF_u8; layout.padded_size];
+            assert!(
+                super::pack_directory_record(&mut buffer, 0, class, 7, &name, metadata, layout,)
+                    .is_ok()
+            );
+            assert_eq!(
+                le_u64(&buffer, file_id_offset),
+                Some(u64::from(metadata.file_index))
+            );
+            if file_id_width == 16 {
+                assert_eq!(
+                    buffer.get(file_id_offset + 8..file_id_offset + 16),
+                    Some([0_u8; 8].as_slice())
+                );
+            }
+            if let Some(offset) = reparse_offset {
+                assert_eq!(
+                    le_u32(&buffer, offset),
+                    Some(wdk_sys::IO_REPARSE_TAG_SYMLINK)
+                );
+            }
+            if let Some(offset) = short_offset {
+                assert_eq!(byte_at(&buffer, offset), Some(0));
+            }
+            assert_eq!(
+                buffer.get(name_offset..name_offset + 2),
+                Some([b'a', 0].as_slice())
+            );
+        }
     }
 
     /// # Panics
