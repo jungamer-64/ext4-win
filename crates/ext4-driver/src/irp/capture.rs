@@ -690,7 +690,7 @@ impl QueueContext {
         ) && !matches!(
             &self.prepared,
             PreparedRequest::Write(write) if write.kind() == DataIoKind::Paging
-        )
+        ) && !matches!(&self.prepared, PreparedRequest::FlushBuffers)
     }
 
     /// Returns the request variant sealed before the IRP entered the queue.
@@ -1339,8 +1339,8 @@ mod tests {
     use core::ffi::c_void;
 
     use super::{
-        PreparedDirectoryPattern, PreparedRequest, QueueContext, QueueContextOwnership,
-        decode_directory_pattern,
+        PreparedDirectoryPattern, PreparedRequest, QueueCancellationKey, QueueContext,
+        QueueContextOwnership, decode_directory_pattern,
     };
     use crate::irp::{
         DispatchMajor, FileSystemControlMinorFunction, IrpCompletion, KernelIrp,
@@ -1814,6 +1814,25 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when cleanup cancels a queued flush that remains legal after the cleanup barrier, or
+    /// when it stops cancelling an ordinary request from the same handle.
+    #[test]
+    fn cleanup_preserves_queued_flushes() {
+        let flush = QueueContext {
+            prepared: PreparedRequest::FlushBuffers,
+            cancellation_key: QueueCancellationKey::Device,
+        };
+        assert!(!flush.cleanup_cancel_eligible());
+
+        let ordinary = QueueContext {
+            prepared: PreparedRequest::QueryInformation,
+            cancellation_key: QueueCancellationKey::Device,
+        };
+        assert!(ordinary.cleanup_cancel_eligible());
     }
 
     /// # Panics

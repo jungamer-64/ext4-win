@@ -354,58 +354,21 @@ impl Drop for CompletionRundownLease {
 // SAFETY: Moving the unique lease between scheduler and completion threads preserves one release.
 unsafe impl Send for CompletionRundownLease {}
 
-/// Allocation-free destination used by a completion callback to publish one envelope.
-pub struct LowerCompletionDestination<O> {
-    /// Stable reactor inbox address.
-    context: NonNull<c_void>,
-    /// Type-correct intrusive enqueue routine, callable through `DISPATCH_LEVEL`.
-    enqueue: unsafe fn(NonNull<c_void>, NonNull<LowerCompletionEnvelope<O>>),
-}
-
-impl<O> LowerCompletionDestination<O> {
-    /// Binds one stable reactor inbox to its allocation-free enqueue routine.
+/// Statically dispatched, allocation-free destination for one lower completion envelope type.
+///
+/// # Safety
+///
+/// Implementations run in a lower completion callback. They must retain a stable destination until
+/// rundown completes, publish the exact envelope once, and neither allocate nor block.
+pub(crate) unsafe trait LowerCompletionRoute<O>:
+    Send + Sync + Sized + 'static
+{
+    /// Publishes one uniquely completion-owned envelope to its type-specific inbox.
     /// # Safety
     ///
-    /// `context` must remain live until the completion rundown gate has drained every envelope.
-    pub const unsafe fn new(
-        context: NonNull<c_void>,
-        enqueue: unsafe fn(NonNull<c_void>, NonNull<LowerCompletionEnvelope<O>>),
-    ) -> Self {
-        Self { context, enqueue }
-    }
-
-    /// Publishes one completed envelope without allocation or blocking.
-    /// # Safety
-    ///
-    /// `envelope` must be the uniquely completion-owned allocation associated with this
-    /// destination and must not have been published before.
-    unsafe fn publish(self, envelope: NonNull<LowerCompletionEnvelope<O>>) {
-        unsafe {
-            // SAFETY: Construction ties this function to the stable, type-correct inbox context.
-            (self.enqueue)(self.context, envelope);
-        }
-    }
+    /// `envelope` must belong to this route and must not have been published before.
+    unsafe fn publish(&self, envelope: NonNull<LowerCompletionEnvelope<O, Self>>);
 }
-
-impl<O> Copy for LowerCompletionDestination<O> {}
-
-impl<O> Clone for LowerCompletionDestination<O> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<O> fmt::Debug for LowerCompletionDestination<O> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("LowerCompletionDestination(..)")
-    }
-}
-
-// SAFETY: The destination is an immutable function/context pair with an explicit stable-lifetime
-// contract.
-unsafe impl<O> Send for LowerCompletionDestination<O> {}
-// SAFETY: Concurrent callbacks may copy the pair; synchronization belongs to the inbox routine.
-unsafe impl<O> Sync for LowerCompletionDestination<O> {}
 
 /// Sole release authority for one ext4win-created private lower IRP and its attached MDLs.
 #[cfg(not(test))]
@@ -439,7 +402,7 @@ impl Drop for LowerIrpReleaseAuthority {
 
 /// Nonpaged, address-stable context passed as the sole lower completion context.
 #[repr(C)]
-pub struct LowerCompletionEnvelope<O> {
+pub struct LowerCompletionEnvelope<O, R: LowerCompletionRoute<O>> {
     /// Intrusive completion-inbox node. The envelope address is also this first field's address.
     node: UnsafeCell<wdk_sys::LIST_ENTRY>,
     /// Suspended scheduler operation; no raw pointer into it is ever created.
@@ -447,7 +410,7 @@ pub struct LowerCompletionEnvelope<O> {
     /// Stable lower transfer buffer/MDL backing storage.
     transfer: ManuallyDrop<AlignedTransferBuffer>,
     /// Reactor destination retained by value.
-    destination: LowerCompletionDestination<O>,
+    destination: R,
     /// Ext4win rundown lease independent of `IoSetCompletionRoutineEx` image protection.
     rundown: ManuallyDrop<CompletionRundownLease>,
     /// Completion-owned private-IRP release authority installed only after registration succeeds.
@@ -465,12 +428,12 @@ pub struct LowerCompletionEnvelope<O> {
     payload_taken: bool,
 }
 
-impl<O> LowerCompletionEnvelope<O> {
+impl<O, R: LowerCompletionRoute<O>> LowerCompletionEnvelope<O, R> {
     /// Builds a fully initialized envelope before completion registration.
     fn new(
         suspended: O,
         transfer: AlignedTransferBuffer,
-        destination: LowerCompletionDestination<O>,
+        destination: R,
         rundown: CompletionRundownLease,
     ) -> Self {
         Self {
@@ -497,7 +460,7 @@ impl<O> LowerCompletionEnvelope<O> {
     /// Recovers the envelope from its first-field intrusive node.
     /// # Safety
     ///
-    /// `node` must be the node of a live `LowerCompletionEnvelope<O>` allocated by this module.
+    /// `node` must be the node of a live `LowerCompletionEnvelope<O, R>` allocated by this module.
     pub unsafe fn from_node(node: NonNull<wdk_sys::LIST_ENTRY>) -> NonNull<Self> {
         node.cast()
     }
@@ -629,7 +592,7 @@ impl<O> LowerCompletionEnvelope<O> {
     }
 }
 
-impl<O> fmt::Debug for LowerCompletionEnvelope<O> {
+impl<O, R: LowerCompletionRoute<O>> fmt::Debug for LowerCompletionEnvelope<O, R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LowerCompletionEnvelope")
@@ -640,7 +603,7 @@ impl<O> fmt::Debug for LowerCompletionEnvelope<O> {
     }
 }
 
-impl<O> Drop for LowerCompletionEnvelope<O> {
+impl<O, R: LowerCompletionRoute<O>> Drop for LowerCompletionEnvelope<O, R> {
     fn drop(&mut self) {
         #[cfg(not(test))]
         if self.release_authority_ready.swap(false, Ordering::AcqRel) {
@@ -672,10 +635,10 @@ impl<O> Drop for LowerCompletionEnvelope<O> {
 }
 
 // SAFETY: `O` moves only between the reactor and envelope; callbacks never access it.
-unsafe impl<O: Send> Send for LowerCompletionEnvelope<O> {}
+unsafe impl<O: Send, R: LowerCompletionRoute<O>> Send for LowerCompletionEnvelope<O, R> {}
 // SAFETY: Callback-visible fields are atomic or callback-exclusive; payload fields are not read
 // until completion inbox ownership is acquired.
-unsafe impl<O: Send> Sync for LowerCompletionEnvelope<O> {}
+unsafe impl<O: Send, R: LowerCompletionRoute<O>> Sync for LowerCompletionEnvelope<O, R> {}
 
 /// Reactor-owned values recovered after lower completion and private-IRP release.
 #[derive(Debug)]
@@ -691,17 +654,17 @@ pub struct CompletedLowerIrp<O> {
 }
 
 /// Stable cancellation identity for an envelope already returned from `IoCallDriver`.
-pub struct PublishedLowerRequest<O> {
+pub struct PublishedLowerRequest<O, R: LowerCompletionRoute<O>> {
     /// Envelope head; never a pointer into suspended operation state.
-    envelope: NonNull<LowerCompletionEnvelope<O>>,
+    envelope: NonNull<LowerCompletionEnvelope<O, R>>,
 }
 
-impl<O> PublishedLowerRequest<O> {
+impl<O, R: LowerCompletionRoute<O>> PublishedLowerRequest<O, R> {
     /// Returns whether this cancellation identity names the supplied envelope head.
     ///
     /// This compares only stable envelope addresses; it never searches for or dereferences an
     /// operation generation.
-    pub fn identifies(&self, envelope: NonNull<LowerCompletionEnvelope<O>>) -> bool {
+    pub fn identifies(&self, envelope: NonNull<LowerCompletionEnvelope<O, R>>) -> bool {
         self.envelope.as_ptr() == envelope.as_ptr()
     }
 
@@ -761,14 +724,14 @@ impl<O> PublishedLowerRequest<O> {
     }
 }
 
-impl<O> fmt::Debug for PublishedLowerRequest<O> {
+impl<O, R: LowerCompletionRoute<O>> fmt::Debug for PublishedLowerRequest<O, R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PublishedLowerRequest(..)")
     }
 }
 
 // SAFETY: The reactor lock and envelope lifecycle atomics serialize use of the stable pointer.
-unsafe impl<O: Send> Send for PublishedLowerRequest<O> {}
+unsafe impl<O: Send, R: LowerCompletionRoute<O>> Send for PublishedLowerRequest<O, R> {}
 
 /// Lower-IRP construction failure that preserves the suspended operation.
 #[derive(Debug)]
@@ -809,13 +772,13 @@ impl<O> LowerRegistrationError<O> {
 
 /// Envelope payload retained intact until every fallible IRP construction step succeeds.
 #[cfg(not(test))]
-struct UnregisteredEnvelope<O> {
+struct UnregisteredEnvelope<O, R: LowerCompletionRoute<O>> {
     /// Suspended scheduler operation.
     suspended: O,
     /// Stable lower transfer allocation.
     transfer: AlignedTransferBuffer,
     /// Completion destination.
-    destination: LowerCompletionDestination<O>,
+    destination: R,
     /// Completion rundown lease.
     rundown: CompletionRundownLease,
 }
@@ -858,7 +821,7 @@ impl LowerIrpTransfer {
 
 /// Fully prepared pre-registration private IRP and stable completion envelope.
 #[cfg(not(test))]
-pub struct PreparedLowerIrp<O> {
+pub struct PreparedLowerIrp<O, R: LowerCompletionRoute<O>> {
     /// Driver-owned device whose image owns the registered completion routine.
     completion_owner: KernelDevice,
     /// Target lower storage device.
@@ -866,18 +829,18 @@ pub struct PreparedLowerIrp<O> {
     /// Pre-submit IRP release authority.
     irp: LowerIrpReleaseAuthority,
     /// Nonpaged stable envelope passed as the sole completion context.
-    envelope: Box<LowerCompletionEnvelope<O>>,
+    envelope: Box<LowerCompletionEnvelope<O, R>>,
 }
 
 #[cfg(not(test))]
-impl<O> fmt::Debug for PreparedLowerIrp<O> {
+impl<O, R: LowerCompletionRoute<O>> fmt::Debug for PreparedLowerIrp<O, R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PreparedLowerIrp(..)")
     }
 }
 
 #[cfg(not(test))]
-impl<O: Send + 'static> PreparedLowerIrp<O> {
+impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
     /// Fallibly builds every IRP, MDL, stack, envelope, and rundown resource before registration.
     /// # Errors
     ///
@@ -887,7 +850,7 @@ impl<O: Send + 'static> PreparedLowerIrp<O> {
         completion_owner: KernelDevice,
         lower: LowerIrpTransfer,
         suspended: O,
-        destination: LowerCompletionDestination<O>,
+        destination: R,
         rundown: CompletionRundownLease,
     ) -> Result<Self, LowerBuildError<O>> {
         let LowerIrpTransfer {
@@ -943,7 +906,7 @@ impl<O: Send + 'static> PreparedLowerIrp<O> {
     /// The scheduler may reserve this identity in an unpublished active slot. It must remove the
     /// slot if [`Self::register_and_submit`] returns an error and may expose cancellation only
     /// after that method returns success.
-    pub fn cancellation_identity(&mut self) -> PublishedLowerRequest<O> {
+    pub fn cancellation_identity(&mut self) -> PublishedLowerRequest<O, R> {
         PublishedLowerRequest {
             envelope: NonNull::from(self.envelope.as_mut()),
         }
@@ -962,7 +925,7 @@ impl<O: Send + 'static> PreparedLowerIrp<O> {
             ffi::IoSetCompletionRoutineEx(
                 self.completion_owner.as_ptr(),
                 self.irp.as_ptr(),
-                Some(lower_request_completed::<O>),
+                Some(lower_request_completed::<O, R>),
                 envelope.as_ptr().cast::<c_void>(),
                 BOOLEAN_TRUE,
                 BOOLEAN_TRUE,
@@ -1000,7 +963,7 @@ impl<O: Send + 'static> PreparedLowerIrp<O> {
     /// `self.envelope`; the caller must invoke the returned request immediately and exactly once.
     unsafe fn into_registered(
         self,
-        envelope_address: NonNull<LowerCompletionEnvelope<O>>,
+        envelope_address: NonNull<LowerCompletionEnvelope<O, R>>,
     ) -> RegisteredLowerRequest {
         let Self {
             completion_owner: _,
@@ -1243,12 +1206,13 @@ unsafe fn release_private_irp(irp: PIRP) {
 ///
 /// The I/O Manager must supply the private IRP and exact envelope-head context registered by
 /// `PreparedLowerIrp`.
-unsafe extern "C" fn lower_request_completed<O: Send + 'static>(
+unsafe extern "C" fn lower_request_completed<O: Send + 'static, R: LowerCompletionRoute<O>>(
     _device: wdk_sys::PDEVICE_OBJECT,
     irp: PIRP,
     context: *mut c_void,
 ) -> NTSTATUS {
-    let Some(envelope_address) = NonNull::new(context.cast::<LowerCompletionEnvelope<O>>()) else {
+    let Some(envelope_address) = NonNull::new(context.cast::<LowerCompletionEnvelope<O, R>>())
+    else {
         return STATUS_MORE_PROCESSING_REQUIRED;
     };
     let envelope = unsafe {
@@ -1302,7 +1266,6 @@ unsafe extern "C" fn lower_request_completed<O: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use core::ffi::c_void;
     use core::ptr::NonNull;
     use core::sync::atomic::Ordering;
 
@@ -1312,26 +1275,35 @@ mod tests {
     use super::{
         AlignedTransferBuffer, CompletionRundown, IOCTL_DISK_GET_LENGTH_INFO, LOWER_CANCEL_CALLING,
         LOWER_COMPLETED_DURING_CANCEL, LOWER_COMPLETED_QUEUED, LOWER_DEFERRED_QUEUED,
-        LOWER_SUBMITTED, LowerBuildError, LowerCompletionDestination, LowerCompletionEnvelope,
+        LOWER_SUBMITTED, LowerBuildError, LowerCompletionEnvelope, LowerCompletionRoute,
         LowerOperation, LowerRegistrationError, LowerTransferMethod, PublishedLowerRequest,
         STATUS_MORE_PROCESSING_REQUIRED,
     };
 
-    /// Records one completed envelope in the synchronous test inbox.
-    /// # Safety
-    ///
-    /// `context` must point to a live, uniquely writable inbox of the exact envelope type.
-    unsafe fn record_completed_u64(
-        context: NonNull<c_void>,
-        envelope: NonNull<LowerCompletionEnvelope<u64>>,
-    ) {
-        let destination = unsafe {
-            // SAFETY: The test context is an address-stable `Option` with this exact type.
-            context
-                .cast::<Option<NonNull<LowerCompletionEnvelope<u64>>>>()
-                .as_mut()
-        };
-        *destination = Some(envelope);
+    /// Concrete test route proving completion publication needs no function pointer.
+    #[derive(Clone, Copy)]
+    struct TestCompletionRoute {
+        /// Address-stable synchronous inbox.
+        inbox: NonNull<Option<NonNull<TestEnvelope>>>,
+    }
+
+    /// Exact envelope type accepted by the synchronous test route.
+    type TestEnvelope = LowerCompletionEnvelope<u64, TestCompletionRoute>;
+
+    // SAFETY: Tests publish synchronously while the stack-local inbox remains live.
+    unsafe impl Send for TestCompletionRoute {}
+    // SAFETY: Tests never access the inbox concurrently.
+    unsafe impl Sync for TestCompletionRoute {}
+
+    // SAFETY: Publication writes exactly one matching envelope into a live synchronous inbox.
+    unsafe impl LowerCompletionRoute<u64> for TestCompletionRoute {
+        unsafe fn publish(&self, envelope: NonNull<TestEnvelope>) {
+            let inbox = unsafe {
+                // SAFETY: Each test keeps the uniquely writable inbox live through publication.
+                &mut *self.inbox.as_ptr()
+            };
+            *inbox = Some(envelope);
+        }
     }
 
     /// # Panics
@@ -1422,10 +1394,9 @@ mod tests {
             return;
         };
         assert!(!transfer.as_void_ptr().is_null());
-        let mut inbox: Option<NonNull<LowerCompletionEnvelope<u64>>> = None;
-        let destination = unsafe {
-            // SAFETY: `inbox` remains address-stable until the synchronous publication returns.
-            LowerCompletionDestination::new(NonNull::from(&mut inbox).cast(), record_completed_u64)
+        let mut inbox: Option<NonNull<TestEnvelope>> = None;
+        let destination = TestCompletionRoute {
+            inbox: NonNull::from(&mut inbox),
         };
         let Ok(mut envelope) = memory::boxed_try_with(move || {
             Ok(LowerCompletionEnvelope::new(
@@ -1443,7 +1414,7 @@ mod tests {
         };
         let recovered = unsafe {
             // SAFETY: `node` is the live first field of this exact envelope.
-            LowerCompletionEnvelope::<u64>::from_node(node)
+            TestEnvelope::from_node(node)
         };
         assert_eq!(address, recovered);
 
@@ -1493,10 +1464,9 @@ mod tests {
             return;
         };
         assert!(transfer.as_void_ptr().is_null());
-        let mut inbox: Option<NonNull<LowerCompletionEnvelope<u64>>> = None;
-        let destination = unsafe {
-            // SAFETY: The context remains live and publication is not invoked in this test.
-            LowerCompletionDestination::new(NonNull::from(&mut inbox).cast(), record_completed_u64)
+        let mut inbox: Option<NonNull<TestEnvelope>> = None;
+        let destination = TestCompletionRoute {
+            inbox: NonNull::from(&mut inbox),
         };
         let Ok(envelope) = memory::boxed_try_with(move || {
             Ok(LowerCompletionEnvelope::new(

@@ -341,6 +341,24 @@ fn execute_immediate(major: DispatchMajor) -> DriverResult<IrpCompletion> {
     }
 }
 
+/// Selects the scheduler lane shared by requests that remain legal across CLEANUP.
+/// # Errors
+///
+/// Returns `FileClosed` after CLOSE has begun consuming the handle lane.
+fn post_cleanup_lane(
+    state: HandleAdmissionState,
+    request: PostCleanupRequest,
+) -> DriverResult<HandleOperationLane> {
+    match state {
+        HandleAdmissionState::OpenHandle
+        | HandleAdmissionState::CleanupDraining
+        | HandleAdmissionState::CleanedHandle => Ok(HandleOperationLane::PostCleanup(request)),
+        HandleAdmissionState::ClosingHandle | HandleAdmissionState::ClosedHandle => {
+            Err(DriverError::FileClosed)
+        }
+    }
+}
+
 /// Converts one CSQ-owned request into a concrete consuming operation.
 ///
 /// Classification is copied out before `owned` moves so no pointer into queue metadata can enter
@@ -546,40 +564,25 @@ pub(crate) fn admit_owned(mut owned: OwnedIrp) -> Result<AdmittedOperation, Admi
                         )
                     }
                     HandleRequestClass::PagingRead | HandleRequestClass::PagingWrite => {
-                        if matches!(
-                            state,
-                            HandleAdmissionState::ClosingHandle
-                                | HandleAdmissionState::ClosedHandle
-                        ) {
-                            return Err(AdmitOperationError::new(DriverError::FileClosed, owned));
-                        }
                         let request = if handle_class == HandleRequestClass::PagingRead {
                             PostCleanupRequest::PagingRead
                         } else {
                             PostCleanupRequest::PagingWrite
                         };
+                        let lane = match post_cleanup_lane(state, request) {
+                            Ok(lane) => lane,
+                            Err(error) => return Err(AdmitOperationError::new(error, owned)),
+                        };
                         (
-                            OperationAdmission::Handle {
-                                file_object,
-                                lane: HandleOperationLane::PostCleanup(request),
-                            },
+                            OperationAdmission::Handle { file_object, lane },
                             LifecyclePublication::None,
                         )
                     }
                     HandleRequestClass::FlushBuffers => {
-                        let lane = match state {
-                            HandleAdmissionState::OpenHandle => HandleOperationLane::Ordinary,
-                            HandleAdmissionState::CleanupDraining
-                            | HandleAdmissionState::CleanedHandle => {
-                                HandleOperationLane::PostCleanup(PostCleanupRequest::FlushBuffers)
-                            }
-                            HandleAdmissionState::ClosingHandle
-                            | HandleAdmissionState::ClosedHandle => {
-                                return Err(AdmitOperationError::new(
-                                    DriverError::FileClosed,
-                                    owned,
-                                ));
-                            }
+                        let lane = match post_cleanup_lane(state, PostCleanupRequest::FlushBuffers)
+                        {
+                            Ok(lane) => lane,
+                            Err(error) => return Err(AdmitOperationError::new(error, owned)),
                         };
                         (
                             OperationAdmission::Handle { file_object, lane },
@@ -644,9 +647,16 @@ pub(crate) fn admit_owned(mut owned: OwnedIrp) -> Result<AdmittedOperation, Admi
 
 #[cfg(test)]
 mod tests {
-    use crate::irp::DispatchMajor;
+    use crate::{
+        irp::{
+            DispatchMajor,
+            reactor::{HandleOperationLane, PostCleanupRequest},
+        },
+        kernel::status::DriverError,
+        state::HandleAdmissionState,
+    };
 
-    use super::{DispatchPolicy, dispatch_policy};
+    use super::{DispatchPolicy, dispatch_policy, post_cleanup_lane};
 
     /// Keeps the production operation-construction graph inside the unit-test reachability set.
     ///
@@ -702,5 +712,38 @@ mod tests {
             dispatch_policy(DispatchMajor::Close),
             DispatchPolicy::Queued
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when paging I/O or flush loses its post-cleanup lane while the handle is open, or
+    /// remains admissible after close begins.
+    #[test]
+    fn post_cleanup_requests_keep_one_lane_for_the_whole_live_handle() {
+        for request in [
+            PostCleanupRequest::PagingRead,
+            PostCleanupRequest::PagingWrite,
+            PostCleanupRequest::FlushBuffers,
+        ] {
+            for state in [
+                HandleAdmissionState::OpenHandle,
+                HandleAdmissionState::CleanupDraining,
+                HandleAdmissionState::CleanedHandle,
+            ] {
+                assert!(matches!(
+                    post_cleanup_lane(state, request),
+                    Ok(HandleOperationLane::PostCleanup(observed)) if observed == request
+                ));
+            }
+            for state in [
+                HandleAdmissionState::ClosingHandle,
+                HandleAdmissionState::ClosedHandle,
+            ] {
+                assert!(matches!(
+                    post_cleanup_lane(state, request),
+                    Err(DriverError::FileClosed)
+                ));
+            }
+        }
     }
 }
