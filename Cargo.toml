@@ -3,6 +3,12 @@ members = [
     "crates/ext4-core",
     "crates/ext4-driver",
     "tools/production-reachability",
+    "tools/xtask",
+]
+default-members = [
+    "crates/ext4-core",
+    "tools/production-reachability",
+    "tools/xtask",
 ]
 resolver = "3"
 
