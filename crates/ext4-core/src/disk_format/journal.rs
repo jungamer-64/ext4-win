@@ -75,10 +75,6 @@ const JBD2_CHECKSUM_CRC32C: u8 = 4;
 const JOURNAL_HEADER_BYTES: usize = 12;
 /// Bytes occupied by the JBD2 superblock payload.
 const JOURNAL_SUPERBLOCK_BYTES: usize = 1024;
-/// Byte offset of an external journal superblock on its journal device.
-const JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET: u64 = 2048;
-/// External journal blocks reserved before usable log space.
-const JOURNAL_OVERHEAD_BLOCKS: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Full filesystem metadata block supplied to the journal commit path.
@@ -206,30 +202,6 @@ impl PreparedJournalCommit {
     }
 }
 
-/// Mount-time replay writes and resulting clean journal state.
-#[derive(Debug)]
-pub(crate) struct PreparedJournalRecovery {
-    /// Filesystem home-block writes reconstructed from committed journal records.
-    home_writes: Vec<PlannedStorageWrite>,
-    /// Journal superblock write required to mark replay clean, if any.
-    clean_write: Option<PlannedStorageWrite>,
-    /// Clean journal state published only after every required write is durable.
-    clean_journal: Journal<CleanJournal>,
-}
-
-impl PreparedJournalRecovery {
-    /// Consumes the recovery plan into its preallocated parts.
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Vec<PlannedStorageWrite>,
-        Option<PlannedStorageWrite>,
-        Journal<CleanJournal>,
-    ) {
-        (self.home_writes, self.clean_write, self.clean_journal)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// JBD2 journal with typestate-tracked replay and commit phases.
 pub(crate) struct Journal<State = CleanJournal> {
@@ -347,136 +319,6 @@ impl<State> Journal<State> {
             ring,
             filesystem_blocks,
             state: PhantomData,
-        })
-    }
-
-    /// Loads an external journal device and validates its filesystem UUID.
-    /// # Errors
-    ///
-    /// Returns an error when the external superblock cannot be read or parsed, its UUID does not
-    /// match the filesystem, or the external ring geometry is unsupported.
-    pub(crate) fn from_external_device(
-        journal: &mut OperationDevice<'_>,
-        block_size: BlockSize,
-        expected_uuid: [u8; 16],
-        filesystem_blocks: u64,
-    ) -> Result<Journal<LoadedJournal>> {
-        let mut raw = memory::repeated_vec(
-            0_u8,
-            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-        journal.read_exact_at(
-            ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET),
-            &mut raw,
-        )?;
-        let superblock = JournalSuperblock::parse(&raw)?;
-        if *superblock.uuid() != expected_uuid {
-            return Err(Error::UnsupportedJournal);
-        }
-        let location = JournalLocation::External(ExternalJournalLayout::new(journal, block_size)?);
-        let ring = superblock.validate_for_mount(block_size, location.capacity_blocks())?;
-        location.validate_ring(&ring)?;
-        Ok(Journal {
-            location,
-            superblock,
-            ring,
-            filesystem_blocks,
-            state: PhantomData,
-        })
-    }
-
-    /// Verifies that one metadata transaction can fit in the usable log window.
-    /// # Errors
-    ///
-    /// Returns an error when the descriptor tag count or required overhead exceeds the usable
-    /// journal ring.
-    pub(crate) fn ensure_transaction_capacity(&self, metadata_blocks: usize) -> Result<()> {
-        if metadata_blocks > self.descriptor_tag_capacity()? {
-            return Err(Error::TransactionTooLarge);
-        }
-        let required = u32::try_from(metadata_blocks)
-            .map_err(|_| Error::TransactionTooLarge)?
-            .checked_add(JOURNAL_OVERHEAD_BLOCKS)
-            .ok_or(Error::TransactionTooLarge)?;
-        if required > self.usable_log_blocks()? {
-            Err(Error::TransactionTooLarge)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Parses committed replay records and preallocates every mount-time recovery write.
-    ///
-    /// No write or flush is issued here. The mount operation must execute the returned home writes,
-    /// flush them, persist the optional clean journal superblock, and flush the journal target
-    /// before publishing mounted state.
-    /// # Errors
-    ///
-    /// Returns an error when journal scanning, replay filtering, or write-plan allocation fails.
-    pub(crate) fn prepare_recovery(
-        self,
-        journal_device: &mut OperationDevice<'_>,
-        block_size: BlockSize,
-        recovery_state: RecoveryState,
-    ) -> Result<PreparedJournalRecovery> {
-        if recovery_state == RecoveryState::NeedsRecovery && self.superblock.start() == 0 {
-            return Err(Error::JournalCorrupt);
-        }
-        let scan = self.committed_transactions(journal_device, block_size)?;
-        if scan.tail == JournalScanTail::CleanSuperblock {
-            return Ok(PreparedJournalRecovery {
-                home_writes: Vec::new(),
-                clean_write: None,
-                clean_journal: self.copy_without_state()?,
-            });
-        }
-
-        let mut revokes = Vec::new();
-        for transaction in &scan.transactions {
-            for (order, event) in transaction.events.iter().enumerate() {
-                if let JournalTransactionEvent::Revoke(block) = event {
-                    revokes.try_push(RevokedBlock {
-                        sequence: transaction.sequence,
-                        order,
-                        block: *block,
-                    })?;
-                }
-            }
-        }
-
-        let mut next_sequence = self.superblock.sequence();
-        let mut home_writes = Vec::new();
-        for transaction in scan.transactions {
-            next_sequence = transaction.sequence.next();
-            for (order, event) in transaction.events.into_iter().enumerate() {
-                if let JournalTransactionEvent::Entry(entry) = event {
-                    if is_revoked_after(&revokes, entry.home, transaction.sequence, order) {
-                        continue;
-                    }
-                    home_writes.try_push(PlannedStorageWrite::new(
-                        StorageTarget::Filesystem,
-                        block_size.offset_of(entry.home)?,
-                        entry.bytes,
-                    ))?;
-                }
-            }
-        }
-
-        let clean_bytes = self.superblock.encode_clean(block_size, next_sequence)?;
-        let clean_state_bytes = memory::copied_slice(&clean_bytes)?;
-        let clean_write = PlannedStorageWrite::new(
-            self.location.storage_target(),
-            self.offset_of(0, block_size)?,
-            clean_bytes,
-        );
-        let mut clean_journal = self.copy_without_state::<CleanJournal>()?;
-        clean_journal
-            .superblock
-            .apply_clean(next_sequence, clean_state_bytes);
-        Ok(PreparedJournalRecovery {
-            home_writes,
-            clean_write: Some(clean_write),
-            clean_journal,
         })
     }
 
@@ -1407,7 +1249,7 @@ enum JournalLocation {
     /// Journal stored in an inode on the filesystem device.
     Internal(InternalJournalLayout),
     /// Journal stored on a separate block device.
-    External(ExternalJournalLayout),
+    External,
 }
 
 impl JournalLocation {
@@ -1415,7 +1257,7 @@ impl JournalLocation {
     const fn storage_target(&self) -> StorageTarget {
         match self {
             Self::Internal(_) => StorageTarget::Filesystem,
-            Self::External(_) => StorageTarget::ExternalJournal,
+            Self::External => StorageTarget::ExternalJournal,
         }
     }
 
@@ -1426,7 +1268,7 @@ impl JournalLocation {
     fn try_clone(&self) -> Result<Self> {
         match self {
             Self::Internal(layout) => Ok(Self::Internal(layout.try_clone()?)),
-            Self::External(layout) => Ok(Self::External(*layout)),
+            Self::External => Ok(Self::External),
         }
     }
 
@@ -1438,7 +1280,7 @@ impl JournalLocation {
     fn offset_of(&self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
         match self {
             Self::Internal(layout) => block_size.offset_of(layout.map_logical(logical)?),
-            Self::External(layout) => layout.offset_of(logical, block_size),
+            Self::External => block_size.offset_of(BlockAddress::new(u64::from(logical))),
         }
     }
 
@@ -1449,7 +1291,10 @@ impl JournalLocation {
     fn validate_ring(&self, ring: &JournalRing) -> Result<()> {
         match self {
             Self::Internal(layout) => layout.validate_ring(ring),
-            Self::External(layout) => layout.validate_ring(ring),
+            Self::External => {
+                let _ = ring;
+                Err(Error::UnsupportedJournal)
+            }
         }
     }
 
@@ -1460,7 +1305,7 @@ impl JournalLocation {
     fn contains_home_block(&self, block: BlockAddress) -> Result<bool> {
         match self {
             Self::Internal(layout) => layout.contains_physical(block),
-            Self::External(_) => Ok(false),
+            Self::External => Ok(false),
         }
     }
 
@@ -1468,7 +1313,7 @@ impl JournalLocation {
     const fn capacity_blocks(&self) -> u32 {
         match self {
             Self::Internal(layout) => layout.capacity_blocks(),
-            Self::External(layout) => layout.capacity_blocks(),
+            Self::External => 0,
         }
     }
 }
@@ -1639,80 +1484,6 @@ impl JournalExtent {
     /// Returns whether a physical block lies inside this extent.
     fn contains_physical(self, block: BlockAddress) -> bool {
         block.get() >= self.physical_start.get() && block.get() < self.physical_end
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Contiguous layout for a journal stored on a separate journal device.
-struct ExternalJournalLayout {
-    /// Byte offset where the external journal superblock starts.
-    base: ByteOffset,
-    /// Total blocks available on the external journal device.
-    capacity_blocks: u32,
-}
-
-impl ExternalJournalLayout {
-    /// Derives external journal capacity from the journal device length.
-    /// # Errors
-    ///
-    /// Returns an error when the device is too small after the external superblock offset or its
-    /// block capacity is outside the supported range.
-    fn new(journal: &OperationDevice<'_>, block_size: BlockSize) -> Result<Self> {
-        let base = ByteOffset::new(JOURNAL_EXTERNAL_SUPERBLOCK_OFFSET);
-        let remaining = journal
-            .len()
-            .bytes()
-            .checked_sub(base.get())
-            .ok_or(Error::UnsupportedJournal)?;
-        let capacity_blocks = remaining
-            .checked_div(u64::from(block_size.bytes()))
-            .ok_or(Error::ArithmeticOverflow)?;
-        let capacity_blocks =
-            u32::try_from(capacity_blocks).map_err(|_| Error::UnsupportedJournal)?;
-        if capacity_blocks <= JOURNAL_OVERHEAD_BLOCKS {
-            return Err(Error::UnsupportedJournal);
-        }
-        Ok(Self {
-            base,
-            capacity_blocks,
-        })
-    }
-
-    /// Verifies that the journal ring fits on the external device.
-    /// # Errors
-    ///
-    /// Returns an error when the ring max length exceeds external journal capacity.
-    fn validate_ring(self, ring: &JournalRing) -> Result<()> {
-        if ring.maxlen <= self.capacity_blocks {
-            Ok(())
-        } else {
-            Err(Error::UnsupportedJournal)
-        }
-    }
-
-    /// Maps a logical journal block to an external journal byte offset.
-    /// # Errors
-    ///
-    /// Returns an error when `logical` exceeds capacity or byte-offset arithmetic overflows.
-    fn offset_of(self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
-        if logical >= self.capacity_blocks {
-            return Err(Error::UnsupportedJournal);
-        }
-        Ok(ByteOffset::new(
-            self.base
-                .get()
-                .checked_add(
-                    u64::from(logical)
-                        .checked_mul(u64::from(block_size.bytes()))
-                        .ok_or(Error::ArithmeticOverflow)?,
-                )
-                .ok_or(Error::ArithmeticOverflow)?,
-        ))
-    }
-
-    /// Returns the external journal capacity in blocks.
-    const fn capacity_blocks(self) -> u32 {
-        self.capacity_blocks
     }
 }
 
