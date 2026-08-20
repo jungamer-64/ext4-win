@@ -19,9 +19,9 @@ license = "MIT OR Apache-2.0"
 cc = "1"
 hkdf = { version = "0.13", default-features = false }
 sha2 = { version = "0.11", default-features = false }
-wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
-wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
-wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
+wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "8e88dd899d9fa988df841e08cc01e9f663e5a415" }
+wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "8e88dd899d9fa988df841e08cc01e9f663e5a415" }
+wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "8e88dd899d9fa988df841e08cc01e9f663e5a415" }
 
 [profile.dev]
 panic = "abort"
