@@ -18,7 +18,10 @@ cargo xtask verify-journal-interop
 `verify-portable` runs on Windows, Linux, and macOS. `verify-driver` requires a
 Windows host with the MSVC/WDK environment needed by `windows-drivers-rs`.
 `verify-journal-interop` requires Linux e2fsprogs, either natively or through
-WSL.
+WSL. It creates fresh 4 KiB and 4 KiB/16 KiB BIGALLOC images, drives typed
+ext4-core namespace/data/xattr mutations, and uses `debugfs` plus `e2fsck` as
+independent oracles. The 4 KiB external-journal profile additionally exercises
+rename/write/xattr recovery at every modeled write-prefix and flush cut.
 
 The sole release authority is:
 
