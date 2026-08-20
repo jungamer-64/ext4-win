@@ -25,10 +25,23 @@ use wdk_sys::{NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_SUCCESS};
 ///
 /// The build script forces this symbol into the linked image. Ordinary builds
 /// receive an all-zero identity, which the production artifact gate rejects.
+/// The fixed-size array keeps the marker bytes at the symbol address so the
+/// link map can bind those exact bytes to the signed image.
+const EXT4WIN_PRODUCTION_ARTIFACT_RECORD: &str =
+    concat!("EXT4WIN_ARTIFACT_ID=", env!("EXT4WIN_ARTIFACT_ID"));
+
 #[used]
 #[unsafe(no_mangle)]
-static EXT4WIN_PRODUCTION_ARTIFACT_ID: &[u8] =
-    concat!("EXT4WIN_ARTIFACT_ID=", env!("EXT4WIN_ARTIFACT_ID")).as_bytes();
+static EXT4WIN_PRODUCTION_ARTIFACT_ID: [u8; EXT4WIN_PRODUCTION_ARTIFACT_RECORD.len()] = {
+    let source = EXT4WIN_PRODUCTION_ARTIFACT_RECORD.as_bytes();
+    let mut record = [0; EXT4WIN_PRODUCTION_ARTIFACT_RECORD.len()];
+    let mut index = 0;
+    while index < source.len() {
+        record[index] = source[index];
+        index += 1;
+    }
+    record
+};
 
 #[cfg(not(test))]
 #[global_allocator]

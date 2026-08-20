@@ -3,7 +3,7 @@
 extern crate alloc;
 
 use alloc::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, TryReserveError, VecDeque},
     format,
     string::String,
     vec,
@@ -49,7 +49,6 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("durable publication boundary", "publish_durable"),
     ("completion registration import", "IoSetCompletionRoutineEx"),
     ("lower submission import", "IofCallDriver"),
-    ("artifact identity", ARTIFACT_ID_SYMBOL),
 ];
 
 /// AMD64 COFF machine identifier.
@@ -94,6 +93,13 @@ enum GateError {
         /// Underlying operating-system error.
         source: io::Error,
     },
+    /// Memory reservation required by the host-side artifact analysis failed.
+    Allocation {
+        /// Analyzer structure being reserved.
+        purpose: &'static str,
+        /// Allocation or capacity failure returned by the collection.
+        source: TryReserveError,
+    },
     /// The LLVM IR is not structurally usable by the graph gate.
     InvalidIr(String),
     /// The release artifacts do not form one verified production bundle.
@@ -110,6 +116,9 @@ impl fmt::Display for GateError {
                 path,
                 source,
             } => write!(formatter, "{operation} {}: {source}", path.display()),
+            Self::Allocation { purpose, source } => {
+                write!(formatter, "cannot allocate {purpose}: {source}")
+            }
             Self::InvalidIr(detail) => write!(formatter, "invalid LLVM IR: {detail}"),
             Self::InvalidArtifact(detail) => {
                 write!(formatter, "invalid release artifact: {detail}")
@@ -122,7 +131,15 @@ impl fmt::Display for GateError {
     }
 }
 
-impl core::error::Error for GateError {}
+impl core::error::Error for GateError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Allocation { source, .. } => Some(source),
+            Self::InvalidIr(_) | Self::InvalidArtifact(_) | Self::InvalidArguments => None,
+        }
+    }
+}
 
 /// A normalized opaque-pointer LLVM function signature.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -250,6 +267,17 @@ struct LinkMap {
     image_base: u64,
     /// Absolute linked address of `DriverEntry`.
     driver_entry: u64,
+    /// Absolute linked address of the identity bytes forced into the final image.
+    artifact_identity: u64,
+}
+
+/// One initialized section of the on-disk PE image.
+#[derive(Debug)]
+struct PeSection {
+    /// Relative virtual address where the section is linked.
+    virtual_address: u32,
+    /// Bytes actually present in the image file for this section.
+    raw_data: core::ops::Range<usize>,
 }
 
 /// Final PE facts required to bind the map and signed image.
@@ -261,6 +289,8 @@ struct PeImage {
     image_base: u64,
     /// Entry-point relative virtual address.
     entry_rva: u32,
+    /// Initialized PE sections used to resolve link-map addresses to file bytes.
+    sections: Vec<PeSection>,
 }
 
 /// Classification for a forbidden production sink.
@@ -409,7 +439,7 @@ impl ArtifactBundle {
 
         let link_map = LinkMap::parse(&link_map_text)?;
         let image = PeImage::parse(&driver)?;
-        link_map.verify_image(&image)?;
+        link_map.verify_image(&image, &driver, &ir_identity)?;
 
         Ok(Self {
             paths,
@@ -502,23 +532,15 @@ impl LinkMap {
             })?;
         let image_base = parse_hex_u64(image_base.trim(), "link-map image base")?;
 
-        let driver_entry = map.lines().find_map(|line| {
-            let mut fields = line.split_whitespace();
-            let _section_offset = fields.next()?;
-            if fields.next()? != DRIVER_ENTRY {
-                return None;
-            }
-            fields.next()
-        });
-        let driver_entry = driver_entry.ok_or_else(|| {
-            GateError::InvalidArtifact("link map omits the DriverEntry public symbol".to_owned())
-        })?;
-        let driver_entry = parse_hex_u64(driver_entry, "linked DriverEntry address")?;
+        let driver_entry = linked_symbol_address(map, DRIVER_ENTRY, "DriverEntry")?;
+        let artifact_identity =
+            linked_symbol_address(map, ARTIFACT_ID_SYMBOL, "artifact identity")?;
 
         Ok(Self {
             timestamp,
             image_base,
             driver_entry,
+            artifact_identity,
         })
     }
 
@@ -527,7 +549,12 @@ impl LinkMap {
     /// # Errors
     ///
     /// Returns an artifact error on any timestamp, base-address, or entry-point mismatch.
-    fn verify_image(&self, image: &PeImage) -> GateResult<()> {
+    fn verify_image(
+        &self,
+        image: &PeImage,
+        image_bytes: &[u8],
+        identity: &ArtifactIdentity,
+    ) -> GateResult<()> {
         if self.timestamp != image.timestamp {
             return Err(GateError::InvalidArtifact(format!(
                 "link-map timestamp {:08x} does not match PE timestamp {:08x}",
@@ -552,8 +579,32 @@ impl LinkMap {
                 self.driver_entry, image_entry
             )));
         }
+        let linked_identity = image.artifact_identity(image_bytes, self.artifact_identity)?;
+        if &linked_identity != identity {
+            return Err(GateError::InvalidArtifact(format!(
+                "link-map artifact identity {} resolves to PE identity {}, not LLVM identity {}",
+                self.artifact_identity, linked_identity.0, identity.0
+            )));
+        }
         Ok(())
     }
+}
+
+/// Recovers the absolute address recorded for one public symbol in an MSVC map.
+///
+/// # Errors
+///
+/// Returns an artifact error when the public-symbol row is absent or its address is malformed.
+fn linked_symbol_address(map: &str, symbol: &str, role: &'static str) -> GateResult<u64> {
+    let address = map.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let _section_offset = fields.next()?;
+        (fields.next()? == symbol).then(|| fields.next()).flatten()
+    });
+    let address = address.ok_or_else(|| {
+        GateError::InvalidArtifact(format!("link map omits the {role} public symbol {symbol}"))
+    })?;
+    parse_hex_u64(address, "linked public-symbol address")
 }
 
 impl PeImage {
@@ -587,6 +638,16 @@ impl PeImage {
         if read_u16(image, coff, "COFF machine")? != IMAGE_FILE_MACHINE_AMD64 {
             return Err(GateError::InvalidArtifact(
                 "signed driver is not an AMD64 image".to_owned(),
+            ));
+        }
+        let section_count = usize::from(read_u16(
+            image,
+            checked_offset(coff, 2, "COFF section count")?,
+            "COFF section count",
+        )?);
+        if section_count == 0 {
+            return Err(GateError::InvalidArtifact(
+                "signed driver has no initialized PE sections".to_owned(),
             ));
         }
         let timestamp_offset = checked_offset(coff, 4, "COFF timestamp")?;
@@ -717,11 +778,148 @@ impl PeImage {
             ));
         }
 
+        let section_table = optional_end;
+        let section_table_size = section_count.checked_mul(40).ok_or_else(|| {
+            GateError::InvalidArtifact("PE section-table size overflows address space".to_owned())
+        })?;
+        let section_table_end =
+            checked_offset(section_table, section_table_size, "PE section table")?;
+        if image.get(section_table..section_table_end).is_none() {
+            return Err(GateError::InvalidArtifact(
+                "signed driver has a truncated PE section table".to_owned(),
+            ));
+        }
+        let mut sections = Vec::new();
+        sections
+            .try_reserve_exact(section_count)
+            .map_err(|source| GateError::Allocation {
+                purpose: "PE section table",
+                source,
+            })?;
+        for section_index in 0..section_count {
+            let section_offset = checked_offset(
+                section_table,
+                section_index.checked_mul(40).ok_or_else(|| {
+                    GateError::InvalidArtifact(
+                        "PE section index overflows address space".to_owned(),
+                    )
+                })?,
+                "PE section header",
+            )?;
+            let virtual_address = read_u32(
+                image,
+                checked_offset(section_offset, 12, "PE section virtual address")?,
+                "PE section virtual address",
+            )?;
+            let raw_data_size = usize::try_from(read_u32(
+                image,
+                checked_offset(section_offset, 16, "PE section raw-data size")?,
+                "PE section raw-data size",
+            )?)
+            .map_err(|error| {
+                GateError::InvalidArtifact(format!(
+                    "PE section raw-data size does not fit usize: {error}"
+                ))
+            })?;
+            let raw_data_offset = usize::try_from(read_u32(
+                image,
+                checked_offset(section_offset, 20, "PE section raw-data offset")?,
+                "PE section raw-data offset",
+            )?)
+            .map_err(|error| {
+                GateError::InvalidArtifact(format!(
+                    "PE section raw-data offset does not fit usize: {error}"
+                ))
+            })?;
+            let raw_data_end =
+                checked_offset(raw_data_offset, raw_data_size, "PE section raw data")?;
+            if image.get(raw_data_offset..raw_data_end).is_none() {
+                return Err(GateError::InvalidArtifact(format!(
+                    "PE section {section_index} raw data lies outside the driver image"
+                )));
+            }
+            sections.push(PeSection {
+                virtual_address,
+                raw_data: raw_data_offset..raw_data_end,
+            });
+        }
+
         Ok(Self {
             timestamp,
             image_base,
             entry_rva,
+            sections,
         })
+    }
+
+    /// Resolves the map-addressed identity bytes from the exact signed PE image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact error when the link-map address is outside initialized PE bytes or does
+    /// not contain one valid artifact marker.
+    fn artifact_identity(&self, image: &[u8], linked_address: u64) -> GateResult<ArtifactIdentity> {
+        let rva = linked_address.checked_sub(self.image_base).ok_or_else(|| {
+            GateError::InvalidArtifact(format!(
+                "link-map artifact symbol address {linked_address:016x} precedes PE image base {:016x}",
+                self.image_base
+            ))
+        })?;
+        let rva = u32::try_from(rva).map_err(|error| {
+            GateError::InvalidArtifact(format!(
+                "link-map artifact symbol RVA does not fit u32: {error}"
+            ))
+        })?;
+        let marker_end = u64::from(rva)
+            .checked_add(u64::try_from(ARTIFACT_ID_RECORD_LENGTH).map_err(|error| {
+                GateError::InvalidArtifact(format!(
+                    "artifact marker length does not fit u64: {error}"
+                ))
+            })?)
+            .ok_or_else(|| {
+                GateError::InvalidArtifact("artifact marker RVA overflows".to_owned())
+            })?;
+        for section in &self.sections {
+            let section_start = u64::from(section.virtual_address);
+            let section_length = u64::try_from(section.raw_data.len()).map_err(|error| {
+                GateError::InvalidArtifact(format!("PE section length does not fit u64: {error}"))
+            })?;
+            let section_end = section_start.checked_add(section_length).ok_or_else(|| {
+                GateError::InvalidArtifact("PE section RVA range overflows".to_owned())
+            })?;
+            if u64::from(rva) < section_start || marker_end > section_end {
+                continue;
+            }
+            let within_section = u64::from(rva).checked_sub(section_start).ok_or_else(|| {
+                GateError::InvalidArtifact(
+                    "artifact marker RVA precedes its containing section".to_owned(),
+                )
+            })?;
+            let within_section = usize::try_from(within_section).map_err(|error| {
+                GateError::InvalidArtifact(format!(
+                    "artifact marker section offset does not fit usize: {error}"
+                ))
+            })?;
+            let marker_offset = checked_offset(
+                section.raw_data.start,
+                within_section,
+                "artifact marker file offset",
+            )?;
+            let marker_end = checked_offset(
+                marker_offset,
+                ARTIFACT_ID_RECORD_LENGTH,
+                "artifact marker file range",
+            )?;
+            let marker = image.get(marker_offset..marker_end).ok_or_else(|| {
+                GateError::InvalidArtifact(
+                    "artifact marker lies outside the driver image".to_owned(),
+                )
+            })?;
+            return ArtifactIdentity::parse(marker, "link-map-addressed signed-driver marker");
+        }
+        Err(GateError::InvalidArtifact(format!(
+            "link-map artifact symbol address {linked_address:016x} does not resolve to initialized PE bytes"
+        )))
     }
 }
 
@@ -1087,28 +1285,11 @@ impl IrModule {
             });
         }
 
-        for (caller, calls) in unresolved {
-            if violations.len() >= MAX_REPORTED_VIOLATIONS {
-                break;
-            }
-            if !predecessors.contains_key(&caller) {
-                continue;
-            }
-            for call in calls {
-                if violations.len() >= MAX_REPORTED_VIOLATIONS {
-                    break;
-                }
-                let mut path = display_path(&caller, &predecessors, &self.functions)?;
-                path.push(format!(
-                    "unresolved indirect call at LLVM IR line {} [{}]",
-                    call.line, call.signature
-                ));
-                violations.push(Violation {
-                    category: "unresolved indirect call",
-                    path,
-                });
-            }
-        }
+        self.append_reachable_unresolved_indirect_calls(
+            &predecessors,
+            &unresolved,
+            &mut violations,
+        )?;
 
         Ok(AnalysisReport {
             function_count: self.functions.len(),
@@ -1246,6 +1427,8 @@ impl IrModule {
             }
         }
         let predecessors = self.predecessors_from(&roots)?;
+        let unresolved = self.unresolved_indirect_calls();
+        self.append_reachable_unresolved_indirect_calls(&predecessors, &unresolved, violations)?;
         for symbol in predecessors.keys() {
             if violations.len() >= MAX_REPORTED_VIOLATIONS {
                 break;
@@ -1290,6 +1473,8 @@ impl IrModule {
             return Ok(());
         }
         let predecessors = self.predecessors_from(&roots)?;
+        let unresolved = self.unresolved_indirect_calls();
+        self.append_reachable_unresolved_indirect_calls(&predecessors, &unresolved, violations)?;
         for symbol in predecessors.keys() {
             if violations.len() >= MAX_REPORTED_VIOLATIONS {
                 break;
@@ -1337,6 +1522,62 @@ impl IrModule {
             }
         }
         Ok(predecessors)
+    }
+
+    /// Recomputes the indirect call sites that have no compatible address-taken target.
+    fn unresolved_indirect_calls(&self) -> BTreeMap<String, Vec<IndirectCall>> {
+        let address_taken_by_signature = self.address_taken_by_signature();
+        let mut unresolved = BTreeMap::<String, Vec<IndirectCall>>::new();
+        for (caller, function) in &self.functions {
+            for indirect in &function.indirect_calls {
+                let has_candidate = address_taken_by_signature
+                    .get(&indirect.signature)
+                    .is_some_and(|candidates| !candidates.is_empty());
+                if !has_candidate {
+                    unresolved
+                        .entry(caller.clone())
+                        .or_default()
+                        .push(indirect.clone());
+                }
+            }
+        }
+        unresolved
+    }
+
+    /// Reports unresolved execution reachable from any audit-root-specific traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-IR error when a path to the unresolved call cannot be reconstructed.
+    fn append_reachable_unresolved_indirect_calls(
+        &self,
+        predecessors: &BTreeMap<String, Option<String>>,
+        unresolved: &BTreeMap<String, Vec<IndirectCall>>,
+        violations: &mut Vec<Violation>,
+    ) -> GateResult<()> {
+        for (caller, calls) in unresolved {
+            if violations.len() >= MAX_REPORTED_VIOLATIONS {
+                break;
+            }
+            if !predecessors.contains_key(caller) {
+                continue;
+            }
+            for call in calls {
+                if violations.len() >= MAX_REPORTED_VIOLATIONS {
+                    break;
+                }
+                let mut path = display_path(caller, predecessors, &self.functions)?;
+                path.push(format!(
+                    "unresolved indirect call at LLVM IR line {} [{}]",
+                    call.line, call.signature
+                ));
+                violations.push(Violation {
+                    category: "unresolved indirect call",
+                    path,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Groups address-taken functions by normalized LLVM signature.
@@ -2011,11 +2252,17 @@ mod tests {
     }
 
     /// Produces a minimal MSVC map containing every production symbol required by the gate.
-    fn link_map_fixture(timestamp: u32, image_base: u64, driver_entry: u64) -> String {
+    fn link_map_fixture(
+        timestamp: u32,
+        image_base: u64,
+        driver_entry: u64,
+        artifact_identity: u64,
+    ) -> String {
         format!(
             " ext4win\n Timestamp is {timestamp:08x} (fixture)\n\
              Preferred load address is {image_base:016x}\n\
              0001:00001000 DriverEntry {driver_entry:016x} f ext4win.o\n\
+             0002:00000000 EXT4WIN_PRODUCTION_ARTIFACT_ID {artifact_identity:016x} f ext4win.o\n\
              active_irp_cancelled\n\
              storage_retry_timer_dpc\n\
              lower_request_completed\n\
@@ -2055,12 +2302,22 @@ mod tests {
         write_bytes(&mut image, 0x3c, &0x80_u32.to_le_bytes())?;
         write_bytes(&mut image, 0x80, b"PE\0\0")?;
         write_bytes(&mut image, 0x84, &0x8664_u16.to_le_bytes())?;
+        write_bytes(&mut image, 0x86, &1_u16.to_le_bytes())?;
         write_bytes(&mut image, 0x88, &0x1234_5678_u32.to_le_bytes())?;
         write_bytes(&mut image, 0x94, &0x00f0_u16.to_le_bytes())?;
         write_bytes(&mut image, 0x98, &0x020b_u16.to_le_bytes())?;
         write_bytes(&mut image, 0xa8, &0x1000_u32.to_le_bytes())?;
         write_bytes(&mut image, 0xb0, &0x0000_0001_8000_0000_u64.to_le_bytes())?;
         write_bytes(&mut image, 0xdc, &1_u16.to_le_bytes())?;
+        write_bytes(&mut image, 0x190, &0x100_u32.to_le_bytes())?;
+        write_bytes(&mut image, 0x194, &0x2000_u32.to_le_bytes())?;
+        write_bytes(&mut image, 0x198, &0x100_u32.to_le_bytes())?;
+        write_bytes(&mut image, 0x19c, &0x200_u32.to_le_bytes())?;
+        write_bytes(
+            &mut image,
+            0x200,
+            format!("{ARTIFACT_ID_MARKER}0123456789abcdef0123456789abcdef").as_bytes(),
+        )?;
         if has_certificate {
             write_bytes(&mut image, 0x128, &0x300_u32.to_le_bytes())?;
             write_bytes(&mut image, 0x12c, &0x40_u32.to_le_bytes())?;
@@ -2102,29 +2359,69 @@ mod tests {
         )
     }
 
-    /// Map timestamp, image base, and `DriverEntry` must identify the supplied signed PE.
+    /// Map timestamp, image base, `DriverEntry`, and marker address must identify the signed PE.
     ///
     /// # Errors
     ///
     /// Returns an error if a matching pair is rejected or a mismatched entry point is accepted.
     #[test]
     fn link_map_is_bound_to_signed_pe() -> Result<(), GateError> {
-        let image = PeImage::parse(&pe_fixture(true)?)?;
+        let image_bytes = pe_fixture(true)?;
+        let image = PeImage::parse(&image_bytes)?;
+        let identity = ArtifactIdentity::parse(
+            format!("{ARTIFACT_ID_MARKER}0123456789abcdef0123456789abcdef").as_bytes(),
+            "fixture",
+        )?;
         let matching = LinkMap::parse(&link_map_fixture(
             0x1234_5678,
             0x0000_0001_8000_0000,
             0x0000_0001_8000_1000,
+            0x0000_0001_8000_2000,
         ))?;
-        matching.verify_image(&image)?;
+        matching.verify_image(&image, &image_bytes, &identity)?;
 
         let mismatched = LinkMap::parse(&link_map_fixture(
             0x1234_5678,
             0x0000_0001_8000_0000,
             0x0000_0001_8000_2000,
+            0x0000_0001_8000_2000,
         ))?;
         require(
-            mismatched.verify_image(&image).is_err(),
+            mismatched
+                .verify_image(&image, &image_bytes, &identity)
+                .is_err(),
             "mismatched DriverEntry address was accepted",
+        )?;
+
+        let marker_mismatch = LinkMap::parse(&link_map_fixture(
+            0x1234_5678,
+            0x0000_0001_8000_0000,
+            0x0000_0001_8000_1000,
+            0x0000_0001_8000_2008,
+        ))?;
+        require(
+            marker_mismatch
+                .verify_image(&image, &image_bytes, &identity)
+                .is_err(),
+            "map artifact-symbol address not pointing at the marker was accepted",
+        )?;
+
+        let mut mismatched_marker_bytes = image_bytes.clone();
+        write_bytes(
+            &mut mismatched_marker_bytes,
+            0x200,
+            format!("{ARTIFACT_ID_MARKER}fedcba9876543210fedcba9876543210").as_bytes(),
+        )?;
+        let mismatched_marker_image = PeImage::parse(&mismatched_marker_bytes)?;
+        require(
+            matching
+                .verify_image(
+                    &mismatched_marker_image,
+                    &mismatched_marker_bytes,
+                    &identity,
+                )
+                .is_err(),
+            "map-addressed marker with a different identity was accepted",
         )
     }
 
@@ -2135,8 +2432,13 @@ mod tests {
     /// Returns an error if removing a required linked callback is not detected.
     #[test]
     fn link_map_requires_production_roots() -> Result<(), GateError> {
-        let map = link_map_fixture(0x1234_5678, 0x0000_0001_8000_0000, 0x0000_0001_8000_1000)
-            .replace("active_irp_cancelled", "missing_cancel_callback");
+        let map = link_map_fixture(
+            0x1234_5678,
+            0x0000_0001_8000_0000,
+            0x0000_0001_8000_1000,
+            0x0000_0001_8000_2000,
+        )
+        .replace("active_irp_cancelled", "missing_cancel_callback");
         require(
             LinkMap::parse(&map).is_err(),
             "link map without active cancellation callback was accepted",
@@ -2257,6 +2559,51 @@ mod tests {
                 .iter()
                 .any(|violation| violation.category == Sink::Panic.category()),
             "typed indirect target was not reached",
+        )
+    }
+
+    /// Callback-only roots fail closed when their indirect callee has no typed target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if callback reachability ignores unresolved execution.
+    #[test]
+    fn callback_audit_rejects_unresolved_indirect_call() -> Result<(), super::GateError> {
+        let module = IrModule::parse(&release_contract_fixture(
+            successful_lower_submission(),
+            "call void %callback(ptr null)\n  ret i32 -1073741802",
+            "",
+        ))?;
+        let mut violations = Vec::new();
+        module.audit_nonallocating_callbacks(&mut violations)?;
+        require(
+            violations
+                .iter()
+                .any(|violation| violation.category == "unresolved indirect call"),
+            "callback audit accepted an unresolved indirect call",
+        )
+    }
+
+    /// The durable-publication root fails closed when its indirect callee is unresolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if publication reachability ignores unresolved execution.
+    #[test]
+    fn durable_publication_audit_rejects_unresolved_indirect_call() -> Result<(), super::GateError>
+    {
+        let module = IrModule::parse(&release_contract_fixture(
+            successful_lower_submission(),
+            "ret i32 -1073741802",
+            "call void %callback(ptr null)",
+        ))?;
+        let mut violations = Vec::new();
+        module.audit_durable_publication(&mut violations)?;
+        require(
+            violations
+                .iter()
+                .any(|violation| violation.category == "unresolved indirect call"),
+            "durable-publication audit accepted an unresolved indirect call",
         )
     }
 
