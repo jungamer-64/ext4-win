@@ -18,7 +18,7 @@ use crate::disk::storage::{
     CompletedStorageTransfer, OperationDevice, StorageCompletion, StorageRequest,
     StorageRequestIdentity, StorageTarget,
 };
-use crate::disk_format::extent::{ExtentTree, ExtentTreeContext};
+use crate::disk_format::extent::{ExtentInitialization, ExtentTree, ExtentTreeContext};
 use crate::disk_format::inode::Inode;
 use crate::disk_format::superblock::{FilesystemUuid, JournalUuid, RecoveryState};
 use crate::error::{Error, Result};
@@ -220,6 +220,9 @@ struct JournalProfile {
 
 impl JournalProfile {
     /// Validates feature bits that change JBD2 record interpretation.
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedJournal`] for any ambiguous or unsupported wire profile.
     fn from_superblock(superblock: &JournalSuperblock) -> Result<Self> {
         if superblock.compat & JBD2_FEATURE_COMPAT_CHECKSUM != 0
             || superblock.compat & !JBD2_FEATURE_COMPAT_CHECKSUM != 0
@@ -252,18 +255,22 @@ impl JournalProfile {
         })
     }
 
+    /// Returns whether descriptor, payload, revoke, and commit checksums are present.
     const fn has_metadata_checksums(self) -> bool {
         !matches!(self.checksum, JournalChecksumProfile::None)
     }
 
+    /// Returns whether descriptor tags carry full-width v3 checksums.
     const fn has_csum_v3(self) -> bool {
         matches!(self.checksum, JournalChecksumProfile::V3)
     }
 
+    /// Returns whether block addresses carry a high 32-bit word.
     const fn has_64bit(self) -> bool {
         self.block_numbers_64bit
     }
 
+    /// Returns whether revoke control blocks are valid in this profile.
     const fn has_revokes(self) -> bool {
         self.revokes
     }
@@ -279,6 +286,10 @@ struct JournalGeometry {
 }
 
 impl JournalGeometry {
+    /// Validates block size and circular-ring geometry against physical capacity.
+    /// # Errors
+    ///
+    /// Returns an error when the wire block size or ring bounds disagree with the backing layout.
     fn from_superblock(
         superblock: &JournalSuperblock,
         block_size: BlockSize,
@@ -305,6 +316,10 @@ struct JournalCursor {
 }
 
 impl JournalCursor {
+    /// Recovers the next transaction sequence and head from clean or dirty superblock state.
+    /// # Errors
+    ///
+    /// Returns [`Error::JournalCorrupt`] when the selected head is outside the validated ring.
     fn from_superblock(superblock: &JournalSuperblock, ring: JournalRing) -> Result<Self> {
         let (sequence, head) = if superblock.start != 0 {
             (superblock.sequence, superblock.start)
@@ -506,7 +521,12 @@ enum RecoveryPending {
     /// Read the next descriptor, revoke, or commit block.
     Control,
     /// Read descriptor payloads in the half-open tag range.
-    Payload { next: usize, end: usize },
+    Payload {
+        /// Next tag whose payload must be read.
+        next: usize,
+        /// Exclusive tag-range end for this descriptor.
+        end: usize,
+    },
     /// Move the returned payload buffer into one filesystem home write.
     HomeWrite {
         /// Filesystem block selected by the validated tag.
@@ -533,9 +553,19 @@ enum RecoveryIoAction {
     /// Journal control block read.
     ControlRead,
     /// Journal payload read for the specified prevalidated tag.
-    PayloadRead { index: usize, end: usize },
+    PayloadRead {
+        /// Tag whose payload owns the returned buffer.
+        index: usize,
+        /// Exclusive descriptor tag-range end.
+        end: usize,
+    },
     /// Filesystem home-block write.
-    HomeWrite { next: usize, end: usize },
+    HomeWrite {
+        /// Next tag after the completed home write.
+        next: usize,
+        /// Exclusive descriptor tag-range end.
+        end: usize,
+    },
     /// Filesystem durability barrier after replay.
     FilesystemFlush,
     /// Clean journal-superblock write.
@@ -643,89 +673,87 @@ impl JournalRecoveryOperation {
         if self.in_flight.is_some() {
             return Err(Error::DeviceIo);
         }
-        loop {
-            self.advance_pass_boundary()?;
-            let (request, action) = match self.phase {
-                RecoveryPhase::Complete => return Ok(None),
-                RecoveryPhase::FlushFilesystem => (
-                    StorageRequest::Flush {
-                        target: StorageTarget::Filesystem,
-                    },
-                    RecoveryIoAction::FilesystemFlush,
-                ),
-                RecoveryPhase::WriteCleanJournal => {
-                    let offset = self
-                        .journal
-                        .location
-                        .superblock_offset(self.journal.geometry.block_size)?;
-                    let buffer = self.clean_write.take().ok_or(Error::JournalCorrupt)?;
-                    (
-                        StorageRequest::Write {
-                            target: self.journal.location.storage_target(),
-                            offset,
-                            buffer,
-                        },
-                        RecoveryIoAction::CleanJournalWrite,
-                    )
-                }
-                RecoveryPhase::FlushJournal => (
-                    StorageRequest::Flush {
+        self.advance_pass_boundary()?;
+        let (request, action) = match self.phase {
+            RecoveryPhase::Complete => return Ok(None),
+            RecoveryPhase::FlushFilesystem => (
+                StorageRequest::Flush {
+                    target: StorageTarget::Filesystem,
+                },
+                RecoveryIoAction::FilesystemFlush,
+            ),
+            RecoveryPhase::WriteCleanJournal => {
+                let offset = self
+                    .journal
+                    .location
+                    .superblock_offset(self.journal.geometry.block_size)?;
+                let buffer = self.clean_write.take().ok_or(Error::JournalCorrupt)?;
+                (
+                    StorageRequest::Write {
                         target: self.journal.location.storage_target(),
+                        offset,
+                        buffer,
                     },
-                    RecoveryIoAction::JournalFlush,
-                ),
-                RecoveryPhase::Scan | RecoveryPhase::Validate | RecoveryPhase::Replay => {
-                    match self.pending {
-                        RecoveryPending::Control => {
-                            let offset = self
-                                .journal
-                                .offset_of(self.walk.cursor, self.journal.geometry.block_size)?;
-                            let buffer = self.buffer.take().ok_or(Error::DeviceIo)?;
-                            (
-                                StorageRequest::Read {
-                                    target: self.journal.location.storage_target(),
-                                    offset,
-                                    buffer,
-                                },
-                                RecoveryIoAction::ControlRead,
-                            )
-                        }
-                        RecoveryPending::Payload { next, end } => {
-                            let tag = *self.tags.get(next).ok_or(Error::JournalCorrupt)?;
-                            let offset = self
-                                .journal
-                                .offset_of(tag.journal_block, self.journal.geometry.block_size)?;
-                            let buffer = self.buffer.take().ok_or(Error::DeviceIo)?;
-                            (
-                                StorageRequest::Read {
-                                    target: self.journal.location.storage_target(),
-                                    offset,
-                                    buffer,
-                                },
-                                RecoveryIoAction::PayloadRead { index: next, end },
-                            )
-                        }
-                        RecoveryPending::HomeWrite { home, next, end } => {
-                            let offset = self.journal.geometry.block_size.offset_of(home)?;
-                            let buffer = self.buffer.take().ok_or(Error::DeviceIo)?;
-                            (
-                                StorageRequest::Write {
-                                    target: StorageTarget::Filesystem,
-                                    offset,
-                                    buffer,
-                                },
-                                RecoveryIoAction::HomeWrite { next, end },
-                            )
-                        }
+                    RecoveryIoAction::CleanJournalWrite,
+                )
+            }
+            RecoveryPhase::FlushJournal => (
+                StorageRequest::Flush {
+                    target: self.journal.location.storage_target(),
+                },
+                RecoveryIoAction::JournalFlush,
+            ),
+            RecoveryPhase::Scan | RecoveryPhase::Validate | RecoveryPhase::Replay => {
+                match self.pending {
+                    RecoveryPending::Control => {
+                        let offset = self
+                            .journal
+                            .offset_of(self.walk.cursor, self.journal.geometry.block_size)?;
+                        let buffer = self.buffer.take().ok_or(Error::DeviceIo)?;
+                        (
+                            StorageRequest::Read {
+                                target: self.journal.location.storage_target(),
+                                offset,
+                                buffer,
+                            },
+                            RecoveryIoAction::ControlRead,
+                        )
+                    }
+                    RecoveryPending::Payload { next, end } => {
+                        let tag = *self.tags.get(next).ok_or(Error::JournalCorrupt)?;
+                        let offset = self
+                            .journal
+                            .offset_of(tag.journal_block, self.journal.geometry.block_size)?;
+                        let buffer = self.buffer.take().ok_or(Error::DeviceIo)?;
+                        (
+                            StorageRequest::Read {
+                                target: self.journal.location.storage_target(),
+                                offset,
+                                buffer,
+                            },
+                            RecoveryIoAction::PayloadRead { index: next, end },
+                        )
+                    }
+                    RecoveryPending::HomeWrite { home, next, end } => {
+                        let offset = self.journal.geometry.block_size.offset_of(home)?;
+                        let buffer = self.buffer.take().ok_or(Error::DeviceIo)?;
+                        (
+                            StorageRequest::Write {
+                                target: StorageTarget::Filesystem,
+                                offset,
+                                buffer,
+                            },
+                            RecoveryIoAction::HomeWrite { next, end },
+                        )
                     }
                 }
-            };
-            self.in_flight = Some(RecoveryInFlight {
-                identity: StorageRequestIdentity::from_request(&request),
-                action,
-            });
-            return Ok(Some(request));
-        }
+            }
+        };
+        self.in_flight = Some(RecoveryInFlight {
+            identity: StorageRequestIdentity::from_request(&request),
+            action,
+        });
+        Ok(Some(request))
     }
 
     /// Consumes the exact completion for the request returned by [`Self::next_request`].
@@ -824,6 +852,9 @@ impl JournalRecoveryOperation {
     }
 
     /// Advances pass boundaries that require no lower I/O.
+    /// # Errors
+    ///
+    /// Returns an error for inconsistent committed-prefix cursors or failed pre-write allocation.
     fn advance_pass_boundary(&mut self) -> Result<()> {
         loop {
             if self.phase == RecoveryPhase::Scan
@@ -857,6 +888,9 @@ impl JournalRecoveryOperation {
     }
 
     /// Processes one completed journal control-block read according to the active pass.
+    /// # Errors
+    ///
+    /// Returns an error for an invalid phase or committed control-block corruption.
     fn process_control_block(&mut self, block: &[u8]) -> Result<()> {
         match self.phase {
             RecoveryPhase::Scan => self.scan_control_block(block),
@@ -868,6 +902,9 @@ impl JournalRecoveryOperation {
     }
 
     /// Performs the allocation-free committed-prefix scan pass.
+    /// # Errors
+    ///
+    /// Returns an error for arithmetic overflow or unsupported committed revoke structure.
     fn scan_control_block(&mut self, block: &[u8]) -> Result<()> {
         let Ok(header) = Jbd2Header::parse(block) else {
             return self.finish_scan();
@@ -907,7 +944,13 @@ impl JournalRecoveryOperation {
                 self.advance_walk_blocks(1)?;
             }
             JBD2_COMMIT_BLOCK => {
-                self.journal.parse_commit_block(block, self.walk.sequence)?;
+                if self
+                    .journal
+                    .parse_commit_block(block, self.walk.sequence)
+                    .is_err()
+                {
+                    return self.finish_scan();
+                }
                 if self.walk.scan_transaction_tags == 0 && self.walk.scan_transaction_revokes == 0 {
                     return Err(Error::JournalCorrupt);
                 }
@@ -941,6 +984,9 @@ impl JournalRecoveryOperation {
     }
 
     /// Finishes pass one and reserves all address memory before any home write.
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] when bounded tag or revoke reservation fails.
     fn finish_scan(&mut self) -> Result<()> {
         self.tags
             .try_reserve_exact(self.summary.max_transaction_tags)
@@ -954,6 +1000,9 @@ impl JournalRecoveryOperation {
     }
 
     /// Revalidates or replays one control block inside the pass-one committed boundary.
+    /// # Errors
+    ///
+    /// Returns an error for sequence, checksum, UUID, address, or structure corruption.
     fn validate_or_replay_control_block(&mut self, block: &[u8]) -> Result<()> {
         let header = Jbd2Header::parse(block)?;
         if header.sequence() != self.walk.sequence.get() {
@@ -964,9 +1013,6 @@ impl JournalRecoveryOperation {
             JBD2_REVOKE_BLOCK => self.process_revoke(block),
             JBD2_COMMIT_BLOCK => {
                 self.journal.parse_commit_block(block, self.walk.sequence)?;
-                if self.tags.is_empty() && self.phase == RecoveryPhase::Replay {
-                    // A revoke-only transaction is valid and has no replay payload.
-                }
                 self.advance_walk_blocks(1)?;
                 self.walk.sequence = self.walk.sequence.next();
                 self.tags.clear();
@@ -977,6 +1023,9 @@ impl JournalRecoveryOperation {
     }
 
     /// Parses descriptor tags into the transaction-bounded preallocated address vector.
+    /// # Errors
+    ///
+    /// Returns an error for invalid tags, targets, duplicates, capacity, or ring arithmetic.
     fn process_descriptor(&mut self, block: &[u8]) -> Result<()> {
         let descriptor_cursor = self.journal.next_logical(self.walk.cursor)?;
         let start = self.tags.len();
@@ -1017,6 +1066,9 @@ impl JournalRecoveryOperation {
     }
 
     /// Validates revoke structure and builds the latest-sequence table during pass two.
+    /// # Errors
+    ///
+    /// Returns an error for unsupported revokes, invalid targets, checksums, or reserved capacity.
     fn process_revoke(&mut self, block: &[u8]) -> Result<()> {
         if !self.journal.profile.has_revokes() {
             return Err(Error::JournalCorrupt);
@@ -1047,6 +1099,9 @@ impl JournalRecoveryOperation {
     }
 
     /// Prepares replay and clean publication after every committed byte has been validated.
+    /// # Errors
+    ///
+    /// Returns an error when the clean superblock or typestate cannot be allocated and encoded.
     fn prepare_replay_and_clean(&mut self) -> Result<()> {
         let cursor = JournalCursor {
             sequence: self.summary.next_sequence,
@@ -1085,6 +1140,9 @@ impl JournalRecoveryOperation {
     }
 
     /// Advances the active walk with circular ring semantics and a hard geometry bound.
+    /// # Errors
+    ///
+    /// Returns an error when consumption exceeds the ring or cursor arithmetic fails.
     fn advance_walk_blocks(&mut self, count: u32) -> Result<()> {
         let next_consumed = self
             .walk
@@ -1379,14 +1437,25 @@ impl<State> Journal<State> {
         let credits = self.journal_credits(metadata_blocks.len(), block_size)?;
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        for (index, metadata) in metadata_blocks.iter().enumerate() {
+            if metadata.bytes().len() != block_bytes {
+                return Err(Error::InvalidWriteRange);
+            }
+            self.validate_replay_target(metadata.block())?;
+            if metadata_blocks
+                .get(..index)
+                .ok_or(Error::InvalidWriteRange)?
+                .iter()
+                .any(|prior| prior.block() == metadata.block())
+            {
+                return Err(Error::JournalCorrupt);
+            }
+        }
         let mut data_blocks = Vec::new();
         data_blocks
             .try_reserve_exact(metadata_blocks.len())
             .map_err(|_| Error::OutOfMemory)?;
         for metadata in metadata_blocks {
-            if metadata.bytes().len() != block_bytes {
-                return Err(Error::InvalidWriteRange);
-            }
             let mut data = memory::copied_slice(metadata.bytes())?;
             if starts_with_jbd2_magic(&data) {
                 put_be_u32(&mut data, disk_offset(0), 0)?;
@@ -1534,6 +1603,9 @@ impl<State> Journal<State> {
     ///
     /// Descriptor checksum failure is deliberately deferred to pass two so a valid later commit
     /// record distinguishes committed corruption from an incomplete tail.
+    /// # Errors
+    ///
+    /// Returns an error when no complete, structurally valid tag stream terminates in the block.
     fn descriptor_tag_count_for_scan(&self, block: &[u8]) -> Result<usize> {
         let mut offset = JOURNAL_HEADER_BYTES;
         let limit = if self.profile.has_metadata_checksums() {
@@ -1555,6 +1627,9 @@ impl<State> Journal<State> {
     }
 
     /// Visits every fully validated descriptor tag without retaining a descriptor-owned vector.
+    /// # Errors
+    ///
+    /// Returns an error for checksum, UUID, flag, layout, or visitor rejection.
     fn for_each_descriptor_tag(
         &self,
         block: &[u8],
@@ -1669,6 +1744,11 @@ impl<State> Journal<State> {
             return Err(Error::JournalCorrupt);
         }
         let high_size = if self.profile.has_64bit() { 4 } else { 0 };
+        // Linux `journal_tag_bytes()` keeps checksum-v2 in the legacy tag prefix: its truncated
+        // checksum already occupies bytes 4..6. Only 64-bit block numbers add the high word.
+        let tag_size = base_size
+            .checked_add(high_size)
+            .ok_or(Error::ArithmeticOverflow)?;
         let block_high = if high_size == 4 {
             u64::from(be_u32(block, disk_offset(offset).checked_add_bytes(8)?)?)
         } else {
@@ -1680,8 +1760,7 @@ impl<State> Journal<State> {
             0
         };
         let next = offset
-            .checked_add(base_size)
-            .and_then(|value| value.checked_add(high_size))
+            .checked_add(tag_size)
             .and_then(|value| value.checked_add(uuid_size))
             .ok_or(Error::ArithmeticOverflow)?;
         if next > limit {
@@ -1689,8 +1768,7 @@ impl<State> Journal<State> {
         }
         if uuid_size == 16 {
             let uuid_start = offset
-                .checked_add(base_size)
-                .and_then(|value| value.checked_add(high_size))
+                .checked_add(tag_size)
                 .ok_or(Error::ArithmeticOverflow)?;
             let uuid = block
                 .get(uuid_start..next)
@@ -1710,6 +1788,9 @@ impl<State> Journal<State> {
     }
 
     /// Counts revoke records during pass one while deferring its tail checksum to validation.
+    /// # Errors
+    ///
+    /// Returns an error when the revoke header, used length, or entry alignment is invalid.
     fn revoke_count_for_scan(&self, block: &[u8]) -> Result<usize> {
         let (mut offset, limit, entry_size) = self.revoke_layout(block)?;
         let mut count = 0_usize;
@@ -1731,6 +1812,9 @@ impl<State> Journal<State> {
     }
 
     /// Visits every validated revoke address without allocating an intermediate record vector.
+    /// # Errors
+    ///
+    /// Returns an error for checksum, layout, address decoding, or visitor rejection.
     fn for_each_revoke(
         &self,
         block: &[u8],
@@ -1761,19 +1845,22 @@ impl<State> Journal<State> {
     }
 
     /// Returns the checked revoke entry range and width shared by all recovery passes.
+    /// # Errors
+    ///
+    /// Returns an error when the used range does not fit the control block and optional tail.
     fn revoke_layout(&self, block: &[u8]) -> Result<(usize, usize, usize)> {
         let used = usize::try_from(be_u32(block, disk_offset(JOURNAL_HEADER_BYTES))?)
             .map_err(|_| Error::JournalCorrupt)?;
-        if used < 16 || used > block.len() {
-            return Err(Error::JournalCorrupt);
-        }
         let tail = if self.profile.has_metadata_checksums() {
             4
         } else {
             0
         };
-        let limit = used.checked_sub(tail).ok_or(Error::JournalCorrupt)?;
-        Ok((16, limit, if self.profile.has_64bit() { 8 } else { 4 }))
+        let maximum_used = block.len().checked_sub(tail).ok_or(Error::JournalCorrupt)?;
+        if used < 16 || used > maximum_used {
+            return Err(Error::JournalCorrupt);
+        }
+        Ok((16, used, if self.profile.has_64bit() { 8 } else { 4 }))
     }
 
     /// Validates a commit block for the expected transaction sequence.
@@ -1790,8 +1877,8 @@ impl<State> Journal<State> {
             return Err(Error::JournalCorrupt);
         }
         if self.profile.has_metadata_checksums() {
-            if *block.get(0x0C).ok_or(Error::TruncatedStructure)? != JBD2_CHECKSUM_CRC32C
-                || *block.get(0x0D).ok_or(Error::TruncatedStructure)? != 4
+            if *block.get(0x0C).ok_or(Error::TruncatedStructure)? != 0
+                || *block.get(0x0D).ok_or(Error::TruncatedStructure)? != 0
                 || *block.get(0x0E).ok_or(Error::TruncatedStructure)? != 0
                 || *block.get(0x0F).ok_or(Error::TruncatedStructure)? != 0
             {
@@ -1897,9 +1984,11 @@ impl<State> Journal<State> {
         }
 
         let high_size = if self.profile.has_64bit() { 4 } else { 0 };
+        let tag_size = 8_usize
+            .checked_add(high_size)
+            .ok_or(Error::ArithmeticOverflow)?;
         let next = offset
-            .checked_add(8)
-            .and_then(|value| value.checked_add(high_size))
+            .checked_add(tag_size)
             .and_then(|value| value.checked_add(uuid_size))
             .ok_or(Error::ArithmeticOverflow)?;
         if next > self.descriptor_payload_limit(block.len())? {
@@ -1931,8 +2020,7 @@ impl<State> Journal<State> {
         }
         if uuid_size == 16 {
             let uuid_start = offset
-                .checked_add(8)
-                .and_then(|value| value.checked_add(high_size))
+                .checked_add(tag_size)
                 .ok_or(Error::ArithmeticOverflow)?;
             memory::copy_exact(
                 block
@@ -1960,8 +2048,6 @@ impl<State> Journal<State> {
         )?;
         Jbd2Header::commit(sequence.get()).encode(&mut block)?;
         if self.profile.has_metadata_checksums() {
-            *block.get_mut(0x0C).ok_or(Error::TruncatedStructure)? = JBD2_CHECKSUM_CRC32C;
-            *block.get_mut(0x0D).ok_or(Error::TruncatedStructure)? = 4;
             let checksum = self.block_checksum_with_zeroed(&block, 0x10)?;
             put_be_u32(&mut block, disk_offset(0x10), checksum)?;
         }
@@ -1998,11 +2084,11 @@ impl<State> Journal<State> {
         let remaining = usable
             .checked_sub(first_tag_size)
             .ok_or(Error::TransactionTooLarge)?;
-        Ok(remaining
+        remaining
             .checked_div(tag_size)
             .ok_or(Error::TransactionTooLarge)?
             .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow)?)
+            .ok_or(Error::ArithmeticOverflow)
     }
 
     /// Returns the serialized tag width for the active JBD2 feature set.
@@ -2271,6 +2357,9 @@ impl JournalLocation {
     }
 
     /// Returns the first ring block dictated by this physical layout.
+    /// # Errors
+    ///
+    /// Returns an error when the external superblock position has no following block.
     fn expected_first(&self) -> Result<u32> {
         match self {
             Self::Internal(_) => Ok(1),
@@ -2282,6 +2371,9 @@ impl JournalLocation {
     }
 
     /// Maps the journal superblock independently from ring-block identity.
+    /// # Errors
+    ///
+    /// Returns an error when the internal mapping is absent or byte-offset arithmetic overflows.
     fn superblock_offset(&self, block_size: BlockSize) -> Result<ByteOffset> {
         match self {
             Self::Internal(layout) => block_size.offset_of(layout.map_logical(0)?),
@@ -2301,6 +2393,9 @@ struct ExternalJournalLayout {
 
 impl ExternalJournalLayout {
     /// Builds checked external layout geometry.
+    /// # Errors
+    ///
+    /// Returns an error when the JBD2 superblock lies outside the complete device blocks.
     fn new(capacity_blocks: u32, superblock_block: u32) -> Result<Self> {
         if superblock_block >= capacity_blocks {
             return Err(Error::UnsupportedJournal);
@@ -2312,11 +2407,17 @@ impl ExternalJournalLayout {
     }
 
     /// Returns the physical byte offset of the JBD2 superblock.
+    /// # Errors
+    ///
+    /// Returns an error when block-to-byte multiplication overflows.
     fn superblock_offset(self, block_size: BlockSize) -> Result<ByteOffset> {
         block_size.offset_of(BlockAddress::new(u64::from(self.superblock_block)))
     }
 
     /// Verifies that the ring stays inside the device and begins after the superblock.
+    /// # Errors
+    ///
+    /// Returns an error when the ring begins elsewhere or exceeds device capacity.
     fn validate_ring(self, ring: &JournalRing) -> Result<()> {
         let expected_first = self
             .superblock_block
@@ -2351,6 +2452,9 @@ enum ExternalDeviceSuperblockProbe {
 impl ExternalJournalDeviceSuperblock {
     /// Compares UUID before interpreting any other candidate bytes, then validates journal-device
     /// structure for an exact match.
+    /// # Errors
+    ///
+    /// Returns an error when a UUID-matching candidate is not a valid dedicated journal header.
     fn parse(
         raw: &[u8; EXTERNAL_EXT_SUPERBLOCK_BYTES],
         expected: JournalUuid,
@@ -2422,6 +2526,9 @@ impl InternalJournalLayout {
             .try_reserve_exact(extents.len())
             .map_err(|_| Error::OutOfMemory)?;
         for extent in extents {
+            if extent.initialization() != ExtentInitialization::Initialized {
+                return Err(Error::UnsupportedJournal);
+            }
             let len = extent.len().as_u32();
             let logical_start = extent.logical_start().as_u32();
             let logical_end = logical_start
@@ -2572,8 +2679,11 @@ impl JournalExtent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// JBD2 superblock generation controlling clean-head representation.
 enum JournalSuperblockVersion {
+    /// Legacy superblock with an implicit clean head at `s_first`.
     V1,
+    /// Current superblock with explicit `s_head` and feature fields.
     V2,
 }
 
@@ -2981,7 +3091,143 @@ fn journal_superblock_checksum(block: &[u8]) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JOURNAL_SUPERBLOCK_BYTES, journal_superblock_checksum};
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::marker::PhantomData;
+
+    use crate::disk::block::{BlockAddress, BlockSize};
+    use crate::disk::endian::{DiskOffset, put_be_u16, put_be_u32, put_le_u16, put_le_u32};
+    use crate::disk_format::extent::{Extent, ExtentLength, LogicalBlock};
+    use crate::disk_format::superblock::{JournalUuid, RecoveryState};
+    use crate::{Error, Result};
+
+    use super::{
+        EXT4_FEATURE_INCOMPAT_JOURNAL_DEV, EXT4_SUPER_MAGIC, EXTERNAL_EXT_SUPERBLOCK_BYTES,
+        ExternalDeviceSuperblockProbe, ExternalJournalDeviceSuperblock, ExternalJournalLayout,
+        InternalJournalLayout, JBD2_CHECKSUM_CRC32C, JBD2_FEATURE_COMPAT_CHECKSUM,
+        JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT,
+        JBD2_FEATURE_INCOMPAT_CSUM_V2, JBD2_FEATURE_INCOMPAT_CSUM_V3,
+        JBD2_FEATURE_INCOMPAT_FAST_COMMIT, JBD2_FEATURE_INCOMPAT_REVOKE, JBD2_REVOKE_BLOCK,
+        JBD2_TAG_FLAG_LAST_TAG, JBD2_TAG_FLAG_SAME_UUID, JOURNAL_HEADER_BYTES,
+        JOURNAL_SUPERBLOCK_BYTES, Jbd2Header, Journal, JournalCursor, JournalGeometry,
+        JournalLocation, JournalProfile, JournalRecoveryOperation, JournalRing, JournalSequence,
+        JournalSuperblock, JournalSuperblockVersion, LoadedJournal, MetadataBlock, RecoveryPhase,
+        RecoveryRevoke, journal_superblock_checksum,
+    };
+
+    /// Stable UUID used by private JBD2 wire fixtures.
+    const TEST_UUID: [u8; 16] = [
+        0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xA9, 0xBA, 0xCB, 0xDC, 0xED, 0xFE,
+        0x0F,
+    ];
+
+    /// Builds one test JBD2 superblock domain value without passing through its wire parser.
+    /// # Errors
+    ///
+    /// Returns an error when the block-sized retained image cannot be represented or allocated.
+    fn test_superblock(
+        block_size: BlockSize,
+        incompat: u32,
+        maxlen: u32,
+        first: u32,
+        sequence: u32,
+        start: u32,
+        head: u32,
+    ) -> Result<JournalSuperblock> {
+        Ok(JournalSuperblock {
+            raw: vec![
+                0_u8;
+                usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?
+            ],
+            version: JournalSuperblockVersion::V2,
+            block_size: block_size.bytes(),
+            maxlen,
+            first,
+            sequence: JournalSequence::new(sequence),
+            start,
+            errno: 0,
+            compat: 0,
+            incompat,
+            ro_compat: 0,
+            uuid: TEST_UUID,
+            checksum_type: JBD2_CHECKSUM_CRC32C,
+            head,
+            nr_users: 1,
+            first_user: TEST_UUID,
+        })
+    }
+
+    /// Builds an identity-mapped external journal with a selected typestate.
+    /// # Errors
+    ///
+    /// Returns an error for invalid block size, layout, profile, ring, cursor, or allocation.
+    fn test_external_journal<State>(
+        block_log: u32,
+        incompat: u32,
+        maxlen: u32,
+        sequence: u32,
+        start: u32,
+        head: u32,
+        filesystem_blocks: u64,
+    ) -> Result<Journal<State>> {
+        let block_size = BlockSize::from_superblock_log(block_log)?;
+        let superblock_block = 1024_u32
+            .checked_div(block_size.bytes())
+            .and_then(|value| value.checked_add(1))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let first = superblock_block
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let superblock =
+            test_superblock(block_size, incompat, maxlen, first, sequence, start, head)?;
+        let profile = JournalProfile::from_superblock(&superblock)?;
+        let ring = JournalRing::new(&superblock, maxlen, first)?;
+        let cursor = JournalCursor::from_superblock(&superblock, ring)?;
+        Ok(Journal {
+            location: JournalLocation::External(ExternalJournalLayout::new(
+                maxlen,
+                superblock_block,
+            )?),
+            superblock,
+            profile,
+            geometry: JournalGeometry { block_size, ring },
+            cursor,
+            filesystem_blocks,
+            state: PhantomData,
+        })
+    }
+
+    /// Creates one initialized extent for internal-journal layout tests.
+    /// # Errors
+    ///
+    /// Returns an error when `len` is not an encodable nonzero initialized extent length.
+    fn test_extent(logical: u32, len: u16, physical: u64) -> Result<Extent> {
+        Ok(Extent::initialized(
+            LogicalBlock::from_u32(logical),
+            ExtentLength::new(len)?,
+            BlockAddress::new(physical),
+        ))
+    }
+
+    /// Creates a valid external-journal ext superblock header.
+    /// # Errors
+    ///
+    /// Returns an error when a fixed wire field cannot be encoded into the test header.
+    fn external_device_header(block_log: u32, uuid: [u8; 16]) -> Result<[u8; 1024]> {
+        let mut raw = [0_u8; EXTERNAL_EXT_SUPERBLOCK_BYTES];
+        put_le_u32(&mut raw, DiskOffset::new(0x18), block_log)?;
+        put_le_u16(&mut raw, DiskOffset::new(0x38), EXT4_SUPER_MAGIC)?;
+        put_le_u32(
+            &mut raw,
+            DiskOffset::new(0x60),
+            EXT4_FEATURE_INCOMPAT_JOURNAL_DEV,
+        )?;
+        crate::memory::copy_exact(
+            raw.get_mut(0x68..0x78).ok_or(Error::TruncatedStructure)?,
+            &uuid,
+        )?;
+        Ok(raw)
+    }
 
     /// # Panics
     ///
@@ -2992,5 +3238,653 @@ mod tests {
             journal_superblock_checksum(&[0_u8; JOURNAL_SUPERBLOCK_BYTES]),
             Ok(0x1151_2183)
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when unsupported JBD2 feature combinations enter the validated domain.
+    #[test]
+    fn journal_profile_rejects_every_unsupported_feature_boundary() {
+        let outcome = (|| -> Result<()> {
+            let block_size = BlockSize::from_superblock_log(0)?;
+            let mut cases = [
+                (JBD2_FEATURE_COMPAT_CHECKSUM, 0, 0, 0, JBD2_CHECKSUM_CRC32C),
+                (
+                    0,
+                    JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3,
+                    0,
+                    0,
+                    JBD2_CHECKSUM_CRC32C,
+                ),
+                (0, JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT, 0, 0, 0),
+                (0, JBD2_FEATURE_INCOMPAT_FAST_COMMIT, 0, 0, 0),
+                (0, 0x8000_0000, 0, 0, 0),
+                (0, 0, 1, 0, 0),
+                (0, 0, 0, 5, 0),
+                (0, JBD2_FEATURE_INCOMPAT_CSUM_V3, 0, 0, 1),
+            ];
+            for (compat, incompat, ro_compat, errno, checksum_type) in &mut cases {
+                let mut superblock = test_superblock(block_size, *incompat, 64, 2, 9, 0, 2)?;
+                superblock.compat = *compat;
+                superblock.ro_compat = *ro_compat;
+                superblock.errno = *errno;
+                superblock.checksum_type = *checksum_type;
+                assert_eq!(
+                    JournalProfile::from_superblock(&superblock),
+                    Err(Error::UnsupportedJournal)
+                );
+            }
+
+            for incompat in [
+                0,
+                JBD2_FEATURE_INCOMPAT_CSUM_V2,
+                JBD2_FEATURE_INCOMPAT_CSUM_V3,
+                JBD2_FEATURE_INCOMPAT_CSUM_V3
+                    | JBD2_FEATURE_INCOMPAT_64BIT
+                    | JBD2_FEATURE_INCOMPAT_REVOKE,
+            ] {
+                let superblock = test_superblock(block_size, incompat, 64, 2, 9, 0, 2)?;
+                assert!(JournalProfile::from_superblock(&superblock).is_ok());
+            }
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when external journal headers are not UUID-first or use the wrong 1/2/4 KiB layout.
+    #[test]
+    fn external_journal_header_is_uuid_first_and_block_size_aware() {
+        let outcome = (|| -> Result<()> {
+            for (block_log, expected_superblock) in [(0_u32, 2_u32), (1, 1), (2, 1)] {
+                let raw = external_device_header(block_log, TEST_UUID)?;
+                assert_eq!(
+                    ExternalJournalDeviceSuperblock::parse(
+                        &raw,
+                        JournalUuid::from_bytes(TEST_UUID)
+                    )?,
+                    ExternalDeviceSuperblockProbe::Match(ExternalJournalDeviceSuperblock {
+                        block_size: BlockSize::from_superblock_log(block_log)?,
+                        superblock_block: expected_superblock,
+                    })
+                );
+            }
+
+            let corrupt_other_uuid = [0_u8; EXTERNAL_EXT_SUPERBLOCK_BYTES];
+            assert_eq!(
+                ExternalJournalDeviceSuperblock::parse(
+                    &corrupt_other_uuid,
+                    JournalUuid::from_bytes(TEST_UUID)
+                ),
+                Ok(ExternalDeviceSuperblockProbe::Mismatch)
+            );
+            assert_eq!(
+                ExternalJournalDeviceSuperblock::parse(
+                    &corrupt_other_uuid,
+                    JournalUuid::from_bytes([0_u8; 16])
+                ),
+                Err(Error::JournalCorrupt)
+            );
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when descriptor UUID ownership or `SAME_UUID` encoding differs from JBD2.
+    #[test]
+    fn every_descriptor_requires_an_explicit_first_uuid() {
+        let outcome = (|| -> Result<()> {
+            let journal = test_external_journal::<LoadedJournal>(0, 0, 64, 7, 0, 3, 1_000)?;
+            let block_size = journal.geometry.block_size;
+            let metadata = [
+                MetadataBlock::new(BlockAddress::new(20), vec![0x11; 1024]),
+                MetadataBlock::new(BlockAddress::new(21), vec![0x22; 1024]),
+            ];
+            let data = [vec![0x11; 1024], vec![0x22; 1024]];
+            let descriptor = journal.encode_descriptor_block(
+                JournalSequence::new(8),
+                &metadata,
+                &data,
+                block_size,
+            )?;
+            let mut flags = [0_u32; 2];
+            let mut count = 0_usize;
+            journal.for_each_descriptor_tag(&descriptor, |tag| {
+                let destination = flags.get_mut(count).ok_or(Error::JournalCorrupt)?;
+                *destination = tag.flags;
+                count = count.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                Ok(())
+            })?;
+            assert_eq!(count, 2);
+            assert_eq!(flags.first().copied(), Some(0));
+            assert_eq!(
+                flags.get(1).copied(),
+                Some(JBD2_TAG_FLAG_SAME_UUID | JBD2_TAG_FLAG_LAST_TAG)
+            );
+
+            let mut invalid = descriptor;
+            put_be_u16(
+                &mut invalid,
+                DiskOffset::new(
+                    JOURNAL_HEADER_BYTES
+                        .checked_add(6)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                ),
+                u16::try_from(JBD2_TAG_FLAG_SAME_UUID | JBD2_TAG_FLAG_LAST_TAG)
+                    .map_err(|_| Error::ArithmeticOverflow)?,
+            )?;
+            assert_eq!(
+                journal.for_each_descriptor_tag(&invalid, |_tag| Ok(())),
+                Err(Error::JournalCorrupt)
+            );
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the feature-dependent tag stride or first-tag UUID position differs from the
+    /// Linux `journal_tag_bytes()` wire contract.
+    #[test]
+    fn descriptor_tag_stride_matches_jbd2_feature_layout() {
+        let outcome = (|| -> Result<()> {
+            for (incompat, expected_tag_size) in [
+                (0, 8_usize),
+                (JBD2_FEATURE_INCOMPAT_64BIT, 12),
+                (JBD2_FEATURE_INCOMPAT_CSUM_V2, 8),
+                (
+                    JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_64BIT,
+                    12,
+                ),
+                (JBD2_FEATURE_INCOMPAT_CSUM_V3, 16),
+                (
+                    JBD2_FEATURE_INCOMPAT_CSUM_V3 | JBD2_FEATURE_INCOMPAT_64BIT,
+                    16,
+                ),
+            ] {
+                let journal =
+                    test_external_journal::<LoadedJournal>(0, incompat, 64, 7, 0, 3, 1_000)?;
+                assert_eq!(journal.descriptor_tag_size(), expected_tag_size);
+                let metadata = [MetadataBlock::new(BlockAddress::new(20), vec![0x5A; 1024])];
+                let data = [vec![0x5A; 1024]];
+                let descriptor = journal.encode_descriptor_block(
+                    JournalSequence::new(8),
+                    &metadata,
+                    &data,
+                    journal.geometry.block_size,
+                )?;
+                let uuid_start = JOURNAL_HEADER_BYTES
+                    .checked_add(expected_tag_size)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                let uuid_end = uuid_start
+                    .checked_add(TEST_UUID.len())
+                    .ok_or(Error::ArithmeticOverflow)?;
+                assert_eq!(
+                    descriptor.get(uuid_start..uuid_end),
+                    Some(TEST_UUID.as_slice())
+                );
+            }
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when checksum-v2/v3 commit blocks populate the checksum-v1 metadata bytes.
+    #[test]
+    fn metadata_checksum_commit_header_keeps_v1_fields_zero() {
+        let outcome = (|| -> Result<()> {
+            for incompat in [JBD2_FEATURE_INCOMPAT_CSUM_V2, JBD2_FEATURE_INCOMPAT_CSUM_V3] {
+                let journal =
+                    test_external_journal::<LoadedJournal>(0, incompat, 64, 7, 0, 3, 1_000)?;
+                let commit = journal
+                    .encode_commit_block(JournalSequence::new(8), journal.geometry.block_size)?;
+                assert_eq!(commit.get(0x0C..0x10), Some([0_u8; 4].as_slice()));
+                journal.parse_commit_block(&commit, JournalSequence::new(8))?;
+
+                let mut invalid = commit;
+                *invalid.get_mut(0x0C).ok_or(Error::TruncatedStructure)? = 1;
+                assert_eq!(
+                    journal.parse_commit_block(&invalid, JournalSequence::new(8)),
+                    Err(Error::JournalCorrupt)
+                );
+            }
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when exact tag widths do not cause a second descriptor at the wire boundary.
+    #[test]
+    fn descriptor_capacity_drives_multi_descriptor_credits() {
+        let outcome = (|| -> Result<()> {
+            let journal = test_external_journal::<LoadedJournal>(
+                0,
+                JBD2_FEATURE_INCOMPAT_CSUM_V3 | JBD2_FEATURE_INCOMPAT_64BIT,
+                1_024,
+                11,
+                0,
+                3,
+                1_000_000,
+            )?;
+            let capacity = journal.descriptor_tag_capacity()?;
+            let payloads = capacity.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            let credits = journal.journal_credits(payloads, journal.geometry.block_size)?;
+            assert_eq!(credits.descriptors, 2);
+            assert_eq!(
+                credits.total,
+                u32::try_from(payloads.checked_add(3).ok_or(Error::ArithmeticOverflow)?)
+                    .map_err(|_| Error::ArithmeticOverflow)?
+            );
+
+            let mut metadata = Vec::new();
+            metadata
+                .try_reserve_exact(payloads)
+                .map_err(|_| Error::OutOfMemory)?;
+            for index in 0..payloads {
+                metadata
+                    .push_within_capacity(MetadataBlock::new(
+                        BlockAddress::new(
+                            100_u64
+                                .checked_add(
+                                    u64::try_from(index).map_err(|_| Error::ArithmeticOverflow)?,
+                                )
+                                .ok_or(Error::ArithmeticOverflow)?,
+                        ),
+                        vec![0xA5; 1024],
+                    ))
+                    .map_err(|_metadata| Error::OutOfMemory)?;
+            }
+            let prepared =
+                journal.prepare_metadata_transaction(journal.geometry.block_size, &metadata)?;
+            let mut descriptors = 0_usize;
+            for block in &prepared.log_blocks {
+                if let Ok(header) = super::Jbd2Header::parse(block)
+                    && header.block_type() == super::JBD2_DESCRIPTOR_BLOCK
+                {
+                    descriptors = descriptors
+                        .checked_add(1)
+                        .ok_or(Error::ArithmeticOverflow)?;
+                }
+            }
+            assert_eq!(descriptors, 2);
+            assert_eq!(
+                super::Jbd2Header::parse(&prepared.commit_block)?.block_type(),
+                super::JBD2_COMMIT_BLOCK
+            );
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when block-number width, ring wrapping, or sequence wrapping is encoded incorrectly.
+    #[test]
+    fn transaction_encoding_obeys_64bit_and_wrapping_domains() {
+        let outcome = (|| -> Result<()> {
+            let high_block = u64::from(u32::MAX)
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let metadata = [MetadataBlock::new(
+                BlockAddress::new(high_block),
+                vec![0x5A; 1024],
+            )];
+            let narrow = test_external_journal::<LoadedJournal>(
+                0,
+                JBD2_FEATURE_INCOMPAT_CSUM_V2,
+                16,
+                u32::MAX,
+                14,
+                14,
+                high_block
+                    .checked_add(10)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )?;
+            assert_eq!(
+                narrow.prepare_metadata_transaction(narrow.geometry.block_size, &metadata),
+                Err(Error::TransactionTooLarge)
+            );
+
+            let wide = test_external_journal::<LoadedJournal>(
+                0,
+                JBD2_FEATURE_INCOMPAT_CSUM_V3 | JBD2_FEATURE_INCOMPAT_64BIT,
+                16,
+                u32::MAX,
+                14,
+                14,
+                high_block
+                    .checked_add(10)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )?;
+            let prepared =
+                wide.prepare_metadata_transaction(wide.geometry.block_size, &metadata)?;
+            assert_eq!(prepared.descriptor, 14);
+            assert_eq!(prepared.commit, 3);
+            assert_eq!(prepared.next_cursor.head, 4);
+            assert_eq!(prepared.next_cursor.sequence, JournalSequence::new(0));
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when cursor recovery does not distinguish dirty, v1-clean, and v2-clean semantics.
+    #[test]
+    fn cursor_uses_start_for_dirty_and_head_for_clean_v2() {
+        let outcome = (|| -> Result<()> {
+            let block_size = BlockSize::from_superblock_log(0)?;
+            let clean = test_superblock(block_size, 0, 32, 2, 41, 0, 9)?;
+            let ring = JournalRing::new(&clean, 32, 2)?;
+            assert_eq!(
+                JournalCursor::from_superblock(&clean, ring)?,
+                JournalCursor {
+                    sequence: JournalSequence::new(42),
+                    head: 9,
+                }
+            );
+
+            let dirty = test_superblock(block_size, 0, 32, 2, 41, 7, 9)?;
+            assert_eq!(
+                JournalCursor::from_superblock(&dirty, ring)?,
+                JournalCursor {
+                    sequence: JournalSequence::new(41),
+                    head: 7,
+                }
+            );
+
+            let mut v1 = clean;
+            v1.version = JournalSuperblockVersion::V1;
+            assert_eq!(
+                JournalCursor::from_superblock(&v1, ring)?,
+                JournalCursor {
+                    sequence: JournalSequence::new(42),
+                    head: 2,
+                }
+            );
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when internal journal holes, overlap, uninitialized storage, or range violations pass.
+    #[test]
+    fn internal_journal_layout_requires_complete_unique_initialized_storage() {
+        let outcome = (|| -> Result<()> {
+            assert_eq!(
+                InternalJournalLayout::new(
+                    &[test_extent(0, 1, 10)?, test_extent(2, 1, 20)?],
+                    3,
+                    100
+                ),
+                Err(Error::UnsupportedJournal)
+            );
+            assert_eq!(
+                InternalJournalLayout::new(
+                    &[test_extent(0, 2, 10)?, test_extent(2, 2, 11)?],
+                    4,
+                    100
+                ),
+                Err(Error::UnsupportedJournal)
+            );
+            assert_eq!(
+                InternalJournalLayout::new(&[test_extent(0, 2, 99)?], 2, 100),
+                Err(Error::UnsupportedJournal)
+            );
+            let uninitialized = Extent::uninitialized(
+                LogicalBlock::from_u32(0),
+                ExtentLength::new(2)?,
+                BlockAddress::new(10),
+            );
+            assert_eq!(
+                InternalJournalLayout::new(&[uninitialized], 2, 100),
+                Err(Error::UnsupportedJournal)
+            );
+            let valid = InternalJournalLayout::new(
+                &[test_extent(0, 2, 10)?, test_extent(2, 2, 30)?],
+                4,
+                100,
+            )?;
+            assert!(valid.contains_physical(BlockAddress::new(31))?);
+            assert!(!valid.contains_physical(BlockAddress::new(20))?);
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when commit construction accepts duplicate, out-of-range, or journal-owned targets.
+    #[test]
+    fn commit_rejects_invalid_home_block_sets_before_serialization() {
+        let outcome = (|| -> Result<()> {
+            let external = test_external_journal::<LoadedJournal>(0, 0, 64, 7, 0, 3, 100)?;
+            let duplicate = [
+                MetadataBlock::new(BlockAddress::new(10), vec![0; 1024]),
+                MetadataBlock::new(BlockAddress::new(10), vec![1; 1024]),
+            ];
+            assert_eq!(
+                external.prepare_metadata_transaction(external.geometry.block_size, &duplicate),
+                Err(Error::JournalCorrupt)
+            );
+            let outside = [MetadataBlock::new(BlockAddress::new(100), vec![0; 1024])];
+            assert_eq!(
+                external.prepare_metadata_transaction(external.geometry.block_size, &outside),
+                Err(Error::JournalCorrupt)
+            );
+
+            let block_size = BlockSize::from_superblock_log(0)?;
+            let superblock = test_superblock(block_size, 0, 16, 1, 7, 0, 1)?;
+            let profile = JournalProfile::from_superblock(&superblock)?;
+            let ring = JournalRing::new(&superblock, 16, 1)?;
+            let internal = Journal::<LoadedJournal> {
+                location: JournalLocation::Internal(InternalJournalLayout::new(
+                    &[test_extent(0, 16, 40)?],
+                    16,
+                    100,
+                )?),
+                cursor: JournalCursor::from_superblock(&superblock, ring)?,
+                superblock,
+                profile,
+                geometry: JournalGeometry { block_size, ring },
+                filesystem_blocks: 100,
+                state: PhantomData,
+            };
+            let collision = [MetadataBlock::new(BlockAddress::new(45), vec![0; 1024])];
+            assert_eq!(
+                internal.prepare_metadata_transaction(block_size, &collision),
+                Err(Error::JournalCorrupt)
+            );
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when revoke decisions use record order instead of wrapping transaction sequence.
+    #[test]
+    fn revoke_decisions_use_same_or_later_transaction_sequence() {
+        let outcome = (|| -> Result<()> {
+            let journal = test_external_journal::<LoadedJournal>(
+                0,
+                JBD2_FEATURE_INCOMPAT_REVOKE,
+                64,
+                7,
+                3,
+                3,
+                100,
+            )?;
+            let mut operation =
+                JournalRecoveryOperation::new(journal, RecoveryState::NeedsRecovery)?;
+            operation.revokes = vec![
+                RecoveryRevoke {
+                    block: BlockAddress::new(10),
+                    sequence: JournalSequence::new(8),
+                },
+                RecoveryRevoke {
+                    block: BlockAddress::new(11),
+                    sequence: JournalSequence::new(0),
+                },
+            ];
+            assert!(operation.is_revoked(BlockAddress::new(10), JournalSequence::new(8)));
+            assert!(operation.is_revoked(BlockAddress::new(10), JournalSequence::new(7)));
+            assert!(!operation.is_revoked(BlockAddress::new(10), JournalSequence::new(9)));
+            assert!(operation.is_revoked(BlockAddress::new(11), JournalSequence::new(u32::MAX)));
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a checksummed revoke block treats its block-end checksum tail as part of
+    /// `r_count` instead of an independent wire field.
+    #[test]
+    fn revoke_count_excludes_the_independent_checksum_tail() {
+        let outcome = (|| -> Result<()> {
+            for (incompat, address) in [
+                (
+                    JBD2_FEATURE_INCOMPAT_REVOKE | JBD2_FEATURE_INCOMPAT_CSUM_V2,
+                    0x1234_u64,
+                ),
+                (
+                    JBD2_FEATURE_INCOMPAT_REVOKE
+                        | JBD2_FEATURE_INCOMPAT_CSUM_V3
+                        | JBD2_FEATURE_INCOMPAT_64BIT,
+                    0x1234_5678_9ABC_DEF0,
+                ),
+            ] {
+                let journal =
+                    test_external_journal::<LoadedJournal>(0, incompat, 64, 7, 0, 3, u64::MAX)?;
+                let entry_size = if journal.profile.has_64bit() { 8 } else { 4 };
+                let used = 16_usize
+                    .checked_add(entry_size)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                let mut revoke = vec![0_u8; 1024];
+                Jbd2Header {
+                    block_type: JBD2_REVOKE_BLOCK,
+                    sequence: 8,
+                }
+                .encode(&mut revoke)?;
+                put_be_u32(
+                    &mut revoke,
+                    DiskOffset::new(JOURNAL_HEADER_BYTES),
+                    u32::try_from(used).map_err(|_| Error::ArithmeticOverflow)?,
+                )?;
+                if entry_size == 8 {
+                    crate::memory::copy_exact(
+                        revoke.get_mut(16..24).ok_or(Error::TruncatedStructure)?,
+                        &address.to_be_bytes(),
+                    )?;
+                } else {
+                    put_be_u32(
+                        &mut revoke,
+                        DiskOffset::new(16),
+                        u32::try_from(address).map_err(|_| Error::ArithmeticOverflow)?,
+                    )?;
+                }
+                journal.write_block_tail_checksum(&mut revoke)?;
+                assert_eq!(journal.revoke_count_for_scan(&revoke), Ok(1));
+                let mut decoded = None;
+                journal.for_each_revoke(&revoke, |block| {
+                    decoded = Some(block);
+                    Ok(())
+                })?;
+                assert_eq!(decoded, Some(BlockAddress::new(address)));
+
+                put_be_u32(&mut revoke, DiskOffset::new(JOURNAL_HEADER_BYTES), 1_021)?;
+                assert_eq!(
+                    journal.revoke_count_for_scan(&revoke),
+                    Err(Error::JournalCorrupt)
+                );
+            }
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a torn commit becomes committed or committed descriptor corruption is ignored.
+    #[test]
+    fn recovery_discards_torn_commit_but_rejects_committed_corruption() {
+        let outcome = (|| -> Result<()> {
+            let journal = test_external_journal::<LoadedJournal>(
+                0,
+                JBD2_FEATURE_INCOMPAT_CSUM_V3,
+                64,
+                17,
+                3,
+                3,
+                100,
+            )?;
+            let metadata = [MetadataBlock::new(BlockAddress::new(10), vec![0x44; 1024])];
+            let data = [vec![0x44; 1024]];
+            let descriptor = journal.encode_descriptor_block(
+                JournalSequence::new(17),
+                &metadata,
+                &data,
+                journal.geometry.block_size,
+            )?;
+            let commit = journal
+                .encode_commit_block(JournalSequence::new(17), journal.geometry.block_size)?;
+
+            let mut torn = commit.clone();
+            let checksum_byte = torn.get_mut(0x10).ok_or(Error::TruncatedStructure)?;
+            *checksum_byte ^= 0x80;
+            let mut torn_recovery = JournalRecoveryOperation::new(
+                journal.copy_without_state::<LoadedJournal>()?,
+                RecoveryState::NeedsRecovery,
+            )?;
+            torn_recovery.scan_control_block(&descriptor)?;
+            torn_recovery.scan_control_block(&torn)?;
+            assert_eq!(torn_recovery.phase, RecoveryPhase::Validate);
+            assert_eq!(torn_recovery.summary.transactions, 0);
+
+            let mut committed =
+                JournalRecoveryOperation::new(journal, RecoveryState::NeedsRecovery)?;
+            committed.scan_control_block(&descriptor)?;
+            committed.scan_control_block(&commit)?;
+            committed.finish_scan()?;
+            let mut corrupt_descriptor = descriptor;
+            let tail = corrupt_descriptor
+                .last_mut()
+                .ok_or(Error::TruncatedStructure)?;
+            *tail ^= 0x01;
+            assert_eq!(
+                committed.validate_or_replay_control_block(&corrupt_descriptor),
+                Err(Error::ChecksumMismatch)
+            );
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when recovery allocation reservation can fail after entering validation or replay.
+    #[test]
+    fn recovery_reserves_bounded_address_memory_before_validation() {
+        let outcome = (|| -> Result<()> {
+            let journal = test_external_journal::<LoadedJournal>(0, 0, 64, 5, 3, 3, 100)?;
+            let mut operation =
+                JournalRecoveryOperation::new(journal, RecoveryState::NeedsRecovery)?;
+            operation.summary.max_transaction_tags = usize::MAX;
+            assert_eq!(operation.finish_scan(), Err(Error::OutOfMemory));
+            assert_eq!(operation.phase, RecoveryPhase::Scan);
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
     }
 }
