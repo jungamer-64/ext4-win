@@ -34,6 +34,8 @@ const ENCODED_RUSTFLAGS_SEPARATOR: &str = "\u{1f}";
 enum Task {
     /// Runs the complete host-independent development gate.
     Portable,
+    /// Checks, tests, lints, and documents the Windows driver crate.
+    Driver,
     /// Generates Linux JBD2 transactions and verifies core recovery in both directions.
     JournalInterop,
     /// Reproduces tracked external-journal fixtures under the pinned Linux toolchain.
@@ -47,6 +49,8 @@ impl Task {
     fn parse(argument: &OsStr) -> Option<Self> {
         if argument == "verify-portable" {
             Some(Self::Portable)
+        } else if argument == "verify-driver" {
+            Some(Self::Driver)
         } else if argument == "verify-journal-interop" {
             Some(Self::JournalInterop)
         } else if argument == "verify-journal-fixture-provenance" {
@@ -121,6 +125,21 @@ impl ArtifactIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SourceSnapshot([u8; 32]);
 
+impl SourceSnapshot {
+    /// Formats the exact source digest recorded in a production manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when hexadecimal formatting fails.
+    fn hex_digest(&self) -> TaskResult<String> {
+        let mut output = String::with_capacity(64);
+        for byte in self.0 {
+            write!(&mut output, "{byte:02X}")?;
+        }
+        Ok(output)
+    }
+}
+
 /// Exact output paths belonging to one production build.
 #[derive(Debug)]
 struct ProductionArtifacts {
@@ -130,6 +149,10 @@ struct ProductionArtifacts {
     link_map: PathBuf,
     /// Signed driver image copied into the cargo-wdk package.
     driver: PathBuf,
+    /// Signed catalog copied into the cargo-wdk package.
+    catalog: PathBuf,
+    /// Installation metadata copied into the cargo-wdk package.
+    inf: PathBuf,
 }
 
 /// Immutable analyzer inputs copied from one cryptographically re-verified production bundle.
@@ -143,6 +166,10 @@ struct SealedProductionArtifacts {
     map_hash: String,
     /// SHA-256 of the signed driver copy before analyzer execution.
     driver_hash: String,
+    /// SHA-256 of the signed catalog copy before analyzer execution.
+    catalog_hash: String,
+    /// SHA-256 of the installation metadata copy before analyzer execution.
+    inf_hash: String,
 }
 
 impl SealedProductionArtifacts {
@@ -158,6 +185,16 @@ impl SealedProductionArtifacts {
             &self.artifacts.driver,
             &self.driver_hash,
             "sealed signed driver",
+        )?;
+        verify_sha256(
+            &self.artifacts.catalog,
+            &self.catalog_hash,
+            "sealed signed catalog",
+        )?;
+        verify_sha256(
+            &self.artifacts.inf,
+            &self.inf_hash,
+            "sealed driver installation metadata",
         )
     }
 }
@@ -707,6 +744,7 @@ fn run() -> TaskResult<()> {
     let repository_root = repository_root()?;
     match task {
         Task::Portable => verify_portable(&repository_root),
+        Task::Driver => verify_driver(&repository_root),
         Task::JournalInterop => verify_journal_interop(&repository_root),
         Task::JournalFixtureProvenance => verify_journal_fixture_provenance(&repository_root),
         Task::ProductionDriver => verify_production_driver(&repository_root),
@@ -717,7 +755,7 @@ fn run() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-journal-interop|verify-journal-fixture-provenance|verify-production-driver>",
+        "usage: cargo xtask <verify-portable|verify-driver|verify-journal-interop|verify-journal-fixture-provenance|verify-production-driver>",
     )
 }
 
@@ -758,6 +796,38 @@ fn verify_portable(repository_root: &Path) -> TaskResult<()> {
         "portable Clippy gate",
     )?;
     println!("portable development gates: PASS");
+    Ok(())
+}
+
+/// Checks, tests, lints, and documents the Windows kernel driver crate.
+///
+/// # Errors
+///
+/// Returns an error when any driver Cargo gate cannot start or exits unsuccessfully.
+fn verify_driver(repository_root: &Path) -> TaskResult<()> {
+    run_checked(
+        cargo_command(repository_root, &["check", "-p", "ext4win", "--locked"]),
+        "driver check gate",
+    )?;
+    run_checked(
+        cargo_command(repository_root, &["test", "-p", "ext4win", "--locked"]),
+        "driver unit-test gate",
+    )?;
+    run_checked(
+        cargo_command(
+            repository_root,
+            &["clippy", "-p", "ext4win", "--all-targets", "--locked"],
+        ),
+        "driver Clippy gate",
+    )?;
+    run_checked(
+        cargo_command(
+            repository_root,
+            &["doc", "-p", "ext4win", "--no-deps", "--locked"],
+        ),
+        "driver rustdoc gate",
+    )?;
+    println!("driver development gates: PASS");
     Ok(())
 }
 
@@ -3420,6 +3490,8 @@ fn combine_verification_and_cleanup(
 /// Returns an error on non-Windows hosts, failed build or analysis commands, missing or invalid
 /// artifacts, source drift, or artifact hashing failure.
 fn verify_production_driver(repository_root: &Path) -> TaskResult<()> {
+    verify_portable(repository_root)?;
+    verify_driver(repository_root)?;
     verify_journal_interop(repository_root)?;
     if !cfg!(target_os = "windows") {
         return Err(io::Error::new(
@@ -3433,12 +3505,20 @@ fn verify_production_driver(repository_root: &Path) -> TaskResult<()> {
     let identity = ArtifactIdentity::create(repository_root)?;
     build_production_driver(repository_root, &identity)?;
     let artifacts = locate_production_artifacts(repository_root, &identity)?;
-    let signed_driver_hash = verify_final_signed_driver(&artifacts.driver)?;
+    let signed_driver_hash = verify_final_signed_artifact(&artifacts.driver, "production driver")?;
+    let signed_catalog_hash =
+        verify_final_signed_artifact(&artifacts.catalog, "production catalog")?;
     let snapshot_directory =
         create_task_directory(repository_root, "production-artifact-snapshot")?;
     let verification = (|| -> TaskResult<SealedProductionArtifacts> {
         let sealed =
             seal_production_artifacts(&artifacts, &snapshot_directory, &signed_driver_hash)?;
+        if sealed.catalog_hash != signed_catalog_hash {
+            return Err(io::Error::other(
+                "signed catalog changed after final Authenticode verification and before analyzer sealing",
+            )
+            .into());
+        }
         run_production_reachability(repository_root, &sealed.artifacts)?;
         sealed.verify_unchanged()?;
         verify_sha256(
@@ -3446,46 +3526,66 @@ fn verify_production_driver(repository_root: &Path) -> TaskResult<()> {
             &signed_driver_hash,
             "final signed production driver",
         )?;
+        verify_sha256(
+            &artifacts.catalog,
+            &signed_catalog_hash,
+            "final signed production catalog",
+        )?;
+        verify_sha256(
+            &artifacts.inf,
+            &sealed.inf_hash,
+            "final production installation metadata",
+        )?;
         Ok(sealed)
     })();
-    let cleanup = remove_task_directory(
-        repository_root,
-        &snapshot_directory,
-        "production-artifact-snapshot",
-    );
-    let sealed = match (verification, cleanup) {
-        (Ok(sealed), Ok(())) => sealed,
-        (Err(verification_error), Ok(())) | (Ok(_), Err(verification_error)) => {
-            return Err(verification_error);
-        }
-        (Err(verification_error), Err(cleanup_error)) => {
-            return Err(io::Error::other(format!(
-                "production verification failed ({verification_error}); mandatory snapshot cleanup also failed ({cleanup_error})"
-            ))
-            .into());
+    let sealed = match verification {
+        Ok(sealed) => sealed,
+        Err(verification_error) => {
+            let cleanup = remove_task_directory(
+                repository_root,
+                &snapshot_directory,
+                "production-artifact-snapshot",
+            );
+            return combine_verification_and_cleanup(Err(verification_error), cleanup);
         }
     };
-    let source_after = source_snapshot(repository_root)?;
-    if source_before != source_after {
-        return Err(io::Error::other(
-            "source inputs changed while the production artifact gate was running",
-        )
-        .into());
-    }
+    let publication = (|| -> TaskResult<PathBuf> {
+        let source_after = source_snapshot(repository_root)?;
+        if source_before != source_after {
+            return Err(io::Error::other(
+                "source inputs changed while the production artifact gate was running",
+            )
+            .into());
+        }
+        write_production_manifest(
+            repository_root,
+            &snapshot_directory,
+            &identity,
+            &source_before,
+            &sealed,
+        )?;
+        publish_verified_bundle(repository_root, &snapshot_directory, &identity)
+    })();
+    let bundle_directory = match publication {
+        Ok(bundle_directory) => bundle_directory,
+        Err(publication_error) => {
+            let cleanup = remove_task_directory(
+                repository_root,
+                &snapshot_directory,
+                "production-artifact-snapshot",
+            );
+            return combine_verification_and_cleanup(Err(publication_error), cleanup);
+        }
+    };
 
     println!("production artifact bundle: PASS");
     println!("identity: {}", identity.as_str());
-    println!("LLVM IR: {} ({})", artifacts.ir.display(), sealed.ir_hash);
-    println!(
-        "link map: {} ({})",
-        artifacts.link_map.display(),
-        sealed.map_hash
-    );
-    println!(
-        "signed driver: {} ({})",
-        artifacts.driver.display(),
-        sealed.driver_hash
-    );
+    println!("bundle: {}", bundle_directory.display());
+    println!("LLVM IR: ext4win.ll ({})", sealed.ir_hash);
+    println!("link map: ext4win.map ({})", sealed.map_hash,);
+    println!("signed driver: ext4win.sys ({})", sealed.driver_hash,);
+    println!("signed catalog: ext4win.cat ({})", sealed.catalog_hash);
+    println!("installation metadata: ext4win.inf ({})", sealed.inf_hash);
     Ok(())
 }
 
@@ -3531,8 +3631,12 @@ fn locate_production_artifacts(
     let package_root = release_root.join("ext4win_package");
     let link_map = package_root.join("ext4win.map");
     let driver = package_root.join("ext4win.sys");
+    let catalog = package_root.join("ext4win.cat");
+    let inf = package_root.join("ext4win.inf");
     require_file(&link_map, "cargo-wdk package link map")?;
     require_file(&driver, "cargo-wdk signed package driver")?;
+    require_file(&catalog, "cargo-wdk signed package catalog")?;
+    require_file(&inf, "cargo-wdk package installation metadata")?;
 
     let marker = identity.marker();
     let mut matching_ir = Vec::new();
@@ -3552,6 +3656,8 @@ fn locate_production_artifacts(
         ir,
         link_map,
         driver,
+        catalog,
+        inf,
     })
 }
 
@@ -3596,7 +3702,7 @@ fn require_file(path: &Path, description: &str) -> Result<(), io::Error> {
     }
 }
 
-/// Authenticode-verifies the final package SYS and proves it was stable during verification.
+/// Authenticode-verifies one final package artifact and proves it was stable during verification.
 ///
 /// cargo-wdk separately validates the driver/catalog package under its WDK signing workflow.
 /// This final readback uses Authenticode policy so a locally trusted test-signed bundle remains
@@ -3604,18 +3710,21 @@ fn require_file(path: &Path, description: &str) -> Result<(), io::Error> {
 ///
 /// # Errors
 ///
-/// Returns an error when `signtool` rejects the driver or its SHA-256 changes before or after the
-/// verification command.
-fn verify_final_signed_driver(driver: &Path) -> TaskResult<String> {
-    let before = sha256_file(driver)?;
+/// Returns an error when `signtool` rejects the artifact or its SHA-256 changes before or after
+/// the verification command.
+fn verify_final_signed_artifact(path: &Path, description: &str) -> TaskResult<String> {
+    let before = sha256_file(path)?;
     let signtool = locate_signtool()?;
     let mut command = Command::new(signtool);
-    command.args(["verify", "/pa", "/v"]).arg(driver);
-    run_checked(command, "final Authenticode signature verification")?;
+    command.args(["verify", "/pa", "/v"]).arg(path);
+    run_checked(
+        command,
+        &format!("final {description} Authenticode signature verification"),
+    )?;
     verify_sha256(
-        driver,
+        path,
         &before,
-        "signed driver during final Authenticode verification",
+        &format!("{description} during final Authenticode verification"),
     )?;
     Ok(before)
 }
@@ -3707,9 +3816,13 @@ fn seal_production_artifacts(
     let ir = directory.join("ext4win.ll");
     let link_map = directory.join("ext4win.map");
     let driver = directory.join("ext4win.sys");
+    let catalog = directory.join("ext4win.cat");
+    let inf = directory.join("ext4win.inf");
     let ir_hash = copy_stable_artifact(&source.ir, &ir, "release LLVM IR")?;
     let map_hash = copy_stable_artifact(&source.link_map, &link_map, "release link map")?;
     let driver_hash = copy_stable_artifact(&source.driver, &driver, "signed driver")?;
+    let catalog_hash = copy_stable_artifact(&source.catalog, &catalog, "signed catalog")?;
+    let inf_hash = copy_stable_artifact(&source.inf, &inf, "driver installation metadata")?;
     if driver_hash != signed_driver_hash {
         return Err(io::Error::other(
             "signed driver changed after final Authenticode verification and before analyzer sealing",
@@ -3721,11 +3834,202 @@ fn seal_production_artifacts(
             ir,
             link_map,
             driver,
+            catalog,
+            inf,
         },
         ir_hash,
         map_hash,
         driver_hash,
+        catalog_hash,
+        inf_hash,
     })
+}
+
+/// Writes the versioned evidence manifest into an unpublished verified bundle.
+///
+/// # Errors
+///
+/// Returns an error when tool identity cannot be captured or the manifest cannot be created and
+/// durably written.
+fn write_production_manifest(
+    repository_root: &Path,
+    directory: &Path,
+    identity: &ArtifactIdentity,
+    source_snapshot: &SourceSnapshot,
+    sealed: &SealedProductionArtifacts,
+) -> TaskResult<()> {
+    let rustc_verbose = command_version(
+        command_with_arguments("rustc", &["--version", "--verbose"]),
+        "rustc version query",
+    )?;
+    let rustc = required_version_line(&rustc_verbose, "release:")?;
+    let llvm = required_version_line(&rustc_verbose, "LLVM version:")?;
+    let cargo = command_version(
+        command_with_arguments("cargo", &["--version"]),
+        "Cargo version query",
+    )?;
+    let mut cargo_wdk_command = command_with_arguments("cargo", &["wdk", "--version"]);
+    cargo_wdk_command.current_dir(repository_root.join("crates").join("ext4-driver"));
+    let cargo_wdk = command_version(cargo_wdk_command, "cargo-wdk version query")?;
+    let wdk = production_wdk_version()?;
+    let source_hash = source_snapshot.hex_digest()?;
+    let rustflags = ["-C", "target-feature=+crt-static", "--emit=llvm-ir,link"]
+        .join(ENCODED_RUSTFLAGS_SEPARATOR);
+
+    let mut manifest = String::new();
+    writeln!(&mut manifest, "manifest_version=1")?;
+    writeln!(&mut manifest, "artifact_id={}", identity.as_str())?;
+    writeln!(&mut manifest, "source_snapshot_sha256={source_hash}")?;
+    writeln!(&mut manifest, "target=x86_64-pc-windows-msvc")?;
+    writeln!(&mut manifest, "profile=release")?;
+    writeln!(
+        &mut manifest,
+        "rustflags={}",
+        normalized_manifest_value(&rustflags)
+    )?;
+    writeln!(&mut manifest, "rustc={}", normalized_manifest_value(rustc))?;
+    writeln!(&mut manifest, "llvm={}", normalized_manifest_value(llvm))?;
+    writeln!(&mut manifest, "cargo={}", normalized_manifest_value(&cargo))?;
+    writeln!(
+        &mut manifest,
+        "cargo_wdk={}",
+        normalized_manifest_value(&cargo_wdk)
+    )?;
+    writeln!(&mut manifest, "wdk={}", normalized_manifest_value(&wdk))?;
+    write_manifest_artifact(&mut manifest, "ir", "ext4win.ll", &sealed.ir_hash)?;
+    write_manifest_artifact(&mut manifest, "map", "ext4win.map", &sealed.map_hash)?;
+    write_manifest_artifact(&mut manifest, "sys", "ext4win.sys", &sealed.driver_hash)?;
+    write_manifest_artifact(&mut manifest, "cat", "ext4win.cat", &sealed.catalog_hash)?;
+    write_manifest_artifact(&mut manifest, "inf", "ext4win.inf", &sealed.inf_hash)?;
+
+    let manifest_path = directory.join("manifest-v1.txt");
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(manifest_path)?;
+    output.write_all(manifest.as_bytes())?;
+    output.sync_all()?;
+    Ok(())
+}
+
+/// Appends one artifact path and digest pair to the production manifest.
+///
+/// # Errors
+///
+/// Returns a formatting error when the in-memory manifest cannot accept the record.
+fn write_manifest_artifact(
+    manifest: &mut String,
+    name: &str,
+    path: &str,
+    hash: &str,
+) -> Result<(), core::fmt::Error> {
+    writeln!(manifest, "artifact.{name}.path={path}")?;
+    writeln!(manifest, "artifact.{name}.sha256={hash}")
+}
+
+/// Replaces line-breaking or field-separator bytes before recording tool output.
+fn normalized_manifest_value(value: &str) -> String {
+    value
+        .trim()
+        .replace('\r', "")
+        .replace('\n', " | ")
+        .replace(ENCODED_RUSTFLAGS_SEPARATOR, "<US>")
+}
+
+/// Extracts one required field from rustc's verbose version report.
+///
+/// # Errors
+///
+/// Returns an error when the report omits the named nonempty field.
+fn required_version_line<'a>(report: &'a str, prefix: &str) -> TaskResult<&'a str> {
+    report
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix).map(str::trim))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "tool version report omitted required field {prefix}"
+            ))
+            .into()
+        })
+}
+
+/// Runs one version command and returns nonempty UTF-8 stdout.
+///
+/// # Errors
+///
+/// Returns an error when the command fails, emits non-UTF-8 output, or emits no version text.
+fn command_version(command: Command, description: &str) -> TaskResult<String> {
+    let output = run_checked_output(command, description)?;
+    let value = String::from_utf8(output.stdout)?;
+    if value.trim().is_empty() {
+        Err(io::Error::other(format!("{description} returned empty stdout")).into())
+    } else {
+        Ok(value)
+    }
+}
+
+/// Constructs one child command without inheriting a task-specific working directory.
+fn command_with_arguments(program: &str, arguments: &[&str]) -> Command {
+    let mut command = Command::new(program);
+    command.args(arguments);
+    command
+}
+
+/// Resolves the numeric WDK/SDK version containing the exact final signature verifier.
+///
+/// # Errors
+///
+/// Returns an error when the selected tool path is not contained in a numeric Windows Kit.
+fn production_wdk_version() -> TaskResult<String> {
+    let signtool = locate_signtool()?;
+    signtool
+        .ancestors()
+        .filter_map(Path::file_name)
+        .filter_map(OsStr::to_str)
+        .find(|name| WindowsKitVersion::parse(name).is_some())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "selected signtool is not below a numeric Windows Kit: {}",
+                signtool.display()
+            ))
+            .into()
+        })
+}
+
+/// Atomically publishes a fully verified staging directory under its artifact identity.
+///
+/// # Errors
+///
+/// Returns an error when the staging boundary is invalid, the identity already exists, or the
+/// final directory cannot be created or renamed.
+fn publish_verified_bundle(
+    repository_root: &Path,
+    staging_directory: &Path,
+    identity: &ArtifactIdentity,
+) -> TaskResult<PathBuf> {
+    let expected_staging_parent = repository_root
+        .join("target")
+        .join("production-artifact-snapshot");
+    if staging_directory.parent() != Some(expected_staging_parent.as_path()) {
+        return Err(io::Error::other("refusing to publish an unowned staging directory").into());
+    }
+    let verified_parent = repository_root.join("target").join("verified-production");
+    fs::create_dir_all(&verified_parent)?;
+    let destination = verified_parent.join(identity.as_str());
+    if destination.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "verified artifact identity already exists: {}",
+                destination.display()
+            ),
+        )
+        .into());
+    }
+    fs::rename(staging_directory, &destination)?;
+    Ok(destination)
 }
 
 /// Copies one source artifact into a new private file while rejecting any source-byte race.
@@ -3934,8 +4238,9 @@ mod tests {
     use super::{
         ArtifactIdentity, Sha256, Task, TaskResult, UNVERIFIED_ARTIFACT_ID, WindowsKitVersion,
         comma_separated_blocks, copy_exact_bytes, hash_source_record, jbd2_control_checksum,
-        normalize_debugfs_commit_timestamp, normalize_debugfs_descriptor, padded_volume_label,
-        parse_journal_fixture_manifest_text, read_be_u32,
+        normalize_debugfs_commit_timestamp, normalize_debugfs_descriptor,
+        normalized_manifest_value, padded_volume_label, parse_journal_fixture_manifest_text,
+        read_be_u32, required_version_line,
     };
     use sha2::Digest as _;
     use std::{ffi::OsStr, path::Path};
@@ -3982,7 +4287,7 @@ mod tests {
         assert_eq!(WindowsKitVersion::parse("10.0.x.0"), None);
     }
 
-    /// Only the four documented, semantically distinct workflows are accepted.
+    /// Only the five documented, semantically distinct workflows are accepted.
     ///
     /// # Panics
     ///
@@ -3993,6 +4298,7 @@ mod tests {
             Task::parse(OsStr::new("verify-portable")),
             Some(Task::Portable)
         );
+        assert_eq!(Task::parse(OsStr::new("verify-driver")), Some(Task::Driver));
         assert_eq!(
             Task::parse(OsStr::new("verify-journal-interop")),
             Some(Task::JournalInterop)
@@ -4006,6 +4312,26 @@ mod tests {
             Some(Task::ProductionDriver)
         );
         assert_eq!(Task::parse(OsStr::new("verify")), None);
+    }
+
+    /// Production manifest fields preserve tool identity without admitting record injection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if line boundaries survive normalization or required version fields are ambiguous.
+    #[test]
+    fn production_manifest_values_have_one_record_boundary() {
+        assert_eq!(normalized_manifest_value("one\r\ntwo\n"), "one | two");
+        let report = "release: 1.91.0-nightly\nLLVM version: 21.1.0\n";
+        assert_eq!(
+            required_version_line(report, "release:").ok(),
+            Some("1.91.0-nightly")
+        );
+        assert_eq!(
+            required_version_line(report, "LLVM version:").ok(),
+            Some("21.1.0")
+        );
+        assert!(required_version_line(report, "host:").is_err());
     }
 
     /// Snapshot records distinguish content changes, missing files, and path changes.

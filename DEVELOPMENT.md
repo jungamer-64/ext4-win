@@ -1,7 +1,8 @@
 # Development
 
-The default workspace members are host-independent. On Windows, macOS, or
-Linux, run the complete portable gate with:
+The repository pins `nightly-2026-08-10`. The default workspace members are
+host-independent. On Windows, macOS, or Linux, run the complete portable gate
+with:
 
 ```console
 cargo xtask verify-portable
@@ -11,6 +12,26 @@ This checks formatting, compiles all portable targets, runs their tests, and
 runs Clippy. Plain `cargo test` also selects only the portable default members:
 `ext4-core`, `production-reachability`, and `xtask`.
 
+The driver-specific development gate is:
+
+```console
+cargo xtask verify-driver
+```
+
+It checks the driver crate, runs at least 265 unit tests, runs Clippy over all
+driver targets, and builds rustdoc. It is distinct from a signed production
+build and does not by itself prove WDK packaging or release reachability.
+
+JBD2 interoperability is independently checked with:
+
+```console
+cargo xtask verify-journal-interop
+```
+
+This requires e2fsprogs on native Linux or WSL. The core implementation never
+generates its own oracle result: `debugfs` and `e2fsck` establish the external
+filesystem and journal evidence.
+
 Building and signing the kernel driver remains a Windows-only operation because
 it requires MSVC, the Windows Driver Kit, and `cargo-wdk`. On a configured
 Windows host, run:
@@ -19,7 +40,43 @@ Windows host, run:
 cargo xtask verify-production-driver
 ```
 
-That command creates one build identity, builds and signs `ext4win.sys`, binds
-the LLVM IR, link map, and driver image to that identity, runs the production
-reachability gate, and rejects concurrent source changes. It fails explicitly
-on macOS and Linux instead of compiling a non-Windows driver shim.
+This is the only release umbrella. It first runs `verify-portable`,
+`verify-driver`, and `verify-journal-interop`; then it creates one build
+identity, builds and signs the package, binds the LLVM IR, link map, and driver
+image to that identity, runs the production reachability gate, and rejects
+concurrent source changes. It fails explicitly on macOS and Linux instead of
+compiling a non-Windows driver shim.
+
+Successful bundles are atomically published below
+`target/verified-production/<artifact-id>/`. The versioned manifest binds IR,
+MAP, SYS, CAT, and INF hashes to the exact source snapshot, target, profile,
+rustflags, and rustc/LLVM/Cargo/cargo-wdk/WDK versions. The production command
+does not reuse a portable artifact and does not accept a stale release output.
+
+## CI and host boundaries
+
+CI runs `verify-portable` on Windows, Ubuntu, and macOS and runs journal
+interoperability on Ubuntu. The production job requires the dedicated
+`[self-hosted, Windows, X64, ext4-win-wdk]` runner and is serialized globally.
+That runner contract includes MSVC, WDK, cargo-wdk, WSL, and e2fsprogs.
+
+Live DriverStore validation is a separate manual assurance boundary. A green
+self-hosted production job proves the signed bundle and reachability evidence;
+it does not prove which SYS Windows loaded, that Driver Verifier observed the
+driver, or that mount and teardown succeeded. Live validation must compare the
+loaded DriverStore SYS hash with the verified bundle and treat a missing
+Verifier configuration, cleanup failure, or hash mismatch as failure.
+
+## Crash model
+
+Crash-consistency assurance assumes 512-byte atomic sectors. Writes may be
+absent, may persist at a sector-aligned prefix, or may persist completely.
+Successful flushes preserve prior write ordering and make durable only the
+target device. The filesystem image and external-journal image therefore have
+independent volatile and durable states. Recovery is accepted only when
+`e2fsck -f` is clean and externally observable path, content, link, xattr, and
+allocation state is wholly old or wholly new; mixed state is rejected.
+
+Supported-feature acceptance remains owned by the core mount validation. This
+document records verification boundaries and does not maintain a second
+feature matrix.
