@@ -42,6 +42,12 @@ enum Task {
     JournalFixtureProvenance,
     /// Builds and verifies one signed, identity-bound Windows driver bundle.
     ProductionDriver,
+    /// Performs read-only validation of a dedicated live-driver host.
+    CheckLiveDriverHost,
+    /// Builds a verified bundle and exercises it only against a new disposable VHDX.
+    VerifyLiveVhdx,
+    /// Reconciles and removes one interrupted disposable VHDX session.
+    CleanupLiveVhdxSession,
 }
 
 impl Task {
@@ -57,6 +63,12 @@ impl Task {
             Some(Self::JournalFixtureProvenance)
         } else if argument == "verify-production-driver" {
             Some(Self::ProductionDriver)
+        } else if argument == "check-live-driver-host" {
+            Some(Self::CheckLiveDriverHost)
+        } else if argument == "verify-live-vhdx" {
+            Some(Self::VerifyLiveVhdx)
+        } else if argument == "cleanup-live-vhdx-session" {
+            Some(Self::CleanupLiveVhdxSession)
         } else {
             None
         }
@@ -737,17 +749,42 @@ fn run() -> TaskResult<()> {
         .as_deref()
         .and_then(Task::parse)
         .ok_or_else(usage_error)?;
+    let task_argument = arguments.next();
     if arguments.next().is_some() {
         return Err(usage_error().into());
     }
 
     let repository_root = repository_root()?;
     match task {
-        Task::Portable => verify_portable(&repository_root),
-        Task::Driver => verify_driver(&repository_root),
-        Task::JournalInterop => verify_journal_interop(&repository_root),
-        Task::JournalFixtureProvenance => verify_journal_fixture_provenance(&repository_root),
-        Task::ProductionDriver => verify_production_driver(&repository_root),
+        Task::CleanupLiveVhdxSession => {
+            let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
+            cleanup_live_vhdx_session(&repository_root, session_id)
+        }
+        Task::Portable
+        | Task::Driver
+        | Task::JournalInterop
+        | Task::JournalFixtureProvenance
+        | Task::ProductionDriver
+        | Task::CheckLiveDriverHost
+        | Task::VerifyLiveVhdx => {
+            if task_argument.is_some() {
+                return Err(usage_error().into());
+            }
+            match task {
+                Task::Portable => verify_portable(&repository_root),
+                Task::Driver => verify_driver(&repository_root),
+                Task::JournalInterop => verify_journal_interop(&repository_root),
+                Task::JournalFixtureProvenance => {
+                    verify_journal_fixture_provenance(&repository_root)
+                }
+                Task::ProductionDriver => verify_production_driver(&repository_root),
+                Task::CheckLiveDriverHost => check_live_driver_host(&repository_root),
+                Task::VerifyLiveVhdx => verify_live_vhdx(&repository_root),
+                Task::CleanupLiveVhdxSession => {
+                    Err(io::Error::other("cleanup task lost its required argument").into())
+                }
+            }
+        }
     }
 }
 
@@ -755,7 +792,7 @@ fn run() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-driver|verify-journal-interop|verify-journal-fixture-provenance|verify-production-driver>",
+        "usage: cargo xtask <verify-portable|verify-driver|verify-journal-interop|verify-journal-fixture-provenance|verify-production-driver|check-live-driver-host|verify-live-vhdx|cleanup-live-vhdx-session SESSION_ID>",
     )
 }
 
@@ -829,6 +866,118 @@ fn verify_driver(repository_root: &Path) -> TaskResult<()> {
     )?;
     println!("driver development gates: PASS");
     Ok(())
+}
+
+/// Performs read-only validation of the dedicated live-driver host contract.
+///
+/// # Errors
+///
+/// Returns an error on non-Windows hosts or when elevation, Hyper-V PowerShell, WSL,
+/// e2fsprogs, Driver Verifier configuration, or clean ext4win service/package state is absent.
+fn check_live_driver_host(repository_root: &Path) -> TaskResult<()> {
+    require_windows_live_host()?;
+    run_live_vhdx_script(repository_root, "Preflight", None, None)
+}
+
+/// Builds one verified production bundle and exercises it only on a new fixed-size VHDX.
+///
+/// # Errors
+///
+/// Returns an error for host-contract, release-gate, session-recording, VHDX, WSL, DriverStore,
+/// driver operation, dismount, unload, or cleanup failure.
+fn verify_live_vhdx(repository_root: &Path) -> TaskResult<()> {
+    check_live_driver_host(repository_root)?;
+    let bundle = build_verified_production_bundle(repository_root)?;
+    let session_id = ArtifactIdentity::create(repository_root)?;
+    run_live_vhdx_script(
+        repository_root,
+        "Run",
+        Some(bundle.as_path()),
+        Some(session_id.as_str()),
+    )?;
+    println!("live VHDX driver assurance: PASS");
+    println!("session: {}", session_id.as_str());
+    Ok(())
+}
+
+/// Reconciles an interrupted session after validating its generated identity boundary.
+///
+/// # Errors
+///
+/// Returns an error for a malformed identifier, missing or mismatched session evidence, or any
+/// unload, package removal, VHDX detach, or cleanup failure.
+fn cleanup_live_vhdx_session(repository_root: &Path, session_id: &OsStr) -> TaskResult<()> {
+    require_windows_live_host()?;
+    let session_id = session_id
+        .to_str()
+        .filter(|value| {
+            value.len() == UNVERIFIED_ARTIFACT_ID.len()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| {
+            io::Error::other("session id must be exactly 32 lowercase hexadecimal digits")
+        })?;
+    run_live_vhdx_script(repository_root, "Cleanup", None, Some(session_id))
+}
+
+/// Rejects live workflows outside the Windows host boundary.
+///
+/// # Errors
+///
+/// Returns `Unsupported` on non-Windows hosts.
+fn require_windows_live_host() -> TaskResult<()> {
+    if cfg!(target_os = "windows") {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "live VHDX validation requires a dedicated elevated Windows host",
+        )
+        .into())
+    }
+}
+
+/// Invokes the repository-owned live VHDX script with only generated bundle/session identities.
+///
+/// # Errors
+///
+/// Returns an error when the script is absent, PowerShell cannot start, or the requested workflow
+/// fails closed.
+fn run_live_vhdx_script(
+    repository_root: &Path,
+    mode: &str,
+    bundle: Option<&Path>,
+    session_id: Option<&str>,
+) -> TaskResult<()> {
+    let script = repository_root
+        .join("tools")
+        .join("xtask")
+        .join("live-vhdx.ps1");
+    require_file(&script, "live VHDX workflow script")?;
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+    ]);
+    command
+        .arg(script)
+        .arg("-Mode")
+        .arg(mode)
+        .arg("-RepositoryRoot")
+        .arg(repository_root);
+    if let Some(bundle) = bundle {
+        command.arg("-Bundle").arg(bundle);
+    }
+    if let Some(session_id) = session_id {
+        command.arg("-SessionId").arg(session_id);
+    }
+    run_checked(command, &format!("live VHDX {mode} workflow"))
 }
 
 /// Generates JBD2 records with e2fsprogs, replays them through the production core state machine,
@@ -3469,13 +3618,13 @@ fn require_identical_files(expected: &Path, actual: &Path, description: &str) ->
 /// # Errors
 ///
 /// Returns the operation error, finalization error, or a combined diagnostic when both fail.
-fn combine_verification_and_cleanup(
-    operation: TaskResult<()>,
+fn combine_verification_and_cleanup<T>(
+    operation: TaskResult<T>,
     cleanup: TaskResult<()>,
-) -> TaskResult<()> {
+) -> TaskResult<T> {
     match (operation, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(operation_error), Err(cleanup_error)) => Err(io::Error::other(format!(
             "operation failed ({operation_error}); mandatory finalization also failed ({cleanup_error})"
         ))
@@ -3490,6 +3639,17 @@ fn combine_verification_and_cleanup(
 /// Returns an error on non-Windows hosts, failed build or analysis commands, missing or invalid
 /// artifacts, source drift, or artifact hashing failure.
 fn verify_production_driver(repository_root: &Path) -> TaskResult<()> {
+    let _bundle = build_verified_production_bundle(repository_root)?;
+    Ok(())
+}
+
+/// Runs the release umbrella and returns the atomically published evidence bundle.
+///
+/// # Errors
+///
+/// Returns an error on any portable, driver, interoperability, WDK, signing, reachability,
+/// identity, source-drift, or publication failure.
+fn build_verified_production_bundle(repository_root: &Path) -> TaskResult<PathBuf> {
     verify_portable(repository_root)?;
     verify_driver(repository_root)?;
     verify_journal_interop(repository_root)?;
@@ -3586,7 +3746,7 @@ fn verify_production_driver(repository_root: &Path) -> TaskResult<()> {
     println!("signed driver: ext4win.sys ({})", sealed.driver_hash,);
     println!("signed catalog: ext4win.cat ({})", sealed.catalog_hash);
     println!("installation metadata: ext4win.inf ({})", sealed.inf_hash);
-    Ok(())
+    Ok(bundle_directory)
 }
 
 /// Invokes cargo-wdk from the sole driver package with child-local build identity and flags.
@@ -4287,7 +4447,7 @@ mod tests {
         assert_eq!(WindowsKitVersion::parse("10.0.x.0"), None);
     }
 
-    /// Only the five documented, semantically distinct workflows are accepted.
+    /// Only the eight documented, semantically distinct workflows are accepted.
     ///
     /// # Panics
     ///
@@ -4310,6 +4470,18 @@ mod tests {
         assert_eq!(
             Task::parse(OsStr::new("verify-production-driver")),
             Some(Task::ProductionDriver)
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("check-live-driver-host")),
+            Some(Task::CheckLiveDriverHost)
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("verify-live-vhdx")),
+            Some(Task::VerifyLiveVhdx)
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("cleanup-live-vhdx-session")),
+            Some(Task::CleanupLiveVhdxSession)
         );
         assert_eq!(Task::parse(OsStr::new("verify")), None);
     }

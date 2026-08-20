@@ -1,0 +1,510 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Preflight', 'Run', 'Cleanup')]
+    [string]$Mode,
+
+    [Parameter(Mandatory = $true)]
+    [string]$RepositoryRoot,
+
+    [string]$Bundle,
+
+    [string]$SessionId
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$serviceName = 'ext4win'
+$originalInf = 'ext4win.inf'
+$providerName = 'ext4-win'
+$sessionParent = Join-Path $RepositoryRoot 'target\live-vhdx-sessions'
+$script:State = [ordered]@{}
+$script:SessionDirectory = $null
+
+function Assert-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'live VHDX validation requires an elevated administrator process'
+    }
+}
+
+function Assert-SessionId([string]$Value) {
+    if ($Value -notmatch '^[0-9a-f]{32}$') {
+        throw 'session id must be exactly 32 lowercase hexadecimal digits'
+    }
+}
+
+function Invoke-Checked([string]$Program, [string[]]$Arguments, [string]$Description) {
+    & $Program @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Invoke-Wsl([string[]]$Arguments, [string]$Description) {
+    $output = @(& wsl.exe @Arguments)
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed with exit code $LASTEXITCODE"
+    }
+    return $output
+}
+
+function Get-Ext4WinPackages([string]$InventoryPath) {
+    Invoke-Checked 'pnputil.exe' @('/enum-drivers', '/files', '/format', 'xml', '/output-file', $InventoryPath) 'structured DriverStore inventory'
+    [xml]$inventory = [IO.File]::ReadAllText($InventoryPath)
+    return @($inventory.PnpUtil.Driver | Where-Object {
+        $_.OriginalName -eq $originalInf -and $_.ProviderName -eq $providerName
+    })
+}
+
+function Assert-VerifierConfiguration {
+    $settingsPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+    $settings = Get-ItemProperty -LiteralPath $settingsPath -ErrorAction Stop
+    $level = [uint32]$settings.VerifyDriverLevel
+    $drivers = @(([string]$settings.VerifyDrivers) -split '[,;\s]+' | Where-Object { $_ })
+    if ($level -eq 0 -or -not ($drivers -contains 'ext4win.sys')) {
+        throw 'Driver Verifier must have nonzero flags and explicitly include ext4win.sys'
+    }
+}
+
+function Assert-HostContract([bool]$RequireCleanState) {
+    Assert-Administrator
+    foreach ($command in @('New-VHD', 'Get-VHD', 'Mount-VHD', 'Dismount-VHD', 'Get-Disk', 'Initialize-Disk', 'New-Partition')) {
+        if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
+            throw "Hyper-V PowerShell command is unavailable: $command"
+        }
+    }
+    foreach ($program in @('pnputil.exe', 'wsl.exe', 'sc.exe', 'fsutil.exe')) {
+        if (-not (Get-Command $program -ErrorAction SilentlyContinue)) {
+            throw "required Windows command is unavailable: $program"
+        }
+    }
+    Invoke-Wsl @('--status') 'WSL status query' | Out-Null
+    Invoke-Wsl @('--exec', 'mke2fs', '-V') 'WSL e2fsprogs query' | Out-Null
+    Assert-VerifierConfiguration
+    if ($RequireCleanState) {
+        if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+            throw 'an ext4win service already exists; live validation requires a dedicated clean host'
+        }
+        $inventoryPath = Join-Path ([IO.Path]::GetTempPath()) ("ext4win-inventory-{0}.xml" -f [Guid]::NewGuid().ToString('N'))
+        try {
+            $packages = Get-Ext4WinPackages $inventoryPath
+            if ($packages.Count -ne 0) {
+                throw 'one or more ext4win DriverStore packages already exist; clean the dedicated host first'
+            }
+        }
+        finally {
+            if (Test-Path -LiteralPath $inventoryPath) {
+                Remove-Item -LiteralPath $inventoryPath -Force
+            }
+        }
+    }
+}
+
+function Read-KeyValueFile([string]$Path) {
+    $values = [ordered]@{}
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        $separator = $line.IndexOf('=')
+        if ($separator -le 0) {
+            throw "invalid manifest record in $Path"
+        }
+        $key = $line.Substring(0, $separator)
+        $value = $line.Substring($separator + 1)
+        if ($values.Contains($key)) {
+            throw "duplicate manifest key $key in $Path"
+        }
+        $values[$key] = $value
+    }
+    return $values
+}
+
+function Assert-Bundle([string]$BundlePath) {
+    $resolvedBundle = (Resolve-Path -LiteralPath $BundlePath).Path
+    $verifiedParent = (Resolve-Path -LiteralPath (Join-Path $RepositoryRoot 'target\verified-production')).Path
+    if ((Split-Path -Parent $resolvedBundle) -ne $verifiedParent) {
+        throw 'bundle is outside target\verified-production'
+    }
+    $manifestPath = Join-Path $resolvedBundle 'manifest-v1.txt'
+    $manifest = Read-KeyValueFile $manifestPath
+    if ($manifest.manifest_version -ne '1') {
+        throw 'unsupported production bundle manifest version'
+    }
+    if ((Split-Path -Leaf $resolvedBundle) -ne $manifest.artifact_id) {
+        throw 'bundle directory identity differs from its manifest'
+    }
+    foreach ($artifact in @('ir', 'map', 'sys', 'cat', 'inf')) {
+        $pathKey = "artifact.$artifact.path"
+        $hashKey = "artifact.$artifact.sha256"
+        $artifactPath = Join-Path $resolvedBundle $manifest[$pathKey]
+        $actualHash = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash
+        if ($actualHash -ne $manifest[$hashKey]) {
+            throw "bundle artifact hash mismatch: $artifact"
+        }
+    }
+    return [ordered]@{
+        path = $resolvedBundle
+        artifact_id = $manifest.artifact_id
+        sys_hash = $manifest['artifact.sys.sha256']
+        inf_path = (Join-Path $resolvedBundle $manifest['artifact.inf.path'])
+    }
+}
+
+function Set-StateValue([string]$Name, [string]$Value) {
+    if ($Name.Contains('=') -or $Name.Contains("`n") -or $Value.Contains("`r") -or $Value.Contains("`n")) {
+        throw 'session manifest keys and values must be single-line records'
+    }
+    $script:State[$Name] = $Value
+}
+
+function Write-Phase([string]$Phase) {
+    $sequence = 0
+    if ($script:State.Contains('phase_sequence')) {
+        $sequence = [int]$script:State.phase_sequence + 1
+    }
+    Set-StateValue 'phase_sequence' ([string]$sequence)
+    Set-StateValue 'phase' $Phase
+    $path = Join-Path $script:SessionDirectory ('session-v1-{0:D4}.manifest' -f $sequence)
+    $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try {
+        $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false), 4096, $true)
+        try {
+            foreach ($key in ($script:State.Keys | Sort-Object)) {
+                $writer.WriteLine('{0}={1}', $key, $script:State[$key])
+            }
+            $writer.Flush()
+            $stream.Flush($true)
+        }
+        finally {
+            $writer.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Load-Session([string]$RequestedSessionId) {
+    Assert-SessionId $RequestedSessionId
+    $parent = (Resolve-Path -LiteralPath $sessionParent).Path
+    $candidate = Join-Path $parent $RequestedSessionId
+    $resolved = (Resolve-Path -LiteralPath $candidate).Path
+    if ((Split-Path -Parent $resolved) -ne $parent -or (Split-Path -Leaf $resolved) -ne $RequestedSessionId) {
+        throw 'session path escaped the live VHDX session root'
+    }
+    $latest = Get-ChildItem -LiteralPath $resolved -Filter 'session-v1-*.manifest' -File | Sort-Object Name | Select-Object -Last 1
+    if (-not $latest) {
+        throw 'session has no durable manifest'
+    }
+    $script:SessionDirectory = $resolved
+    $script:State = Read-KeyValueFile $latest.FullName
+    if ($script:State.manifest_version -ne '1' -or $script:State.session_id -ne $RequestedSessionId) {
+        throw 'session manifest identity mismatch'
+    }
+    $expectedVhdx = Join-Path $resolved 'disk.vhdx'
+    if ($script:State.vhdx_path -ne $expectedVhdx) {
+        throw 'session VHDX path does not match its generated identity boundary'
+    }
+    $bundleIdentity = Assert-Bundle $script:State.bundle_path
+    if ($bundleIdentity.artifact_id -ne $script:State.artifact_id -or $bundleIdentity.sys_hash -ne $script:State.sys_hash) {
+        throw 'session artifact identity no longer matches the verified bundle'
+    }
+}
+
+function Get-SessionDisk {
+    $vhdxPath = $script:State.vhdx_path
+    $vhd = Get-VHD -Path $vhdxPath -ErrorAction SilentlyContinue
+    if (-not $vhd -or -not $vhd.Attached) {
+        return $null
+    }
+    $disk = @(Get-Disk -Number $vhd.DiskNumber)
+    if ($disk.Count -ne 1) {
+        throw 'attached session VHDX did not resolve to exactly one disk'
+    }
+    if ($script:State.Contains('disk_unique_id') -and $script:State.disk_unique_id -ne [string]$disk[0].UniqueId) {
+        throw 'attached disk unique ID differs from the session manifest'
+    }
+    return $disk[0]
+}
+
+function Assert-DriverStoreHash([string]$OemInf, [string]$ExpectedHash) {
+    $inventoryPath = Join-Path $script:SessionDirectory ("inventory-{0}.xml" -f [Guid]::NewGuid().ToString('N'))
+    $packages = Get-Ext4WinPackages $inventoryPath
+    $selected = @($packages | Where-Object { $_.DriverName -eq $OemInf })
+    if ($selected.Count -ne 1) {
+        throw 'structured inventory did not select exactly one session DriverStore package'
+    }
+    $exportPath = Join-Path $script:SessionDirectory ("driverstore-export-{0}" -f [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $exportPath | Out-Null
+    Invoke-Checked 'pnputil.exe' @('/export-driver', $OemInf, $exportPath) 'DriverStore package export'
+    $drivers = @(Get-ChildItem -LiteralPath $exportPath -Filter 'ext4win.sys' -File -Recurse)
+    if ($drivers.Count -ne 1) {
+        throw 'exported DriverStore package did not contain exactly one ext4win.sys'
+    }
+    $actualHash = (Get-FileHash -LiteralPath $drivers[0].FullName -Algorithm SHA256).Hash
+    if ($actualHash -ne $ExpectedHash) {
+        throw 'DriverStore SYS hash differs from the verified production bundle'
+    }
+}
+
+function Install-SessionDriver {
+    Write-Phase 'DriverInstallRequested'
+    $bundle = Assert-Bundle $script:State.bundle_path
+    Invoke-Checked 'pnputil.exe' @('/add-driver', $bundle.inf_path, '/install') 'ext4win package installation'
+    $inventoryPath = Join-Path $script:SessionDirectory 'inventory-installed.xml'
+    $packages = Get-Ext4WinPackages $inventoryPath
+    if ($packages.Count -ne 1) {
+        throw 'installation did not produce exactly one ext4win DriverStore package'
+    }
+    Set-StateValue 'oem_inf' ([string]$packages[0].DriverName)
+    Write-Phase 'DriverInstalled'
+    Assert-DriverStoreHash $script:State.oem_inf $script:State.sys_hash
+    Assert-VerifierConfiguration
+    Write-Phase 'ServiceStartRequested'
+    Start-Service -Name $serviceName
+    Set-StateValue 'service_started' 'true'
+    Write-Phase 'ServiceStarted'
+    Assert-DriverStoreHash $script:State.oem_inf $script:State.sys_hash
+}
+
+function Format-SessionVhdx {
+    $before = @(Invoke-Wsl @('--exec', 'lsblk', '-dn', '-o', 'NAME') 'WSL device inventory before VHDX attach')
+    Set-StateValue 'wsl_attached' 'true'
+    Write-Phase 'WslAttachRequested'
+    Invoke-Wsl @('--mount', '--vhd', $script:State.vhdx_path, '--bare') 'WSL VHDX attach' | Out-Null
+    Write-Phase 'WslAttached'
+    $after = @(Invoke-Wsl @('--exec', 'lsblk', '-dn', '-o', 'NAME') 'WSL device inventory after VHDX attach')
+    $newDevices = @($after | Where-Object { $_ -and $_ -notin $before })
+    if ($newDevices.Count -ne 1 -or $newDevices[0] -notmatch '^[A-Za-z0-9]+$') {
+        throw 'WSL attach did not expose exactly one safely named block device'
+    }
+    Set-StateValue 'wsl_device' ([string]$newDevices[0])
+    $layout = @(Invoke-Wsl @('--exec', 'lsblk', '-ln', '-o', 'NAME,TYPE', "/dev/$($newDevices[0])") 'WSL partition inventory')
+    $partitions = @($layout | ForEach-Object {
+        $fields = $_ -split '\s+'
+        if ($fields.Count -eq 2 -and $fields[1] -eq 'part' -and $fields[0] -match '^[A-Za-z0-9]+$') {
+            $fields[0]
+        }
+    })
+    if ($partitions.Count -ne 1) {
+        throw 'session VHDX did not expose exactly one WSL partition'
+    }
+    Set-StateValue 'wsl_partition' ([string]$partitions[0])
+    Write-Phase 'WslFormatRequested'
+    Invoke-Wsl @('--user', 'root', '--exec', 'mke2fs', '-t', 'ext4', '-F', '-b', '4096', '-O', 'metadata_csum,64bit', "/dev/$($partitions[0])") 'WSL ext4 format' | Out-Null
+    Write-Phase 'WslFormatted'
+    Write-Phase 'WslUnmountRequested'
+    Invoke-Wsl @('--unmount', $script:State.vhdx_path) 'WSL VHDX unmount' | Out-Null
+    Set-StateValue 'wsl_attached' 'false'
+    Write-Phase 'WslUnmounted'
+}
+
+function Exercise-SessionVolume {
+    Write-Phase 'WindowsAttachRequested'
+    $vhd = Mount-VHD -Path $script:State.vhdx_path -Passthru
+    $disk = @($vhd | Get-Disk)
+    if ($disk.Count -ne 1 -or [string]$disk[0].UniqueId -ne $script:State.disk_unique_id) {
+        throw 'Windows reattach selected a disk outside the session identity'
+    }
+    Write-Phase 'WindowsAttached'
+    Install-SessionDriver
+    $partition = @(Get-Partition -DiskNumber $disk[0].Number | Where-Object { $_.Type -ne 'Reserved' })
+    if ($partition.Count -ne 1 -or [string]$partition[0].PartitionNumber -ne $script:State.partition_number) {
+        throw 'session partition identity changed after WSL formatting'
+    }
+    Write-Phase 'AccessPathRequested'
+    $partition[0] | Add-PartitionAccessPath -AssignDriveLetter
+    $mounted = Get-Partition -DiskNumber $disk[0].Number -PartitionNumber $partition[0].PartitionNumber
+    if (-not $mounted.DriveLetter) {
+        throw 'Windows did not assign an access path to the ext4 session volume'
+    }
+    Set-StateValue 'drive_letter' ([string]$mounted.DriveLetter)
+    Write-Phase 'AccessPathAssigned'
+    $root = '{0}:\' -f $mounted.DriveLetter
+    $alpha = Join-Path $root 'alpha.bin'
+    $beta = Join-Path $root 'beta.bin'
+    $hardlink = Join-Path $root 'beta-link.bin'
+    $payload = [byte[]]::new(8192)
+    for ($index = 0; $index -lt $payload.Length; $index++) {
+        $payload[$index] = [byte]($index % 251)
+    }
+    Write-Phase 'FilesystemOperationsRequested'
+    [IO.File]::WriteAllBytes($alpha, $payload)
+    $readback = [IO.File]::ReadAllBytes($alpha)
+    if ([Convert]::ToBase64String($payload) -ne [Convert]::ToBase64String($readback)) {
+        throw 'live VHDX readback differed from the written payload'
+    }
+    Move-Item -LiteralPath $alpha -Destination $beta
+    New-Item -ItemType HardLink -Path $hardlink -Target $beta | Out-Null
+    $matches = @([IO.Directory]::EnumerateFiles($root, 'beta*'))
+    if ($matches.Count -ne 2) {
+        throw 'patterned directory enumeration did not return both hard-link names'
+    }
+    $stream = [IO.FileStream]::new($beta, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read, 4096, [IO.FileOptions]::WriteThrough)
+    try {
+        $stream.Flush($true)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    Write-Phase 'FilesystemOperationsCompleted'
+    Write-Phase 'VolumeDismountRequested'
+    Invoke-Checked 'fsutil.exe' @('volume', 'dismount', ('{0}:' -f $mounted.DriveLetter)) 'ext4 session volume dismount'
+    Remove-PartitionAccessPath -DiskNumber $disk[0].Number -PartitionNumber $partition[0].PartitionNumber -AccessPath $root
+    Set-StateValue 'drive_letter' ''
+    Dismount-VHD -Path $script:State.vhdx_path
+    Write-Phase 'VolumeDismounted'
+}
+
+function Cleanup-SessionInternal {
+    if ($script:State.wsl_attached -eq 'true') {
+        Write-Phase 'CleanupWslUnmountRequested'
+        Invoke-Wsl @('--unmount', $script:State.vhdx_path) 'cleanup WSL VHDX unmount' | Out-Null
+        Set-StateValue 'wsl_attached' 'false'
+        Write-Phase 'CleanupWslUnmounted'
+    }
+    $disk = Get-SessionDisk
+    if ($disk) {
+        Write-Phase 'CleanupVhdxDismountRequested'
+        Dismount-VHD -Path $script:State.vhdx_path
+        Write-Phase 'CleanupVhdxDismounted'
+    }
+    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+        Write-Phase 'CleanupServiceStopRequested'
+        Stop-Service -Name $serviceName -ErrorAction Stop
+        Set-StateValue 'service_started' 'false'
+        Write-Phase 'CleanupServiceStopped'
+    }
+    if ($script:State.Contains('oem_inf') -and $script:State.oem_inf) {
+        $inventoryPath = Join-Path $script:SessionDirectory 'inventory-cleanup.xml'
+        $packages = Get-Ext4WinPackages $inventoryPath
+        $selected = @($packages | Where-Object { $_.DriverName -eq $script:State.oem_inf })
+        if ($selected.Count -gt 1) {
+            throw 'cleanup OEM identity is ambiguous in structured DriverStore inventory'
+        }
+        if ($selected.Count -eq 1) {
+            Assert-DriverStoreHash $script:State.oem_inf $script:State.sys_hash
+            Write-Phase 'CleanupPackageRemovalRequested'
+            Invoke-Checked 'pnputil.exe' @('/delete-driver', $script:State.oem_inf, '/uninstall', '/force') 'session DriverStore package removal'
+            Write-Phase 'CleanupPackageRemoved'
+        }
+    }
+    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+        Write-Phase 'CleanupServiceDeleteRequested'
+        Invoke-Checked 'sc.exe' @('delete', $serviceName) 'session service deletion'
+        Write-Phase 'CleanupServiceDeleted'
+    }
+    if (Test-Path -LiteralPath $script:State.vhdx_path) {
+        $expectedVhdx = Join-Path $script:SessionDirectory 'disk.vhdx'
+        if ($script:State.vhdx_path -ne $expectedVhdx) {
+            throw 'cleanup refused a VHDX outside the session directory'
+        }
+        Write-Phase 'CleanupVhdxRemovalRequested'
+        Remove-Item -LiteralPath $script:State.vhdx_path -Force
+        Write-Phase 'CleanupVhdxRemoved'
+    }
+    $finalInventory = Join-Path $script:SessionDirectory 'inventory-final.xml'
+    if ((Get-Ext4WinPackages $finalInventory).Count -ne 0) {
+        throw 'ext4win DriverStore package remains after cleanup'
+    }
+    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+        throw 'ext4win service remains after cleanup'
+    }
+    if (Test-Path -LiteralPath $script:State.vhdx_path) {
+        throw 'session VHDX remains after cleanup'
+    }
+    Write-Phase 'Complete'
+}
+
+function Start-LiveSession([string]$BundlePath, [string]$RequestedSessionId) {
+    Assert-HostContract $true
+    Assert-SessionId $RequestedSessionId
+    $bundleIdentity = Assert-Bundle $BundlePath
+    New-Item -ItemType Directory -Path $sessionParent -Force | Out-Null
+    $script:SessionDirectory = Join-Path $sessionParent $RequestedSessionId
+    New-Item -ItemType Directory -Path $script:SessionDirectory | Out-Null
+    $vhdxPath = Join-Path $script:SessionDirectory 'disk.vhdx'
+    Set-StateValue 'manifest_version' '1'
+    Set-StateValue 'session_id' $RequestedSessionId
+    Set-StateValue 'artifact_id' $bundleIdentity.artifact_id
+    Set-StateValue 'bundle_path' $bundleIdentity.path
+    Set-StateValue 'sys_hash' $bundleIdentity.sys_hash
+    Set-StateValue 'service_name' $serviceName
+    Set-StateValue 'vhdx_path' $vhdxPath
+    Set-StateValue 'wsl_attached' 'false'
+    Set-StateValue 'service_started' 'false'
+    Write-Phase 'SessionCreated'
+
+    $operationError = $null
+    try {
+        Write-Phase 'VhdxCreateRequested'
+        New-VHD -Path $vhdxPath -Fixed -SizeBytes 268435456 | Out-Null
+        Write-Phase 'VhdxCreated'
+        Write-Phase 'PartitioningAttachRequested'
+        $vhd = Mount-VHD -Path $vhdxPath -Passthru
+        $disk = @($vhd | Get-Disk)
+        if ($disk.Count -ne 1) {
+            throw 'new session VHDX did not resolve to exactly one disk'
+        }
+        Set-StateValue 'disk_unique_id' ([string]$disk[0].UniqueId)
+        Write-Phase 'PartitioningAttached'
+        Write-Phase 'PartitionCreateRequested'
+        Set-Disk -Number $disk[0].Number -IsOffline $false -IsReadOnly $false
+        Initialize-Disk -Number $disk[0].Number -PartitionStyle GPT
+        $partition = New-Partition -DiskNumber $disk[0].Number -UseMaximumSize
+        Set-StateValue 'partition_number' ([string]$partition.PartitionNumber)
+        Write-Phase 'PartitionCreated'
+        Write-Phase 'PartitioningDismountRequested'
+        Dismount-VHD -Path $vhdxPath
+        Write-Phase 'PartitioningDismounted'
+        Format-SessionVhdx
+        Exercise-SessionVolume
+    }
+    catch {
+        $operationError = $_
+    }
+
+    $cleanupError = $null
+    try {
+        Cleanup-SessionInternal
+    }
+    catch {
+        $cleanupError = $_
+    }
+    if ($operationError -and $cleanupError) {
+        throw "live operation failed ($operationError); mandatory cleanup also failed ($cleanupError)"
+    }
+    if ($operationError) {
+        throw $operationError
+    }
+    if ($cleanupError) {
+        throw $cleanupError
+    }
+}
+
+switch ($Mode) {
+    'Preflight' {
+        Assert-HostContract $true
+        Write-Output 'live driver host contract: PASS'
+    }
+    'Run' {
+        if (-not $Bundle -or -not $SessionId) {
+            throw 'Run requires generated Bundle and SessionId arguments'
+        }
+        Start-LiveSession $Bundle $SessionId
+    }
+    'Cleanup' {
+        Assert-Administrator
+        if (-not $SessionId) {
+            throw 'Cleanup requires a generated SessionId argument'
+        }
+        Load-Session $SessionId
+        if ($script:State.phase -eq 'Complete') {
+            Write-Output 'live VHDX session is already complete'
+            break
+        }
+        Cleanup-SessionInternal
+    }
+}
