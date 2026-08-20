@@ -1,6 +1,6 @@
 //! Volume information query and mutation boundary.
 
-use ext4_core::{ClusterSize, Ext4VolumeLabel};
+use ext4_core::{ClusterSize, Ext4VolumeLabel, VolumeGeometry, VolumeIdentity};
 use wdk_sys::{
     FILE_CASE_PRESERVED_NAMES, FILE_CASE_SENSITIVE_SEARCH, FILE_FS_ATTRIBUTE_INFORMATION,
     FILE_FS_DEVICE_INFORMATION, FILE_FS_FULL_SIZE_INFORMATION, FILE_FS_LABEL_INFORMATION,
@@ -13,8 +13,8 @@ use crate::{
     kernel::status::{DriverError, DriverResult},
     memory::{self, DriverVec},
     state::{
-        MountedVolumeDevice, PreparedVpbLabelPublication, TransferSectorSize, VolumeControlBlock,
-        VolumeRuntime, VolumeSerialNumber,
+        MountedVolumeAccess, MountedVolumeDevice, PreparedVpbLabelPublication, TransferSectorSize,
+        VolumeSerialNumber,
     },
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
@@ -28,28 +28,23 @@ const FILE_SYSTEM_NAME: &[u16] = &[0x0045, 0x0058, 0x0054, 0x0034, 0x0057, 0x004
 /// # Errors
 ///
 /// Returns an error when volume stack decoding or information packing fails.
-pub(crate) fn query(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
-    let (stack, volume) = request.with_active(|active| {
-        Ok::<_, DriverError>((
-            active.current_stack()?.query_volume()?,
-            MountedVolumeDevice::vcb(active.device()).ok_or(DriverError::InvalidDeviceRequest)?,
-        ))
-    })?;
-    let operations = unsafe {
-        // SAFETY: Query-volume runs only as the mounted-device executor's unique active operation.
-        VolumeControlBlock::operation_access(volume)
-    };
+pub(crate) fn query(
+    mut request: PendingIrpLease<'_>,
+    operations: &MountedVolumeAccess<'_>,
+) -> DriverResult<IrpCompletion> {
+    let stack = request.with_active(|active| active.current_stack()?.query_volume())?;
     request.with_active(|active| {
         let length = stack.length();
         let mut buffer = active.buffered_output(length)?;
         let output = buffer.as_mut_slice();
-        let operations = operations.runtime();
+        let identity = operations.volume_identity();
+        let geometry = operations.volume_geometry();
         match stack.information_class() {
-            QueryVolumeInformationClass::Volume => pack_volume_information(operations, output),
-            QueryVolumeInformationClass::Size => pack_size_information(operations, output),
+            QueryVolumeInformationClass::Volume => pack_volume_information(identity, output),
+            QueryVolumeInformationClass::Size => pack_size_information(geometry, output),
             QueryVolumeInformationClass::Device => pack_device_information(output),
             QueryVolumeInformationClass::Attribute => pack_attribute_information(output),
-            QueryVolumeInformationClass::FullSize => pack_full_size_information(operations, output),
+            QueryVolumeInformationClass::FullSize => pack_full_size_information(geometry, output),
         }
     })
 }
@@ -60,25 +55,20 @@ pub(crate) fn query(mut request: PendingIrpLease<'_>) -> DriverResult<IrpComplet
 /// Returns an error when volume stack decoding or label mutation fails.
 pub(crate) fn set(
     mut request: PendingIrpLease<'_>,
+    operations: &MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<SetVolumeResolution> {
-    let (device, volume, label) = request.with_active(|active| {
+    let (device, label) = request.with_active(|active| {
         let stack = active.current_stack()?.set_volume()?;
-        let volume =
-            MountedVolumeDevice::vcb(active.device()).ok_or(DriverError::InvalidDeviceRequest)?;
         let label = match stack.information_class() {
             SetVolumeInformationClass::Label => {
                 let input = active.buffered_input(stack.length())?;
                 volume_label_from_file_fs_label(input.as_slice())?
             }
         };
-        Ok::<_, DriverError>((active.device(), volume, label))
+        Ok::<_, DriverError>((active.device(), label))
     })?;
-    let operations = unsafe {
-        // SAFETY: Set-volume runs only as the mounted-device executor's unique active operation.
-        VolumeControlBlock::operation_access(volume)
-    };
-    if operations.runtime().identity().label() == label {
+    if operations.volume_identity().label() == label {
         return Ok(SetVolumeResolution::Complete(IrpCompletion::EMPTY));
     }
     mutation.set_volume_label(label);
@@ -151,10 +141,9 @@ fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel
 ///
 /// Returns an error when the UTF-16 label byte count overflows or the output buffer is too small.
 fn pack_volume_information(
-    operations: &VolumeRuntime,
+    identity: VolumeIdentity,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let identity = operations.identity();
     let label = identity.label();
     let [a, b, c, d, ..] = identity.uuid().bytes();
     let serial_number = VolumeSerialNumber::from_le_bytes([a, b, c, d]);
@@ -224,10 +213,9 @@ fn pack_volume_information(
 /// Returns an error when ext4 cluster geometry cannot be represented in `FILE_FS_SIZE_INFORMATION`
 /// or the output buffer is too small.
 fn pack_size_information(
-    operations: &VolumeRuntime,
+    geometry: VolumeGeometry,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let geometry = operations.current_epoch().geometry();
     write_fixed(
         output,
         FILE_FS_SIZE_INFORMATION {
@@ -265,10 +253,9 @@ fn pack_device_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
 /// Returns an error when ext4 cluster geometry cannot be represented in
 /// `FILE_FS_FULL_SIZE_INFORMATION` or the output buffer is too small.
 fn pack_full_size_information(
-    operations: &VolumeRuntime,
+    geometry: VolumeGeometry,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let geometry = operations.current_epoch().geometry();
     let available = LARGE_INTEGER {
         QuadPart: i64::try_from(geometry.free_cluster_count().as_u64())
             .map_err(|_| DriverError::InvalidParameter)?,

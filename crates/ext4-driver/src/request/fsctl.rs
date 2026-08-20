@@ -5,7 +5,7 @@ use core::ptr::NonNull;
 use crate::irp::{ActiveIrp, FileSystemControlStack, IrpCompletion, PendingIrpLease};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
-use crate::state::{OpenedObject, OpenedRegularFile, VolumeControlBlock};
+use crate::state::{MountedVolumeAccess, OpenedObject, OpenedRegularFile, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{
     FscryptKeyIdentifier, FscryptKeyPresence, FsverityBlockSize, FsverityEnable,
@@ -184,19 +184,17 @@ pub(crate) fn remove_encryption_key(
 pub(crate) fn get_encryption_key_status(
     request: &mut PendingIrpLease<'_>,
     stack: FileSystemControlStack,
+    operations: &MountedVolumeAccess<'_>,
 ) -> DriverResult<IrpCompletion> {
     request.with_active(|active| {
         let input = read_input(active, stack)?;
         let payload = FscryptKeyStatusPayload::parse(input.as_slice())?;
         let volume = mounted_vcb(active)?;
-        let operations = unsafe {
-            // SAFETY: Key-status runs only as the mounted-device executor's unique active
-            // operation. The non-cloneable lease is consumed before this operation returns.
-            VolumeControlBlock::operation_access(volume)
-        };
-        let presence = operations
-            .runtime()
-            .fscrypt_key_presence(payload.identifier());
+        if !operations.owns_volume(volume) {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                .bugcheck();
+        }
+        let presence = operations.fscrypt_key_presence(payload.identifier());
 
         let mut output = output_buffer(active, stack, FSCRYPT_GET_KEY_STATUS_BYTES)?;
         write_key_status_output(output.as_mut_slice(), presence)?;
