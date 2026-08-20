@@ -273,7 +273,9 @@ impl DirectoryLayout {
         checksum: DirectoryChecksum,
     ) -> Result<Self> {
         match storage {
-            DirectoryStorageKind::Linear => Ok(Self::Linear(LinearDirectory::parse(blocks)?)),
+            DirectoryStorageKind::Linear => {
+                Ok(Self::Linear(LinearDirectory::parse(blocks, checksum)?))
+            }
             DirectoryStorageKind::HTree => Ok(Self::HTree(HtreeDirectory::parse(
                 &blocks,
                 hash_seed,
@@ -318,10 +320,21 @@ impl LinearDirectory {
     /// # Errors
     ///
     /// Returns an error when any block contains a malformed linear dirent stream.
-    fn parse(blocks: Vec<DirectoryBlockData>) -> Result<Self> {
+    fn parse(blocks: Vec<DirectoryBlockData>, checksum: DirectoryChecksum) -> Result<Self> {
         let mut entries = Vec::new();
         for block in blocks {
-            let block_entries = DirectoryEntry::parse_all(block.bytes())?;
+            checksum.verify_dirent_tail(block.bytes())?;
+            let live_limit = block
+                .bytes()
+                .len()
+                .checked_sub(checksum.dirent_tail_bytes())
+                .ok_or(Error::InvalidDirectoryEntry)?;
+            let block_entries = DirectoryEntry::parse_all(
+                block
+                    .bytes()
+                    .get(..live_limit)
+                    .ok_or(Error::InvalidDirectoryEntry)?,
+            )?;
             entries
                 .try_reserve_exact(block_entries.len())
                 .map_err(|_| Error::OutOfMemory)?;
@@ -1612,21 +1625,24 @@ fn find_directory_block(
 pub(crate) struct DirectoryBlock {
     /// Raw directory block bytes; all mutations update this single buffer.
     bytes: Vec<u8>,
+    /// Inode-local checksum context for leaf-directory mutations.
+    checksum: DirectoryChecksum,
 }
 
 impl DirectoryBlock {
     /// Wraps an existing directory block for checked mutation.
-    pub(crate) fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+    pub(crate) fn new(bytes: Vec<u8>, checksum: DirectoryChecksum) -> Self {
+        Self { bytes, checksum }
     }
 
     /// Creates a zero-filled directory block with the filesystem block size.
     /// # Errors
     ///
     /// Returns an error when allocating the block-sized byte buffer fails.
-    pub(crate) fn empty(block_size: usize) -> Result<Self> {
+    pub(crate) fn empty(block_size: usize, checksum: DirectoryChecksum) -> Result<Self> {
         Ok(Self {
             bytes: memory::repeated_vec(0_u8, block_size)?,
+            checksum,
         })
     }
 
@@ -1645,8 +1661,8 @@ impl DirectoryBlock {
         self_inode: InodeId,
         parent_inode: InodeId,
     ) -> Result<()> {
-        let block_len = self.bytes.len();
-        if block_len
+        let live_limit = self.live_limit()?;
+        if live_limit
             < checked_rec_len(DIRENT_HEADER_SIZE)?
                 .checked_mul(2)
                 .ok_or(Error::ArithmeticOverflow)?
@@ -1667,13 +1683,14 @@ impl DirectoryBlock {
             dotdot_offset,
             parent_inode,
             checked_u16(
-                block_len
+                live_limit
                     .checked_sub(dotdot_offset)
                     .ok_or(Error::ArithmeticOverflow)?,
             )?,
             b"..",
             DirectoryEntryKind::Directory,
-        )
+        )?;
+        self.refresh_leaf_checksum()
     }
 
     /// Initializes the block as one free dirent slot.
@@ -1681,9 +1698,11 @@ impl DirectoryBlock {
     ///
     /// Returns an error when the block length cannot be represented as an ext4 `rec_len`.
     pub(crate) fn initialize_free_space(&mut self) -> Result<()> {
-        let rec_len = checked_u16(self.bytes.len())?;
+        let live_limit = self.live_limit()?;
+        let rec_len = checked_u16(live_limit)?;
         self.bytes.fill(0);
-        put_le_u16(&mut self.bytes, disk_offset(4), rec_len)
+        put_le_u16(&mut self.bytes, disk_offset(4), rec_len)?;
+        self.refresh_leaf_checksum()
     }
 
     /// Parses live entries from the current block image.
@@ -1691,7 +1710,12 @@ impl DirectoryBlock {
     ///
     /// Returns an error when the current block image is not a valid ext4 dirent stream.
     pub(crate) fn entries(&self) -> Result<Vec<DirectoryEntry>> {
-        DirectoryEntry::parse_all(&self.bytes)
+        self.verify_leaf_checksum()?;
+        DirectoryEntry::parse_all(
+            self.bytes
+                .get(..self.live_limit()?)
+                .ok_or(Error::InvalidDirectoryEntry)?,
+        )
     }
 
     /// Checks whether a live entry already owns `name`.
@@ -1721,13 +1745,14 @@ impl DirectoryBlock {
         if self.contains_name(name)? {
             return Err(Error::NameAlreadyExists);
         }
+        let live_limit = self.live_limit()?;
         let needed = checked_rec_len(
             DIRENT_HEADER_SIZE
                 .checked_add(name.bytes().len())
                 .ok_or(Error::ArithmeticOverflow)?,
         )?;
         let mut offset = 0_usize;
-        while offset < self.bytes.len() {
+        while offset < live_limit {
             let rec_len = usize::from(le_u16(
                 &self.bytes,
                 disk_offset(offset).checked_add_bytes(4)?,
@@ -1736,7 +1761,7 @@ impl DirectoryBlock {
                 || offset
                     .checked_add(rec_len)
                     .ok_or(Error::ArithmeticOverflow)?
-                    > self.bytes.len()
+                    > live_limit
             {
                 return Err(Error::InvalidDirectoryEntry);
             }
@@ -1756,6 +1781,7 @@ impl DirectoryBlock {
                     name.bytes(),
                     kind,
                 )?;
+                self.refresh_leaf_checksum()?;
                 return Ok(true);
             }
             let used = checked_rec_len(
@@ -1781,6 +1807,7 @@ impl DirectoryBlock {
                     name.bytes(),
                     kind,
                 )?;
+                self.refresh_leaf_checksum()?;
                 return Ok(true);
             }
             offset = offset
@@ -1796,8 +1823,10 @@ impl DirectoryBlock {
     /// Returns an error when a scanned dirent is malformed or the removed entry's inode/name cannot
     /// be converted back into domain types.
     pub(crate) fn remove(&mut self, name: &Ext4Name) -> Result<Option<DirectoryEntry>> {
+        self.verify_leaf_checksum()?;
+        let live_limit = self.live_limit()?;
         let mut offset = 0_usize;
-        while offset < self.bytes.len() {
+        while offset < live_limit {
             let rec_len = usize::from(le_u16(
                 &self.bytes,
                 disk_offset(offset).checked_add_bytes(4)?,
@@ -1806,7 +1835,7 @@ impl DirectoryBlock {
                 || offset
                     .checked_add(rec_len)
                     .ok_or(Error::ArithmeticOverflow)?
-                    > self.bytes.len()
+                    > live_limit
             {
                 return Err(Error::InvalidDirectoryEntry);
             }
@@ -1842,6 +1871,7 @@ impl DirectoryBlock {
                     kind,
                 };
                 put_le_u32(&mut self.bytes, disk_offset(offset), 0)?;
+                self.refresh_leaf_checksum()?;
                 return Ok(Some(removed));
             }
             offset = offset
@@ -1889,8 +1919,10 @@ impl DirectoryBlock {
         inode: InodeId,
         kind: DirectoryEntryKind,
     ) -> Result<Option<DirectoryEntry>> {
+        self.verify_leaf_checksum()?;
+        let live_limit = self.live_limit()?;
         let mut offset = 0_usize;
-        while offset < self.bytes.len() {
+        while offset < live_limit {
             let rec_len = usize::from(le_u16(
                 &self.bytes,
                 disk_offset(offset).checked_add_bytes(4)?,
@@ -1899,7 +1931,7 @@ impl DirectoryBlock {
                 || offset
                     .checked_add(rec_len)
                     .ok_or(Error::ArithmeticOverflow)?
-                    > self.bytes.len()
+                    > live_limit
             {
                 return Err(Error::InvalidDirectoryEntry);
             }
@@ -1941,6 +1973,7 @@ impl DirectoryBlock {
                     name.bytes(),
                     kind,
                 )?;
+                self.refresh_leaf_checksum()?;
                 return Ok(Some(previous));
             }
             offset = offset
@@ -1948,6 +1981,34 @@ impl DirectoryBlock {
                 .ok_or(Error::ArithmeticOverflow)?;
         }
         Ok(None)
+    }
+
+    /// Returns the byte boundary owned by live directory entries.
+    /// # Errors
+    ///
+    /// Returns an error when the block cannot contain the checksum tail required by its inode.
+    fn live_limit(&self) -> Result<usize> {
+        self.bytes
+            .len()
+            .checked_sub(self.checksum.dirent_tail_bytes())
+            .ok_or(Error::InvalidDirectoryEntry)
+    }
+
+    /// Verifies the checksum tail before interpreting this block as a leaf.
+    /// # Errors
+    ///
+    /// Returns an error when the tail is malformed or its checksum does not match the dirents.
+    fn verify_leaf_checksum(&self) -> Result<()> {
+        self.checksum.verify_dirent_tail(&self.bytes)
+    }
+
+    /// Rebuilds the checksum tail from the current authoritative dirent bytes.
+    /// # Errors
+    ///
+    /// Returns an error when the checksum tail cannot be encoded at the leaf boundary.
+    fn refresh_leaf_checksum(&mut self) -> Result<()> {
+        let live_limit = self.live_limit()?;
+        self.checksum.write_dirent_tail(&mut self.bytes, live_limit)
     }
 }
 

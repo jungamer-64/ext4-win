@@ -2126,7 +2126,6 @@ fn verify_linux_generated_journal_case(
     )?;
     verify_pattern_block(&reference_image, case.block_size, free_block, 0xB2)?;
     verify_primary_recovery_marker(&image, true)?;
-
     drive_core_mount_and_clean_close(&image)?;
     verify_pattern_block(&image, case.block_size, free_block, 0xB2)?;
 
@@ -3075,7 +3074,7 @@ fn verify_external_journal_fault_matrix(
             let mut image = File::open(&filesystem)?;
             read_image_block(&mut image, fixture.replay_block, fixture.block_size)?
         };
-        require_old_or_new_bytes(
+        require_old_new_or_sector_prefix_bytes(
             "recovery home block",
             &observed,
             &old_replay_block,
@@ -3364,22 +3363,43 @@ fn require_stopped_effect(
     Ok(())
 }
 
-/// Requires one fixed-width representation to equal either complete semantic endpoint.
+/// Requires an interrupted recovery write to equal a sector-prefix transition from old to new.
 ///
+/// The dirty journal remains authoritative until replayed home blocks and the journal-clean marker
+/// are durable. A device may therefore expose complete old/new bytes or a prefix of newly persisted
+/// sectors followed by the old suffix before the next mount replays the transaction again.
 /// # Errors
 ///
-/// Returns an error when an interrupted write exposes a third, partially updated value.
-fn require_old_or_new_bytes(
+/// Returns an error when the representations differ in length, are not sector-sized, or contain a
+/// mixture that no single ordered 512-byte write prefix can produce.
+fn require_old_new_or_sector_prefix_bytes(
     label: &str,
     observed: &[u8],
     old: &[u8],
     new: &[u8],
 ) -> TaskResult<()> {
-    if observed == old || observed == new {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("{label} is neither the old nor new state")).into())
+    const SECTOR_BYTES: usize = 512;
+
+    if observed.len() != old.len()
+        || observed.len() != new.len()
+        || !observed.len().is_multiple_of(SECTOR_BYTES)
+    {
+        return Err(io::Error::other(format!(
+            "{label} does not share one sector-aligned representation"
+        ))
+        .into());
     }
+    for prefix in (0..=observed.len()).step_by(SECTOR_BYTES) {
+        if observed.get(..prefix) == new.get(..prefix)
+            && observed.get(prefix..) == old.get(prefix..)
+        {
+            return Ok(());
+        }
+    }
+    Err(io::Error::other(format!(
+        "{label} is not an ordered sector-prefix transition"
+    ))
+    .into())
 }
 
 /// Uses e2fsck as an independent oracle for one external-journal crash outcome.

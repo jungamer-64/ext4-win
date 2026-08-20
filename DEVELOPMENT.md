@@ -36,7 +36,9 @@ write, grow, shrink, rename, hard link, unlink, and xattr set/update/delete.
 The 4 KiB-block/16 KiB-cluster BIGALLOC profile covers allocation, truncate,
 unlink, cluster reuse, and free-space accounting. The 4 KiB external-journal
 profile commits rename, sparse-extension write, and xattr update together and
-requires every recovered result to be the complete old or complete new state.
+models interrupted home-block writes as an ordered 512-byte prefix of the new
+image followed by the old suffix. The next mount must replay that dirty journal
+to the complete new state, after which `e2fsck` must accept the filesystem.
 
 Building and signing the kernel driver remains a Windows-only operation because
 it requires MSVC, the Windows Driver Kit, and `cargo-wdk`. On a configured

@@ -12,6 +12,15 @@ pub(super) struct BlockImage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Descriptor transition required when a derived bitmap is first persisted.
+pub(super) enum BitmapInitializationTransition {
+    /// Preserve the descriptor's current initialization state.
+    Preserve,
+    /// Clear the corresponding uninitialized flag at commit.
+    Initialize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Accumulated block group accounting changes.
 pub(super) struct GroupDelta {
     /// Block group receiving the accounting changes.
@@ -22,6 +31,10 @@ pub(super) struct GroupDelta {
     pub(super) free_inodes_delta: i64,
     /// Used-directory count delta for the descriptor.
     pub(super) used_dirs_delta: i64,
+    /// Block bitmap initialization transition.
+    pub(super) block_bitmap_initialization: BitmapInitializationTransition,
+    /// Inode bitmap initialization transition.
+    pub(super) inode_bitmap_initialization: BitmapInitializationTransition,
 }
 
 impl GroupDelta {
@@ -32,6 +45,8 @@ impl GroupDelta {
             free_clusters_delta: FreeClusterDelta::ZERO,
             free_inodes_delta: 0,
             used_dirs_delta: 0,
+            block_bitmap_initialization: BitmapInitializationTransition::Preserve,
+            inode_bitmap_initialization: BitmapInitializationTransition::Preserve,
         }
     }
 }

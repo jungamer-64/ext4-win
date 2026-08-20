@@ -1,5 +1,7 @@
 //! Superblock parsing and mount-policy validation.
 
+use alloc::vec::Vec;
+
 use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u32};
@@ -22,6 +24,8 @@ const FREE_BLOCKS_COUNT_LO_OFFSET: usize = 12;
 const FREE_BLOCKS_COUNT_HI_OFFSET: usize = 344;
 /// Byte offset of `s_checksum` and exclusive end of the superblock checksum input.
 const SUPERBLOCK_CHECKSUM_OFFSET: usize = 1020;
+/// Byte offset of `s_reserved_gdt_blocks` inside the superblock.
+const RESERVED_GDT_BLOCKS_OFFSET: usize = 206;
 /// Magic value stored in `s_magic`.
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 /// Clean filesystem bit stored in `s_state`.
@@ -474,6 +478,24 @@ impl BlocksPerGroup {
     }
 }
 
+/// Descriptor-table expansion blocks reserved after each backup descriptor table.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ReservedGdtBlockCount(u16);
+
+impl ReservedGdtBlockCount {
+    /// Creates a reserved descriptor-table block count from its on-disk field.
+    #[must_use]
+    const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    /// Returns the count for block-address arithmetic.
+    #[must_use]
+    pub(crate) fn as_u64(self) -> u64 {
+        u64::from(self.0)
+    }
+}
+
 /// Inodes per ext4 block group.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct InodesPerGroup(u32);
@@ -821,6 +843,48 @@ pub enum RecoveryState {
     Clean,
     /// Journal recovery is required before mounting cleanly.
     NeedsRecovery,
+}
+
+/// Validated result of reading the primary superblock at the mount boundary.
+///
+/// A recovery-marker update changes `s_feature_incompat` in the first sector and `s_checksum` in
+/// the second. If power is lost after only the first sector reaches stable storage, the retained
+/// checksum identifies the previous valid marker image exactly. Only that constrained tear is
+/// repairable; every other checksum mismatch remains corruption.
+#[derive(Debug)]
+pub(crate) enum PrimarySuperblockRead {
+    /// The on-disk image is already fully valid.
+    Valid(Superblock),
+    /// The first sector contains the next recovery marker while the checksum still authenticates
+    /// the previous marker. Mount must durably restore this image before interpreting metadata.
+    TornRecoveryMarker {
+        /// Complete primary-superblock image already validated as the previous marker state.
+        repair: Vec<u8>,
+    },
+    /// Every structural field needed to locate and validate JBD2 is supported, but the primary
+    /// checksum is invalid. A committed journal payload must repair the primary block before this
+    /// provisional value may become mounted state.
+    ChecksumInvalid(ChecksumInvalidSuperblock),
+}
+
+/// Structurally validated primary metadata that has not established checksum authority.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChecksumInvalidSuperblock(Superblock);
+
+impl ChecksumInvalidSuperblock {
+    /// Returns the provisional geometry and journal placement solely for recovery bootstrap.
+    pub(crate) const fn recovery_bootstrap(self) -> Superblock {
+        self.0
+    }
+}
+
+/// Whether the primary-superblock checksum participates in parsing admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SuperblockChecksumValidation {
+    /// Require the checksum selected by the feature set.
+    Required,
+    /// Validate every other structural field while withholding mounted-state authority.
+    DeferredToJournalReplay,
 }
 
 /// Metadata checksum mode selected by validated features.
@@ -1374,6 +1438,8 @@ pub struct Superblock {
     first_data_block: BlockAddress,
     /// Blocks assigned to each block group.
     blocks_per_group: BlocksPerGroup,
+    /// Expansion blocks reserved after each primary or backup descriptor table.
+    reserved_gdt_blocks: ReservedGdtBlockCount,
     /// Allocation clusters assigned to each block group.
     clusters_per_group: ClustersPerGroup,
     /// Inodes assigned to each block group.
@@ -1405,10 +1471,46 @@ impl Superblock {
     ///
     /// # Errors
     /// Returns an error when the superblock cannot support journaled writes.
-    pub fn read_write_from(device: &mut OperationDevice<'_>) -> Result<Self> {
+    pub(crate) fn read_write_from(
+        device: &mut OperationDevice<'_>,
+    ) -> Result<PrimarySuperblockRead> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
         device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
-        Self::parse_read_write(&raw)
+        match Self::parse_read_write(&raw) {
+            Ok(superblock) => Ok(PrimarySuperblockRead::Valid(superblock)),
+            Err(Error::ChecksumMismatch) => match Self::restore_torn_recovery_marker(raw) {
+                Ok(restored) => Ok(restored),
+                Err(Error::ChecksumMismatch) => Self::parse_with_policy(
+                    &raw,
+                    FeatureSet::read_write,
+                    SuperblockChecksumValidation::DeferredToJournalReplay,
+                )
+                .map(ChecksumInvalidSuperblock)
+                .map(PrimarySuperblockRead::ChecksumInvalid),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Recognizes the sole repairable primary-superblock checksum failure.
+    ///
+    /// The stored checksum belongs to the state before a contiguous marker write. Toggling only
+    /// `INCOMPAT_RECOVER` must therefore recreate a fully valid superblock; reparsing the candidate
+    /// keeps all feature, geometry, and journal checks at the ordinary admission boundary.
+    /// # Errors
+    ///
+    /// Returns an error when toggling only the marker does not recreate a fully valid primary
+    /// superblock or the owned repair image cannot be allocated.
+    fn restore_torn_recovery_marker(
+        mut raw: [u8; SUPERBLOCK_SIZE],
+    ) -> Result<PrimarySuperblockRead> {
+        let incompat = le_u32(&raw, disk_offset(96))?;
+        put_le_u32(&mut raw, disk_offset(96), incompat ^ INCOMPAT_RECOVER)?;
+        Self::parse_read_write(&raw)?;
+        Ok(PrimarySuperblockRead::TornRecoveryMarker {
+            repair: memory::copied_slice(&raw)?,
+        })
     }
 
     /// Parses and validates a 1024-byte superblock payload for read-write mode.
@@ -1416,7 +1518,11 @@ impl Superblock {
     /// # Errors
     /// Returns an error when the payload cannot support journaled writes.
     pub fn parse_read_write(raw: &[u8]) -> Result<Self> {
-        Self::parse_with_policy(raw, FeatureSet::read_write)
+        Self::parse_with_policy(
+            raw,
+            FeatureSet::read_write,
+            SuperblockChecksumValidation::Required,
+        )
     }
 
     /// Parses a raw superblock with the supplied feature validation policy.
@@ -1427,6 +1533,7 @@ impl Superblock {
     fn parse_with_policy(
         raw: &[u8],
         validate_features: fn(u32, u32, u32) -> Result<FeatureSet>,
+        checksum_validation: SuperblockChecksumValidation,
     ) -> Result<Self> {
         if raw.len() < SUPERBLOCK_SIZE {
             return Err(Error::TruncatedStructure);
@@ -1446,6 +1553,8 @@ impl Superblock {
         let log_cluster_size = le_u32(raw, disk_offset(28))?;
         let block_size = BlockSize::from_superblock_log(log_block_size)?;
         let blocks_per_group = BlocksPerGroup::new(le_u32(raw, disk_offset(32))?)?;
+        let reserved_gdt_blocks =
+            ReservedGdtBlockCount::new(le_u16(raw, disk_offset(RESERVED_GDT_BLOCKS_OFFSET))?);
         let raw_clusters_per_group = le_u32(raw, disk_offset(36))?;
         let inodes_per_group = InodesPerGroup::new(le_u32(raw, disk_offset(40))?)?;
         let first_inode = InodeId::try_from(le_u32(raw, disk_offset(84))?)?;
@@ -1487,9 +1596,10 @@ impl Superblock {
         })?;
         let free_clusters_count = free_blocks_count
             .into_free_cluster_count(geometry.blocks_per_cluster, geometry.cluster_count)?;
-        match features.metadata_checksum() {
-            MetadataChecksum::None => {}
-            MetadataChecksum::Crc32c => {
+        match (features.metadata_checksum(), checksum_validation) {
+            (MetadataChecksum::None, _) => {}
+            (MetadataChecksum::Crc32c, SuperblockChecksumValidation::DeferredToJournalReplay) => {}
+            (MetadataChecksum::Crc32c, SuperblockChecksumValidation::Required) => {
                 let expected = le_u32(raw, disk_offset(SUPERBLOCK_CHECKSUM_OFFSET))?;
                 if expected != 0 {
                     let checksum_input = raw
@@ -1553,6 +1663,7 @@ impl Superblock {
             free_inodes_count,
             first_data_block,
             blocks_per_group,
+            reserved_gdt_blocks,
             clusters_per_group: geometry.clusters_per_group,
             inodes_per_group,
             inode_size,
@@ -1566,6 +1677,32 @@ impl Superblock {
             default_directory_hash_version,
             features,
         })
+    }
+
+    /// Filesystem block containing the primary superblock for this block size.
+    pub(crate) const fn primary_block(block_size: BlockSize) -> BlockAddress {
+        if block_size.bytes() == 1024 {
+            BlockAddress::new(1)
+        } else {
+            BlockAddress::new(0)
+        }
+    }
+
+    /// Validates the primary-superblock payload embedded in a journaled filesystem block.
+    /// # Errors
+    ///
+    /// Returns an error when the block does not contain a complete, checksum-valid primary
+    /// superblock accepted by the read-write feature policy.
+    pub(crate) fn parse_primary_block(block: &[u8], block_size: BlockSize) -> Result<Self> {
+        let offset = if block_size.bytes() == 1024 {
+            0
+        } else {
+            usize::try_from(SUPERBLOCK_OFFSET).map_err(|_| Error::ArithmeticOverflow)?
+        };
+        let end = offset
+            .checked_add(SUPERBLOCK_SIZE)
+            .ok_or(Error::ArithmeticOverflow)?;
+        Self::parse_read_write(block.get(offset..end).ok_or(Error::TruncatedStructure)?)
     }
 
     /// Validated block size.
@@ -1620,6 +1757,12 @@ impl Superblock {
     #[must_use]
     pub const fn blocks_per_group(self) -> BlocksPerGroup {
         self.blocks_per_group
+    }
+
+    /// Descriptor-table expansion blocks reserved in every superblock group.
+    #[must_use]
+    pub(crate) const fn reserved_gdt_blocks(self) -> ReservedGdtBlockCount {
+        self.reserved_gdt_blocks
     }
 
     /// Allocation clusters per block group.

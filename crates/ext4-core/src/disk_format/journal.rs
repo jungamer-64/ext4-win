@@ -20,7 +20,7 @@ use crate::disk::storage::{
 };
 use crate::disk_format::extent::{ExtentInitialization, ExtentTree, ExtentTreeContext};
 use crate::disk_format::inode::Inode;
-use crate::disk_format::superblock::{FilesystemUuid, JournalUuid, RecoveryState};
+use crate::disk_format::superblock::{FilesystemUuid, JournalUuid, RecoveryState, Superblock};
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
 
@@ -317,16 +317,22 @@ struct JournalCursor {
 
 impl JournalCursor {
     /// Recovers the next transaction sequence and head from clean or dirty superblock state.
+    ///
+    /// A never-started v2 journal can retain zero in the later-added `s_head` field. Zero is not a
+    /// ring address, so only that clean initial state is canonicalized to the first usable block.
     /// # Errors
     ///
     /// Returns [`Error::JournalCorrupt`] when the selected head is outside the validated ring.
     fn from_superblock(superblock: &JournalSuperblock, ring: JournalRing) -> Result<Self> {
         let (sequence, head) = if superblock.start != 0 {
             (superblock.sequence, superblock.start)
-        } else if superblock.version == JournalSuperblockVersion::V1 {
-            (superblock.sequence.next(), ring.first)
         } else {
-            (superblock.sequence.next(), superblock.head)
+            let clean_head = match superblock.version {
+                JournalSuperblockVersion::V1 => ring.first,
+                JournalSuperblockVersion::V2 if superblock.head == 0 => ring.first,
+                JournalSuperblockVersion::V2 => superblock.head,
+            };
+            (superblock.sequence.next(), clean_head)
         };
         if head < ring.first || head >= ring.maxlen {
             return Err(Error::JournalCorrupt);
@@ -427,6 +433,9 @@ pub(crate) struct JournalRecoveryOperation {
     pending: RecoveryPending,
     /// Whether replay issued at least one home-block write.
     wrote_home: bool,
+    /// Proof that a checksum-invalid primary block has a committed, independently validated
+    /// replacement before any journal-clean transition can begin.
+    primary_repair: PrimaryRepairValidation,
 }
 
 /// Recovery action selected from the primary ext4 recovery marker.
@@ -436,6 +445,25 @@ enum RecoveryPolicy {
     Replay,
     /// Treat committed records as stale and recover only the next journal cursor.
     Discard,
+}
+
+/// Validation state for journal-authoritative primary-superblock repair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimaryRepairValidation {
+    /// Ordinary recovery began from a checksum-valid primary superblock.
+    NotRequired,
+    /// Recovery bootstrap used provisional geometry; no committed replacement has been validated.
+    Required {
+        /// Filesystem block containing the primary superblock.
+        home: BlockAddress,
+    },
+    /// A committed JBD2 payload carries a checksum-valid replacement primary superblock.
+    Validated {
+        /// Filesystem block containing the primary superblock.
+        home: BlockAddress,
+        /// Transaction whose payload established repair authority.
+        sequence: JournalSequence,
+    },
 }
 
 /// Recovery pass and durability state.
@@ -615,12 +643,46 @@ impl JournalRecoveryOperation {
         journal: Journal<LoadedJournal>,
         recovery_state: RecoveryState,
     ) -> Result<Self> {
+        let policy = match recovery_state {
+            RecoveryState::Clean => RecoveryPolicy::Discard,
+            RecoveryState::NeedsRecovery => RecoveryPolicy::Replay,
+        };
+        Self::new_with_primary_repair(journal, policy, PrimaryRepairValidation::NotRequired)
+    }
+
+    /// Starts replay only after a committed payload proves it can replace the invalid primary
+    /// superblock used for journal discovery.
+    /// # Errors
+    ///
+    /// Returns an error when the journal is already clean or recovery state cannot be allocated.
+    pub(crate) fn repairing_primary(journal: Journal<LoadedJournal>) -> Result<Self> {
+        let home = Superblock::primary_block(journal.geometry.block_size);
+        Self::new_with_primary_repair(
+            journal,
+            RecoveryPolicy::Replay,
+            PrimaryRepairValidation::Required { home },
+        )
+    }
+
+    /// Builds the common bounded recovery state with an explicit primary-repair contract.
+    /// # Errors
+    ///
+    /// Returns an error when recovery buffers or clean typestate cannot be allocated, or a repair
+    /// request has no dirty journal authority.
+    fn new_with_primary_repair(
+        journal: Journal<LoadedJournal>,
+        policy: RecoveryPolicy,
+        primary_repair: PrimaryRepairValidation,
+    ) -> Result<Self> {
         let block_bytes = usize::try_from(journal.geometry.block_size.bytes())
             .map_err(|_| Error::ArithmeticOverflow)?;
         let buffer = memory::repeated_vec(0_u8, block_bytes)?;
         let start_cursor = journal.cursor.head;
         let start_sequence = journal.cursor.sequence;
         let already_clean = journal.superblock.start() == 0;
+        if already_clean && primary_repair != PrimaryRepairValidation::NotRequired {
+            return Err(Error::ChecksumMismatch);
+        }
         let clean_journal = if already_clean {
             Some(journal.copy_without_state::<CleanJournal>()?)
         } else {
@@ -628,10 +690,7 @@ impl JournalRecoveryOperation {
         };
         Ok(Self {
             journal,
-            policy: match recovery_state {
-                RecoveryState::Clean => RecoveryPolicy::Discard,
-                RecoveryState::NeedsRecovery => RecoveryPolicy::Replay,
-            },
+            policy,
             phase: if already_clean {
                 RecoveryPhase::Complete
             } else {
@@ -661,6 +720,7 @@ impl JournalRecoveryOperation {
             in_flight: None,
             pending: RecoveryPending::Control,
             wrote_home: false,
+            primary_repair,
         })
     }
 
@@ -779,17 +839,20 @@ impl JournalRecoveryOperation {
                 let tag = *self.tags.get(index).ok_or(Error::JournalCorrupt)?;
                 self.journal
                     .verify_tag_checksum(tag.sequence, &tag.as_journal_tag(), &buffer)?;
-                if tag.flags & JBD2_TAG_FLAG_ESCAPE != 0 && be_u32(&buffer, disk_offset(0))? != 0 {
-                    return Err(Error::JournalCorrupt);
+                // The tag checksum authenticates the escaped on-disk bytes. Restore the semantic
+                // payload only after that check and before any ext4 structure validates it.
+                if tag.flags & JBD2_TAG_FLAG_ESCAPE != 0 {
+                    if be_u32(&buffer, disk_offset(0))? != 0 {
+                        return Err(Error::JournalCorrupt);
+                    }
+                    put_be_u32(&mut buffer, disk_offset(0), JBD2_MAGIC)?;
                 }
+                self.validate_primary_repair_payload(tag, &buffer)?;
                 let next = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
                 if self.phase == RecoveryPhase::Replay
                     && tag.flags & JBD2_TAG_FLAG_DELETED == 0
                     && !self.is_revoked(tag.home, tag.sequence)
                 {
-                    if tag.flags & JBD2_TAG_FLAG_ESCAPE != 0 {
-                        put_be_u32(&mut buffer, disk_offset(0), JBD2_MAGIC)?;
-                    }
                     self.buffer = Some(buffer);
                     self.pending = RecoveryPending::HomeWrite {
                         home: tag.home,
@@ -1103,6 +1166,15 @@ impl JournalRecoveryOperation {
     ///
     /// Returns an error when the clean superblock or typestate cannot be allocated and encoded.
     fn prepare_replay_and_clean(&mut self) -> Result<()> {
+        match self.primary_repair {
+            PrimaryRepairValidation::NotRequired => {}
+            PrimaryRepairValidation::Required { .. } => return Err(Error::ChecksumMismatch),
+            PrimaryRepairValidation::Validated { home, sequence } => {
+                if self.is_revoked(home, sequence) {
+                    return Err(Error::JournalCorrupt);
+                }
+            }
+        }
         let cursor = JournalCursor {
             sequence: self.summary.next_sequence,
             head: self.summary.end_cursor,
@@ -1123,6 +1195,31 @@ impl JournalRecoveryOperation {
             RecoveryPhase::Replay
         } else {
             RecoveryPhase::WriteCleanJournal
+        };
+        Ok(())
+    }
+
+    /// Promotes one committed journal payload into primary-superblock repair authority.
+    /// # Errors
+    ///
+    /// Returns an error when a payload targeting the primary block does not itself contain a
+    /// checksum-valid read-write superblock.
+    fn validate_primary_repair_payload(&mut self, tag: RecoveryTag, payload: &[u8]) -> Result<()> {
+        if self.phase != RecoveryPhase::Validate || tag.flags & JBD2_TAG_FLAG_DELETED != 0 {
+            return Ok(());
+        }
+        let home = match self.primary_repair {
+            PrimaryRepairValidation::NotRequired => return Ok(()),
+            PrimaryRepairValidation::Required { home }
+            | PrimaryRepairValidation::Validated { home, .. } => home,
+        };
+        if tag.home != home {
+            return Ok(());
+        }
+        Superblock::parse_primary_block(payload, self.journal.geometry.block_size)?;
+        self.primary_repair = PrimaryRepairValidation::Validated {
+            home,
+            sequence: tag.sequence,
         };
         Ok(())
     }
@@ -1744,11 +1841,7 @@ impl<State> Journal<State> {
             return Err(Error::JournalCorrupt);
         }
         let high_size = if self.profile.has_64bit() { 4 } else { 0 };
-        // Linux `journal_tag_bytes()` keeps checksum-v2 in the legacy tag prefix: its truncated
-        // checksum already occupies bytes 4..6. Only 64-bit block numbers add the high word.
-        let tag_size = base_size
-            .checked_add(high_size)
-            .ok_or(Error::ArithmeticOverflow)?;
+        let tag_size = self.descriptor_tag_size();
         let block_high = if high_size == 4 {
             u64::from(be_u32(block, disk_offset(offset).checked_add_bytes(8)?)?)
         } else {
@@ -1984,9 +2077,7 @@ impl<State> Journal<State> {
         }
 
         let high_size = if self.profile.has_64bit() { 4 } else { 0 };
-        let tag_size = 8_usize
-            .checked_add(high_size)
-            .ok_or(Error::ArithmeticOverflow)?;
+        let tag_size = self.descriptor_tag_size();
         let next = offset
             .checked_add(tag_size)
             .and_then(|value| value.checked_add(uuid_size))
@@ -2093,12 +2184,16 @@ impl<State> Journal<State> {
 
     /// Returns the serialized tag width for the active JBD2 feature set.
     fn descriptor_tag_size(&self) -> usize {
-        if self.profile.has_csum_v3() {
-            16
-        } else if self.profile.has_64bit() {
-            12
-        } else {
-            8
+        match (
+            self.profile.has_csum_v3(),
+            self.profile.has_64bit(),
+            matches!(self.profile.checksum, JournalChecksumProfile::V2),
+        ) {
+            (true, _, _) => 16,
+            (false, true, true) => 14,
+            (false, true, false) => 12,
+            (false, false, true) => 10,
+            (false, false, false) => 8,
         }
     }
 
@@ -3395,10 +3490,10 @@ mod tests {
             for (incompat, expected_tag_size) in [
                 (0, 8_usize),
                 (JBD2_FEATURE_INCOMPAT_64BIT, 12),
-                (JBD2_FEATURE_INCOMPAT_CSUM_V2, 8),
+                (JBD2_FEATURE_INCOMPAT_CSUM_V2, 10),
                 (
                     JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_64BIT,
-                    12,
+                    14,
                 ),
                 (JBD2_FEATURE_INCOMPAT_CSUM_V3, 16),
                 (
@@ -3589,6 +3684,15 @@ mod tests {
                 JournalCursor {
                     sequence: JournalSequence::new(42),
                     head: 9,
+                }
+            );
+
+            let never_started = test_superblock(block_size, 0, 32, 2, 1, 0, 0)?;
+            assert_eq!(
+                JournalCursor::from_superblock(&never_started, ring)?,
+                JournalCursor {
+                    sequence: JournalSequence::new(2),
+                    head: 2,
                 }
             );
 
@@ -3864,6 +3968,46 @@ mod tests {
             *tail ^= 0x01;
             assert_eq!(
                 committed.validate_or_replay_control_block(&corrupt_descriptor),
+                Err(Error::ChecksumMismatch)
+            );
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics if a checksum-invalid primary can consume a clean journal or erase a dirty journal
+    /// before a committed replacement primary payload has been validated.
+    #[test]
+    fn primary_repair_requires_committed_replacement_authority() {
+        let outcome = (|| -> Result<()> {
+            let clean = test_external_journal::<LoadedJournal>(
+                0,
+                JBD2_FEATURE_INCOMPAT_CSUM_V3,
+                64,
+                17,
+                0,
+                3,
+                100,
+            )?;
+            assert!(matches!(
+                JournalRecoveryOperation::repairing_primary(clean),
+                Err(Error::ChecksumMismatch)
+            ));
+
+            let dirty = test_external_journal::<LoadedJournal>(
+                0,
+                JBD2_FEATURE_INCOMPAT_CSUM_V3,
+                64,
+                17,
+                3,
+                3,
+                100,
+            )?;
+            let mut recovery = JournalRecoveryOperation::repairing_primary(dirty)?;
+            assert_eq!(
+                recovery.prepare_replay_and_clean(),
                 Err(Error::ChecksumMismatch)
             );
             Ok(())

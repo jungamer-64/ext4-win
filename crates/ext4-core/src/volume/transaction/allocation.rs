@@ -17,7 +17,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 &self.volume.superblock,
                 group,
             )?;
-            let bitmap_index = self.ensure_block_bitmap_update(descriptor.block_bitmap())?;
+            let bitmap_index = self.ensure_block_bitmap_update(group, &descriptor)?;
             let clusters_in_group = self.volume.superblock.clusters_in_group(group)?;
             for bit in 0..clusters_in_group {
                 let position = ClusterBitmapPosition::new(group, bit);
@@ -169,7 +169,7 @@ impl MutationResolvePass<'_, '_, '_> {
             &self.volume.superblock,
             group,
         )?;
-        let bitmap_index = self.ensure_block_bitmap_update(descriptor.block_bitmap())?;
+        let bitmap_index = self.ensure_block_bitmap_update(group, &descriptor)?;
         let bitmap = self
             .block_bitmap_updates
             .get_mut(bitmap_index)
@@ -231,7 +231,7 @@ impl MutationResolvePass<'_, '_, '_> {
             if descriptor.free_inodes_count() == 0 {
                 continue;
             }
-            let bitmap_index = self.ensure_inode_bitmap_update(descriptor.inode_bitmap())?;
+            let bitmap_index = self.ensure_inode_bitmap_update(group, &descriptor)?;
             let inodes_in_group = self.inodes_in_group(group)?;
             for bit in 0..inodes_in_group {
                 let position = InodeBitmapPosition::new(group, bit);
@@ -275,7 +275,7 @@ impl MutationResolvePass<'_, '_, '_> {
             &self.volume.superblock,
             group,
         )?;
-        let bitmap_index = self.ensure_inode_bitmap_update(descriptor.inode_bitmap())?;
+        let bitmap_index = self.ensure_inode_bitmap_update(group, &descriptor)?;
         let bitmap = self
             .inode_bitmap_updates
             .get_mut(bitmap_index)
@@ -294,8 +294,10 @@ impl MutationResolvePass<'_, '_, '_> {
     /// represented.
     pub(super) fn ensure_block_bitmap_update(
         &mut self,
-        bitmap_block: BlockAddress,
+        group: BlockGroupId,
+        descriptor: &BlockGroupDescriptor,
     ) -> Result<usize> {
+        let bitmap_block = descriptor.block_bitmap();
         if let Some(index) = self
             .block_bitmap_updates
             .iter()
@@ -303,18 +305,24 @@ impl MutationResolvePass<'_, '_, '_> {
         {
             return Ok(index);
         }
-        let mut bytes = memory::repeated_vec(
-            0_u8,
-            usize::try_from(self.volume.superblock.block_size().bytes())
-                .map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-        self.volume.device.read_exact_at(
-            self.volume
-                .superblock
-                .block_size()
-                .offset_of(bitmap_block)?,
-            &mut bytes,
-        )?;
+        let bytes = match descriptor.block_bitmap_initialization() {
+            AllocationBitmapInitialization::Initialized => read_allocation_bitmap(
+                &mut self.volume.device,
+                &self.volume.superblock,
+                bitmap_block,
+            )?,
+            AllocationBitmapInitialization::Uninitialized => {
+                let layouts =
+                    read_group_metadata_layouts(&mut self.volume.device, &self.volume.superblock)?;
+                let bytes = materialize_uninitialized_block_bitmap(
+                    &self.volume.superblock,
+                    group,
+                    &layouts,
+                )?;
+                self.record_group_block_bitmap_initialization(group)?;
+                bytes
+            }
+        };
         self.block_bitmap_updates.try_push(BlockImage {
             block: bitmap_block,
             bytes,
@@ -332,8 +340,10 @@ impl MutationResolvePass<'_, '_, '_> {
     /// be represented.
     pub(super) fn ensure_inode_bitmap_update(
         &mut self,
-        bitmap_block: BlockAddress,
+        group: BlockGroupId,
+        descriptor: &BlockGroupDescriptor,
     ) -> Result<usize> {
+        let bitmap_block = descriptor.inode_bitmap();
         if let Some(index) = self
             .inode_bitmap_updates
             .iter()
@@ -341,18 +351,18 @@ impl MutationResolvePass<'_, '_, '_> {
         {
             return Ok(index);
         }
-        let mut bytes = memory::repeated_vec(
-            0_u8,
-            usize::try_from(self.volume.superblock.block_size().bytes())
-                .map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-        self.volume.device.read_exact_at(
-            self.volume
-                .superblock
-                .block_size()
-                .offset_of(bitmap_block)?,
-            &mut bytes,
-        )?;
+        let bytes = match descriptor.inode_bitmap_initialization() {
+            AllocationBitmapInitialization::Initialized => read_allocation_bitmap(
+                &mut self.volume.device,
+                &self.volume.superblock,
+                bitmap_block,
+            )?,
+            AllocationBitmapInitialization::Uninitialized => {
+                let bytes = materialize_uninitialized_inode_bitmap(&self.volume.superblock, group)?;
+                self.record_group_inode_bitmap_initialization(group)?;
+                bytes
+            }
+        };
         self.inode_bitmap_updates.try_push(BlockImage {
             block: bitmap_block,
             bytes,
@@ -438,6 +448,32 @@ impl MutationResolvePass<'_, '_, '_> {
     ) -> Result<()> {
         let entry = self.group_delta_mut(group)?;
         entry.free_clusters_delta = entry.free_clusters_delta.checked_add(delta.as_i64())?;
+        Ok(())
+    }
+
+    /// Records that this transaction will persist a formerly derived block bitmap.
+    /// # Errors
+    ///
+    /// Returns an error when the group delta cannot be staged.
+    pub(super) fn record_group_block_bitmap_initialization(
+        &mut self,
+        group: BlockGroupId,
+    ) -> Result<()> {
+        self.group_delta_mut(group)?.block_bitmap_initialization =
+            BitmapInitializationTransition::Initialize;
+        Ok(())
+    }
+
+    /// Records that this transaction will persist a formerly derived inode bitmap.
+    /// # Errors
+    ///
+    /// Returns an error when the group delta cannot be staged.
+    pub(super) fn record_group_inode_bitmap_initialization(
+        &mut self,
+        group: BlockGroupId,
+    ) -> Result<()> {
+        self.group_delta_mut(group)?.inode_bitmap_initialization =
+            BitmapInitializationTransition::Initialize;
         Ok(())
     }
 

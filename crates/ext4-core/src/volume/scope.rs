@@ -16,7 +16,7 @@ pub(super) use crate::disk_format::extent::{
     BlockMapping, Extent, ExtentBlockRun, ExtentLength, ExtentTree, ExtentTreeContext,
     LogicalBlock, MutableExtentTree, SerializedExtentTree,
 };
-pub(super) use crate::disk_format::group::BlockGroupDescriptor;
+pub(super) use crate::disk_format::group::{AllocationBitmapInitialization, BlockGroupDescriptor};
 pub(super) use crate::disk_format::inode::{
     DirectoryEntryMutationCapability, DirectoryStorageKind, EncodedInodeBlockCount,
     EncodedInodeSize, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times,
@@ -53,7 +53,9 @@ pub(super) use crate::protection::verity::{
 pub(super) use super::block_group::{
     BitmapBitState, ClusterBitmapPosition, ClusterReferenceDelta, ClusterReferenceIndex,
     InodeBitmapPosition, cluster_bitmap_bit_state, inode_bitmap_bit_state, inode_offset_on_device,
-    round_up_div, set_cluster_bitmap_bit, set_inode_bitmap_bit,
+    materialize_uninitialized_block_bitmap, materialize_uninitialized_inode_bitmap,
+    read_allocation_bitmap, read_group_metadata_layouts, round_up_div, set_cluster_bitmap_bit,
+    set_inode_bitmap_bit,
 };
 pub(super) use super::inode_record::{
     AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord, ResizeInodeBlockMap,

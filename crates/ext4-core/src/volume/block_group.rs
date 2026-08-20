@@ -10,20 +10,38 @@ struct MountedAllocationSnapshot {
 }
 
 impl MountedAllocationSnapshot {
-    /// Reads every block-group descriptor and its two allocation bitmaps exactly once.
+    /// Reads every descriptor and materializes its semantic allocation bitmap state.
     /// # Errors
     ///
     /// Returns an error when group geometry is invalid or any descriptor or bitmap cannot be read.
     fn load(reader: &mut OperationDevice<'_>, superblock: &Superblock) -> Result<Self> {
         let group_count = superblock.block_group_count()?;
-        let mut groups = Vec::new();
+        let mut descriptors = Vec::new();
+        let mut layouts = Vec::new();
         for group in 0..group_count.as_u32() {
             let group = BlockGroupId::from_u32(group);
             let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
-            let block_bitmap =
-                read_allocation_bitmap(reader, superblock, descriptor.block_bitmap())?;
-            let inode_bitmap =
-                read_allocation_bitmap(reader, superblock, descriptor.inode_bitmap())?;
+            layouts.try_push(GroupMetadataLayout::from_descriptor(group, &descriptor))?;
+            descriptors.try_push((group, descriptor))?;
+        }
+        let mut groups = Vec::new();
+        for (group, descriptor) in descriptors {
+            let block_bitmap = match descriptor.block_bitmap_initialization() {
+                AllocationBitmapInitialization::Initialized => {
+                    read_allocation_bitmap(reader, superblock, descriptor.block_bitmap())?
+                }
+                AllocationBitmapInitialization::Uninitialized => {
+                    materialize_uninitialized_block_bitmap(superblock, group, &layouts)?
+                }
+            };
+            let inode_bitmap = match descriptor.inode_bitmap_initialization() {
+                AllocationBitmapInitialization::Initialized => {
+                    read_allocation_bitmap(reader, superblock, descriptor.inode_bitmap())?
+                }
+                AllocationBitmapInitialization::Uninitialized => {
+                    materialize_uninitialized_inode_bitmap(superblock, group)?
+                }
+            };
             groups.try_push(GroupAllocationSnapshot {
                 group,
                 descriptor,
@@ -73,6 +91,31 @@ struct GroupAllocationSnapshot {
     block_bitmap: Vec<u8>,
     /// Inode allocation bitmap block.
     inode_bitmap: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Static metadata locations selected by one block-group descriptor.
+pub(super) struct GroupMetadataLayout {
+    /// Block group whose descriptor selected these locations.
+    group: BlockGroupId,
+    /// Block allocation bitmap block.
+    block_bitmap: BlockAddress,
+    /// Inode allocation bitmap block.
+    inode_bitmap: BlockAddress,
+    /// First inode-table block.
+    inode_table: BlockAddress,
+}
+
+impl GroupMetadataLayout {
+    /// Captures the static layout fields from a verified descriptor.
+    fn from_descriptor(group: BlockGroupId, descriptor: &BlockGroupDescriptor) -> Self {
+        Self {
+            group,
+            block_bitmap: descriptor.block_bitmap(),
+            inode_bitmap: descriptor.inode_bitmap(),
+            inode_table: descriptor.inode_table(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -417,19 +460,167 @@ impl ClusterReferenceIndex {
     }
 }
 
-/// Reads one allocation bitmap block into a fallibly allocated image.
+/// Reads all static group layouts without treating bitmap contents as authoritative.
+/// # Errors
+///
+/// Returns an error when block-group geometry, descriptor validation, or allocation fails.
+pub(super) fn read_group_metadata_layouts(
+    reader: &mut OperationDevice<'_>,
+    superblock: &Superblock,
+) -> Result<Vec<GroupMetadataLayout>> {
+    let group_count = superblock.block_group_count()?;
+    let mut layouts = Vec::new();
+    for group in 0..group_count.as_u32() {
+        let group = BlockGroupId::from_u32(group);
+        let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
+        layouts.try_push(GroupMetadataLayout::from_descriptor(group, &descriptor))?;
+    }
+    Ok(layouts)
+}
+
+/// Derives the semantic contents of a block bitmap whose descriptor carries `BLOCK_UNINIT`.
+///
+/// An uninitialized on-disk block is not an all-free bitmap. ext4 derives its used clusters from
+/// the superblock copies, descriptor tables and every descriptor-selected bitmap and inode table.
+/// # Errors
+///
+/// Returns an error when metadata geometry is outside the filesystem or bitmap construction fails.
+pub(super) fn materialize_uninitialized_block_bitmap(
+    superblock: &Superblock,
+    group: BlockGroupId,
+    layouts: &[GroupMetadataLayout],
+) -> Result<Vec<u8>> {
+    let mut bytes = empty_allocation_bitmap(superblock)?;
+    let clusters_in_group = superblock.clusters_in_group(group)?;
+    reserve_bitmap_padding(
+        &mut bytes,
+        clusters_in_group,
+        superblock.clusters_per_group().as_u32(),
+    )?;
+
+    if group_has_superblock(superblock, group) {
+        let superblock_block = group_start_block(superblock, group)?;
+        let metadata_blocks = 1_u64
+            .checked_add(descriptor_table_blocks(superblock)?)
+            .and_then(|count| count.checked_add(superblock.reserved_gdt_blocks().as_u64()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        for offset in 0..metadata_blocks {
+            mark_metadata_block(
+                &mut bytes,
+                superblock,
+                group,
+                BlockAddress::new(
+                    superblock_block
+                        .get()
+                        .checked_add(offset)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                ),
+            )?;
+        }
+    }
+
+    for layout in layouts {
+        mark_metadata_block(&mut bytes, superblock, group, layout.block_bitmap)?;
+        mark_metadata_block(&mut bytes, superblock, group, layout.inode_bitmap)?;
+        for offset in 0..inode_table_blocks(superblock, layout.group)? {
+            mark_metadata_block(
+                &mut bytes,
+                superblock,
+                group,
+                BlockAddress::new(
+                    layout
+                        .inode_table
+                        .get()
+                        .checked_add(offset)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                ),
+            )?;
+        }
+    }
+    Ok(bytes)
+}
+
+/// Derives the semantic contents of an inode bitmap whose descriptor carries `INODE_UNINIT`.
+/// # Errors
+///
+/// Returns an error when inode geometry or bitmap construction is invalid.
+pub(super) fn materialize_uninitialized_inode_bitmap(
+    superblock: &Superblock,
+    group: BlockGroupId,
+) -> Result<Vec<u8>> {
+    let mut bytes = empty_allocation_bitmap(superblock)?;
+    let inodes_in_group = inode_count_in_group(superblock, group)?;
+    reserve_bitmap_padding(
+        &mut bytes,
+        inodes_in_group,
+        superblock.inodes_per_group().as_u32(),
+    )?;
+    if group.as_u32() == 0 {
+        let reserved = superblock
+            .first_inode()
+            .as_u32()
+            .checked_sub(1)
+            .ok_or(Error::InvalidSuperblock)?;
+        for bit in 0..core::cmp::min(reserved, inodes_in_group) {
+            set_bitmap_bit(&mut bytes, bit, BitmapBitState::Used)?;
+        }
+    }
+    Ok(bytes)
+}
+
+/// Marks one metadata block in the bitmap when its allocation cluster belongs to `bitmap_group`.
+/// # Errors
+///
+/// Returns an error when the metadata block or its bitmap position is outside mounted geometry.
+fn mark_metadata_block(
+    bytes: &mut [u8],
+    superblock: &Superblock,
+    bitmap_group: BlockGroupId,
+    block: BlockAddress,
+) -> Result<()> {
+    let cluster = superblock.cluster_of_block(block)?;
+    if superblock.cluster_group_of(cluster)? != bitmap_group {
+        return Ok(());
+    }
+    let position = ClusterBitmapPosition::from_cluster(superblock, cluster)?;
+    set_cluster_bitmap_bit(bytes, position, BitmapBitState::Used)
+}
+
+/// Marks bitmap bits outside the populated tail of a partial group as unavailable.
+/// # Errors
+///
+/// Returns an error when the bitmap domain exceeds its allocated byte image.
+fn reserve_bitmap_padding(bytes: &mut [u8], populated: u32, capacity: u32) -> Result<()> {
+    if populated > capacity {
+        return Err(Error::InvalidSuperblock);
+    }
+    for bit in populated..capacity {
+        set_bitmap_bit(bytes, bit, BitmapBitState::Used)?;
+    }
+    Ok(())
+}
+
+/// Allocates one zero-filled bitmap block.
+/// # Errors
+///
+/// Returns an error when the block byte count cannot be represented or allocated.
+fn empty_allocation_bitmap(superblock: &Superblock) -> Result<Vec<u8>> {
+    memory::repeated_vec(
+        0_u8,
+        usize::try_from(superblock.block_size().bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+    )
+}
+
+/// Reads one initialized allocation bitmap block into a fallibly allocated image.
 /// # Errors
 ///
 /// Returns an error when the bitmap byte count cannot be represented or the block cannot be read.
-fn read_allocation_bitmap(
+pub(super) fn read_allocation_bitmap(
     reader: &mut OperationDevice<'_>,
     superblock: &Superblock,
     block: BlockAddress,
 ) -> Result<Vec<u8>> {
-    let mut bytes = memory::repeated_vec(
-        0_u8,
-        usize::try_from(superblock.block_size().bytes()).map_err(|_| Error::ArithmeticOverflow)?,
-    )?;
+    let mut bytes = empty_allocation_bitmap(superblock)?;
     reader.read_exact_at(superblock.block_size().offset_of(block)?, &mut bytes)?;
     Ok(bytes)
 }
