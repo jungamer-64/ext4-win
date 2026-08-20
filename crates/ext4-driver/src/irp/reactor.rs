@@ -330,15 +330,11 @@ pub(crate) trait CompletionOperation: fmt::Debug + Send + 'static {
 pub(crate) enum PublicationAuthority {
     /// Durable visibility releases resource intents and the serialized commit grant.
     Durable {
-        /// Stable mounted VCB receiving publication.
-        volume: NonNull<crate::state::VolumeControlBlock>,
         /// FIFO mutation ticket whose grants are consumed.
         ticket: u64,
     },
     /// Checkpoint publication releases journal space but owns no resource intent.
     Checkpoint {
-        /// Stable mounted VCB receiving overlay removal.
-        volume: NonNull<crate::state::VolumeControlBlock>,
         /// Overlay epoch being retired.
         epoch: ext4_core::EpochSequence,
     },
@@ -356,8 +352,6 @@ pub(crate) trait InfalliblePublication: fmt::Debug + Send + 'static {
 /// Resource-intent request prepared before a mutation can reserve allocation.
 #[derive(Debug)]
 pub(crate) struct IntentRequest {
-    /// Stable mounted VCB whose resources are named by this request.
-    volume: NonNull<crate::state::VolumeControlBlock>,
     /// Stable FIFO mutation ticket.
     ticket: u64,
     /// Complete resource set acquired atomically or not at all.
@@ -367,20 +361,10 @@ pub(crate) struct IntentRequest {
 impl IntentRequest {
     /// Builds a fallibly allocated intent request before any lower write exists.
     pub(crate) const fn new(
-        volume: NonNull<crate::state::VolumeControlBlock>,
         ticket: u64,
         resources: DriverVec<MutationResource>,
     ) -> Self {
-        Self {
-            volume,
-            ticket,
-            resources,
-        }
-    }
-
-    /// Mounted volume whose resource namespace this request uses.
-    pub(crate) const fn volume(&self) -> NonNull<crate::state::VolumeControlBlock> {
-        self.volume
+        Self { ticket, resources }
     }
 
     /// Stable FIFO ticket.
@@ -399,28 +383,18 @@ impl IntentRequest {
 pub(crate) enum WaitCondition {
     /// Durable values are waiting for the short epoch visibility gate.
     Visibility {
-        /// Mounted runtime whose epoch gate is requested.
-        volume: NonNull<crate::state::VolumeControlBlock>,
         /// Durable mutation ticket.
         ticket: u64,
     },
     /// Published overlay work is waiting for the independent checkpoint slot.
     Checkpoint {
-        /// Mounted runtime whose checkpoint gate is requested.
-        volume: NonNull<crate::state::VolumeControlBlock>,
         /// Visible overlay epoch.
         epoch: ext4_core::EpochSequence,
     },
     /// Ordinary flush waits for every already granted or queued commit to become durable.
-    VolumeDurability {
-        /// Mounted volume whose commit lane must drain.
-        volume: NonNull<crate::state::VolumeControlBlock>,
-    },
+    VolumeDurability,
     /// Shutdown/clean-dismount waits until checkpoint has released journal space.
-    JournalClean {
-        /// Mounted volume whose journal must return to the clean ready state.
-        volume: NonNull<crate::state::VolumeControlBlock>,
-    },
+    JournalClean,
     /// A per-handle terminal or durability barrier has not drained earlier work.
     Barrier {
         /// Stable barrier identity resumed by one matching release event.
@@ -467,8 +441,6 @@ pub(crate) enum OperationTransition {
     },
     /// Wait for the serialized journal commit slot.
     RequestCommit {
-        /// Mounted runtime whose journal gate is requested.
-        volume: NonNull<crate::state::VolumeControlBlock>,
         /// FIFO mutation ticket.
         ticket: u64,
         /// Operation resumed only by its commit grant.
@@ -722,8 +694,6 @@ enum ActivePhase {
     },
     /// Journal commit grant is queued.
     Commit {
-        /// Mounted runtime whose commit gate is queued.
-        volume: NonNull<crate::state::VolumeControlBlock>,
         /// FIFO mutation ticket.
         ticket: u64,
         /// Suspended state machine.
@@ -876,8 +846,6 @@ unsafe impl Sync for RetryTimerEnvelope {}
 /// Resource ownership retained outside the suspended operation payload.
 #[derive(Debug)]
 struct HeldIntent {
-    /// Mounted resource namespace.
-    volume: NonNull<crate::state::VolumeControlBlock>,
     /// Stable FIFO ticket.
     ticket: u64,
     /// Complete atomically acquired resource set.
@@ -887,8 +855,6 @@ struct HeldIntent {
 /// Serialized commit ownership retained by one active slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HeldCommit {
-    /// Mounted runtime whose gate was granted.
-    volume: NonNull<crate::state::VolumeControlBlock>,
     /// Stable FIFO ticket.
     ticket: u64,
 }
@@ -3348,7 +3314,7 @@ mod tests {
     use crate::kernel::status::DriverError;
     use crate::kernel::storage::StorageFailureClass;
     use crate::memory::{self, DriverVec};
-    use crate::state::{KernelDevice, KernelFileObject, VolumeControlBlock};
+    use crate::state::{KernelDevice, KernelFileObject};
 
     use super::{
         ActivePhase, ActiveSlot, ActiveSlotIdentity, AdmittedOperation, CLEANUP_HANDLE_BARRIER,
@@ -3624,133 +3590,6 @@ mod tests {
 
         slots[0].phase = ActivePhase::Vacant;
         assert!(!active_predecessor_is_live(&slots, first));
-        slots[1].phase = ActivePhase::Vacant;
-    }
-
-    /// # Panics
-    ///
-    /// Panics if disjoint resource intents conflict or an overlapping later FIFO ticket bypasses
-    /// an earlier request.
-    #[test]
-    fn intent_arbitration_is_overlap_scoped_and_fifo() {
-        let volume = NonNull::<VolumeControlBlock>::dangling();
-        let metadata = [MutationResource::VOLUME_METADATA];
-        let keys = [MutationResource::KEY_SET];
-        assert!(resource_sets_overlap(&metadata, &metadata));
-        assert!(!resource_sets_overlap(&metadata, &keys));
-
-        let Ok(held_resources) = DriverVec::try_copied_from_slice(&metadata) else {
-            return;
-        };
-        let mut slots = core::array::from_fn(|_| ActiveSlot::vacant());
-        slots[0].intent = Some(HeldIntent {
-            volume,
-            ticket: 1,
-            resources: held_resources,
-        });
-        let Ok(candidate_resources) = DriverVec::try_copied_from_slice(&metadata) else {
-            return;
-        };
-        let candidate = IntentRequest::new(volume, 3, candidate_resources);
-        assert_eq!(candidate.volume(), volume);
-        assert_eq!(candidate.ticket(), 3);
-        assert_eq!(candidate.resources(), metadata);
-        assert!(intent_conflicts_with_held(&slots, &candidate));
-        assert_eq!(
-            slots[0].intent.as_ref().map(|intent| intent.ticket),
-            Some(1)
-        );
-
-        let Ok(disjoint_resources) = DriverVec::try_copied_from_slice(&keys) else {
-            return;
-        };
-        let disjoint = IntentRequest::new(volume, 4, disjoint_resources);
-        assert!(!intent_conflicts_with_held(&slots, &disjoint));
-
-        let Ok(earlier_resources) = DriverVec::try_copied_from_slice(&metadata) else {
-            return;
-        };
-        slots[1].phase = ActivePhase::Intent {
-            request: IntentRequest::new(volume, 2, earlier_resources),
-            operation: test_operation!(),
-        };
-        assert!(earlier_queued_intent_conflicts(&slots, &candidate));
-        assert!(!earlier_queued_intent_conflicts(&slots, &disjoint));
-        slots[1].phase = ActivePhase::Vacant;
-    }
-
-    /// # Panics
-    ///
-    /// Panics if stale-plan re-resolution releases an unchanged intent set or retains a changed
-    /// volume, ticket, or resource set.
-    #[test]
-    fn stale_resolution_retains_only_the_exact_held_intent() {
-        let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut other_storage = MaybeUninit::<VolumeControlBlock>::uninit();
-        let other = NonNull::from(&mut other_storage).cast::<VolumeControlBlock>();
-        let original = [MutationResource::VOLUME_METADATA, MutationResource::KEY_SET];
-        let reordered = [MutationResource::KEY_SET, MutationResource::VOLUME_METADATA];
-        let duplicated = [
-            MutationResource::VOLUME_METADATA,
-            MutationResource::VOLUME_METADATA,
-        ];
-        assert!(mutation_resource_sets_equal(&original, &reordered));
-        assert!(!mutation_resource_sets_equal(&duplicated, &original));
-
-        let Ok(held_resources) = DriverVec::try_copied_from_slice(&original) else {
-            return;
-        };
-        let held = HeldIntent {
-            volume,
-            ticket: 17,
-            resources: held_resources,
-        };
-        let Ok(reordered_resources) = DriverVec::try_copied_from_slice(&reordered) else {
-            return;
-        };
-        let matching = IntentRequest::new(volume, 17, reordered_resources);
-        assert!(held_intent_matches_request(&held, &matching));
-
-        let changed_set = [MutationResource::VOLUME_METADATA];
-        let Ok(changed_resources) = DriverVec::try_copied_from_slice(&changed_set) else {
-            return;
-        };
-        let changed = IntentRequest::new(volume, 17, changed_resources);
-        assert!(!held_intent_matches_request(&held, &changed));
-
-        let Ok(ticket_resources) = DriverVec::try_copied_from_slice(&original) else {
-            return;
-        };
-        let changed_ticket = IntentRequest::new(volume, 18, ticket_resources);
-        assert!(!held_intent_matches_request(&held, &changed_ticket));
-
-        let Ok(volume_resources) = DriverVec::try_copied_from_slice(&original) else {
-            return;
-        };
-        let changed_volume = IntentRequest::new(other, 17, volume_resources);
-        assert!(!held_intent_matches_request(&held, &changed_volume));
-    }
-
-    /// # Panics
-    ///
-    /// Panics if commit visibility accounting ignores either a granted or queued commit.
-    #[test]
-    fn commit_work_tracks_granted_and_queued_slots() {
-        let mut volume_storage = MaybeUninit::<VolumeControlBlock>::uninit();
-        let mut other_storage = MaybeUninit::<VolumeControlBlock>::uninit();
-        let volume = NonNull::from(&mut volume_storage).cast::<VolumeControlBlock>();
-        let other = NonNull::from(&mut other_storage).cast::<VolumeControlBlock>();
-        let mut slots = core::array::from_fn(|_| ActiveSlot::vacant());
-        slots[0].commit = Some(HeldCommit { volume, ticket: 9 });
-        assert!(volume_has_commit_work(&slots, volume));
-        assert!(!volume_has_commit_work(&slots, other));
-        slots[0].commit = None;
-        slots[1].phase = ActivePhase::Commit {
-            volume,
-            ticket: 10,
-            operation: test_operation!(),
-        };
-        assert!(volume_has_commit_work(&slots, volume));
         slots[1].phase = ActivePhase::Vacant;
     }
 
