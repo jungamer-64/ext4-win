@@ -295,7 +295,6 @@ impl XattrSet {
     }
 
     /// Returns entries in stable xattr name order.
-    #[must_use]
     pub fn entries(&self) -> impl ExactSizeIterator<Item = (&XattrName, &XattrValue)> {
         self.entries.iter().map(|entry| (&entry.name, &entry.value))
     }

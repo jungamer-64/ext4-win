@@ -12,6 +12,12 @@ const UNVERIFIED_ARTIFACT_ID: &str = "00000000000000000000000000000000";
 /// Linker-visible symbol that keeps the artifact marker in the final PE image.
 const ARTIFACT_ID_SYMBOL: &str = "EXT4WIN_PRODUCTION_ARTIFACT_ID";
 
+/// File generated into Cargo's build output and embedded verbatim in the driver image.
+const ARTIFACT_ID_RECORD_FILE: &str = "artifact-identity.bin";
+
+/// Prefix shared with the production reachability verifier.
+const ARTIFACT_ID_MARKER: &str = "EXT4WIN_ARTIFACT_ID=";
+
 fn main() -> Result<(), Box<dyn Error>> {
     const SECURITY_CAPTURE_SOURCE: &str = "native/security_capture.c";
     const DATA_TRANSFER_SOURCE: &str = "native/data_transfer.c";
@@ -24,6 +30,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let artifact_id = production_artifact_id()?;
     println!("cargo:rustc-env={ARTIFACT_ID_ENVIRONMENT}={artifact_id}");
+    write_artifact_identity_record(&artifact_id)?;
 
     let config = wdk_build::Config::from_env_auto()?;
     config.configure_binary_build()?;
@@ -55,6 +62,25 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     native.compile("ext4win_security_capture");
     Ok(())
+}
+
+/// Writes the exact bytes later embedded at the linker-visible identity symbol.
+///
+/// # Errors
+///
+/// Returns an environment or I/O error when Cargo's output directory cannot be resolved or
+/// written.
+fn write_artifact_identity_record(artifact_id: &str) -> Result<(), io::Error> {
+    let out_directory =
+        PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Cargo did not provide OUT_DIR")
+        })?);
+    let mut record = String::from(ARTIFACT_ID_MARKER);
+    record.push_str(artifact_id);
+    fs::write(
+        out_directory.join(ARTIFACT_ID_RECORD_FILE),
+        record.as_bytes(),
+    )
 }
 
 /// Validates the externally supplied artifact identity or selects the fail-closed sentinel.
