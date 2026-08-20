@@ -5,6 +5,7 @@ members = [
     "tools/production-reachability",
     "tools/xtask",
 ]
+exclude = ["fuzz"]
 default-members = [
     "crates/ext4-core",
     "tools/production-reachability",
