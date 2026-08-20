@@ -7,7 +7,7 @@ use crate::kernel::status::{DriverError, DriverResult};
 use core::ptr::NonNull;
 
 use crate::state::{
-    KernelDevice, KernelFileObject, KernelVpb, MountedVolumeDevice, OpenedFileObject, OpenedVolume,
+    KernelDevice, KernelFileObject, KernelVpb, MountedVolumeAccess, OpenedFileObject, OpenedVolume,
     VolumeControlBlock,
 };
 
@@ -115,7 +115,10 @@ pub(crate) fn classify(
 /// # Errors
 ///
 /// Returns an error for malformed FILE_OBJECT state, a volume lock owned elsewhere, or dismount.
-pub(crate) fn authorize_path_handle(request: &mut PendingIrpLease<'_>) -> DriverResult<()> {
+pub(crate) fn authorize_path_handle(
+    request: &mut PendingIrpLease<'_>,
+    operations: &MountedVolumeAccess<'_>,
+) -> DriverResult<()> {
     let (volume, file_object) = request.with_active(|active| {
         let opened = OpenedFileObject::decode(active.current_stack()?.file_object()?)?;
         Ok::<_, DriverError>(match opened {
@@ -123,11 +126,9 @@ pub(crate) fn authorize_path_handle(request: &mut PendingIrpLease<'_>) -> Driver
             OpenedFileObject::Volume(opened) => (opened.volume(), opened.file_object()),
         })
     })?;
-    let operations = unsafe {
-        // SAFETY: Authorization is a non-suspending reactor-thread projection and no reference is
-        // retained by the operation.
-        VolumeControlBlock::operation_access(volume)
-    };
+    if !operations.owns_volume(volume) {
+        crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption().bugcheck();
+    }
     operations.authorize_handle(file_object)
 }
 
@@ -146,10 +147,6 @@ pub(crate) fn direct_volume_target(
         let device = active.device();
         let opened = OpenedVolume::decode(active.current_stack()?.file_object()?)?;
         let volume = opened.volume();
-        if MountedVolumeDevice::vcb(device) != Some(volume) {
-            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
-                .bugcheck();
-        }
         Ok(DirectVolumeTarget {
             device,
             volume,

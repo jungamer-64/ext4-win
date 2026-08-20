@@ -22,8 +22,11 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ext4_core::{
-    CompletedMount, DirectoryNodeId, Ext4Name, FileNodeId, FileOffset, MutationResolvePass,
-    NewDirectoryMetadata, NewFileMetadata, NodeId, WindowsName, XattrName, XattrValue,
+    CleanJournalDurability, CommitLease, CommitReadyMutation, CompletedMount, DirectoryNodeId,
+    DurableMutation, Ext4Name, FileNodeId, FileOffset, FscryptKeyIdentifier, FscryptKeyPresence,
+    MountedProfile, MutationLease, MutationResolvePass, NewDirectoryMetadata, NewFileMetadata,
+    NodeId, ReservedMutation, ResolvedMutation, VisibilityLease, VolumeGeometry, VolumeIdentity,
+    WindowsName, XattrName, XattrValue,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, LARGE_INTEGER, PDEVICE_OBJECT,
@@ -32,15 +35,17 @@ use wdk_sys::{
 #[cfg(not(test))]
 use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 
+use crate::irp::reactor::ReactorTarget;
 use crate::irp::{
     ActiveFileObject, ByteRangeLockKey, CompletionReactor, CreateDeletion, DataIoKind,
     DeleteAccess, DesiredAccess, DirectoryEntryIndex, DispatchTarget, ExistingOperationAccess,
     FileAttributesWriteAccess, RegularFileWriteAccess, RequestorProcess, ShareAccess,
 };
+use crate::kernel::cng::CngOperation;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::kernel::storage::MountedStorage;
+use crate::kernel::storage::{MountedStorage, MountedStorageRoute};
 use crate::memory::{self, DriverVec};
 
 /// Non-null kernel device object pointer at the WDK boundary.
@@ -499,6 +504,7 @@ impl ControlDeviceExtension {
             CompletionReactor::initialize_at(
                 core::ptr::addr_of_mut!(extension.header.reactor),
                 device,
+                ReactorTarget::ControlDevice,
             )
         }
     }
@@ -525,7 +531,11 @@ impl ControlDeviceExtension {
         };
         unsafe {
             // SAFETY: Teardown has exclusive access to the extension.
-            CompletionReactor::release_at(core::ptr::addr_of_mut!(extension.header.reactor));
+            let target =
+                CompletionReactor::release_at(core::ptr::addr_of_mut!(extension.header.reactor));
+            if !matches!(target, ReactorTarget::ControlDevice) {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            }
         }
     }
 }
@@ -936,19 +946,43 @@ impl MountedVolumeRef {
     }
 }
 
-/// Reactor-thread access to one stable mounted VCB.
-///
-/// Multiple suspended operations may retain this identity, but only the reactor thread may call
-/// its projection methods and no projection may cross an operation transition.
-pub(crate) struct VolumeAccess {
-    /// Mounted VCB that owns the projected runtime and control-plane ledger.
-    owner: MountedVolumeRef,
-    /// Mounted runtime projected without borrowing the whole VCB.
-    runtime: NonNull<VolumeRuntime>,
-    /// Volume lifecycle projected under the same unique actor authority.
-    control: NonNull<VolumeControlPlane>,
-    /// FCB ledger used only to count active namespace handles during volume lock.
-    file_control_blocks: NonNull<FileControlBlockLedger>,
+/// Non-cloneable mounted-volume authority owned only by the WDK reactor shell.
+#[derive(Debug)]
+pub(crate) struct MountedVolumeBinding {
+    /// Heap-stable VCB whose unique actor access is projected by [`Self::with_access`].
+    volume: Box<VolumeControlBlock>,
+}
+
+impl MountedVolumeBinding {
+    /// Takes sole reactor ownership of a completed mounted VCB.
+    pub(crate) const fn new(volume: Box<VolumeControlBlock>) -> Self {
+        Self { volume }
+    }
+
+    /// Runs one non-suspending reactor transition with lifetime-bound mounted access.
+    pub(crate) fn with_access<R>(
+        &mut self,
+        transition: impl FnOnce(&mut MountedVolumeAccess<'_>) -> R,
+    ) -> R {
+        transition(&mut MountedVolumeAccess {
+            volume: self.volume.as_mut(),
+        })
+    }
+
+    /// Returns the VCB to terminal mounted-device teardown after reactor drain.
+    pub(crate) fn into_volume(self) -> Box<VolumeControlBlock> {
+        self.volume
+    }
+}
+
+// SAFETY: The binding moves once into the device reactor. Only that reactor's sole actor thread
+// calls `with_access`, and teardown recovers the Box only after the actor and completions drain.
+unsafe impl Send for MountedVolumeBinding {}
+
+/// Lifetime-bound mounted VCB access available only inside one reactor callback.
+pub(crate) struct MountedVolumeAccess<'volume> {
+    /// Unique VCB borrow that cannot cross a scheduler transition or lower submission.
+    volume: &'volume mut VolumeControlBlock,
 }
 
 /// VPB-visible effect produced when a direct-volume handle is cleaned up.
@@ -1024,7 +1058,17 @@ impl VolumeCloseOutcome {
     }
 }
 
-impl VolumeAccess {
+impl MountedVolumeAccess<'_> {
+    /// Returns the stable raw identity stored in FCB and open-handle lifetime records.
+    pub(crate) fn file_object_owner(&mut self) -> NonNull<VolumeControlBlock> {
+        NonNull::from(&mut *self.volume)
+    }
+
+    /// Checks that a lifetime record belongs to this device-local mounted binding.
+    pub(crate) fn owns_volume(&self, candidate: NonNull<VolumeControlBlock>) -> bool {
+        NonNull::from(&*self.volume) == candidate
+    }
+
     /// Records one direct-volume FILE_OBJECT share claim.
     /// # Errors
     ///
@@ -1035,10 +1079,7 @@ impl VolumeAccess {
         desired_access: DesiredAccess,
         share_access: ShareAccess,
     ) -> DriverResult<()> {
-        let control = unsafe {
-            // SAFETY: This non-cloneable actor lease uniquely owns volume-handle transitions.
-            self.control.as_mut()
-        };
+        let control = &mut self.volume.volume_control;
         control.state.authorize_create()?;
         let next_count = control
             .volume_file_objects
@@ -1056,10 +1097,7 @@ impl VolumeAccess {
         &mut self,
         file_object: KernelFileObject,
     ) -> VolumeHandleCleanup {
-        let control = unsafe {
-            // SAFETY: This non-cloneable actor lease uniquely owns volume-handle transitions.
-            self.control.as_mut()
-        };
+        let control = &mut self.volume.volume_control;
         control.handles.cleanup(file_object);
         let (state, effect) = control.state.cleanup(file_object);
         control.state = state;
@@ -1073,10 +1111,7 @@ impl VolumeAccess {
         release_plan: CloseReleasePlan,
     ) -> VolumeCloseOutcome {
         let cleanup = {
-            let control = unsafe {
-                // SAFETY: This non-cloneable actor lease uniquely owns volume-handle transitions.
-                self.control.as_mut()
-            };
+            let control = &mut self.volume.volume_control;
             let cleanup = match release_plan {
                 CloseReleasePlan::CleanedHandle => VolumeHandleCleanup::Released,
                 CloseReleasePlan::CancelledOpen => {
@@ -1107,15 +1142,8 @@ impl VolumeAccess {
 
     /// Atomically moves the actor-owned volume into its one physical-retirement transition.
     fn begin_retirement(&mut self) -> VolumeRetirement {
-        let namespace_empty = unsafe {
-            // SAFETY: The VCB retains the synchronized ledger throughout this actor lease.
-            self.file_control_blocks.as_ref()
-        }
-        .is_empty();
-        let control = unsafe {
-            // SAFETY: This non-cloneable actor lease uniquely owns lifecycle transitions.
-            self.control.as_mut()
-        };
+        let namespace_empty = self.volume.file_control_blocks.is_empty();
+        let control = &mut self.volume.volume_control;
         let (state, retirement) = control
             .state
             .retire_if_unreferenced(namespace_empty, control.volume_file_objects);
@@ -1132,16 +1160,9 @@ impl VolumeAccess {
         &self,
         owner: KernelFileObject,
     ) -> DriverResult<PreparedVolumeStateTransition> {
-        let control = unsafe {
-            // SAFETY: The stable VCB retains its control plane throughout reactor processing.
-            self.control.as_ref()
-        };
+        let control = &self.volume.volume_control;
         let next_state = control.state.lock(owner)?;
-        let namespace_handles = unsafe {
-            // SAFETY: The heap-stable VCB retains this ledger throughout the actor lease.
-            self.file_control_blocks.as_ref()
-        }
-        .active_handle_count();
+        let namespace_handles = self.volume.file_control_blocks.active_handle_count();
         if namespace_handles != 0 || control.handles.active_handle_count() != 1 {
             return Err(DriverError::AccessDenied);
         }
@@ -1158,10 +1179,7 @@ impl VolumeAccess {
     ///
     /// Returns not-locked when this FILE_OBJECT is not the current lock owner.
     pub(crate) fn unlock_volume(&mut self, owner: KernelFileObject) -> DriverResult<()> {
-        let control = unsafe {
-            // SAFETY: This non-cloneable actor lease uniquely owns volume lifecycle transitions.
-            self.control.as_mut()
-        };
+        let control = &mut self.volume.volume_control;
         control.state = control.state.unlock(owner)?;
         Ok(())
     }
@@ -1175,10 +1193,7 @@ impl VolumeAccess {
         &mut self,
         owner: KernelFileObject,
     ) -> DriverResult<PreparedVolumeStateTransition> {
-        let control = unsafe {
-            // SAFETY: This non-cloneable actor lease uniquely owns volume lifecycle transitions.
-            self.control.as_mut()
-        };
+        let control = &mut self.volume.volume_control;
         control.state = control.state.begin_dismount(owner)?;
         Ok(PreparedVolumeStateTransition {
             kind: PreparedVolumeStateTransitionKind::CleanClose {
@@ -1192,10 +1207,7 @@ impl VolumeAccess {
     ///
     /// Returns volume dismounted when another terminal close already began.
     pub(crate) fn prepare_shutdown(&mut self) -> DriverResult<PreparedVolumeStateTransition> {
-        let control = unsafe {
-            // SAFETY: This non-cloneable actor lease uniquely owns volume lifecycle transitions.
-            self.control.as_mut()
-        };
+        let control = &mut self.volume.volume_control;
         control.state = control.state.begin_shutdown()?;
         Ok(PreparedVolumeStateTransition {
             kind: PreparedVolumeStateTransitionKind::CleanClose {
@@ -1209,10 +1221,7 @@ impl VolumeAccess {
         &mut self,
         transition: PreparedVolumeStateTransition,
     ) {
-        let control = unsafe {
-            // SAFETY: Only the reactor thread publishes volume lifecycle transitions.
-            self.control.as_mut()
-        };
+        let control = &mut self.volume.volume_control;
         match transition.kind {
             PreparedVolumeStateTransitionKind::Lock { expected, next } => {
                 if control.state != expected {
@@ -1233,12 +1242,7 @@ impl VolumeAccess {
     ///
     /// Returns volume dismounted after a successful forced dismount.
     pub(crate) fn ensure_mounted(&self) -> DriverResult<()> {
-        unsafe {
-            // SAFETY: The actor lease keeps the heap-stable volume control plane live.
-            self.control.as_ref()
-        }
-        .state
-        .ensure_mounted()
+        self.volume.volume_control.state.ensure_mounted()
     }
 
     /// Authorizes creation of a new FILE_OBJECT against the current volume state.
@@ -1246,12 +1250,7 @@ impl VolumeAccess {
     ///
     /// Returns access denied while locked or volume dismounted after terminal dismount.
     pub(crate) fn authorize_create(&self) -> DriverResult<()> {
-        unsafe {
-            // SAFETY: The actor lease keeps the heap-stable volume control plane live.
-            self.control.as_ref()
-        }
-        .state
-        .authorize_create()
+        self.volume.volume_control.state.authorize_create()
     }
 
     /// Authorizes one ordinary handle operation against the current volume state.
@@ -1260,12 +1259,10 @@ impl VolumeAccess {
     /// Returns access denied when another handle owns the lock, or volume dismounted after
     /// terminal logical dismount.
     pub(crate) fn authorize_handle(&self, file_object: KernelFileObject) -> DriverResult<()> {
-        unsafe {
-            // SAFETY: The actor lease keeps the heap-stable volume control plane live.
-            self.control.as_ref()
-        }
-        .state
-        .authorize_handle(file_object)
+        self.volume
+            .volume_control
+            .state
+            .authorize_handle(file_object)
     }
 
     /// Rejects namespace traversal through an inode that is delete-pending.
@@ -1273,11 +1270,7 @@ impl VolumeAccess {
     ///
     /// Returns delete-pending while an open FCB owns a deferred deletion for `node`.
     pub(crate) fn ensure_node_openable(&self, node: NodeId) -> DriverResult<()> {
-        let ledger = unsafe {
-            // SAFETY: The mounted VCB and its independently synchronized ledger remain live for
-            // this actor lease.
-            self.file_control_blocks.as_ref()
-        };
+        let ledger = &self.volume.file_control_blocks;
         if ledger.node_delete_pending(node) {
             Err(DriverError::DeletePending)
         } else {
@@ -1291,11 +1284,7 @@ impl VolumeAccess {
     /// Returns delete-pending for a terminal target or sharing-violation while any active handle
     /// could still reference an inode that replacement would unlink.
     pub(crate) fn ensure_node_replaceable(&self, node: NodeId) -> DriverResult<()> {
-        let ledger = unsafe {
-            // SAFETY: The mounted VCB and its independently synchronized ledger remain live for
-            // this actor lease.
-            self.file_control_blocks.as_ref()
-        };
+        let ledger = &self.volume.file_control_blocks;
         ledger.ensure_node_replaceable(node)
     }
 
@@ -1305,12 +1294,7 @@ impl VolumeAccess {
         fcb: NonNull<FileControlBlock>,
         target: NonNull<FileDeleteTarget>,
     ) {
-        unsafe {
-            // SAFETY: The mounted VCB and its synchronized ledger remain live, and this actor lease
-            // serializes deletion completion with every namespace operation.
-            self.file_control_blocks.as_ref()
-        }
-        .complete_delete(fcb, target);
+        self.volume.file_control_blocks.complete_delete(fcb, target);
     }
 
     /// Publishes a validated delete-pending target into one live FCB.
@@ -1319,38 +1303,190 @@ impl VolumeAccess {
         fcb: NonNull<FileControlBlock>,
         pending: PendingFileDeletion,
     ) {
-        unsafe {
-            // SAFETY: The mounted VCB and its synchronized ledger remain live, and this actor lease
-            // serializes the disposition mutation with every namespace operation.
-            self.file_control_blocks.as_ref()
-        }
-        .set_delete_pending(fcb, pending);
+        self.volume
+            .file_control_blocks
+            .set_delete_pending(fcb, pending);
     }
 
     /// Reports one committed namespace mutation through the mounted VCB notifier.
     pub(crate) fn report_directory_change(&self, change: DirectoryChange) {
-        let volume = unsafe {
-            // SAFETY: The actor lease retains the heap-stable mounted VCB for this request.
-            self.owner.as_non_null().as_ref()
-        };
-        volume.report_directory_change(change);
+        self.volume.report_directory_change(change);
     }
 
-    /// Borrows the mounted runtime for one non-suspending reactor transition.
-    pub(crate) fn runtime(&self) -> &VolumeRuntime {
+    /// Immutable mounted profile required to construct core operation state machines.
+    pub(crate) fn mounted_profile(&self) -> &MountedProfile {
+        self.volume.runtime.profile()
+    }
+
+    /// Validated lower-device route for one core storage request.
+    pub(crate) fn storage_route(&self) -> MountedStorageRoute {
+        self.volume.runtime.storage()
+    }
+
+    /// Allocates operation-local cryptographic state from the mounted providers.
+    /// # Errors
+    ///
+    /// Returns an error when CNG operation state cannot be allocated or initialized.
+    pub(crate) fn new_crypto_operation(&self) -> DriverResult<CngOperation> {
+        self.volume.runtime.crypto().try_new_operation()
+    }
+
+    /// Acquires one immutable committed epoch lease.
+    /// # Errors
+    ///
+    /// Returns an error when reads are no longer reliable or the bounded lease registry is full.
+    pub(crate) fn acquire_epoch(&mut self) -> DriverResult<EpochLease> {
+        self.volume.runtime.acquire_epoch()
+    }
+
+    /// Allocates one mutation ticket and active-mutation lifetime lease.
+    /// # Errors
+    ///
+    /// Returns an error when mutation is no longer authorized or bounded accounting overflows.
+    pub(crate) fn admit_mutation(&mut self) -> DriverResult<(u64, MutationActivityLease)> {
+        self.volume.runtime.admit_mutation()
+    }
+
+    /// Resolves one ephemeral core pass against the current mutation coordinator snapshot.
+    /// # Errors
+    ///
+    /// Returns a core mutation error when the pass cannot resolve against the current snapshot.
+    pub(crate) fn resolve_mutation(
+        &self,
+        pass: MutationResolvePass<'_, '_, '_>,
+        ticket: u64,
+    ) -> Result<ResolvedMutation, ext4_core::Error> {
+        pass.resolve(ticket, self.volume.runtime.coordinator())
+    }
+
+    /// Revalidates one resolved mutation under its granted resource intent.
+    /// # Errors
+    ///
+    /// Returns a core mutation error when revalidation no longer matches the granted intent.
+    pub(crate) fn reserve_mutation(
+        &self,
+        resolved: ResolvedMutation,
+        intent: MutationLease,
+    ) -> Result<ReservedMutation, ext4_core::Error> {
+        resolved.reserve(self.volume.runtime.coordinator(), intent)
+    }
+
+    /// Prepares a commit from the coordinator and current immutable epoch authorities.
+    /// # Errors
+    ///
+    /// Returns a core mutation error when commit preparation cannot consume the supplied grant.
+    pub(crate) fn prepare_mutation_commit(
+        &self,
+        reserved: ReservedMutation,
+        commit: CommitLease,
+    ) -> Result<CommitReadyMutation, ext4_core::Error> {
+        reserved.prepare_commit(
+            self.volume.runtime.coordinator(),
+            self.volume.runtime.current_epoch(),
+            commit,
+        )
+    }
+
+    /// Reserves both immutable epoch publication slots before the first lower write.
+    /// # Errors
+    ///
+    /// Returns an error when mutation is no longer authorized or bounded stable storage is full.
+    pub(crate) fn reserve_epoch_publication(&mut self) -> DriverResult<EpochPublicationSlots> {
         unsafe {
-            // SAFETY: The VCB remains stable and this reference cannot outlive the access borrow.
-            self.runtime.as_ref()
+            // SAFETY: MountedVolumeBinding owns this runtime at a stable Box address through drain.
+            self.volume.runtime.reserve_epoch_publication()
         }
     }
 
-    /// Borrows the mounted runtime mutably for one non-suspending reactor transition.
-    pub(crate) fn runtime_mut(&mut self) -> &mut VolumeRuntime {
-        unsafe {
-            // SAFETY: Only the sole reactor thread constructs active projection scopes, and the
-            // returned reference is tied to this unique access borrow.
-            self.runtime.as_mut()
-        }
+    /// Grants the serialized commit lane when its runtime preconditions are satisfied.
+    #[cfg(not(test))]
+    pub(crate) fn try_grant_commit(&mut self, ticket: u64) -> Option<CommitLease> {
+        self.volume.runtime.try_grant_commit(ticket)
+    }
+
+    /// Returns an unused pre-write commit grant to the runtime.
+    #[cfg(not(test))]
+    pub(crate) fn abandon_commit(&mut self, ticket: u64) {
+        self.volume.runtime.abandon_commit(ticket);
+    }
+
+    /// Grants the short durable-visibility publication lane.
+    #[cfg(not(test))]
+    pub(crate) fn try_grant_visibility(&mut self, ticket: u64) -> Option<VisibilityLease> {
+        self.volume.runtime.try_grant_visibility(ticket)
+    }
+
+    /// Grants the detached checkpoint lane for one visible epoch.
+    #[cfg(not(test))]
+    pub(crate) fn try_grant_checkpoint(
+        &mut self,
+        epoch: ext4_core::EpochSequence,
+    ) -> Option<ext4_core::CheckpointLease> {
+        self.volume.runtime.try_grant_checkpoint(epoch)
+    }
+
+    /// Reports whether no mutation or checkpoint owns journal space.
+    #[cfg(not(test))]
+    pub(crate) fn journal_is_clean(&self) -> bool {
+        self.volume.runtime.journal_is_clean()
+    }
+
+    /// Publishes one durable mutation into its pre-reserved immutable epoch slot.
+    pub(crate) fn publish_durable(
+        &mut self,
+        mutation: DurableMutation,
+        visibility: VisibilityLease,
+        durable_slot: EpochPublicationSlot,
+        checkpoint_slot: EpochPublicationSlot,
+    ) -> PendingCheckpoint {
+        self.volume
+            .runtime
+            .publish_durable(mutation, visibility, durable_slot, checkpoint_slot)
+    }
+
+    /// Publishes an overlay-free checkpoint and releases journal space.
+    pub(crate) fn publish_checkpoint(
+        &mut self,
+        durability: CleanJournalDurability,
+        publication: EpochPublicationSlot,
+        epoch: ext4_core::EpochSequence,
+    ) {
+        self.volume
+            .runtime
+            .publish_checkpoint(durability, publication, epoch);
+    }
+
+    /// Records a confirmed durable abort as a read-only transition.
+    pub(crate) fn record_durable_abort(&mut self) {
+        self.volume.runtime.record_durable_abort();
+    }
+
+    /// Records an unknown write or flush outcome requiring replay.
+    pub(crate) fn record_durability_unknown(&mut self) {
+        self.volume.runtime.record_durability_unknown();
+    }
+
+    /// Records that committed reads can no longer be trusted.
+    pub(crate) fn record_read_unreliable(&mut self) {
+        self.volume.runtime.record_read_unreliable();
+    }
+
+    /// Current committed volume identity.
+    pub(crate) fn volume_identity(&self) -> VolumeIdentity {
+        self.volume.runtime.identity()
+    }
+
+    /// Current committed allocation geometry.
+    pub(crate) fn volume_geometry(&self) -> VolumeGeometry {
+        self.volume.runtime.current_epoch().geometry()
+    }
+
+    /// Current committed fscrypt key presence.
+    pub(crate) fn fscrypt_key_presence(
+        &self,
+        identifier: FscryptKeyIdentifier,
+    ) -> FscryptKeyPresence {
+        self.volume.runtime.fscrypt_key_presence(identifier)
     }
 
     /// Stages a missing child in the current ephemeral mutation resolve pass.
@@ -1364,7 +1500,7 @@ impl VolumeAccess {
         name: &Ext4Name,
         target: ChildCreationTarget,
     ) -> DriverResult<PendingChildCreation> {
-        let owner = self.owner;
+        let owner = MountedVolumeRef::new(NonNull::from(&*self.volume));
         let file_control_blocks = unsafe {
             // SAFETY: `owner` stays live for the lease lifetime, so projecting the disjoint ledger
             // field produces a stable raw address.
@@ -2717,8 +2853,6 @@ impl VolumeSerialNumber {
 pub(crate) struct MountedVolumeDeviceExtension {
     /// Common driver-owned device extension header.
     header: DeviceExtensionHeader,
-    /// Heap-owned VCB for this mounted volume device.
-    vcb: *mut VolumeControlBlock,
     /// Mount-preallocated work item that performs actor-safe physical retirement.
     retirement_work_item: wdk_sys::PIO_WORKITEM,
 }
@@ -2803,7 +2937,6 @@ impl MountedVolumeDevice {
                 .as_mut()
         }
         .ok_or(DriverError::InvalidParameter)?;
-        extension.vcb = core::ptr::null_mut();
         extension.retirement_work_item = core::ptr::null_mut();
         let vpb = unsafe {
             // SAFETY: The VPB was supplied by the I/O Manager for this mount
@@ -2819,13 +2952,17 @@ impl MountedVolumeDevice {
             CompletionReactor::initialize_at(
                 core::ptr::addr_of_mut!(extension.header.reactor),
                 device,
+                ReactorTarget::MountedVolume(MountedVolumeBinding::new(vcb)),
             )?;
         }
         if let Err(error) = register_shutdown_notification(device) {
             unsafe {
                 // SAFETY: Shutdown registration failed before this device was
                 // published, so no actor continuation can still own the executor.
-                CompletionReactor::release_at(core::ptr::addr_of_mut!(extension.header.reactor));
+                let target = CompletionReactor::release_at(core::ptr::addr_of_mut!(
+                    extension.header.reactor
+                ));
+                drop(target);
             }
             return Err(error);
         }
@@ -2841,7 +2978,10 @@ impl MountedVolumeDevice {
             unsafe {
                 // SAFETY: Work-item allocation failed before publication; no request can race
                 // executor teardown.
-                CompletionReactor::release_at(core::ptr::addr_of_mut!(extension.header.reactor));
+                let target = CompletionReactor::release_at(core::ptr::addr_of_mut!(
+                    extension.header.reactor
+                ));
+                drop(target);
             }
             return Err(DriverError::InsufficientResources);
         }
@@ -2858,39 +2998,8 @@ impl MountedVolumeDevice {
         vpb.RealDevice = real_device.as_ptr();
         vpb.Flags |= mounted_flag;
 
-        extension.vcb = Box::into_raw(vcb);
         device_object.Flags &= !DO_DEVICE_INITIALIZING;
         Ok(())
-    }
-
-    /// Returns the mounted VCB pointer stored in a mounted device extension.
-    pub(crate) fn vcb(device: KernelDevice) -> Option<NonNull<VolumeControlBlock>> {
-        let device_object = unsafe {
-            // SAFETY: `device` is a non-null DEVICE_OBJECT decoded at the
-            // dispatch boundary and is read for its extension pointer only.
-            device.as_ptr().as_ref()
-        }?;
-        let header = unsafe {
-            // SAFETY: Driver-owned device extensions share `DeviceExtensionHeader`
-            // as their first field, so the kind can be checked before reading
-            // any mounted-volume-only fields.
-            device_object
-                .DeviceExtension
-                .cast::<DeviceExtensionHeader>()
-                .as_ref()
-        }?;
-        if header.kind != DeviceExtensionKind::MOUNTED_VOLUME {
-            return None;
-        }
-        let extension = unsafe {
-            // SAFETY: The common header identified this driver-owned extension
-            // as a mounted volume before the full mounted layout is read.
-            device_object
-                .DeviceExtension
-                .cast::<MountedVolumeDeviceExtension>()
-                .as_ref()
-        }?;
-        NonNull::new(extension.vcb)
     }
 
     /// Releases actor, VPB, and VCB resources before the I/O Manager deletes this device.
@@ -2916,30 +3025,21 @@ impl MountedVolumeDevice {
             NonNull::new(extension.retirement_work_item).unwrap_or_else(|| {
                 KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
             });
-        unsafe {
+        let target = unsafe {
             // SAFETY: Terminal teardown closes admission, drains IRPs, and joins the actor before
             // any VCB or VPB storage is released.
-            CompletionReactor::release_at(core::ptr::addr_of_mut!(extension.header.reactor));
-        }
-        let vcb = NonNull::new(extension.vcb).unwrap_or_else(|| {
-            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
-        });
-        if !unsafe {
-            // SAFETY: The executor is joined, granting teardown exclusive VCB access.
-            vcb.as_ref()
-        }
-        .is_logically_dismounted()
-        {
+            CompletionReactor::release_at(core::ptr::addr_of_mut!(extension.header.reactor))
+        };
+        let ReactorTarget::MountedVolume(binding) = target else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        let vcb = binding.into_volume();
+        if !vcb.is_logically_dismounted() {
             Self::unregister_shutdown_notification(device);
         }
         Self::detach_vpb(device);
-        extension.vcb = core::ptr::null_mut();
         extension.retirement_work_item = core::ptr::null_mut();
-        unsafe {
-            // SAFETY: Mount transferred this Box to the extension and terminal teardown takes it
-            // exactly once after every actor access ended.
-            drop(Box::from_raw(vcb.as_ptr()));
-        }
+        drop(vcb);
         if teardown == MountedDeviceTeardown::DriverUnload {
             #[cfg(not(test))]
             unsafe {
@@ -5604,12 +5704,11 @@ mod tests {
     use crate::kernel::status::DriverError;
 
     use super::{
-        CleanCloseTerminal, CleanupStart, CloseReleasePlan, ControlDeviceExtension,
-        DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode, DeviceExtensionKind,
-        DirectoryChange, DirectoryChangeAction, DriverDeviceKind, FileControlBlock,
-        FileControlBlockLedger, FileControlBlockOpenState, FileControlBlockRelease,
-        FileObjectCloseKind, HandleAdmissionState, HandleDeletion, KernelDevice, KernelFileObject,
-        MountedVolumeDevice, MountedVolumeDeviceExtension, MountedVolumeState, NativeFileByteRange,
+        CleanCloseTerminal, CleanupStart, CloseReleasePlan, DIRECTORY_NOTIFICATION_DIRECTORY_UNITS,
+        DataTransferMode, DeviceExtensionKind, DirectoryChange, DirectoryChangeAction,
+        DriverDeviceKind, FileControlBlock, FileControlBlockLedger, FileControlBlockOpenState,
+        FileControlBlockRelease, FileObjectCloseKind, HandleAdmissionState, HandleDeletion,
+        KernelDevice, KernelFileObject, MountedVolumeState, NativeFileByteRange,
         NoIntermediateTransfer, OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation,
         OpenedNodeMode, OpenedObject, OpenedRegularFile, OpenedVolumeHandle,
         TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
@@ -5813,29 +5912,6 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn mounted_volume_vcb_rejects_control_device_extension() {
-        let mut extension = core::mem::MaybeUninit::<ControlDeviceExtension>::zeroed();
-        let mut device = wdk_sys::DEVICE_OBJECT {
-            DeviceExtension: extension.as_mut_ptr().cast(),
-            ..wdk_sys::DEVICE_OBJECT::default()
-        };
-        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device));
-        assert!(device.is_some());
-        if let Some(device) = device {
-            assert_eq!(ControlDeviceExtension::initialize(device), Ok(()));
-            assert_eq!(MountedVolumeDevice::vcb(device), None);
-            unsafe {
-                // SAFETY: The test initialized the control extension above and
-                // no queue user exists after the local assertions.
-                ControlDeviceExtension::release(device);
-            }
-        }
-    }
-
-    /// # Panics
-    ///
     /// Panics when a device extension discriminant decodes to the wrong teardown owner.
     #[test]
     fn driver_device_kinds_select_exact_teardown_owners() {
@@ -5851,28 +5927,6 @@ mod tests {
             DriverDeviceKind::decode(DeviceExtensionKind { value: u8::MAX }),
             Err(DriverError::InternalInvariantViolation)
         );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when the mounted extension no longer exposes its live VCB pointer.
-    #[test]
-    fn mounted_volume_vcb_decodes_mounted_device_extension() {
-        let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut extension = core::mem::MaybeUninit::<MountedVolumeDeviceExtension>::zeroed();
-        let extension = unsafe {
-            // SAFETY: The test initializes every field read by
-            // MountedVolumeDevice::vcb before exposing this extension.
-            extension.assume_init_mut()
-        };
-        extension.header.kind = DeviceExtensionKind::MOUNTED_VOLUME;
-        extension.vcb = volume.as_ptr();
-        let mut device = wdk_sys::DEVICE_OBJECT {
-            DeviceExtension: core::ptr::from_mut(extension).cast(),
-            ..wdk_sys::DEVICE_OBJECT::default()
-        };
-        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device));
-        assert_eq!(device.and_then(MountedVolumeDevice::vcb), Some(volume));
     }
 
     /// # Panics

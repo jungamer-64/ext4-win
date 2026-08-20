@@ -24,10 +24,10 @@ use crate::{
     },
     state::{
         ChildCreationTarget, DataTransferMode, DirectoryChange, DirectoryChangeAction,
-        FileControlBlock, HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeDevice,
+        FileControlBlock, HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeAccess,
         NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
         OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion, UninitializedFileObject,
-        VolumeAccess, VolumeControlBlock, WriteCommitment, abandon_file_control_block,
+        VolumeControlBlock, WriteCommitment, abandon_file_control_block,
     },
 };
 
@@ -42,11 +42,13 @@ const UTF16_BACKSLASH: u16 = 0x005C;
 /// Returns an error when create stack decoding or ext4 open/create handling rejects the request.
 pub(crate) fn execute(
     request: PendingIrpLease<'_>,
-    operations: &mut VolumeAccess,
+    operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<CreateResolution> {
+    let mounted_volume = operations.file_object_owner();
     open_or_create(
-        PreparedCreateRequest::decode(request)?,
+        PreparedCreateRequest::decode(request, mounted_volume)?,
+        mounted_volume,
         operations,
         mutation,
     )
@@ -91,6 +93,7 @@ impl<'a> PreparedCreateRequest<'a> {
     /// malformed.
     fn decode(
         mut request: PendingIrpLease<'a>,
+        mounted_volume: NonNull<VolumeControlBlock>,
     ) -> Result<Self, crate::kernel::status::DriverError> {
         let (device, parameters, target, create_ea) = request.with_active(|active| {
             let current = active.current_stack()?;
@@ -99,8 +102,6 @@ impl<'a> PreparedCreateRequest<'a> {
             let parameters = stack.parameters();
             let file_object = UninitializedFileObject::decode(file_object)?;
             let device = active.device();
-            let mounted_volume =
-                MountedVolumeDevice::vcb(device).ok_or(DriverError::InvalidDeviceRequest)?;
             Ok::<_, DriverError>((
                 device,
                 parameters,
@@ -162,7 +163,8 @@ impl CreateCompletionOwner<'_> {
 /// fails, or the selected open/create disposition cannot be satisfied.
 fn open_or_create(
     request: PreparedCreateRequest<'_>,
-    operations: &mut VolumeAccess,
+    mounted_volume: NonNull<VolumeControlBlock>,
+    operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<CreateResolution> {
     let PreparedCreateRequest {
@@ -170,9 +172,6 @@ fn open_or_create(
         target,
         create_ea,
     } = request;
-    let Some(mounted_volume) = MountedVolumeDevice::vcb(owner.device()) else {
-        return Err(DriverError::InvalidDeviceRequest);
-    };
     let disposition = owner.parameters().disposition();
     let target = match target {
         CreateTargetSpecifier::Volume => {
@@ -195,24 +194,20 @@ fn open_or_create(
             node,
             node_mode,
             location,
-        } => {
-            let mounted_volume = MountedVolumeDevice::vcb(owner.device())
-                .ok_or(DriverError::InvalidDeviceRequest)?;
-            open_existing_node(
-                &mut owner,
-                disposition,
-                ExistingNodeTarget {
-                    volume: mounted_volume,
-                    node,
-                    node_mode,
-                    location,
-                },
-                operations,
-                mutation,
-            )
-            .map(CreateCompletion::Handle)
-            .map(CreateResolution::Complete)
-        }
+        } => open_existing_node(
+            &mut owner,
+            disposition,
+            ExistingNodeTarget {
+                volume: mounted_volume,
+                node,
+                node_mode,
+                location,
+            },
+            operations,
+            mutation,
+        )
+        .map(CreateCompletion::Handle)
+        .map(CreateResolution::Complete),
         CreateTargetLookup::Missing { parent, name } => {
             let publication = create_missing_node(
                 owner,
@@ -700,7 +695,7 @@ fn open_existing_node(
     request: &mut CreateCompletionOwner<'_>,
     disposition: CreateDisposition,
     target: ExistingNodeTarget,
-    operations: &mut VolumeAccess,
+    operations: &mut MountedVolumeAccess<'_>,
     read: &mut impl CommittedReadPass,
 ) -> DriverResult<CreateAction> {
     let ExistingNodeTarget {
@@ -774,7 +769,7 @@ fn open_volume(
     mut request: CreateCompletionOwner<'_>,
     create_ea: CreateEa,
     volume: NonNull<VolumeControlBlock>,
-    operations: &mut VolumeAccess,
+    operations: &mut MountedVolumeAccess<'_>,
 ) -> DriverResult<CreateAction> {
     if !create_ea.is_empty() {
         return Err(DriverError::InvalidParameter);
@@ -829,7 +824,7 @@ fn destructive_directory_error(directory: DirectoryNodeId) -> DriverError {
 fn create_missing_node(
     mut request: CreateCompletionOwner<'_>,
     create_ea: CreateEa,
-    operations: &mut VolumeAccess,
+    operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
     disposition: CreateDisposition,
     parent: DirectoryNodeId,
@@ -926,7 +921,7 @@ fn validate_existing_node_options(
 /// Returns an error when path or file-reference resolution fails.
 fn resolve_target(
     target: CreateTargetSpecifier,
-    operations: &mut VolumeAccess,
+    operations: &mut MountedVolumeAccess<'_>,
     read: &mut impl CommittedReadPass,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
@@ -999,7 +994,7 @@ fn file_reference_lookup_error(error: ext4_core::Error) -> DriverError {
 fn resolve_path(
     name: CreatePathName,
     anchor: CreatePathAnchor,
-    operations: &mut VolumeAccess,
+    operations: &mut MountedVolumeAccess<'_>,
     read: &mut impl CommittedReadPass,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
@@ -1325,7 +1320,7 @@ pub(crate) struct PreparedCreatePublication {
 
 impl PreparedCreatePublication {
     /// Publishes a committed child using pointer writes and prepared-value moves only.
-    pub(crate) fn publish(self, operations: &mut VolumeAccess) -> CreateCompletion {
+    pub(crate) fn publish(self, operations: &mut MountedVolumeAccess<'_>) -> CreateCompletion {
         let Self {
             claim,
             handle,

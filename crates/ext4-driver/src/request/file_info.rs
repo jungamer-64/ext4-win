@@ -24,11 +24,10 @@ use crate::memory::{self, DriverVec};
 use crate::state::{
     CleanupStart, CloseReleasePlan, DirectoryChange, DirectoryChangeAction, DirectoryCursor,
     DirectoryNotificationRegistration, FileCleanupDisposition, FileControlBlock, FileDeleteTarget,
-    MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation, OpenedObject,
-    OpenedRegularFile, PendingFileDeletion, PreparedFilePositionPublication,
-    PreparedHandleAdmission, PreparedOpenedLocationPublication, VolumeAccess, VolumeControlBlock,
-    VolumeHandleCleanup, VolumeRetirement, release_cancelled_file_control_block,
-    release_file_control_block,
+    MountedVolumeAccess, MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation,
+    OpenedObject, OpenedRegularFile, PendingFileDeletion, PreparedFilePositionPublication,
+    PreparedHandleAdmission, PreparedOpenedLocationPublication, VolumeHandleCleanup,
+    VolumeRetirement, release_cancelled_file_control_block, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -165,8 +164,11 @@ impl WriteSnapshotWindows {
 ///
 /// Returns an error when the IRP stack has no opened FILE_OBJECT, cleanup state is invalid, or a
 /// pending namespace deletion cannot be committed.
-pub(crate) fn cleanup(mut request: PendingIrpLease<'_>) -> DriverResult<CleanupResolution> {
-    let plan = request.with_active(begin_cleanup_file_object)?;
+pub(crate) fn cleanup(
+    mut request: PendingIrpLease<'_>,
+    operations: &mut MountedVolumeAccess<'_>,
+) -> DriverResult<CleanupResolution> {
+    let plan = request.with_active(|active| begin_cleanup_file_object(active, operations))?;
     Ok(match plan {
         CleanupPlan::Complete => CleanupResolution::Complete(IrpCompletion::EMPTY),
         CleanupPlan::Delete(plan) => CleanupResolution::Delete(plan),
@@ -195,7 +197,7 @@ pub(crate) struct PreparedCleanupPublication {
 
 impl PreparedCleanupPublication {
     /// Publishes the completed deletion and notification without allocation or ordinary failure.
-    pub(crate) fn publish(self, operations: &mut VolumeAccess) -> IrpCompletion {
+    pub(crate) fn publish(self, operations: &mut MountedVolumeAccess<'_>) -> IrpCompletion {
         operations.complete_file_delete(self.fcb, self.target);
         operations.report_directory_change(self.notification);
         IrpCompletion::EMPTY
@@ -210,9 +212,12 @@ unsafe impl Send for PreparedCleanupPublication {}
 /// # Errors
 ///
 /// Returns an error when the close stack has no FILE_OBJECT.
-pub(crate) fn close(target: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion> {
+pub(crate) fn close(
+    target: &mut ActiveIrp<'_>,
+    operations: &mut MountedVolumeAccess<'_>,
+) -> DriverResult<IrpCompletion> {
     let file_object = target.current_stack()?.file_object()?;
-    if release_file_contexts(target.device(), file_object) == VolumeRetirement::Start {
+    if release_file_contexts(target.device(), file_object, operations) == VolumeRetirement::Start {
         MountedVolumeDevice::schedule_retirement(target.device());
     }
     Ok(IrpCompletion::EMPTY)
@@ -257,7 +262,7 @@ pub(crate) fn query(
 /// Returns an error when set stack decoding or the requested file mutation fails.
 pub(crate) fn set(
     request: PendingIrpLease<'_>,
-    operations: &mut VolumeAccess,
+    operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<SetFileResolution> {
     set_file_information(request, operations, mutation)
@@ -819,7 +824,7 @@ pub(crate) enum SetFilePublication {
 
 impl SetFilePublication {
     /// Publishes prepared driver state without allocation or ordinary failure.
-    pub(crate) fn publish(self, operations: &VolumeAccess) {
+    pub(crate) fn publish(self, operations: &MountedVolumeAccess<'_>) {
         match self {
             Self::None => {}
             Self::HardLink(changes) => (*changes).report(operations),
@@ -841,7 +846,7 @@ impl SetFilePublication {
 /// mutation cannot be committed.
 fn set_file_information(
     mut request: PendingIrpLease<'_>,
-    operations: &mut VolumeAccess,
+    operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<SetFileResolution> {
     let plan = request.with_active(|active| {
@@ -1412,7 +1417,7 @@ pub(crate) struct HardLinkDirectoryChanges {
 
 impl HardLinkDirectoryChanges {
     /// Reports the committed notification sequence.
-    fn report(self, operations: &VolumeAccess) {
+    fn report(self, operations: &MountedVolumeAccess<'_>) {
         operations.report_directory_change(self.first);
         if let Some(second) = self.second {
             operations.report_directory_change(*second);
@@ -1427,7 +1432,7 @@ impl HardLinkDirectoryChanges {
 /// the journal transaction fails.
 fn set_hard_link_information(
     request: HardLinkMutation,
-    operations: &mut VolumeAccess,
+    operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<HardLinkDirectoryChanges> {
     let HardLinkMutation {
@@ -1484,7 +1489,7 @@ fn set_hard_link_information(
 /// Returns an error when a rejected collision exists, the target is a directory, read-only,
 /// delete-pending, or still has an active handle.
 fn prepare_hard_link_destination(
-    operations: &mut VolumeAccess,
+    operations: &mut MountedVolumeAccess<'_>,
     read: &mut impl CommittedReadPass,
     source_node: NodeId,
     target_parent: DirectoryNodeId,
@@ -1650,7 +1655,7 @@ enum PreparedRename {
 /// fails.
 fn set_rename_information(
     request: RenameMutation,
-    operations: &mut VolumeAccess,
+    operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<PreparedRename> {
     let RenameMutation {
@@ -1735,7 +1740,7 @@ impl RenameDirectoryNameChanges {
     /// Returns an error when a replace-capable target cannot be read or a visible child name
     /// cannot be represented in the Windows notification namespace.
     fn prepare(
-        operations: &mut VolumeAccess,
+        operations: &mut MountedVolumeAccess<'_>,
         read: &mut impl CommittedReadPass,
         request: RenameNotificationRequest<'_>,
     ) -> DriverResult<Option<Self>> {
@@ -1789,7 +1794,7 @@ impl RenameDirectoryNameChanges {
     }
 
     /// Reports every name transition after the corresponding ext4 transaction commits.
-    fn report(self, operations: &VolumeAccess) {
+    fn report(self, operations: &MountedVolumeAccess<'_>) {
         if let Some(replaced_target) = self.replaced_target {
             operations.report_directory_change(replaced_target);
         }
@@ -2643,7 +2648,10 @@ unsafe impl Send for PendingCleanupDeletion {}
 /// # Errors
 ///
 /// Returns an error when the FILE_OBJECT has no opened context.
-fn begin_cleanup_file_object(active: &mut ActiveIrp<'_>) -> DriverResult<CleanupPlan> {
+fn begin_cleanup_file_object(
+    active: &mut ActiveIrp<'_>,
+    operations: &mut MountedVolumeAccess<'_>,
+) -> DriverResult<CleanupPlan> {
     let file_object = active.current_stack()?.file_object()?;
     let opened_file = OpenedFileObject::decode(file_object)?;
     match opened_file {
@@ -2651,7 +2659,7 @@ fn begin_cleanup_file_object(active: &mut ActiveIrp<'_>) -> DriverResult<Cleanup
             cleanup_opened_node(active, file_object, opened_file)
         }
         OpenedFileObject::Volume(opened_volume) => {
-            cleanup_opened_volume(active.device(), file_object, opened_volume)?;
+            cleanup_opened_volume(active.device(), file_object, opened_volume, operations)?;
             Ok(CleanupPlan::Complete)
         }
     }
@@ -2742,6 +2750,7 @@ fn cleanup_opened_volume(
     device: crate::state::KernelDevice,
     file_object: ActiveFileObject<'_>,
     opened_volume: crate::state::OpenedVolume<'_>,
+    operations: &mut MountedVolumeAccess<'_>,
 ) -> DriverResult<()> {
     let cleanup_was_published = file_object.cleanup_complete();
     match (opened_volume.begin_cleanup(), cleanup_was_published) {
@@ -2752,7 +2761,9 @@ fn cleanup_opened_volume(
                 .bugcheck();
         }
     }
-    let mut operations = claim_volume_operation_lane(opened_volume.volume());
+    if !operations.owns_volume(opened_volume.volume()) {
+        return Err(DriverError::InvalidDeviceRequest);
+    }
     let effect = operations.cleanup_volume_handle(opened_volume.file_object());
     if effect == VolumeHandleCleanup::Unlocked {
         MountedVolumeDevice::publish_volume_lock(device, false);
@@ -4044,20 +4055,11 @@ fn write_regular_file_windowed(
     }))
 }
 
-/// Claims the actor-owned operation lane for one serialized mounted-device request.
-fn claim_volume_operation_lane(volume: NonNull<VolumeControlBlock>) -> VolumeAccess {
-    unsafe {
-        // SAFETY: Every caller runs as the mounted-device executor's sole active data-plane
-        // request and returns the non-cloneable lease by value, so a second lane claim cannot be
-        // constructed before this request releases the first.
-        VolumeControlBlock::operation_access(volume)
-    }
-}
-
 /// Detaches and releases heap-owned FCB and CCB pointers stored on a FILE_OBJECT.
 fn release_file_contexts(
     device: crate::state::KernelDevice,
     file_object: ActiveFileObject<'_>,
+    operations: &mut MountedVolumeAccess<'_>,
 ) -> VolumeRetirement {
     if file_object.has_no_file_system_contexts() {
         return VolumeRetirement::Retained;
@@ -4087,14 +4089,20 @@ fn release_file_contexts(
                 // detached the unique owning pointer before this terminal drop.
                 drop(Box::from_raw(handle.as_ptr()));
             }
-            let mut operations = claim_volume_operation_lane(volume);
+            if !operations.owns_volume(volume) {
+                crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                    .bugcheck();
+            }
             operations.close_node_file_object()
         }
         OpenedFileObject::Volume(opened) => {
             let release_plan = opened.close_release_plan(close_kind);
             let file_object_address = opened.file_object();
             let (volume, handle) = opened.detach_contexts();
-            let mut operations = claim_volume_operation_lane(volume);
+            if !operations.owns_volume(volume) {
+                crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                    .bugcheck();
+            }
             let outcome = operations.close_volume_file_object(file_object_address, release_plan);
             if outcome.cleanup() == VolumeHandleCleanup::Unlocked {
                 MountedVolumeDevice::publish_volume_lock(device, false);

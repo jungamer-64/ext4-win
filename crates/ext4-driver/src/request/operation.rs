@@ -1,8 +1,6 @@
 //! Concrete top-level request operations advanced only by scheduler events.
 
 use alloc::boxed::Box;
-use core::ptr::NonNull;
-
 use ext4_core::{
     CleanCloseOperation, CleanCloseTransition, CleanJournalDurability, CommitDurability,
     CommitReadyMutation, DurableMutation, EpochReadOperation, Error, ExternalJournalProbeOperation,
@@ -15,8 +13,9 @@ use ext4_core::{
 use wdk_sys::STATUS_SUCCESS;
 
 use crate::irp::reactor::{
-    CLEANUP_HANDLE_BARRIER, CLOSE_HANDLE_BARRIER, CompletionOperation, InfalliblePublication,
-    IntentRequest, OperationTransition, PublicationAuthority, WaitCondition,
+    CLEANUP_HANDLE_BARRIER, CLOSE_HANDLE_BARRIER, CompletionOperation, ControlDeviceOperation,
+    InfalliblePublication, IntentRequest, MountedVolumeOperation, OperationTransition,
+    PublicationAuthority, ReactorTarget, WaitCondition,
 };
 use crate::irp::{CreateCompletion, IrpCompletion, OwnedIrp};
 use crate::kernel::cng::CngOperation;
@@ -30,10 +29,35 @@ use crate::kernel::storage::{
 use crate::memory;
 use crate::request::file_system_control::MountAdmission;
 use crate::state::{
-    EpochLease, EpochPublicationSlot, EpochPublicationSlots, MountedVolumeDevice,
-    MountedVolumeDeviceExtension, MutationActivityLease, PendingCheckpoint,
+    EpochLease, EpochPublicationSlot, EpochPublicationSlots, MountedVolumeAccess,
+    MountedVolumeDevice, MountedVolumeDeviceExtension, MutationActivityLease, PendingCheckpoint,
     PreparedVolumeStateTransition, VolumeControlBlock,
 };
+
+/// Implements the shell adapter that alone projects a mounted-volume access capability.
+macro_rules! impl_mounted_operation_adapter {
+    ($operation:ty) => {
+        impl CompletionOperation for $operation {
+            fn advance(
+                self: Box<Self>,
+                event: OperationEvent,
+                target: &mut ReactorTarget,
+            ) -> OperationTransition {
+                target.with_mounted_access(|access| self.advance_mounted(event, access))
+            }
+
+            fn record_storage_failure(
+                &mut self,
+                failure: StorageFailureClass,
+                target: &mut ReactorTarget,
+            ) {
+                target.with_mounted_access(|access| {
+                    self.record_mounted_storage_failure(failure, access);
+                });
+            }
+        }
+    };
+}
 
 /// Admission failure that preserves the unique top-level completion authority.
 #[derive(Debug)]
@@ -440,8 +464,8 @@ impl MountRequestOperation {
     }
 }
 
-impl CompletionOperation for MountRequestOperation {
-    fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+impl ControlDeviceOperation for MountRequestOperation {
+    fn advance_control(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
         let state = core::mem::replace(&mut self.state, MountRequestState::Terminal);
         match state {
             MountRequestState::QueryLength { owned, admission } => match event {
@@ -585,7 +609,23 @@ impl CompletionOperation for MountRequestOperation {
         }
     }
 
-    fn record_storage_failure(&mut self, _failure: StorageFailureClass) {}
+    fn record_control_storage_failure(&mut self, _failure: StorageFailureClass) {}
+}
+
+impl CompletionOperation for MountRequestOperation {
+    fn advance(
+        self: Box<Self>,
+        event: OperationEvent,
+        target: &mut ReactorTarget,
+    ) -> OperationTransition {
+        target.require_control_device();
+        self.advance_control(event)
+    }
+
+    fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget) {
+        target.require_control_device();
+        self.record_control_storage_failure(failure);
+    }
 }
 
 // SAFETY: Stable kernel identities are pinned by the top-level mount IRP; the core operation and
@@ -626,8 +666,6 @@ enum ReadOperationState {
 /// One restartable read operation over a fixed committed epoch.
 #[derive(Debug)]
 struct ReadRequestOperation {
-    /// Mounted VCB retained by the admitted device/FILE_OBJECT lifetime.
-    volume: NonNull<VolumeControlBlock>,
     /// Immutable epoch pinned independently from later checkpoint publication.
     epoch: EpochLease,
     /// Concrete mounted lower devices.
@@ -649,36 +687,19 @@ impl ReadRequestOperation {
     fn try_new(
         owned: OwnedIrp,
         kind: ReadRequestKind,
+        access: &mut MountedVolumeAccess<'_>,
     ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-        let volume = match MountedVolumeDevice::vcb(owned.device()) {
-            Some(volume) => volume,
-            None => {
-                return Err(AdmitOperationError::new(
-                    DriverError::InvalidDeviceRequest,
-                    owned,
-                ));
-            }
+        let crypto = match access.new_crypto_operation() {
+            Ok(crypto) => crypto,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
-        let (epoch, devices, read, crypto) = {
-            let mut access = unsafe {
-                // SAFETY: Admission executes on the sole reactor thread and the mounted VCB is
-                // stable until its reactor has drained every admitted operation.
-                VolumeControlBlock::operation_access(volume)
-            };
-            let crypto = match access.runtime().crypto().try_new_operation() {
-                Ok(crypto) => crypto,
-                Err(error) => return Err(AdmitOperationError::new(error, owned)),
-            };
-            let read = EpochReadOperation::new(access.runtime().profile());
-            let devices = access.runtime().storage();
-            let epoch = match access.runtime_mut().acquire_epoch() {
-                Ok(epoch) => epoch,
-                Err(error) => return Err(AdmitOperationError::new(error, owned)),
-            };
-            (epoch, devices, read, crypto)
+        let read = EpochReadOperation::new(access.mounted_profile());
+        let devices = access.storage_route();
+        let epoch = match access.acquire_epoch() {
+            Ok(epoch) => epoch,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
         match memory::boxed_try_map((owned, epoch, crypto), |(owned, epoch, crypto)| Self {
-            volume,
             epoch,
             devices,
             kind,
@@ -701,6 +722,7 @@ impl ReadRequestOperation {
     fn execute_pass(
         kind: ReadRequestKind,
         owned: &mut OwnedIrp,
+        access: &MountedVolumeAccess<'_>,
         read: &mut ext4_core::EpochReadPass<'_, '_, '_>,
     ) -> DriverResult<IrpCompletion> {
         match kind {
@@ -717,7 +739,7 @@ impl ReadRequestOperation {
             }
             ReadRequestKind::GetReparsePoint => {
                 let mut request = owned.request();
-                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                crate::request::file_system_control::authorize_path_handle(&mut request, access)?;
                 crate::request::reparse::get_reparse_point(request, read)
             }
         }
@@ -730,8 +752,12 @@ impl ReadRequestOperation {
     }
 }
 
-impl CompletionOperation for ReadRequestOperation {
-    fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+impl MountedVolumeOperation for ReadRequestOperation {
+    fn advance_mounted(
+        mut self: Box<Self>,
+        event: OperationEvent,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
         let state = core::mem::replace(&mut self.state, ReadOperationState::Terminal);
         let ReadOperationState::Running { mut owned, read } = state else {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -743,7 +769,7 @@ impl CompletionOperation for ReadRequestOperation {
                 event,
                 self.epoch.epoch(),
                 &mut self.crypto,
-                |pass| match Self::execute_pass(kind, &mut owned, pass) {
+                |pass| match Self::execute_pass(kind, &mut owned, access, pass) {
                     Err(DriverError::Core(Error::OperationSuspended)) => {
                         Err(Error::OperationSuspended)
                     }
@@ -769,22 +795,21 @@ impl CompletionOperation for ReadRequestOperation {
         }
     }
 
-    fn record_storage_failure(&mut self, failure: StorageFailureClass) {
+    fn record_mounted_storage_failure(
+        &mut self,
+        failure: StorageFailureClass,
+        access: &mut MountedVolumeAccess<'_>,
+    ) {
         if matches!(
             failure,
             StorageFailureClass::DurabilityUnknown | StorageFailureClass::ReadUnreliable
         ) {
-            let mut access = unsafe {
-                // SAFETY: Failure classification executes on the sole reactor thread while this
-                // operation retains the mounted VCB lifetime.
-                VolumeControlBlock::operation_access(self.volume)
-            };
             match failure {
                 StorageFailureClass::ReadUnreliable => {
-                    access.runtime_mut().record_read_unreliable();
+                    access.record_read_unreliable();
                 }
                 StorageFailureClass::DurabilityUnknown => {
-                    access.runtime_mut().record_durability_unknown();
+                    access.record_durability_unknown();
                 }
                 StorageFailureClass::Terminal => {}
             }
@@ -850,8 +875,12 @@ impl ImmediateRequestOperation {
     }
 }
 
-impl CompletionOperation for ImmediateRequestOperation {
-    fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+impl MountedVolumeOperation for ImmediateRequestOperation {
+    fn advance_mounted(
+        mut self: Box<Self>,
+        event: OperationEvent,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
         let state = core::mem::replace(&mut self.state, ImmediateOperationState::Terminal);
         let ImmediateOperationState::Ready(mut owned) = state else {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -887,17 +916,20 @@ impl CompletionOperation for ImmediateRequestOperation {
         let result = match event {
             OperationEvent::Admitted => match self.kind {
                 ImmediateRequestKind::QueryVolumeInformation => {
-                    crate::request::volume_info::query(owned.request())
+                    crate::request::volume_info::query(owned.request(), access)
                 }
                 ImmediateRequestKind::Close => owned
                     .request()
-                    .with_active(crate::request::file_info::close),
+                    .with_active(|active| crate::request::file_info::close(active, access)),
                 ImmediateRequestKind::GetEncryptionKeyStatus => (|| {
                     let mut request = owned.request();
-                    crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                    crate::request::file_system_control::authorize_path_handle(
+                        &mut request,
+                        access,
+                    )?;
                     let stack = request
                         .with_active(|active| active.current_stack()?.file_system_control())?;
-                    crate::request::fsctl::get_encryption_key_status(&mut request, stack)
+                    crate::request::fsctl::get_encryption_key_status(&mut request, stack, access)
                 })(),
             },
             OperationEvent::CancelRequested => Err(DriverError::from(Error::OperationCancelled)),
@@ -914,7 +946,11 @@ impl CompletionOperation for ImmediateRequestOperation {
         OperationTransition::Complete
     }
 
-    fn record_storage_failure(&mut self, _failure: StorageFailureClass) {
+    fn record_mounted_storage_failure(
+        &mut self,
+        _failure: StorageFailureClass,
+        _access: &mut MountedVolumeAccess<'_>,
+    ) {
         crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
             .bugcheck();
     }
@@ -957,8 +993,12 @@ impl NotificationOperation {
     }
 }
 
-impl CompletionOperation for NotificationOperation {
-    fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+impl MountedVolumeOperation for NotificationOperation {
+    fn advance_mounted(
+        mut self: Box<Self>,
+        event: OperationEvent,
+        _access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
         let state = core::mem::replace(&mut self.state, NotificationOperationState::Terminal);
         let NotificationOperationState::Ready(owned) = state else {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -986,7 +1026,11 @@ impl CompletionOperation for NotificationOperation {
         OperationTransition::Complete
     }
 
-    fn record_storage_failure(&mut self, _failure: StorageFailureClass) {
+    fn record_mounted_storage_failure(
+        &mut self,
+        _failure: StorageFailureClass,
+        _access: &mut MountedVolumeAccess<'_>,
+    ) {
         crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
             .bugcheck();
     }
@@ -1093,15 +1137,9 @@ impl VolumeControlOperation {
         owned: OwnedIrp,
         target: crate::request::file_system_control::DirectVolumeTarget,
         transition: PreparedVolumeStateTransition,
+        access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
-        {
-            let mut access = unsafe {
-                // SAFETY: The lifecycle request runs on the sole mounted-device reactor and the
-                // top-level IRP retains the VCB/FILE_OBJECT identities through publication.
-                VolumeControlBlock::operation_access(target.volume())
-            };
-            access.publish_volume_state_transition(transition);
-        }
+        access.publish_volume_state_transition(transition);
         match kind {
             VolumeControlRequestKind::Lock => {
                 MountedVolumeDevice::publish_volume_lock(target.device(), true);
@@ -1126,13 +1164,9 @@ impl VolumeControlOperation {
     /// Returns a driver allocation error if the close state machine cannot be reserved before the
     /// closing durability sequence begins.
     fn prepare_clean_close(
-        volume: NonNull<VolumeControlBlock>,
+        access: &MountedVolumeAccess<'_>,
     ) -> DriverResult<Box<CleanCloseOperation>> {
-        let access = unsafe {
-            // SAFETY: This is a non-suspending immutable profile projection on the reactor thread.
-            VolumeControlBlock::operation_access(volume)
-        };
-        let profile = access.runtime().profile();
+        let profile = access.mounted_profile();
         let filesystem_length = profile.filesystem_length();
         let journal_target = profile.journal_target();
         memory::boxed_try_with(|| Ok(CleanCloseOperation::new(filesystem_length, journal_target)))
@@ -1145,16 +1179,11 @@ impl VolumeControlOperation {
         target: crate::request::file_system_control::DirectVolumeTarget,
         transition: PreparedVolumeStateTransition,
         result: CleanCloseTransition,
+        access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         match result {
             CleanCloseTransition::SubmitLower { request, suspended } => {
-                let devices = {
-                    let access = unsafe {
-                        // SAFETY: Storage routing is copied during one reactor transition.
-                        VolumeControlBlock::operation_access(target.volume())
-                    };
-                    access.runtime().storage()
-                };
+                let devices = access.storage_route();
                 self.state = VolumeControlOperationState::CleanClosing {
                     owned,
                     target,
@@ -1168,7 +1197,7 @@ impl VolumeControlOperation {
                 }
             }
             CleanCloseTransition::Complete(Ok(_durability)) => {
-                Self::publish(self.kind, owned, target, transition)
+                Self::publish(self.kind, owned, target, transition, access)
             }
             CleanCloseTransition::Complete(Err(error)) => {
                 Self::complete(owned, Err(DriverError::from(error)))
@@ -1177,8 +1206,12 @@ impl VolumeControlOperation {
     }
 }
 
-impl CompletionOperation for VolumeControlOperation {
-    fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+impl MountedVolumeOperation for VolumeControlOperation {
+    fn advance_mounted(
+        mut self: Box<Self>,
+        event: OperationEvent,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
         let state = core::mem::replace(&mut self.state, VolumeControlOperationState::Terminal);
         match state {
             VolumeControlOperationState::Ready(mut owned) => match event {
@@ -1189,11 +1222,9 @@ impl CompletionOperation for VolumeControlOperation {
                         Ok(target) => target,
                         Err(error) => return Self::complete(owned, Err(error)),
                     };
-                    let mut access = unsafe {
-                        // SAFETY: The target is decoded from this live IRP and no reference escapes
-                        // this reactor-thread transition.
-                        VolumeControlBlock::operation_access(target.volume())
-                    };
+                    if !access.owns_volume(target.volume()) {
+                        return Self::complete(owned, Err(DriverError::InvalidDeviceRequest));
+                    }
                     match self.kind {
                         VolumeControlRequestKind::Unlock => {
                             let result = access.unlock_volume(target.owner());
@@ -1217,16 +1248,14 @@ impl CompletionOperation for VolumeControlOperation {
                                 Err(error) => return Self::complete(owned, Err(error)),
                             };
                             let closing = transition.is_clean_close();
-                            let devices = access.runtime().storage();
+                            let devices = access.storage_route();
                             self.state = VolumeControlOperationState::Waiting {
                                 owned,
                                 target,
                                 transition,
                                 devices,
                             };
-                            let condition = WaitCondition::JournalClean {
-                                volume: target.volume(),
-                            };
+                            let condition = WaitCondition::JournalClean;
                             if closing {
                                 OperationTransition::WaitForClosingDrain {
                                     condition,
@@ -1266,12 +1295,12 @@ impl CompletionOperation for VolumeControlOperation {
                         return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
                     }
                     if transition.is_clean_close() {
-                        let close = match Self::prepare_clean_close(target.volume()) {
+                        let close = match Self::prepare_clean_close(access) {
                             Ok(close) => close,
                             Err(error) => return Self::complete(owned, Err(error)),
                         };
                         let result = close.advance(OperationEvent::Admitted);
-                        self.drive_clean_close(owned, target, transition, result)
+                        self.drive_clean_close(owned, target, transition, result, access)
                     } else {
                         let request = StorageRequest::Flush {
                             target: ext4_core::StorageTarget::Filesystem,
@@ -1314,7 +1343,7 @@ impl CompletionOperation for VolumeControlOperation {
                     return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
                 };
                 match expected.complete(completion) {
-                    Ok(()) => Self::publish(self.kind, owned, target, transition),
+                    Ok(()) => Self::publish(self.kind, owned, target, transition, access),
                     Err(error) => Self::complete(owned, Err(DriverError::from(error))),
                 }
             }
@@ -1325,28 +1354,28 @@ impl CompletionOperation for VolumeControlOperation {
                 close,
             } => {
                 let result = close.advance(event);
-                self.drive_clean_close(owned, target, transition, result)
+                self.drive_clean_close(owned, target, transition, result, access)
             }
             VolumeControlOperationState::Terminal => OperationTransition::Complete,
         }
     }
 
-    fn record_storage_failure(&mut self, failure: StorageFailureClass) {
+    fn record_mounted_storage_failure(
+        &mut self,
+        failure: StorageFailureClass,
+        access: &mut MountedVolumeAccess<'_>,
+    ) {
         if failure != StorageFailureClass::DurabilityUnknown {
             return;
         }
-        let target = match &self.state {
+        let _target = match &self.state {
             VolumeControlOperationState::Flushing { target, .. }
             | VolumeControlOperationState::CleanClosing { target, .. } => *target,
             VolumeControlOperationState::Ready(_)
             | VolumeControlOperationState::Waiting { .. }
             | VolumeControlOperationState::Terminal => return,
         };
-        let mut access = unsafe {
-            // SAFETY: Failure publication executes on the sole reactor thread after lower release.
-            VolumeControlBlock::operation_access(target.volume())
-        };
-        access.runtime_mut().record_durability_unknown();
+        access.record_durability_unknown();
     }
 }
 
@@ -1398,8 +1427,6 @@ enum FlushOperationState {
 /// One non-retrying-at-the-domain-level device flush operation.
 #[derive(Debug)]
 struct FlushRequestOperation {
-    /// Stable mounted VCB selected from the receiving mounted device.
-    volume: NonNull<VolumeControlBlock>,
     /// Mounted lower devices.
     devices: MountedStorageRoute,
     /// Barrier semantics.
@@ -1416,25 +1443,10 @@ impl FlushRequestOperation {
     fn try_new(
         owned: OwnedIrp,
         kind: FlushRequestKind,
+        access: &MountedVolumeAccess<'_>,
     ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-        let volume = match MountedVolumeDevice::vcb(owned.device()) {
-            Some(volume) => volume,
-            None => {
-                return Err(AdmitOperationError::new(
-                    DriverError::InvalidDeviceRequest,
-                    owned,
-                ));
-            }
-        };
-        let devices = {
-            let access = unsafe {
-                // SAFETY: Admission projects immutable storage geometry from the stable VCB.
-                VolumeControlBlock::operation_access(volume)
-            };
-            access.runtime().storage()
-        };
+        let devices = access.storage_route();
         match memory::boxed_try_map(owned, |owned| Self {
-            volume,
             devices,
             kind,
             state: FlushOperationState::Ready(owned),
@@ -1452,24 +1464,26 @@ impl FlushRequestOperation {
     ///
     /// Returns an error when the active stack, FILE_OBJECT lifecycle, or selected mounted volume
     /// does not authorize this flush.
-    fn validate_target(&self, owned: &mut OwnedIrp) -> DriverResult<()> {
+    fn validate_target(
+        &self,
+        owned: &mut OwnedIrp,
+        access: &MountedVolumeAccess<'_>,
+    ) -> DriverResult<()> {
         let selected = owned.request().with_active(|active| {
             if self.kind == FlushRequestKind::Shutdown {
-                return MountedVolumeDevice::vcb(active.device())
-                    .ok_or(DriverError::InvalidDeviceRequest);
+                return Ok(None);
             }
             let stack = active.current_stack()?;
             match stack.file_object() {
                 Ok(file_object) => match crate::state::OpenedFileObject::decode(file_object)? {
-                    crate::state::OpenedFileObject::Node(opened) => Ok(opened.volume()),
-                    crate::state::OpenedFileObject::Volume(opened) => Ok(opened.volume()),
+                    crate::state::OpenedFileObject::Node(opened) => Ok(Some(opened.volume())),
+                    crate::state::OpenedFileObject::Volume(opened) => Ok(Some(opened.volume())),
                 },
-                Err(DriverError::InvalidParameter) => MountedVolumeDevice::vcb(active.device())
-                    .ok_or(DriverError::InvalidDeviceRequest),
+                Err(DriverError::InvalidParameter) => Ok(None),
                 Err(error) => Err(error),
             }
         })?;
-        if selected == self.volume {
+        if selected.is_none_or(|selected| access.owns_volume(selected)) {
             Ok(())
         } else {
             Err(DriverError::InvalidDeviceRequest)
@@ -1488,6 +1502,7 @@ impl FlushRequestOperation {
         owned: OwnedIrp,
         transition: PreparedVolumeStateTransition,
         result: CleanCloseTransition,
+        access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         match result {
             CleanCloseTransition::SubmitLower { request, suspended } => {
@@ -1503,13 +1518,7 @@ impl FlushRequestOperation {
                 }
             }
             CleanCloseTransition::Complete(Ok(_durability)) => {
-                {
-                    let mut access = unsafe {
-                        // SAFETY: Shutdown terminal publication is one reactor-thread transition.
-                        VolumeControlBlock::operation_access(self.volume)
-                    };
-                    access.publish_volume_state_transition(transition);
-                }
+                access.publish_volume_state_transition(transition);
                 Self::complete(owned, Ok(IrpCompletion::EMPTY))
             }
             CleanCloseTransition::Complete(Err(error)) => {
@@ -1519,13 +1528,17 @@ impl FlushRequestOperation {
     }
 }
 
-impl CompletionOperation for FlushRequestOperation {
-    fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+impl MountedVolumeOperation for FlushRequestOperation {
+    fn advance_mounted(
+        mut self: Box<Self>,
+        event: OperationEvent,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
         let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
         match state {
             FlushOperationState::Ready(mut owned) => match event {
                 OperationEvent::Admitted => {
-                    if let Err(error) = self.validate_target(&mut owned) {
+                    if let Err(error) = self.validate_target(&mut owned, access) {
                         return Self::complete(owned, Err(error));
                     }
                     match self.kind {
@@ -1535,31 +1548,21 @@ impl CompletionOperation for FlushRequestOperation {
                                 transition: None,
                             };
                             OperationTransition::Wait {
-                                condition: WaitCondition::VolumeDurability {
-                                    volume: self.volume,
-                                },
+                                condition: WaitCondition::VolumeDurability,
                                 suspended: self,
                             }
                         }
                         FlushRequestKind::Shutdown => {
-                            let transition = {
-                                let mut access = unsafe {
-                                    // SAFETY: Shutdown enters Closing in one actor-owned transition.
-                                    VolumeControlBlock::operation_access(self.volume)
-                                };
-                                match access.prepare_shutdown() {
-                                    Ok(transition) => transition,
-                                    Err(error) => return Self::complete(owned, Err(error)),
-                                }
+                            let transition = match access.prepare_shutdown() {
+                                Ok(transition) => transition,
+                                Err(error) => return Self::complete(owned, Err(error)),
                             };
                             self.state = FlushOperationState::Waiting {
                                 owned,
                                 transition: Some(transition),
                             };
                             OperationTransition::WaitForClosingDrain {
-                                condition: WaitCondition::JournalClean {
-                                    volume: self.volume,
-                                },
+                                condition: WaitCondition::JournalClean,
                                 suspended: self,
                             }
                         }
@@ -1602,13 +1605,12 @@ impl CompletionOperation for FlushRequestOperation {
                             }
                         }
                         (FlushRequestKind::Shutdown, Some(transition)) => {
-                            let close =
-                                match VolumeControlOperation::prepare_clean_close(self.volume) {
-                                    Ok(close) => close,
-                                    Err(error) => return Self::complete(owned, Err(error)),
-                                };
+                            let close = match VolumeControlOperation::prepare_clean_close(access) {
+                                Ok(close) => close,
+                                Err(error) => return Self::complete(owned, Err(error)),
+                            };
                             let result = close.advance(OperationEvent::Admitted);
-                            self.drive_clean_close(owned, transition, result)
+                            self.drive_clean_close(owned, transition, result, access)
                         }
                         (FlushRequestKind::FlushBuffers, Some(_))
                         | (FlushRequestKind::Shutdown, None) => {
@@ -1645,21 +1647,21 @@ impl CompletionOperation for FlushRequestOperation {
                 close,
             } => {
                 let result = close.advance(event);
-                self.drive_clean_close(owned, transition, result)
+                self.drive_clean_close(owned, transition, result, access)
             }
             FlushOperationState::Terminal => OperationTransition::Complete,
         }
     }
 
-    fn record_storage_failure(&mut self, failure: StorageFailureClass) {
+    fn record_mounted_storage_failure(
+        &mut self,
+        failure: StorageFailureClass,
+        access: &mut MountedVolumeAccess<'_>,
+    ) {
         if failure != StorageFailureClass::DurabilityUnknown {
             return;
         }
-        let mut access = unsafe {
-            // SAFETY: Failure publication executes on the sole reactor thread after lower release.
-            VolumeControlBlock::operation_access(self.volume)
-        };
-        access.runtime_mut().record_durability_unknown();
+        access.record_durability_unknown();
     }
 }
 
@@ -1761,7 +1763,7 @@ impl PendingDriverPublication {
 
 impl PreparedDriverPublication {
     /// Applies only moves and prevalidated pointer/state updates after commit durability.
-    fn publish(self, operations: &mut crate::state::VolumeAccess) -> TopLevelCompletion {
+    fn publish(self, operations: &mut crate::state::MountedVolumeAccess<'_>) -> TopLevelCompletion {
         match self {
             Self::Create(publication) => {
                 TopLevelCompletion::Create((*publication).publish(operations))
@@ -1958,8 +1960,6 @@ enum MutationOperationState {
 /// One journaled request whose operation allocation is reused through checkpoint completion.
 #[derive(Debug)]
 struct MutationRequestOperation {
-    /// Stable mounted volume receiving all coordinator and publication transitions.
-    volume: NonNull<VolumeControlBlock>,
     /// Validated mounted lower devices.
     devices: MountedStorageRoute,
     /// Stable FIFO ticket retained across stale-plan re-resolution.
@@ -1999,46 +1999,29 @@ impl MutationRequestOperation {
     fn try_new(
         owned: OwnedIrp,
         kind: MutationRequestKind,
+        access: &mut MountedVolumeAccess<'_>,
     ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-        let volume = match MountedVolumeDevice::vcb(owned.device()) {
-            Some(volume) => volume,
-            None => {
-                return Err(AdmitOperationError::new(
-                    DriverError::InvalidDeviceRequest,
-                    owned,
-                ));
-            }
-        };
         let now = match crate::kernel::time::current_ext4_timestamp() {
             Ok(now) => now,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
-        let (ticket, activity, devices, epoch, resolve, crypto) = {
-            let mut access = unsafe {
-                // SAFETY: Admission executes on the sole reactor thread and every returned token
-                // is owned by the operation before that access projection ends.
-                VolumeControlBlock::operation_access(volume)
-            };
-            let crypto = match access.runtime().crypto().try_new_operation() {
-                Ok(crypto) => crypto,
-                Err(error) => return Err(AdmitOperationError::new(error, owned)),
-            };
-            let (ticket, activity) = match access.runtime_mut().admit_mutation() {
-                Ok(admission) => admission,
-                Err(error) => return Err(AdmitOperationError::new(error, owned)),
-            };
-            let epoch = match access.runtime_mut().acquire_epoch() {
-                Ok(epoch) => epoch,
-                Err(error) => return Err(AdmitOperationError::new(error, owned)),
-            };
-            let devices = access.runtime().storage();
-            let resolve = MutationResolveOperation::new(access.runtime().profile());
-            (ticket, activity, devices, epoch, resolve, crypto)
+        let crypto = match access.new_crypto_operation() {
+            Ok(crypto) => crypto,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
+        let (ticket, activity) = match access.admit_mutation() {
+            Ok(admission) => admission,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
+        };
+        let epoch = match access.acquire_epoch() {
+            Ok(epoch) => epoch,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
+        };
+        let devices = access.storage_route();
+        let resolve = MutationResolveOperation::new(access.mounted_profile());
         match memory::boxed_try_map(
             (owned, epoch, crypto, activity),
             |(owned, epoch, crypto, activity)| Self {
-                volume,
                 devices,
                 ticket,
                 _activity: activity,
@@ -2095,7 +2078,7 @@ impl MutationRequestOperation {
         kind: MutationRequestKind,
         cleanup_deletion: &mut Option<crate::request::file_info::PendingCleanupDeletion>,
         owned: &mut OwnedIrp,
-        operations: &mut crate::state::VolumeAccess,
+        operations: &mut crate::state::MountedVolumeAccess<'_>,
         mutation: &mut crate::request::DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<DriverResolveDisposition> {
         match kind {
@@ -2148,7 +2131,7 @@ impl MutationRequestOperation {
                 ))
             }
             MutationRequestKind::SetVolumeInformation => {
-                match crate::request::volume_info::set(owned.request(), mutation)? {
+                match crate::request::volume_info::set(owned.request(), operations, mutation)? {
                     crate::request::volume_info::SetVolumeResolution::Complete(completion) => Ok(
                         DriverResolveDisposition::Complete(TopLevelCompletion::Normal(completion)),
                     ),
@@ -2161,7 +2144,10 @@ impl MutationRequestOperation {
             }
             MutationRequestKind::SetReparsePoint => {
                 let mut request = owned.request();
-                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                crate::request::file_system_control::authorize_path_handle(
+                    &mut request,
+                    operations,
+                )?;
                 let completion = crate::request::reparse::set_reparse_point(request, mutation)?;
                 Ok(DriverResolveDisposition::Mutation(
                     PendingDriverPublication::Normal(completion),
@@ -2169,7 +2155,10 @@ impl MutationRequestOperation {
             }
             MutationRequestKind::DeleteReparsePoint => {
                 let mut request = owned.request();
-                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                crate::request::file_system_control::authorize_path_handle(
+                    &mut request,
+                    operations,
+                )?;
                 let completion = crate::request::reparse::delete_reparse_point(request, mutation)?;
                 Ok(DriverResolveDisposition::Mutation(
                     PendingDriverPublication::Normal(completion),
@@ -2177,7 +2166,10 @@ impl MutationRequestOperation {
             }
             MutationRequestKind::EnableVerity => {
                 let mut request = owned.request();
-                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                crate::request::file_system_control::authorize_path_handle(
+                    &mut request,
+                    operations,
+                )?;
                 let completion = crate::request::fsctl::enable_verity(request, mutation)?;
                 Ok(DriverResolveDisposition::Mutation(
                     PendingDriverPublication::Normal(completion),
@@ -2185,7 +2177,10 @@ impl MutationRequestOperation {
             }
             MutationRequestKind::AddEncryptionKey => {
                 let mut request = owned.request();
-                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                crate::request::file_system_control::authorize_path_handle(
+                    &mut request,
+                    operations,
+                )?;
                 let stack =
                     request.with_active(|active| active.current_stack()?.file_system_control())?;
                 let completion =
@@ -2196,7 +2191,10 @@ impl MutationRequestOperation {
             }
             MutationRequestKind::RemoveEncryptionKey => {
                 let mut request = owned.request();
-                crate::request::file_system_control::authorize_path_handle(&mut request)?;
+                crate::request::file_system_control::authorize_path_handle(
+                    &mut request,
+                    operations,
+                )?;
                 let stack =
                     request.with_active(|active| active.current_stack()?.file_system_control())?;
                 let completion =
@@ -2207,7 +2205,7 @@ impl MutationRequestOperation {
             }
             MutationRequestKind::Cleanup => {
                 if cleanup_deletion.is_none() {
-                    match crate::request::file_info::cleanup(owned.request())? {
+                    match crate::request::file_info::cleanup(owned.request(), operations)? {
                         crate::request::file_info::CleanupResolution::Complete(completion) => {
                             return Ok(DriverResolveDisposition::Complete(
                                 TopLevelCompletion::Normal(completion),
@@ -2232,21 +2230,17 @@ impl MutationRequestOperation {
     }
 
     /// Reacquires the latest immutable epoch while retaining the original FIFO ticket.
-    fn restart_resolution(self: Box<Self>, owned: OwnedIrp) -> OperationTransition {
-        let (epoch, resolve) = {
-            let mut access = unsafe {
-                // SAFETY: Stale-plan restart runs on the sole reactor thread and projects the
-                // stable mounted runtime only for token acquisition.
-                VolumeControlBlock::operation_access(self.volume)
-            };
-            let epoch = match access.runtime_mut().acquire_epoch() {
-                Ok(epoch) => epoch,
-                Err(error) => return self.complete_error(owned, error),
-            };
-            let resolve = MutationResolveOperation::new(access.runtime().profile());
-            (epoch, resolve)
+    fn restart_resolution(
+        self: Box<Self>,
+        owned: OwnedIrp,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        let epoch = match access.acquire_epoch() {
+            Ok(epoch) => epoch,
+            Err(error) => return self.complete_error(owned, error),
         };
-        self.advance_resolution(owned, epoch, resolve, OperationEvent::Admitted)
+        let resolve = MutationResolveOperation::new(access.mounted_profile());
+        self.advance_resolution(owned, epoch, resolve, OperationEvent::Admitted, access)
     }
 
     /// Integrates one resolution event and emits only its matching next action.
@@ -2256,6 +2250,7 @@ impl MutationRequestOperation {
         epoch: EpochLease,
         resolve: MutationResolveOperation,
         event: OperationEvent,
+        operations: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         let mut ready = match resolve.accept(event) {
             Ok(ready) => ready,
@@ -2263,18 +2258,13 @@ impl MutationRequestOperation {
         };
         let mut publication = None;
         let resolved = {
-            let mut operations = unsafe {
-                // SAFETY: One reactor transition owns this VCB projection; no reference crosses
-                // the transition or enters a completion envelope.
-                VolumeControlBlock::operation_access(self.volume)
-            };
             let kind = self.kind;
             let mut pass = ready.begin_pass(epoch.epoch(), self.now, &mut self.crypto);
             match Self::execute_resolve(
                 kind,
                 &mut self.cleanup_deletion,
                 &mut owned,
-                &mut operations,
+                operations,
                 &mut pass,
             ) {
                 Ok(DriverResolveDisposition::Complete(completion)) => {
@@ -2282,7 +2272,7 @@ impl MutationRequestOperation {
                 }
                 Ok(DriverResolveDisposition::Mutation(prepared)) => {
                     publication = Some(prepared);
-                    pass.resolve(self.ticket, operations.runtime().coordinator())
+                    operations.resolve_mutation(pass, self.ticket)
                 }
                 Err(DriverError::Core(Error::OperationSuspended)) => Err(Error::OperationSuspended),
                 Err(error) => return self.complete_error(owned, error),
@@ -2321,7 +2311,7 @@ impl MutationRequestOperation {
                     publication,
                 };
                 OperationTransition::RequestIntent {
-                    request: IntentRequest::new(self.volume, self.ticket, requested),
+                    request: IntentRequest::new(self.ticket, requested),
                     suspended: self,
                 }
             }
@@ -2437,13 +2427,14 @@ impl MutationRequestOperation {
     }
 
     /// Converts a commit-path lower failure into a recovery-required terminal result.
-    fn fail_commit_path(&self, context: CommitContext, error: Error) -> OperationTransition {
-        let mut access = unsafe {
-            // SAFETY: Failure publication runs on the sole reactor thread against a stable VCB.
-            VolumeControlBlock::operation_access(self.volume)
-        };
+    fn fail_commit_path(
+        &self,
+        context: CommitContext,
+        error: Error,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
         if self.write_effect_observed {
-            access.runtime_mut().record_durability_unknown();
+            access.record_durability_unknown();
         }
         self.complete_error(context.owned, DriverError::from(error))
     }
@@ -2460,9 +2451,10 @@ impl MutationRequestOperation {
         context: CommitContext,
         phase: CommitIoPhase,
         event: OperationEvent,
+        access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         let OperationEvent::StorageCompleted(completion) = event else {
-            return self.fail_commit_path(context, Error::DeviceIo);
+            return self.fail_commit_path(context, Error::DeviceIo, access);
         };
         match phase {
             CommitIoPhase::OrderedWrite {
@@ -2470,40 +2462,39 @@ impl MutationRequestOperation {
                 remaining,
             } => match expected.complete(completion) {
                 Ok(()) => self.observed_write().drive_ordered(context, remaining),
-                Err(error) => self.fail_commit_path(context, error),
+                Err(error) => self.fail_commit_path(context, error, access),
             },
             CommitIoPhase::OrderedFlush { expected, next } => match expected.complete(completion) {
                 Ok(()) => self.drive_journal(context, next.completed()),
-                Err(error) => self.fail_commit_path(context, error),
+                Err(error) => self.fail_commit_path(context, error, access),
             },
             CommitIoPhase::JournalWrite {
                 expected,
                 remaining,
             } => match expected.complete(completion) {
                 Ok(()) => self.observed_write().drive_journal(context, remaining),
-                Err(error) => self.fail_commit_path(context, error),
+                Err(error) => self.fail_commit_path(context, error, access),
             },
             CommitIoPhase::JournalFlush { expected, next } => match expected.complete(completion) {
                 Ok(()) => self.submit_commit_record(context, next),
-                Err(error) => self.fail_commit_path(context, error),
+                Err(error) => self.fail_commit_path(context, error, access),
             },
             CommitIoPhase::CommitWrite { expected, next } => match expected.complete(completion) {
                 Ok(()) => self.observed_write().submit_commit_flush(context, next),
-                Err(error) => self.fail_commit_path(context, error),
+                Err(error) => self.fail_commit_path(context, error, access),
             },
             CommitIoPhase::CommitFlush { expected, next } => match expected.complete(completion) {
                 Ok(()) => {
                     let durable = next.completed();
-                    let volume = self.volume;
                     let ticket = self.ticket;
                     let mut this = self;
                     this.state = MutationOperationState::AwaitingVisibility { context, durable };
                     OperationTransition::Wait {
-                        condition: WaitCondition::Visibility { volume, ticket },
+                        condition: WaitCondition::Visibility { ticket },
                         suspended: this,
                     }
                 }
-                Err(error) => self.fail_commit_path(context, error),
+                Err(error) => self.fail_commit_path(context, error, access),
             },
         }
     }
@@ -2600,19 +2591,16 @@ impl MutationRequestOperation {
         &self,
         publication: EpochPublicationSlot,
         failure: StorageFailureClass,
+        access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         drop(publication);
-        let mut access = unsafe {
-            // SAFETY: Detached checkpoint failure is published on the sole reactor thread.
-            VolumeControlBlock::operation_access(self.volume)
-        };
         match failure {
-            StorageFailureClass::Terminal => access.runtime_mut().record_durable_abort(),
+            StorageFailureClass::Terminal => access.record_durable_abort(),
             StorageFailureClass::ReadUnreliable => {
-                access.runtime_mut().record_read_unreliable();
+                access.record_read_unreliable();
             }
             StorageFailureClass::DurabilityUnknown => {
-                access.runtime_mut().record_durability_unknown();
+                access.record_durability_unknown();
             }
         }
         OperationTransition::Complete
@@ -2625,9 +2613,14 @@ impl MutationRequestOperation {
         publication: EpochPublicationSlot,
         epoch: ext4_core::EpochSequence,
         event: OperationEvent,
+        access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         let OperationEvent::StorageCompleted(completion) = event else {
-            return self.fail_checkpoint(publication, StorageFailureClass::DurabilityUnknown);
+            return self.fail_checkpoint(
+                publication,
+                StorageFailureClass::DurabilityUnknown,
+                access,
+            );
         };
         match phase {
             CheckpointIoPhase::HomeWrite {
@@ -2635,20 +2628,24 @@ impl MutationRequestOperation {
                 remaining,
             } => match expected.complete(completion) {
                 Ok(()) => self.drive_checkpoint_home(remaining, publication, epoch),
-                Err(_) => self.fail_checkpoint(publication, StorageFailureClass::Terminal),
+                Err(_) => self.fail_checkpoint(publication, StorageFailureClass::Terminal, access),
             },
             CheckpointIoPhase::HomeFlush { expected, next } => {
                 match expected.complete(completion) {
                     Ok(()) => self.submit_clean_record(next, publication, epoch),
-                    Err(_) => self.fail_checkpoint(publication, StorageFailureClass::Terminal),
+                    Err(_) => {
+                        self.fail_checkpoint(publication, StorageFailureClass::Terminal, access)
+                    }
                 }
             }
             CheckpointIoPhase::CleanWrite { expected, next } => {
                 match expected.complete(completion) {
                     Ok(()) => self.submit_clean_flush(next, publication, epoch),
-                    Err(_) => {
-                        self.fail_checkpoint(publication, StorageFailureClass::DurabilityUnknown)
-                    }
+                    Err(_) => self.fail_checkpoint(
+                        publication,
+                        StorageFailureClass::DurabilityUnknown,
+                        access,
+                    ),
                 }
             }
             CheckpointIoPhase::CleanFlush { expected, next } => {
@@ -2662,17 +2659,23 @@ impl MutationRequestOperation {
                         };
                         OperationTransition::Publish { publication: this }
                     }
-                    Err(_) => {
-                        self.fail_checkpoint(publication, StorageFailureClass::DurabilityUnknown)
-                    }
+                    Err(_) => self.fail_checkpoint(
+                        publication,
+                        StorageFailureClass::DurabilityUnknown,
+                        access,
+                    ),
                 }
             }
         }
     }
 }
 
-impl CompletionOperation for MutationRequestOperation {
-    fn advance(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+impl MountedVolumeOperation for MutationRequestOperation {
+    fn advance_mounted(
+        mut self: Box<Self>,
+        event: OperationEvent,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
         let event = if self.kind == MutationRequestKind::Cleanup && !self.cleanup_barrier_released {
             match event {
                 OperationEvent::Admitted => {
@@ -2705,7 +2708,7 @@ impl CompletionOperation for MutationRequestOperation {
                 owned,
                 epoch,
                 resolve,
-            } => self.advance_resolution(owned, epoch, resolve, event),
+            } => self.advance_resolution(owned, epoch, resolve, event, access),
             MutationOperationState::AwaitingIntent {
                 owned,
                 resolved,
@@ -2714,19 +2717,12 @@ impl CompletionOperation for MutationRequestOperation {
                 let OperationEvent::IntentGranted(intent) = event else {
                     return self.complete_error(owned, DriverError::InvalidDeviceRequest);
                 };
-                let reserved = {
-                    let access = unsafe {
-                        // SAFETY: Version revalidation is a non-suspending projection on the sole
-                        // reactor thread.
-                        VolumeControlBlock::operation_access(self.volume)
-                    };
-                    resolved.reserve(access.runtime().coordinator(), intent)
-                };
+                let reserved = access.reserve_mutation(resolved, intent);
                 let reserved = match reserved {
                     Ok(reserved) => reserved,
                     Err(Error::ClusterReferenceConflict) => {
                         drop(publication);
-                        return self.restart_resolution(owned);
+                        return self.restart_resolution(owned, access);
                     }
                     Err(error) => {
                         drop(publication);
@@ -2738,16 +2734,7 @@ impl CompletionOperation for MutationRequestOperation {
                     Err(error) => return self.complete_error(owned, error),
                 };
                 let slots = {
-                    let mut access = unsafe {
-                        // SAFETY: The VCB is heap-stable and publication reservations remain
-                        // operation-owned until publish or pre-write rollback.
-                        VolumeControlBlock::operation_access(self.volume)
-                    };
-                    let reservations = unsafe {
-                        // SAFETY: This mounted runtime remains at its final VCB address until the
-                        // operation publishes or drops both returned reservations.
-                        access.runtime_mut().reserve_epoch_publication()
-                    };
+                    let reservations = access.reserve_epoch_publication();
                     match reservations {
                         Ok(slots) => slots,
                         Err(error) => return self.complete_error(owned, error),
@@ -2760,7 +2747,6 @@ impl CompletionOperation for MutationRequestOperation {
                     slots,
                 };
                 OperationTransition::RequestCommit {
-                    volume: self.volume,
                     ticket: self.ticket,
                     suspended: self,
                 }
@@ -2774,15 +2760,8 @@ impl CompletionOperation for MutationRequestOperation {
                 let OperationEvent::CommitGranted(commit) = event else {
                     return self.complete_error(owned, DriverError::InvalidDeviceRequest);
                 };
-                let ready: Result<CommitReadyMutation, Error> = {
-                    let access = unsafe {
-                        // SAFETY: Commit preparation borrows stable runtime state only for this
-                        // transition and all returned values are owned.
-                        VolumeControlBlock::operation_access(self.volume)
-                    };
-                    let runtime = access.runtime();
-                    reserved.prepare_commit(runtime.coordinator(), runtime.current_epoch(), commit)
-                };
+                let ready: Result<CommitReadyMutation, Error> =
+                    access.prepare_mutation_commit(reserved, commit);
                 let ready = match ready {
                     Ok(ready) => ready,
                     Err(error) => return self.complete_error(owned, DriverError::from(error)),
@@ -2797,11 +2776,11 @@ impl CompletionOperation for MutationRequestOperation {
                 self.drive_ordered(context, ready.start())
             }
             MutationOperationState::CommitIo { context, phase } => {
-                self.advance_commit_io(context, phase, event)
+                self.advance_commit_io(context, phase, event, access)
             }
             MutationOperationState::AwaitingVisibility { context, durable } => {
                 let OperationEvent::VisibilityGranted(visibility) = event else {
-                    return self.fail_commit_path(context, Error::DeviceIo);
+                    return self.fail_commit_path(context, Error::DeviceIo, access);
                 };
                 self.state = MutationOperationState::PublishingDurable {
                     context,
@@ -2811,12 +2790,11 @@ impl CompletionOperation for MutationRequestOperation {
                 OperationTransition::Publish { publication: self }
             }
             MutationOperationState::PublishingDurable { context, .. } => {
-                self.fail_commit_path(context, Error::DeviceIo)
+                self.fail_commit_path(context, Error::DeviceIo, access)
             }
             MutationOperationState::AwaitingCheckpoint(pending) => match event {
                 OperationEvent::Admitted => OperationTransition::Wait {
                     condition: WaitCondition::Checkpoint {
-                        volume: self.volume,
                         epoch: pending.epoch(),
                     },
                     suspended: {
@@ -2837,42 +2815,45 @@ impl CompletionOperation for MutationRequestOperation {
                 | OperationEvent::VisibilityGranted(_)
                 | OperationEvent::BarrierReleased(_) => {
                     let (_, publication, _) = pending.into_parts();
-                    self.fail_checkpoint(publication, StorageFailureClass::DurabilityUnknown)
+                    self.fail_checkpoint(
+                        publication,
+                        StorageFailureClass::DurabilityUnknown,
+                        access,
+                    )
                 }
             },
             MutationOperationState::CheckpointIo {
                 phase,
                 publication,
                 epoch,
-            } => self.advance_checkpoint_io(phase, publication, epoch, event),
+            } => self.advance_checkpoint_io(phase, publication, epoch, event, access),
             MutationOperationState::PublishingCheckpoint { publication, .. } => {
-                self.fail_checkpoint(publication, StorageFailureClass::DurabilityUnknown)
+                self.fail_checkpoint(publication, StorageFailureClass::DurabilityUnknown, access)
             }
             MutationOperationState::Terminal => OperationTransition::Complete,
         }
     }
 
-    fn record_storage_failure(&mut self, failure: StorageFailureClass) {
-        let mut access = unsafe {
-            // SAFETY: Lower completion returns this operation to the sole reactor thread before
-            // failure classification mutates the stable volume runtime.
-            VolumeControlBlock::operation_access(self.volume)
-        };
+    fn record_mounted_storage_failure(
+        &mut self,
+        failure: StorageFailureClass,
+        access: &mut MountedVolumeAccess<'_>,
+    ) {
         match (&self.state, failure) {
             (_, StorageFailureClass::ReadUnreliable) => {
-                access.runtime_mut().record_read_unreliable();
+                access.record_read_unreliable();
             }
             (MutationOperationState::CommitIo { .. }, StorageFailureClass::DurabilityUnknown) => {
-                access.runtime_mut().record_durability_unknown();
+                access.record_durability_unknown();
             }
             (MutationOperationState::CheckpointIo { .. }, StorageFailureClass::Terminal) => {
-                access.runtime_mut().record_durable_abort();
+                access.record_durable_abort();
             }
             (
                 MutationOperationState::CheckpointIo { .. },
                 StorageFailureClass::DurabilityUnknown,
             ) => {
-                access.runtime_mut().record_durability_unknown();
+                access.record_durability_unknown();
             }
             (
                 MutationOperationState::Resolving { .. },
@@ -2897,14 +2878,10 @@ impl InfalliblePublication for MutationRequestOperation {
     fn authority(&self) -> PublicationAuthority {
         match &self.state {
             MutationOperationState::PublishingDurable { .. } => PublicationAuthority::Durable {
-                volume: self.volume,
                 ticket: self.ticket,
             },
             MutationOperationState::PublishingCheckpoint { epoch, .. } => {
-                PublicationAuthority::Checkpoint {
-                    volume: self.volume,
-                    epoch: *epoch,
-                }
+                PublicationAuthority::Checkpoint { epoch: *epoch }
             }
             MutationOperationState::Resolving { .. }
             | MutationOperationState::AwaitingIntent { .. }
@@ -2920,7 +2897,10 @@ impl InfalliblePublication for MutationRequestOperation {
         }
     }
 
-    fn publish(mut self: Box<Self>) -> Box<dyn CompletionOperation> {
+    fn publish(
+        mut self: Box<Self>,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> Box<dyn CompletionOperation> {
         let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
         match state {
             MutationOperationState::PublishingDurable {
@@ -2934,21 +2914,9 @@ impl InfalliblePublication for MutationRequestOperation {
                     durable_slot,
                     checkpoint_slot,
                 } = context;
-                let (completion, pending) = {
-                    let mut access = unsafe {
-                        // SAFETY: Publication is the sole reactor-owned transition and all inputs
-                        // were preallocated before the first write.
-                        VolumeControlBlock::operation_access(self.volume)
-                    };
-                    let pending = access.runtime_mut().publish_durable(
-                        durable,
-                        visibility,
-                        durable_slot,
-                        checkpoint_slot,
-                    );
-                    let completion = publication.publish(&mut access);
-                    (completion, pending)
-                };
+                let pending =
+                    access.publish_durable(durable, visibility, durable_slot, checkpoint_slot);
+                let completion = publication.publish(access);
                 let _complete = Self::complete_success(owned, completion);
                 self.state = MutationOperationState::AwaitingCheckpoint(pending);
             }
@@ -2957,14 +2925,7 @@ impl InfalliblePublication for MutationRequestOperation {
                 publication,
                 epoch,
             } => {
-                let mut access = unsafe {
-                    // SAFETY: Checkpoint publication exclusively consumes the matching gate and
-                    // pre-reserved epoch slot on the reactor thread.
-                    VolumeControlBlock::operation_access(self.volume)
-                };
-                access
-                    .runtime_mut()
-                    .publish_checkpoint(durability, publication, epoch);
+                access.publish_checkpoint(durability, publication, epoch);
                 self.state = MutationOperationState::Terminal;
             }
             MutationOperationState::Resolving { .. }
@@ -2987,6 +2948,13 @@ impl InfalliblePublication for MutationRequestOperation {
 // mutable access is confined to the sole reactor thread and completion envelopes move only owned
 // state.
 unsafe impl Send for MutationRequestOperation {}
+
+impl_mounted_operation_adapter!(ReadRequestOperation);
+impl_mounted_operation_adapter!(ImmediateRequestOperation);
+impl_mounted_operation_adapter!(NotificationOperation);
+impl_mounted_operation_adapter!(VolumeControlOperation);
+impl_mounted_operation_adapter!(FlushRequestOperation);
+impl_mounted_operation_adapter!(MutationRequestOperation);
 
 /// Allocates one completion-driven mount operation.
 /// # Errors
@@ -3027,8 +2995,9 @@ pub(crate) fn volume_control(
 pub(crate) fn read(
     owned: OwnedIrp,
     kind: ReadRequestKind,
+    access: &mut MountedVolumeAccess<'_>,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-    ReadRequestOperation::try_new(owned, kind)
+    ReadRequestOperation::try_new(owned, kind, access)
 }
 
 /// Allocates one concrete single-transition operation.
@@ -3049,8 +3018,9 @@ pub(crate) fn immediate(
 pub(crate) fn mutation(
     owned: OwnedIrp,
     kind: MutationRequestKind,
+    access: &mut MountedVolumeAccess<'_>,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-    MutationRequestOperation::try_new(owned, kind)
+    MutationRequestOperation::try_new(owned, kind, access)
 }
 
 /// Allocates one concrete durability-barrier and lower-flush operation.
@@ -3060,8 +3030,9 @@ pub(crate) fn mutation(
 pub(crate) fn flush(
     owned: OwnedIrp,
     kind: FlushRequestKind,
+    access: &MountedVolumeAccess<'_>,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-    FlushRequestOperation::try_new(owned, kind)
+    FlushRequestOperation::try_new(owned, kind, access)
 }
 
 #[cfg(test)]

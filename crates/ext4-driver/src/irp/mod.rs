@@ -11,6 +11,7 @@ mod cancel;
 mod capture;
 pub(crate) mod lower;
 pub(crate) mod reactor;
+mod scheduler;
 
 #[cfg(not(test))]
 pub(crate) use cancel::ActiveCancelDestination;
@@ -841,11 +842,6 @@ impl OwnedIrp {
     /// Borrows this pending IRP as an active request without releasing completion authority.
     pub(crate) const fn request(&mut self) -> PendingIrpLease<'_> {
         PendingIrpLease { owner: self }
-    }
-
-    /// Device object that admitted this top-level request.
-    pub(crate) const fn device(&self) -> KernelDevice {
-        self.target.device
     }
 
     /// Installs the active cancellation token after this IRP leaves the CSQ.

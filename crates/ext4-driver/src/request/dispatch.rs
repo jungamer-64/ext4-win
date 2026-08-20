@@ -15,7 +15,7 @@ use super::operation::{
     ReadRequestKind,
 };
 use crate::irp::reactor::{
-    AdmittedOperation, HandleOperationLane, OperationAdmission, PostCleanupRequest,
+    AdmittedOperation, HandleOperationLane, OperationAdmission, PostCleanupRequest, ReactorTarget,
 };
 use crate::state::HandleAdmissionState;
 
@@ -367,7 +367,10 @@ fn post_cleanup_lane(
 ///
 /// Returns the still-owned IRP when lifecycle admission, request decoding, operation allocation,
 /// or mounted-state validation fails.
-pub(crate) fn admit_owned(mut owned: OwnedIrp) -> Result<AdmittedOperation, AdmitOperationError> {
+pub(crate) fn admit_owned(
+    mut owned: OwnedIrp,
+    target: &mut ReactorTarget,
+) -> Result<AdmittedOperation, AdmitOperationError> {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum HandleRequestClass {
         Device,
@@ -621,13 +624,28 @@ pub(crate) fn admit_owned(mut owned: OwnedIrp) -> Result<AdmittedOperation, Admi
     };
 
     let operation = match admission {
-        Admission::Mount(admission) => super::operation::mount(owned, admission),
-        Admission::Read(kind) => super::operation::read(owned, kind),
-        Admission::Mutation(kind) => super::operation::mutation(owned, kind),
-        Admission::Flush(kind) => super::operation::flush(owned, kind),
-        Admission::Immediate(kind) => super::operation::immediate(owned, kind),
-        Admission::Notification => super::operation::notification(owned),
-        Admission::VolumeControl(kind) => super::operation::volume_control(owned, kind),
+        Admission::Mount(admission) => {
+            target.require_control_device();
+            super::operation::mount(owned, admission)
+        }
+        Admission::Read(kind) => {
+            target.with_mounted_access(|access| super::operation::read(owned, kind, access))
+        }
+        Admission::Mutation(kind) => {
+            target.with_mounted_access(|access| super::operation::mutation(owned, kind, access))
+        }
+        Admission::Flush(kind) => {
+            target.with_mounted_access(|access| super::operation::flush(owned, kind, access))
+        }
+        Admission::Immediate(kind) => {
+            target.with_mounted_access(|_| super::operation::immediate(owned, kind))
+        }
+        Admission::Notification => {
+            target.with_mounted_access(|_| super::operation::notification(owned))
+        }
+        Admission::VolumeControl(kind) => {
+            target.with_mounted_access(|_| super::operation::volume_control(owned, kind))
+        }
         Admission::FsControl(_) => Err(AdmitOperationError::new(
             DriverError::InternalInvariantViolation,
             owned,
