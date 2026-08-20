@@ -616,6 +616,19 @@ impl JournalUuid {
     pub const fn bytes(self) -> [u8; 16] {
         self.0
     }
+
+    /// Returns whether no external-journal identifier was recorded.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        let mut index = 0;
+        while index < self.0.len() {
+            if self.0[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
 }
 
 /// Ext4 volume label stored in `s_volume_name`.
@@ -964,10 +977,8 @@ impl ClusterGeometry {
 enum JournalFeature {
     /// The filesystem has no journal.
     None,
-    /// The journal lives in an ext4 inode on the filesystem device.
-    Internal,
-    /// The journal lives on a separate JBD2 device.
-    External,
+    /// The filesystem requires one internal or external JBD2 journal.
+    Present,
 }
 
 /// Superblock copy placement selected by sparse-super feature bits.
@@ -1131,10 +1142,12 @@ impl FeatureSet {
         {
             return Err(Error::UnsupportedWriteFeature);
         }
+        if incompat & INCOMPAT_JOURNAL_DEV != 0 {
+            return Err(Error::UnsupportedWriteFeature);
+        }
         if incompat
             & !(INCOMPAT_FILETYPE
                 | INCOMPAT_RECOVER
-                | INCOMPAT_JOURNAL_DEV
                 | INCOMPAT_EXTENTS
                 | INCOMPAT_64BIT
                 | INCOMPAT_FLEX_BG
@@ -1207,10 +1220,8 @@ impl FeatureSet {
         };
         let journal = if compat & COMPAT_HAS_JOURNAL == 0 {
             JournalFeature::None
-        } else if incompat & INCOMPAT_JOURNAL_DEV != 0 {
-            JournalFeature::External
         } else {
-            JournalFeature::Internal
+            JournalFeature::Present
         };
         let recovery_state = if incompat & INCOMPAT_RECOVER != 0 {
             RecoveryState::NeedsRecovery
@@ -1294,11 +1305,6 @@ impl FeatureSet {
     /// Returns whether the filesystem advertises a journal.
     pub(crate) const fn has_journal(self) -> bool {
         !matches!(self.journal, JournalFeature::None)
-    }
-
-    /// Returns whether the journal lives on a separate journal device.
-    pub(crate) const fn has_external_journal(self) -> bool {
-        matches!(self.journal, JournalFeature::External)
     }
 
     /// Returns the metadata checksum mode.
@@ -1516,12 +1522,15 @@ impl Superblock {
         )?;
         let journal_uuid = JournalUuid::from_bytes(journal_uuid);
         let journal_mode = if features.has_journal() {
-            if features.has_external_journal() {
-                if journal_inode != 0 {
+            if journal_inode == 0 {
+                if journal_uuid.is_zero() {
                     return Err(Error::InvalidSuperblock);
                 }
                 JournalMode::External(journal_uuid)
             } else {
+                if !journal_uuid.is_zero() {
+                    return Err(Error::InvalidSuperblock);
+                }
                 JournalMode::Internal(InodeId::try_from(journal_inode)?)
             }
         } else {
@@ -1746,18 +1755,23 @@ impl Superblock {
         self.features.recovery_state()
     }
 
-    /// Builds a primary-superblock image with the recovery-required bit cleared.
+    /// Builds a primary-superblock image with the requested recovery marker.
     ///
     /// This function performs no write. The mount operation must persist the returned image and
     /// flush it before publishing mounted state.
     /// # Errors
     /// Returns an error when the primary superblock cannot be read or rewritten.
-    pub(crate) fn prepare_clear_recover(
+    pub(crate) fn prepare_recovery_marker(
         device: &mut OperationDevice<'_>,
+        state: RecoveryState,
     ) -> Result<[u8; SUPERBLOCK_SIZE]> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
         device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
-        let incompat = le_u32(&raw, disk_offset(96))? & !INCOMPAT_RECOVER;
+        let current = le_u32(&raw, disk_offset(96))?;
+        let incompat = match state {
+            RecoveryState::Clean => current & !INCOMPAT_RECOVER,
+            RecoveryState::NeedsRecovery => current | INCOMPAT_RECOVER,
+        };
         put_le_u32(&mut raw, disk_offset(96), incompat)?;
         Self::refresh_checksum(&mut raw)?;
         Ok(raw)

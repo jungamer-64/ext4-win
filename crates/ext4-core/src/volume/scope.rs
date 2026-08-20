@@ -25,13 +25,11 @@ pub(super) use crate::disk_format::inode::{
     InodeKind, InodeMode, InodeStorage, LinkCountAfterDecrement, NewDirectoryMetadata,
     NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
-pub(super) use crate::disk_format::journal::{
-    CleanJournal, DirtyJournal, Journal, LoadedJournal, MetadataBlock,
-};
+pub(super) use crate::disk_format::journal::{CleanJournal, DirtyJournal, Journal, MetadataBlock};
 pub(super) use crate::disk_format::superblock::{
     BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel, FreeClusterCount,
-    FreeClusterDelta, InodeTimestampEncoding, JournalMode, MetadataChecksum, RecoveryState,
-    SparseSuperblockLayout, Superblock, XattrMutationSupport,
+    FreeClusterDelta, InodeTimestampEncoding, MetadataChecksum, SparseSuperblockLayout, Superblock,
+    XattrMutationSupport,
 };
 pub(super) use crate::disk_format::xattr::{
     self as xattr_storage, InodeXattrSet, XattrName, XattrSet, XattrValue,

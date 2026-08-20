@@ -4,9 +4,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::scope::*;
-use crate::disk::storage::{
-    OperationDevice, StorageReadOverlay, StorageRequestIdentity, StorageTarget, StorageTranscript,
-};
+use crate::disk::storage::{OperationDevice, StorageReadOverlay, StorageTarget, StorageTranscript};
 use crate::disk_format::journal::{CleanJournal, Journal, MetadataBlock};
 
 /// Maximum distinct resources whose committed versions are tracked by one mounted volume.
