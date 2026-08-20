@@ -1,0 +1,38 @@
+name: fuzz
+
+on:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust and cargo-fuzz
+        run: |
+          rustup toolchain install nightly-2026-08-10 --profile minimal
+          cargo install --locked cargo-fuzz --version 0.13.2
+      - name: Replay mount corpus
+        run: cargo fuzz run mount_image fuzz/corpus/mount_image -- -runs=1
+      - name: Replay journal corpus
+        run: cargo fuzz run journal_recovery fuzz/corpus/journal_recovery -- -runs=1
+
+  scheduled:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust and cargo-fuzz
+        run: |
+          rustup toolchain install nightly-2026-08-10 --profile minimal
+          cargo install --locked cargo-fuzz --version 0.13.2
+      - name: Fuzz mount images
+        run: cargo fuzz run mount_image -- -max_total_time=300
+      - name: Fuzz journal recovery
+        run: cargo fuzz run journal_recovery -- -max_total_time=300

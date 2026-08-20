@@ -1,0 +1,28 @@
+[package]
+name = "ext4-win-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+cargo-fuzz-version = "0.13.2"
+
+[dependencies]
+ext4-core = { path = "../crates/ext4-core" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "mount_image"
+path = "fuzz_targets/mount_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_recovery"
+path = "fuzz_targets/journal_recovery.rs"
+test = false
+doc = false
+bench = false
