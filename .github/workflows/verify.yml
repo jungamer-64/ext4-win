@@ -1,0 +1,55 @@
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    name: portable (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install nightly-2026-08-10 --profile minimal --component rustfmt --component clippy
+      - name: Verify portable workspace
+        run: cargo xtask verify-portable
+
+  journal-interop:
+    name: JBD2 interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install nightly-2026-08-10 --profile minimal --component rustfmt --component clippy
+      - name: Install e2fsprogs oracle
+        run: sudo apt-get update && sudo apt-get install --yes e2fsprogs
+      - name: Verify journal interoperability
+        run: cargo xtask verify-journal-interop
+
+  production-driver:
+    name: signed production driver
+    runs-on: [self-hosted, Windows, X64, ext4-win-wdk]
+    timeout-minutes: 90
+    concurrency:
+      group: ext4-win-wdk-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify runner contract
+        shell: pwsh
+        run: |
+          rustc --version --verbose
+          cargo wdk --version
+          wsl.exe --exec e2fsck -V
+      - name: Verify production release bundle
+        shell: pwsh
+        run: cargo xtask verify-production-driver
