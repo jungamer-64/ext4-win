@@ -230,9 +230,11 @@ impl MutationResolvePass<'_, '_, '_> {
         )?;
         self.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
         let inode_id = raw_inode.id();
+        let directory_checksum = self.volume.directory_checksum(&raw_inode.parse()?);
 
         let mut directory = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+            directory_checksum,
         )?;
         directory.initialize_dot_entries(inode_id, parent.inode())?;
         self.stage_directory_block(block, directory.into_bytes())?;
@@ -652,6 +654,7 @@ impl MutationResolvePass<'_, '_, '_> {
 
         let mut block = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+            self.volume.directory_checksum(&parent_inode),
         )?;
         block.initialize_free_space()?;
         let inserted = block.insert(child, &disk_name, kind)?;
@@ -1032,7 +1035,11 @@ impl MutationResolvePass<'_, '_, '_> {
                     .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
                 bytes
             };
-            blocks.try_push((logical, physical, DirectoryBlock::new(bytes)))?;
+            blocks.try_push((
+                logical,
+                physical,
+                DirectoryBlock::new(bytes, self.volume.directory_checksum(inode)),
+            ))?;
         }
         Ok(blocks)
     }

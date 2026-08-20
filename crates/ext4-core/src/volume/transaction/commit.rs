@@ -83,6 +83,12 @@ impl MutationResolvePass<'_, '_, '_> {
                     delta.group,
                 )?;
             }
+            if delta.block_bitmap_initialization == BitmapInitializationTransition::Initialize {
+                descriptor.initialize_block_bitmap(&self.volume.superblock, delta.group)?;
+            }
+            if delta.inode_bitmap_initialization == BitmapInitializationTransition::Initialize {
+                descriptor.initialize_inode_bitmap(&self.volume.superblock, delta.group)?;
+            }
             if let Some(bitmap) = self
                 .block_bitmap_updates
                 .iter()
@@ -99,7 +105,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .iter()
                 .find(|bitmap| bitmap.block == descriptor.inode_bitmap())
             {
-                descriptor.refresh_inode_bitmap_checksum(
+                descriptor.refresh_inode_bitmap_metadata(
                     &self.volume.superblock,
                     delta.group,
                     bitmap.bytes.as_slice(),

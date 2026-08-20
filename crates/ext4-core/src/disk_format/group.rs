@@ -30,6 +30,16 @@ const BG_FREE_BLOCKS_LO_OFFSET: usize = 12;
 const BG_FREE_INODES_LO_OFFSET: usize = 14;
 /// Offset of `bg_used_dirs_count_lo` in a block group descriptor.
 const BG_USED_DIRS_LO_OFFSET: usize = 16;
+/// Offset of `bg_flags` in a block group descriptor.
+const BG_FLAGS_OFFSET: usize = 18;
+/// The inode bitmap has not yet been initialized on disk.
+const BG_INODE_UNINIT: u16 = 0x0001;
+/// The block bitmap has not yet been initialized on disk.
+const BG_BLOCK_UNINIT: u16 = 0x0002;
+/// The inode table has been zeroed.
+const BG_INODE_ZEROED: u16 = 0x0004;
+/// Descriptor flags understood by the read-write implementation.
+const BG_KNOWN_FLAGS: u16 = BG_INODE_UNINIT | BG_BLOCK_UNINIT | BG_INODE_ZEROED;
 /// Offset of the low block bitmap checksum field.
 const BG_BLOCK_BITMAP_CSUM_LO_OFFSET: usize = 24;
 /// Offset of the low inode bitmap checksum field.
@@ -65,6 +75,15 @@ const fn disk_offset(offset: usize) -> DiskOffset {
     DiskOffset::new(offset)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Whether an allocation bitmap has an authoritative on-disk image.
+pub(crate) enum AllocationBitmapInitialization {
+    /// The bitmap block is authoritative and must be read from disk.
+    Initialized,
+    /// The bitmap must be derived from block-group geometry before it is used.
+    Uninitialized,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Decoded block group descriptor backed by its writable raw bytes.
 pub(crate) struct BlockGroupDescriptor {
@@ -86,6 +105,10 @@ pub(crate) struct BlockGroupDescriptor {
     used_dirs_count: u32,
     /// Unused inode-table tail count mirrored into the descriptor.
     itable_unused_count: u32,
+    /// Initialization state of the block allocation bitmap.
+    block_bitmap_initialization: AllocationBitmapInitialization,
+    /// Initialization state of the inode allocation bitmap.
+    inode_bitmap_initialization: AllocationBitmapInitialization,
 }
 
 impl BlockGroupDescriptor {
@@ -150,6 +173,10 @@ impl BlockGroupDescriptor {
             BG_ITABLE_UNUSED_HI_OFFSET,
             superblock.descriptor_layout(),
         )?;
+        let flags = le_u16(&bytes, disk_offset(BG_FLAGS_OFFSET))?;
+        if flags & !BG_KNOWN_FLAGS != 0 {
+            return Err(Error::InvalidSuperblock);
+        }
         Ok(Self {
             offset,
             bytes,
@@ -160,6 +187,8 @@ impl BlockGroupDescriptor {
             free_inodes_count,
             used_dirs_count,
             itable_unused_count,
+            block_bitmap_initialization: bitmap_initialization(flags, BG_BLOCK_UNINIT),
+            inode_bitmap_initialization: bitmap_initialization(flags, BG_INODE_UNINIT),
         })
     }
 
@@ -186,6 +215,16 @@ impl BlockGroupDescriptor {
     /// Returns the first inode table block address.
     pub(crate) const fn inode_table(&self) -> BlockAddress {
         self.inode_table
+    }
+
+    /// Returns whether the block allocation bitmap is authoritative on disk.
+    pub(crate) const fn block_bitmap_initialization(&self) -> AllocationBitmapInitialization {
+        self.block_bitmap_initialization
+    }
+
+    /// Returns whether the inode allocation bitmap is authoritative on disk.
+    pub(crate) const fn inode_bitmap_initialization(&self) -> AllocationBitmapInitialization {
+        self.inode_bitmap_initialization
     }
 
     /// Returns the decoded free inode count.
@@ -290,29 +329,75 @@ impl BlockGroupDescriptor {
             superblock,
             group,
             bitmap,
+            superblock.clusters_per_group().as_u32(),
             BG_BLOCK_BITMAP_CSUM_LO_OFFSET,
             BG_BLOCK_BITMAP_CSUM_HI_OFFSET,
         )
     }
 
-    /// Recomputes the inode bitmap checksum fields for this group.
+    /// Recomputes inode-bitmap-derived descriptor metadata for this group.
     /// # Errors
     ///
-    /// Returns an error when the inode bitmap checksum fields or descriptor checksum cannot be
-    /// rewritten.
-    pub(crate) fn refresh_inode_bitmap_checksum(
+    /// Returns an error when the inode bitmap is truncated or the unused-tail count, bitmap
+    /// checksum, or descriptor checksum cannot be rewritten.
+    pub(crate) fn refresh_inode_bitmap_metadata(
         &mut self,
         superblock: &Superblock,
         group: BlockGroupId,
         bitmap: &[u8],
     ) -> Result<()> {
+        self.itable_unused_count =
+            trailing_unused_inode_count(bitmap, superblock.inodes_per_group().as_u32())?;
+        write_descriptor_count(
+            &mut self.bytes,
+            BG_ITABLE_UNUSED_LO_OFFSET,
+            BG_ITABLE_UNUSED_HI_OFFSET,
+            self.itable_unused_count,
+            superblock.descriptor_layout(),
+        )?;
         self.refresh_bitmap_checksum(
             superblock,
             group,
             bitmap,
+            superblock.inodes_per_group().as_u32(),
             BG_INODE_BITMAP_CSUM_LO_OFFSET,
             BG_INODE_BITMAP_CSUM_HI_OFFSET,
-        )
+        )?;
+        write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)
+    }
+
+    /// Records that the derived block bitmap is becoming authoritative on disk.
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor flags or checksum cannot be rewritten.
+    pub(crate) fn initialize_block_bitmap(
+        &mut self,
+        superblock: &Superblock,
+        group: BlockGroupId,
+    ) -> Result<()> {
+        if self.block_bitmap_initialization == AllocationBitmapInitialization::Initialized {
+            return Ok(());
+        }
+        clear_descriptor_flag(&mut self.bytes, BG_BLOCK_UNINIT)?;
+        self.block_bitmap_initialization = AllocationBitmapInitialization::Initialized;
+        write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)
+    }
+
+    /// Records that the derived inode bitmap is becoming authoritative on disk.
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor flags or checksum cannot be rewritten.
+    pub(crate) fn initialize_inode_bitmap(
+        &mut self,
+        superblock: &Superblock,
+        group: BlockGroupId,
+    ) -> Result<()> {
+        if self.inode_bitmap_initialization == AllocationBitmapInitialization::Initialized {
+            return Ok(());
+        }
+        clear_descriptor_flag(&mut self.bytes, BG_INODE_UNINIT)?;
+        self.inode_bitmap_initialization = AllocationBitmapInitialization::Initialized;
+        write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)
     }
 
     /// Writes a metadata CRC32C bitmap checksum and refreshes the descriptor checksum.
@@ -325,13 +410,14 @@ impl BlockGroupDescriptor {
         superblock: &Superblock,
         group: BlockGroupId,
         bitmap: &[u8],
+        bitmap_bits: u32,
         lo_offset: usize,
         hi_offset: usize,
     ) -> Result<()> {
         if superblock.descriptor_checksum() != BlockGroupDescriptorChecksum::MetadataCrc32c {
             return Ok(());
         }
-        let checksum = bitmap_checksum(superblock, group, bitmap);
+        let checksum = bitmap_checksum(superblock, bitmap, bitmap_bits)?;
         put_le_u16(
             &mut self.bytes,
             disk_offset(lo_offset),
@@ -346,6 +432,27 @@ impl BlockGroupDescriptor {
         }
         write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)
     }
+}
+
+/// Decodes one bitmap's initialization state from the shared descriptor flags.
+const fn bitmap_initialization(
+    flags: u16,
+    uninitialized_flag: u16,
+) -> AllocationBitmapInitialization {
+    if flags & uninitialized_flag == 0 {
+        AllocationBitmapInitialization::Initialized
+    } else {
+        AllocationBitmapInitialization::Uninitialized
+    }
+}
+
+/// Clears one descriptor flag while preserving all unrelated descriptor state.
+/// # Errors
+///
+/// Returns an error when the descriptor flag field is truncated.
+fn clear_descriptor_flag(bytes: &mut [u8], flag: u16) -> Result<()> {
+    let flags = le_u16(bytes, disk_offset(BG_FLAGS_OFFSET))?;
+    put_le_u16(bytes, disk_offset(BG_FLAGS_OFFSET), flags & !flag)
 }
 
 /// Writes the active block group descriptor checksum into the raw descriptor.
@@ -569,9 +676,46 @@ fn apply_u32_delta(current: u32, delta: i64) -> Result<u32> {
     }
 }
 
-/// Computes the metadata_csum checksum for a group bitmap payload.
-fn bitmap_checksum(superblock: &Superblock, group: BlockGroupId, bitmap: &[u8]) -> u32 {
-    let group_bytes = group.as_u32().to_le_bytes();
-    let checksum = ext4_crc32c(superblock.checksum_seed().as_u32(), &group_bytes);
-    ext4_crc32c(checksum, bitmap)
+/// Computes the metadata checksum over the bitmap's semantic byte domain.
+/// # Errors
+///
+/// Returns an error when the bitmap bit count is not byte-aligned or the image is truncated.
+fn bitmap_checksum(superblock: &Superblock, bitmap: &[u8], bitmap_bits: u32) -> Result<u32> {
+    let payload = bitmap_payload(bitmap, bitmap_bits)?;
+    Ok(ext4_crc32c(superblock.checksum_seed().as_u32(), payload))
+}
+
+/// Returns the authoritative bytes for one allocation bitmap's semantic bit domain.
+/// # Errors
+///
+/// Returns an error when the bitmap bit count is not byte-aligned or the image is truncated.
+fn bitmap_payload(bitmap: &[u8], bitmap_bits: u32) -> Result<&[u8]> {
+    if bitmap_bits.checked_rem(8) != Some(0) {
+        return Err(Error::InvalidSuperblock);
+    }
+    let bitmap_bytes = usize::try_from(
+        bitmap_bits
+            .checked_div(8)
+            .ok_or(Error::ArithmeticOverflow)?,
+    )
+    .map_err(|_| Error::ArithmeticOverflow)?;
+    bitmap.get(..bitmap_bytes).ok_or(Error::TruncatedStructure)
+}
+
+/// Counts free inode slots after the highest allocated inode in a group.
+/// # Errors
+///
+/// Returns an error when the inode bitmap's semantic byte domain is invalid or truncated.
+fn trailing_unused_inode_count(bitmap: &[u8], bitmap_bits: u32) -> Result<u32> {
+    let payload = bitmap_payload(bitmap, bitmap_bits)?;
+    for bit in (0..bitmap_bits).rev() {
+        let byte_index = usize::try_from(bit / 8).map_err(|_| Error::ArithmeticOverflow)?;
+        let byte = *payload.get(byte_index).ok_or(Error::TruncatedStructure)?;
+        if byte & (1_u8 << (bit % 8)) != 0 {
+            return bitmap_bits
+                .checked_sub(bit.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow);
+        }
+    }
+    Ok(bitmap_bits)
 }

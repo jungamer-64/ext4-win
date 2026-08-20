@@ -13,7 +13,9 @@ use commit::{
     descriptor_byte_count, directory_entry_kind, map_extents, reject_reserved_directory_name,
     verity_metadata_image,
 };
-use staging::{BlockImage, EncryptedBlockBase, GroupDelta, RangeWrite};
+use staging::{
+    BitmapInitializationTransition, BlockImage, EncryptedBlockBase, GroupDelta, RangeWrite,
+};
 
 /// Extent-tree reader that overlays this transaction's staged metadata blocks on the device.
 struct TransactionExtentSource<'source, 'device> {

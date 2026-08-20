@@ -11,7 +11,10 @@ use crate::disk_format::journal::{
     CleanJournal, ExternalJournalLoad, Journal, JournalRecoveryOperation, LoadedJournal,
     MetadataBlock,
 };
-use crate::disk_format::superblock::{FilesystemUuid, JournalMode, JournalUuid, RecoveryState};
+use crate::disk_format::superblock::{
+    ChecksumInvalidSuperblock, FilesystemUuid, JournalMode, JournalUuid, PrimarySuperblockRead,
+    RecoveryState,
+};
 
 /// Maximum distinct resources whose committed versions are tracked by one mounted volume.
 const MAX_TRACKED_RESOURCES: usize = 4096;
@@ -1087,21 +1090,47 @@ pub struct MountOperation {
 enum MountState {
     /// Resolve the primary superblock and internal journal placement.
     Resolving,
+    /// A validated previous recovery-marker image is ready to replace a torn primary superblock.
+    RepairWriteReady {
+        /// Complete repaired primary-superblock image.
+        marker: Vec<u8>,
+    },
+    /// The repair write is owned by the lower stack.
+    RepairWritePending {
+        /// Expected repair-write completion.
+        expected: StorageRequestIdentity,
+    },
+    /// The repair write completed and must be made durable before metadata is interpreted.
+    RepairFlushReady,
+    /// The repair flush is owned by the lower stack.
+    RepairFlushPending {
+        /// Expected filesystem flush completion.
+        expected: StorageRequestIdentity,
+    },
+    /// The repaired primary superblock is durable and must be read through a fresh transcript.
+    Repaired,
     /// Await a core-minted token for the exact external-journal requirement.
     AwaitingExternal {
-        /// Primary filesystem superblock retained across driver discovery.
-        superblock: Superblock,
+        /// Primary admission state retained across driver discovery.
+        primary: ResolvedPrimary,
         /// Requirement that the attached token must satisfy exactly.
         requirement: ExternalJournalRequirement,
     },
     /// Drive bounded journal recovery without a storage transcript.
     Recovering {
-        /// Primary superblock whose marker decides replay versus stale discard.
-        superblock: Superblock,
+        /// Primary admission state whose checksum status selects ordinary or repair replay.
+        primary: ResolvedPrimary,
         /// Device selected by the validated journal location.
         journal_target: StorageTarget,
         /// Consuming three-pass recovery operation.
         operation: Box<JournalRecoveryOperation>,
+    },
+    /// Journal replay repaired the primary block; strict revalidation must precede publication.
+    VerifyingReplayedPrimary {
+        /// Clean journal retained while the repaired primary is re-read.
+        journal: Journal<CleanJournal>,
+        /// Device containing the journal.
+        journal_target: StorageTarget,
     },
     /// Build the allocation ownership index from the recovered filesystem image.
     Indexing(MountPublicationSeed),
@@ -1157,10 +1186,15 @@ struct IndexedMountSeed {
 /// Journal resolution result before recovery begins.
 #[derive(Debug)]
 enum JournalResolution {
+    /// A torn recovery-marker write was recognized and must be restored before journal resolution.
+    RepairRecoveryMarker {
+        /// Fully allocated previous valid primary-superblock image.
+        marker: Vec<u8>,
+    },
     /// A concrete loaded journal is ready for bounded recovery.
     Loaded {
-        /// Validated primary superblock.
-        superblock: Superblock,
+        /// Valid primary metadata or provisional recovery-only geometry.
+        primary: ResolvedPrimary,
         /// Loaded journal.
         journal: Journal<LoadedJournal>,
         /// Device that owns journal records.
@@ -1168,11 +1202,48 @@ enum JournalResolution {
     },
     /// Driver discovery is required before external recovery can begin.
     Discover {
-        /// Validated primary superblock.
-        superblock: Superblock,
+        /// Valid primary metadata or provisional recovery-only geometry.
+        primary: ResolvedPrimary,
         /// Exact candidate validation requirement.
         requirement: ExternalJournalRequirement,
     },
+}
+
+/// Primary-superblock authority retained through journal discovery and recovery.
+#[derive(Clone, Copy, Debug)]
+enum ResolvedPrimary {
+    /// The primary checksum and every structural field are valid.
+    Valid(Superblock),
+    /// Only recovery-bootstrap fields are admitted; journal replay must replace the primary block.
+    JournalRepairRequired(ChecksumInvalidSuperblock),
+}
+
+impl ResolvedPrimary {
+    /// Returns geometry and journal placement for the recovery bootstrap boundary only.
+    const fn recovery_bootstrap(self) -> Superblock {
+        match self {
+            Self::Valid(superblock) => superblock,
+            Self::JournalRepairRequired(provisional) => provisional.recovery_bootstrap(),
+        }
+    }
+
+    /// Constructs recovery with authority appropriate to the primary checksum state.
+    /// # Errors
+    ///
+    /// Returns an error when recovery buffers cannot be allocated or provisional primary metadata
+    /// has no dirty journal from which to establish repair authority.
+    fn begin_recovery(
+        self,
+        journal: Journal<LoadedJournal>,
+    ) -> Result<Box<JournalRecoveryOperation>> {
+        let operation = match self {
+            Self::Valid(superblock) => {
+                JournalRecoveryOperation::new(journal, superblock.recovery_state())
+            }
+            Self::JournalRepairRequired(_) => JournalRecoveryOperation::repairing_primary(journal),
+        }?;
+        memory::try_box(operation)
+    }
 }
 
 impl MountOperation {
@@ -1196,7 +1267,7 @@ impl MountOperation {
         let validated = *validated;
         let state = core::mem::replace(&mut self.state, MountState::Resolving);
         let MountState::AwaitingExternal {
-            superblock,
+            primary,
             requirement,
         } = state
         else {
@@ -1205,12 +1276,10 @@ impl MountOperation {
         if requirement != validated.requirement {
             return MountTransition::Complete(Err(Error::UnsupportedJournal));
         }
-        match JournalRecoveryOperation::new(validated.journal, superblock.recovery_state())
-            .and_then(memory::try_box)
-        {
+        match primary.begin_recovery(validated.journal) {
             Ok(operation) => {
                 self.state = MountState::Recovering {
-                    superblock,
+                    primary,
                     journal_target: StorageTarget::ExternalJournal,
                     operation,
                 };
@@ -1234,7 +1303,13 @@ impl MountOperation {
             super::OperationEvent::CancelRequested => {
                 if matches!(
                     self.state,
-                    MountState::Recovering { .. }
+                    MountState::RepairWriteReady { .. }
+                        | MountState::RepairWritePending { .. }
+                        | MountState::RepairFlushReady
+                        | MountState::RepairFlushPending { .. }
+                        | MountState::Repaired
+                        | MountState::Recovering { .. }
+                        | MountState::VerifyingReplayedPrimary { .. }
                         | MountState::MarkerWriteReady { .. }
                         | MountState::MarkerWritePending { .. }
                         | MountState::MarkerFlushReady(_)
@@ -1264,6 +1339,14 @@ impl MountOperation {
                 self.filesystem.complete(completion)?;
                 self.state = MountState::Resolving;
             }
+            MountState::RepairWritePending { expected } => {
+                expected.complete(completion)?;
+                self.state = MountState::RepairFlushReady;
+            }
+            MountState::RepairFlushPending { expected } => {
+                expected.complete(completion)?;
+                self.state = MountState::Repaired;
+            }
             MountState::Indexing(publication) => {
                 self.filesystem.complete(completion)?;
                 self.state = MountState::Indexing(publication);
@@ -1272,14 +1355,24 @@ impl MountOperation {
                 self.filesystem.complete(completion)?;
                 self.state = MountState::PreparingMarker(indexed);
             }
+            MountState::VerifyingReplayedPrimary {
+                journal,
+                journal_target,
+            } => {
+                self.filesystem.complete(completion)?;
+                self.state = MountState::VerifyingReplayedPrimary {
+                    journal,
+                    journal_target,
+                };
+            }
             MountState::Recovering {
-                superblock,
+                primary,
                 journal_target,
                 mut operation,
             } => {
                 operation.complete(completion)?;
                 self.state = MountState::Recovering {
-                    superblock,
+                    primary,
                     journal_target,
                     operation,
                 };
@@ -1299,6 +1392,9 @@ impl MountOperation {
                 self.state = MountState::Published(completed);
             }
             state @ (MountState::AwaitingExternal { .. }
+            | MountState::RepairWriteReady { .. }
+            | MountState::RepairFlushReady
+            | MountState::Repaired
             | MountState::MarkerWriteReady { .. }
             | MountState::MarkerFlushReady(_)
             | MountState::Published(_)) => {
@@ -1314,16 +1410,17 @@ impl MountOperation {
         loop {
             match core::mem::replace(&mut self.state, MountState::Resolving) {
                 MountState::Resolving => match self.resolve_journal() {
+                    Ok(JournalResolution::RepairRecoveryMarker { marker }) => {
+                        self.state = MountState::RepairWriteReady { marker };
+                    }
                     Ok(JournalResolution::Loaded {
-                        superblock,
+                        primary,
                         journal,
                         journal_target,
-                    }) => match JournalRecoveryOperation::new(journal, superblock.recovery_state())
-                        .and_then(memory::try_box)
-                    {
+                    }) => match primary.begin_recovery(journal) {
                         Ok(operation) => {
                             self.state = MountState::Recovering {
-                                superblock,
+                                primary,
                                 journal_target,
                                 operation,
                             };
@@ -1331,11 +1428,11 @@ impl MountOperation {
                         Err(error) => return MountTransition::Complete(Err(error)),
                     },
                     Ok(JournalResolution::Discover {
-                        superblock,
+                        primary,
                         requirement,
                     }) => {
                         self.state = MountState::AwaitingExternal {
-                            superblock,
+                            primary,
                             requirement,
                         };
                         return MountTransition::DiscoverExternalJournal {
@@ -1349,12 +1446,53 @@ impl MountOperation {
                     }
                     Err(error) => return MountTransition::Complete(Err(error)),
                 },
+                MountState::RepairWriteReady { marker } => {
+                    let request = crate::StorageRequest::Write {
+                        target: StorageTarget::Filesystem,
+                        offset: ByteOffset::new(1024),
+                        buffer: marker,
+                    };
+                    let expected = StorageRequestIdentity::from_request(&request);
+                    self.state = MountState::RepairWritePending { expected };
+                    return MountTransition::SubmitLower {
+                        request,
+                        suspended: self,
+                    };
+                }
+                MountState::RepairWritePending { expected } => {
+                    self.state = MountState::RepairWritePending { expected };
+                    return MountTransition::Complete(Err(Error::DeviceIo));
+                }
+                MountState::RepairFlushReady => {
+                    let request = crate::StorageRequest::Flush {
+                        target: StorageTarget::Filesystem,
+                    };
+                    let expected = StorageRequestIdentity::from_request(&request);
+                    self.state = MountState::RepairFlushPending { expected };
+                    return MountTransition::SubmitLower {
+                        request,
+                        suspended: self,
+                    };
+                }
+                MountState::RepairFlushPending { expected } => {
+                    self.state = MountState::RepairFlushPending { expected };
+                    return MountTransition::Complete(Err(Error::DeviceIo));
+                }
+                MountState::Repaired => {
+                    if self.cancel_requested {
+                        return MountTransition::Complete(Err(Error::OperationCancelled));
+                    }
+                    let filesystem_length = self.filesystem.len();
+                    self.filesystem =
+                        StorageTranscript::new(StorageTarget::Filesystem, filesystem_length);
+                    self.state = MountState::Resolving;
+                }
                 MountState::AwaitingExternal {
-                    superblock,
+                    primary,
                     requirement,
                 } => {
                     self.state = MountState::AwaitingExternal {
-                        superblock,
+                        primary,
                         requirement,
                     };
                     return MountTransition::DiscoverExternalJournal {
@@ -1363,13 +1501,13 @@ impl MountOperation {
                     };
                 }
                 MountState::Recovering {
-                    superblock,
+                    primary,
                     journal_target,
                     mut operation,
                 } => match operation.next_request() {
                     Ok(Some(request)) => {
                         self.state = MountState::Recovering {
-                            superblock,
+                            primary,
                             journal_target,
                             operation,
                         };
@@ -1388,16 +1526,56 @@ impl MountOperation {
                                 StorageTarget::Filesystem,
                                 filesystem_length,
                             );
+                            self.state = match primary {
+                                ResolvedPrimary::Valid(superblock) => {
+                                    MountState::Indexing(MountPublicationSeed {
+                                        superblock,
+                                        journal,
+                                        journal_target,
+                                    })
+                                }
+                                ResolvedPrimary::JournalRepairRequired(_) => {
+                                    MountState::VerifyingReplayedPrimary {
+                                        journal,
+                                        journal_target,
+                                    }
+                                }
+                            };
+                        }
+                        Err(error) => return MountTransition::Complete(Err(error)),
+                    },
+                    Err(error) => return MountTransition::Complete(Err(error)),
+                },
+                MountState::VerifyingReplayedPrimary {
+                    journal,
+                    journal_target,
+                } => {
+                    let primary = {
+                        let mut filesystem = OperationDevice::new(&mut self.filesystem);
+                        Superblock::read_write_from(&mut filesystem)
+                    };
+                    match primary {
+                        Ok(PrimarySuperblockRead::Valid(superblock)) => {
                             self.state = MountState::Indexing(MountPublicationSeed {
                                 superblock,
                                 journal,
                                 journal_target,
                             });
                         }
+                        Ok(
+                            PrimarySuperblockRead::TornRecoveryMarker { .. }
+                            | PrimarySuperblockRead::ChecksumInvalid(_),
+                        ) => return MountTransition::Complete(Err(Error::ChecksumMismatch)),
+                        Err(Error::OperationSuspended) => {
+                            self.state = MountState::VerifyingReplayedPrimary {
+                                journal,
+                                journal_target,
+                            };
+                            return self.submit_pending_read();
+                        }
                         Err(error) => return MountTransition::Complete(Err(error)),
-                    },
-                    Err(error) => return MountTransition::Complete(Err(error)),
-                },
+                    }
+                }
                 MountState::Indexing(publication) => {
                     let clusters = {
                         let device = OperationDevice::new(&mut self.filesystem);
@@ -1535,10 +1713,20 @@ impl MountOperation {
     ///
     /// Returns an error for invalid primary metadata, journal placement, profile, or suspended I/O.
     fn resolve_journal(&mut self) -> Result<JournalResolution> {
-        let superblock = {
+        let primary_read = {
             let mut filesystem = OperationDevice::new(&mut self.filesystem);
             Superblock::read_write_from(&mut filesystem)?
         };
+        let primary = match primary_read {
+            PrimarySuperblockRead::Valid(superblock) => ResolvedPrimary::Valid(superblock),
+            PrimarySuperblockRead::TornRecoveryMarker { repair } => {
+                return Ok(JournalResolution::RepairRecoveryMarker { marker: repair });
+            }
+            PrimarySuperblockRead::ChecksumInvalid(provisional) => {
+                ResolvedPrimary::JournalRepairRequired(provisional)
+            }
+        };
+        let superblock = primary.recovery_bootstrap();
         match superblock.journal_mode() {
             JournalMode::Internal(journal_inode_id) => {
                 let journal_inode = {
@@ -1557,13 +1745,13 @@ impl MountOperation {
                     )?
                 };
                 Ok(JournalResolution::Loaded {
-                    superblock,
+                    primary,
                     journal,
                     journal_target: StorageTarget::Filesystem,
                 })
             }
             JournalMode::External(journal_uuid) => Ok(JournalResolution::Discover {
-                superblock,
+                primary,
                 requirement: ExternalJournalRequirement {
                     journal_uuid,
                     filesystem_uuid: superblock.uuid(),
