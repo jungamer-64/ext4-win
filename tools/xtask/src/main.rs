@@ -3596,7 +3596,11 @@ fn require_file(path: &Path, description: &str) -> Result<(), io::Error> {
     }
 }
 
-/// Cryptographically verifies the final package SYS and proves it was stable during verification.
+/// Authenticode-verifies the final package SYS and proves it was stable during verification.
+///
+/// cargo-wdk separately validates the driver/catalog package under its WDK signing workflow.
+/// This final readback uses Authenticode policy so a locally trusted test-signed bundle remains
+/// verifiable; it does not claim a Microsoft production-root deployment chain.
 ///
 /// # Errors
 ///
@@ -3606,7 +3610,7 @@ fn verify_final_signed_driver(driver: &Path) -> TaskResult<String> {
     let before = sha256_file(driver)?;
     let signtool = locate_signtool()?;
     let mut command = Command::new(signtool);
-    command.args(["verify", "/kp", "/v"]).arg(driver);
+    command.args(["verify", "/pa", "/v"]).arg(driver);
     run_checked(command, "final Authenticode signature verification")?;
     verify_sha256(
         driver,
