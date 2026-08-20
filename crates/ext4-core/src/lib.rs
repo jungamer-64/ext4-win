@@ -33,7 +33,7 @@ pub use disk_format::inode::{
     NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 pub use disk_format::superblock::{
-    ClusterCount, ClusterSize, Ext4VolumeLabel, FilesystemUuid, FreeClusterCount,
+    ClusterCount, ClusterSize, Ext4VolumeLabel, FilesystemUuid, FreeClusterCount, JournalUuid,
 };
 pub use disk_format::xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 pub use error::{Error, Result};
@@ -51,13 +51,16 @@ pub use volume::{
     CleanJournalRecordPhase, CommitDurability, CommitLease, CommitReadyMutation, CommitRecordPhase,
     CommittedEpoch, CommittedReadPass, CompletedMount, DirectoryChild, DirectoryEntry,
     DirectoryNode, DirectoryNodeId, DurableMutation, EpochReadOperation, EpochReadPass,
-    EpochSequence, FileNode, FileNodeId, HardLinkDestination, HardLinkEntry, HardLinkNodeId,
-    HardLinks, HomeBlockDurability, JournalPayloadDurability, MountOperation, MountTransition,
-    MountedProfile, MutationCoordinatorState, MutationLease, MutationResolveOperation,
-    MutationResolvePass, MutationResolveReady, MutationResolveTransition, MutationResource, NodeId,
+    EpochSequence, ExternalJournalProbeOperation, ExternalJournalProbeOutcome,
+    ExternalJournalProbeTransition, ExternalJournalRequirement, FileNode, FileNodeId,
+    HardLinkDestination, HardLinkEntry, HardLinkNodeId, HardLinks, HomeBlockDurability,
+    JournalPayloadDurability, MountOperation, MountTransition, MountedProfile,
+    MutationCoordinatorState, MutationLease, MutationResolveOperation, MutationResolvePass,
+    MutationResolveReady, MutationResolveTransition, MutationResource, NodeId,
     ObservedResourceVersionSet, OperationEvent, OperationId, OrderedDataDurability,
     PublishedMutation, ReadTransition, RenameTargetCollision, ReservedMutation, ResolvedMutation,
     ResourceVersion, RetryPermit, StorageRequestSequence, StorageRequestSequenceStep, SymlinkNode,
     SymlinkNodeId, TransactionDirectory, TransactionFile, TransactionHardLinkSource,
-    TransactionNode, TransactionSymlink, VisibilityLease, VolumeGeometry, VolumeIdentity,
+    TransactionNode, TransactionSymlink, ValidatedExternalJournal, VisibilityLease, VolumeGeometry,
+    VolumeIdentity,
 };

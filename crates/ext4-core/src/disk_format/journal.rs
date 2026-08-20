@@ -11,10 +11,16 @@ use core::marker::PhantomData;
 
 use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::disk::checksum::ext4_crc32c;
-use crate::disk::endian::{DiskOffset, be_u16, be_u32, be_u64, put_be_u16, put_be_u32};
-use crate::disk::storage::{OperationDevice, StorageRequest, StorageTarget};
+use crate::disk::endian::{
+    DiskOffset, be_u16, be_u32, be_u64, le_u16, le_u32, put_be_u16, put_be_u32,
+};
+use crate::disk::storage::{
+    CompletedStorageTransfer, OperationDevice, StorageCompletion, StorageRequest,
+    StorageRequestIdentity, StorageTarget,
+};
 use crate::disk_format::extent::{ExtentTree, ExtentTreeContext};
 use crate::disk_format::inode::Inode;
+use crate::disk_format::superblock::{FilesystemUuid, JournalUuid, RecoveryState};
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
 
@@ -78,6 +84,14 @@ const JOURNAL_HEADER_BYTES: usize = 12;
 const JOURNAL_SUPERBLOCK_BYTES: usize = 1024;
 /// One descriptor block and one commit block are the minimum transaction overhead.
 const JOURNAL_MIN_TRANSACTION_BLOCKS: u32 = 2;
+/// Byte offset of the ext-family superblock on an external journal device.
+const EXTERNAL_EXT_SUPERBLOCK_OFFSET: u64 = 1024;
+/// ext-family superblock byte length.
+const EXTERNAL_EXT_SUPERBLOCK_BYTES: usize = 1024;
+/// ext-family superblock magic.
+const EXT4_SUPER_MAGIC: u16 = 0xEF53;
+/// ext-family incompatible feature selecting a dedicated journal device.
+const EXT4_FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Full filesystem metadata block supplied to the journal commit path.
@@ -200,6 +214,8 @@ struct JournalProfile {
     checksum: JournalChecksumProfile,
     /// Whether tags and revoke records carry 64-bit filesystem block addresses.
     block_numbers_64bit: bool,
+    /// Whether revoke control blocks are part of the selected profile.
+    revokes: bool,
 }
 
 impl JournalProfile {
@@ -232,6 +248,7 @@ impl JournalProfile {
         Ok(Self {
             checksum,
             block_numbers_64bit: superblock.incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0,
+            revokes: superblock.incompat & JBD2_FEATURE_INCOMPAT_REVOKE != 0,
         })
     }
 
@@ -245,6 +262,10 @@ impl JournalProfile {
 
     const fn has_64bit(self) -> bool {
         self.block_numbers_64bit
+    }
+
+    const fn has_revokes(self) -> bool {
+        self.revokes
     }
 }
 
@@ -262,13 +283,14 @@ impl JournalGeometry {
         superblock: &JournalSuperblock,
         block_size: BlockSize,
         capacity_blocks: u32,
+        expected_first: u32,
     ) -> Result<Self> {
         if superblock.block_size != block_size.bytes() {
             return Err(Error::UnsupportedJournal);
         }
         Ok(Self {
             block_size,
-            ring: JournalRing::new(superblock, capacity_blocks)?,
+            ring: JournalRing::new(superblock, capacity_blocks, expected_first)?,
         })
     }
 }
@@ -284,18 +306,17 @@ struct JournalCursor {
 
 impl JournalCursor {
     fn from_superblock(superblock: &JournalSuperblock, ring: JournalRing) -> Result<Self> {
-        let head = if superblock.version == JournalSuperblockVersion::V1 {
-            ring.first
+        let (sequence, head) = if superblock.start != 0 {
+            (superblock.sequence, superblock.start)
+        } else if superblock.version == JournalSuperblockVersion::V1 {
+            (superblock.sequence.next(), ring.first)
         } else {
-            superblock.head
+            (superblock.sequence.next(), superblock.head)
         };
         if head < ring.first || head >= ring.maxlen {
             return Err(Error::JournalCorrupt);
         }
-        Ok(Self {
-            sequence: superblock.sequence,
-            head,
-        })
+        Ok(Self { sequence, head })
     }
 }
 
@@ -345,6 +366,15 @@ pub(crate) struct Journal<State = CleanJournal> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LoadedJournal;
 
+/// Result of probing one external-journal candidate by its expected UUID.
+#[derive(Debug)]
+pub(crate) enum ExternalJournalLoad {
+    /// Candidate UUID differs and discovery may continue.
+    Mismatch,
+    /// Candidate exactly matches and carries a fully validated loaded journal.
+    Match(Journal<LoadedJournal>),
+}
+
 /// Journal whose committed transactions have been checkpointed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CleanJournal;
@@ -352,6 +382,167 @@ pub(crate) struct CleanJournal;
 /// Journal after descriptor/data/commit blocks have been durably written.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DirtyJournal;
+
+/// Bounded three-pass recovery that owns every lower transfer until completion.
+#[derive(Debug)]
+pub(crate) struct JournalRecoveryOperation {
+    /// Loaded journal whose wire profile and geometry were validated before recovery.
+    journal: Journal<LoadedJournal>,
+    /// Whether committed payloads are replayed or only discarded as stale records.
+    policy: RecoveryPolicy,
+    /// Current pass or durability boundary.
+    phase: RecoveryPhase,
+    /// Cursor and transaction-local state for the active pass.
+    walk: RecoveryWalk,
+    /// Committed-prefix boundary and allocation maxima established by the scan pass.
+    summary: RecoverySummary,
+    /// Preallocated tags for at most one transaction.
+    tags: Vec<RecoveryTag>,
+    /// Latest revoke sequence for each encountered home block.
+    revokes: Vec<RecoveryRevoke>,
+    /// One reusable journal payload/control buffer.
+    buffer: Option<Vec<u8>>,
+    /// Pre-serialized clean journal superblock write image.
+    clean_write: Option<Vec<u8>>,
+    /// Clean typestate prepared before the first home write.
+    clean_journal: Option<Journal<CleanJournal>>,
+    /// Exact request identity and semantic continuation owned by the operation.
+    in_flight: Option<RecoveryInFlight>,
+    /// Pending control, payload, or home-write action in the active pass.
+    pending: RecoveryPending,
+    /// Whether replay issued at least one home-block write.
+    wrote_home: bool,
+}
+
+/// Recovery action selected from the primary ext4 recovery marker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryPolicy {
+    /// Replay the validated committed prefix into filesystem home blocks.
+    Replay,
+    /// Treat committed records as stale and recover only the next journal cursor.
+    Discard,
+}
+
+/// Recovery pass and durability state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryPhase {
+    /// Locate the continuous committed prefix and compute allocation maxima.
+    Scan,
+    /// Revalidate every committed structure, payload, address, and revoke before writes.
+    Validate,
+    /// Re-read and replay one payload buffer at a time.
+    Replay,
+    /// Flush replayed home blocks before invalidating the journal tail.
+    FlushFilesystem,
+    /// Persist the clean journal cursor.
+    WriteCleanJournal,
+    /// Make the clean journal cursor durable.
+    FlushJournal,
+    /// Recovery is complete and the clean journal may be published.
+    Complete,
+}
+
+/// Cursor and transaction-local counters reused by each recovery pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecoveryWalk {
+    /// Next logical journal block to inspect.
+    cursor: u32,
+    /// Transaction sequence expected at `cursor`.
+    sequence: JournalSequence,
+    /// Ring blocks consumed by this pass.
+    consumed: u32,
+    /// Tags observed in the scan pass's current transaction.
+    scan_transaction_tags: usize,
+    /// Revoke records observed in the scan pass's current transaction.
+    scan_transaction_revokes: usize,
+}
+
+/// Bounds and end cursor established without retaining payload bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecoverySummary {
+    /// Logical block where the first candidate transaction begins.
+    start_cursor: u32,
+    /// First transaction sequence expected in the journal.
+    start_sequence: JournalSequence,
+    /// Logical block immediately after the last committed transaction.
+    end_cursor: u32,
+    /// First sequence not contained in the committed prefix.
+    next_sequence: JournalSequence,
+    /// Maximum tag count in any one committed transaction.
+    max_transaction_tags: usize,
+    /// Total revoke record count in the committed prefix.
+    revoke_records: usize,
+    /// Number of complete committed transactions.
+    transactions: u32,
+}
+
+/// One validated descriptor tag retained only for the active transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecoveryTag {
+    /// Filesystem home block.
+    home: BlockAddress,
+    /// Logical journal block containing the payload.
+    journal_block: u32,
+    /// Transaction sequence used by checksum and revoke decisions.
+    sequence: JournalSequence,
+    /// Descriptor flags controlling escape and deletion semantics.
+    flags: u32,
+    /// Expected v2/v3 payload checksum.
+    checksum: u32,
+}
+
+/// Latest sequence that revoked one filesystem home block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecoveryRevoke {
+    /// Revoked filesystem home block.
+    block: BlockAddress,
+    /// Latest transaction sequence carrying its revoke record.
+    sequence: JournalSequence,
+}
+
+/// Local action waiting to be submitted after the previous completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryPending {
+    /// Read the next descriptor, revoke, or commit block.
+    Control,
+    /// Read descriptor payloads in the half-open tag range.
+    Payload { next: usize, end: usize },
+    /// Move the returned payload buffer into one filesystem home write.
+    HomeWrite {
+        /// Filesystem block selected by the validated tag.
+        home: BlockAddress,
+        /// Next tag after this home write completes.
+        next: usize,
+        /// Exclusive descriptor tag range end.
+        end: usize,
+    },
+}
+
+/// Request continuation retained while the buffer belongs to the lower stack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecoveryInFlight {
+    /// Exact physical transfer identity.
+    identity: StorageRequestIdentity,
+    /// Operation-specific meaning of the transfer.
+    action: RecoveryIoAction,
+}
+
+/// Semantic meaning of one recovery transfer completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryIoAction {
+    /// Journal control block read.
+    ControlRead,
+    /// Journal payload read for the specified prevalidated tag.
+    PayloadRead { index: usize, end: usize },
+    /// Filesystem home-block write.
+    HomeWrite { next: usize, end: usize },
+    /// Filesystem durability barrier after replay.
+    FilesystemFlush,
+    /// Clean journal-superblock write.
+    CleanJournalWrite,
+    /// Journal durability barrier after the clean write.
+    JournalFlush,
+}
 
 /// Wrapping JBD2 transaction sequence number.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -373,10 +564,560 @@ impl JournalSequence {
         Self(self.0.wrapping_add(1))
     }
 
+    /// Returns the preceding sequence for clean-superblock encoding.
+    const fn previous(self) -> Self {
+        Self(self.0.wrapping_sub(1))
+    }
+
     /// Compares two wrapping sequence numbers using half-range ordering.
     const fn is_after(self, other: Self) -> bool {
         let distance = self.0.wrapping_sub(other.0);
         distance != 0 && distance < 0x8000_0000
+    }
+}
+
+impl JournalRecoveryOperation {
+    /// Starts bounded recovery from a fully validated loaded journal.
+    /// # Errors
+    ///
+    /// Returns an error when the block buffer or clean typestate cannot be allocated.
+    pub(crate) fn new(
+        journal: Journal<LoadedJournal>,
+        recovery_state: RecoveryState,
+    ) -> Result<Self> {
+        let block_bytes = usize::try_from(journal.geometry.block_size.bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?;
+        let buffer = memory::repeated_vec(0_u8, block_bytes)?;
+        let start_cursor = journal.cursor.head;
+        let start_sequence = journal.cursor.sequence;
+        let already_clean = journal.superblock.start() == 0;
+        let clean_journal = if already_clean {
+            Some(journal.copy_without_state::<CleanJournal>()?)
+        } else {
+            None
+        };
+        Ok(Self {
+            journal,
+            policy: match recovery_state {
+                RecoveryState::Clean => RecoveryPolicy::Discard,
+                RecoveryState::NeedsRecovery => RecoveryPolicy::Replay,
+            },
+            phase: if already_clean {
+                RecoveryPhase::Complete
+            } else {
+                RecoveryPhase::Scan
+            },
+            walk: RecoveryWalk {
+                cursor: start_cursor,
+                sequence: start_sequence,
+                consumed: 0,
+                scan_transaction_tags: 0,
+                scan_transaction_revokes: 0,
+            },
+            summary: RecoverySummary {
+                start_cursor,
+                start_sequence,
+                end_cursor: start_cursor,
+                next_sequence: start_sequence,
+                max_transaction_tags: 0,
+                revoke_records: 0,
+                transactions: 0,
+            },
+            tags: Vec::new(),
+            revokes: Vec::new(),
+            buffer: Some(buffer),
+            clean_write: None,
+            clean_journal,
+            in_flight: None,
+            pending: RecoveryPending::Control,
+            wrote_home: false,
+        })
+    }
+
+    /// Returns the next owned lower request, or `None` when recovery is complete.
+    /// # Errors
+    ///
+    /// Returns an error for an invalid operation state, address arithmetic failure, or a corrupt
+    /// committed prefix discovered before the first home write.
+    pub(crate) fn next_request(&mut self) -> Result<Option<StorageRequest>> {
+        if self.in_flight.is_some() {
+            return Err(Error::DeviceIo);
+        }
+        loop {
+            self.advance_pass_boundary()?;
+            let (request, action) = match self.phase {
+                RecoveryPhase::Complete => return Ok(None),
+                RecoveryPhase::FlushFilesystem => (
+                    StorageRequest::Flush {
+                        target: StorageTarget::Filesystem,
+                    },
+                    RecoveryIoAction::FilesystemFlush,
+                ),
+                RecoveryPhase::WriteCleanJournal => {
+                    let offset = self
+                        .journal
+                        .location
+                        .superblock_offset(self.journal.geometry.block_size)?;
+                    let buffer = self.clean_write.take().ok_or(Error::JournalCorrupt)?;
+                    (
+                        StorageRequest::Write {
+                            target: self.journal.location.storage_target(),
+                            offset,
+                            buffer,
+                        },
+                        RecoveryIoAction::CleanJournalWrite,
+                    )
+                }
+                RecoveryPhase::FlushJournal => (
+                    StorageRequest::Flush {
+                        target: self.journal.location.storage_target(),
+                    },
+                    RecoveryIoAction::JournalFlush,
+                ),
+                RecoveryPhase::Scan | RecoveryPhase::Validate | RecoveryPhase::Replay => {
+                    match self.pending {
+                        RecoveryPending::Control => {
+                            let offset = self
+                                .journal
+                                .offset_of(self.walk.cursor, self.journal.geometry.block_size)?;
+                            let buffer = self.buffer.take().ok_or(Error::DeviceIo)?;
+                            (
+                                StorageRequest::Read {
+                                    target: self.journal.location.storage_target(),
+                                    offset,
+                                    buffer,
+                                },
+                                RecoveryIoAction::ControlRead,
+                            )
+                        }
+                        RecoveryPending::Payload { next, end } => {
+                            let tag = *self.tags.get(next).ok_or(Error::JournalCorrupt)?;
+                            let offset = self
+                                .journal
+                                .offset_of(tag.journal_block, self.journal.geometry.block_size)?;
+                            let buffer = self.buffer.take().ok_or(Error::DeviceIo)?;
+                            (
+                                StorageRequest::Read {
+                                    target: self.journal.location.storage_target(),
+                                    offset,
+                                    buffer,
+                                },
+                                RecoveryIoAction::PayloadRead { index: next, end },
+                            )
+                        }
+                        RecoveryPending::HomeWrite { home, next, end } => {
+                            let offset = self.journal.geometry.block_size.offset_of(home)?;
+                            let buffer = self.buffer.take().ok_or(Error::DeviceIo)?;
+                            (
+                                StorageRequest::Write {
+                                    target: StorageTarget::Filesystem,
+                                    offset,
+                                    buffer,
+                                },
+                                RecoveryIoAction::HomeWrite { next, end },
+                            )
+                        }
+                    }
+                }
+            };
+            self.in_flight = Some(RecoveryInFlight {
+                identity: StorageRequestIdentity::from_request(&request),
+                action,
+            });
+            return Ok(Some(request));
+        }
+    }
+
+    /// Consumes the exact completion for the request returned by [`Self::next_request`].
+    /// # Errors
+    ///
+    /// Returns an error for mismatched transfers, I/O failures, checksum failures, or committed
+    /// journal corruption.
+    pub(crate) fn complete(&mut self, completion: StorageCompletion) -> Result<()> {
+        let in_flight = self.in_flight.take().ok_or(Error::DeviceIo)?;
+        let transfer = in_flight.identity.complete_transfer(completion)?;
+        match in_flight.action {
+            RecoveryIoAction::ControlRead => {
+                let CompletedStorageTransfer::Read { buffer, .. } = transfer else {
+                    return Err(Error::DeviceIo);
+                };
+                self.process_control_block(&buffer)?;
+                self.buffer = Some(buffer);
+            }
+            RecoveryIoAction::PayloadRead { index, end } => {
+                let CompletedStorageTransfer::Read { mut buffer, .. } = transfer else {
+                    return Err(Error::DeviceIo);
+                };
+                let tag = *self.tags.get(index).ok_or(Error::JournalCorrupt)?;
+                self.journal
+                    .verify_tag_checksum(tag.sequence, &tag.as_journal_tag(), &buffer)?;
+                if tag.flags & JBD2_TAG_FLAG_ESCAPE != 0 && be_u32(&buffer, disk_offset(0))? != 0 {
+                    return Err(Error::JournalCorrupt);
+                }
+                let next = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                if self.phase == RecoveryPhase::Replay
+                    && tag.flags & JBD2_TAG_FLAG_DELETED == 0
+                    && !self.is_revoked(tag.home, tag.sequence)
+                {
+                    if tag.flags & JBD2_TAG_FLAG_ESCAPE != 0 {
+                        put_be_u32(&mut buffer, disk_offset(0), JBD2_MAGIC)?;
+                    }
+                    self.buffer = Some(buffer);
+                    self.pending = RecoveryPending::HomeWrite {
+                        home: tag.home,
+                        next,
+                        end,
+                    };
+                    self.wrote_home = true;
+                } else {
+                    self.buffer = Some(buffer);
+                    self.pending = if next < end {
+                        RecoveryPending::Payload { next, end }
+                    } else {
+                        RecoveryPending::Control
+                    };
+                }
+            }
+            RecoveryIoAction::HomeWrite { next, end } => {
+                let CompletedStorageTransfer::Write { buffer, .. } = transfer else {
+                    return Err(Error::DeviceIo);
+                };
+                self.buffer = Some(buffer);
+                self.pending = if next < end {
+                    RecoveryPending::Payload { next, end }
+                } else {
+                    RecoveryPending::Control
+                };
+            }
+            RecoveryIoAction::FilesystemFlush => {
+                let CompletedStorageTransfer::Flush { .. } = transfer else {
+                    return Err(Error::DeviceIo);
+                };
+                self.phase = RecoveryPhase::WriteCleanJournal;
+            }
+            RecoveryIoAction::CleanJournalWrite => {
+                let CompletedStorageTransfer::Write { .. } = transfer else {
+                    return Err(Error::DeviceIo);
+                };
+                self.phase = RecoveryPhase::FlushJournal;
+            }
+            RecoveryIoAction::JournalFlush => {
+                let CompletedStorageTransfer::Flush { .. } = transfer else {
+                    return Err(Error::DeviceIo);
+                };
+                self.phase = RecoveryPhase::Complete;
+            }
+        }
+        Ok(())
+    }
+
+    /// Consumes a completed operation into the clean journal typestate.
+    /// # Errors
+    ///
+    /// Returns an error when lower I/O is still outstanding or the durability sequence has not
+    /// reached its terminal state.
+    pub(crate) fn into_clean(self) -> Result<Journal<CleanJournal>> {
+        if self.phase != RecoveryPhase::Complete || self.in_flight.is_some() {
+            return Err(Error::DeviceIo);
+        }
+        self.clean_journal.ok_or(Error::JournalCorrupt)
+    }
+
+    /// Advances pass boundaries that require no lower I/O.
+    fn advance_pass_boundary(&mut self) -> Result<()> {
+        loop {
+            if self.phase == RecoveryPhase::Scan
+                && self.walk.consumed >= self.journal.usable_log_blocks()?
+            {
+                self.finish_scan()?;
+                continue;
+            }
+            let at_validated_end =
+                matches!(self.phase, RecoveryPhase::Validate | RecoveryPhase::Replay)
+                    && self.pending == RecoveryPending::Control
+                    && self.walk.sequence == self.summary.next_sequence;
+            if !at_validated_end {
+                return Ok(());
+            }
+            if self.walk.cursor != self.summary.end_cursor {
+                return Err(Error::JournalCorrupt);
+            }
+            match self.phase {
+                RecoveryPhase::Validate => self.prepare_replay_and_clean()?,
+                RecoveryPhase::Replay => {
+                    self.phase = if self.wrote_home {
+                        RecoveryPhase::FlushFilesystem
+                    } else {
+                        RecoveryPhase::WriteCleanJournal
+                    };
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    /// Processes one completed journal control-block read according to the active pass.
+    fn process_control_block(&mut self, block: &[u8]) -> Result<()> {
+        match self.phase {
+            RecoveryPhase::Scan => self.scan_control_block(block),
+            RecoveryPhase::Validate | RecoveryPhase::Replay => {
+                self.validate_or_replay_control_block(block)
+            }
+            _ => Err(Error::DeviceIo),
+        }
+    }
+
+    /// Performs the allocation-free committed-prefix scan pass.
+    fn scan_control_block(&mut self, block: &[u8]) -> Result<()> {
+        let Ok(header) = Jbd2Header::parse(block) else {
+            return self.finish_scan();
+        };
+        if header.sequence() != self.walk.sequence.get() {
+            return self.finish_scan();
+        }
+        match header.block_type() {
+            JBD2_DESCRIPTOR_BLOCK => {
+                let Ok(tag_count) = self.journal.descriptor_tag_count_for_scan(block) else {
+                    return self.finish_scan();
+                };
+                self.walk.scan_transaction_tags = self
+                    .walk
+                    .scan_transaction_tags
+                    .checked_add(tag_count)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                self.advance_walk_blocks(
+                    u32::try_from(tag_count)
+                        .map_err(|_| Error::ArithmeticOverflow)?
+                        .checked_add(1)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                )?;
+            }
+            JBD2_REVOKE_BLOCK => {
+                if !self.journal.profile.has_revokes() {
+                    return Err(Error::JournalCorrupt);
+                }
+                let Ok(revoke_count) = self.journal.revoke_count_for_scan(block) else {
+                    return self.finish_scan();
+                };
+                self.walk.scan_transaction_revokes = self
+                    .walk
+                    .scan_transaction_revokes
+                    .checked_add(revoke_count)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                self.advance_walk_blocks(1)?;
+            }
+            JBD2_COMMIT_BLOCK => {
+                self.journal.parse_commit_block(block, self.walk.sequence)?;
+                if self.walk.scan_transaction_tags == 0 && self.walk.scan_transaction_revokes == 0 {
+                    return Err(Error::JournalCorrupt);
+                }
+                self.advance_walk_blocks(1)?;
+                self.summary.max_transaction_tags = self
+                    .summary
+                    .max_transaction_tags
+                    .max(self.walk.scan_transaction_tags);
+                self.summary.revoke_records = self
+                    .summary
+                    .revoke_records
+                    .checked_add(self.walk.scan_transaction_revokes)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                self.summary.transactions = self
+                    .summary
+                    .transactions
+                    .checked_add(1)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                self.walk.sequence = self.walk.sequence.next();
+                self.summary.end_cursor = self.walk.cursor;
+                self.summary.next_sequence = self.walk.sequence;
+                self.walk.scan_transaction_tags = 0;
+                self.walk.scan_transaction_revokes = 0;
+                if self.walk.consumed >= self.journal.usable_log_blocks()? {
+                    self.finish_scan()?;
+                }
+            }
+            _ => self.finish_scan()?,
+        }
+        Ok(())
+    }
+
+    /// Finishes pass one and reserves all address memory before any home write.
+    fn finish_scan(&mut self) -> Result<()> {
+        self.tags
+            .try_reserve_exact(self.summary.max_transaction_tags)
+            .map_err(|_| Error::OutOfMemory)?;
+        self.revokes
+            .try_reserve_exact(self.summary.revoke_records)
+            .map_err(|_| Error::OutOfMemory)?;
+        self.phase = RecoveryPhase::Validate;
+        self.reset_walk();
+        Ok(())
+    }
+
+    /// Revalidates or replays one control block inside the pass-one committed boundary.
+    fn validate_or_replay_control_block(&mut self, block: &[u8]) -> Result<()> {
+        let header = Jbd2Header::parse(block)?;
+        if header.sequence() != self.walk.sequence.get() {
+            return Err(Error::JournalCorrupt);
+        }
+        match header.block_type() {
+            JBD2_DESCRIPTOR_BLOCK => self.process_descriptor(block),
+            JBD2_REVOKE_BLOCK => self.process_revoke(block),
+            JBD2_COMMIT_BLOCK => {
+                self.journal.parse_commit_block(block, self.walk.sequence)?;
+                if self.tags.is_empty() && self.phase == RecoveryPhase::Replay {
+                    // A revoke-only transaction is valid and has no replay payload.
+                }
+                self.advance_walk_blocks(1)?;
+                self.walk.sequence = self.walk.sequence.next();
+                self.tags.clear();
+                Ok(())
+            }
+            _ => Err(Error::JournalCorrupt),
+        }
+    }
+
+    /// Parses descriptor tags into the transaction-bounded preallocated address vector.
+    fn process_descriptor(&mut self, block: &[u8]) -> Result<()> {
+        let descriptor_cursor = self.journal.next_logical(self.walk.cursor)?;
+        let start = self.tags.len();
+        let sequence = self.walk.sequence;
+        let journal = &self.journal;
+        let tags = &mut self.tags;
+        let mut payload_cursor = descriptor_cursor;
+        journal.for_each_descriptor_tag(block, |tag| {
+            journal.validate_replay_target(tag.block)?;
+            if tags.iter().any(|existing| existing.home == tag.block) {
+                return Err(Error::JournalCorrupt);
+            }
+            let recovery_tag = RecoveryTag {
+                home: tag.block,
+                journal_block: payload_cursor,
+                sequence,
+                flags: tag.flags,
+                checksum: tag.checksum,
+            };
+            tags.push_within_capacity(recovery_tag)
+                .map_err(|_tag| Error::JournalCorrupt)?;
+            payload_cursor = journal.next_logical(payload_cursor)?;
+            Ok(())
+        })?;
+        let end = self.tags.len();
+        if start == end {
+            return Err(Error::JournalCorrupt);
+        }
+        let consumed_payloads = end.checked_sub(start).ok_or(Error::ArithmeticOverflow)?;
+        self.advance_walk_blocks(
+            u32::try_from(consumed_payloads)
+                .map_err(|_| Error::ArithmeticOverflow)?
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )?;
+        self.pending = RecoveryPending::Payload { next: start, end };
+        Ok(())
+    }
+
+    /// Validates revoke structure and builds the latest-sequence table during pass two.
+    fn process_revoke(&mut self, block: &[u8]) -> Result<()> {
+        if !self.journal.profile.has_revokes() {
+            return Err(Error::JournalCorrupt);
+        }
+        let phase = self.phase;
+        let sequence = self.walk.sequence;
+        let journal = &self.journal;
+        let revokes = &mut self.revokes;
+        journal.for_each_revoke(block, |revoked| {
+            journal.validate_replay_target(revoked)?;
+            if phase == RecoveryPhase::Validate {
+                if let Some(existing) = revokes.iter_mut().find(|entry| entry.block == revoked) {
+                    if sequence.is_after(existing.sequence) {
+                        existing.sequence = sequence;
+                    }
+                } else {
+                    revokes
+                        .push_within_capacity(RecoveryRevoke {
+                            block: revoked,
+                            sequence,
+                        })
+                        .map_err(|_entry| Error::JournalCorrupt)?;
+                }
+            }
+            Ok(())
+        })?;
+        self.advance_walk_blocks(1)
+    }
+
+    /// Prepares replay and clean publication after every committed byte has been validated.
+    fn prepare_replay_and_clean(&mut self) -> Result<()> {
+        let cursor = JournalCursor {
+            sequence: self.summary.next_sequence,
+            head: self.summary.end_cursor,
+        };
+        let clean_write = self
+            .journal
+            .superblock
+            .encode_clean(self.journal.geometry.block_size, cursor)?;
+        let clean_state = memory::copied_slice(&clean_write)?;
+        let mut clean_journal = self.journal.copy_without_state::<CleanJournal>()?;
+        clean_journal.cursor = cursor;
+        clean_journal.superblock.apply_clean(cursor, clean_state);
+        self.clean_write = Some(clean_write);
+        self.clean_journal = Some(clean_journal);
+        self.tags.clear();
+        self.reset_walk();
+        self.phase = if self.policy == RecoveryPolicy::Replay && self.summary.transactions != 0 {
+            RecoveryPhase::Replay
+        } else {
+            RecoveryPhase::WriteCleanJournal
+        };
+        Ok(())
+    }
+
+    /// Resets a bounded pass to the committed prefix start.
+    fn reset_walk(&mut self) {
+        self.walk = RecoveryWalk {
+            cursor: self.summary.start_cursor,
+            sequence: self.summary.start_sequence,
+            consumed: 0,
+            scan_transaction_tags: 0,
+            scan_transaction_revokes: 0,
+        };
+        self.pending = RecoveryPending::Control;
+    }
+
+    /// Advances the active walk with circular ring semantics and a hard geometry bound.
+    fn advance_walk_blocks(&mut self, count: u32) -> Result<()> {
+        let next_consumed = self
+            .walk
+            .consumed
+            .checked_add(count)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if next_consumed > self.journal.usable_log_blocks()? {
+            return Err(Error::JournalCorrupt);
+        }
+        for _index in 0..count {
+            self.walk.cursor = self.journal.next_logical(self.walk.cursor)?;
+        }
+        self.walk.consumed = next_consumed;
+        Ok(())
+    }
+
+    /// Returns whether a same-or-later transaction revoked this payload's home block.
+    fn is_revoked(&self, block: BlockAddress, sequence: JournalSequence) -> bool {
+        self.revokes.iter().any(|revoked| {
+            revoked.block == block
+                && (revoked.sequence == sequence || revoked.sequence.is_after(sequence))
+        })
+    }
+}
+
+impl RecoveryTag {
+    /// Projects the validated recovery address into the checksum parser's wire tag view.
+    const fn as_journal_tag(self) -> JournalTag {
+        JournalTag {
+            block: self.home,
+            flags: self.flags,
+            checksum: self.checksum,
+        }
     }
 }
 
@@ -440,7 +1181,12 @@ impl<State> Journal<State> {
         read_journal_block(reader, &location, block_size, 0, &mut raw)?;
         let superblock = JournalSuperblock::parse(&raw)?;
         let profile = JournalProfile::from_superblock(&superblock)?;
-        let geometry = JournalGeometry::from_superblock(&superblock, block_size, capacity_blocks)?;
+        let geometry = JournalGeometry::from_superblock(
+            &superblock,
+            block_size,
+            capacity_blocks,
+            location.expected_first()?,
+        )?;
         location.validate_ring(&geometry.ring)?;
         let cursor = JournalCursor::from_superblock(&superblock, geometry.ring)?;
 
@@ -453,6 +1199,71 @@ impl<State> Journal<State> {
             filesystem_blocks,
             state: PhantomData,
         })
+    }
+
+    /// Probes and loads a dedicated external journal device.
+    /// # Errors
+    ///
+    /// Returns an error when a matching UUID names an invalid journal device, its JBD2 profile is
+    /// unsupported, its sole user differs from `filesystem_uuid`, or device geometry is invalid.
+    pub(crate) fn from_external_device(
+        reader: &mut OperationDevice<'_>,
+        expected_uuid: JournalUuid,
+        filesystem_uuid: FilesystemUuid,
+        expected_block_size: BlockSize,
+        filesystem_blocks: u64,
+    ) -> Result<ExternalJournalLoad> {
+        let mut ext_raw = [0_u8; EXTERNAL_EXT_SUPERBLOCK_BYTES];
+        reader.read_exact_at(
+            ByteOffset::new(EXTERNAL_EXT_SUPERBLOCK_OFFSET),
+            &mut ext_raw,
+        )?;
+        let ext = match ExternalJournalDeviceSuperblock::parse(&ext_raw, expected_uuid)? {
+            ExternalDeviceSuperblockProbe::Mismatch => return Ok(ExternalJournalLoad::Mismatch),
+            ExternalDeviceSuperblockProbe::Match(ext) => ext,
+        };
+        if ext.block_size != expected_block_size {
+            return Err(Error::UnsupportedJournal);
+        }
+        let device_blocks = reader
+            .len()
+            .bytes()
+            .checked_div(u64::from(ext.block_size.bytes()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let capacity_blocks =
+            u32::try_from(device_blocks).map_err(|_| Error::UnsupportedJournal)?;
+        let layout = ExternalJournalLayout::new(capacity_blocks, ext.superblock_block)?;
+        let mut journal_raw = memory::repeated_vec(
+            0_u8,
+            usize::try_from(ext.block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        reader.read_exact_at(layout.superblock_offset(ext.block_size)?, &mut journal_raw)?;
+        let superblock = JournalSuperblock::parse(&journal_raw)?;
+        if superblock.uuid != expected_uuid.bytes()
+            || superblock.nr_users != 1
+            || superblock.first_user != filesystem_uuid.bytes()
+        {
+            return Err(Error::JournalCorrupt);
+        }
+        let profile = JournalProfile::from_superblock(&superblock)?;
+        let location = JournalLocation::External(layout);
+        let geometry = JournalGeometry::from_superblock(
+            &superblock,
+            ext.block_size,
+            capacity_blocks,
+            location.expected_first()?,
+        )?;
+        location.validate_ring(&geometry.ring)?;
+        let cursor = JournalCursor::from_superblock(&superblock, geometry.ring)?;
+        Ok(ExternalJournalLoad::Match(Journal {
+            location,
+            superblock,
+            profile,
+            geometry,
+            cursor,
+            filesystem_blocks,
+            state: PhantomData,
+        }))
     }
 
     /// Serializes every commit, publish-overlay, and checkpoint allocation before the first write.
@@ -493,7 +1304,7 @@ impl<State> Journal<State> {
             .map_err(|_| Error::OutOfMemory)?;
         precommit_writes.try_push(PlannedStorageWrite::new(
             journal_target,
-            self.offset_of(0, block_size)?,
+            self.location.superblock_offset(block_size)?,
             dirty_superblock,
         ))?;
         let mut cursor = prepared.descriptor;
@@ -523,8 +1334,11 @@ impl<State> Journal<State> {
         clean_journal
             .superblock
             .apply_clean(prepared.next_cursor, clean_state_bytes);
-        let clean_write =
-            PlannedStorageWrite::new(journal_target, self.offset_of(0, block_size)?, clean_bytes);
+        let clean_write = PlannedStorageWrite::new(
+            journal_target,
+            self.location.superblock_offset(block_size)?,
+            clean_bytes,
+        );
 
         let mut home_writes = Vec::new();
         home_writes
@@ -701,184 +1515,6 @@ impl<State> Journal<State> {
             .min(payloads))
     }
 
-    /// Scans the journal ring for complete committed transactions.
-    /// # Errors
-    ///
-    /// Returns an error when usable ring bounds cannot be computed or a transaction block cannot be
-    /// read and parsed.
-    fn committed_transactions(
-        &self,
-        journal: &mut OperationDevice<'_>,
-        block_size: BlockSize,
-    ) -> Result<JournalReplayScan> {
-        if self.superblock.start() == 0 {
-            return Ok(JournalReplayScan {
-                transactions: Vec::new(),
-                tail: JournalScanTail::CleanSuperblock,
-            });
-        }
-
-        let mut transactions = Vec::new();
-        let mut cursor = self.superblock.start();
-        let mut sequence = self.cursor.sequence;
-        let mut consumed = 0_u32;
-        while consumed < self.usable_log_blocks()? {
-            match self.parse_transaction(journal, block_size, cursor, sequence)? {
-                JournalTransactionScan::Committed {
-                    transaction,
-                    next_cursor,
-                    consumed: transaction_blocks,
-                } => {
-                    transactions.try_push(transaction)?;
-                    cursor = next_cursor;
-                    sequence = sequence.next();
-                    consumed = consumed
-                        .checked_add(transaction_blocks)
-                        .ok_or(Error::ArithmeticOverflow)?;
-                }
-                JournalTransactionScan::IncompleteTail => {
-                    return Ok(JournalReplayScan {
-                        transactions,
-                        tail: JournalScanTail::IncompleteTail,
-                    });
-                }
-                JournalTransactionScan::EndOfLog => {
-                    if transactions.is_empty() {
-                        return Err(Error::JournalCorrupt);
-                    }
-                    return Ok(JournalReplayScan {
-                        transactions,
-                        tail: JournalScanTail::EndOfLog,
-                    });
-                }
-            }
-        }
-        Ok(JournalReplayScan {
-            transactions,
-            tail: JournalScanTail::EndOfLog,
-        })
-    }
-
-    /// Parses one transaction starting at the supplied logical journal block.
-    /// # Errors
-    ///
-    /// Returns an error when a transaction has inconsistent sequence numbers, duplicate descriptor
-    /// blocks, corrupt escaped data, duplicate home blocks, invalid revokes, or a bad commit block.
-    fn parse_transaction(
-        &self,
-        journal: &mut OperationDevice<'_>,
-        block_size: BlockSize,
-        start: u32,
-        sequence: JournalSequence,
-    ) -> Result<JournalTransactionScan> {
-        let mut transaction = JournalTransaction {
-            sequence,
-            events: Vec::new(),
-        };
-        let mut cursor = start;
-        let mut consumed = 0_u32;
-        let mut descriptor_seen = false;
-
-        while consumed < self.usable_log_blocks()? {
-            let block = self.read_journal_block(journal, block_size, cursor)?;
-            let Ok(header) = Jbd2Header::parse(&block) else {
-                return Ok(transaction_tail(consumed));
-            };
-            if header.sequence() != sequence.get() {
-                if consumed == 0 {
-                    return Ok(JournalTransactionScan::EndOfLog);
-                }
-                return Err(Error::JournalCorrupt);
-            }
-
-            match header.block_type() {
-                JBD2_DESCRIPTOR_BLOCK => {
-                    if descriptor_seen {
-                        return Err(Error::UnsupportedJournal);
-                    }
-                    descriptor_seen = true;
-                    let descriptor = self.parse_descriptor_block(&block)?;
-                    cursor = self.next_logical(cursor)?;
-                    consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
-                    for tag in descriptor.tags {
-                        let mut data = self.read_journal_block(journal, block_size, cursor)?;
-                        if tag.flags & JBD2_TAG_FLAG_DELETED == 0 {
-                            self.verify_tag_checksum(sequence, &tag, &data)?;
-                            if tag.flags & JBD2_TAG_FLAG_ESCAPE != 0 {
-                                if be_u32(&data, disk_offset(0))? != 0 {
-                                    return Err(Error::JournalCorrupt);
-                                }
-                                put_be_u32(&mut data, disk_offset(0), JBD2_MAGIC)?;
-                            }
-                            self.validate_replay_target(tag.block)?;
-                            if transaction.events.iter().any(|event| {
-                                matches!(event, JournalTransactionEvent::Entry(entry) if entry.home == tag.block)
-                            }) {
-                                return Err(Error::JournalCorrupt);
-                            }
-                            transaction.events.try_push(JournalTransactionEvent::Entry(
-                                JournalEntry {
-                                    home: tag.block,
-                                    bytes: data,
-                                },
-                            ))?;
-                        }
-                        cursor = self.next_logical(cursor)?;
-                        consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
-                    }
-                }
-                JBD2_REVOKE_BLOCK => {
-                    let revoke = self.parse_revoke_block(&block)?;
-                    for block in revoke.blocks {
-                        transaction
-                            .events
-                            .try_push(JournalTransactionEvent::Revoke(block))?;
-                    }
-                    cursor = self.next_logical(cursor)?;
-                    consumed = consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
-                }
-                JBD2_COMMIT_BLOCK => {
-                    if transaction.events.is_empty() {
-                        return Err(Error::JournalCorrupt);
-                    }
-                    self.parse_commit_block(&block, sequence)?;
-                    return Ok(JournalTransactionScan::Committed {
-                        transaction,
-                        next_cursor: self.next_logical(cursor)?,
-                        consumed: consumed.checked_add(1).ok_or(Error::ArithmeticOverflow)?,
-                    });
-                }
-                _ => {
-                    if consumed == 0 {
-                        return Ok(JournalTransactionScan::EndOfLog);
-                    }
-                    return Err(Error::UnsupportedJournal);
-                }
-            }
-        }
-
-        Ok(JournalTransactionScan::IncompleteTail)
-    }
-
-    /// Reads one logical journal block into an owned buffer.
-    /// # Errors
-    ///
-    /// Returns an error when the journal block size cannot be allocated or the logical block cannot
-    /// be read from the journal location.
-    fn read_journal_block(
-        &self,
-        journal: &mut OperationDevice<'_>,
-        block_size: BlockSize,
-        logical: u32,
-    ) -> Result<Vec<u8>> {
-        let mut block = memory::repeated_vec(
-            0_u8,
-            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-        journal.read_exact_at(self.offset_of(logical, block_size)?, &mut block)?;
-        Ok(block)
-    }
-
     /// Rejects replay targets outside the filesystem or inside the internal journal.
     /// # Errors
     ///
@@ -894,12 +1530,36 @@ impl<State> Journal<State> {
         Ok(())
     }
 
-    /// Parses descriptor tags from a JBD2 descriptor block.
-    /// # Errors
+    /// Counts structurally decodable tags during the committed-prefix scan.
     ///
-    /// Returns an error when the descriptor tail checksum is invalid, no last tag is present, or any
-    /// tag is malformed.
-    fn parse_descriptor_block(&self, block: &[u8]) -> Result<JournalDescriptor> {
+    /// Descriptor checksum failure is deliberately deferred to pass two so a valid later commit
+    /// record distinguishes committed corruption from an incomplete tail.
+    fn descriptor_tag_count_for_scan(&self, block: &[u8]) -> Result<usize> {
+        let mut offset = JOURNAL_HEADER_BYTES;
+        let limit = if self.profile.has_metadata_checksums() {
+            block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)?
+        } else {
+            block.len()
+        };
+        let mut count = 0_usize;
+        loop {
+            let Some((tag, next_offset)) = self.parse_tag(block, offset, limit, count == 0)? else {
+                return Err(Error::JournalCorrupt);
+            };
+            count = count.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            offset = next_offset;
+            if tag.flags & JBD2_TAG_FLAG_LAST_TAG != 0 {
+                return Ok(count);
+            }
+        }
+    }
+
+    /// Visits every fully validated descriptor tag without retaining a descriptor-owned vector.
+    fn for_each_descriptor_tag(
+        &self,
+        block: &[u8],
+        mut visit: impl FnMut(JournalTag) -> Result<()>,
+    ) -> Result<()> {
         self.verify_block_tail_checksum(block)?;
         let mut offset = JOURNAL_HEADER_BYTES;
         let limit = if self.profile.has_metadata_checksums() {
@@ -907,25 +1567,18 @@ impl<State> Journal<State> {
         } else {
             block.len()
         };
-        let mut tags = Vec::new();
-        let mut saw_last = false;
-        while offset < limit {
-            let Some((tag, next_offset)) = self.parse_tag(block, offset, limit, tags.is_empty())?
-            else {
+        let mut count = 0_usize;
+        loop {
+            let Some((tag, next_offset)) = self.parse_tag(block, offset, limit, count == 0)? else {
                 return Err(Error::JournalCorrupt);
             };
-            let last = tag.flags & JBD2_TAG_FLAG_LAST_TAG != 0;
-            tags.try_push(tag)?;
+            visit(tag)?;
+            count = count.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
             offset = next_offset;
-            if last {
-                saw_last = true;
-                break;
+            if tag.flags & JBD2_TAG_FLAG_LAST_TAG != 0 {
+                return Ok(());
             }
         }
-        if tags.is_empty() || !saw_last {
-            return Err(Error::JournalCorrupt);
-        }
-        Ok(JournalDescriptor { tags })
     }
 
     /// Parses one descriptor tag and returns the next tag offset.
@@ -1056,13 +1709,59 @@ impl<State> Journal<State> {
         )))
     }
 
-    /// Parses a revoke block into the home blocks it cancels.
-    /// # Errors
-    ///
-    /// Returns an error when the revoke block checksum is invalid, its used length is inconsistent,
-    /// or its block-address entries are not exactly aligned.
-    fn parse_revoke_block(&self, block: &[u8]) -> Result<JournalRevoke> {
+    /// Counts revoke records during pass one while deferring its tail checksum to validation.
+    fn revoke_count_for_scan(&self, block: &[u8]) -> Result<usize> {
+        let (mut offset, limit, entry_size) = self.revoke_layout(block)?;
+        let mut count = 0_usize;
+        while offset
+            .checked_add(entry_size)
+            .ok_or(Error::ArithmeticOverflow)?
+            <= limit
+        {
+            count = count.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            offset = offset
+                .checked_add(entry_size)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        if offset == limit {
+            Ok(count)
+        } else {
+            Err(Error::JournalCorrupt)
+        }
+    }
+
+    /// Visits every validated revoke address without allocating an intermediate record vector.
+    fn for_each_revoke(
+        &self,
+        block: &[u8],
+        mut visit: impl FnMut(BlockAddress) -> Result<()>,
+    ) -> Result<()> {
         self.verify_block_tail_checksum(block)?;
+        let (mut offset, limit, entry_size) = self.revoke_layout(block)?;
+        while offset
+            .checked_add(entry_size)
+            .ok_or(Error::ArithmeticOverflow)?
+            <= limit
+        {
+            let revoked = if entry_size == 8 {
+                be_u64(block, disk_offset(offset))?
+            } else {
+                u64::from(be_u32(block, disk_offset(offset))?)
+            };
+            visit(BlockAddress::new(revoked))?;
+            offset = offset
+                .checked_add(entry_size)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        if offset == limit {
+            Ok(())
+        } else {
+            Err(Error::JournalCorrupt)
+        }
+    }
+
+    /// Returns the checked revoke entry range and width shared by all recovery passes.
+    fn revoke_layout(&self, block: &[u8]) -> Result<(usize, usize, usize)> {
         let used = usize::try_from(be_u32(block, disk_offset(JOURNAL_HEADER_BYTES))?)
             .map_err(|_| Error::JournalCorrupt)?;
         if used < 16 || used > block.len() {
@@ -1074,28 +1773,7 @@ impl<State> Journal<State> {
             0
         };
         let limit = used.checked_sub(tail).ok_or(Error::JournalCorrupt)?;
-        let entry_size = if self.profile.has_64bit() { 8 } else { 4 };
-        let mut offset = 16_usize;
-        let mut blocks = Vec::new();
-        while offset
-            .checked_add(entry_size)
-            .ok_or(Error::ArithmeticOverflow)?
-            <= limit
-        {
-            let block = if entry_size == 8 {
-                be_u64(block, disk_offset(offset))?
-            } else {
-                u64::from(be_u32(block, disk_offset(offset))?)
-            };
-            blocks.try_push(BlockAddress::new(block))?;
-            offset = offset
-                .checked_add(entry_size)
-                .ok_or(Error::ArithmeticOverflow)?;
-        }
-        if offset != limit {
-            return Err(Error::JournalCorrupt);
-        }
-        Ok(JournalRevoke { blocks })
+        Ok((16, limit, if self.profile.has_64bit() { 8 } else { 4 }))
     }
 
     /// Validates a commit block for the expected transaction sequence.
@@ -1103,11 +1781,7 @@ impl<State> Journal<State> {
     ///
     /// Returns an error when the block is not a commit block for `expected_sequence`, checksum
     /// metadata fields are invalid, or the commit checksum fails.
-    fn parse_commit_block(
-        &self,
-        block: &[u8],
-        expected_sequence: JournalSequence,
-    ) -> Result<JournalCommit> {
+    fn parse_commit_block(&self, block: &[u8], expected_sequence: JournalSequence) -> Result<()> {
         let header = Jbd2Header::parse(block)?;
         if header.block_type() != JBD2_COMMIT_BLOCK {
             return Err(Error::JournalCorrupt);
@@ -1125,9 +1799,7 @@ impl<State> Journal<State> {
             }
             self.verify_commit_checksum(block)?;
         }
-        Ok(JournalCommit {
-            sequence: JournalSequence::new(header.sequence()),
-        })
+        Ok(())
     }
 
     /// Encodes descriptor tags for the metadata blocks in a new transaction.
@@ -1463,15 +2135,14 @@ impl<State> Journal<State> {
         let end = checksum_offset
             .checked_add(4)
             .ok_or(Error::ArithmeticOverflow)?;
-        let mut checked = memory::copied_slice(block)?;
-        checked
-            .get_mut(checksum_offset..end)
-            .ok_or(Error::TruncatedStructure)?
-            .fill(0);
-        Ok(ext4_crc32c(
-            ext4_crc32c(u32::MAX, self.superblock.uuid()),
-            &checked,
-        ))
+        let prefix = block
+            .get(..checksum_offset)
+            .ok_or(Error::TruncatedStructure)?;
+        let suffix = block.get(end..).ok_or(Error::TruncatedStructure)?;
+        let seed = ext4_crc32c(u32::MAX, self.superblock.uuid());
+        let seed = ext4_crc32c(seed, prefix);
+        let seed = ext4_crc32c(seed, &[0_u8; 4]);
+        Ok(ext4_crc32c(seed, suffix))
     }
 }
 
@@ -1490,12 +2161,16 @@ impl JournalRing {
     ///
     /// Returns an error when `first`, `maxlen`, or `start` falls outside the supported ring shape or
     /// physical journal capacity.
-    fn new(superblock: &JournalSuperblock, capacity_blocks: u32) -> Result<Self> {
+    fn new(
+        superblock: &JournalSuperblock,
+        capacity_blocks: u32,
+        expected_first: u32,
+    ) -> Result<Self> {
         let first = superblock.first();
         let maxlen = superblock.maxlen();
         if maxlen == 0
             || maxlen > capacity_blocks
-            || first != 1
+            || first != expected_first
             || first >= maxlen
             || (superblock.start() != 0
                 && (superblock.start() < first || superblock.start() >= maxlen))
@@ -1538,7 +2213,7 @@ enum JournalLocation {
     /// Journal stored in an inode on the filesystem device.
     Internal(InternalJournalLayout),
     /// Journal stored on a separate block device.
-    External,
+    External(ExternalJournalLayout),
 }
 
 impl JournalLocation {
@@ -1546,7 +2221,7 @@ impl JournalLocation {
     const fn storage_target(&self) -> StorageTarget {
         match self {
             Self::Internal(_) => StorageTarget::Filesystem,
-            Self::External => StorageTarget::ExternalJournal,
+            Self::External(_) => StorageTarget::ExternalJournal,
         }
     }
 
@@ -1557,7 +2232,7 @@ impl JournalLocation {
     fn try_clone(&self) -> Result<Self> {
         match self {
             Self::Internal(layout) => Ok(Self::Internal(layout.try_clone()?)),
-            Self::External => Ok(Self::External),
+            Self::External(layout) => Ok(Self::External(*layout)),
         }
     }
 
@@ -1569,7 +2244,7 @@ impl JournalLocation {
     fn offset_of(&self, logical: u32, block_size: BlockSize) -> Result<ByteOffset> {
         match self {
             Self::Internal(layout) => block_size.offset_of(layout.map_logical(logical)?),
-            Self::External => block_size.offset_of(BlockAddress::new(u64::from(logical))),
+            Self::External(_layout) => block_size.offset_of(BlockAddress::new(u64::from(logical))),
         }
     }
 
@@ -1580,10 +2255,7 @@ impl JournalLocation {
     fn validate_ring(&self, ring: &JournalRing) -> Result<()> {
         match self {
             Self::Internal(layout) => layout.validate_ring(ring),
-            Self::External => {
-                let _ = ring;
-                Err(Error::UnsupportedJournal)
-            }
+            Self::External(layout) => layout.validate_ring(ring),
         }
     }
 
@@ -1594,16 +2266,123 @@ impl JournalLocation {
     fn contains_home_block(&self, block: BlockAddress) -> Result<bool> {
         match self {
             Self::Internal(layout) => layout.contains_physical(block),
-            Self::External => Ok(false),
+            Self::External(_) => Ok(false),
         }
     }
 
-    /// Returns the physical journal capacity in blocks.
-    const fn capacity_blocks(&self) -> u32 {
+    /// Returns the first ring block dictated by this physical layout.
+    fn expected_first(&self) -> Result<u32> {
         match self {
-            Self::Internal(layout) => layout.capacity_blocks(),
-            Self::External => 0,
+            Self::Internal(_) => Ok(1),
+            Self::External(layout) => layout
+                .superblock_block
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow),
         }
+    }
+
+    /// Maps the journal superblock independently from ring-block identity.
+    fn superblock_offset(&self, block_size: BlockSize) -> Result<ByteOffset> {
+        match self {
+            Self::Internal(layout) => block_size.offset_of(layout.map_logical(0)?),
+            Self::External(layout) => layout.superblock_offset(block_size),
+        }
+    }
+}
+
+/// Identity-mapped external JBD2 device with a separately located journal superblock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExternalJournalLayout {
+    /// Total complete device blocks.
+    capacity_blocks: u32,
+    /// Device block containing the JBD2 superblock.
+    superblock_block: u32,
+}
+
+impl ExternalJournalLayout {
+    /// Builds checked external layout geometry.
+    fn new(capacity_blocks: u32, superblock_block: u32) -> Result<Self> {
+        if superblock_block >= capacity_blocks {
+            return Err(Error::UnsupportedJournal);
+        }
+        Ok(Self {
+            capacity_blocks,
+            superblock_block,
+        })
+    }
+
+    /// Returns the physical byte offset of the JBD2 superblock.
+    fn superblock_offset(self, block_size: BlockSize) -> Result<ByteOffset> {
+        block_size.offset_of(BlockAddress::new(u64::from(self.superblock_block)))
+    }
+
+    /// Verifies that the ring stays inside the device and begins after the superblock.
+    fn validate_ring(self, ring: &JournalRing) -> Result<()> {
+        let expected_first = self
+            .superblock_block
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if ring.first == expected_first && ring.maxlen <= self.capacity_blocks {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedJournal)
+        }
+    }
+}
+
+/// Dedicated ext-family superblock facts required to locate an external JBD2 journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExternalJournalDeviceSuperblock {
+    /// Block size shared by the external ext header and JBD2 device.
+    block_size: BlockSize,
+    /// Device block immediately after the ext superblock that stores the JBD2 superblock.
+    superblock_block: u32,
+}
+
+/// UUID-first probe classification for a candidate external journal device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalDeviceSuperblockProbe {
+    /// Candidate UUID differs, so discovery may inspect another device.
+    Mismatch,
+    /// UUID matches and every dedicated-journal header invariant is valid.
+    Match(ExternalJournalDeviceSuperblock),
+}
+
+impl ExternalJournalDeviceSuperblock {
+    /// Compares UUID before interpreting any other candidate bytes, then validates journal-device
+    /// structure for an exact match.
+    fn parse(
+        raw: &[u8; EXTERNAL_EXT_SUPERBLOCK_BYTES],
+        expected: JournalUuid,
+    ) -> Result<ExternalDeviceSuperblockProbe> {
+        let mut uuid = [0_u8; 16];
+        memory::copy_exact(
+            &mut uuid,
+            raw.get(0x68..0x78).ok_or(Error::TruncatedStructure)?,
+        )?;
+        if uuid != expected.bytes() {
+            return Ok(ExternalDeviceSuperblockProbe::Mismatch);
+        }
+        if le_u16(raw, disk_offset(0x38))? != EXT4_SUPER_MAGIC
+            || le_u32(raw, disk_offset(0x60))? != EXT4_FEATURE_INCOMPAT_JOURNAL_DEV
+            || le_u32(raw, disk_offset(0x5C))? != 0
+            || le_u32(raw, disk_offset(0x64))? != 0
+        {
+            return Err(Error::JournalCorrupt);
+        }
+        let block_size = BlockSize::from_superblock_log(le_u32(raw, disk_offset(0x18))?)?;
+        let superblock_block = u32::try_from(
+            EXTERNAL_EXT_SUPERBLOCK_OFFSET
+                .checked_div(u64::from(block_size.bytes()))
+                .ok_or(Error::ArithmeticOverflow)?
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )
+        .map_err(|_| Error::ArithmeticOverflow)?;
+        Ok(ExternalDeviceSuperblockProbe::Match(Self {
+            block_size,
+            superblock_block,
+        }))
     }
 }
 
@@ -1728,11 +2507,6 @@ impl InternalJournalLayout {
             }
         }
         Ok(false)
-    }
-
-    /// Returns the journal inode capacity in blocks.
-    const fn capacity_blocks(&self) -> u32 {
-        self.capacity_blocks
     }
 }
 
@@ -1914,39 +2688,6 @@ impl JournalSuperblock {
         })
     }
 
-    /// Validates JBD2 features and ring geometry for mounting.
-    /// # Errors
-    ///
-    /// Returns an error when block size, feature bits, checksum type, or ring geometry are outside
-    /// the supported JBD2 profile.
-    fn validate_for_mount(
-        &self,
-        block_size: BlockSize,
-        capacity_blocks: u32,
-    ) -> Result<JournalRing> {
-        if self.block_size != block_size.bytes() {
-            return Err(Error::UnsupportedJournal);
-        }
-        if self.compat != 0 {
-            return Err(Error::UnsupportedJournal);
-        }
-        if self.incompat & (JBD2_FEATURE_INCOMPAT_FAST_COMMIT | JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT)
-            != 0
-        {
-            return Err(Error::UnsupportedJournal);
-        }
-        if self.incompat & !JBD2_SUPPORTED_INCOMPAT != 0 {
-            return Err(Error::UnsupportedJournal);
-        }
-        if self.ro_compat != 0 {
-            return Err(Error::UnsupportedJournal);
-        }
-        if self.has_metadata_checksums() && self.checksum_type != JBD2_CHECKSUM_CRC32C {
-            return Err(Error::UnsupportedJournal);
-        }
-        JournalRing::new(self, capacity_blocks)
-    }
-
     /// Encodes a superblock image with updated sequence and start fields.
     /// # Errors
     ///
@@ -1982,7 +2723,7 @@ impl JournalSuperblock {
     /// Returns an error when the clean sequence/start state cannot be encoded into a valid
     /// superblock image.
     fn encode_clean(&self, block_size: BlockSize, cursor: JournalCursor) -> Result<Vec<u8>> {
-        self.encode_with_state(block_size, cursor.sequence, 0, cursor.head)
+        self.encode_with_state(block_size, cursor.sequence.previous(), 0, cursor.head)
     }
 
     /// Encodes a dirty journal superblock pointing at a transaction descriptor.
@@ -2001,7 +2742,7 @@ impl JournalSuperblock {
 
     /// Applies the clean superblock state after it has been written.
     fn apply_clean(&mut self, cursor: JournalCursor, raw: Vec<u8>) {
-        self.sequence = cursor.sequence;
+        self.sequence = cursor.sequence.previous();
         self.start = 0;
         self.head = cursor.head;
         self.raw = raw;
@@ -2014,11 +2755,6 @@ impl JournalSuperblock {
         self.raw = raw;
     }
 
-    /// Returns the journal block size recorded by the superblock.
-    pub(crate) const fn block_size(&self) -> u32 {
-        self.block_size
-    }
-
     /// Returns the total logical block count recorded by the superblock.
     pub(crate) const fn maxlen(&self) -> u32 {
         self.maxlen
@@ -2029,11 +2765,6 @@ impl JournalSuperblock {
         self.first
     }
 
-    /// Returns the next journal transaction sequence.
-    pub(crate) const fn sequence(&self) -> JournalSequence {
-        self.sequence
-    }
-
     /// Returns the first pending transaction block, or zero when clean.
     pub(crate) const fn start(&self) -> u32 {
         self.start
@@ -2042,21 +2773,6 @@ impl JournalSuperblock {
     /// Returns the UUID used by JBD2 checksum calculations.
     pub(crate) const fn uuid(&self) -> &[u8; 16] {
         &self.uuid
-    }
-
-    /// Returns whether journal tags carry high block-number fields.
-    pub(crate) const fn has_64bit(&self) -> bool {
-        self.incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0
-    }
-
-    /// Returns whether v3 journal checksums are enabled.
-    fn has_csum_v3(&self) -> bool {
-        self.incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0
-    }
-
-    /// Returns whether descriptor, commit, and tail checksums are enabled.
-    fn has_metadata_checksums(&self) -> bool {
-        self.incompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0
     }
 
     /// Returns whether the journal superblock checksum field is populated.
@@ -2136,24 +2852,6 @@ impl Jbd2Header {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Committed journal transaction reconstructed during replay scanning.
-struct JournalTransaction {
-    /// Transaction sequence shared by all records in this transaction.
-    sequence: JournalSequence,
-    /// Replayable entries and revokes in journal order.
-    events: Vec<JournalTransactionEvent>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Result of scanning the journal for committed transactions.
-struct JournalReplayScan {
-    /// Complete transactions found before the scan tail.
-    transactions: Vec<JournalTransaction>,
-    /// Reason the journal scan stopped.
-    tail: JournalScanTail,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 /// Serialized transaction ready to be written to the journal.
 struct PreparedJournalTransaction {
     /// Sequence number encoded into descriptor and commit blocks.
@@ -2182,60 +2880,6 @@ struct JournalCredits {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Reason a replay scan stopped after the last complete transaction.
-enum JournalScanTail {
-    /// Superblock already reported a clean journal.
-    CleanSuperblock,
-    /// Scan reached a non-transaction block after complete transactions.
-    EndOfLog,
-    /// Scan reached a partial transaction tail.
-    IncompleteTail,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Result of scanning for one transaction at a journal cursor.
-enum JournalTransactionScan {
-    /// A complete transaction ending in a valid commit block.
-    Committed {
-        /// Parsed transaction contents.
-        transaction: JournalTransaction,
-        /// Logical block after the commit block.
-        next_cursor: u32,
-        /// Number of logical blocks consumed by this transaction.
-        consumed: u32,
-    },
-    /// A descriptor or revoke sequence ended before a commit block.
-    IncompleteTail,
-    /// No transaction starts at the requested cursor.
-    EndOfLog,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Journaled metadata payload and its filesystem home block.
-struct JournalEntry {
-    /// Filesystem block overwritten during checkpoint or replay.
-    home: BlockAddress,
-    /// Metadata bytes carried by the journal transaction.
-    bytes: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Ordered event inside a journal transaction.
-enum JournalTransactionEvent {
-    /// Metadata block payload to replay unless revoked later.
-    Entry(JournalEntry),
-    /// Home block whose older payload must not be replayed.
-    Revoke(BlockAddress),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Parsed descriptor block containing journal payload tags.
-struct JournalDescriptor {
-    /// Tags that map following data blocks to filesystem blocks.
-    tags: Vec<JournalTag>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Descriptor tag for one following data block.
 struct JournalTag {
     /// Filesystem home block for the following payload.
@@ -2244,31 +2888,6 @@ struct JournalTag {
     flags: u32,
     /// Stored data-block checksum.
     checksum: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Revoke block listing home blocks cancelled by a transaction.
-struct JournalRevoke {
-    /// Home blocks whose older journal entries are revoked.
-    blocks: Vec<BlockAddress>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Validated commit block for a transaction.
-struct JournalCommit {
-    /// Sequence number committed by this block.
-    sequence: JournalSequence,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Revoke event annotated with transaction order for replay filtering.
-struct RevokedBlock {
-    /// Sequence of the transaction that recorded the revoke.
-    sequence: JournalSequence,
-    /// Event order inside the transaction.
-    order: usize,
-    /// Home block cancelled by the revoke.
-    block: BlockAddress,
 }
 
 impl<State> Journal<State> {
@@ -2320,15 +2939,6 @@ fn validate_tag_flags(flags: u32) -> Result<()> {
     }
 }
 
-/// Classifies a transaction tail based on how much of it was consumed.
-fn transaction_tail(consumed: u32) -> JournalTransactionScan {
-    if consumed == 0 {
-        JournalTransactionScan::EndOfLog
-    } else {
-        JournalTransactionScan::IncompleteTail
-    }
-}
-
 /// Verifies the checksum stored in a journal superblock.
 /// # Errors
 ///
@@ -2359,30 +2969,14 @@ fn refresh_journal_superblock_checksum(block: &mut [u8]) -> Result<()> {
 ///
 /// Returns an error when the superblock body or checksum field is truncated.
 fn journal_superblock_checksum(block: &[u8]) -> Result<u32> {
-    let mut checked = memory::copied_slice(
-        block
-            .get(..JOURNAL_SUPERBLOCK_BYTES)
-            .ok_or(Error::TruncatedStructure)?,
-    )?;
-    checked
-        .get_mut(0xFC..0x100)
-        .ok_or(Error::TruncatedStructure)?
-        .fill(0);
-    Ok(ext4_crc32c(u32::MAX, &checked))
-}
-
-/// Returns whether a later revoke cancels replay of a home block.
-fn is_revoked_after(
-    revokes: &[RevokedBlock],
-    block: BlockAddress,
-    sequence: JournalSequence,
-    order: usize,
-) -> bool {
-    revokes.iter().any(|revoked| {
-        revoked.block == block
-            && (revoked.sequence.is_after(sequence)
-                || (revoked.sequence == sequence && revoked.order > order))
-    })
+    let checked = block
+        .get(..JOURNAL_SUPERBLOCK_BYTES)
+        .ok_or(Error::TruncatedStructure)?;
+    let prefix = checked.get(..0xFC).ok_or(Error::TruncatedStructure)?;
+    let suffix = checked.get(0x100..).ok_or(Error::TruncatedStructure)?;
+    let seed = ext4_crc32c(u32::MAX, prefix);
+    let seed = ext4_crc32c(seed, &[0_u8; 4]);
+    Ok(ext4_crc32c(seed, suffix))
 }
 
 #[cfg(test)]

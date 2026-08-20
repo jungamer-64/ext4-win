@@ -4,8 +4,14 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::scope::*;
-use crate::disk::storage::{OperationDevice, StorageReadOverlay, StorageTarget, StorageTranscript};
-use crate::disk_format::journal::{CleanJournal, Journal, MetadataBlock};
+use crate::disk::storage::{
+    OperationDevice, StorageReadOverlay, StorageRequestIdentity, StorageTarget, StorageTranscript,
+};
+use crate::disk_format::journal::{
+    CleanJournal, ExternalJournalLoad, Journal, JournalRecoveryOperation, LoadedJournal,
+    MetadataBlock,
+};
+use crate::disk_format::superblock::{FilesystemUuid, JournalMode, JournalUuid, RecoveryState};
 
 /// Maximum distinct resources whose committed versions are tracked by one mounted volume.
 const MAX_TRACKED_RESOURCES: usize = 4096;
@@ -656,6 +662,152 @@ impl CompletedMount {
     }
 }
 
+/// Immutable requirement emitted when the primary filesystem names an external journal UUID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalJournalRequirement {
+    /// External journal UUID from the primary filesystem superblock.
+    journal_uuid: JournalUuid,
+    /// Primary filesystem UUID required as the sole JBD2 user.
+    filesystem_uuid: FilesystemUuid,
+    /// Filesystem and journal block size.
+    block_size: BlockSize,
+    /// Filesystem home-block upper bound used by replay validation.
+    filesystem_blocks: u64,
+}
+
+impl ExternalJournalRequirement {
+    /// UUID used to select candidate volume devices.
+    #[must_use]
+    pub const fn journal_uuid(self) -> JournalUuid {
+        self.journal_uuid
+    }
+
+    /// Filesystem UUID that must be the external journal's sole user.
+    #[must_use]
+    pub const fn filesystem_uuid(self) -> FilesystemUuid {
+        self.filesystem_uuid
+    }
+
+    /// Required external journal block size.
+    #[must_use]
+    pub const fn block_size(self) -> BlockSize {
+        self.block_size
+    }
+}
+
+/// Non-forgeable proof that one concrete device was fully validated by the core probe path.
+#[derive(Debug)]
+pub struct ValidatedExternalJournal {
+    /// Requirement satisfied by this exact validation.
+    requirement: ExternalJournalRequirement,
+    /// Validated candidate device length.
+    device_length: DeviceLength,
+    /// Loaded journal whose profile and external layout are already validated.
+    journal: Journal<LoadedJournal>,
+}
+
+impl ValidatedExternalJournal {
+    /// Validated external device length retained for driver storage ownership.
+    #[must_use]
+    pub const fn device_length(&self) -> DeviceLength {
+        self.device_length
+    }
+}
+
+/// Terminal classification of one external-journal candidate.
+#[derive(Debug)]
+pub enum ExternalJournalProbeOutcome {
+    /// Candidate UUID differs and discovery may continue.
+    Mismatch,
+    /// Candidate exactly matches and is safe to attach under its current device ownership.
+    Match(ValidatedExternalJournal),
+}
+
+/// One consuming transition of an external-journal probe.
+#[derive(Debug)]
+pub enum ExternalJournalProbeTransition {
+    /// Submit one candidate-device read.
+    SubmitLower {
+        /// Owned external-journal request.
+        request: crate::StorageRequest,
+        /// Probe resumed only by the matching completion.
+        suspended: Box<ExternalJournalProbeOperation>,
+    },
+    /// Probe completed with a mismatch, validated token, or structural error.
+    Complete(Result<ExternalJournalProbeOutcome>),
+}
+
+/// Concrete completion-driven validator for one external-journal candidate device.
+#[derive(Debug)]
+pub struct ExternalJournalProbeOperation {
+    /// Filesystem-derived requirement.
+    requirement: ExternalJournalRequirement,
+    /// Candidate device transcript used only before a token is minted.
+    candidate: StorageTranscript,
+}
+
+impl ExternalJournalProbeOperation {
+    /// Starts validation for one candidate device length.
+    #[must_use]
+    pub const fn new(requirement: ExternalJournalRequirement, device_length: DeviceLength) -> Self {
+        Self {
+            requirement,
+            candidate: StorageTranscript::new(StorageTarget::ExternalJournal, device_length),
+        }
+    }
+
+    /// Consumes one probe event and runs to the next lower read or terminal classification.
+    #[must_use]
+    pub fn advance(
+        mut self: Box<Self>,
+        event: super::OperationEvent,
+    ) -> ExternalJournalProbeTransition {
+        let accepted = match event {
+            super::OperationEvent::Admitted => Ok(()),
+            super::OperationEvent::StorageCompleted(completion) => {
+                self.candidate.complete(completion)
+            }
+            super::OperationEvent::CancelRequested => Err(Error::OperationCancelled),
+            _ => Err(Error::DeviceIo),
+        };
+        if let Err(error) = accepted {
+            return ExternalJournalProbeTransition::Complete(Err(error));
+        }
+        let loaded = {
+            let mut device = OperationDevice::new(&mut self.candidate);
+            Journal::<LoadedJournal>::from_external_device(
+                &mut device,
+                self.requirement.journal_uuid,
+                self.requirement.filesystem_uuid,
+                self.requirement.block_size,
+                self.requirement.filesystem_blocks,
+            )
+        };
+        match loaded {
+            Ok(ExternalJournalLoad::Mismatch) => {
+                ExternalJournalProbeTransition::Complete(Ok(ExternalJournalProbeOutcome::Mismatch))
+            }
+            Ok(ExternalJournalLoad::Match(journal)) => {
+                ExternalJournalProbeTransition::Complete(Ok(ExternalJournalProbeOutcome::Match(
+                    ValidatedExternalJournal {
+                        requirement: self.requirement,
+                        device_length: self.candidate.len(),
+                        journal,
+                    },
+                )))
+            }
+            Err(Error::OperationSuspended) => match self.candidate.take_pending_request() {
+                Ok(request) => ExternalJournalProbeTransition::SubmitLower {
+                    request,
+                    suspended: self,
+                },
+                Err(error) => ExternalJournalProbeTransition::Complete(Err(error)),
+            },
+            Err(error) => ExternalJournalProbeTransition::Complete(Err(error)),
+        }
+    }
+}
+
 /// One consuming transition of the mount operation.
 #[derive(Debug)]
 pub enum MountTransition {
@@ -666,39 +818,86 @@ pub enum MountTransition {
         /// Mount state resumed only by the matching completion.
         suspended: Box<MountOperation>,
     },
+    /// Driver must discover, exclusively reopen, and revalidate the named external journal.
+    DiscoverExternalJournal {
+        /// Exact filesystem-derived discovery requirement.
+        requirement: ExternalJournalRequirement,
+        /// Mount operation awaiting a matching validation token.
+        suspended: Box<MountOperation>,
+    },
     /// Mount terminated with either fully separated mounted state or a normal error.
     Complete(Result<Box<CompletedMount>>),
 }
 
 /// Completion-driven journaled mount operation.
-///
-/// All device reads are retained in operation-owned transcripts. No borrowed buffer or pointer
-/// into this state is placed in a lower request.
 #[derive(Debug)]
 pub struct MountOperation {
-    /// Filesystem-device read transcript.
+    /// Filesystem-device transcript used only for restartable metadata resolution.
     filesystem: StorageTranscript,
-    /// External-journal transcript, present only when the caller supplied that device.
-    external_journal: Option<StorageTranscript>,
-    /// Fallibly constructed mount key snapshot moved into the first committed epoch.
-    fscrypt_keys: FscryptKeySet,
-    /// Explicit mount phase.
+    /// Mount key snapshot moved once into the initial epoch before marker publication.
+    fscrypt_keys: Option<FscryptKeySet>,
+    /// Explicit mount and durability phase.
     state: MountState,
+    /// Cancellation recorded after a durability-changing recovery phase has begun.
+    cancel_requested: bool,
 }
 
 /// Internal mount phase with no independently inspectable flags.
 #[derive(Debug)]
 enum MountState {
-    /// Parse, validate, and drive recovery work.
+    /// Resolve the primary superblock and internal journal placement.
     Resolving,
+    /// Await a core-minted token for the exact external-journal requirement.
+    AwaitingExternal {
+        /// Primary filesystem superblock retained across driver discovery.
+        superblock: Superblock,
+        /// Requirement that the attached token must satisfy exactly.
+        requirement: ExternalJournalRequirement,
+    },
+    /// Drive bounded journal recovery without a storage transcript.
+    Recovering {
+        /// Primary superblock whose marker decides replay versus stale discard.
+        superblock: Superblock,
+        /// Device selected by the validated journal location.
+        journal_target: StorageTarget,
+        /// Consuming three-pass recovery operation.
+        operation: JournalRecoveryOperation,
+    },
     /// Build the allocation ownership index from the recovered filesystem image.
     Indexing(MountPublicationSeed),
+    /// Prepare the marker image and all publication allocations before its first write.
+    PreparingMarker(IndexedMountSeed),
+    /// Marker write is ready for lower submission.
+    MarkerWriteReady {
+        /// Fully allocated mount result, publishable only after marker flush.
+        completed: Box<CompletedMount>,
+        /// Owned primary-superblock marker image.
+        marker: Vec<u8>,
+    },
+    /// Marker write is owned by the lower stack.
+    MarkerWritePending {
+        /// Fully allocated mount result.
+        completed: Box<CompletedMount>,
+        /// Expected marker write completion.
+        expected: StorageRequestIdentity,
+    },
+    /// Marker write completed and its filesystem flush is ready.
+    MarkerFlushReady(Box<CompletedMount>),
+    /// Marker flush is owned by the lower stack.
+    MarkerFlushPending {
+        /// Fully allocated mount result.
+        completed: Box<CompletedMount>,
+        /// Expected filesystem flush completion.
+        expected: StorageRequestIdentity,
+    },
+    /// Recovery marker is durable and the completed mount may be published.
+    Published(Box<CompletedMount>),
 }
 
 /// Mount values retained while the recovered allocation index is constructed.
 #[derive(Debug)]
 struct MountPublicationSeed {
-    /// Cleaned and validated superblock state.
+    /// Validated primary superblock state.
     superblock: Superblock,
     /// Clean journal coordinator state.
     journal: Journal<CleanJournal>,
@@ -706,28 +905,75 @@ struct MountPublicationSeed {
     journal_target: StorageTarget,
 }
 
+/// Allocation-indexed mount values awaiting durable write-session marking.
+#[derive(Debug)]
+struct IndexedMountSeed {
+    /// Recovery and journal placement facts.
+    publication: MountPublicationSeed,
+    /// Fully validated committed allocation ownership.
+    clusters: ClusterReferenceIndex,
+}
+
+/// Journal resolution result before recovery begins.
+#[derive(Debug)]
+enum JournalResolution {
+    /// A concrete loaded journal is ready for bounded recovery.
+    Loaded {
+        /// Validated primary superblock.
+        superblock: Superblock,
+        /// Loaded journal.
+        journal: Journal<LoadedJournal>,
+        /// Device that owns journal records.
+        journal_target: StorageTarget,
+    },
+    /// Driver discovery is required before external recovery can begin.
+    Discover {
+        /// Validated primary superblock.
+        superblock: Superblock,
+        /// Exact candidate validation requirement.
+        requirement: ExternalJournalRequirement,
+    },
+}
+
 impl MountOperation {
-    /// Creates an internal- or external-journal mount operation.
-    ///
-    /// `external_journal_length` describes an actually supplied journal device. The parsed ext4
-    /// journal mode must agree with its presence before any recovery write is issued.
+    /// Creates a mount operation for a primary filesystem device only.
     #[must_use]
-    pub const fn new(
-        filesystem_length: DeviceLength,
-        external_journal_length: Option<DeviceLength>,
-        fscrypt_keys: FscryptKeySet,
-    ) -> Self {
+    pub const fn new(filesystem_length: DeviceLength, fscrypt_keys: FscryptKeySet) -> Self {
         Self {
             filesystem: StorageTranscript::new(StorageTarget::Filesystem, filesystem_length),
-            external_journal: match external_journal_length {
-                Some(length) => Some(StorageTranscript::new(
-                    StorageTarget::ExternalJournal,
-                    length,
-                )),
-                None => None,
-            },
-            fscrypt_keys,
+            fscrypt_keys: Some(fscrypt_keys),
             state: MountState::Resolving,
+            cancel_requested: false,
+        }
+    }
+
+    /// Attaches a token minted by exclusive core validation and resumes external recovery.
+    #[must_use]
+    pub fn attach_external_journal(
+        mut self: Box<Self>,
+        validated: ValidatedExternalJournal,
+    ) -> MountTransition {
+        let state = core::mem::replace(&mut self.state, MountState::Resolving);
+        let MountState::AwaitingExternal {
+            superblock,
+            requirement,
+        } = state
+        else {
+            return MountTransition::Complete(Err(Error::DeviceIo));
+        };
+        if requirement != validated.requirement {
+            return MountTransition::Complete(Err(Error::UnsupportedJournal));
+        }
+        match JournalRecoveryOperation::new(validated.journal, superblock.recovery_state()) {
+            Ok(operation) => {
+                self.state = MountState::Recovering {
+                    superblock,
+                    journal_target: StorageTarget::ExternalJournal,
+                    operation,
+                };
+                self.drive()
+            }
+            Err(error) => MountTransition::Complete(Err(error)),
         }
     }
 
@@ -737,19 +983,27 @@ impl MountOperation {
         let accepted = match event {
             super::OperationEvent::Admitted => match &self.state {
                 MountState::Resolving => Ok(()),
-                MountState::Indexing(_) => Err(Error::DeviceIo),
+                _ => Err(Error::DeviceIo),
             },
             super::OperationEvent::StorageCompleted(completion) => {
                 self.accept_completion(completion)
             }
-            super::OperationEvent::CancelRequested => Err(Error::OperationCancelled),
-            super::OperationEvent::RetryElapsed(_)
-            | super::OperationEvent::DeviceLengthCompleted(_)
-            | super::OperationEvent::IntentGranted(_)
-            | super::OperationEvent::CommitGranted(_)
-            | super::OperationEvent::VisibilityGranted(_)
-            | super::OperationEvent::CheckpointGranted(_)
-            | super::OperationEvent::BarrierReleased(_) => Err(Error::DeviceIo),
+            super::OperationEvent::CancelRequested => {
+                if matches!(
+                    self.state,
+                    MountState::Recovering { .. }
+                        | MountState::MarkerWriteReady { .. }
+                        | MountState::MarkerWritePending { .. }
+                        | MountState::MarkerFlushReady(_)
+                        | MountState::MarkerFlushPending { .. }
+                ) {
+                    self.cancel_requested = true;
+                    Ok(())
+                } else {
+                    Err(Error::OperationCancelled)
+                }
+            }
+            _ => Err(Error::DeviceIo),
         };
         if let Err(error) = accepted {
             return MountTransition::Complete(Err(error));
@@ -758,71 +1012,162 @@ impl MountOperation {
     }
 
     /// Routes one completion exclusively to the phase that submitted it.
-    /// # Errors
-    ///
-    /// Returns an error when the completion does not match the suspended phase or transfer.
     fn accept_completion(&mut self, completion: crate::StorageCompletion) -> Result<()> {
         match core::mem::replace(&mut self.state, MountState::Resolving) {
             MountState::Resolving => {
-                self.complete_read(completion)?;
+                self.filesystem.complete(completion)?;
                 self.state = MountState::Resolving;
-                Ok(())
             }
             MountState::Indexing(publication) => {
-                self.complete_read(completion)?;
+                self.filesystem.complete(completion)?;
                 self.state = MountState::Indexing(publication);
-                Ok(())
+            }
+            MountState::PreparingMarker(indexed) => {
+                self.filesystem.complete(completion)?;
+                self.state = MountState::PreparingMarker(indexed);
+            }
+            MountState::Recovering {
+                superblock,
+                journal_target,
+                mut operation,
+            } => {
+                operation.complete(completion)?;
+                self.state = MountState::Recovering {
+                    superblock,
+                    journal_target,
+                    operation,
+                };
+            }
+            MountState::MarkerWritePending {
+                completed,
+                expected,
+            } => {
+                expected.complete(completion)?;
+                self.state = MountState::MarkerFlushReady(completed);
+            }
+            MountState::MarkerFlushPending {
+                completed,
+                expected,
+            } => {
+                expected.complete(completion)?;
+                self.state = MountState::Published(completed);
+            }
+            state @ (MountState::AwaitingExternal { .. }
+            | MountState::MarkerWriteReady { .. }
+            | MountState::MarkerFlushReady(_)
+            | MountState::Published(_)) => {
+                self.state = state;
+                return Err(Error::DeviceIo);
             }
         }
+        Ok(())
     }
 
     /// Advances internal phases without polling unrelated operations.
     fn drive(mut self: Box<Self>) -> MountTransition {
         loop {
             match core::mem::replace(&mut self.state, MountState::Resolving) {
-                MountState::Resolving => match self.drive_recovery() {
-                    Ok(publication) => self.state = MountState::Indexing(publication),
+                MountState::Resolving => match self.resolve_journal() {
+                    Ok(JournalResolution::Loaded {
+                        superblock,
+                        journal,
+                        journal_target,
+                    }) => match JournalRecoveryOperation::new(journal, superblock.recovery_state())
+                    {
+                        Ok(operation) => {
+                            self.state = MountState::Recovering {
+                                superblock,
+                                journal_target,
+                                operation,
+                            };
+                        }
+                        Err(error) => return MountTransition::Complete(Err(error)),
+                    },
+                    Ok(JournalResolution::Discover {
+                        superblock,
+                        requirement,
+                    }) => {
+                        self.state = MountState::AwaitingExternal {
+                            superblock,
+                            requirement,
+                        };
+                        return MountTransition::DiscoverExternalJournal {
+                            requirement,
+                            suspended: self,
+                        };
+                    }
                     Err(Error::OperationSuspended) => {
                         self.state = MountState::Resolving;
                         return self.submit_pending_read();
                     }
                     Err(error) => return MountTransition::Complete(Err(error)),
                 },
+                MountState::AwaitingExternal {
+                    superblock,
+                    requirement,
+                } => {
+                    self.state = MountState::AwaitingExternal {
+                        superblock,
+                        requirement,
+                    };
+                    return MountTransition::DiscoverExternalJournal {
+                        requirement,
+                        suspended: self,
+                    };
+                }
+                MountState::Recovering {
+                    superblock,
+                    journal_target,
+                    mut operation,
+                } => match operation.next_request() {
+                    Ok(Some(request)) => {
+                        self.state = MountState::Recovering {
+                            superblock,
+                            journal_target,
+                            operation,
+                        };
+                        return MountTransition::SubmitLower {
+                            request,
+                            suspended: self,
+                        };
+                    }
+                    Ok(None) => match operation.into_clean() {
+                        Ok(journal) => {
+                            if self.cancel_requested {
+                                return MountTransition::Complete(Err(Error::OperationCancelled));
+                            }
+                            let filesystem_length = self.filesystem.len();
+                            self.filesystem = StorageTranscript::new(
+                                StorageTarget::Filesystem,
+                                filesystem_length,
+                            );
+                            self.state = MountState::Indexing(MountPublicationSeed {
+                                superblock,
+                                journal,
+                                journal_target,
+                            });
+                        }
+                        Err(error) => return MountTransition::Complete(Err(error)),
+                    },
+                    Err(error) => return MountTransition::Complete(Err(error)),
+                },
                 MountState::Indexing(publication) => {
                     let clusters = {
                         let device = OperationDevice::new(&mut self.filesystem);
-                        let mut volume = EpochReadView::mounting(
-                            device,
-                            publication.superblock,
-                            &self.fscrypt_keys,
-                        );
+                        let keys = match self.fscrypt_keys.as_ref() {
+                            Some(keys) => keys,
+                            None => return MountTransition::Complete(Err(Error::DeviceIo)),
+                        };
+                        let mut volume =
+                            EpochReadView::mounting(device, publication.superblock, keys);
                         ClusterReferenceIndex::load(&mut volume)
                     };
                     match clusters {
                         Ok(clusters) => {
-                            let Self {
-                                filesystem,
-                                external_journal: _,
-                                fscrypt_keys,
-                                state: _,
-                            } = *self;
-                            let profile = MountedProfile::new(
-                                publication.superblock,
-                                filesystem.len(),
-                                publication.journal_target,
-                            );
-                            let epoch = CommittedEpoch::initial(
-                                publication.superblock,
-                                fscrypt_keys,
+                            self.state = MountState::PreparingMarker(IndexedMountSeed {
+                                publication,
                                 clusters,
-                            );
-                            let coordinator = MutationCoordinatorState::new(publication.journal);
-                            let completed = CompletedMount {
-                                profile,
-                                epoch,
-                                coordinator,
-                            };
-                            return MountTransition::Complete(memory::try_box(completed));
+                            });
                         }
                         Err(Error::OperationSuspended) => {
                             self.state = MountState::Indexing(publication);
@@ -831,45 +1176,163 @@ impl MountOperation {
                         Err(error) => return MountTransition::Complete(Err(error)),
                     }
                 }
+                MountState::PreparingMarker(indexed) => {
+                    let raw = {
+                        let mut filesystem = OperationDevice::new(&mut self.filesystem);
+                        Superblock::prepare_recovery_marker(
+                            &mut filesystem,
+                            RecoveryState::NeedsRecovery,
+                        )
+                    };
+                    match raw {
+                        Ok(raw) => {
+                            let marked = match Superblock::parse_read_write(&raw) {
+                                Ok(marked) => marked,
+                                Err(error) => return MountTransition::Complete(Err(error)),
+                            };
+                            let keys = match self.fscrypt_keys.take() {
+                                Some(keys) => keys,
+                                None => return MountTransition::Complete(Err(Error::DeviceIo)),
+                            };
+                            let completed = CompletedMount {
+                                profile: MountedProfile::new(
+                                    marked,
+                                    self.filesystem.len(),
+                                    indexed.publication.journal_target,
+                                ),
+                                epoch: CommittedEpoch::initial(marked, keys, indexed.clusters),
+                                coordinator: MutationCoordinatorState::new(
+                                    indexed.publication.journal,
+                                ),
+                            };
+                            let completed = match memory::try_box(completed) {
+                                Ok(completed) => completed,
+                                Err(error) => return MountTransition::Complete(Err(error)),
+                            };
+                            let marker = match memory::copied_slice(&raw) {
+                                Ok(marker) => marker,
+                                Err(error) => return MountTransition::Complete(Err(error)),
+                            };
+                            self.state = MountState::MarkerWriteReady { completed, marker };
+                        }
+                        Err(Error::OperationSuspended) => {
+                            self.state = MountState::PreparingMarker(indexed);
+                            return self.submit_pending_read();
+                        }
+                        Err(error) => return MountTransition::Complete(Err(error)),
+                    }
+                }
+                MountState::MarkerWriteReady { completed, marker } => {
+                    let request = crate::StorageRequest::Write {
+                        target: StorageTarget::Filesystem,
+                        offset: ByteOffset::new(1024),
+                        buffer: marker,
+                    };
+                    let expected = StorageRequestIdentity::from_request(&request);
+                    self.state = MountState::MarkerWritePending {
+                        completed,
+                        expected,
+                    };
+                    return MountTransition::SubmitLower {
+                        request,
+                        suspended: self,
+                    };
+                }
+                MountState::MarkerWritePending {
+                    completed,
+                    expected,
+                } => {
+                    self.state = MountState::MarkerWritePending {
+                        completed,
+                        expected,
+                    };
+                    return MountTransition::Complete(Err(Error::DeviceIo));
+                }
+                MountState::MarkerFlushReady(completed) => {
+                    let request = crate::StorageRequest::Flush {
+                        target: StorageTarget::Filesystem,
+                    };
+                    let expected = StorageRequestIdentity::from_request(&request);
+                    self.state = MountState::MarkerFlushPending {
+                        completed,
+                        expected,
+                    };
+                    return MountTransition::SubmitLower {
+                        request,
+                        suspended: self,
+                    };
+                }
+                MountState::MarkerFlushPending {
+                    completed,
+                    expected,
+                } => {
+                    self.state = MountState::MarkerFlushPending {
+                        completed,
+                        expected,
+                    };
+                    return MountTransition::Complete(Err(Error::DeviceIo));
+                }
+                MountState::Published(completed) => {
+                    return if self.cancel_requested {
+                        MountTransition::Complete(Err(Error::OperationCancelled))
+                    } else {
+                        MountTransition::Complete(Ok(completed))
+                    };
+                }
             }
         }
     }
 
-    /// Moves the current resolve pass's sole pending read into lower ownership.
-    fn submit_pending_read(mut self: Box<Self>) -> MountTransition {
-        let request = if self.filesystem.has_pending_request() {
-            self.filesystem.take_pending_request()
-        } else if let Some(journal) = self.external_journal.as_mut() {
-            if journal.has_pending_request() {
-                journal.take_pending_request()
-            } else {
-                Err(Error::DeviceIo)
-            }
-        } else {
-            Err(Error::DeviceIo)
+    /// Resolves primary metadata and either loads an internal journal or emits discovery facts.
+    fn resolve_journal(&mut self) -> Result<JournalResolution> {
+        let superblock = {
+            let mut filesystem = OperationDevice::new(&mut self.filesystem);
+            Superblock::read_write_from(&mut filesystem)?
         };
-        match request {
+        match superblock.journal_mode() {
+            JournalMode::Internal(journal_inode_id) => {
+                let journal_inode = {
+                    let filesystem = OperationDevice::new(&mut self.filesystem);
+                    let keys = self.fscrypt_keys.as_ref().ok_or(Error::DeviceIo)?;
+                    let mut volume = EpochReadView::mounting(filesystem, superblock, keys);
+                    volume.read_inode_record(journal_inode_id)?
+                };
+                let journal = {
+                    let mut filesystem = OperationDevice::new(&mut self.filesystem);
+                    Journal::<LoadedJournal>::from_inode(
+                        &journal_inode,
+                        superblock.block_size(),
+                        superblock.block_count().as_u64(),
+                        &mut filesystem,
+                    )?
+                };
+                Ok(JournalResolution::Loaded {
+                    superblock,
+                    journal,
+                    journal_target: StorageTarget::Filesystem,
+                })
+            }
+            JournalMode::External(journal_uuid) => Ok(JournalResolution::Discover {
+                superblock,
+                requirement: ExternalJournalRequirement {
+                    journal_uuid,
+                    filesystem_uuid: superblock.uuid(),
+                    block_size: superblock.block_size(),
+                    filesystem_blocks: superblock.block_count().as_u64(),
+                },
+            }),
+            JournalMode::None => Err(Error::UnsupportedJournal),
+        }
+    }
+
+    /// Moves the current restartable metadata read into lower ownership.
+    fn submit_pending_read(mut self: Box<Self>) -> MountTransition {
+        match self.filesystem.take_pending_request() {
             Ok(request) => MountTransition::SubmitLower {
                 request,
                 suspended: self,
             },
             Err(error) => MountTransition::Complete(Err(error)),
-        }
-    }
-
-    /// Integrates one read completion into its operation-owned transcript.
-    /// # Errors
-    ///
-    /// Returns an error when the completion does not match either mount transcript or reports an
-    /// invalid transfer.
-    fn complete_read(&mut self, completion: crate::StorageCompletion) -> Result<()> {
-        match completion.target() {
-            StorageTarget::Filesystem => self.filesystem.complete(completion),
-            StorageTarget::ExternalJournal => self
-                .external_journal
-                .as_mut()
-                .ok_or(Error::UnsupportedJournal)?
-                .complete(completion),
         }
     }
 }
