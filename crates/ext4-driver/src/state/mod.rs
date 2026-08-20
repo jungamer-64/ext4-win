@@ -1983,44 +1983,6 @@ impl VolumeControlBlock {
         )
     }
 
-    /// Projects stable mounted fields for one reactor-thread transition.
-    /// # Safety
-    ///
-    /// The caller must run on the owning reactor thread and must not retain a projected reference
-    /// across a transition, lower submission, timer arm, or completion callback.
-    pub(crate) unsafe fn operation_access(volume: NonNull<Self>) -> VolumeAccess {
-        let runtime = unsafe {
-            // SAFETY: The VCB is heap-stable, so its runtime field has a stable address.
-            core::ptr::addr_of_mut!((*volume.as_ptr()).runtime)
-        };
-        let runtime = unsafe {
-            // SAFETY: A field address projected from a non-null live VCB cannot be null.
-            NonNull::new_unchecked(runtime)
-        };
-        let control = unsafe {
-            // SAFETY: The VCB is heap-stable, so its volume control plane has a stable address.
-            core::ptr::addr_of_mut!((*volume.as_ptr()).volume_control)
-        };
-        let control = unsafe {
-            // SAFETY: A field address projected from a non-null live VCB cannot be null.
-            NonNull::new_unchecked(control)
-        };
-        let file_control_blocks = unsafe {
-            // SAFETY: The VCB is heap-stable, so its FCB ledger has a stable address.
-            core::ptr::addr_of_mut!((*volume.as_ptr()).file_control_blocks)
-        };
-        let file_control_blocks = unsafe {
-            // SAFETY: A field address projected from a non-null live VCB cannot be null.
-            NonNull::new_unchecked(file_control_blocks)
-        };
-        VolumeAccess {
-            owner: MountedVolumeRef::new(volume),
-            runtime,
-            control,
-            file_control_blocks,
-        }
-    }
-
     /// Returns whether logical dismount already consumed shutdown registration.
     fn is_logically_dismounted(&self) -> bool {
         matches!(
