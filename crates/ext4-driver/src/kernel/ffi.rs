@@ -25,8 +25,16 @@ pub(crate) use wdk_sys::ntddk::{
     IoSetCompletionRoutineEx, IoUnregisterShutdownNotification, IofCallDriver,
     KeAcquireSpinLockRaiseToDpc, KeInitializeDpc, KeInitializeEvent, KeInitializeSpinLock,
     KeInitializeTimer, KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject,
-    MmBuildMdlForNonPagedPool, MmUnlockPages, PsCreateSystemThread, PsTerminateSystemThread,
-    ZwClose, ZwWaitForSingleObject,
+    MmBuildMdlForNonPagedPool, MmUnlockPages, ObfDereferenceObject, PsCreateSystemThread,
+    PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
+};
+
+#[cfg(not(test))]
+pub(crate) use wdk_sys::IoFileObjectType;
+#[cfg(not(test))]
+pub(crate) use wdk_sys::ntddk::{
+    ExFreePool, IoGetDeviceAttachmentBaseRef, IoGetDeviceInterfaces, IoGetDeviceObjectPointer,
+    IoGetRelatedDeviceObject, ObReferenceObjectByHandle, ZwCreateFile,
 };
 
 #[cfg(not(test))]

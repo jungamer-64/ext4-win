@@ -1,6 +1,7 @@
 //! Completion-driven lower-storage geometry, commands, retry policy, and mount-length probes.
 
 use core::mem::size_of;
+use core::ptr::NonNull;
 
 use ext4_core::{
     ByteOffset, CompletedStorageTransfer, DeviceLength, Error, StorageCompletion, StorageRequest,
@@ -143,9 +144,9 @@ impl LowerStorageDevice {
     }
 }
 
-/// Mounted filesystem and optional external-journal lower devices.
+/// Copyable request route into mount-owned lower devices.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MountedStorageDevices {
+pub struct MountedStorageRoute {
     /// Driver-owned device whose image pins completion routine code.
     completion_owner: KernelDevice,
     /// Filesystem lower device.
@@ -154,7 +155,7 @@ pub struct MountedStorageDevices {
     external_journal: Option<LowerStorageDevice>,
 }
 
-impl MountedStorageDevices {
+impl MountedStorageRoute {
     /// Builds the immutable lower device set.
     #[must_use]
     pub const fn new(
@@ -169,6 +170,16 @@ impl MountedStorageDevices {
         }
     }
 
+    /// Selects an external journal for a transient discovery or exclusive-validation route.
+    #[must_use]
+    pub const fn with_external(self, external_journal: LowerStorageDevice) -> Self {
+        Self {
+            completion_owner: self.completion_owner,
+            filesystem: self.filesystem,
+            external_journal: Some(external_journal),
+        }
+    }
+
     /// Selects one concrete lower device from an owned core request target.
     /// # Errors
     ///
@@ -180,6 +191,95 @@ impl MountedStorageDevices {
                 self.external_journal.ok_or(DriverError::InvalidParameter)
             }
         }
+    }
+}
+
+/// Exclusive external-journal kernel ownership retained until mounted runtime teardown.
+#[derive(Debug)]
+pub struct ExternalJournalLease {
+    /// Exclusive kernel file handle opened with share access zero.
+    _handle: wdk_sys::HANDLE,
+    /// Referenced file object whose related device remains valid for lower I/O.
+    _file_object: NonNull<wdk_sys::FILE_OBJECT>,
+}
+
+impl ExternalJournalLease {
+    /// Takes ownership of an exclusive handle and its separately referenced file object.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a live kernel handle returned by `ZwCreateFile`, and `file_object` must own
+    /// exactly one reference obtained from that handle. Neither ownership may be released elsewhere.
+    #[cfg(not(test))]
+    pub(crate) unsafe fn from_exclusive(
+        handle: wdk_sys::HANDLE,
+        file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    ) -> Self {
+        Self {
+            _handle: handle,
+            _file_object: file_object,
+        }
+    }
+}
+
+impl Drop for ExternalJournalLease {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: This RAII owner holds the unique handle ownership transferred by
+            // `from_exclusive`; closing it releases the share-access claim exactly once.
+            let _status = crate::kernel::ffi::ZwClose(self._handle);
+        }
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: This owner also holds exactly one object reference obtained independently
+            // from the handle; the related device is no longer routed after this owner drops.
+            let _remaining =
+                crate::kernel::ffi::ObfDereferenceObject(self._file_object.as_ptr().cast());
+        }
+    }
+}
+
+// SAFETY: The kernel handle and referenced FILE_OBJECT may move between reactor continuations; all
+// mutation and final release remain serialized by the owning mount/VCB state machine.
+unsafe impl Send for ExternalJournalLease {}
+
+/// Non-copy mounted storage lifetime owner.
+#[derive(Debug)]
+pub struct MountedStorage {
+    /// Copyable request route borrowed by individual operations.
+    route: MountedStorageRoute,
+    /// Exclusive external journal lease, absent for an internal journal.
+    _external_journal: Option<ExternalJournalLease>,
+}
+
+impl MountedStorage {
+    /// Creates primary-filesystem storage before journal placement is known.
+    #[must_use]
+    pub const fn primary(completion_owner: KernelDevice, filesystem: LowerStorageDevice) -> Self {
+        Self {
+            route: MountedStorageRoute::new(completion_owner, filesystem, None),
+            _external_journal: None,
+        }
+    }
+
+    /// Installs exclusive external-journal ownership into this mount lifetime.
+    #[must_use]
+    pub fn with_external(self, external: LowerStorageDevice, lease: ExternalJournalLease) -> Self {
+        Self {
+            route: MountedStorageRoute::new(
+                self.route.completion_owner,
+                self.route.filesystem,
+                Some(external),
+            ),
+            _external_journal: Some(lease),
+        }
+    }
+
+    /// Returns a copyable route without transferring lifetime ownership.
+    #[must_use]
+    pub const fn route(&self) -> MountedStorageRoute {
+        self.route
     }
 }
 
@@ -304,6 +404,12 @@ impl<O> PreparedStorageCommand<O> {
         self.command
     }
 
+    /// Borrows the suspended scheduler payload without exposing command representation.
+    #[cfg(not(test))]
+    pub(crate) const fn suspended(&self) -> &O {
+        self.command.suspended()
+    }
+
     /// Whether submission may mutate device durability state.
     pub(crate) const fn is_effect_bearing(&self) -> bool {
         matches!(
@@ -318,7 +424,7 @@ impl<O> PreparedStorageCommand<O> {
     /// Returns the owned operation and request when target selection, sector coverage, aligned
     /// transfer allocation, or exact-copy preparation fails.
     pub fn try_new(
-        devices: MountedStorageDevices,
+        devices: MountedStorageRoute,
         request: StorageRequest,
         suspended: O,
     ) -> Result<Self, StorageCommandBuildError<O>> {
@@ -473,6 +579,16 @@ impl<O> PreparedStorageCommand<O> {
 }
 
 impl<O> StorageCommand<O> {
+    /// Borrows the suspended operation carried through every lower phase and retry.
+    #[cfg(not(test))]
+    const fn suspended(&self) -> &O {
+        match self {
+            Self::Read { suspended, .. }
+            | Self::Write { suspended, .. }
+            | Self::Flush { suspended, .. } => suspended,
+        }
+    }
+
     /// Concrete target, lower offset, and buffer method for this phase.
     fn lower_contract(
         &self,
@@ -689,6 +805,12 @@ impl<O> RetryingStorageCommand<O> {
     /// Timer delay to arm.
     pub const fn delay(&self) -> StorageRetryDelay {
         self.delay
+    }
+
+    /// Borrows scheduler metadata retained with the suspended operation.
+    #[cfg(not(test))]
+    pub(crate) const fn suspended(&self) -> &O {
+        self.command.suspended()
     }
 
     /// Cancels an unsubmitted retry while preserving the suspended operation.
@@ -945,7 +1067,7 @@ mod tests {
     use alloc::vec;
 
     use super::{
-        DeviceLengthProbe, FailedStorageCommand, LowerStorageDevice, MountedStorageDevices,
+        DeviceLengthProbe, FailedStorageCommand, LowerStorageDevice, MountedStorageRoute,
         PreparedStorageCommand, STATUS_CRC_ERROR, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY,
         STATUS_IO_TIMEOUT, STATUS_RETRY, StorageCommandStep, StorageFailureClass,
         StorageRetryDecision, StorageRetryDelay, WriteTransferPhase, failed_unsubmitted_request,
@@ -959,7 +1081,7 @@ mod tests {
     struct StorageFixture {
         _owner: Box<wdk_sys::DEVICE_OBJECT>,
         _lower: Box<wdk_sys::DEVICE_OBJECT>,
-        devices: MountedStorageDevices,
+        devices: MountedStorageRoute,
     }
 
     fn storage_fixture() -> Option<StorageFixture> {
@@ -982,7 +1104,7 @@ mod tests {
         Some(StorageFixture {
             _owner: owner,
             _lower: lower,
-            devices: MountedStorageDevices::new(completion_owner, filesystem, None),
+            devices: MountedStorageRoute::new(completion_owner, filesystem, None),
         })
     }
 

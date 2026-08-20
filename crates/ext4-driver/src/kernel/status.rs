@@ -89,6 +89,14 @@ pub(crate) enum DriverError {
     NoSuchFile,
     /// Candidate volume does not contain a mountable ext4 filesystem.
     UnrecognizedVolume,
+    /// No distinct volume interface exposes the required external-journal UUID.
+    ExternalJournalNotFound,
+    /// More than one distinct device exposes the required external-journal UUID.
+    ExternalJournalAmbiguous,
+    /// The uniquely matching journal could not be reopened with share access zero.
+    ExternalJournalExclusiveOpenFailed,
+    /// The volume-interface namespace could not be enumerated or resolved safely.
+    ExternalJournalDiscoveryFailed,
     /// Caller selected a valid but unsupported Windows filesystem behavior.
     NotSupported,
     /// ext4-core rejected the requested filesystem operation.
@@ -134,6 +142,10 @@ impl DriverError {
             Self::NoMoreFiles => STATUS_NO_MORE_FILES,
             Self::NoSuchFile => STATUS_NO_SUCH_FILE,
             Self::UnrecognizedVolume => STATUS_UNRECOGNIZED_VOLUME,
+            Self::ExternalJournalNotFound => STATUS_OBJECT_NAME_NOT_FOUND,
+            Self::ExternalJournalAmbiguous => STATUS_OBJECT_NAME_COLLISION,
+            Self::ExternalJournalExclusiveOpenFailed => ntstatus(0xC000_0043),
+            Self::ExternalJournalDiscoveryFailed => STATUS_IO_DEVICE_ERROR,
             Self::NotSupported => STATUS_NOT_SUPPORTED,
             Self::Core(error) => core_error_status(error),
         }

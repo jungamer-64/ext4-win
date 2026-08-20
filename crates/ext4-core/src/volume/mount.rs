@@ -720,7 +720,7 @@ pub enum ExternalJournalProbeOutcome {
     /// Candidate UUID differs and discovery may continue.
     Mismatch,
     /// Candidate exactly matches and is safe to attach under its current device ownership.
-    Match(ValidatedExternalJournal),
+    Match(Box<ValidatedExternalJournal>),
 }
 
 /// One consuming transition of an external-journal probe.
@@ -744,6 +744,243 @@ pub struct ExternalJournalProbeOperation {
     requirement: ExternalJournalRequirement,
     /// Candidate device transcript used only before a token is minted.
     candidate: StorageTranscript,
+}
+
+/// Proof that the primary recovery marker was durably cleared after every mounted device drained.
+#[derive(Debug)]
+pub struct CleanCloseDurability {
+    /// Prevents construction outside this module.
+    _private: (),
+}
+
+/// One consuming transition of the clean-close durability protocol.
+#[derive(Debug)]
+pub enum CleanCloseTransition {
+    /// Submit one preallocated read, flush, or marker write.
+    SubmitLower {
+        /// Owned lower-storage request.
+        request: crate::StorageRequest,
+        /// Operation resumed only by the matching completion.
+        suspended: Box<CleanCloseOperation>,
+    },
+    /// The marker is durably clean, or the volume must remain recovery-required.
+    Complete(Result<CleanCloseDurability>),
+}
+
+/// Allocation-before-effects clean shutdown/dismount operation.
+#[derive(Debug)]
+pub struct CleanCloseOperation {
+    /// Primary filesystem transcript used only to obtain the latest superblock bytes.
+    filesystem: StorageTranscript,
+    /// Journal flush target selected by validated mount placement.
+    journal_target: StorageTarget,
+    /// Current preparation, I/O, or terminal phase.
+    phase: CleanClosePhase,
+    /// Preallocated clean primary-superblock write image.
+    marker: Option<Vec<u8>>,
+    /// Cancellation observed after closing began; it never interrupts durability.
+    cancellation_requested: bool,
+}
+
+/// Exact clean-close phase, separating ready requests from outstanding completions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanClosePhase {
+    /// Read and pre-encode the latest primary marker before effects.
+    PrepareMarker,
+    /// Primary-superblock read is owned by the lower stack.
+    MarkerReadPending,
+    /// Filesystem data and metadata flush is ready.
+    FilesystemFlushReady,
+    /// Filesystem flush is owned by the lower stack.
+    FilesystemFlushPending(StorageRequestIdentity),
+    /// External-journal flush is ready.
+    JournalFlushReady,
+    /// External-journal flush is owned by the lower stack.
+    JournalFlushPending(StorageRequestIdentity),
+    /// Preallocated clean marker write is ready.
+    MarkerWriteReady,
+    /// Clean marker write is owned by the lower stack.
+    MarkerWritePending(StorageRequestIdentity),
+    /// Final primary-filesystem flush is ready.
+    MarkerFlushReady,
+    /// Final primary-filesystem flush is owned by the lower stack.
+    MarkerFlushPending(StorageRequestIdentity),
+    /// Every required durability boundary completed successfully.
+    Complete,
+}
+
+impl CleanCloseOperation {
+    /// Starts close preparation before the first effect-bearing request.
+    #[must_use]
+    pub const fn new(
+        filesystem_length: crate::DeviceLength,
+        journal_target: StorageTarget,
+    ) -> Self {
+        Self {
+            filesystem: StorageTranscript::new(StorageTarget::Filesystem, filesystem_length),
+            journal_target,
+            phase: CleanClosePhase::PrepareMarker,
+            marker: None,
+            cancellation_requested: false,
+        }
+    }
+
+    /// Consumes one event and runs until the next lower request or terminal durability result.
+    #[must_use]
+    pub fn advance(mut self: Box<Self>, event: super::OperationEvent) -> CleanCloseTransition {
+        let accepted = match event {
+            super::OperationEvent::Admitted if self.phase == CleanClosePhase::PrepareMarker => {
+                Ok(())
+            }
+            super::OperationEvent::StorageCompleted(completion) => self.complete_lower(completion),
+            super::OperationEvent::CancelRequested => {
+                self.cancellation_requested = true;
+                Ok(())
+            }
+            _ => Err(Error::DeviceIo),
+        };
+        if let Err(error) = accepted {
+            return CleanCloseTransition::Complete(Err(error));
+        }
+        self.drive()
+    }
+
+    /// Validates one exact lower completion and advances to the next ready phase.
+    /// # Errors
+    ///
+    /// Returns an error for a failed, mismatched, short, or phase-inconsistent completion.
+    fn complete_lower(&mut self, completion: crate::StorageCompletion) -> Result<()> {
+        match self.phase {
+            CleanClosePhase::MarkerReadPending => {
+                self.filesystem.complete(completion)?;
+                self.phase = CleanClosePhase::PrepareMarker;
+                Ok(())
+            }
+            CleanClosePhase::FilesystemFlushPending(expected) => {
+                expected.complete(completion)?;
+                self.phase = if self.journal_target == StorageTarget::ExternalJournal {
+                    CleanClosePhase::JournalFlushReady
+                } else {
+                    CleanClosePhase::MarkerWriteReady
+                };
+                Ok(())
+            }
+            CleanClosePhase::JournalFlushPending(expected) => {
+                expected.complete(completion)?;
+                self.phase = CleanClosePhase::MarkerWriteReady;
+                Ok(())
+            }
+            CleanClosePhase::MarkerWritePending(expected) => {
+                expected.complete(completion)?;
+                self.phase = CleanClosePhase::MarkerFlushReady;
+                Ok(())
+            }
+            CleanClosePhase::MarkerFlushPending(expected) => {
+                expected.complete(completion)?;
+                self.phase = CleanClosePhase::Complete;
+                Ok(())
+            }
+            CleanClosePhase::PrepareMarker
+            | CleanClosePhase::FilesystemFlushReady
+            | CleanClosePhase::JournalFlushReady
+            | CleanClosePhase::MarkerWriteReady
+            | CleanClosePhase::MarkerFlushReady
+            | CleanClosePhase::Complete => Err(Error::DeviceIo),
+        }
+    }
+
+    /// Drives allocation-free request publication after the marker image has been prepared.
+    fn drive(mut self: Box<Self>) -> CleanCloseTransition {
+        loop {
+            match self.phase {
+                CleanClosePhase::PrepareMarker => {
+                    let raw = {
+                        let mut filesystem = OperationDevice::new(&mut self.filesystem);
+                        Superblock::prepare_recovery_marker(&mut filesystem, RecoveryState::Clean)
+                    };
+                    match raw {
+                        Ok(raw) => {
+                            self.marker = match memory::copied_slice(&raw) {
+                                Ok(marker) => Some(marker),
+                                Err(error) => return CleanCloseTransition::Complete(Err(error)),
+                            };
+                            self.phase = CleanClosePhase::FilesystemFlushReady;
+                        }
+                        Err(Error::OperationSuspended) => {
+                            let request = match self.filesystem.take_pending_request() {
+                                Ok(request) => request,
+                                Err(error) => {
+                                    return CleanCloseTransition::Complete(Err(error));
+                                }
+                            };
+                            self.phase = CleanClosePhase::MarkerReadPending;
+                            return CleanCloseTransition::SubmitLower {
+                                request,
+                                suspended: self,
+                            };
+                        }
+                        Err(error) => return CleanCloseTransition::Complete(Err(error)),
+                    }
+                }
+                CleanClosePhase::FilesystemFlushReady => {
+                    return self.submit_flush(StorageTarget::Filesystem);
+                }
+                CleanClosePhase::JournalFlushReady => {
+                    return self.submit_flush(StorageTarget::ExternalJournal);
+                }
+                CleanClosePhase::MarkerWriteReady => {
+                    let Some(marker) = self.marker.take() else {
+                        return CleanCloseTransition::Complete(Err(Error::DeviceIo));
+                    };
+                    let request = crate::StorageRequest::Write {
+                        target: StorageTarget::Filesystem,
+                        offset: crate::ByteOffset::new(1024),
+                        buffer: marker,
+                    };
+                    let expected = StorageRequestIdentity::from_request(&request);
+                    self.phase = CleanClosePhase::MarkerWritePending(expected);
+                    return CleanCloseTransition::SubmitLower {
+                        request,
+                        suspended: self,
+                    };
+                }
+                CleanClosePhase::MarkerFlushReady => {
+                    return self.submit_flush(StorageTarget::Filesystem);
+                }
+                CleanClosePhase::Complete => {
+                    let _cancellation_was_recorded = self.cancellation_requested;
+                    return CleanCloseTransition::Complete(Ok(CleanCloseDurability {
+                        _private: (),
+                    }));
+                }
+                CleanClosePhase::MarkerReadPending
+                | CleanClosePhase::FilesystemFlushPending(_)
+                | CleanClosePhase::JournalFlushPending(_)
+                | CleanClosePhase::MarkerWritePending(_)
+                | CleanClosePhase::MarkerFlushPending(_) => {
+                    return CleanCloseTransition::Complete(Err(Error::DeviceIo));
+                }
+            }
+        }
+    }
+
+    /// Emits one allocation-free flush and records its exact next pending state.
+    fn submit_flush(mut self: Box<Self>, target: StorageTarget) -> CleanCloseTransition {
+        let request = crate::StorageRequest::Flush { target };
+        let expected = StorageRequestIdentity::from_request(&request);
+        self.phase = match self.phase {
+            CleanClosePhase::FilesystemFlushReady => {
+                CleanClosePhase::FilesystemFlushPending(expected)
+            }
+            CleanClosePhase::JournalFlushReady => CleanClosePhase::JournalFlushPending(expected),
+            CleanClosePhase::MarkerFlushReady => CleanClosePhase::MarkerFlushPending(expected),
+            _ => return CleanCloseTransition::Complete(Err(Error::DeviceIo)),
+        };
+        CleanCloseTransition::SubmitLower {
+            request,
+            suspended: self,
+        }
+    }
 }
 
 impl ExternalJournalProbeOperation {
@@ -788,13 +1025,16 @@ impl ExternalJournalProbeOperation {
                 ExternalJournalProbeTransition::Complete(Ok(ExternalJournalProbeOutcome::Mismatch))
             }
             Ok(ExternalJournalLoad::Match(journal)) => {
-                ExternalJournalProbeTransition::Complete(Ok(ExternalJournalProbeOutcome::Match(
-                    ValidatedExternalJournal {
-                        requirement: self.requirement,
-                        device_length: self.candidate.len(),
-                        journal,
-                    },
-                )))
+                match memory::try_box(ValidatedExternalJournal {
+                    requirement: self.requirement,
+                    device_length: self.candidate.len(),
+                    journal,
+                }) {
+                    Ok(validated) => ExternalJournalProbeTransition::Complete(Ok(
+                        ExternalJournalProbeOutcome::Match(validated),
+                    )),
+                    Err(error) => ExternalJournalProbeTransition::Complete(Err(error)),
+                }
             }
             Err(Error::OperationSuspended) => match self.candidate.take_pending_request() {
                 Ok(request) => ExternalJournalProbeTransition::SubmitLower {
@@ -861,7 +1101,7 @@ enum MountState {
         /// Device selected by the validated journal location.
         journal_target: StorageTarget,
         /// Consuming three-pass recovery operation.
-        operation: JournalRecoveryOperation,
+        operation: Box<JournalRecoveryOperation>,
     },
     /// Build the allocation ownership index from the recovered filesystem image.
     Indexing(MountPublicationSeed),
@@ -951,8 +1191,9 @@ impl MountOperation {
     #[must_use]
     pub fn attach_external_journal(
         mut self: Box<Self>,
-        validated: ValidatedExternalJournal,
+        validated: Box<ValidatedExternalJournal>,
     ) -> MountTransition {
+        let validated = *validated;
         let state = core::mem::replace(&mut self.state, MountState::Resolving);
         let MountState::AwaitingExternal {
             superblock,
@@ -964,7 +1205,9 @@ impl MountOperation {
         if requirement != validated.requirement {
             return MountTransition::Complete(Err(Error::UnsupportedJournal));
         }
-        match JournalRecoveryOperation::new(validated.journal, superblock.recovery_state()) {
+        match JournalRecoveryOperation::new(validated.journal, superblock.recovery_state())
+            .and_then(memory::try_box)
+        {
             Ok(operation) => {
                 self.state = MountState::Recovering {
                     superblock,
@@ -1012,6 +1255,9 @@ impl MountOperation {
     }
 
     /// Routes one completion exclusively to the phase that submitted it.
+    /// # Errors
+    ///
+    /// Returns an error for a failed, mismatched, short, or phase-inconsistent completion.
     fn accept_completion(&mut self, completion: crate::StorageCompletion) -> Result<()> {
         match core::mem::replace(&mut self.state, MountState::Resolving) {
             MountState::Resolving => {
@@ -1073,6 +1319,7 @@ impl MountOperation {
                         journal,
                         journal_target,
                     }) => match JournalRecoveryOperation::new(journal, superblock.recovery_state())
+                        .and_then(memory::try_box)
                     {
                         Ok(operation) => {
                             self.state = MountState::Recovering {
@@ -1131,7 +1378,7 @@ impl MountOperation {
                             suspended: self,
                         };
                     }
-                    Ok(None) => match operation.into_clean() {
+                    Ok(None) => match (*operation).into_clean() {
                         Ok(journal) => {
                             if self.cancel_requested {
                                 return MountTransition::Complete(Err(Error::OperationCancelled));
@@ -1284,6 +1531,9 @@ impl MountOperation {
     }
 
     /// Resolves primary metadata and either loads an internal journal or emits discovery facts.
+    /// # Errors
+    ///
+    /// Returns an error for invalid primary metadata, journal placement, profile, or suspended I/O.
     fn resolve_journal(&mut self) -> Result<JournalResolution> {
         let superblock = {
             let mut filesystem = OperationDevice::new(&mut self.filesystem);
@@ -1334,5 +1584,213 @@ impl MountOperation {
             },
             Err(error) => MountTransition::Complete(Err(error)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use crate::disk::endian::{DiskOffset, le_u32, put_le_u32};
+    use crate::memory::FallibleVec;
+    use crate::{
+        ByteOffset, CompletedStorageTransfer, DeviceLength, Error, Result, StorageCompletion,
+        StorageRequest, StorageTarget,
+    };
+
+    use super::{CleanCloseOperation, CleanCloseTransition};
+    use crate::volume::OperationEvent;
+
+    /// Request shape observed by the clean-close host adapter.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ObservedCloseRequest {
+        ReadFilesystem,
+        FlushFilesystem,
+        FlushExternalJournal,
+        WriteCleanMarker,
+    }
+
+    /// Terminal result retained by the fault-injection adapter.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ObservedCloseOutcome {
+        Durable,
+        Failed(Error),
+    }
+
+    /// Drives the production clean-close state machine, optionally failing one effect completion.
+    /// # Errors
+    ///
+    /// Returns an error for allocation, wire mutation, or an unexpected request shape.
+    fn run_clean_close(
+        journal_target: StorageTarget,
+        fail_effect: Option<usize>,
+        cancellation_at_closing: bool,
+    ) -> Result<(Vec<ObservedCloseRequest>, ObservedCloseOutcome)> {
+        let initial_event = if cancellation_at_closing {
+            OperationEvent::CancelRequested
+        } else {
+            OperationEvent::Admitted
+        };
+        let mut transition = crate::memory::try_box(CleanCloseOperation::new(
+            DeviceLength::from_bytes(16_384),
+            journal_target,
+        ))?
+        .advance(initial_event);
+        let mut observed = Vec::new();
+        observed
+            .try_reserve_exact(5)
+            .map_err(|_| Error::OutOfMemory)?;
+        let mut effect_index = 0_usize;
+        loop {
+            match transition {
+                CleanCloseTransition::SubmitLower {
+                    mut request,
+                    suspended,
+                } => {
+                    let shape = match &mut request {
+                        StorageRequest::Read {
+                            target,
+                            offset,
+                            buffer,
+                        } => {
+                            if *target != StorageTarget::Filesystem
+                                || *offset != ByteOffset::new(1024)
+                                || buffer.len() != 1024
+                            {
+                                return Err(Error::DeviceIo);
+                            }
+                            let mut primary = [0_u8; 1024];
+                            put_le_u32(&mut primary, DiskOffset::new(96), 0x0000_0004)?;
+                            crate::memory::copy_exact(buffer, &primary)?;
+                            ObservedCloseRequest::ReadFilesystem
+                        }
+                        StorageRequest::Flush { target } => {
+                            effect_index = effect_index
+                                .checked_add(1)
+                                .ok_or(Error::ArithmeticOverflow)?;
+                            match target {
+                                StorageTarget::Filesystem => ObservedCloseRequest::FlushFilesystem,
+                                StorageTarget::ExternalJournal => {
+                                    ObservedCloseRequest::FlushExternalJournal
+                                }
+                            }
+                        }
+                        StorageRequest::Write {
+                            target,
+                            offset,
+                            buffer,
+                        } => {
+                            effect_index = effect_index
+                                .checked_add(1)
+                                .ok_or(Error::ArithmeticOverflow)?;
+                            if *target != StorageTarget::Filesystem
+                                || *offset != ByteOffset::new(1024)
+                                || le_u32(buffer, DiskOffset::new(96))? != 0
+                            {
+                                return Err(Error::DeviceIo);
+                            }
+                            ObservedCloseRequest::WriteCleanMarker
+                        }
+                    };
+                    observed.try_push(shape)?;
+                    let information = request.byte_count();
+                    let transfer = CompletedStorageTransfer::from_request(request);
+                    let completion = if fail_effect == Some(effect_index) && effect_index != 0 {
+                        StorageCompletion::failure(transfer, Error::DeviceIo)
+                    } else {
+                        StorageCompletion::success(transfer, information)
+                    };
+                    transition = suspended.advance(OperationEvent::StorageCompleted(completion));
+                }
+                CleanCloseTransition::Complete(result) => {
+                    let outcome = match result {
+                        Ok(_durability) => ObservedCloseOutcome::Durable,
+                        Err(error) => ObservedCloseOutcome::Failed(error),
+                    };
+                    return Ok((observed, outcome));
+                }
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when internal-journal close clears the marker outside the required flush ordering.
+    #[test]
+    fn internal_journal_clean_close_obeys_durability_order() {
+        let result = (|| -> Result<()> {
+            let (observed, outcome) = run_clean_close(StorageTarget::Filesystem, None, false)?;
+            assert_eq!(
+                observed,
+                vec![
+                    ObservedCloseRequest::ReadFilesystem,
+                    ObservedCloseRequest::FlushFilesystem,
+                    ObservedCloseRequest::WriteCleanMarker,
+                    ObservedCloseRequest::FlushFilesystem,
+                ]
+            );
+            assert_eq!(outcome, ObservedCloseOutcome::Durable);
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when external-journal close omits its flush before the primary marker write.
+    #[test]
+    fn external_journal_clean_close_flushes_both_devices_in_order() {
+        let result = (|| -> Result<()> {
+            let (observed, outcome) = run_clean_close(StorageTarget::ExternalJournal, None, false)?;
+            assert_eq!(
+                observed,
+                vec![
+                    ObservedCloseRequest::ReadFilesystem,
+                    ObservedCloseRequest::FlushFilesystem,
+                    ObservedCloseRequest::FlushExternalJournal,
+                    ObservedCloseRequest::WriteCleanMarker,
+                    ObservedCloseRequest::FlushFilesystem,
+                ]
+            );
+            assert_eq!(outcome, ObservedCloseOutcome::Durable);
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when any failed durability boundary publishes a clean terminal outcome.
+    #[test]
+    fn clean_close_fault_matrix_never_publishes_uncertain_durability() {
+        let result = (|| -> Result<()> {
+            for effect in 1..=3 {
+                let (_observed, outcome) =
+                    run_clean_close(StorageTarget::Filesystem, Some(effect), false)?;
+                assert_eq!(outcome, ObservedCloseOutcome::Failed(Error::DeviceIo));
+            }
+            for effect in 1..=4 {
+                let (_observed, outcome) =
+                    run_clean_close(StorageTarget::ExternalJournal, Some(effect), false)?;
+                assert_eq!(outcome, ObservedCloseOutcome::Failed(Error::DeviceIo));
+            }
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when cancellation recorded after entering Closing interrupts the durability sequence.
+    #[test]
+    fn cancellation_after_closing_is_recorded_without_interrupting_close() {
+        let result = (|| -> Result<()> {
+            let (observed, outcome) = run_clean_close(StorageTarget::ExternalJournal, None, true)?;
+            assert_eq!(observed.len(), 5);
+            assert_eq!(outcome, ObservedCloseOutcome::Durable);
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
     }
 }

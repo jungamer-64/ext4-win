@@ -620,14 +620,7 @@ impl JournalUuid {
     /// Returns whether no external-journal identifier was recorded.
     #[must_use]
     pub const fn is_zero(self) -> bool {
-        let mut index = 0;
-        while index < self.0.len() {
-            if self.0[index] != 0 {
-                return false;
-            }
-            index += 1;
-        }
-        true
+        matches!(self.0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     }
 }
 

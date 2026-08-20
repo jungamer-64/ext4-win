@@ -33,14 +33,31 @@ use crate::kernel::storage::{
     DeviceLengthProbe, PreparedStorageCommand, RetryingStorageCommand, StorageCommand,
     StorageCommandStep, StorageRetryDecision, StorageRetryDelay, failed_unsubmitted_request,
 };
-use crate::kernel::storage::{MountedStorageDevices, StorageFailureClass};
+use crate::kernel::storage::{MountedStorageRoute, StorageFailureClass};
 use crate::memory::DriverVec;
 
 /// Operation representation moved through storage-command envelopes.
 type SuspendedOperation = Box<dyn CompletionOperation>;
+/// Scheduler metadata retained with an operation through lower phases and retries.
+#[cfg(not(test))]
+#[derive(Debug)]
+pub(crate) struct ScheduledStorageOperation {
+    /// Suspended filesystem operation that consumes the lower completion.
+    operation: SuspendedOperation,
+    /// Cancellation policy fixed when the durability-changing effect was scheduled.
+    cancellation: EffectCancellation,
+}
+
+#[cfg(not(test))]
+impl ScheduledStorageOperation {
+    /// Recovers the suspended filesystem operation after lower-command ownership ends.
+    fn into_operation(self) -> SuspendedOperation {
+        self.operation
+    }
+}
 /// One concrete storage command captured by a private lower IRP.
 #[cfg(not(test))]
-type ReactorStorageCommand = StorageCommand<SuspendedOperation>;
+type ReactorStorageCommand = StorageCommand<ScheduledStorageOperation>;
 /// Stable completion envelope type linked into this reactor's storage inbox.
 #[cfg(not(test))]
 type ReactorStorageEnvelope =
@@ -113,16 +130,31 @@ unsafe impl LowerCompletionRoute<ReactorLengthProbe> for LengthCompletionRoute {
 #[cfg(not(test))]
 enum PublishedReactorLower {
     /// Core read/write/flush request.
-    Storage(PublishedLowerRequest<ReactorStorageCommand, StorageCompletionRoute>),
+    Storage {
+        /// Published private lower IRP identity.
+        lower: PublishedLowerRequest<ReactorStorageCommand, StorageCompletionRoute>,
+        /// Whether top-level cancellation may propagate to this private lower IRP.
+        cancellation: EffectCancellation,
+    },
     /// Mount-time device length query.
     Length(PublishedLowerRequest<ReactorLengthProbe, LengthCompletionRoute>),
+}
+
+/// Cancellation semantics at an effect-bearing lower-storage boundary.
+#[cfg(not(test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectCancellation {
+    /// Cancellation wins until the first write or flush is submitted.
+    AbortBeforeEffect,
+    /// One-way closing already began, so durability must continue to a known outcome.
+    ContinueClosing,
 }
 
 #[cfg(not(test))]
 impl fmt::Debug for PublishedReactorLower {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Storage(_) => formatter.write_str("Storage"),
+            Self::Storage { .. } => formatter.write_str("Storage"),
             Self::Length(_) => formatter.write_str("Length"),
         }
     }
@@ -137,10 +169,17 @@ impl PublishedReactorLower {
     #[cfg(not(test))]
     unsafe fn cancel(&self) {
         match self {
-            Self::Storage(lower) => unsafe {
+            Self::Storage {
+                lower,
+                cancellation: EffectCancellation::AbortBeforeEffect,
+            } => unsafe {
                 // SAFETY: The active slot retains the storage envelope identity through this call.
                 lower.cancel();
             },
+            Self::Storage {
+                lower: _,
+                cancellation: EffectCancellation::ContinueClosing,
+            } => {}
             Self::Length(lower) => unsafe {
                 // SAFETY: The active slot retains the length envelope identity through this call.
                 lower.cancel();
@@ -404,10 +443,19 @@ pub(crate) enum OperationTransition {
     /// Build and submit one owned lower command.
     SubmitLower {
         /// Mounted devices selected by the operation's stable volume capability.
-        devices: MountedStorageDevices,
+        devices: MountedStorageRoute,
         /// Owned core transfer token.
         request: StorageRequest,
         /// Operation moved by value into the lower completion envelope.
+        suspended: Box<dyn CompletionOperation>,
+    },
+    /// Submit one close-durability command after the one-way `Closing` boundary.
+    SubmitClosingLower {
+        /// Mounted devices selected by the stable VCB lifetime owner.
+        devices: MountedStorageRoute,
+        /// Owned core clean-close transfer.
+        request: StorageRequest,
+        /// Close operation that must continue even when top-level cancellation is pending.
         suspended: Box<dyn CompletionOperation>,
     },
     /// Atomically acquire a resolved mutation's full resource set.
@@ -430,13 +478,20 @@ pub(crate) enum OperationTransition {
     #[cfg(not(test))]
     ArmRetry {
         /// Failed command retaining the original suspended operation.
-        retry: RetryingStorageCommand<Box<dyn CompletionOperation>>,
+        retry: RetryingStorageCommand<ScheduledStorageOperation>,
     },
     /// Wait for a visibility, checkpoint, or terminal-barrier grant.
     Wait {
         /// Exact condition whose release produces an event.
         condition: WaitCondition,
         /// Operation retained without being re-executed.
+        suspended: Box<dyn CompletionOperation>,
+    },
+    /// Wait for pre-closing mutations/checkpoints without allowing cancellation to undo closing.
+    WaitForClosingDrain {
+        /// Clean-journal and admitted-mutation drain condition.
+        condition: WaitCondition,
+        /// Close operation resumed only when the condition becomes true.
         suspended: Box<dyn CompletionOperation>,
     },
     /// Apply a prebuilt allocation-free publication and continue one operation.
@@ -683,7 +738,7 @@ enum ActivePhase {
     },
     /// One retry timer is armed; the original operation remains inside the command.
     #[cfg(not(test))]
-    Retry(RetryingStorageCommand<Box<dyn CompletionOperation>>),
+    Retry(RetryingStorageCommand<ScheduledStorageOperation>),
     /// Lower IRP registration/call is executing on the reactor thread.
     #[cfg(not(test))]
     Registering,
@@ -1718,7 +1773,26 @@ impl CompletionReactor {
                     drop(request);
                     return;
                 };
-                self.submit_storage(index, devices, request, suspended);
+                self.submit_storage(
+                    index,
+                    devices,
+                    request,
+                    suspended,
+                    EffectCancellation::AbortBeforeEffect,
+                );
+            }
+            OperationTransition::SubmitClosingLower {
+                devices,
+                request,
+                suspended,
+            } => {
+                self.submit_storage(
+                    index,
+                    devices,
+                    request,
+                    suspended,
+                    EffectCancellation::ContinueClosing,
+                );
             }
             OperationTransition::RequestIntent { request, suspended } => {
                 let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
@@ -1785,6 +1859,19 @@ impl CompletionReactor {
                 let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
                     return;
                 };
+                self.set_phase(
+                    index,
+                    ActivePhase::Waiting {
+                        condition,
+                        operation: suspended,
+                    },
+                );
+                self.grant_available_wait(index);
+            }
+            OperationTransition::WaitForClosingDrain {
+                condition,
+                suspended,
+            } => {
                 self.set_phase(
                     index,
                     ActivePhase::Waiting {
@@ -1973,15 +2060,20 @@ impl CompletionReactor {
     fn submit_storage(
         &self,
         index: usize,
-        devices: MountedStorageDevices,
+        devices: MountedStorageRoute,
         request: StorageRequest,
         suspended: SuspendedOperation,
+        cancellation: EffectCancellation,
     ) {
-        let prepared = match PreparedStorageCommand::try_new(devices, request, suspended) {
+        let scheduled = ScheduledStorageOperation {
+            operation: suspended,
+            cancellation,
+        };
+        let prepared = match PreparedStorageCommand::try_new(devices, request, scheduled) {
             Ok(prepared) => prepared,
             Err(error) => {
-                let (error, suspended, request) = error.into_parts();
-                self.set_ready_storage_failure(index, suspended, request, error);
+                let (error, scheduled, request) = error.into_parts();
+                self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
                 return;
             }
         };
@@ -2057,19 +2149,27 @@ impl CompletionReactor {
     fn submit_prepared_storage(
         &self,
         index: usize,
-        prepared: PreparedStorageCommand<SuspendedOperation>,
+        prepared: PreparedStorageCommand<ScheduledStorageOperation>,
     ) {
-        if prepared.is_effect_bearing() && self.consume_cancellation_before_effect(index) {
-            let (suspended, _request) = prepared.into_command().into_parts();
-            self.set_ready_operation_event(index, suspended, OperationEvent::CancelRequested);
+        let cancellation = prepared.suspended().cancellation;
+        if cancellation == EffectCancellation::AbortBeforeEffect
+            && prepared.is_effect_bearing()
+            && self.consume_cancellation_before_effect(index)
+        {
+            let (scheduled, _request) = prepared.into_command().into_parts();
+            self.set_ready_operation_event(
+                index,
+                scheduled.into_operation(),
+                OperationEvent::CancelRequested,
+            );
             return;
         }
         let Some(rundown) = self.completion_rundown.acquire() else {
             let command = prepared.into_command();
-            let (suspended, request) = command.into_parts();
+            let (scheduled, request) = command.into_parts();
             self.set_ready_storage_failure(
                 index,
-                suspended,
+                scheduled.into_operation(),
                 request,
                 DriverError::InvalidDeviceRequest,
             );
@@ -2082,12 +2182,12 @@ impl CompletionReactor {
             Ok(lower) => lower,
             Err(error) => {
                 let (error, command) = error.into_parts();
-                let (suspended, request) = command.into_parts();
-                self.set_ready_storage_failure(index, suspended, request, error);
+                let (scheduled, request) = command.into_parts();
+                self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
                 return;
             }
         };
-        let cancellation = lower.cancellation_identity();
+        let cancellation_identity = lower.cancellation_identity();
         self.set_phase(index, ActivePhase::Registering);
         match lower.register_and_submit() {
             Ok(()) => {
@@ -2101,11 +2201,14 @@ impl CompletionReactor {
                 if !matches!(slot.phase, ActivePhase::Registering) {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }
-                slot.phase = ActivePhase::Lower(PublishedReactorLower::Storage(cancellation));
+                slot.phase = ActivePhase::Lower(PublishedReactorLower::Storage {
+                    lower: cancellation_identity,
+                    cancellation,
+                });
             }
             Err(error) => {
                 let (error, command) = error.into_parts();
-                let (suspended, request) = command.into_parts();
+                let (scheduled, request) = command.into_parts();
                 let slots = unsafe {
                     // SAFETY: Registration failure cannot have published a completion callback.
                     &mut *self.active.get()
@@ -2117,7 +2220,7 @@ impl CompletionReactor {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }
                 slot.phase = ActivePhase::Vacant;
-                self.set_ready_storage_failure(index, suspended, request, error);
+                self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
             }
         }
     }
@@ -2214,12 +2317,12 @@ impl CompletionReactor {
                     self.submit_prepared_storage(index, prepared);
                 }
                 Ok(StorageCommandStep::Complete {
-                    suspended,
+                    suspended: scheduled,
                     completion,
                 }) => {
                     self.set_ready_operation_event(
                         index,
-                        suspended,
+                        scheduled.into_operation(),
                         OperationEvent::StorageCompleted(completion),
                     );
                 }
@@ -2228,7 +2331,8 @@ impl CompletionReactor {
                         self.apply_transition(index, OperationTransition::ArmRetry { retry })
                     }
                     StorageRetryDecision::Terminal(failed) => {
-                        let (mut suspended, request, class) = failed.into_failure();
+                        let (scheduled, request, class) = failed.into_failure();
+                        let mut suspended = scheduled.into_operation();
                         suspended.record_storage_failure(class);
                         self.set_ready_operation_event(
                             index,
@@ -2327,7 +2431,7 @@ impl CompletionReactor {
         for (index, slot) in slots.iter_mut().enumerate() {
             let phase = core::mem::replace(&mut slot.phase, ActivePhase::Vacant);
             match phase {
-                ActivePhase::Lower(PublishedReactorLower::Storage(lower))
+                ActivePhase::Lower(PublishedReactorLower::Storage { lower, .. })
                     if lower.identifies(envelope) =>
                 {
                     return index;
@@ -2361,10 +2465,16 @@ impl CompletionReactor {
 
     /// Retains one retry command until its concrete fixed-delay timer event arrives.
     #[cfg(not(test))]
-    fn arm_retry(&self, index: usize, retry: RetryingStorageCommand<SuspendedOperation>) {
-        if self.cancellation_is_pending(index) {
-            let (suspended, _request) = retry.into_parts();
-            self.set_ready_operation_event(index, suspended, OperationEvent::CancelRequested);
+    fn arm_retry(&self, index: usize, retry: RetryingStorageCommand<ScheduledStorageOperation>) {
+        if retry.suspended().cancellation == EffectCancellation::AbortBeforeEffect
+            && self.cancellation_is_pending(index)
+        {
+            let (scheduled, _request) = retry.into_parts();
+            self.set_ready_operation_event(
+                index,
+                scheduled.into_operation(),
+                OperationEvent::CancelRequested,
+            );
             return;
         }
         let delay = retry.delay();
@@ -2426,9 +2536,15 @@ impl CompletionReactor {
                 };
                 retry
             };
-            if self.cancellation_is_pending(index) {
-                let (suspended, _request) = retry.into_parts();
-                self.set_ready_operation_event(index, suspended, OperationEvent::CancelRequested);
+            if retry.suspended().cancellation == EffectCancellation::AbortBeforeEffect
+                && self.cancellation_is_pending(index)
+            {
+                let (scheduled, _request) = retry.into_parts();
+                self.set_ready_operation_event(
+                    index,
+                    scheduled.into_operation(),
+                    OperationEvent::CancelRequested,
+                );
                 continue;
             }
             let prepared = match retry.permitted() {
@@ -3302,6 +3418,14 @@ mod tests {
                 drop(request);
                 drop(suspended);
             }
+            OperationTransition::SubmitClosingLower {
+                devices: _devices,
+                request,
+                suspended,
+            } => {
+                drop(request);
+                drop(suspended);
+            }
             OperationTransition::RequestIntent { request, suspended } => {
                 let _volume = request.volume();
                 let _ticket = request.ticket();
@@ -3317,6 +3441,12 @@ mod tests {
                 drop(suspended);
             }
             OperationTransition::Wait {
+                condition: _condition,
+                suspended,
+            } => {
+                drop(suspended);
+            }
+            OperationTransition::WaitForClosingDrain {
                 condition: _condition,
                 suspended,
             } => {

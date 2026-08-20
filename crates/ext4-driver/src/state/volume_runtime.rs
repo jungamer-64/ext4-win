@@ -15,7 +15,7 @@ use crate::irp::reactor::MAX_OPERATIONS;
 use crate::kernel::cng::CngProvider;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::kernel::storage::MountedStorageDevices;
+use crate::kernel::storage::{MountedStorage, MountedStorageRoute};
 use crate::memory;
 
 /// Current epoch plus one distinct retained epoch per operation and two pre-commit publication
@@ -432,6 +432,30 @@ impl Drop for EpochLease {
 // the sole reactor thread after lower-buffer ownership ends.
 unsafe impl Send for EpochLease {}
 
+/// Non-cloneable proof that one admitted mutation still participates in close draining.
+#[derive(Debug)]
+pub(crate) struct MutationActivityLease {
+    /// Stable runtime counter decremented only when the complete mutation operation drops.
+    active_mutations: NonNull<u32>,
+}
+
+impl Drop for MutationActivityLease {
+    fn drop(&mut self) {
+        let active_mutations = unsafe {
+            // SAFETY: The VCB outlives every admitted operation and reactor teardown drains all
+            // operation leases before releasing the mounted runtime.
+            self.active_mutations.as_mut()
+        };
+        *active_mutations = active_mutations.checked_sub(1).unwrap_or_else(|| {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+        });
+    }
+}
+
+// SAFETY: The lease moves only with its reactor operation; final release remains serialized on the
+// owning reactor thread.
+unsafe impl Send for MutationActivityLease {}
+
 /// Pair of epoch slots reserved before a commit can issue its first lower write.
 #[derive(Debug)]
 pub(crate) struct EpochPublicationSlots {
@@ -545,7 +569,7 @@ pub(crate) struct VolumeRuntime {
     /// Journal cursor, allocation state, and resource versions.
     coordinator: MutationCoordinatorState,
     /// Validated lower-device geometry and completion owner.
-    storage: MountedStorageDevices,
+    storage: MountedStorage,
     /// Immutable mount-scoped CNG algorithm providers.
     crypto: CngProvider,
     /// Current read/write reliability state.
@@ -554,6 +578,8 @@ pub(crate) struct VolumeRuntime {
     commit_gate: CommitGateState,
     /// Short epoch-swap gate independent from checkpoint I/O.
     visibility_gate: VisibilityGateState,
+    /// Mutations admitted before closing and not yet fully checkpointed or abandoned.
+    active_mutations: u32,
 }
 
 impl VolumeRuntime {
@@ -562,10 +588,7 @@ impl VolumeRuntime {
     ///
     /// Returns an error when the initial epoch registry or mount-scoped CNG providers cannot be
     /// allocated and initialized.
-    pub(crate) fn try_new(
-        mount: CompletedMount,
-        storage: MountedStorageDevices,
-    ) -> DriverResult<Self> {
+    pub(crate) fn try_new(mount: CompletedMount, storage: MountedStorage) -> DriverResult<Self> {
         let (profile, epoch, coordinator) = mount.into_parts();
         let crypto = CngProvider::try_open()?;
         Ok(Self {
@@ -577,6 +600,7 @@ impl VolumeRuntime {
             failure: VolumeFailureState::Operational,
             commit_gate: CommitGateState::Ready,
             visibility_gate: VisibilityGateState::Ready,
+            active_mutations: 0,
         })
     }
 
@@ -586,8 +610,8 @@ impl VolumeRuntime {
     }
 
     /// Validated mounted lower devices.
-    pub(crate) const fn storage(&self) -> MountedStorageDevices {
-        self.storage
+    pub(crate) const fn storage(&self) -> MountedStorageRoute {
+        self.storage.route()
     }
 
     /// Mount-scoped algorithm providers used to prebuild operation-owned CNG objects.
@@ -597,7 +621,7 @@ impl VolumeRuntime {
 
     /// Whether journal space has no granted commit or published overlay awaiting checkpoint.
     pub(crate) const fn journal_is_clean(&self) -> bool {
-        matches!(self.commit_gate, CommitGateState::Ready)
+        self.active_mutations == 0 && matches!(self.commit_gate, CommitGateState::Ready)
     }
 
     /// Acquires one current immutable epoch for a read or resolve operation.
@@ -624,9 +648,22 @@ impl VolumeRuntime {
     /// # Errors
     ///
     /// Returns an error when mutations are no longer authorized or ticket allocation overflows.
-    pub(crate) fn admit_mutation(&mut self) -> DriverResult<u64> {
+    pub(crate) fn admit_mutation(&mut self) -> DriverResult<(u64, MutationActivityLease)> {
         self.failure.authorize_mutation()?;
-        self.coordinator.admit_mutation().map_err(DriverError::from)
+        let ticket = self
+            .coordinator
+            .admit_mutation()
+            .map_err(DriverError::from)?;
+        self.active_mutations = self
+            .active_mutations
+            .checked_add(1)
+            .ok_or(DriverError::InsufficientResources)?;
+        Ok((
+            ticket,
+            MutationActivityLease {
+                active_mutations: NonNull::from(&mut self.active_mutations),
+            },
+        ))
     }
 
     /// Mutable coordinator used only by infallible visibility/checkpoint publication.

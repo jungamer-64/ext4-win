@@ -4,11 +4,13 @@ use alloc::boxed::Box;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    CleanJournalDurability, CommitDurability, CommitReadyMutation, DurableMutation,
-    EpochReadOperation, Error, FscryptKeySet, HomeBlockDurability, JournalPayloadDurability,
-    MountOperation, MountTransition, MutationResolveOperation, MutationResolveTransition,
-    OperationEvent, OrderedDataDurability, ReadTransition, ReservedMutation, ResolvedMutation,
-    StorageRequest, StorageRequestIdentity, StorageRequestSequence, StorageRequestSequenceStep,
+    CleanCloseOperation, CleanCloseTransition, CleanJournalDurability, CommitDurability,
+    CommitReadyMutation, DurableMutation, EpochReadOperation, Error, ExternalJournalProbeOperation,
+    ExternalJournalProbeOutcome, ExternalJournalProbeTransition, ExternalJournalRequirement,
+    FscryptKeySet, HomeBlockDurability, JournalPayloadDurability, MountOperation, MountTransition,
+    MutationResolveOperation, MutationResolveTransition, OperationEvent, OrderedDataDurability,
+    ReadTransition, ReservedMutation, ResolvedMutation, StorageRequest, StorageRequestIdentity,
+    StorageRequestSequence, StorageRequestSequenceStep,
 };
 use wdk_sys::STATUS_SUCCESS;
 
@@ -18,15 +20,19 @@ use crate::irp::reactor::{
 };
 use crate::irp::{CreateCompletion, IrpCompletion, OwnedIrp};
 use crate::kernel::cng::CngOperation;
+use crate::kernel::external_journal::{ExclusiveExternalJournal, ExternalJournalCandidates};
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::kernel::storage::{LowerStorageDevice, MountedStorageDevices, StorageFailureClass};
+use crate::kernel::storage::{
+    ExternalJournalLease, LowerStorageDevice, MountedStorage, MountedStorageRoute,
+    StorageFailureClass,
+};
 use crate::memory;
 use crate::request::file_system_control::MountAdmission;
 use crate::state::{
     EpochLease, EpochPublicationSlot, EpochPublicationSlots, MountedVolumeDevice,
-    MountedVolumeDeviceExtension, PendingCheckpoint, PreparedVolumeStateTransition,
-    VolumeControlBlock,
+    MountedVolumeDeviceExtension, MutationActivityLease, PendingCheckpoint,
+    PreparedVolumeStateTransition, VolumeControlBlock,
 };
 
 /// Admission failure that preserves the unique top-level completion authority.
@@ -67,12 +73,84 @@ enum MountRequestState {
         /// Stable kernel identities captured from the mount stack.
         admission: MountAdmission,
         /// Concrete lower storage geometry used by core requests.
-        devices: MountedStorageDevices,
+        devices: MountedStorage,
         /// Suspended consuming core mount operation.
         mount: Box<MountOperation>,
     },
+    /// One shared candidate awaits its device-length completion.
+    DiscoveringCandidateLength {
+        /// Discovery ownership shared by every candidate phase.
+        context: ExternalMountContext,
+    },
+    /// Core validation of one shared candidate owns the next lower completion.
+    DiscoveringCandidateProbe {
+        /// Discovery ownership shared by every candidate phase.
+        context: ExternalMountContext,
+        /// Candidate geometry used only for this shared probe.
+        candidate: LowerStorageDevice,
+        /// Suspended core candidate validator.
+        probe: Box<ExternalJournalProbeOperation>,
+    },
+    /// The unique matching interface has been reopened exclusively and awaits its length.
+    QueryExclusiveJournalLength {
+        /// Top-level mount IRP.
+        owned: OwnedIrp,
+        /// Stable mount admission identities.
+        admission: MountAdmission,
+        /// Primary storage owner, not yet carrying the external lease.
+        devices: MountedStorage,
+        /// Core mount suspended in `AwaitingExternal`.
+        mount: Box<MountOperation>,
+        /// Exact filesystem-derived validation requirement.
+        requirement: ExternalJournalRequirement,
+        /// Exclusive handle and referenced file object.
+        external: ExclusiveExternalJournal,
+    },
+    /// The exclusive device is being revalidated before its token may enter the mount.
+    ProbingExclusiveJournal {
+        /// Complete ownership suspended across exclusive core validation.
+        context: ExclusiveExternalProbeContext,
+        /// Suspended core validator over the exclusive device.
+        probe: Box<ExternalJournalProbeOperation>,
+    },
     /// Terminal completion consumed the mount IRP.
     Terminal,
+}
+
+/// Shared ownership carried while all distinct volume candidates are probed.
+#[derive(Debug)]
+struct ExternalMountContext {
+    /// Unique top-level mount completion authority.
+    owned: OwnedIrp,
+    /// Stable filesystem device and VPB identities.
+    admission: MountAdmission,
+    /// Primary storage lifetime owner.
+    devices: MountedStorage,
+    /// Core mount suspended at external-journal discovery.
+    mount: Box<MountOperation>,
+    /// Exact filesystem-derived UUID/profile/user requirement.
+    requirement: ExternalJournalRequirement,
+    /// Deduplicated shared-open candidate set.
+    candidates: ExternalJournalCandidates,
+    /// Candidate whose length or core probe is currently active.
+    candidate_index: usize,
+}
+
+/// Ownership retained while the unique share-zero journal is revalidated by core.
+#[derive(Debug)]
+struct ExclusiveExternalProbeContext {
+    /// Unique top-level mount completion authority.
+    owned: OwnedIrp,
+    /// Stable filesystem device and VPB identities.
+    admission: MountAdmission,
+    /// Primary storage lifetime owner, not yet carrying the external lease.
+    devices: MountedStorage,
+    /// Core mount suspended at external-journal discovery.
+    mount: Box<MountOperation>,
+    /// Lower route with an already validated device length.
+    external: LowerStorageDevice,
+    /// Unique share-zero handle and referenced FILE_OBJECT.
+    lease: ExternalJournalLease,
 }
 
 /// Mount admission driven entirely by private-IRP completion events.
@@ -113,11 +191,12 @@ impl MountRequestOperation {
         mut self: Box<Self>,
         owned: OwnedIrp,
         admission: MountAdmission,
-        devices: MountedStorageDevices,
+        devices: MountedStorage,
         transition: MountTransition,
     ) -> OperationTransition {
         match transition {
             MountTransition::SubmitLower { request, suspended } => {
+                let route = devices.route();
                 self.state = MountRequestState::Mounting {
                     owned,
                     admission,
@@ -125,10 +204,30 @@ impl MountRequestOperation {
                     mount: suspended,
                 };
                 OperationTransition::SubmitLower {
-                    devices,
+                    devices: route,
                     request,
                     suspended: self,
                 }
+            }
+            MountTransition::DiscoverExternalJournal {
+                requirement,
+                suspended,
+            } => {
+                let candidates =
+                    match ExternalJournalCandidates::enumerate(admission.target_device()) {
+                        Ok(candidates) => candidates,
+                        Err(error) => return Self::complete(owned, Err(error)),
+                    };
+                let context = ExternalMountContext {
+                    owned,
+                    admission,
+                    devices,
+                    mount: suspended,
+                    requirement,
+                    candidates,
+                    candidate_index: 0,
+                };
+                self.query_next_external_candidate(context)
             }
             MountTransition::Complete(Ok(completed)) => {
                 Self::complete(owned, Self::publish_mount(admission, devices, completed))
@@ -142,6 +241,146 @@ impl MountRequestOperation {
         }
     }
 
+    /// Starts the next shared probe, or converts the unique shared match into an exclusive reopen.
+    fn query_next_external_candidate(
+        mut self: Box<Self>,
+        context: ExternalMountContext,
+    ) -> OperationTransition {
+        if context.candidate_index < context.candidates.len() {
+            let Some(target) = context.candidates.device(context.candidate_index) else {
+                return Self::complete(context.owned, Err(DriverError::InternalInvariantViolation));
+            };
+            let completion_owner = context.admission.file_system_device();
+            self.state = MountRequestState::DiscoveringCandidateLength { context };
+            OperationTransition::QueryDeviceLength {
+                completion_owner,
+                target,
+                suspended: self,
+            }
+        } else {
+            let ExternalMountContext {
+                owned,
+                admission,
+                devices,
+                mount,
+                requirement,
+                candidates,
+                candidate_index: _,
+            } = context;
+            let selected = match candidates.into_selected() {
+                Ok(selected) => selected,
+                Err(error) => return Self::complete(owned, Err(error)),
+            };
+            let external = match ExclusiveExternalJournal::open(selected) {
+                Ok(external) => external,
+                Err(error) => return Self::complete(owned, Err(error)),
+            };
+            let completion_owner = admission.file_system_device();
+            let target = external.device();
+            self.state = MountRequestState::QueryExclusiveJournalLength {
+                owned,
+                admission,
+                devices,
+                mount,
+                requirement,
+                external,
+            };
+            OperationTransition::QueryDeviceLength {
+                completion_owner,
+                target,
+                suspended: self,
+            }
+        }
+    }
+
+    /// Converts one shared core-probe transition into a lower request or the next candidate.
+    fn drive_shared_external_probe(
+        mut self: Box<Self>,
+        mut context: ExternalMountContext,
+        candidate: LowerStorageDevice,
+        transition: ExternalJournalProbeTransition,
+    ) -> OperationTransition {
+        match transition {
+            ExternalJournalProbeTransition::SubmitLower { request, suspended } => {
+                let route = context.devices.route().with_external(candidate);
+                self.state = MountRequestState::DiscoveringCandidateProbe {
+                    context,
+                    candidate,
+                    probe: suspended,
+                };
+                OperationTransition::SubmitLower {
+                    devices: route,
+                    request,
+                    suspended: self,
+                }
+            }
+            ExternalJournalProbeTransition::Complete(Ok(outcome)) => {
+                let record_result = match outcome {
+                    ExternalJournalProbeOutcome::Match(_) => {
+                        context.candidates.record_match(context.candidate_index)
+                    }
+                    ExternalJournalProbeOutcome::Mismatch => Ok(()),
+                };
+                if let Err(error) = record_result {
+                    return Self::complete(context.owned, Err(error));
+                }
+                context.candidate_index = match context.candidate_index.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        return Self::complete(
+                            context.owned,
+                            Err(DriverError::InternalInvariantViolation),
+                        );
+                    }
+                };
+                self.query_next_external_candidate(context)
+            }
+            ExternalJournalProbeTransition::Complete(Err(error)) => {
+                Self::complete(context.owned, Err(DriverError::from(error)))
+            }
+        }
+    }
+
+    /// Converts the exclusive revalidation transition into mount attachment or a lower request.
+    fn drive_exclusive_external_probe(
+        mut self: Box<Self>,
+        context: ExclusiveExternalProbeContext,
+        transition: ExternalJournalProbeTransition,
+    ) -> OperationTransition {
+        match transition {
+            ExternalJournalProbeTransition::SubmitLower { request, suspended } => {
+                let route = context.devices.route().with_external(context.external);
+                self.state = MountRequestState::ProbingExclusiveJournal {
+                    context,
+                    probe: suspended,
+                };
+                OperationTransition::SubmitLower {
+                    devices: route,
+                    request,
+                    suspended: self,
+                }
+            }
+            ExternalJournalProbeTransition::Complete(Ok(ExternalJournalProbeOutcome::Match(
+                validated,
+            ))) => {
+                let devices = context
+                    .devices
+                    .with_external(context.external, context.lease);
+                let transition = context.mount.attach_external_journal(validated);
+                self.drive_mount(context.owned, context.admission, devices, transition)
+            }
+            ExternalJournalProbeTransition::Complete(Ok(ExternalJournalProbeOutcome::Mismatch)) => {
+                Self::complete(
+                    context.owned,
+                    Err(DriverError::ExternalJournalExclusiveOpenFailed),
+                )
+            }
+            ExternalJournalProbeTransition::Complete(Err(error)) => {
+                Self::complete(context.owned, Err(DriverError::from(error)))
+            }
+        }
+    }
+
     /// Publishes a fully mounted VCB and device after every core recovery action is complete.
     /// # Errors
     ///
@@ -149,7 +388,7 @@ impl MountRequestOperation {
     /// publication fails.
     fn publish_mount(
         admission: MountAdmission,
-        devices: MountedStorageDevices,
+        devices: MountedStorage,
         completed: Box<ext4_core::CompletedMount>,
     ) -> DriverResult<IrpCompletion> {
         let _output_buffer_length = admission.output_buffer_length().as_usize();
@@ -220,13 +459,10 @@ impl CompletionOperation for MountRequestOperation {
                             Ok(filesystem) => filesystem,
                             Err(error) => return Self::complete(owned, Err(error)),
                         };
-                    let devices = MountedStorageDevices::new(
-                        admission.file_system_device(),
-                        filesystem,
-                        None,
-                    );
+                    let devices =
+                        MountedStorage::primary(admission.file_system_device(), filesystem);
                     let mount = match memory::boxed_try_with(move || {
-                        Ok(MountOperation::new(length, None, FscryptKeySet::empty()))
+                        Ok(MountOperation::new(length, FscryptKeySet::empty()))
                     }) {
                         Ok(mount) => mount,
                         Err(error) => return Self::complete(owned, Err(error)),
@@ -258,6 +494,92 @@ impl CompletionOperation for MountRequestOperation {
             } => {
                 let transition = mount.advance(event);
                 self.drive_mount(owned, admission, devices, transition)
+            }
+            MountRequestState::DiscoveringCandidateLength { context } => match event {
+                OperationEvent::DeviceLengthCompleted(Ok(length)) => {
+                    let Some(device) = context.candidates.device(context.candidate_index) else {
+                        return Self::complete(
+                            context.owned,
+                            Err(DriverError::InternalInvariantViolation),
+                        );
+                    };
+                    let candidate = match LowerStorageDevice::from_device(device, length) {
+                        Ok(candidate) => candidate,
+                        Err(error) => return Self::complete(context.owned, Err(error)),
+                    };
+                    let probe = match memory::boxed_try_with(|| {
+                        Ok(ExternalJournalProbeOperation::new(
+                            context.requirement,
+                            length,
+                        ))
+                    }) {
+                        Ok(probe) => probe,
+                        Err(error) => return Self::complete(context.owned, Err(error)),
+                    };
+                    let transition = probe.advance(OperationEvent::Admitted);
+                    self.drive_shared_external_probe(context, candidate, transition)
+                }
+                OperationEvent::DeviceLengthCompleted(Err(error)) => {
+                    Self::complete(context.owned, Err(DriverError::from(error)))
+                }
+                OperationEvent::CancelRequested => Self::complete(
+                    context.owned,
+                    Err(DriverError::from(Error::OperationCancelled)),
+                ),
+                _ => Self::complete(context.owned, Err(DriverError::InternalInvariantViolation)),
+            },
+            MountRequestState::DiscoveringCandidateProbe {
+                context,
+                candidate,
+                probe,
+            } => {
+                let transition = probe.advance(event);
+                self.drive_shared_external_probe(context, candidate, transition)
+            }
+            MountRequestState::QueryExclusiveJournalLength {
+                owned,
+                admission,
+                devices,
+                mount,
+                requirement,
+                external,
+            } => match event {
+                OperationEvent::DeviceLengthCompleted(Ok(length)) => {
+                    let (external_device, lease) = external.into_parts();
+                    let external = match LowerStorageDevice::from_device(external_device, length) {
+                        Ok(external) => external,
+                        Err(error) => return Self::complete(owned, Err(error)),
+                    };
+                    let probe = match memory::boxed_try_with(|| {
+                        Ok(ExternalJournalProbeOperation::new(requirement, length))
+                    }) {
+                        Ok(probe) => probe,
+                        Err(error) => return Self::complete(owned, Err(error)),
+                    };
+                    let transition = probe.advance(OperationEvent::Admitted);
+                    self.drive_exclusive_external_probe(
+                        ExclusiveExternalProbeContext {
+                            owned,
+                            admission,
+                            devices,
+                            mount,
+                            external,
+                            lease,
+                        },
+                        transition,
+                    )
+                }
+                OperationEvent::DeviceLengthCompleted(Err(error)) => {
+                    Self::complete(owned, Err(DriverError::from(error)))
+                }
+                OperationEvent::CancelRequested => {
+                    Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
+                }
+                _ => Self::complete(owned, Err(DriverError::InternalInvariantViolation)),
+            },
+            MountRequestState::ProbingExclusiveJournal { context, probe } => {
+                let transition = probe.advance(event);
+                self.drive_exclusive_external_probe(context, transition)
             }
             MountRequestState::Terminal => OperationTransition::Complete,
         }
@@ -309,7 +631,7 @@ struct ReadRequestOperation {
     /// Immutable epoch pinned independently from later checkpoint publication.
     epoch: EpochLease,
     /// Concrete mounted lower devices.
-    devices: MountedStorageDevices,
+    devices: MountedStorageRoute,
     /// Request semantics selected from captured queue metadata.
     kind: ReadRequestKind,
     /// Mutable CNG objects and work buffers owned across every read suspension.
@@ -701,7 +1023,7 @@ enum VolumeControlOperationState {
         /// State publication prepared before suspension.
         transition: PreparedVolumeStateTransition,
         /// Concrete lower devices already selected from the mounted runtime.
-        devices: MountedStorageDevices,
+        devices: MountedStorageRoute,
     },
     /// The clean-journal barrier released and one lower device flush is in flight.
     Flushing {
@@ -713,6 +1035,17 @@ enum VolumeControlOperationState {
         transition: PreparedVolumeStateTransition,
         /// Exact lower completion identity.
         expected: StorageRequestIdentity,
+    },
+    /// One-way dismount close is preparing or executing its durability sequence.
+    CleanClosing {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Stable direct-volume identities.
+        target: crate::request::file_system_control::DirectVolumeTarget,
+        /// Terminal publication retained until durable marker clearance.
+        transition: PreparedVolumeStateTransition,
+        /// Suspended core clean-close operation.
+        close: Box<CleanCloseOperation>,
     },
     /// Terminal completion consumed the IRP.
     Terminal,
@@ -786,6 +1119,62 @@ impl VolumeControlOperation {
         }
         Self::complete(owned, Ok(IrpCompletion::EMPTY))
     }
+
+    /// Allocates the core clean-close operation from immutable mounted geometry.
+    /// # Errors
+    ///
+    /// Returns a driver allocation error if the close state machine cannot be reserved before the
+    /// closing durability sequence begins.
+    fn prepare_clean_close(
+        volume: NonNull<VolumeControlBlock>,
+    ) -> DriverResult<Box<CleanCloseOperation>> {
+        let access = unsafe {
+            // SAFETY: This is a non-suspending immutable profile projection on the reactor thread.
+            VolumeControlBlock::operation_access(volume)
+        };
+        let profile = access.runtime().profile();
+        let filesystem_length = profile.filesystem_length();
+        let journal_target = profile.journal_target();
+        memory::boxed_try_with(|| Ok(CleanCloseOperation::new(filesystem_length, journal_target)))
+    }
+
+    /// Drives one uninterruptible dismount durability transition.
+    fn drive_clean_close(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        target: crate::request::file_system_control::DirectVolumeTarget,
+        transition: PreparedVolumeStateTransition,
+        result: CleanCloseTransition,
+    ) -> OperationTransition {
+        match result {
+            CleanCloseTransition::SubmitLower { request, suspended } => {
+                let devices = {
+                    let access = unsafe {
+                        // SAFETY: Storage routing is copied during one reactor transition.
+                        VolumeControlBlock::operation_access(target.volume())
+                    };
+                    access.runtime().storage()
+                };
+                self.state = VolumeControlOperationState::CleanClosing {
+                    owned,
+                    target,
+                    transition,
+                    close: suspended,
+                };
+                OperationTransition::SubmitClosingLower {
+                    devices,
+                    request,
+                    suspended: self,
+                }
+            }
+            CleanCloseTransition::Complete(Ok(_durability)) => {
+                Self::publish(self.kind, owned, target, transition)
+            }
+            CleanCloseTransition::Complete(Err(error)) => {
+                Self::complete(owned, Err(DriverError::from(error)))
+            }
+        }
+    }
 }
 
 impl CompletionOperation for VolumeControlOperation {
@@ -827,6 +1216,7 @@ impl CompletionOperation for VolumeControlOperation {
                                 Ok(transition) => transition,
                                 Err(error) => return Self::complete(owned, Err(error)),
                             };
+                            let closing = transition.is_clean_close();
                             let devices = access.runtime().storage();
                             self.state = VolumeControlOperationState::Waiting {
                                 owned,
@@ -834,11 +1224,19 @@ impl CompletionOperation for VolumeControlOperation {
                                 transition,
                                 devices,
                             };
-                            OperationTransition::Wait {
-                                condition: WaitCondition::JournalClean {
-                                    volume: target.volume(),
-                                },
-                                suspended: self,
+                            let condition = WaitCondition::JournalClean {
+                                volume: target.volume(),
+                            };
+                            if closing {
+                                OperationTransition::WaitForClosingDrain {
+                                    condition,
+                                    suspended: self,
+                                }
+                            } else {
+                                OperationTransition::Wait {
+                                    condition,
+                                    suspended: self,
+                                }
                             }
                         }
                     }
@@ -867,20 +1265,29 @@ impl CompletionOperation for VolumeControlOperation {
                     if permit.into_identity() != 1 {
                         return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
                     }
-                    let request = StorageRequest::Flush {
-                        target: ext4_core::StorageTarget::Filesystem,
-                    };
-                    let expected = StorageRequestIdentity::from_request(&request);
-                    self.state = VolumeControlOperationState::Flushing {
-                        owned,
-                        target,
-                        transition,
-                        expected,
-                    };
-                    OperationTransition::SubmitLower {
-                        devices,
-                        request,
-                        suspended: self,
+                    if transition.is_clean_close() {
+                        let close = match Self::prepare_clean_close(target.volume()) {
+                            Ok(close) => close,
+                            Err(error) => return Self::complete(owned, Err(error)),
+                        };
+                        let result = close.advance(OperationEvent::Admitted);
+                        self.drive_clean_close(owned, target, transition, result)
+                    } else {
+                        let request = StorageRequest::Flush {
+                            target: ext4_core::StorageTarget::Filesystem,
+                        };
+                        let expected = StorageRequestIdentity::from_request(&request);
+                        self.state = VolumeControlOperationState::Flushing {
+                            owned,
+                            target,
+                            transition,
+                            expected,
+                        };
+                        OperationTransition::SubmitLower {
+                            devices,
+                            request,
+                            suspended: self,
+                        }
                     }
                 }
                 OperationEvent::CancelRequested => {
@@ -911,6 +1318,15 @@ impl CompletionOperation for VolumeControlOperation {
                     Err(error) => Self::complete(owned, Err(DriverError::from(error))),
                 }
             }
+            VolumeControlOperationState::CleanClosing {
+                owned,
+                target,
+                transition,
+                close,
+            } => {
+                let result = close.advance(event);
+                self.drive_clean_close(owned, target, transition, result)
+            }
             VolumeControlOperationState::Terminal => OperationTransition::Complete,
         }
     }
@@ -919,8 +1335,12 @@ impl CompletionOperation for VolumeControlOperation {
         if failure != StorageFailureClass::DurabilityUnknown {
             return;
         }
-        let VolumeControlOperationState::Flushing { target, .. } = &self.state else {
-            return;
+        let target = match &self.state {
+            VolumeControlOperationState::Flushing { target, .. }
+            | VolumeControlOperationState::CleanClosing { target, .. } => *target,
+            VolumeControlOperationState::Ready(_)
+            | VolumeControlOperationState::Waiting { .. }
+            | VolumeControlOperationState::Terminal => return,
         };
         let mut access = unsafe {
             // SAFETY: Failure publication executes on the sole reactor thread after lower release.
@@ -949,13 +1369,27 @@ enum FlushOperationState {
     /// IRP target has not yet been validated on the reactor thread.
     Ready(OwnedIrp),
     /// IRP waits behind the selected volume durability barrier.
-    Waiting(OwnedIrp),
+    Waiting {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Shutdown terminal publication, absent for ordinary flush buffers.
+        transition: Option<PreparedVolumeStateTransition>,
+    },
     /// One filesystem flush is owned by a lower completion envelope.
     InFlight {
         /// Unique top-level completion authority.
         owned: OwnedIrp,
         /// Identity of the exact lower flush.
         expected: StorageRequestIdentity,
+    },
+    /// One-way shutdown close is preparing or executing its durability sequence.
+    CleanClosing {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Shutdown terminal publication retained until durable marker clearance.
+        transition: PreparedVolumeStateTransition,
+        /// Suspended core clean-close operation.
+        close: Box<CleanCloseOperation>,
     },
     /// Terminal completion consumed the IRP.
     Terminal,
@@ -967,7 +1401,7 @@ struct FlushRequestOperation {
     /// Stable mounted VCB selected from the receiving mounted device.
     volume: NonNull<VolumeControlBlock>,
     /// Mounted lower devices.
-    devices: MountedStorageDevices,
+    devices: MountedStorageRoute,
     /// Barrier semantics.
     kind: FlushRequestKind,
     /// Current consuming state.
@@ -1047,6 +1481,42 @@ impl FlushRequestOperation {
         let _status = owned.complete_result(result);
         OperationTransition::Complete
     }
+
+    /// Drives one uninterruptible shutdown durability transition.
+    fn drive_clean_close(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        transition: PreparedVolumeStateTransition,
+        result: CleanCloseTransition,
+    ) -> OperationTransition {
+        match result {
+            CleanCloseTransition::SubmitLower { request, suspended } => {
+                self.state = FlushOperationState::CleanClosing {
+                    owned,
+                    transition,
+                    close: suspended,
+                };
+                OperationTransition::SubmitClosingLower {
+                    devices: self.devices,
+                    request,
+                    suspended: self,
+                }
+            }
+            CleanCloseTransition::Complete(Ok(_durability)) => {
+                {
+                    let mut access = unsafe {
+                        // SAFETY: Shutdown terminal publication is one reactor-thread transition.
+                        VolumeControlBlock::operation_access(self.volume)
+                    };
+                    access.publish_volume_state_transition(transition);
+                }
+                Self::complete(owned, Ok(IrpCompletion::EMPTY))
+            }
+            CleanCloseTransition::Complete(Err(error)) => {
+                Self::complete(owned, Err(DriverError::from(error)))
+            }
+        }
+    }
 }
 
 impl CompletionOperation for FlushRequestOperation {
@@ -1058,18 +1528,41 @@ impl CompletionOperation for FlushRequestOperation {
                     if let Err(error) = self.validate_target(&mut owned) {
                         return Self::complete(owned, Err(error));
                     }
-                    let condition = match self.kind {
-                        FlushRequestKind::FlushBuffers => WaitCondition::VolumeDurability {
-                            volume: self.volume,
-                        },
-                        FlushRequestKind::Shutdown => WaitCondition::JournalClean {
-                            volume: self.volume,
-                        },
-                    };
-                    self.state = FlushOperationState::Waiting(owned);
-                    OperationTransition::Wait {
-                        condition,
-                        suspended: self,
+                    match self.kind {
+                        FlushRequestKind::FlushBuffers => {
+                            self.state = FlushOperationState::Waiting {
+                                owned,
+                                transition: None,
+                            };
+                            OperationTransition::Wait {
+                                condition: WaitCondition::VolumeDurability {
+                                    volume: self.volume,
+                                },
+                                suspended: self,
+                            }
+                        }
+                        FlushRequestKind::Shutdown => {
+                            let transition = {
+                                let mut access = unsafe {
+                                    // SAFETY: Shutdown enters Closing in one actor-owned transition.
+                                    VolumeControlBlock::operation_access(self.volume)
+                                };
+                                match access.prepare_shutdown() {
+                                    Ok(transition) => transition,
+                                    Err(error) => return Self::complete(owned, Err(error)),
+                                }
+                            };
+                            self.state = FlushOperationState::Waiting {
+                                owned,
+                                transition: Some(transition),
+                            };
+                            OperationTransition::WaitForClosingDrain {
+                                condition: WaitCondition::JournalClean {
+                                    volume: self.volume,
+                                },
+                                suspended: self,
+                            }
+                        }
                     }
                 }
                 OperationEvent::CancelRequested => {
@@ -1086,7 +1579,7 @@ impl CompletionOperation for FlushRequestOperation {
                     Self::complete(owned, Err(DriverError::InternalInvariantViolation))
                 }
             },
-            FlushOperationState::Waiting(owned) => match event {
+            FlushOperationState::Waiting { owned, transition } => match event {
                 OperationEvent::BarrierReleased(permit) => {
                     let expected_identity = match self.kind {
                         FlushRequestKind::FlushBuffers => 0,
@@ -1095,15 +1588,32 @@ impl CompletionOperation for FlushRequestOperation {
                     if permit.into_identity() != expected_identity {
                         return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
                     }
-                    let request = StorageRequest::Flush {
-                        target: ext4_core::StorageTarget::Filesystem,
-                    };
-                    let expected = StorageRequestIdentity::from_request(&request);
-                    self.state = FlushOperationState::InFlight { owned, expected };
-                    OperationTransition::SubmitLower {
-                        devices: self.devices,
-                        request,
-                        suspended: self,
+                    match (self.kind, transition) {
+                        (FlushRequestKind::FlushBuffers, None) => {
+                            let request = StorageRequest::Flush {
+                                target: ext4_core::StorageTarget::Filesystem,
+                            };
+                            let expected = StorageRequestIdentity::from_request(&request);
+                            self.state = FlushOperationState::InFlight { owned, expected };
+                            OperationTransition::SubmitLower {
+                                devices: self.devices,
+                                request,
+                                suspended: self,
+                            }
+                        }
+                        (FlushRequestKind::Shutdown, Some(transition)) => {
+                            let close =
+                                match VolumeControlOperation::prepare_clean_close(self.volume) {
+                                    Ok(close) => close,
+                                    Err(error) => return Self::complete(owned, Err(error)),
+                                };
+                            let result = close.advance(OperationEvent::Admitted);
+                            self.drive_clean_close(owned, transition, result)
+                        }
+                        (FlushRequestKind::FlushBuffers, Some(_))
+                        | (FlushRequestKind::Shutdown, None) => {
+                            Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                        }
                     }
                 }
                 OperationEvent::CancelRequested => {
@@ -1128,6 +1638,14 @@ impl CompletionOperation for FlushRequestOperation {
                     Ok(()) => Self::complete(owned, Ok(IrpCompletion::EMPTY)),
                     Err(error) => Self::complete(owned, Err(DriverError::from(error))),
                 }
+            }
+            FlushOperationState::CleanClosing {
+                owned,
+                transition,
+                close,
+            } => {
+                let result = close.advance(event);
+                self.drive_clean_close(owned, transition, result)
             }
             FlushOperationState::Terminal => OperationTransition::Complete,
         }
@@ -1443,9 +1961,11 @@ struct MutationRequestOperation {
     /// Stable mounted volume receiving all coordinator and publication transitions.
     volume: NonNull<VolumeControlBlock>,
     /// Validated mounted lower devices.
-    devices: MountedStorageDevices,
+    devices: MountedStorageRoute,
     /// Stable FIFO ticket retained across stale-plan re-resolution.
     ticket: u64,
+    /// Close-drain activity retained until every terminal/checkpoint path drops this operation.
+    _activity: MutationActivityLease,
     /// Timestamp fixed for the logical mutation across every replay pass.
     now: ext4_core::Ext4Timestamp,
     /// Captured request semantics.
@@ -1493,7 +2013,7 @@ impl MutationRequestOperation {
             Ok(now) => now,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
-        let (ticket, devices, epoch, resolve, crypto) = {
+        let (ticket, activity, devices, epoch, resolve, crypto) = {
             let mut access = unsafe {
                 // SAFETY: Admission executes on the sole reactor thread and every returned token
                 // is owned by the operation before that access projection ends.
@@ -1503,8 +2023,8 @@ impl MutationRequestOperation {
                 Ok(crypto) => crypto,
                 Err(error) => return Err(AdmitOperationError::new(error, owned)),
             };
-            let ticket = match access.runtime_mut().admit_mutation() {
-                Ok(ticket) => ticket,
+            let (ticket, activity) = match access.runtime_mut().admit_mutation() {
+                Ok(admission) => admission,
                 Err(error) => return Err(AdmitOperationError::new(error, owned)),
             };
             let epoch = match access.runtime_mut().acquire_epoch() {
@@ -1513,27 +2033,31 @@ impl MutationRequestOperation {
             };
             let devices = access.runtime().storage();
             let resolve = MutationResolveOperation::new(access.runtime().profile());
-            (ticket, devices, epoch, resolve, crypto)
+            (ticket, activity, devices, epoch, resolve, crypto)
         };
-        match memory::boxed_try_map((owned, epoch, crypto), |(owned, epoch, crypto)| Self {
-            volume,
-            devices,
-            ticket,
-            now,
-            kind,
-            crypto,
-            cleanup_deletion: None,
-            write_effect_observed: false,
-            cleanup_barrier_released: false,
-            state: MutationOperationState::Resolving {
-                owned,
-                epoch,
-                resolve,
+        match memory::boxed_try_map(
+            (owned, epoch, crypto, activity),
+            |(owned, epoch, crypto, activity)| Self {
+                volume,
+                devices,
+                ticket,
+                _activity: activity,
+                now,
+                kind,
+                crypto,
+                cleanup_deletion: None,
+                write_effect_observed: false,
+                cleanup_barrier_released: false,
+                state: MutationOperationState::Resolving {
+                    owned,
+                    epoch,
+                    resolve,
+                },
             },
-        }) {
+        ) {
             Ok(operation) => Ok(operation),
             Err(error) => {
-                let (error, (owned, _epoch, _crypto)) = error.into_parts();
+                let (error, (owned, _epoch, _crypto, _activity)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
             }
         }
