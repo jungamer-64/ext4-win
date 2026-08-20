@@ -41,6 +41,21 @@ pub fn assert_deterministic_mount(filesystem: &[u8], external_journal: Option<&[
     let first = run_mount(filesystem, external_journal);
     let second = run_mount(filesystem, external_journal);
     assert_eq!(first, second, "mount/recovery result must be deterministic");
+    assert_ne!(
+        first,
+        MountOutcome::StepBudgetExhausted,
+        "mount/recovery must terminate within the explicit transition budget"
+    );
+}
+
+/// Bounded external-journal validation result before mount continuation attachment.
+enum ExternalValidation {
+    /// The selected journal matched and is ready to attach.
+    Match(Box<ext4_core::ValidatedExternalJournal>),
+    /// The selected bytes were rejected by the production validator.
+    Rejected,
+    /// The validator failed to terminate within its explicit budget.
+    StepBudgetExhausted,
 }
 
 /// Owns the mutable images seen by one completion-driven execution.
@@ -87,10 +102,7 @@ impl Devices {
                     .ok()
                     .and_then(|start| start.checked_add(buffer.len()).map(|end| (start, end)))
                     .and_then(|(start, end)| self.target(target)?.get(start..end))
-                    .is_some_and(|source| {
-                        buffer.copy_from_slice(source);
-                        true
-                    });
+                    .is_some_and(|source| copy_exact(&mut buffer, source));
                 let transfer = CompletedStorageTransfer::Read {
                     target,
                     offset,
@@ -112,10 +124,7 @@ impl Devices {
                     .ok()
                     .and_then(|start| start.checked_add(buffer.len()).map(|end| (start, end)))
                     .and_then(|(start, end)| self.target_mut(target)?.get_mut(start..end))
-                    .is_some_and(|destination| {
-                        destination.copy_from_slice(&buffer);
-                        true
-                    });
+                    .is_some_and(|destination| copy_exact(destination, &buffer));
                 let transfer = CompletedStorageTransfer::Write {
                     target,
                     offset,
@@ -138,6 +147,17 @@ impl Devices {
             }
         }
     }
+}
+
+/// Copies one fuzz-device range only when both checked slices have the same length.
+fn copy_exact(destination: &mut [u8], source: &[u8]) -> bool {
+    if destination.len() != source.len() {
+        return false;
+    }
+    for (destination, source) in destination.iter_mut().zip(source) {
+        *destination = *source;
+    }
+    true
 }
 
 /// Advances the concrete production mount operation within the explicit step budget.
@@ -168,11 +188,14 @@ fn run_mount(filesystem: &[u8], external_journal: Option<&[u8]>) -> MountOutcome
                 };
                 let journal_length =
                     DeviceLength::from_bytes(u64::try_from(journal.len()).unwrap_or(u64::MAX));
-                let Some(validated) =
-                    validate_external_journal(&mut devices, requirement, journal_length)
-                else {
-                    return MountOutcome::Rejected;
-                };
+                let validated =
+                    match validate_external_journal(&mut devices, requirement, journal_length) {
+                        ExternalValidation::Match(validated) => validated,
+                        ExternalValidation::Rejected => return MountOutcome::Rejected,
+                        ExternalValidation::StepBudgetExhausted => {
+                            return MountOutcome::StepBudgetExhausted;
+                        }
+                    };
                 transition = suspended.attach_external_journal(validated);
             }
             MountTransition::Complete(result) => {
@@ -192,10 +215,12 @@ fn validate_external_journal(
     devices: &mut Devices,
     requirement: ext4_core::ExternalJournalRequirement,
     length: DeviceLength,
-) -> Option<Box<ext4_core::ValidatedExternalJournal>> {
-    let mut transition = Box::try_new(ExternalJournalProbeOperation::new(requirement, length))
-        .ok()?
-        .advance(OperationEvent::Admitted);
+) -> ExternalValidation {
+    let Ok(operation) = Box::try_new(ExternalJournalProbeOperation::new(requirement, length))
+    else {
+        return ExternalValidation::Rejected;
+    };
+    let mut transition = operation.advance(OperationEvent::Admitted);
     for _step in 0..MAX_STEPS {
         match transition {
             ExternalJournalProbeTransition::SubmitLower { request, suspended } => {
@@ -204,11 +229,11 @@ fn validate_external_journal(
             }
             ExternalJournalProbeTransition::Complete(Ok(ExternalJournalProbeOutcome::Match(
                 validated,
-            ))) => return Some(validated),
+            ))) => return ExternalValidation::Match(validated),
             ExternalJournalProbeTransition::Complete(
                 Ok(ExternalJournalProbeOutcome::Mismatch) | Err(_),
-            ) => return None,
+            ) => return ExternalValidation::Rejected,
         }
     }
-    None
+    ExternalValidation::StepBudgetExhausted
 }
