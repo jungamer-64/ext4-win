@@ -30,7 +30,13 @@ cargo xtask verify-journal-interop
 
 This requires e2fsprogs on native Linux or WSL. The core implementation never
 generates its own oracle result: `debugfs` and `e2fsck` establish the external
-filesystem and journal evidence.
+filesystem and journal evidence. Each scenario starts from a newly formatted or
+freshly copied image. The 4 KiB internal profile covers create, multi-block
+write, grow, shrink, rename, hard link, unlink, and xattr set/update/delete.
+The 4 KiB-block/16 KiB-cluster BIGALLOC profile covers allocation, truncate,
+unlink, cluster reuse, and free-space accounting. The 4 KiB external-journal
+profile commits rename, sparse-extension write, and xattr update together and
+requires every recovered result to be the complete old or complete new state.
 
 Building and signing the kernel driver remains a Windows-only operation because
 it requires MSVC, the Windows Driver Kit, and `cargo-wdk`. On a configured

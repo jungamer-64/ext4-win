@@ -1358,6 +1358,7 @@ fn verify_journal_interop(repository_root: &Path) -> TaskResult<()> {
         },
     ];
     let verification = (|| -> TaskResult<()> {
+        verify_internal_mutation_profiles(linux, &temporary_root)?;
         for case in cases {
             verify_linux_generated_journal_case(linux, &temporary_root, case)?;
         }
@@ -1373,6 +1374,593 @@ fn verify_journal_interop(repository_root: &Path) -> TaskResult<()> {
     combine_verification_and_cleanup(verification, cleanup)?;
     println!("JBD2 Linux -> core recovery and clean-close interoperability: PASS");
     Ok(())
+}
+
+/// Independently observed free-space counters from a debugfs superblock projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DebugfsFreeSpace {
+    /// Free filesystem blocks, in filesystem block units.
+    blocks: u64,
+    /// Free inode records.
+    inodes: u64,
+}
+
+/// Generates fresh 4 KiB and BIGALLOC images, mutates them through ext4-core, and validates each
+/// final state with debugfs and e2fsck.
+///
+/// # Errors
+///
+/// Returns an error for image generation, production mutation failure, independent-oracle
+/// mismatch, accounting drift, or e2fsck rejection.
+fn verify_internal_mutation_profiles(
+    linux: LinuxEnvironment,
+    temporary_root: &Path,
+) -> TaskResult<()> {
+    let regular_root = temporary_root.join("mutation-4k");
+    fs::create_dir(&regular_root)?;
+    let regular_image = regular_root.join("filesystem.img");
+    format_mutation_image(linux, &regular_image, None)?;
+    verify_regular_mutation_profile(linux, &regular_root, &regular_image)?;
+
+    let bigalloc_root = temporary_root.join("mutation-bigalloc-16k");
+    fs::create_dir(&bigalloc_root)?;
+    let bigalloc_image = bigalloc_root.join("filesystem.img");
+    format_mutation_image(linux, &bigalloc_image, Some(16_384))?;
+    verify_bigalloc_mutation_profile(linux, &bigalloc_root, &bigalloc_image)?;
+    println!("ext4-core fresh-image mutation profiles: PASS");
+    Ok(())
+}
+
+/// Creates one deterministic fresh ext4 image accepted by the production mount validator.
+///
+/// # Errors
+///
+/// Returns an error when image allocation, path conversion, or mke2fs execution fails.
+fn format_mutation_image(
+    linux: LinuxEnvironment,
+    image: &Path,
+    cluster_bytes: Option<u32>,
+) -> TaskResult<()> {
+    const IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+    File::create(image)?.set_len(IMAGE_BYTES)?;
+    let image_path = linux.tool_path(image)?;
+    let features = if cluster_bytes.is_some() {
+        "metadata_csum,64bit,bigalloc,^metadata_csum_seed,^orphan_file"
+    } else {
+        "metadata_csum,64bit,^metadata_csum_seed,^orphan_file"
+    };
+    let mut mke2fs = linux.command("mke2fs");
+    mke2fs.args([
+        "-q",
+        "-F",
+        "-t",
+        "ext4",
+        "-b",
+        "4096",
+        "-O",
+        features,
+        "-E",
+        "lazy_itable_init=0,lazy_journal_init=0",
+        "-J",
+        "size=8",
+    ]);
+    if let Some(cluster_bytes) = cluster_bytes {
+        mke2fs.args(["-C", &cluster_bytes.to_string()]);
+    }
+    mke2fs.arg(&image_path);
+    run_checked(mke2fs, "fresh mutation image format")
+}
+
+/// Exercises create, multi-block write, grow, shrink, rename, hard link, unlink, and xattr
+/// set/update/delete on one fresh 4 KiB filesystem.
+///
+/// # Errors
+///
+/// Returns an error for typed mutation failure or any independent debugfs/e2fsck mismatch.
+fn verify_regular_mutation_profile(
+    linux: LinuxEnvironment,
+    case_root: &Path,
+    image: &Path,
+) -> TaskResult<()> {
+    const INITIAL_BYTES: usize = 20_480;
+    const FINAL_BYTES: usize = 12_288;
+    const FINAL_SIZE: u64 = 12_288;
+    const GROWN_BYTES: u64 = 28_672;
+    const TAIL_OFFSET: u64 = 24_576;
+
+    let baseline = debugfs_free_space(linux, image)?;
+    let source = ext4_core::Ext4Name::new(b"source.bin").map_err(core_task_error)?;
+    let renamed = ext4_core::Ext4Name::new(b"renamed.bin").map_err(core_task_error)?;
+    let linked = ext4_core::Ext4Name::new(b"linked.bin").map_err(core_task_error)?;
+    let initial = vec![0x5A_u8; INITIAL_BYTES];
+    drive_internal_core_mutation(image, |pass| {
+        let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        let file = pass.create_file(root, &source, mutation_file_metadata()?)?;
+        pass.write_file_range(file, ext4_core::FileOffset::ZERO, &initial)
+    })?;
+
+    drive_internal_core_mutation(image, |pass| {
+        let (_root, file_id) = mutation_root_file(pass, &source)?;
+        let file = pass.file(file_id)?;
+        pass.extend_file(file, ext4_core::FileSize::from_bytes(GROWN_BYTES))?;
+        pass.write_file_range(
+            file,
+            ext4_core::FileOffset::from_bytes(TAIL_OFFSET),
+            &[0xE5_u8; 4096],
+        )?;
+        let node = pass.node(ext4_core::NodeId::File(file_id))?;
+        pass.set_xattr(
+            node,
+            mutation_xattr_name()?,
+            ext4_core::XattrValue::new(b"set-value")?,
+        )?;
+        Ok(())
+    })?;
+    debugfs_require_xattr(
+        linux,
+        case_root,
+        image,
+        "/source.bin",
+        b"set-value",
+        "regular-set",
+    )?;
+
+    drive_internal_core_mutation(image, |pass| {
+        let (root, file_id) = mutation_root_file(pass, &source)?;
+        let file = pass.file(file_id)?;
+        pass.truncate_file(file, ext4_core::FileSize::from_bytes(FINAL_SIZE))?;
+        pass.rename_child(
+            root,
+            &source,
+            root,
+            &renamed,
+            ext4_core::RenameTargetCollision::Reject,
+        )?;
+        let hard_link = pass.hard_link_source(ext4_core::HardLinkNodeId::File(file_id))?;
+        pass.create_hard_link(
+            hard_link,
+            root,
+            &linked,
+            ext4_core::HardLinkDestination::Vacant,
+        )?;
+        let node = pass.node(ext4_core::NodeId::File(file_id))?;
+        pass.set_xattr(
+            node,
+            mutation_xattr_name()?,
+            ext4_core::XattrValue::new(b"updated-value")?,
+        )
+    })?;
+    debugfs_require_xattr(
+        linux,
+        case_root,
+        image,
+        "/renamed.bin",
+        b"updated-value",
+        "regular-update",
+    )?;
+
+    drive_internal_core_mutation(image, |pass| {
+        let (root, file_id) = mutation_root_file(pass, &linked)?;
+        pass.unlink_file(root, &renamed)?;
+        let node = pass.node(ext4_core::NodeId::File(file_id))?;
+        let removed = pass.remove_xattr(node, &mutation_xattr_name()?)?;
+        if removed.is_none() {
+            return Err(ext4_core::Error::InvalidXattr);
+        }
+        Ok(())
+    })?;
+
+    let expected = initial
+        .get(..FINAL_BYTES)
+        .ok_or_else(|| io::Error::other("regular expected-content range is absent"))?;
+    debugfs_require_file(
+        linux,
+        case_root,
+        image,
+        "/linked.bin",
+        expected,
+        1,
+        "regular",
+    )?;
+    debugfs_require_absent(linux, image, "/source.bin")?;
+    debugfs_require_absent(linux, image, "/renamed.bin")?;
+    debugfs_require_xattr_absent(linux, image, "/linked.bin", b"user.ext4win.interop")?;
+    require_free_space_delta(baseline, debugfs_free_space(linux, image)?, 3, 1, "regular")?;
+    verify_internal_e2fsck_clean(linux, image, "regular mutation profile")
+}
+
+/// Exercises allocation, truncation, unlink, and deterministic cluster reuse on one fresh
+/// 4 KiB-block/16 KiB-cluster BIGALLOC filesystem.
+///
+/// # Errors
+///
+/// Returns an error for typed mutation failure, non-reuse, accounting drift, or oracle rejection.
+fn verify_bigalloc_mutation_profile(
+    linux: LinuxEnvironment,
+    case_root: &Path,
+    image: &Path,
+) -> TaskResult<()> {
+    let baseline = debugfs_free_space(linux, image)?;
+    let alpha = ext4_core::Ext4Name::new(b"alpha.bin").map_err(core_task_error)?;
+    let beta = ext4_core::Ext4Name::new(b"beta.bin").map_err(core_task_error)?;
+    let alpha_content = vec![0xA6_u8; 20_480];
+    drive_internal_core_mutation(image, |pass| {
+        let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        let file = pass.create_file(root, &alpha, mutation_file_metadata()?)?;
+        pass.write_file_range(file, ext4_core::FileOffset::ZERO, &alpha_content)
+    })?;
+    drive_internal_core_mutation(image, |pass| {
+        let (_root, file_id) = mutation_root_file(pass, &alpha)?;
+        let file = pass.file(file_id)?;
+        pass.truncate_file(file, ext4_core::FileSize::from_bytes(4096))
+    })?;
+    let image_path = linux.tool_path(image)?;
+    let alpha_blocks = debugfs_block_sequence(linux, &image_path, "blocks /alpha.bin")?;
+    let alpha_cluster = first_bigalloc_cluster(&alpha_blocks)?;
+
+    drive_internal_core_mutation(image, |pass| {
+        let (root, _file_id) = mutation_root_file(pass, &alpha)?;
+        pass.unlink_file(root, &alpha)
+    })?;
+    drive_internal_core_mutation(image, |pass| {
+        let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        let file = pass.create_file(root, &beta, mutation_file_metadata()?)?;
+        pass.write_file_range(file, ext4_core::FileOffset::ZERO, &[0xB7_u8; 4096])
+    })?;
+    let beta_blocks = debugfs_block_sequence(linux, &image_path, "blocks /beta.bin")?;
+    let beta_cluster = first_bigalloc_cluster(&beta_blocks)?;
+    if beta_cluster != alpha_cluster {
+        return Err(io::Error::other(format!(
+            "BIGALLOC cluster was not reused: released={alpha_cluster} allocated={beta_cluster}"
+        ))
+        .into());
+    }
+    debugfs_require_file(
+        linux,
+        case_root,
+        image,
+        "/beta.bin",
+        &[0xB7_u8; 4096],
+        1,
+        "bigalloc",
+    )?;
+    debugfs_require_absent(linux, image, "/alpha.bin")?;
+    require_free_space_delta(
+        baseline,
+        debugfs_free_space(linux, image)?,
+        4,
+        1,
+        "BIGALLOC",
+    )?;
+    verify_internal_e2fsck_clean(linux, image, "BIGALLOC mutation profile")
+}
+
+/// Returns deterministic POSIX metadata used by interoperability-created regular files.
+///
+/// # Errors
+///
+/// Returns an error only if the fixed permission representation becomes invalid.
+fn mutation_file_metadata() -> ext4_core::Result<ext4_core::NewFileMetadata> {
+    Ok(ext4_core::NewFileMetadata::new(
+        ext4_core::Ext4Owner::new(
+            ext4_core::Ext4Uid::from_u32(1000),
+            ext4_core::Ext4Gid::from_u32(1000),
+        ),
+        ext4_core::Ext4Permissions::new(0o644)?,
+    ))
+}
+
+/// Returns the fixed public xattr name exercised by mutation interoperability.
+///
+/// # Errors
+///
+/// Returns an error only if the fixed name representation becomes invalid.
+fn mutation_xattr_name() -> ext4_core::Result<ext4_core::XattrName> {
+    ext4_core::XattrName::new(ext4_core::XattrNamespace::User, b"ext4win.interop")
+}
+
+/// Resolves one named root child into its typed transaction directory and file identities.
+///
+/// # Errors
+///
+/// Returns an error when the root or child cannot be read, the name is absent, or it is not a
+/// regular file.
+fn mutation_root_file(
+    pass: &mut ext4_core::MutationResolvePass<'_, '_, '_>,
+    name: &ext4_core::Ext4Name,
+) -> ext4_core::Result<(ext4_core::TransactionDirectory, ext4_core::FileNodeId)> {
+    let root =
+        ext4_core::CommittedReadPass::load_directory(pass, ext4_core::DirectoryNodeId::ROOT)?;
+    let child = ext4_core::CommittedReadPass::lookup_child(pass, &root, name)?;
+    let file_id = match child {
+        ext4_core::ChildLookup::Found(child) => match *child.node() {
+            ext4_core::NodeId::File(file) => file,
+            ext4_core::NodeId::Directory(_) | ext4_core::NodeId::Symlink(_) => {
+                return Err(ext4_core::Error::WrongInodeKind);
+            }
+        },
+        ext4_core::ChildLookup::NotFound => return Err(ext4_core::Error::InvalidDirectoryEntry),
+    };
+    Ok((pass.directory(root.id())?, file_id))
+}
+
+/// Converts the first physical block into its 16 KiB BIGALLOC cluster identity.
+///
+/// # Errors
+///
+/// Returns an error when debugfs reports no allocated block.
+fn first_bigalloc_cluster(blocks: &[u64]) -> TaskResult<u64> {
+    blocks
+        .first()
+        .copied()
+        .and_then(|block| block.checked_div(4))
+        .ok_or_else(|| io::Error::other("BIGALLOC file has no physical cluster").into())
+}
+
+/// Captures one debugfs request's UTF-8 stdout and diagnostics.
+///
+/// # Errors
+///
+/// Returns an error for path conversion, process failure, or non-UTF-8 output.
+fn debugfs_request_output(
+    linux: LinuxEnvironment,
+    image: &Path,
+    request: &str,
+) -> TaskResult<String> {
+    let image_path = linux.tool_path(image)?;
+    let mut command = linux.command("debugfs");
+    command.args(["-R", request, &image_path]);
+    let output = run_checked_output(command, &format!("debugfs request `{request}`"))?;
+    let mut text = String::from_utf8(output.stdout)?;
+    text.push_str(&String::from_utf8(output.stderr)?);
+    Ok(text)
+}
+
+/// Reads free block and inode counters through the independent debugfs parser.
+///
+/// # Errors
+///
+/// Returns an error when debugfs fails or omits either numeric field.
+fn debugfs_free_space(linux: LinuxEnvironment, image: &Path) -> TaskResult<DebugfsFreeSpace> {
+    let output = debugfs_request_output(linux, image, "stats")?;
+    Ok(DebugfsFreeSpace {
+        blocks: debugfs_numeric_field(&output, "Free blocks:")?,
+        inodes: debugfs_numeric_field(&output, "Free inodes:")?,
+    })
+}
+
+/// Parses one exact numeric field from debugfs output.
+///
+/// # Errors
+///
+/// Returns an error when the field is absent, empty, or not an unsigned integer.
+fn debugfs_numeric_field(output: &str, field: &str) -> TaskResult<u64> {
+    let value = output
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(field))
+        .ok_or_else(|| io::Error::other(format!("debugfs omitted `{field}`")))?;
+    Ok(value.trim().parse()?)
+}
+
+/// Requires exact block/inode consumption relative to a fresh-image baseline.
+///
+/// # Errors
+///
+/// Returns an error for counter growth, arithmetic failure, or a mismatching allocation charge.
+fn require_free_space_delta(
+    baseline: DebugfsFreeSpace,
+    observed: DebugfsFreeSpace,
+    expected_blocks: u64,
+    expected_inodes: u64,
+    label: &str,
+) -> TaskResult<()> {
+    let consumed_blocks = baseline
+        .blocks
+        .checked_sub(observed.blocks)
+        .ok_or_else(|| io::Error::other(format!("{label} free-block count grew unexpectedly")))?;
+    let consumed_inodes = baseline
+        .inodes
+        .checked_sub(observed.inodes)
+        .ok_or_else(|| io::Error::other(format!("{label} free-inode count grew unexpectedly")))?;
+    if consumed_blocks != expected_blocks || consumed_inodes != expected_inodes {
+        return Err(io::Error::other(format!(
+            "{label} accounting mismatch: blocks={consumed_blocks}/{expected_blocks} \
+             inodes={consumed_inodes}/{expected_inodes}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Requires one debugfs-visible regular file to have exact content, size, and link count.
+///
+/// # Errors
+///
+/// Returns an error when stat/dump fails or any observable differs.
+fn debugfs_require_file(
+    linux: LinuxEnvironment,
+    case_root: &Path,
+    image: &Path,
+    path: &str,
+    expected: &[u8],
+    links: u16,
+    label: &str,
+) -> TaskResult<()> {
+    let stat = debugfs_request_output(linux, image, &format!("stat {path}"))?;
+    let size_field = format!("Size: {}", expected.len());
+    let links_field = format!("Links: {links}");
+    if !stat.contains("Inode:") || !stat.contains(&size_field) || !stat.contains(&links_field) {
+        return Err(
+            io::Error::other(format!("{label} stat mismatch for {path}: {}", stat.trim())).into(),
+        );
+    }
+    let dump = case_root.join(format!("{label}-dump.bin"));
+    let dump_path = linux.tool_path(&dump)?;
+    let image_path = linux.tool_path(image)?;
+    let mut command = linux.command("debugfs");
+    command.args(["-R", &format!("dump -p {path} {dump_path}"), &image_path]);
+    run_checked(command, &format!("debugfs dump for {label}"))?;
+    let observed = fs::read(&dump)?;
+    fs::remove_file(&dump)?;
+    if observed != expected {
+        return Err(io::Error::other(format!("{label} content mismatch for {path}")).into());
+    }
+    Ok(())
+}
+
+/// Requires debugfs not to resolve one path to an inode.
+///
+/// # Errors
+///
+/// Returns an error when debugfs fails or reports an existing inode.
+fn debugfs_require_absent(linux: LinuxEnvironment, image: &Path, path: &str) -> TaskResult<()> {
+    let stat = debugfs_request_output(linux, image, &format!("stat {path}"))?;
+    if stat.contains("Inode:") {
+        Err(io::Error::other(format!("debugfs unexpectedly resolved {path}")).into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Returns whether debugfs resolves one path to an inode.
+///
+/// # Errors
+///
+/// Returns an error when debugfs cannot inspect the image.
+fn debugfs_path_exists(linux: LinuxEnvironment, image: &Path, path: &str) -> TaskResult<bool> {
+    Ok(debugfs_request_output(linux, image, &format!("stat {path}"))?.contains("Inode:"))
+}
+
+/// Requires an external-journal recovery result to be one complete namespace/data/xattr endpoint.
+///
+/// # Errors
+///
+/// Returns an error when old/new namespace states are mixed or the selected endpoint's content,
+/// link count, or xattr value differs.
+fn debugfs_require_external_old_or_new(
+    linux: LinuxEnvironment,
+    case_root: &Path,
+    image: &Path,
+    old_content: &[u8],
+    new_content: &[u8],
+    label: &str,
+) -> TaskResult<()> {
+    let old_exists = debugfs_path_exists(linux, image, "/external-old.bin")?;
+    let new_exists = debugfs_path_exists(linux, image, "/external-new.bin")?;
+    match (old_exists, new_exists) {
+        (true, false) => {
+            let endpoint = format!("{label}-old");
+            debugfs_require_file(
+                linux,
+                case_root,
+                image,
+                "/external-old.bin",
+                old_content,
+                1,
+                &endpoint,
+            )?;
+            debugfs_require_xattr(
+                linux,
+                case_root,
+                image,
+                "/external-old.bin",
+                b"external-old",
+                &endpoint,
+            )
+        }
+        (false, true) => {
+            let endpoint = format!("{label}-new");
+            debugfs_require_file(
+                linux,
+                case_root,
+                image,
+                "/external-new.bin",
+                new_content,
+                1,
+                &endpoint,
+            )?;
+            debugfs_require_xattr(
+                linux,
+                case_root,
+                image,
+                "/external-new.bin",
+                b"external-new",
+                &endpoint,
+            )
+        }
+        (false, false) | (true, true) => Err(io::Error::other(format!(
+            "{label} external mutation has mixed namespace state: old={old_exists} new={new_exists}"
+        ))
+        .into()),
+    }
+}
+
+/// Requires one exact xattr value through debugfs's independent xattr decoder.
+///
+/// # Errors
+///
+/// Returns an error when extraction fails or the value differs.
+fn debugfs_require_xattr(
+    linux: LinuxEnvironment,
+    case_root: &Path,
+    image: &Path,
+    path: &str,
+    expected: &[u8],
+    label: &str,
+) -> TaskResult<()> {
+    let output = case_root.join(format!("{label}-xattr.bin"));
+    let output_path = linux.tool_path(&output)?;
+    let image_path = linux.tool_path(image)?;
+    let request = format!("ea_get -f {output_path} {path} user.ext4win.interop");
+    let mut command = linux.command("debugfs");
+    command.args(["-R", &request, &image_path]);
+    run_checked(command, &format!("debugfs xattr extraction for {label}"))?;
+    let observed = fs::read(&output)?;
+    fs::remove_file(&output)?;
+    if observed != expected {
+        return Err(io::Error::other(format!("{label} xattr mismatch for {path}")).into());
+    }
+    Ok(())
+}
+
+/// Requires one xattr name to be absent from debugfs's decoded list.
+///
+/// # Errors
+///
+/// Returns an error when debugfs fails or reports the removed name.
+fn debugfs_require_xattr_absent(
+    linux: LinuxEnvironment,
+    image: &Path,
+    path: &str,
+    qualified_name: &[u8],
+) -> TaskResult<()> {
+    let output = debugfs_request_output(linux, image, &format!("ea_list {path}"))?;
+    let qualified_name = String::from_utf8(qualified_name.to_vec())?;
+    if output.contains(&qualified_name) {
+        Err(io::Error::other(format!(
+            "debugfs still reports removed xattr {qualified_name} on {path}"
+        ))
+        .into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Requires e2fsck to accept one internal-journal mutation image without modification.
+///
+/// # Errors
+///
+/// Returns an error for path conversion, process launch, or non-clean e2fsck status.
+fn verify_internal_e2fsck_clean(
+    linux: LinuxEnvironment,
+    image: &Path,
+    label: &str,
+) -> TaskResult<()> {
+    let image_path = linux.tool_path(image)?;
+    let mut e2fsck = linux.command("e2fsck");
+    e2fsck.args(["-f", "-n", &image_path]);
+    run_checked(e2fsck, &format!("e2fsck for {label}"))
 }
 
 /// Expands one tracked raw pair, drives core external recovery/close, and asks e2fsck to validate
@@ -1407,7 +1995,7 @@ fn verify_external_journal_fixture(
     let journal = case_root.join("external-journal.img");
     fs::copy(&tracked_filesystem, &filesystem)?;
     fs::copy(&tracked_journal, &journal)?;
-    if fixture.name == "external-1k-v2-32" {
+    if fixture.name == "external-4k-v3-64" {
         verify_external_journal_fault_matrix(linux, &case_root, &filesystem, &journal, fixture)?;
     }
     drive_external_core_mount_and_clean_close(&filesystem, &journal)?;
@@ -2443,8 +3031,8 @@ fn append_debugfs_block_range(output: &mut String, start: u64, end: u64) -> Task
 /// boundary, abandons the in-memory typestate, and proves that a fresh mount reaches a clean
 /// old-or-new state.
 ///
-/// The smallest tracked external-journal fixture keeps this exhaustive matrix bounded while the
-/// ordinary interoperability loop independently covers every supported block-size/profile pair.
+/// The 4 KiB external-journal fixture is the mutation/crash profile; the ordinary interoperability
+/// loop independently covers every supported block-size/checksum/address-width pair.
 ///
 /// # Errors
 ///
@@ -2529,17 +3117,50 @@ fn verify_external_journal_fault_matrix(
         remove_fault_pair(&filesystem, &journal)?;
     }
 
-    const FAULT_LABEL: &[u8] = b"FAULT-JBD2";
-    let old_label = read_raw_volume_label(&clean_filesystem)?;
-    let new_label = padded_volume_label(FAULT_LABEL)?;
+    let source_name = ext4_core::Ext4Name::new(b"external-old.bin").map_err(core_task_error)?;
+    let target_name = ext4_core::Ext4Name::new(b"external-new.bin").map_err(core_task_error)?;
+    let old_content = vec![0x31_u8; 1024];
+    let appended = vec![0x42_u8; 2048];
+    let mut new_content = old_content.clone();
+    new_content.resize(4096, 0);
+    new_content.extend_from_slice(&appended);
+    drive_external_core_mutation(&clean_filesystem, &clean_journal, |pass| {
+        let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        let file = pass.create_file(root, &source_name, mutation_file_metadata()?)?;
+        pass.write_file_range(file, ext4_core::FileOffset::ZERO, &old_content)
+    })?;
+    drive_external_core_mutation(&clean_filesystem, &clean_journal, |pass| {
+        let (_root, file_id) = mutation_root_file(pass, &source_name)?;
+        let node = pass.node(ext4_core::NodeId::File(file_id))?;
+        pass.set_xattr(
+            node,
+            mutation_xattr_name()?,
+            ext4_core::XattrValue::new(b"external-old")?,
+        )
+    })?;
+    debugfs_require_file(
+        linux,
+        &matrix_root,
+        &clean_filesystem,
+        "/external-old.bin",
+        &old_content,
+        1,
+        "external-baseline",
+    )?;
     let (probe_filesystem, probe_journal) = copy_fault_pair(
         &matrix_root,
         "mutation-probe",
         &clean_filesystem,
         &clean_journal,
     )?;
-    let mutation_probe =
-        run_external_mutation_until_boundary(&probe_filesystem, &probe_journal, FAULT_LABEL, None)?;
+    let mutation_probe = run_external_file_mutation_until_boundary(
+        &probe_filesystem,
+        &probe_journal,
+        &source_name,
+        &target_name,
+        &appended,
+        None,
+    )?;
     let mutation_effects = require_completed_effect_probe("commit/checkpoint", mutation_probe)?;
     let mutation_cuts = enumerate_effect_cuts(&mutation_effects)?;
     remove_fault_pair(&probe_filesystem, &probe_journal)?;
@@ -2548,23 +3169,23 @@ fn verify_external_journal_fault_matrix(
         let stem = format!("mutation-{}", effect_cut_stem(cut));
         let (filesystem, journal) =
             copy_fault_pair(&matrix_root, &stem, &clean_filesystem, &clean_journal)?;
-        let run =
-            run_external_mutation_until_boundary(&filesystem, &journal, FAULT_LABEL, Some(cut))?;
-        require_stopped_effect("commit/checkpoint", cut, run)?;
-        let interrupted_label = read_raw_volume_label(&filesystem)?;
-        require_old_or_new_bytes(
-            "interrupted volume label",
-            &interrupted_label,
-            &old_label,
-            &new_label,
+        let run = run_external_file_mutation_until_boundary(
+            &filesystem,
+            &journal,
+            &source_name,
+            &target_name,
+            &appended,
+            Some(cut),
         )?;
+        require_stopped_effect("commit/checkpoint", cut, run)?;
         drive_external_core_mount_and_clean_close(&filesystem, &journal)?;
-        let remounted_label = read_raw_volume_label(&filesystem)?;
-        require_old_or_new_bytes(
-            "remounted volume label",
-            &remounted_label,
-            &old_label,
-            &new_label,
+        debugfs_require_external_old_or_new(
+            linux,
+            &matrix_root,
+            &filesystem,
+            &old_content,
+            &new_content,
+            &stem,
         )?;
         verify_primary_recovery_marker(&filesystem, false)?;
         verify_external_e2fsck_clean(linux, &filesystem, &journal, &stem)?;
@@ -2761,41 +3382,6 @@ fn require_old_or_new_bytes(
     }
 }
 
-/// Reads the fixed-width ext4 primary volume-label field.
-///
-/// # Errors
-///
-/// Returns an error for offset arithmetic or raw image I/O failure.
-fn read_raw_volume_label(image: &Path) -> TaskResult<[u8; 16]> {
-    const SUPERBLOCK_OFFSET: u64 = 1024;
-    const VOLUME_LABEL_OFFSET: u64 = 0x78;
-
-    let mut file = File::open(image)?;
-    let offset = SUPERBLOCK_OFFSET
-        .checked_add(VOLUME_LABEL_OFFSET)
-        .ok_or_else(|| io::Error::other("volume-label offset overflow"))?;
-    file.seek(io::SeekFrom::Start(offset))?;
-    let mut label = [0_u8; 16];
-    file.read_exact(&mut label)?;
-    Ok(label)
-}
-
-/// Pads one accepted ext4 volume label into its complete on-disk field.
-///
-/// # Errors
-///
-/// Returns an error when the caller supplies more than the ext4 field width.
-fn padded_volume_label(label: &[u8]) -> TaskResult<[u8; 16]> {
-    if label.len() > 16 {
-        return Err(io::Error::other("fault-matrix volume label exceeds 16 bytes").into());
-    }
-    let mut padded = [0_u8; 16];
-    for (destination, source) in padded.iter_mut().zip(label) {
-        *destination = *source;
-    }
-    Ok(padded)
-}
-
 /// Uses e2fsck as an independent oracle for one external-journal crash outcome.
 ///
 /// # Errors
@@ -2812,6 +3398,42 @@ fn verify_external_e2fsck_clean(
     let mut e2fsck = linux.command("e2fsck");
     e2fsck.args(["-f", "-n", "-j", &journal_path, &filesystem_path]);
     run_checked(e2fsck, &format!("fault-matrix e2fsck for {label}"))
+}
+
+/// Opens and fully mounts one internal-journal image through the public production protocol.
+///
+/// # Errors
+///
+/// Returns an error for device geometry, host I/O, unexpected external discovery, or core mount
+/// rejection.
+fn mount_internal_core<S: HostStorage>(
+    storage: &mut S,
+) -> TaskResult<Box<ext4_core::CompletedMount>> {
+    let filesystem_length =
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
+    let mut transition = Box::try_new(ext4_core::MountOperation::new(
+        filesystem_length,
+        ext4_core::FscryptKeySet::empty(),
+    ))?
+    .advance(ext4_core::OperationEvent::Admitted);
+    loop {
+        match transition {
+            ext4_core::MountTransition::SubmitLower { request, suspended } => {
+                let completion = complete_file_request(storage, request)?;
+                transition =
+                    suspended.advance(ext4_core::OperationEvent::StorageCompleted(completion));
+            }
+            ext4_core::MountTransition::DiscoverExternalJournal { .. } => {
+                return Err(io::Error::other(
+                    "internal-journal interoperability image requested external discovery",
+                )
+                .into());
+            }
+            ext4_core::MountTransition::Complete(result) => {
+                return result.map_err(|error| core_task_error(error).into());
+            }
+        }
+    }
 }
 
 /// Opens and fully mounts one external-journal image pair through the public production protocol.
@@ -2848,6 +3470,35 @@ fn mount_external_core<S: HostStorage>(
             }
             ext4_core::MountTransition::Complete(result) => {
                 return result.map_err(|error| core_task_error(error).into());
+            }
+        }
+    }
+}
+
+/// Runs a clean close for one mounted profile through the same storage boundary.
+///
+/// # Errors
+///
+/// Returns an error for lower storage I/O or a rejected clean-close transition.
+fn complete_core_clean_close<S: HostStorage>(
+    storage: &mut S,
+    filesystem_length: ext4_core::DeviceLength,
+    journal_target: ext4_core::StorageTarget,
+) -> TaskResult<()> {
+    let mut close = Box::try_new(ext4_core::CleanCloseOperation::new(
+        filesystem_length,
+        journal_target,
+    ))?
+    .advance(ext4_core::OperationEvent::Admitted);
+    loop {
+        match close {
+            ext4_core::CleanCloseTransition::SubmitLower { request, suspended } => {
+                let completion = complete_file_request(storage, request)?;
+                close = suspended.advance(ext4_core::OperationEvent::StorageCompleted(completion));
+            }
+            ext4_core::CleanCloseTransition::Complete(result) => {
+                result.map_err(core_task_error)?;
+                return Ok(());
             }
         }
     }
@@ -2938,21 +3589,48 @@ fn run_external_clean_close_until_boundary(
     }
 }
 
-/// Mounts a clean external-journal pair and runs one volume-label commit through checkpoint.
+/// Mounts a clean external-journal pair and runs one rename/write/xattr commit through checkpoint.
 ///
 /// # Errors
 ///
 /// Returns an error for mount/resolve/commit/checkpoint failure or host storage I/O.
-fn run_external_mutation_until_boundary(
+fn run_external_file_mutation_until_boundary(
     filesystem: &Path,
     journal: &Path,
-    label: &[u8],
+    source_name: &ext4_core::Ext4Name,
+    target_name: &ext4_core::Ext4Name,
+    appended: &[u8],
     cut: Option<EffectCut>,
 ) -> TaskResult<EffectBoundaryRun> {
     let mut storage = CrashStorageAdapter::open_external(filesystem, journal)?;
     let completed = mount_external_core(&mut storage)?;
-    let (prepared, mut coordinator, ticket) =
-        prepare_volume_label_commit(&mut storage, completed, label)?;
+    let (profile, epoch, mut coordinator) = (*completed).into_parts();
+    let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
+    let (prepared, ()) = prepare_core_mutation(
+        &mut storage,
+        &profile,
+        &epoch,
+        &coordinator,
+        ticket,
+        |pass| {
+            let (root, file_id) = mutation_root_file(pass, source_name)?;
+            let file = pass.file(file_id)?;
+            pass.write_file_range(file, ext4_core::FileOffset::from_bytes(4096), appended)?;
+            pass.rename_child(
+                root,
+                source_name,
+                root,
+                target_name,
+                ext4_core::RenameTargetCollision::Reject,
+            )?;
+            let node = pass.node(ext4_core::NodeId::File(file_id))?;
+            pass.set_xattr(
+                node,
+                mutation_xattr_name()?,
+                ext4_core::XattrValue::new(b"external-new")?,
+            )
+        },
+    )?;
     let mut controller = EffectBoundaryController::new(cut)?;
 
     let ordered = match complete_boundary_sequence(&mut storage, &mut controller, prepared.start())?
@@ -3064,48 +3742,11 @@ fn complete_boundary_request(
 /// Returns an error for host file I/O, unexpected external discovery, or any core terminal error.
 fn drive_core_mount_and_clean_close(image: &Path) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_internal(image)?;
-    let length = ext4_core::DeviceLength::from_bytes(storage.filesystem.metadata()?.len());
-    let mut transition = Box::try_new(ext4_core::MountOperation::new(
-        length,
-        ext4_core::FscryptKeySet::empty(),
-    ))?
-    .advance(ext4_core::OperationEvent::Admitted);
-    let completed = loop {
-        match transition {
-            ext4_core::MountTransition::SubmitLower { request, suspended } => {
-                let completion = complete_file_request(&mut storage, request)?;
-                transition =
-                    suspended.advance(ext4_core::OperationEvent::StorageCompleted(completion));
-            }
-            ext4_core::MountTransition::DiscoverExternalJournal { .. } => {
-                return Err(io::Error::other(
-                    "internal-journal interoperability image requested external discovery",
-                )
-                .into());
-            }
-            ext4_core::MountTransition::Complete(result) => {
-                break result.map_err(core_task_error)?;
-            }
-        }
-    };
+    let length =
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
+    let completed = mount_internal_core(&mut storage)?;
     let (profile, _epoch, _coordinator) = completed.into_parts();
-    let mut close = Box::try_new(ext4_core::CleanCloseOperation::new(
-        length,
-        profile.journal_target(),
-    ))?
-    .advance(ext4_core::OperationEvent::Admitted);
-    loop {
-        match close {
-            ext4_core::CleanCloseTransition::SubmitLower { request, suspended } => {
-                let completion = complete_file_request(&mut storage, request)?;
-                close = suspended.advance(ext4_core::OperationEvent::StorageCompleted(completion));
-            }
-            ext4_core::CleanCloseTransition::Complete(result) => {
-                result.map_err(core_task_error)?;
-                return Ok(());
-            }
-        }
-    }
+    complete_core_clean_close(&mut storage, length, profile.journal_target())
 }
 
 /// Executes production external discovery, validation, recovery, and clean close against two
@@ -3121,26 +3762,10 @@ fn drive_external_core_mount_and_clean_close(
 ) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_external(filesystem, external_journal)?;
     let filesystem_length =
-        ext4_core::DeviceLength::from_bytes(storage.filesystem.metadata()?.len());
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let completed = mount_external_core(&mut storage)?;
     let (profile, _epoch, _coordinator) = completed.into_parts();
-    let mut close = Box::try_new(ext4_core::CleanCloseOperation::new(
-        filesystem_length,
-        profile.journal_target(),
-    ))?
-    .advance(ext4_core::OperationEvent::Admitted);
-    loop {
-        match close {
-            ext4_core::CleanCloseTransition::SubmitLower { request, suspended } => {
-                let completion = complete_file_request(&mut storage, request)?;
-                close = suspended.advance(ext4_core::OperationEvent::StorageCompleted(completion));
-            }
-            ext4_core::CleanCloseTransition::Complete(result) => {
-                result.map_err(core_task_error)?;
-                return Ok(());
-            }
-        }
-    }
+    complete_core_clean_close(&mut storage, filesystem_length, profile.journal_target())
 }
 
 /// Runs the public core validator for one exclusively selected external-journal file.
@@ -3183,6 +3808,74 @@ fn drive_external_probe<S: HostStorage>(
     }
 }
 
+/// Resolves and fully preallocates one production mutation against an explicit committed epoch.
+///
+/// The mutation closure is restarted after lower reads exactly as it is in the driver. Its owned
+/// output becomes observable only when resolve reaches a terminal success.
+///
+/// # Errors
+///
+/// Returns an error for resolve I/O, mutation rejection, reservation conflict, or fallible
+/// preallocation before the first commit write.
+fn prepare_core_mutation<S, F, R>(
+    storage: &mut S,
+    profile: &ext4_core::MountedProfile,
+    epoch: &ext4_core::CommittedEpoch,
+    coordinator: &ext4_core::MutationCoordinatorState,
+    ticket: u64,
+    mut mutate: F,
+) -> TaskResult<(ext4_core::CommitReadyMutation, R)>
+where
+    S: HostStorage,
+    F: for<'storage, 'epoch, 'crypto> FnMut(
+        &mut ext4_core::MutationResolvePass<'storage, 'epoch, 'crypto>,
+    ) -> ext4_core::Result<R>,
+{
+    let mut operation = ext4_core::MutationResolveOperation::new(profile);
+    let mut event = ext4_core::OperationEvent::Admitted;
+    let (resolved, output) = loop {
+        let mut ready = operation.accept(event).map_err(core_task_error)?;
+        let mut pass_output = None;
+        let result = {
+            let mut crypto = RejectingCryptographicOperation;
+            let mut pass = ready.begin_pass(
+                epoch,
+                ext4_core::Ext4Timestamp::from_unix_seconds(1),
+                &mut crypto,
+            );
+            match mutate(&mut pass) {
+                Ok(output) => {
+                    pass_output = Some(output);
+                    pass.resolve(ticket, coordinator)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        match ready.finish(result) {
+            ext4_core::MutationResolveTransition::SubmitLower { request, suspended } => {
+                event = ext4_core::OperationEvent::StorageCompleted(complete_file_request(
+                    storage, request,
+                )?);
+                operation = suspended;
+            }
+            ext4_core::MutationResolveTransition::Complete(result) => {
+                let resolved = result.map_err(core_task_error)?;
+                let output = pass_output.ok_or_else(|| {
+                    io::Error::other("successful mutation resolve lost its owned output")
+                })?;
+                break (resolved, output);
+            }
+        }
+    };
+    let reserved = resolved
+        .reserve(coordinator, ext4_core::MutationLease::granted(ticket))
+        .map_err(core_task_error)?;
+    let prepared = reserved
+        .prepare_commit(coordinator, epoch, ext4_core::CommitLease::granted(ticket))
+        .map_err(core_task_error)?;
+    Ok((prepared, output))
+}
+
 /// Resolves and fully preallocates one volume-label commit from an owned completed mount.
 ///
 /// This is the shared semantic boundary used by ordinary interoperability and the exhaustive
@@ -3203,43 +3896,109 @@ fn prepare_volume_label_commit<S: HostStorage>(
 )> {
     let (profile, epoch, mut coordinator) = (*completed).into_parts();
     let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
-    let mut operation = ext4_core::MutationResolveOperation::new(&profile);
-    let mut event = ext4_core::OperationEvent::Admitted;
-    let resolved = loop {
-        let mut ready = operation.accept(event).map_err(core_task_error)?;
-        let result = {
-            let mut crypto = RejectingCryptographicOperation;
-            let mut pass = ready.begin_pass(
-                &epoch,
-                ext4_core::Ext4Timestamp::from_unix_seconds(1),
-                &mut crypto,
-            );
-            pass.set_volume_label(ext4_core::Ext4VolumeLabel::new(label).map_err(core_task_error)?);
-            pass.resolve(ticket, &coordinator)
-        };
-        match ready.finish(result) {
-            ext4_core::MutationResolveTransition::SubmitLower { request, suspended } => {
-                event = ext4_core::OperationEvent::StorageCompleted(complete_file_request(
-                    storage, request,
-                )?);
-                operation = suspended;
-            }
-            ext4_core::MutationResolveTransition::Complete(result) => {
-                break result.map_err(core_task_error)?;
-            }
-        }
-    };
-    let reserved = resolved
-        .reserve(&coordinator, ext4_core::MutationLease::granted(ticket))
-        .map_err(core_task_error)?;
-    let prepared = reserved
-        .prepare_commit(
-            &coordinator,
-            &epoch,
-            ext4_core::CommitLease::granted(ticket),
-        )
-        .map_err(core_task_error)?;
+    let (prepared, ()) =
+        prepare_core_mutation(storage, &profile, &epoch, &coordinator, ticket, |pass| {
+            pass.set_volume_label(ext4_core::Ext4VolumeLabel::new(label)?);
+            Ok(())
+        })?;
     Ok((prepared, coordinator, ticket))
+}
+
+/// Completes a fully preallocated mutation through commit publication and clean checkpoint.
+///
+/// # Errors
+///
+/// Returns an error for any lower write/flush failure or completion identity mismatch.
+fn complete_prepared_mutation<S: HostStorage>(
+    storage: &mut S,
+    coordinator: &mut ext4_core::MutationCoordinatorState,
+    ticket: u64,
+    prepared: ext4_core::CommitReadyMutation,
+) -> TaskResult<ext4_core::CommittedEpoch> {
+    let ordered = complete_storage_sequence(storage, prepared.start())?;
+    complete_file_request_checked(storage, ordered.flush_request())?;
+    let payloads = complete_storage_sequence(storage, ordered.completed())?;
+    complete_file_request_checked(storage, payloads.flush_request())?;
+    let (commit_request, commit_durability) = payloads.completed().submit();
+    complete_file_request_checked(storage, commit_request)?;
+    complete_file_request_checked(storage, commit_durability.flush_request())?;
+    let published = commit_durability
+        .completed()
+        .publish(coordinator, ext4_core::VisibilityLease::granted(ticket));
+    let (epoch, checkpoint) = published.into_parts();
+    let home = complete_storage_sequence(
+        storage,
+        checkpoint.start(ext4_core::CheckpointLease::granted(epoch.sequence())),
+    )?;
+    complete_file_request_checked(storage, home.flush_request())?;
+    let (clean_request, clean_durability) = home.completed().submit();
+    complete_file_request_checked(storage, clean_request)?;
+    complete_file_request_checked(storage, clean_durability.flush_request())?;
+    Ok(clean_durability.completed(coordinator))
+}
+
+/// Executes one typed mutation against a mounted image and cleanly closes the volume.
+///
+/// # Errors
+///
+/// Returns an error for admission, resolve, commit, checkpoint, clean-close, or host I/O failure.
+fn drive_core_mutation<S, F, R>(
+    storage: &mut S,
+    completed: Box<ext4_core::CompletedMount>,
+    mutate: F,
+) -> TaskResult<R>
+where
+    S: HostStorage,
+    F: for<'storage, 'epoch, 'crypto> FnMut(
+        &mut ext4_core::MutationResolvePass<'storage, 'epoch, 'crypto>,
+    ) -> ext4_core::Result<R>,
+{
+    let filesystem_length =
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
+    let (profile, epoch, mut coordinator) = (*completed).into_parts();
+    let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
+    let (prepared, output) =
+        prepare_core_mutation(storage, &profile, &epoch, &coordinator, ticket, mutate)?;
+    let _checkpointed_epoch =
+        complete_prepared_mutation(storage, &mut coordinator, ticket, prepared)?;
+    complete_core_clean_close(storage, filesystem_length, profile.journal_target())?;
+    Ok(output)
+}
+
+/// Mounts one internal-journal image, executes a typed mutation, and cleanly closes it.
+///
+/// # Errors
+///
+/// Returns an error for image I/O or any production mount/mutation/close transition.
+fn drive_internal_core_mutation<F, R>(image: &Path, mutate: F) -> TaskResult<R>
+where
+    F: for<'storage, 'epoch, 'crypto> FnMut(
+        &mut ext4_core::MutationResolvePass<'storage, 'epoch, 'crypto>,
+    ) -> ext4_core::Result<R>,
+{
+    let mut storage = FileStorageAdapter::open_internal(image)?;
+    let completed = mount_internal_core(&mut storage)?;
+    drive_core_mutation(&mut storage, completed, mutate)
+}
+
+/// Mounts one external-journal image pair, executes a typed mutation, and cleanly closes it.
+///
+/// # Errors
+///
+/// Returns an error for image I/O or any production mount/mutation/close transition.
+fn drive_external_core_mutation<F, R>(
+    filesystem: &Path,
+    external_journal: &Path,
+    mutate: F,
+) -> TaskResult<R>
+where
+    F: for<'storage, 'epoch, 'crypto> FnMut(
+        &mut ext4_core::MutationResolvePass<'storage, 'epoch, 'crypto>,
+    ) -> ext4_core::Result<R>,
+{
+    let mut storage = FileStorageAdapter::open_external(filesystem, external_journal)?;
+    let completed = mount_external_core(&mut storage)?;
+    drive_core_mutation(&mut storage, completed, mutate)
 }
 
 /// Mounts a clean image, commits a core-generated metadata transaction, and intentionally stops
@@ -3250,29 +4009,7 @@ fn prepare_volume_label_commit<S: HostStorage>(
 /// Returns an error for mount/resolve/commit typestate failure or host image I/O failure.
 fn drive_core_commit_without_checkpoint(image: &Path, label: &[u8]) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_internal(image)?;
-    let length = ext4_core::DeviceLength::from_bytes(storage.filesystem.metadata()?.len());
-    let mut mount = Box::try_new(ext4_core::MountOperation::new(
-        length,
-        ext4_core::FscryptKeySet::empty(),
-    ))?
-    .advance(ext4_core::OperationEvent::Admitted);
-    let completed = loop {
-        match mount {
-            ext4_core::MountTransition::SubmitLower { request, suspended } => {
-                let completion = complete_file_request(&mut storage, request)?;
-                mount = suspended.advance(ext4_core::OperationEvent::StorageCompleted(completion));
-            }
-            ext4_core::MountTransition::DiscoverExternalJournal { .. } => {
-                return Err(io::Error::other(
-                    "core-generated internal transaction requested external discovery",
-                )
-                .into());
-            }
-            ext4_core::MountTransition::Complete(result) => {
-                break result.map_err(core_task_error)?;
-            }
-        }
-    };
+    let completed = mount_internal_core(&mut storage)?;
     let (prepared, _coordinator, _ticket) =
         prepare_volume_label_commit(&mut storage, completed, label)?;
     let ordered = complete_storage_sequence(&mut storage, prepared.start())?;
@@ -3321,7 +4058,7 @@ fn complete_file_request_checked(
     Ok(())
 }
 
-/// Cryptographic boundary used by the volume-label-only production mutation resolve pass.
+/// Cryptographic boundary used by unencrypted interoperability mutation resolve passes.
 #[derive(Debug)]
 struct RejectingCryptographicOperation;
 
@@ -4807,8 +5544,8 @@ mod tests {
         TaskResult, UNVERIFIED_ARTIFACT_ID, WindowsKitVersion, comma_separated_blocks,
         copy_exact_bytes, effect_cut_stem, enumerate_effect_cuts, hash_source_record,
         jbd2_control_checksum, normalize_debugfs_commit_timestamp, normalize_debugfs_descriptor,
-        normalized_manifest_value, padded_volume_label, parse_journal_fixture_manifest_text,
-        read_be_u32, required_version_line,
+        normalized_manifest_value, parse_journal_fixture_manifest_text, read_be_u32,
+        required_version_line,
     };
     use sha2::Digest as _;
     use std::{ffi::OsStr, fs, path::Path};
@@ -4962,24 +5699,6 @@ mod tests {
         assert!(serialized.is_ok(), "ordered block list must serialize");
         assert_eq!(serialized.ok().as_deref(), Some("4-6,9,11-12"));
         assert!(comma_separated_blocks(&[]).is_err());
-    }
-
-    /// Volume-label boundary conversion accepts every representable width and rejects overflow.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a short label is rejected, padding is nonzero, or a 17-byte label is accepted.
-    #[test]
-    fn fault_matrix_volume_label_padding_has_exact_ext4_width() {
-        assert_eq!(
-            padded_volume_label(b"FAULT-JBD2").ok(),
-            Some(*b"FAULT-JBD2\0\0\0\0\0\0")
-        );
-        assert_eq!(
-            padded_volume_label(b"0123456789ABCDEF").ok(),
-            Some(*b"0123456789ABCDEF")
-        );
-        assert!(padded_volume_label(b"0123456789ABCDEFG").is_err());
     }
 
     /// Write effects expand to every atomic-sector prefix while flushes remain target-local cuts.
