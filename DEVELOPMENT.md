@@ -67,6 +67,45 @@ driver, or that mount and teardown succeeded. Live validation must compare the
 loaded DriverStore SYS hash with the verified bundle and treat a missing
 Verifier configuration, cleanup failure, or hash mismatch as failure.
 
+On a dedicated host, the read-only preflight is:
+
+```console
+cargo xtask check-live-driver-host
+```
+
+It requires elevation, Hyper-V PowerShell, WSL/e2fsprogs, an explicit
+`ext4win.sys` Driver Verifier configuration, and absence of an existing
+ext4win service or DriverStore package. The full destructive command is:
+
+```console
+cargo xtask verify-live-vhdx
+```
+
+The command does not accept a disk path or disk number. It first creates a
+verified production bundle and then creates only a new fixed-size VHDX below
+`target/live-vhdx-sessions/<session-id>/`. WSL device discovery is bounded to
+the one new device introduced by that VHDX, and WSL is explicitly unmounted
+before the disk is reattached for Windows-driver access.
+
+Before service start and again after service start, the workflow consumes
+PnPUtil XML inventory, selects the exact newly published OEM INF, exports that
+package, and compares its SYS hash with the production manifest. It does not
+parse localized PnPUtil display text. File create/read/write, rename, hard
+link, patterned enumeration, durable flush, clean volume dismount, driver
+unload, package removal, and VHDX removal must all succeed.
+
+Every external side effect is preceded by a new, durably flushed
+`session-v1-NNNN.manifest` snapshot. An interrupted session is reconciled with:
+
+```console
+cargo xtask cleanup-live-vhdx-session <session-id>
+```
+
+Cleanup resolves only the generated session directory and refuses to act
+unless the verified bundle identity and SYS hash, exact VHDX path, recorded
+disk unique ID, service name, and structured-inventory OEM INF still match.
+Physical disks remain permanently outside this workflow.
+
 ## Crash model
 
 Crash-consistency assurance assumes 512-byte atomic sectors. Writes may be

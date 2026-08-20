@@ -46,3 +46,19 @@ state. Mixed allocation, link, or xattr state is invalid.
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for host contracts, CI boundaries, and
 live-driver assurance limits.
+
+The manual live commands are:
+
+```console
+cargo xtask check-live-driver-host
+cargo xtask verify-live-vhdx
+cargo xtask cleanup-live-vhdx-session <session-id>
+```
+
+They accept no physical disk path or disk number. `verify-live-vhdx` creates
+its own fixed-size disposable VHDX, formats it through WSL, unmounts it from
+WSL before Windows access, verifies the exported DriverStore SYS hash before
+and after service start, exercises file-system behavior under Driver Verifier,
+and requires complete service/package/VHDX cleanup. Each external side effect
+is preceded by a durable append-only session manifest. Cleanup revalidates the
+session artifact identity, OEM INF, VHDX path, and disk unique ID before acting.
