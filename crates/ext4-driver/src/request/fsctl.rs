@@ -800,24 +800,52 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn fsverity_enable_payload_rejects_reserved_and_bad_pointer_pairs() {
-        let reserved = enable_verity_payload(1, 1024, 0, 0, 0, 0);
-        let mut reserved = must!(reserved);
-        {
-            let mut output = LittleEndianOutput::new(&mut reserved);
-            must!(output.write_u32(wire_offset(FSVERITY_ENABLE_RESERVED1_OFFSET), 1));
-        }
-        assert_eq!(
-            FsverityEnablePayload::parse(&reserved),
-            Err(DriverError::InvalidParameter)
-        );
-
+    fn fsverity_enable_payload_rejects_bad_pointer_pairs() {
         let bad_salt = enable_verity_payload(1, 1024, 0, 1, 0, 0);
         let bad_salt = must!(bad_salt);
         assert_eq!(
             FsverityEnablePayload::parse(&bad_salt),
             Err(DriverError::InvalidParameter)
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when any generated nonzero reserved bit is accepted by the fs-verity decoder.
+    #[test]
+    fn fsverity_enable_payload_rejects_every_reserved_bit() {
+        let baseline = must!(enable_verity_payload(1, 1024, 0, 0, 0, 0));
+        let reserved1_end =
+            FSVERITY_ENABLE_RESERVED1_OFFSET.checked_add(core::mem::size_of::<u32>());
+        let reserved2_end =
+            FSVERITY_ENABLE_RESERVED2_OFFSET.checked_add(FSVERITY_ENABLE_RESERVED2_BYTES);
+        assert!(reserved1_end.is_some());
+        assert!(reserved2_end.is_some());
+        let (Some(reserved1_end), Some(reserved2_end)) = (reserved1_end, reserved2_end) else {
+            return;
+        };
+
+        for offset in (FSVERITY_ENABLE_RESERVED1_OFFSET..reserved1_end)
+            .chain(FSVERITY_ENABLE_RESERVED2_OFFSET..reserved2_end)
+        {
+            for bit in 0..u8::BITS {
+                let mask = 1_u8.checked_shl(bit);
+                assert!(mask.is_some());
+                let Some(mask) = mask else {
+                    continue;
+                };
+                let mut payload = baseline.clone();
+                let reserved = payload.get_mut(offset);
+                assert!(reserved.is_some());
+                if let Some(reserved) = reserved {
+                    *reserved = mask;
+                }
+                assert_eq!(
+                    FsverityEnablePayload::parse(&payload),
+                    Err(DriverError::InvalidParameter)
+                );
+            }
+        }
     }
 
     /// Builds a Linux fscrypt add-key payload.

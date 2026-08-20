@@ -264,8 +264,57 @@ impl<'a> LittleEndianOutput<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WireByteLen, WireOffset, WireRange};
+    use super::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
     use crate::kernel::status::DriverError;
+
+    /// # Panics
+    ///
+    /// Panics when the checked range contract disagrees with the generated payload boundary.
+    #[test]
+    fn generated_wire_ranges_match_payload_boundaries() {
+        let payload = [0_u8; 32];
+        for payload_len in 0..=payload.len() {
+            let view = payload.get(..payload_len);
+            assert!(view.is_some());
+            let Some(view) = view else {
+                continue;
+            };
+            for offset in 0..=34 {
+                for length in 0..=8 {
+                    let range = WireRange::new(WireOffset::new(offset), WireByteLen::new(length));
+                    assert!(range.is_ok());
+                    if let Ok(range) = range {
+                        let expected = offset
+                            .checked_add(length)
+                            .is_some_and(|end| end <= payload_len);
+                        assert_eq!(range.read_from(view).is_ok(), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a scalar wire value cannot round-trip at an aligned or unaligned byte offset.
+    #[test]
+    fn generated_scalar_fields_are_alignment_independent() {
+        for offset in 0..=8 {
+            let offset_value = u64::try_from(offset);
+            assert!(offset_value.is_ok());
+            let Ok(offset_value) = offset_value else {
+                continue;
+            };
+            let value = 0x8070_6050_4030_2010_u64 ^ offset_value;
+            let mut payload = [0_u8; 16];
+            let mut output = LittleEndianOutput::new(&mut payload);
+            assert_eq!(output.write_u64(WireOffset::new(offset), value), Ok(()));
+            assert_eq!(
+                LittleEndianInput::new(&payload).read_u64(WireOffset::new(offset)),
+                Ok(value)
+            );
+        }
+    }
 
     /// # Panics
     ///

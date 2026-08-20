@@ -388,6 +388,7 @@ mod tests {
     use super::{
         pack_attribute_information, pack_device_information, volume_label_from_file_fs_label,
     };
+    use ext4_core::Ext4VolumeLabel;
 
     /// # Panics
     ///
@@ -436,6 +437,51 @@ mod tests {
             volume_label_from_file_fs_label(input.as_slice()),
             Err(DriverError::InvalidParameter)
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when generated UTF-16 or ext4 label boundaries are decoded inconsistently.
+    #[test]
+    fn generated_file_fs_labels_obey_utf16_and_ext4_boundaries() {
+        let maximum_plus_one = Ext4VolumeLabel::MAX_BYTES.checked_add(1);
+        assert!(maximum_plus_one.is_some());
+        let Some(maximum_plus_one) = maximum_plus_one else {
+            return;
+        };
+        for length in 0..=maximum_plus_one {
+            let label = vec![b'A'; length];
+            assert_eq!(
+                volume_label_from_file_fs_label(&label_information_bytes(&label)).is_ok(),
+                length <= Ext4VolumeLabel::MAX_BYTES
+            );
+        }
+
+        for byte in 1..=u8::MAX {
+            let label = [byte];
+            let decoded = volume_label_from_file_fs_label(&label_information_bytes(&label));
+            assert!(decoded.is_ok());
+            if let Ok(decoded) = decoded {
+                assert_eq!(decoded.bytes(), label.as_slice());
+            }
+        }
+
+        for unit in [0x0100_u16, 0xd7ff, 0xd800, 0xdfff, 0xffff] {
+            assert_eq!(
+                volume_label_from_file_fs_label(&label_information_units(&[unit])),
+                Err(DriverError::NotSupported)
+            );
+        }
+
+        for odd_length in (1_u32..=33).step_by(2) {
+            let mut input = label_information_bytes(b"0123456789abcdef");
+            let mut output = crate::wire::LittleEndianOutput::new(input.as_mut_slice());
+            assert_eq!(output.write_u32(WireOffset::new(0), odd_length), Ok(()));
+            assert_eq!(
+                volume_label_from_file_fs_label(input.as_slice()),
+                Err(DriverError::InvalidParameter)
+            );
+        }
     }
 
     /// # Panics
@@ -492,6 +538,29 @@ mod tests {
             for byte in label {
                 input.extend_from_slice(u16::from(*byte).to_le_bytes().as_slice());
             }
+        }
+        input
+    }
+
+    /// Builds a FILE_FS_LABEL_INFORMATION byte image from raw UTF-16 units.
+    /// # Panics
+    ///
+    /// Panics when fixed test fixture lengths cannot be represented.
+    fn label_information_units(units: &[u16]) -> alloc::vec::Vec<u8> {
+        let label_bytes = units.len().checked_mul(core::mem::size_of::<u16>());
+        assert!(label_bytes.is_some());
+        let Some(label_bytes) = label_bytes else {
+            return Vec::new();
+        };
+        let label_len = u32::try_from(label_bytes);
+        assert!(label_len.is_ok());
+        let Ok(label_len) = label_len else {
+            return Vec::new();
+        };
+        let mut input = Vec::new();
+        input.extend_from_slice(label_len.to_le_bytes().as_slice());
+        for unit in units {
+            input.extend_from_slice(unit.to_le_bytes().as_slice());
         }
         input
     }

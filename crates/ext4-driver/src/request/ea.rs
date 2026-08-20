@@ -790,9 +790,9 @@ mod tests {
     };
 
     use super::{
-        CreateEa, WindowsEaName, WindowsEaRecord, WindowsEaValue, indexed_ea_entries,
-        pack_full_ea_entries, parse_full_ea_list, parse_get_ea_list, wire_offset,
-        xattr_name_from_ea_name,
+        CreateEa, EA_RECORD_ALIGNMENT, WindowsEaName, WindowsEaRecord, WindowsEaValue,
+        indexed_ea_entries, pack_full_ea_entries, parse_full_ea_list, parse_get_ea_list,
+        wire_offset, xattr_name_from_ea_name,
     };
 
     /// Builds a create dispatch target carrying one EA system buffer.
@@ -1108,6 +1108,39 @@ mod tests {
             parse_full_ea_list(input.as_slice()),
             Err(DriverError::EaListInconsistent)
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a generated non-DWORD-aligned EA record offset is accepted.
+    #[test]
+    fn generated_full_ea_offsets_require_dword_alignment() {
+        let entries = sample_ea_records();
+        let mut baseline = vec![0; 96];
+        let written = pack_full_ea_entries(entries.as_slice(), baseline.as_mut_slice());
+        assert!(written.is_ok());
+        let Ok(written) = written else {
+            return;
+        };
+        let baseline = baseline.get(..written);
+        assert!(baseline.is_some());
+        let Some(baseline) = baseline else {
+            return;
+        };
+
+        for next in 1_u32..32 {
+            if usize::try_from(next).is_ok_and(|offset| offset.is_multiple_of(EA_RECORD_ALIGNMENT))
+            {
+                continue;
+            }
+            let mut input = baseline.to_vec();
+            let mut output = LittleEndianOutput::new(input.as_mut_slice());
+            assert_eq!(output.write_u32(wire_offset(0), next), Ok(()));
+            assert_eq!(
+                parse_full_ea_list(input.as_slice()),
+                Err(DriverError::EaListInconsistent)
+            );
+        }
     }
 
     /// # Panics
