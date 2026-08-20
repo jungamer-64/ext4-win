@@ -552,7 +552,45 @@ impl FixtureLoopDevices {
     }
 }
 
-/// Host-file implementation of the production storage target boundary.
+/// Host-side storage behavior required by the production core state machines.
+trait HostStorage {
+    /// Returns the selected device length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target is unavailable or its metadata cannot be read.
+    fn length(&self, target: ext4_core::StorageTarget) -> TaskResult<u64>;
+    /// Reads one exact range from the selected volatile image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target is unavailable or the exact range cannot be read.
+    fn read_exact(
+        &mut self,
+        target: ext4_core::StorageTarget,
+        offset: u64,
+        output: &mut [u8],
+    ) -> TaskResult<()>;
+    /// Applies one complete write to the selected volatile image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target is unavailable or the complete range cannot be written.
+    fn write_all(
+        &mut self,
+        target: ext4_core::StorageTarget,
+        offset: u64,
+        input: &[u8],
+    ) -> TaskResult<()>;
+    /// Makes only the selected device's volatile image durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target is unavailable or cannot reach host durability.
+    fn flush(&mut self, target: ext4_core::StorageTarget) -> TaskResult<()>;
+}
+
+/// Direct host-file implementation used by ordinary interoperability execution.
 #[derive(Debug)]
 struct FileStorageAdapter {
     /// Primary filesystem image.
@@ -561,23 +599,82 @@ struct FileStorageAdapter {
     external_journal: Option<File>,
 }
 
-/// Progress of one production workflow stopped only after a complete write or flush effect.
+/// One write completed against a volatile crash-model device since its last flush.
+#[derive(Debug)]
+struct PendingCrashWrite {
+    /// Device-relative byte offset.
+    offset: u64,
+    /// Complete write payload retained for sector-prefix materialization.
+    bytes: Vec<u8>,
+}
+
+/// Independent volatile/durable state for one crash-model device.
+#[derive(Debug)]
+struct CrashDeviceImage {
+    /// Caller-visible image used by core reads and volatile writes.
+    volatile: File,
+    /// Last state made durable by a successful flush.
+    durable: Vec<u8>,
+    /// Ordered writes accepted after the last successful device-local flush.
+    pending: Vec<PendingCrashWrite>,
+}
+
+/// Fault adapter keeping filesystem and external journal durability independent.
+#[derive(Debug)]
+struct CrashStorageAdapter {
+    /// Primary filesystem device state.
+    filesystem: CrashDeviceImage,
+    /// Dedicated external journal device state.
+    external_journal: CrashDeviceImage,
+}
+
+/// Shape of one completed write or flush in a production workflow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageEffect {
+    /// One volatile write whose crash persistence is selectable at 512-byte boundaries.
+    Write {
+        /// Device receiving the write.
+        target: ext4_core::StorageTarget,
+        /// Complete write byte length.
+        bytes: usize,
+    },
+    /// One successful flush affecting only its selected device.
+    Flush {
+        /// Device made durable.
+        target: ext4_core::StorageTarget,
+    },
+}
+
+/// Exact crash boundary selected from a previously probed storage-effect trace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectCut {
+    /// One-based effect index.
+    effect: usize,
+    /// Persisted byte prefix for a write, or `None` for a completed flush.
+    write_prefix: Option<usize>,
+}
+
+/// Progress of one production workflow stopped only after a selected write or flush effect.
+#[derive(Debug, Eq, PartialEq)]
 struct EffectBoundaryRun {
     /// Number of write/flush requests completed by this execution.
     completed_effects: usize,
     /// Whether the workflow reached its semantic terminal state instead of simulating a crash.
     completed: bool,
+    /// Exact ordered effect shapes observed before termination.
+    effects: Vec<StorageEffect>,
 }
 
 /// Counts production durability effects and withholds the completion that crosses a selected
 /// crash boundary.
 #[derive(Debug)]
 struct EffectBoundaryController {
-    /// One-based write/flush completion at which the in-memory operation is abandoned.
-    stop_after: Option<usize>,
+    /// Selected write-prefix or completed-flush crash boundary.
+    cut: Option<EffectCut>,
     /// Write/flush completions already applied to the host image.
     completed_effects: usize,
+    /// Ordered effect trace used to enumerate every subsequent crash run.
+    effects: Vec<StorageEffect>,
 }
 
 impl EffectBoundaryController {
@@ -586,43 +683,75 @@ impl EffectBoundaryController {
     /// # Errors
     ///
     /// Returns an error when zero is supplied even though effect boundaries are one-based.
-    fn new(stop_after: Option<usize>) -> TaskResult<Self> {
-        if stop_after == Some(0) {
+    fn new(cut: Option<EffectCut>) -> TaskResult<Self> {
+        if cut.is_some_and(|cut| cut.effect == 0) {
             return Err(io::Error::other("effect boundary zero is invalid").into());
         }
         Ok(Self {
-            stop_after,
+            cut,
             completed_effects: 0,
+            effects: Vec::new(),
         })
     }
 
     /// Executes one request and returns no completion when its durable effect is the selected
     /// simulated-crash boundary.
     ///
-    /// A final `sync_all` models the maximal persistence permitted at that boundary. The remount
-    /// must therefore accept both the old and new semantic state without relying on volatile
-    /// operation state.
+    /// A write cut persists the selected 512-byte prefix plus earlier writes on that device. A
+    /// flush cut persists only the selected device. The remount must therefore accept both the
+    /// old and new semantic state without relying on volatile operation state.
     ///
     /// # Errors
     ///
     /// Returns an error for request I/O, effect-count overflow, or host durability failure.
     fn complete(
         &mut self,
-        storage: &mut FileStorageAdapter,
+        storage: &mut CrashStorageAdapter,
         request: ext4_core::StorageRequest,
     ) -> TaskResult<Option<ext4_core::StorageCompletion>> {
-        let has_effect = matches!(
-            request,
-            ext4_core::StorageRequest::Write { .. } | ext4_core::StorageRequest::Flush { .. }
-        );
+        let effect = match &request {
+            ext4_core::StorageRequest::Read { .. } => None,
+            ext4_core::StorageRequest::Write { target, buffer, .. } => Some(StorageEffect::Write {
+                target: *target,
+                bytes: buffer.len(),
+            }),
+            ext4_core::StorageRequest::Flush { target } => {
+                Some(StorageEffect::Flush { target: *target })
+            }
+        };
         let completion = complete_file_request(storage, request)?;
-        if has_effect {
+        if let Some(effect) = effect {
             self.completed_effects = self
                 .completed_effects
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("effect boundary count overflow"))?;
-            if self.stop_after == Some(self.completed_effects) {
-                storage.sync_all()?;
+            self.effects.push(effect);
+            if self
+                .cut
+                .is_some_and(|cut| cut.effect == self.completed_effects)
+            {
+                let cut = self
+                    .cut
+                    .ok_or_else(|| io::Error::other("selected effect cut disappeared"))?;
+                match (effect, cut.write_prefix) {
+                    (StorageEffect::Write { target, bytes }, Some(prefix)) => {
+                        if prefix > bytes || prefix % 512 != 0 {
+                            return Err(io::Error::other(
+                                "write crash prefix is outside a 512-byte sector boundary",
+                            )
+                            .into());
+                        }
+                        storage.materialize_write_prefix(target, prefix)?;
+                    }
+                    (StorageEffect::Flush { .. }, None) => storage.materialize_durable()?,
+                    (StorageEffect::Write { .. }, None)
+                    | (StorageEffect::Flush { .. }, Some(_)) => {
+                        return Err(io::Error::other(
+                            "effect cut persistence does not match its request kind",
+                        )
+                        .into());
+                    }
+                }
                 return Ok(None);
             }
         }
@@ -630,18 +759,20 @@ impl EffectBoundaryController {
     }
 
     /// Reports a simulated crash after the selected completion.
-    const fn stopped(self) -> EffectBoundaryRun {
+    fn stopped(self) -> EffectBoundaryRun {
         EffectBoundaryRun {
             completed_effects: self.completed_effects,
             completed: false,
+            effects: self.effects,
         }
     }
 
     /// Reports normal completion of the production workflow.
-    const fn completed(self) -> EffectBoundaryRun {
+    fn completed(self) -> EffectBoundaryRun {
         EffectBoundaryRun {
             completed_effects: self.completed_effects,
             completed: true,
+            effects: self.effects,
         }
     }
 }
@@ -700,18 +831,215 @@ impl FileStorageAdapter {
         }
     }
 
-    /// Flushes both host files after a deliberately interrupted core commit.
-    ///
+    /// Returns one routed immutable host file or rejects an unavailable external target.
     /// # Errors
     ///
-    /// Returns the first host durability failure.
-    fn sync_all(&self) -> TaskResult<()> {
-        self.filesystem.sync_all()?;
-        if let Some(external) = &self.external_journal {
-            external.sync_all()?;
+    /// Returns an error when an internal-only adapter receives an external-journal request.
+    fn target(&self, target: ext4_core::StorageTarget) -> TaskResult<&File> {
+        match target {
+            ext4_core::StorageTarget::Filesystem => Ok(&self.filesystem),
+            ext4_core::StorageTarget::ExternalJournal => self
+                .external_journal
+                .as_ref()
+                .ok_or_else(|| io::Error::other("unexpected external-journal request").into()),
+        }
+    }
+}
+
+impl HostStorage for FileStorageAdapter {
+    fn length(&self, target: ext4_core::StorageTarget) -> TaskResult<u64> {
+        Ok(self.target(target)?.metadata()?.len())
+    }
+
+    fn read_exact(
+        &mut self,
+        target: ext4_core::StorageTarget,
+        offset: u64,
+        output: &mut [u8],
+    ) -> TaskResult<()> {
+        let file = self.target_mut(target)?;
+        file.seek(io::SeekFrom::Start(offset))?;
+        file.read_exact(output)?;
+        Ok(())
+    }
+
+    fn write_all(
+        &mut self,
+        target: ext4_core::StorageTarget,
+        offset: u64,
+        input: &[u8],
+    ) -> TaskResult<()> {
+        let file = self.target_mut(target)?;
+        file.seek(io::SeekFrom::Start(offset))?;
+        file.write_all(input)?;
+        Ok(())
+    }
+
+    fn flush(&mut self, target: ext4_core::StorageTarget) -> TaskResult<()> {
+        self.target_mut(target)?.sync_all()?;
+        Ok(())
+    }
+}
+
+impl CrashDeviceImage {
+    /// Opens one volatile image and snapshots its initial durable bytes.
+    /// # Errors
+    ///
+    /// Returns an error when the image cannot be read or opened read/write.
+    fn open(path: &Path) -> TaskResult<Self> {
+        Ok(Self {
+            volatile: OpenOptions::new().read(true).write(true).open(path)?,
+            durable: fs::read(path)?,
+            pending: Vec::new(),
+        })
+    }
+
+    /// Copies the volatile device state into its durable image after a successful flush.
+    /// # Errors
+    ///
+    /// Returns an error when host synchronization or image reading fails.
+    fn flush(&mut self) -> TaskResult<()> {
+        self.volatile.sync_all()?;
+        self.volatile.seek(io::SeekFrom::Start(0))?;
+        self.durable.clear();
+        self.volatile.read_to_end(&mut self.durable)?;
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Replaces the caller-visible image with durable bytes and an optional pending-write prefix.
+    /// # Errors
+    ///
+    /// Returns an error for invalid ranges or host image I/O failure.
+    fn materialize(&mut self, write_prefix: Option<usize>) -> TaskResult<()> {
+        let durable_len = u64::try_from(self.durable.len())?;
+        self.volatile.set_len(durable_len)?;
+        self.volatile.seek(io::SeekFrom::Start(0))?;
+        self.volatile.write_all(&self.durable)?;
+        if let Some(prefix) = write_prefix {
+            let Some((selected, prior)) = self.pending.split_last() else {
+                return Err(io::Error::other("write cut has no pending device write").into());
+            };
+            for write in prior {
+                write_host_range(&mut self.volatile, write.offset, &write.bytes)?;
+            }
+            let bytes = selected
+                .bytes
+                .get(..prefix)
+                .ok_or_else(|| io::Error::other("write cut prefix exceeds its payload"))?;
+            write_host_range(&mut self.volatile, selected.offset, bytes)?;
+        }
+        self.volatile.sync_all()?;
+        Ok(())
+    }
+}
+
+impl CrashStorageAdapter {
+    /// Opens two independently durable device images for one external-journal fault run.
+    /// # Errors
+    ///
+    /// Returns an error when either image cannot be opened or snapshotted.
+    fn open_external(filesystem: &Path, external_journal: &Path) -> TaskResult<Self> {
+        Ok(Self {
+            filesystem: CrashDeviceImage::open(filesystem)?,
+            external_journal: CrashDeviceImage::open(external_journal)?,
+        })
+    }
+
+    /// Returns the selected crash-model device.
+    fn target(&self, target: ext4_core::StorageTarget) -> &CrashDeviceImage {
+        match target {
+            ext4_core::StorageTarget::Filesystem => &self.filesystem,
+            ext4_core::StorageTarget::ExternalJournal => &self.external_journal,
+        }
+    }
+
+    /// Returns the uniquely borrowed selected crash-model device.
+    fn target_mut(&mut self, target: ext4_core::StorageTarget) -> &mut CrashDeviceImage {
+        match target {
+            ext4_core::StorageTarget::Filesystem => &mut self.filesystem,
+            ext4_core::StorageTarget::ExternalJournal => &mut self.external_journal,
+        }
+    }
+
+    /// Materializes only durable bytes for both independently flushed devices.
+    /// # Errors
+    ///
+    /// Returns an error when either caller-visible image cannot be replaced and synchronized.
+    fn materialize_durable(&mut self) -> TaskResult<()> {
+        self.filesystem.materialize(None)?;
+        self.external_journal.materialize(None)?;
+        Ok(())
+    }
+
+    /// Materializes a sector prefix on one device while losing all volatile writes on the other.
+    /// # Errors
+    ///
+    /// Returns an error when the selected pending write or host image range is invalid.
+    fn materialize_write_prefix(
+        &mut self,
+        target: ext4_core::StorageTarget,
+        prefix: usize,
+    ) -> TaskResult<()> {
+        match target {
+            ext4_core::StorageTarget::Filesystem => {
+                self.filesystem.materialize(Some(prefix))?;
+                self.external_journal.materialize(None)?;
+            }
+            ext4_core::StorageTarget::ExternalJournal => {
+                self.filesystem.materialize(None)?;
+                self.external_journal.materialize(Some(prefix))?;
+            }
         }
         Ok(())
     }
+}
+
+impl HostStorage for CrashStorageAdapter {
+    fn length(&self, target: ext4_core::StorageTarget) -> TaskResult<u64> {
+        Ok(self.target(target).volatile.metadata()?.len())
+    }
+
+    fn read_exact(
+        &mut self,
+        target: ext4_core::StorageTarget,
+        offset: u64,
+        output: &mut [u8],
+    ) -> TaskResult<()> {
+        let file = &mut self.target_mut(target).volatile;
+        file.seek(io::SeekFrom::Start(offset))?;
+        file.read_exact(output)?;
+        Ok(())
+    }
+
+    fn write_all(
+        &mut self,
+        target: ext4_core::StorageTarget,
+        offset: u64,
+        input: &[u8],
+    ) -> TaskResult<()> {
+        let device = self.target_mut(target);
+        write_host_range(&mut device.volatile, offset, input)?;
+        device.pending.push(PendingCrashWrite {
+            offset,
+            bytes: input.to_vec(),
+        });
+        Ok(())
+    }
+
+    fn flush(&mut self, target: ext4_core::StorageTarget) -> TaskResult<()> {
+        self.target_mut(target).flush()
+    }
+}
+
+/// Writes one exact host-file range without changing bytes outside the supplied slice.
+/// # Errors
+///
+/// Returns an error when seeking or writing the selected range fails.
+fn write_host_range(file: &mut File, offset: u64, bytes: &[u8]) -> TaskResult<()> {
+    file.seek(io::SeekFrom::Start(offset))?;
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 impl JournalInteropCase {
@@ -2146,14 +2474,15 @@ fn verify_external_journal_fault_matrix(
     let recovery_probe =
         run_external_mount_until_boundary(&probe_filesystem, &probe_journal, None)?;
     let recovery_effects = require_completed_effect_probe("recovery", recovery_probe)?;
+    let recovery_cuts = enumerate_effect_cuts(&recovery_effects)?;
     remove_fault_pair(&probe_filesystem, &probe_journal)?;
 
-    for boundary in 1..=recovery_effects {
-        let stem = format!("recovery-{boundary:03}");
+    for cut in recovery_cuts.iter().copied() {
+        let stem = format!("recovery-{}", effect_cut_stem(cut));
         let (filesystem, journal) =
             copy_fault_pair(&matrix_root, &stem, dirty_filesystem, dirty_journal)?;
-        let run = run_external_mount_until_boundary(&filesystem, &journal, Some(boundary))?;
-        require_stopped_effect("recovery", boundary, run)?;
+        let run = run_external_mount_until_boundary(&filesystem, &journal, Some(cut))?;
+        require_stopped_effect("recovery", cut, run)?;
         let observed = {
             let mut image = File::open(&filesystem)?;
             read_image_block(&mut image, fixture.replay_block, fixture.block_size)?
@@ -2185,14 +2514,15 @@ fn verify_external_journal_fault_matrix(
     let close_probe =
         run_external_clean_close_until_boundary(&probe_filesystem, &probe_journal, None)?;
     let close_effects = require_completed_effect_probe("clean close", close_probe)?;
+    let close_cuts = enumerate_effect_cuts(&close_effects)?;
     remove_fault_pair(&probe_filesystem, &probe_journal)?;
 
-    for boundary in 1..=close_effects {
-        let stem = format!("close-{boundary:03}");
+    for cut in close_cuts.iter().copied() {
+        let stem = format!("close-{}", effect_cut_stem(cut));
         let (filesystem, journal) =
             copy_fault_pair(&matrix_root, &stem, &clean_filesystem, &clean_journal)?;
-        let run = run_external_clean_close_until_boundary(&filesystem, &journal, Some(boundary))?;
-        require_stopped_effect("clean close", boundary, run)?;
+        let run = run_external_clean_close_until_boundary(&filesystem, &journal, Some(cut))?;
+        require_stopped_effect("clean close", cut, run)?;
         drive_external_core_mount_and_clean_close(&filesystem, &journal)?;
         verify_primary_recovery_marker(&filesystem, false)?;
         verify_external_e2fsck_clean(linux, &filesystem, &journal, &stem)?;
@@ -2211,19 +2541,16 @@ fn verify_external_journal_fault_matrix(
     let mutation_probe =
         run_external_mutation_until_boundary(&probe_filesystem, &probe_journal, FAULT_LABEL, None)?;
     let mutation_effects = require_completed_effect_probe("commit/checkpoint", mutation_probe)?;
+    let mutation_cuts = enumerate_effect_cuts(&mutation_effects)?;
     remove_fault_pair(&probe_filesystem, &probe_journal)?;
 
-    for boundary in 1..=mutation_effects {
-        let stem = format!("mutation-{boundary:03}");
+    for cut in mutation_cuts.iter().copied() {
+        let stem = format!("mutation-{}", effect_cut_stem(cut));
         let (filesystem, journal) =
             copy_fault_pair(&matrix_root, &stem, &clean_filesystem, &clean_journal)?;
-        let run = run_external_mutation_until_boundary(
-            &filesystem,
-            &journal,
-            FAULT_LABEL,
-            Some(boundary),
-        )?;
-        require_stopped_effect("commit/checkpoint", boundary, run)?;
+        let run =
+            run_external_mutation_until_boundary(&filesystem, &journal, FAULT_LABEL, Some(cut))?;
+        require_stopped_effect("commit/checkpoint", cut, run)?;
         let interrupted_label = read_raw_volume_label(&filesystem)?;
         require_old_or_new_bytes(
             "interrupted volume label",
@@ -2246,9 +2573,18 @@ fn verify_external_journal_fault_matrix(
 
     remove_fault_pair(&clean_filesystem, &clean_journal)?;
     fs::remove_dir(&matrix_root)?;
+    let total_effects = recovery_effects
+        .len()
+        .checked_add(mutation_effects.len())
+        .and_then(|count| count.checked_add(close_effects.len()))
+        .ok_or_else(|| io::Error::other("fault-matrix effect count overflow"))?;
     println!(
-        "JBD2 production fault matrix: PASS ({recovery_effects} recovery, \
-         {mutation_effects} commit/checkpoint, {close_effects} clean-close boundaries)"
+        "JBD2 production fault matrix: PASS ({} recovery, {} commit/checkpoint, \
+         {} clean-close sector/flush cuts across {} effects)",
+        recovery_cuts.len(),
+        mutation_cuts.len(),
+        close_cuts.len(),
+        total_effects,
     );
     Ok(())
 }
@@ -2293,19 +2629,76 @@ fn remove_fault_pair(filesystem: &Path, journal: &Path) -> TaskResult<()> {
     combine_verification_and_cleanup(filesystem_result, journal_result)
 }
 
-/// Requires a non-empty full probe and returns its effect count.
+/// Requires a non-empty full probe and returns its exact ordered effect trace.
 ///
 /// # Errors
 ///
 /// Returns an error when the workflow stopped unexpectedly or exposed no write/flush boundary.
-fn require_completed_effect_probe(label: &str, run: EffectBoundaryRun) -> TaskResult<usize> {
+fn require_completed_effect_probe(
+    label: &str,
+    run: EffectBoundaryRun,
+) -> TaskResult<Vec<StorageEffect>> {
     if !run.completed {
         return Err(io::Error::other(format!("{label} effect probe stopped unexpectedly")).into());
     }
     if run.completed_effects == 0 {
         return Err(io::Error::other(format!("{label} effect probe found no boundary")).into());
     }
-    Ok(run.completed_effects)
+    if run.completed_effects != run.effects.len() {
+        return Err(io::Error::other(format!(
+            "{label} effect probe counted {} effects but recorded {}",
+            run.completed_effects,
+            run.effects.len()
+        ))
+        .into());
+    }
+    Ok(run.effects)
+}
+
+/// Enumerates every permitted crash persistence outcome for one exact production trace.
+///
+/// Each write contributes an unpersisted case, every 512-byte prefix, and the full write. Each
+/// flush contributes one target-local durable cut.
+///
+/// # Errors
+///
+/// Returns an error when a production write is empty or is not composed of atomic sectors.
+fn enumerate_effect_cuts(effects: &[StorageEffect]) -> TaskResult<Vec<EffectCut>> {
+    let mut cuts = Vec::new();
+    for (index, observed) in effects.iter().copied().enumerate() {
+        let effect_number = index
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("effect index overflow"))?;
+        match observed {
+            StorageEffect::Write { bytes, .. } => {
+                if bytes == 0 || bytes % 512 != 0 {
+                    return Err(io::Error::other(format!(
+                        "effect {effect_number} write length {bytes} is not a positive sector multiple"
+                    ))
+                    .into());
+                }
+                for prefix in (0..=bytes).step_by(512) {
+                    cuts.push(EffectCut {
+                        effect: effect_number,
+                        write_prefix: Some(prefix),
+                    });
+                }
+            }
+            StorageEffect::Flush { .. } => cuts.push(EffectCut {
+                effect: effect_number,
+                write_prefix: None,
+            }),
+        }
+    }
+    Ok(cuts)
+}
+
+/// Produces a filesystem-safe identity for one sector-prefix or target-local-flush cut.
+fn effect_cut_stem(cut: EffectCut) -> String {
+    match cut.write_prefix {
+        Some(prefix) => format!("{:03}-write-{prefix:08}", cut.effect),
+        None => format!("{:03}-flush", cut.effect),
+    }
 }
 
 /// Requires one exact simulated-crash boundary to have been reached.
@@ -2313,13 +2706,39 @@ fn require_completed_effect_probe(label: &str, run: EffectBoundaryRun) -> TaskRe
 /// # Errors
 ///
 /// Returns an error when the workflow terminated or stopped after a different effect count.
-fn require_stopped_effect(label: &str, expected: usize, run: EffectBoundaryRun) -> TaskResult<()> {
-    if run.completed || run.completed_effects != expected {
+fn require_stopped_effect(
+    label: &str,
+    expected: EffectCut,
+    run: EffectBoundaryRun,
+) -> TaskResult<()> {
+    if run.completed
+        || run.completed_effects != expected.effect
+        || run.effects.len() != expected.effect
+    {
         return Err(io::Error::other(format!(
-            "{label} boundary {expected} produced completed={} effects={}",
-            run.completed, run.completed_effects
+            "{label} boundary {} produced completed={} effects={} trace={}",
+            effect_cut_stem(expected),
+            run.completed,
+            run.completed_effects,
+            run.effects.len()
         ))
         .into());
+    }
+    let observed = run
+        .effects
+        .last()
+        .copied()
+        .ok_or_else(|| io::Error::other("stopped effect trace is empty"))?;
+    match (observed, expected.write_prefix) {
+        (StorageEffect::Write { bytes, .. }, Some(prefix)) if prefix <= bytes => {}
+        (StorageEffect::Flush { .. }, None) => {}
+        _ => {
+            return Err(io::Error::other(format!(
+                "{label} boundary {} does not match its observed request",
+                effect_cut_stem(expected)
+            ))
+            .into());
+        }
     }
     Ok(())
 }
@@ -2400,18 +2819,13 @@ fn verify_external_e2fsck_clean(
 /// # Errors
 ///
 /// Returns an error for device geometry, host I/O, probe mismatch, or core mount rejection.
-fn mount_external_core(
-    storage: &mut FileStorageAdapter,
+fn mount_external_core<S: HostStorage>(
+    storage: &mut S,
 ) -> TaskResult<Box<ext4_core::CompletedMount>> {
     let filesystem_length =
-        ext4_core::DeviceLength::from_bytes(storage.filesystem.metadata()?.len());
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let external_length = ext4_core::DeviceLength::from_bytes(
-        storage
-            .external_journal
-            .as_ref()
-            .ok_or_else(|| io::Error::other("external adapter lost its journal"))?
-            .metadata()?
-            .len(),
+        storage.length(ext4_core::StorageTarget::ExternalJournal)?,
     );
     let mut transition = Box::try_new(ext4_core::MountOperation::new(
         filesystem_length,
@@ -2447,20 +2861,15 @@ fn mount_external_core(
 fn run_external_mount_until_boundary(
     filesystem: &Path,
     journal: &Path,
-    stop_after: Option<usize>,
+    cut: Option<EffectCut>,
 ) -> TaskResult<EffectBoundaryRun> {
-    let mut storage = FileStorageAdapter::open_external(filesystem, journal)?;
+    let mut storage = CrashStorageAdapter::open_external(filesystem, journal)?;
     let filesystem_length =
-        ext4_core::DeviceLength::from_bytes(storage.filesystem.metadata()?.len());
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let external_length = ext4_core::DeviceLength::from_bytes(
-        storage
-            .external_journal
-            .as_ref()
-            .ok_or_else(|| io::Error::other("external adapter lost its journal"))?
-            .metadata()?
-            .len(),
+        storage.length(ext4_core::StorageTarget::ExternalJournal)?,
     );
-    let mut controller = EffectBoundaryController::new(stop_after)?;
+    let mut controller = EffectBoundaryController::new(cut)?;
     let mut transition = Box::try_new(ext4_core::MountOperation::new(
         filesystem_length,
         ext4_core::FscryptKeySet::empty(),
@@ -2484,6 +2893,7 @@ fn run_external_mount_until_boundary(
             }
             ext4_core::MountTransition::Complete(result) => {
                 result.map_err(core_task_error)?;
+                storage.materialize_durable()?;
                 return Ok(controller.completed());
             }
         }
@@ -2498,14 +2908,14 @@ fn run_external_mount_until_boundary(
 fn run_external_clean_close_until_boundary(
     filesystem: &Path,
     journal: &Path,
-    stop_after: Option<usize>,
+    cut: Option<EffectCut>,
 ) -> TaskResult<EffectBoundaryRun> {
-    let mut storage = FileStorageAdapter::open_external(filesystem, journal)?;
+    let mut storage = CrashStorageAdapter::open_external(filesystem, journal)?;
     let filesystem_length =
-        ext4_core::DeviceLength::from_bytes(storage.filesystem.metadata()?.len());
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let completed = mount_external_core(&mut storage)?;
     let (profile, _epoch, _coordinator) = completed.into_parts();
-    let mut controller = EffectBoundaryController::new(stop_after)?;
+    let mut controller = EffectBoundaryController::new(cut)?;
     let mut close = Box::try_new(ext4_core::CleanCloseOperation::new(
         filesystem_length,
         profile.journal_target(),
@@ -2521,6 +2931,7 @@ fn run_external_clean_close_until_boundary(
             }
             ext4_core::CleanCloseTransition::Complete(result) => {
                 result.map_err(core_task_error)?;
+                storage.materialize_durable()?;
                 return Ok(controller.completed());
             }
         }
@@ -2536,13 +2947,13 @@ fn run_external_mutation_until_boundary(
     filesystem: &Path,
     journal: &Path,
     label: &[u8],
-    stop_after: Option<usize>,
+    cut: Option<EffectCut>,
 ) -> TaskResult<EffectBoundaryRun> {
-    let mut storage = FileStorageAdapter::open_external(filesystem, journal)?;
+    let mut storage = CrashStorageAdapter::open_external(filesystem, journal)?;
     let completed = mount_external_core(&mut storage)?;
     let (prepared, mut coordinator, ticket) =
         prepare_volume_label_commit(&mut storage, completed, label)?;
-    let mut controller = EffectBoundaryController::new(stop_after)?;
+    let mut controller = EffectBoundaryController::new(cut)?;
 
     let ordered = match complete_boundary_sequence(&mut storage, &mut controller, prepared.start())?
     {
@@ -2599,6 +3010,7 @@ fn run_external_mutation_until_boundary(
         return Ok(controller.stopped());
     }
     let _checkpointed_epoch = clean_durability.completed(&mut coordinator);
+    storage.materialize_durable()?;
     Ok(controller.completed())
 }
 
@@ -2608,7 +3020,7 @@ fn run_external_mutation_until_boundary(
 ///
 /// Returns an error for host I/O or a mismatching lower completion identity.
 fn complete_boundary_sequence<Next>(
-    storage: &mut FileStorageAdapter,
+    storage: &mut CrashStorageAdapter,
     controller: &mut EffectBoundaryController,
     mut sequence: ext4_core::StorageRequestSequence<Next>,
 ) -> TaskResult<BoundarySequence<Next>> {
@@ -2633,7 +3045,7 @@ fn complete_boundary_sequence<Next>(
 ///
 /// Returns an error for host I/O or a mismatching lower completion identity.
 fn complete_boundary_request(
-    storage: &mut FileStorageAdapter,
+    storage: &mut CrashStorageAdapter,
     controller: &mut EffectBoundaryController,
     request: ext4_core::StorageRequest,
 ) -> TaskResult<bool> {
@@ -2736,8 +3148,8 @@ fn drive_external_core_mount_and_clean_close(
 /// # Errors
 ///
 /// Returns an error for file I/O, core corruption, or a UUID mismatch after exclusive selection.
-fn drive_external_probe(
-    storage: &mut FileStorageAdapter,
+fn drive_external_probe<S: HostStorage>(
+    storage: &mut S,
     requirement: ext4_core::ExternalJournalRequirement,
     external_length: ext4_core::DeviceLength,
 ) -> TaskResult<Box<ext4_core::ValidatedExternalJournal>> {
@@ -2780,8 +3192,8 @@ fn drive_external_probe(
 ///
 /// Returns an error for mutation admission, resolve I/O, reservation conflict, invalid label, or
 /// fallible preallocation before the first commit write.
-fn prepare_volume_label_commit(
-    storage: &mut FileStorageAdapter,
+fn prepare_volume_label_commit<S: HostStorage>(
+    storage: &mut S,
     completed: Box<ext4_core::CompletedMount>,
     label: &[u8],
 ) -> TaskResult<(
@@ -2871,7 +3283,6 @@ fn drive_core_commit_without_checkpoint(image: &Path, label: &[u8]) -> TaskResul
     complete_file_request_checked(&mut storage, commit_request)?;
     complete_file_request_checked(&mut storage, commit_durability.flush_request())?;
     let _durable_uncheckpointed = commit_durability.completed();
-    storage.sync_all()?;
     Ok(())
 }
 
@@ -2880,8 +3291,8 @@ fn drive_core_commit_without_checkpoint(image: &Path, label: &[u8]) -> TaskResul
 /// # Errors
 ///
 /// Returns an error for request I/O or completion identity mismatch.
-fn complete_storage_sequence<Next>(
-    storage: &mut FileStorageAdapter,
+fn complete_storage_sequence<S: HostStorage, Next>(
+    storage: &mut S,
     mut sequence: ext4_core::StorageRequestSequence<Next>,
 ) -> TaskResult<Next> {
     loop {
@@ -2901,7 +3312,7 @@ fn complete_storage_sequence<Next>(
 ///
 /// Returns an error for host I/O or a mismatched completion identity.
 fn complete_file_request_checked(
-    storage: &mut FileStorageAdapter,
+    storage: &mut impl HostStorage,
     request: ext4_core::StorageRequest,
 ) -> TaskResult<()> {
     let identity = ext4_core::StorageRequestIdentity::from_request(&request);
@@ -2976,8 +3387,8 @@ impl ext4_core::CryptographicOperation for RejectingCryptographicOperation {
 /// # Errors
 ///
 /// Returns an error for external-device requests, offset arithmetic, or host file I/O failure.
-fn complete_file_request(
-    storage: &mut FileStorageAdapter,
+fn complete_file_request<S: HostStorage>(
+    storage: &mut S,
     request: ext4_core::StorageRequest,
 ) -> TaskResult<ext4_core::StorageCompletion> {
     let transfer = match request {
@@ -2986,9 +3397,7 @@ fn complete_file_request(
             offset,
             mut buffer,
         } => {
-            let file = storage.target_mut(target)?;
-            file.seek(io::SeekFrom::Start(offset.get()))?;
-            file.read_exact(&mut buffer)?;
+            storage.read_exact(target, offset.get(), &mut buffer)?;
             ext4_core::CompletedStorageTransfer::Read {
                 target,
                 offset,
@@ -3000,9 +3409,7 @@ fn complete_file_request(
             offset,
             buffer,
         } => {
-            let file = storage.target_mut(target)?;
-            file.seek(io::SeekFrom::Start(offset.get()))?;
-            file.write_all(&buffer)?;
+            storage.write_all(target, offset.get(), &buffer)?;
             ext4_core::CompletedStorageTransfer::Write {
                 target,
                 offset,
@@ -3010,7 +3417,7 @@ fn complete_file_request(
             }
         }
         ext4_core::StorageRequest::Flush { target } => {
-            storage.target_mut(target)?.sync_all()?;
+            storage.flush(target)?;
             ext4_core::CompletedStorageTransfer::Flush { target }
         }
     };
@@ -4396,14 +4803,15 @@ fn run_checked_output(mut command: Command, description: &str) -> TaskResult<Out
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactIdentity, Sha256, Task, TaskResult, UNVERIFIED_ARTIFACT_ID, WindowsKitVersion,
-        comma_separated_blocks, copy_exact_bytes, hash_source_record, jbd2_control_checksum,
-        normalize_debugfs_commit_timestamp, normalize_debugfs_descriptor,
+        ArtifactIdentity, CrashStorageAdapter, EffectCut, HostStorage, Sha256, StorageEffect, Task,
+        TaskResult, UNVERIFIED_ARTIFACT_ID, WindowsKitVersion, comma_separated_blocks,
+        copy_exact_bytes, effect_cut_stem, enumerate_effect_cuts, hash_source_record,
+        jbd2_control_checksum, normalize_debugfs_commit_timestamp, normalize_debugfs_descriptor,
         normalized_manifest_value, padded_volume_label, parse_journal_fixture_manifest_text,
         read_be_u32, required_version_line,
     };
     use sha2::Digest as _;
-    use std::{ffi::OsStr, path::Path};
+    use std::{ffi::OsStr, fs, path::Path};
 
     /// Artifact identities satisfy the build-script boundary without using the sentinel.
     ///
@@ -4572,6 +4980,117 @@ mod tests {
             Some(*b"0123456789ABCDEF")
         );
         assert!(padded_volume_label(b"0123456789ABCDEFG").is_err());
+    }
+
+    /// Write effects expand to every atomic-sector prefix while flushes remain target-local cuts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if sector-prefix enumeration skips an endpoint or accepts a non-sector write.
+    #[test]
+    fn fault_matrix_enumerates_atomic_write_prefixes_and_flushes() {
+        let effects = [
+            StorageEffect::Write {
+                target: ext4_core::StorageTarget::Filesystem,
+                bytes: 1024,
+            },
+            StorageEffect::Flush {
+                target: ext4_core::StorageTarget::ExternalJournal,
+            },
+        ];
+        let cuts = enumerate_effect_cuts(&effects);
+        assert!(cuts.is_ok(), "sector-aligned effects must enumerate");
+        assert_eq!(
+            cuts.ok(),
+            Some(vec![
+                EffectCut {
+                    effect: 1,
+                    write_prefix: Some(0),
+                },
+                EffectCut {
+                    effect: 1,
+                    write_prefix: Some(512),
+                },
+                EffectCut {
+                    effect: 1,
+                    write_prefix: Some(1024),
+                },
+                EffectCut {
+                    effect: 2,
+                    write_prefix: None,
+                },
+            ])
+        );
+        assert_eq!(
+            effect_cut_stem(EffectCut {
+                effect: 2,
+                write_prefix: None,
+            }),
+            "002-flush"
+        );
+        assert!(
+            enumerate_effect_cuts(&[StorageEffect::Write {
+                target: ext4_core::StorageTarget::Filesystem,
+                bytes: 513,
+            }])
+            .is_err()
+        );
+    }
+
+    /// A journal flush cannot make filesystem writes durable, and a filesystem write cut retains
+    /// earlier ordered writes while dropping the selected write's unpersisted suffix.
+    ///
+    /// # Panics
+    ///
+    /// Panics if independently durable device state or write-prefix materialization regresses.
+    #[test]
+    fn crash_storage_keeps_device_durability_independent() {
+        let root = std::env::temp_dir();
+        let filesystem = root.join(format!(
+            "ext4win-crash-adapter-{}-filesystem.img",
+            std::process::id()
+        ));
+        let journal = root.join(format!(
+            "ext4win-crash-adapter-{}-journal.img",
+            std::process::id()
+        ));
+        let result = (|| -> TaskResult<()> {
+            fs::write(&filesystem, [0xA1_u8; 1024])?;
+            fs::write(&journal, [0xB2_u8; 1024])?;
+            let mut storage = CrashStorageAdapter::open_external(&filesystem, &journal)?;
+            storage.write_all(ext4_core::StorageTarget::Filesystem, 0, &[0xC3_u8; 512])?;
+            storage.write_all(
+                ext4_core::StorageTarget::ExternalJournal,
+                0,
+                &[0xD4_u8; 512],
+            )?;
+            storage.flush(ext4_core::StorageTarget::ExternalJournal)?;
+            storage.write_all(ext4_core::StorageTarget::Filesystem, 512, &[0xE5_u8; 512])?;
+            storage.materialize_write_prefix(ext4_core::StorageTarget::Filesystem, 0)?;
+            drop(storage);
+
+            let filesystem_bytes = fs::read(&filesystem)?;
+            let journal_bytes = fs::read(&journal)?;
+            assert_eq!(filesystem_bytes.get(..512), Some([0xC3_u8; 512].as_slice()));
+            assert_eq!(filesystem_bytes.get(512..), Some([0xA1_u8; 512].as_slice()));
+            assert_eq!(journal_bytes.get(..512), Some([0xD4_u8; 512].as_slice()));
+            assert_eq!(journal_bytes.get(512..), Some([0xB2_u8; 512].as_slice()));
+            Ok(())
+        })();
+        let filesystem_cleanup = fs::remove_file(&filesystem);
+        let journal_cleanup = fs::remove_file(&journal);
+        assert!(
+            result.is_ok(),
+            "crash adapter verification failed: {result:?}"
+        );
+        assert!(
+            filesystem_cleanup.is_ok(),
+            "filesystem fixture cleanup failed: {filesystem_cleanup:?}"
+        );
+        assert!(
+            journal_cleanup.is_ok(),
+            "journal fixture cleanup failed: {journal_cleanup:?}"
+        );
     }
 
     /// Known debugfs descriptor residue is canonicalized without relaxing production parsing.
