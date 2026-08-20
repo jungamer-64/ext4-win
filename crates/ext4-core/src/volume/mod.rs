@@ -15,9 +15,11 @@ pub use event::{
     RetryPermit, VisibilityLease,
 };
 pub use mount::{
-    CommittedEpoch, CompletedMount, EpochSequence, MountOperation, MountTransition, MountedProfile,
-    MutationCoordinatorState, MutationResource, ObservedResourceVersionSet, ResourceVersion,
-    VolumeGeometry, VolumeIdentity,
+    CommittedEpoch, CompletedMount, EpochSequence, ExternalJournalProbeOperation,
+    ExternalJournalProbeOutcome, ExternalJournalProbeTransition, ExternalJournalRequirement,
+    MountOperation, MountTransition, MountedProfile, MutationCoordinatorState, MutationResource,
+    ObservedResourceVersionSet, ResourceVersion, ValidatedExternalJournal, VolumeGeometry,
+    VolumeIdentity,
 };
 pub use node::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,

@@ -222,9 +222,21 @@ impl StorageRequestIdentity {
     /// Returns an error for a failed, short, wrong-device, wrong-offset, or wrong-kind
     /// completion.
     pub fn complete(self, completion: StorageCompletion) -> Result<()> {
+        self.complete_transfer(completion).map(|_transfer| ())
+    }
+
+    /// Validates a matching completion and returns ownership of its completed transfer.
+    /// # Errors
+    ///
+    /// Returns an error for a failed, short, wrong-device, wrong-offset, or wrong-kind
+    /// completion.
+    pub fn complete_transfer(
+        self,
+        completion: StorageCompletion,
+    ) -> Result<CompletedStorageTransfer> {
         let (transfer, information, result) = completion.into_parts();
         result?;
-        let (target, offset, byte_count) = match transfer {
+        let (target, offset, byte_count) = match &transfer {
             CompletedStorageTransfer::Read {
                 target,
                 offset,
@@ -234,15 +246,15 @@ impl StorageRequestIdentity {
                 target,
                 offset,
                 buffer,
-            } => (target, Some(offset), buffer.len()),
-            CompletedStorageTransfer::Flush { target } => (target, None, 0),
+            } => (*target, Some(*offset), buffer.len()),
+            CompletedStorageTransfer::Flush { target } => (*target, None, 0),
         };
         if target == self.target
             && offset == self.offset
             && byte_count == self.byte_count
             && information == self.byte_count
         {
-            Ok(())
+            Ok(transfer)
         } else {
             Err(Error::DeviceIo)
         }
@@ -301,11 +313,6 @@ impl StorageTranscript {
     /// Returns the validated device length.
     pub(crate) const fn len(&self) -> DeviceLength {
         self.length
-    }
-
-    /// Returns whether the current resolve pass produced one request for submission.
-    pub(crate) const fn has_pending_request(&self) -> bool {
-        self.pending_request.is_some()
     }
 
     /// Reads an exact range from the retained transcript or requests one owned lower transfer.
