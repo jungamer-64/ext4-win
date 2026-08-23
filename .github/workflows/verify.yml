@@ -8,48 +8,516 @@ on:
 permissions:
   contents: read
 
+env:
+  RUST_TOOLCHAIN: nightly-2026-08-23
+
+  # Keep cargo-wdk aligned with the exact windows-drivers-rs revision
+  # used by this repository.
+  WINDOWS_DRIVERS_RS_REV: 8e88dd899d9fa988df841e08cc01e9f663e5a415
+
 jobs:
   portable:
     name: portable (${{ matrix.os }})
+
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+
     runs-on: ${{ matrix.os }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install nightly-2026-08-10 --profile minimal --component rustfmt --component clippy
+        run: >
+          rustup toolchain install
+          ${{ env.RUST_TOOLCHAIN }}
+          --profile minimal
+          --component rustfmt
+          --component clippy
+
       - name: Verify portable workspace
         run: cargo xtask verify-portable
+
 
   journal-interop:
     name: JBD2 interoperability
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install nightly-2026-08-10 --profile minimal --component rustfmt --component clippy
+        run: >
+          rustup toolchain install
+          ${{ env.RUST_TOOLCHAIN }}
+          --profile minimal
+          --component rustfmt
+          --component clippy
+
       - name: Install e2fsprogs oracle
-        run: sudo apt-get update && sudo apt-get install --yes e2fsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes e2fsprogs
+
       - name: Verify journal interoperability
         run: cargo xtask verify-journal-interop
 
+
   production-driver:
-    name: signed production driver
-    runs-on: [self-hosted, Windows, X64, ext4-win-wdk]
+    name: signed production driver (WDK 28000)
+    runs-on: windows-2025-vs2026
     timeout-minutes: 90
-    concurrency:
-      group: ext4-win-wdk-production
-      cancel-in-progress: false
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          rustup toolchain install `
+            "${{ env.RUST_TOOLCHAIN }}" `
+            --profile minimal `
+            --component rustfmt `
+            --component clippy
+
+          rustup toolchain list
+
+      - name: Configure LLVM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $clang = Get-Command clang.exe -ErrorAction Stop
+          $llvmBin = Split-Path $clang.Source
+
+          Write-Host "clang: $($clang.Source)"
+          Write-Host "LLVM bin: $llvmBin"
+
+          "LIBCLANG_PATH=$llvmBin" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          clang --version
+
+      - name: Install Windows SDK and WDK 28000
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Installing Windows SDK 28000..."
+
+          winget install `
+            --id Microsoft.WindowsSDK.10.0.28000 `
+            --exact `
+            --source winget `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows SDK installation failed with exit code $LASTEXITCODE"
+          }
+
+          Write-Host ""
+          Write-Host "Installing Windows WDK 28000..."
+
+          winget install `
+            --id Microsoft.WindowsWDK.10.0.28000 `
+            --exact `
+            --source winget `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows WDK installation failed with exit code $LASTEXITCODE"
+          }
+
+          $kitsRoot = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            "Windows Kits\10"
+
+          $libRoot = Join-Path $kitsRoot "Lib"
+
+          if (-not (Test-Path $libRoot)) {
+            throw "Windows Kits Lib directory was not found: $libRoot"
+          }
+
+          #
+          # The WinGet package version is currently 28000.2526,
+          # while the installed Windows Kits directory is
+          # 10.0.28000.0.
+          #
+          $kitVersion = Get-ChildItem `
+            -Path $libRoot `
+            -Directory |
+            Where-Object {
+              $_.Name -like "10.0.28000.*"
+            } |
+            Sort-Object {
+              [version]$_.Name
+            } -Descending |
+            Select-Object -First 1
+
+          if (-not $kitVersion) {
+            Write-Host ""
+            Write-Host "Installed Windows Kit versions:"
+
+            Get-ChildItem `
+              -Path $libRoot `
+              -Directory |
+              Select-Object Name
+
+            throw "WDK/SDK 28000 was installed but no 10.0.28000.x Kit directory was found"
+          }
+
+          $version = $kitVersion.Name
+
+          Write-Host ""
+          Write-Host "Windows Kits root: $kitsRoot"
+          Write-Host "Selected WDK version: $version"
+
+          #
+          # wdk-build recognizes these environment variables.
+          #
+          # Explicitly setting them prevents the preinstalled
+          # Windows Kit from being selected accidentally.
+          #
+          "WDKContentRoot=$kitsRoot" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "Version_Number=$version" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "EXT4WIN_WDK_VERSION=$version" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          #
+          # cargo-wdk can discover WDK tools itself,
+          # but exposing both x64 and x86 directories
+          # also makes the CI environment deterministic.
+          #
+          foreach ($arch in @("x64", "x86")) {
+            $bin = Join-Path `
+              $kitsRoot `
+              "bin\$version\$arch"
+
+            if (Test-Path $bin) {
+              Write-Host "Adding to PATH: $bin"
+
+              $bin |
+                Out-File `
+                  -FilePath $env:GITHUB_PATH `
+                  -Encoding utf8 `
+                  -Append
+            }
+          }
+
+      - name: Verify WDK 28000 installation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "WDKContentRoot = $env:WDKContentRoot"
+          Write-Host "Version_Number = $env:Version_Number"
+
+          $requiredPaths = @(
+            "$env:WDKContentRoot\Include\$env:Version_Number\km",
+            "$env:WDKContentRoot\Include\$env:Version_Number\shared",
+            "$env:WDKContentRoot\Lib\$env:Version_Number\km\x64"
+          )
+
+          foreach ($path in $requiredPaths) {
+            Write-Host "Checking: $path"
+
+            if (-not (Test-Path $path)) {
+              throw "Required WDK path does not exist: $path"
+            }
+          }
+
+          Write-Host ""
+          Write-Host "Available WDK tools:"
+
+          Get-ChildItem `
+            -Path "$env:WDKContentRoot\bin\$env:Version_Number" `
+            -Recurse `
+            -File `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Name -in @(
+                "signtool.exe",
+                "Inf2Cat.exe",
+                "stampinf.exe",
+                "infverif.exe"
+              )
+            } |
+            Select-Object Name, FullName
+
+      - name: Install cargo-wdk
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          #
+          # Use exactly the same windows-drivers-rs revision
+          # as the repository's WDK crates.
+          #
+          cargo install cargo-wdk `
+            --git https://github.com/microsoft/windows-drivers-rs `
+            --rev "${{ env.WINDOWS_DRIVERS_RS_REV }}" `
+            --locked
+
+          cargo wdk --version
+
+      - name: Set up WSL oracle
+        uses: Vampire/setup-wsl@v7.0.0
+        with:
+          distribution: Ubuntu-24.04
+          set-as-default: 'true'
+          additional-packages: e2fsprogs
+          use-cache: 'false'
+          wsl-version: 2
+
       - name: Verify runner contract
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=== Rust ==="
           rustc --version --verbose
+
+          Write-Host ""
+          Write-Host "=== Cargo ==="
+          cargo --version
+
+          Write-Host ""
+          Write-Host "=== cargo-wdk ==="
           cargo wdk --version
-          wsl.exe --exec e2fsck -V
+
+          Write-Host ""
+          Write-Host "=== LLVM ==="
+          clang --version
+
+          Write-Host ""
+          Write-Host "=== WDK ==="
+          Write-Host "WDKContentRoot=$env:WDKContentRoot"
+          Write-Host "Version_Number=$env:Version_Number"
+
+          Write-Host ""
+          Write-Host "=== WSL ==="
+          wsl.exe --status
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "WSL status query failed"
+          }
+
+          Write-Host ""
+          Write-Host "=== WSL distributions ==="
+          wsl.exe --list --verbose
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "WSL distribution query failed"
+          }
+
+          Write-Host ""
+          Write-Host "=== Linux PATH ==="
+
+          #
+          # wsl.exe --exec does not guarantee the normal
+          # interactive/login-shell PATH.
+          #
+          # e2fsprogs tools such as mke2fs/debugfs/e2fsck
+          # live below /usr/sbin on Ubuntu.
+          #
+          $linuxPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+          wsl.exe `
+            --distribution Ubuntu-24.04 `
+            --exec /usr/bin/env `
+            "PATH=$linuxPath" `
+            /usr/bin/env
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to execute /usr/bin/env in WSL"
+          }
+
+          Write-Host ""
+          Write-Host "=== e2fsprogs ==="
+
+          wsl.exe `
+            --distribution Ubuntu-24.04 `
+            --exec /usr/bin/env `
+            "PATH=$linuxPath" `
+            mke2fs -V
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "mke2fs is unavailable in WSL"
+          }
+
+          wsl.exe `
+            --distribution Ubuntu-24.04 `
+            --exec /usr/bin/env `
+            "PATH=$linuxPath" `
+            debugfs -V
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "debugfs is unavailable in WSL"
+          }
+
+          wsl.exe `
+            --distribution Ubuntu-24.04 `
+            --exec /usr/bin/env `
+            "PATH=$linuxPath" `
+            e2fsck -V
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "e2fsck is unavailable in WSL"
+          }
+
+          Write-Host ""
+          Write-Host "=== e2fsprogs locations ==="
+
+          foreach ($tool in @(
+            "mke2fs",
+            "debugfs",
+            "e2fsck"
+          )) {
+            wsl.exe `
+              --distribution Ubuntu-24.04 `
+              --exec /usr/bin/env `
+              "PATH=$linuxPath" `
+              /usr/bin/which $tool
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "$tool could not be resolved through the CI Linux PATH"
+            }
+          }
+
+      #
+      # cargo-wdk automatically generates WDRLocalTestCert
+      # for test signing.
+      #
+      # --verify-signature intentionally requires the signing
+      # certificate to already be trusted, so first perform a
+      # normal signed build to generate/reuse the certificate,
+      # then trust that certificate only inside this disposable
+      # GitHub-hosted VM.
+      #
+      - name: Bootstrap cargo-wdk test certificate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Push-Location crates/ext4-driver
+
+          try {
+            cargo wdk build `
+              --profile release `
+              --locked
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Initial cargo-wdk build failed with exit code $LASTEXITCODE"
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+          Write-Host ""
+          Write-Host "Searching for WDRLocalTestCert.cer..."
+
+          $cert = Get-ChildItem `
+            -Path "$env:GITHUB_WORKSPACE\target" `
+            -Filter "WDRLocalTestCert.cer" `
+            -File `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if (-not $cert) {
+            throw "cargo-wdk did not produce WDRLocalTestCert.cer"
+          }
+
+          Write-Host ""
+          Write-Host "Generated certificate:"
+          Write-Host $cert.FullName
+
+          #
+          # Required by cargo-wdk --verify-signature.
+          #
+          # The GitHub-hosted Windows VM is ephemeral and
+          # discarded after the job completes.
+          #
+          Import-Certificate `
+            -FilePath $cert.FullName `
+            -CertStoreLocation "Cert:\LocalMachine\Root" |
+            Out-Null
+
+          Write-Host ""
+          Write-Host "Trusted WDRLocalTestCert in LocalMachine\Root."
+
       - name: Verify production release bundle
         shell: pwsh
-        run: cargo xtask verify-production-driver
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cargo xtask verify-production-driver
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Production verification failed with exit code $LASTEXITCODE"
+          }
+
+      - name: List verified production bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $bundleRoot = "target\verified-production"
+
+          if (-not (Test-Path $bundleRoot)) {
+            throw "$bundleRoot was not created"
+          }
+
+          Write-Host "Verified production artifacts:"
+
+          Get-ChildItem `
+            -Path $bundleRoot `
+            -Recurse `
+            -File |
+            Select-Object FullName, Length
+
+      - name: Upload verified production bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ext4-win-verified-production-wdk-${{ env.EXT4WIN_WDK_VERSION }}
+          path: target/verified-production/**
+          if-no-files-found: error
+          retention-days: 14

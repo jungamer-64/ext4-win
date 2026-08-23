@@ -210,7 +210,6 @@ impl SealedProductionArtifacts {
         )
     }
 }
-
 /// Native Linux tools or the same tools reached through one installed WSL distribution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinuxEnvironment {
@@ -219,6 +218,16 @@ enum LinuxEnvironment {
     /// Host commands execute through `wsl.exe --exec`.
     Wsl,
 }
+
+/// Deterministic Linux executable search path used for direct WSL execution.
+///
+/// `wsl.exe --exec` does not execute through an interactive/login shell and
+/// therefore must not rely on the distribution's shell initialization to add
+/// administrative directories such as `/usr/sbin`.
+///
+/// e2fsprogs utilities including `mke2fs`, `debugfs`, and `e2fsck` are normally
+/// installed below `/usr/sbin` on Ubuntu.
+const WSL_TOOL_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 impl LinuxEnvironment {
     /// Discovers and verifies every mandatory e2fsprogs executable.
@@ -238,21 +247,34 @@ impl LinuxEnvironment {
             )
             .into());
         };
+
         for tool in ["mke2fs", "debugfs", "e2fsck"] {
             let mut command = environment.command(tool);
             command.arg("-V");
+
             run_checked(command, &format!("required {tool} availability"))?;
         }
+
         Ok(environment)
     }
 
     /// Builds one direct or WSL-routed child command.
+    ///
+    /// WSL execution uses `/usr/bin/env` with one deterministic Linux PATH
+    /// rather than relying on the non-login environment inherited by
+    /// `wsl.exe --exec`.
     fn command(self, program: &str) -> Command {
         match self {
             Self::Native => Command::new(program),
+
             Self::Wsl => {
                 let mut command = Command::new("wsl.exe");
-                command.args(["--exec", program]);
+
+                command
+                    .args(["--exec", "/usr/bin/env"])
+                    .arg(format!("PATH={WSL_TOOL_PATH}"))
+                    .arg(program);
+
                 command
             }
         }
@@ -261,8 +283,11 @@ impl LinuxEnvironment {
     /// Builds one Linux command with an environment variable visible in the Linux process.
     ///
     /// A Windows environment override on `wsl.exe` is not forwarded into the distribution unless
-    /// `WSLENV` is configured. Routing through `env` keeps fixture generation independent of the
-    /// caller's global WSL configuration while avoiding shell interpretation.
+    /// `WSLENV` is configured. Routing through `/usr/bin/env` keeps fixture generation independent
+    /// of the caller's global WSL configuration while avoiding shell interpretation.
+    ///
+    /// The deterministic PATH also ensures programs located in `/usr/sbin` can be executed when
+    /// WSL is entered through `wsl.exe --exec`.
     fn command_with_environment(self, program: &str, key: &str, value: &str) -> Command {
         match self {
             Self::Native => {
@@ -270,12 +295,16 @@ impl LinuxEnvironment {
                 command.env(key, value);
                 command
             }
+
             Self::Wsl => {
                 let mut command = Command::new("wsl.exe");
+
                 command
-                    .args(["--exec", "env"])
+                    .args(["--exec", "/usr/bin/env"])
+                    .arg(format!("PATH={WSL_TOOL_PATH}"))
                     .arg(format!("{key}={value}"))
                     .arg(program);
+
                 command
             }
         }
@@ -292,12 +321,22 @@ impl LinuxEnvironment {
                 .to_str()
                 .map(str::to_owned)
                 .ok_or_else(|| io::Error::other("journal gate path is not UTF-8").into()),
+
             Self::Wsl => {
                 let mut command = Command::new("wsl.exe");
-                command.args(["--exec", "wslpath", "-a"]).arg(path);
+
+                //
+                // Use an absolute path here as well so path conversion does
+                // not depend on the environment supplied by wsl.exe.
+                //
+                command.args(["--exec", "/usr/bin/wslpath", "-a"]).arg(path);
+
                 let output = run_checked_output(command, "WSL path conversion")?;
+
                 let converted = String::from_utf8(output.stdout)?;
+
                 let converted = converted.trim();
+
                 if converted.is_empty() {
                     Err(io::Error::other("WSL returned an empty converted path").into())
                 } else {
@@ -315,10 +354,14 @@ impl LinuxEnvironment {
     fn e2fsprogs_version(self) -> TaskResult<String> {
         let mut command = self.command("mke2fs");
         command.arg("-V");
+
         let output = run_checked_output(command, "e2fsprogs version query")?;
+
         let mut bytes = output.stdout;
         bytes.extend_from_slice(&output.stderr);
+
         let version_output = String::from_utf8(bytes)?;
+
         version_output
             .lines()
             .find_map(|line| {
@@ -338,8 +381,11 @@ impl LinuxEnvironment {
     /// selected Linux environment does not run as root.
     fn require_loop_device_authority(self) -> TaskResult<()> {
         let mut identity = self.command("id");
+
         identity.arg("-u");
+
         let output = run_checked_output(identity, "Linux effective-user query")?;
+
         if String::from_utf8(output.stdout)?.trim() != "0" {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -347,16 +393,22 @@ impl LinuxEnvironment {
             )
             .into());
         }
+
         let mut version = self.command("losetup");
+
         version.arg("--version");
+
         run_checked(version, "required loop-device tooling")?;
+
         let mut free = self.command("losetup");
+
         free.arg("--find");
+
         run_checked_output(free, "free loop-device query")?;
+
         Ok(())
     }
 }
-
 /// One generated internal-journal interoperability profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct JournalInteropCase {
