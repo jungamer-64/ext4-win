@@ -1,8 +1,7 @@
 # Development
 
-The repository pins `nightly-2026-08-10`. The default workspace members are
-host-independent. On Windows, macOS, or Linux, run the complete portable gate
-with:
+The default workspace members are host-independent.
+On Windows, macOS, or Linux, run the complete portable gate with:
 
 ```console
 cargo xtask verify-portable

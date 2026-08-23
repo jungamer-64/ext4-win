@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned Rust and cargo-fuzz
         run: |
-          rustup toolchain install nightly-2026-08-10 --profile minimal
+          rustup toolchain install nightly-2026-08-23 --profile minimal
           cargo install --locked cargo-fuzz --version 0.13.2
       - name: Replay mount corpus
         run: cargo fuzz run mount_image fuzz/corpus/mount_image -- -runs=1
@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned Rust and cargo-fuzz
         run: |
-          rustup toolchain install nightly-2026-08-10 --profile minimal
+          rustup toolchain install nightly-2026-08-23 --profile minimal
           cargo install --locked cargo-fuzz --version 0.13.2
       - name: Fuzz mount images
         run: cargo fuzz run mount_image -- -max_total_time=300

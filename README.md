@@ -7,7 +7,7 @@ that produces a safer ownership or state model.
 
 ## Verification
 
-The repository pins `nightly-2026-08-10`. The canonical development gates are:
+The canonical development gates are:
 
 ```console
 cargo xtask verify-portable
