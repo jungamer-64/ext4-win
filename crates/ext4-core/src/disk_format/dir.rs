@@ -515,7 +515,7 @@ fn dx_capacity(
 }
 
 /// Parsed HTree root block.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct HtreeRoot {
     /// Directory hash context selected by root info.
     hash: DirectoryHashScheme,
@@ -628,7 +628,7 @@ impl HtreeRoot {
 }
 
 /// HTree index table.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct DxIndex {
     /// Entries in on-disk order.
     entries: Vec<DxEntry>,
@@ -637,6 +637,17 @@ pub(crate) struct DxIndex {
 }
 
 impl DxIndex {
+    /// Copies this routing table without an infallible allocation path.
+    /// # Errors
+    ///
+    /// Returns an error when allocating the copied route vector fails.
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            entries: memory::copied_slice(&self.entries)?,
+            limit: self.limit,
+        })
+    }
+
     /// Parses a root or interior HTree index table.
     /// # Errors
     ///
@@ -992,7 +1003,7 @@ impl HtreeHashRange {
 }
 
 /// Right sibling produced by a median index split.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct DxIndexSplit {
     /// Hash boundary inserted into the parent.
     boundary: u32,

@@ -20,7 +20,7 @@ struct VerityReadPlan {
 }
 
 /// One resident routing table in an on-demand HTree path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct HtreePathLevel {
     /// Logical block containing this table (`0` for the root).
     logical: u32,
@@ -31,7 +31,7 @@ struct HtreePathLevel {
 }
 
 /// Root-to-leaf route. Its length is bounded by the mounted HTree depth profile.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct HtreePath {
     /// Resident root-to-leaf index levels.
     levels: Vec<HtreePathLevel>,
@@ -99,6 +99,25 @@ fn retain_bounded_htree_candidate(
 }
 
 impl HtreePath {
+    /// Copies this bounded route without introducing an infallible allocation path.
+    /// # Errors
+    ///
+    /// Returns an error when allocating either the level vector or a copied index fails.
+    fn try_clone(&self) -> Result<Self> {
+        let mut levels = Vec::new();
+        levels
+            .try_reserve_exact(self.levels.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for level in &self.levels {
+            levels.try_push(HtreePathLevel {
+                logical: level.logical,
+                index: level.index.try_clone()?,
+                selected: level.selected,
+            })?;
+        }
+        Ok(Self { levels })
+    }
+
     /// Returns the currently selected leaf logical block.
     /// # Errors
     ///
@@ -644,7 +663,7 @@ impl EpochReadView<'_, '_> {
         let mut path = self.htree_path_for_hash(
             inode,
             tree,
-            root.index().clone(),
+            root.index().try_clone()?,
             root.indirect_levels(),
             starting_major,
             checksum,
@@ -653,7 +672,7 @@ impl EpochReadView<'_, '_> {
         loop {
             let hash = root.hash_context();
             let entries = self.read_sorted_htree_leaf(inode, tree, &path, hash)?;
-            let mut next_path = path.clone();
+            let mut next_path = path.try_clone()?;
             let has_next = self.advance_htree_path(
                 inode,
                 tree,
@@ -702,7 +721,7 @@ impl EpochReadView<'_, '_> {
                 let mut collision_after = after_key;
                 let mut final_collision_path = next_path;
                 loop {
-                    let mut following = final_collision_path.clone();
+                    let mut following = final_collision_path.try_clone()?;
                     if !self.advance_htree_path(
                         inode,
                         tree,
@@ -733,7 +752,7 @@ impl EpochReadView<'_, '_> {
                         return Ok(DirectoryScanBatch::new(output, continuation, false));
                     }
                     let mut collision_candidates = Vec::new();
-                    let mut collision_path = path.clone();
+                    let mut collision_path = path.try_clone()?;
                     loop {
                         for candidate in self
                             .read_sorted_htree_leaf(inode, tree, &collision_path, hash)?
@@ -753,7 +772,7 @@ impl EpochReadView<'_, '_> {
                         if collision_path == final_collision_path {
                             break;
                         }
-                        let mut following = collision_path.clone();
+                        let mut following = collision_path.try_clone()?;
                         if !self.advance_htree_path(
                             inode,
                             tree,
@@ -1128,7 +1147,7 @@ impl EpochReadView<'_, '_> {
                 let mut path = self.htree_path_for_hash(
                     inode,
                     &tree,
-                    root.index().clone(),
+                    root.index().try_clone()?,
                     root.indirect_levels(),
                     hash.major,
                     checksum,
