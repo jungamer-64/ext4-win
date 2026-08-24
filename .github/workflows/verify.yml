@@ -47,8 +47,8 @@ jobs:
         run: cargo xtask verify-portable
 
 
-  journal-interop:
-    name: JBD2 interoperability
+  ext4-interop:
+    name: ext4 interoperability
     runs-on: ubuntu-latest
 
     steps:
@@ -72,6 +72,9 @@ jobs:
 
       - name: Verify journal interoperability
         run: cargo xtask verify-journal-interop
+
+      - name: Verify HTree interoperability
+        run: sudo --preserve-env=PATH cargo xtask verify-htree-interop
 
 
   production-driver:

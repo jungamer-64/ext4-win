@@ -13,7 +13,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read as _, Seek as _, Write as _},
     path::{Path, PathBuf},
-    process::{self, Command, ExitCode, Output},
+    process::{self, Command, ExitCode, Output, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -38,6 +38,8 @@ enum Task {
     Driver,
     /// Generates Linux JBD2 transactions and verifies core recovery in both directions.
     JournalInterop,
+    /// Exercises bounded HTree reads and local updates against fresh ext4 images.
+    HtreeInterop,
     /// Reproduces tracked external-journal fixtures under the pinned Linux toolchain.
     JournalFixtureProvenance,
     /// Builds and verifies one signed, identity-bound Windows driver bundle.
@@ -59,6 +61,8 @@ impl Task {
             Some(Self::Driver)
         } else if argument == "verify-journal-interop" {
             Some(Self::JournalInterop)
+        } else if argument == "verify-htree-interop" {
+            Some(Self::HtreeInterop)
         } else if argument == "verify-journal-fixture-provenance" {
             Some(Self::JournalFixtureProvenance)
         } else if argument == "verify-production-driver" {
@@ -243,7 +247,7 @@ impl LinuxEnvironment {
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "journal interoperability requires Linux or an installed WSL distribution",
+                "ext4 interoperability requires Linux or an installed WSL distribution",
             )
             .into());
         };
@@ -320,7 +324,7 @@ impl LinuxEnvironment {
             Self::Native => path
                 .to_str()
                 .map(str::to_owned)
-                .ok_or_else(|| io::Error::other("journal gate path is not UTF-8").into()),
+                .ok_or_else(|| io::Error::other("ext4 gate path is not UTF-8").into()),
 
             Self::Wsl => {
                 let mut command = Command::new("wsl.exe");
@@ -676,8 +680,8 @@ struct CrashDeviceImage {
 struct CrashStorageAdapter {
     /// Primary filesystem device state.
     filesystem: CrashDeviceImage,
-    /// Dedicated external journal device state.
-    external_journal: CrashDeviceImage,
+    /// Dedicated external journal device state when selected by the mounted profile.
+    external_journal: Option<CrashDeviceImage>,
 }
 
 /// Shape of one completed write or flush in a production workflow.
@@ -987,6 +991,17 @@ impl CrashDeviceImage {
 }
 
 impl CrashStorageAdapter {
+    /// Opens one internally journaled device image for a fault run.
+    /// # Errors
+    ///
+    /// Returns an error when the filesystem image cannot be opened or snapshotted.
+    fn open_internal(filesystem: &Path) -> TaskResult<Self> {
+        Ok(Self {
+            filesystem: CrashDeviceImage::open(filesystem)?,
+            external_journal: None,
+        })
+    }
+
     /// Opens two independently durable device images for one external-journal fault run.
     /// # Errors
     ///
@@ -994,23 +1009,38 @@ impl CrashStorageAdapter {
     fn open_external(filesystem: &Path, external_journal: &Path) -> TaskResult<Self> {
         Ok(Self {
             filesystem: CrashDeviceImage::open(filesystem)?,
-            external_journal: CrashDeviceImage::open(external_journal)?,
+            external_journal: Some(CrashDeviceImage::open(external_journal)?),
         })
     }
 
     /// Returns the selected crash-model device.
-    fn target(&self, target: ext4_core::StorageTarget) -> &CrashDeviceImage {
+    /// # Errors
+    ///
+    /// Returns an error when an internal-journal run receives an external-journal request.
+    fn target(&self, target: ext4_core::StorageTarget) -> TaskResult<&CrashDeviceImage> {
         match target {
-            ext4_core::StorageTarget::Filesystem => &self.filesystem,
-            ext4_core::StorageTarget::ExternalJournal => &self.external_journal,
+            ext4_core::StorageTarget::Filesystem => Ok(&self.filesystem),
+            ext4_core::StorageTarget::ExternalJournal => self
+                .external_journal
+                .as_ref()
+                .ok_or_else(|| io::Error::other("unexpected external-journal request").into()),
         }
     }
 
     /// Returns the uniquely borrowed selected crash-model device.
-    fn target_mut(&mut self, target: ext4_core::StorageTarget) -> &mut CrashDeviceImage {
+    /// # Errors
+    ///
+    /// Returns an error when an internal-journal run receives an external-journal request.
+    fn target_mut(
+        &mut self,
+        target: ext4_core::StorageTarget,
+    ) -> TaskResult<&mut CrashDeviceImage> {
         match target {
-            ext4_core::StorageTarget::Filesystem => &mut self.filesystem,
-            ext4_core::StorageTarget::ExternalJournal => &mut self.external_journal,
+            ext4_core::StorageTarget::Filesystem => Ok(&mut self.filesystem),
+            ext4_core::StorageTarget::ExternalJournal => self
+                .external_journal
+                .as_mut()
+                .ok_or_else(|| io::Error::other("unexpected external-journal request").into()),
         }
     }
 
@@ -1020,7 +1050,9 @@ impl CrashStorageAdapter {
     /// Returns an error when either caller-visible image cannot be replaced and synchronized.
     fn materialize_durable(&mut self) -> TaskResult<()> {
         self.filesystem.materialize(None)?;
-        self.external_journal.materialize(None)?;
+        if let Some(journal) = self.external_journal.as_mut() {
+            journal.materialize(None)?;
+        }
         Ok(())
     }
 
@@ -1036,11 +1068,16 @@ impl CrashStorageAdapter {
         match target {
             ext4_core::StorageTarget::Filesystem => {
                 self.filesystem.materialize(Some(prefix))?;
-                self.external_journal.materialize(None)?;
+                if let Some(journal) = self.external_journal.as_mut() {
+                    journal.materialize(None)?;
+                }
             }
             ext4_core::StorageTarget::ExternalJournal => {
                 self.filesystem.materialize(None)?;
-                self.external_journal.materialize(Some(prefix))?;
+                self.external_journal
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("unexpected external-journal write cut"))?
+                    .materialize(Some(prefix))?;
             }
         }
         Ok(())
@@ -1049,7 +1086,7 @@ impl CrashStorageAdapter {
 
 impl HostStorage for CrashStorageAdapter {
     fn length(&self, target: ext4_core::StorageTarget) -> TaskResult<u64> {
-        Ok(self.target(target).volatile.metadata()?.len())
+        Ok(self.target(target)?.volatile.metadata()?.len())
     }
 
     fn read_exact(
@@ -1058,7 +1095,7 @@ impl HostStorage for CrashStorageAdapter {
         offset: u64,
         output: &mut [u8],
     ) -> TaskResult<()> {
-        let file = &mut self.target_mut(target).volatile;
+        let file = &mut self.target_mut(target)?.volatile;
         file.seek(io::SeekFrom::Start(offset))?;
         file.read_exact(output)?;
         Ok(())
@@ -1070,7 +1107,7 @@ impl HostStorage for CrashStorageAdapter {
         offset: u64,
         input: &[u8],
     ) -> TaskResult<()> {
-        let device = self.target_mut(target);
+        let device = self.target_mut(target)?;
         write_host_range(&mut device.volatile, offset, input)?;
         device.pending.push(PendingCrashWrite {
             offset,
@@ -1080,7 +1117,7 @@ impl HostStorage for CrashStorageAdapter {
     }
 
     fn flush(&mut self, target: ext4_core::StorageTarget) -> TaskResult<()> {
-        self.target_mut(target).flush()
+        self.target_mut(target)?.flush()
     }
 }
 
@@ -1143,6 +1180,7 @@ fn run() -> TaskResult<()> {
         Task::Portable
         | Task::Driver
         | Task::JournalInterop
+        | Task::HtreeInterop
         | Task::JournalFixtureProvenance
         | Task::ProductionDriver
         | Task::CheckLiveDriverHost
@@ -1154,6 +1192,7 @@ fn run() -> TaskResult<()> {
                 Task::Portable => verify_portable(&repository_root),
                 Task::Driver => verify_driver(&repository_root),
                 Task::JournalInterop => verify_journal_interop(&repository_root),
+                Task::HtreeInterop => verify_htree_interop(&repository_root),
                 Task::JournalFixtureProvenance => {
                     verify_journal_fixture_provenance(&repository_root)
                 }
@@ -1172,7 +1211,7 @@ fn run() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-driver|verify-journal-interop|verify-journal-fixture-provenance|verify-production-driver|check-live-driver-host|verify-live-vhdx|cleanup-live-vhdx-session SESSION_ID>",
+        "usage: cargo xtask <verify-portable|verify-driver|verify-journal-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-live-driver-host|verify-live-vhdx|cleanup-live-vhdx-session SESSION_ID>",
     )
 }
 
@@ -1459,8 +1498,674 @@ fn verify_internal_mutation_profiles(
     let bigalloc_image = bigalloc_root.join("filesystem.img");
     format_mutation_image(linux, &bigalloc_image, Some(16_384))?;
     verify_bigalloc_mutation_profile(linux, &bigalloc_root, &bigalloc_image)?;
+
     println!("ext4-core fresh-image mutation profiles: PASS");
     Ok(())
+}
+
+/// Exercises the HTree read and mutation contract against independently formatted images.
+///
+/// # Errors
+///
+/// Returns an error when Linux filesystem tools are unavailable, a profile fails, or temporary
+/// artifact cleanup cannot complete.
+fn verify_htree_interop(repository_root: &Path) -> TaskResult<()> {
+    let linux = LinuxEnvironment::require()?;
+    let temporary_root = create_task_directory(repository_root, "htree-interop")?;
+    let verification = (|| -> TaskResult<()> {
+        verify_large_directory_depth_two(linux, &temporary_root)?;
+        for block_size in [1_024_u32, 4_096] {
+            for metadata_checksum in [false, true] {
+                for large_directory in [false, true] {
+                    verify_htree_mutation_profile(
+                        linux,
+                        &temporary_root,
+                        block_size,
+                        metadata_checksum,
+                        large_directory,
+                    )?;
+                }
+            }
+        }
+        verify_htree_fault_matrix(linux, &temporary_root)?;
+        Ok(())
+    })();
+    let cleanup = remove_task_directory(repository_root, &temporary_root, "htree-interop");
+    combine_verification_and_cleanup(verification, cleanup)?;
+    println!("ext4-core HTree interoperability profiles: PASS");
+    Ok(())
+}
+
+/// Number of maximum-length names committed atomically by the HTree fault workflow.
+const HTREE_FAULT_ENTRY_COUNT: usize = 5;
+/// Maximum recovered images checked by one external-oracle process.
+const HTREE_FAULT_ORACLE_BATCH: usize = 8;
+
+/// One recovered HTree crash image awaiting independent black-box validation.
+#[derive(Debug)]
+struct HtreeFaultOracleCase {
+    /// Stable cut label used in diagnostics.
+    label: String,
+    /// Recovered and cleanly closed filesystem image.
+    image: PathBuf,
+}
+
+/// Exercises every sector/flush crash cut of a transaction that converts and splits a directory.
+///
+/// # Errors
+///
+/// Returns an error when probe/cut execution, crash recovery, namespace endpoint validation,
+/// independent filesystem validation, or task-owned artifact handling fails.
+fn verify_htree_fault_matrix(linux: LinuxEnvironment, temporary_root: &Path) -> TaskResult<()> {
+    const BLOCK_SIZE: u32 = 1_024;
+
+    let matrix_root = temporary_root.join("fault-matrix");
+    fs::create_dir(&matrix_root)?;
+    let baseline = matrix_root.join("baseline.img");
+    format_htree_image(
+        linux,
+        &baseline,
+        16 * 1024 * 1024,
+        BLOCK_SIZE,
+        true,
+        false,
+        1,
+    )?;
+
+    let probe = matrix_root.join("probe.img");
+    fs::copy(&baseline, &probe)?;
+    let probe_run = run_internal_htree_mutation_until_boundary(&probe, None)?;
+    let effects = require_completed_effect_probe("HTree commit/checkpoint", probe_run)?;
+    let cuts = enumerate_effect_cuts(&effects)?;
+    fs::remove_file(&probe)?;
+
+    let mut batch_start = 0_usize;
+    while batch_start < cuts.len() {
+        let batch_end = core::cmp::min(
+            batch_start
+                .checked_add(HTREE_FAULT_ORACLE_BATCH)
+                .ok_or_else(|| io::Error::other("HTree fault-oracle batch boundary overflow"))?,
+            cuts.len(),
+        );
+        let cut_batch = cuts
+            .get(batch_start..batch_end)
+            .ok_or_else(|| io::Error::other("invalid HTree fault-oracle batch range"))?;
+        let mut cases = Vec::new();
+        cases
+            .try_reserve_exact(cut_batch.len())
+            .map_err(|_| io::Error::other("HTree fault-oracle batch allocation failed"))?;
+        for cut in cut_batch.iter().copied() {
+            let label = format!("htree-{}", effect_cut_stem(cut));
+            let image = matrix_root.join(format!("{label}.img"));
+            fs::copy(&baseline, &image)?;
+            let run = run_internal_htree_mutation_until_boundary(&image, Some(cut))?;
+            require_stopped_effect("HTree commit/checkpoint", cut, run)?;
+            drive_core_mount_and_clean_close(&image)?;
+            cases.push(HtreeFaultOracleCase { label, image });
+        }
+        verify_htree_fault_oracle_batch(linux, &cases)?;
+        for case in cases {
+            fs::remove_file(case.image)?;
+        }
+        batch_start = batch_end;
+    }
+
+    println!(
+        "HTree production fault matrix: PASS ({} sector/flush cuts across {} effects)",
+        cuts.len(),
+        effects.len()
+    );
+    Ok(())
+}
+
+/// Builds the fixed maximum-length name set used by every HTree fault run and endpoint check.
+///
+/// # Errors
+///
+/// Returns an error when name generation, ext4 validation, or bounded vector allocation fails.
+fn htree_fault_names() -> TaskResult<Vec<ext4_core::Ext4Name>> {
+    let mut names = Vec::new();
+    names
+        .try_reserve_exact(HTREE_FAULT_ENTRY_COUNT)
+        .map_err(|_| io::Error::other("HTree fault-name allocation failed"))?;
+    for index in 0..HTREE_FAULT_ENTRY_COUNT {
+        let raw = depth_two_profile_name(index)?;
+        names.push(ext4_core::Ext4Name::new(raw.as_bytes()).map_err(core_task_error)?);
+    }
+    Ok(names)
+}
+
+/// Requires one recovered fault image to expose the complete old or complete new namespace.
+///
+/// # Errors
+///
+/// Returns an error when black-box directory inspection fails, the transaction is partially
+/// visible, or the complete new endpoint is not represented as a readable HTree.
+fn verify_htree_fault_endpoint(listing: &str, tree_dump: &str, label: &str) -> TaskResult<()> {
+    let names = htree_fault_names()?;
+    let present = names
+        .iter()
+        .filter(|name| {
+            let marker = format!("/{}/", String::from_utf8_lossy(name.bytes()));
+            listing.contains(&marker)
+        })
+        .count();
+    match present {
+        0 => Ok(()),
+        HTREE_FAULT_ENTRY_COUNT if tree_dump.contains("Root node dump") => Ok(()),
+        HTREE_FAULT_ENTRY_COUNT => Err(io::Error::other(format!(
+            "{label} exposes the new namespace without a readable HTree root"
+        ))
+        .into()),
+        partial => Err(io::Error::other(format!(
+            "{label} exposes a partial HTree transaction ({partial}/{HTREE_FAULT_ENTRY_COUNT})"
+        ))
+        .into()),
+    }
+}
+
+/// Runs namespace inspection and read-only fsck for a bounded set of recovered images in one
+/// external process, then validates each delimited result independently.
+///
+/// # Errors
+///
+/// Returns an error when path conversion, an oracle command, output decoding/delimiting, fsck, or
+/// an endpoint invariant fails.
+fn verify_htree_fault_oracle_batch(
+    linux: LinuxEnvironment,
+    cases: &[HtreeFaultOracleCase],
+) -> TaskResult<()> {
+    if cases.is_empty() || cases.len() > HTREE_FAULT_ORACLE_BATCH {
+        return Err(io::Error::other("invalid HTree fault-oracle batch size").into());
+    }
+    let script = r#"set -eu
+i=0
+for image do
+    printf '\n__EXT4WIN_HTREE_CASE_%s_LISTING__\n' "$i"
+    debugfs -R 'ls -p /' "$image" 2>&1
+    printf '\n__EXT4WIN_HTREE_CASE_%s_TREE__\n' "$i"
+    debugfs -R 'htree_dump /' "$image" 2>&1
+    printf '\n__EXT4WIN_HTREE_CASE_%s_FSCK__\n' "$i"
+    e2fsck -f -n "$image" 2>&1
+    printf '\n__EXT4WIN_HTREE_CASE_%s_END__\n' "$i"
+    i=$((i + 1))
+done
+"#;
+    let mut command = linux.command("sh");
+    command.args(["-c", script, "ext4win-htree-oracle"]);
+    for case in cases {
+        command.arg(linux.tool_path(&case.image)?);
+    }
+    let output = run_checked_output(command, "batched HTree debugfs/e2fsck oracle")?;
+    let output = String::from_utf8(output.stdout)?;
+    for (index, case) in cases.iter().enumerate() {
+        let listing_marker = format!("__EXT4WIN_HTREE_CASE_{index}_LISTING__");
+        let tree_marker = format!("__EXT4WIN_HTREE_CASE_{index}_TREE__");
+        let fsck_marker = format!("__EXT4WIN_HTREE_CASE_{index}_FSCK__");
+        let end_marker = format!("__EXT4WIN_HTREE_CASE_{index}_END__");
+        let listing =
+            delimited_oracle_section(&output, &listing_marker, &tree_marker, &case.label)?;
+        let tree_dump = delimited_oracle_section(&output, &tree_marker, &fsck_marker, &case.label)?;
+        let _fsck = delimited_oracle_section(&output, &fsck_marker, &end_marker, &case.label)?;
+        verify_htree_fault_endpoint(listing, tree_dump, &case.label)?;
+    }
+    Ok(())
+}
+
+/// Returns one uniquely delimited oracle section.
+///
+/// # Errors
+///
+/// Returns an error when either delimiter is missing or reversed.
+fn delimited_oracle_section<'output>(
+    output: &'output str,
+    start: &str,
+    end: &str,
+    label: &str,
+) -> TaskResult<&'output str> {
+    let after_start = output
+        .split_once(start)
+        .map(|(_, suffix)| suffix)
+        .ok_or_else(|| io::Error::other(format!("{label} oracle omitted {start}")))?;
+    after_start
+        .split_once(end)
+        .map(|(section, _)| section)
+        .ok_or_else(|| io::Error::other(format!("{label} oracle omitted {end}")).into())
+}
+
+/// Generates one indexed-directory profile, drives local HTree updates, and validates the result
+/// through black-box filesystem tools.
+///
+/// # Errors
+///
+/// Returns an error when formatting, batched mutation, bounded enumeration, exact lookup, rename,
+/// debugfs inspection, or e2fsck validation fails.
+fn verify_htree_mutation_profile(
+    linux: LinuxEnvironment,
+    temporary_root: &Path,
+    block_size: u32,
+    metadata_checksum: bool,
+    large_directory: bool,
+) -> TaskResult<()> {
+    const ENTRY_COUNT: usize = 48;
+    const MUTATION_BATCH: usize = 24;
+
+    let checksum_label = if metadata_checksum { "csum" } else { "nocsum" };
+    let size_label = if large_directory { "large" } else { "standard" };
+    let label = format!("htree-{block_size}-{checksum_label}-{size_label}");
+    println!("HTree interoperability profile: {label}");
+    let case_root = temporary_root.join(&label);
+    fs::create_dir(&case_root)?;
+    let image = case_root.join("filesystem.img");
+    format_htree_image(
+        linux,
+        &image,
+        32 * 1024 * 1024,
+        block_size,
+        metadata_checksum,
+        large_directory,
+        8,
+    )?;
+
+    for first in (0..ENTRY_COUNT).step_by(MUTATION_BATCH) {
+        let end = core::cmp::min(
+            first
+                .checked_add(MUTATION_BATCH)
+                .ok_or_else(|| io::Error::other("HTree mutation batch boundary overflow"))?,
+            ENTRY_COUNT,
+        );
+        drive_internal_core_mutation(&image, |pass| {
+            let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+            for index in first..end {
+                let name = htree_profile_name(block_size, "entry", index)?;
+                pass.create_file(root, &name, mutation_file_metadata()?)?;
+            }
+            Ok(())
+        })?;
+    }
+
+    let source =
+        htree_profile_name(block_size, "entry", ENTRY_COUNT - 1).map_err(core_task_error)?;
+    let renamed =
+        htree_profile_name(block_size, "renamed", ENTRY_COUNT - 1).map_err(core_task_error)?;
+    drive_internal_core_mutation(&image, |pass| {
+        let root =
+            ext4_core::CommittedReadPass::load_directory(pass, ext4_core::DirectoryNodeId::ROOT)?;
+        let mut cursor = ext4_core::DirectoryScanCursor::start();
+        let mut count = 0_usize;
+        let mut saw_source = false;
+        loop {
+            let batch = ext4_core::CommittedReadPass::scan_directory(
+                pass,
+                &root,
+                &cursor,
+                ext4_core::DirectoryScanLimit::MAX,
+            )?;
+            if batch.entries().len() > ext4_core::MAX_DIRECTORY_SCAN_ENTRIES {
+                return Err(ext4_core::Error::InvalidDirectoryScanLimit);
+            }
+            let exhausted = batch.is_exhausted();
+            cursor = *batch.continuation();
+            for scanned in batch.into_entries() {
+                count = count
+                    .checked_add(1)
+                    .ok_or(ext4_core::Error::ArithmeticOverflow)?;
+                if scanned.entry().name() == &source {
+                    saw_source = true;
+                }
+            }
+            if exhausted {
+                break;
+            }
+        }
+        if count != ENTRY_COUNT + 3 || !saw_source {
+            return Err(ext4_core::Error::InvalidDirectoryEntry);
+        }
+        if !matches!(
+            ext4_core::CommittedReadPass::lookup_child(pass, &root, &source)?,
+            ext4_core::ChildLookup::Found(_)
+        ) {
+            return Err(ext4_core::Error::DirectoryEntryNotFound);
+        }
+        let transaction_root = pass.directory(root.id())?;
+        pass.rename_child(
+            transaction_root,
+            &source,
+            transaction_root,
+            &renamed,
+            ext4_core::RenameTargetCollision::Reject,
+        )
+    })?;
+
+    let dump = debugfs_request_output(linux, &image, "htree_dump /")?;
+    if !dump.contains("Root node dump") {
+        return Err(io::Error::other(format!(
+            "{label} did not produce a debugfs-readable HTree root"
+        ))
+        .into());
+    }
+    let renamed_path = format!("/{}", String::from_utf8_lossy(renamed.bytes()));
+    let source_path = format!("/{}", String::from_utf8_lossy(source.bytes()));
+    if !debugfs_path_exists(linux, &image, &renamed_path)? {
+        return Err(io::Error::other(format!(
+            "{label} renamed HTree entry is absent from debugfs"
+        ))
+        .into());
+    }
+    debugfs_require_absent(linux, &image, &source_path)?;
+    verify_internal_e2fsck_clean(linux, &image, &label)
+}
+
+/// Formats a temporary HTree interoperability image with explicit block/checksum/large-directory
+/// features.
+///
+/// # Errors
+///
+/// Returns an error when image allocation, host path conversion, or mke2fs execution fails.
+fn format_htree_image(
+    linux: LinuxEnvironment,
+    image: &Path,
+    image_bytes: u64,
+    block_size: u32,
+    metadata_checksum: bool,
+    large_directory: bool,
+    journal_megabytes: u32,
+) -> TaskResult<()> {
+    File::create(image)?.set_len(image_bytes)?;
+    let image_path = linux.tool_path(image)?;
+    let checksum = if metadata_checksum {
+        "metadata_csum,^uninit_bg"
+    } else {
+        "^metadata_csum,uninit_bg"
+    };
+    let large = if large_directory {
+        "large_dir"
+    } else {
+        "^large_dir"
+    };
+    let features = format!("64bit,dir_index,{checksum},{large},^metadata_csum_seed,^orphan_file");
+    let journal_size = format!("size={journal_megabytes}");
+    let mut mke2fs = linux.command("mke2fs");
+    mke2fs.args([
+        "-q",
+        "-F",
+        "-t",
+        "ext4",
+        "-b",
+        &block_size.to_string(),
+        "-O",
+        &features,
+        "-E",
+        "lazy_itable_init=0,lazy_journal_init=0",
+        "-J",
+        &journal_size,
+        &image_path,
+    ]);
+    run_checked(mke2fs, "HTree mutation image format")
+}
+
+/// Builds and validates one real two-level LARGEDIR tree through external directory optimization.
+///
+/// The external tool sees only an ordinary directory stream. Its optimizer chooses the HTree
+/// representation, while ext4-core subsequently proves that the resulting depth-two root is
+/// readable through the production lookup and paging paths.
+///
+/// # Errors
+///
+/// Returns an error when image formatting, external population/optimization, raw depth
+/// verification, production lookup/paging, or final filesystem validation fails.
+fn verify_large_directory_depth_two(
+    linux: LinuxEnvironment,
+    temporary_root: &Path,
+) -> TaskResult<()> {
+    const ENTRY_COUNT: usize = 64_000;
+    const BLOCK_SIZE: u32 = 1_024;
+    const MINIMUM_DIRECTORY_BYTES: usize = 16 * 1024 * 1024;
+    const DX_ROOT_INDIRECT_LEVELS_OFFSET: usize = 30;
+
+    let label = "htree-1024-csum-large-depth2";
+    println!("HTree interoperability profile: {label}");
+    let case_root = temporary_root.join(label);
+    fs::create_dir(&case_root)?;
+    let image = case_root.join("filesystem.img");
+    format_htree_image(linux, &image, 64 * 1024 * 1024, BLOCK_SIZE, true, true, 8)?;
+    let image_path = linux.tool_path(&image)?;
+    populate_depth_two_mounted_image(linux, &image_path, ENTRY_COUNT)?;
+
+    let blocks = debugfs_block_sequence(linux, &image_path, "blocks /depth2")?;
+    let directory_bytes = blocks
+        .len()
+        .checked_mul(usize::try_from(BLOCK_SIZE)?)
+        .ok_or_else(|| io::Error::other("depth-two directory byte size overflow"))?;
+    if directory_bytes <= MINIMUM_DIRECTORY_BYTES {
+        return Err(io::Error::other(format!(
+            "{label} directory is only {directory_bytes} bytes; expected more than 16 MiB"
+        ))
+        .into());
+    }
+    let first = blocks
+        .first()
+        .copied()
+        .ok_or_else(|| io::Error::other("depth-two directory has no root block"))?;
+    let mut file = File::open(&image)?;
+    let root = read_image_block(&mut file, first, BLOCK_SIZE)?;
+    if root.get(DX_ROOT_INDIRECT_LEVELS_OFFSET).copied() != Some(2) {
+        return Err(io::Error::other(format!(
+            "{label} optimizer did not produce a depth-two HTree root"
+        ))
+        .into());
+    }
+
+    let directory_name = ext4_core::Ext4Name::new(b"depth2").map_err(core_task_error)?;
+    let target_name = ext4_core::Ext4Name::new(
+        depth_two_profile_name(
+            ENTRY_COUNT
+                .checked_sub(1)
+                .ok_or_else(|| io::Error::other("depth-two entry count underflow"))?,
+        )?
+        .as_bytes(),
+    )
+    .map_err(core_task_error)?;
+    let ((), exact_lower_reads) = drive_internal_core_read_observed(&image, |pass| {
+        let root =
+            ext4_core::CommittedReadPass::load_directory(pass, ext4_core::DirectoryNodeId::ROOT)?;
+        let child = ext4_core::CommittedReadPass::lookup_child(pass, &root, &directory_name)?;
+        let directory_id = match child {
+            ext4_core::ChildLookup::Found(child) => match *child.node() {
+                ext4_core::NodeId::Directory(directory) => directory,
+                ext4_core::NodeId::File(_) | ext4_core::NodeId::Symlink(_) => {
+                    return Err(ext4_core::Error::WrongInodeKind);
+                }
+            },
+            ext4_core::ChildLookup::NotFound => {
+                return Err(ext4_core::Error::DirectoryEntryNotFound);
+            }
+        };
+        let directory = ext4_core::CommittedReadPass::load_directory(pass, directory_id)?;
+        if !matches!(
+            ext4_core::CommittedReadPass::lookup_child(pass, &directory, &target_name)?,
+            ext4_core::ChildLookup::Found(_)
+        ) {
+            return Err(ext4_core::Error::DirectoryEntryNotFound);
+        }
+        Ok(())
+    })?;
+    if exact_lower_reads >= blocks.len() {
+        return Err(io::Error::other(format!(
+            "{label} exact lookup issued {exact_lower_reads} lower reads for {} directory blocks",
+            blocks.len()
+        ))
+        .into());
+    }
+
+    drive_internal_core_read(&image, |pass| {
+        let root =
+            ext4_core::CommittedReadPass::load_directory(pass, ext4_core::DirectoryNodeId::ROOT)?;
+        let child = ext4_core::CommittedReadPass::lookup_child(pass, &root, &directory_name)?;
+        let directory_id = match child {
+            ext4_core::ChildLookup::Found(child) => match *child.node() {
+                ext4_core::NodeId::Directory(directory) => directory,
+                ext4_core::NodeId::File(_) | ext4_core::NodeId::Symlink(_) => {
+                    return Err(ext4_core::Error::WrongInodeKind);
+                }
+            },
+            ext4_core::ChildLookup::NotFound => {
+                return Err(ext4_core::Error::DirectoryEntryNotFound);
+            }
+        };
+        let directory = ext4_core::CommittedReadPass::load_directory(pass, directory_id)?;
+        let first = ext4_core::CommittedReadPass::scan_directory(
+            pass,
+            &directory,
+            &ext4_core::DirectoryScanCursor::start(),
+            ext4_core::DirectoryScanLimit::MAX,
+        )?;
+        if first.entries().len() != ext4_core::MAX_DIRECTORY_SCAN_ENTRIES || first.is_exhausted() {
+            return Err(ext4_core::Error::InvalidDirectoryEntry);
+        }
+        let second = ext4_core::CommittedReadPass::scan_directory(
+            pass,
+            &directory,
+            first.continuation(),
+            ext4_core::DirectoryScanLimit::MAX,
+        )?;
+        if second.entries().len() != ext4_core::MAX_DIRECTORY_SCAN_ENTRIES || second.is_exhausted()
+        {
+            return Err(ext4_core::Error::InvalidDirectoryEntry);
+        }
+        Ok(())
+    })?;
+    println!(
+        "depth-two >16 MiB lookup/paging: PASS ({exact_lower_reads} exact lower reads, {} directory blocks)",
+        blocks.len()
+    );
+    verify_internal_e2fsck_clean(linux, &image, label)
+}
+
+/// Populates a mounted ext4 image through the kernel's public filesystem behavior.
+///
+/// # Errors
+///
+/// Returns an error when mount-directory creation, loop mounting, hard-link population, sync,
+/// unmount, or mandatory mount-directory cleanup fails.
+fn populate_depth_two_mounted_image(
+    linux: LinuxEnvironment,
+    image_path: &str,
+    entry_count: usize,
+) -> TaskResult<()> {
+    const PREFIX: &str = "/tmp/ext4win-htree-mount.";
+
+    let mut temporary = linux.command("mktemp");
+    temporary.args(["-d", "/tmp/ext4win-htree-mount.XXXXXXXX"]);
+    let output = run_checked_output(temporary, "depth-two mount directory creation")?;
+    let mount_directory = String::from_utf8(output.stdout)?.trim().to_owned();
+    if !mount_directory.starts_with(PREFIX)
+        || mount_directory.len() <= PREFIX.len()
+        || mount_directory.contains(char::is_whitespace)
+    {
+        return Err(io::Error::other("mktemp returned an unsafe depth-two mount path").into());
+    }
+
+    let mut mount = linux.command("mount");
+    mount.args(["-o", "loop", image_path, &mount_directory]);
+    if let Err(error) = run_checked(mount, "depth-two loop mount") {
+        let cleanup = remove_depth_two_mount_directory(linux, &mount_directory);
+        return combine_verification_and_cleanup(Err(error), cleanup);
+    }
+
+    let workload = (|| -> TaskResult<()> {
+        let script = r#"import os, sys
+root = sys.argv[1]
+count = int(sys.argv[2])
+depth = os.path.join(root, "depth2")
+os.mkdir(depth)
+target = os.path.join(root, "depth2-target")
+open(target, "wb").close()
+for index in range(count):
+    name = f"depth-{index:05d}-"
+    name += "x" * (255 - len(name))
+    os.link(target, os.path.join(depth, name))
+"#;
+        let mut populate = linux.command("python3");
+        populate
+            .args(["-c", script, &mount_directory, &entry_count.to_string()])
+            .stdout(Stdio::null());
+        run_checked(populate, "depth-two mounted directory population")?;
+        let mut sync = linux.command("sync");
+        sync.args(["-f", &mount_directory]);
+        run_checked(sync, "depth-two mounted image sync")
+    })();
+    let mut unmount = linux.command("umount");
+    unmount.arg(&mount_directory);
+    let unmounted =
+        combine_verification_and_cleanup(workload, run_checked(unmount, "depth-two loop unmount"));
+    let removed = remove_depth_two_mount_directory(linux, &mount_directory);
+    combine_verification_and_cleanup(unmounted, removed)
+}
+
+/// Removes one empty, validated Linux-local mount directory.
+///
+/// # Errors
+///
+/// Returns an error when the path is outside the dedicated prefix or removal fails.
+fn remove_depth_two_mount_directory(
+    linux: LinuxEnvironment,
+    mount_directory: &str,
+) -> TaskResult<()> {
+    const PREFIX: &str = "/tmp/ext4win-htree-mount.";
+
+    if !mount_directory.starts_with(PREFIX)
+        || mount_directory.len() <= PREFIX.len()
+        || mount_directory.contains(char::is_whitespace)
+    {
+        return Err(io::Error::other("refusing unsafe depth-two mount cleanup path").into());
+    }
+    let mut remove = linux.command("rmdir");
+    remove.args(["--", mount_directory]);
+    run_checked(remove, "depth-two mount directory cleanup")
+}
+
+/// Builds one unique maximum-length directory component for the depth-two profile.
+///
+/// # Errors
+///
+/// Returns an error when the fixed prefix exceeds the ext4 name limit or padding allocation fails.
+fn depth_two_profile_name(index: usize) -> TaskResult<String> {
+    const NAME_BYTES: usize = 255;
+
+    let mut name = format!("depth-{index:05}-");
+    let padding = NAME_BYTES
+        .checked_sub(name.len())
+        .ok_or_else(|| io::Error::other("depth-two name prefix exceeds ext4 limit"))?;
+    name.try_reserve_exact(padding)
+        .map_err(|_| io::Error::other("depth-two name allocation failed"))?;
+    name.extend(core::iter::repeat_n('x', padding));
+    Ok(name)
+}
+
+/// Builds a deterministic long name that forces local leaf splits at the selected block size.
+///
+/// # Errors
+///
+/// Returns an error when the generated component length is invalid or allocation fails.
+fn htree_profile_name(
+    block_size: u32,
+    prefix: &str,
+    index: usize,
+) -> ext4_core::Result<ext4_core::Ext4Name> {
+    let total_bytes: usize = match block_size {
+        1_024 => 103,
+        4_096 => 115,
+        _ => return Err(ext4_core::Error::UnsupportedBlockSize),
+    };
+    let mut name = format!("{prefix}-{index:04}-");
+    let padding = total_bytes
+        .checked_sub(name.len())
+        .ok_or(ext4_core::Error::InvalidName)?;
+    name.try_reserve_exact(padding)
+        .map_err(|_| ext4_core::Error::OutOfMemory)?;
+    name.extend(core::iter::repeat_n('x', padding));
+    ext4_core::Ext4Name::new(name.as_bytes())
 }
 
 /// Creates one deterministic fresh ext4 image accepted by the production mount validator.
@@ -3703,63 +4408,101 @@ fn run_external_file_mutation_until_boundary(
             )
         },
     )?;
+    run_prepared_mutation_until_boundary(&mut storage, &mut coordinator, ticket, prepared, cut)
+}
+
+/// Runs the fixed HTree conversion/split transaction until completion or one durability cut.
+///
+/// # Errors
+///
+/// Returns an error for name construction, internal mount/resolve/reservation, or commit/checkpoint
+/// boundary execution failure.
+fn run_internal_htree_mutation_until_boundary(
+    filesystem: &Path,
+    cut: Option<EffectCut>,
+) -> TaskResult<EffectBoundaryRun> {
+    let names = htree_fault_names()?;
+    let mut storage = CrashStorageAdapter::open_internal(filesystem)?;
+    let completed = mount_internal_core(&mut storage)?;
+    let (profile, epoch, mut coordinator) = (*completed).into_parts();
+    let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
+    let (prepared, ()) = prepare_core_mutation(
+        &mut storage,
+        &profile,
+        &epoch,
+        &coordinator,
+        ticket,
+        |pass| {
+            let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+            for name in &names {
+                pass.create_file(root, name, mutation_file_metadata()?)?;
+            }
+            Ok(())
+        },
+    )?;
+    run_prepared_mutation_until_boundary(&mut storage, &mut coordinator, ticket, prepared, cut)
+}
+
+/// Drives one preallocated production mutation through every durability boundary or one exact cut.
+///
+/// # Errors
+///
+/// Returns an error for controller construction, host storage effects, completion identity,
+/// publication, checkpoint, or final durable materialization failure.
+fn run_prepared_mutation_until_boundary(
+    storage: &mut CrashStorageAdapter,
+    coordinator: &mut ext4_core::MutationCoordinatorState,
+    ticket: u64,
+    prepared: ext4_core::CommitReadyMutation,
+    cut: Option<EffectCut>,
+) -> TaskResult<EffectBoundaryRun> {
     let mut controller = EffectBoundaryController::new(cut)?;
 
-    let ordered = match complete_boundary_sequence(&mut storage, &mut controller, prepared.start())?
-    {
+    let ordered = match complete_boundary_sequence(storage, &mut controller, prepared.start())? {
         BoundarySequence::Stopped => return Ok(controller.stopped()),
         BoundarySequence::Finished(ordered) => ordered,
     };
-    if !complete_boundary_request(&mut storage, &mut controller, ordered.flush_request())? {
+    if !complete_boundary_request(storage, &mut controller, ordered.flush_request())? {
         return Ok(controller.stopped());
     }
-    let payloads =
-        match complete_boundary_sequence(&mut storage, &mut controller, ordered.completed())? {
-            BoundarySequence::Stopped => return Ok(controller.stopped()),
-            BoundarySequence::Finished(payloads) => payloads,
-        };
-    if !complete_boundary_request(&mut storage, &mut controller, payloads.flush_request())? {
+    let payloads = match complete_boundary_sequence(storage, &mut controller, ordered.completed())?
+    {
+        BoundarySequence::Stopped => return Ok(controller.stopped()),
+        BoundarySequence::Finished(payloads) => payloads,
+    };
+    if !complete_boundary_request(storage, &mut controller, payloads.flush_request())? {
         return Ok(controller.stopped());
     }
     let (commit_request, commit_durability) = payloads.completed().submit();
-    if !complete_boundary_request(&mut storage, &mut controller, commit_request)? {
+    if !complete_boundary_request(storage, &mut controller, commit_request)? {
         return Ok(controller.stopped());
     }
-    if !complete_boundary_request(
-        &mut storage,
-        &mut controller,
-        commit_durability.flush_request(),
-    )? {
+    if !complete_boundary_request(storage, &mut controller, commit_durability.flush_request())? {
         return Ok(controller.stopped());
     }
-    let published = commit_durability.completed().publish(
-        &mut coordinator,
-        ext4_core::VisibilityLease::granted(ticket),
-    );
+    let published = commit_durability
+        .completed()
+        .publish(coordinator, ext4_core::VisibilityLease::granted(ticket));
     let (epoch, checkpoint) = published.into_parts();
     let home = match complete_boundary_sequence(
-        &mut storage,
+        storage,
         &mut controller,
         checkpoint.start(ext4_core::CheckpointLease::granted(epoch.sequence())),
     )? {
         BoundarySequence::Stopped => return Ok(controller.stopped()),
         BoundarySequence::Finished(home) => home,
     };
-    if !complete_boundary_request(&mut storage, &mut controller, home.flush_request())? {
+    if !complete_boundary_request(storage, &mut controller, home.flush_request())? {
         return Ok(controller.stopped());
     }
     let (clean_request, clean_durability) = home.completed().submit();
-    if !complete_boundary_request(&mut storage, &mut controller, clean_request)? {
+    if !complete_boundary_request(storage, &mut controller, clean_request)? {
         return Ok(controller.stopped());
     }
-    if !complete_boundary_request(
-        &mut storage,
-        &mut controller,
-        clean_durability.flush_request(),
-    )? {
+    if !complete_boundary_request(storage, &mut controller, clean_durability.flush_request())? {
         return Ok(controller.stopped());
     }
-    let _checkpointed_epoch = clean_durability.completed(&mut coordinator);
+    let _checkpointed_epoch = clean_durability.completed(coordinator);
     storage.materialize_durable()?;
     Ok(controller.completed())
 }
@@ -4051,6 +4794,70 @@ where
     let mut storage = FileStorageAdapter::open_internal(image)?;
     let completed = mount_internal_core(&mut storage)?;
     drive_core_mutation(&mut storage, completed, mutate)
+}
+
+/// Mounts one internal-journal image, executes a restartable committed-epoch read, and cleanly
+/// closes it without manufacturing an empty mutation.
+///
+/// # Errors
+///
+/// Returns an error for image I/O, mount/read suspension, the terminal read result, or clean close.
+fn drive_internal_core_read<F, R>(image: &Path, read: F) -> TaskResult<R>
+where
+    F: for<'storage, 'epoch> FnMut(
+        &mut ext4_core::EpochReadPass<'_, 'storage, 'epoch>,
+    ) -> ext4_core::Result<R>,
+{
+    drive_internal_core_read_observed(image, read).map(|(output, _lower_reads)| output)
+}
+
+/// Mounts one internal-journal image, executes a restartable committed-epoch read, and reports
+/// how many lower reads the production operation submitted after mounting.
+///
+/// # Errors
+///
+/// Returns an error for image I/O, mount/read suspension, unexpected non-read I/O, the terminal
+/// read result, request-count overflow, or clean close.
+fn drive_internal_core_read_observed<F, R>(image: &Path, mut read: F) -> TaskResult<(R, usize)>
+where
+    F: for<'storage, 'epoch> FnMut(
+        &mut ext4_core::EpochReadPass<'_, 'storage, 'epoch>,
+    ) -> ext4_core::Result<R>,
+{
+    let mut storage = FileStorageAdapter::open_internal(image)?;
+    let filesystem_length =
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
+    let completed = mount_internal_core(&mut storage)?;
+    let (profile, epoch, _coordinator) = (*completed).into_parts();
+    let mut operation = ext4_core::EpochReadOperation::new(&profile);
+    let mut event = ext4_core::OperationEvent::Admitted;
+    let mut lower_reads = 0_usize;
+    let output = loop {
+        let mut crypto = RejectingCryptographicOperation;
+        match operation.run(event, &epoch, &mut crypto, |pass| read(pass)) {
+            ext4_core::ReadTransition::SubmitLower { request, suspended } => {
+                if !matches!(&request, ext4_core::StorageRequest::Read { .. }) {
+                    return Err(io::Error::other(
+                        "committed read operation submitted non-read storage I/O",
+                    )
+                    .into());
+                }
+                lower_reads = lower_reads
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("lower read count overflow"))?;
+                event = ext4_core::OperationEvent::StorageCompleted(complete_file_request(
+                    &mut storage,
+                    request,
+                )?);
+                operation = suspended;
+            }
+            ext4_core::ReadTransition::Complete(result) => {
+                break result.map_err(core_task_error)?;
+            }
+        }
+    };
+    complete_core_clean_close(&mut storage, filesystem_length, profile.journal_target())?;
+    Ok((output, lower_reads))
 }
 
 /// Mounts one external-journal image pair, executes a typed mutation, and cleanly closes it.
@@ -4869,6 +5676,7 @@ fn build_verified_production_bundle(repository_root: &Path) -> TaskResult<PathBu
     verify_portable(repository_root)?;
     verify_driver(repository_root)?;
     verify_journal_interop(repository_root)?;
+    verify_htree_interop(repository_root)?;
     if !cfg!(target_os = "windows") {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -5679,6 +6487,10 @@ mod tests {
         assert_eq!(
             Task::parse(OsStr::new("verify-journal-interop")),
             Some(Task::JournalInterop)
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("verify-htree-interop")),
+            Some(Task::HtreeInterop)
         );
         assert_eq!(
             Task::parse(OsStr::new("verify-journal-fixture-provenance")),
