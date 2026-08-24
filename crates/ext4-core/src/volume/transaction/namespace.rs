@@ -14,7 +14,7 @@ enum ExistingRenameTarget {
 }
 
 /// One staged-aware root or interior-node level on a mutation path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct MutationHtreeLevel {
     /// Logical block containing this index (`0` for the root).
     logical: u32,
@@ -27,7 +27,7 @@ struct MutationHtreeLevel {
 }
 
 /// Bounded root-to-leaf mutation route.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct MutationHtreePath {
     /// Resident root-to-leaf routing levels.
     levels: Vec<MutationHtreeLevel>,
@@ -1065,7 +1065,7 @@ impl MutationResolvePass<'_, '_, '_> {
             logical: 0,
             physical: root_physical,
             selected: root.index().select(major),
-            index: root.index().clone(),
+            index: root.index().try_clone()?,
         })?;
         for _ in 0..root.indirect_levels() {
             let logical = levels
