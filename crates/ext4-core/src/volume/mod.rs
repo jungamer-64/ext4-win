@@ -1,6 +1,7 @@
 //! Mounted ext4 volume state and journaled write transactions.
 
 mod block_group;
+mod directory;
 mod event;
 mod inode_record;
 mod mount;
@@ -10,6 +11,10 @@ mod read;
 mod scope;
 mod transaction;
 
+pub use directory::{
+    DirectoryScanBatch, DirectoryScanCursor, DirectoryScanLimit, MAX_DIRECTORY_SCAN_ENTRIES,
+    ScannedDirectoryEntry,
+};
 pub use event::{
     BarrierPermit, CheckpointLease, CommitLease, MutationLease, OperationEvent, OperationId,
     RetryPermit, VisibilityLease,

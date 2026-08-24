@@ -83,6 +83,17 @@ pub trait CommittedReadPass {
     ///
     /// Returns an error when the target is malformed, cannot be read, or cannot be allocated.
     fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>>;
+    /// Reads at most `limit` raw live entries from a live directory continuation.
+    /// # Errors
+    ///
+    /// Returns an error when the directory/index/dirent representation is invalid, entry names
+    /// cannot be projected, referenced inodes are invalid, or bounded result allocation fails.
+    fn scan_directory(
+        &mut self,
+        directory: &DirectoryNode,
+        cursor: &DirectoryScanCursor,
+        limit: DirectoryScanLimit,
+    ) -> Result<DirectoryScanBatch>;
     /// Enumerates every reachable hard link to a non-directory inode.
     /// # Errors
     ///
@@ -215,6 +226,20 @@ impl EpochReadPass<'_, '_, '_> {
         self.view.read_symlink(symlink)
     }
 
+    /// Reads one bounded live-directory page.
+    /// # Errors
+    ///
+    /// Returns an error when storage is incomplete or directory traversal/projection fails.
+    pub fn scan_directory(
+        &mut self,
+        directory: &DirectoryNode,
+        cursor: &DirectoryScanCursor,
+        limit: DirectoryScanLimit,
+    ) -> Result<DirectoryScanBatch> {
+        self.view
+            .scan_directory(directory, cursor, limit, self.crypto)
+    }
+
     /// Enumerates every reachable hard link to a non-directory inode.
     /// # Errors
     ///
@@ -293,6 +318,15 @@ impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
 
     fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
         self.read_symlink(symlink)
+    }
+
+    fn scan_directory(
+        &mut self,
+        directory: &DirectoryNode,
+        cursor: &DirectoryScanCursor,
+        limit: DirectoryScanLimit,
+    ) -> Result<DirectoryScanBatch> {
+        self.scan_directory(directory, cursor, limit)
     }
 
     fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {

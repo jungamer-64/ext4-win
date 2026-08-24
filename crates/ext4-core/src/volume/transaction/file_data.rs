@@ -24,7 +24,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .volume
             .superblock
             .inode_data_encoding()
-            .encode_size(new_size)?;
+            .encode_file_size(new_size)?;
         let inode_index = self.ensure_inode_update(file.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
@@ -501,7 +501,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .volume
             .superblock
             .inode_data_encoding()
-            .encode_size(new_size)?;
+            .encode_file_size(new_size)?;
         let inode_index = self.ensure_inode_update(file.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
@@ -525,7 +525,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .volume
             .superblock
             .inode_data_encoding()
-            .encode_size(new_size)?;
+            .encode_file_size(new_size)?;
         let inode_index = self.ensure_inode_update(file.inode())?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;

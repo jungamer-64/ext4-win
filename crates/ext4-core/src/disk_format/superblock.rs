@@ -7,7 +7,7 @@ use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u32};
 use crate::disk::storage::OperationDevice;
 use crate::disk_format::inode::{
-    FileSizeEncoding, InodeBlockCountEncoding, InodeDataEncoding, InodeId,
+    DirectorySizeEncoding, FileSizeEncoding, InodeBlockCountEncoding, InodeDataEncoding, InodeId,
 };
 use crate::error::{Error, Result};
 use crate::memory;
@@ -1052,8 +1052,10 @@ pub(crate) enum SparseSuperblockLayout {
 pub(crate) enum DirectoryIndexing {
     /// Indexed directories are outside this mounted profile.
     Disabled,
-    /// HTree indexed directories are part of this mounted profile.
-    Enabled,
+    /// HTree indexing is enabled with at most one interior index level.
+    Standard,
+    /// Pre-enabled `INCOMPAT_LARGEDIR` permits two interior index levels.
+    LargeDirectory,
 }
 
 impl DirectoryIndexing {
@@ -1061,9 +1063,10 @@ impl DirectoryIndexing {
     /// # Errors
     ///
     /// Returns an error when the mounted feature policy disables HTree directory indexing.
-    pub(crate) const fn require_supported(self) -> Result<()> {
+    pub(crate) const fn require_supported(self) -> Result<u8> {
         match self {
-            Self::Enabled => Ok(()),
+            Self::Standard => Ok(1),
+            Self::LargeDirectory => Ok(2),
             Self::Disabled => Err(Error::UnsupportedDirectoryHash),
         }
     }
@@ -1168,6 +1171,8 @@ pub(crate) struct FeatureSet {
     xattr_mutation: XattrMutationSupport,
     /// File-size encoding supported by inode records.
     file_size_encoding: FileSizeEncoding,
+    /// Directory-size encoding selected by the incompatible large-directory feature.
+    directory_size_encoding: DirectorySizeEncoding,
     /// Inode block-count encoding supported by inode records.
     inode_block_count_encoding: InodeBlockCountEncoding,
     /// Timestamp encoding supported by inode records.
@@ -1224,7 +1229,6 @@ impl FeatureSet {
             & (INCOMPAT_META_BG
                 | INCOMPAT_MMP
                 | INCOMPAT_EA_INODE
-                | INCOMPAT_LARGEDIR
                 | INCOMPAT_INLINE_DATA
                 | INCOMPAT_CASEFOLD)
             != 0
@@ -1301,10 +1305,12 @@ impl FeatureSet {
             } else {
                 SparseSuperblockLayout::FullCopies
             },
-            directory_indexing: if compat & COMPAT_DIR_INDEX != 0 {
-                DirectoryIndexing::Enabled
-            } else {
+            directory_indexing: if compat & COMPAT_DIR_INDEX == 0 {
                 DirectoryIndexing::Disabled
+            } else if incompat & INCOMPAT_LARGEDIR != 0 {
+                DirectoryIndexing::LargeDirectory
+            } else {
+                DirectoryIndexing::Standard
             },
             allocation_bitmap_domain: if read_only_compat & RO_COMPAT_BIGALLOC != 0 {
                 AllocationBitmapDomain::Clusters
@@ -1327,6 +1333,11 @@ impl FeatureSet {
                 FileSizeEncoding::LargeFile
             } else {
                 FileSizeEncoding::Legacy
+            },
+            directory_size_encoding: if incompat & INCOMPAT_LARGEDIR != 0 {
+                DirectorySizeEncoding::LargeDirectory
+            } else {
+                DirectorySizeEncoding::Standard
             },
             inode_block_count_encoding: if read_only_compat & RO_COMPAT_HUGE_FILE != 0 {
                 InodeBlockCountEncoding::HugeFile
@@ -1853,6 +1864,7 @@ impl Superblock {
     pub(crate) const fn inode_data_encoding(self) -> InodeDataEncoding {
         InodeDataEncoding::new(
             self.features.file_size_encoding,
+            self.features.directory_size_encoding,
             self.features.inode_block_count_encoding,
             self.block_size,
         )
@@ -2153,4 +2165,62 @@ fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
     adjusted
         .checked_div(divisor)
         .ok_or(Error::InvalidClusterGeometry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Panics
+    ///
+    /// Panics when pre-enabled large-directory capability stops selecting the wider size/depth
+    /// profile or becomes required for standard HTree mounts.
+    #[test]
+    fn large_directory_feature_selects_explicit_size_and_index_profiles() {
+        let required_incompat = INCOMPAT_FILETYPE | INCOMPAT_EXTENTS;
+        let standard =
+            FeatureSet::read_write(COMPAT_HAS_JOURNAL | COMPAT_DIR_INDEX, required_incompat, 0);
+        assert!(standard.is_ok());
+        let Ok(standard) = standard else {
+            return;
+        };
+        assert_eq!(standard.directory_indexing, DirectoryIndexing::Standard);
+        assert_eq!(standard.directory_indexing.require_supported(), Ok(1));
+        assert_eq!(
+            standard.directory_size_encoding,
+            DirectorySizeEncoding::Standard
+        );
+
+        let large = FeatureSet::read_write(
+            COMPAT_HAS_JOURNAL | COMPAT_DIR_INDEX,
+            required_incompat | INCOMPAT_LARGEDIR,
+            0,
+        );
+        assert!(large.is_ok());
+        let Ok(large) = large else {
+            return;
+        };
+        assert_eq!(large.directory_indexing, DirectoryIndexing::LargeDirectory);
+        assert_eq!(large.directory_indexing.require_supported(), Ok(2));
+        assert_eq!(
+            large.directory_size_encoding,
+            DirectorySizeEncoding::LargeDirectory
+        );
+
+        let size_only =
+            FeatureSet::read_write(COMPAT_HAS_JOURNAL, required_incompat | INCOMPAT_LARGEDIR, 0);
+        assert!(size_only.is_ok());
+        let Ok(size_only) = size_only else {
+            return;
+        };
+        assert_eq!(size_only.directory_indexing, DirectoryIndexing::Disabled);
+        assert_eq!(
+            size_only.directory_indexing.require_supported(),
+            Err(Error::UnsupportedDirectoryHash)
+        );
+        assert_eq!(
+            size_only.directory_size_encoding,
+            DirectorySizeEncoding::LargeDirectory
+        );
+    }
 }

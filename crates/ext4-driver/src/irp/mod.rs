@@ -1902,11 +1902,6 @@ impl IrpBufferLength {
 pub(crate) struct DirectoryEntryIndex(u32);
 
 impl DirectoryEntryIndex {
-    /// Creates a directory entry index from the Windows cursor field.
-    pub(crate) const fn from_u32(value: u32) -> Self {
-        Self(value)
-    }
-
     /// Returns the cursor index.
     pub(crate) const fn as_u32(self) -> u32 {
         self.0

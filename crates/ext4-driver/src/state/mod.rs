@@ -23,10 +23,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use ext4_core::{
     CleanJournalDurability, CommitLease, CommitReadyMutation, CompletedMount, DirectoryNodeId,
-    DurableMutation, Ext4Name, FileNodeId, FileOffset, FscryptKeyIdentifier, FscryptKeyPresence,
-    MountedProfile, MutationLease, MutationResolvePass, NewDirectoryMetadata, NewFileMetadata,
-    NodeId, ReservedMutation, ResolvedMutation, VisibilityLease, VolumeGeometry, VolumeIdentity,
-    WindowsName, XattrName, XattrValue,
+    DirectoryScanCursor, DurableMutation, Ext4Name, FileNodeId, FileOffset, FscryptKeyIdentifier,
+    FscryptKeyPresence, MountedProfile, MutationLease, MutationResolvePass, NewDirectoryMetadata,
+    NewFileMetadata, NodeId, ReservedMutation, ResolvedMutation, VisibilityLease, VolumeGeometry,
+    VolumeIdentity, WindowsName, XattrName, XattrValue,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, LARGE_INTEGER, PDEVICE_OBJECT,
@@ -38,7 +38,7 @@ use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 use crate::irp::reactor::ReactorTarget;
 use crate::irp::{
     ActiveFileObject, ByteRangeLockKey, CompletionReactor, CreateDeletion, DataIoKind,
-    DeleteAccess, DesiredAccess, DirectoryEntryIndex, DispatchTarget, ExistingOperationAccess,
+    DeleteAccess, DesiredAccess, DispatchTarget, ExistingOperationAccess,
     FileAttributesWriteAccess, RegularFileWriteAccess, RequestorProcess, ShareAccess,
 };
 use crate::kernel::cng::CngOperation;
@@ -3874,31 +3874,8 @@ enum FileControlBlockRelease {
     LastReference,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Per-handle directory enumeration state.
-pub(crate) struct DirectoryCursor {
-    /// Next directory entry index to emit.
-    next_entry: DirectoryEntryIndex,
-}
-
-impl DirectoryCursor {
-    /// Creates a cursor at the first directory entry.
-    pub(crate) const fn start() -> Self {
-        Self {
-            next_entry: DirectoryEntryIndex::from_u32(0),
-        }
-    }
-
-    /// Returns the next directory entry index to emit.
-    pub(crate) const fn next_entry(self) -> DirectoryEntryIndex {
-        self.next_entry
-    }
-
-    /// Moves the cursor to a specific directory entry index.
-    pub(crate) const fn seek(&mut self, next_entry: DirectoryEntryIndex) {
-        self.next_entry = next_entry;
-    }
-}
+/// Core-owned live-directory continuation stored directly in the CCB.
+pub(crate) type DirectoryCursor = DirectoryScanCursor;
 
 /// Stable namespace identity selected for a deferred Windows deletion.
 #[derive(Debug, Eq, PartialEq)]
@@ -4644,8 +4621,8 @@ enum OpenedHandleKind {
     },
     /// Directory handle with enumeration cursor.
     Directory {
-        /// Directory enumeration cursor.
-        cursor: UnsafeCell<DirectoryCursor>,
+        /// Stable, separately allocated directory enumeration cursor.
+        cursor: Box<UnsafeCell<DirectoryCursor>>,
     },
     /// Symlink handle.
     Symlink,
@@ -4653,6 +4630,9 @@ enum OpenedHandleKind {
 
 impl OpenedHandle {
     /// Creates per-handle state for an opened node.
+    /// # Errors
+    ///
+    /// Returns an error when a directory cursor cannot be allocated.
     pub(crate) fn new(
         node: NodeId,
         node_mode: OpenedNodeMode,
@@ -4660,7 +4640,7 @@ impl OpenedHandle {
         deletion: HandleDeletion,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
-    ) -> Self {
+    ) -> DriverResult<Self> {
         Self::from_parts(
             node,
             node_mode,
@@ -4672,6 +4652,9 @@ impl OpenedHandle {
     }
 
     /// Creates per-handle state from explicit lifecycle fields.
+    /// # Errors
+    ///
+    /// Returns an error when a directory cursor cannot be allocated.
     fn from_parts(
         node: NodeId,
         node_mode: OpenedNodeMode,
@@ -4679,18 +4662,18 @@ impl OpenedHandle {
         deletion: HandleDeletion,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
-    ) -> Self {
+    ) -> DriverResult<Self> {
         let state = OpenedHandleState::new(node_mode, location, deletion, data_transfer_mode);
         let kind = match node {
             NodeId::File(_) => OpenedHandleKind::File {
                 write_access: regular_file_write_access,
             },
             NodeId::Directory(_) => OpenedHandleKind::Directory {
-                cursor: UnsafeCell::new(DirectoryCursor::start()),
+                cursor: memory::boxed_try_with(|| Ok(UnsafeCell::new(DirectoryCursor::start())))?,
             },
             NodeId::Symlink(_) => OpenedHandleKind::Symlink,
         };
-        Self { state, kind }
+        Ok(Self { state, kind })
     }
 
     /// Returns data transfer buffering policy requested for this handle.
@@ -4793,7 +4776,7 @@ impl OpenedHandle {
     /// Returns the stable interior cursor address for directory handles.
     fn directory_cursor(&self) -> Option<NonNull<DirectoryCursor>> {
         match &self.kind {
-            OpenedHandleKind::Directory { cursor } => NonNull::new(cursor.get()),
+            OpenedHandleKind::Directory { cursor } => NonNull::new(cursor.as_ref().get()),
             OpenedHandleKind::File { .. } | OpenedHandleKind::Symlink => None,
         }
     }
@@ -5698,8 +5681,8 @@ mod tests {
     use ext4_core::{DirectoryNodeId, Ext4Name, FileOffset, NodeId};
 
     use crate::irp::{
-        ActiveFileObject, CreateDeletion, DataIoKind, DeleteAccess, DirectoryEntryIndex,
-        FileAttributesWriteAccess, ReceivedIrp, RegularFileWriteAccess,
+        ActiveFileObject, CreateDeletion, DataIoKind, DeleteAccess, FileAttributesWriteAccess,
+        ReceivedIrp, RegularFileWriteAccess,
     };
     use crate::kernel::status::DriverError;
 
@@ -5722,6 +5705,26 @@ mod tests {
             delete_access: DeleteAccess::Denied,
             file_attributes_write_access: FileAttributesWriteAccess::Denied,
         }
+    }
+
+    /// Allocates a directory-handle fixture through the production constructor.
+    /// # Panics
+    ///
+    /// Panics when the fixed fixture cannot allocate its directory cursor.
+    fn directory_handle(
+        node_mode: OpenedNodeMode,
+        data_transfer_mode: DataTransferMode,
+    ) -> Option<OpenedHandle> {
+        let handle = OpenedHandle::new(
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            node_mode,
+            OpenedLocation::Root,
+            retained_handle_deletion(),
+            data_transfer_mode,
+            RegularFileWriteAccess::Denied,
+        );
+        assert!(handle.is_ok());
+        handle.ok()
     }
 
     fn file_object_with_contexts(
@@ -6057,14 +6060,12 @@ mod tests {
     fn typed_opened_directory_exposes_cursor_without_option() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
+        let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            retained_handle_deletion(),
             DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
+        ) else {
+            return;
+        };
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
@@ -6072,17 +6073,9 @@ mod tests {
         let result = with_active_file_object(&mut file, |file_object| {
             let mut directory = OpenedDirectory::decode(file_object)?;
             assert_eq!(directory.id(), DirectoryNodeId::ROOT);
-            assert_eq!(
-                directory.cursor_mut().next_entry(),
-                DirectoryEntryIndex::from_u32(0)
-            );
-            directory
-                .cursor_mut()
-                .seek(DirectoryEntryIndex::from_u32(7));
-            assert_eq!(
-                directory.cursor_mut().next_entry(),
-                DirectoryEntryIndex::from_u32(7)
-            );
+            assert_eq!(directory.cursor_mut().ordinal(), 0);
+            directory.cursor_mut().seek_ordinal(7);
+            assert_eq!(directory.cursor_mut().ordinal(), 7);
             Ok(())
         });
         assert_eq!(result, Ok(()));
@@ -6095,14 +6088,12 @@ mod tests {
     fn opened_directory_reuses_a_stable_notification_name_descriptor() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
+        let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            retained_handle_deletion(),
             DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
+        ) else {
+            return;
+        };
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
@@ -6199,14 +6190,12 @@ mod tests {
     fn typed_opened_decoders_reject_wrong_node_kind() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
+        let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            retained_handle_deletion(),
             DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
+        ) else {
+            return;
+        };
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
@@ -6227,14 +6216,12 @@ mod tests {
     fn reparse_point_directory_handle_rejects_directory_operations() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
+        let Some(mut handle) = directory_handle(
             OpenedNodeMode::ReparsePoint,
-            OpenedLocation::Root,
-            retained_handle_deletion(),
             DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
+        ) else {
+            return;
+        };
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
@@ -6253,14 +6240,12 @@ mod tests {
     /// Panics when cleanup retries repeat cleanup-owned side effects.
     #[test]
     fn handle_lifecycle_makes_completed_cleanup_idempotent() {
-        let handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
+        let Some(handle) = directory_handle(
             OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            retained_handle_deletion(),
             DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
+        ) else {
+            return;
+        };
         assert_eq!(
             handle.begin_cleanup_admission(),
             HandleAdmissionState::CleanupDraining
@@ -6289,14 +6274,12 @@ mod tests {
     /// Panics when a filter-cancelled open cannot select its one atomic release path.
     #[test]
     fn active_cancelled_open_selects_combined_share_and_reference_release() {
-        let handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
+        let Some(handle) = directory_handle(
             OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            retained_handle_deletion(),
             DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
+        ) else {
+            return;
+        };
         handle.begin_close_admission(FileObjectCloseKind::CancelledOpen, false);
         assert_eq!(
             handle.close_release_plan(FileObjectCloseKind::CancelledOpen, false),
@@ -6336,14 +6319,12 @@ mod tests {
         };
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
+        let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            retained_handle_deletion(),
             DataTransferMode::NoIntermediate(transfer),
-            RegularFileWriteAccess::Denied,
-        );
+        ) else {
+            return;
+        };
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
@@ -6366,14 +6347,12 @@ mod tests {
     fn synchronous_opened_object_reads_sets_and_advances_position() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
+        let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            retained_handle_deletion(),
             DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
+        ) else {
+            return;
+        };
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
@@ -6449,14 +6428,12 @@ mod tests {
     fn asynchronous_and_paging_io_do_not_advance_position() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
+        let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            retained_handle_deletion(),
             DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
+        ) else {
+            return;
+        };
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
@@ -6511,14 +6488,12 @@ mod tests {
     fn file_position_and_native_lock_range_reject_signed_overflow() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let mut handle = OpenedHandle::new(
-            NodeId::Directory(DirectoryNodeId::ROOT),
+        let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
-            OpenedLocation::Root,
-            retained_handle_deletion(),
             DataTransferMode::IntermediateAllowed,
-            RegularFileWriteAccess::Denied,
-        );
+        ) else {
+            return;
+        };
         let mut file = file_object_with_contexts(
             core::ptr::addr_of_mut!(fcb).cast(),
             core::ptr::addr_of_mut!(handle).cast(),
