@@ -12,8 +12,9 @@ below instead of substituting generic Cargo commands for a canonical gate.
 | `cargo xtask verify-portable` | Windows, Linux, or macOS | Checks formatting and all portable targets, then runs the portable tests and Clippy. |
 | `cargo xtask verify-driver` | Windows with MSVC and WDK configured | Checks, tests, lints, and builds rustdoc for the `ext4win` kernel-driver crate. It does not build a signed release package. |
 | `cargo xtask verify-journal-interop` | Native Linux or Windows with WSL; e2fsprogs | Exercises ext4 mutation and recovery against independently generated `debugfs` and `e2fsck` evidence. |
+| `cargo xtask verify-htree-interop` | Native Linux or Windows with WSL; e2fsprogs and root loop-mount authority | Exercises bounded HTree lookup, paging, and local mutation against independently generated ext4 images. |
 | `cargo xtask verify-journal-fixture-provenance` | Native Linux or Windows with WSL; root loop-device authority and the manifest-pinned e2fsprogs release | Regenerates the tracked external-journal fixtures and requires byte-for-byte and digest equality. |
-| `cargo xtask verify-production-driver` | Windows with MSVC, WDK, `cargo-wdk`, WSL, and e2fsprogs | Runs the development and interoperability gates, builds and signs one identity-bound package, and verifies release reachability. |
+| `cargo xtask verify-production-driver` | Windows with MSVC, WDK, `cargo-wdk`, WSL/e2fsprogs, and WSL root loop-mount authority | Runs the development and interoperability gates, builds and signs one identity-bound package, and verifies release reachability. |
 | `cargo xtask check-live-driver-host` | Dedicated elevated Windows host with Hyper-V PowerShell, WSL/e2fsprogs, and Driver Verifier configured | Performs the read-only preflight for disposable live validation. |
 | `cargo xtask verify-live-vhdx` | A host that passes the live preflight | Builds a verified bundle and exercises it only against a newly created disposable VHDX. |
 | `cargo xtask cleanup-live-vhdx-session <session-id>` | Dedicated elevated Windows host | Reconciles an interrupted session and removes only resources whose recorded identities still match. |
@@ -48,11 +49,12 @@ scenarios describe tested behavior; they do not create a second feature matrix.
 ## Production release evidence
 
 `verify-production-driver` is the sole release umbrella. It first runs
-`verify-portable`, `verify-driver`, and `verify-journal-interop`. It then creates
-one build identity, builds and signs the package, binds the LLVM IR, link map,
-and driver image to that identity, runs the production reachability gate, and
-rejects concurrent source changes. It fails explicitly on macOS and Linux
-instead of compiling a non-Windows driver shim.
+`verify-portable`, `verify-driver`, `verify-journal-interop`, and
+`verify-htree-interop`. It then creates one build identity, builds and signs the
+package, binds the LLVM IR, link map, and driver image to that identity, runs
+the production reachability gate, and rejects concurrent source changes. It
+fails explicitly on macOS and Linux instead of compiling a non-Windows driver
+shim.
 
 Successful bundles are atomically published below
 `target/verified-production/<artifact-id>/`. The versioned manifest binds the
