@@ -555,30 +555,6 @@ impl EpochReadView<'_, '_> {
         }
     }
 
-    /// Enumerates directory entries from a typed directory node.
-    ///
-    /// # Errors
-    /// Returns an error when the directory is too large for eager
-    /// enumeration, or contains malformed entries.
-    pub(super) fn read_directory(
-        &mut self,
-        directory: &DirectoryNode,
-        crypto: &mut dyn CryptographicOperation,
-    ) -> Result<Vec<DirectoryEntry>> {
-        let entries = self.read_directory_layout(directory.inode())?.entries()?;
-        let entries = if directory.protection().is_encrypted() {
-            match self.decrypt_directory_entries(directory.inode(), &entries, crypto) {
-                Err(Error::MissingEncryptionKey) => {
-                    Self::project_locked_directory_entries(entries)?
-                }
-                result => result?,
-            }
-        } else {
-            entries
-        };
-        self.validate_directory_entries(entries)
-    }
-
     /// Enumerates the authoritative directory names of one hard-linkable inode.
     ///
     /// Traversal is iterative so the future cannot retain an unbounded async recursion chain. The
@@ -635,47 +611,6 @@ impl EpochReadView<'_, '_> {
         }
 
         HardLinks::try_from_entries(links, expected)
-    }
-
-    /// Decrypts directory-entry names for an unlocked encrypted directory.
-    /// # Errors
-    ///
-    /// Returns an error when the directory filename key is unavailable or any decrypted entry name
-    /// is not a valid ext4 component.
-    pub(super) fn decrypt_directory_entries(
-        &mut self,
-        directory: &Inode,
-        entries: &[RawDirectoryEntry],
-        crypto: &mut dyn CryptographicOperation,
-    ) -> Result<Vec<RawDirectoryEntry>> {
-        let mut decrypted = Vec::new();
-        decrypted
-            .try_reserve_exact(entries.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for entry in entries {
-            let name = self.decrypt_directory_child_name(directory, entry.name(), crypto)?;
-            decrypted.try_push(RawDirectoryEntry::new(entry.inode(), &name, entry.kind())?)?;
-        }
-        Ok(decrypted)
-    }
-
-    /// Projects encrypted on-disk dirent names into reversible no-key names.
-    /// # Errors
-    ///
-    /// Returns an error when an encrypted directory entry name cannot be encoded as a no-key display
-    /// name.
-    pub(super) fn project_locked_directory_entries(
-        entries: Vec<RawDirectoryEntry>,
-    ) -> Result<Vec<RawDirectoryEntry>> {
-        let mut projected = Vec::new();
-        projected
-            .try_reserve_exact(entries.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for entry in entries {
-            let name = Self::project_locked_directory_name(entry.name())?;
-            projected.try_push(RawDirectoryEntry::new(entry.inode(), &name, entry.kind())?)?;
-        }
-        Ok(projected)
     }
 
     /// Projects one encrypted on-disk dirent name into a no-key display name.
@@ -806,27 +741,6 @@ impl EpochReadView<'_, '_> {
         Ok(DirectoryChild::new(parent.id(), name, node))
     }
 
-    /// Converts raw directory entries into public entries with validated node identity.
-    /// # Errors
-    ///
-    /// Returns an error when any directory entry references an inode that cannot be loaded and
-    /// classified.
-    pub(super) fn validate_directory_entries(
-        &mut self,
-        entries: Vec<RawDirectoryEntry>,
-    ) -> Result<Vec<DirectoryEntry>> {
-        let mut validated = Vec::new();
-        validated
-            .try_reserve_exact(entries.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for entry in entries {
-            let (inode, name, kind) = entry.into_parts();
-            let node = self.load_inode_node(inode)?.id();
-            validated.try_push(DirectoryEntry::new(name, node, kind))?;
-        }
-        Ok(validated)
-    }
-
     /// Converts one raw directory entry into a public entry using an explicit visible name.
     /// # Errors
     ///
@@ -842,65 +756,6 @@ impl EpochReadView<'_, '_> {
             node,
             entry.kind(),
         ))
-    }
-
-    /// Loads and validates the directory layout selected by an inode.
-    /// # Errors
-    ///
-    /// Returns an error when the directory exceeds eager-read limits, uses unsupported indexed
-    /// storage, or its blocks cannot be parsed as the selected layout.
-    pub(super) fn read_directory_layout(&mut self, inode: &Inode) -> Result<DirectoryLayout> {
-        if inode.size().bytes() > MAX_EAGER_DIRECTORY_BYTES {
-            return Err(Error::DirectoryTooLarge);
-        }
-        let storage = inode.directory_storage_kind()?;
-        if matches!(storage, DirectoryStorageKind::HTree) {
-            self.superblock.directory_indexing().require_supported()?;
-        }
-        DirectoryLayout::from_storage_kind(
-            storage,
-            self.read_directory_block_data(inode)?,
-            self.superblock.directory_hash_seed(),
-            self.superblock.default_directory_hash_version(),
-            self.directory_checksum(inode),
-        )
-    }
-
-    /// Reads directory file blocks through the inode extent tree.
-    /// # Errors
-    ///
-    /// Returns an error when the directory extent tree contains holes or uninitialized extents,
-    /// range arithmetic fails, or a directory block cannot be read.
-    pub(super) fn read_directory_block_data(
-        &mut self,
-        inode: &Inode,
-    ) -> Result<Vec<DirectoryBlockData>> {
-        let block_size = self.superblock.block_size();
-        let block_bytes =
-            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
-        let block_count = round_up_div(inode.size().bytes(), u64::from(block_size.bytes()))?;
-        let context = self.extent_tree_context(inode);
-        let tree = MutableExtentTree::load_inode_tree(
-            inode.extent_root()?,
-            block_size,
-            &mut self.device,
-            context,
-        )?;
-        let mut blocks = Vec::new();
-        for logical in 0..block_count {
-            let logical_block = LogicalBlock::try_from(logical)?;
-            let physical = match tree.map_logical(logical_block) {
-                BlockMapping::Physical(physical) => physical,
-                BlockMapping::Uninitialized | BlockMapping::Hole => {
-                    return Err(Error::InvalidDirectoryEntry);
-                }
-            };
-            let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
-            self.device
-                .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
-            blocks.try_push(DirectoryBlockData::new(logical_block.as_u32(), bytes))?;
-        }
-        Ok(blocks)
     }
 
     /// Reads plaintext file data, decrypting fscrypt contents when needed.

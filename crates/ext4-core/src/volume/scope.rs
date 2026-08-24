@@ -9,8 +9,7 @@ pub(super) use crate::disk::checksum::ext4_crc32c;
 pub(super) use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 pub(super) use crate::disk::storage::OperationDevice;
 pub(super) use crate::disk_format::dir::{
-    DirectoryBlock, DirectoryBlockData, DirectoryChecksum, DirectoryEntry as RawDirectoryEntry,
-    DirectoryEntryKind, DirectoryLayout, build_htree_directory,
+    DirectoryBlock, DirectoryChecksum, DirectoryEntry as RawDirectoryEntry, DirectoryEntryKind,
 };
 pub(super) use crate::disk_format::extent::{
     BlockMapping, Extent, ExtentBlockRun, ExtentLength, ExtentTree, ExtentTreeContext,
@@ -79,8 +78,6 @@ pub(super) const fn disk_offset(offset: usize) -> DiskOffset {
 
 // Volume mutation offsets are kept together so inode/superblock rewrites use one
 // source of truth for on-disk byte layout.
-/// Maximum directory size read eagerly for lookup and enumeration.
-pub(super) const MAX_EAGER_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
 /// `i_mode` type bits for ext4 directories.
 #[cfg(test)]
 pub(super) const MODE_DIRECTORY: u16 = 0x4000;

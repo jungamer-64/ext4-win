@@ -83,12 +83,6 @@ pub trait CommittedReadPass {
     ///
     /// Returns an error when the target is malformed, cannot be read, or cannot be allocated.
     fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>>;
-    /// Enumerates validated directory entries.
-    /// # Errors
-    ///
-    /// Returns an error when directory storage is invalid, encrypted names cannot be decoded, or
-    /// result allocation fails.
-    fn read_directory(&mut self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>>;
     /// Enumerates every reachable hard link to a non-directory inode.
     /// # Errors
     ///
@@ -221,14 +215,6 @@ impl EpochReadPass<'_, '_, '_> {
         self.view.read_symlink(symlink)
     }
 
-    /// Enumerates validated directory entries.
-    /// # Errors
-    ///
-    /// Returns an error when storage is incomplete or the directory is invalid.
-    pub fn read_directory(&mut self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
-        self.view.read_directory(directory, self.crypto)
-    }
-
     /// Enumerates every reachable hard link to a non-directory inode.
     /// # Errors
     ///
@@ -307,10 +293,6 @@ impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
 
     fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
         self.read_symlink(symlink)
-    }
-
-    fn read_directory(&mut self, directory: &DirectoryNode) -> Result<Vec<DirectoryEntry>> {
-        self.read_directory(directory)
     }
 
     fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
