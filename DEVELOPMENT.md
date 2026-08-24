@@ -1,128 +1,88 @@
 # Development
 
-The default workspace members are host-independent.
-On Windows, macOS, or Linux, run the complete portable gate with:
+The workspace separates the portable ext4 domain from the Windows kernel
+boundary. Default Cargo commands select the host-independent members:
+`ext4-core`, `production-reachability`, and `xtask`. Use the repository tasks
+below instead of substituting generic Cargo commands for a canonical gate.
 
-```console
-cargo xtask verify-portable
-```
+## Verification commands
 
-This checks formatting, compiles all portable targets, runs their tests, and
-runs Clippy. Plain `cargo test` also selects only the portable default members:
-`ext4-core`, `production-reachability`, and `xtask`.
+| Command | Host requirements | What it establishes |
+| --- | --- | --- |
+| `cargo xtask verify-portable` | Windows, Linux, or macOS | Checks formatting and all portable targets, then runs the portable tests and Clippy. |
+| `cargo xtask verify-driver` | Windows with MSVC and WDK configured | Checks, tests, lints, and builds rustdoc for the `ext4win` kernel-driver crate. It does not build a signed release package. |
+| `cargo xtask verify-journal-interop` | Native Linux or Windows with WSL; e2fsprogs | Exercises ext4 mutation and recovery against independently generated `debugfs` and `e2fsck` evidence. |
+| `cargo xtask verify-journal-fixture-provenance` | Native Linux or Windows with WSL; root loop-device authority and the manifest-pinned e2fsprogs release | Regenerates the tracked external-journal fixtures and requires byte-for-byte and digest equality. |
+| `cargo xtask verify-production-driver` | Windows with MSVC, WDK, `cargo-wdk`, WSL, and e2fsprogs | Runs the development and interoperability gates, builds and signs one identity-bound package, and verifies release reachability. |
+| `cargo xtask check-live-driver-host` | Dedicated elevated Windows host with Hyper-V PowerShell, WSL/e2fsprogs, and Driver Verifier configured | Performs the read-only preflight for disposable live validation. |
+| `cargo xtask verify-live-vhdx` | A host that passes the live preflight | Builds a verified bundle and exercises it only against a newly created disposable VHDX. |
+| `cargo xtask cleanup-live-vhdx-session <session-id>` | Dedicated elevated Windows host | Reconciles an interrupted session and removes only resources whose recorded identities still match. |
 
-The driver-specific development gate is:
+## Ext4 durability and interoperability
 
-```console
-cargo xtask verify-driver
-```
+`verify-journal-interop` treats e2fsprogs as an independent oracle rather than
+generating expected results through the production core. Every scenario starts
+from a newly formatted or freshly copied image. The 4 KiB profile covers file
+and directory creation, multi-block writes, growth, truncation, rename, hard
+links, unlink, and xattr creation, replacement, and removal. The 4 KiB-block/
+16 KiB-cluster BIGALLOC profile additionally covers allocation, cluster reuse,
+and free-space accounting.
 
-It checks the driver crate, runs at least 265 unit tests, runs Clippy over all
-driver targets, and builds rustdoc. It is distinct from a signed production
-build and does not by itself prove WDK packaging or release reachability.
+Journal recovery is one part of this ext4-wide gate. Linux-generated JBD2
+records exercise supported block sizes, checksum layouts, 64-bit block numbers,
+and revokes. The external-journal profile groups rename, sparse-extension write,
+and xattr update into one mutation and evaluates interrupted home-block writes
+and flush cuts. Recovery is accepted only when `e2fsck -f` is clean and the
+observable namespace, content, links, xattrs, and allocation state are wholly
+old or wholly new.
 
-JBD2 interoperability is independently checked with:
+The crash model assumes atomic 512-byte sectors. Writes may be absent, may
+persist at a sector-aligned prefix, or may persist completely. Successful
+flushes preserve prior write ordering and make durable only the target device,
+so an external journal and its filesystem image have independent volatile and
+durable states.
 
-```console
-cargo xtask verify-journal-interop
-```
+Supported-feature acceptance remains owned by core mount validation. These
+scenarios describe tested behavior; they do not create a second feature matrix.
 
-This requires e2fsprogs on native Linux or WSL. The core implementation never
-generates its own oracle result: `debugfs` and `e2fsck` establish the external
-filesystem and journal evidence. Each scenario starts from a newly formatted or
-freshly copied image. The 4 KiB internal profile covers create, multi-block
-write, grow, shrink, rename, hard link, unlink, and xattr set/update/delete.
-The 4 KiB-block/16 KiB-cluster BIGALLOC profile covers allocation, truncate,
-unlink, cluster reuse, and free-space accounting. The 4 KiB external-journal
-profile commits rename, sparse-extension write, and xattr update together and
-models interrupted home-block writes as an ordered 512-byte prefix of the new
-image followed by the old suffix. The next mount must replay that dirty journal
-to the complete new state, after which `e2fsck` must accept the filesystem.
+## Production release evidence
 
-Building and signing the kernel driver remains a Windows-only operation because
-it requires MSVC, the Windows Driver Kit, and `cargo-wdk`. On a configured
-Windows host, run:
-
-```console
-cargo xtask verify-production-driver
-```
-
-This is the only release umbrella. It first runs `verify-portable`,
-`verify-driver`, and `verify-journal-interop`; then it creates one build
-identity, builds and signs the package, binds the LLVM IR, link map, and driver
-image to that identity, runs the production reachability gate, and rejects
-concurrent source changes. It fails explicitly on macOS and Linux instead of
-compiling a non-Windows driver shim.
+`verify-production-driver` is the sole release umbrella. It first runs
+`verify-portable`, `verify-driver`, and `verify-journal-interop`. It then creates
+one build identity, builds and signs the package, binds the LLVM IR, link map,
+and driver image to that identity, runs the production reachability gate, and
+rejects concurrent source changes. It fails explicitly on macOS and Linux
+instead of compiling a non-Windows driver shim.
 
 Successful bundles are atomically published below
-`target/verified-production/<artifact-id>/`. The versioned manifest binds IR,
-MAP, SYS, CAT, and INF hashes to the exact source snapshot, target, profile,
-rustflags, and rustc/LLVM/Cargo/cargo-wdk/WDK versions. The production command
-does not reuse a portable artifact and does not accept a stale release output.
+`target/verified-production/<artifact-id>/`. The versioned manifest binds the
+IR, MAP, SYS, CAT, and INF hashes to the exact source snapshot, target, profile,
+rustflags, and rustc, LLVM, Cargo, `cargo-wdk`, and WDK versions. The production
+command neither reuses portable artifacts nor accepts stale release output.
 
-## CI and host boundaries
+## CI and live-driver boundaries
 
-CI runs `verify-portable` on Windows, Ubuntu, and macOS and runs journal
+CI runs `verify-portable` on Windows, Ubuntu, and macOS and runs ext4
 interoperability on Ubuntu. The production job requires the dedicated
 `[self-hosted, Windows, X64, ext4-win-wdk]` runner and is serialized globally.
-That runner contract includes MSVC, WDK, cargo-wdk, WSL, and e2fsprogs.
+That runner contract includes MSVC, WDK, `cargo-wdk`, WSL, and e2fsprogs.
 
-Live DriverStore validation is a separate manual assurance boundary. A green
-self-hosted production job proves the signed bundle and reachability evidence;
-it does not prove which SYS Windows loaded, that Driver Verifier observed the
-driver, or that mount and teardown succeeded. Live validation must compare the
+A green production job proves the signed bundle and its reachability evidence.
+It does not prove which SYS Windows loaded, that Driver Verifier observed that
+image, or that mount and teardown succeeded. Live validation must compare the
 loaded DriverStore SYS hash with the verified bundle and treat a missing
 Verifier configuration, cleanup failure, or hash mismatch as failure.
 
-On a dedicated host, the read-only preflight is:
+`verify-live-vhdx` does not accept a disk path or disk number. It creates one
+fixed-size VHDX below `target/live-vhdx-sessions/<session-id>/`, bounds WSL
+device discovery to the device introduced by that VHDX, and unmounts the device
+from WSL before Windows-driver access. It selects the newly published OEM INF
+from structured PnPUtil XML and verifies the exported SYS hash before and after
+service start.
 
-```console
-cargo xtask check-live-driver-host
-```
-
-It requires elevation, Hyper-V PowerShell, WSL/e2fsprogs, an explicit
-`ext4win.sys` Driver Verifier configuration, and absence of an existing
-ext4win service or DriverStore package. The full destructive command is:
-
-```console
-cargo xtask verify-live-vhdx
-```
-
-The command does not accept a disk path or disk number. It first creates a
-verified production bundle and then creates only a new fixed-size VHDX below
-`target/live-vhdx-sessions/<session-id>/`. WSL device discovery is bounded to
-the one new device introduced by that VHDX, and WSL is explicitly unmounted
-before the disk is reattached for Windows-driver access.
-
-Before service start and again after service start, the workflow consumes
-PnPUtil XML inventory, selects the exact newly published OEM INF, exports that
-package, and compares its SYS hash with the production manifest. It does not
-parse localized PnPUtil display text. File create/read/write, rename, hard
-link, patterned enumeration, durable flush, clean volume dismount, driver
-unload, package removal, and VHDX removal must all succeed.
-
-Every external side effect is preceded by a new, durably flushed
-`session-v1-NNNN.manifest` snapshot. An interrupted session is reconciled with:
-
-```console
-cargo xtask cleanup-live-vhdx-session <session-id>
-```
-
-Cleanup resolves only the generated session directory and refuses to act
-unless the verified bundle identity and SYS hash, exact VHDX path, recorded
-disk unique ID, service name, and structured-inventory OEM INF still match.
-Physical disks remain permanently outside this workflow.
-
-## Crash model
-
-Crash-consistency assurance assumes 512-byte atomic sectors. Writes may be
-absent, may persist at a sector-aligned prefix, or may persist completely.
-Successful flushes preserve prior write ordering and make durable only the
-target device. The filesystem image and external-journal image therefore have
-independent volatile and durable states. Recovery is accepted only when
-`e2fsck -f` is clean and externally observable path, content, link, xattr, and
-allocation state is wholly old or wholly new; mixed state is rejected.
-
-Supported-feature acceptance remains owned by the core mount validation. This
-document records verification boundaries and does not maintain a second
-feature matrix.
+The live scenario requires file create, read, write, rename, hard link,
+patterned enumeration, durable flush, clean dismount, driver unload, package
+removal, and VHDX removal to succeed. Every external side effect is preceded by
+a durably flushed session-manifest snapshot. Cleanup revalidates the verified
+bundle identity, SYS hash, OEM INF, VHDX path, disk unique ID, and service name
+before acting. Physical disks remain permanently outside this workflow.

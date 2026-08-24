@@ -1,67 +1,89 @@
 # ext4-win
 
-`ext4-win` is a native Windows ext4 file-system driver backed by the portable
-`ext4-core` implementation. The repository follows the ext4 on-disk and JBD2
-contracts as external authorities; internal Rust APIs are free to evolve when
-that produces a safer ownership or state model.
+`ext4-win` is a native read-write ext4 file-system driver for Windows. It
+combines a portable, `no_std` ext4 implementation with a Windows kernel driver
+that exposes ext4 volumes through the Windows file-system interface.
 
-## Verification
+The ext4 on-disk format is the external authority. Internal Rust APIs and state
+models are free to evolve so that ownership, validation, and durability remain
+explicit.
 
-The canonical development gates are:
+## Ext4 capabilities
+
+The implemented file-system surface includes:
+
+- file and directory creation, lookup, enumeration, rename, and removal;
+- extent-backed reads and writes, sparse extension, truncation, and allocation;
+- hard links, native symbolic links, POSIX metadata, timestamps, and volume
+  labels;
+- inline and external extended attributes;
+- indexed directories and BIGALLOC allocation geometry;
+- fscrypt key handling and encrypted namespace and data access;
+- fs-verity enablement and verified reads; and
+- Windows extended attributes, reparse points, security information, and file
+  metadata projected onto ext4 storage.
+
+Mutations are journaled and recovered before a mounted volume is published.
+Both internal and external journals are represented by the core mount and
+durability protocols.
+
+This is not an exhaustive feature-flag matrix. `ext4-core` mount validation is
+the authority for whether a particular volume's feature set, geometry, and
+journal configuration are accepted. The project does not claim compatibility
+with every ext4 volume.
+
+## Architecture
+
+| Component | Responsibility |
+| --- | --- |
+| `ext4-core` | Validates ext4 disk structures and owns traversal, allocation, protected-file handling, journal recovery, and transactional mutation without depending on Windows types. |
+| `ext4win` | Translates Windows kernel requests into typed core operations and owns IRP, storage, cancellation, mount, and driver lifetime boundaries. |
+| `xtask` and `production-reachability` | Define the canonical development gates and bind release evidence to the exact signed driver artifact. |
+
+The dependency direction keeps ext4 semantics in the portable core while the
+driver contains Windows-specific representation and lifecycle concerns.
+
+## Build and evaluate
+
+The portable ext4 implementation and repository tooling can be checked on
+Windows, Linux, or macOS:
 
 ```console
 cargo xtask verify-portable
-cargo xtask verify-driver
-cargo xtask verify-journal-interop
 ```
 
-`verify-portable` runs on Windows, Linux, and macOS. `verify-driver` requires a
-Windows host with the MSVC/WDK environment needed by `windows-drivers-rs`.
-`verify-journal-interop` requires Linux e2fsprogs, either natively or through
-WSL. It creates fresh 4 KiB and 4 KiB/16 KiB BIGALLOC images, drives typed
-ext4-core namespace/data/xattr mutations, and uses `debugfs` plus `e2fsck` as
-independent oracles. The 4 KiB external-journal profile additionally exercises
-rename/write/xattr recovery at every modeled write-prefix and flush cut.
-
-The sole release authority is:
+Checking the kernel driver requires Windows with the configured MSVC and WDK
+toolchain:
 
 ```console
-cargo xtask verify-production-driver
+cargo xtask verify-driver
 ```
 
-It runs all three gates above before building and signing the driver, checks
-production reachability against identity-matched LLVM IR, link map, and SYS,
-and publishes an immutable evidence bundle at
-`target/verified-production/<artifact-id>/`. `manifest-v1.txt` records SHA-256
-hashes for IR, MAP, SYS, CAT, and INF together with the source snapshot,
-rustc/LLVM/Cargo/cargo-wdk/WDK versions, target, profile, and exact rustflags.
-A portable build is not production-driver validation.
-
-## Durability boundary
-
-The crash model assumes atomic 512-byte sectors and preservation of write
-ordering established before each successful flush. A flush makes durable only
-the device it targets; an external journal and its filesystem image therefore
-have independent volatile and durable states. Acceptance after any modeled
-cut point requires a clean `e2fsck -f` result and an observable namespace and
-metadata state equal to either the complete old state or the complete new
-state. Mixed allocation, link, or xattr state is invalid.
-
-See [DEVELOPMENT.md](DEVELOPMENT.md) for host contracts, CI boundaries, and
-live-driver assurance limits.
-
-The manual live commands are:
+Live evaluation is deliberately limited to a new disposable VHDX on a
+dedicated, elevated Windows host:
 
 ```console
 cargo xtask check-live-driver-host
 cargo xtask verify-live-vhdx
-cargo xtask cleanup-live-vhdx-session <session-id>
 ```
 
-They accept no physical disk path or disk number. `verify-live-vhdx` creates
-its own fixed-size disposable VHDX, formats it through WSL, unmounts it from
-WSL before Windows access, verifies the exported DriverStore SYS hash before
-and after service start, exercises file-system behavior under Driver Verifier,
-and requires complete service/package/VHDX cleanup. Each external side effect
-is preceded by a durable append-only session manifest. Cleanup revalidates the
-session artifact identity, OEM INF, VHDX path, and disk unique ID before acting.
+The workflow does not accept a physical disk path or disk number. It builds an
+identity-bound driver bundle, creates and formats its own VHDX, verifies the
+DriverStore image, exercises file-system operations under Driver Verifier, and
+requires service, package, and VHDX cleanup.
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for prerequisites, the complete command
+matrix, ext4 interoperability coverage, production release evidence, and live
+validation boundaries.
+
+## Assurance boundaries
+
+- Portable verification covers the host-independent core and tooling; it does
+  not validate a Windows kernel artifact.
+- Driver verification checks the WDK-facing crate but does not prove that a
+  signed package contains the analyzed build.
+- Production verification binds source, LLVM IR, link map, SYS, CAT, and INF
+  into one signed evidence bundle; it does not prove which image Windows loaded.
+- Live VHDX verification checks the loaded artifact and observable file-system
+  behavior for its generated test volume. It is not evidence for an arbitrary
+  physical volume or an untested ext4 feature combination.
