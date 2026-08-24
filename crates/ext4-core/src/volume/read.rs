@@ -19,6 +19,132 @@ struct VerityReadPlan {
     verifier: FsverityVerifier,
 }
 
+/// One resident routing table in an on-demand HTree path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HtreePathLevel {
+    /// Logical block containing this table (`0` for the root).
+    logical: u32,
+    /// Validated root or interior-node routing table.
+    index: DxIndex,
+    /// Child selected inside `index`.
+    selected: usize,
+}
+
+/// Root-to-leaf route. Its length is bounded by the mounted HTree depth profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HtreePath {
+    /// Resident root-to-leaf index levels.
+    levels: Vec<HtreePathLevel>,
+}
+
+/// One raw HTree entry paired with its already calculated semantic sort key.
+#[derive(Debug, Eq, PartialEq)]
+struct HtreeScanCandidate {
+    /// Raw leaf entry retained for projection only after ordering is decided.
+    entry: RawDirectoryEntry,
+    /// Root-selected name hash used by both routing and enumeration order.
+    hash: DirectoryHash,
+}
+
+impl HtreeScanCandidate {
+    /// Builds a candidate under the parsed root's hash authority.
+    fn new(entry: RawDirectoryEntry, hash: DirectoryHashContext) -> Self {
+        let name_hash = hash.hash_name(entry.name());
+        Self {
+            entry,
+            hash: name_hash,
+        }
+    }
+
+    /// Compares the complete stable HTree enumeration key.
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.hash
+            .cmp(&other.hash)
+            .then(self.entry.name().bytes().cmp(other.entry.name().bytes()))
+    }
+
+    /// Returns whether this candidate follows the caller's consumed key.
+    fn is_after(&self, consumed: Option<(u32, u32, DirectoryCursorName)>) -> bool {
+        consumed.is_none_or(|key| {
+            (self.hash.major, self.hash.minor, self.entry.name().bytes())
+                > (key.0, key.1, key.2.bytes())
+        })
+    }
+}
+
+/// Retains the smallest `capacity` candidates without growing with a collision run.
+/// # Errors
+///
+/// Returns an error when bounded candidate insertion or removal cannot be represented.
+fn retain_bounded_htree_candidate(
+    candidates: &mut Vec<HtreeScanCandidate>,
+    candidate: HtreeScanCandidate,
+    capacity: usize,
+) -> Result<()> {
+    if capacity == 0 {
+        return Ok(());
+    }
+    let insert_at = candidates
+        .iter()
+        .position(|retained| candidate.cmp(retained).is_lt())
+        .unwrap_or(candidates.len());
+    if insert_at >= capacity {
+        return Ok(());
+    }
+    candidates.try_insert(insert_at, candidate)?;
+    if candidates.len() > capacity {
+        let _discarded = candidates.try_remove_at(capacity)?;
+    }
+    Ok(())
+}
+
+impl HtreePath {
+    /// Returns the currently selected leaf logical block.
+    /// # Errors
+    ///
+    /// Returns an error when the path is empty, its selected route is absent, or it points back to
+    /// a resident index level.
+    fn leaf(&self) -> Result<u32> {
+        let leaf = self
+            .levels
+            .last()
+            .and_then(|level| level.index.entry(level.selected))
+            .map(|entry| entry.block())
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        if self.levels.iter().any(|level| level.logical == leaf) {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        Ok(leaf)
+    }
+
+    /// Returns the effective hash boundary for the currently selected leaf.
+    /// # Errors
+    ///
+    /// Returns an error when the path is empty or its selected route is absent.
+    fn boundary(&self) -> Result<u32> {
+        if self.levels.is_empty() {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let mut boundary = 0;
+        for level in &self.levels {
+            boundary = level.index.route_boundary(level.selected, boundary)?;
+        }
+        Ok(boundary)
+    }
+
+    /// Reconstructs the primary-hash interval selected by every resident path level.
+    /// # Errors
+    ///
+    /// Returns an error when any selected route is absent or violates its parent interval.
+    fn hash_range(&self) -> Result<HtreeHashRange> {
+        let mut range = HtreeHashRange::root();
+        for level in &self.levels {
+            range = range.descend(&level.index, level.selected)?;
+        }
+        Ok(range)
+    }
+}
+
 impl EpochReadView<'_, '_> {
     /// Loads a regular file by previously validated file identity.
     /// # Errors
@@ -312,6 +438,728 @@ impl EpochReadView<'_, '_> {
         Ok(target)
     }
 
+    /// Reads at most one validated batch from a live directory image.
+    /// # Errors
+    ///
+    /// Returns an error when the inode mapping, HTree routing, leaf checksum, dirent stream,
+    /// encrypted-name projection, or referenced inode is invalid.
+    pub(super) fn scan_directory(
+        &mut self,
+        directory: &DirectoryNode,
+        cursor: &DirectoryScanCursor,
+        limit: DirectoryScanLimit,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<DirectoryScanBatch> {
+        if matches!(cursor.position, DirectoryScanPosition::End) {
+            return Ok(DirectoryScanBatch::new(Vec::new(), *cursor, true));
+        }
+        if directory.protection().is_verity() {
+            return Err(Error::UnsupportedVerity);
+        }
+        let inode = directory.inode();
+        let tree = self.directory_extent_tree(inode)?;
+        match inode.directory_storage_kind()? {
+            DirectoryStorageKind::Linear => {
+                self.scan_linear_directory(directory, cursor, limit, crypto, &tree)
+            }
+            DirectoryStorageKind::HTree => {
+                self.scan_htree_directory(directory, cursor, limit, crypto, &tree)
+            }
+        }
+    }
+
+    /// Scans a linear directory in physical dirent order without retaining prior blocks.
+    /// # Errors
+    ///
+    /// Returns an error when cursor recovery, block mapping, dirent parsing, projection, or result
+    /// allocation fails.
+    fn scan_linear_directory(
+        &mut self,
+        directory: &DirectoryNode,
+        cursor: &DirectoryScanCursor,
+        limit: DirectoryScanLimit,
+        crypto: &mut dyn CryptographicOperation,
+        tree: &MutableExtentTree,
+    ) -> Result<DirectoryScanBatch> {
+        let inode = directory.inode();
+        let block_size = self.superblock.block_size();
+        let block_count = round_up_div(inode.size().bytes(), u64::from(block_size.bytes()))?;
+        let (mut logical, mut requested_offset, mut skip, mut ordinal) = match &cursor.position {
+            DirectoryScanPosition::Start => (0_u64, 0_u32, 0_u64, 0_u64),
+            DirectoryScanPosition::Linear { logical, offset } => {
+                (u64::from(*logical), *offset, 0, cursor.ordinal)
+            }
+            DirectoryScanPosition::Ordinal(target) => (0, 0, *target, 0),
+            DirectoryScanPosition::End => return Err(Error::InvalidDirectoryEntry),
+            DirectoryScanPosition::AfterDot
+            | DirectoryScanPosition::AfterDotDot
+            | DirectoryScanPosition::HTree { .. } => (0, 0, cursor.ordinal, 0),
+        };
+        if logical > block_count {
+            logical = 0;
+            requested_offset = 0;
+            skip = cursor.ordinal;
+            ordinal = 0;
+        }
+        let mut output = Vec::new();
+        while logical < block_count {
+            let block =
+                self.read_directory_logical_block(inode, tree, LogicalBlock::try_from(logical)?)?;
+            let records = block.records()?;
+            if requested_offset != 0
+                && !records
+                    .iter()
+                    .any(|record| record.offset() == requested_offset)
+            {
+                logical = 0;
+                requested_offset = 0;
+                skip = cursor.ordinal;
+                ordinal = 0;
+                continue;
+            }
+            for (record_index, record) in records.iter().enumerate() {
+                if record.offset() < requested_offset {
+                    continue;
+                }
+                if skip != 0 {
+                    skip = skip.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+                    ordinal = ordinal.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                    continue;
+                }
+                let next_position = if record.entry().name().bytes() == b"." {
+                    DirectoryScanPosition::AfterDot
+                } else if record.entry().name().bytes() == b".." {
+                    DirectoryScanPosition::AfterDotDot
+                } else if let Some(next) = records.get(
+                    record_index
+                        .checked_add(1)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                ) {
+                    DirectoryScanPosition::Linear {
+                        logical: u32::try_from(logical).map_err(|_| Error::ArithmeticOverflow)?,
+                        offset: next.offset(),
+                    }
+                } else {
+                    DirectoryScanPosition::Linear {
+                        logical: u32::try_from(
+                            logical.checked_add(1).ok_or(Error::ArithmeticOverflow)?,
+                        )
+                        .map_err(|_| Error::ArithmeticOverflow)?,
+                        offset: 0,
+                    }
+                };
+                let next_cursor = DirectoryScanCursor::after_entry(next_position, ordinal)?;
+                let entry = self.project_scanned_directory_entry(
+                    directory,
+                    record.entry().try_clone()?,
+                    crypto,
+                )?;
+                output.try_push(ScannedDirectoryEntry::new(entry, ordinal, next_cursor))?;
+                ordinal = ordinal.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                if output.len() == limit.entries() {
+                    return Ok(DirectoryScanBatch::new(output, next_cursor, false));
+                }
+            }
+            logical = logical.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            requested_offset = 0;
+        }
+        let end = DirectoryScanCursor::end(ordinal);
+        Ok(DirectoryScanBatch::new(output, end, true))
+    }
+
+    /// Scans an indexed directory in stable semantic-key order while retaining at most one leaf.
+    /// # Errors
+    ///
+    /// Returns an error when root/path/leaf validation, cursor recovery, projection, or bounded
+    /// result allocation fails.
+    fn scan_htree_directory(
+        &mut self,
+        directory: &DirectoryNode,
+        cursor: &DirectoryScanCursor,
+        limit: DirectoryScanLimit,
+        crypto: &mut dyn CryptographicOperation,
+        tree: &MutableExtentTree,
+    ) -> Result<DirectoryScanBatch> {
+        let inode = directory.inode();
+        let checksum = self.directory_checksum(inode);
+        let root_block =
+            self.read_directory_logical_block(inode, tree, LogicalBlock::try_from(0_u64)?)?;
+        let maximum_depth = self.superblock.directory_indexing().require_supported()?;
+        let root = HtreeRoot::parse(
+            root_block.bytes(),
+            inode.id(),
+            self.superblock.directory_hash_seed(),
+            maximum_depth,
+            checksum,
+        )?;
+        let mut output = Vec::new();
+        let mut ordinal = cursor.ordinal;
+        let mut skip = 0_u64;
+        let mut after_key = None;
+        let mut dot_start = 2_usize;
+        match &cursor.position {
+            DirectoryScanPosition::Start => {
+                ordinal = 0;
+                dot_start = 0;
+            }
+            DirectoryScanPosition::AfterDot => dot_start = 1,
+            DirectoryScanPosition::AfterDotDot => {}
+            DirectoryScanPosition::HTree { major, minor } => {
+                after_key = Some((*major, *minor, cursor.htree_name));
+            }
+            DirectoryScanPosition::Ordinal(target) => {
+                ordinal = 0;
+                skip = *target;
+                dot_start = 0;
+            }
+            DirectoryScanPosition::Linear { .. } => {
+                ordinal = 0;
+                skip = cursor.ordinal;
+                dot_start = 0;
+            }
+            DirectoryScanPosition::End => return Err(Error::InvalidDirectoryEntry),
+        }
+        for (index, raw) in root.dot_entries().iter().enumerate().skip(dot_start) {
+            if skip != 0 {
+                skip = skip.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+                ordinal = ordinal.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                continue;
+            }
+            let position = if index == 0 {
+                DirectoryScanPosition::AfterDot
+            } else {
+                DirectoryScanPosition::AfterDotDot
+            };
+            let next_cursor = DirectoryScanCursor::after_entry(position, ordinal)?;
+            let entry =
+                self.project_scanned_directory_entry(directory, raw.try_clone()?, crypto)?;
+            output.try_push(ScannedDirectoryEntry::new(entry, ordinal, next_cursor))?;
+            ordinal = ordinal.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            if output.len() == limit.entries() {
+                return Ok(DirectoryScanBatch::new(output, next_cursor, false));
+            }
+        }
+
+        let starting_major = after_key.as_ref().map_or(0, |key| key.0);
+        let mut path = self.htree_path_for_hash(
+            inode,
+            tree,
+            root.index().clone(),
+            root.indirect_levels(),
+            starting_major,
+            checksum,
+        )?;
+        let mut completed_collision_major = None;
+        loop {
+            let hash = root.hash_context();
+            let entries = self.read_sorted_htree_leaf(inode, tree, &path, hash)?;
+            let mut next_path = path.clone();
+            let has_next = self.advance_htree_path(
+                inode,
+                tree,
+                &mut next_path,
+                root.indirect_levels(),
+                checksum,
+            )?;
+            let continued_major = if has_next {
+                let boundary = next_path.boundary()?;
+                (boundary & 1 != 0).then_some(boundary & !1)
+            } else {
+                None
+            };
+
+            if let Some(collision_major) = continued_major {
+                for candidate in entries
+                    .into_iter()
+                    .map(|entry| HtreeScanCandidate::new(entry, hash))
+                {
+                    if completed_collision_major
+                        .is_some_and(|completed| candidate.hash.major <= completed)
+                        || !candidate.is_after(after_key)
+                    {
+                        continue;
+                    }
+                    if candidate.hash.major < collision_major
+                        && self.emit_htree_scan_candidate(
+                            directory,
+                            candidate,
+                            &mut ordinal,
+                            &mut skip,
+                            &mut output,
+                            crypto,
+                        )?
+                        && output.len() == limit.entries()
+                    {
+                        let continuation = output
+                            .last()
+                            .map(ScannedDirectoryEntry::next_cursor)
+                            .copied()
+                            .ok_or(Error::InvalidDirectoryEntry)?;
+                        return Ok(DirectoryScanBatch::new(output, continuation, false));
+                    }
+                }
+
+                let mut collision_after = after_key;
+                let mut final_collision_path = next_path;
+                loop {
+                    let mut following = final_collision_path.clone();
+                    if !self.advance_htree_path(
+                        inode,
+                        tree,
+                        &mut following,
+                        root.indirect_levels(),
+                        checksum,
+                    )? || following.boundary()? != (collision_major | 1)
+                    {
+                        break;
+                    }
+                    final_collision_path = following;
+                }
+                loop {
+                    let capacity = if skip == 0 {
+                        limit
+                            .entries()
+                            .checked_sub(output.len())
+                            .ok_or(Error::ArithmeticOverflow)?
+                    } else {
+                        MAX_DIRECTORY_SCAN_ENTRIES
+                    };
+                    if capacity == 0 {
+                        let continuation = output
+                            .last()
+                            .map(ScannedDirectoryEntry::next_cursor)
+                            .copied()
+                            .ok_or(Error::InvalidDirectoryEntry)?;
+                        return Ok(DirectoryScanBatch::new(output, continuation, false));
+                    }
+                    let mut collision_candidates = Vec::new();
+                    let mut collision_path = path.clone();
+                    loop {
+                        for candidate in self
+                            .read_sorted_htree_leaf(inode, tree, &collision_path, hash)?
+                            .into_iter()
+                            .map(|entry| HtreeScanCandidate::new(entry, hash))
+                        {
+                            if candidate.hash.major == collision_major
+                                && candidate.is_after(collision_after)
+                            {
+                                retain_bounded_htree_candidate(
+                                    &mut collision_candidates,
+                                    candidate,
+                                    capacity,
+                                )?;
+                            }
+                        }
+                        if collision_path == final_collision_path {
+                            break;
+                        }
+                        let mut following = collision_path.clone();
+                        if !self.advance_htree_path(
+                            inode,
+                            tree,
+                            &mut following,
+                            root.indirect_levels(),
+                            checksum,
+                        )? {
+                            return Err(Error::InvalidDirectoryEntry);
+                        }
+                        if following.boundary()? != (collision_major | 1) {
+                            return Err(Error::InvalidDirectoryEntry);
+                        }
+                        collision_path = following;
+                    }
+                    let retained = collision_candidates.len();
+                    if retained == 0 {
+                        break;
+                    }
+                    for candidate in collision_candidates {
+                        collision_after = Some((
+                            candidate.hash.major,
+                            candidate.hash.minor,
+                            DirectoryCursorName::from_name(candidate.entry.name())?,
+                        ));
+                        let _emitted = self.emit_htree_scan_candidate(
+                            directory,
+                            candidate,
+                            &mut ordinal,
+                            &mut skip,
+                            &mut output,
+                            crypto,
+                        )?;
+                        if output.len() == limit.entries() {
+                            let continuation = output
+                                .last()
+                                .map(ScannedDirectoryEntry::next_cursor)
+                                .copied()
+                                .ok_or(Error::InvalidDirectoryEntry)?;
+                            return Ok(DirectoryScanBatch::new(output, continuation, false));
+                        }
+                    }
+                    if retained < capacity {
+                        break;
+                    }
+                }
+                path = final_collision_path;
+                completed_collision_major = Some(collision_major);
+                continue;
+            }
+
+            for candidate in entries
+                .into_iter()
+                .map(|entry| HtreeScanCandidate::new(entry, hash))
+            {
+                if completed_collision_major
+                    .is_some_and(|completed| candidate.hash.major <= completed)
+                    || !candidate.is_after(after_key)
+                {
+                    continue;
+                }
+                let _emitted = self.emit_htree_scan_candidate(
+                    directory,
+                    candidate,
+                    &mut ordinal,
+                    &mut skip,
+                    &mut output,
+                    crypto,
+                )?;
+                if output.len() == limit.entries() {
+                    let continuation = output
+                        .last()
+                        .map(ScannedDirectoryEntry::next_cursor)
+                        .copied()
+                        .ok_or(Error::InvalidDirectoryEntry)?;
+                    return Ok(DirectoryScanBatch::new(output, continuation, false));
+                }
+            }
+            if !has_next {
+                break;
+            }
+            path = next_path;
+        }
+        let end = DirectoryScanCursor::end(ordinal);
+        Ok(DirectoryScanBatch::new(output, end, true))
+    }
+
+    /// Reads, validates, and sorts exactly one selected HTree leaf.
+    /// # Errors
+    ///
+    /// Returns an error when the selected leaf is unmapped, malformed, outside its routed hash
+    /// interval, or cannot be sorted with checked memory operations.
+    fn read_sorted_htree_leaf(
+        &mut self,
+        inode: &Inode,
+        tree: &MutableExtentTree,
+        path: &HtreePath,
+        hash: DirectoryHashContext,
+    ) -> Result<Vec<RawDirectoryEntry>> {
+        let leaf = self.read_directory_logical_block(
+            inode,
+            tree,
+            LogicalBlock::try_from(u64::from(path.leaf()?))?,
+        )?;
+        let mut entries = leaf.entries()?;
+        path.hash_range()?.validate_leaf(&entries, hash)?;
+        memory::heap_sort_by(&mut entries, |left, right| {
+            let left_hash = hash.hash_name(left.name());
+            let right_hash = hash.hash_name(right.name());
+            left_hash
+                .cmp(&right_hash)
+                .then(left.name().bytes().cmp(right.name().bytes()))
+        })?;
+        Ok(entries)
+    }
+
+    /// Applies ordinal seek accounting and appends one ordered HTree candidate when selected.
+    /// # Errors
+    ///
+    /// Returns an error when cursor arithmetic, entry projection, or bounded output allocation
+    /// fails.
+    fn emit_htree_scan_candidate(
+        &mut self,
+        directory: &DirectoryNode,
+        candidate: HtreeScanCandidate,
+        ordinal: &mut u64,
+        skip: &mut u64,
+        output: &mut Vec<ScannedDirectoryEntry>,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<bool> {
+        if *skip != 0 {
+            *skip = skip.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+            *ordinal = ordinal.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            return Ok(false);
+        }
+        let next_cursor = DirectoryScanCursor::after_htree_entry(
+            candidate.hash.major,
+            candidate.hash.minor,
+            candidate.entry.name(),
+            *ordinal,
+        )?;
+        let entry = self.project_scanned_directory_entry(directory, candidate.entry, crypto)?;
+        output.try_push(ScannedDirectoryEntry::new(entry, *ordinal, next_cursor))?;
+        *ordinal = ordinal.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        Ok(true)
+    }
+
+    /// Converts one raw on-disk dirent into its caller-visible validated entry.
+    /// # Errors
+    ///
+    /// Returns an error when encrypted-name projection or referenced-inode validation fails.
+    fn project_scanned_directory_entry(
+        &mut self,
+        directory: &DirectoryNode,
+        raw: RawDirectoryEntry,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<DirectoryEntry> {
+        let visible = if directory.protection().is_encrypted() {
+            match self.decrypt_directory_child_name(directory.inode(), raw.name(), crypto) {
+                Ok(name) => name,
+                Err(Error::MissingEncryptionKey) => {
+                    Self::project_locked_directory_name(raw.name())?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            raw.name().try_to_owned_name()?
+        };
+        self.validate_directory_entry(raw, &visible)
+    }
+
+    /// Loads the directory's extent mapping once for one lookup or scan call.
+    /// # Errors
+    ///
+    /// Returns an error when the directory extent root or an external extent node is invalid.
+    fn directory_extent_tree(&mut self, inode: &Inode) -> Result<MutableExtentTree> {
+        let context = self.extent_tree_context(inode);
+        MutableExtentTree::load_inode_tree(
+            inode.extent_root()?,
+            self.superblock.block_size(),
+            &mut self.device,
+            context,
+        )
+    }
+
+    /// Reads one mapped logical directory block.
+    /// # Errors
+    ///
+    /// Returns an error when the logical block is outside the semantic directory size, unmapped,
+    /// unreadable, or cannot be allocated.
+    fn read_directory_logical_block(
+        &mut self,
+        inode: &Inode,
+        tree: &MutableExtentTree,
+        logical: LogicalBlock,
+    ) -> Result<DirectoryBlock> {
+        let block_count = round_up_div(
+            inode.size().bytes(),
+            u64::from(self.superblock.block_size().bytes()),
+        )?;
+        if logical.as_u64() >= block_count {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let physical = match tree.map_logical(logical) {
+            BlockMapping::Physical(physical) => physical,
+            BlockMapping::Uninitialized | BlockMapping::Hole => {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+        };
+        let block_size = self.superblock.block_size();
+        let mut bytes = memory::repeated_vec(
+            0_u8,
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        self.device
+            .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
+        Ok(DirectoryBlock::new(bytes, self.directory_checksum(inode)))
+    }
+
+    /// Builds a root-to-leaf path for a primary hash without reading unrelated leaves.
+    /// # Errors
+    ///
+    /// Returns an error when a selected pointer is absent, out of range, cyclic, unreadable, or
+    /// does not contain a valid interior node.
+    fn htree_path_for_hash(
+        &mut self,
+        inode: &Inode,
+        tree: &MutableExtentTree,
+        root: DxIndex,
+        indirect_levels: u8,
+        major: u32,
+        checksum: DirectoryChecksum,
+    ) -> Result<HtreePath> {
+        let mut levels = Vec::new();
+        let selected = root.select(major);
+        levels.try_push(HtreePathLevel {
+            logical: 0,
+            index: root,
+            selected,
+        })?;
+        for _ in 0..indirect_levels {
+            let logical = levels
+                .last()
+                .and_then(|level| level.index.entry(level.selected))
+                .map(|entry| entry.block())
+                .ok_or(Error::InvalidDirectoryEntry)?;
+            if levels.iter().any(|level| level.logical == logical) {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            let block = self.read_directory_logical_block(
+                inode,
+                tree,
+                LogicalBlock::try_from(u64::from(logical))?,
+            )?;
+            let index = DxIndex::parse_node(block.bytes(), checksum)?;
+            let selected = index.select(major);
+            levels.try_push(HtreePathLevel {
+                logical,
+                index,
+                selected,
+            })?;
+        }
+        Ok(HtreePath { levels })
+    }
+
+    /// Advances one HTree path to its next leaf using at most one new node per descended level.
+    /// # Errors
+    ///
+    /// Returns an error when the path shape is invalid or a descended node is cyclic, unreadable,
+    /// or malformed.
+    fn advance_htree_path(
+        &mut self,
+        inode: &Inode,
+        tree: &MutableExtentTree,
+        path: &mut HtreePath,
+        indirect_levels: u8,
+        checksum: DirectoryChecksum,
+    ) -> Result<bool> {
+        let expected_levels = usize::from(indirect_levels)
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let Some(level_to_advance) = path.levels.iter().rposition(|level| {
+            level
+                .selected
+                .checked_add(1)
+                .is_some_and(|next| next < level.index.len())
+        }) else {
+            return Ok(false);
+        };
+        let level = path
+            .levels
+            .get_mut(level_to_advance)
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        level.selected = level
+            .selected
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        path.levels.truncate(
+            level_to_advance
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?,
+        );
+        while path.levels.len() < expected_levels {
+            let logical = path
+                .levels
+                .last()
+                .and_then(|level| level.index.entry(level.selected))
+                .map(|entry| entry.block())
+                .ok_or(Error::InvalidDirectoryEntry)?;
+            if path.levels.iter().any(|level| level.logical == logical) {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            let block = self.read_directory_logical_block(
+                inode,
+                tree,
+                LogicalBlock::try_from(u64::from(logical))?,
+            )?;
+            path.levels.try_push(HtreePathLevel {
+                logical,
+                index: DxIndex::parse_node(block.bytes(), checksum)?,
+                selected: 0,
+            })?;
+        }
+        Ok(true)
+    }
+
+    /// Finds one exact on-disk name without materializing unrelated directory leaves.
+    /// # Errors
+    ///
+    /// Returns an error when the directory storage, selected path, collision continuation, leaf
+    /// hash interval, or exact entry is invalid.
+    fn find_raw_directory_entry(
+        &mut self,
+        inode: &Inode,
+        name: &Ext4Name,
+    ) -> Result<Option<RawDirectoryEntry>> {
+        let tree = self.directory_extent_tree(inode)?;
+        let block_size = self.superblock.block_size();
+        match inode.directory_storage_kind()? {
+            DirectoryStorageKind::Linear => {
+                let block_count =
+                    round_up_div(inode.size().bytes(), u64::from(block_size.bytes()))?;
+                for logical in 0..block_count {
+                    let block = self.read_directory_logical_block(
+                        inode,
+                        &tree,
+                        LogicalBlock::try_from(logical)?,
+                    )?;
+                    if let Some(entry) = block.find(name)? {
+                        return Ok(Some(entry));
+                    }
+                }
+                Ok(None)
+            }
+            DirectoryStorageKind::HTree => {
+                let checksum = self.directory_checksum(inode);
+                let root_block = self.read_directory_logical_block(
+                    inode,
+                    &tree,
+                    LogicalBlock::try_from(0_u64)?,
+                )?;
+                let root = HtreeRoot::parse(
+                    root_block.bytes(),
+                    inode.id(),
+                    self.superblock.directory_hash_seed(),
+                    self.superblock.directory_indexing().require_supported()?,
+                    checksum,
+                )?;
+                if let Some(entry) = root.dot_entries().iter().find(|entry| entry.name() == name) {
+                    return Ok(Some(entry.try_clone()?));
+                }
+                let hash = root.hash_context().hash_name(name);
+                let mut path = self.htree_path_for_hash(
+                    inode,
+                    &tree,
+                    root.index().clone(),
+                    root.indirect_levels(),
+                    hash.major,
+                    checksum,
+                )?;
+                loop {
+                    let leaf = self.read_directory_logical_block(
+                        inode,
+                        &tree,
+                        LogicalBlock::try_from(u64::from(path.leaf()?))?,
+                    )?;
+                    let entries = leaf.entries()?;
+                    path.hash_range()?
+                        .validate_leaf(&entries, root.hash_context())?;
+                    if let Some(entry) = entries.into_iter().find(|entry| entry.name() == name) {
+                        return Ok(Some(entry));
+                    }
+                    if !self.advance_htree_path(
+                        inode,
+                        &tree,
+                        &mut path,
+                        root.indirect_levels(),
+                        checksum,
+                    )? || path.boundary()? & !1 != hash.major
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
     /// Reads only the requested fs-verity data blocks and authenticates each Merkle proof to the
     /// descriptor root before publishing bytes to `out`.
     /// # Errors
@@ -590,22 +1438,32 @@ impl EpochReadView<'_, '_> {
             }
             visited.try_push(directory_id)?;
             let directory = self.load_directory(directory_id)?;
-            let entries = self.read_directory(&directory, crypto)?;
-            for entry in entries {
-                if matches!(entry.name().bytes(), b"." | b"..") {
-                    continue;
-                }
-                match *entry.node() {
-                    NodeId::Directory(child) => {
-                        if visited.contains(&child) || pending.contains(&child) {
-                            return Err(Error::InvalidDirectoryEntry);
+            let mut cursor = DirectoryScanCursor::start();
+            loop {
+                let batch =
+                    self.scan_directory(&directory, &cursor, DirectoryScanLimit::MAX, crypto)?;
+                let exhausted = batch.is_exhausted();
+                cursor = *batch.continuation();
+                for scanned in batch.into_entries() {
+                    let entry = scanned.into_entry();
+                    if matches!(entry.name().bytes(), b"." | b"..") {
+                        continue;
+                    }
+                    match *entry.node() {
+                        NodeId::Directory(child) => {
+                            if visited.contains(&child) || pending.contains(&child) {
+                                return Err(Error::InvalidDirectoryEntry);
+                            }
+                            pending.try_push(child)?;
                         }
-                        pending.try_push(child)?;
+                        node if node == target_node => {
+                            links.try_push(HardLinkEntry::try_new(directory_id, entry.name())?)?;
+                        }
+                        NodeId::File(_) | NodeId::Symlink(_) => {}
                     }
-                    node if node == target_node => {
-                        links.try_push(HardLinkEntry::try_new(directory_id, entry.name())?)?;
-                    }
-                    NodeId::File(_) | NodeId::Symlink(_) => {}
+                }
+                if exhausted {
+                    break;
                 }
             }
         }
@@ -647,7 +1505,7 @@ impl EpochReadView<'_, '_> {
         parent: &DirectoryNode,
         name: &Ext4Name,
     ) -> Result<ChildLookup> {
-        if let Some(entry) = self.read_directory_layout(parent.inode())?.find(name)? {
+        if let Some(entry) = self.find_raw_directory_entry(parent.inode(), name)? {
             return Ok(ChildLookup::Found(self.directory_child(parent, entry)?));
         }
         Ok(ChildLookup::NotFound)
@@ -696,9 +1554,7 @@ impl EpochReadView<'_, '_> {
                     }
                     Err(error) => return Err(error),
                 };
-            let entry = self
-                .read_directory_layout(parent.inode())?
-                .find(&ciphertext)?;
+            let entry = self.find_raw_directory_entry(parent.inode(), &ciphertext)?;
             return match entry {
                 Some(entry) => Ok(Some(self.validate_directory_entry(entry, &visible_name)?)),
                 None => Ok(None),
@@ -707,24 +1563,32 @@ impl EpochReadView<'_, '_> {
         if parent.protection().is_verity() {
             return Err(Error::UnsupportedVerity);
         }
+        let exact = requested.to_ext4()?;
+        if let Some(raw) = self.find_raw_directory_entry(parent.inode(), &exact)? {
+            return Ok(Some(self.validate_directory_entry(raw, &exact)?));
+        }
         let mut folded = None;
-
-        for entry in self.read_directory(parent, crypto)? {
-            let Ok(name) = WindowsName::from_ext4(entry.name()) else {
-                continue;
-            };
-            if name.equals(requested) {
-                return Ok(Some(entry));
-            }
-            if name.equals_ascii_case_insensitive(requested) {
-                if folded.is_some() {
-                    return Err(Error::AmbiguousWindowsName);
+        let mut cursor = DirectoryScanCursor::start();
+        loop {
+            let batch = self.scan_directory(parent, &cursor, DirectoryScanLimit::MAX, crypto)?;
+            let exhausted = batch.is_exhausted();
+            cursor = *batch.continuation();
+            for scanned in batch.into_entries() {
+                let entry = scanned.into_entry();
+                let Ok(name) = WindowsName::from_ext4(entry.name()) else {
+                    continue;
+                };
+                if name.equals_ascii_case_insensitive(requested) {
+                    if folded.is_some() {
+                        return Err(Error::AmbiguousWindowsName);
+                    }
+                    folded = Some(entry);
                 }
-                folded = Some(entry);
+            }
+            if exhausted {
+                return Ok(folded);
             }
         }
-
-        Ok(folded)
     }
 
     /// Converts a directory entry into a child whose inode kind is validated.
@@ -1129,4 +1993,70 @@ fn extent_payload_end_bytes(extent_tree: &ExtentTree, block_size: BlockSize) -> 
     end_blocks
         .checked_mul(u64::from(block_size.bytes()))
         .ok_or(Error::ArithmeticOverflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds one synthetic collision candidate without coupling the test to a hash algorithm.
+    fn collision_candidate(name_byte: u8, minor: u32, inode: u32) -> Option<HtreeScanCandidate> {
+        let name_bytes = [name_byte];
+        let Ok(name) = Ext4Name::new(&name_bytes) else {
+            return None;
+        };
+        let Ok(inode) = InodeId::try_from(inode) else {
+            return None;
+        };
+        let Ok(entry) = RawDirectoryEntry::new(inode, &name, DirectoryEntryKind::File) else {
+            return None;
+        };
+        Some(HtreeScanCandidate {
+            entry,
+            hash: DirectoryHash {
+                major: 0x1234_5600,
+                minor,
+            },
+        })
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a bounded collision merge loses, duplicates, or reorders entries while resuming
+    /// by the complete `(major, minor, raw name)` key.
+    #[test]
+    fn bounded_collision_merge_resumes_by_complete_semantic_key() {
+        let specifications = [(b'z', 1), (b'm', 2), (b'a', 1), (b'c', 3), (b'b', 2)];
+        let mut consumed = None;
+        let mut observed = Vec::new();
+        for page in 0..3_u32 {
+            let mut retained = Vec::new();
+            for (index, (name, minor)) in specifications.iter().copied().enumerate() {
+                let Some(candidate) = collision_candidate(
+                    name,
+                    minor,
+                    u32::try_from(index).unwrap_or(0).saturating_add(12),
+                ) else {
+                    return;
+                };
+                if candidate.is_after(consumed)
+                    && retain_bounded_htree_candidate(&mut retained, candidate, 2).is_err()
+                {
+                    return;
+                }
+            }
+            assert_eq!(retained.len(), if page < 2 { 2 } else { 1 });
+            for candidate in retained {
+                let Some(name_byte) = candidate.entry.name().bytes().first().copied() else {
+                    return;
+                };
+                let Ok(name) = DirectoryCursorName::from_name(candidate.entry.name()) else {
+                    return;
+                };
+                consumed = Some((candidate.hash.major, candidate.hash.minor, name));
+                observed.push(name_byte);
+            }
+        }
+        assert_eq!(observed, vec![b'a', b'z', b'b', b'm', b'c']);
+    }
 }

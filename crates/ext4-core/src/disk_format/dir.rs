@@ -39,8 +39,6 @@ const DX_BLOCK_MASK: u32 = 0x0fff_ffff;
 const fn disk_offset(offset: usize) -> DiskOffset {
     DiskOffset::new(offset)
 }
-/// Maximum HTree indirect depth accepted while `largedir` remains unsupported.
-const DX_MAX_DEPTH_WITHOUT_LARGEDIR: u8 = 2;
 /// Default seed used by ext4 when all four superblock seed words are zero.
 const DEFAULT_HASH_SEED: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
 /// TEA delta used by ext4 directory hashing.
@@ -221,6 +219,35 @@ impl DirectoryEntry {
     pub(crate) fn into_parts(self) -> (InodeId, Ext4Name, DirectoryEntryKind) {
         (self.inode, self.name, self.kind)
     }
+
+    /// Returns the minimum aligned bytes needed to serialize this entry.
+    /// # Errors
+    ///
+    /// Returns an error when record-length arithmetic cannot be represented.
+    pub(crate) fn encoded_len(&self) -> Result<usize> {
+        required_name_rec_len(self.name.bytes().len())
+    }
+}
+
+/// One live dirent and its byte coordinate inside a directory block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirectoryRecord {
+    /// Byte offset of the record header inside its logical block.
+    offset: u32,
+    /// Validated live entry stored at that coordinate.
+    entry: DirectoryEntry,
+}
+
+impl DirectoryRecord {
+    /// Returns the record's byte offset inside its logical block.
+    pub(crate) const fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// Borrows the validated live entry.
+    pub(crate) const fn entry(&self) -> &DirectoryEntry {
+        &self.entry
+    }
 }
 
 /// Metadata checksum context for directory data and index blocks.
@@ -250,7 +277,7 @@ impl DirectoryChecksum {
 
     /// Returns the bytes reserved for a leaf dirent tail.
     #[must_use]
-    fn dirent_tail_bytes(self) -> usize {
+    pub(crate) fn dirent_tail_bytes(self) -> usize {
         match self {
             Self::None => 0,
             Self::Crc32c { .. } => DIRENT_TAIL_BYTES,
@@ -372,51 +399,25 @@ impl DirectoryChecksum {
         let Self::Crc32c { inode_seed } = self else {
             return Ok(());
         };
-        let tail_offset = count_offset
-            .checked_add(
-                limit
-                    .checked_mul(DX_ENTRY_BYTES)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .ok_or(Error::ArithmeticOverflow)?;
-        let checksum_offset = tail_offset
-            .checked_add(4)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if checksum_offset
-            .checked_add(4)
-            .ok_or(Error::ArithmeticOverflow)?
-            > bytes.len()
-        {
-            return Err(Error::InvalidDirectoryEntry);
-        }
+        let (tail_offset, checksum_offset) = dx_tail_offsets(bytes.len(), count_offset, limit)?;
         put_le_u32(bytes, disk_offset(tail_offset), 0)?;
         put_le_u32(bytes, disk_offset(checksum_offset), 0)?;
-        let table_end = count_offset
-            .checked_add(
-                count
-                    .checked_mul(DX_ENTRY_BYTES)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .ok_or(Error::ArithmeticOverflow)?;
-        let mut checksum = ext4_crc32c(
+        let checksum = dx_tail_checksum(
             inode_seed,
-            bytes.get(..table_end).ok_or(Error::InvalidDirectoryEntry)?,
-        );
-        checksum = ext4_crc32c(
-            checksum,
-            bytes
-                .get(tail_offset..checksum_offset)
-                .ok_or(Error::InvalidDirectoryEntry)?,
-        );
-        checksum = ext4_crc32c(checksum, &0_u32.to_le_bytes());
+            bytes,
+            count_offset,
+            count,
+            tail_offset,
+            checksum_offset,
+        )?;
         put_le_u32(bytes, disk_offset(checksum_offset), checksum)
     }
 
     /// Verifies an HTree dx tail when enabled.
     /// # Errors
     ///
-    /// Returns an error when the dx tail is outside the block, the reserved field is nonzero, or the
-    /// stored CRC32C does not match the index bytes.
+    /// Returns an error when the dx tail is outside the block or the stored CRC32C does not match
+    /// the index bytes. The first tail word is checksum-covered but semantically unused.
     fn verify_dx_tail(
         self,
         bytes: &[u8],
@@ -427,49 +428,81 @@ impl DirectoryChecksum {
         let Self::Crc32c { inode_seed } = self else {
             return Ok(());
         };
-        let tail_offset = count_offset
-            .checked_add(
-                limit
-                    .checked_mul(DX_ENTRY_BYTES)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .ok_or(Error::ArithmeticOverflow)?;
-        let checksum_offset = tail_offset
-            .checked_add(4)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if checksum_offset
-            .checked_add(4)
-            .ok_or(Error::ArithmeticOverflow)?
-            > bytes.len()
-        {
-            return Err(Error::InvalidDirectoryEntry);
-        }
-        if le_u32(bytes, disk_offset(tail_offset))? != 0 {
-            return Err(Error::InvalidDirectoryEntry);
-        }
-        let table_end = count_offset
-            .checked_add(
-                count
-                    .checked_mul(DX_ENTRY_BYTES)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .ok_or(Error::ArithmeticOverflow)?;
-        let mut checksum = ext4_crc32c(
+        let (tail_offset, checksum_offset) = dx_tail_offsets(bytes.len(), count_offset, limit)?;
+        let checksum = dx_tail_checksum(
             inode_seed,
-            bytes.get(..table_end).ok_or(Error::InvalidDirectoryEntry)?,
-        );
-        checksum = ext4_crc32c(
-            checksum,
-            bytes
-                .get(tail_offset..checksum_offset)
-                .ok_or(Error::InvalidDirectoryEntry)?,
-        );
-        checksum = ext4_crc32c(checksum, &0_u32.to_le_bytes());
+            bytes,
+            count_offset,
+            count,
+            tail_offset,
+            checksum_offset,
+        )?;
         if le_u32(bytes, disk_offset(checksum_offset))? != checksum {
             return Err(Error::ChecksumMismatch);
         }
         Ok(())
     }
+}
+
+/// Returns the reserved/checksum word offsets for one checksum-enabled index table.
+/// # Errors
+///
+/// Returns an error when table geometry overflows or places either tail word outside the block.
+fn dx_tail_offsets(
+    block_bytes: usize,
+    count_offset: usize,
+    limit: usize,
+) -> Result<(usize, usize)> {
+    let tail_offset = count_offset
+        .checked_add(
+            limit
+                .checked_mul(DX_ENTRY_BYTES)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )
+        .ok_or(Error::ArithmeticOverflow)?;
+    let checksum_offset = tail_offset
+        .checked_add(4)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if checksum_offset
+        .checked_add(4)
+        .ok_or(Error::ArithmeticOverflow)?
+        > block_bytes
+    {
+        return Err(Error::InvalidDirectoryEntry);
+    }
+    Ok((tail_offset, checksum_offset))
+}
+
+/// Calculates one index-block checksum while treating the stored checksum word as zero.
+/// # Errors
+///
+/// Returns an error when the used table or reserved tail word falls outside `bytes`.
+fn dx_tail_checksum(
+    inode_seed: u32,
+    bytes: &[u8],
+    count_offset: usize,
+    count: usize,
+    tail_offset: usize,
+    checksum_offset: usize,
+) -> Result<u32> {
+    let table_end = count_offset
+        .checked_add(
+            count
+                .checked_mul(DX_ENTRY_BYTES)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )
+        .ok_or(Error::ArithmeticOverflow)?;
+    let mut checksum = ext4_crc32c(
+        inode_seed,
+        bytes.get(..table_end).ok_or(Error::InvalidDirectoryEntry)?,
+    );
+    checksum = ext4_crc32c(
+        checksum,
+        bytes
+            .get(tail_offset..checksum_offset)
+            .ok_or(Error::InvalidDirectoryEntry)?,
+    );
+    Ok(ext4_crc32c(checksum, &0_u32.to_le_bytes()))
 }
 
 /// Calculates how many dx entries fit in one root or node block.
@@ -491,7 +524,7 @@ fn dx_capacity(
 
 /// Parsed HTree root block.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct HtreeRoot {
+pub(crate) struct HtreeRoot {
     /// Directory hash context selected by root info.
     hash: DirectoryHashContext,
     /// `.` and `..` entries stored before the root info.
@@ -508,21 +541,39 @@ impl HtreeRoot {
     ///
     /// Returns an error when the root is too small, lacks valid `.`/`..` entries, carries
     /// unsupported hash metadata, or has an invalid root index.
-    fn parse(
+    pub(crate) fn parse(
         bytes: &[u8],
+        directory_inode: InodeId,
         hash_seed: DirectoryHashSeed,
-        _default_hash_version: DirectoryHashVersion,
+        maximum_indirect_levels: u8,
         checksum: DirectoryChecksum,
     ) -> Result<Self> {
         if bytes.len() < DX_ROOT_COUNT_OFFSET + DX_ENTRY_BYTES {
             return Err(Error::InvalidDirectoryEntry);
         }
         let dot = parse_live_entry_at(bytes, 0)?;
-        if dot.name().bytes() != b"." {
+        if dot.inode() != directory_inode
+            || dot.name().bytes() != b"."
+            || dot.kind() != DirectoryEntryKind::Directory
+        {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        if usize::from(le_u16(bytes, disk_offset(4))?) != checked_rec_len(DIRENT_HEADER_SIZE + 1)? {
             return Err(Error::InvalidDirectoryEntry);
         }
         let dotdot = parse_live_entry_at(bytes, checked_rec_len(DIRENT_HEADER_SIZE + 1)?)?;
-        if dotdot.name().bytes() != b".." {
+        if dotdot.name().bytes() != b".." || dotdot.kind() != DirectoryEntryKind::Directory {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let dotdot_offset = checked_rec_len(DIRENT_HEADER_SIZE + 1)?;
+        if usize::from(le_u16(
+            bytes,
+            disk_offset(dotdot_offset).checked_add_bytes(4)?,
+        )?) != bytes
+            .len()
+            .checked_sub(dotdot_offset)
+            .ok_or(Error::ArithmeticOverflow)?
+        {
             return Err(Error::InvalidDirectoryEntry);
         }
         if le_u32(bytes, disk_offset(DX_ROOT_INFO_OFFSET))? != 0 {
@@ -541,10 +592,15 @@ impl HtreeRoot {
         let indirect_levels = *bytes
             .get(DX_ROOT_INFO_OFFSET + 6)
             .ok_or(Error::InvalidDirectoryEntry)?;
-        if indirect_levels > DX_MAX_DEPTH_WITHOUT_LARGEDIR {
-            return Err(Error::DirectoryTooLarge);
+        if indirect_levels > maximum_indirect_levels
+            || *bytes
+                .get(DX_ROOT_INFO_OFFSET + 7)
+                .ok_or(Error::InvalidDirectoryEntry)?
+                != 0
+        {
+            return Err(Error::InvalidDirectoryEntry);
         }
-        let index = DxIndex::parse(bytes, DX_ROOT_COUNT_OFFSET, checksum)?;
+        let index = DxIndex::parse_at(bytes, DX_ROOT_COUNT_OFFSET, checksum)?;
         Ok(Self {
             hash: DirectoryHashContext::new(hash_seed, hash_version),
             dot_entries: {
@@ -558,13 +614,34 @@ impl HtreeRoot {
         })
     }
 
+    /// Returns the hash context selected by this root.
+    pub(crate) const fn hash_context(&self) -> DirectoryHashContext {
+        self.hash
+    }
+
+    /// Returns the two special entries stored in this root.
+    pub(crate) fn dot_entries(&self) -> &[DirectoryEntry] {
+        &self.dot_entries
+    }
+
+    /// Returns the number of index blocks between the root and a leaf.
+    pub(crate) const fn indirect_levels(&self) -> u8 {
+        self.indirect_levels
+    }
+
+    /// Returns the root routing table.
+    pub(crate) const fn index(&self) -> &DxIndex {
+        &self.index
+    }
 }
 
 /// HTree index table.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct DxIndex {
+pub(crate) struct DxIndex {
     /// Entries in on-disk order.
     entries: Vec<DxEntry>,
+    /// Canonical table capacity encoded in the count/limit header.
+    limit: usize,
 }
 
 impl DxIndex {
@@ -573,14 +650,14 @@ impl DxIndex {
     ///
     /// Returns an error when count/limit fields are inconsistent, the table extends outside the
     /// block, a child pointer is zero, or the dx tail checksum is invalid.
-    fn parse(bytes: &[u8], count_offset: usize, checksum: DirectoryChecksum) -> Result<Self> {
+    fn parse_at(bytes: &[u8], count_offset: usize, checksum: DirectoryChecksum) -> Result<Self> {
         let limit = usize::from(le_u16(bytes, disk_offset(count_offset))?);
         let count = usize::from(le_u16(
             bytes,
             disk_offset(count_offset).checked_add_bytes(2)?,
         )?);
         let capacity = dx_capacity(bytes.len(), count_offset, checksum)?;
-        if count == 0 || count > limit || limit > capacity {
+        if count == 0 || count > limit || limit != capacity {
             return Err(Error::InvalidDirectoryEntry);
         }
         checksum.verify_dx_tail(bytes, count_offset, count, limit)?;
@@ -608,24 +685,454 @@ impl DxIndex {
             } else {
                 le_u32(bytes, disk_offset(entry_offset))?
             };
-            let block =
-                le_u32(bytes, disk_offset(entry_offset).checked_add_bytes(4)?)? & DX_BLOCK_MASK;
-            if block == 0 {
+            let raw_block = le_u32(bytes, disk_offset(entry_offset).checked_add_bytes(4)?)?;
+            if raw_block == 0 || raw_block & !DX_BLOCK_MASK != 0 {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            let block = raw_block & DX_BLOCK_MASK;
+            if entries
+                .last()
+                .is_some_and(|previous: &DxEntry| previous.hash > hash)
+            {
                 return Err(Error::InvalidDirectoryEntry);
             }
             entries.try_push(DxEntry { hash, block })?;
         }
-        Ok(Self { entries })
+        Ok(Self { entries, limit })
+    }
+
+    /// Parses an interior-node routing table.
+    /// # Errors
+    ///
+    /// Returns an error when the fake dirent header, count/limit table, ordering, pointer range, or
+    /// checksum tail is invalid.
+    pub(crate) fn parse_node(bytes: &[u8], checksum: DirectoryChecksum) -> Result<Self> {
+        if le_u32(bytes, disk_offset(0))? != 0
+            || usize::from(le_u16(bytes, disk_offset(4))?) != bytes.len()
+            || *bytes.get(6).ok_or(Error::InvalidDirectoryEntry)? != 0
+            || *bytes.get(7).ok_or(Error::InvalidDirectoryEntry)? != 0
+        {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        Self::parse_at(bytes, DX_NODE_COUNT_OFFSET, checksum)
+    }
+
+    /// Selects the last child whose stored boundary is not greater than `major`.
+    pub(crate) fn select(&self, major: u32) -> usize {
+        self.entries
+            .iter()
+            .rposition(|entry| entry.hash <= major)
+            .unwrap_or(0)
+    }
+
+    /// Returns the number of routed children.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns one routed child.
+    pub(crate) fn entry(&self, index: usize) -> Option<DxEntry> {
+        self.entries.get(index).copied()
+    }
+
+    /// Resolves a selected route's effective boundary across an index-node sentinel.
+    /// # Errors
+    ///
+    /// Returns an error when `selected` does not identify an entry in this table.
+    pub(crate) fn route_boundary(&self, selected: usize, inherited: u32) -> Result<u32> {
+        let entry = self.entry(selected).ok_or(Error::InvalidDirectoryEntry)?;
+        if selected == 0 {
+            Ok(inherited)
+        } else {
+            Ok(entry.hash())
+        }
+    }
+
+    /// Builds a routing table for a root block.
+    /// # Errors
+    ///
+    /// Returns an error when the block geometry or supplied route set is invalid.
+    pub(crate) fn root(
+        block_size: usize,
+        checksum: DirectoryChecksum,
+        entries: Vec<DxEntry>,
+    ) -> Result<Self> {
+        Self::from_routes(
+            dx_capacity(block_size, DX_ROOT_COUNT_OFFSET, checksum)?,
+            entries,
+        )
+    }
+
+    /// Inserts one route after the selected child, splitting by entry median when full.
+    /// # Errors
+    ///
+    /// Returns an error when the selected route is absent, allocation fails, or arithmetic
+    /// overflows.
+    pub(crate) fn insert_after(
+        &mut self,
+        selected: usize,
+        route: DxEntry,
+    ) -> Result<Option<DxIndexSplit>> {
+        if selected >= self.entries.len() {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let insert_at = selected.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        if self
+            .entries
+            .get(selected)
+            .is_none_or(|left| left.hash > route.hash)
+            || self
+                .entries
+                .get(insert_at)
+                .is_some_and(|right| route.hash > right.hash)
+        {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        self.entries.try_insert(insert_at, route)?;
+        if self.entries.len() <= self.limit {
+            return Ok(None);
+        }
+        let median = self
+            .entries
+            .len()
+            .checked_div(2)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let right_len = self
+            .entries
+            .len()
+            .checked_sub(median)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let mut right_entries = Vec::new();
+        right_entries
+            .try_reserve_exact(right_len)
+            .map_err(|_| Error::OutOfMemory)?;
+        while self.entries.len() > median {
+            right_entries.try_push(self.entries.try_remove_at(median)?)?;
+        }
+        let boundary = right_entries
+            .first()
+            .map(|entry| entry.hash)
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        if let Some(first) = right_entries.first_mut() {
+            first.hash = 0;
+        }
+        if let Some(first) = self.entries.first_mut() {
+            first.hash = 0;
+        }
+        Ok(Some(DxIndexSplit {
+            boundary,
+            right: Self {
+                entries: right_entries,
+                limit: self.limit,
+            },
+        }))
+    }
+
+    /// Returns whether another route would exceed this table's capacity.
+    pub(crate) fn is_full(&self) -> bool {
+        self.entries.len() >= self.limit
+    }
+
+    /// Builds one checked table from an already owned route set.
+    /// # Errors
+    ///
+    /// Returns an error when the route set is empty, exceeds `limit`, or is not ordered.
+    fn from_routes(limit: usize, mut entries: Vec<DxEntry>) -> Result<Self> {
+        if entries.is_empty() || entries.len() > limit {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        if let Some(first) = entries.first_mut() {
+            first.hash = 0;
+        }
+        for index in 1..entries.len() {
+            let previous = index.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+            if entries
+                .get(previous)
+                .zip(entries.get(index))
+                .is_none_or(|(left, right)| left.hash > right.hash)
+            {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+        }
+        Ok(Self { entries, limit })
+    }
+
+    /// Serializes this index table into an already initialized root or node block.
+    /// # Errors
+    ///
+    /// Returns an error when capacity, route encoding, checksum geometry, or field arithmetic is
+    /// invalid.
+    fn write_at(
+        &self,
+        bytes: &mut [u8],
+        count_offset: usize,
+        checksum: DirectoryChecksum,
+    ) -> Result<()> {
+        let limit = dx_capacity(bytes.len(), count_offset, checksum)?;
+        if limit != self.limit || self.entries.is_empty() || self.entries.len() > limit {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let table_end = count_offset
+            .checked_add(
+                limit
+                    .checked_mul(DX_ENTRY_BYTES)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::ArithmeticOverflow)?;
+        bytes
+            .get_mut(count_offset..table_end)
+            .ok_or(Error::InvalidDirectoryEntry)?
+            .fill(0);
+        put_le_u16(bytes, disk_offset(count_offset), checked_u16(limit)?)?;
+        put_le_u16(
+            bytes,
+            disk_offset(count_offset).checked_add_bytes(2)?,
+            checked_u16(self.entries.len())?,
+        )?;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let offset = count_offset
+                .checked_add(
+                    index
+                        .checked_mul(DX_ENTRY_BYTES)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                )
+                .ok_or(Error::ArithmeticOverflow)?;
+            if index != 0 {
+                put_le_u32(bytes, disk_offset(offset), entry.hash)?;
+            }
+            put_le_u32(
+                bytes,
+                disk_offset(offset).checked_add_bytes(4)?,
+                entry.block,
+            )?;
+        }
+        checksum.write_dx_tail(bytes, count_offset, self.entries.len(), limit)
+    }
+}
+
+/// Primary-hash interval routed by one validated root-to-leaf HTree path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HtreeHashRange {
+    /// Inclusive lower primary-hash boundary.
+    lower: u32,
+    /// Optional upper boundary and whether equality is admitted for a continued collision.
+    upper: Option<(u32, bool)>,
+}
+
+impl HtreeHashRange {
+    /// Creates the unconstrained range owned by the root table.
+    pub(crate) const fn root() -> Self {
+        Self {
+            lower: 0,
+            upper: None,
+        }
+    }
+
+    /// Intersects this range with one selected index-table route.
+    /// # Errors
+    ///
+    /// Returns an error when `selected` is absent or the resulting interval is empty.
+    pub(crate) fn descend(self, index: &DxIndex, selected: usize) -> Result<Self> {
+        for entry_index in 1..index.len() {
+            let boundary = index
+                .entry(entry_index)
+                .map(|entry| entry.hash() & !1)
+                .ok_or(Error::InvalidDirectoryEntry)?;
+            if boundary < self.lower
+                || self.upper.is_some_and(|(end, inclusive)| {
+                    boundary > end || (boundary == end && !inclusive)
+                })
+            {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+        }
+        let selected_entry = index.entry(selected).ok_or(Error::InvalidDirectoryEntry)?;
+        let selected_lower = if selected == 0 {
+            self.lower
+        } else {
+            selected_entry.hash() & !1
+        };
+        let lower = selected_lower;
+        let next = selected
+            .checked_add(1)
+            .and_then(|next| index.entry(next))
+            .map(|entry| (entry.hash() & !1, entry.hash() & 1 != 0));
+        let upper = match (self.upper, next) {
+            (None, None) => None,
+            (Some(bound), None) | (None, Some(bound)) => Some(bound),
+            (Some(left), Some(right)) => Some(match left.0.cmp(&right.0) {
+                core::cmp::Ordering::Less => left,
+                core::cmp::Ordering::Greater => right,
+                core::cmp::Ordering::Equal => (left.0, left.1 && right.1),
+            }),
+        };
+        if upper.is_some_and(|(end, inclusive)| end < lower || (end == lower && !inclusive)) {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        Ok(Self { lower, upper })
+    }
+
+    /// Validates every live leaf entry against this path's routed hash interval.
+    /// # Errors
+    ///
+    /// Returns an error when a special root name appears in a leaf or a name hashes outside the
+    /// selected interval.
+    pub(crate) fn validate_leaf(
+        self,
+        entries: &[DirectoryEntry],
+        hash: DirectoryHashContext,
+    ) -> Result<()> {
+        for entry in entries {
+            if matches!(entry.name().bytes(), b"." | b"..") {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            let major = hash.hash_name(entry.name()).major;
+            if major < self.lower
+                || self
+                    .upper
+                    .is_some_and(|(end, inclusive)| major > end || (major == end && !inclusive))
+            {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Right sibling produced by a median index split.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DxIndexSplit {
+    /// Hash boundary inserted into the parent.
+    boundary: u32,
+    /// Right half whose first in-block hash is canonical zero.
+    right: DxIndex,
+}
+
+impl DxIndexSplit {
+    /// Returns the parent routing boundary.
+    pub(crate) const fn boundary(&self) -> u32 {
+        self.boundary
+    }
+
+    /// Consumes the split into its right sibling table.
+    pub(crate) fn into_right(self) -> DxIndex {
+        self.right
     }
 }
 
 /// One HTree index entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DxEntry {
+pub(crate) struct DxEntry {
     /// First hash value routed to `block`.
     hash: u32,
     /// Directory logical block pointer.
     block: u32,
+}
+
+impl DxEntry {
+    /// Creates one checked in-memory route.
+    /// # Errors
+    ///
+    /// Returns an error when the logical block does not fit the on-disk pointer field.
+    pub(crate) fn new(hash: u32, block: u32) -> Result<Self> {
+        if block == 0 || block & !DX_BLOCK_MASK != 0 {
+            return Err(Error::DirectoryIndexFull);
+        }
+        Ok(Self { hash, block })
+    }
+    /// Returns the stored hash boundary, including its continuation bit.
+    pub(crate) const fn hash(self) -> u32 {
+        self.hash
+    }
+
+    /// Returns the child logical block number.
+    pub(crate) const fn block(self) -> u32 {
+        self.block
+    }
+}
+
+/// Serializes one interior-node index block.
+/// # Errors
+///
+/// Returns an error when the block geometry, fake dirent, routing table, or checksum tail cannot be
+/// represented.
+pub(crate) fn write_htree_node(
+    bytes: &mut [u8],
+    index: &DxIndex,
+    checksum: DirectoryChecksum,
+) -> Result<()> {
+    bytes.fill(0);
+    put_le_u16(bytes, disk_offset(4), checked_u16(bytes.len())?)?;
+    index.write_at(bytes, DX_NODE_COUNT_OFFSET, checksum)
+}
+
+/// Rewrites only the routing authority and depth in an existing HTree root block.
+/// # Errors
+///
+/// Returns an error when the existing root metadata is truncated or the new routing table cannot be
+/// represented with the root's canonical capacity/checksum layout.
+pub(crate) fn write_htree_root_index(
+    bytes: &mut [u8],
+    indirect_levels: u8,
+    index: &DxIndex,
+    checksum: DirectoryChecksum,
+) -> Result<()> {
+    *bytes
+        .get_mut(DX_ROOT_INFO_OFFSET + 6)
+        .ok_or(Error::InvalidDirectoryEntry)? = indirect_levels;
+    index.write_at(bytes, DX_ROOT_COUNT_OFFSET, checksum)
+}
+
+/// Creates a new HTree root from the fixed root fields and a project-local routing table.
+/// # Errors
+///
+/// Returns an error when the block cannot hold the special entries/root metadata/index table or an
+/// encoded field is outside its on-disk range.
+pub(crate) fn create_htree_root(
+    block_size: usize,
+    self_inode: InodeId,
+    parent_inode: InodeId,
+    hash_version: DirectoryHashVersion,
+    index: &DxIndex,
+    checksum: DirectoryChecksum,
+) -> Result<Vec<u8>> {
+    let mut bytes = memory::repeated_vec(0_u8, block_size)?;
+    let dot_len = checked_rec_len(DIRENT_HEADER_SIZE + 1)?;
+    write_entry(
+        &mut bytes,
+        0,
+        self_inode,
+        checked_u16(dot_len)?,
+        b".",
+        DirectoryEntryKind::Directory,
+    )?;
+    write_entry(
+        &mut bytes,
+        dot_len,
+        parent_inode,
+        checked_u16(
+            block_size
+                .checked_sub(dot_len)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )?,
+        b"..",
+        DirectoryEntryKind::Directory,
+    )?;
+    put_le_u32(&mut bytes, disk_offset(DX_ROOT_INFO_OFFSET), 0)?;
+    *bytes
+        .get_mut(DX_ROOT_INFO_OFFSET + 4)
+        .ok_or(Error::InvalidDirectoryEntry)? = hash_version.to_raw();
+    *bytes
+        .get_mut(DX_ROOT_INFO_OFFSET + 5)
+        .ok_or(Error::InvalidDirectoryEntry)? = DX_ROOT_INFO_LEN;
+    *bytes
+        .get_mut(DX_ROOT_INFO_OFFSET + 6)
+        .ok_or(Error::InvalidDirectoryEntry)? = 0;
+    *bytes
+        .get_mut(DX_ROOT_INFO_OFFSET + 7)
+        .ok_or(Error::InvalidDirectoryEntry)? = 0;
+    index.write_at(&mut bytes, DX_ROOT_COUNT_OFFSET, checksum)?;
+    Ok(bytes)
 }
 
 /// Mutable ext4 directory block with checked dirent surgery.
@@ -654,9 +1161,65 @@ impl DirectoryBlock {
         })
     }
 
+    /// Serializes one leaf-local entry set into a fresh block image.
+    /// # Errors
+    ///
+    /// Returns an error when the entries cannot fit, a record cannot be represented, or allocation
+    /// fails.
+    pub(crate) fn from_entries(
+        block_size: usize,
+        checksum: DirectoryChecksum,
+        entries: &[DirectoryEntry],
+    ) -> Result<Self> {
+        let mut block = Self::empty(block_size, checksum)?;
+        let live_limit = block.live_limit()?;
+        if entries.is_empty() {
+            block.initialize_free_space()?;
+            return Ok(block);
+        }
+        let mut minimum = 0_usize;
+        for entry in entries {
+            minimum = minimum
+                .checked_add(entry.encoded_len()?)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        if minimum > live_limit {
+            return Err(Error::NoSpace);
+        }
+        let mut offset = 0_usize;
+        for (index, entry) in entries.iter().enumerate() {
+            let last = index.checked_add(1).ok_or(Error::ArithmeticOverflow)? == entries.len();
+            let rec_len = if last {
+                live_limit
+                    .checked_sub(offset)
+                    .ok_or(Error::ArithmeticOverflow)?
+            } else {
+                entry.encoded_len()?
+            };
+            write_entry(
+                &mut block.bytes,
+                offset,
+                entry.inode(),
+                checked_u16(rec_len)?,
+                entry.name().bytes(),
+                entry.kind(),
+            )?;
+            offset = offset
+                .checked_add(rec_len)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        block.refresh_leaf_checksum()?;
+        Ok(block)
+    }
+
     /// Returns the mutated directory block bytes.
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+
+    /// Borrows the authoritative block image.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// Initializes `.` and `..`, leaving the second entry to own remaining space.
@@ -724,6 +1287,75 @@ impl DirectoryBlock {
                 .get(..self.live_limit()?)
                 .ok_or(Error::InvalidDirectoryEntry)?,
         )
+    }
+
+    /// Parses live entries together with their physical byte coordinates.
+    /// # Errors
+    ///
+    /// Returns an error when the checksum or any record boundary, alignment, name length, or live
+    /// inode is invalid.
+    pub(crate) fn records(&self) -> Result<Vec<DirectoryRecord>> {
+        self.verify_leaf_checksum()?;
+        let live_limit = self.live_limit()?;
+        let mut records = Vec::new();
+        let mut offset = 0_usize;
+        while offset < live_limit {
+            let remaining = live_limit
+                .checked_sub(offset)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if remaining < DIRENT_HEADER_SIZE {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            let rec_len = usize::from(le_u16(
+                &self.bytes,
+                disk_offset(offset).checked_add_bytes(4)?,
+            )?);
+            if rec_len < DIRENT_HEADER_SIZE
+                || !rec_len.is_multiple_of(DIRENT_ALIGNMENT)
+                || rec_len > remaining
+            {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            let name_len = usize::from(
+                *self
+                    .bytes
+                    .get(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
+                    .ok_or(Error::InvalidDirectoryEntry)?,
+            );
+            if name_len
+                > rec_len
+                    .checked_sub(DIRENT_HEADER_SIZE)
+                    .ok_or(Error::InvalidDirectoryEntry)?
+            {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            if le_u32(&self.bytes, disk_offset(offset))? != 0 {
+                records.try_push(DirectoryRecord {
+                    offset: u32::try_from(offset).map_err(|_| Error::ArithmeticOverflow)?,
+                    entry: parse_live_entry_at(
+                        self.bytes
+                            .get(..live_limit)
+                            .ok_or(Error::InvalidDirectoryEntry)?,
+                        offset,
+                    )?,
+                })?;
+            }
+            offset = offset
+                .checked_add(rec_len)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        Ok(records)
+    }
+
+    /// Finds one exact name in this leaf block.
+    /// # Errors
+    ///
+    /// Returns an error when the block checksum or dirent stream is invalid.
+    pub(crate) fn find(&self, name: &Ext4Name) -> Result<Option<DirectoryEntry>> {
+        self.entries()?
+            .into_iter()
+            .find(|entry| entry.name() == name)
+            .map_or(Ok(None), |entry| Ok(Some(entry)))
     }
 
     /// Checks whether a live entry already owns `name`.
@@ -1021,7 +1653,7 @@ impl DirectoryBlock {
 }
 
 /// Directory hash result used for HTree leaf routing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct DirectoryHash {
     /// Primary 32-bit HTree hash.
     pub(crate) major: u32,
@@ -1417,4 +2049,451 @@ fn checked_rec_len(value: usize) -> Result<usize> {
 /// Returns an error when the record length cannot be represented as an ext4 `u16` field.
 fn checked_u16(value: usize) -> Result<u16> {
     u16::try_from(value).map_err(|_| Error::InvalidDirectoryEntry)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    /// Builds a fixed nonzero inode id for directory-format tests.
+    /// # Errors
+    ///
+    /// Returns an error if the fixed fixture leaves the inode-id domain.
+    fn inode(value: u32) -> Result<InodeId> {
+        InodeId::try_from(value)
+    }
+
+    /// Builds a one-leaf root block using only production format constructors.
+    /// # Errors
+    ///
+    /// Returns an error when the fixed root fields cannot be represented.
+    fn root_block(checksum: DirectoryChecksum) -> Result<Vec<u8>> {
+        let mut routes = Vec::new();
+        routes.try_push(DxEntry::new(0, 1)?)?;
+        let index = DxIndex::root(1_024, checksum, routes)?;
+        create_htree_root(
+            1_024,
+            inode(11)?,
+            inode(2)?,
+            DirectoryHashVersion::HalfMd4,
+            &index,
+            checksum,
+        )
+    }
+
+    /// Converts fallible fixture construction into an assertion-friendly optional value.
+    /// # Panics
+    ///
+    /// Panics when production constructors reject the fixed test fixture.
+    fn test_value<T>(result: Result<T>) -> Option<T> {
+        assert!(result.is_ok());
+        result.ok()
+    }
+
+    /// # Panics
+    ///
+    /// Panics when canonical HTree root fields stop being enforced.
+    #[test]
+    fn htree_root_rejects_reserved_depth_capacity_and_special_entry_corruption() {
+        let seed = DirectoryHashSeed::from_words([1, 2, 3, 4]);
+        let Some(root) = test_value(root_block(DirectoryChecksum::None)) else {
+            return;
+        };
+        let Some(directory_inode) = test_value(inode(11)) else {
+            return;
+        };
+        assert!(
+            HtreeRoot::parse(&root, directory_inode, seed, 0, DirectoryChecksum::None,).is_ok()
+        );
+
+        let mut excessive_depth = root.clone();
+        let depth_offset = DX_ROOT_INFO_OFFSET.checked_add(6);
+        assert!(depth_offset.is_some());
+        let Some(depth_offset) = depth_offset else {
+            return;
+        };
+        let depth = excessive_depth.get_mut(depth_offset);
+        assert!(depth.is_some());
+        let Some(depth) = depth else {
+            return;
+        };
+        *depth = 1;
+        assert_eq!(
+            HtreeRoot::parse(
+                &excessive_depth,
+                directory_inode,
+                seed,
+                0,
+                DirectoryChecksum::None,
+            ),
+            Err(Error::InvalidDirectoryEntry)
+        );
+
+        let mut reserved = root.clone();
+        let reserved_offset = DX_ROOT_INFO_OFFSET.checked_add(7);
+        assert!(reserved_offset.is_some());
+        let Some(reserved_offset) = reserved_offset else {
+            return;
+        };
+        let reserved_byte = reserved.get_mut(reserved_offset);
+        assert!(reserved_byte.is_some());
+        let Some(reserved_byte) = reserved_byte else {
+            return;
+        };
+        *reserved_byte = 1;
+        assert_eq!(
+            HtreeRoot::parse(&reserved, directory_inode, seed, 1, DirectoryChecksum::None,),
+            Err(Error::InvalidDirectoryEntry)
+        );
+
+        let mut noncanonical_limit = root.clone();
+        let Some(limit) = test_value(le_u16(
+            &noncanonical_limit,
+            disk_offset(DX_ROOT_COUNT_OFFSET),
+        )) else {
+            return;
+        };
+        let reduced_limit = limit.checked_sub(1);
+        assert!(reduced_limit.is_some());
+        let Some(reduced_limit) = reduced_limit else {
+            return;
+        };
+        let write_limit = put_le_u16(
+            &mut noncanonical_limit,
+            disk_offset(DX_ROOT_COUNT_OFFSET),
+            reduced_limit,
+        );
+        assert!(write_limit.is_ok());
+        if write_limit.is_err() {
+            return;
+        }
+        assert_eq!(
+            HtreeRoot::parse(
+                &noncanonical_limit,
+                directory_inode,
+                seed,
+                0,
+                DirectoryChecksum::None,
+            ),
+            Err(Error::InvalidDirectoryEntry)
+        );
+
+        let mut wrong_self = root;
+        let Some(wrong_inode) = test_value(inode(12)) else {
+            return;
+        };
+        let write_inode = put_le_u32(&mut wrong_self, disk_offset(0), wrong_inode.as_u32());
+        assert!(write_inode.is_ok());
+        if write_inode.is_err() {
+            return;
+        }
+        assert_eq!(
+            HtreeRoot::parse(
+                &wrong_self,
+                directory_inode,
+                seed,
+                0,
+                DirectoryChecksum::None,
+            ),
+            Err(Error::InvalidDirectoryEntry)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when index checksums stop covering used routing bytes.
+    #[test]
+    fn htree_root_checksum_rejects_routing_corruption() {
+        let Some(directory_inode) = test_value(inode(11)) else {
+            return;
+        };
+        let checksum = DirectoryChecksum::metadata_csum(
+            ChecksumSeed::from_u32(0x1234_5678),
+            directory_inode,
+            9,
+        );
+        let Some(mut root) = test_value(root_block(checksum)) else {
+            return;
+        };
+        let seed = DirectoryHashSeed::from_words([0; 4]);
+        assert!(HtreeRoot::parse(&root, directory_inode, seed, 0, checksum).is_ok());
+        let route_offset = DX_ROOT_COUNT_OFFSET.checked_add(4);
+        assert!(route_offset.is_some());
+        let Some(route_offset) = route_offset else {
+            return;
+        };
+        let route_byte = root.get_mut(route_offset);
+        assert!(route_byte.is_some());
+        let Some(route_byte) = route_byte else {
+            return;
+        };
+        *route_byte ^= 0x40;
+        assert_eq!(
+            HtreeRoot::parse(&root, directory_inode, seed, 0, checksum),
+            Err(Error::ChecksumMismatch)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the semantically unused index-tail word is rejected or omitted from checksum
+    /// coverage.
+    #[test]
+    fn htree_tail_reserved_word_is_unused_but_checksum_covered() {
+        let Some(directory_inode) = test_value(inode(11)) else {
+            return;
+        };
+        let checksum = DirectoryChecksum::metadata_csum(
+            ChecksumSeed::from_u32(0x1234_5678),
+            directory_inode,
+            9,
+        );
+        assert!(matches!(checksum, DirectoryChecksum::Crc32c { .. }));
+        let DirectoryChecksum::Crc32c { inode_seed } = checksum else {
+            return;
+        };
+        let Some(mut root) = test_value(root_block(checksum)) else {
+            return;
+        };
+        let seed = DirectoryHashSeed::from_words([0; 4]);
+        let Some(limit) =
+            test_value(le_u16(&root, disk_offset(DX_ROOT_COUNT_OFFSET)).map(usize::from))
+        else {
+            return;
+        };
+        let Some(count_offset) = test_value(disk_offset(DX_ROOT_COUNT_OFFSET).checked_add_bytes(2))
+        else {
+            return;
+        };
+        let Some(count) = test_value(le_u16(&root, count_offset).map(usize::from)) else {
+            return;
+        };
+        let Some((tail_offset, checksum_offset)) =
+            test_value(dx_tail_offsets(root.len(), DX_ROOT_COUNT_OFFSET, limit))
+        else {
+            return;
+        };
+        assert!(put_le_u32(&mut root, disk_offset(tail_offset), 0xde00_000c).is_ok());
+        assert!(put_le_u32(&mut root, disk_offset(checksum_offset), 0).is_ok());
+        let Some(expected) = test_value(dx_tail_checksum(
+            inode_seed,
+            &root,
+            DX_ROOT_COUNT_OFFSET,
+            count,
+            tail_offset,
+            checksum_offset,
+        )) else {
+            return;
+        };
+        assert!(put_le_u32(&mut root, disk_offset(checksum_offset), expected).is_ok());
+        assert!(HtreeRoot::parse(&root, directory_inode, seed, 0, checksum).is_ok());
+
+        let Some(reserved) = root.get_mut(tail_offset) else {
+            return;
+        };
+        *reserved ^= 1;
+        assert_eq!(
+            HtreeRoot::parse(&root, directory_inode, seed, 0, checksum),
+            Err(Error::ChecksumMismatch)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when median split ordering or capacity semantics drift.
+    #[test]
+    fn index_insert_splits_at_entry_median_and_rejects_disordered_routes() {
+        let Some(first) = test_value(DxEntry::new(0, 1)) else {
+            return;
+        };
+        let Some(second) = test_value(DxEntry::new(20, 2)) else {
+            return;
+        };
+        let mut index = DxIndex {
+            entries: vec![first, second],
+            limit: 2,
+        };
+        let Some(route) = test_value(DxEntry::new(10, 3)) else {
+            return;
+        };
+        let Some(split_result) = test_value(index.insert_after(0, route)) else {
+            return;
+        };
+        assert!(split_result.is_some());
+        let Some(split) = split_result else {
+            return;
+        };
+        assert_eq!(index.len(), 1);
+        assert_eq!(split.boundary(), 10);
+        let right = split.into_right();
+        assert_eq!(right.len(), 2);
+        assert_eq!(right.entry(0).map(DxEntry::hash), Some(0));
+        assert_eq!(right.entry(1).map(DxEntry::hash), Some(20));
+
+        let Some(first) = test_value(DxEntry::new(0, 1)) else {
+            return;
+        };
+        let Some(second) = test_value(DxEntry::new(20, 2)) else {
+            return;
+        };
+        let mut ordered = DxIndex {
+            entries: vec![first, second],
+            limit: 3,
+        };
+        let Some(disordered) = test_value(DxEntry::new(30, 3)) else {
+            return;
+        };
+        assert_eq!(
+            ordered.insert_after(0, disordered),
+            Err(Error::InvalidDirectoryEntry)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a child table's zero sentinel stops inheriting its parent route boundary.
+    #[test]
+    fn index_first_route_inherits_the_effective_parent_boundary() {
+        let Some(parent_first) = test_value(DxEntry::new(0, 10)) else {
+            return;
+        };
+        let Some(parent_second) = test_value(DxEntry::new(0x1234_5679, 20)) else {
+            return;
+        };
+        let Some(parent) = test_value(DxIndex::from_routes(3, vec![parent_first, parent_second]))
+        else {
+            return;
+        };
+        let Some(parent_boundary) = test_value(parent.route_boundary(1, 0)) else {
+            return;
+        };
+        assert_eq!(parent_boundary, 0x1234_5679);
+
+        let Some(child_first) = test_value(DxEntry::new(0, 30)) else {
+            return;
+        };
+        let Some(child) = test_value(DxIndex::from_routes(2, vec![child_first])) else {
+            return;
+        };
+        assert_eq!(
+            child.route_boundary(0, parent_boundary),
+            Ok(parent_boundary)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when collision-continuation boundaries stop controlling leaf admission.
+    #[test]
+    fn leaf_hash_range_admits_upper_equality_only_for_continuations() {
+        let hash = DirectoryHashContext::new(
+            DirectoryHashSeed::from_words([1, 2, 3, 4]),
+            DirectoryHashVersion::HalfMd4,
+        );
+        let Some(first_inode) = test_value(inode(12)) else {
+            return;
+        };
+        let Some(first_name) = test_value(Ext4Name::new(b"alpha")) else {
+            return;
+        };
+        let Some(first) = test_value(DirectoryEntry::new(
+            first_inode,
+            &first_name,
+            DirectoryEntryKind::File,
+        )) else {
+            return;
+        };
+        let Some(second_inode) = test_value(inode(13)) else {
+            return;
+        };
+        let Some(second_name) = test_value(Ext4Name::new(b"omega")) else {
+            return;
+        };
+        let Some(second) = test_value(DirectoryEntry::new(
+            second_inode,
+            &second_name,
+            DirectoryEntryKind::File,
+        )) else {
+            return;
+        };
+        let (lower_entry, upper_entry) =
+            if hash.hash_name(first.name()).major < hash.hash_name(second.name()).major {
+                (first, second)
+            } else {
+                (second, first)
+            };
+        let upper = hash.hash_name(upper_entry.name()).major;
+
+        let Some(exclusive_first) = test_value(DxEntry::new(0, 1)) else {
+            return;
+        };
+        let Some(exclusive_upper) = test_value(DxEntry::new(upper, 2)) else {
+            return;
+        };
+        let Some(exclusive) = test_value(DxIndex::from_routes(
+            3,
+            vec![exclusive_first, exclusive_upper],
+        )) else {
+            return;
+        };
+        let Some(range) = test_value(HtreeHashRange::root().descend(&exclusive, 0)) else {
+            return;
+        };
+        let Some(lower_clone) = test_value(lower_entry.try_clone()) else {
+            return;
+        };
+        assert!(range.validate_leaf(&[lower_clone], hash).is_ok());
+        let Some(upper_clone) = test_value(upper_entry.try_clone()) else {
+            return;
+        };
+        assert_eq!(
+            range.validate_leaf(&[upper_clone], hash),
+            Err(Error::InvalidDirectoryEntry)
+        );
+
+        let Some(continued_first) = test_value(DxEntry::new(0, 1)) else {
+            return;
+        };
+        let Some(continued_upper) = test_value(DxEntry::new(upper | 1, 2)) else {
+            return;
+        };
+        let Some(continued) = test_value(DxIndex::from_routes(
+            3,
+            vec![continued_first, continued_upper],
+        )) else {
+            return;
+        };
+        assert!(
+            HtreeHashRange::root()
+                .descend(&continued, 0)
+                .and_then(|range| range.validate_leaf(&[upper_entry], hash))
+                .is_ok()
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when chunked half-MD4 hashing diverges from an independently generated long-name
+    /// known-answer vector.
+    #[test]
+    fn half_md4_hashes_maximum_length_name_across_all_chunks() {
+        let hash = DirectoryHashContext::new(
+            DirectoryHashSeed::from_words([0x3be8_72af, 0xff4d_af2f, 0x5752_a385, 0xe752_9d11]),
+            DirectoryHashVersion::HalfMd4,
+        );
+        let mut bytes = b"depth-49999-".to_vec();
+        bytes.resize(255, b'x');
+        let Some(name) = test_value(Ext4Name::new(&bytes)) else {
+            return;
+        };
+        assert_eq!(
+            hash.hash_name(&name),
+            DirectoryHash {
+                major: 0x1d7e_9c3e,
+                minor: 0x9457_ab15,
+            }
+        );
+    }
 }

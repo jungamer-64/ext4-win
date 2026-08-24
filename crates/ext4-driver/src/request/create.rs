@@ -853,14 +853,14 @@ fn create_missing_node(
     let node = creation.node();
     let notification = DirectoryChange::new(parent, name, node, DirectoryChangeAction::Added)?;
     let handle = memory::boxed_try_with(|| {
-        Ok(OpenedHandle::new(
+        OpenedHandle::new(
             node,
             OpenedNodeMode::Direct,
             location,
             policy.handle_deletion(),
             policy.data_transfer_mode(),
             policy.regular_file_write_access(),
-        ))
+        )
     })?;
     create_ea.apply_to_pending_child(&mut creation, mutation)?;
     let file_object =
@@ -1190,14 +1190,14 @@ fn initialize_file_object(
     policy: CreateHandlePolicy,
 ) -> DriverResult<NonNull<FileControlBlock>> {
     let handle = memory::boxed_try_with(|| {
-        Ok(OpenedHandle::new(
+        OpenedHandle::new(
             node,
             node_mode,
             location,
             policy.handle_deletion(),
             policy.data_transfer_mode(),
             policy.regular_file_write_access(),
-        ))
+        )
     })?;
     let fcb = open_shared_file_control_block(
         &file_object,

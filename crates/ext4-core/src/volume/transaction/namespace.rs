@@ -13,6 +13,99 @@ enum ExistingRenameTarget {
     SameInode,
 }
 
+/// One staged-aware root or interior-node level on a mutation path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MutationHtreeLevel {
+    /// Logical block containing this index (`0` for the root).
+    logical: u32,
+    /// Physical block receiving a rewritten image.
+    physical: BlockAddress,
+    /// Validated routing table at this level.
+    index: DxIndex,
+    /// Child selected for the mutation key.
+    selected: usize,
+}
+
+/// Bounded root-to-leaf mutation route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MutationHtreePath {
+    /// Resident root-to-leaf routing levels.
+    levels: Vec<MutationHtreeLevel>,
+}
+
+impl MutationHtreePath {
+    /// Returns the leaf logical block selected by the deepest route.
+    /// # Errors
+    ///
+    /// Returns an error when the path is empty, the selected route is absent, or the selected leaf
+    /// points back to a resident index block.
+    fn leaf(&self) -> Result<u32> {
+        let leaf = self
+            .levels
+            .last()
+            .and_then(|level| level.index.entry(level.selected))
+            .map(|entry| entry.block())
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        if self.levels.iter().any(|level| level.logical == leaf) {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        Ok(leaf)
+    }
+
+    /// Returns the effective boundary of the currently selected leaf route.
+    /// # Errors
+    ///
+    /// Returns an error when the path is empty or the selected route is absent.
+    fn boundary(&self) -> Result<u32> {
+        if self.levels.is_empty() {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let mut boundary = 0;
+        for level in &self.levels {
+            boundary = level.index.route_boundary(level.selected, boundary)?;
+        }
+        Ok(boundary)
+    }
+
+    /// Reconstructs the primary-hash interval selected by this route.
+    /// # Errors
+    ///
+    /// Returns an error when a selected route is absent or violates its parent interval.
+    fn hash_range(&self) -> Result<HtreeHashRange> {
+        let mut range = HtreeHashRange::root();
+        for level in &self.levels {
+            range = range.descend(&level.index, level.selected)?;
+        }
+        Ok(range)
+    }
+}
+
+/// Root bytes, parsed root semantics, and selected mutation route.
+struct HtreeMutationContext {
+    /// Parsed root semantics and hash context.
+    root: HtreeRoot,
+    /// Mutable serialized root image staged only after routing changes succeed.
+    root_bytes: Vec<u8>,
+    /// Active staged-aware route selected for this mutation.
+    path: MutationHtreePath,
+}
+
+/// One exact entry's staged-aware mutable leaf location.
+struct DirectoryEntryLocation {
+    /// Physical leaf block receiving the mutation.
+    physical: BlockAddress,
+    /// Parsed staged-aware leaf image.
+    block: DirectoryBlock,
+}
+
+/// Selection mode for a staged-aware HTree route.
+enum HtreePathTarget<'name> {
+    /// Select the leaf routed by an exact raw name.
+    Name(&'name Ext4Name),
+    /// Select the first leaf in index order.
+    First,
+}
+
 impl MutationResolvePass<'_, '_, '_> {
     /// Creates an empty regular file under a directory.
     ///
@@ -545,13 +638,16 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when `parent` is not a directory, its lookup name cannot be derived, or the
     /// requested entry is absent.
     fn find_child_entry(&mut self, parent: InodeId, name: &Ext4Name) -> Result<RawDirectoryEntry> {
-        let inode = self.volume.read_inode_record(parent)?;
+        let inode = self.raw_inode_for_policy(parent)?.parse()?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
         let lookup_name = self.directory_lookup_name(&inode, name)?;
-        if let Some(entry) = self.directory_layout(&inode)?.find(&lookup_name)? {
-            return Ok(entry);
+        if let Some(location) = self.directory_entry_location(&inode, &lookup_name)? {
+            return location
+                .block
+                .find(&lookup_name)?
+                .ok_or(Error::InvalidDirectoryEntry);
         }
         Err(Error::DirectoryEntryNotFound)
     }
@@ -580,8 +676,8 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Adds a child entry to a mutable directory, extending it when supported.
     /// # Errors
     ///
-    /// Returns an error when `parent` is not mutable, `name` already exists, encryption or HTree
-    /// rebuild fails, or a new directory block cannot be allocated and staged.
+    /// Returns an error when `parent` is not mutable, `name` already exists, encryption or local
+    /// HTree routing/split fails, or a new directory block cannot be allocated and staged.
     fn add_directory_entry(
         &mut self,
         parent: InodeId,
@@ -600,8 +696,7 @@ impl MutationResolvePass<'_, '_, '_> {
             self.volume
                 .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
         if self
-            .directory_layout(&parent_inode)?
-            .find(&disk_name)?
+            .directory_entry_location(&parent_inode, &disk_name)?
             .is_some()
         {
             return Err(Error::NameAlreadyExists);
@@ -610,13 +705,27 @@ impl MutationResolvePass<'_, '_, '_> {
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
-            entries.try_push(RawDirectoryEntry::new(child, &disk_name, kind)?)?;
-            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
-            return Ok(());
+            return self.insert_htree_directory_entry(
+                inode_index,
+                raw_parent,
+                &parent_inode,
+                RawDirectoryEntry::new(child, &disk_name, kind)?,
+            );
         }
 
-        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
+        let mut tree = self.mutable_extent_tree(&parent_inode)?;
+        if tree.contains_uninitialized() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        let block_size = self.volume.superblock.block_size();
+        let block_size_u64 = u64::from(block_size.bytes());
+        let block_count = round_up_div(parent_inode.size().bytes(), block_size_u64)?;
+        for logical in 0..block_count {
+            let (physical, mut block) = self.read_mutation_directory_block(
+                &parent_inode,
+                &tree,
+                LogicalBlock::try_from(logical)?,
+            )?;
             if block.insert(child, &disk_name, kind)? {
                 self.stage_directory_block(physical, block.into_bytes())?;
                 raw_parent
@@ -626,30 +735,23 @@ impl MutationResolvePass<'_, '_, '_> {
             }
         }
 
-        match self.volume.superblock.directory_indexing() {
-            DirectoryIndexing::Enabled => {
-                let mut entries = self.directory_layout(&parent_inode)?.entries()?;
-                entries.try_push(RawDirectoryEntry::new(child, &disk_name, kind)?)?;
-                self.stage_rebuilt_htree_directory(
-                    inode_index,
-                    raw_parent,
-                    &parent_inode,
-                    &entries,
-                )?;
-                return Ok(());
-            }
-            DirectoryIndexing::Disabled => {}
+        if block_count == 1
+            && !matches!(
+                self.volume.superblock.directory_indexing(),
+                DirectoryIndexing::Disabled
+            )
+        {
+            return self.convert_linear_directory_to_htree(
+                inode_index,
+                raw_parent,
+                &parent_inode,
+                tree,
+                RawDirectoryEntry::new(child, &disk_name, kind)?,
+            );
         }
 
-        let block_size = self.volume.superblock.block_size();
-        let block_size_u64 = u64::from(block_size.bytes());
         let new_physical = self.allocate_cluster()?;
-        let mut tree = self.mutable_extent_tree(&parent_inode)?;
-        if tree.contains_uninitialized() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
-        let logical_block =
-            LogicalBlock::try_from(round_up_div(parent_inode.size().bytes(), block_size_u64)?)?;
+        let logical_block = LogicalBlock::try_from(block_count)?;
         tree.insert_or_extend_initialized(logical_block, new_physical)?;
 
         let mut block = DirectoryBlock::empty(
@@ -673,7 +775,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .volume
             .superblock
             .inode_data_encoding()
-            .encode_size(new_parent_size)?;
+            .encode_directory_size(DirectorySize::from_bytes(new_parent_size.bytes()))?;
         raw_parent.set_encoded_size(encoded_size)?;
         raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
         self.stage_extent_tree(&mut raw_parent, tree)?;
@@ -699,28 +801,17 @@ impl MutationResolvePass<'_, '_, '_> {
         }
         self.require_directory_entry_delete_mutation_for_inode(&parent_inode)?;
         let disk_name = self.directory_lookup_name(&parent_inode, name)?;
-        if matches!(
-            parent_inode.directory_storage_kind()?,
-            DirectoryStorageKind::HTree
-        ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
-            let Some(position) = entries.iter().position(|entry| entry.name() == &disk_name) else {
-                return Err(Error::DirectoryEntryNotFound);
-            };
-            let removed = entries.try_remove_at(position)?;
-            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
-            return Ok(removed);
-        }
-        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
-            if let Some(removed) = block.remove(&disk_name)? {
-                self.stage_directory_block(physical, block.into_bytes())?;
-                raw_parent
-                    .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-                self.replace_live_inode(inode_index, raw_parent)?;
-                return Ok(removed);
-            }
-        }
-        Err(Error::DirectoryEntryNotFound)
+        let Some(mut location) = self.directory_entry_location(&parent_inode, &disk_name)? else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        let removed = location
+            .block
+            .remove(&disk_name)?
+            .ok_or(Error::DirectoryEntryNotFound)?;
+        self.stage_directory_block(location.physical, location.block.into_bytes())?;
+        raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+        self.replace_live_inode(inode_index, raw_parent)?;
+        Ok(removed)
     }
 
     /// Renames a child entry while preserving the expected child inode and kind.
@@ -749,51 +840,94 @@ impl MutationResolvePass<'_, '_, '_> {
         let new_disk_name =
             self.volume
                 .encrypt_directory_child_name(&parent_inode, new_name, self.crypto)?;
+        if self
+            .directory_entry_location(&parent_inode, &new_disk_name)?
+            .is_some()
+        {
+            return Err(Error::NameAlreadyExists);
+        }
+        let Some(mut source) = self.directory_entry_location(&parent_inode, &old_disk_name)? else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
         if matches!(
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
-            if entries.iter().any(|entry| entry.name() == &new_disk_name) {
-                return Err(Error::NameAlreadyExists);
-            }
-            let Some(position) = entries
-                .iter()
-                .position(|entry| entry.name() == &old_disk_name)
-            else {
-                return Err(Error::DirectoryEntryNotFound);
-            };
-            let renamed = entries
-                .get(position)
-                .ok_or(Error::InvalidDirectoryEntry)?
-                .try_clone()?;
-            if renamed.inode() != child {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            *entries
-                .get_mut(position)
-                .ok_or(Error::InvalidDirectoryEntry)? =
-                RawDirectoryEntry::new(child, &new_disk_name, kind)?;
-            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
-            return Ok(renamed);
-        }
-        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
-            if let Some(renamed) = block.rename(&old_disk_name, &new_disk_name)? {
+            let tree = self.mutable_extent_tree(&parent_inode)?;
+            let target_context = self.mutation_htree_context(
+                &parent_inode,
+                &tree,
+                HtreePathTarget::Name(&new_disk_name),
+            )?;
+            let (target_physical, _target_block) = self.read_mutation_directory_block(
+                &parent_inode,
+                &tree,
+                LogicalBlock::try_from(u64::from(target_context.path.leaf()?))?,
+            )?;
+            if target_physical == source.physical {
+                let renamed = source
+                    .block
+                    .rename(&old_disk_name, &new_disk_name)?
+                    .ok_or(Error::DirectoryEntryNotFound)?;
                 if renamed.inode() != child {
                     return Err(Error::InvalidDirectoryEntry);
                 }
-                let replacement = block.replace(&new_disk_name, child, kind)?;
+                let replacement = source.block.replace(&new_disk_name, child, kind)?;
                 if replacement.is_none() {
                     return Err(Error::InvalidDirectoryEntry);
                 }
-                self.stage_directory_block(physical, block.into_bytes())?;
+                self.stage_directory_block(source.physical, source.block.into_bytes())?;
                 raw_parent
                     .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
                 self.replace_live_inode(inode_index, raw_parent)?;
                 return Ok(renamed);
             }
+            let renamed = source
+                .block
+                .remove(&old_disk_name)?
+                .ok_or(Error::DirectoryEntryNotFound)?;
+            if renamed.inode() != child {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            self.stage_directory_block(source.physical, source.block.into_bytes())?;
+            self.insert_htree_directory_entry(
+                inode_index,
+                raw_parent,
+                &parent_inode,
+                RawDirectoryEntry::new(child, &new_disk_name, kind)?,
+            )?;
+            return Ok(renamed);
         }
-        Err(Error::DirectoryEntryNotFound)
+        match source.block.rename(&old_disk_name, &new_disk_name) {
+            Ok(Some(renamed)) => {
+                if renamed.inode() != child {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
+                let replacement = source.block.replace(&new_disk_name, child, kind)?;
+                if replacement.is_none() {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
+                self.stage_directory_block(source.physical, source.block.into_bytes())?;
+                raw_parent
+                    .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+                self.replace_live_inode(inode_index, raw_parent)?;
+                Ok(renamed)
+            }
+            Ok(None) => Err(Error::DirectoryEntryNotFound),
+            Err(Error::NoSpace) => {
+                let renamed = source
+                    .block
+                    .remove(&old_disk_name)?
+                    .ok_or(Error::DirectoryEntryNotFound)?;
+                if renamed.inode() != child {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
+                self.stage_directory_block(source.physical, source.block.into_bytes())?;
+                self.add_directory_entry(parent, new_name, child, kind)?;
+                Ok(renamed)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Replaces the inode and kind stored for an existing directory name.
@@ -818,35 +952,17 @@ impl MutationResolvePass<'_, '_, '_> {
         let disk_name =
             self.volume
                 .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
-        if matches!(
-            parent_inode.directory_storage_kind()?,
-            DirectoryStorageKind::HTree
-        ) {
-            let mut entries = self.directory_layout(&parent_inode)?.entries()?;
-            let Some(position) = entries.iter().position(|entry| entry.name() == &disk_name) else {
-                return Err(Error::DirectoryEntryNotFound);
-            };
-            let replaced = entries
-                .get(position)
-                .ok_or(Error::InvalidDirectoryEntry)?
-                .try_clone()?;
-            *entries
-                .get_mut(position)
-                .ok_or(Error::InvalidDirectoryEntry)? =
-                RawDirectoryEntry::new(child, &disk_name, kind)?;
-            self.stage_rebuilt_htree_directory(inode_index, raw_parent, &parent_inode, &entries)?;
-            return Ok(replaced);
-        }
-        for (_logical, physical, mut block) in self.directory_blocks(&parent_inode)? {
-            if let Some(replaced) = block.replace(&disk_name, child, kind)? {
-                self.stage_directory_block(physical, block.into_bytes())?;
-                raw_parent
-                    .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-                self.replace_live_inode(inode_index, raw_parent)?;
-                return Ok(replaced);
-            }
-        }
-        Err(Error::DirectoryEntryNotFound)
+        let Some(mut location) = self.directory_entry_location(&parent_inode, &disk_name)? else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        let replaced = location
+            .block
+            .replace(&disk_name, child, kind)?
+            .ok_or(Error::DirectoryEntryNotFound)?;
+        self.stage_directory_block(location.physical, location.block.into_bytes())?;
+        raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+        self.replace_live_inode(inode_index, raw_parent)?;
+        Ok(replaced)
     }
 
     /// Stages the latest image for a mutated directory block.
@@ -867,18 +983,696 @@ impl MutationResolvePass<'_, '_, '_> {
         Ok(())
     }
 
+    /// Reads one logical directory block, preferring this transaction's newest staged image.
+    /// # Errors
+    ///
+    /// Returns an error when the logical block is outside the semantic directory size, is not
+    /// physically mapped, has an invalid staged length, or cannot be read or allocated.
+    fn read_mutation_directory_block(
+        &mut self,
+        inode: &Inode,
+        tree: &MutableExtentTree,
+        logical: LogicalBlock,
+    ) -> Result<(BlockAddress, DirectoryBlock)> {
+        let block_count = round_up_div(
+            inode.size().bytes(),
+            u64::from(self.volume.superblock.block_size().bytes()),
+        )?;
+        if logical.as_u64() >= block_count {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let physical = match tree.map_logical(logical) {
+            BlockMapping::Physical(physical) => physical,
+            BlockMapping::Uninitialized | BlockMapping::Hole => {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+        };
+        let block_size = self.volume.superblock.block_size();
+        let block_bytes =
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let bytes = if let Some(staged) = self
+            .directory_updates
+            .iter()
+            .find(|image| image.block == physical)
+        {
+            if staged.bytes.len() != block_bytes {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            memory::copied_slice(&staged.bytes)?
+        } else {
+            let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
+            self.volume
+                .device
+                .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
+            bytes
+        };
+        Ok((
+            physical,
+            DirectoryBlock::new(bytes, self.volume.directory_checksum(inode)),
+        ))
+    }
+
+    /// Builds one staged-aware HTree path for a primary hash.
+    /// # Errors
+    ///
+    /// Returns an error when the root or an interior node is malformed, the configured depth is
+    /// unsupported, a route cycles, or a selected block cannot be read.
+    fn mutation_htree_context(
+        &mut self,
+        inode: &Inode,
+        tree: &MutableExtentTree,
+        target: HtreePathTarget<'_>,
+    ) -> Result<HtreeMutationContext> {
+        let checksum = self.volume.directory_checksum(inode);
+        let (root_physical, root_block) =
+            self.read_mutation_directory_block(inode, tree, LogicalBlock::try_from(0_u64)?)?;
+        let root = HtreeRoot::parse(
+            root_block.bytes(),
+            inode.id(),
+            self.volume.superblock.directory_hash_seed(),
+            self.volume
+                .superblock
+                .directory_indexing()
+                .require_supported()?,
+            checksum,
+        )?;
+        let major = match target {
+            HtreePathTarget::Name(name) => root.hash_context().hash_name(name).major,
+            HtreePathTarget::First => 0,
+        };
+        let mut levels = Vec::new();
+        levels.try_push(MutationHtreeLevel {
+            logical: 0,
+            physical: root_physical,
+            selected: root.index().select(major),
+            index: root.index().clone(),
+        })?;
+        for _ in 0..root.indirect_levels() {
+            let logical = levels
+                .last()
+                .and_then(|level| level.index.entry(level.selected))
+                .map(|entry| entry.block())
+                .ok_or(Error::InvalidDirectoryEntry)?;
+            if levels.iter().any(|level| level.logical == logical) {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            let (physical, block) = self.read_mutation_directory_block(
+                inode,
+                tree,
+                LogicalBlock::try_from(u64::from(logical))?,
+            )?;
+            let index = DxIndex::parse_node(block.bytes(), checksum)?;
+            levels.try_push(MutationHtreeLevel {
+                logical,
+                physical,
+                selected: index.select(major),
+                index,
+            })?;
+        }
+        Ok(HtreeMutationContext {
+            root,
+            root_bytes: root_block.into_bytes(),
+            path: MutationHtreePath { levels },
+        })
+    }
+
+    /// Advances a mutation path to the next leaf while keeping only the active root-to-leaf route.
+    /// # Errors
+    ///
+    /// Returns an error when the path is malformed, an interior route cycles, or a selected block
+    /// cannot be read and validated.
+    fn advance_mutation_htree_path(
+        &mut self,
+        inode: &Inode,
+        tree: &MutableExtentTree,
+        path: &mut MutationHtreePath,
+        indirect_levels: u8,
+    ) -> Result<bool> {
+        let expected_levels = usize::from(indirect_levels)
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let Some(level_to_advance) = path.levels.iter().rposition(|level| {
+            level
+                .selected
+                .checked_add(1)
+                .is_some_and(|next| next < level.index.len())
+        }) else {
+            return Ok(false);
+        };
+        let level = path
+            .levels
+            .get_mut(level_to_advance)
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        level.selected = level
+            .selected
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        path.levels.truncate(
+            level_to_advance
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?,
+        );
+        let checksum = self.volume.directory_checksum(inode);
+        while path.levels.len() < expected_levels {
+            let logical = path
+                .levels
+                .last()
+                .and_then(|level| level.index.entry(level.selected))
+                .map(|entry| entry.block())
+                .ok_or(Error::InvalidDirectoryEntry)?;
+            if path.levels.iter().any(|level| level.logical == logical) {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            let (physical, block) = self.read_mutation_directory_block(
+                inode,
+                tree,
+                LogicalBlock::try_from(u64::from(logical))?,
+            )?;
+            path.levels.try_push(MutationHtreeLevel {
+                logical,
+                physical,
+                index: DxIndex::parse_node(block.bytes(), checksum)?,
+                selected: 0,
+            })?;
+        }
+        Ok(true)
+    }
+
+    /// Finds an exact entry and returns only its mutable leaf block.
+    /// # Errors
+    ///
+    /// Returns an error when directory mapping, HTree routing, hash intervals, or a leaf dirent
+    /// stream is invalid.
+    fn directory_entry_location(
+        &mut self,
+        inode: &Inode,
+        name: &Ext4Name,
+    ) -> Result<Option<DirectoryEntryLocation>> {
+        let tree = self.mutable_extent_tree(inode)?;
+        match inode.directory_storage_kind()? {
+            DirectoryStorageKind::Linear => {
+                let block_count = round_up_div(
+                    inode.size().bytes(),
+                    u64::from(self.volume.superblock.block_size().bytes()),
+                )?;
+                for logical in 0..block_count {
+                    let (physical, block) = self.read_mutation_directory_block(
+                        inode,
+                        &tree,
+                        LogicalBlock::try_from(logical)?,
+                    )?;
+                    if block.find(name)?.is_some() {
+                        return Ok(Some(DirectoryEntryLocation { physical, block }));
+                    }
+                }
+                Ok(None)
+            }
+            DirectoryStorageKind::HTree => {
+                if matches!(name.bytes(), b"." | b"..") {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
+                let mut context =
+                    self.mutation_htree_context(inode, &tree, HtreePathTarget::Name(name))?;
+                let hash = context.root.hash_context().hash_name(name);
+                loop {
+                    let (physical, block) = self.read_mutation_directory_block(
+                        inode,
+                        &tree,
+                        LogicalBlock::try_from(u64::from(context.path.leaf()?))?,
+                    )?;
+                    let entries = block.entries()?;
+                    context
+                        .path
+                        .hash_range()?
+                        .validate_leaf(&entries, context.root.hash_context())?;
+                    if entries.iter().any(|entry| entry.name() == name) {
+                        return Ok(Some(DirectoryEntryLocation { physical, block }));
+                    }
+                    if !self.advance_mutation_htree_path(
+                        inode,
+                        &tree,
+                        &mut context.path,
+                        context.root.indirect_levels(),
+                    )? || context.path.boundary()? & !1 != hash.major
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inserts one child through the selected HTree leaf and propagates only required splits.
+    /// # Errors
+    ///
+    /// Returns an error when routing or leaf data is invalid, a split cannot be represented, the
+    /// configured index depth is exhausted, allocation fails, or staging cannot complete.
+    fn insert_htree_directory_entry(
+        &mut self,
+        inode_index: StagedInodeIndex,
+        mut raw_parent: LiveInodeRecord,
+        parent_inode: &Inode,
+        entry: RawDirectoryEntry,
+    ) -> Result<()> {
+        let mut tree = self.mutable_extent_tree(parent_inode)?;
+        if tree.contains_uninitialized() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        let checksum = self.volume.directory_checksum(parent_inode);
+        let mut context =
+            self.mutation_htree_context(parent_inode, &tree, HtreePathTarget::Name(entry.name()))?;
+        let leaf_logical = context.path.leaf()?;
+        let (leaf_physical, mut leaf) = self.read_mutation_directory_block(
+            parent_inode,
+            &tree,
+            LogicalBlock::try_from(u64::from(leaf_logical))?,
+        )?;
+        context
+            .path
+            .hash_range()?
+            .validate_leaf(&leaf.entries()?, context.root.hash_context())?;
+        if leaf.insert(entry.inode(), entry.name(), entry.kind())? {
+            self.stage_directory_block(leaf_physical, leaf.into_bytes())?;
+            raw_parent
+                .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+            return self.replace_live_inode(inode_index, raw_parent);
+        }
+
+        if context
+            .path
+            .levels
+            .iter()
+            .all(|level| level.index.is_full())
+            && context.root.indirect_levels()
+                >= self
+                    .volume
+                    .superblock
+                    .directory_indexing()
+                    .require_supported()?
+        {
+            return Err(Error::DirectoryIndexFull);
+        }
+        let hash = context.root.hash_context();
+        let mut entries = leaf.entries()?;
+        entries.try_push(entry)?;
+        memory::heap_sort_by(&mut entries, |left, right| {
+            let left_hash = hash.hash_name(left.name());
+            let right_hash = hash.hash_name(right.name());
+            left_hash
+                .cmp(&right_hash)
+                .then(left.name().bytes().cmp(right.name().bytes()))
+        })?;
+        let split_at = self.directory_leaf_split(&entries, checksum)?;
+        let (left_entries, right_entries) = entries
+            .split_at_checked(split_at)
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        let left_last_hash = left_entries
+            .last()
+            .map(|entry| hash.hash_name(entry.name()).major)
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        let right_first_hash = right_entries
+            .first()
+            .map(|entry| hash.hash_name(entry.name()).major)
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        let boundary = right_first_hash | u32::from(left_last_hash == right_first_hash);
+        let block_bytes = usize::try_from(self.volume.superblock.block_size().bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?;
+        let left = DirectoryBlock::from_entries(block_bytes, checksum, left_entries)?;
+        let right = DirectoryBlock::from_entries(block_bytes, checksum, right_entries)?;
+        let mut next_logical = round_up_div(
+            parent_inode.size().bytes(),
+            u64::from(self.volume.superblock.block_size().bytes()),
+        )?;
+        let (right_logical, right_physical) =
+            self.allocate_directory_block(&mut tree, &mut next_logical)?;
+        self.stage_directory_block(leaf_physical, left.into_bytes())?;
+        self.stage_directory_block(right_physical, right.into_bytes())?;
+        self.propagate_htree_route(
+            parent_inode,
+            &mut tree,
+            &mut next_logical,
+            &mut context,
+            DxEntry::new(boundary, right_logical)?,
+        )?;
+        self.finish_directory_growth(inode_index, raw_parent, tree, next_logical, false)
+    }
+
+    /// Selects the deterministic byte-balanced split that leaves both leaf halves representable.
+    /// # Errors
+    ///
+    /// Returns an error when record lengths overflow or no split can fit both resulting leaves.
+    fn directory_leaf_split(
+        &self,
+        entries: &[RawDirectoryEntry],
+        checksum: DirectoryChecksum,
+    ) -> Result<usize> {
+        let usable = usize::try_from(self.volume.superblock.block_size().bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?
+            .checked_sub(checksum.dirent_tail_bytes())
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        let mut total = 0_usize;
+        for entry in entries {
+            total = total
+                .checked_add(entry.encoded_len()?)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        let mut left = 0_usize;
+        let mut selected = None;
+        for split in 1..entries.len() {
+            let prior = split.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+            left = left
+                .checked_add(
+                    entries
+                        .get(prior)
+                        .ok_or(Error::InvalidDirectoryEntry)?
+                        .encoded_len()?,
+                )
+                .ok_or(Error::ArithmeticOverflow)?;
+            let right = total.checked_sub(left).ok_or(Error::ArithmeticOverflow)?;
+            if left > usable || right > usable {
+                continue;
+            }
+            let difference = left.abs_diff(right);
+            if selected
+                .as_ref()
+                .is_none_or(|(_, best_difference)| difference < *best_difference)
+            {
+                selected = Some((split, difference));
+            }
+        }
+        selected
+            .map(|(split, _)| split)
+            .ok_or(Error::InvalidDirectoryEntry)
+    }
+
+    /// Propagates one new child route, splitting index nodes by median and growing the root.
+    /// # Errors
+    ///
+    /// Returns an error when a path route is invalid, the permitted index depth is exhausted, a
+    /// node image cannot be represented, allocation fails, or staging cannot complete.
+    fn propagate_htree_route(
+        &mut self,
+        inode: &Inode,
+        tree: &mut MutableExtentTree,
+        next_logical: &mut u64,
+        context: &mut HtreeMutationContext,
+        mut route: DxEntry,
+    ) -> Result<()> {
+        let checksum = self.volume.directory_checksum(inode);
+        let block_bytes = usize::try_from(self.volume.superblock.block_size().bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?;
+        for level_index in (0..context.path.levels.len()).rev() {
+            let split = {
+                let level = context
+                    .path
+                    .levels
+                    .get_mut(level_index)
+                    .ok_or(Error::InvalidDirectoryEntry)?;
+                level.index.insert_after(level.selected, route)?
+            };
+            let level = context
+                .path
+                .levels
+                .get_mut(level_index)
+                .ok_or(Error::InvalidDirectoryEntry)?;
+            let Some(split) = split else {
+                if level_index == 0 {
+                    write_htree_root_index(
+                        &mut context.root_bytes,
+                        context.root.indirect_levels(),
+                        &level.index,
+                        checksum,
+                    )?;
+                    self.stage_directory_block(
+                        level.physical,
+                        memory::copied_slice(&context.root_bytes)?,
+                    )?;
+                } else {
+                    let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
+                    write_htree_node(&mut bytes, &level.index, checksum)?;
+                    self.stage_directory_block(level.physical, bytes)?;
+                }
+                return Ok(());
+            };
+            if level_index == 0 {
+                let maximum = self
+                    .volume
+                    .superblock
+                    .directory_indexing()
+                    .require_supported()?;
+                let new_depth = context
+                    .root
+                    .indirect_levels()
+                    .checked_add(1)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                if new_depth > maximum {
+                    return Err(Error::DirectoryIndexFull);
+                }
+                let boundary = split.boundary();
+                let right = split.into_right();
+                let (left_logical, left_physical) =
+                    self.allocate_directory_block(tree, next_logical)?;
+                let (right_logical, right_physical) =
+                    self.allocate_directory_block(tree, next_logical)?;
+                let mut left_bytes = memory::repeated_vec(0_u8, block_bytes)?;
+                write_htree_node(&mut left_bytes, &level.index, checksum)?;
+                let mut right_bytes = memory::repeated_vec(0_u8, block_bytes)?;
+                write_htree_node(&mut right_bytes, &right, checksum)?;
+                let mut root_routes = Vec::new();
+                root_routes.try_push(DxEntry::new(0, left_logical)?)?;
+                root_routes.try_push(DxEntry::new(boundary, right_logical)?)?;
+                let root_index = DxIndex::root(block_bytes, checksum, root_routes)?;
+                write_htree_root_index(&mut context.root_bytes, new_depth, &root_index, checksum)?;
+                self.stage_directory_block(left_physical, left_bytes)?;
+                self.stage_directory_block(right_physical, right_bytes)?;
+                self.stage_directory_block(
+                    level.physical,
+                    memory::copied_slice(&context.root_bytes)?,
+                )?;
+                return Ok(());
+            }
+            let boundary = split.boundary();
+            let right = split.into_right();
+            let mut left_bytes = memory::repeated_vec(0_u8, block_bytes)?;
+            write_htree_node(&mut left_bytes, &level.index, checksum)?;
+            self.stage_directory_block(level.physical, left_bytes)?;
+            let (right_logical, right_physical) =
+                self.allocate_directory_block(tree, next_logical)?;
+            let mut right_bytes = memory::repeated_vec(0_u8, block_bytes)?;
+            write_htree_node(&mut right_bytes, &right, checksum)?;
+            self.stage_directory_block(right_physical, right_bytes)?;
+            route = DxEntry::new(boundary, right_logical)?;
+        }
+        Err(Error::InvalidDirectoryEntry)
+    }
+
+    /// Converts a one-block linear directory into a root plus the minimum indexed leaf set.
+    /// # Errors
+    ///
+    /// Returns an error when the linear block is malformed, the new leaf or root cannot be
+    /// represented, allocation fails, or the staged directory growth cannot be published.
+    fn convert_linear_directory_to_htree(
+        &mut self,
+        inode_index: StagedInodeIndex,
+        raw_parent: LiveInodeRecord,
+        parent_inode: &Inode,
+        mut tree: MutableExtentTree,
+        entry: RawDirectoryEntry,
+    ) -> Result<()> {
+        let checksum = self.volume.directory_checksum(parent_inode);
+        let (root_physical, block) = self.read_mutation_directory_block(
+            parent_inode,
+            &tree,
+            LogicalBlock::try_from(0_u64)?,
+        )?;
+        let entries = block.entries()?;
+        let dot_inode = entries
+            .iter()
+            .find(|candidate| candidate.name().bytes() == b".")
+            .map(RawDirectoryEntry::inode)
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        let parent_inode_id = entries
+            .iter()
+            .find(|candidate| candidate.name().bytes() == b"..")
+            .map(RawDirectoryEntry::inode)
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        if dot_inode != parent_inode.id() {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let hash = DirectoryHashContext::new(
+            self.volume.superblock.directory_hash_seed(),
+            self.volume.superblock.default_directory_hash_version(),
+        );
+        let mut children = Vec::new();
+        for child in entries {
+            if !matches!(child.name().bytes(), b"." | b"..") {
+                children.try_push(child)?;
+            }
+        }
+        children.try_push(entry)?;
+        memory::heap_sort_by(&mut children, |left, right| {
+            hash.hash_name(left.name())
+                .cmp(&hash.hash_name(right.name()))
+                .then(left.name().bytes().cmp(right.name().bytes()))
+        })?;
+        let block_bytes = usize::try_from(self.volume.superblock.block_size().bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?;
+        let mut next_logical = 1_u64;
+        let mut routes = Vec::new();
+        match DirectoryBlock::from_entries(block_bytes, checksum, &children) {
+            Ok(leaf) => {
+                let (leaf_logical, leaf_physical) =
+                    self.allocate_directory_block(&mut tree, &mut next_logical)?;
+                routes.try_push(DxEntry::new(0, leaf_logical)?)?;
+                self.stage_directory_block(leaf_physical, leaf.into_bytes())?;
+            }
+            Err(Error::NoSpace) => {
+                let split_at = self.directory_leaf_split(&children, checksum)?;
+                let (left_entries, right_entries) = children
+                    .split_at_checked(split_at)
+                    .ok_or(Error::InvalidDirectoryEntry)?;
+                let left_last_hash = left_entries
+                    .last()
+                    .map(|child| hash.hash_name(child.name()).major)
+                    .ok_or(Error::InvalidDirectoryEntry)?;
+                let right_first_hash = right_entries
+                    .first()
+                    .map(|child| hash.hash_name(child.name()).major)
+                    .ok_or(Error::InvalidDirectoryEntry)?;
+                let boundary = right_first_hash | u32::from(left_last_hash == right_first_hash);
+                let left = DirectoryBlock::from_entries(block_bytes, checksum, left_entries)?;
+                let right = DirectoryBlock::from_entries(block_bytes, checksum, right_entries)?;
+                let (left_logical, left_physical) =
+                    self.allocate_directory_block(&mut tree, &mut next_logical)?;
+                let (right_logical, right_physical) =
+                    self.allocate_directory_block(&mut tree, &mut next_logical)?;
+                routes.try_push(DxEntry::new(0, left_logical)?)?;
+                routes.try_push(DxEntry::new(boundary, right_logical)?)?;
+                self.stage_directory_block(left_physical, left.into_bytes())?;
+                self.stage_directory_block(right_physical, right.into_bytes())?;
+            }
+            Err(error) => return Err(error),
+        }
+        let root_index = DxIndex::root(block_bytes, checksum, routes)?;
+        let root = create_htree_root(
+            block_bytes,
+            parent_inode.id(),
+            parent_inode_id,
+            self.volume.superblock.default_directory_hash_version(),
+            &root_index,
+            checksum,
+        )?;
+        self.stage_directory_block(root_physical, root)?;
+        self.finish_directory_growth(inode_index, raw_parent, tree, next_logical, true)
+    }
+
+    /// Allocates and maps the next directory logical block.
+    /// # Errors
+    ///
+    /// Returns an error when the logical block is outside the HTree address domain, cluster
+    /// allocation fails, or the extent mapping cannot be extended.
+    fn allocate_directory_block(
+        &mut self,
+        tree: &mut MutableExtentTree,
+        next_logical: &mut u64,
+    ) -> Result<(u32, BlockAddress)> {
+        let logical = u32::try_from(*next_logical).map_err(|_| Error::DirectoryIndexFull)?;
+        DxEntry::new(0, logical)?;
+        let physical = self.allocate_cluster()?;
+        tree.insert_or_extend_initialized(LogicalBlock::try_from(*next_logical)?, physical)?;
+        *next_logical = next_logical
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok((logical, physical))
+    }
+
+    /// Publishes directory size/extent/timestamp changes after local block staging succeeds.
+    /// # Errors
+    ///
+    /// Returns an error when size encoding, timestamps, extent staging, or inode replacement
+    /// cannot represent the completed growth.
+    fn finish_directory_growth(
+        &mut self,
+        inode_index: StagedInodeIndex,
+        mut raw_parent: LiveInodeRecord,
+        tree: MutableExtentTree,
+        block_count: u64,
+        mark_indexed: bool,
+    ) -> Result<()> {
+        if mark_indexed {
+            raw_parent.mark_indexed_directory()?;
+        }
+        let size = FileSize::from_bytes(
+            block_count
+                .checked_mul(u64::from(self.volume.superblock.block_size().bytes()))
+                .ok_or(Error::ArithmeticOverflow)?,
+        );
+        let encoded = self
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_directory_size(DirectorySize::from_bytes(size.bytes()))?;
+        raw_parent.set_encoded_size(encoded)?;
+        raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+        self.stage_extent_tree(&mut raw_parent, tree)?;
+        self.replace_live_inode(inode_index, raw_parent)
+    }
+
     /// Returns whether a directory contains only `.` and `..`.
     /// # Errors
     ///
     /// Returns an error when the directory layout cannot be loaded or parsed.
     fn directory_is_empty(&mut self, inode: &Inode) -> Result<bool> {
-        for entry in self.directory_layout(inode)?.entries()? {
-            let name = entry.name().bytes();
-            if name != b"." && name != b".." {
-                return Ok(false);
+        let tree = self.mutable_extent_tree(inode)?;
+        match inode.directory_storage_kind()? {
+            DirectoryStorageKind::Linear => {
+                let block_count = round_up_div(
+                    inode.size().bytes(),
+                    u64::from(self.volume.superblock.block_size().bytes()),
+                )?;
+                for logical in 0..block_count {
+                    let (_physical, block) = self.read_mutation_directory_block(
+                        inode,
+                        &tree,
+                        LogicalBlock::try_from(logical)?,
+                    )?;
+                    if block
+                        .entries()?
+                        .iter()
+                        .any(|entry| !matches!(entry.name().bytes(), b"." | b".."))
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            DirectoryStorageKind::HTree => {
+                let mut context =
+                    self.mutation_htree_context(inode, &tree, HtreePathTarget::First)?;
+                loop {
+                    let (_physical, block) = self.read_mutation_directory_block(
+                        inode,
+                        &tree,
+                        LogicalBlock::try_from(u64::from(context.path.leaf()?))?,
+                    )?;
+                    let entries = block.entries()?;
+                    context
+                        .path
+                        .hash_range()?
+                        .validate_leaf(&entries, context.root.hash_context())?;
+                    if !entries.is_empty() {
+                        return Ok(false);
+                    }
+                    if !self.advance_mutation_htree_path(
+                        inode,
+                        &tree,
+                        &mut context.path,
+                        context.root.indirect_levels(),
+                    )? {
+                        break;
+                    }
+                }
             }
         }
         Ok(true)
     }
-
 }

@@ -406,9 +406,19 @@ impl LiveInodeRecord {
         now: Ext4Timestamp,
         block_size: BlockSize,
     ) -> Result<DeletedInodeRecord> {
+        let kind = self.parse()?.kind();
         self.raw.set_deletion_time(now.seconds())?;
         self.raw.set_deleted_links_count()?;
-        let size = self.raw.encoding.encode_size(FileSize::from_bytes(0))?;
+        let size = match kind {
+            InodeKind::Directory => self
+                .raw
+                .encoding
+                .encode_directory_size(DirectorySize::from_bytes(0))?,
+            InodeKind::File | InodeKind::Symlink => self
+                .raw
+                .encoding
+                .encode_file_size(FileSize::from_bytes(0))?,
+        };
         self.raw.set_encoded_size(size)?;
         let allocation_size = self
             .raw
@@ -432,9 +442,19 @@ impl LiveInodeRecord {
         block_size: BlockSize,
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<DeletedInodeRecord> {
+        let kind = self.parse()?.kind();
         self.raw.set_deletion_time(now.seconds())?;
         self.raw.set_deleted_links_count()?;
-        let size = self.raw.encoding.encode_size(FileSize::from_bytes(0))?;
+        let size = match kind {
+            InodeKind::Directory => self
+                .raw
+                .encoding
+                .encode_directory_size(DirectorySize::from_bytes(0))?,
+            InodeKind::File | InodeKind::Symlink => self
+                .raw
+                .encoding
+                .encode_file_size(FileSize::from_bytes(0))?,
+        };
         self.raw.set_encoded_size(size)?;
         let allocation_size = self
             .raw
@@ -592,7 +612,7 @@ impl RawInodeRecord {
         self.bytes.fill(0);
         self.set_mode(InodeMode::regular_file(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
-        let size = self.encoding.encode_size(FileSize::from_bytes(0))?;
+        let size = self.encoding.encode_file_size(FileSize::from_bytes(0))?;
         self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::ONE)?;
         self.set_timestamps(now, timestamp_encoding)?;
@@ -627,7 +647,7 @@ impl RawInodeRecord {
         self.set_owner(metadata.owner())?;
         let size = self
             .encoding
-            .encode_size(FileSize::from_bytes(u64::from(block_size.bytes())))?;
+            .encode_directory_size(DirectorySize::from_bytes(u64::from(block_size.bytes())))?;
         self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::TWO)?;
         self.set_timestamps(now, timestamp_encoding)?;
@@ -665,7 +685,7 @@ impl RawInodeRecord {
         self.bytes.fill(0);
         self.set_mode(InodeMode::symlink(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
-        let size = self.encoding.encode_size(FileSize::from_bytes(
+        let size = self.encoding.encode_file_size(FileSize::from_bytes(
             u64::try_from(target.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
         ))?;
         self.set_encoded_size(size)?;
@@ -700,7 +720,7 @@ impl RawInodeRecord {
         self.bytes.fill(0);
         self.set_mode(InodeMode::symlink(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
-        let size = self.encoding.encode_size(FileSize::from_bytes(
+        let size = self.encoding.encode_file_size(FileSize::from_bytes(
             u64::try_from(target.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
         ))?;
         self.set_encoded_size(size)?;
@@ -1185,6 +1205,7 @@ mod tests {
             bytes: vec![0_u8; 128],
             encoding: InodeDataEncoding::new(
                 crate::disk_format::inode::FileSizeEncoding::LargeFile,
+                crate::disk_format::inode::DirectorySizeEncoding::LargeDirectory,
                 crate::disk_format::inode::InodeBlockCountEncoding::HugeFile,
                 block_size()?,
             ),

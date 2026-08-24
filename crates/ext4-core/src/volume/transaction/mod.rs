@@ -1296,6 +1296,16 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
         self.volume.read_symlink(symlink)
     }
 
+    fn scan_directory(
+        &mut self,
+        directory: &DirectoryNode,
+        cursor: &DirectoryScanCursor,
+        limit: DirectoryScanLimit,
+    ) -> Result<DirectoryScanBatch> {
+        self.volume
+            .scan_directory(directory, cursor, limit, self.crypto)
+    }
+
     fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
         self.volume.read_hard_links(target, self.crypto)
     }

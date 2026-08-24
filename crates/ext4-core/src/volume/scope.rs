@@ -10,6 +10,8 @@ pub(super) use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put
 pub(super) use crate::disk::storage::OperationDevice;
 pub(super) use crate::disk_format::dir::{
     DirectoryBlock, DirectoryChecksum, DirectoryEntry as RawDirectoryEntry, DirectoryEntryKind,
+    DirectoryHash, DirectoryHashContext, DxEntry, DxIndex, HtreeHashRange, HtreeRoot,
+    create_htree_root, write_htree_node, write_htree_root_index,
 };
 pub(super) use crate::disk_format::extent::{
     BlockMapping, Extent, ExtentBlockRun, ExtentLength, ExtentTree, ExtentTreeContext,
@@ -17,7 +19,7 @@ pub(super) use crate::disk_format::extent::{
 };
 pub(super) use crate::disk_format::group::{AllocationBitmapInitialization, BlockGroupDescriptor};
 pub(super) use crate::disk_format::inode::{
-    DirectoryEntryMutationCapability, DirectoryStorageKind, EncodedInodeBlockCount,
+    DirectoryEntryMutationCapability, DirectorySize, DirectoryStorageKind, EncodedInodeBlockCount,
     EncodedInodeSize, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times,
     Ext4Timestamp, FileAllocationSize, FileOffset, FilePayloadMutationCapability, FileSize,
     FileSizeMutationCapability, Inode, InodeBlockCountUnit, InodeDataEncoding, InodeFlags, InodeId,
@@ -55,6 +57,10 @@ pub(super) use super::block_group::{
     materialize_uninitialized_block_bitmap, materialize_uninitialized_inode_bitmap,
     read_allocation_bitmap, read_group_metadata_layouts, round_up_div, set_cluster_bitmap_bit,
     set_inode_bitmap_bit,
+};
+pub(super) use super::directory::{
+    DirectoryCursorName, DirectoryScanBatch, DirectoryScanCursor, DirectoryScanLimit,
+    DirectoryScanPosition, MAX_DIRECTORY_SCAN_ENTRIES, ScannedDirectoryEntry,
 };
 pub(super) use super::inode_record::{
     AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord, ResizeInodeBlockMap,

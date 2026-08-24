@@ -4,20 +4,20 @@ use alloc::boxed::Box;
 use core::{num::NonZeroUsize, ptr::NonNull};
 
 use ext4_core::{
-    ChildLookup, CommittedReadPass, DirectoryEntry, DirectoryNodeId, Ext4LinkCount, Ext4Name,
-    Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes,
-    FileAllocationSize, FileNodeId, FileOffset, FileSize, HardLinkDestination, HardLinkNodeId,
-    HardLinks, NodeId, RenameTargetCollision, WindowsName, WindowsOverlay,
+    ChildLookup, CommittedReadPass, DirectoryNode, DirectoryNodeId, DirectoryScanLimit,
+    Ext4LinkCount, Ext4Name, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
+    Ext4WindowsAttributes, FileAllocationSize, FileNodeId, FileOffset, FileSize,
+    HardLinkDestination, HardLinkNodeId, HardLinks, NodeId, RenameTargetCollision, WindowsName,
+    WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
 use crate::irp::{
     ActiveFileObject, ActiveIrp, CreateDeletion, DataIoKind, DirectoryChangeFilter,
-    DirectoryCursorPosition, DirectoryEntryEmission, DirectoryEntryIndex,
-    DirectoryInformationClass, DirectoryWatchScope, FileAttributesWriteAccess, IrpBufferLength,
-    IrpCompletion, OwnedIrp, PendingIrpLease, PreparedDirectoryPattern, QueryFileInformationClass,
-    ReadStartingPoint, RegularFileWriteAccess, SetFileInformationClass, SetFileStack,
-    WriteStartingPoint,
+    DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
+    DirectoryWatchScope, FileAttributesWriteAccess, IrpBufferLength, IrpCompletion, OwnedIrp,
+    PendingIrpLease, PreparedDirectoryPattern, QueryFileInformationClass, ReadStartingPoint,
+    RegularFileWriteAccess, SetFileInformationClass, SetFileStack, WriteStartingPoint,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::{self, DriverVec};
@@ -1315,12 +1315,20 @@ pub(crate) fn validate_pending_deletion(
     readonly.validate_attributes(file_attributes(metadata))?;
     if let NodeId::Directory(directory_id) = node {
         let directory = read.load_directory(directory_id)?;
-        let entries = read.read_directory(&directory)?;
-        if entries
-            .iter()
-            .any(|entry| !matches!(entry.name().bytes(), b"." | b".."))
-        {
-            return Err(DriverError::from(ext4_core::Error::DirectoryNotEmpty));
+        let mut cursor = DirectoryCursor::start();
+        loop {
+            let batch = read.scan_directory(&directory, &cursor, DirectoryScanLimit::MAX)?;
+            if batch
+                .entries()
+                .iter()
+                .any(|entry| !matches!(entry.entry().name().bytes(), b"." | b".."))
+            {
+                return Err(DriverError::from(ext4_core::Error::DirectoryNotEmpty));
+            }
+            if batch.is_exhausted() {
+                break;
+            }
+            cursor = *batch.continuation();
         }
     }
     Ok(())
@@ -1858,23 +1866,27 @@ pub(crate) fn query_directory(
     };
     let (cursor, packed, result) = {
         let directory = read.load_directory(directory_id)?;
-        let entries = read.read_directory(&directory)?;
         let mut packed = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
         let result = emit_directory_entries(
             read,
+            &directory,
             &mut cursor,
             entry_emission,
             class,
             &pattern,
-            &entries,
             packed.as_mut_slice(),
         );
         (cursor, packed, result)
     };
 
-    let information = result?;
+    let publish_cursor = matches!(
+        result,
+        Ok(_)
+            | Err(DriverError::BufferOverflow | DriverError::NoMoreFiles | DriverError::NoSuchFile)
+    );
+    let information = result.unwrap_or(0);
     request.with_active(|active| {
-        {
+        if result.is_ok() {
             let mut output = active.data_output(length)?;
             let destination = output
                 .as_mut_slice()
@@ -1886,11 +1898,14 @@ pub(crate) fn query_directory(
                 .ok_or(DriverError::InternalInvariantViolation)?;
             memory::copy_exact(destination, source)?;
         }
-        let file_object = active.current_stack()?.file_object()?;
-        let mut opened_file = OpenedDirectory::decode(file_object)?;
-        *opened_file.cursor_mut() = cursor;
+        if publish_cursor {
+            let file_object = active.current_stack()?.file_object()?;
+            let mut opened_file = OpenedDirectory::decode(file_object)?;
+            *opened_file.cursor_mut() = cursor;
+        }
         Ok::<_, DriverError>(())
     })?;
+    result?;
     IrpCompletion::from_usize(information)
 }
 
@@ -2318,8 +2333,8 @@ fn is_all_directory_pattern(units: &[u16]) -> bool {
 fn initialize_directory_cursor(cursor: &mut DirectoryCursor, position: DirectoryCursorPosition) {
     match position {
         DirectoryCursorPosition::Current => {}
-        DirectoryCursorPosition::Restart => cursor.seek(DirectoryEntryIndex::from_u32(0)),
-        DirectoryCursorPosition::Index(index) => cursor.seek(index),
+        DirectoryCursorPosition::Restart => cursor.restart(),
+        DirectoryCursorPosition::Index(index) => cursor.seek_ordinal(u64::from(index.as_u32())),
     }
 }
 
@@ -2330,77 +2345,97 @@ fn initialize_directory_cursor(cursor: &mut DirectoryCursor, position: Directory
 /// output buffer, metadata loading fails, or a directory record cannot be packed.
 fn emit_directory_entries(
     read: &mut impl CommittedReadPass,
+    directory: &DirectoryNode,
     cursor: &mut DirectoryCursor,
     entry_emission: DirectoryEntryEmission,
     class: DirectoryInformationClass,
     pattern: &DirectoryPattern,
-    entries: &[DirectoryEntry],
     buffer: &mut [u8],
 ) -> DriverResult<usize> {
-    let start =
-        usize::try_from(cursor.next_entry().as_u32()).map_err(|_| DriverError::InvalidParameter)?;
     let mut emitted = 0_usize;
     let mut written = 0_usize;
     let mut information = 0_usize;
     let mut previous_start = None;
 
-    for (raw_index, entry) in entries.iter().enumerate().skip(start) {
-        let entry_index = u32::try_from(raw_index).map_err(|_| DriverError::InvalidParameter)?;
-        let next_entry = entry_index
-            .checked_add(1)
-            .ok_or(DriverError::InvalidParameter)?;
-        let Ok(name) = WindowsName::from_ext4(entry.name()) else {
-            cursor.seek(DirectoryEntryIndex::from_u32(next_entry));
-            continue;
+    loop {
+        let batch = match read.scan_directory(directory, cursor, DirectoryScanLimit::MAX) {
+            Ok(batch) => batch,
+            Err(_) if emitted != 0 => return Ok(information),
+            Err(error) => return Err(DriverError::from(error)),
         };
-        if !pattern.matches(&name) {
-            cursor.seek(DirectoryEntryIndex::from_u32(next_entry));
-            continue;
+        let exhausted = batch.is_exhausted();
+        let entries = batch.into_entries();
+        if entries.is_empty() && !exhausted {
+            return Err(DriverError::InternalInvariantViolation);
         }
-
-        let metadata = metadata_from_node(read, *entry.node())?;
-        let layout = DirectoryRecordLayout::new(class, &name)?;
-        let required = written
-            .checked_add(layout.unpadded_size)
-            .ok_or(DriverError::InvalidParameter)?;
-        if required > buffer.len() {
-            if emitted == 0 {
-                return Err(DriverError::BufferOverflow);
+        for scanned in entries {
+            let entry = scanned.entry();
+            let next_cursor = *scanned.next_cursor();
+            let Ok(name) = WindowsName::from_ext4(entry.name()) else {
+                *cursor = next_cursor;
+                continue;
+            };
+            if !pattern.matches(&name) {
+                *cursor = next_cursor;
+                continue;
             }
-            break;
-        }
 
-        if let Some(previous_start) = previous_start {
-            let next_offset = written
-                .checked_sub(previous_start)
+            let metadata = match metadata_from_node(read, *entry.node()) {
+                Ok(metadata) => metadata,
+                Err(_) if emitted != 0 => return Ok(information),
+                Err(error) => return Err(error),
+            };
+            let layout = DirectoryRecordLayout::new(class, &name)?;
+            let required = written
+                .checked_add(layout.unpadded_size)
                 .ok_or(DriverError::InvalidParameter)?;
-            LittleEndianOutput::new(buffer).write_u32(
-                record_field_offset(previous_start, DIRECTORY_NEXT_ENTRY_OFFSET)?,
-                u32::try_from(next_offset).map_err(|_| DriverError::InvalidParameter)?,
-            )?;
+            if required > buffer.len() {
+                if emitted == 0 {
+                    return Err(DriverError::BufferOverflow);
+                }
+                return Ok(information);
+            }
+
+            if let Some(previous_start) = previous_start {
+                let next_offset = written
+                    .checked_sub(previous_start)
+                    .ok_or(DriverError::InvalidParameter)?;
+                LittleEndianOutput::new(buffer).write_u32(
+                    record_field_offset(previous_start, DIRECTORY_NEXT_ENTRY_OFFSET)?,
+                    u32::try_from(next_offset).map_err(|_| DriverError::InvalidParameter)?,
+                )?;
+            }
+
+            let file_index = directory_file_index(scanned.ordinal());
+            pack_directory_record(buffer, written, class, file_index, &name, metadata, layout)?;
+            previous_start = Some(written);
+            information = required;
+            emitted = emitted
+                .checked_add(1)
+                .ok_or(DriverError::InvalidParameter)?;
+            written = written
+                .checked_add(layout.padded_size)
+                .ok_or(DriverError::InvalidParameter)?;
+            *cursor = next_cursor;
+
+            if matches!(entry_emission, DirectoryEntryEmission::Single) {
+                return Ok(information);
+            }
         }
 
-        pack_directory_record(buffer, written, class, entry_index, &name, metadata, layout)?;
-        previous_start = Some(written);
-        information = required;
-        emitted = emitted
-            .checked_add(1)
-            .ok_or(DriverError::InvalidParameter)?;
-        written = written
-            .checked_add(layout.padded_size)
-            .ok_or(DriverError::InvalidParameter)?;
-        cursor.seek(DirectoryEntryIndex::from_u32(next_entry));
-
-        if matches!(entry_emission, DirectoryEntryEmission::Single) {
-            break;
+        if exhausted {
+            return if emitted == 0 {
+                Err(pattern.exhausted_error())
+            } else {
+                Ok(information)
+            };
         }
     }
+}
 
-    if emitted == 0 {
-        Err(pattern.exhausted_error())
-    } else {
-        Ok(information)
-    }
+/// Projects the 64-bit live-scan ordinal into Windows' legacy directory index field.
+fn directory_file_index(ordinal: u64) -> u32 {
+    u32::try_from(ordinal).unwrap_or(0)
 }
 
 /// Packs one variable-length directory information record.
@@ -4696,6 +4731,16 @@ mod tests {
 
         assert!(pattern.matches(&matched));
         assert!(!pattern.matches(&rejected));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when Windows directory indices wrap instead of becoming the required zero sentinel.
+    #[test]
+    fn directory_file_index_uses_zero_beyond_the_u32_ordinal_domain() {
+        assert_eq!(super::directory_file_index(0), 0);
+        assert_eq!(super::directory_file_index(u64::from(u32::MAX)), u32::MAX);
+        assert_eq!(super::directory_file_index(u64::from(u32::MAX) + 1), 0);
     }
 
     /// # Panics

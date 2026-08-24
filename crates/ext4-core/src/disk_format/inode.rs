@@ -135,6 +135,27 @@ impl FileSize {
     }
 }
 
+/// Size of a directory data stream in bytes.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct DirectorySize(u64);
+
+impl DirectorySize {
+    /// Creates a directory size at the inode/directory boundary.
+    pub(crate) const fn from_bytes(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the directory data-stream size in bytes.
+    pub(crate) const fn bytes(self) -> u64 {
+        self.0
+    }
+
+    /// Projects this validated directory quantity into the common inode size view.
+    const fn file_size(self) -> FileSize {
+        FileSize::from_bytes(self.0)
+    }
+}
+
 /// Number of bytes allocated to an inode by ext4 allocation accounting.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FileAllocationSize(u64);
@@ -160,6 +181,15 @@ pub(crate) enum FileSizeEncoding {
     Legacy,
     /// Both inode size halves form one 64-bit value.
     LargeFile,
+}
+
+/// Directory-size encoding selected by `INCOMPAT_LARGEDIR`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectorySizeEncoding {
+    /// Directory size is limited to the standard signed 31-bit byte range.
+    Standard,
+    /// Both inode size halves form one directory-size value.
+    LargeDirectory,
 }
 
 /// Block-count encoding selected by the mounted superblock.
@@ -234,6 +264,8 @@ impl EncodedInodeBlockCount {
 pub(crate) struct InodeDataEncoding {
     /// Mounted large-file feature selection.
     file_size: FileSizeEncoding,
+    /// Mounted large-directory feature selection.
+    directory_size: DirectorySizeEncoding,
     /// Mounted huge-file feature selection.
     block_count: InodeBlockCountEncoding,
     /// Mounted block geometry used by size limits and block units.
@@ -244,11 +276,13 @@ impl InodeDataEncoding {
     /// Builds the single inode data encoding selected by mounted features and geometry.
     pub(crate) const fn new(
         file_size: FileSizeEncoding,
+        directory_size: DirectorySizeEncoding,
         block_count: InodeBlockCountEncoding,
         block_size: BlockSize,
     ) -> Self {
         Self {
             file_size,
+            directory_size,
             block_count,
             block_size,
         }
@@ -264,7 +298,7 @@ impl InodeDataEncoding {
     /// # Errors
     /// Returns an error when the mounted feature profile or extent logical-block domain cannot
     /// represent `size`.
-    pub(crate) fn encode_size(self, size: FileSize) -> Result<EncodedInodeSize> {
+    pub(crate) fn encode_file_size(self, size: FileSize) -> Result<EncodedInodeSize> {
         let bytes = size.bytes();
         if self.file_size == FileSizeEncoding::Legacy && bytes > LEGACY_FILE_SIZE_LIMIT {
             return Err(Error::UnsupportedInodeMutation);
@@ -279,14 +313,45 @@ impl InodeDataEncoding {
         })
     }
 
+    /// Validates and splits a directory size for inode serialization.
+    /// # Errors
+    ///
+    /// Returns [`Error::DirectorySizeLimit`] when the mounted standard profile cannot represent the
+    /// requested growth, or an invalid-write error when extent addressing cannot represent it.
+    pub(crate) fn encode_directory_size(self, size: DirectorySize) -> Result<EncodedInodeSize> {
+        if self.directory_size == DirectorySizeEncoding::Standard
+            && size.bytes() > LEGACY_FILE_SIZE_LIMIT
+        {
+            return Err(Error::DirectorySizeLimit);
+        }
+        let size = size.file_size();
+        if size.bytes() > self.maximum_file_size().bytes() {
+            return Err(Error::InvalidWriteRange);
+        }
+        Ok(EncodedInodeSize {
+            low: u32::try_from(size.bytes() & u64::from(u32::MAX))
+                .map_err(|_| Error::ArithmeticOverflow)?,
+            high: u32::try_from(size.bytes() >> 32).map_err(|_| Error::ArithmeticOverflow)?,
+        })
+    }
+
     /// Parses and validates the combined inode size fields.
     ///
     /// # Errors
     /// Returns an error when the fields contradict the mounted large-file feature or exceed the
     /// extent logical-block domain.
-    pub(crate) fn decode_size(self, low: u32, high: u32) -> Result<FileSize> {
+    pub(crate) fn decode_size(self, kind: InodeKind, low: u32, high: u32) -> Result<FileSize> {
         let size = FileSize::from_bytes(u64::from(low) | (u64::from(high) << 32));
-        if self.file_size == FileSizeEncoding::Legacy && size.bytes() > LEGACY_FILE_SIZE_LIMIT {
+        let outside_profile = match kind {
+            InodeKind::Directory => {
+                self.directory_size == DirectorySizeEncoding::Standard
+                    && size.bytes() > LEGACY_FILE_SIZE_LIMIT
+            }
+            InodeKind::File | InodeKind::Symlink => {
+                self.file_size == FileSizeEncoding::Legacy && size.bytes() > LEGACY_FILE_SIZE_LIMIT
+            }
+        };
+        if outside_profile {
             return Err(Error::InvalidInode);
         }
         if size.bytes() > self.maximum_file_size().bytes() {
@@ -1229,8 +1294,11 @@ impl Inode {
             Ext4Uid::from_u32(parse_uid(raw)?),
             Ext4Gid::from_u32(parse_gid(raw)?),
         );
-        let size =
-            encoding.decode_size(le_u32(raw, disk_offset(4))?, le_u32(raw, disk_offset(108))?)?;
+        let size = encoding.decode_size(
+            mode.kind(),
+            le_u32(raw, disk_offset(4))?,
+            le_u32(raw, disk_offset(108))?,
+        )?;
         let times = parse_times(raw)?;
         let links_count = Ext4LinkCount::new(le_u16(raw, disk_offset(26))?)?;
         let flags = InodeFlags::from_u32(le_u32(raw, disk_offset(32))?);
@@ -1467,9 +1535,10 @@ fn parse_times(raw: &[u8]) -> Result<Ext4Times> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectoryStorageKind, Ext4LinkCount, Ext4Permissions, FileAllocationSize, FileSize,
-        FileSizeEncoding, Inode, InodeBlockCountEncoding, InodeBlockCountUnit, InodeDataEncoding,
-        InodeFlags, InodeId, InodeMode, MODE_DIRECTORY, MODE_REGULAR,
+        DirectorySize, DirectorySizeEncoding, DirectoryStorageKind, Ext4LinkCount, Ext4Permissions,
+        FileAllocationSize, FileSize, FileSizeEncoding, Inode, InodeBlockCountEncoding,
+        InodeBlockCountUnit, InodeDataEncoding, InodeFlags, InodeId, InodeKind, InodeMode,
+        MODE_DIRECTORY, MODE_REGULAR,
     };
     use crate::disk::block::BlockSize;
     use crate::disk::endian::{put_le_u16, put_le_u32};
@@ -1490,6 +1559,7 @@ mod tests {
     fn inode_data_encoding() -> Result<InodeDataEncoding> {
         Ok(InodeDataEncoding::new(
             FileSizeEncoding::LargeFile,
+            DirectorySizeEncoding::LargeDirectory,
             InodeBlockCountEncoding::HugeFile,
             BlockSize::from_superblock_log(0)?,
         ))
@@ -1567,7 +1637,7 @@ mod tests {
         };
 
         let above_four_gib = FileSize::from_bytes((1_u64 << 32) + 17);
-        let encoded = encoding.encode_size(above_four_gib);
+        let encoded = encoding.encode_file_size(above_four_gib);
         assert!(encoded.is_ok());
         let Ok(encoded) = encoded else {
             return;
@@ -1575,14 +1645,14 @@ mod tests {
         assert_eq!(encoded.low(), 17);
         assert_eq!(encoded.high(), 1);
         assert_eq!(
-            encoding.decode_size(encoded.low(), encoded.high()),
+            encoding.decode_size(InodeKind::File, encoded.low(), encoded.high()),
             Ok(above_four_gib)
         );
 
         let maximum = encoding.maximum_file_size();
-        assert!(encoding.encode_size(maximum).is_ok());
+        assert!(encoding.encode_file_size(maximum).is_ok());
         assert_eq!(
-            encoding.encode_size(FileSize::from_bytes(maximum.bytes() + 1)),
+            encoding.encode_file_size(FileSize::from_bytes(maximum.bytes() + 1)),
             Err(Error::InvalidWriteRange)
         );
     }
@@ -1599,17 +1669,22 @@ mod tests {
         };
         let encoding = InodeDataEncoding::new(
             FileSizeEncoding::Legacy,
+            DirectorySizeEncoding::Standard,
             InodeBlockCountEncoding::LegacySectors,
             block_size,
         );
 
         assert_eq!(
-            encoding.encode_size(FileSize::from_bytes(0x8000_0000)),
+            encoding.encode_file_size(FileSize::from_bytes(0x8000_0000)),
             Err(Error::UnsupportedInodeMutation)
         );
         assert_eq!(
-            encoding.decode_size(0x8000_0000, 0),
+            encoding.decode_size(InodeKind::File, 0x8000_0000, 0),
             Err(Error::InvalidInode)
+        );
+        assert_eq!(
+            encoding.encode_directory_size(DirectorySize::from_bytes(0x8000_0000)),
+            Err(Error::DirectorySizeLimit)
         );
     }
 
@@ -1695,6 +1770,7 @@ mod tests {
         };
         let encoding = InodeDataEncoding::new(
             FileSizeEncoding::LargeFile,
+            DirectorySizeEncoding::LargeDirectory,
             InodeBlockCountEncoding::LegacySectors,
             block_size,
         );

@@ -170,7 +170,10 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::NameAlreadyExists | Error::AmbiguousWindowsName => STATUS_OBJECT_NAME_COLLISION,
         Error::TooManyLinks => ntstatus(0xC000_0265),
         Error::WrongInodeKind => STATUS_OBJECT_TYPE_MISMATCH,
-        Error::NoSpace | Error::NoFreeInode => STATUS_DISK_FULL,
+        Error::NoSpace
+        | Error::NoFreeInode
+        | Error::DirectorySizeLimit
+        | Error::DirectoryIndexFull => STATUS_DISK_FULL,
         Error::DirectoryNotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
         Error::CannotRemoveRoot => STATUS_CANNOT_DELETE,
         Error::MissingEncryptionKey => STATUS_ACCESS_DENIED,
@@ -190,8 +193,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::UnsupportedDirectoryHash
         | Error::UnsupportedInodeMutation
         | Error::UnsupportedEncryption
-        | Error::UnsupportedVerity
-        | Error::DirectoryTooLarge => STATUS_NOT_SUPPORTED,
+        | Error::UnsupportedVerity => STATUS_NOT_SUPPORTED,
         Error::DeviceRange
         | Error::ArithmeticOverflow
         | Error::InvalidName
@@ -200,6 +202,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::InvalidEncryptionContext
         | Error::InvalidVerityMetadata
         | Error::InvalidWriteRange
+        | Error::InvalidDirectoryScanLimit
         | Error::TransactionTooLarge => STATUS_INVALID_PARAMETER,
         Error::TruncatedStructure
         | Error::InvalidMagic
@@ -255,6 +258,14 @@ mod tests {
     fn core_space_and_mount_errors_map_to_fsd_statuses() {
         assert_eq!(
             DriverError::from(Error::NoFreeInode).ntstatus(),
+            STATUS_DISK_FULL
+        );
+        assert_eq!(
+            DriverError::from(Error::DirectorySizeLimit).ntstatus(),
+            STATUS_DISK_FULL
+        );
+        assert_eq!(
+            DriverError::from(Error::DirectoryIndexFull).ntstatus(),
             STATUS_DISK_FULL
         );
         assert_eq!(
