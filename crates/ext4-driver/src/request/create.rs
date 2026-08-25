@@ -462,6 +462,10 @@ impl CreateFileReference {
     ///
     /// Returns an error when the FILE_OBJECT name is absent, malformed, or uses an unsupported
     /// object-id/prefixed file-reference form.
+    #[expect(
+        unsafe_code,
+        reason = "the I/O Manager owns the checked binary UNICODE_STRING for this active create"
+    )]
     fn decode(file_object: &FILE_OBJECT) -> DriverResult<Self> {
         let name = file_object.FileName;
         let byte_len = usize::from(name.Length);
@@ -525,6 +529,10 @@ impl CreatePathName {
     ///
     /// Returns an error when the raw UNICODE_STRING is malformed, contains an empty path component,
     /// or contains a component not representable in the Windows namespace domain.
+    #[expect(
+        unsafe_code,
+        reason = "the I/O Manager owns the checked UTF-16 UNICODE_STRING for this active create"
+    )]
     fn decode(file_object: &FILE_OBJECT) -> DriverResult<Self> {
         let name = file_object.FileName;
         if name.Length == 0 {
@@ -1361,6 +1369,10 @@ impl Drop for PendingFileControlBlockClaim {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "the pending claim is reactor-owned while its IRP and mounted VCB retain raw identities"
+)]
 // SAFETY: The top-level create IRP pins the FILE_OBJECT, and the mounted VCB pins the FCB ledger;
 // only the reactor thread consumes or drops this claim.
 unsafe impl Send for PendingFileControlBlockClaim {}
@@ -1377,6 +1389,10 @@ fn attach_preallocated_file_object(
 }
 
 /// Stores prepared contexts through the stable FILE_OBJECT identity captured before the commit.
+#[expect(
+    unsafe_code,
+    reason = "successful create exclusively publishes the preallocated contexts to one FILE_OBJECT"
+)]
 fn attach_preallocated_file_object_raw(
     file_object: KernelFileObject,
     fcb: NonNull<FileControlBlock>,
@@ -1395,6 +1411,10 @@ fn attach_preallocated_file_object_raw(
 }
 
 /// Stores a typed VCB/volume-handle context pair in one direct-volume FILE_OBJECT.
+#[expect(
+    unsafe_code,
+    reason = "successful volume create exclusively publishes contexts to its active FILE_OBJECT"
+)]
 fn attach_volume_file_object(
     mut file_object: UninitializedFileObject<'_>,
     volume: NonNull<VolumeControlBlock>,
@@ -1422,6 +1442,10 @@ mod tests {
     /// # Errors
     ///
     /// Returns an error when the fixed test stack cannot be decoded as a create/open request.
+    #[expect(
+        unsafe_code,
+        reason = "the live stack fixtures satisfy ReceivedIrp's raw dispatch-pair contract"
+    )]
     fn decoded_create_parameters(
         options: wdk_sys::ULONG,
         desired_access: wdk_sys::ACCESS_MASK,
@@ -1451,10 +1475,13 @@ mod tests {
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
 
-        let mut received = ReceivedIrp::decode(
-            core::ptr::addr_of_mut!(device),
-            core::ptr::addr_of_mut!(irp),
-        )?;
+        let mut received = unsafe {
+            // SAFETY: Both stack-local fixtures remain live through the active decode operation.
+            ReceivedIrp::decode(
+                core::ptr::addr_of_mut!(device),
+                core::ptr::addr_of_mut!(irp),
+            )?
+        };
         received.with_active(|active| Ok(active.current_stack()?.create()?.parameters()))
     }
 
@@ -1854,6 +1881,10 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the live stack fixtures satisfy ReceivedIrp's raw dispatch-pair contract"
+    )]
     fn create_path_anchor_rejects_conflicting_absolute_related_object() {
         let vcb = NonNull::<VolumeControlBlock>::dangling();
         let mut related = FILE_OBJECT::default();
@@ -1873,10 +1904,13 @@ mod tests {
             .__bindgen_anon_2
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
-        let mut received = ReceivedIrp::decode(
-            core::ptr::addr_of_mut!(device),
-            core::ptr::addr_of_mut!(irp),
-        );
+        let mut received = unsafe {
+            // SAFETY: Both stack-local fixtures remain live through the active decode operation.
+            ReceivedIrp::decode(
+                core::ptr::addr_of_mut!(device),
+                core::ptr::addr_of_mut!(irp),
+            )
+        };
         assert!(received.is_ok());
         let decoded = received.as_mut().map(|received| {
             received.with_active(|active| {

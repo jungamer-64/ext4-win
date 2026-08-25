@@ -3,10 +3,11 @@
 use alloc::boxed::Box;
 use core::{ffi::c_void, num::NonZeroUsize, ptr::NonNull};
 
+use wdk_sys::PVOID;
 #[cfg(not(test))]
-use wdk_sys::NTSTATUS;
-use wdk_sys::{PVOID, STATUS_SUCCESS};
+use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
 
+#[cfg(not(test))]
 use crate::kernel::ffi;
 use crate::{
     kernel::status::{DriverError, DriverResult},
@@ -149,6 +150,10 @@ struct CapturedDataMapping {
     length: NonZeroUsize,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The I/O Manager keeps the system buffer or locked MDL mapping valid until the owning IRP
 // completes. The mapping remains opaque and is consumed only through checked native copies.
 unsafe impl Send for CapturedDataMapping {}
@@ -207,6 +212,9 @@ impl CapturedReadOutput {
 
     /// Copies driver-owned bytes into one checked range without admitting requestor memory into
     /// Rust's aliasing model.
+    /// # Errors
+    ///
+    /// Returns an error when the selected range exceeds the prepared output or native copy fails.
     fn copy_window(&mut self, offset: usize, source: &[u8]) -> DriverResult<()> {
         match self {
             Self::Empty => super::copy_requestor_output_window(None, 0, offset, source),
@@ -357,6 +365,10 @@ struct CapturedRequestorInput {
     length: NonZeroUsize,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The immutable nonpaged allocation is uniquely owned and crosses threads only inside the
 // typed device-mailbox payload whose publication requires `Send`.
 unsafe impl Send for CapturedRequestorInput {}
@@ -366,6 +378,13 @@ impl CapturedRequestorInput {
     /// # Errors
     ///
     /// Returns a completion preserving native capture failure or allocation validation failure.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn capture_ea_name_list(
         target: &ActiveIrp<'_>,
         source: NonNull<c_void>,
@@ -437,6 +456,13 @@ impl CapturedRequestorInput {
     /// # Errors
     ///
     /// Returns a completion preserving native capture failure or allocation validation failure.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn capture_directory_pattern(
         target: &ActiveIrp<'_>,
         source: NonNull<wdk_sys::UNICODE_STRING>,
@@ -498,6 +524,10 @@ impl CapturedRequestorInput {
     }
 
     /// Borrows the exact captured bytes.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn as_slice(&self) -> &[u8] {
         unsafe {
             // SAFETY: Native capture initialized exactly `length` bytes in this owned allocation.
@@ -507,6 +537,13 @@ impl CapturedRequestorInput {
 }
 
 impl Drop for CapturedRequestorInput {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn drop(&mut self) {
         #[cfg(not(test))]
         unsafe {
@@ -1081,6 +1118,10 @@ enum QuerySecurityOutputState {
     Written,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The native target owns locked pages and exposes no dereferenceable Rust pointer. Its
 // unique state crosses threads only inside the typed device-mailbox payload and is consumed by the
 // device actor or released by Drop.
@@ -1092,6 +1133,13 @@ impl CapturedQuerySecurityOutput {
     ///
     /// Returns overflow with the exact required length, a native capture failure, or an invariant
     /// error when the native ownership contract is violated.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn capture(
         target: &ActiveIrp<'_>,
         declared_length: super::IrpBufferLength,
@@ -1169,6 +1217,13 @@ impl CapturedQuerySecurityOutput {
     ///
     /// Returns an invariant error when the descriptor length differs from the plan sealed at queue
     /// entry or the opaque native target rejects the owned source.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     pub(crate) fn copy_from_owned(&mut self, source: &[u8]) -> DriverResult<()> {
         if source.len() != self.length.get() {
             return Err(DriverError::InternalInvariantViolation);
@@ -1204,6 +1259,13 @@ impl CapturedQuerySecurityOutput {
 }
 
 impl Drop for CapturedQuerySecurityOutput {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn drop(&mut self) {
         #[cfg(not(test))]
         if let QuerySecurityOutputState::Pending(native) = &self.state {
@@ -1224,6 +1286,10 @@ pub(crate) struct CapturedSetSecurityDescriptor {
     length: NonZeroUsize,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Capture returns an immutable nonpaged allocation without requestor aliases. Unique
 // ownership crosses threads only inside the typed device-mailbox payload and Drop frees it once.
 unsafe impl Send for CapturedSetSecurityDescriptor {}
@@ -1234,6 +1300,13 @@ impl CapturedSetSecurityDescriptor {
     ///
     /// Returns a native boundary failure or an invariant error when successful output ownership is
     /// incomplete.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn capture(
         target: &ActiveIrp<'_>,
         source: NonNull<c_void>,
@@ -1290,6 +1363,10 @@ impl CapturedSetSecurityDescriptor {
     }
 
     /// Borrows the immutable descriptor snapshot.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn as_slice(&self) -> &[u8] {
         unsafe {
             // SAFETY: Native capture allocated and initialized exactly `length` bytes, and the
@@ -1300,6 +1377,13 @@ impl CapturedSetSecurityDescriptor {
 }
 
 impl Drop for CapturedSetSecurityDescriptor {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn drop(&mut self) {
         #[cfg(not(test))]
         unsafe {
@@ -1336,6 +1420,10 @@ mod tests {
     };
 
     /// Builds a typed target and installs its current stack pointer.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn build_target(
         device: &mut wdk_sys::DEVICE_OBJECT,
         irp: &mut wdk_sys::IRP,
@@ -1346,7 +1434,10 @@ mod tests {
             .__bindgen_anon_2
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::from_mut(stack);
-        ReceivedIrp::decode(core::ptr::from_mut(device), core::ptr::from_mut(irp)).ok()
+        unsafe {
+            // SAFETY: Both mutable fixture objects remain live for the returned test owner.
+            ReceivedIrp::decode(core::ptr::from_mut(device), core::ptr::from_mut(irp)).ok()
+        }
     }
 
     /// Captures one prepared request through its lifetime-bound active IRP view.
@@ -1494,6 +1585,10 @@ mod tests {
     ///
     /// Panics when queued read capture retains the mutable caller mapping or re-reads stack state.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn prepared_read_seals_stack_and_borrows_the_original_output_mapping() {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
@@ -1549,6 +1644,10 @@ mod tests {
     ///
     /// Panics when queued write capture copies caller data or re-reads mutable stack state.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn prepared_write_seals_stack_and_borrows_the_original_input_mapping() {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
@@ -1827,6 +1926,10 @@ mod tests {
     ///
     /// Panics when DriverContext[0] publication is not taken and cleared exactly once.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn queue_context_publish_peek_take_clears_slot_zero() {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut irp = wdk_sys::IRP::default();
@@ -1835,7 +1938,10 @@ mod tests {
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
         let mut target = build_target(&mut device, &mut irp, &mut stack);
-        let kernel_irp = KernelIrp::from_raw(core::ptr::addr_of_mut!(irp));
+        let kernel_irp = unsafe {
+            // SAFETY: The stack-local fixture remains live throughout this test.
+            KernelIrp::from_raw(core::ptr::addr_of_mut!(irp))
+        };
         assert!(kernel_irp.is_some());
         let context = target
             .as_mut()
@@ -1868,9 +1974,16 @@ mod tests {
     ///
     /// Panics when allocation-free lifecycle markers alias or fail to round-trip exactly.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn lifecycle_queue_context_markers_remain_distinct() {
         let mut irp = wdk_sys::IRP::default();
-        let Some(kernel_irp) = KernelIrp::from_raw(core::ptr::addr_of_mut!(irp)) else {
+        let Some(kernel_irp) = (unsafe {
+            // SAFETY: The stack-local fixture remains live throughout this test.
+            KernelIrp::from_raw(core::ptr::addr_of_mut!(irp))
+        }) else {
             return;
         };
 

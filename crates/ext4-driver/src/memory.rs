@@ -6,8 +6,16 @@ use alloc::{
     collections::{TryReserveError, TryReserveErrorKind},
     vec::Vec,
 };
-use core::{alloc::Layout, fmt};
+use core::{
+    alloc::Layout,
+    fmt,
+    marker::PhantomData,
+    mem::{ManuallyDrop, MaybeUninit},
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering, fence},
+};
 
+use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
 
 /// Converts allocator failure into the driver error domain.
@@ -40,6 +48,77 @@ pub(crate) fn copy_exact<T: Copy>(destination: &mut [T], source: &[T]) -> Driver
         *target = source;
     }
     Ok(())
+}
+
+/// Rollback owner for a value constructed in caller-provided address-stable storage.
+///
+/// Until [`Self::publish`] consumes this guard, dropping it destroys the initialized value in
+/// place. This keeps fallible native initialization from leaking Rust-owned fields after the value
+/// has moved out of ordinary stack ownership.
+#[must_use]
+pub(crate) struct InPlaceInitialization<T> {
+    /// Initialized destination uniquely owned until publication.
+    destination: NonNull<T>,
+    /// True while guard drop must roll the value back.
+    rollback: bool,
+}
+
+impl<T> InPlaceInitialization<T> {
+    /// Initializes `value` at its final address and takes rollback ownership.
+    /// # Safety
+    ///
+    /// `destination` must be aligned, writable storage for one `T`, must not currently hold an
+    /// initialized value, and must remain uniquely owned through [`Self::publish`] or guard drop.
+    /// # Errors
+    ///
+    /// Returns invalid parameter when `destination` is null; `value` remains ordinarily dropped.
+    #[expect(
+        unsafe_code,
+        reason = "this boundary uniquely owns final-address initialization until explicit publication"
+    )]
+    pub(crate) unsafe fn write(destination: *mut T, value: T) -> DriverResult<Self> {
+        let destination = NonNull::new(destination).ok_or(DriverError::InvalidParameter)?;
+        unsafe {
+            // SAFETY: The caller supplies exclusive writable uninitialized storage for one T.
+            destination.as_ptr().write(value);
+        }
+        Ok(Self {
+            destination,
+            rollback: true,
+        })
+    }
+
+    /// Returns exclusive access before the value is published to another observer.
+    #[expect(
+        unsafe_code,
+        reason = "the unpublished guard retains unique access to the initialized destination"
+    )]
+    pub(crate) fn get_mut(&mut self) -> &mut T {
+        unsafe {
+            // SAFETY: An armed guard uniquely owns the initialized destination.
+            self.destination.as_mut()
+        }
+    }
+
+    /// Transfers drop responsibility to the owner of the final-address storage.
+    pub(crate) fn publish(mut self) {
+        self.rollback = false;
+    }
+}
+
+impl<T> Drop for InPlaceInitialization<T> {
+    #[expect(
+        unsafe_code,
+        reason = "an armed initialization guard uniquely owns and rolls back its in-place value"
+    )]
+    fn drop(&mut self) {
+        if self.rollback {
+            unsafe {
+                // SAFETY: The armed guard uniquely owns this initialized value until drop.
+                self.destination.as_ptr().drop_in_place();
+            }
+        }
+    }
 }
 
 /// Error returned by owned push operations.
@@ -109,6 +188,270 @@ pub(crate) struct KernelVec<T, A: Allocator = Global> {
 /// In driver builds, `Global` is backed by `wdk_alloc::WdkAllocator`, which allocates from
 /// `POOL_FLAG_NON_PAGED`.
 pub(crate) type DriverVec<T> = KernelVec<T, Global>;
+
+/// One stable nonpaged allocation shared by explicit owner and lease types.
+///
+/// The standard `Arc` overflow path lowers to `llvm.trap`, which is not an admissible failure sink
+/// in the production kernel image. This representation keeps allocation failure and reference
+/// exhaustion recoverable while preserving ownership if a lease is deliberately forgotten.
+struct DriverSharedInner<T> {
+    /// Number of live owners and leases.
+    references: AtomicUsize,
+    /// Initialized exactly once before a [`DriverShared`] becomes observable.
+    value: MaybeUninit<T>,
+}
+
+/// Stable shared owner for driver state that must outlive independently retained leases.
+///
+/// This type intentionally does not implement `Clone`. Every additional authority is acquired
+/// fallibly as a [`DriverSharedLease`], so the finite reference budget remains explicit.
+pub(crate) struct DriverShared<T> {
+    /// Owned shared allocation.
+    inner: NonNull<DriverSharedInner<T>>,
+    /// Records ownership and drop-check responsibility for `T`.
+    ownership: PhantomData<DriverSharedInner<T>>,
+}
+
+impl<T> DriverShared<T> {
+    /// Allocates and initializes one stable shared owner.
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the nonpaged allocation cannot be created.
+    pub(crate) fn try_new(value: T) -> DriverResult<Self> {
+        Ok(DriverSharedSlot::try_new()?.initialize(value))
+    }
+
+    /// Acquires one independently owned lease.
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the finite reference count is exhausted.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) fn try_acquire(&self) -> DriverResult<DriverSharedLease<T>> {
+        let references = unsafe {
+            // SAFETY: This owner holds one reference, so the allocation remains live throughout
+            // the atomic increment.
+            &self.inner.as_ref().references
+        };
+        match references.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            if current == 0 {
+                None
+            } else {
+                current.checked_add(1)
+            }
+        }) {
+            Ok(_) => Ok(DriverSharedLease {
+                inner: self.inner,
+                ownership: PhantomData,
+            }),
+            Err(0) => KernelWideInconsistency::shared_ownership_corruption().bugcheck(),
+            Err(_) => Err(DriverError::InsufficientResources),
+        }
+    }
+
+    /// Borrows the initialized shared value.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) fn get(&self) -> &T {
+        let inner = unsafe {
+            // SAFETY: This owner holds one reference, so the allocation remains live for the
+            // returned borrow.
+            self.inner.as_ref()
+        };
+        unsafe {
+            // SAFETY: `DriverShared` can only be constructed by initializing its unique slot.
+            inner.value.assume_init_ref()
+        }
+    }
+}
+
+impl<T> fmt::Debug for DriverShared<T>
+where
+    T: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(formatter)
+    }
+}
+
+impl<T> Drop for DriverShared<T> {
+    fn drop(&mut self) {
+        release_shared(self.inner);
+    }
+}
+
+/// One independently retained reference to a [`DriverShared`] value.
+pub(crate) struct DriverSharedLease<T> {
+    /// Shared allocation retained by this lease.
+    inner: NonNull<DriverSharedInner<T>>,
+    /// Records ownership and drop-check responsibility for `T`.
+    ownership: PhantomData<DriverSharedInner<T>>,
+}
+
+impl<T> DriverSharedLease<T> {
+    /// Borrows the initialized value retained by this lease.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) fn get(&self) -> &T {
+        let inner = unsafe {
+            // SAFETY: This lease owns one reference, so the allocation remains live for the
+            // returned borrow.
+            self.inner.as_ref()
+        };
+        unsafe {
+            // SAFETY: Every lease originates from an initialized `DriverShared` owner.
+            inner.value.assume_init_ref()
+        }
+    }
+}
+
+impl<T> fmt::Debug for DriverSharedLease<T>
+where
+    T: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(formatter)
+    }
+}
+
+impl<T> Drop for DriverSharedLease<T> {
+    fn drop(&mut self) {
+        release_shared(self.inner);
+    }
+}
+
+/// Unique uninitialized allocation reserved for an infallible later publication.
+pub(crate) struct DriverSharedSlot<T> {
+    /// Unique allocation; no lease can exist before initialization consumes this type.
+    inner: NonNull<DriverSharedInner<T>>,
+    /// Records ownership and drop-check responsibility for `T`.
+    ownership: PhantomData<DriverSharedInner<T>>,
+}
+
+impl<T> DriverSharedSlot<T> {
+    /// Reserves one stable allocation without constructing `T`.
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the nonpaged allocation cannot be created.
+    pub(crate) fn try_new() -> DriverResult<Self> {
+        let allocation = boxed_try_with(|| {
+            Ok(DriverSharedInner {
+                references: AtomicUsize::new(1),
+                value: MaybeUninit::uninit(),
+            })
+        })?;
+        Ok(Self {
+            inner: NonNull::from(Box::leak(allocation)),
+            ownership: PhantomData,
+        })
+    }
+
+    /// Initializes the unique reservation and converts it into shared ownership.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) fn initialize(self, value: T) -> DriverShared<T> {
+        let mut slot = ManuallyDrop::new(self);
+        unsafe {
+            // SAFETY: `DriverSharedSlot` is unique and exposes no acquisition operation. This is
+            // the sole initialization, and `ManuallyDrop` transfers its allocation reference to
+            // the returned initialized owner.
+            slot.inner.as_mut().value.write(value);
+        }
+        DriverShared {
+            inner: slot.inner,
+            ownership: PhantomData,
+        }
+    }
+}
+
+impl<T> Drop for DriverSharedSlot<T> {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: An unconsumed slot is uniquely owned, contains no initialized `T`, and was
+            // allocated as this exact box type.
+            drop(Box::from_raw(self.inner.as_ptr()));
+        }
+    }
+}
+
+/// Releases one initialized shared reference and destroys the allocation after the final release.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+fn release_shared<T>(inner: NonNull<DriverSharedInner<T>>) {
+    let references = unsafe {
+        // SAFETY: The caller owns one reference, so the allocation is live for this decrement.
+        &inner.as_ref().references
+    };
+    let previous = match references.try_update(Ordering::Release, Ordering::Relaxed, |current| {
+        current.checked_sub(1)
+    }) {
+        Ok(previous) => previous,
+        Err(_) => KernelWideInconsistency::shared_ownership_corruption().bugcheck(),
+    };
+    if previous != 1 {
+        return;
+    }
+
+    fence(Ordering::Acquire);
+    let mut allocation = unsafe {
+        // SAFETY: The transition from one reference to zero gives this path exclusive ownership,
+        // and this allocation originated from the matching box type.
+        Box::from_raw(inner.as_ptr())
+    };
+    unsafe {
+        // SAFETY: Every initialized owner originated from `DriverSharedSlot::initialize`, so `T`
+        // is live and this final-reference path must drop it exactly once.
+        allocation.value.assume_init_drop();
+    }
+    drop(allocation);
+}
+
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+// SAFETY: Ownership of `T` can move across threads only when `T` is both transferable and safe to
+// share. All reference-count transitions are atomic and the value is immutable after publication.
+unsafe impl<T: Send + Sync> Send for DriverShared<T> {}
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+// SAFETY: Shared access exposes only `&T`, requiring `T: Sync`; final destruction may occur on any
+// holder's thread, requiring `T: Send`.
+unsafe impl<T: Send + Sync> Sync for DriverShared<T> {}
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+// SAFETY: A lease has the same transfer and shared-access contract as its owner.
+unsafe impl<T: Send + Sync> Send for DriverSharedLease<T> {}
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+// SAFETY: A lease has the same transfer and shared-access contract as its owner.
+unsafe impl<T: Send + Sync> Sync for DriverSharedLease<T> {}
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+// SAFETY: The uninitialized slot is uniquely owned and may move when its eventual `T` may move.
+unsafe impl<T: Send> Send for DriverSharedSlot<T> {}
 
 impl<T, A> fmt::Debug for KernelVec<T, A>
 where
@@ -442,6 +785,10 @@ pub(crate) fn boxed_try_map<S, T>(
 ///
 /// Returns [`DriverError::InvalidBufferSize`] when `length` cannot form a byte-slice layout, or
 /// [`DriverError::InsufficientResources`] when the allocation fails.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 pub(crate) fn boxed_zeroed_bytes(length: usize) -> DriverResult<Box<[u8]>> {
     if Layout::array::<u8>(length).is_err() {
         return Err(DriverError::InvalidBufferSize);
@@ -455,4 +802,138 @@ pub(crate) fn boxed_zeroed_bytes(length: usize) -> DriverResult<Box<[u8]>> {
         bytes.assume_init()
     };
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{DriverShared, DriverSharedSlot, InPlaceInitialization};
+    use crate::kernel::status::DriverError;
+
+    /// Records exactly when the final shared reference destroys its value.
+    struct DropProbe<'a> {
+        /// Destructor observation owned by the test frame.
+        drops: &'a AtomicUsize,
+    }
+
+    impl Drop for DropProbe<'_> {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if fallible in-place initialization leaks on rollback or remains guard-owned after
+    /// explicit publication.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the test supplies live aligned MaybeUninit storage and drops published values once"
+    )]
+    fn in_place_initialization_rolls_back_until_publication() {
+        let drops = AtomicUsize::new(0);
+        let mut rollback_storage = core::mem::MaybeUninit::<DropProbe<'_>>::uninit();
+        {
+            let guard = unsafe {
+                // SAFETY: The MaybeUninit slot is aligned, writable, uninitialized, and uniquely
+                // retained until guard drop.
+                InPlaceInitialization::write(
+                    rollback_storage.as_mut_ptr(),
+                    DropProbe { drops: &drops },
+                )
+            };
+            assert!(guard.is_ok());
+        }
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+
+        let mut published_storage = core::mem::MaybeUninit::<DropProbe<'_>>::uninit();
+        let guard = unsafe {
+            // SAFETY: The second MaybeUninit slot is uniquely retained through publication.
+            InPlaceInitialization::write(
+                published_storage.as_mut_ptr(),
+                DropProbe { drops: &drops },
+            )
+        };
+        assert!(guard.is_ok());
+        let Ok(guard) = guard else {
+            return;
+        };
+        let published = published_storage.as_mut_ptr();
+        guard.publish();
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        unsafe {
+            // SAFETY: Publication transferred the one initialized value to this test owner.
+            published.drop_in_place();
+        }
+        assert_eq!(drops.load(Ordering::Acquire), 2);
+    }
+
+    /// # Panics
+    ///
+    /// Panics if dropping the primary owner invalidates retained leases or destroys the value more
+    /// than once.
+    #[test]
+    fn shared_leases_retain_the_value_until_the_final_release() {
+        let drops = AtomicUsize::new(0);
+        let Ok(owner) = DriverShared::try_new(DropProbe { drops: &drops }) else {
+            return;
+        };
+        let Ok(first) = owner.try_acquire() else {
+            return;
+        };
+        let Ok(second) = owner.try_acquire() else {
+            return;
+        };
+
+        drop(owner);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        drop(first);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        drop(second);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    /// # Panics
+    ///
+    /// Panics if preallocated publication does not initialize exactly one retained value.
+    #[test]
+    fn shared_slot_publishes_without_an_additional_allocation() {
+        let Ok(slot) = DriverSharedSlot::try_new() else {
+            return;
+        };
+        let owner = slot.initialize(0x5A_u32);
+        let Ok(lease) = owner.try_acquire() else {
+            return;
+        };
+        drop(owner);
+        assert_eq!(*lease.get(), 0x5A);
+    }
+
+    /// # Panics
+    ///
+    /// Panics if reference-budget exhaustion traps or mutates the owner count.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    fn shared_reference_exhaustion_is_recoverable() {
+        let Ok(owner) = DriverShared::try_new(0xA5_u32) else {
+            return;
+        };
+        let references = unsafe {
+            // SAFETY: This module-private test owns the only reference and restores the valid
+            // count before the owner is dropped.
+            &owner.inner.as_ref().references
+        };
+        references.store(usize::MAX, Ordering::Release);
+        assert!(matches!(
+            owner.try_acquire(),
+            Err(DriverError::InsufficientResources)
+        ));
+        assert_eq!(references.load(Ordering::Acquire), usize::MAX);
+        references.store(1, Ordering::Release);
+    }
 }

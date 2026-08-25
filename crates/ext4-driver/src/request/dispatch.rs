@@ -106,159 +106,307 @@ pub(crate) fn install(driver: &mut DRIVER_OBJECT) -> Result<(), DispatchInstallE
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active create/open dispatch call.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn create(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::Create)
+    unsafe {
+        // SAFETY: This callback receives the active create dispatch objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::Create)
+    }
 }
 
 /// Handles close IRPs.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active close dispatch call.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::Close)
+    unsafe {
+        // SAFETY: This callback receives the active close dispatch objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::Close)
+    }
 }
 
 /// Handles cleanup IRPs.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active cleanup dispatch call.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn cleanup(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::Cleanup)
+    unsafe {
+        // SAFETY: This callback receives the active cleanup dispatch objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::Cleanup)
+    }
 }
 
 /// Handles read IRPs.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active read dispatch call.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn read(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::Read)
+    unsafe {
+        // SAFETY: This callback receives the active read dispatch objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::Read)
+    }
 }
 
 /// Handles write IRPs.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active write dispatch call.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn write(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::Write)
+    unsafe {
+        // SAFETY: This callback receives the active write dispatch objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::Write)
+    }
 }
 
 /// Handles file information queries.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active file-information query.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn query_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::QueryInformation)
+    unsafe {
+        // SAFETY: This callback receives the active query dispatch objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::QueryInformation)
+    }
 }
 
 /// Handles file information mutations.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active file-information mutation.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn set_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::SetInformation)
+    unsafe {
+        // SAFETY: This callback receives the active set dispatch objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::SetInformation)
+    }
 }
 
 /// Handles volume information queries.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active volume-information query.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn query_volume_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::QueryVolumeInformation)
+    unsafe {
+        // SAFETY: This callback receives the active volume query objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::QueryVolumeInformation)
+    }
 }
 
 /// Handles volume information mutations.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active volume-information mutation.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn set_volume_information(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::SetVolumeInformation)
+    unsafe {
+        // SAFETY: This callback receives the active volume set objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::SetVolumeInformation)
+    }
 }
 
 /// Handles directory enumeration and change notification.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active directory-control dispatch.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn directory_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::DirectoryControl)
+    unsafe {
+        // SAFETY: This callback receives the active directory objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::DirectoryControl)
+    }
 }
 
 /// Handles file-system control requests.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active filesystem-control dispatch.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn file_system_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::FileSystemControl)
+    unsafe {
+        // SAFETY: This callback receives the active filesystem-control objects from the manager.
+        dispatch(device, irp, DispatchMajor::FileSystemControl)
+    }
 }
 
 /// Rejects unsupported device-control requests.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active device-control dispatch.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn device_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::DeviceControl)
+    unsafe {
+        // SAFETY: This callback receives the active device-control objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::DeviceControl)
+    }
 }
 
 /// Handles security descriptor queries.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active security query.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn query_security(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::QuerySecurity)
+    unsafe {
+        // SAFETY: This callback receives the active security query objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::QuerySecurity)
+    }
 }
 
 /// Handles security descriptor mutations.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active security mutation.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn set_security(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::SetSecurity)
+    unsafe {
+        // SAFETY: This callback receives the active security set objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::SetSecurity)
+    }
 }
 
 /// Handles flush requests.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active flush dispatch call.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn flush_buffers(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::FlushBuffers)
+    unsafe {
+        // SAFETY: This callback receives the active flush dispatch objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::FlushBuffers)
+    }
 }
 
 /// Handles extended-attribute queries.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active EA query.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn query_ea(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::QueryEa)
+    unsafe {
+        // SAFETY: This callback receives the active EA query objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::QueryEa)
+    }
 }
 
 /// Handles extended-attribute mutations.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active EA mutation.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn set_ea(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::SetEa)
+    unsafe {
+        // SAFETY: This callback receives the active EA set objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::SetEa)
+    }
 }
 
 /// Handles byte-range lock requests.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active lock-control dispatch.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn lock_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::LockControl)
+    unsafe {
+        // SAFETY: This callback receives the active lock dispatch objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::LockControl)
+    }
 }
 
 /// Handles shutdown notification.
 ///
 /// # Safety
 /// The I/O Manager must pass the DEVICE_OBJECT and IRP for the active shutdown dispatch.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn shutdown(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    dispatch(device, irp, DispatchMajor::Shutdown)
+    unsafe {
+        // SAFETY: This callback receives the active shutdown objects from the I/O Manager.
+        dispatch(device, irp, DispatchMajor::Shutdown)
+    }
 }
 
 /// Dispatches one IRP through the unified completion-driven receive boundary.
-fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS {
-    let received = match ReceivedIrp::decode(device, irp) {
+/// # Safety
+///
+/// `device` and `irp` must be the live objects supplied to the active callback for `major`.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS {
+    let received = match unsafe {
+        // SAFETY: The callback caller retains the WDK-provided device and IRP for this transition.
+        ReceivedIrp::decode(device, irp)
+    } {
         Ok(received) => received,
-        Err(error) => return ReceivedIrp::complete_decode_error(irp, error),
+        Err(error) => {
+            return unsafe {
+                // SAFETY: The same callback contract retains a non-null IRP for error completion.
+                ReceivedIrp::complete_decode_error(irp, error)
+            };
+        }
     };
 
     match dispatch_policy(major) {

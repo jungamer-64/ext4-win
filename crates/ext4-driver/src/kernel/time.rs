@@ -8,6 +8,10 @@ use crate::kernel::status::DriverError;
 /// # Errors
 ///
 /// Returns an error when the system time cannot be represented as an ext4 timestamp.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 pub(crate) fn current_ext4_timestamp() -> Result<Ext4Timestamp, DriverError> {
     let mut time = wdk_sys::LARGE_INTEGER { QuadPart: 0 };
     unsafe {

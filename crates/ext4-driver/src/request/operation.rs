@@ -410,6 +410,10 @@ impl MountRequestOperation {
     ///
     /// Returns an error when VCB/provider allocation, notifier or device initialization, or WDK
     /// publication fails.
+    #[expect(
+        unsafe_code,
+        reason = "mount publication owns the audited IoCreateDevice and unpublished-device rollback boundary"
+    )]
     fn publish_mount(
         admission: MountAdmission,
         devices: MountedStorage,
@@ -445,6 +449,12 @@ impl MountRequestOperation {
             return Err(DriverError::InsufficientResources);
         }
 
+        let Some(device) = (unsafe {
+            // SAFETY: Successful IoCreateDevice returned this unpublished live mounted device.
+            crate::state::KernelDevice::from_raw(device)
+        }) else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
         match MountedVolumeDevice::initialize(
             device,
             vcb,
@@ -456,7 +466,7 @@ impl MountRequestOperation {
                 unsafe {
                     // SAFETY: Initialization rejected the unpublished device and retained no VCB
                     // ownership in its extension.
-                    ffi::IoDeleteDevice(device);
+                    ffi::IoDeleteDevice(device.as_ptr());
                 }
                 Err(error)
             }
@@ -628,6 +638,10 @@ impl CompletionOperation for MountRequestOperation {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "the mount operation moves only through the reactor while its IRP pins kernel identities"
+)]
 // SAFETY: Stable kernel identities are pinned by the top-level mount IRP; the core operation and
 // IRP move only by value between the reactor and nonpaged completion envelopes.
 unsafe impl Send for MountRequestOperation {}
@@ -817,6 +831,10 @@ impl MountedVolumeOperation for ReadRequestOperation {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "the read operation moves only through the reactor while its VCB and epoch stay retained"
+)]
 // SAFETY: The VCB and epoch remain stable until reactor drain, and the unique IRP moves only
 // between this box and completion envelopes.
 unsafe impl Send for ReadRequestOperation {}
@@ -956,6 +974,10 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "the immediate operation's unique IRP authority moves only on the reactor thread"
+)]
 // SAFETY: Unique IRP authority is moved only by the reactor thread.
 unsafe impl Send for ImmediateRequestOperation {}
 
@@ -1036,6 +1058,10 @@ impl MountedVolumeOperation for NotificationOperation {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "the notification IRP moves only from the reactor into the FsRtl ownership boundary"
+)]
 // SAFETY: Unique IRP authority moves only on the sole reactor thread until it is consumed by the
 // FsRtl notification package.
 unsafe impl Send for NotificationOperation {}
@@ -1379,6 +1405,10 @@ impl MountedVolumeOperation for VolumeControlOperation {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "the volume-control operation moves through the reactor while mounted identities stay pinned"
+)]
 // SAFETY: Stable VCB/FILE_OBJECT identities remain pinned by the IRP and mounted device; state
 // moves only by value between the sole reactor thread and stable lower envelopes.
 unsafe impl Send for VolumeControlOperation {}
@@ -1665,6 +1695,10 @@ impl MountedVolumeOperation for FlushRequestOperation {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "the flush operation moves through the reactor while its VCB and top-level IRP remain live"
+)]
 // SAFETY: The mounted VCB and top-level IRP remain live through reactor drain; the operation moves
 // only by value between the reactor and stable completion envelopes.
 unsafe impl Send for FlushRequestOperation {}
@@ -2954,6 +2988,10 @@ impl InfalliblePublication for MutationRequestOperation {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "the mutation operation moves through the sole reactor while all raw identities remain retained"
+)]
 // SAFETY: Every raw identity names VCB/FCB/FILE_OBJECT storage retained through reactor drain;
 // mutable access is confined to the sole reactor thread and completion envelopes move only owned
 // state.

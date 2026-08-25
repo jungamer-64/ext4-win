@@ -807,6 +807,10 @@ mod tests {
     /// # Errors
     ///
     /// Returns an error when the local target pointers cannot be decoded.
+    #[expect(
+        unsafe_code,
+        reason = "the borrowed WDK fixtures outlive the returned received-IRP owner"
+    )]
     fn create_target_with_ea(
         system_buffer: *mut c_void,
         ea_length: wdk_sys::ULONG,
@@ -833,10 +837,13 @@ mod tests {
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::addr_of_mut!(*stack);
 
-        ReceivedIrp::decode(
-            core::ptr::addr_of_mut!(*device),
-            core::ptr::addr_of_mut!(*irp),
-        )
+        unsafe {
+            // SAFETY: Both borrowed fixtures remain live for the returned received IRP.
+            ReceivedIrp::decode(
+                core::ptr::addr_of_mut!(*device),
+                core::ptr::addr_of_mut!(*irp),
+            )
+        }
     }
 
     /// Builds a DriverVec of sample EA records.

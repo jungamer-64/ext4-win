@@ -61,6 +61,10 @@ impl LowerStorageDevice {
     /// # Errors
     ///
     /// Returns an error when device flags, sector size, alignment, or length are invalid.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub fn from_device(device: KernelDevice, length: DeviceLength) -> DriverResult<Self> {
         let object = unsafe {
             // SAFETY: The mounted lower device is live and read only for immutable geometry.
@@ -211,6 +215,10 @@ impl ExternalJournalLease {
     /// `handle` must be a live kernel handle returned by `ZwCreateFile`, and `file_object` must own
     /// exactly one reference obtained from that handle. Neither ownership may be released elsewhere.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) unsafe fn from_exclusive(
         handle: wdk_sys::HANDLE,
         file_object: NonNull<wdk_sys::FILE_OBJECT>,
@@ -223,6 +231,13 @@ impl ExternalJournalLease {
 }
 
 impl Drop for ExternalJournalLease {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn drop(&mut self) {
         #[cfg(not(test))]
         unsafe {
@@ -240,6 +255,10 @@ impl Drop for ExternalJournalLease {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The kernel handle and referenced FILE_OBJECT may move between reactor continuations; all
 // mutation and final release remain serialized by the owning mount/VCB state machine.
 unsafe impl Send for ExternalJournalLease {}
@@ -1084,6 +1103,10 @@ mod tests {
         devices: MountedStorageRoute,
     }
 
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn storage_fixture() -> Option<StorageFixture> {
         let Ok(mut owner) = memory::boxed_try_with(|| Ok(wdk_sys::DEVICE_OBJECT::default())) else {
             return None;
@@ -1097,8 +1120,14 @@ mod tests {
         }) else {
             return None;
         };
-        let completion_owner = KernelDevice::from_raw(core::ptr::from_mut(owner.as_mut()))?;
-        let target = KernelDevice::from_raw(core::ptr::from_mut(lower.as_mut()))?;
+        let completion_owner = unsafe {
+            // SAFETY: The fixture Box retains this device for the returned storage fixture.
+            KernelDevice::from_raw(core::ptr::from_mut(owner.as_mut()))?
+        };
+        let target = unsafe {
+            // SAFETY: The fixture Box retains this lower device for the returned storage fixture.
+            KernelDevice::from_raw(core::ptr::from_mut(lower.as_mut()))?
+        };
         let filesystem =
             LowerStorageDevice::from_device(target, DeviceLength::from_bytes(4096)).ok()?;
         Some(StorageFixture {
@@ -1134,13 +1163,20 @@ mod tests {
     ///
     /// Panics when sector coverage loses the exact requested subrange.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn sector_coverage_is_checked_and_exact() {
         let mut raw = wdk_sys::DEVICE_OBJECT {
             SectorSize: 512,
             AlignmentRequirement: wdk_sys::FILE_512_BYTE_ALIGNMENT,
             ..wdk_sys::DEVICE_OBJECT::default()
         };
-        let Some(device) = KernelDevice::from_raw(core::ptr::addr_of_mut!(raw)) else {
+        let Some(device) = (unsafe {
+            // SAFETY: The stack-local device remains live throughout this test.
+            KernelDevice::from_raw(core::ptr::addr_of_mut!(raw))
+        }) else {
             return;
         };
         let geometry = LowerStorageDevice::from_device(device, DeviceLength::from_bytes(4096));

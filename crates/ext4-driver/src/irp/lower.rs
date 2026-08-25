@@ -2,7 +2,6 @@
 
 use alloc::alloc::{alloc_zeroed, dealloc};
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
@@ -25,6 +24,7 @@ use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 #[cfg(not(test))]
 use crate::memory;
+use crate::memory::{DriverShared, DriverSharedLease, DriverSharedSlot};
 #[cfg(not(test))]
 use crate::state::KernelDevice;
 
@@ -47,6 +47,62 @@ const LOWER_COMPLETED_QUEUED: u8 = 2;
 const LOWER_COMPLETED_DURING_CANCEL: u8 = 3;
 /// The cancel caller returned and queued the deferred-release envelope.
 const LOWER_DEFERRED_QUEUED: u8 = 4;
+
+/// Publication owner selected by the lower completion/cancel state machine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LowerCompletionClaim {
+    /// Completion owns immediate private-IRP release and inbox publication.
+    PublishNow,
+    /// The active cancel caller owns publication after `IoCancelIrp` returns.
+    DeferToCancel,
+}
+
+/// Result of attempting to hand publication to a cancel call previously observed in progress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionDuringCancelClaim {
+    /// Completion atomically handed publication to the cancel caller.
+    Deferred,
+    /// Cancel returned the lifecycle to submitted before the handoff was committed.
+    RetrySubmitted,
+    /// The lifecycle left every valid completion/cancel state.
+    Corrupt,
+}
+
+/// Atomically hands a completed request to the cancel caller that was observed in progress.
+fn claim_completion_during_cancel(lifecycle: &AtomicU8) -> CompletionDuringCancelClaim {
+    match lifecycle.compare_exchange(
+        LOWER_CANCEL_CALLING,
+        LOWER_COMPLETED_DURING_CANCEL,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => CompletionDuringCancelClaim::Deferred,
+        Err(LOWER_SUBMITTED) => CompletionDuringCancelClaim::RetrySubmitted,
+        Err(_) => CompletionDuringCancelClaim::Corrupt,
+    }
+}
+
+/// Selects the sole inbox-publication owner without overwriting a concurrent cancel transition.
+fn claim_lower_completion(lifecycle: &AtomicU8) -> Option<LowerCompletionClaim> {
+    loop {
+        match lifecycle.compare_exchange(
+            LOWER_SUBMITTED,
+            LOWER_COMPLETED_QUEUED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(LowerCompletionClaim::PublishNow),
+            Err(LOWER_CANCEL_CALLING) => match claim_completion_during_cancel(lifecycle) {
+                CompletionDuringCancelClaim::Deferred => {
+                    return Some(LowerCompletionClaim::DeferToCancel);
+                }
+                CompletionDuringCancelClaim::RetrySubmitted => {}
+                CompletionDuringCancelClaim::Corrupt => return None,
+            },
+            Err(_) => return None,
+        }
+    }
+}
 
 /// Test rundown high bit marking terminal closure.
 #[cfg(test)]
@@ -135,6 +191,10 @@ impl AlignedTransferBuffer {
     /// # Errors
     ///
     /// Returns an error when layout validation or allocation fails.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub fn try_zeroed(len: usize, alignment: usize) -> DriverResult<Self> {
         let layout =
             Layout::from_size_align(len, alignment).map_err(|_| DriverError::InvalidBufferSize)?;
@@ -172,6 +232,10 @@ impl AlignedTransferBuffer {
     }
 
     /// Immutable initialized bytes after lower-buffer release.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub fn as_slice(&self) -> &[u8] {
         unsafe {
             // SAFETY: This allocation owns `len` initialized bytes until `Drop`.
@@ -180,6 +244,10 @@ impl AlignedTransferBuffer {
     }
 
     /// Mutable initialized bytes before submission or after lower-buffer release.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe {
             // SAFETY: The caller's mutable borrow excludes every Rust access to this allocation.
@@ -199,6 +267,10 @@ impl fmt::Debug for AlignedTransferBuffer {
 }
 
 impl Drop for AlignedTransferBuffer {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drop(&mut self) {
         if self.is_empty() {
             return;
@@ -210,6 +282,10 @@ impl Drop for AlignedTransferBuffer {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Ownership moves the allocation; it never grants concurrent Rust access.
 unsafe impl Send for AlignedTransferBuffer {}
 
@@ -225,38 +301,60 @@ struct CompletionRundownState {
 
 impl CompletionRundownState {
     /// Initializes native rundown in its final reference-counted allocation.
-    fn try_new() -> DriverResult<Arc<Self>> {
-        let state = Arc::try_new(Self {
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the stable shared allocation cannot be created.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
+    fn try_new() -> DriverResult<DriverShared<Self>> {
+        let slot = DriverSharedSlot::try_new()?;
+        let state = slot.initialize(Self {
             #[cfg(not(test))]
             native: UnsafeCell::new(MaybeUninit::uninit()),
             #[cfg(test)]
             state: AtomicUsize::new(0),
-        })
-        .map_err(|_| DriverError::InsufficientResources)?;
+        });
         #[cfg(not(test))]
         unsafe {
-            // SAFETY: Arc placed the state at its final address, and this is the unique
+            // SAFETY: DriverShared placed the state at its final address, and this is the unique
             // initialization before the owner is exposed.
-            ffi::ExInitializeRundownProtection(state.native.get().cast());
+            ffi::ExInitializeRundownProtection(state.get().native.get().cast());
         }
         Ok(state)
     }
 
     /// Acquires one completion lifetime lease unless teardown has closed the gate.
-    fn acquire(owner: &Arc<Self>) -> Option<CompletionRundownLease> {
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the finite shared-reference budget is exhausted.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
+    fn acquire(owner: &DriverShared<Self>) -> DriverResult<Option<CompletionRundownLease>> {
+        let lease = owner.try_acquire()?;
         #[cfg(not(test))]
         {
             let acquired = unsafe {
                 // SAFETY: Native storage was initialized and remains stable by the owner contract.
-                ffi::ExAcquireRundownProtection(owner.native.get().cast())
+                ffi::ExAcquireRundownProtection(lease.get().native.get().cast())
             };
             if acquired == 0 {
-                return None;
+                return Ok(None);
             }
         }
         #[cfg(test)]
         {
-            owner
+            if lease
+                .get()
                 .state
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                     if state & TEST_RUNDOWN_CLOSED != 0 {
@@ -267,11 +365,12 @@ impl CompletionRundownState {
                             .filter(|next| next & TEST_RUNDOWN_CLOSED == 0)
                     }
                 })
-                .ok()?;
+                .is_err()
+            {
+                return Ok(None);
+            }
         }
-        Some(CompletionRundownLease {
-            owner: Arc::clone(owner),
-        })
+        Ok(Some(CompletionRundownLease { owner: lease }))
     }
 
     /// Closes acquisition and waits for every completion envelope to be reclaimed.
@@ -279,6 +378,10 @@ impl CompletionRundownState {
     ///
     /// The caller must first guarantee that every in-flight completion can still reach and wake
     /// its reactor so retained leases can drain.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub unsafe fn close_and_wait(&self) {
         #[cfg(not(test))]
         unsafe {
@@ -298,6 +401,13 @@ impl CompletionRundownState {
     }
 
     /// Releases one successful acquisition.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn release(&self) {
         #[cfg(not(test))]
         unsafe {
@@ -317,7 +427,7 @@ impl CompletionRundownState {
 /// Stable rundown gate protecting completion destinations beyond completion-routine invocation.
 pub struct CompletionRundown {
     /// Shared owner retained by the reactor and every successful acquisition.
-    owner: Arc<CompletionRundownState>,
+    owner: DriverShared<CompletionRundownState>,
 }
 
 impl CompletionRundown {
@@ -332,7 +442,10 @@ impl CompletionRundown {
     }
 
     /// Acquires one completion lifetime lease unless teardown has closed the gate.
-    pub fn acquire(&self) -> Option<CompletionRundownLease> {
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the finite shared-reference budget is exhausted.
+    pub fn acquire(&self) -> DriverResult<Option<CompletionRundownLease>> {
         CompletionRundownState::acquire(&self.owner)
     }
 
@@ -341,10 +454,14 @@ impl CompletionRundown {
     ///
     /// The caller must first guarantee that every in-flight completion can still reach and wake
     /// its reactor so retained leases can drain.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub unsafe fn close_and_wait(&self) {
         unsafe {
             // SAFETY: The caller supplies the shutdown protocol required by the shared state.
-            self.owner.close_and_wait();
+            self.owner.get().close_and_wait();
         }
     }
 }
@@ -358,7 +475,7 @@ impl fmt::Debug for CompletionRundown {
 /// One successful acquisition that structurally retains its release destination.
 pub struct CompletionRundownLease {
     /// Shared release owner; forgetting the lease delays teardown but cannot dangle.
-    owner: Arc<CompletionRundownState>,
+    owner: DriverSharedLease<CompletionRundownState>,
 }
 
 impl fmt::Debug for CompletionRundownLease {
@@ -369,13 +486,21 @@ impl fmt::Debug for CompletionRundownLease {
 
 impl Drop for CompletionRundownLease {
     fn drop(&mut self) {
-        self.owner.release();
+        self.owner.get().release();
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Executive rundown functions or the test atomic synchronize all interior state, and the
-// native slot never moves after its Arc allocation.
+// native slot never moves after its driver-shared allocation.
 unsafe impl Send for CompletionRundownState {}
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The same native/atomic protocol serializes every shared access to interior state.
 unsafe impl Sync for CompletionRundownState {}
 
@@ -385,6 +510,10 @@ unsafe impl Sync for CompletionRundownState {}
 ///
 /// Implementations run in a lower completion callback. They must retain a stable destination until
 /// rundown completes, publish the exact envelope once, and neither allocate nor block.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 pub(crate) unsafe trait LowerCompletionRoute<O>:
     Send + Sync + Sized + 'static
 {
@@ -392,6 +521,10 @@ pub(crate) unsafe trait LowerCompletionRoute<O>:
     /// # Safety
     ///
     /// `envelope` must belong to this route and must not have been published before.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn publish(&self, envelope: NonNull<LowerCompletionEnvelope<O, Self>>);
 }
 
@@ -417,6 +550,10 @@ impl LowerIrpReleaseAuthority {
 
 #[cfg(not(test))]
 impl Drop for LowerIrpReleaseAuthority {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drop(&mut self) {
         unsafe {
             // SAFETY: This value is the unique release authority and lower ownership has ended.
@@ -486,6 +623,10 @@ impl<O, R: LowerCompletionRoute<O>> LowerCompletionEnvelope<O, R> {
     /// # Safety
     ///
     /// `node` must be the node of a live `LowerCompletionEnvelope<O, R>` allocated by this module.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub unsafe fn from_node(node: NonNull<wdk_sys::LIST_ENTRY>) -> NonNull<Self> {
         node.cast()
     }
@@ -496,6 +637,10 @@ impl<O, R: LowerCompletionRoute<O>> LowerCompletionEnvelope<O, R> {
     /// The slot must be uninitialized, completion registration must have succeeded, and the
     /// caller must proceed directly to `IoCallDriver` without exposing the envelope elsewhere.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn install_release_authority(&self, authority: LowerIrpReleaseAuthority) {
         unsafe {
             // SAFETY: Registration success is the sole writer and completion cannot run before
@@ -511,6 +656,10 @@ impl<O, R: LowerCompletionRoute<O>> LowerCompletionEnvelope<O, R> {
     /// The caller must own the cancel-calling lifecycle state, excluding completion-side release
     /// until the matching `IoCancelIrp` call returns.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn irp_for_cancel(&self) -> PIRP {
         if !self.release_authority_ready.load(Ordering::Acquire) {
             KernelWideInconsistency::lower_completion_ownership_corruption().bugcheck();
@@ -532,6 +681,10 @@ impl<O, R: LowerCompletionRoute<O>> LowerCompletionEnvelope<O, R> {
     /// Lower completion must uniquely own release for `completed_irp`, or deferred reclaim must
     /// own the lifecycle state published after the cancel caller returned.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn release_private_irp(&self, completed_irp: PIRP) {
         if !self.release_authority_ready.swap(false, Ordering::AcqRel) {
             KernelWideInconsistency::lower_completion_ownership_corruption().bugcheck();
@@ -556,6 +709,10 @@ impl<O, R: LowerCompletionRoute<O>> LowerCompletionEnvelope<O, R> {
     ///
     /// The caller must have removed this exact envelope once from its completion inbox and must
     /// exclude every cancellation caller.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub unsafe fn reclaim(mut envelope: Box<Self>) -> CompletedLowerIrp<O> {
         let lifecycle = envelope.lifecycle.load(Ordering::Acquire);
         if lifecycle == LOWER_DEFERRED_QUEUED {
@@ -598,6 +755,10 @@ impl<O, R: LowerCompletionRoute<O>> LowerCompletionEnvelope<O, R> {
     }
 
     /// Reclaims only the suspended operation after completion registration failed.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn reclaim_unsubmitted(mut envelope: Box<Self>) -> O {
         let suspended = unsafe {
             // SAFETY: Registration failure proves no callback can access the envelope payload.
@@ -629,6 +790,10 @@ impl<O, R: LowerCompletionRoute<O>> fmt::Debug for LowerCompletionEnvelope<O, R>
 }
 
 impl<O, R: LowerCompletionRoute<O>> Drop for LowerCompletionEnvelope<O, R> {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drop(&mut self) {
         #[cfg(not(test))]
         if self.release_authority_ready.swap(false, Ordering::AcqRel) {
@@ -659,8 +824,16 @@ impl<O, R: LowerCompletionRoute<O>> Drop for LowerCompletionEnvelope<O, R> {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: `O` moves only between the reactor and envelope; callbacks never access it.
 unsafe impl<O: Send, R: LowerCompletionRoute<O>> Send for LowerCompletionEnvelope<O, R> {}
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Callback-visible fields are atomic or callback-exclusive; payload fields are not read
 // until completion inbox ownership is acquired.
 unsafe impl<O: Send, R: LowerCompletionRoute<O>> Sync for LowerCompletionEnvelope<O, R> {}
@@ -699,6 +872,10 @@ impl<O, R: LowerCompletionRoute<O>> PublishedLowerRequest<O, R> {
     /// The reactor's active-operation lock must prove this envelope is still live and that
     /// `IoCallDriver` has returned. The lock must remain held until this call returns.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub unsafe fn cancel(&self) {
         let envelope = unsafe {
             // SAFETY: The caller proves the envelope remains live under the reactor lock.
@@ -755,6 +932,10 @@ impl<O, R: LowerCompletionRoute<O>> fmt::Debug for PublishedLowerRequest<O, R> {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The reactor lock and envelope lifecycle atomics serialize use of the stable pointer.
 unsafe impl<O: Send, R: LowerCompletionRoute<O>> Send for PublishedLowerRequest<O, R> {}
 
@@ -942,6 +1123,10 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
     ///
     /// Registration failure is the sole error after construction; the pre-submit builder then
     /// releases the IRP, MDL, envelope, payload, and rundown lease locally.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub fn register_and_submit(mut self) -> Result<(), LowerRegistrationError<O>> {
         let envelope = NonNull::from(self.envelope.as_mut());
         let status = unsafe {
@@ -986,6 +1171,10 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
     ///
     /// Completion registration must have succeeded for `envelope_address`, which must identify
     /// `self.envelope`; the caller must invoke the returned request immediately and exactly once.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn into_registered(
         self,
         envelope_address: NonNull<LowerCompletionEnvelope<O, R>>,
@@ -1026,6 +1215,10 @@ struct RegisteredLowerRequest {
 #[cfg(not(test))]
 impl RegisteredLowerRequest {
     /// Calls the lower driver exactly once and never touches IRP/envelope state afterward.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn call_driver(self) {
         unsafe {
             // SAFETY: Successful completion registration transferred all lifetime authority to
@@ -1042,6 +1235,10 @@ impl RegisteredLowerRequest {
 ///
 /// Returns an error when the transfer contract is inconsistent, target geometry is invalid, an
 /// IRP or MDL cannot be allocated, or an ABI field cannot represent the request.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn prepare_private_irp(
     target: KernelDevice,
     operation: LowerOperation,
@@ -1167,6 +1364,10 @@ fn prepare_private_irp(
 /// # Safety
 ///
 /// `irp` must be freshly allocated with a positive unused stack depth.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn next_irp_stack_location(irp: PIRP) -> PIO_STACK_LOCATION {
     let irp = unsafe {
         // SAFETY: The caller guarantees one valid live private IRP.
@@ -1191,6 +1392,10 @@ unsafe fn next_irp_stack_location(irp: PIRP) -> PIO_STACK_LOCATION {
 /// # Safety
 ///
 /// `irp` must be uniquely release-owned and no lower stack may still use it.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn release_private_irp(irp: PIRP) {
     let irp_ref = unsafe {
         // SAFETY: The caller holds the sole release authority.
@@ -1231,6 +1436,10 @@ unsafe fn release_private_irp(irp: PIRP) {
 ///
 /// The I/O Manager must supply the private IRP and exact envelope-head context registered by
 /// `PreparedLowerIrp`.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn lower_request_completed<O: Send + 'static, R: LowerCompletionRoute<O>>(
     _device: wdk_sys::PDEVICE_OBJECT,
     irp: PIRP,
@@ -1261,13 +1470,8 @@ unsafe extern "C" fn lower_request_completed<O: Send + 'static, R: LowerCompleti
     };
     envelope.status.store(status, Ordering::Relaxed);
     envelope.information.store(information, Ordering::Relaxed);
-    match envelope.lifecycle.compare_exchange(
-        LOWER_SUBMITTED,
-        LOWER_COMPLETED_QUEUED,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => {
+    match claim_lower_completion(&envelope.lifecycle) {
+        Some(LowerCompletionClaim::PublishNow) => {
             unsafe {
                 // SAFETY: Normal completion owns release authority and no cancel call is active.
                 envelope.release_private_irp(irp);
@@ -1277,12 +1481,8 @@ unsafe extern "C" fn lower_request_completed<O: Send + 'static, R: LowerCompleti
                 envelope.destination.publish(envelope_address);
             }
         }
-        Err(LOWER_CANCEL_CALLING) => {
-            envelope
-                .lifecycle
-                .store(LOWER_COMPLETED_DURING_CANCEL, Ordering::Release);
-        }
-        Err(_) => {
+        Some(LowerCompletionClaim::DeferToCancel) => {}
+        None => {
             KernelWideInconsistency::lower_completion_ownership_corruption().bugcheck();
         }
     }
@@ -1298,11 +1498,12 @@ mod tests {
     use crate::memory;
 
     use super::{
-        AlignedTransferBuffer, CompletionRundown, IOCTL_DISK_GET_LENGTH_INFO, LOWER_CANCEL_CALLING,
-        LOWER_COMPLETED_DURING_CANCEL, LOWER_COMPLETED_QUEUED, LOWER_DEFERRED_QUEUED,
-        LOWER_SUBMITTED, LowerBuildError, LowerCompletionEnvelope, LowerCompletionRoute,
-        LowerOperation, LowerRegistrationError, LowerTransferMethod, PublishedLowerRequest,
-        STATUS_MORE_PROCESSING_REQUIRED,
+        AlignedTransferBuffer, CompletionDuringCancelClaim, CompletionRundown,
+        IOCTL_DISK_GET_LENGTH_INFO, LOWER_CANCEL_CALLING, LOWER_COMPLETED_DURING_CANCEL,
+        LOWER_COMPLETED_QUEUED, LOWER_DEFERRED_QUEUED, LOWER_SUBMITTED, LowerBuildError,
+        LowerCompletionClaim, LowerCompletionEnvelope, LowerCompletionRoute, LowerOperation,
+        LowerRegistrationError, LowerTransferMethod, PublishedLowerRequest,
+        STATUS_MORE_PROCESSING_REQUIRED, claim_completion_during_cancel, claim_lower_completion,
     };
 
     /// Concrete test route proving completion publication needs no function pointer.
@@ -1315,13 +1516,29 @@ mod tests {
     /// Exact envelope type accepted by the synchronous test route.
     type TestEnvelope = LowerCompletionEnvelope<u64, TestCompletionRoute>;
 
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     // SAFETY: Tests publish synchronously while the stack-local inbox remains live.
     unsafe impl Send for TestCompletionRoute {}
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     // SAFETY: Tests never access the inbox concurrently.
     unsafe impl Sync for TestCompletionRoute {}
 
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     // SAFETY: Publication writes exactly one matching envelope into a live synchronous inbox.
     unsafe impl LowerCompletionRoute<u64> for TestCompletionRoute {
+        #[expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )]
         unsafe fn publish(&self, envelope: NonNull<TestEnvelope>) {
             let inbox = unsafe {
                 // SAFETY: Each test keeps the uniquely writable inbox live through publication.
@@ -1372,6 +1589,34 @@ mod tests {
 
     /// # Panics
     ///
+    /// Panics when completion can overwrite a cancel caller that already restored the submitted
+    /// state, leaving neither side responsible for publication.
+    #[test]
+    fn completion_retries_when_cancel_returns_before_deferred_handoff() {
+        let lifecycle = core::sync::atomic::AtomicU8::new(LOWER_CANCEL_CALLING);
+
+        assert_eq!(
+            lifecycle.compare_exchange(
+                LOWER_CANCEL_CALLING,
+                LOWER_SUBMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ),
+            Ok(LOWER_CANCEL_CALLING)
+        );
+        assert_eq!(
+            claim_completion_during_cancel(&lifecycle),
+            CompletionDuringCancelClaim::RetrySubmitted
+        );
+        assert_eq!(
+            claim_lower_completion(&lifecycle),
+            Some(LowerCompletionClaim::PublishNow)
+        );
+        assert_eq!(lifecycle.load(Ordering::Acquire), LOWER_COMPLETED_QUEUED);
+    }
+
+    /// # Panics
+    ///
     /// Panics when conflicting lower transfer flags are accepted.
     #[test]
     fn transfer_method_rejects_conflicting_device_flags() {
@@ -1393,18 +1638,23 @@ mod tests {
     ///
     /// Panics when rundown can close while a lease remains or admits work after closure.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn completion_rundown_rejects_post_teardown_acquisition() {
         let Ok(rundown) = CompletionRundown::try_new() else {
             return;
         };
-        let lease = rundown.acquire();
-        assert!(lease.is_some());
+        let Ok(Some(lease)) = rundown.acquire() else {
+            return;
+        };
         drop(lease);
         unsafe {
             // SAFETY: No acquired lease remains in this isolated test gate.
             rundown.close_and_wait();
         }
-        assert!(rundown.acquire().is_none());
+        assert!(matches!(rundown.acquire(), Ok(None)));
     }
 
     /// # Panics
@@ -1412,11 +1662,15 @@ mod tests {
     /// Panics if the completion context stops being the envelope head or reclaim duplicates any
     /// owned payload.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn stable_envelope_head_round_trips_owned_payload_once() {
         let Ok(rundown) = CompletionRundown::try_new() else {
             return;
         };
-        let Some(lease) = rundown.acquire() else {
+        let Ok(Some(lease)) = rundown.acquire() else {
             return;
         };
         let Ok(transfer) = AlignedTransferBuffer::try_zeroed(16, 16) else {
@@ -1484,11 +1738,15 @@ mod tests {
     ///
     /// Panics if pre-submit failures lose the operation or publish the envelope.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn unsubmitted_failures_preserve_operation_ownership() {
         let Ok(rundown) = CompletionRundown::try_new() else {
             return;
         };
-        let Some(lease) = rundown.acquire() else {
+        let Ok(Some(lease)) = rundown.acquire() else {
             return;
         };
         let Ok(transfer) = AlignedTransferBuffer::try_zeroed(0, 1) else {

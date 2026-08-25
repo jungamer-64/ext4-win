@@ -5,7 +5,7 @@ use wdk_sys::{
     FILE_CASE_PRESERVED_NAMES, FILE_CASE_SENSITIVE_SEARCH, FILE_FS_ATTRIBUTE_INFORMATION,
     FILE_FS_DEVICE_INFORMATION, FILE_FS_FULL_SIZE_INFORMATION, FILE_FS_LABEL_INFORMATION,
     FILE_FS_SIZE_INFORMATION, FILE_FS_VOLUME_INFORMATION, FILE_SUPPORTS_EXTENDED_ATTRIBUTES,
-    FILE_SUPPORTS_HARD_LINKS, FILE_SUPPORTS_REPARSE_POINTS, FILE_UNICODE_ON_DISK, LARGE_INTEGER,
+    FILE_SUPPORTS_HARD_LINKS, FILE_SUPPORTS_REPARSE_POINTS, FILE_UNICODE_ON_DISK,
 };
 
 use crate::{
@@ -163,6 +163,7 @@ fn pack_volume_information(
     let output = output
         .get_mut(..required)
         .ok_or(DriverError::BufferTooSmall)?;
+    output.fill(0);
     let mut writer = LittleEndianOutput::new(output);
     writer.write_bytes(
         WireOffset::new(core::mem::offset_of!(
@@ -216,21 +217,39 @@ fn pack_size_information(
     geometry: VolumeGeometry,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    write_fixed(
-        output,
-        FILE_FS_SIZE_INFORMATION {
-            TotalAllocationUnits: LARGE_INTEGER {
-                QuadPart: i64::try_from(geometry.cluster_count().as_u64())
-                    .map_err(|_| DriverError::InvalidParameter)?,
-            },
-            AvailableAllocationUnits: LARGE_INTEGER {
-                QuadPart: i64::try_from(geometry.free_cluster_count().as_u64())
-                    .map_err(|_| DriverError::InvalidParameter)?,
-            },
-            SectorsPerAllocationUnit: sectors_per_allocation_unit(geometry.cluster_size())?,
-            BytesPerSector: TransferSectorSize::WINDOWS_REPORTED.as_u32(),
-        },
-    )
+    let size = core::mem::size_of::<FILE_FS_SIZE_INFORMATION>();
+    let mut writer = fixed_record_writer(output, size)?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            FILE_FS_SIZE_INFORMATION,
+            TotalAllocationUnits
+        )),
+        i64::try_from(geometry.cluster_count().as_u64())
+            .map_err(|_| DriverError::InvalidParameter)?,
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            FILE_FS_SIZE_INFORMATION,
+            AvailableAllocationUnits
+        )),
+        i64::try_from(geometry.free_cluster_count().as_u64())
+            .map_err(|_| DriverError::InvalidParameter)?,
+    )?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            FILE_FS_SIZE_INFORMATION,
+            SectorsPerAllocationUnit
+        )),
+        sectors_per_allocation_unit(geometry.cluster_size())?,
+    )?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            FILE_FS_SIZE_INFORMATION,
+            BytesPerSector
+        )),
+        TransferSectorSize::WINDOWS_REPORTED.as_u32(),
+    )?;
+    information_length(size)
 }
 
 /// Packs `FILE_FS_DEVICE_INFORMATION`.
@@ -238,13 +257,23 @@ fn pack_size_information(
 ///
 /// Returns an error when the output buffer is too small for `FILE_FS_DEVICE_INFORMATION`.
 fn pack_device_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
-    write_fixed(
-        output,
-        FILE_FS_DEVICE_INFORMATION {
-            DeviceType: wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM,
-            Characteristics: 0,
-        },
-    )
+    let size = core::mem::size_of::<FILE_FS_DEVICE_INFORMATION>();
+    let mut writer = fixed_record_writer(output, size)?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            FILE_FS_DEVICE_INFORMATION,
+            DeviceType
+        )),
+        wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM,
+    )?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            FILE_FS_DEVICE_INFORMATION,
+            Characteristics
+        )),
+        0,
+    )?;
+    information_length(size)
 }
 
 /// Packs `FILE_FS_FULL_SIZE_INFORMATION`.
@@ -256,23 +285,48 @@ fn pack_full_size_information(
     geometry: VolumeGeometry,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let available = LARGE_INTEGER {
-        QuadPart: i64::try_from(geometry.free_cluster_count().as_u64())
-            .map_err(|_| DriverError::InvalidParameter)?,
-    };
-    write_fixed(
-        output,
-        FILE_FS_FULL_SIZE_INFORMATION {
-            TotalAllocationUnits: LARGE_INTEGER {
-                QuadPart: i64::try_from(geometry.cluster_count().as_u64())
-                    .map_err(|_| DriverError::InvalidParameter)?,
-            },
-            CallerAvailableAllocationUnits: available,
-            ActualAvailableAllocationUnits: available,
-            SectorsPerAllocationUnit: sectors_per_allocation_unit(geometry.cluster_size())?,
-            BytesPerSector: TransferSectorSize::WINDOWS_REPORTED.as_u32(),
-        },
-    )
+    let total = i64::try_from(geometry.cluster_count().as_u64())
+        .map_err(|_| DriverError::InvalidParameter)?;
+    let available = i64::try_from(geometry.free_cluster_count().as_u64())
+        .map_err(|_| DriverError::InvalidParameter)?;
+    let size = core::mem::size_of::<FILE_FS_FULL_SIZE_INFORMATION>();
+    let mut writer = fixed_record_writer(output, size)?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            FILE_FS_FULL_SIZE_INFORMATION,
+            TotalAllocationUnits
+        )),
+        total,
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            FILE_FS_FULL_SIZE_INFORMATION,
+            CallerAvailableAllocationUnits
+        )),
+        available,
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            FILE_FS_FULL_SIZE_INFORMATION,
+            ActualAvailableAllocationUnits
+        )),
+        available,
+    )?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            FILE_FS_FULL_SIZE_INFORMATION,
+            SectorsPerAllocationUnit
+        )),
+        sectors_per_allocation_unit(geometry.cluster_size())?,
+    )?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            FILE_FS_FULL_SIZE_INFORMATION,
+            BytesPerSector
+        )),
+        TransferSectorSize::WINDOWS_REPORTED.as_u32(),
+    )?;
+    information_length(size)
 }
 
 /// Packs `FILE_FS_ATTRIBUTE_INFORMATION`.
@@ -295,6 +349,7 @@ fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> 
     let output = output
         .get_mut(..required)
         .ok_or(DriverError::BufferTooSmall)?;
+    output.fill(0);
     let mut writer = LittleEndianOutput::new(output);
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
@@ -357,22 +412,14 @@ fn information_length(value: usize) -> DriverResult<IrpCompletion> {
     IrpCompletion::from_usize(value)
 }
 
-/// Writes one fixed-size WDK information structure into an output byte buffer.
+/// Clears one fixed-size WDK information record before its fields are encoded.
 /// # Errors
 ///
-/// Returns an error when `output` is smaller than `T`.
-fn write_fixed<T>(output: &mut [u8], value: T) -> DriverResult<IrpCompletion> {
-    let size = core::mem::size_of::<T>();
-    if output.len() < size {
-        return Err(DriverError::BufferTooSmall);
-    }
-    unsafe {
-        // SAFETY: The output slice is at least `size_of::<T>()` bytes and the
-        // write does not read from the destination. Unaligned write avoids
-        // imposing an alignment requirement on the system buffer.
-        output.as_mut_ptr().cast::<T>().write_unaligned(value);
-    }
-    information_length(size)
+/// Returns an error when `output` is smaller than `size`.
+fn fixed_record_writer(output: &mut [u8], size: usize) -> DriverResult<LittleEndianOutput<'_>> {
+    let record = output.get_mut(..size).ok_or(DriverError::BufferTooSmall)?;
+    record.fill(0);
+    Ok(LittleEndianOutput::new(record))
 }
 
 #[cfg(test)]
@@ -489,7 +536,7 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn device_information_reports_disk_file_system_without_device_flags() {
-        let mut buffer = vec![0; core::mem::size_of::<wdk_sys::FILE_FS_DEVICE_INFORMATION>()];
+        let mut buffer = vec![0xA5; core::mem::size_of::<wdk_sys::FILE_FS_DEVICE_INFORMATION>()];
         let written = pack_device_information(buffer.as_mut_slice());
         assert!(written.is_ok());
         if let Ok(written) = written {
@@ -500,6 +547,7 @@ mod tests {
                 Ok(wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM)
             );
             assert_eq!(output.read_u32(WireOffset::new(4)), Ok(0));
+            assert!(buffer.iter().all(|byte| *byte != 0xA5));
         }
     }
 
@@ -508,7 +556,7 @@ mod tests {
     /// Panics when the advertised filesystem capabilities omit hard-link creation.
     #[test]
     fn attribute_information_advertises_hard_links() {
-        let mut buffer = vec![0; 128];
+        let mut buffer = vec![0xA5; 128];
         let written = pack_attribute_information(buffer.as_mut_slice());
         assert!(written.is_ok());
         let attributes = LittleEndianInput::new(buffer.as_slice()).read_u32(WireOffset::new(
@@ -518,6 +566,17 @@ mod tests {
         if let Ok(attributes) = attributes {
             assert_ne!(attributes & wdk_sys::FILE_SUPPORTS_HARD_LINKS, 0);
         }
+        let required =
+            core::mem::offset_of!(wdk_sys::FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName)
+                .checked_add(core::mem::size_of_val(super::FILE_SYSTEM_NAME));
+        assert!(required.is_some());
+        let Some(required) = required else {
+            return;
+        };
+        let prefix = buffer.get(..required);
+        let tail = buffer.get(required..);
+        assert!(prefix.is_some_and(|bytes| bytes.iter().all(|byte| *byte != 0xA5)));
+        assert!(tail.is_some_and(|bytes| bytes.iter().all(|byte| *byte == 0xA5)));
     }
 
     /// Builds a FILE_FS_LABEL_INFORMATION byte image from label bytes.

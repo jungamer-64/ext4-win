@@ -55,15 +55,31 @@ pub(crate) struct KernelDevice {
     device: NonNull<c_void>,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: WDM device objects are I/O Manager-owned, nonpaged objects that may be dispatched on any
 // processor. This boundary exposes only stable identity and immutable device properties; teardown
 // contracts require every reactor operation and lower completion to drain before deletion.
 unsafe impl Send for KernelDevice {}
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Shared copies do not grant Rust mutation of the DEVICE_OBJECT.
 unsafe impl Sync for KernelDevice {}
 
 impl KernelDevice {
     /// Converts a raw WDK device pointer into the non-null boundary type.
+    /// # Safety
+    ///
+    /// A non-null pointer must identify a live I/O Manager-owned `DEVICE_OBJECT` for every use of
+    /// the returned value.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) unsafe fn from_raw(device: PDEVICE_OBJECT) -> Option<Self> {
         NonNull::new(device.cast()).map(|device| Self { device })
     }
@@ -74,6 +90,10 @@ impl KernelDevice {
     }
 
     /// Returns the owning driver object for creating sibling device objects.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn driver_object(self) -> Option<PDRIVER_OBJECT> {
         let device = unsafe {
             // SAFETY: `self` is a non-null DEVICE_OBJECT pointer decoded at the
@@ -84,6 +104,10 @@ impl KernelDevice {
     }
 
     /// Returns the lower-device stack size advertised by the I/O Manager.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn stack_size(self) -> Option<i8> {
         let device = unsafe {
             // SAFETY: `self` is a non-null DEVICE_OBJECT pointer decoded at the
@@ -97,6 +121,10 @@ impl KernelDevice {
     /// # Errors
     ///
     /// Returns an error when the device object is invalid or its alignment mask is malformed.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn transfer_buffer_alignment(self) -> DriverResult<TransferBufferAlignment> {
         let device = unsafe {
             // SAFETY: `self` is a non-null DEVICE_OBJECT pointer decoded at the
@@ -290,7 +318,15 @@ pub(crate) enum FileObjectCloseKind {
 
 impl KernelFileObject {
     /// Converts a raw WDK file object pointer into the non-null boundary type.
-    pub(crate) fn from_raw(file_object: *mut FILE_OBJECT) -> Option<Self> {
+    /// # Safety
+    ///
+    /// A non-null pointer must identify a live I/O Manager-owned `FILE_OBJECT` retained by the
+    /// operation that uses the returned value.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) unsafe fn from_raw(file_object: *mut FILE_OBJECT) -> Option<Self> {
         NonNull::new(file_object).map(|file_object| Self { file_object })
     }
 
@@ -300,6 +336,10 @@ impl KernelFileObject {
     }
 
     /// Publishes one already range-checked current-byte offset.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn write_current_byte_offset(self, position: i64) {
         unsafe {
             // SAFETY: The owning active-operation token retains this FILE_OBJECT and prevalidated
@@ -322,6 +362,10 @@ impl ActiveFileObject<'_> {
     }
 
     /// Publishes completion of every cleanup-owned release as the final cleanup mutation.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn mark_cleanup_complete(self) {
         unsafe {
             // SAFETY: Cleanup is the unique lifecycle transition that publishes this
@@ -346,6 +390,10 @@ impl ActiveFileObject<'_> {
     }
 
     /// Writes the synchronized current position while the owning operation is serialized.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn write_current_byte_offset(self, position: i64) {
         unsafe {
             // SAFETY: The caller has validated synchronous-handle serialization and this active
@@ -394,6 +442,10 @@ impl<'owner> UninitializedFileObject<'owner> {
     ///
     /// # Safety
     /// The caller must own the sole successful-create attachment transition for this FILE_OBJECT.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) unsafe fn as_mut(&mut self) -> &mut FILE_OBJECT {
         unsafe {
             // SAFETY: This non-copy typestate is constructed only while FsContext/FsContext2 are
@@ -412,7 +464,14 @@ pub(crate) struct KernelVpb {
 
 impl KernelVpb {
     /// Converts a raw WDK VPB pointer into the non-null boundary type.
-    pub(crate) fn from_raw(vpb: *mut wdk_sys::VPB) -> Option<Self> {
+    /// # Safety
+    ///
+    /// A non-null pointer must identify a live I/O Manager-owned `VPB` for the mount operation.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) unsafe fn from_raw(vpb: *mut wdk_sys::VPB) -> Option<Self> {
         NonNull::new(vpb).map(|vpb| Self { vpb })
     }
 
@@ -483,6 +542,10 @@ impl ControlDeviceExtension {
     /// # Errors
     ///
     /// Returns an error when the device has no extension or its reactor cannot be initialized.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn initialize(device: KernelDevice) -> DriverResult<()> {
         let device_object = unsafe {
             // SAFETY: `device` is the newly created control device object.
@@ -513,6 +576,10 @@ impl ControlDeviceExtension {
     /// # Safety
     ///
     /// No dispatch callback or device actor may still access the control device.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn release(device: KernelDevice) {
         let Some(device_object) = (unsafe {
             // SAFETY: The caller owns teardown of the control device.
@@ -552,8 +619,7 @@ impl ControlDevice {
     /// # Errors
     ///
     /// Returns an error when the device pointer is null or its extension cannot be initialized.
-    pub(crate) fn registered(device: PDEVICE_OBJECT) -> DriverResult<Self> {
-        let device = KernelDevice::from_raw(device).ok_or(DriverError::InvalidParameter)?;
+    pub(crate) fn registered(device: KernelDevice) -> DriverResult<Self> {
         ControlDeviceExtension::initialize(device)?;
         Ok(Self { device })
     }
@@ -880,6 +946,10 @@ impl VolumeHandleLedger {
     /// # Errors
     ///
     /// Returns an error when an existing direct-volume handle conflicts with the requested access.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn open(
         &mut self,
         file_object: KernelFileObject,
@@ -904,6 +974,10 @@ impl VolumeHandleLedger {
     }
 
     /// Removes one direct-volume FILE_OBJECT share claim at cleanup or canceled-open close.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn cleanup(&mut self, file_object: KernelFileObject) {
         unsafe {
             // SAFETY: A successful volume open recorded this FILE_OBJECT exactly once, and the
@@ -975,6 +1049,10 @@ impl MountedVolumeBinding {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The binding moves once into the device reactor. Only that reactor's sole actor thread
 // calls `with_access`, and teardown recovers the Box only after the actor and completions drain.
 unsafe impl Send for MountedVolumeBinding {}
@@ -1491,6 +1569,10 @@ impl MountedVolumeAccess<'_> {
     /// # Errors
     ///
     /// Returns an error when the parent cannot be loaded or child creation cannot be staged.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn begin_child_creation(
         &self,
         transaction: &mut MutationResolvePass<'_, '_, '_>,
@@ -1533,6 +1615,10 @@ struct FileControlBlockLedger {
     lock: FileControlBlockLedgerLock,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Every production and test access to `table` is serialized by `lock`; no reference to
 // the table or an FCB's ledger-owned mutable fields escapes the guard scope.
 unsafe impl Sync for FileControlBlockLedger {}
@@ -1561,6 +1647,10 @@ struct FileControlBlockLedgerLock {
     native: Mutex<()>,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Production access uses only the executive-resource routines against pinned initialized
 // storage. The host backend is a `Mutex`. Both provide exclusive guard ownership.
 unsafe impl Sync for FileControlBlockLedgerLock {}
@@ -1588,6 +1678,13 @@ impl FileControlBlockLedgerLock {
     /// # Errors
     ///
     /// Returns an error when stable resource storage cannot be allocated or initialized.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn try_new() -> DriverResult<Self> {
         #[cfg(not(test))]
         {
@@ -1613,6 +1710,13 @@ impl FileControlBlockLedgerLock {
     }
 
     /// Acquires exclusive ledger ownership until the returned guard drops.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn acquire(&self) -> FileControlBlockLedgerGuard<'_> {
         #[cfg(not(test))]
         unsafe {
@@ -1643,6 +1747,13 @@ impl FileControlBlockLedgerLock {
 }
 
 impl Drop for FileControlBlockLedgerGuard<'_> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn drop(&mut self) {
         #[cfg(not(test))]
         unsafe {
@@ -1655,6 +1766,10 @@ impl Drop for FileControlBlockLedgerGuard<'_> {
 
 #[cfg(not(test))]
 impl Drop for FileControlBlockLedgerLock {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drop(&mut self) {
         let status = unsafe {
             // SAFETY: Construction publishes this wrapper only after successful initialization,
@@ -1737,6 +1852,10 @@ impl FileControlBlockLedger {
     /// # Errors
     ///
     /// Returns an error when allocation, reference growth, or share validation fails.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn open(
         &self,
         volume: NonNull<VolumeControlBlock>,
@@ -1812,6 +1931,10 @@ impl FileControlBlockLedger {
     }
 
     /// Attempts to reuse an existing entry without allocating a candidate FCB.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn try_open_present(
         &self,
         node: NodeId,
@@ -1840,6 +1963,10 @@ impl FileControlBlockLedger {
     }
 
     /// Releases a share claim and selects final-active-handle deletion while retaining the FCB.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn release_share_access(
         &self,
         fcb: NonNull<FileControlBlock>,
@@ -1861,6 +1988,10 @@ impl FileControlBlockLedger {
     }
 
     /// Publishes a stable delete-pending target for one live FCB.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn set_delete_pending(&self, fcb: NonNull<FileControlBlock>, pending: PendingFileDeletion) {
         let previous = {
             let _guard = self.lock.acquire();
@@ -1879,6 +2010,10 @@ impl FileControlBlockLedger {
     }
 
     /// Cancels delete-pending for one live FCB.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn clear_delete_pending(&self, fcb: NonNull<FileControlBlock>) {
         let previous = {
             let _guard = self.lock.acquire();
@@ -1897,6 +2032,10 @@ impl FileControlBlockLedger {
     }
 
     /// Returns whether one live FCB is delete-pending.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn delete_pending(&self, fcb: NonNull<FileControlBlock>) -> bool {
         let _guard = self.lock.acquire();
         let table = unsafe {
@@ -1912,6 +2051,10 @@ impl FileControlBlockLedger {
     }
 
     /// Publishes committed removal of the exact pending target.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn complete_delete(&self, fcb: NonNull<FileControlBlock>, target: NonNull<FileDeleteTarget>) {
         let completed = {
             let _guard = self.lock.acquire();
@@ -1930,6 +2073,10 @@ impl FileControlBlockLedger {
     }
 
     /// Atomically releases a share claim and the same FILE_OBJECT's final FCB reference.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn release_share_access_and_reference(
         &self,
         fcb: NonNull<FileControlBlock>,
@@ -1954,6 +2101,10 @@ impl FileControlBlockLedger {
     }
 
     /// Releases one FILE_OBJECT's final FCB reference at close.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn close(&self, fcb: NonNull<FileControlBlock>) {
         let removed = {
             let _guard = self.lock.acquire();
@@ -1967,6 +2118,10 @@ impl FileControlBlockLedger {
     }
 
     /// Counts namespace handles whose cleanup share claims remain active.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn active_handle_count(&self) -> u32 {
         let _guard = self.lock.acquire();
         let table = unsafe {
@@ -1985,6 +2140,10 @@ impl FileControlBlockLedger {
     }
 
     /// Returns whether every namespace FILE_OBJECT has released its FCB reference.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn is_empty(&self) -> bool {
         let _guard = self.lock.acquire();
         unsafe {
@@ -1994,6 +2153,10 @@ impl FileControlBlockLedger {
     }
 
     /// Returns whether a currently open inode identity rejects new namespace traversal.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn node_delete_pending(&self, node: NodeId) -> bool {
         let _guard = self.lock.acquire();
         let table = unsafe {
@@ -2018,6 +2181,10 @@ impl FileControlBlockLedger {
     /// # Errors
     ///
     /// Returns delete-pending or sharing-violation when the open state rejects replacement.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn ensure_node_replaceable(&self, node: NodeId) -> DriverResult<()> {
         let _guard = self.lock.acquire();
         let table = unsafe {
@@ -2087,6 +2254,10 @@ impl VolumeControlBlock {
     /// # Errors
     ///
     /// Returns an error when FCB allocation/reference growth or Windows share validation fails.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn open_existing_file_control_block(
         volume: NonNull<Self>,
         node: NodeId,
@@ -2286,6 +2457,13 @@ impl DirectoryChangeNotifier {
     ///
     /// Returns an error when FsRtl cannot allocate the volume synchronization object or this
     /// lifecycle transition is attempted twice.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn initialize(&mut self) -> DriverResult<()> {
         #[cfg(not(test))]
         {
@@ -2346,6 +2524,13 @@ impl DirectoryChangeNotifier {
     }
 
     /// Gives one queued directory-change IRP to FsRtl for pending completion.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     pub(crate) fn register(
         &self,
         target: DispatchTarget,
@@ -2396,6 +2581,13 @@ impl DirectoryChangeNotifier {
     }
 
     /// Reports one committed namespace name change to matching watcher IRPs.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn report(&self, change: DirectoryChange) {
         #[cfg(not(test))]
         {
@@ -2437,6 +2629,13 @@ impl DirectoryChangeNotifier {
     }
 
     /// Cancels and releases notification state owned by one cleaned-up FILE_OBJECT.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     pub(crate) fn cleanup(&self, context: NonNull<c_void>) {
         #[cfg(not(test))]
         {
@@ -2468,6 +2667,13 @@ impl DirectoryChangeNotifier {
 }
 
 impl Drop for DirectoryChangeNotifier {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn drop(&mut self) {
         #[cfg(not(test))]
         {
@@ -2676,6 +2882,10 @@ impl PendingChildCreation {
     /// # Errors
     ///
     /// Returns an error when FCB allocation/reference growth or Windows share validation fails.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn open_file_control_block(
         &self,
         file_object: KernelFileObject,
@@ -2729,6 +2939,10 @@ impl PendingChildCreation {
 /// # Errors
 ///
 /// Returns an error without changing either count when reference growth or share validation fails.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn record_reused_file_control_block_open(
     table: &DriverVec<Box<FileControlBlock>>,
     fcb: NonNull<FileControlBlock>,
@@ -2753,6 +2967,10 @@ fn record_reused_file_control_block_open(
 /// # Errors
 ///
 /// Returns an error when Windows rejects the requested share claim.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn record_file_control_block_share(
     table: &DriverVec<Box<FileControlBlock>>,
     fcb: NonNull<FileControlBlock>,
@@ -2771,6 +2989,10 @@ fn record_file_control_block_share(
 }
 
 /// Releases one open reference to an FCB in a VCB-owned table.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn close_file_control_block_in_table(
     table: &mut DriverVec<Box<FileControlBlock>>,
     fcb: NonNull<FileControlBlock>,
@@ -2880,6 +3102,10 @@ pub(crate) struct PreparedVpbLabelPublication {
 
 impl PreparedVpbLabelPublication {
     /// Publishes the already encoded label without allocation or ordinary failure.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn publish(self) {
         let vpb = unsafe {
             // SAFETY: The mounted device retains this VPB through every admitted operation, and
@@ -2891,6 +3117,10 @@ impl PreparedVpbLabelPublication {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The VPB is I/O Manager-owned stable mounted state and publication remains serialized by
 // the device reactor.
 unsafe impl Send for PreparedVpbLabelPublication {}
@@ -2902,13 +3132,16 @@ impl MountedVolumeDevice {
     ///
     /// Returns an error when the mounted DEVICE_OBJECT, device extension, or VPB initialization
     /// target is absent or invalid.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn initialize(
-        device: PDEVICE_OBJECT,
+        device: KernelDevice,
         vcb: Box<VolumeControlBlock>,
         vpb: NonNull<wdk_sys::VPB>,
         real_device: KernelDevice,
     ) -> DriverResult<()> {
-        let device = KernelDevice::from_raw(device).ok_or(DriverError::InvalidParameter)?;
         let stack_size = real_device
             .stack_size()
             .ok_or(DriverError::InvalidParameter)?
@@ -3005,6 +3238,10 @@ impl MountedVolumeDevice {
     ///
     /// New dispatch must be excluded. Every FILE_OBJECT must have completed Close, or teardown
     /// terminates at the VCB ownership boundary instead of freeing referenced state.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn release(device: KernelDevice, teardown: MountedDeviceTeardown) {
         let device_object = unsafe {
             // SAFETY: The caller owns terminal teardown of this mounted device.
@@ -3050,6 +3287,13 @@ impl MountedVolumeDevice {
     }
 
     /// Queues the preallocated work item that retires this device after its actor returns.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     pub(crate) fn schedule_retirement(device: KernelDevice) {
         let work_item = Self::retirement_work_item(device);
         #[cfg(not(test))]
@@ -3068,6 +3312,10 @@ impl MountedVolumeDevice {
     }
 
     /// Returns the mount-preallocated retirement work item from a live mounted extension.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn retirement_work_item(device: KernelDevice) -> NonNull<wdk_sys::_IO_WORKITEM> {
         let device_object = unsafe {
             // SAFETY: The caller retains the mounted device and its extension.
@@ -3092,6 +3340,10 @@ impl MountedVolumeDevice {
     ///
     /// Returns an error when the mounted device or its VPB pointer is absent, or the ext4 label does
     /// not fit in the VPB label field.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn prepare_vpb_label_publication(
         device: KernelDevice,
         volume_label: ext4_core::Ext4VolumeLabel,
@@ -3140,6 +3392,13 @@ impl MountedVolumeDevice {
     }
 
     /// Stops shutdown IRP delivery after this volume has logically dismounted.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     pub(crate) fn unregister_shutdown_notification(device: KernelDevice) {
         #[cfg(not(test))]
         unsafe {
@@ -3155,8 +3414,13 @@ impl MountedVolumeDevice {
     /// # Errors
     ///
     /// Stops the system if the mounted device has lost its VPB/real-device association.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn complete_dismount(device: KernelDevice) {
-        let real_device = Self::with_vpb(device, |vpb| {
+        let real_device = Self::with_vpb(device, |vpb| unsafe {
+            // SAFETY: The locked VPB retains its associated real device during this operation.
             KernelDevice::from_raw(vpb.RealDevice).ok_or(DriverError::InvalidParameter)
         })
         .and_then(core::convert::identity)
@@ -3180,6 +3444,10 @@ impl MountedVolumeDevice {
     }
 
     /// Removes this mounted device from its VPB while holding the global VPB lock.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn detach_vpb(device: KernelDevice) {
         let mounted = u16::try_from(wdk_sys::VPB_MOUNTED).unwrap_or_else(|_| {
             KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
@@ -3213,6 +3481,10 @@ impl MountedVolumeDevice {
     /// # Errors
     ///
     /// Returns an error when the mounted device or its VPB is absent.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn with_vpb<R>(
         device: KernelDevice,
         operation: impl FnOnce(&mut wdk_sys::VPB) -> R,
@@ -3252,8 +3524,15 @@ impl MountedVolumeDevice {
 /// `device` and `context` must be the unique pair queued by
 /// `MountedVolumeDevice::schedule_retirement`.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: wdk_sys::PVOID) {
-    let Some(device) = KernelDevice::from_raw(device) else {
+    let Some(device) = (unsafe {
+        // SAFETY: The queued work item retains the device supplied at retirement scheduling.
+        KernelDevice::from_raw(device)
+    }) else {
         KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
     };
     let work_item = NonNull::new(context.cast::<wdk_sys::_IO_WORKITEM>())
@@ -3282,6 +3561,13 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
 ///
 /// Returns an error when the I/O Manager cannot register the mounted device for
 /// `IRP_MJ_SHUTDOWN` delivery.
+#[cfg_attr(
+    not(test),
+    expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )
+)]
 fn register_shutdown_notification(device: KernelDevice) -> DriverResult<()> {
     #[cfg(not(test))]
     {
@@ -3366,6 +3652,10 @@ pub(crate) struct FileControlBlock {
     open_state: UnsafeCell<FileControlBlockOpenState>,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: `volume`, `owner`, and `node` are immutable after construction. FsRtl synchronizes its
 // opaque byte-range lock package, while `open_state` is accessed only under the owner ledger's
 // exclusive executive resource.
@@ -3496,6 +3786,10 @@ impl FileControlBlockOpenState {
     ///
     /// Returns an error when existing handles do not share the effective operation access or when
     /// the requested handle claim cannot be recorded.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn record_share_access(
         &mut self,
         file_object: KernelFileObject,
@@ -3539,6 +3833,10 @@ impl FileControlBlockOpenState {
     }
 
     /// Removes one FILE_OBJECT's recorded share-access claim.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn remove_share_access(&mut self, file_object: KernelFileObject) {
         unsafe {
             // SAFETY: Successful create recorded this FILE_OBJECT against this ledger-owned
@@ -3706,6 +4004,13 @@ impl NativeFileByteRange {
 
 impl FileByteRangeLocks {
     /// Initializes FsRtl state for a newly allocated FCB.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn new() -> Self {
         #[cfg(not(test))]
         {
@@ -3726,6 +4031,13 @@ impl FileByteRangeLocks {
     }
 
     /// Lets FsRtl process and complete one byte-range lock IRP.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn process(&self, target: DispatchTarget) -> wdk_sys::NTSTATUS {
         #[cfg(not(test))]
         {
@@ -3750,6 +4062,13 @@ impl FileByteRangeLocks {
     /// # Errors
     ///
     /// Returns an error when the resolved range cannot be represented by FsRtl.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn permits_read(
         &self,
         requestor: RequestorProcess,
@@ -3789,6 +4108,13 @@ impl FileByteRangeLocks {
     /// # Errors
     ///
     /// Returns an error when the resolved range cannot be represented by FsRtl.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn permits_write(
         &self,
         requestor: RequestorProcess,
@@ -3825,6 +4151,13 @@ impl FileByteRangeLocks {
     }
 
     /// Releases all locks associated with this cleanup IRP's FILE_OBJECT and requestor.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn release_for_cleanup(&self, requestor: RequestorProcess, file_object: KernelFileObject) {
         #[cfg(not(test))]
         unsafe {
@@ -3847,6 +4180,13 @@ impl FileByteRangeLocks {
 }
 
 impl Drop for FileByteRangeLocks {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn drop(&mut self) {
         #[cfg(not(test))]
         unsafe {
@@ -4494,6 +4834,10 @@ impl OpenedHandleState {
     }
 
     /// Returns the opened location identity.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn location(&self) -> &OpenedLocation {
         unsafe {
             // SAFETY: The device operation lane serializes every location read and replacement.
@@ -4526,6 +4870,10 @@ impl OpenedHandleState {
     }
 
     /// Replaces the opened location after a successful rename.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn replace_location(&self, location: OpenedLocation) {
         unsafe {
             // SAFETY: The device operation lane serializes rename with every other operation that
@@ -4579,6 +4927,10 @@ impl OpenedHandleState {
     /// # Errors
     ///
     /// Returns an error when allocation of the CCB-owned descriptor fails.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn ensure_directory_notification_name(
         &self,
         directory: DirectoryNodeId,
@@ -4802,6 +5154,10 @@ pub(crate) struct PreparedOpenedLocationPublication {
 
 impl PreparedOpenedLocationPublication {
     /// Moves the prepared location into the live CCB without allocation or validation.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn publish(self) {
         let handle = unsafe {
             // SAFETY: The originating top-level IRP retains the FILE_OBJECT/CCB through commit,
@@ -4812,6 +5168,10 @@ impl PreparedOpenedLocationPublication {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: This token moves only through the reactor and completion envelopes. Its CCB is stable
 // from successful CREATE publication until the ordered CLOSE transition.
 unsafe impl Send for PreparedOpenedLocationPublication {}
@@ -4843,6 +5203,10 @@ impl PreparedFilePositionPublication {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The FILE_OBJECT is kept live through the per-handle active-operation lane and the token
 // is moved only through reactor-owned operation state.
 unsafe impl Send for PreparedFilePositionPublication {}
@@ -4928,6 +5292,10 @@ impl<'owner> OpenedObject<'owner> {
     }
 
     /// Cancels delete-pending for the shared FCB.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn clear_delete_pending(&self) {
         let owner = file_control_block_owner(self.fcb);
         unsafe {
@@ -4938,6 +5306,10 @@ impl<'owner> OpenedObject<'owner> {
     }
 
     /// Returns whether the shared FCB is delete-pending.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn delete_pending(&self) -> bool {
         let owner = file_control_block_owner(self.fcb);
         unsafe {
@@ -4972,6 +5344,10 @@ impl<'owner> OpenedObject<'owner> {
     /// # Errors
     ///
     /// Returns an error when the handle is asynchronous or its raw position is negative.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn current_file_position(&self) -> DriverResult<FileOffset> {
         if !self.has_synchronous_file_position() {
             return Err(DriverError::InvalidParameter);
@@ -5076,6 +5452,10 @@ impl<'owner> OpenedObject<'owner> {
     ///
     /// A close IRP is the sole transition permitted to consume this pair. Any pointer change
     /// between decode and detachment is global lifecycle corruption.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn detach_contexts(self) -> (NonNull<FileControlBlock>, NonNull<OpenedHandle>) {
         let object = unsafe {
             // SAFETY: This consumed active opened-object capability represents the unique close
@@ -5097,6 +5477,10 @@ impl<'owner> OpenedObject<'owner> {
     }
 
     /// Returns the decoded file control block.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn file_control_block(&self) -> &FileControlBlock {
         unsafe {
             // SAFETY: `decode` only constructs this type from a non-null
@@ -5123,6 +5507,10 @@ impl<'owner> OpenedObject<'owner> {
     }
 
     /// Returns the decoded per-handle state.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn handle(&self) -> &OpenedHandle {
         unsafe {
             // SAFETY: `decode` only constructs this type from a non-null
@@ -5220,6 +5608,10 @@ impl PreparedHandleAdmission {
     }
 
     /// Returns the current admission-visible lifecycle.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn state(&self) -> HandleAdmissionState {
         match self.target {
             PreparedHandleAdmissionTarget::Node(handle) => unsafe {
@@ -5236,6 +5628,10 @@ impl PreparedHandleAdmission {
     }
 
     /// Closes ordinary admission after the cleanup operation allocation succeeded.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn begin_cleanup(self) {
         let state = match self.target {
             PreparedHandleAdmissionTarget::Node(handle) => unsafe {
@@ -5255,6 +5651,10 @@ impl PreparedHandleAdmission {
     }
 
     /// Closes every remaining admission after the close operation allocation succeeded.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn begin_close(self) {
         match self.target {
             PreparedHandleAdmissionTarget::Node(handle) => unsafe {
@@ -5318,6 +5718,10 @@ impl<'owner> OpenedVolume<'owner> {
     }
 
     /// Begins this handle's idempotent cleanup transition.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn begin_cleanup(&self) -> CleanupStart {
         unsafe {
             // SAFETY: Decode validated the live `OpenedVolumeHandle` context pointer.
@@ -5327,6 +5731,10 @@ impl<'owner> OpenedVolume<'owner> {
     }
 
     /// Publishes completion after its share claim has been removed.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn finish_cleanup(&self) {
         unsafe {
             // SAFETY: Decode validated the live `OpenedVolumeHandle` context pointer.
@@ -5336,6 +5744,10 @@ impl<'owner> OpenedVolume<'owner> {
     }
 
     /// Selects the only legal terminal close release.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn close_release_plan(&self, close_kind: FileObjectCloseKind) -> CloseReleasePlan {
         unsafe {
             // SAFETY: Decode validated the live `OpenedVolumeHandle` context pointer.
@@ -5345,6 +5757,10 @@ impl<'owner> OpenedVolume<'owner> {
     }
 
     /// Detaches the exact VCB and volume-handle pair at terminal close.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn detach_contexts(
         self,
     ) -> (NonNull<VolumeControlBlock>, NonNull<OpenedVolumeHandle>) {
@@ -5515,6 +5931,10 @@ impl<'owner> OpenedDirectory<'owner> {
     }
 
     /// Returns the mutable directory enumeration cursor.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn cursor_mut(&mut self) -> &mut DirectoryCursor {
         unsafe {
             // SAFETY: `cursor` points into the live directory handle variant
@@ -5526,6 +5946,10 @@ impl<'owner> OpenedDirectory<'owner> {
 }
 
 /// Releases one FILE_OBJECT reference to a VCB-owned FCB.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 pub(crate) fn release_file_control_block(fcb: NonNull<FileControlBlock>) {
     let owner = file_control_block_owner(fcb);
     let owner = unsafe {
@@ -5536,6 +5960,10 @@ pub(crate) fn release_file_control_block(fcb: NonNull<FileControlBlock>) {
 }
 
 /// Releases one FILE_OBJECT's share claim while retaining its FCB reference until close.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 pub(crate) fn release_file_share_access(
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
@@ -5549,6 +5977,10 @@ pub(crate) fn release_file_share_access(
 }
 
 /// Rolls back a pre-attachment FCB reference and its recorded share claim.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 pub(crate) fn abandon_file_control_block(
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
@@ -5562,6 +5994,10 @@ pub(crate) fn abandon_file_control_block(
 }
 
 /// Atomically releases a cancelled open's active share claim and final FCB reference.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 pub(crate) fn release_cancelled_file_control_block(
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
@@ -5575,6 +6011,10 @@ pub(crate) fn release_cancelled_file_control_block(
 }
 
 /// Returns the ledger pointer stored immutably in one live FCB.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn file_control_block_owner(fcb: NonNull<FileControlBlock>) -> NonNull<FileControlBlockLedger> {
     unsafe {
         // SAFETY: All callers hold one live FILE_OBJECT or pre-attachment reference to this FCB.
@@ -5587,6 +6027,10 @@ fn file_control_block_owner(fcb: NonNull<FileControlBlock>) -> NonNull<FileContr
 /// # Safety
 /// The I/O Manager must call this only as the registered unload routine for this driver object,
 /// after no dispatch callbacks can still use the control device being unregistered.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 pub(crate) unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
     let Some(driver) = (unsafe {
         // SAFETY: The I/O Manager invokes DriverUnload with this driver's live object.
@@ -5594,11 +6038,12 @@ pub(crate) unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
     }) else {
         return;
     };
-    let control = find_control_device(driver.DeviceObject)
-        .and_then(|device| device.ok_or(DriverError::InternalInvariantViolation))
-        .unwrap_or_else(|_| {
-            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck()
-        });
+    let control = unsafe {
+        // SAFETY: DriverUnload owns a stable device-chain traversal until deletion begins below.
+        find_control_device(driver.DeviceObject)
+    }
+    .and_then(|device| device.ok_or(DriverError::InternalInvariantViolation))
+    .unwrap_or_else(|_| KernelWideInconsistency::driver_device_teardown_corruption().bugcheck());
     unsafe {
         // SAFETY: Unregistration closes the I/O Manager's filesystem entry before actor teardown.
         ffi::IoUnregisterFileSystem(control.as_ptr());
@@ -5613,7 +6058,10 @@ pub(crate) unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
         ffi::IoDeleteDevice(control.as_ptr());
     }
 
-    while let Some(device) = KernelDevice::from_raw(driver.DeviceObject) {
+    while let Some(device) = unsafe {
+        // SAFETY: DriverUnload owns this device-chain member until it is deleted below.
+        KernelDevice::from_raw(driver.DeviceObject)
+    } {
         if driver_device_kind(device) != Ok(DriverDeviceKind::MountedVolume) {
             KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
         }
@@ -5632,10 +6080,21 @@ pub(crate) unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
 /// # Errors
 ///
 /// Returns an invariant error for an unknown extension or more than one control device.
-fn find_control_device(first: PDEVICE_OBJECT) -> DriverResult<Option<KernelDevice>> {
+/// # Safety
+///
+/// `first` must be null or the head of a live driver-owned device chain that remains stable for
+/// this read-only traversal.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+unsafe fn find_control_device(first: PDEVICE_OBJECT) -> DriverResult<Option<KernelDevice>> {
     let mut found = None;
     let mut next = first;
-    while let Some(device) = KernelDevice::from_raw(next) {
+    while let Some(device) = unsafe {
+        // SAFETY: The caller retains every device-chain member for this traversal.
+        KernelDevice::from_raw(next)
+    } {
         if driver_device_kind(device)? == DriverDeviceKind::Control
             && found.replace(device).is_some()
         {
@@ -5654,6 +6113,10 @@ fn find_control_device(first: PDEVICE_OBJECT) -> DriverResult<Option<KernelDevic
 /// # Errors
 ///
 /// Returns an invariant error when the device or its typed extension header is absent or unknown.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn driver_device_kind(device: KernelDevice) -> DriverResult<DriverDeviceKind> {
     let device = unsafe {
         // SAFETY: The unload chain retains this device until its resources are selected.
@@ -5768,14 +6231,23 @@ mod tests {
     ///
     /// Panics when the mounted/locked policy permits a competing handle or create.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn mounted_volume_lock_policy_is_owned_by_one_file_object() {
         let mut owner_file = wdk_sys::FILE_OBJECT::default();
         let mut competing_file = wdk_sys::FILE_OBJECT::default();
-        let Some(owner) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(owner_file)) else {
+        let Some(owner) = (unsafe {
+            // SAFETY: The stack-local owner FILE_OBJECT remains live throughout this test.
+            KernelFileObject::from_raw(core::ptr::addr_of_mut!(owner_file))
+        }) else {
             return;
         };
-        let Some(competing) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(competing_file))
-        else {
+        let Some(competing) = (unsafe {
+            // SAFETY: The stack-local competing FILE_OBJECT remains live throughout this test.
+            KernelFileObject::from_raw(core::ptr::addr_of_mut!(competing_file))
+        }) else {
             return;
         };
 
@@ -5801,14 +6273,23 @@ mod tests {
     ///
     /// Panics when logical dismount can be reversed or loses its retained lock owner.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
         let mut owner_file = wdk_sys::FILE_OBJECT::default();
         let mut competing_file = wdk_sys::FILE_OBJECT::default();
-        let Some(owner) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(owner_file)) else {
+        let Some(owner) = (unsafe {
+            // SAFETY: The stack-local owner FILE_OBJECT remains live throughout this test.
+            KernelFileObject::from_raw(core::ptr::addr_of_mut!(owner_file))
+        }) else {
             return;
         };
-        let Some(competing) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(competing_file))
-        else {
+        let Some(competing) = (unsafe {
+            // SAFETY: The stack-local competing FILE_OBJECT remains live throughout this test.
+            KernelFileObject::from_raw(core::ptr::addr_of_mut!(competing_file))
+        }) else {
             return;
         };
 
@@ -5881,6 +6362,10 @@ mod tests {
     /// # Errors
     ///
     /// Returns an error when the test IRP boundary or `operation` rejects the FILE_OBJECT.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn with_active_file_object<R>(
         file: &mut wdk_sys::FILE_OBJECT,
         operation: impl for<'view> FnOnce(ActiveFileObject<'view>) -> Result<R, DriverError>,
@@ -5896,10 +6381,13 @@ mod tests {
             .__bindgen_anon_2
             .__bindgen_anon_1
             .CurrentStackLocation = core::ptr::from_mut(&mut stack);
-        let mut received = ReceivedIrp::decode(
-            core::ptr::from_mut(&mut device),
-            core::ptr::from_mut(&mut irp),
-        )?;
+        let mut received = unsafe {
+            // SAFETY: Both stack-local fixtures remain live through the active operation.
+            ReceivedIrp::decode(
+                core::ptr::from_mut(&mut device),
+                core::ptr::from_mut(&mut irp),
+            )?
+        };
         received.with_active(|active| operation(active.current_stack()?.file_object()?))
     }
 
@@ -5949,12 +6437,19 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn kernel_device_decodes_transfer_alignment_requirement() {
         let mut device = wdk_sys::DEVICE_OBJECT {
             AlignmentRequirement: wdk_sys::FILE_512_BYTE_ALIGNMENT,
             ..wdk_sys::DEVICE_OBJECT::default()
         };
-        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device));
+        let device = unsafe {
+            // SAFETY: The stack-local device remains live throughout this test.
+            KernelDevice::from_raw(core::ptr::addr_of_mut!(device))
+        };
         assert!(device.is_some());
         let Some(device) = device else {
             return;
@@ -5971,6 +6466,10 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn no_intermediate_transfer_validates_range_and_buffer_alignment() {
         let buffer_alignment =
             TransferBufferAlignment::from_requirement_mask(wdk_sys::FILE_QUAD_ALIGNMENT);
@@ -6031,8 +6530,18 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn kernel_file_object_rejects_null_raw_pointer() {
-        assert_eq!(KernelFileObject::from_raw(core::ptr::null_mut()), None);
+        assert_eq!(
+            unsafe {
+                // SAFETY: Null has no liveness obligation and is rejected before use.
+                KernelFileObject::from_raw(core::ptr::null_mut())
+            },
+            None
+        );
     }
 
     /// # Panics
@@ -6083,6 +6592,10 @@ mod tests {
     ///
     /// Panics when FsRtl directory-name storage is recreated or relocated between registrations.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn opened_directory_reuses_a_stable_notification_name_descriptor() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
@@ -6423,6 +6936,10 @@ mod tests {
     ///
     /// Panics when asynchronous or paging I/O changes the current-position field.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn asynchronous_and_paging_io_do_not_advance_position() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));

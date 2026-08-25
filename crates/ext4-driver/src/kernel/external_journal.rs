@@ -35,6 +35,13 @@ struct SharedExternalJournalCandidate {
 }
 
 impl Drop for SharedExternalJournalCandidate {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn drop(&mut self) {
         #[cfg(not(test))]
         unsafe {
@@ -46,6 +53,10 @@ impl Drop for SharedExternalJournalCandidate {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The referenced kernel objects are immutable identities; discovery and final release are
 // serialized by the mount operation on the reactor thread.
 unsafe impl Send for SharedExternalJournalCandidate {}
@@ -65,6 +76,10 @@ impl ExternalJournalCandidates {
     ///
     /// Returns an error for kernel enumeration failure or fallible ownership capture failure.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn enumerate(filesystem: KernelDevice) -> DriverResult<Self> {
         let mut list = core::ptr::null_mut();
         let status = unsafe {
@@ -191,6 +206,10 @@ pub(crate) struct SelectedExternalJournal {
     base_identity: NonNull<c_void>,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The path is owned data and the identity is compared only as an opaque pointer value.
 unsafe impl Send for SelectedExternalJournal {}
 
@@ -209,6 +228,10 @@ impl ExclusiveExternalJournal {
     ///
     /// Returns a distinct exclusive-open failure for sharing, namespace races, or object lookup.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn open(selected: SelectedExternalJournal) -> DriverResult<Self> {
         let mut name = unicode_string(selected.path.as_slice())?;
         let mut attributes = wdk_sys::OBJECT_ATTRIBUTES {
@@ -282,7 +305,10 @@ impl ExclusiveExternalJournal {
             // lookup and transfer into the lease.
             crate::kernel::ffi::IoGetRelatedDeviceObject(file_object.as_ptr())
         };
-        let Some(device) = KernelDevice::from_raw(related) else {
+        let Some(device) = (unsafe {
+            // SAFETY: The explicit FILE_OBJECT reference retains its related device for the lease.
+            KernelDevice::from_raw(related)
+        }) else {
             release_file_and_handle(file_object, handle);
             return Err(DriverError::ExternalJournalExclusiveOpenFailed);
         };
@@ -352,6 +378,10 @@ impl InterfaceList {
 
 #[cfg(not(test))]
 impl Drop for InterfaceList {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drop(&mut self) {
         unsafe {
             // SAFETY: `IoGetDeviceInterfaces` allocated this buffer from system pool and transferred
@@ -372,6 +402,10 @@ impl Drop for InterfaceList {
 /// # Errors
 ///
 /// Returns discovery failure when no representable terminator is found.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn terminated_length(start: *const u16) -> DriverResult<usize> {
     for length in 0..=MAX_UNICODE_UNITS {
         let unit_ptr = unsafe {
@@ -423,6 +457,10 @@ fn unicode_string(path: &[u16]) -> DriverResult<wdk_sys::UNICODE_STRING> {
 ///
 /// Returns an error for malformed paths, kernel identity failures, or allocation failure. An
 /// inaccessible interface is not a structural error and produces `None`.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn open_shared_candidate(path: &[u16]) -> DriverResult<Option<SharedExternalJournalCandidate>> {
     let owned_path = DriverVec::try_copied_from_slice(path)?;
     let mut name = unicode_string(path)?;
@@ -443,7 +481,10 @@ fn open_shared_candidate(path: &[u16]) -> DriverResult<Option<SharedExternalJour
     let Some(file_object) = NonNull::new(file_object) else {
         return Err(DriverError::ExternalJournalDiscoveryFailed);
     };
-    let Some(device) = KernelDevice::from_raw(device) else {
+    let Some(device) = (unsafe {
+        // SAFETY: Successful IoGetDeviceObjectPointer returned this referenced live device.
+        KernelDevice::from_raw(device)
+    }) else {
         unsafe {
             // SAFETY: A successful `IoGetDeviceObjectPointer` transferred this reference even if
             // its companion device output was unexpectedly null.
@@ -475,6 +516,10 @@ fn open_shared_candidate(path: &[u16]) -> DriverResult<Option<SharedExternalJour
 /// # Errors
 ///
 /// Returns discovery failure if WDK does not produce a base device.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn base_device_identity(device: KernelDevice) -> DriverResult<NonNull<c_void>> {
     let base = unsafe {
         // SAFETY: The input is a live device identity and the WDK returns one referenced base
@@ -491,6 +536,10 @@ fn base_device_identity(device: KernelDevice) -> DriverResult<NonNull<c_void>> {
 
 #[cfg(not(test))]
 /// Releases a successful pre-lease `ZwCreateFile` handle.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn close_handle(handle: wdk_sys::HANDLE) {
     unsafe {
         // SAFETY: Called only for a handle successfully returned by `ZwCreateFile` before lease
@@ -501,6 +550,10 @@ fn close_handle(handle: wdk_sys::HANDLE) {
 
 #[cfg(not(test))]
 /// Releases both pre-lease ownerships after exclusive-open validation fails.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn release_file_and_handle(file_object: NonNull<wdk_sys::FILE_OBJECT>, handle: wdk_sys::HANDLE) {
     unsafe {
         // SAFETY: This is the sole pre-lease ownership from `ObReferenceObjectByHandle`.
@@ -515,15 +568,26 @@ fn release_file_and_handle(file_object: NonNull<wdk_sys::FILE_OBJECT>, handle: w
 #[cfg(test)]
 mod tests {
     use super::DriverError;
+    use crate::memory;
 
     /// # Panics
     ///
     /// Panics if a non-null kernel identity is rejected or host tests enter live PnP discovery.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn live_discovery_is_not_forged_by_host_tests() {
-        let device = super::KernelDevice::from_raw(
-            core::ptr::NonNull::<wdk_sys::DEVICE_OBJECT>::dangling().as_ptr(),
-        );
+        let Ok(mut device_fixture) =
+            memory::boxed_try_with(|| Ok(wdk_sys::DEVICE_OBJECT::default()))
+        else {
+            return;
+        };
+        let device = unsafe {
+            // SAFETY: The boxed DEVICE_OBJECT remains alive through the host-guard call.
+            super::KernelDevice::from_raw(device_fixture.as_mut())
+        };
         assert!(device.is_some());
         let Some(device) = device else {
             return;
