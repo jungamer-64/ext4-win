@@ -8,9 +8,11 @@ extern crate alloc;
 mod cli;
 /// Owns portable, driver, and deterministic fuzz development gates.
 mod development;
+/// Owns hosted DriverStore and demand-start service lifecycle verification.
+mod driver_load;
 /// Owns external ext4 interoperability and production-core host execution.
 mod interop;
-/// Owns the elevated live-driver/VHDX process boundary.
+/// Owns VHDX, WSL, filesystem I/O, and Driver Verifier live assurance.
 mod live;
 /// Owns repository paths, child processes, temporary directories, hashes, and cleanup.
 mod process;

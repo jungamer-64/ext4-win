@@ -14,6 +14,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $sessionParent = Join-Path $RepositoryRoot 'target\live-vhdx-sessions'
+$driverSessionParent = Join-Path $RepositoryRoot 'target\driver-load-sessions'
+$driverLoadScript = Join-Path $RepositoryRoot 'tools\xtask\driver-load.ps1'
 $script:State = [ordered]@{}
 $script:SessionDirectory = $null
 
@@ -44,6 +46,31 @@ function Invoke-Wsl([string[]]$Arguments, [string]$Description) {
         throw "$Description failed with exit code $LASTEXITCODE"
     }
     return $output
+}
+
+function Invoke-DriverLoadSession([string]$RequestedMode, [string]$BundlePath, [string]$RequestedSessionId) {
+    if (-not (Test-Path -LiteralPath $driverLoadScript -PathType Leaf)) {
+        throw 'repository driver-load workflow script is absent'
+    }
+    $arguments = @(
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        $driverLoadScript,
+        '-Mode',
+        $RequestedMode,
+        '-RepositoryRoot',
+        $RepositoryRoot,
+        '-SessionId',
+        $RequestedSessionId
+    )
+    if ($BundlePath) {
+        $arguments += @('-Bundle', $BundlePath)
+    }
+    Invoke-Checked 'powershell.exe' $arguments "delegated driver-load $RequestedMode session"
 }
 
 function Assert-VerifierConfiguration {
@@ -261,7 +288,7 @@ function Exercise-SessionVolume {
     Write-Phase 'VolumeDismounted'
 }
 
-function Cleanup-SessionInternal {
+function Cleanup-VhdxResources {
     if ($script:State.wsl_attached -eq 'true') {
         Write-Phase 'CleanupWslUnmountRequested'
         Invoke-Wsl @('--unmount', $script:State.vhdx_path) 'cleanup WSL VHDX unmount' | Out-Null
@@ -286,10 +313,47 @@ function Cleanup-SessionInternal {
     if (Test-Path -LiteralPath $script:State.vhdx_path) {
         throw 'session VHDX remains after cleanup'
     }
-    Write-Phase 'CleanupDriverLoadSessionRequested'
-    Invoke-DriverLoadSession 'Cleanup' $null $script:State.driver_session_id
-    Set-StateValue 'driver_session_started' 'false'
-    Write-Phase 'CleanupDriverLoadSessionCompleted'
+}
+
+function Cleanup-DriverLoadResources {
+    $driverSessionDirectory = Join-Path $driverSessionParent $script:State.driver_session_id
+    if (Test-Path -LiteralPath $driverSessionDirectory -PathType Container) {
+        Write-Phase 'CleanupDriverLoadSessionRequested'
+        Invoke-DriverLoadSession 'Cleanup' $null $script:State.driver_session_id
+        Set-StateValue 'driver_session_started' 'false'
+        Write-Phase 'CleanupDriverLoadSessionCompleted'
+    }
+    elseif ($script:State.driver_session_started -eq 'true') {
+        throw 'live VHDX session reports a started driver-load session but its durable identity is absent'
+    }
+}
+
+function Cleanup-SessionInternal {
+    $vhdxCleanupError = $null
+    try {
+        Cleanup-VhdxResources
+    }
+    catch {
+        $vhdxCleanupError = $_
+    }
+
+    $driverCleanupError = $null
+    try {
+        Cleanup-DriverLoadResources
+    }
+    catch {
+        $driverCleanupError = $_
+    }
+
+    if ($vhdxCleanupError -and $driverCleanupError) {
+        throw "VHDX cleanup failed ($vhdxCleanupError); mandatory driver-load cleanup also failed ($driverCleanupError)"
+    }
+    if ($vhdxCleanupError) {
+        throw $vhdxCleanupError
+    }
+    if ($driverCleanupError) {
+        throw $driverCleanupError
+    }
     Write-Phase 'Complete'
 }
 

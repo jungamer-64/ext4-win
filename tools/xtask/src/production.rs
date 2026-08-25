@@ -139,6 +139,17 @@ struct SealedProductionArtifacts {
     inf_hash: String,
 }
 
+/// Atomically published production bundle whose manifest and artifacts passed the release gate.
+#[derive(Debug)]
+pub(crate) struct VerifiedProductionBundle(PathBuf);
+
+impl VerifiedProductionBundle {
+    /// Returns the exact published directory passed to downstream artifact consumers.
+    pub(crate) fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
 impl SealedProductionArtifacts {
     /// Rejects analyzer input mutation after the exact snapshot was sealed.
     ///
@@ -183,7 +194,9 @@ pub(crate) fn verify_production_driver(repository_root: &Path) -> TaskResult<()>
 ///
 /// Returns an error on any portable, driver, interoperability, WDK, signing, reachability,
 /// identity, source-drift, or publication failure.
-pub(crate) fn build_verified_production_bundle(repository_root: &Path) -> TaskResult<PathBuf> {
+pub(crate) fn build_verified_production_bundle(
+    repository_root: &Path,
+) -> TaskResult<VerifiedProductionBundle> {
     verify_portable(repository_root)?;
     verify_driver(repository_root)?;
     verify_journal_interop(repository_root)?;
@@ -281,7 +294,7 @@ pub(crate) fn build_verified_production_bundle(repository_root: &Path) -> TaskRe
     println!("signed driver: ext4win.sys ({})", sealed.driver_hash,);
     println!("signed catalog: ext4win.cat ({})", sealed.catalog_hash);
     println!("installation metadata: ext4win.inf ({})", sealed.inf_hash);
-    Ok(bundle_directory)
+    Ok(VerifiedProductionBundle(bundle_directory))
 }
 
 /// Invokes cargo-wdk from the sole driver package with child-local build identity and flags.

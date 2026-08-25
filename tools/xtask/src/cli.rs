@@ -1,6 +1,9 @@
 use crate::{
     TaskResult,
     development::{verify_driver, verify_fuzz_replay, verify_portable},
+    driver_load::{
+        check_hosted_driver_host, cleanup_driver_load_session, verify_hosted_driver_load,
+    },
     interop::{verify_htree_interop, verify_journal_fixture_provenance, verify_journal_interop},
     live::{check_live_driver_host, cleanup_live_vhdx_session, verify_live_vhdx},
     process::repository_root,
@@ -25,6 +28,12 @@ enum Task {
     JournalFixtureProvenance,
     /// Builds and verifies one signed, identity-bound Windows driver bundle.
     ProductionDriver,
+    /// Performs read-only validation of a hosted kernel-load smoke host.
+    CheckHostedDriverHost,
+    /// Builds one production bundle and proves its demand-start kernel initialization.
+    VerifyHostedDriverLoad,
+    /// Reconciles one interrupted DriverStore/service lifecycle session.
+    CleanupDriverLoadSession,
     /// Performs read-only validation of a dedicated live-driver host.
     CheckLiveDriverHost,
     /// Builds a verified bundle and exercises it only against a new disposable VHDX.
@@ -50,6 +59,12 @@ impl Task {
             Some(Self::JournalFixtureProvenance)
         } else if argument == "verify-production-driver" {
             Some(Self::ProductionDriver)
+        } else if argument == "check-hosted-driver-host" {
+            Some(Self::CheckHostedDriverHost)
+        } else if argument == "verify-hosted-driver-load" {
+            Some(Self::VerifyHostedDriverLoad)
+        } else if argument == "cleanup-driver-load-session" {
+            Some(Self::CleanupDriverLoadSession)
         } else if argument == "check-live-driver-host" {
             Some(Self::CheckLiveDriverHost)
         } else if argument == "verify-live-vhdx" {
@@ -93,6 +108,10 @@ fn execute() -> TaskResult<()> {
 
     let repository_root = repository_root()?;
     match task {
+        Task::CleanupDriverLoadSession => {
+            let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
+            cleanup_driver_load_session(&repository_root, session_id)
+        }
         Task::CleanupLiveVhdxSession => {
             let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
             cleanup_live_vhdx_session(&repository_root, session_id)
@@ -104,6 +123,8 @@ fn execute() -> TaskResult<()> {
         | Task::HtreeInterop
         | Task::JournalFixtureProvenance
         | Task::ProductionDriver
+        | Task::CheckHostedDriverHost
+        | Task::VerifyHostedDriverLoad
         | Task::CheckLiveDriverHost
         | Task::VerifyLiveVhdx => {
             if task_argument.is_some() {
@@ -119,9 +140,11 @@ fn execute() -> TaskResult<()> {
                     verify_journal_fixture_provenance(&repository_root)
                 }
                 Task::ProductionDriver => verify_production_driver(&repository_root),
+                Task::CheckHostedDriverHost => check_hosted_driver_host(&repository_root),
+                Task::VerifyHostedDriverLoad => verify_hosted_driver_load(&repository_root),
                 Task::CheckLiveDriverHost => check_live_driver_host(&repository_root),
                 Task::VerifyLiveVhdx => verify_live_vhdx(&repository_root),
-                Task::CleanupLiveVhdxSession => {
+                Task::CleanupDriverLoadSession | Task::CleanupLiveVhdxSession => {
                     Err(io::Error::other("cleanup task lost its required argument").into())
                 }
             }
@@ -133,7 +156,7 @@ fn execute() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-driver|verify-fuzz-replay|verify-journal-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-live-driver-host|verify-live-vhdx|cleanup-live-vhdx-session SESSION_ID>",
+        "usage: cargo xtask <verify-portable|verify-driver|verify-fuzz-replay|verify-journal-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|check-live-driver-host|verify-live-vhdx|cleanup-live-vhdx-session SESSION_ID>",
     )
 }
 
@@ -172,6 +195,18 @@ mod tests {
         assert_eq!(
             Task::parse(OsStr::new("verify-production-driver")),
             Some(Task::ProductionDriver)
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("check-hosted-driver-host")),
+            Some(Task::CheckHostedDriverHost)
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("verify-hosted-driver-load")),
+            Some(Task::VerifyHostedDriverLoad)
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("cleanup-driver-load-session")),
+            Some(Task::CleanupDriverLoadSession)
         );
         assert_eq!(
             Task::parse(OsStr::new("check-live-driver-host")),
