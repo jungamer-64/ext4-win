@@ -849,6 +849,7 @@ impl CompletionReactor {
         device: KernelDevice,
         target: ReactorTarget,
     ) -> DriverResult<()> {
+        let completion_rundown = CompletionRundown::try_new()?;
         unsafe {
             // SAFETY: The caller owns writable, final-address device-extension bytes.
             core::ptr::write(
@@ -865,7 +866,7 @@ impl CompletionReactor {
                     cancel_ready: AtomicU64::new(0),
                     lifecycle: AtomicU8::new(ReactorState::Running.as_raw()),
                     admission: AdmissionRundown::new(),
-                    completion_rundown: CompletionRundown::new(),
+                    completion_rundown,
                     thread_handle: core::ptr::null_mut(),
                     scheduler: UnsafeCell::new(Scheduler::new()),
                     payloads: UnsafeCell::new(core::array::from_fn(|_| ShellSlot::vacant())),
@@ -885,10 +886,6 @@ impl CompletionReactor {
         initialize_list_head(reactor.completion_head.get());
         initialize_list_head(reactor.length_completion_head.get());
         reactor.admission.initialize();
-        unsafe {
-            // SAFETY: The embedded gate is now at its final device-extension address.
-            reactor.completion_rundown.initialize();
-        }
         #[cfg(not(test))]
         for timer in &reactor.retry_timers {
             unsafe {

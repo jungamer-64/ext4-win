@@ -2,11 +2,11 @@
 
 use alloc::alloc::{alloc_zeroed, dealloc};
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::fmt;
-use core::marker::PhantomPinned;
 use core::mem::ManuallyDrop;
 #[cfg(not(test))]
 use core::mem::MaybeUninit;
@@ -213,49 +213,42 @@ impl Drop for AlignedTransferBuffer {
 // SAFETY: Ownership moves the allocation; it never grants concurrent Rust access.
 unsafe impl Send for AlignedTransferBuffer {}
 
-/// Stable rundown gate protecting completion destinations beyond completion-routine invocation.
-pub struct CompletionRundown {
+/// Reference-counted rundown state retained by every lower-completion lease.
+struct CompletionRundownState {
     /// Native executive rundown storage.
     #[cfg(not(test))]
     native: UnsafeCell<MaybeUninit<wdk_sys::EX_RUNDOWN_REF>>,
     /// Deterministic closed bit and lease count in unit tests.
     #[cfg(test)]
     state: AtomicUsize,
-    /// Prevents movement through automatic `Unpin` assumptions after native initialization.
-    _pin: PhantomPinned,
 }
 
-impl CompletionRundown {
-    /// Creates uninitialized native storage or an open test gate.
-    pub const fn new() -> Self {
-        Self {
+impl CompletionRundownState {
+    /// Initializes native rundown in its final reference-counted allocation.
+    fn try_new() -> DriverResult<Arc<Self>> {
+        let state = Arc::try_new(Self {
             #[cfg(not(test))]
             native: UnsafeCell::new(MaybeUninit::uninit()),
             #[cfg(test)]
             state: AtomicUsize::new(0),
-            _pin: PhantomPinned,
-        }
-    }
-
-    /// Initializes native rundown after this value reaches its final address.
-    /// # Safety
-    ///
-    /// The rundown must remain address-stable until [`Self::close_and_wait`] returns.
-    pub unsafe fn initialize(&self) {
+        })
+        .map_err(|_| DriverError::InsufficientResources)?;
         #[cfg(not(test))]
         unsafe {
-            // SAFETY: The caller guarantees final stable storage and one initialization.
-            ffi::ExInitializeRundownProtection(self.native.get().cast());
+            // SAFETY: Arc placed the state at its final address, and this is the unique
+            // initialization before the owner is exposed.
+            ffi::ExInitializeRundownProtection(state.native.get().cast());
         }
+        Ok(state)
     }
 
     /// Acquires one completion lifetime lease unless teardown has closed the gate.
-    pub unsafe fn acquire(&self) -> Option<CompletionRundownLease> {
+    fn acquire(owner: &Arc<Self>) -> Option<CompletionRundownLease> {
         #[cfg(not(test))]
         {
             let acquired = unsafe {
                 // SAFETY: Native storage was initialized and remains stable by the owner contract.
-                ffi::ExAcquireRundownProtection(self.native.get().cast())
+                ffi::ExAcquireRundownProtection(owner.native.get().cast())
             };
             if acquired == 0 {
                 return None;
@@ -263,7 +256,8 @@ impl CompletionRundown {
         }
         #[cfg(test)]
         {
-            self.state
+            owner
+                .state
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                     if state & TEST_RUNDOWN_CLOSED != 0 {
                         None
@@ -276,7 +270,7 @@ impl CompletionRundown {
                 .ok()?;
         }
         Some(CompletionRundownLease {
-            owner: NonNull::from(self),
+            owner: Arc::clone(owner),
         })
     }
 
@@ -320,14 +314,70 @@ impl CompletionRundown {
     }
 }
 
+/// Stable rundown gate protecting completion destinations beyond completion-routine invocation.
+pub struct CompletionRundown {
+    /// Shared owner retained by the reactor and every successful acquisition.
+    owner: Arc<CompletionRundownState>,
+}
+
+impl CompletionRundown {
+    /// Allocates and initializes an open rundown gate.
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the stable owner allocation fails.
+    pub fn try_new() -> DriverResult<Self> {
+        Ok(Self {
+            owner: CompletionRundownState::try_new()?,
+        })
+    }
+
+    /// Acquires one completion lifetime lease unless teardown has closed the gate.
+    pub fn acquire(&self) -> Option<CompletionRundownLease> {
+        CompletionRundownState::acquire(&self.owner)
+    }
+
+    /// Closes acquisition and waits for every completion envelope to be reclaimed.
+    /// # Safety
+    ///
+    /// The caller must first guarantee that every in-flight completion can still reach and wake
+    /// its reactor so retained leases can drain.
+    pub unsafe fn close_and_wait(&self) {
+        unsafe {
+            // SAFETY: The caller supplies the shutdown protocol required by the shared state.
+            self.owner.close_and_wait();
+        }
+    }
+}
+
 impl fmt::Debug for CompletionRundown {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("CompletionRundown(..)")
     }
 }
 
-// SAFETY: Executive rundown functions or the test atomic synchronize all interior state.
-unsafe impl Sync for CompletionRundown {}
+/// One successful acquisition that structurally retains its release destination.
+pub struct CompletionRundownLease {
+    /// Shared release owner; forgetting the lease delays teardown but cannot dangle.
+    owner: Arc<CompletionRundownState>,
+}
+
+impl fmt::Debug for CompletionRundownLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompletionRundownLease(..)")
+    }
+}
+
+impl Drop for CompletionRundownLease {
+    fn drop(&mut self) {
+        self.owner.release();
+    }
+}
+
+// SAFETY: Executive rundown functions or the test atomic synchronize all interior state, and the
+// native slot never moves after its Arc allocation.
+unsafe impl Send for CompletionRundownState {}
+// SAFETY: The same native/atomic protocol serializes every shared access to interior state.
+unsafe impl Sync for CompletionRundownState {}
 
 /// Statically dispatched, allocation-free destination for one lower completion envelope type.
 ///
@@ -1344,7 +1394,9 @@ mod tests {
     /// Panics when rundown can close while a lease remains or admits work after closure.
     #[test]
     fn completion_rundown_rejects_post_teardown_acquisition() {
-        let rundown = CompletionRundown::new();
+        let Ok(rundown) = CompletionRundown::try_new() else {
+            return;
+        };
         let lease = rundown.acquire();
         assert!(lease.is_some());
         drop(lease);
@@ -1361,7 +1413,9 @@ mod tests {
     /// owned payload.
     #[test]
     fn stable_envelope_head_round_trips_owned_payload_once() {
-        let rundown = CompletionRundown::new();
+        let Ok(rundown) = CompletionRundown::try_new() else {
+            return;
+        };
         let Some(lease) = rundown.acquire() else {
             return;
         };
@@ -1431,7 +1485,9 @@ mod tests {
     /// Panics if pre-submit failures lose the operation or publish the envelope.
     #[test]
     fn unsubmitted_failures_preserve_operation_ownership() {
-        let rundown = CompletionRundown::new();
+        let Ok(rundown) = CompletionRundown::try_new() else {
+            return;
+        };
         let Some(lease) = rundown.acquire() else {
             return;
         };

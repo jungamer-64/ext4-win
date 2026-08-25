@@ -1,9 +1,9 @@
 //! Mounted profile, bounded epoch leases, mutation coordination, and volume failure state.
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::fmt;
 use core::mem::MaybeUninit;
-use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use ext4_core::{
     CheckpointOperation, CleanJournalDurability, CommittedEpoch, CompletedMount, DurableMutation,
@@ -11,16 +11,10 @@ use ext4_core::{
     MutationCoordinatorState, PublishedMutation, VisibilityLease,
 };
 
-use crate::irp::reactor::MAX_OPERATIONS;
 use crate::kernel::cng::CngProvider;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::storage::{MountedStorage, MountedStorageRoute};
-use crate::memory;
-
-/// Current epoch plus one distinct retained epoch per operation and two pre-commit publication
-/// reservations.
-const MAX_EPOCH_SLOTS: usize = MAX_OPERATIONS + 2;
 
 /// Volume reliability state after lower-device or checkpoint failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,304 +76,97 @@ impl VolumeFailureState {
     }
 }
 
-/// One fixed registry slot with lifecycle encoded by its variant.
-enum EpochSlot {
-    /// Available for a pre-write publication reservation.
-    Vacant {
-        /// Last generation used by this slot.
-        generation: u64,
-    },
-    /// Reserved before the first lower write; publication into this slot cannot fail.
-    Reserved {
-        /// Generation uniquely identifying this reservation.
-        generation: u64,
-        /// Fallibly allocated storage initialized only by infallible publication.
-        storage: Box<MaybeUninit<CommittedEpoch>>,
-    },
-    /// Immutable epoch retained by the current pointer or outstanding leases.
-    Occupied {
-        /// Generation checked by every lease.
-        generation: u64,
-        /// Immutable committed state.
-        epoch: Box<CommittedEpoch>,
-        /// Number of outstanding operation leases.
-        leases: u8,
-        /// Whether new reads acquire this slot.
-        current: bool,
-    },
-}
-
-impl fmt::Debug for EpochSlot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Vacant { generation } => formatter
-                .debug_struct("Vacant")
-                .field("generation", generation)
-                .finish(),
-            Self::Reserved {
-                generation,
-                storage: _,
-            } => formatter
-                .debug_struct("Reserved")
-                .field("generation", generation)
-                .finish(),
-            Self::Occupied {
-                generation,
-                epoch,
-                leases,
-                current,
-            } => formatter
-                .debug_struct("Occupied")
-                .field("generation", generation)
-                .field("epoch", &epoch.sequence())
-                .field("leases", leases)
-                .field("current", current)
-                .finish(),
-        }
-    }
-}
-
-/// Bounded registry retaining committed epochs without reference-counted ownership.
+/// Current immutable epoch; each operation retains the exact version it observed.
 #[derive(Debug)]
 pub(crate) struct EpochRegistry {
-    /// Current and retained epoch slots.
-    slots: [EpochSlot; MAX_EPOCH_SLOTS],
-    /// Slot selected for new read leases.
-    current: usize,
+    /// Epoch selected for new operations.
+    current: Arc<CommittedEpoch>,
 }
 
 impl EpochRegistry {
-    /// Fallibly installs the initial mount epoch in heap-stable storage.
+    /// Fallibly installs the initial mount epoch in shared immutable storage.
     /// # Errors
     ///
     /// Returns an error when storage for the initial immutable epoch cannot be allocated.
     pub(crate) fn try_new(initial: CommittedEpoch) -> DriverResult<Self> {
-        let initial = memory::boxed_try_with(move || Ok(initial))?;
-        let mut slots = core::array::from_fn(|_| EpochSlot::Vacant { generation: 0 });
-        let first = slots
-            .first_mut()
-            .ok_or(DriverError::InternalInvariantViolation)?;
-        *first = EpochSlot::Occupied {
-            generation: 1,
-            epoch: initial,
-            leases: 0,
-            current: true,
-        };
-        Ok(Self { slots, current: 0 })
+        let current = Arc::try_new(initial).map_err(|_| DriverError::InsufficientResources)?;
+        Ok(Self { current })
     }
 
-    /// Acquires one non-cloneable lease on the current immutable epoch.
-    /// # Errors
-    ///
-    /// Returns an invariant error if the bounded active-operation count cannot fit the lease field.
-    pub(crate) fn acquire_current(&mut self) -> DriverResult<EpochLease> {
-        let index = self.current;
-        let generation = {
-            let Some(slot) = self.slots.get_mut(index) else {
-                return Err(DriverError::InternalInvariantViolation);
-            };
-            let EpochSlot::Occupied {
-                generation,
-                leases,
-                current: true,
-                ..
-            } = slot
-            else {
-                return Err(DriverError::InternalInvariantViolation);
-            };
-            *leases = leases
-                .checked_add(1)
-                .ok_or(DriverError::InternalInvariantViolation)?;
-            *generation
-        };
-        Ok(EpochLease {
-            registry: NonNull::from(&mut *self),
-            index,
-            generation,
-        })
+    /// Acquires one operation lease on the current immutable epoch.
+    pub(crate) fn acquire_current(&self) -> EpochLease {
+        EpochLease {
+            epoch: Arc::clone(&self.current),
+        }
     }
 
     /// Borrows the current epoch for one non-suspending reactor transition.
     pub(crate) fn current(&self) -> &CommittedEpoch {
-        match self.slots.get(self.current) {
-            Some(EpochSlot::Occupied {
-                epoch,
-                current: true,
-                ..
-            }) => epoch.as_ref(),
-            _ => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
-        }
+        self.current.as_ref()
     }
 
-    /// Reserves both durable and checkpoint epoch slots before any lower write is issued.
+    /// Reserves both durable and checkpoint epoch allocations before any lower write is issued.
     /// # Errors
     ///
-    /// Returns insufficient resources if long-lived readers exhaust the bounded registry or a
-    /// slot generation cannot advance.
-    /// # Safety
-    ///
-    /// The registry must already reside in its final mounted VCB address and remain live until both
-    /// returned reservations are published or dropped on the reactor thread.
-    pub(crate) unsafe fn reserve_publication(&mut self) -> DriverResult<EpochPublicationSlots> {
-        let mut indices =
-            self.slots.iter().enumerate().filter_map(|(index, slot)| {
-                matches!(slot, EpochSlot::Vacant { .. }).then_some(index)
-            });
-        let durable_index = indices.next().ok_or(DriverError::InsufficientResources)?;
-        let checkpoint_index = indices.next().ok_or(DriverError::InsufficientResources)?;
-        let durable_generation = next_slot_generation(
-            self.slots
-                .get(durable_index)
-                .ok_or(DriverError::InternalInvariantViolation)?,
-        )?;
-        let checkpoint_generation = next_slot_generation(
-            self.slots
-                .get(checkpoint_index)
-                .ok_or(DriverError::InternalInvariantViolation)?,
-        )?;
-        let durable_storage = memory::boxed_try_with(|| Ok(MaybeUninit::uninit()))?;
-        let checkpoint_storage = memory::boxed_try_with(|| Ok(MaybeUninit::uninit()))?;
-        let durable_slot = self
-            .slots
-            .get_mut(durable_index)
-            .ok_or(DriverError::InternalInvariantViolation)?;
-        *durable_slot = EpochSlot::Reserved {
-            generation: durable_generation,
-            storage: durable_storage,
-        };
-        let checkpoint_slot = self
-            .slots
-            .get_mut(checkpoint_index)
-            .ok_or(DriverError::InternalInvariantViolation)?;
-        *checkpoint_slot = EpochSlot::Reserved {
-            generation: checkpoint_generation,
-            storage: checkpoint_storage,
-        };
-        let registry = NonNull::from(self);
+    /// Returns insufficient resources when either stable allocation fails.
+    pub(crate) fn reserve_publication(&self) -> DriverResult<EpochPublicationSlots> {
+        let durable =
+            Arc::try_new(MaybeUninit::uninit()).map_err(|_| DriverError::InsufficientResources)?;
+        let checkpoint =
+            Arc::try_new(MaybeUninit::uninit()).map_err(|_| DriverError::InsufficientResources)?;
         Ok(EpochPublicationSlots {
-            durable: EpochPublicationSlot {
-                registry,
-                index: durable_index,
-                generation: durable_generation,
-                consumed: false,
-            },
+            durable: EpochPublicationSlot { storage: durable },
             checkpoint: EpochPublicationSlot {
-                registry,
-                index: checkpoint_index,
-                generation: checkpoint_generation,
-                consumed: false,
+                storage: checkpoint,
             },
         })
     }
 
-    /// Releases one lease and recycles a non-current epoch as soon as its count reaches zero.
-    fn release(&mut self, index: usize, generation: u64) {
-        let Some(slot) = self.slots.get_mut(index) else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
-        let EpochSlot::Occupied {
-            generation: current_generation,
-            leases,
-            current,
-            ..
-        } = slot
-        else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
-        if *current_generation != generation || *leases == 0 {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        *leases = match leases.checked_sub(1) {
-            Some(remaining) => remaining,
-            None => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
-        };
-        if *leases == 0 && !*current {
-            let released = core::mem::replace(slot, EpochSlot::Vacant { generation });
-            drop(released);
-        }
-    }
-
-    /// Publishes one pre-reserved immutable epoch by moves and fixed-slot replacement only.
-    fn publish(&mut self, index: usize, generation: u64, epoch: CommittedEpoch) {
-        let storage = {
-            let Some(target) = self.slots.get_mut(index) else {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            };
-            let reserved = core::mem::replace(target, EpochSlot::Vacant { generation });
-            match reserved {
-                EpochSlot::Reserved {
-                    generation: current,
-                    storage,
-                } if current == generation => storage,
-                EpochSlot::Vacant { .. }
-                | EpochSlot::Reserved { .. }
-                | EpochSlot::Occupied { .. } => {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
-                }
-            }
-        };
-        let previous = self.current;
-        let Some(previous_slot) = self.slots.get_mut(previous) else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
-        match previous_slot {
-            EpochSlot::Occupied {
-                generation,
-                leases,
-                current,
-                ..
-            } if *current => {
-                *current = false;
-                if *leases == 0 {
-                    let generation = *generation;
-                    let released =
-                        core::mem::replace(previous_slot, EpochSlot::Vacant { generation });
-                    drop(released);
-                }
-            }
-            EpochSlot::Vacant { .. } | EpochSlot::Reserved { .. } | EpochSlot::Occupied { .. } => {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
-        }
-        let epoch = Box::write(storage, epoch);
-        let Some(target) = self.slots.get_mut(index) else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
-        *target = EpochSlot::Occupied {
-            generation,
-            epoch,
-            leases: 0,
-            current: true,
-        };
-        self.current = index;
-    }
-
-    /// Rolls back one unused pre-write reservation.
-    fn release_reservation(&mut self, index: usize, generation: u64) {
-        let Some(slot) = self.slots.get_mut(index) else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
-        if !matches!(slot, EpochSlot::Reserved { generation: current, .. } if *current == generation)
-        {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        let released = core::mem::replace(slot, EpochSlot::Vacant { generation });
-        drop(released);
+    /// Publishes one preallocated immutable epoch without a fallible post-commit step.
+    fn publish(&mut self, publication: EpochPublicationSlot, epoch: CommittedEpoch) {
+        self.current = publication.initialize(epoch);
     }
 }
 
-/// Returns the next reservation generation for one vacant slot.
-/// # Errors
-///
-/// Returns an invariant error for a non-vacant slot or insufficient resources on generation
-/// exhaustion.
-fn next_slot_generation(slot: &EpochSlot) -> DriverResult<u64> {
-    let EpochSlot::Vacant { generation } = slot else {
-        return Err(DriverError::InternalInvariantViolation);
-    };
-    generation
-        .checked_add(1)
-        .ok_or(DriverError::InsufficientResources)
+/// Immutable operation view that keeps the exact observed epoch alive.
+#[derive(Debug)]
+pub(crate) struct EpochLease {
+    /// Shared immutable epoch owner.
+    epoch: Arc<CommittedEpoch>,
+}
+
+impl EpochLease {
+    /// Borrows the immutable epoch retained by this operation.
+    pub(crate) fn epoch(&self) -> &CommittedEpoch {
+        self.epoch.as_ref()
+    }
+}
+
+/// Preallocated storage for one infallible post-commit epoch publication.
+pub(crate) struct EpochPublicationSlot {
+    /// Uninitialized shared allocation that becomes the published epoch owner.
+    storage: Arc<MaybeUninit<CommittedEpoch>>,
+}
+
+impl EpochPublicationSlot {
+    /// Initializes this uniquely owned reservation and converts it to immutable epoch ownership.
+    fn initialize(mut self, epoch: CommittedEpoch) -> Arc<CommittedEpoch> {
+        let Some(storage) = Arc::get_mut(&mut self.storage) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        storage.write(epoch);
+        unsafe {
+            // SAFETY: The unique allocation was initialized immediately above and is consumed by
+            // this conversion, so no uninitialized Arc remains accessible.
+            self.storage.assume_init()
+        }
+    }
+}
+
+impl fmt::Debug for EpochPublicationSlot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EpochPublicationSlot(..)")
+    }
 }
 
 /// Pair of epoch slots reserved before a commit can issue its first lower write.
@@ -438,7 +225,7 @@ enum VisibilityGateState {
 pub(crate) struct VolumeRuntime {
     /// Immutable feature, geometry, and device identity.
     profile: MountedProfile,
-    /// Bounded immutable epoch registry.
+    /// Current immutable epoch owner.
     epochs: EpochRegistry,
     /// Journal cursor, allocation state, and resource versions.
     coordinator: MutationCoordinatorState,
@@ -453,7 +240,7 @@ pub(crate) struct VolumeRuntime {
     /// Short epoch-swap gate independent from checkpoint I/O.
     visibility_gate: VisibilityGateState,
     /// Mutations admitted before closing and not yet fully checkpointed or abandoned.
-    active_mutations: u32,
+    active_mutations: Arc<AtomicU32>,
 }
 
 impl VolumeRuntime {
@@ -474,7 +261,8 @@ impl VolumeRuntime {
             failure: VolumeFailureState::Operational,
             commit_gate: CommitGateState::Ready,
             visibility_gate: VisibilityGateState::Ready,
-            active_mutations: 0,
+            active_mutations: Arc::try_new(AtomicU32::new(0))
+                .map_err(|_| DriverError::InsufficientResources)?,
         })
     }
 
@@ -494,18 +282,18 @@ impl VolumeRuntime {
     }
 
     /// Whether journal space has no granted commit or published overlay awaiting checkpoint.
-    pub(crate) const fn journal_is_clean(&self) -> bool {
-        self.active_mutations == 0 && matches!(self.commit_gate, CommitGateState::Ready)
+    pub(crate) fn journal_is_clean(&self) -> bool {
+        self.active_mutations.load(Ordering::Acquire) == 0
+            && matches!(self.commit_gate, CommitGateState::Ready)
     }
 
     /// Acquires one current immutable epoch for a read or resolve operation.
     /// # Errors
     ///
-    /// Returns an error when reads are no longer authorized or the bounded lease count cannot
-    /// advance.
+    /// Returns an error when reads are no longer authorized.
     pub(crate) fn acquire_epoch(&mut self) -> DriverResult<EpochLease> {
         self.failure.authorize_read()?;
-        self.epochs.acquire_current()
+        Ok(self.epochs.acquire_current())
     }
 
     /// Current epoch for one non-suspending projection.
@@ -524,20 +312,12 @@ impl VolumeRuntime {
     /// Returns an error when mutations are no longer authorized or ticket allocation overflows.
     pub(crate) fn admit_mutation(&mut self) -> DriverResult<(u64, MutationActivityLease)> {
         self.failure.authorize_mutation()?;
+        let activity = MutationActivityLease::acquire(&self.active_mutations)?;
         let ticket = self
             .coordinator
             .admit_mutation()
             .map_err(DriverError::from)?;
-        self.active_mutations = self
-            .active_mutations
-            .checked_add(1)
-            .ok_or(DriverError::InsufficientResources)?;
-        Ok((
-            ticket,
-            MutationActivityLease {
-                active_mutations: NonNull::from(&mut self.active_mutations),
-            },
-        ))
+        Ok((ticket, activity))
     }
 
     /// Mutable coordinator used only by infallible visibility/checkpoint publication.
@@ -548,19 +328,11 @@ impl VolumeRuntime {
     /// Reserves both post-commit epoch slots while allocation failure remains harmless.
     /// # Errors
     ///
-    /// Returns an error when mutations are not authorized, registry slots are exhausted, a slot
-    /// generation overflows, or stable epoch storage cannot be allocated.
-    /// # Safety
-    ///
-    /// This runtime must already reside inside its final heap-stable VCB.
-    pub(crate) unsafe fn reserve_epoch_publication(
-        &mut self,
-    ) -> DriverResult<EpochPublicationSlots> {
+    /// Returns an error when mutations are not authorized or stable epoch storage cannot be
+    /// allocated.
+    pub(crate) fn reserve_epoch_publication(&mut self) -> DriverResult<EpochPublicationSlots> {
         self.failure.authorize_mutation()?;
-        unsafe {
-            // SAFETY: The caller extends this runtime's stable-address guarantee to the registry.
-            self.epochs.reserve_publication()
-        }
+        self.epochs.reserve_publication()
     }
 
     /// Grants the commit slot if this ticket is currently eligible.
@@ -628,7 +400,7 @@ impl VolumeRuntime {
         let published: PublishedMutation = mutation.publish(self.coordinator_mut(), visibility);
         let (epoch, checkpoint) = published.into_parts();
         let sequence = epoch.sequence();
-        durable_slot.publish(epoch);
+        self.epochs.publish(durable_slot, epoch);
         self.commit_gate = CommitGateState::CheckpointPending { epoch: sequence };
         self.visibility_gate = VisibilityGateState::Ready;
         PendingCheckpoint {
@@ -649,7 +421,7 @@ impl VolumeRuntime {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
         let checkpointed = durability.completed(self.coordinator_mut());
-        publication.publish(checkpointed);
+        self.epochs.publish(publication, checkpointed);
         self.commit_gate = CommitGateState::Ready;
     }
 
@@ -679,6 +451,39 @@ impl VolumeRuntime {
         identifier: FscryptKeyIdentifier,
     ) -> FscryptKeyPresence {
         self.current_epoch().fscrypt_key_presence(identifier)
+    }
+}
+
+/// One admitted mutation that keeps its activity counter alive through every terminal path.
+#[derive(Debug)]
+pub(crate) struct MutationActivityLease {
+    /// Shared mutation-count owner retained independently from the runtime field.
+    active: Arc<AtomicU32>,
+}
+
+impl MutationActivityLease {
+    /// Increments the logical activity budget and returns its release authority.
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the finite mutation count is exhausted.
+    fn acquire(active: &Arc<AtomicU32>) -> DriverResult<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| DriverError::InsufficientResources)?;
+        Ok(Self {
+            active: Arc::clone(active),
+        })
+    }
+}
+
+impl Drop for MutationActivityLease {
+    fn drop(&mut self) {
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        if previous == 0 {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
     }
 }
 
