@@ -773,15 +773,6 @@ pub(crate) enum DirectoryHashVersion {
     TeaUnsigned,
 }
 
-/// Byte interpretation used by ext4 directory hash algorithms.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DirectoryHashByteInterpretation {
-    /// Interpret each name byte through signed 8-bit extension.
-    Signed,
-    /// Interpret each name byte as an unsigned value.
-    Unsigned,
-}
-
 impl DirectoryHashVersion {
     /// Converts the on-disk version byte to a supported hash version.
     /// # Errors
@@ -797,17 +788,6 @@ impl DirectoryHashVersion {
             4 => Ok(Self::HalfMd4Unsigned),
             5 => Ok(Self::TeaUnsigned),
             _ => Err(Error::UnsupportedDirectoryHash),
-        }
-    }
-
-    /// Returns how this version interprets name bytes.
-    #[must_use]
-    pub(crate) const fn byte_interpretation(self) -> DirectoryHashByteInterpretation {
-        match self {
-            Self::Legacy | Self::HalfMd4 | Self::Tea => DirectoryHashByteInterpretation::Signed,
-            Self::LegacyUnsigned | Self::HalfMd4Unsigned | Self::TeaUnsigned => {
-                DirectoryHashByteInterpretation::Unsigned
-            }
         }
     }
 

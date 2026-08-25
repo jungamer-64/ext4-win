@@ -48,8 +48,8 @@ struct HtreeScanCandidate {
 
 impl HtreeScanCandidate {
     /// Builds a candidate under the parsed root's hash authority.
-    fn new(entry: RawDirectoryEntry, hash: DirectoryHashContext) -> Self {
-        let name_hash = hash.hash_name(entry.name());
+    fn new(entry: RawDirectoryEntry, hash: DirectoryHashScheme) -> Self {
+        let name_hash = hash.hash(entry.name());
         Self {
             entry,
             hash: name_hash,
@@ -670,7 +670,7 @@ impl EpochReadView<'_, '_> {
         )?;
         let mut completed_collision_major = None;
         loop {
-            let hash = root.hash_context();
+            let hash = root.hash_scheme();
             let entries = self.read_sorted_htree_leaf(inode, tree, &path, hash)?;
             let mut next_path = path.try_clone()?;
             let has_next = self.advance_htree_path(
@@ -869,7 +869,7 @@ impl EpochReadView<'_, '_> {
         inode: &Inode,
         tree: &MutableExtentTree,
         path: &HtreePath,
-        hash: DirectoryHashContext,
+        hash: DirectoryHashScheme,
     ) -> Result<Vec<RawDirectoryEntry>> {
         let leaf = self.read_directory_logical_block(
             inode,
@@ -879,8 +879,8 @@ impl EpochReadView<'_, '_> {
         let mut entries = leaf.entries()?;
         path.hash_range()?.validate_leaf(&entries, hash)?;
         memory::heap_sort_by(&mut entries, |left, right| {
-            let left_hash = hash.hash_name(left.name());
-            let right_hash = hash.hash_name(right.name());
+            let left_hash = hash.hash(left.name());
+            let right_hash = hash.hash(right.name());
             left_hash
                 .cmp(&right_hash)
                 .then(left.name().bytes().cmp(right.name().bytes()))
@@ -1143,7 +1143,7 @@ impl EpochReadView<'_, '_> {
                 if let Some(entry) = root.dot_entries().iter().find(|entry| entry.name() == name) {
                     return Ok(Some(entry.try_clone()?));
                 }
-                let hash = root.hash_context().hash_name(name);
+                let hash = root.hash_scheme().hash(name);
                 let mut path = self.htree_path_for_hash(
                     inode,
                     &tree,
@@ -1160,7 +1160,7 @@ impl EpochReadView<'_, '_> {
                     )?;
                     let entries = leaf.entries()?;
                     path.hash_range()?
-                        .validate_leaf(&entries, root.hash_context())?;
+                        .validate_leaf(&entries, root.hash_scheme())?;
                     if let Some(entry) = entries.into_iter().find(|entry| entry.name() == name) {
                         return Ok(Some(entry));
                     }

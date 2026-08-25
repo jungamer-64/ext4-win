@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 
 use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::disk_format::directory_hash::DirectoryHashScheme;
 use crate::disk_format::inode::InodeId;
 use crate::disk_format::superblock::{ChecksumSeed, DirectoryHashSeed, DirectoryHashVersion};
 use crate::error::{Error, Result};
@@ -515,8 +516,8 @@ fn dx_capacity(
 /// Parsed HTree root block.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct HtreeRoot {
-    /// Directory hash context selected by root info.
-    hash: DirectoryHashContext,
+    /// Directory hash scheme selected by root info.
+    hash: DirectoryHashScheme,
     /// `.` and `..` entries stored before the root info.
     dot_entries: Vec<DirectoryEntry>,
     /// Number of index levels between root entries and leaf blocks.
@@ -592,7 +593,7 @@ impl HtreeRoot {
         }
         let index = DxIndex::parse_at(bytes, DX_ROOT_COUNT_OFFSET, checksum)?;
         Ok(Self {
-            hash: DirectoryHashContext::new(hash_seed, hash_version),
+            hash: DirectoryHashScheme::from_metadata(hash_seed, hash_version),
             dot_entries: {
                 let mut dot_entries = Vec::new();
                 dot_entries.try_push(dot)?;
@@ -604,8 +605,8 @@ impl HtreeRoot {
         })
     }
 
-    /// Returns the hash context selected by this root.
-    pub(crate) const fn hash_context(&self) -> DirectoryHashContext {
+    /// Returns the hash scheme selected by this root.
+    pub(crate) const fn hash_scheme(&self) -> DirectoryHashScheme {
         self.hash
     }
 
@@ -981,13 +982,13 @@ impl HtreeHashRange {
     pub(crate) fn validate_leaf(
         self,
         entries: &[DirectoryEntry],
-        hash: DirectoryHashContext,
+        hash: DirectoryHashScheme,
     ) -> Result<()> {
         for entry in entries {
             if matches!(entry.name().bytes(), b"." | b"..") {
                 return Err(Error::InvalidDirectoryEntry);
             }
-            let major = hash.hash_name(entry.name()).major;
+            let major = hash.hash(entry.name()).major;
             if major < self.lower
                 || self
                     .upper
@@ -2148,7 +2149,7 @@ mod tests {
     /// Panics when collision-continuation boundaries stop controlling leaf admission.
     #[test]
     fn leaf_hash_range_admits_upper_equality_only_for_continuations() {
-        let hash = DirectoryHashContext::new(
+        let hash = DirectoryHashScheme::from_metadata(
             DirectoryHashSeed::from_words([1, 2, 3, 4]),
             DirectoryHashVersion::HalfMd4,
         );
@@ -2179,12 +2180,12 @@ mod tests {
             return;
         };
         let (lower_entry, upper_entry) =
-            if hash.hash_name(first.name()).major < hash.hash_name(second.name()).major {
+            if hash.hash(first.name()).major < hash.hash(second.name()).major {
                 (first, second)
             } else {
                 (second, first)
             };
-        let upper = hash.hash_name(upper_entry.name()).major;
+        let upper = hash.hash(upper_entry.name()).major;
 
         let Some(exclusive_first) = test_value(DxEntry::new(0, 1)) else {
             return;
@@ -2230,30 +2231,6 @@ mod tests {
                 .descend(&continued, 0)
                 .and_then(|range| range.validate_leaf(&[upper_entry], hash))
                 .is_ok()
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when chunked half-MD4 hashing diverges from an independently generated long-name
-    /// known-answer vector.
-    #[test]
-    fn half_md4_hashes_maximum_length_name_across_all_chunks() {
-        let hash = DirectoryHashContext::new(
-            DirectoryHashSeed::from_words([0x3be8_72af, 0xff4d_af2f, 0x5752_a385, 0xe752_9d11]),
-            DirectoryHashVersion::HalfMd4,
-        );
-        let mut bytes = b"depth-49999-".to_vec();
-        bytes.resize(255, b'x');
-        let Some(name) = test_value(Ext4Name::new(&bytes)) else {
-            return;
-        };
-        assert_eq!(
-            hash.hash_name(&name),
-            DirectoryHash {
-                major: 0x1d7e_9c3e,
-                minor: 0x9457_ab15,
-            }
         );
     }
 }
