@@ -17,11 +17,10 @@ jobs:
       - name: Install pinned Rust and cargo-fuzz
         run: |
           rustup toolchain install nightly-2026-08-23 --profile minimal
-          cargo install --locked cargo-fuzz --version 0.13.2
-      - name: Replay mount corpus
-        run: cargo fuzz run mount_image fuzz/corpus/mount_image -- -runs=1
-      - name: Replay journal corpus
-        run: cargo fuzz run journal_recovery fuzz/corpus/journal_recovery -- -runs=1
+          cargo_fuzz_version="$(tr -d '\r\n' < fuzz/cargo-fuzz.version)"
+          cargo install --locked cargo-fuzz --version "${cargo_fuzz_version}"
+      - name: Replay tracked corpora
+        run: cargo xtask verify-fuzz-replay
 
   scheduled:
     if: github.event_name == 'schedule'
@@ -31,8 +30,10 @@ jobs:
       - name: Install pinned Rust and cargo-fuzz
         run: |
           rustup toolchain install nightly-2026-08-23 --profile minimal
-          cargo install --locked cargo-fuzz --version 0.13.2
-      - name: Fuzz mount images
-        run: cargo fuzz run mount_image -- -max_total_time=300
-      - name: Fuzz journal recovery
-        run: cargo fuzz run journal_recovery -- -max_total_time=300
+          cargo_fuzz_version="$(tr -d '\r\n' < fuzz/cargo-fuzz.version)"
+          cargo install --locked cargo-fuzz --version "${cargo_fuzz_version}"
+      - name: Run scheduled fuzz campaigns
+        run: |
+          while IFS= read -r target; do
+            cargo fuzz run "${target}" -- -max_total_time=300
+          done < <(cargo fuzz list)

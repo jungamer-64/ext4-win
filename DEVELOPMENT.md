@@ -11,6 +11,7 @@ below instead of substituting generic Cargo commands for a canonical gate.
 | --- | --- | --- |
 | `cargo xtask verify-portable` | Windows, Linux, or macOS | Checks formatting and all portable targets, then runs the portable tests and Clippy. |
 | `cargo xtask verify-driver` | Windows with MSVC and WDK configured | Checks, tests, lints, and builds rustdoc for the `ext4win` kernel-driver crate. It does not build a signed release package. |
+| `cargo xtask verify-fuzz-replay` | Host with the repository-pinned cargo-fuzz installed | Discovers every declared fuzz target and replays its tracked corpus once under the bounded fuzz harness. |
 | `cargo xtask verify-journal-interop` | Native Linux or Windows with WSL; e2fsprogs | Exercises ext4 mutation and recovery against independently generated `debugfs` and `e2fsck` evidence. |
 | `cargo xtask verify-htree-interop` | Native Linux or Windows with WSL; e2fsprogs and root loop-mount authority | Exercises bounded HTree lookup, paging, and local mutation against independently generated ext4 images. |
 | `cargo xtask verify-journal-fixture-provenance` | Native Linux or Windows with WSL; root loop-device authority and the manifest-pinned e2fsprogs release | Regenerates the tracked external-journal fixtures and requires byte-for-byte and digest equality. |
@@ -18,6 +19,10 @@ below instead of substituting generic Cargo commands for a canonical gate.
 | `cargo xtask check-live-driver-host` | Dedicated elevated Windows host with Hyper-V PowerShell, WSL/e2fsprogs, and Driver Verifier configured | Performs the read-only preflight for disposable live validation. |
 | `cargo xtask verify-live-vhdx` | A host that passes the live preflight | Builds a verified bundle and exercises it only against a newly created disposable VHDX. |
 | `cargo xtask cleanup-live-vhdx-session <session-id>` | Dedicated elevated Windows host | Reconciles an interrupted session and removes only resources whose recorded identities still match. |
+
+`verify-fuzz-replay` is the deterministic pull-request gate for previously retained inputs.
+The scheduled fuzz campaign remains a separate, time-bounded search rather than part of the
+signed production umbrella.
 
 ## Ext4 durability and interoperability
 
@@ -64,8 +69,9 @@ command neither reuses portable artifacts nor accepts stale release output.
 
 ## CI and live-driver boundaries
 
-CI runs `verify-portable` on Windows, Ubuntu, and macOS and runs ext4
-interoperability on Ubuntu. The production job requires the dedicated
+CI runs `verify-portable` on Windows, Ubuntu, and macOS, replays every tracked fuzz corpus on
+pull requests, runs time-bounded fuzz campaigns on schedule, and runs ext4 interoperability on
+Ubuntu. The production job requires the dedicated
 `[self-hosted, Windows, X64, ext4-win-wdk]` runner and is serialized globally.
 That runner contract includes MSVC, WDK, `cargo-wdk`, WSL, and e2fsprogs.
 
