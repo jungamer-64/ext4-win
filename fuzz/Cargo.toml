@@ -7,7 +7,6 @@ publish = false
 
 [package.metadata]
 cargo-fuzz = true
-cargo-fuzz-version = "0.13.2"
 
 [dependencies]
 ext4-core = { path = "../crates/ext4-core" }
