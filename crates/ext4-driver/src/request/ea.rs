@@ -326,10 +326,15 @@ fn query_ea(
     if length.as_usize() < required {
         return Err(DriverError::BufferTooSmall);
     }
-    let written = request.request.with_active(|active| {
-        let mut output = active.data_output(length)?;
-        pack_full_ea_entries(entries, output.as_mut_slice())
-    })?;
+    let mut packed = DriverVec::try_repeated_copy(0_u8, required)?;
+    let written = pack_full_ea_entries(entries, packed.as_mut_slice())?;
+    let source = packed
+        .as_slice()
+        .get(..written)
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    request
+        .request
+        .with_active(|active| active.requestor_output(length)?.copy_from(0, source))?;
     IrpCompletion::from_usize(written)
 }
 
@@ -454,8 +459,11 @@ fn parse_set_ea_entries(
     if length.is_empty() {
         return Ok(DriverVec::new());
     }
-    let input = target.data_input(length)?;
-    parse_full_ea_list(input.as_slice())
+    let mut snapshot = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
+    target
+        .requestor_input(length)?
+        .copy_to(snapshot.as_mut_slice())?;
+    parse_full_ea_list(snapshot.as_slice())
 }
 
 /// Parses FILE_GET_EA_INFORMATION selection from the query stack.

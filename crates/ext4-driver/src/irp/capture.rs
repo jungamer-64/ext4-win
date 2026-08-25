@@ -130,6 +130,14 @@ impl PreparedRead {
         self.output.address()
     }
 
+    /// Copies driver-owned bytes into one checked output window.
+    /// # Errors
+    ///
+    /// Returns an invariant error when the selected range exceeds the captured read output or the
+    /// native copy boundary rejects it.
+    pub(crate) fn copy_window(&mut self, offset: usize, source: &[u8]) -> DriverResult<()> {
+        self.output.copy_window(offset, source)
+    }
 }
 
 /// Non-empty system mapping retained by one pending data-transfer IRP.
@@ -142,8 +150,7 @@ struct CapturedDataMapping {
 }
 
 // SAFETY: The I/O Manager keeps the system buffer or locked MDL mapping valid until the owning IRP
-// completes. Direction-specific ownership controls whether the mapping becomes a Rust slice or is
-// consumed only through a native copy boundary.
+// completes. The mapping remains opaque and is consumed only through checked native copies.
 unsafe impl Send for CapturedDataMapping {}
 
 impl CapturedDataMapping {
@@ -198,6 +205,19 @@ impl CapturedReadOutput {
         }
     }
 
+    /// Copies driver-owned bytes into one checked range without admitting requestor memory into
+    /// Rust's aliasing model.
+    fn copy_window(&mut self, offset: usize, source: &[u8]) -> DriverResult<()> {
+        match self {
+            Self::Empty => super::copy_requestor_output_window(None, 0, offset, source),
+            Self::Mapped(mapping) => super::copy_requestor_output_window(
+                Some(mapping.address()),
+                mapping.len(),
+                offset,
+                source,
+            ),
+        }
+    }
 }
 
 /// Write parameters and system mapping captured before queue insertion.
@@ -305,28 +325,12 @@ impl CapturedWriteInput {
                 if destination.is_empty() {
                     return Ok(());
                 }
-                let source_length = wdk_sys::ULONG::try_from(mapping.len())
-                    .map_err(|_| DriverError::InternalInvariantViolation)?;
-                let source_offset = wdk_sys::ULONG::try_from(offset)
-                    .map_err(|_| DriverError::InternalInvariantViolation)?;
-                let destination_length = wdk_sys::ULONG::try_from(destination.len())
-                    .map_err(|_| DriverError::InternalInvariantViolation)?;
-                let status = unsafe {
-                    // SAFETY: The pending IRP retains `mapping`; checked arithmetic proves the
-                    // selected source window is in range, and `destination` is a distinct,
-                    // initialized driver-owned mutable range for the native copy.
-                    ffi::ext4win_copy_write_input_window(
-                        mapping.address().as_ptr().cast(),
-                        source_length,
-                        source_offset,
-                        destination.as_mut_ptr().cast(),
-                        destination_length,
-                    )
-                };
-                if status < STATUS_SUCCESS {
-                    return Err(DriverError::InternalInvariantViolation);
-                }
-                Ok(())
+                super::copy_requestor_input_window(
+                    Some(mapping.address()),
+                    mapping.len(),
+                    offset,
+                    destination,
+                )
             }
         }
     }
@@ -1534,7 +1538,7 @@ mod tests {
                         prepared.stack().key(),
                         crate::irp::ByteRangeLockKey::from_ulong(41)
                     );
-                    prepared.output_mut().fill(0x55);
+                    assert_eq!(prepared.copy_window(0, &[0x55; 32]), Ok(()));
                 }
             }
         }

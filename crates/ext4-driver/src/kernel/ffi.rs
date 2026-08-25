@@ -105,12 +105,21 @@ unsafe extern "C" {
 }
 
 unsafe extern "system" {
-    /// Copies one checked write-input window into driver-owned storage.
-    pub(crate) fn ext4win_copy_write_input_window(
+    /// Copies one checked requestor-input window into driver-owned storage.
+    pub(crate) fn ext4win_copy_requestor_input_window(
         source: *const core::ffi::c_void,
         source_length: wdk_sys::ULONG,
         source_offset: wdk_sys::ULONG,
         destination: wdk_sys::PVOID,
         destination_length: wdk_sys::ULONG,
+    ) -> wdk_sys::NTSTATUS;
+
+    /// Copies driver-owned bytes into one checked requestor-output window.
+    pub(crate) fn ext4win_copy_requestor_output_window(
+        destination: wdk_sys::PVOID,
+        destination_length: wdk_sys::ULONG,
+        destination_offset: wdk_sys::ULONG,
+        source: *const core::ffi::c_void,
+        source_length: wdk_sys::ULONG,
     ) -> wdk_sys::NTSTATUS;
 }

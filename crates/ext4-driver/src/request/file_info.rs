@@ -33,8 +33,8 @@ use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset
 
 use super::DriverMutationPass;
 
-/// Maximum requestor write bytes snapshotted into Rust-owned memory at one time.
-const MAX_WRITE_SNAPSHOT_BYTES: usize = 65_536;
+/// Maximum requestor data bytes copied through driver-owned memory at one time.
+const MAX_DATA_TRANSFER_WINDOW_BYTES: usize = 65_536;
 
 /// Captures one opened-handle lifecycle capability while the top-level IRP retains its contexts.
 /// # Errors
@@ -54,19 +54,19 @@ pub(crate) fn prepare_handle_admission(
     })
 }
 
-/// One non-empty, bounded source interval selected from a pending write IRP.
+/// One non-empty, bounded interval selected from a pending data-transfer IRP.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WriteSnapshotWindow {
-    /// Byte displacement from the start of the captured request input.
-    input_offset: usize,
-    /// Exact non-zero byte count copied before the next suspension point.
+struct DataTransferWindow {
+    /// Byte displacement from the start of the request transfer.
+    offset: usize,
+    /// Exact non-zero byte count copied in this interval.
     length: NonZeroUsize,
 }
 
-impl WriteSnapshotWindow {
-    /// Byte displacement from the start of the captured request input.
-    const fn input_offset(self) -> usize {
-        self.input_offset
+impl DataTransferWindow {
+    /// Byte displacement from the start of the request transfer.
+    const fn offset(self) -> usize {
+        self.offset
     }
 
     /// Exact byte count in this window.
@@ -75,9 +75,9 @@ impl WriteSnapshotWindow {
     }
 }
 
-/// Monotonic state machine partitioning one non-empty write into bounded snapshots.
+/// Monotonic state machine partitioning one non-empty data transfer into bounded copies.
 #[derive(Debug)]
-struct WriteSnapshotWindows {
+struct DataTransferWindows {
     /// Exact request byte count.
     total: NonZeroUsize,
     /// Prefix already selected for transfer.
@@ -110,7 +110,7 @@ impl PreparedWritePublication {
     }
 }
 
-impl WriteSnapshotWindows {
+impl DataTransferWindows {
     /// Starts at the first byte of one non-empty request.
     const fn new(total: NonZeroUsize) -> Self {
         Self {
@@ -121,10 +121,10 @@ impl WriteSnapshotWindows {
 
     /// Required reusable snapshot allocation size.
     const fn snapshot_capacity(&self) -> usize {
-        if self.total.get() < MAX_WRITE_SNAPSHOT_BYTES {
+        if self.total.get() < MAX_DATA_TRANSFER_WINDOW_BYTES {
             self.total.get()
         } else {
-            MAX_WRITE_SNAPSHOT_BYTES
+            MAX_DATA_TRANSFER_WINDOW_BYTES
         }
     }
 
@@ -132,18 +132,19 @@ impl WriteSnapshotWindows {
     /// # Errors
     ///
     /// Returns an invariant error if internal progress no longer describes a prefix of `total`.
-    fn next_window(&mut self) -> DriverResult<Option<WriteSnapshotWindow>> {
+    fn next_window(&mut self) -> DriverResult<Option<DataTransferWindow>> {
         let remaining = self
             .total
             .get()
             .checked_sub(self.completed)
             .ok_or(DriverError::InternalInvariantViolation)?;
-        let Some(length) = NonZeroUsize::new(core::cmp::min(remaining, MAX_WRITE_SNAPSHOT_BYTES))
+        let Some(length) =
+            NonZeroUsize::new(core::cmp::min(remaining, MAX_DATA_TRANSFER_WINDOW_BYTES))
         else {
             return Ok(None);
         };
-        let window = WriteSnapshotWindow {
-            input_offset: self.completed,
+        let window = DataTransferWindow {
+            offset: self.completed,
             length,
         };
         self.completed = self
@@ -1887,16 +1888,11 @@ pub(crate) fn query_directory(
     let information = result.unwrap_or(0);
     request.with_active(|active| {
         if result.is_ok() {
-            let mut output = active.data_output(length)?;
-            let destination = output
-                .as_mut_slice()
-                .get_mut(..information)
-                .ok_or(DriverError::InternalInvariantViolation)?;
             let source = packed
                 .as_slice()
                 .get(..information)
                 .ok_or(DriverError::InternalInvariantViolation)?;
-            memory::copy_exact(destination, source)?;
+            active.requestor_output(length)?.copy_from(0, source)?;
         }
         if publish_cursor {
             let file_object = active.current_stack()?.file_object()?;
@@ -3942,7 +3938,7 @@ fn regular_file_end(
     Ok(end)
 }
 
-/// Reads a regular file directly into the output mapping owned by the pending read IRP.
+/// Reads a regular file through bounded driver-owned windows into the pending read IRP.
 /// # Errors
 ///
 /// Returns an error when the captured read contract, opened FILE_OBJECT, transfer alignment,
@@ -3953,7 +3949,7 @@ fn read_regular_file_direct(
 ) -> DriverResult<IrpCompletion> {
     let stack = request.prepared_read()?.stack();
     let output_address = request.prepared_read()?.output_address();
-    let Some((file_id, kind, range, data_transfer_mode)) = request.with_active(|active| {
+    let Some((file_id, kind, range)) = request.with_active(|active| {
         let kind = active.data_io_kind();
         let file_object = active.current_stack()?.file_object()?;
         let mut opened_file = OpenedRegularFile::decode(file_object)?;
@@ -3980,20 +3976,37 @@ fn read_regular_file_direct(
         {
             return Err(DriverError::FileLockConflict);
         }
-        Ok(Some((opened_file.id(), kind, range, data_transfer_mode)))
+        Ok(Some((opened_file.id(), kind, range)))
     })?
     else {
         return Ok(IrpCompletion::EMPTY);
     };
 
     let file = read.load_file(file_id)?;
-    let bytes_read = {
-        let output = request.prepared_read_mut()?.output_mut();
-        data_transfer_mode.validate_buffer(
-            NonNull::new(output.as_mut_ptr()).ok_or(DriverError::InternalInvariantViolation)?,
-        )?;
-        read.read_file(&file, range.start(), output)?.as_usize()
-    };
+    let total = NonZeroUsize::new(range.length()).ok_or(DriverError::InternalInvariantViolation)?;
+    let mut windows = DataTransferWindows::new(total);
+    let mut snapshot = DriverVec::try_repeated_copy(0_u8, windows.snapshot_capacity())?;
+    let mut bytes_read = 0_usize;
+    while let Some(window) = windows.next_window()? {
+        let chunk = snapshot
+            .as_mut_slice()
+            .get_mut(..window.length())
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        let chunk_offset = range.start().checked_add_len(window.offset())?;
+        let chunk_read = read.read_file(&file, chunk_offset, chunk)?.as_usize();
+        let source = chunk
+            .get(..chunk_read)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        request
+            .prepared_read_mut()?
+            .copy_window(window.offset(), source)?;
+        bytes_read = bytes_read
+            .checked_add(chunk_read)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        if chunk_read != window.length() {
+            break;
+        }
+    }
     request.with_active(|active| {
         let file_object = active.current_stack()?.file_object()?;
         let mut opened_file = OpenedRegularFile::decode(file_object)?;
@@ -4063,7 +4076,7 @@ fn write_regular_file_windowed(
     let bytes_written = {
         let total = NonZeroUsize::new(stack.length().as_usize())
             .ok_or(DriverError::InternalInvariantViolation)?;
-        let mut windows = WriteSnapshotWindows::new(total);
+        let mut windows = DataTransferWindows::new(total);
         let mut snapshot = DriverVec::try_repeated_copy(0_u8, windows.snapshot_capacity())?;
         let file = mutation.file(file_id)?;
         while let Some(window) = windows.next_window()? {
@@ -4073,8 +4086,8 @@ fn write_regular_file_windowed(
                 .ok_or(DriverError::InternalInvariantViolation)?;
             request
                 .prepared_write()?
-                .copy_window(window.input_offset(), chunk)?;
-            let chunk_offset = range.start().checked_add_len(window.input_offset())?;
+                .copy_window(window.offset(), chunk)?;
+            let chunk_offset = range.start().checked_add_len(window.offset())?;
             mutation.write_file_range(file, chunk_offset, chunk)?;
         }
         windows.completed()
@@ -4281,30 +4294,33 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when non-empty write progress is not exhaustive, ordered, or snapshot-bounded.
+    /// Panics when non-empty transfer progress is not exhaustive, ordered, or window-bounded.
     #[test]
-    fn write_snapshot_windows_partition_the_exact_request() {
-        let total_value = super::MAX_WRITE_SNAPSHOT_BYTES
+    fn data_transfer_windows_partition_the_exact_request() {
+        let total_value = super::MAX_DATA_TRANSFER_WINDOW_BYTES
             .saturating_mul(2)
             .saturating_add(17);
         let Some(total) = core::num::NonZeroUsize::new(total_value) else {
             return;
         };
-        let mut windows = super::WriteSnapshotWindows::new(total);
-        assert_eq!(windows.snapshot_capacity(), super::MAX_WRITE_SNAPSHOT_BYTES);
+        let mut windows = super::DataTransferWindows::new(total);
+        assert_eq!(
+            windows.snapshot_capacity(),
+            super::MAX_DATA_TRANSFER_WINDOW_BYTES
+        );
 
         for (expected_offset, expected_length) in [
-            (0, super::MAX_WRITE_SNAPSHOT_BYTES),
+            (0, super::MAX_DATA_TRANSFER_WINDOW_BYTES),
             (
-                super::MAX_WRITE_SNAPSHOT_BYTES,
-                super::MAX_WRITE_SNAPSHOT_BYTES,
+                super::MAX_DATA_TRANSFER_WINDOW_BYTES,
+                super::MAX_DATA_TRANSFER_WINDOW_BYTES,
             ),
-            (super::MAX_WRITE_SNAPSHOT_BYTES.saturating_mul(2), 17),
+            (super::MAX_DATA_TRANSFER_WINDOW_BYTES.saturating_mul(2), 17),
         ] {
             let window = windows.next_window();
             assert!(window.is_ok());
             if let Ok(Some(window)) = window {
-                assert_eq!(window.input_offset(), expected_offset);
+                assert_eq!(window.offset(), expected_offset);
                 assert_eq!(window.length(), expected_length);
             } else {
                 return;
@@ -4316,12 +4332,12 @@ mod tests {
         let Some(one_byte) = core::num::NonZeroUsize::new(1) else {
             return;
         };
-        let mut minimum = super::WriteSnapshotWindows::new(one_byte);
+        let mut minimum = super::DataTransferWindows::new(one_byte);
         assert_eq!(minimum.snapshot_capacity(), 1);
         assert_eq!(
             minimum.next_window(),
-            Ok(Some(super::WriteSnapshotWindow {
-                input_offset: 0,
+            Ok(Some(super::DataTransferWindow {
+                offset: 0,
                 length: one_byte,
             }))
         );

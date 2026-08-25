@@ -461,6 +461,32 @@ impl ActiveIrp<'_> {
         BufferedOutput::from_active(self.associated_system_buffer()?, length.as_usize())
     }
 
+    /// Returns an opaque requestor-input range tied to this active owner borrow.
+    ///
+    /// The range can only be copied into driver-owned storage; it never becomes a Rust slice.
+    /// # Errors
+    ///
+    /// Returns an error when neither a system buffer nor a mapped MDL covers `length`.
+    pub(crate) fn requestor_input(
+        &self,
+        length: IrpBufferLength,
+    ) -> Result<RequestorInput<'_>, DriverError> {
+        RequestorInput::from_active(self.requestor_buffer(length)?)
+    }
+
+    /// Returns an opaque requestor-output range tied to this active owner borrow.
+    ///
+    /// The range can only receive bytes from driver-owned storage; it never becomes a Rust slice.
+    /// # Errors
+    ///
+    /// Returns an error when neither a system buffer nor a mapped MDL covers `length`.
+    pub(crate) fn requestor_output(
+        &mut self,
+        length: IrpBufferLength,
+    ) -> Result<RequestorOutput<'_>, DriverError> {
+        RequestorOutput::from_active(self.requestor_buffer(length)?)
+    }
+
     /// Returns read-like IRP data bytes tied to this active owner borrow.
     /// # Errors
     ///
@@ -544,6 +570,160 @@ impl ActiveIrp<'_> {
         };
         mdl_data_buffer_address(mdl, length)
     }
+
+    /// Captures an opaque requestor buffer without creating a Rust reference to its bytes.
+    fn requestor_buffer(&self, length: IrpBufferLength) -> DriverResult<RequestorBuffer> {
+        let length = length.as_usize();
+        let address = if length == 0 {
+            None
+        } else {
+            Some(self.data_buffer_address(IrpBufferLength::from_usize(length)?)?)
+        };
+        Ok(RequestorBuffer { address, length })
+    }
+}
+
+/// Opaque requestor-backed range that never participates in Rust's reference aliasing model.
+#[derive(Clone, Copy, Debug)]
+struct RequestorBuffer {
+    /// First byte when the range is non-empty.
+    address: Option<NonNull<u8>>,
+    /// Exact mapped byte count.
+    length: usize,
+}
+
+/// Requestor input that may only be snapshotted into driver-owned storage.
+#[derive(Debug)]
+pub(crate) struct RequestorInput<'owner> {
+    /// Opaque requestor-backed range.
+    buffer: RequestorBuffer,
+    /// Prevents use after the active completion owner is released.
+    owner: core::marker::PhantomData<&'owner ()>,
+}
+
+impl RequestorInput<'_> {
+    /// Binds an opaque range to the active completion-owner lifetime.
+    fn from_active(buffer: RequestorBuffer) -> DriverResult<Self> {
+        Ok(Self {
+            buffer,
+            owner: core::marker::PhantomData,
+        })
+    }
+
+    /// Snapshots the complete input into equally sized driver-owned storage.
+    /// # Errors
+    ///
+    /// Returns an error when the destination length differs or the native copy rejects the range.
+    pub(crate) fn copy_to(&self, destination: &mut [u8]) -> DriverResult<()> {
+        copy_requestor_input_window(self.buffer.address, self.buffer.length, 0, destination)
+    }
+}
+
+/// Requestor output that may only receive bytes from driver-owned storage.
+#[derive(Debug)]
+pub(crate) struct RequestorOutput<'owner> {
+    /// Opaque requestor-backed range.
+    buffer: RequestorBuffer,
+    /// Prevents use after the active completion owner is released.
+    owner: core::marker::PhantomData<&'owner mut ()>,
+}
+
+impl RequestorOutput<'_> {
+    /// Binds an opaque range to the active completion-owner lifetime.
+    fn from_active(buffer: RequestorBuffer) -> DriverResult<Self> {
+        Ok(Self {
+            buffer,
+            owner: core::marker::PhantomData,
+        })
+    }
+
+    /// Copies driver-owned bytes to `offset` in the requestor output.
+    /// # Errors
+    ///
+    /// Returns an error when the selected range exceeds the output or native copy rejects it.
+    pub(crate) fn copy_from(&mut self, offset: usize, source: &[u8]) -> DriverResult<()> {
+        copy_requestor_output_window(self.buffer.address, self.buffer.length, offset, source)
+    }
+}
+
+/// Copies one checked requestor-input window into driver-owned storage.
+fn copy_requestor_input_window(
+    address: Option<NonNull<u8>>,
+    total_length: usize,
+    offset: usize,
+    destination: &mut [u8],
+) -> DriverResult<()> {
+    let end = offset
+        .checked_add(destination.len())
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    if end > total_length {
+        return Err(DriverError::InternalInvariantViolation);
+    }
+    if destination.is_empty() {
+        return Ok(());
+    }
+    let address = address.ok_or(DriverError::InternalInvariantViolation)?;
+    let source_length = wdk_sys::ULONG::try_from(total_length)
+        .map_err(|_| DriverError::InternalInvariantViolation)?;
+    let source_offset =
+        wdk_sys::ULONG::try_from(offset).map_err(|_| DriverError::InternalInvariantViolation)?;
+    let destination_length = wdk_sys::ULONG::try_from(destination.len())
+        .map_err(|_| DriverError::InternalInvariantViolation)?;
+    let status = unsafe {
+        // SAFETY: The active or pending IRP owns `address` for `total_length`; checked arithmetic
+        // selects an in-range source window, and `destination` is driver-owned mutable storage.
+        ffi::ext4win_copy_requestor_input_window(
+            address.as_ptr().cast(),
+            source_length,
+            source_offset,
+            destination.as_mut_ptr().cast(),
+            destination_length,
+        )
+    };
+    if status < STATUS_SUCCESS {
+        return Err(DriverError::InternalInvariantViolation);
+    }
+    Ok(())
+}
+
+/// Copies driver-owned bytes into one checked requestor-output window.
+fn copy_requestor_output_window(
+    address: Option<NonNull<u8>>,
+    total_length: usize,
+    offset: usize,
+    source: &[u8],
+) -> DriverResult<()> {
+    let end = offset
+        .checked_add(source.len())
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    if end > total_length {
+        return Err(DriverError::InternalInvariantViolation);
+    }
+    if source.is_empty() {
+        return Ok(());
+    }
+    let address = address.ok_or(DriverError::InternalInvariantViolation)?;
+    let destination_length = wdk_sys::ULONG::try_from(total_length)
+        .map_err(|_| DriverError::InternalInvariantViolation)?;
+    let destination_offset =
+        wdk_sys::ULONG::try_from(offset).map_err(|_| DriverError::InternalInvariantViolation)?;
+    let source_length = wdk_sys::ULONG::try_from(source.len())
+        .map_err(|_| DriverError::InternalInvariantViolation)?;
+    let status = unsafe {
+        // SAFETY: The active or pending IRP owns `address` for `total_length`; checked arithmetic
+        // selects an in-range destination window, and `source` is initialized driver-owned bytes.
+        ffi::ext4win_copy_requestor_output_window(
+            address.as_ptr().cast(),
+            destination_length,
+            destination_offset,
+            source.as_ptr().cast(),
+            source_length,
+        )
+    };
+    if status < STATUS_SUCCESS {
+        return Err(DriverError::InternalInvariantViolation);
+    }
+    Ok(())
 }
 
 /// Opaque kernel process identity used solely for native byte-range lock ownership.
@@ -1717,7 +1897,6 @@ impl IrpByteBuffer {
             core::slice::from_raw_parts_mut(self.address.as_ptr(), self.length)
         }
     }
-
 }
 
 /// Immutable bytes decoded from a buffered or data-input IRP boundary.
@@ -1745,7 +1924,6 @@ impl BufferedInput<'_> {
     pub(crate) fn as_slice(&self) -> &[u8] {
         self.bytes.as_slice()
     }
-
 }
 
 /// Mutable bytes decoded from a buffered or data-output IRP boundary.
