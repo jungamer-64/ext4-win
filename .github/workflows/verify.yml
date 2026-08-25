@@ -73,8 +73,11 @@ jobs:
       - name: Verify journal interoperability
         run: cargo xtask verify-journal-interop
 
+      - name: Build HTree interoperability verifier
+        run: cargo build --locked --package xtask
+
       - name: Verify HTree interoperability
-        run: sudo --preserve-env=PATH cargo xtask verify-htree-interop
+        run: sudo ./target/debug/xtask verify-htree-interop
 
 
   production-driver:
