@@ -80,6 +80,10 @@ const JBD2_TAG_FLAG_LAST_TAG: u32 = 0x0008;
 const JBD2_CHECKSUM_CRC32C: u8 = 4;
 /// Bytes occupied by the common JBD2 control block header.
 const JOURNAL_HEADER_BYTES: usize = 12;
+/// Byte offset of the checksum that authenticates a metadata-checksummed commit block.
+const JOURNAL_COMMIT_CHECKSUM_OFFSET: usize = 0x10;
+/// Full commit-header storage, including the trailing alignment bytes before block padding.
+const JOURNAL_COMMIT_HEADER_BYTES: usize = 0x40;
 /// Bytes occupied by the JBD2 superblock payload.
 const JOURNAL_SUPERBLOCK_BYTES: usize = 1024;
 /// One descriptor block and one commit block are the minimum transaction overhead.
@@ -2139,8 +2143,13 @@ impl<State> Journal<State> {
         )?;
         Jbd2Header::commit(sequence.get()).encode(&mut block)?;
         if self.profile.has_metadata_checksums() {
-            let checksum = self.block_checksum_with_zeroed(&block, 0x10)?;
-            put_be_u32(&mut block, disk_offset(0x10), checksum)?;
+            let checksum =
+                self.block_checksum_with_zeroed(&block, JOURNAL_COMMIT_CHECKSUM_OFFSET)?;
+            put_be_u32(
+                &mut block,
+                disk_offset(JOURNAL_COMMIT_CHECKSUM_OFFSET),
+                checksum,
+            )?;
         }
         Ok(block)
     }
@@ -2293,19 +2302,66 @@ impl<State> Journal<State> {
         put_be_u32(block, disk_offset(offset), checksum)
     }
 
-    /// Verifies the checksum field embedded in a commit block.
+    /// Verifies the checksum field embedded in a complete or partially persisted commit block.
     /// # Errors
     ///
-    /// Returns an error when the commit checksum field is truncated or does not match the block
-    /// checksum with that field zeroed.
+    /// Returns an error when the commit checksum field or complete header is truncated, or neither
+    /// the observed block nor the authenticated header with zero-filled block padding matches.
     fn verify_commit_checksum(&self, block: &[u8]) -> Result<()> {
-        let expected = be_u32(block, disk_offset(0x10))?;
-        let actual = self.block_checksum_with_zeroed(block, 0x10)?;
-        if expected == actual {
+        let expected = be_u32(block, disk_offset(JOURNAL_COMMIT_CHECKSUM_OFFSET))?;
+        let complete = self.block_checksum_with_zeroed(block, JOURNAL_COMMIT_CHECKSUM_OFFSET)?;
+        if expected == complete {
+            return Ok(());
+        }
+        let zero_filled_tail = self.commit_checksum_with_zero_filled_tail(block)?;
+        if expected == zero_filled_tail {
             Ok(())
         } else {
             Err(Error::ChecksumMismatch)
         }
+    }
+
+    /// Authenticates the persisted commit header while reconstructing unwritten padding as zeroes.
+    ///
+    /// A freshly encoded commit fills the block after its fixed header with zeroes. Storage may
+    /// persist the sector containing that header while retaining stale later sectors. Computing
+    /// the checksum over this reconstructed representation preserves that crash-recovery contract
+    /// without allocating during the committed-prefix scan.
+    /// # Errors
+    ///
+    /// Returns an error when the fixed commit header or checksum field is truncated.
+    fn commit_checksum_with_zero_filled_tail(&self, block: &[u8]) -> Result<u32> {
+        const ZERO_CHUNK: [u8; 64] = [0; 64];
+
+        let header = block
+            .get(..JOURNAL_COMMIT_HEADER_BYTES)
+            .ok_or(Error::TruncatedStructure)?;
+        let checksum_end = JOURNAL_COMMIT_CHECKSUM_OFFSET
+            .checked_add(4)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let prefix = header
+            .get(..JOURNAL_COMMIT_CHECKSUM_OFFSET)
+            .ok_or(Error::TruncatedStructure)?;
+        let suffix = header
+            .get(checksum_end..)
+            .ok_or(Error::TruncatedStructure)?;
+        let seed = ext4_crc32c(u32::MAX, self.superblock.uuid());
+        let seed = ext4_crc32c(seed, prefix);
+        let seed = ext4_crc32c(seed, &[0_u8; 4]);
+        let mut seed = ext4_crc32c(seed, suffix);
+        let mut remaining = block
+            .len()
+            .checked_sub(header.len())
+            .ok_or(Error::TruncatedStructure)?;
+        while remaining != 0 {
+            let count = remaining.min(ZERO_CHUNK.len());
+            let zeroes = ZERO_CHUNK.get(..count).ok_or(Error::TruncatedStructure)?;
+            seed = ext4_crc32c(seed, zeroes);
+            remaining = remaining
+                .checked_sub(zeroes.len())
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        Ok(seed)
     }
 
     /// Computes a control-block checksum with its checksum field zeroed.
@@ -3203,11 +3259,11 @@ mod tests {
         JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT,
         JBD2_FEATURE_INCOMPAT_CSUM_V2, JBD2_FEATURE_INCOMPAT_CSUM_V3,
         JBD2_FEATURE_INCOMPAT_FAST_COMMIT, JBD2_FEATURE_INCOMPAT_REVOKE, JBD2_REVOKE_BLOCK,
-        JBD2_TAG_FLAG_LAST_TAG, JBD2_TAG_FLAG_SAME_UUID, JOURNAL_HEADER_BYTES,
-        JOURNAL_SUPERBLOCK_BYTES, Jbd2Header, Journal, JournalCursor, JournalGeometry,
-        JournalLocation, JournalProfile, JournalRecoveryOperation, JournalRing, JournalSequence,
-        JournalSuperblock, JournalSuperblockVersion, LoadedJournal, MetadataBlock, RecoveryPhase,
-        RecoveryRevoke, journal_superblock_checksum,
+        JBD2_TAG_FLAG_LAST_TAG, JBD2_TAG_FLAG_SAME_UUID, JOURNAL_COMMIT_CHECKSUM_OFFSET,
+        JOURNAL_HEADER_BYTES, JOURNAL_SUPERBLOCK_BYTES, Jbd2Header, Journal, JournalCursor,
+        JournalGeometry, JournalLocation, JournalProfile, JournalRecoveryOperation, JournalRing,
+        JournalSequence, JournalSuperblock, JournalSuperblockVersion, LoadedJournal, MetadataBlock,
+        RecoveryPhase, RecoveryRevoke, journal_superblock_checksum,
     };
 
     /// Stable UUID used by private JBD2 wire fixtures.
@@ -3290,6 +3346,32 @@ mod tests {
             filesystem_blocks,
             state: PhantomData,
         })
+    }
+
+    /// Builds a known-answer commit whose first sector is durable and later sector remains stale.
+    /// # Errors
+    ///
+    /// Returns an error when fixed fixture fields fall outside the journal block.
+    fn partial_commit_block_fixture() -> Result<Vec<u8>> {
+        let mut block = vec![0_u8; 1024];
+        crate::memory::copy_exact(
+            block
+                .get_mut(..JOURNAL_HEADER_BYTES)
+                .ok_or(Error::TruncatedStructure)?,
+            &[
+                0xC0, 0x3B, 0x39, 0x98, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x11,
+            ],
+        )?;
+        put_be_u32(
+            &mut block,
+            DiskOffset::new(JOURNAL_COMMIT_CHECKSUM_OFFSET),
+            0xF3C6_0B55,
+        )?;
+        block
+            .get_mut(512..)
+            .ok_or(Error::TruncatedStructure)?
+            .fill(0xA5);
+        Ok(block)
     }
 
     /// Creates one initialized extent for internal-journal layout tests.
@@ -3547,6 +3629,36 @@ mod tests {
                 assert_eq!(
                     journal.parse_commit_block(&invalid, JournalSequence::new(8)),
                     Err(Error::JournalCorrupt)
+                );
+            }
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when checksum-v2/v3 recovery rejects an authenticated partial commit or accepts a
+    /// corrupted persisted header.
+    #[test]
+    fn metadata_checksum_commit_accepts_only_authenticated_zero_filled_tail() {
+        let outcome = (|| -> Result<()> {
+            for incompat in [JBD2_FEATURE_INCOMPAT_CSUM_V2, JBD2_FEATURE_INCOMPAT_CSUM_V3] {
+                let journal =
+                    test_external_journal::<LoadedJournal>(0, incompat, 64, 17, 3, 3, 1_000)?;
+                let partial = partial_commit_block_fixture()?;
+                assert_ne!(
+                    journal.block_checksum_with_zeroed(&partial, JOURNAL_COMMIT_CHECKSUM_OFFSET,)?,
+                    0xF3C6_0B55
+                );
+                journal.parse_commit_block(&partial, JournalSequence::new(17))?;
+
+                let mut corrupted = partial_commit_block_fixture()?;
+                let commit_second = corrupted.get_mut(0x30).ok_or(Error::TruncatedStructure)?;
+                *commit_second ^= 0x01;
+                assert_eq!(
+                    journal.parse_commit_block(&corrupted, JournalSequence::new(17)),
+                    Err(Error::ChecksumMismatch)
                 );
             }
             Ok(())
@@ -3920,9 +4032,10 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when a torn commit becomes committed or committed descriptor corruption is ignored.
+    /// Panics when an unauthenticated torn commit becomes committed, an authenticated partial
+    /// commit is discarded, or committed descriptor corruption is ignored.
     #[test]
-    fn recovery_discards_torn_commit_but_rejects_committed_corruption() {
+    fn recovery_accepts_authenticated_partial_commit_and_rejects_corruption() {
         let outcome = (|| -> Result<()> {
             let journal = test_external_journal::<LoadedJournal>(
                 0,
@@ -3943,6 +4056,19 @@ mod tests {
             )?;
             let commit = journal
                 .encode_commit_block(JournalSequence::new(17), journal.geometry.block_size)?;
+
+            let mut partial_recovery = JournalRecoveryOperation::new(
+                journal.copy_without_state::<LoadedJournal>()?,
+                RecoveryState::NeedsRecovery,
+            )?;
+            partial_recovery.scan_control_block(&descriptor)?;
+            partial_recovery.scan_control_block(&partial_commit_block_fixture()?)?;
+            partial_recovery.finish_scan()?;
+            assert_eq!(partial_recovery.summary.transactions, 1);
+            assert_eq!(
+                partial_recovery.summary.next_sequence,
+                JournalSequence::new(18)
+            );
 
             let mut torn = commit.clone();
             let checksum_byte = torn.get_mut(0x10).ok_or(Error::TruncatedStructure)?;

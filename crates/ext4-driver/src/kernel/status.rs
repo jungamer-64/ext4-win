@@ -221,7 +221,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
 mod tests {
     use ext4_core::Error;
     use wdk_sys::{
-        STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL, STATUS_FILE_CORRUPT_ERROR,
+        STATUS_CANCELLED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL, STATUS_FILE_CORRUPT_ERROR,
         STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_COLLISION,
         STATUS_OBJECT_NAME_NOT_FOUND, STATUS_VOLUME_DIRTY,
     };
@@ -283,6 +283,17 @@ mod tests {
         assert_eq!(
             DriverError::from(Error::UnsupportedVerity).ntstatus(),
             STATUS_NOT_SUPPORTED
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when cancellation loses its exact Windows completion status.
+    #[test]
+    fn cancellation_maps_to_status_cancelled() {
+        assert_eq!(
+            DriverError::from(Error::OperationCancelled).ntstatus(),
+            STATUS_CANCELLED
         );
     }
 

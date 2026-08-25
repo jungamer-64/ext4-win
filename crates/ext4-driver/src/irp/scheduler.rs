@@ -1042,6 +1042,51 @@ mod tests {
         }
     }
 
+    /// Verifies pre-commit cancellation resumes without entering lower I/O and leaves no grant.
+    /// # Panics
+    ///
+    /// Panics when intent/commit waiting cancellation retains authority or enters a lower phase.
+    #[test]
+    fn precommit_cancellation_releases_scheduler_authority() {
+        let mut scheduler = Scheduler::new();
+
+        let intent_waiter = require_some!(scheduler.reserve());
+        let intent_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
+        assert_eq!(
+            scheduler.request_intent(intent_waiter, IntentRequest::new(1, intent_resources),),
+            Some(super::IntentDisposition::Queued)
+        );
+        assert_eq!(
+            scheduler.request_cancel(intent_waiter.index()),
+            CancelDisposition::ResumeOperation
+        );
+        let resumed_intent = require_some!(scheduler.take_ready());
+        assert_eq!(resumed_intent, intent_waiter);
+        assert!(scheduler.checkpoint_authority_is_clear(resumed_intent));
+        assert!(scheduler.complete(resumed_intent));
+
+        let commit_waiter = require_some!(scheduler.reserve());
+        let commit_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
+        assert_eq!(
+            scheduler.request_intent(commit_waiter, IntentRequest::new(2, commit_resources),),
+            Some(super::IntentDisposition::Queued)
+        );
+        assert_eq!(scheduler.grant_next_intent(), Some((commit_waiter, 2)));
+        assert!(scheduler.request_commit(commit_waiter, 2));
+        assert_eq!(
+            scheduler.request_cancel(commit_waiter.index()),
+            CancelDisposition::ResumeOperation
+        );
+        let resumed_commit = require_some!(scheduler.take_ready());
+        assert_eq!(resumed_commit, commit_waiter);
+        assert!(!scheduler.checkpoint_authority_is_clear(resumed_commit));
+        assert!(scheduler.release_intent(resumed_commit));
+        assert_eq!(scheduler.abandon_commit(resumed_commit), None);
+        assert!(scheduler.checkpoint_authority_is_clear(resumed_commit));
+        assert!(!scheduler.has_commit_work());
+        assert!(scheduler.complete(resumed_commit));
+    }
+
     /// Verifies terminal admission closure while already-active work remains completable.
     /// # Panics
     ///
