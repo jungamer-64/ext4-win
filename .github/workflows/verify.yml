@@ -81,7 +81,7 @@ jobs:
 
 
   production-driver:
-    name: signed production driver (WDK 28000)
+    name: hosted kernel-load smoke (WDK 28000)
     runs-on: windows-2025-vs2026
     timeout-minutes: 90
 
@@ -459,46 +459,82 @@ jobs:
           Write-Host ""
           Write-Host "Searching for WDRLocalTestCert.cer..."
 
-          $cert = Get-ChildItem `
+          $certFiles = @(Get-ChildItem `
             -Path "$env:GITHUB_WORKSPACE\target" `
             -Filter "WDRLocalTestCert.cer" `
             -File `
             -Recurse `
-            -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
+            -ErrorAction SilentlyContinue)
 
-          if (-not $cert) {
+          if ($certFiles.Count -eq 0) {
             throw "cargo-wdk did not produce WDRLocalTestCert.cer"
           }
 
+          $certificates = @($certFiles | ForEach-Object {
+            [PSCustomObject]@{
+              File = $_
+              Certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($_.FullName)
+            }
+          })
+          $thumbprints = @($certificates.Certificate.Thumbprint | Sort-Object -Unique)
+
+          if ($thumbprints.Count -ne 1) {
+            throw "cargo-wdk produced multiple WDRLocalTestCert identities: $($thumbprints -join ', ')"
+          }
+
+          $certificateRecord = $certificates |
+            Sort-Object { $_.File.LastWriteTime } -Descending |
+            Select-Object -First 1
+          $thumbprint = $thumbprints[0]
+
           Write-Host ""
-          Write-Host "Generated certificate:"
-          Write-Host $cert.FullName
+          Write-Host "Generated certificate identity: $thumbprint"
+          Write-Host "Selected certificate file: $($certificateRecord.File.FullName)"
 
           #
-          # Required by cargo-wdk --verify-signature.
+          # Root is required by cargo-wdk --verify-signature;
+          # TrustedPublisher admits the test-signed package install.
           #
           # The GitHub-hosted Windows VM is ephemeral and
           # discarded after the job completes.
           #
-          Import-Certificate `
-            -FilePath $cert.FullName `
-            -CertStoreLocation "Cert:\LocalMachine\Root" |
-            Out-Null
+          foreach ($store in @("Root", "TrustedPublisher")) {
+            Import-Certificate `
+              -FilePath $certificateRecord.File.FullName `
+              -CertStoreLocation "Cert:\LocalMachine\$store" |
+              Out-Null
 
-          Write-Host ""
-          Write-Host "Trusted WDRLocalTestCert in LocalMachine\Root."
+            $trusted = Get-Item `
+              -LiteralPath "Cert:\LocalMachine\$store\$thumbprint" `
+              -ErrorAction Stop
 
-      - name: Verify production release bundle
+            if ($trusted.Thumbprint -ne $thumbprint) {
+              throw "LocalMachine\$store certificate identity mismatch"
+            }
+
+            Write-Host "Trusted LocalMachine\$store thumbprint: $($trusted.Thumbprint)"
+          }
+
+      - name: Check hosted driver environment
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          cargo xtask verify-production-driver
+          cargo xtask check-hosted-driver-host
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Production verification failed with exit code $LASTEXITCODE"
+            throw "Hosted driver preflight failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Verify hosted driver load
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cargo xtask verify-hosted-driver-load
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Hosted driver-load verification failed with exit code $LASTEXITCODE"
           }
 
       - name: List verified production bundle
