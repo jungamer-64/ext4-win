@@ -13,7 +13,7 @@ env:
 
   # Keep cargo-wdk aligned with the exact windows-drivers-rs revision
   # used by this repository.
-  WINDOWS_DRIVERS_RS_REV: 8e88dd899d9fa988df841e08cc01e9f663e5a415
+  WINDOWS_DRIVERS_RS_REV: 7d3000c6e60041c6ea1ab75abebe411e6482fca6
 
 jobs:
   portable:
