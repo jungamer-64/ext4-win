@@ -1390,12 +1390,10 @@ impl MountedVolumeAccess<'_> {
     /// Reserves both immutable epoch publication slots before the first lower write.
     /// # Errors
     ///
-    /// Returns an error when mutation is no longer authorized or bounded stable storage is full.
+    /// Returns an error when mutation is no longer authorized or stable storage cannot be
+    /// allocated.
     pub(crate) fn reserve_epoch_publication(&mut self) -> DriverResult<EpochPublicationSlots> {
-        unsafe {
-            // SAFETY: MountedVolumeBinding owns this runtime at a stable Box address through drain.
-            self.volume.runtime.reserve_epoch_publication()
-        }
+        self.volume.runtime.reserve_epoch_publication()
     }
 
     /// Grants the serialized commit lane when its runtime preconditions are satisfied.
