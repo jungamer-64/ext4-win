@@ -1,7 +1,8 @@
 use crate::{
     TaskResult,
+    driver_load::{DriverLoadSessionId, check_hosted_driver_host},
     process::{require_file, run_checked},
-    production::{ArtifactIdentity, UNVERIFIED_ARTIFACT_ID, build_verified_production_bundle},
+    production::build_verified_production_bundle,
 };
 use std::{ffi::OsStr, io, path::Path, process::Command};
 
@@ -9,10 +10,11 @@ use std::{ffi::OsStr, io, path::Path, process::Command};
 ///
 /// # Errors
 ///
-/// Returns an error on non-Windows hosts or when elevation, Hyper-V PowerShell, WSL,
-/// e2fsprogs, Driver Verifier configuration, or clean ext4win service/package state is absent.
+/// Returns an error on non-Windows hosts or when the common driver-load preflight, Hyper-V
+/// PowerShell, WSL, e2fsprogs, or Driver Verifier configuration is absent.
 pub(crate) fn check_live_driver_host(repository_root: &Path) -> TaskResult<()> {
     require_windows_live_host()?;
+    check_hosted_driver_host(repository_root)?;
     run_live_vhdx_script(repository_root, "Preflight", None, None)
 }
 
@@ -25,12 +27,12 @@ pub(crate) fn check_live_driver_host(repository_root: &Path) -> TaskResult<()> {
 pub(crate) fn verify_live_vhdx(repository_root: &Path) -> TaskResult<()> {
     check_live_driver_host(repository_root)?;
     let bundle = build_verified_production_bundle(repository_root)?;
-    let session_id = ArtifactIdentity::create(repository_root)?;
+    let session_id = DriverLoadSessionId::create(repository_root)?;
     run_live_vhdx_script(
         repository_root,
         "Run",
         Some(bundle.as_path()),
-        Some(session_id.as_str()),
+        Some(&session_id),
     )?;
     println!("live VHDX driver assurance: PASS");
     println!("session: {}", session_id.as_str());
@@ -48,18 +50,8 @@ pub(crate) fn cleanup_live_vhdx_session(
     session_id: &OsStr,
 ) -> TaskResult<()> {
     require_windows_live_host()?;
-    let session_id = session_id
-        .to_str()
-        .filter(|value| {
-            value.len() == UNVERIFIED_ARTIFACT_ID.len()
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-        .ok_or_else(|| {
-            io::Error::other("session id must be exactly 32 lowercase hexadecimal digits")
-        })?;
-    run_live_vhdx_script(repository_root, "Cleanup", None, Some(session_id))
+    let session_id = DriverLoadSessionId::parse(session_id)?;
+    run_live_vhdx_script(repository_root, "Cleanup", None, Some(&session_id))
 }
 
 /// Rejects live workflows outside the Windows host boundary.
@@ -89,7 +81,7 @@ fn run_live_vhdx_script(
     repository_root: &Path,
     mode: &str,
     bundle: Option<&Path>,
-    session_id: Option<&str>,
+    session_id: Option<&DriverLoadSessionId>,
 ) -> TaskResult<()> {
     let script = repository_root
         .join("tools")
@@ -115,7 +107,7 @@ fn run_live_vhdx_script(
         command.arg("-Bundle").arg(bundle);
     }
     if let Some(session_id) = session_id {
-        command.arg("-SessionId").arg(session_id);
+        command.arg("-SessionId").arg(session_id.as_str());
     }
     run_checked(command, &format!("live VHDX {mode} workflow"))
 }
