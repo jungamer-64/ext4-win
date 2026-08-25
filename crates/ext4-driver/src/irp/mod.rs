@@ -365,11 +365,11 @@ impl DispatchTarget {
     /// # Errors
     ///
     /// Returns an error when either the device object or IRP pointer is null.
-    pub(crate) fn decode(device: PDEVICE_OBJECT, irp: PIRP) -> Result<Self, DriverError> {
-        let Some(device) = KernelDevice::from_raw(device) else {
+    pub(crate) unsafe fn decode(device: PDEVICE_OBJECT, irp: PIRP) -> Result<Self, DriverError> {
+        let Some(device) = (unsafe { KernelDevice::from_raw(device) }) else {
             return Err(DriverError::InvalidParameter);
         };
-        let Some(irp) = KernelIrp::from_raw(irp) else {
+        let Some(irp) = (unsafe { KernelIrp::from_raw(irp) }) else {
             return Err(DriverError::InvalidParameter);
         };
         Ok(Self { device, irp })
@@ -465,13 +465,6 @@ impl ActiveIrp<'_> {
     /// # Errors
     ///
     /// Returns an error when neither a system buffer nor a mapped MDL can provide the input.
-    pub(crate) fn data_input(
-        &self,
-        length: IrpBufferLength,
-    ) -> Result<BufferedInput<'_>, DriverError> {
-        BufferedInput::from_active(self.data_buffer_address(length)?, length.as_usize())
-    }
-
     /// Returns a write input address without creating a Rust reference before queue publication.
     /// # Errors
     ///
@@ -484,13 +477,6 @@ impl ActiveIrp<'_> {
     /// # Errors
     ///
     /// Returns an error when neither a system buffer nor a mapped MDL can provide the output.
-    pub(crate) fn data_output(
-        &mut self,
-        length: IrpBufferLength,
-    ) -> Result<BufferedOutput<'_>, DriverError> {
-        BufferedOutput::from_active(self.data_buffer_address(length)?, length.as_usize())
-    }
-
     /// Returns a read output address without creating a Rust reference before queue publication.
     /// # Errors
     ///
@@ -623,9 +609,9 @@ impl ReceivedIrp {
     /// # Errors
     ///
     /// Returns an error when either the device object or IRP pointer is null.
-    pub(crate) fn decode(device: PDEVICE_OBJECT, irp: PIRP) -> DriverResult<Self> {
+    pub(crate) unsafe fn decode(device: PDEVICE_OBJECT, irp: PIRP) -> DriverResult<Self> {
         Ok(Self {
-            target: DispatchTarget::decode(device, irp)?,
+            target: unsafe { DispatchTarget::decode(device, irp)? },
         })
     }
 
@@ -958,7 +944,7 @@ struct KernelIrp {
 
 impl KernelIrp {
     /// Converts a raw WDK IRP pointer into the private non-null boundary type.
-    fn from_raw(irp: PIRP) -> Option<Self> {
+    unsafe fn from_raw(irp: PIRP) -> Option<Self> {
         NonNull::new(irp).map(|irp| Self { irp })
     }
 
@@ -1732,20 +1718,6 @@ impl IrpByteBuffer {
         }
     }
 
-    /// Copies an unaligned fixed-size payload out of the buffer.
-    /// # Errors
-    ///
-    /// Returns an error when the raw IRP byte buffer is smaller than `T`.
-    fn read_unaligned<T: Copy>(&self) -> DriverResult<T> {
-        if self.length < core::mem::size_of::<T>() {
-            return Err(DriverError::BufferTooSmall);
-        }
-        Ok(unsafe {
-            // SAFETY: The buffer length was checked above and unaligned read
-            // avoids imposing an alignment contract on I/O manager storage.
-            self.address.as_ptr().cast::<T>().read_unaligned()
-        })
-    }
 }
 
 /// Immutable bytes decoded from a buffered or data-input IRP boundary.
@@ -1774,13 +1746,6 @@ impl BufferedInput<'_> {
         self.bytes.as_slice()
     }
 
-    /// Copies an unaligned fixed-size input payload.
-    /// # Errors
-    ///
-    /// Returns an error when the buffered input payload is smaller than `T`.
-    pub(crate) fn read_unaligned<T: Copy>(&self) -> DriverResult<T> {
-        self.bytes.read_unaligned()
-    }
 }
 
 /// Mutable bytes decoded from a buffered or data-output IRP boundary.

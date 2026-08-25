@@ -250,7 +250,7 @@ impl CompletionRundown {
     }
 
     /// Acquires one completion lifetime lease unless teardown has closed the gate.
-    pub fn acquire(&self) -> Option<CompletionRundownLease> {
+    pub unsafe fn acquire(&self) -> Option<CompletionRundownLease> {
         #[cfg(not(test))]
         {
             let acquired = unsafe {
@@ -328,31 +328,6 @@ impl fmt::Debug for CompletionRundown {
 
 // SAFETY: Executive rundown functions or the test atomic synchronize all interior state.
 unsafe impl Sync for CompletionRundown {}
-
-/// Non-cloneable completion rundown lease owned by exactly one envelope.
-pub struct CompletionRundownLease {
-    /// Stable gate that outlives every acquired lease.
-    owner: NonNull<CompletionRundown>,
-}
-
-impl fmt::Debug for CompletionRundownLease {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("CompletionRundownLease(..)")
-    }
-}
-
-impl Drop for CompletionRundownLease {
-    fn drop(&mut self) {
-        let owner = unsafe {
-            // SAFETY: Acquisition requires the gate owner to outlive all leases.
-            self.owner.as_ref()
-        };
-        owner.release();
-    }
-}
-
-// SAFETY: Moving the unique lease between scheduler and completion threads preserves one release.
-unsafe impl Send for CompletionRundownLease {}
 
 /// Statically dispatched, allocation-free destination for one lower completion envelope type.
 ///

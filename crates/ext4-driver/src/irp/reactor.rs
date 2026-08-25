@@ -2734,7 +2734,7 @@ unsafe fn reactor_from_csq<'reactor>(csq: PIO_CSQ) -> Option<&'reactor Completio
 }
 
 /// Initializes one intrusive list head.
-fn initialize_list_head(head: PLIST_ENTRY) {
+unsafe fn initialize_list_head(head: PLIST_ENTRY) {
     let head = unsafe {
         // SAFETY: Caller supplies writable stable list-head storage.
         &mut *head
@@ -2744,7 +2744,7 @@ fn initialize_list_head(head: PLIST_ENTRY) {
 }
 
 /// Returns whether one initialized intrusive list is empty.
-fn list_is_empty(head: PLIST_ENTRY) -> bool {
+unsafe fn list_is_empty(head: PLIST_ENTRY) -> bool {
     unsafe {
         // SAFETY: Caller retains the initialized head for this single pointer observation.
         (*head).Flink == head
@@ -2752,7 +2752,7 @@ fn list_is_empty(head: PLIST_ENTRY) -> bool {
 }
 
 /// Removes and returns the head entry of a nonempty intrusive list.
-fn remove_head_list(head: PLIST_ENTRY) -> Option<NonNull<LIST_ENTRY>> {
+unsafe fn remove_head_list(head: PLIST_ENTRY) -> Option<NonNull<LIST_ENTRY>> {
     let entry = unsafe {
         // SAFETY: Caller holds the list's owning lock.
         (*head).Flink
@@ -2765,7 +2765,7 @@ fn remove_head_list(head: PLIST_ENTRY) -> Option<NonNull<LIST_ENTRY>> {
 }
 
 /// Inserts an unlinked entry at one intrusive list tail.
-fn insert_tail_list(head: PLIST_ENTRY, entry: PLIST_ENTRY) {
+unsafe fn insert_tail_list(head: PLIST_ENTRY, entry: PLIST_ENTRY) {
     let head_ref = unsafe {
         // SAFETY: Initialized list is held under its owning lock.
         &mut *head
@@ -2785,7 +2785,7 @@ fn insert_tail_list(head: PLIST_ENTRY, entry: PLIST_ENTRY) {
 }
 
 /// Removes one entry from its initialized intrusive list.
-fn remove_entry_list(entry: PLIST_ENTRY) {
+unsafe fn remove_entry_list(entry: PLIST_ENTRY) {
     let entry_ref = unsafe {
         // SAFETY: Entry remains linked under its owning lock.
         &mut *entry
@@ -2804,7 +2804,7 @@ fn remove_entry_list(entry: PLIST_ENTRY) {
 }
 
 /// Embedded pending-list entry for one top-level IRP.
-fn irp_list_entry(irp: PIRP) -> Option<PLIST_ENTRY> {
+unsafe fn irp_list_entry(irp: PIRP) -> Option<PLIST_ENTRY> {
     let mut irp = NonNull::new(irp)?;
     Some(unsafe {
         // SAFETY: CSQ queue ownership keeps the IRP live and exclusively linked.
@@ -2829,7 +2829,7 @@ fn irp_from_list_entry(entry: PLIST_ENTRY) -> PIRP {
 }
 
 /// Tests one queued IRP against the synchronous selector under the CSQ lock.
-fn queued_irp_matches_context(irp: PIRP, context: PVOID) -> bool {
+unsafe fn queued_irp_matches_context(irp: PIRP, context: PVOID) -> bool {
     let Some(irp) = KernelIrp::from_raw(irp) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };

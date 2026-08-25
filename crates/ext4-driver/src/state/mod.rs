@@ -64,7 +64,7 @@ unsafe impl Sync for KernelDevice {}
 
 impl KernelDevice {
     /// Converts a raw WDK device pointer into the non-null boundary type.
-    pub(crate) fn from_raw(device: PDEVICE_OBJECT) -> Option<Self> {
+    pub(crate) unsafe fn from_raw(device: PDEVICE_OBJECT) -> Option<Self> {
         NonNull::new(device.cast()).map(|device| Self { device })
     }
 

@@ -3,6 +3,7 @@
 #![feature(allocator_api)]
 #![feature(try_reserve_kind)]
 #![feature(vec_push_within_capacity)]
+#![deny(unsafe_code)]
 #![no_std]
 
 extern crate alloc;
