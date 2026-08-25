@@ -670,7 +670,7 @@ impl EpochReadView<'_, '_> {
         )?;
         let mut completed_collision_major = None;
         loop {
-            let hash = root.hash_context();
+            let hash = root.hash_scheme();
             let entries = self.read_sorted_htree_leaf(inode, tree, &path, hash)?;
             let mut next_path = path.try_clone()?;
             let has_next = self.advance_htree_path(
@@ -1143,7 +1143,7 @@ impl EpochReadView<'_, '_> {
                 if let Some(entry) = root.dot_entries().iter().find(|entry| entry.name() == name) {
                     return Ok(Some(entry.try_clone()?));
                 }
-                let hash = root.hash_context().hash(name);
+                let hash = root.hash_scheme().hash(name);
                 let mut path = self.htree_path_for_hash(
                     inode,
                     &tree,
@@ -1160,7 +1160,7 @@ impl EpochReadView<'_, '_> {
                     )?;
                     let entries = leaf.entries()?;
                     path.hash_range()?
-                        .validate_leaf(&entries, root.hash_context())?;
+                        .validate_leaf(&entries, root.hash_scheme())?;
                     if let Some(entry) = entries.into_iter().find(|entry| entry.name() == name) {
                         return Ok(Some(entry));
                     }

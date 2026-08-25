@@ -1057,7 +1057,7 @@ impl MutationResolvePass<'_, '_, '_> {
             checksum,
         )?;
         let major = match target {
-            HtreePathTarget::Name(name) => root.hash_context().hash(name).major,
+            HtreePathTarget::Name(name) => root.hash_scheme().hash(name).major,
             HtreePathTarget::First => 0,
         };
         let mut levels = Vec::new();
@@ -1193,7 +1193,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 }
                 let mut context =
                     self.mutation_htree_context(inode, &tree, HtreePathTarget::Name(name))?;
-                let hash = context.root.hash_context().hash(name);
+                let hash = context.root.hash_scheme().hash(name);
                 loop {
                     let (physical, block) = self.read_mutation_directory_block(
                         inode,
@@ -1204,7 +1204,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     context
                         .path
                         .hash_range()?
-                        .validate_leaf(&entries, context.root.hash_context())?;
+                        .validate_leaf(&entries, context.root.hash_scheme())?;
                     if entries.iter().any(|entry| entry.name() == name) {
                         return Ok(Some(DirectoryEntryLocation { physical, block }));
                     }
@@ -1250,7 +1250,7 @@ impl MutationResolvePass<'_, '_, '_> {
         context
             .path
             .hash_range()?
-            .validate_leaf(&leaf.entries()?, context.root.hash_context())?;
+            .validate_leaf(&leaf.entries()?, context.root.hash_scheme())?;
         if leaf.insert(entry.inode(), entry.name(), entry.kind())? {
             self.stage_directory_block(leaf_physical, leaf.into_bytes())?;
             raw_parent
@@ -1272,7 +1272,7 @@ impl MutationResolvePass<'_, '_, '_> {
         {
             return Err(Error::DirectoryIndexFull);
         }
-        let hash = context.root.hash_context();
+        let hash = context.root.hash_scheme();
         let mut entries = leaf.entries()?;
         entries.try_push(entry)?;
         memory::heap_sort_by(&mut entries, |left, right| {
@@ -1658,7 +1658,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     context
                         .path
                         .hash_range()?
-                        .validate_leaf(&entries, context.root.hash_context())?;
+                        .validate_leaf(&entries, context.root.hash_scheme())?;
                     if !entries.is_empty() {
                         return Ok(false);
                     }
