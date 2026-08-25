@@ -41,6 +41,10 @@ pub(crate) use wdk_sys::ntddk::{
 pub(crate) use wdk_sys::ntddk::{IoAcquireCancelSpinLock, IoReleaseCancelSpinLock};
 
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "system" {
     /// Captures an exact-length query-security output as an opaque native target.
     pub(crate) fn ext4win_capture_query_security_output(
@@ -96,6 +100,10 @@ unsafe extern "system" {
 }
 
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" {
     /// Atomically replaces `IRP.CancelRoutine` under the caller-held cancel spin lock.
     pub(crate) fn ext4win_set_cancel_routine(
@@ -104,6 +112,10 @@ unsafe extern "C" {
     ) -> wdk_sys::PDRIVER_CANCEL;
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "system" {
     /// Copies one checked requestor-input window into driver-owned storage.
     pub(crate) fn ext4win_copy_requestor_input_window(

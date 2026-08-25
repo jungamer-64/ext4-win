@@ -971,6 +971,10 @@ mod tests {
     ///
     /// Panics when cancellation loses work or bypasses a non-interruptible phase.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn cancellation_covers_wait_retry_registering_and_lower_phases() {
         let mut scheduler = Scheduler::new();
         for (phase, expected) in [

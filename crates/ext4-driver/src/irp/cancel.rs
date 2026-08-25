@@ -25,6 +25,10 @@ impl ActiveCancelDestination {
     /// # Safety
     ///
     /// `context` must remain live until every cancellation token using this destination is dropped.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) const unsafe fn new(
         context: NonNull<c_void>,
         publish: unsafe fn(NonNull<c_void>, usize),
@@ -54,6 +58,10 @@ impl ActiveCancelEnvelope {
     /// # Safety
     ///
     /// This must run exactly once before the containing device is published.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) unsafe fn initialize(&self, destination: ActiveCancelDestination) {
         let slot = unsafe {
             // SAFETY: Device initialization has exclusive access before callback publication.
@@ -66,6 +74,10 @@ impl ActiveCancelEnvelope {
     }
 
     /// Publishes this envelope's sole concrete cancel event without allocation or blocking.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn publish(&self) {
         let destination = unsafe {
             // SAFETY: Initialization precedes cancel-routine installation and never mutates later.
@@ -81,6 +93,10 @@ impl ActiveCancelEnvelope {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Initialization happens-before device publication; the destination is immutable later.
 unsafe impl Sync for ActiveCancelEnvelope {}
 
@@ -101,6 +117,10 @@ impl ActiveCancellation {
     ///
     /// The caller must exclusively own an IRP removed from its CSQ, and `envelope` must remain
     /// stable until this returned token is dropped.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) unsafe fn install(irp: PIRP, envelope: NonNull<ActiveCancelEnvelope>) -> Self {
         let Some(mut irp_address) = NonNull::new(irp) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -149,6 +169,10 @@ impl ActiveCancellation {
 
 #[cfg(not(test))]
 impl Drop for ActiveCancellation {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drop(&mut self) {
         let mut old_irql = 0;
         unsafe {
@@ -178,12 +202,20 @@ impl Drop for ActiveCancellation {
     }
 }
 
-// SAFETY: The token is moved only with its uniquely owned top-level IRP.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+// SAFETY: The token is moved only with its uniquely owned top-level IRP.
 unsafe impl Send for ActiveCancellation {}
 
 /// Returns the driver-owned active-cancel context slot.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn active_cancel_context(irp: &mut wdk_sys::IRP) -> &mut *mut c_void {
     let overlay = unsafe {
         // SAFETY: `DriverContext` and list linkage occupy independent tail-overlay fields.
@@ -201,6 +233,10 @@ fn active_cancel_context(irp: &mut wdk_sys::IRP) -> &mut *mut c_void {
 ///
 /// The I/O Manager invokes this only for an IRP installed by [`ActiveCancellation::install`].
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn active_irp_cancelled(_device: PDEVICE_OBJECT, irp: PIRP) {
     let Some(irp_address) = NonNull::new(irp) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -246,6 +282,10 @@ mod tests {
     /// # Safety
     ///
     /// `context` must point to a live, uniquely writable `AtomicUsize` for this call.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn record_cancel(context: NonNull<c_void>, index: usize) {
         let counter = unsafe {
             // SAFETY: The test destination points to this live `AtomicUsize` for the whole call.
@@ -259,6 +299,10 @@ mod tests {
     ///
     /// Panics if an address-stable cancel envelope publishes anything except its fixed slot.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn stable_envelope_publishes_exact_slot_without_allocation() {
         let observed = AtomicUsize::new(0);
         let envelope = ActiveCancelEnvelope::inert(17);

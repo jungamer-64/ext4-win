@@ -18,6 +18,7 @@ use crate::kernel::{
     fatal::KernelWideInconsistency,
     status::{DriverError, DriverResult},
 };
+use crate::memory::InPlaceInitialization;
 use crate::state::{KernelDevice, KernelFileObject, MountedVolumeAccess, MountedVolumeBinding};
 
 #[cfg(not(test))]
@@ -91,22 +92,46 @@ struct LengthCompletionRoute {
     reactor: NonNull<CompletionReactor>,
 }
 
-// SAFETY: The completion rundown lease keeps the immutable reactor address live across threads.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+// SAFETY: The completion rundown lease keeps the immutable reactor address live across threads.
 unsafe impl Send for StorageCompletionRoute {}
-// SAFETY: Callback publication serializes reactor inbox mutation with its spin lock.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+// SAFETY: Callback publication serializes reactor inbox mutation with its spin lock.
 unsafe impl Sync for StorageCompletionRoute {}
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The completion rundown lease keeps the immutable reactor address live across threads.
-#[cfg(not(test))]
 unsafe impl Send for LengthCompletionRoute {}
-// SAFETY: Callback publication serializes reactor inbox mutation with its spin lock.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+// SAFETY: Callback publication serializes reactor inbox mutation with its spin lock.
 unsafe impl Sync for LengthCompletionRoute {}
 
-// SAFETY: This route performs only typed intrusive publication and wakeup under the reactor lock.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+// SAFETY: This route performs only typed intrusive publication and wakeup under the reactor lock.
 unsafe impl LowerCompletionRoute<ReactorStorageCommand> for StorageCompletionRoute {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn publish(&self, envelope: NonNull<ReactorStorageEnvelope>) {
         let reactor = unsafe {
             // SAFETY: The envelope's rundown lease retains the stable reactor through publication.
@@ -119,9 +144,17 @@ unsafe impl LowerCompletionRoute<ReactorStorageCommand> for StorageCompletionRou
     }
 }
 
-// SAFETY: This route performs only typed intrusive publication and wakeup under the reactor lock.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+// SAFETY: This route performs only typed intrusive publication and wakeup under the reactor lock.
 unsafe impl LowerCompletionRoute<ReactorLengthProbe> for LengthCompletionRoute {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn publish(&self, envelope: NonNull<ReactorLengthEnvelope>) {
         let reactor = unsafe {
             // SAFETY: The envelope's rundown lease retains the stable reactor through publication.
@@ -175,6 +208,10 @@ impl PublishedReactorLower {
     ///
     /// The active slot must still retain this exact published lower identity.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn cancel(&self) {
         match self {
             Self::Storage {
@@ -471,6 +508,13 @@ impl AdmissionRundown {
     }
 
     /// Initializes native rundown after final placement.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn initialize(&self) {
         #[cfg(not(test))]
         unsafe {
@@ -480,6 +524,13 @@ impl AdmissionRundown {
     }
 
     /// Acquires one admission lease unless teardown closed the gate.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn acquire(&self) -> Option<AdmissionLease<'_>> {
         #[cfg(not(test))]
         {
@@ -509,6 +560,13 @@ impl AdmissionRundown {
     }
 
     /// Closes admission and waits for every capture/insertion lease.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn close_and_wait(&self) {
         #[cfg(not(test))]
         unsafe {
@@ -528,6 +586,13 @@ impl AdmissionRundown {
     }
 
     /// Releases one admission lease.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn release(&self) {
         #[cfg(not(test))]
         unsafe {
@@ -544,6 +609,10 @@ impl AdmissionRundown {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Native rundown or the test atomic serializes every interior access.
 unsafe impl Sync for AdmissionRundown {}
 
@@ -591,6 +660,10 @@ impl OperationReservation {
 }
 
 impl Drop for OperationReservation {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drop(&mut self) {
         release_operation_reservation(unsafe {
             // SAFETY: Device teardown waits for the admitted count to reach zero.
@@ -679,6 +752,10 @@ impl RetryTimerEnvelope {
     /// The envelope and `reactor` must both be at their final nonpaged addresses and remain live
     /// until every armed timer and DPC has drained.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn initialize(&self, reactor: NonNull<CompletionReactor>) {
         unsafe {
             // SAFETY: The timer field is in final-address nonpaged device-extension storage.
@@ -697,6 +774,10 @@ impl RetryTimerEnvelope {
 
     /// Arms one concrete fixed-delay retry for the current slot generation.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn arm(&self, generation: u64, delay: StorageRetryDelay) {
         self.generation.store(generation, Ordering::Release);
         let hundred_nanoseconds = match delay {
@@ -719,6 +800,10 @@ impl RetryTimerEnvelope {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Native timer/DPC state is initialized once at a stable address; callbacks publish only
 // atomics and the reactor thread exclusively owns operation payloads.
 unsafe impl Sync for RetryTimerEnvelope {}
@@ -793,7 +878,7 @@ pub(crate) struct CompletionReactor {
     /// Lifetime gate retained by every lower completion envelope.
     completion_rundown: CompletionRundown,
     /// System-thread handle joined during teardown.
-    thread_handle: wdk_sys::HANDLE,
+    thread_handle: AtomicPtr<c_void>,
     /// Pure pointer-free scheduling authority owned by the sole actor.
     scheduler: UnsafeCell<Scheduler>,
     /// Fixed WDK-shell payload registry; callbacks never dereference these values.
@@ -836,6 +921,12 @@ impl CompletionReactor {
         core::ptr::addr_of!(self.csq).cast_mut()
     }
 
+    /// Returns the exclusively owned embedded CSQ address during initialization.
+    #[cfg(not(test))]
+    fn csq_mut_ptr(&mut self) -> PIO_CSQ {
+        core::ptr::addr_of_mut!(self.csq)
+    }
+
     /// Initializes one reactor directly in stable device-extension storage.
     /// # Safety
     ///
@@ -844,15 +935,19 @@ impl CompletionReactor {
     ///
     /// Returns an error when native queue, event, timer, cancel, or worker-thread initialization
     /// cannot be completed.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) unsafe fn initialize_at(
         reactor: *mut Self,
         device: KernelDevice,
         target: ReactorTarget,
     ) -> DriverResult<()> {
         let completion_rundown = CompletionRundown::try_new()?;
-        unsafe {
-            // SAFETY: The caller owns writable, final-address device-extension bytes.
-            core::ptr::write(
+        let mut initialization = unsafe {
+            // SAFETY: The caller owns writable, uninitialized final-address extension storage.
+            InPlaceInitialization::write(
                 reactor,
                 Self {
                     csq: wdk_sys::IO_CSQ::default(),
@@ -867,7 +962,7 @@ impl CompletionReactor {
                     lifecycle: AtomicU8::new(ReactorState::Running.as_raw()),
                     admission: AdmissionRundown::new(),
                     completion_rundown,
-                    thread_handle: core::ptr::null_mut(),
+                    thread_handle: AtomicPtr::new(core::ptr::null_mut()),
                     scheduler: UnsafeCell::new(Scheduler::new()),
                     payloads: UnsafeCell::new(core::array::from_fn(|_| ShellSlot::vacant())),
                     retry_timers: core::array::from_fn(RetryTimerEnvelope::inert),
@@ -875,22 +970,29 @@ impl CompletionReactor {
                     device,
                     target: UnsafeCell::new(target),
                 },
-            );
+            )?
+        };
+        let reactor = initialization.get_mut();
+        #[cfg(not(test))]
+        let reactor_address = NonNull::from(&mut *reactor);
+        unsafe {
+            // SAFETY: This is an exclusive, final-address list head before reactor publication.
+            initialize_list_head(reactor.pending_head.get());
         }
-        let reactor = unsafe {
-            // SAFETY: A complete value was written immediately above.
-            reactor.as_ref()
+        unsafe {
+            // SAFETY: This is an exclusive, final-address list head before reactor publication.
+            initialize_list_head(reactor.completion_head.get());
         }
-        .ok_or(DriverError::InvalidParameter)?;
-        initialize_list_head(reactor.pending_head.get());
-        initialize_list_head(reactor.completion_head.get());
-        initialize_list_head(reactor.length_completion_head.get());
+        unsafe {
+            // SAFETY: This is an exclusive, final-address list head before reactor publication.
+            initialize_list_head(reactor.length_completion_head.get());
+        }
         reactor.admission.initialize();
         #[cfg(not(test))]
         for timer in &reactor.retry_timers {
             unsafe {
                 // SAFETY: Every timer and the reactor itself are now at their final addresses.
-                timer.initialize(NonNull::from(reactor));
+                timer.initialize(reactor_address);
             }
         }
         #[cfg(not(test))]
@@ -898,7 +1000,7 @@ impl CompletionReactor {
             let destination = unsafe {
                 // SAFETY: Reactor storage is now final-address and remains live through drain.
                 ActiveCancelDestination::new(
-                    NonNull::from(reactor).cast::<c_void>(),
+                    reactor_address.cast::<c_void>(),
                     publish_active_cancel,
                 )
             };
@@ -912,12 +1014,12 @@ impl CompletionReactor {
         {
             unsafe {
                 // SAFETY: Stable reactor-owned spin-lock storage.
-                ffi::KeInitializeSpinLock(core::ptr::addr_of!(reactor.lock).cast_mut());
+                ffi::KeInitializeSpinLock(core::ptr::addr_of_mut!(reactor.lock));
             }
             let status = unsafe {
                 // SAFETY: First-field CSQ and callbacks share this stable reactor lifetime.
                 ffi::IoCsqInitialize(
-                    reactor.csq_ptr(),
+                    reactor.csq_mut_ptr(),
                     Some(csq_insert_irp),
                     Some(csq_remove_irp),
                     Some(csq_peek_next_irp),
@@ -932,7 +1034,7 @@ impl CompletionReactor {
             unsafe {
                 // SAFETY: Stable event storage initialized before thread publication.
                 ffi::KeInitializeEvent(
-                    core::ptr::addr_of!(reactor.wake_event).cast_mut(),
+                    core::ptr::addr_of_mut!(reactor.wake_event),
                     wdk_sys::_EVENT_TYPE::SynchronizationEvent,
                     0,
                 );
@@ -953,23 +1055,36 @@ impl CompletionReactor {
                     core::ptr::null_mut(),
                     core::ptr::null_mut(),
                     Some(completion_reactor_thread),
-                    core::ptr::from_ref(reactor).cast_mut().cast::<c_void>(),
+                    reactor_address.as_ptr().cast::<c_void>(),
                 )
             };
-            if status < STATUS_SUCCESS || thread_handle.is_null() {
+            if status < STATUS_SUCCESS {
+                if !thread_handle.is_null() {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
                 return Err(DriverError::InsufficientResources);
             }
-            unsafe {
-                // SAFETY: Initialization is exclusive before device publication.
-                core::ptr::addr_of!(reactor.thread_handle)
-                    .cast_mut()
-                    .write(thread_handle);
+            if thread_handle.is_null() {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             }
+            let published_reactor = unsafe {
+                // SAFETY: Successful creation may start the thread, so only shared atomic access is
+                // used from this point until rollback ownership is discharged.
+                reactor_address.as_ref()
+            };
+            published_reactor
+                .thread_handle
+                .store(thread_handle.cast::<c_void>(), Ordering::Release);
         }
+        initialization.publish();
         Ok(())
     }
 
     /// Captures a queued request and emits only its admission event.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn receive(mut received: ReceivedIrp, major: DispatchMajor) -> NTSTATUS {
         let reactor = match Self::from_device(received.device()) {
             Ok(reactor) => reactor,
@@ -1000,6 +1115,10 @@ impl CompletionReactor {
     }
 
     /// Removes and completes every queued ordinary request for one FILE_OBJECT.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn cancel_pending_ordinary(&self, file_object: KernelFileObject) {
         let selection = PendingIrpSelection::cleanup(file_object);
         loop {
@@ -1007,7 +1126,10 @@ impl CompletionReactor {
             if irp.is_null() {
                 return;
             }
-            let owned = OwnedIrp::from_queued_raw(self.device, irp);
+            let owned = unsafe {
+                // SAFETY: CSQ removal returned this live IRP with exclusive queue ownership.
+                OwnedIrp::from_queued_raw(self.device, irp)
+            };
             release_operation_reservation(&self.admitted);
             let _status = owned.complete_cancelled();
         }
@@ -1018,6 +1140,10 @@ impl CompletionReactor {
     ///
     /// Returns [`DriverError::InvalidParameter`] when either the device object or its extension is
     /// null.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn from_device(device: KernelDevice) -> DriverResult<NonNull<Self>> {
         let object = unsafe {
             // SAFETY: Dispatch owns a live typed device pointer.
@@ -1028,6 +1154,10 @@ impl CompletionReactor {
     }
 
     /// Publishes a pending IRP to the CSQ, then wakes the reactor for its admission event.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn enqueue(&self, pending: PendingIrp, reservation: OperationReservation) {
         #[cfg(test)]
         mark_pending_for_csq_test(pending.target.irp);
@@ -1044,11 +1174,21 @@ impl CompletionReactor {
             );
         }
         #[cfg(test)]
-        self.insert_irp(irp);
+        unsafe {
+            // SAFETY: The isolated test queue owns this live unlinked fixture IRP.
+            self.insert_irp(irp);
+        }
         self.wake();
     }
 
     /// Signals that at least one concrete admission/completion/cancel/grant event exists.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn wake(&self) {
         #[cfg(not(test))]
         unsafe {
@@ -1058,6 +1198,10 @@ impl CompletionReactor {
     }
 
     /// Removes the next queued IRP matching an optional synchronous selection.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn remove_next_irp(&self, selection: Option<&PendingIrpSelection>) -> PIRP {
         let context = selection.map_or(core::ptr::null_mut(), |selection| {
             core::ptr::from_ref(selection).cast_mut().cast::<c_void>()
@@ -1069,32 +1213,71 @@ impl CompletionReactor {
         }
         #[cfg(test)]
         {
-            let irp = self.peek_next_irp(core::ptr::null_mut(), context);
+            let irp = unsafe {
+                // SAFETY: The isolated test reactor serializes its pending-list access.
+                self.peek_next_irp(core::ptr::null_mut(), context)
+            };
             if !irp.is_null() {
-                self.remove_irp(irp);
+                unsafe {
+                    // SAFETY: The preceding peek returned this still-linked fixture IRP.
+                    self.remove_irp(irp);
+                }
             }
             irp
         }
     }
 
     /// Inserts one IRP at the pending FIFO tail while the CSQ lock is held.
-    fn insert_irp(&self, irp: PIRP) {
-        let Some(entry) = irp_list_entry(irp) else {
+    /// # Safety
+    ///
+    /// The caller must hold the queue lock and `irp` must be live and currently unlinked.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    unsafe fn insert_irp(&self, irp: PIRP) {
+        let Some(entry) = (unsafe {
+            // SAFETY: The caller retains exclusive queue ownership of this live IRP.
+            irp_list_entry(irp)
+        }) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        insert_tail_list(self.pending_head.get(), entry);
+        unsafe {
+            // SAFETY: The queue lock protects the initialized head and unlinked entry.
+            insert_tail_list(self.pending_head.get(), entry);
+        }
     }
 
     /// Removes one pending IRP while the CSQ lock is held.
-    fn remove_irp(&self, irp: PIRP) {
-        let Some(entry) = irp_list_entry(irp) else {
+    /// # Safety
+    ///
+    /// The caller must hold the queue lock and `irp` must be live and linked in this queue.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    unsafe fn remove_irp(&self, irp: PIRP) {
+        let Some(entry) = (unsafe {
+            // SAFETY: The caller retains exclusive queue ownership of this linked IRP.
+            irp_list_entry(irp)
+        }) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        remove_entry_list(entry);
+        unsafe {
+            // SAFETY: The queue lock protects the linked entry and its neighbors.
+            remove_entry_list(entry);
+        }
     }
 
     /// Finds the next pending IRP matching an optional FILE_OBJECT identity.
-    fn peek_next_irp(&self, irp: PIRP, context: PVOID) -> PIRP {
+    /// # Safety
+    ///
+    /// The caller must hold the queue lock; a non-null `irp` must be live and linked in this queue.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    unsafe fn peek_next_irp(&self, irp: PIRP, context: PVOID) -> PIRP {
         let head = self.pending_head.get();
         let mut entry = if irp.is_null() {
             unsafe {
@@ -1102,7 +1285,10 @@ impl CompletionReactor {
                 (*head).Flink
             }
         } else {
-            let Some(entry) = irp_list_entry(irp) else {
+            let Some(entry) = (unsafe {
+                // SAFETY: The caller proves this non-null IRP is live and linked.
+                irp_list_entry(irp)
+            }) else {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             };
             unsafe {
@@ -1111,8 +1297,14 @@ impl CompletionReactor {
             }
         };
         while entry != head {
-            let candidate = irp_from_list_entry(entry);
-            if queued_irp_matches_context(candidate, context) {
+            let candidate = unsafe {
+                // SAFETY: `entry` is a live IRP list node protected by the queue lock.
+                irp_from_list_entry(entry)
+            };
+            if unsafe {
+                // SAFETY: The same queue ownership retains the candidate and its context.
+                queued_irp_matches_context(candidate, context)
+            } {
                 return candidate;
             }
             entry = unsafe {
@@ -1124,6 +1316,10 @@ impl CompletionReactor {
     }
 
     /// Executes one non-suspending transition against the pointer-free scheduler model.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn with_scheduler<R>(&self, transition: impl FnOnce(&mut Scheduler) -> R) -> R {
         let scheduler = unsafe {
             // SAFETY: Scheduler state is accessed only by the sole reactor actor or isolated tests.
@@ -1133,6 +1329,10 @@ impl CompletionReactor {
     }
 
     /// Executes one non-suspending transition against WDK-shell payload storage.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn with_payloads<R>(
         &self,
         transition: impl FnOnce(&mut [ShellSlot; MAX_OPERATIONS]) -> R,
@@ -1350,6 +1550,10 @@ impl CompletionReactor {
 
     /// Publishes cancellation into one active slot or its exact published lower request.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn request_active_cancel(&self, index: usize) {
         match self.with_scheduler(|scheduler| scheduler.request_cancel(index)) {
             CancelDisposition::Ignored
@@ -1393,6 +1597,10 @@ impl CompletionReactor {
     ///
     /// No new dispatch callback may enter this device extension. The mounted state and completion
     /// destination must remain live until this method joins the reactor and drains rundown.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) unsafe fn release_at(reactor: *mut Self) -> ReactorTarget {
         let mut reactor_address = NonNull::new(reactor).unwrap_or_else(|| {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
@@ -1408,7 +1616,10 @@ impl CompletionReactor {
             if irp.is_null() {
                 break;
             }
-            let owned = OwnedIrp::from_queued_raw(reactor.device, irp);
+            let owned = unsafe {
+                // SAFETY: Drain removed this live IRP exclusively from the CSQ.
+                OwnedIrp::from_queued_raw(reactor.device, irp)
+            };
             release_operation_reservation(&reactor.admitted);
             let _status = owned.complete_cancelled();
         }
@@ -1416,7 +1627,7 @@ impl CompletionReactor {
 
         #[cfg(not(test))]
         {
-            let thread_handle = reactor.thread_handle;
+            let thread_handle = reactor.thread_handle.load(Ordering::Acquire);
             if thread_handle.is_null() {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             }
@@ -1444,11 +1655,19 @@ impl CompletionReactor {
             // SAFETY: The thread is joined and every completion can still reach this empty inbox.
             reactor.completion_rundown.close_and_wait();
         }
+        let completion_list_empty = unsafe {
+            // SAFETY: The worker is joined and teardown exclusively owns this initialized list.
+            list_is_empty(reactor.completion_head.get())
+        };
+        let length_completion_list_empty = unsafe {
+            // SAFETY: The worker is joined and teardown exclusively owns this initialized list.
+            list_is_empty(reactor.length_completion_head.get())
+        };
         if reactor.state() != ReactorState::Stopped
             || reactor.admitted.load(Ordering::Acquire) != 0
             || reactor.has_active()
-            || !list_is_empty(reactor.completion_head.get())
-            || !list_is_empty(reactor.length_completion_head.get())
+            || !completion_list_empty
+            || !length_completion_list_empty
         {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
@@ -1456,7 +1675,9 @@ impl CompletionReactor {
             // SAFETY: Join, empty slots, and rundown closure grant exclusive teardown access.
             reactor_address.as_mut()
         };
-        reactor.thread_handle = core::ptr::null_mut();
+        reactor
+            .thread_handle
+            .store(core::ptr::null_mut(), Ordering::Release);
         let target = core::mem::replace(
             unsafe {
                 // SAFETY: Join and rundown closure grant terminal exclusive shell access.
@@ -1482,6 +1703,10 @@ impl CompletionReactor {
 
     /// Executes one non-suspending transition against device-specific shell authority.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn with_target<R>(&self, transition: impl FnOnce(&mut ReactorTarget) -> R) -> R {
         let target = unsafe {
             // SAFETY: This method is called only from the dedicated reactor thread; callbacks never
@@ -1493,6 +1718,10 @@ impl CompletionReactor {
 
     /// Runs concrete-event delivery on the sole PASSIVE_LEVEL reactor thread.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn run(&self) {
         loop {
             if self.state() == ReactorState::Draining {
@@ -1504,11 +1733,19 @@ impl CompletionReactor {
             progressed |= self.drain_retry_events();
             progressed |= self.admit_pending_requests();
             progressed |= self.drive_ready_operations();
+            let completion_list_empty = unsafe {
+                // SAFETY: The sole reactor actor observes this initialized inbox list.
+                list_is_empty(self.completion_head.get())
+            };
+            let length_completion_list_empty = unsafe {
+                // SAFETY: The sole reactor actor observes this initialized inbox list.
+                list_is_empty(self.length_completion_head.get())
+            };
             if self.state() == ReactorState::Draining
                 && self.admitted.load(Ordering::Acquire) == 0
                 && !self.has_active()
-                && list_is_empty(self.completion_head.get())
-                && list_is_empty(self.length_completion_head.get())
+                && completion_list_empty
+                && length_completion_list_empty
             {
                 self.lifecycle
                     .store(ReactorState::Stopped.as_raw(), Ordering::Release);
@@ -1522,6 +1759,10 @@ impl CompletionReactor {
 
     /// Waits for a newly published admission, lower completion, cancel, timer, or grant event.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn wait_for_event(&self) {
         let status = unsafe {
             // SAFETY: This thread is the sole waiter on the initialized auto-reset event.
@@ -1542,6 +1783,10 @@ impl CompletionReactor {
 
     /// Converts pending CSQ ownership into explicit operation admission events.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn admit_pending_requests(&self) -> bool {
         let mut admitted_any = false;
         loop {
@@ -1550,7 +1795,10 @@ impl CompletionReactor {
                 return admitted_any;
             }
             admitted_any = true;
-            let mut owned = OwnedIrp::from_queued_raw(self.device, irp);
+            let mut owned = unsafe {
+                // SAFETY: CSQ removal returned this live IRP with exclusive completion ownership.
+                OwnedIrp::from_queued_raw(self.device, irp)
+            };
             let index = match self.reserve_active_slot() {
                 Ok(index) => index,
                 Err(_) => {
@@ -1942,9 +2190,16 @@ impl CompletionReactor {
         target: KernelDevice,
         suspended: SuspendedOperation,
     ) {
-        let Some(rundown) = self.completion_rundown.acquire() else {
-            self.set_ready_length_failure(index, suspended, DriverError::InvalidDeviceRequest);
-            return;
+        let rundown = match self.completion_rundown.acquire() {
+            Ok(Some(rundown)) => rundown,
+            Ok(None) => {
+                self.set_ready_length_failure(index, suspended, DriverError::InvalidDeviceRequest);
+                return;
+            }
+            Err(error) => {
+                self.set_ready_length_failure(index, suspended, error);
+                return;
+            }
         };
         let destination = LengthCompletionRoute {
             reactor: NonNull::from(self),
@@ -1997,16 +2252,25 @@ impl CompletionReactor {
             );
             return;
         }
-        let Some(rundown) = self.completion_rundown.acquire() else {
-            let command = prepared.into_command();
-            let (scheduled, request) = command.into_parts();
-            self.set_ready_storage_failure(
-                index,
-                scheduled.into_operation(),
-                request,
-                DriverError::InvalidDeviceRequest,
-            );
-            return;
+        let rundown = match self.completion_rundown.acquire() {
+            Ok(Some(rundown)) => rundown,
+            Ok(None) => {
+                let command = prepared.into_command();
+                let (scheduled, request) = command.into_parts();
+                self.set_ready_storage_failure(
+                    index,
+                    scheduled.into_operation(),
+                    request,
+                    DriverError::InvalidDeviceRequest,
+                );
+                return;
+            }
+            Err(error) => {
+                let command = prepared.into_command();
+                let (scheduled, request) = command.into_parts();
+                self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
+                return;
+            }
         };
         let destination = StorageCompletionRoute {
             reactor: NonNull::from(self),
@@ -2079,15 +2343,23 @@ impl CompletionReactor {
     /// `envelope` must be uniquely completion-owned, unlinked, nonpaged, and protected by this
     /// reactor's completion rundown lease.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn enqueue_storage(&self, envelope: NonNull<ReactorStorageEnvelope>) {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion callbacks and inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
         };
-        insert_tail_list(self.completion_head.get(), unsafe {
-            // SAFETY: Completion owns this unlinked first-field node until publication.
+        let node = unsafe {
+            // SAFETY: Completion owns this live envelope until its node is linked below.
             envelope.as_ref().node_ptr()
-        });
+        };
+        unsafe {
+            // SAFETY: The reactor lock is held and `node` is live and unlinked.
+            insert_tail_list(self.completion_head.get(), node);
+        }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
             ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
@@ -2097,12 +2369,19 @@ impl CompletionReactor {
 
     /// Removes one completed storage envelope, if present.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn pop_storage_completion(&self) -> Option<NonNull<ReactorStorageEnvelope>> {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion list access.
             ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
         };
-        let node = remove_head_list(self.completion_head.get());
+        let node = unsafe {
+            // SAFETY: The reactor lock is held for this initialized completion list.
+            remove_head_list(self.completion_head.get())
+        };
         unsafe {
             // SAFETY: Releases the exact acquisition above.
             ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
@@ -2115,6 +2394,10 @@ impl CompletionReactor {
 
     /// Reclaims and routes all lower completions currently published to this reactor.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drain_storage_completions(&self) -> bool {
         let mut progressed = false;
         while let Some(envelope) = self.pop_storage_completion() {
@@ -2174,15 +2457,23 @@ impl CompletionReactor {
     /// `envelope` must be uniquely completion-owned, unlinked, nonpaged, and protected by this
     /// reactor's completion rundown lease.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn enqueue_length(&self, envelope: NonNull<ReactorLengthEnvelope>) {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion callbacks and inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
         };
-        insert_tail_list(self.length_completion_head.get(), unsafe {
-            // SAFETY: Completion owns this unlinked first-field node until publication.
+        let node = unsafe {
+            // SAFETY: Completion owns this live envelope until its node is linked below.
             envelope.as_ref().node_ptr()
-        });
+        };
+        unsafe {
+            // SAFETY: The reactor lock is held and `node` is live and unlinked.
+            insert_tail_list(self.length_completion_head.get(), node);
+        }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
             ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
@@ -2192,12 +2483,19 @@ impl CompletionReactor {
 
     /// Removes one completed length-query envelope, if present.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn pop_length_completion(&self) -> Option<NonNull<ReactorLengthEnvelope>> {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion list access.
             ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
         };
-        let node = remove_head_list(self.length_completion_head.get());
+        let node = unsafe {
+            // SAFETY: The reactor lock is held for this initialized completion list.
+            remove_head_list(self.length_completion_head.get())
+        };
         unsafe {
             // SAFETY: Releases the exact acquisition above.
             ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
@@ -2210,6 +2508,10 @@ impl CompletionReactor {
 
     /// Reclaims and routes every completed mount-time device-length query.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drain_length_completions(&self) -> bool {
         let mut progressed = false;
         while let Some(envelope) = self.pop_length_completion() {
@@ -2509,6 +2811,10 @@ impl CompletionReactor {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Stable device placement and documented spin-lock/reactor-thread disciplines serialize
 // every interior field.
 unsafe impl Sync for CompletionReactor {}
@@ -2530,6 +2836,10 @@ fn slot_bit(index: usize) -> u64 {
 ///
 /// `context` must identify the live final-address reactor owning `index`'s cancel envelope.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn publish_active_cancel(context: NonNull<c_void>, index: usize) {
     let reactor = unsafe {
         // SAFETY: Active top-level IRP ownership retains the reactor through token removal.
@@ -2556,6 +2866,10 @@ fn driver_error_to_core(error: DriverError) -> ext4_core::Error {
 ///
 /// `context` must point to the address-stable [`RetryTimerEnvelope`] installed in the reactor.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn storage_retry_timer_dpc(
     _dpc: *mut wdk_sys::KDPC,
     context: PVOID,
@@ -2594,6 +2908,10 @@ unsafe extern "C" fn storage_retry_timer_dpc(
 ///
 /// `context` must be the stable reactor address passed to `PsCreateSystemThread`.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn completion_reactor_thread(context: PVOID) {
     let Some(reactor) = NonNull::new(context.cast::<CompletionReactor>()) else {
         let _status = unsafe {
@@ -2618,6 +2936,10 @@ unsafe extern "C" fn completion_reactor_thread(context: PVOID) {
 ///
 /// `csq` must be the first field of a live reactor and `irp` an unlinked pending IRP.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn csq_insert_irp(csq: PIO_CSQ, irp: PIRP) {
     let Some(reactor) = (unsafe {
         // SAFETY: Native initialization binds this callback to the first-field CSQ.
@@ -2625,7 +2947,10 @@ unsafe extern "C" fn csq_insert_irp(csq: PIO_CSQ, irp: PIRP) {
     }) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
-    reactor.insert_irp(irp);
+    unsafe {
+        // SAFETY: The CSQ calls insertion with its lock held and an unlinked live IRP.
+        reactor.insert_irp(irp);
+    }
 }
 
 /// CSQ removal callback.
@@ -2633,6 +2958,10 @@ unsafe extern "C" fn csq_insert_irp(csq: PIO_CSQ, irp: PIRP) {
 ///
 /// `irp` must currently be linked in this reactor's pending list under the CSQ lock.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn csq_remove_irp(csq: PIO_CSQ, irp: PIRP) {
     let Some(reactor) = (unsafe {
         // SAFETY: Native initialization binds this callback to the first-field CSQ.
@@ -2640,7 +2969,10 @@ unsafe extern "C" fn csq_remove_irp(csq: PIO_CSQ, irp: PIRP) {
     }) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
-    reactor.remove_irp(irp);
+    unsafe {
+        // SAFETY: The CSQ calls removal with its lock held and this IRP still linked.
+        reactor.remove_irp(irp);
+    }
 }
 
 /// CSQ FIFO peek callback.
@@ -2648,6 +2980,10 @@ unsafe extern "C" fn csq_remove_irp(csq: PIO_CSQ, irp: PIRP) {
 ///
 /// A non-null `irp` must be linked in this queue and `context` is an optional FILE_OBJECT key.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn csq_peek_next_irp(csq: PIO_CSQ, irp: PIRP, context: PVOID) -> PIRP {
     let Some(reactor) = (unsafe {
         // SAFETY: Native initialization binds this callback to the first-field CSQ.
@@ -2655,7 +2991,10 @@ unsafe extern "C" fn csq_peek_next_irp(csq: PIO_CSQ, irp: PIRP, context: PVOID) 
     }) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
-    reactor.peek_next_irp(irp, context)
+    unsafe {
+        // SAFETY: The CSQ holds the queue lock and validates the optional starting IRP.
+        reactor.peek_next_irp(irp, context)
+    }
 }
 
 /// CSQ spin-lock acquisition callback.
@@ -2663,6 +3002,10 @@ unsafe extern "C" fn csq_peek_next_irp(csq: PIO_CSQ, irp: PIRP, context: PVOID) 
 ///
 /// `irql` must point to writable saved-IRQL storage supplied by the I/O Manager.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn csq_acquire_lock(csq: PIO_CSQ, irql: wdk_sys::PKIRQL) {
     let Some(reactor) = (unsafe {
         // SAFETY: Native initialization binds this callback to the first-field CSQ.
@@ -2687,6 +3030,10 @@ unsafe extern "C" fn csq_acquire_lock(csq: PIO_CSQ, irql: wdk_sys::PKIRQL) {
 ///
 /// `irql` must be the value returned by the matching acquisition callback.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn csq_release_lock(csq: PIO_CSQ, irql: wdk_sys::KIRQL) {
     let Some(reactor) = (unsafe {
         // SAFETY: Native initialization binds this callback to the first-field CSQ.
@@ -2705,6 +3052,10 @@ unsafe extern "C" fn csq_release_lock(csq: PIO_CSQ, irql: wdk_sys::KIRQL) {
 ///
 /// The CSQ framework must have atomically removed `irp` before invoking this callback.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "C" fn csq_complete_canceled_irp(csq: PIO_CSQ, irp: PIRP) {
     let Some(reactor) = (unsafe {
         // SAFETY: Native initialization binds this callback to the first-field CSQ.
@@ -2712,7 +3063,10 @@ unsafe extern "C" fn csq_complete_canceled_irp(csq: PIO_CSQ, irp: PIRP) {
     }) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
-    let owned = OwnedIrp::from_queued_raw(reactor.device, irp);
+    let owned = unsafe {
+        // SAFETY: The CSQ removed this live IRP exclusively before invoking cancellation.
+        OwnedIrp::from_queued_raw(reactor.device, irp)
+    };
     release_operation_reservation(&reactor.admitted);
     let _status = owned.complete_cancelled();
 }
@@ -2722,6 +3076,10 @@ unsafe extern "C" fn csq_complete_canceled_irp(csq: PIO_CSQ, irp: PIRP) {
 ///
 /// `csq` must identify a live reactor initialized by `CompletionReactor::initialize_at`.
 #[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn reactor_from_csq<'reactor>(csq: PIO_CSQ) -> Option<&'reactor CompletionReactor> {
     let reactor = NonNull::new(csq.cast::<CompletionReactor>())?;
     Some(unsafe {
@@ -2731,6 +3089,13 @@ unsafe fn reactor_from_csq<'reactor>(csq: PIO_CSQ) -> Option<&'reactor Completio
 }
 
 /// Initializes one intrusive list head.
+/// # Safety
+///
+/// `head` must point to exclusive writable storage that remains live for the list lifetime.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn initialize_list_head(head: PLIST_ENTRY) {
     let head = unsafe {
         // SAFETY: Caller supplies writable stable list-head storage.
@@ -2741,6 +3106,13 @@ unsafe fn initialize_list_head(head: PLIST_ENTRY) {
 }
 
 /// Returns whether one initialized intrusive list is empty.
+/// # Safety
+///
+/// `head` must identify a live initialized list protected against concurrent mutation.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn list_is_empty(head: PLIST_ENTRY) -> bool {
     unsafe {
         // SAFETY: Caller retains the initialized head for this single pointer observation.
@@ -2749,6 +3121,13 @@ unsafe fn list_is_empty(head: PLIST_ENTRY) -> bool {
 }
 
 /// Removes and returns the head entry of a nonempty intrusive list.
+/// # Safety
+///
+/// `head` must identify a live initialized list whose owning lock is held by the caller.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn remove_head_list(head: PLIST_ENTRY) -> Option<NonNull<LIST_ENTRY>> {
     let entry = unsafe {
         // SAFETY: Caller holds the list's owning lock.
@@ -2757,11 +3136,21 @@ unsafe fn remove_head_list(head: PLIST_ENTRY) -> Option<NonNull<LIST_ENTRY>> {
     if entry == head {
         return None;
     }
-    remove_entry_list(entry);
+    unsafe {
+        // SAFETY: `entry` is the first linked node under the caller-held list lock.
+        remove_entry_list(entry);
+    }
     NonNull::new(entry)
 }
 
 /// Inserts an unlinked entry at one intrusive list tail.
+/// # Safety
+///
+/// The caller must hold the list lock; both pointers must be live and `entry` must be unlinked.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn insert_tail_list(head: PLIST_ENTRY, entry: PLIST_ENTRY) {
     let head_ref = unsafe {
         // SAFETY: Initialized list is held under its owning lock.
@@ -2782,6 +3171,13 @@ unsafe fn insert_tail_list(head: PLIST_ENTRY, entry: PLIST_ENTRY) {
 }
 
 /// Removes one entry from its initialized intrusive list.
+/// # Safety
+///
+/// The caller must hold the list lock and `entry` must be a live linked member.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn remove_entry_list(entry: PLIST_ENTRY) {
     let entry_ref = unsafe {
         // SAFETY: Entry remains linked under its owning lock.
@@ -2797,10 +3193,20 @@ unsafe fn remove_entry_list(entry: PLIST_ENTRY) {
         // SAFETY: Next remains live in the same locked list.
         (*next).Blink = previous;
     }
-    initialize_list_head(entry);
+    unsafe {
+        // SAFETY: Removal now uniquely owns the detached entry for self-link initialization.
+        initialize_list_head(entry);
+    }
 }
 
 /// Embedded pending-list entry for one top-level IRP.
+/// # Safety
+///
+/// A non-null `irp` must be live and exclusively retained by the CSQ operation.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn irp_list_entry(irp: PIRP) -> Option<PLIST_ENTRY> {
     let mut irp = NonNull::new(irp)?;
     Some(unsafe {
@@ -2818,7 +3224,14 @@ const IRP_LIST_ENTRY_OFFSET: usize = core::mem::offset_of!(wdk_sys::IRP, Tail)
     );
 
 /// Recovers an IRP from its embedded pending-list entry.
-fn irp_from_list_entry(entry: PLIST_ENTRY) -> PIRP {
+/// # Safety
+///
+/// `entry` must be the embedded list node of a live WDK IRP.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+unsafe fn irp_from_list_entry(entry: PLIST_ENTRY) -> PIRP {
     entry
         .cast::<u8>()
         .wrapping_sub(IRP_LIST_ENTRY_OFFSET)
@@ -2826,8 +3239,18 @@ fn irp_from_list_entry(entry: PLIST_ENTRY) -> PIRP {
 }
 
 /// Tests one queued IRP against the synchronous selector under the CSQ lock.
+/// # Safety
+///
+/// `irp` must be a live queued IRP whose context cannot change while the queue lock is held.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe fn queued_irp_matches_context(irp: PIRP, context: PVOID) -> bool {
-    let Some(irp) = KernelIrp::from_raw(irp) else {
+    let Some(irp) = (unsafe {
+        // SAFETY: The caller retains the live queued IRP for this context observation.
+        KernelIrp::from_raw(irp)
+    }) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
     if context.is_null() {
@@ -2851,6 +3274,10 @@ unsafe fn queued_irp_matches_context(irp: PIRP, context: PVOID) -> bool {
 
 /// Models the CSQ pending transition in unit tests.
 #[cfg(test)]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn mark_pending_for_csq_test(irp: KernelIrp) {
     let pending_bit = match u8::try_from(wdk_sys::SL_PENDING_RETURNED) {
         Ok(bit) => bit,
@@ -3032,10 +3459,16 @@ mod tests {
     /// Panics if typed handle lanes lose their admission, cancellation, or terminal-barrier
     /// distinctions.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn handle_admission_and_terminal_barriers_are_typed() {
         let mut raw_file = wdk_sys::FILE_OBJECT::default();
-        let Some(file_object) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(raw_file))
-        else {
+        let Some(file_object) = (unsafe {
+            // SAFETY: The stack-local FILE_OBJECT remains live throughout this test.
+            KernelFileObject::from_raw(core::ptr::addr_of_mut!(raw_file))
+        }) else {
             return;
         };
         let ordinary = OperationAdmission::Handle {
@@ -3067,9 +3500,16 @@ mod tests {
     /// Panics if callback publication is lost before, or remains legal after, the exact
     /// effect-bearing write boundary.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn active_cancel_is_consumed_by_one_exact_slot() {
         let mut raw_device = wdk_sys::DEVICE_OBJECT::default();
-        let Some(device) = KernelDevice::from_raw(core::ptr::addr_of_mut!(raw_device)) else {
+        let Some(device) = (unsafe {
+            // SAFETY: The stack-local device remains live until reactor release.
+            KernelDevice::from_raw(core::ptr::addr_of_mut!(raw_device))
+        }) else {
             return;
         };
         let mut storage = MaybeUninit::<CompletionReactor>::uninit();
@@ -3130,8 +3570,10 @@ mod tests {
         assert!(reactor.with_scheduler(|scheduler| scheduler.complete(identity)));
 
         let mut raw_file = wdk_sys::FILE_OBJECT::default();
-        let Some(file_object) = KernelFileObject::from_raw(core::ptr::addr_of_mut!(raw_file))
-        else {
+        let Some(file_object) = (unsafe {
+            // SAFETY: The stack-local FILE_OBJECT remains live through reactor release.
+            KernelFileObject::from_raw(core::ptr::addr_of_mut!(raw_file))
+        }) else {
             return;
         };
         reactor.cancel_pending_ordinary(file_object);
@@ -3145,24 +3587,46 @@ mod tests {
     ///
     /// Panics if intrusive completion inbox removal or error-domain mapping changes silently.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn intrusive_inbox_and_error_mapping_are_exact() {
         let mut head = wdk_sys::LIST_ENTRY::default();
         let mut first = wdk_sys::LIST_ENTRY::default();
         let mut second = wdk_sys::LIST_ENTRY::default();
-        initialize_list_head(core::ptr::addr_of_mut!(head));
-        insert_tail_list(
-            core::ptr::addr_of_mut!(head),
-            core::ptr::addr_of_mut!(first),
-        );
-        insert_tail_list(
-            core::ptr::addr_of_mut!(head),
-            core::ptr::addr_of_mut!(second),
-        );
-        let removed = remove_head_list(core::ptr::addr_of_mut!(head));
+        unsafe {
+            // SAFETY: This test exclusively owns the live head before any insertion.
+            initialize_list_head(core::ptr::addr_of_mut!(head));
+        }
+        unsafe {
+            // SAFETY: This test exclusively owns the initialized head and unlinked first node.
+            insert_tail_list(
+                core::ptr::addr_of_mut!(head),
+                core::ptr::addr_of_mut!(first),
+            );
+        }
+        unsafe {
+            // SAFETY: This test exclusively owns the initialized head and unlinked second node.
+            insert_tail_list(
+                core::ptr::addr_of_mut!(head),
+                core::ptr::addr_of_mut!(second),
+            );
+        }
+        let removed = unsafe {
+            // SAFETY: The test exclusively owns the initialized nonempty list.
+            remove_head_list(core::ptr::addr_of_mut!(head))
+        };
         assert_eq!(removed, NonNull::new(core::ptr::addr_of_mut!(first)));
-        let removed = remove_head_list(core::ptr::addr_of_mut!(head));
+        let removed = unsafe {
+            // SAFETY: The test still exclusively owns the initialized nonempty list.
+            remove_head_list(core::ptr::addr_of_mut!(head))
+        };
         assert_eq!(removed, NonNull::new(core::ptr::addr_of_mut!(second)));
-        assert!(list_is_empty(core::ptr::addr_of_mut!(head)));
+        assert!(unsafe {
+            // SAFETY: The test exclusively owns the initialized list head.
+            list_is_empty(core::ptr::addr_of_mut!(head))
+        });
 
         assert_eq!(
             driver_error_to_core(DriverError::InsufficientResources),

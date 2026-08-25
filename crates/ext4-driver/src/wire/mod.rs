@@ -191,6 +191,14 @@ impl<'a> LittleEndianInput<'a> {
     pub(crate) fn read_u64(self, offset: WireOffset) -> DriverResult<u64> {
         Ok(u64::from_le_bytes(self.fixed(offset)?))
     }
+
+    /// Reads a little-endian `i64` from the payload.
+    /// # Errors
+    ///
+    /// Returns an error when the eight-byte little-endian field is not fully present at `offset`.
+    pub(crate) fn read_i64(self, offset: WireOffset) -> DriverResult<i64> {
+        Ok(i64::from_le_bytes(self.fixed(offset)?))
+    }
 }
 
 /// Little-endian writer over a checked external payload.
@@ -260,6 +268,14 @@ impl<'a> LittleEndianOutput<'a> {
     pub(crate) fn write_u64(&mut self, offset: WireOffset, value: u64) -> DriverResult<()> {
         self.write_bytes(offset, value.to_le_bytes().as_slice())
     }
+
+    /// Writes a little-endian `i64` into the payload.
+    /// # Errors
+    ///
+    /// Returns an error when the eight-byte little-endian field cannot be written at `offset`.
+    pub(crate) fn write_i64(&mut self, offset: WireOffset, value: i64) -> DriverResult<()> {
+        self.write_bytes(offset, value.to_le_bytes().as_slice())
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +328,10 @@ mod tests {
             assert_eq!(
                 LittleEndianInput::new(&payload).read_u64(WireOffset::new(offset)),
                 Ok(value)
+            );
+            assert_eq!(
+                LittleEndianInput::new(&payload).read_i64(WireOffset::new(offset)),
+                Ok(i64::from_le_bytes(value.to_le_bytes()))
             );
         }
     }

@@ -85,6 +85,10 @@ struct BCryptBufferDesc {
 
 #[cfg_attr(not(test), link(name = "Cng"))]
 #[cfg_attr(test, link(name = "Bcrypt"))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 unsafe extern "system" {
     fn BCryptOpenAlgorithmProvider(
         algorithm: *mut *mut c_void,
@@ -186,6 +190,10 @@ impl AlgorithmHandle {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: CNG algorithm handles are opaque kernel provider identities. They are opened and closed
 // on the PASSIVE_LEVEL reactor, and operation calls are serialized by that same reactor thread.
 unsafe impl Send for AlgorithmHandle {}
@@ -198,6 +206,10 @@ impl OwnedAlgorithmHandle {
     /// # Errors
     ///
     /// Returns an error when CNG cannot open the provider or returns a null handle.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn open(identifier: &[u16]) -> DriverResult<Self> {
         let mut raw = core::ptr::null_mut();
         let status = unsafe {
@@ -222,6 +234,10 @@ impl OwnedAlgorithmHandle {
 }
 
 impl Drop for OwnedAlgorithmHandle {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drop(&mut self) {
         let _status = unsafe {
             // SAFETY: This value owns the only close authority and mounted-runtime teardown drains
@@ -411,6 +427,10 @@ impl ReusableHash {
     ///
     /// Returns an error when the stable object allocation, ABI conversion, CNG construction, or
     /// returned handle validation fails.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn try_new(provider: &HashProvider) -> DriverResult<Self> {
         let mut object = DriverVec::try_repeated_copy(0_u8, provider.object_bytes)?;
         let object_bytes =
@@ -443,6 +463,10 @@ impl ReusableHash {
     ///
     /// Returns an error when the requested digest size differs from the mounted provider, an ABI
     /// length overflows, or CNG hashing/finalization fails.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn digest<const N: usize>(&mut self, input: &[u8]) -> Ext4Result<[u8; N]> {
         if self.digest_bytes != N {
             return Err(Error::CryptographicFailure);
@@ -472,6 +496,10 @@ impl ReusableHash {
 }
 
 impl Drop for ReusableHash {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drop(&mut self) {
         let _status = unsafe {
             // SAFETY: This operation owns the sole destroy authority and the backing allocation is
@@ -492,6 +520,10 @@ impl core::fmt::Debug for ReusableHash {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: The object and handle move together, their heap allocation is address-stable, and every
 // call/destroy executes on the sole PASSIVE_LEVEL reactor thread.
 unsafe impl Send for ReusableHash {}
@@ -512,6 +544,10 @@ impl GeneratedKey<'_> {
 }
 
 impl Drop for GeneratedKey<'_> {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn drop(&mut self) {
         let _status = unsafe {
             // SAFETY: This value owns the sole destroy authority; its borrowed key-object buffer
@@ -551,11 +587,19 @@ impl core::fmt::Debug for SymmetricExecution {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: Operation admission and every cryptographic call/drop execute on the sole PASSIVE_LEVEL
 // reactor. Opaque provider handles remain live until that reactor drains every operation.
 unsafe impl Send for CngOperation {}
 
 impl CryptographicOperation for CngOperation {
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn fill_random(&mut self, output: &mut [u8]) -> Ext4Result<()> {
         let output_bytes = u32::try_from(output.len()).map_err(|_| Error::ArithmeticOverflow)?;
         let status = unsafe {
@@ -571,6 +615,10 @@ impl CryptographicOperation for CngOperation {
         cng_status_to_core(status)
     }
 
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn hkdf_sha512(&mut self, key: &[u8], info: &[u8], output: &mut [u8]) -> Ext4Result<()> {
         let generated = generate_key(self.hkdf, self.key_object.as_mut_slice(), key)?;
         set_wide_property_core(
@@ -689,6 +737,10 @@ enum CipherDirection {
 ///
 /// Returns an error when the object prefix or ABI lengths are invalid, or CNG cannot construct a
 /// non-null key handle.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn generate_key<'object>(
     execution: SymmetricExecution,
     key_object: &'object mut [u8],
@@ -758,6 +810,10 @@ fn crypt_xts(
 ///
 /// Returns an error when a length is not representable, CNG rejects the operation, or the provider
 /// reports a short result.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn crypt_in_place(
     key: &GeneratedKey<'_>,
     buffer: &mut [u8],
@@ -1014,6 +1070,10 @@ fn copy_equal(destination: &mut [u8], source: &[u8]) -> Ext4Result<()> {
 ///
 /// Returns an error when ABI conversion or CNG lookup fails, or the provider returns a value with
 /// an unexpected byte length.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn query_usize_property(algorithm: AlgorithmHandle, property: &[u16]) -> DriverResult<usize> {
     let mut value = 0_u32;
     let mut result_bytes = 0_u32;
@@ -1042,6 +1102,10 @@ fn query_usize_property(algorithm: AlgorithmHandle, property: &[u16]) -> DriverR
 /// # Errors
 ///
 /// Returns an error when the property byte length is not representable or CNG rejects the value.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn set_wide_property(
     algorithm: AlgorithmHandle,
     property: &[u16],
@@ -1069,6 +1133,10 @@ fn set_wide_property(
 /// # Errors
 ///
 /// Returns an error when the property byte length is not representable or CNG rejects the value.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn set_wide_property_core(object: *mut c_void, property: &[u16], value: &[u16]) -> Ext4Result<()> {
     let value_bytes = value
         .len()
@@ -1093,6 +1161,10 @@ fn set_wide_property_core(object: *mut c_void, property: &[u16], value: &[u16]) 
 /// # Errors
 ///
 /// Returns an error when the ABI length is not representable or CNG rejects the value.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn set_u32_property_core(object: *mut c_void, property: &[u16], mut value: u32) -> Ext4Result<()> {
     let value_bytes =
         u32::try_from(core::mem::size_of::<u32>()).map_err(|_| Error::ArithmeticOverflow)?;

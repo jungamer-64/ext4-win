@@ -33,6 +33,10 @@ const EXT4WIN_PRODUCTION_ARTIFACT_RECORD_LENGTH: usize =
 /// verbatim keeps the record at the symbol address so the link map can bind those exact bytes to
 /// the signed image.
 #[used]
+#[expect(
+    unsafe_code,
+    reason = "the production artifact record must expose one stable linker-visible symbol"
+)]
 #[unsafe(no_mangle)]
 static EXT4WIN_PRODUCTION_ARTIFACT_ID: [u8; EXT4WIN_PRODUCTION_ARTIFACT_RECORD_LENGTH] =
     *include_bytes!(concat!(env!("OUT_DIR"), "/artifact-identity.bin"));
@@ -46,6 +50,10 @@ static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 ///
 /// # Safety
 /// The kernel must pass a valid `DRIVER_OBJECT` for the lifetime of this call.
+#[expect(
+    unsafe_code,
+    reason = "DriverEntry is the audited Windows loader ABI and initial device-ownership boundary"
+)]
 #[unsafe(export_name = "DriverEntry")]
 pub unsafe extern "system" fn driver_entry(
     driver: PDRIVER_OBJECT,
@@ -86,13 +94,19 @@ pub unsafe extern "system" fn driver_entry(
         return kernel::status::DriverError::InsufficientResources.ntstatus();
     }
 
+    let Some(device) = (unsafe {
+        // SAFETY: Successful IoCreateDevice returned this unpublished live device to the driver.
+        state::KernelDevice::from_raw(device)
+    }) else {
+        return kernel::status::DriverError::InternalInvariantViolation.ntstatus();
+    };
     let control_device = match state::ControlDevice::registered(device) {
         Ok(control_device) => control_device,
         Err(error) => {
             unsafe {
                 // SAFETY: `device` was returned by IoCreateDevice and has not
                 // been registered with the I/O Manager.
-                kernel::ffi::IoDeleteDevice(device);
+                kernel::ffi::IoDeleteDevice(device.as_ptr());
             }
             return error.ntstatus();
         }

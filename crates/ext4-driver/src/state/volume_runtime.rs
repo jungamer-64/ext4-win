@@ -1,8 +1,6 @@
 //! Mounted profile, bounded epoch leases, mutation coordination, and volume failure state.
 
-use alloc::sync::Arc;
 use core::fmt;
-use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use ext4_core::{
@@ -15,6 +13,7 @@ use crate::kernel::cng::CngProvider;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::storage::{MountedStorage, MountedStorageRoute};
+use crate::memory::{DriverShared, DriverSharedLease, DriverSharedSlot};
 
 /// Volume reliability state after lower-device or checkpoint failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,7 +79,7 @@ impl VolumeFailureState {
 #[derive(Debug)]
 pub(crate) struct EpochRegistry {
     /// Epoch selected for new operations.
-    current: Arc<CommittedEpoch>,
+    current: DriverShared<CommittedEpoch>,
 }
 
 impl EpochRegistry {
@@ -89,20 +88,23 @@ impl EpochRegistry {
     ///
     /// Returns an error when storage for the initial immutable epoch cannot be allocated.
     pub(crate) fn try_new(initial: CommittedEpoch) -> DriverResult<Self> {
-        let current = Arc::try_new(initial).map_err(|_| DriverError::InsufficientResources)?;
+        let current = DriverShared::try_new(initial)?;
         Ok(Self { current })
     }
 
     /// Acquires one operation lease on the current immutable epoch.
-    pub(crate) fn acquire_current(&self) -> EpochLease {
-        EpochLease {
-            epoch: Arc::clone(&self.current),
-        }
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the finite shared-reference budget is exhausted.
+    pub(crate) fn acquire_current(&self) -> DriverResult<EpochLease> {
+        Ok(EpochLease {
+            epoch: self.current.try_acquire()?,
+        })
     }
 
     /// Borrows the current epoch for one non-suspending reactor transition.
     pub(crate) fn current(&self) -> &CommittedEpoch {
-        self.current.as_ref()
+        self.current.get()
     }
 
     /// Reserves both durable and checkpoint epoch allocations before any lower write is issued.
@@ -110,10 +112,8 @@ impl EpochRegistry {
     ///
     /// Returns insufficient resources when either stable allocation fails.
     pub(crate) fn reserve_publication(&self) -> DriverResult<EpochPublicationSlots> {
-        let durable =
-            Arc::try_new(MaybeUninit::uninit()).map_err(|_| DriverError::InsufficientResources)?;
-        let checkpoint =
-            Arc::try_new(MaybeUninit::uninit()).map_err(|_| DriverError::InsufficientResources)?;
+        let durable = DriverSharedSlot::try_new()?;
+        let checkpoint = DriverSharedSlot::try_new()?;
         Ok(EpochPublicationSlots {
             durable: EpochPublicationSlot { storage: durable },
             checkpoint: EpochPublicationSlot {
@@ -132,34 +132,26 @@ impl EpochRegistry {
 #[derive(Debug)]
 pub(crate) struct EpochLease {
     /// Shared immutable epoch owner.
-    epoch: Arc<CommittedEpoch>,
+    epoch: DriverSharedLease<CommittedEpoch>,
 }
 
 impl EpochLease {
     /// Borrows the immutable epoch retained by this operation.
     pub(crate) fn epoch(&self) -> &CommittedEpoch {
-        self.epoch.as_ref()
+        self.epoch.get()
     }
 }
 
 /// Preallocated storage for one infallible post-commit epoch publication.
 pub(crate) struct EpochPublicationSlot {
     /// Uninitialized shared allocation that becomes the published epoch owner.
-    storage: Arc<MaybeUninit<CommittedEpoch>>,
+    storage: DriverSharedSlot<CommittedEpoch>,
 }
 
 impl EpochPublicationSlot {
     /// Initializes this uniquely owned reservation and converts it to immutable epoch ownership.
-    fn initialize(mut self, epoch: CommittedEpoch) -> Arc<CommittedEpoch> {
-        let Some(storage) = Arc::get_mut(&mut self.storage) else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
-        storage.write(epoch);
-        unsafe {
-            // SAFETY: The unique allocation was initialized immediately above and is consumed by
-            // this conversion, so no uninitialized Arc remains accessible.
-            self.storage.assume_init()
-        }
+    fn initialize(self, epoch: CommittedEpoch) -> DriverShared<CommittedEpoch> {
+        self.storage.initialize(epoch)
     }
 }
 
@@ -240,7 +232,7 @@ pub(crate) struct VolumeRuntime {
     /// Short epoch-swap gate independent from checkpoint I/O.
     visibility_gate: VisibilityGateState,
     /// Mutations admitted before closing and not yet fully checkpointed or abandoned.
-    active_mutations: Arc<AtomicU32>,
+    active_mutations: DriverShared<AtomicU32>,
 }
 
 impl VolumeRuntime {
@@ -261,8 +253,7 @@ impl VolumeRuntime {
             failure: VolumeFailureState::Operational,
             commit_gate: CommitGateState::Ready,
             visibility_gate: VisibilityGateState::Ready,
-            active_mutations: Arc::try_new(AtomicU32::new(0))
-                .map_err(|_| DriverError::InsufficientResources)?,
+            active_mutations: DriverShared::try_new(AtomicU32::new(0))?,
         })
     }
 
@@ -283,7 +274,7 @@ impl VolumeRuntime {
 
     /// Whether journal space has no granted commit or published overlay awaiting checkpoint.
     pub(crate) fn journal_is_clean(&self) -> bool {
-        self.active_mutations.load(Ordering::Acquire) == 0
+        self.active_mutations.get().load(Ordering::Acquire) == 0
             && matches!(self.commit_gate, CommitGateState::Ready)
     }
 
@@ -293,7 +284,7 @@ impl VolumeRuntime {
     /// Returns an error when reads are no longer authorized.
     pub(crate) fn acquire_epoch(&mut self) -> DriverResult<EpochLease> {
         self.failure.authorize_read()?;
-        Ok(self.epochs.acquire_current())
+        self.epochs.acquire_current()
     }
 
     /// Current epoch for one non-suspending projection.
@@ -458,7 +449,7 @@ impl VolumeRuntime {
 #[derive(Debug)]
 pub(crate) struct MutationActivityLease {
     /// Shared mutation-count owner retained independently from the runtime field.
-    active: Arc<AtomicU32>,
+    active: DriverSharedLease<AtomicU32>,
 }
 
 impl MutationActivityLease {
@@ -466,21 +457,21 @@ impl MutationActivityLease {
     /// # Errors
     ///
     /// Returns insufficient resources when the finite mutation count is exhausted.
-    fn acquire(active: &Arc<AtomicU32>) -> DriverResult<Self> {
-        active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    fn acquire(active: &DriverShared<AtomicU32>) -> DriverResult<Self> {
+        let lease = active.try_acquire()?;
+        lease
+            .get()
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| DriverError::InsufficientResources)?;
-        Ok(Self {
-            active: Arc::clone(active),
-        })
+        Ok(Self { active: lease })
     }
 }
 
 impl Drop for MutationActivityLease {
     fn drop(&mut self) {
-        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.active.get().fetch_sub(1, Ordering::AcqRel);
         if previous == 0 {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }

@@ -25,7 +25,6 @@ pub(crate) use capture::{
 };
 use capture::{QueueContext, QueueContextOwnership};
 
-#[cfg(not(test))]
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory;
@@ -362,13 +361,23 @@ pub(crate) struct DispatchTarget {
 
 impl DispatchTarget {
     /// Decodes raw WDK dispatch pointers.
+    /// # Safety
+    ///
+    /// The pointers must identify the live device and IRP supplied for the active WDK dispatch
+    /// callback. The caller must retain both until completion ownership is transferred or consumed.
     /// # Errors
     ///
     /// Returns an error when either the device object or IRP pointer is null.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) unsafe fn decode(device: PDEVICE_OBJECT, irp: PIRP) -> Result<Self, DriverError> {
+        // SAFETY: The caller guarantees that every non-null callback device remains live.
         let Some(device) = (unsafe { KernelDevice::from_raw(device) }) else {
             return Err(DriverError::InvalidParameter);
         };
+        // SAFETY: The caller guarantees that every non-null callback IRP remains live.
         let Some(irp) = (unsafe { KernelIrp::from_raw(irp) }) else {
             return Err(DriverError::InvalidParameter);
         };
@@ -409,6 +418,10 @@ impl ActiveIrp<'_> {
     }
 
     /// Returns whether this request is normal handle I/O or paging I/O.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn data_io_kind(&self) -> DataIoKind {
         let flags = unsafe {
             // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
@@ -426,6 +439,13 @@ impl ActiveIrp<'_> {
     ///
     /// Returns an invariant error when the I/O Manager does not expose a requestor process for
     /// this live IRP.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     pub(crate) fn requestor_process(&self) -> DriverResult<RequestorProcess> {
         #[cfg(not(test))]
         let process = unsafe {
@@ -451,6 +471,8 @@ impl ActiveIrp<'_> {
     }
 
     /// Returns METHOD_BUFFERED output bytes tied to this active owner borrow.
+    ///
+    /// The complete output range is initialized to zero before it can become a Rust byte slice.
     /// # Errors
     ///
     /// Returns an error when the associated system buffer is null.
@@ -515,6 +537,10 @@ impl ActiveIrp<'_> {
     /// # Errors
     ///
     /// Returns an error when the current stack pointer is null.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn current_stack(&self) -> Result<CurrentIrpStackLocation<'_>, DriverError> {
         let irp = unsafe {
             // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
@@ -538,6 +564,10 @@ impl ActiveIrp<'_> {
     /// # Errors
     ///
     /// Returns an error when the active IRP has no system buffer.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn associated_system_buffer(&self) -> Result<NonNull<u8>, DriverError> {
         let irp = unsafe {
             // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
@@ -556,6 +586,10 @@ impl ActiveIrp<'_> {
     /// # Errors
     ///
     /// Returns an error when neither a system buffer nor a valid mapped MDL covers `length`.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn data_buffer_address(&self, length: IrpBufferLength) -> Result<NonNull<u8>, DriverError> {
         if let Ok(system_buffer) = self.associated_system_buffer() {
             return Ok(system_buffer);
@@ -572,14 +606,20 @@ impl ActiveIrp<'_> {
     }
 
     /// Captures an opaque requestor buffer without creating a Rust reference to its bytes.
+    /// # Errors
+    ///
+    /// Returns an error when a nonempty IRP buffer has no valid system-buffer or MDL mapping.
     fn requestor_buffer(&self, length: IrpBufferLength) -> DriverResult<RequestorBuffer> {
-        let length = length.as_usize();
-        let address = if length == 0 {
+        let byte_count = length.as_usize();
+        let address = if byte_count == 0 {
             None
         } else {
-            Some(self.data_buffer_address(IrpBufferLength::from_usize(length)?)?)
+            Some(self.data_buffer_address(length)?)
         };
-        Ok(RequestorBuffer { address, length })
+        Ok(RequestorBuffer {
+            address,
+            length: byte_count,
+        })
     }
 }
 
@@ -603,6 +643,9 @@ pub(crate) struct RequestorInput<'owner> {
 
 impl RequestorInput<'_> {
     /// Binds an opaque range to the active completion-owner lifetime.
+    /// # Errors
+    ///
+    /// Returns an error when the opaque mapping does not satisfy the active input contract.
     fn from_active(buffer: RequestorBuffer) -> DriverResult<Self> {
         Ok(Self {
             buffer,
@@ -630,6 +673,9 @@ pub(crate) struct RequestorOutput<'owner> {
 
 impl RequestorOutput<'_> {
     /// Binds an opaque range to the active completion-owner lifetime.
+    /// # Errors
+    ///
+    /// Returns an error when the opaque mapping does not satisfy the active output contract.
     fn from_active(buffer: RequestorBuffer) -> DriverResult<Self> {
         Ok(Self {
             buffer,
@@ -647,6 +693,14 @@ impl RequestorOutput<'_> {
 }
 
 /// Copies one checked requestor-input window into driver-owned storage.
+/// # Errors
+///
+/// Returns an error when the range is invalid, unrepresentable by the native ABI, or rejected by
+/// the native copy boundary.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn copy_requestor_input_window(
     address: Option<NonNull<u8>>,
     total_length: usize,
@@ -687,6 +741,14 @@ fn copy_requestor_input_window(
 }
 
 /// Copies driver-owned bytes into one checked requestor-output window.
+/// # Errors
+///
+/// Returns an error when the range is invalid, unrepresentable by the native ABI, or rejected by
+/// the native copy boundary.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn copy_requestor_output_window(
     address: Option<NonNull<u8>>,
     total_length: usize,
@@ -754,6 +816,10 @@ impl ActiveFileObject<'_> {
     }
 
     /// Returns the WDK FILE_OBJECT for the lifetime of this active view.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn as_ref(&self) -> &wdk_sys::FILE_OBJECT {
         unsafe {
             // SAFETY: Construction is private to a lifetime-bound current-stack view whose IRP
@@ -768,8 +834,16 @@ impl ActiveFileObject<'_> {
     }
 
     /// Returns the related FILE_OBJECT retained by this active create request, when present.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn related_file_object(self) -> Option<Self> {
-        KernelFileObject::from_raw(self.as_ref().RelatedFileObject).map(|address| Self {
+        unsafe {
+            // SAFETY: The active create IRP retains its related FILE_OBJECT for this owner borrow.
+            KernelFileObject::from_raw(self.as_ref().RelatedFileObject)
+        }
+        .map(|address| Self {
             address,
             owner: core::marker::PhantomData,
         })
@@ -786,13 +860,21 @@ pub(crate) struct ReceivedIrp {
 
 impl ReceivedIrp {
     /// Decodes raw WDK dispatch pointers into a received IRP.
+    /// # Safety
+    ///
+    /// The pointers must identify the live device and IRP supplied for the active WDK dispatch
+    /// callback.
     /// # Errors
     ///
     /// Returns an error when either the device object or IRP pointer is null.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) unsafe fn decode(device: PDEVICE_OBJECT, irp: PIRP) -> DriverResult<Self> {
-        Ok(Self {
-            target: unsafe { DispatchTarget::decode(device, irp)? },
-        })
+        // SAFETY: The caller retains the raw callback pair for this received completion owner.
+        let target = unsafe { DispatchTarget::decode(device, irp)? };
+        Ok(Self { target })
     }
 
     /// Executes one non-suspending operation against a lifetime-bound active IRP view.
@@ -827,6 +909,10 @@ impl ReceivedIrp {
     /// FsRtl completes lock requests itself, including requests that wait for a conflicting range.
     /// This consuming transition prevents the normal driver completion path from completing the
     /// same IRP again.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn delegate_byte_range_lock(
         self,
         file_control_block: NonNull<FileControlBlock>,
@@ -840,9 +926,19 @@ impl ReceivedIrp {
     }
 
     /// Completes a raw IRP when dispatch-target decoding failed.
-    pub(crate) fn complete_decode_error(irp: PIRP, error: DriverError) -> NTSTATUS {
+    /// # Safety
+    ///
+    /// A non-null `irp` must be the live IRP supplied to the active dispatch callback.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) unsafe fn complete_decode_error(irp: PIRP, error: DriverError) -> NTSTATUS {
         let completion = IrpCompletion::from_error(error);
-        if let Some(irp) = KernelIrp::from_raw(irp) {
+        if let Some(irp) = unsafe {
+            // SAFETY: The caller retains the callback's live IRP through this terminal completion.
+            KernelIrp::from_raw(irp)
+        } {
             return irp.complete(completion);
         }
         completion.status()
@@ -981,8 +1077,19 @@ impl<'a> PendingIrpLease<'a> {
 
 impl OwnedIrp {
     /// Takes queue context and terminal completion authority from one exclusively removed IRP.
-    fn from_queued_raw(device: KernelDevice, irp: PIRP) -> Self {
-        let Some(irp) = KernelIrp::from_raw(irp) else {
+    /// # Safety
+    ///
+    /// `irp` must be a live IRP exclusively removed from this device's CSQ with its queue context
+    /// still published.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    unsafe fn from_queued_raw(device: KernelDevice, irp: PIRP) -> Self {
+        let Some(irp) = (unsafe {
+            // SAFETY: The caller owns the exclusively removed live IRP.
+            KernelIrp::from_raw(irp)
+        }) else {
             crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
                 .bugcheck();
         };
@@ -996,9 +1103,19 @@ impl OwnedIrp {
     }
 
     /// Builds queued ownership directly for completion-focused unit tests.
+    /// # Safety
+    ///
+    /// `irp` must name a live test fixture retained until the returned owner is consumed.
     #[cfg(test)]
-    fn from_test_raw(device: KernelDevice, irp: PIRP) -> Option<Self> {
-        let irp = KernelIrp::from_raw(irp)?;
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    unsafe fn from_test_raw(device: KernelDevice, irp: PIRP) -> Option<Self> {
+        let irp = unsafe {
+            // SAFETY: The test caller supplies a live fixture for the returned owner lifetime.
+            KernelIrp::from_raw(irp)?
+        };
         Some(Self {
             target: DispatchTarget { device, irp },
             context: QueueContextOwnership::Captured(QueueContext::for_test_create().ok()?),
@@ -1012,6 +1129,10 @@ impl OwnedIrp {
 
     /// Installs the active cancellation token after this IRP leaves the CSQ.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn install_active_cancellation(&mut self, envelope: NonNull<ActiveCancelEnvelope>) {
         if self.active_cancellation.is_some() {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -1079,6 +1200,10 @@ impl OwnedIrp {
     }
 
     /// Transfers this queued directory-change IRP's terminal completion authority to FsRtl.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn delegate_directory_notification(
         self,
         notifier: NonNull<DirectoryChangeNotifier>,
@@ -1110,6 +1235,10 @@ impl OwnedIrp {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 // SAFETY: After CSQ removal, this unique completion authority moves only between the sole reactor
 // thread and an ext4win-owned lower completion envelope. No requestor-context access occurs while
 // the lower stack owns that envelope.
@@ -1124,6 +1253,14 @@ struct KernelIrp {
 
 impl KernelIrp {
     /// Converts a raw WDK IRP pointer into the private non-null boundary type.
+    /// # Safety
+    ///
+    /// A non-null pointer must identify a live I/O Manager-owned IRP retained by the current
+    /// completion owner.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn from_raw(irp: PIRP) -> Option<Self> {
         NonNull::new(irp).map(|irp| Self { irp })
     }
@@ -1134,6 +1271,10 @@ impl KernelIrp {
     }
 
     /// Publishes one queue context into the sole driver-owned IRP context slot.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn publish_queue_context(self, context: QueueContextOwnership) {
         let mut irp = self.irp;
         let irp = unsafe {
@@ -1164,6 +1305,10 @@ impl KernelIrp {
     }
 
     /// Takes the context after CSQ removal or cancellation transferred exclusive IRP ownership.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn take_queue_context(self) -> QueueContextOwnership {
         let mut irp = self.irp;
         let irp = unsafe {
@@ -1209,6 +1354,10 @@ impl KernelIrp {
     /// # Safety
     /// The caller must hold the owning cancel-safe queue lock so removal cannot take or free the
     /// context until this method returns.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     unsafe fn published_queue_context_matches(
         self,
         cancellation: *mut c_void,
@@ -1263,6 +1412,10 @@ impl KernelIrp {
     }
 
     /// Writes the raw WDK completion pair after a typed completion path selected its semantics.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn write_status_and_information(self, status: NTSTATUS, information: wdk_sys::ULONG_PTR) {
         let mut irp = self.irp;
         let irp = unsafe {
@@ -1275,6 +1428,10 @@ impl KernelIrp {
     }
 
     /// Installs a Rust-owned create reparse allocation into the IRP tail overlay.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn install_create_symlink_reparse_buffer(self, buffer: CreateSymlinkReparseBuffer) {
         let mut irp = self.irp;
         let irp = unsafe {
@@ -1286,6 +1443,13 @@ impl KernelIrp {
     }
 
     /// Invokes the I/O Manager after the unique owner wrote all terminal IRP fields.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        )
+    )]
     fn finish_completion(self, status: NTSTATUS) -> NTSTATUS {
         #[cfg(not(test))]
         unsafe {
@@ -1379,6 +1543,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     }
 
     /// Returns the raw minor-function byte for local enum decoding only.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn raw_minor_function(self) -> wdk_sys::UCHAR {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1403,13 +1571,21 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     /// # Errors
     ///
     /// Returns an error when the raw `FileObject` pointer in the current stack location is null.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn kernel_file_object(self) -> Result<KernelFileObject, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
             // for the current dispatch callback.
             self.stack.as_ref()
         };
-        KernelFileObject::from_raw(stack.FileObject).ok_or(DriverError::InvalidParameter)
+        unsafe {
+            // SAFETY: The active IRP stack retains its FILE_OBJECT for this owner-bound view.
+            KernelFileObject::from_raw(stack.FileObject)
+        }
+        .ok_or(DriverError::InvalidParameter)
     }
 
     /// Decodes mount-volume parameters from the current stack location.
@@ -1417,6 +1593,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when the VPB or target device object is null, or the output length is not
     /// representable.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn mount_volume(self) -> Result<MountVolumeStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1429,10 +1609,16 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
             stack.Parameters.MountVolume
         };
 
-        let Some(vpb) = KernelVpb::from_raw(mount.Vpb) else {
+        let Some(vpb) = (unsafe {
+            // SAFETY: The I/O Manager retains the mount VPB through this active mount IRP.
+            KernelVpb::from_raw(mount.Vpb)
+        }) else {
             return Err(DriverError::InvalidParameter);
         };
-        let Some(target_device) = KernelDevice::from_raw(mount.DeviceObject) else {
+        let Some(target_device) = (unsafe {
+            // SAFETY: The I/O Manager retains the mount target device through this mount IRP.
+            KernelDevice::from_raw(mount.DeviceObject)
+        }) else {
             return Err(DriverError::InvalidParameter);
         };
 
@@ -1448,6 +1634,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when the FILE_OBJECT is absent, buffer lengths are invalid, or the FSCTL
     /// code is unsupported.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn file_system_control(self) -> Result<FileSystemControlStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1472,6 +1662,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when the FILE_OBJECT or security context is absent, EA length is invalid, or
     /// create parameters are unsupported.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn create(self) -> Result<CreateStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1507,6 +1701,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when the output length is not representable or the volume information class
     /// is unsupported.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn query_volume(self) -> Result<QueryVolumeStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1529,6 +1727,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when the input length is not representable or the volume information class
     /// is unsupported.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn set_volume(self) -> Result<SetVolumeStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1551,6 +1753,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when the FILE_OBJECT is absent, the output length is invalid, or the file
     /// information class is unsupported.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn query_file(self) -> Result<QueryFileStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1574,6 +1780,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when the FILE_OBJECT is absent, the input length is invalid, or the file
     /// information class is unsupported.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn set_file(self) -> Result<SetFileStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1597,6 +1807,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when the FILE_OBJECT is absent, the output length is invalid, or the
     /// directory information class is unsupported.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn query_directory(self) -> Result<QueryDirectoryStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1633,6 +1847,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     /// # Errors
     ///
     /// Returns an error when the current stack location cannot be decoded.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn query_directory_file_name(
         self,
     ) -> Result<Option<NonNull<wdk_sys::UNICODE_STRING>>, DriverError> {
@@ -1652,6 +1870,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when the FILE_OBJECT is absent or the notification filter is empty or
     /// contains unsupported bits.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn notify_directory(self) -> Result<NotifyDirectoryStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1675,6 +1897,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when an EA name list pointer is missing, the FILE_OBJECT is absent, or
     /// buffer lengths are invalid.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn query_ea(self) -> Result<QueryEaStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1713,6 +1939,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     /// # Errors
     ///
     /// Returns an error when the list length is invalid or a non-empty list has no address.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn query_ea_name_list(
         self,
     ) -> Result<Option<(NonNull<c_void>, IrpBufferLength)>, DriverError> {
@@ -1736,6 +1966,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     /// # Errors
     ///
     /// Returns an error when the FILE_OBJECT is absent or the set-EA input length is invalid.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn set_ea(self) -> Result<SetEaStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1758,6 +1992,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when the FILE_OBJECT is absent, requested security bits are unsupported, or
     /// the output length is invalid.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn query_security(self) -> Result<QuerySecurityStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1781,6 +2019,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     ///
     /// Returns an error when the FILE_OBJECT or security descriptor is absent, or requested security
     /// bits are unsupported.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn set_security(self) -> Result<SetSecurityStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1806,6 +2048,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     /// # Errors
     ///
     /// Returns an error when the read stack has no FILE_OBJECT or an invalid byte count.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn read(self) -> Result<ReadStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1833,6 +2079,10 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     /// # Errors
     ///
     /// Returns an error when the write stack has no FILE_OBJECT or an invalid byte count.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     pub(crate) fn write(self) -> Result<WriteStack, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
@@ -1881,6 +2131,10 @@ impl IrpByteBuffer {
     }
 
     /// Returns the buffer as a byte slice.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn as_slice(&self) -> &[u8] {
         unsafe {
             // SAFETY: IrpByteBuffer is constructed only after the active IRP
@@ -1890,6 +2144,10 @@ impl IrpByteBuffer {
     }
 
     /// Returns the buffer as a mutable byte slice.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe {
             // SAFETY: IrpByteBuffer is constructed only after the active IRP
@@ -1936,13 +2194,24 @@ pub(crate) struct BufferedOutput<'owner> {
 }
 
 impl BufferedOutput<'_> {
-    /// Binds a mutable buffer view to an active completion-owner borrow.
+    /// Initializes and binds a mutable buffer view to an active completion-owner borrow.
     /// # Errors
     ///
     /// Returns an error when the output buffer length cannot safely back a mutable Rust slice.
+    #[expect(
+        unsafe_code,
+        reason = "the buffered-output boundary initializes raw I/O Manager storage before exposing Rust bytes"
+    )]
     fn from_active(address: NonNull<u8>, length: usize) -> Result<Self, DriverError> {
+        let bytes = IrpByteBuffer::new(address, length)?;
+        unsafe {
+            // SAFETY: The active METHOD_BUFFERED output contract provides writable system-buffer
+            // storage for `length` bytes. Raw initialization occurs before any Rust reference to
+            // those bytes exists.
+            address.as_ptr().write_bytes(0, length);
+        }
         Ok(Self {
-            bytes: IrpByteBuffer::new(address, length)?,
+            bytes,
             owner: core::marker::PhantomData,
         })
     }
@@ -1958,6 +2227,10 @@ impl BufferedOutput<'_> {
 ///
 /// Returns an error when `length` exceeds the MDL byte count or the MDL cannot be mapped to system
 /// address space.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn mdl_data_buffer_address(
     mdl: NonNull<wdk_sys::MDL>,
     length: IrpBufferLength,
@@ -1980,6 +2253,10 @@ fn mdl_data_buffer_address(
 /// # Errors
 ///
 /// Returns an error when an already-mapped MDL has no mapped address or mapping locked pages fails.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
 fn mapped_mdl_address(
     mdl: NonNull<wdk_sys::MDL>,
     mdl_ref: &wdk_sys::MDL,
@@ -3552,19 +3829,72 @@ mod tests {
     };
     use crate::kernel::status::DriverError;
     use crate::security_descriptor::SecurityComponentSelection;
-    use crate::state::{KernelDevice, KernelFileObject, KernelVpb, WriteCommitment};
+    use crate::state::{KernelDevice, KernelFileObject, WriteCommitment};
 
     /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
     const MOUNT_VOLUME_MINOR: wdk_sys::UCHAR = 1;
 
-    /// Returns a non-null opaque pointer for decode-only dispatch tests.
-    fn opaque<T>() -> *mut T {
-        NonNull::<c_void>::dangling().as_ptr().cast()
+    /// Binds one live stack-local device fixture to the raw WDK boundary.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    fn kernel_device_fixture(device: &mut wdk_sys::DEVICE_OBJECT) -> Option<KernelDevice> {
+        unsafe {
+            // SAFETY: The caller's mutable fixture outlives every returned use in these tests.
+            KernelDevice::from_raw(core::ptr::from_mut(device))
+        }
+    }
+
+    /// Binds one live stack-local IRP fixture to the private completion boundary.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    fn kernel_irp_fixture(irp: &mut wdk_sys::IRP) -> Option<KernelIrp> {
+        unsafe {
+            // SAFETY: The caller's mutable fixture outlives every returned use in these tests.
+            KernelIrp::from_raw(core::ptr::from_mut(irp))
+        }
+    }
+
+    /// Creates a received IRP from live stack-local device and IRP fixtures.
+    /// # Errors
+    ///
+    /// Returns invalid parameter when either fixture cannot cross the raw dispatch boundary.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    fn received_irp_fixture(
+        device: &mut wdk_sys::DEVICE_OBJECT,
+        irp: &mut wdk_sys::IRP,
+    ) -> Result<ReceivedIrp, DriverError> {
+        unsafe {
+            // SAFETY: Both mutable fixtures remain live for the returned owner in the caller.
+            ReceivedIrp::decode(core::ptr::from_mut(device), core::ptr::from_mut(irp))
+        }
+    }
+
+    /// Creates test completion ownership from live stack-local fixtures.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    fn owned_irp_fixture(device: KernelDevice, irp: &mut wdk_sys::IRP) -> Option<OwnedIrp> {
+        unsafe {
+            // SAFETY: The test fixture provides exclusive completion ownership until consumption.
+            OwnedIrp::from_test_raw(device, core::ptr::from_mut(irp))
+        }
     }
 
     use core::ptr::NonNull;
 
     /// Reads the active IRP status union arm.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn irp_status(irp: &wdk_sys::IRP) -> wdk_sys::NTSTATUS {
         unsafe {
             // SAFETY: Tests read the status arm after initializing or writing
@@ -3588,19 +3918,64 @@ mod tests {
 
     /// # Panics
     ///
+    /// Panics when buffered output becomes a Rust slice before the complete declared range has
+    /// been initialized.
+    #[test]
+    fn buffered_output_initializes_only_its_declared_range_before_borrow() {
+        let mut storage = [0xA5_u8; 17];
+        let address = NonNull::new(storage.as_mut_ptr());
+        assert!(address.is_some());
+        let Some(address) = address else {
+            return;
+        };
+        {
+            let output = super::BufferedOutput::from_active(address, 13);
+            assert!(output.is_ok());
+            let Ok(mut output) = output else {
+                return;
+            };
+            assert!(output.as_mut_slice().iter().all(|byte| *byte == 0));
+            output.as_mut_slice().fill(0x3C);
+        }
+        assert!(
+            storage
+                .get(..13)
+                .is_some_and(|bytes| bytes.iter().all(|byte| *byte == 0x3C))
+        );
+        assert!(
+            storage
+                .get(13..)
+                .is_some_and(|bytes| bytes.iter().all(|byte| *byte == 0xA5))
+        );
+    }
+
+    /// # Panics
+    ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn null_dispatch_target_is_invalid_parameter() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut irp = wdk_sys::IRP::default();
         assert_eq!(
-            DispatchTarget::decode(core::ptr::null_mut(), opaque::<wdk_sys::IRP>())
-                .err()
-                .map(crate::kernel::status::DriverError::ntstatus),
+            unsafe {
+                // SAFETY: The non-null fixture IRP remains live; the null device is rejected.
+                DispatchTarget::decode(core::ptr::null_mut(), core::ptr::from_mut(&mut irp))
+            }
+            .err()
+            .map(crate::kernel::status::DriverError::ntstatus),
             Some(STATUS_INVALID_PARAMETER)
         );
         assert_eq!(
-            DispatchTarget::decode(opaque::<wdk_sys::DEVICE_OBJECT>(), core::ptr::null_mut())
-                .err()
-                .map(crate::kernel::status::DriverError::ntstatus),
+            unsafe {
+                // SAFETY: The non-null fixture device remains live; the null IRP is rejected.
+                DispatchTarget::decode(core::ptr::from_mut(&mut device), core::ptr::null_mut())
+            }
+            .err()
+            .map(crate::kernel::status::DriverError::ntstatus),
             Some(STATUS_INVALID_PARAMETER)
         );
     }
@@ -3610,12 +3985,13 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn decoded_dispatch_target_preserves_pointers() {
-        let device = opaque::<wdk_sys::DEVICE_OBJECT>();
-        let irp = opaque::<wdk_sys::IRP>();
-        let decoded = ReceivedIrp::decode(device, irp);
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut irp = wdk_sys::IRP::default();
+        let device_pointer = core::ptr::from_mut(&mut device);
+        let decoded = received_irp_fixture(&mut device, &mut irp);
         assert!(decoded.is_ok());
         if let Ok(received) = decoded {
-            assert_eq!(received.device().as_ptr(), device);
+            assert_eq!(received.device().as_ptr(), device_pointer);
         }
     }
 
@@ -3623,9 +3999,13 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn irp_completion_writes_status_and_information_together() {
         let mut irp = wdk_sys::IRP::default();
-        let kernel_irp = KernelIrp::from_raw(core::ptr::addr_of_mut!(irp));
+        let kernel_irp = kernel_irp_fixture(&mut irp);
         assert!(kernel_irp.is_some());
         let information = InformationLength::from_usize(128);
         assert!(information.is_ok());
@@ -3647,10 +4027,14 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn failed_irp_completion_writes_zero_information() {
         let mut irp = wdk_sys::IRP::default();
         irp.IoStatus.Information = 128;
-        let kernel_irp = KernelIrp::from_raw(core::ptr::addr_of_mut!(irp));
+        let kernel_irp = kernel_irp_fixture(&mut irp);
         assert!(kernel_irp.is_some());
         if let Some(kernel_irp) = kernel_irp {
             kernel_irp.write_status_block(IrpCompletion::from_error(
@@ -3727,6 +4111,10 @@ mod tests {
     /// Panics when create reparse completion does not transfer the exact allocation and publish the
     /// WDK reparse status pair.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn create_reparse_completion_transfers_exact_auxiliary_buffer() {
         const EXPECTED: [u8; 22] = [
             0x0C, 0x00, 0x00, 0xA0, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
@@ -3734,13 +4122,13 @@ mod tests {
         ];
 
         let mut device_object = wdk_sys::DEVICE_OBJECT::default();
-        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device_object));
+        let device = kernel_device_fixture(&mut device_object);
         assert!(device.is_some());
         let Some(device) = device else {
             return;
         };
         let mut irp = wdk_sys::IRP::default();
-        let owned = OwnedIrp::from_test_raw(device, core::ptr::addr_of_mut!(irp));
+        let owned = owned_irp_fixture(device, &mut irp);
         assert!(owned.is_some());
         let Some(owned) = owned else {
             return;
@@ -3789,19 +4177,23 @@ mod tests {
     ///
     /// Panics when a successful handle create does not publish its exact Windows create action.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn create_handle_completion_publishes_exact_action() {
         for (action, expected) in [
             (CreateAction::Opened, wdk_sys::FILE_OPENED),
             (CreateAction::Created, wdk_sys::FILE_CREATED),
         ] {
             let mut device_object = wdk_sys::DEVICE_OBJECT::default();
-            let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device_object));
+            let device = kernel_device_fixture(&mut device_object);
             assert!(device.is_some());
             let Some(device) = device else {
                 return;
             };
             let mut irp = wdk_sys::IRP::default();
-            let owned = OwnedIrp::from_test_raw(device, core::ptr::addr_of_mut!(irp));
+            let owned = owned_irp_fixture(device, &mut irp);
             assert!(owned.is_some());
             let Some(owned) = owned else {
                 return;
@@ -3826,15 +4218,19 @@ mod tests {
     ///
     /// Panics when a failed create request publishes ownership into the IRP tail overlay.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn failed_create_completion_never_publishes_auxiliary_buffer() {
         let mut device_object = wdk_sys::DEVICE_OBJECT::default();
-        let device = KernelDevice::from_raw(core::ptr::addr_of_mut!(device_object));
+        let device = kernel_device_fixture(&mut device_object);
         assert!(device.is_some());
         let Some(device) = device else {
             return;
         };
         let mut irp = wdk_sys::IRP::default();
-        let owned = OwnedIrp::from_test_raw(device, core::ptr::addr_of_mut!(irp));
+        let owned = owned_irp_fixture(device, &mut irp);
         assert!(owned.is_some());
         if let Some(owned) = owned {
             assert_eq!(
@@ -3874,10 +4270,7 @@ mod tests {
     fn current_stack_location_rejects_null_pointer() {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut irp = wdk_sys::IRP::default();
-        let mut received = ReceivedIrp::decode(
-            core::ptr::addr_of_mut!(device),
-            core::ptr::addr_of_mut!(irp),
-        );
+        let mut received = received_irp_fixture(&mut device, &mut irp);
         assert!(received.is_ok());
         assert_eq!(
             received
@@ -3953,11 +4346,8 @@ mod tests {
             let mount = current.mount_volume();
             assert!(mount.is_ok());
             if let Ok(mount) = mount {
-                assert_eq!(Some(mount.vpb()), KernelVpb::from_raw(vpb.as_ptr()));
-                assert_eq!(
-                    Some(mount.target_device()),
-                    KernelDevice::from_raw(target.as_ptr())
-                );
+                assert_eq!(mount.vpb().as_non_null(), vpb);
+                assert_eq!(mount.target_device().as_ptr(), target.as_ptr());
                 assert_eq!(mount.output_buffer_length().as_usize(), 16);
             }
         }
@@ -3967,8 +4357,13 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn file_system_control_stack_decodes_supported_user_control() {
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         let mut stack = wdk_sys::IO_STACK_LOCATION {
             FileObject: file_object.as_ptr(),
             ..wdk_sys::IO_STACK_LOCATION::default()
@@ -3991,7 +4386,10 @@ mod tests {
             if let Ok(control) = control {
                 assert_eq!(
                     current.file_object().ok().map(ActiveFileObject::address),
-                    KernelFileObject::from_raw(file_object.as_ptr())
+                    unsafe {
+                        // SAFETY: The owning test allocation remains live through this comparison.
+                        KernelFileObject::from_raw(file_object.as_ptr())
+                    }
                 );
                 assert_eq!(control.input_buffer_length().as_usize(), 32);
                 assert_eq!(control.output_buffer_length().as_usize(), 128);
@@ -4082,8 +4480,13 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn create_stack_preserves_access_share_options_and_ea_length() {
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         let desired_access =
             wdk_sys::FILE_READ_DATA | wdk_sys::FILE_WRITE_DATA | wdk_sys::SYNCHRONIZE;
         let mut security_context = wdk_sys::IO_SECURITY_CONTEXT {
@@ -4117,7 +4520,10 @@ mod tests {
             if let Ok(create) = create {
                 assert_eq!(
                     current.file_object().ok().map(ActiveFileObject::address),
-                    KernelFileObject::from_raw(file_object.as_ptr())
+                    unsafe {
+                        // SAFETY: The owning test allocation remains live through this comparison.
+                        KernelFileObject::from_raw(file_object.as_ptr())
+                    }
                 );
                 let parameters = create.parameters();
                 assert_eq!(parameters.desired_access().as_raw(), desired_access);
@@ -4562,9 +4968,14 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn query_ea_stack_decodes_name_selection_length_and_emission() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         let ea_list = NonNull::<u8>::dangling();
         stack.FileObject = file_object.as_ptr();
         stack.Flags = u8::try_from(wdk_sys::SL_RETURN_SINGLE_ENTRY | wdk_sys::SL_INDEX_SPECIFIED)
@@ -4585,7 +4996,10 @@ mod tests {
             if let Ok(query) = query {
                 assert_eq!(
                     current.file_object().ok().map(ActiveFileObject::address),
-                    KernelFileObject::from_raw(file_object.as_ptr())
+                    unsafe {
+                        // SAFETY: The owning test allocation remains live through this comparison.
+                        KernelFileObject::from_raw(file_object.as_ptr())
+                    }
                 );
                 assert_eq!(query.entry_emission(), EaEntryEmission::Single);
                 assert_eq!(query.length().as_usize(), 128);
@@ -4604,7 +5018,8 @@ mod tests {
     #[test]
     fn query_ea_stack_decodes_index_selection() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         stack.FileObject = file_object.as_ptr();
         stack.Flags = u8::try_from(wdk_sys::SL_INDEX_SPECIFIED).unwrap_or(u8::MAX);
         stack.Parameters.QueryEa = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_11 {
@@ -4630,9 +5045,14 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn set_ea_stack_preserves_file_object_and_length() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         stack.FileObject = file_object.as_ptr();
         stack.Parameters.SetEa =
             wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_12 { Length: 64 };
@@ -4645,7 +5065,10 @@ mod tests {
             if let Ok(set) = set {
                 assert_eq!(
                     current.file_object().ok().map(ActiveFileObject::address),
-                    KernelFileObject::from_raw(file_object.as_ptr())
+                    unsafe {
+                        // SAFETY: The owning test allocation remains live through this comparison.
+                        KernelFileObject::from_raw(file_object.as_ptr())
+                    }
                 );
                 assert_eq!(set.length().as_usize(), 64);
             }
@@ -4656,9 +5079,14 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn query_security_stack_preserves_file_object_information_and_length() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         stack.FileObject = file_object.as_ptr();
         stack.Parameters.QuerySecurity = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_18 {
             SecurityInformation: wdk_sys::OWNER_SECURITY_INFORMATION
@@ -4675,7 +5103,10 @@ mod tests {
             if let Ok(query) = query {
                 assert_eq!(
                     current.file_object().ok().map(ActiveFileObject::address),
-                    KernelFileObject::from_raw(file_object.as_ptr())
+                    unsafe {
+                        // SAFETY: The owning test allocation remains live through this comparison.
+                        KernelFileObject::from_raw(file_object.as_ptr())
+                    }
                 );
                 assert_eq!(
                     query.selection().owner(),
@@ -4700,7 +5131,8 @@ mod tests {
     #[test]
     fn query_security_stack_rejects_sacl_at_decode() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         stack.FileObject = file_object.as_ptr();
         stack.Parameters.QuerySecurity = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_18 {
             SecurityInformation: wdk_sys::SACL_SECURITY_INFORMATION,
@@ -4729,7 +5161,8 @@ mod tests {
         const LABEL_SECURITY_INFORMATION: wdk_sys::SECURITY_INFORMATION = 0x10;
 
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         stack.FileObject = file_object.as_ptr();
         stack.Parameters.QuerySecurity = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_18 {
             SecurityInformation: LABEL_SECURITY_INFORMATION,
@@ -4830,9 +5263,14 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn set_security_stack_preserves_file_object_information_and_descriptor() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         let descriptor = NonNull::<c_void>::dangling();
         stack.FileObject = file_object.as_ptr();
         stack.Parameters.SetSecurity = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_19 {
@@ -4849,7 +5287,10 @@ mod tests {
             if let Ok(set) = set {
                 assert_eq!(
                     current.file_object().ok().map(ActiveFileObject::address),
-                    KernelFileObject::from_raw(file_object.as_ptr())
+                    unsafe {
+                        // SAFETY: The owning test allocation remains live through this comparison.
+                        KernelFileObject::from_raw(file_object.as_ptr())
+                    }
                 );
                 assert_eq!(
                     set.selection().owner(),
@@ -4870,7 +5311,8 @@ mod tests {
     /// Panics when read starting points or lock keys are decoded incorrectly.
     #[test]
     fn read_stack_decodes_absolute_and_current_positions() {
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         for (raw_offset, expected) in [
             (
                 8192,
@@ -4951,7 +5393,8 @@ mod tests {
     /// Panics when write starting points or lock keys are decoded incorrectly.
     #[test]
     fn write_stack_decodes_absolute_current_and_end_positions() {
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         for (raw_offset, expected) in [
             (
                 4096,
@@ -5038,10 +5481,7 @@ mod tests {
                 Flags: flags,
                 ..wdk_sys::IRP::default()
             };
-            let mut received = ReceivedIrp::decode(
-                core::ptr::addr_of_mut!(device),
-                core::ptr::addr_of_mut!(irp),
-            );
+            let mut received = received_irp_fixture(&mut device, &mut irp);
             assert!(received.is_ok());
             if let Ok(received) = received.as_mut() {
                 assert_eq!(
@@ -5189,9 +5629,14 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn query_file_stack_preserves_file_object_length_and_class() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         stack.FileObject = file_object.as_ptr();
         stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
             Length: 64,
@@ -5207,7 +5652,10 @@ mod tests {
             if let Ok(query) = query {
                 assert_eq!(
                     current.file_object().ok().map(ActiveFileObject::address),
-                    KernelFileObject::from_raw(file_object.as_ptr())
+                    unsafe {
+                        // SAFETY: The owning test allocation remains live through this comparison.
+                        KernelFileObject::from_raw(file_object.as_ptr())
+                    }
                 );
                 assert_eq!(query.length().as_usize(), 64);
                 assert_eq!(
@@ -5223,7 +5671,8 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn query_file_stack_decodes_name_attribute_tag_and_link_classes() {
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         for (raw_class, expected) in [
             (
                 wdk_sys::_FILE_INFORMATION_CLASS::FileNameInformation,
@@ -5270,9 +5719,14 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn set_file_stack_preserves_file_object_length_and_class() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         stack.FileObject = file_object.as_ptr();
         stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
             Length: 40,
@@ -5291,7 +5745,10 @@ mod tests {
             if let Ok(set) = set {
                 assert_eq!(
                     current.file_object().ok().map(ActiveFileObject::address),
-                    KernelFileObject::from_raw(file_object.as_ptr())
+                    unsafe {
+                        // SAFETY: The owning test allocation remains live through this comparison.
+                        KernelFileObject::from_raw(file_object.as_ptr())
+                    }
                 );
                 assert_eq!(set.length().as_usize(), 40);
                 assert_eq!(set.information_class(), SetFileInformationClass::Basic);
@@ -5324,7 +5781,8 @@ mod tests {
     #[test]
     fn file_information_stack_rejects_unsupported_class_before_handler() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         stack.FileObject = file_object.as_ptr();
         stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
             Length: 64,
@@ -5349,9 +5807,14 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn query_directory_stack_decodes_restart_pattern_length_class_and_emission() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         let file_name = NonNull::<wdk_sys::UNICODE_STRING>::dangling();
         stack.FileObject = file_object.as_ptr();
         stack.Flags = u8::try_from(wdk_sys::SL_RESTART_SCAN | wdk_sys::SL_RETURN_SINGLE_ENTRY)
@@ -5372,7 +5835,10 @@ mod tests {
             if let Ok(query) = query {
                 assert_eq!(
                     current.file_object().ok().map(ActiveFileObject::address),
-                    KernelFileObject::from_raw(file_object.as_ptr())
+                    unsafe {
+                        // SAFETY: The owning test allocation remains live through this comparison.
+                        KernelFileObject::from_raw(file_object.as_ptr())
+                    }
                 );
                 assert_eq!(query.cursor_position(), DirectoryCursorPosition::Restart);
                 assert!(current.query_directory_file_name().ok().flatten().is_some());
@@ -5392,7 +5858,8 @@ mod tests {
     #[test]
     fn query_directory_stack_decodes_names_class() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         stack.FileObject = file_object.as_ptr();
         stack.Parameters.QueryDirectory = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_6 {
             Length: 128,
@@ -5477,7 +5944,8 @@ mod tests {
     #[test]
     fn query_directory_stack_decodes_index_cursor() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         stack.FileObject = file_object.as_ptr();
         stack.Flags = u8::try_from(wdk_sys::SL_INDEX_SPECIFIED).unwrap_or(u8::MAX);
         stack.Parameters.QueryDirectory = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_6 {
@@ -5507,8 +5975,13 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
     fn notify_directory_stack_decodes_filter_and_scope() {
-        let file_object = NonNull::<wdk_sys::FILE_OBJECT>::dangling();
+        let mut file_object_storage = wdk_sys::FILE_OBJECT::default();
+        let file_object = NonNull::from(&mut file_object_storage);
         let completion_filter = wdk_sys::FILE_NOTIFY_CHANGE_FILE_NAME
             | wdk_sys::FILE_NOTIFY_CHANGE_ATTRIBUTES
             | wdk_sys::FILE_NOTIFY_CHANGE_SECURITY;
@@ -5533,7 +6006,10 @@ mod tests {
             if let Ok(notification) = notification {
                 assert_eq!(
                     current.file_object().ok().map(ActiveFileObject::address),
-                    KernelFileObject::from_raw(file_object.as_ptr())
+                    unsafe {
+                        // SAFETY: The owning test allocation remains live through this comparison.
+                        KernelFileObject::from_raw(file_object.as_ptr())
+                    }
                 );
                 assert_eq!(
                     notification.completion_filter(),

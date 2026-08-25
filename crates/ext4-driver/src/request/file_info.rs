@@ -205,6 +205,10 @@ impl PreparedCleanupPublication {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "the cleanup publication remains reactor-owned while the handle barrier retains its pointers"
+)]
 // SAFETY: FCB/target lifetime is protected by the cleanup barrier through publication, and the
 // token is moved only through reactor-owned operation state.
 unsafe impl Send for PreparedCleanupPublication {}
@@ -270,6 +274,10 @@ pub(crate) fn set(
 }
 
 /// Transfers one queued directory-change IRP to the VCB's FsRtl notification list.
+#[expect(
+    unsafe_code,
+    reason = "the active notification IRP retains the mounted VCB borrowed for FsRtl registration"
+)]
 pub(crate) fn notify_change_directory(mut owned: OwnedIrp) -> wdk_sys::NTSTATUS {
     let registration = owned.request().with_active(|active| {
         DirectoryNotificationRequest::decode(active).and_then(|mut request| {
@@ -857,10 +865,7 @@ fn set_file_information(
         let mut opened_file = OpenedObject::decode(file_object)?;
         let plan = match stack.information_class() {
             SetFileInformationClass::Basic => SetFilePlan::Basic {
-                info: read_file_information_input::<wdk_sys::FILE_BASIC_INFORMATION>(
-                    active,
-                    stack.length(),
-                )?,
+                info: read_basic_information_input(active, stack.length())?,
                 node: opened_file.node(),
             },
             SetFileInformationClass::Position => {
@@ -868,25 +873,19 @@ fn set_file_information(
                 SetFilePlan::Complete
             }
             SetFileInformationClass::EndOfFile => {
-                let info = read_file_information_input::<wdk_sys::FILE_END_OF_FILE_INFORMATION>(
-                    active,
-                    stack.length(),
-                )?;
+                let end_of_file = read_end_of_file_input(active, stack.length())?;
                 let regular_file = OpenedRegularFile::decode(file_object)?;
                 SetFilePlan::EndOfFile {
                     file: regular_file.id(),
-                    size: file_size_from_large_integer(info.EndOfFile)?,
+                    size: file_size_from_large_integer(end_of_file)?,
                 }
             }
             SetFileInformationClass::Allocation => {
-                let info = read_file_information_input::<wdk_sys::FILE_ALLOCATION_INFORMATION>(
-                    active,
-                    stack.length(),
-                )?;
+                let allocation_size = read_allocation_size_input(active, stack.length())?;
                 let regular_file = OpenedRegularFile::decode(file_object)?;
                 SetFilePlan::Allocation {
                     file: regular_file.id(),
-                    size: file_size_from_large_integer(info.AllocationSize)?,
+                    size: file_size_from_large_integer(allocation_size)?,
                 }
             }
             SetFileInformationClass::Disposition => {
@@ -1024,9 +1023,8 @@ fn set_position_information(
     stack: SetFileStack,
     opened_file: &mut OpenedObject<'_>,
 ) -> DriverResult<()> {
-    let info =
-        read_file_information_input::<wdk_sys::FILE_POSITION_INFORMATION>(active, stack.length())?;
-    let position = file_offset_from_large_integer(info.CurrentByteOffset)?;
+    let current_byte_offset = read_position_input(active, stack.length())?;
+    let position = file_offset_from_large_integer(current_byte_offset)?;
     opened_file
         .data_transfer_mode()
         .validate_position(position.bytes())?;
@@ -1203,11 +1201,7 @@ fn disposition_plan(
     opened.require_delete_access()?;
     let request = match format {
         DispositionInputFormat::Legacy => {
-            let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION>(
-                active,
-                stack.length(),
-            )?;
-            if info.DeleteFile == 0 {
+            if !read_legacy_disposition_input(active, stack.length())? {
                 FileDispositionRequest::keep(FileDispositionTarget::Mutable)
             } else {
                 FileDispositionRequest::delete(
@@ -1217,11 +1211,7 @@ fn disposition_plan(
             }
         }
         DispositionInputFormat::Extended => {
-            let info = read_file_information_input::<wdk_sys::FILE_DISPOSITION_INFORMATION_EX>(
-                active,
-                stack.length(),
-            )?;
-            decode_extended_disposition(info.Flags)?
+            decode_extended_disposition(read_extended_disposition_input(active, stack.length())?)?
         }
     };
     request.target.validate(opened.create_deletion())?;
@@ -2643,6 +2633,10 @@ fn signed_i64(value: u64) -> DriverResult<i64> {
 }
 
 /// Converts an ext4 timestamp to a Windows time QuadPart.
+#[expect(
+    unsafe_code,
+    reason = "LARGE_INTEGER exposes its signed payload through the generated WDK union field"
+)]
 fn windows_time_quad(timestamp: Ext4Timestamp) -> i64 {
     let time = windows_time(timestamp);
     unsafe {
@@ -2671,6 +2665,10 @@ pub(crate) struct PendingCleanupDeletion {
     target: NonNull<FileDeleteTarget>,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "the cleanup plan remains reactor-owned while its FILE_OBJECT retains stable pointers"
+)]
 // SAFETY: The per-handle terminal barrier retains the FCB, target, and VCB until this value is
 // consumed; it moves only between the sole reactor thread and lower completion envelopes.
 unsafe impl Send for PendingCleanupDeletion {}
@@ -2737,6 +2735,10 @@ fn cleanup_opened_node(
 ///
 /// Returns an error when the target name no longer identifies the FCB inode, the directory is no
 /// longer empty, or the ext4 transaction cannot be committed.
+#[expect(
+    unsafe_code,
+    reason = "the cleanup FILE_OBJECT retains the FCB-owned delete target until staged publication"
+)]
 pub(crate) fn stage_cleanup_deletion(
     plan: &PendingCleanupDeletion,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
@@ -2805,6 +2807,10 @@ fn cleanup_opened_volume(
 }
 
 /// Releases FsRtl notification records owned by a FILE_OBJECT during its cleanup transition.
+#[expect(
+    unsafe_code,
+    reason = "the active opened handle retains its mounted VCB through the cleanup transition"
+)]
 fn cleanup_directory_notification(opened_file: &OpenedObject<'_>) {
     let volume = opened_file.volume();
     let vcb = unsafe {
@@ -2816,15 +2822,232 @@ fn cleanup_directory_notification(opened_file: &OpenedObject<'_>) {
         .cleanup(opened_file.notification_context());
 }
 
-/// Reads a fixed-size set-information input structure.
+/// Passes one checked buffered set-information input to its typed record decoder.
 /// # Errors
 ///
-/// Returns an error when the buffered input is smaller than `T`.
-fn read_file_information_input<T: Copy>(
+/// Returns an error when the IRP buffer cannot be captured or typed record decoding fails.
+fn decode_file_information_input<T>(
     active: &ActiveIrp<'_>,
     length: IrpBufferLength,
+    decode: impl FnOnce(&[u8]) -> DriverResult<T>,
 ) -> DriverResult<T> {
-    active.buffered_input(length)?.read_unaligned()
+    let input = active.buffered_input(length)?;
+    decode(input.as_slice())
+}
+
+/// Decodes one complete fixed-size record from checked little-endian fields.
+/// # Errors
+///
+/// Returns an error when `bytes` is smaller than the record or a scalar field is out of range.
+fn decode_fixed_file_information<T>(
+    bytes: &[u8],
+    record_length: usize,
+    decode: impl FnOnce(LittleEndianInput<'_>) -> DriverResult<T>,
+) -> DriverResult<T> {
+    let record = bytes
+        .get(..record_length)
+        .ok_or(DriverError::BufferTooSmall)?;
+    decode(LittleEndianInput::new(record))
+}
+
+/// Decodes `FILE_BASIC_INFORMATION` without treating an arbitrary `Copy` type as a wire record.
+/// # Errors
+///
+/// Returns an error when the declared input is short or any scalar field is out of range.
+fn read_basic_information_input(
+    active: &ActiveIrp<'_>,
+    length: IrpBufferLength,
+) -> DriverResult<wdk_sys::FILE_BASIC_INFORMATION> {
+    decode_file_information_input(active, length, decode_basic_information_record)
+}
+
+/// Decodes a complete `FILE_BASIC_INFORMATION` record.
+/// # Errors
+///
+/// Returns an error when `bytes` is shorter than the complete fixed record.
+fn decode_basic_information_record(bytes: &[u8]) -> DriverResult<wdk_sys::FILE_BASIC_INFORMATION> {
+    decode_fixed_file_information(
+        bytes,
+        core::mem::size_of::<wdk_sys::FILE_BASIC_INFORMATION>(),
+        |input| {
+            Ok(wdk_sys::FILE_BASIC_INFORMATION {
+                CreationTime: LARGE_INTEGER {
+                    QuadPart: input.read_i64(WireOffset::new(core::mem::offset_of!(
+                        wdk_sys::FILE_BASIC_INFORMATION,
+                        CreationTime
+                    )))?,
+                },
+                LastAccessTime: LARGE_INTEGER {
+                    QuadPart: input.read_i64(WireOffset::new(core::mem::offset_of!(
+                        wdk_sys::FILE_BASIC_INFORMATION,
+                        LastAccessTime
+                    )))?,
+                },
+                LastWriteTime: LARGE_INTEGER {
+                    QuadPart: input.read_i64(WireOffset::new(core::mem::offset_of!(
+                        wdk_sys::FILE_BASIC_INFORMATION,
+                        LastWriteTime
+                    )))?,
+                },
+                ChangeTime: LARGE_INTEGER {
+                    QuadPart: input.read_i64(WireOffset::new(core::mem::offset_of!(
+                        wdk_sys::FILE_BASIC_INFORMATION,
+                        ChangeTime
+                    )))?,
+                },
+                FileAttributes: input.read_u32(WireOffset::new(core::mem::offset_of!(
+                    wdk_sys::FILE_BASIC_INFORMATION,
+                    FileAttributes
+                )))?,
+            })
+        },
+    )
+}
+
+/// Decodes the signed EOF field from `FILE_END_OF_FILE_INFORMATION`.
+/// # Errors
+///
+/// Returns an error when the declared input is shorter than the fixed record.
+fn read_end_of_file_input(
+    active: &ActiveIrp<'_>,
+    length: IrpBufferLength,
+) -> DriverResult<LARGE_INTEGER> {
+    decode_file_information_input(active, length, decode_end_of_file_record)
+}
+
+/// Decodes a complete `FILE_END_OF_FILE_INFORMATION` record.
+/// # Errors
+///
+/// Returns an error when `bytes` is shorter than the complete fixed record.
+fn decode_end_of_file_record(bytes: &[u8]) -> DriverResult<LARGE_INTEGER> {
+    decode_fixed_file_information(
+        bytes,
+        core::mem::size_of::<wdk_sys::FILE_END_OF_FILE_INFORMATION>(),
+        |input| {
+            Ok(LARGE_INTEGER {
+                QuadPart: input.read_i64(WireOffset::new(core::mem::offset_of!(
+                    wdk_sys::FILE_END_OF_FILE_INFORMATION,
+                    EndOfFile
+                )))?,
+            })
+        },
+    )
+}
+
+/// Decodes the signed allocation-size field from `FILE_ALLOCATION_INFORMATION`.
+/// # Errors
+///
+/// Returns an error when the declared input is shorter than the fixed record.
+fn read_allocation_size_input(
+    active: &ActiveIrp<'_>,
+    length: IrpBufferLength,
+) -> DriverResult<LARGE_INTEGER> {
+    decode_file_information_input(active, length, decode_allocation_size_record)
+}
+
+/// Decodes a complete `FILE_ALLOCATION_INFORMATION` record.
+/// # Errors
+///
+/// Returns an error when `bytes` is shorter than the complete fixed record.
+fn decode_allocation_size_record(bytes: &[u8]) -> DriverResult<LARGE_INTEGER> {
+    decode_fixed_file_information(
+        bytes,
+        core::mem::size_of::<wdk_sys::FILE_ALLOCATION_INFORMATION>(),
+        |input| {
+            Ok(LARGE_INTEGER {
+                QuadPart: input.read_i64(WireOffset::new(core::mem::offset_of!(
+                    wdk_sys::FILE_ALLOCATION_INFORMATION,
+                    AllocationSize
+                )))?,
+            })
+        },
+    )
+}
+
+/// Decodes the signed cursor from `FILE_POSITION_INFORMATION`.
+/// # Errors
+///
+/// Returns an error when the declared input is shorter than the fixed record.
+fn read_position_input(
+    active: &ActiveIrp<'_>,
+    length: IrpBufferLength,
+) -> DriverResult<LARGE_INTEGER> {
+    decode_file_information_input(active, length, decode_position_record)
+}
+
+/// Decodes a complete `FILE_POSITION_INFORMATION` record.
+/// # Errors
+///
+/// Returns an error when `bytes` is shorter than the complete fixed record.
+fn decode_position_record(bytes: &[u8]) -> DriverResult<LARGE_INTEGER> {
+    decode_fixed_file_information(
+        bytes,
+        core::mem::size_of::<wdk_sys::FILE_POSITION_INFORMATION>(),
+        |input| {
+            Ok(LARGE_INTEGER {
+                QuadPart: input.read_i64(WireOffset::new(core::mem::offset_of!(
+                    wdk_sys::FILE_POSITION_INFORMATION,
+                    CurrentByteOffset
+                )))?,
+            })
+        },
+    )
+}
+
+/// Decodes `FILE_DISPOSITION_INFORMATION::DeleteFile` as a domain boolean.
+/// # Errors
+///
+/// Returns an error when the declared input is shorter than the fixed record.
+fn read_legacy_disposition_input(
+    active: &ActiveIrp<'_>,
+    length: IrpBufferLength,
+) -> DriverResult<bool> {
+    decode_file_information_input(active, length, decode_legacy_disposition_record)
+}
+
+/// Decodes a complete `FILE_DISPOSITION_INFORMATION` record.
+/// # Errors
+///
+/// Returns an error when `bytes` is shorter than the complete fixed record.
+fn decode_legacy_disposition_record(bytes: &[u8]) -> DriverResult<bool> {
+    decode_fixed_file_information(
+        bytes,
+        core::mem::size_of::<wdk_sys::FILE_DISPOSITION_INFORMATION>(),
+        |input| {
+            Ok(input.read_u8(WireOffset::new(core::mem::offset_of!(
+                wdk_sys::FILE_DISPOSITION_INFORMATION,
+                DeleteFile
+            )))? != 0)
+        },
+    )
+}
+
+/// Decodes `FILE_DISPOSITION_INFORMATION_EX::Flags` as its checked wire integer.
+/// # Errors
+///
+/// Returns an error when the declared input is shorter than the fixed record.
+fn read_extended_disposition_input(
+    active: &ActiveIrp<'_>,
+    length: IrpBufferLength,
+) -> DriverResult<u32> {
+    decode_file_information_input(active, length, decode_extended_disposition_record)
+}
+
+/// Decodes a complete `FILE_DISPOSITION_INFORMATION_EX` record.
+/// # Errors
+///
+/// Returns an error when `bytes` is shorter than the complete fixed record.
+fn decode_extended_disposition_record(bytes: &[u8]) -> DriverResult<u32> {
+    decode_fixed_file_information(
+        bytes,
+        core::mem::size_of::<wdk_sys::FILE_DISPOSITION_INFORMATION_EX>(),
+        |input| {
+            input.read_u32(WireOffset::new(core::mem::offset_of!(
+                wdk_sys::FILE_DISPOSITION_INFORMATION_EX,
+                Flags
+            )))
+        },
+    )
 }
 
 /// Decoded variable-length namespace destination shared by rename and hard-link information.
@@ -3157,6 +3380,10 @@ fn set_basic_times(
 ///
 /// Returns an error when `value` is a negative non-sentinel timestamp or Windows cannot convert it
 /// to Unix seconds.
+#[expect(
+    unsafe_code,
+    reason = "Windows time conversion crosses the audited RtlTimeToSecondsSince1970 ABI"
+)]
 fn windows_time_field(value: LARGE_INTEGER, current: Ext4Timestamp) -> DriverResult<Ext4Timestamp> {
     let quad = large_integer_quad(value);
     if quad == WINDOWS_TIME_UNCHANGED || quad == WINDOWS_TIME_PRESERVE {
@@ -3341,6 +3568,10 @@ fn regular_file_size(
 }
 
 /// Returns the signed payload of a LARGE_INTEGER.
+#[expect(
+    unsafe_code,
+    reason = "LARGE_INTEGER exposes its signed payload through the generated WDK union field"
+)]
 fn large_integer_quad(value: LARGE_INTEGER) -> i64 {
     unsafe {
         // SAFETY: `QuadPart` is the LARGE_INTEGER representation used by this
@@ -3511,16 +3742,44 @@ fn pack_basic_information(
     output: &mut [u8],
     metadata: FileMetadata,
 ) -> DriverResult<IrpCompletion> {
-    write_fixed(
-        output,
-        wdk_sys::FILE_BASIC_INFORMATION {
-            CreationTime: windows_time(metadata.times.created()),
-            LastAccessTime: windows_time(metadata.times.accessed()),
-            LastWriteTime: windows_time(metadata.times.modified()),
-            ChangeTime: windows_time(metadata.times.changed()),
-            FileAttributes: file_attributes(metadata),
-        },
-    )
+    let size = core::mem::size_of::<wdk_sys::FILE_BASIC_INFORMATION>();
+    let mut writer = fixed_record_writer(output, size)?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_BASIC_INFORMATION,
+            CreationTime
+        )),
+        windows_time_quad(metadata.times.created()),
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_BASIC_INFORMATION,
+            LastAccessTime
+        )),
+        windows_time_quad(metadata.times.accessed()),
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_BASIC_INFORMATION,
+            LastWriteTime
+        )),
+        windows_time_quad(metadata.times.modified()),
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_BASIC_INFORMATION,
+            ChangeTime
+        )),
+        windows_time_quad(metadata.times.changed()),
+    )?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_BASIC_INFORMATION,
+            FileAttributes
+        )),
+        file_attributes(metadata),
+    )?;
+    IrpCompletion::from_usize(size)
 }
 
 /// Packs FILE_STANDARD_INFORMATION.
@@ -3534,16 +3793,44 @@ fn pack_standard_information(
     delete_pending: bool,
 ) -> DriverResult<IrpCompletion> {
     let links = WindowsLinkInformation::from_metadata(metadata, delete_pending)?;
-    write_fixed(
-        output,
-        wdk_sys::FILE_STANDARD_INFORMATION {
-            AllocationSize: large_integer_from_u64(metadata.allocation_size.bytes())?,
-            EndOfFile: large_integer_from_u64(metadata.size.bytes())?,
-            NumberOfLinks: links.total_links,
-            DeletePending: boolean(links.delete_pending),
-            Directory: boolean(links.directory),
-        },
-    )
+    let size = core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>();
+    let mut writer = fixed_record_writer(output, size)?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_STANDARD_INFORMATION,
+            AllocationSize
+        )),
+        signed_i64(metadata.allocation_size.bytes())?,
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_STANDARD_INFORMATION,
+            EndOfFile
+        )),
+        signed_i64(metadata.size.bytes())?,
+    )?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_STANDARD_INFORMATION,
+            NumberOfLinks
+        )),
+        links.total_links,
+    )?;
+    writer.write_u8(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_STANDARD_INFORMATION,
+            DeletePending
+        )),
+        boolean(links.delete_pending),
+    )?;
+    writer.write_u8(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_STANDARD_INFORMATION,
+            Directory
+        )),
+        boolean(links.directory),
+    )?;
+    IrpCompletion::from_usize(size)
 }
 
 /// Packs FILE_STANDARD_LINK_INFORMATION.
@@ -3557,15 +3844,37 @@ fn pack_standard_link_information(
     delete_pending: bool,
 ) -> DriverResult<IrpCompletion> {
     let links = WindowsLinkInformation::from_metadata(metadata, delete_pending)?;
-    write_fixed(
-        output,
-        wdk_sys::FILE_STANDARD_LINK_INFORMATION {
-            NumberOfAccessibleLinks: links.accessible_links,
-            TotalNumberOfLinks: links.total_links,
-            DeletePending: boolean(links.delete_pending),
-            Directory: boolean(links.directory),
-        },
-    )
+    let size = core::mem::size_of::<wdk_sys::FILE_STANDARD_LINK_INFORMATION>();
+    let mut writer = fixed_record_writer(output, size)?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+            NumberOfAccessibleLinks
+        )),
+        links.accessible_links,
+    )?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+            TotalNumberOfLinks
+        )),
+        links.total_links,
+    )?;
+    writer.write_u8(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+            DeletePending
+        )),
+        boolean(links.delete_pending),
+    )?;
+    writer.write_u8(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+            Directory
+        )),
+        boolean(links.directory),
+    )?;
+    IrpCompletion::from_usize(size)
 }
 
 /// Packs FILE_INTERNAL_INFORMATION.
@@ -3576,14 +3885,16 @@ fn pack_internal_information(
     output: &mut [u8],
     metadata: FileMetadata,
 ) -> DriverResult<IrpCompletion> {
-    write_fixed(
-        output,
-        wdk_sys::FILE_INTERNAL_INFORMATION {
-            IndexNumber: LARGE_INTEGER {
-                QuadPart: i64::from(metadata.file_index),
-            },
-        },
-    )
+    let size = core::mem::size_of::<wdk_sys::FILE_INTERNAL_INFORMATION>();
+    let mut writer = fixed_record_writer(output, size)?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_INTERNAL_INFORMATION,
+            IndexNumber
+        )),
+        i64::from(metadata.file_index),
+    )?;
+    IrpCompletion::from_usize(size)
 }
 
 /// Packs FILE_POSITION_INFORMATION.
@@ -3596,12 +3907,16 @@ fn pack_position_information(
     opened_file: &OpenedObject,
 ) -> DriverResult<IrpCompletion> {
     let current = opened_file.current_file_position()?;
-    write_fixed(
-        output,
-        wdk_sys::FILE_POSITION_INFORMATION {
-            CurrentByteOffset: large_integer_from_u64(current.bytes())?,
-        },
-    )
+    let size = core::mem::size_of::<wdk_sys::FILE_POSITION_INFORMATION>();
+    let mut writer = fixed_record_writer(output, size)?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_POSITION_INFORMATION,
+            CurrentByteOffset
+        )),
+        signed_i64(current.bytes())?,
+    )?;
+    IrpCompletion::from_usize(size)
 }
 
 /// Packs FILE_NETWORK_OPEN_INFORMATION.
@@ -3613,18 +3928,58 @@ fn pack_network_open_information(
     output: &mut [u8],
     metadata: FileMetadata,
 ) -> DriverResult<IrpCompletion> {
-    write_fixed(
-        output,
-        wdk_sys::FILE_NETWORK_OPEN_INFORMATION {
-            CreationTime: windows_time(metadata.times.created()),
-            LastAccessTime: windows_time(metadata.times.accessed()),
-            LastWriteTime: windows_time(metadata.times.modified()),
-            ChangeTime: windows_time(metadata.times.changed()),
-            AllocationSize: large_integer_from_u64(metadata.allocation_size.bytes())?,
-            EndOfFile: large_integer_from_u64(metadata.size.bytes())?,
-            FileAttributes: file_attributes(metadata),
-        },
-    )
+    let size = core::mem::size_of::<wdk_sys::FILE_NETWORK_OPEN_INFORMATION>();
+    let mut writer = fixed_record_writer(output, size)?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
+            CreationTime
+        )),
+        windows_time_quad(metadata.times.created()),
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
+            LastAccessTime
+        )),
+        windows_time_quad(metadata.times.accessed()),
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
+            LastWriteTime
+        )),
+        windows_time_quad(metadata.times.modified()),
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
+            ChangeTime
+        )),
+        windows_time_quad(metadata.times.changed()),
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
+            AllocationSize
+        )),
+        signed_i64(metadata.allocation_size.bytes())?,
+    )?;
+    writer.write_i64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
+            EndOfFile
+        )),
+        signed_i64(metadata.size.bytes())?,
+    )?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
+            FileAttributes
+        )),
+        file_attributes(metadata),
+    )?;
+    IrpCompletion::from_usize(size)
 }
 
 /// Packs FILE_NAME_INFORMATION.
@@ -3661,13 +4016,23 @@ fn pack_attribute_tag_information(
     output: &mut [u8],
     metadata: FileMetadata,
 ) -> DriverResult<IrpCompletion> {
-    write_fixed(
-        output,
-        wdk_sys::FILE_ATTRIBUTE_TAG_INFORMATION {
-            FileAttributes: file_attributes(metadata),
-            ReparseTag: reparse_tag(metadata.reparse_point),
-        },
-    )
+    let size = core::mem::size_of::<wdk_sys::FILE_ATTRIBUTE_TAG_INFORMATION>();
+    let mut writer = fixed_record_writer(output, size)?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_ATTRIBUTE_TAG_INFORMATION,
+            FileAttributes
+        )),
+        file_attributes(metadata),
+    )?;
+    writer.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_ATTRIBUTE_TAG_INFORMATION,
+            ReparseTag
+        )),
+        reparse_tag(metadata.reparse_point),
+    )?;
+    IrpCompletion::from_usize(size)
 }
 
 /// Projects an opened location to the name payload returned to Windows.
@@ -3698,25 +4063,21 @@ const FILE_NAME_INFORMATION_NAME_LENGTH_OFFSET: usize = 0;
 /// Offset of FileName in FILE_NAME_INFORMATION.
 const FILE_NAME_INFORMATION_NAME_OFFSET: usize = 4;
 
-/// Writes one fixed-size information structure into the caller's buffer.
+/// Clears one fixed-size information record before its fields are encoded.
 /// # Errors
 ///
-/// Returns an error when `output` is smaller than `T`.
-fn write_fixed<T>(output: &mut [u8], value: T) -> DriverResult<IrpCompletion> {
-    let size = core::mem::size_of::<T>();
-    if output.len() < size {
-        return Err(DriverError::BufferTooSmall);
-    }
-    unsafe {
-        // SAFETY: The output slice is at least `size_of::<T>()` bytes and the
-        // write does not read from the destination. Unaligned write avoids
-        // imposing an alignment requirement on the system buffer.
-        output.as_mut_ptr().cast::<T>().write_unaligned(value);
-    }
-    IrpCompletion::from_usize(size)
+/// Returns an error when `output` is smaller than `size`.
+fn fixed_record_writer(output: &mut [u8], size: usize) -> DriverResult<LittleEndianOutput<'_>> {
+    let record = output.get_mut(..size).ok_or(DriverError::BufferTooSmall)?;
+    record.fill(0);
+    Ok(LittleEndianOutput::new(record))
 }
 
 /// Converts an ext4 timestamp to a Windows system-time LARGE_INTEGER.
+#[expect(
+    unsafe_code,
+    reason = "Windows time conversion crosses the audited RtlSecondsSince1970ToTime ABI"
+)]
 fn windows_time(timestamp: Ext4Timestamp) -> LARGE_INTEGER {
     let mut time = LARGE_INTEGER { QuadPart: 0 };
     unsafe {
@@ -3749,16 +4110,6 @@ fn file_attributes(metadata: FileMetadata) -> wdk_sys::ULONG {
     } else {
         attributes
     }
-}
-
-/// Creates a signed LARGE_INTEGER from an unsigned byte count.
-/// # Errors
-///
-/// Returns an error when `value` exceeds the signed LARGE_INTEGER range.
-fn large_integer_from_u64(value: u64) -> DriverResult<LARGE_INTEGER> {
-    Ok(LARGE_INTEGER {
-        QuadPart: i64::try_from(value).map_err(|_| DriverError::InvalidParameter)?,
-    })
 }
 
 /// Converts a Rust boolean to WDK BOOLEAN.
@@ -4104,6 +4455,10 @@ fn write_regular_file_windowed(
 }
 
 /// Detaches and releases heap-owned FCB and CCB pointers stored on a FILE_OBJECT.
+#[expect(
+    unsafe_code,
+    reason = "close consumes the unique Box pointers detached from the active FILE_OBJECT contexts"
+)]
 fn release_file_contexts(
     device: crate::state::KernelDevice,
     file_object: ActiveFileObject<'_>,
@@ -4290,6 +4645,315 @@ mod tests {
             return false;
         };
         crate::memory::copy_exact(target, &value.to_le_bytes()).is_ok()
+    }
+
+    /// Writes one little-endian i64 into a test input buffer.
+    fn put_le_i64(buffer: &mut [u8], offset: usize, value: i64) -> bool {
+        let Some(end) = offset.checked_add(core::mem::size_of::<i64>()) else {
+            return false;
+        };
+        let Some(target) = buffer.get_mut(offset..end) else {
+            return false;
+        };
+        crate::memory::copy_exact(target, &value.to_le_bytes()).is_ok()
+    }
+
+    /// Asserts that every byte not owned by an encoded scalar field was cleared.
+    /// # Panics
+    ///
+    /// Panics when an ABI padding byte is nonzero.
+    fn assert_padding_zero(record: &[u8], fields: &[(usize, usize)]) {
+        for (offset, byte) in record.iter().copied().enumerate() {
+            let is_field = fields.iter().any(|(start, length)| {
+                start
+                    .checked_add(*length)
+                    .is_some_and(|end| *start <= offset && offset < end)
+            });
+            if !is_field {
+                assert_eq!(byte, 0, "padding byte {offset} retained stale storage");
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when any fixed set-information decoder loses a scalar field or accepts a truncated
+    /// Windows record.
+    #[test]
+    fn fixed_set_information_decoders_are_field_checked_and_length_bounded() {
+        let basic_size = core::mem::size_of::<wdk_sys::FILE_BASIC_INFORMATION>();
+        let mut basic = vec![0xA5_u8; basic_size];
+        let times = [-7_i64, 11, -13, 17];
+        for (offset, value) in [
+            (
+                core::mem::offset_of!(wdk_sys::FILE_BASIC_INFORMATION, CreationTime),
+                times[0],
+            ),
+            (
+                core::mem::offset_of!(wdk_sys::FILE_BASIC_INFORMATION, LastAccessTime),
+                times[1],
+            ),
+            (
+                core::mem::offset_of!(wdk_sys::FILE_BASIC_INFORMATION, LastWriteTime),
+                times[2],
+            ),
+            (
+                core::mem::offset_of!(wdk_sys::FILE_BASIC_INFORMATION, ChangeTime),
+                times[3],
+            ),
+        ] {
+            assert!(put_le_i64(&mut basic, offset, value));
+        }
+        let attributes = 0x1234_5678;
+        assert!(put_le_u32(
+            &mut basic,
+            core::mem::offset_of!(wdk_sys::FILE_BASIC_INFORMATION, FileAttributes),
+            attributes,
+        ));
+        let decoded = super::decode_basic_information_record(&basic);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
+        assert_eq!(super::large_integer_quad(decoded.CreationTime), times[0]);
+        assert_eq!(super::large_integer_quad(decoded.LastAccessTime), times[1]);
+        assert_eq!(super::large_integer_quad(decoded.LastWriteTime), times[2]);
+        assert_eq!(super::large_integer_quad(decoded.ChangeTime), times[3]);
+        assert_eq!(decoded.FileAttributes, attributes);
+
+        let eof_value = -0x0102_0304_0506_0708_i64;
+        let eof_size = core::mem::size_of::<wdk_sys::FILE_END_OF_FILE_INFORMATION>();
+        let mut eof = vec![0xA5_u8; eof_size];
+        assert!(put_le_i64(
+            &mut eof,
+            core::mem::offset_of!(wdk_sys::FILE_END_OF_FILE_INFORMATION, EndOfFile),
+            eof_value,
+        ));
+        assert_eq!(
+            super::decode_end_of_file_record(&eof).map(super::large_integer_quad),
+            Ok(eof_value)
+        );
+
+        let allocation_value = 0x0102_0304_0506_0708_i64;
+        let allocation_size = core::mem::size_of::<wdk_sys::FILE_ALLOCATION_INFORMATION>();
+        let mut allocation = vec![0xA5_u8; allocation_size];
+        assert!(put_le_i64(
+            &mut allocation,
+            core::mem::offset_of!(wdk_sys::FILE_ALLOCATION_INFORMATION, AllocationSize),
+            allocation_value,
+        ));
+        assert_eq!(
+            super::decode_allocation_size_record(&allocation).map(super::large_integer_quad),
+            Ok(allocation_value)
+        );
+
+        let position_value = -91_i64;
+        let position_size = core::mem::size_of::<wdk_sys::FILE_POSITION_INFORMATION>();
+        let mut position = vec![0xA5_u8; position_size];
+        assert!(put_le_i64(
+            &mut position,
+            core::mem::offset_of!(wdk_sys::FILE_POSITION_INFORMATION, CurrentByteOffset),
+            position_value,
+        ));
+        assert_eq!(
+            super::decode_position_record(&position).map(super::large_integer_quad),
+            Ok(position_value)
+        );
+
+        let legacy_size = core::mem::size_of::<wdk_sys::FILE_DISPOSITION_INFORMATION>();
+        let mut legacy = vec![0xA5_u8; legacy_size];
+        let legacy_offset =
+            core::mem::offset_of!(wdk_sys::FILE_DISPOSITION_INFORMATION, DeleteFile);
+        let Some(delete_file) = legacy.get_mut(legacy_offset) else {
+            return;
+        };
+        *delete_file = 1;
+        assert_eq!(super::decode_legacy_disposition_record(&legacy), Ok(true));
+
+        let extended_size = core::mem::size_of::<wdk_sys::FILE_DISPOSITION_INFORMATION_EX>();
+        let mut extended = vec![0xA5_u8; extended_size];
+        let flags = 0x8765_4321;
+        assert!(put_le_u32(
+            &mut extended,
+            core::mem::offset_of!(wdk_sys::FILE_DISPOSITION_INFORMATION_EX, Flags),
+            flags,
+        ));
+        assert_eq!(
+            super::decode_extended_disposition_record(&extended),
+            Ok(flags)
+        );
+
+        for result in [
+            basic
+                .len()
+                .checked_sub(1)
+                .and_then(|length| basic.get(..length))
+                .and_then(|input| super::decode_basic_information_record(input).err()),
+            eof.len()
+                .checked_sub(1)
+                .and_then(|length| eof.get(..length))
+                .and_then(|input| super::decode_end_of_file_record(input).err()),
+            allocation
+                .len()
+                .checked_sub(1)
+                .and_then(|length| allocation.get(..length))
+                .and_then(|input| super::decode_allocation_size_record(input).err()),
+            position
+                .len()
+                .checked_sub(1)
+                .and_then(|length| position.get(..length))
+                .and_then(|input| super::decode_position_record(input).err()),
+            legacy
+                .len()
+                .checked_sub(1)
+                .and_then(|length| legacy.get(..length))
+                .and_then(|input| super::decode_legacy_disposition_record(input).err()),
+            extended
+                .len()
+                .checked_sub(1)
+                .and_then(|length| extended.get(..length))
+                .and_then(|input| super::decode_extended_disposition_record(input).err()),
+        ] {
+            assert_eq!(result, Some(DriverError::BufferTooSmall));
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when an explicitly packed fixed record exposes pre-existing bytes through ABI
+    /// padding.
+    #[test]
+    fn fixed_query_information_packers_clear_every_padding_byte() {
+        let metadata = test_metadata(super::FileMetadataKind::File);
+        assert!(metadata.is_some());
+        let Some(metadata) = metadata else {
+            return;
+        };
+
+        let mut basic = vec![0xA5_u8; core::mem::size_of::<wdk_sys::FILE_BASIC_INFORMATION>()];
+        assert!(super::pack_basic_information(&mut basic, metadata).is_ok());
+        assert_padding_zero(
+            &basic,
+            &[
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_BASIC_INFORMATION, CreationTime),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_BASIC_INFORMATION, LastAccessTime),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_BASIC_INFORMATION, LastWriteTime),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_BASIC_INFORMATION, ChangeTime),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_BASIC_INFORMATION, FileAttributes),
+                    4,
+                ),
+            ],
+        );
+
+        let mut standard =
+            vec![0xA5_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>()];
+        assert!(super::pack_standard_information(&mut standard, metadata, false).is_ok());
+        assert_padding_zero(
+            &standard,
+            &[
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, AllocationSize),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, EndOfFile),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, NumberOfLinks),
+                    4,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, DeletePending),
+                    1,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, Directory),
+                    1,
+                ),
+            ],
+        );
+
+        let mut standard_link =
+            vec![0xA5_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_LINK_INFORMATION>()];
+        assert!(super::pack_standard_link_information(&mut standard_link, metadata, false).is_ok());
+        assert_padding_zero(
+            &standard_link,
+            &[
+                (
+                    core::mem::offset_of!(
+                        wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+                        NumberOfAccessibleLinks
+                    ),
+                    4,
+                ),
+                (
+                    core::mem::offset_of!(
+                        wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+                        TotalNumberOfLinks
+                    ),
+                    4,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, DeletePending),
+                    1,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, Directory),
+                    1,
+                ),
+            ],
+        );
+
+        let mut network =
+            vec![0xA5_u8; core::mem::size_of::<wdk_sys::FILE_NETWORK_OPEN_INFORMATION>()];
+        assert!(super::pack_network_open_information(&mut network, metadata).is_ok());
+        assert_padding_zero(
+            &network,
+            &[
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_NETWORK_OPEN_INFORMATION, CreationTime),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_NETWORK_OPEN_INFORMATION, LastAccessTime),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_NETWORK_OPEN_INFORMATION, LastWriteTime),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_NETWORK_OPEN_INFORMATION, ChangeTime),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_NETWORK_OPEN_INFORMATION, AllocationSize),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_NETWORK_OPEN_INFORMATION, EndOfFile),
+                    8,
+                ),
+                (
+                    core::mem::offset_of!(wdk_sys::FILE_NETWORK_OPEN_INFORMATION, FileAttributes),
+                    4,
+                ),
+            ],
+        );
     }
 
     /// # Panics
@@ -5700,6 +6364,10 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the live stack fixtures satisfy ReceivedIrp's raw dispatch-pair contract"
+    )]
     fn rename_replace_flag_decode_boundary_selects_replace_collision() {
         let mut input = [0_u8; core::mem::size_of::<wdk_sys::FILE_RENAME_INFORMATION>()];
         let Some(replace_flag) = input.get_mut(super::FILE_NAMESPACE_REPLACE_IF_EXISTS_OFFSET)
@@ -5759,10 +6427,13 @@ mod tests {
             .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
 
         let mut device = wdk_sys::DEVICE_OBJECT::default();
-        let mut target = ReceivedIrp::decode(
-            core::ptr::addr_of_mut!(device),
-            core::ptr::addr_of_mut!(irp),
-        );
+        let mut target = unsafe {
+            // SAFETY: Both stack-local fixtures remain live through the active decode operation.
+            ReceivedIrp::decode(
+                core::ptr::addr_of_mut!(device),
+                core::ptr::addr_of_mut!(irp),
+            )
+        };
         assert!(target.is_ok());
         if let Ok(target) = target.as_mut() {
             let parsed = target.with_active(|active| {
