@@ -70,7 +70,7 @@ function Assert-CleanDriverState {
     }
     $inventoryPath = Join-Path ([IO.Path]::GetTempPath()) ("ext4win-inventory-{0}.xml" -f [Guid]::NewGuid().ToString('N'))
     try {
-        if ((Get-Ext4WinPackages $inventoryPath).Count -ne 0) {
+        if (@(Get-Ext4WinPackages $inventoryPath).Count -ne 0) {
             throw 'one or more ext4win DriverStore packages already exist; recover or clean the host first'
         }
     }
@@ -468,7 +468,7 @@ function Cleanup-DriverLoadSession {
     }
 
     $finalInventory = Join-Path $script:SessionDirectory ("inventory-final-{0}.xml" -f [Guid]::NewGuid().ToString('N'))
-    if ((Get-Ext4WinPackages $finalInventory).Count -ne 0) {
+    if (@(Get-Ext4WinPackages $finalInventory).Count -ne 0) {
         throw 'ext4win DriverStore package remains after cleanup'
     }
     if ((Test-Path -LiteralPath $serviceRegistryPath) -or (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
