@@ -382,80 +382,6 @@ fn next_slot_generation(slot: &EpochSlot) -> DriverResult<u64> {
         .ok_or(DriverError::InsufficientResources)
 }
 
-/// Non-cloneable immutable epoch capability owned by one operation.
-pub(crate) struct EpochLease {
-    /// Stable mounted registry.
-    registry: NonNull<EpochRegistry>,
-    /// Fixed slot index.
-    index: usize,
-    /// Slot generation preventing stale reuse.
-    generation: u64,
-}
-
-impl EpochLease {
-    /// Borrows the immutable epoch selected when this lease was acquired.
-    pub(crate) fn epoch(&self) -> &CommittedEpoch {
-        let registry = unsafe {
-            // SAFETY: The VCB outlives every operation lease and teardown drains operations first.
-            self.registry.as_ref()
-        };
-        match registry.slots.get(self.index) {
-            Some(EpochSlot::Occupied {
-                generation, epoch, ..
-            }) if *generation == self.generation => epoch.as_ref(),
-            _ => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
-        }
-    }
-}
-
-impl fmt::Debug for EpochLease {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("EpochLease")
-            .field("index", &self.index)
-            .field("generation", &self.generation)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for EpochLease {
-    fn drop(&mut self) {
-        let registry = unsafe {
-            // SAFETY: Reactor teardown drains every lease before releasing the stable VCB.
-            self.registry.as_mut()
-        };
-        registry.release(self.index, self.generation);
-    }
-}
-
-// SAFETY: The lease is moved only among reactor state and completion envelopes; release occurs on
-// the sole reactor thread after lower-buffer ownership ends.
-unsafe impl Send for EpochLease {}
-
-/// Non-cloneable proof that one admitted mutation still participates in close draining.
-#[derive(Debug)]
-pub(crate) struct MutationActivityLease {
-    /// Stable runtime counter decremented only when the complete mutation operation drops.
-    active_mutations: NonNull<u32>,
-}
-
-impl Drop for MutationActivityLease {
-    fn drop(&mut self) {
-        let active_mutations = unsafe {
-            // SAFETY: The VCB outlives every admitted operation and reactor teardown drains all
-            // operation leases before releasing the mounted runtime.
-            self.active_mutations.as_mut()
-        };
-        *active_mutations = active_mutations.checked_sub(1).unwrap_or_else(|| {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
-        });
-    }
-}
-
-// SAFETY: The lease moves only with its reactor operation; final release remains serialized on the
-// owning reactor thread.
-unsafe impl Send for MutationActivityLease {}
-
 /// Pair of epoch slots reserved before a commit can issue its first lower write.
 #[derive(Debug)]
 pub(crate) struct EpochPublicationSlots {
@@ -471,58 +397,6 @@ impl EpochPublicationSlots {
         (self.durable, self.checkpoint)
     }
 }
-
-/// One pre-reserved infallible epoch publication target.
-pub(crate) struct EpochPublicationSlot {
-    /// Stable registry address.
-    registry: NonNull<EpochRegistry>,
-    /// Fixed target index.
-    index: usize,
-    /// Reservation generation.
-    generation: u64,
-    /// Whether publication already consumed this reservation.
-    consumed: bool,
-}
-
-impl EpochPublicationSlot {
-    /// Publishes an already-built epoch without allocation or an ordinary failure path.
-    pub(crate) fn publish(mut self, epoch: CommittedEpoch) {
-        let registry = unsafe {
-            // SAFETY: The reservation contract keeps the mounted registry stable and uniquely
-            // reactor-owned for publication.
-            self.registry.as_mut()
-        };
-        registry.publish(self.index, self.generation, epoch);
-        self.consumed = true;
-    }
-}
-
-impl fmt::Debug for EpochPublicationSlot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("EpochPublicationSlot")
-            .field("index", &self.index)
-            .field("generation", &self.generation)
-            .field("consumed", &self.consumed)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for EpochPublicationSlot {
-    fn drop(&mut self) {
-        if self.consumed {
-            return;
-        }
-        let registry = unsafe {
-            // SAFETY: An unpublished reservation remains uniquely owned by this token.
-            self.registry.as_mut()
-        };
-        registry.release_reservation(self.index, self.generation);
-    }
-}
-
-// SAFETY: Publication tokens move only among reactor-owned operation state.
-unsafe impl Send for EpochPublicationSlot {}
 
 /// Commit/checkpoint gate state for the currently supported one-transaction journal profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -130,10 +130,6 @@ impl PreparedRead {
         self.output.address()
     }
 
-    /// Borrows the exact caller output range for the duration of active read execution.
-    pub(crate) fn output_mut(&mut self) -> &mut [u8] {
-        self.output.as_mut_slice()
-    }
 }
 
 /// Non-empty system mapping retained by one pending data-transfer IRP.
@@ -202,18 +198,6 @@ impl CapturedReadOutput {
         }
     }
 
-    /// Borrows the complete captured output range.
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        match self {
-            Self::Empty => &mut [],
-            Self::Mapped(mapping) => unsafe {
-                // SAFETY: Capture validated this exact non-empty mapping while the owning IRP was
-                // live. `&mut self` proves unique actor access and the IRP cannot complete while
-                // its `PendingIrpLease` is executing.
-                core::slice::from_raw_parts_mut(mapping.address().as_ptr(), mapping.len())
-            },
-        }
-    }
 }
 
 /// Write parameters and system mapping captured before queue insertion.
