@@ -2714,8 +2714,13 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 resolved,
                 publication,
             } => {
-                let OperationEvent::IntentGranted(intent) = event else {
-                    return self.complete_error(owned, DriverError::InvalidDeviceRequest);
+                let intent = match event {
+                    OperationEvent::IntentGranted(intent) => intent,
+                    OperationEvent::CancelRequested => {
+                        return self
+                            .complete_error(owned, DriverError::from(Error::OperationCancelled));
+                    }
+                    _ => return self.complete_error(owned, DriverError::InvalidDeviceRequest),
                 };
                 let reserved = access.reserve_mutation(resolved, intent);
                 let reserved = match reserved {
@@ -2757,8 +2762,13 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 publication,
                 slots,
             } => {
-                let OperationEvent::CommitGranted(commit) = event else {
-                    return self.complete_error(owned, DriverError::InvalidDeviceRequest);
+                let commit = match event {
+                    OperationEvent::CommitGranted(commit) => commit,
+                    OperationEvent::CancelRequested => {
+                        return self
+                            .complete_error(owned, DriverError::from(Error::OperationCancelled));
+                    }
+                    _ => return self.complete_error(owned, DriverError::InvalidDeviceRequest),
                 };
                 let ready: Result<CommitReadyMutation, Error> =
                     access.prepare_mutation_commit(reserved, commit);
