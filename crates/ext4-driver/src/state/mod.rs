@@ -6022,60 +6022,6 @@ fn file_control_block_owner(fcb: NonNull<FileControlBlock>) -> NonNull<FileContr
     }
 }
 
-/// Driver unload callback registered in the driver object.
-///
-/// # Safety
-/// The I/O Manager must call this only as the registered unload routine for this driver object,
-/// after no dispatch callbacks can still use the control device being unregistered.
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-pub(crate) unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
-    let Some(driver) = (unsafe {
-        // SAFETY: The I/O Manager invokes DriverUnload with this driver's live object.
-        driver.as_mut()
-    }) else {
-        return;
-    };
-    let control = unsafe {
-        // SAFETY: DriverUnload owns a stable device-chain traversal until deletion begins below.
-        find_control_device(driver.DeviceObject)
-    }
-    .and_then(|device| device.ok_or(DriverError::InternalInvariantViolation))
-    .unwrap_or_else(|_| KernelWideInconsistency::driver_device_teardown_corruption().bugcheck());
-    unsafe {
-        // SAFETY: Unregistration closes the I/O Manager's filesystem entry before actor teardown.
-        ffi::IoUnregisterFileSystem(control.as_ptr());
-    }
-    unsafe {
-        // SAFETY: Unregistration excludes new control requests. Joining this actor also completes
-        // any in-flight mount, stabilizing the complete driver device chain.
-        ControlDeviceExtension::release(control);
-    }
-    unsafe {
-        // SAFETY: Control extension resources were released exactly once above.
-        ffi::IoDeleteDevice(control.as_ptr());
-    }
-
-    while let Some(device) = unsafe {
-        // SAFETY: DriverUnload owns this device-chain member until it is deleted below.
-        KernelDevice::from_raw(driver.DeviceObject)
-    } {
-        if driver_device_kind(device) != Ok(DriverDeviceKind::MountedVolume) {
-            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
-        }
-        unsafe {
-            // SAFETY: The control actor is gone, so the mounted-device set can no longer grow.
-            MountedVolumeDevice::release(device, MountedDeviceTeardown::DriverUnload);
-        }
-        unsafe {
-            // SAFETY: Mounted extension resources were released exactly once above.
-            ffi::IoDeleteDevice(device.as_ptr());
-        }
-    }
-}
-
 /// Finds the unique control device before unload joins its mount-capable actor.
 /// # Errors
 ///
