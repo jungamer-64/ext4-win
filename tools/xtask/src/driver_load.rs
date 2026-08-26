@@ -85,10 +85,27 @@ pub(crate) fn check_hosted_driver_host(repository_root: &Path) -> TaskResult<()>
 pub(crate) fn verify_hosted_driver_load(repository_root: &Path) -> TaskResult<()> {
     check_hosted_driver_host(repository_root)?;
     let bundle = build_verified_production_bundle(repository_root)?;
+    shutdown_production_wsl_oracle()?;
     let session_id = DriverLoadSessionId::create(repository_root)?;
+    println!("driver-load session: {}", session_id.as_str());
     run_driver_load_script(repository_root, "Run", Some(&bundle), Some(&session_id))?;
     println!("hosted kernel-load smoke assurance: PASS");
-    println!("session: {}", session_id.as_str());
+    Ok(())
+}
+
+/// Shuts down the production gate's WSL oracle before registering a filesystem driver.
+///
+/// The production gate may leave its ext4-backed WSL virtual disk attached. The hosted smoke
+/// session must not let that oracle volume become an incidental mount target.
+///
+/// # Errors
+///
+/// Returns an error when WSL cannot detach its distributions and virtual machine.
+fn shutdown_production_wsl_oracle() -> TaskResult<()> {
+    let mut command = Command::new("wsl.exe");
+    command.arg("--shutdown");
+    run_checked(command, "production WSL oracle shutdown")?;
+    println!("production WSL oracle shutdown: PASS");
     Ok(())
 }
 
