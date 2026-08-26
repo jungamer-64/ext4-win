@@ -44,6 +44,28 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments, [string]$Descrip
     }
 }
 
+function Get-Sha256FileHash([string]$Path) {
+    $stream = [IO.File]::Open(
+        $Path,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read
+    )
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $digest = $sha256.ComputeHash($stream)
+        }
+        finally {
+            $sha256.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+    return [BitConverter]::ToString($digest).Replace('-', '')
+}
+
 function Get-Ext4WinPackages([string]$InventoryPath) {
     Invoke-Checked 'pnputil.exe' @('/enum-drivers', '/files', '/format', 'xml', '/output-file', $InventoryPath) 'structured DriverStore inventory' | Out-Null
     [xml]$inventory = [IO.File]::ReadAllText($InventoryPath)
@@ -147,7 +169,7 @@ function Assert-Bundle([string]$BundlePath) {
             throw "bundle artifact path is not canonical: $artifact"
         }
         $artifactPath = Join-Path $resolvedBundle $artifactPaths[$artifact]
-        $actualHash = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash
+        $actualHash = Get-Sha256FileHash $artifactPath
         if ($actualHash -ne [string]$manifest[$hashKey]) {
             throw "bundle artifact hash mismatch: $artifact"
         }
@@ -273,7 +295,7 @@ function Export-And-VerifyPackage($Package, [string]$ExpectedHash) {
     if ($drivers.Count -ne 1) {
         throw 'exported DriverStore package did not contain exactly one ext4win.sys'
     }
-    $actualHash = (Get-FileHash -LiteralPath $drivers[0].FullName -Algorithm SHA256).Hash
+    $actualHash = Get-Sha256FileHash $drivers[0].FullName
     if ($actualHash -ne $ExpectedHash) {
         throw 'exported DriverStore SYS hash differs from the verified production bundle'
     }
@@ -324,7 +346,7 @@ function Assert-ServiceConfiguration([string]$ExpectedHash, [bool]$RequireImageF
         throw 'ext4win service raw ImagePath differs from the durable session identity'
     }
     if (Test-Path -LiteralPath $resolvedImagePath) {
-        $imageHash = (Get-FileHash -LiteralPath $resolvedImagePath -Algorithm SHA256).Hash
+        $imageHash = Get-Sha256FileHash $resolvedImagePath
         if ($imageHash -ne $ExpectedHash) {
             throw 'service DriverStore ImagePath SYS hash differs from the verified production bundle'
         }
