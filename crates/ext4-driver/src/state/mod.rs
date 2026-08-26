@@ -498,7 +498,7 @@ impl DeviceExtensionKind {
 
 /// Driver-owned device kind decoded before selecting a concrete extension teardown path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DriverDeviceKind {
+pub(crate) enum DriverDeviceKind {
     /// Registered filesystem control device.
     Control,
     /// Mounted ext4 volume device.
@@ -530,11 +530,148 @@ struct DeviceExtensionHeader {
     kind: DeviceExtensionKind,
 }
 
+/// Filesystem registration lifecycle retained in the named control-device extension.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileSystemRegistrationState {
+    /// The secure device and reactor exist but have not been published.
+    Unpublished = 0,
+    /// `IoRegisterFileSystem` owns its registration reference.
+    Registered = 1,
+    /// One control request is consuming registration and quiescing the reactor.
+    PreparingUnload = 2,
+    /// Registration is gone and the reactor is stopped, ready for `DriverUnload`.
+    PreparedForUnload = 3,
+}
+
+impl FileSystemRegistrationState {
+    /// Stable atomic representation.
+    const fn as_raw(self) -> u8 {
+        match self {
+            Self::Unpublished => 0,
+            Self::Registered => 1,
+            Self::PreparingUnload => 2,
+            Self::PreparedForUnload => 3,
+        }
+    }
+
+    /// Checks one atomic representation before it controls external lifecycle authority.
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unpublished),
+            1 => Some(Self::Registered),
+            2 => Some(Self::PreparingUnload),
+            3 => Some(Self::PreparedForUnload),
+            _ => None,
+        }
+    }
+}
+
+/// Outcome of acquiring the one-shot prepare-unload transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrepareUnloadAdmission {
+    /// This request owns the transition from registered to prepared.
+    Acquired,
+    /// A prior request completed the same idempotent transition.
+    AlreadyPrepared,
+}
+
+/// Atomic owner of the one external filesystem-registration lifecycle.
+struct FileSystemRegistration {
+    /// Checked [`FileSystemRegistrationState`] representation.
+    state: AtomicU8,
+}
+
+impl FileSystemRegistration {
+    /// Creates one unpublished registration authority.
+    fn unpublished() -> Self {
+        Self {
+            state: AtomicU8::new(FileSystemRegistrationState::Unpublished.as_raw()),
+        }
+    }
+
+    /// Returns the checked registration state.
+    fn state(&self) -> FileSystemRegistrationState {
+        FileSystemRegistrationState::from_raw(self.state.load(Ordering::Acquire)).unwrap_or_else(
+            || KernelWideInconsistency::driver_device_teardown_corruption().bugcheck(),
+        )
+    }
+
+    /// Publishes the sole registration fact after the external reference is acquired.
+    fn mark_registered(&self) {
+        if self
+            .state
+            .compare_exchange(
+                FileSystemRegistrationState::Unpublished.as_raw(),
+                FileSystemRegistrationState::Registered.as_raw(),
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
+    }
+
+    /// Acquires the idempotent transition that consumes the I/O Manager registration reference.
+    /// # Errors
+    ///
+    /// Returns a busy error while another request owns the transition, or an invariant error when
+    /// an unpublished device receives a lifecycle request.
+    fn begin_prepare_unload(&self) -> DriverResult<PrepareUnloadAdmission> {
+        match self.state.compare_exchange(
+            FileSystemRegistrationState::Registered.as_raw(),
+            FileSystemRegistrationState::PreparingUnload.as_raw(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(PrepareUnloadAdmission::Acquired),
+            Err(raw)
+                if FileSystemRegistrationState::from_raw(raw)
+                    == Some(FileSystemRegistrationState::PreparedForUnload) =>
+            {
+                Ok(PrepareUnloadAdmission::AlreadyPrepared)
+            }
+            Err(raw)
+                if FileSystemRegistrationState::from_raw(raw)
+                    == Some(FileSystemRegistrationState::PreparingUnload) =>
+            {
+                Err(DriverError::DeviceBusy)
+            }
+            Err(raw)
+                if FileSystemRegistrationState::from_raw(raw)
+                    == Some(FileSystemRegistrationState::Unpublished) =>
+            {
+                Err(DriverError::InternalInvariantViolation)
+            }
+            Err(_) => KernelWideInconsistency::driver_device_teardown_corruption().bugcheck(),
+        }
+    }
+
+    /// Commits the prepared state after unregistration and reactor quiescence both complete.
+    fn finish_prepare_unload(&self) {
+        if self
+            .state
+            .compare_exchange(
+                FileSystemRegistrationState::PreparingUnload.as_raw(),
+                FileSystemRegistrationState::PreparedForUnload.as_raw(),
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
+    }
+}
+
 /// Device extension stored in the file-system control device.
 #[repr(C)]
 pub(crate) struct ControlDeviceExtension {
     /// Common driver-owned device extension header.
     header: DeviceExtensionHeader,
+    /// One authoritative state for filesystem registration and reactor quiescence.
+    registration: FileSystemRegistration,
 }
 
 impl ControlDeviceExtension {
@@ -562,6 +699,7 @@ impl ControlDeviceExtension {
         }
         .ok_or(DriverError::InvalidParameter)?;
         extension.header.kind = DeviceExtensionKind::CONTROL;
+        extension.registration = FileSystemRegistration::unpublished();
         unsafe {
             // SAFETY: The extension is stable device-owned storage.
             CompletionReactor::initialize_at(
@@ -572,61 +710,271 @@ impl ControlDeviceExtension {
         }
     }
 
-    /// Releases resources stored in the extension.
+    /// Returns the exact extension of a checked control device.
+    /// # Errors
+    ///
+    /// Returns an error when the device kind or extension pointer is invalid.
     /// # Safety
     ///
-    /// No dispatch callback or device actor may still access the control device.
+    /// `device` must remain a live control device for the returned borrow.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    unsafe fn release(device: KernelDevice) {
-        let Some(device_object) = (unsafe {
-            // SAFETY: The caller owns teardown of the control device.
-            device.as_ptr().as_mut()
-        }) else {
-            return;
-        };
-        let Some(extension) = (unsafe {
-            // SAFETY: The control device was created with this extension type.
+    unsafe fn from_device<'device>(device: KernelDevice) -> DriverResult<&'device Self> {
+        if driver_device_kind(device)? != DriverDeviceKind::Control {
+            return Err(DriverError::InvalidDeviceRequest);
+        }
+        let device_object = unsafe {
+            // SAFETY: The caller retains this checked control device through the returned borrow.
+            device.as_ptr().as_ref()
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        unsafe {
+            // SAFETY: The decoded control kind selects the exact extension layout.
             device_object
                 .DeviceExtension
                 .cast::<ControlDeviceExtension>()
-                .as_mut()
-        }) else {
-            return;
+                .as_ref()
+        }
+        .ok_or(DriverError::InvalidParameter)
+    }
+
+    /// Releases an initialized control extension that was never registered.
+    /// # Safety
+    ///
+    /// The device must still be unpublished and no dispatch callback may access it.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    unsafe fn release_unpublished(device: KernelDevice) {
+        let extension = unsafe {
+            // SAFETY: The caller retains the unpublished control device exclusively.
+            Self::from_device(device)
+        }
+        .unwrap_or_else(|_| {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck()
+        });
+        if extension.registration.state() != FileSystemRegistrationState::Unpublished {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
+        let target = unsafe {
+            // SAFETY: The unpublished device cannot receive dispatch and owns this live reactor.
+            CompletionReactor::release_at(core::ptr::addr_of!(extension.header.reactor).cast_mut())
         };
-        unsafe {
-            // SAFETY: Teardown has exclusive access to the extension.
-            let target =
-                CompletionReactor::release_at(core::ptr::addr_of_mut!(extension.header.reactor));
-            if !matches!(target, ReactorTarget::ControlDevice) {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
+        if !matches!(target, ReactorTarget::ControlDevice) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+    }
+
+    /// Releases a control extension after the external prepare-unload transition.
+    /// # Safety
+    ///
+    /// The I/O Manager must have invoked `DriverUnload`, excluding every dispatch callback.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    unsafe fn release_prepared(device: KernelDevice) {
+        let extension = unsafe {
+            // SAFETY: DriverUnload retains exclusive access to this control device.
+            Self::from_device(device)
+        }
+        .unwrap_or_else(|_| {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck()
+        });
+        if extension.registration.state() != FileSystemRegistrationState::PreparedForUnload {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
+        let target = unsafe {
+            // SAFETY: Prepare-unload stopped this exact reactor before releasing registration.
+            CompletionReactor::release_quiesced_at(
+                core::ptr::addr_of!(extension.header.reactor).cast_mut(),
+            )
+        };
+        if !matches!(target, ReactorTarget::ControlDevice) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
     }
 }
 
 /// Registered file system control device owned by the driver.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ControlDevice {
-    /// File-system control device registered with the I/O Manager.
-    device: KernelDevice,
-}
+pub(crate) struct ControlDevice;
 
 impl ControlDevice {
-    /// Creates registered control-device state.
+    /// Creates, secures, names, initializes, and registers the filesystem control device.
     /// # Errors
     ///
-    /// Returns an error when the device pointer is null or its extension cannot be initialized.
-    pub(crate) fn registered(device: KernelDevice) -> DriverResult<Self> {
-        ControlDeviceExtension::initialize(device)?;
-        Ok(Self { device })
+    /// Returns the exact native failure status when secure creation or symbolic-link publication
+    /// fails, or the mapped driver failure when extension initialization fails.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) fn create(driver: PDRIVER_OBJECT) -> Result<Self, wdk_sys::NTSTATUS> {
+        let extension_size =
+            wdk_sys::ULONG::try_from(core::mem::size_of::<ControlDeviceExtension>())
+                .map_err(|_| DriverError::InvalidParameter.ntstatus())?;
+        let mut device_name = lifecycle_unicode_string(
+            &crate::lifecycle_control::CONTROL_DEVICE_NT_NAME,
+            crate::lifecycle_control::CONTROL_DEVICE_NT_NAME_BYTE_LENGTH,
+            crate::lifecycle_control::CONTROL_DEVICE_NT_NAME_MAXIMUM_BYTE_LENGTH,
+        );
+        let device_sddl = lifecycle_unicode_string(
+            &crate::lifecycle_control::CONTROL_DEVICE_SDDL,
+            crate::lifecycle_control::CONTROL_DEVICE_SDDL_BYTE_LENGTH,
+            crate::lifecycle_control::CONTROL_DEVICE_SDDL_MAXIMUM_BYTE_LENGTH,
+        );
+        let mut device = core::ptr::null_mut();
+        let status = unsafe {
+            // SAFETY: Generated strings are stable, terminated contract values; `device` is
+            // writable out storage and the custom GUID is unique to this control device.
+            ffi::WdmlibIoCreateDeviceSecure(
+                driver,
+                extension_size,
+                core::ptr::addr_of_mut!(device_name),
+                ffi::FILE_DEVICE_DISK_FILE_SYSTEM,
+                wdk_sys::FILE_DEVICE_SECURE_OPEN,
+                0,
+                core::ptr::addr_of!(device_sddl),
+                core::ptr::addr_of!(crate::lifecycle_control::CONTROL_DEVICE_CLASS_GUID),
+                core::ptr::addr_of_mut!(device),
+            )
+        };
+        if status < STATUS_SUCCESS {
+            return Err(status);
+        }
+        let Some(device) = (unsafe {
+            // SAFETY: Successful secure creation returns a live unpublished device.
+            KernelDevice::from_raw(device)
+        }) else {
+            return Err(DriverError::InternalInvariantViolation.ntstatus());
+        };
+        if let Err(error) = ControlDeviceExtension::initialize(device) {
+            unsafe {
+                // SAFETY: Extension initialization failed before any device publication.
+                ffi::IoDeleteDevice(device.as_ptr());
+            }
+            return Err(error.ntstatus());
+        }
+
+        let mut dos_name = lifecycle_unicode_string(
+            &crate::lifecycle_control::CONTROL_DEVICE_DOS_NAME,
+            crate::lifecycle_control::CONTROL_DEVICE_DOS_NAME_BYTE_LENGTH,
+            crate::lifecycle_control::CONTROL_DEVICE_DOS_NAME_MAXIMUM_BYTE_LENGTH,
+        );
+        let link_status = unsafe {
+            // SAFETY: Both generated names remain stable for this synchronous publication call.
+            ffi::IoCreateSymbolicLink(
+                core::ptr::addr_of_mut!(dos_name),
+                core::ptr::addr_of_mut!(device_name),
+            )
+        };
+        if link_status < STATUS_SUCCESS {
+            unsafe {
+                // SAFETY: Symbolic-link publication failed, so the initialized device remains
+                // unpublished and exclusively owned by this rollback path.
+                ControlDeviceExtension::release_unpublished(device);
+            }
+            unsafe {
+                // SAFETY: Reactor rollback completed and no external reference was published.
+                ffi::IoDeleteDevice(device.as_ptr());
+            }
+            return Err(link_status);
+        }
+
+        unsafe {
+            // SAFETY: The named, initialized disk-filesystem control device is ready to acquire
+            // its registration reference while DO_DEVICE_INITIALIZING still excludes opens.
+            ffi::IoRegisterFileSystem(device.as_ptr());
+        }
+        let extension = unsafe {
+            // SAFETY: This exact device was initialized as the filesystem control device above.
+            ControlDeviceExtension::from_device(device)
+        }
+        .unwrap_or_else(|_| {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck()
+        });
+        extension.registration.mark_registered();
+        let device_object = unsafe {
+            // SAFETY: Registration state now represents every lifecycle fact that dispatch can
+            // observe once this final publication flag is cleared.
+            device.as_ptr().as_mut()
+        }
+        .unwrap_or_else(|| KernelWideInconsistency::driver_device_teardown_corruption().bugcheck());
+        device_object.Flags &= !DO_DEVICE_INITIALIZING;
+        Ok(Self)
     }
 
-    /// Returns the raw WDK device pointer for FFI calls.
-    pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
-        self.device.as_ptr()
+    /// Consumes the filesystem registration reference and quiesces the control reactor exactly
+    /// once before SCM asks the I/O Manager to unload the driver.
+    /// # Errors
+    ///
+    /// Returns an error for a non-control device, an unpublished state, or a concurrent prepare
+    /// request that still owns the transition.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) fn prepare_unload(device: KernelDevice) -> DriverResult<()> {
+        let extension = unsafe {
+            // SAFETY: The active control IOCTL retains its target device for this transition.
+            ControlDeviceExtension::from_device(device)?
+        };
+        if extension.registration.begin_prepare_unload()? == PrepareUnloadAdmission::AlreadyPrepared
+        {
+            return Ok(());
+        }
+        unsafe {
+            // SAFETY: This request exclusively consumed the Registered state, so it owns the sole
+            // I/O Manager registration reference and may release it exactly once.
+            ffi::IoUnregisterFileSystem(device.as_ptr());
+        }
+        unsafe {
+            // SAFETY: Unregistration prevents new filesystem mount dispatch; the live extension
+            // remains address-stable while its actor drains all already-admitted work.
+            CompletionReactor::quiesce_at(core::ptr::addr_of!(extension.header.reactor).cast_mut());
+        }
+        extension.registration.finish_prepare_unload();
+        Ok(())
+    }
+
+    /// Removes the Win32 control-device alias during terminal driver unload.
+    /// # Safety
+    ///
+    /// The I/O Manager must have excluded new device references before this call.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    unsafe fn delete_symbolic_link() {
+        let mut dos_name = lifecycle_unicode_string(
+            &crate::lifecycle_control::CONTROL_DEVICE_DOS_NAME,
+            crate::lifecycle_control::CONTROL_DEVICE_DOS_NAME_BYTE_LENGTH,
+            crate::lifecycle_control::CONTROL_DEVICE_DOS_NAME_MAXIMUM_BYTE_LENGTH,
+        );
+        let status = unsafe {
+            // SAFETY: The generated name identifies the alias published by `Self::create`.
+            ffi::IoDeleteSymbolicLink(core::ptr::addr_of_mut!(dos_name))
+        };
+        if status < STATUS_SUCCESS {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
+    }
+}
+
+/// Builds a native string view over one generated, terminated lifecycle-contract buffer.
+fn lifecycle_unicode_string(
+    buffer: &'static [u16],
+    byte_length: wdk_sys::USHORT,
+    maximum_byte_length: wdk_sys::USHORT,
+) -> UNICODE_STRING {
+    UNICODE_STRING {
+        Length: byte_length,
+        MaximumLength: maximum_byte_length,
+        Buffer: buffer.as_ptr().cast_mut(),
     }
 }
 
@@ -6022,7 +6370,61 @@ fn file_control_block_owner(fcb: NonNull<FileControlBlock>) -> NonNull<FileContr
     }
 }
 
-/// Finds the unique control device before unload joins its mount-capable actor.
+/// Driver unload callback reached only after the external prepare-unload transition released the
+/// filesystem registration reference and every caller closed its control handle.
+///
+/// # Safety
+/// The I/O Manager must call this only as the registered unload routine after excluding all new
+/// device references and dispatch callbacks.
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+pub(crate) unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
+    let Some(driver) = (unsafe {
+        // SAFETY: The I/O Manager invokes DriverUnload with this driver's live object.
+        driver.as_mut()
+    }) else {
+        return;
+    };
+    let control = unsafe {
+        // SAFETY: DriverUnload owns a stable device-chain traversal until deletion begins below.
+        find_control_device(driver.DeviceObject)
+    }
+    .and_then(|device| device.ok_or(DriverError::InternalInvariantViolation))
+    .unwrap_or_else(|_| KernelWideInconsistency::driver_device_teardown_corruption().bugcheck());
+    unsafe {
+        // SAFETY: Unload-pending excludes new opens of the published Win32 alias.
+        ControlDevice::delete_symbolic_link();
+    }
+    unsafe {
+        // SAFETY: Prepare-unload already joined this reactor; DriverUnload now owns final release.
+        ControlDeviceExtension::release_prepared(control);
+    }
+    unsafe {
+        // SAFETY: The alias and extension resources were released exactly once above.
+        ffi::IoDeleteDevice(control.as_ptr());
+    }
+
+    while let Some(device) = unsafe {
+        // SAFETY: DriverUnload owns this device-chain member until it is deleted below.
+        KernelDevice::from_raw(driver.DeviceObject)
+    } {
+        if driver_device_kind(device) != Ok(DriverDeviceKind::MountedVolume) {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
+        unsafe {
+            // SAFETY: The prepared control actor is gone, so the mounted-device set cannot grow.
+            MountedVolumeDevice::release(device, MountedDeviceTeardown::DriverUnload);
+        }
+        unsafe {
+            // SAFETY: Mounted extension resources were released exactly once above.
+            ffi::IoDeleteDevice(device.as_ptr());
+        }
+    }
+}
+
+/// Finds the unique prepared control device before terminal device-chain deletion.
 /// # Errors
 ///
 /// Returns an invariant error for an unknown extension or more than one control device.
@@ -6063,7 +6465,7 @@ unsafe fn find_control_device(first: PDEVICE_OBJECT) -> DriverResult<Option<Kern
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-fn driver_device_kind(device: KernelDevice) -> DriverResult<DriverDeviceKind> {
+pub(crate) fn driver_device_kind(device: KernelDevice) -> DriverResult<DriverDeviceKind> {
     let device = unsafe {
         // SAFETY: The unload chain retains this device until its resources are selected.
         device.as_ptr().as_ref()
@@ -6097,14 +6499,46 @@ mod tests {
         CleanCloseTerminal, CleanupStart, CloseReleasePlan, DIRECTORY_NOTIFICATION_DIRECTORY_UNITS,
         DataTransferMode, DeviceExtensionKind, DirectoryChange, DirectoryChangeAction,
         DriverDeviceKind, FileControlBlock, FileControlBlockLedger, FileControlBlockOpenState,
-        FileControlBlockRelease, FileObjectCloseKind, HandleAdmissionState, HandleDeletion,
-        KernelDevice, KernelFileObject, MountedVolumeState, NativeFileByteRange,
-        NoIntermediateTransfer, OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation,
-        OpenedNodeMode, OpenedObject, OpenedRegularFile, OpenedVolumeHandle,
+        FileControlBlockRelease, FileObjectCloseKind, FileSystemRegistration,
+        FileSystemRegistrationState, HandleAdmissionState, HandleDeletion, KernelDevice,
+        KernelFileObject, MountedVolumeState, NativeFileByteRange, NoIntermediateTransfer,
+        OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation, OpenedNodeMode,
+        OpenedObject, OpenedRegularFile, OpenedVolumeHandle, PrepareUnloadAdmission,
         TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
         VolumeHandleCleanup, VolumeRetirement, select_close_release_plan,
         shutdown_registration_status,
     };
+
+    /// # Panics
+    ///
+    /// Panics when registration can be consumed before publication, concurrently consumed without
+    /// a busy result, or consumed more than once after its idempotent commit point.
+    #[test]
+    fn filesystem_registration_has_one_recoverable_prepare_unload_transition() {
+        let registration = FileSystemRegistration::unpublished();
+        assert_eq!(
+            registration.begin_prepare_unload(),
+            Err(DriverError::InternalInvariantViolation)
+        );
+        registration.mark_registered();
+        assert_eq!(
+            registration.begin_prepare_unload(),
+            Ok(PrepareUnloadAdmission::Acquired)
+        );
+        assert_eq!(
+            registration.begin_prepare_unload(),
+            Err(DriverError::DeviceBusy)
+        );
+        registration.finish_prepare_unload();
+        assert_eq!(
+            registration.state(),
+            FileSystemRegistrationState::PreparedForUnload
+        );
+        assert_eq!(
+            registration.begin_prepare_unload(),
+            Ok(PrepareUnloadAdmission::AlreadyPrepared)
+        );
+    }
 
     /// Returns the common no-delete fixture policy for opened-handle tests.
     const fn retained_handle_deletion() -> HandleDeletion {

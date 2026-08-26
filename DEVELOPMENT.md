@@ -92,8 +92,12 @@ reachability. The hosted load gate additionally proves that structured PnPUtil
 inventory selected the sole installed package, both its exported SYS and the
 service `ImagePath` SYS match the production manifest SHA-256, the registry
 records `Type=2` and `Start=3`, and demand-start initialization returned with
-the service in `Running` state. Stop, OEM package removal, and final
-service/package absence are mandatory.
+the service in `Running` state. Before SCM stop, the administrator/System-only
+named control device consumes the `IoRegisterFileSystem` reference through its
+payload-free prepare-unload request and quiesces the control reactor. SCM stop
+must then complete `DriverUnload`; OEM package removal and final service/package
+absence are mandatory. The lifecycle device path and IOCTL are generated into
+the driver and read by the cleanup owner from the same versioned contract.
 
 The hosted gate does not claim a byte hash of kernel memory, VHDX or filesystem
 I/O behavior, or Driver Verifier coverage. Those are distinct live-validation

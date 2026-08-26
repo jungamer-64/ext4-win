@@ -174,7 +174,17 @@ fn run_driver_load_script(
         .arg("-RepositoryRoot")
         .arg(repository_root);
     if let Some(bundle) = bundle {
-        command.arg("-Bundle").arg(bundle.as_path());
+        command
+            .arg("-Bundle")
+            .arg(bundle.as_path())
+            .arg("-BundleArtifactId")
+            .arg(bundle.artifact_id())
+            .arg("-BundleSysHash")
+            .arg(bundle.driver_hash())
+            .arg("-BundleCatalogHash")
+            .arg(bundle.catalog_hash())
+            .arg("-BundleInfHash")
+            .arg(bundle.inf_hash());
     }
     if let Some(session_id) = session_id {
         command.arg("-SessionId").arg(session_id.as_str());

@@ -1,12 +1,20 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Preflight', 'Start', 'Run', 'Cleanup')]
+    [ValidateSet('Preflight', 'Start', 'Run', 'Cleanup', 'PrepareUnload')]
     [string]$Mode,
 
     [Parameter(Mandatory = $true)]
     [string]$RepositoryRoot,
 
     [string]$Bundle,
+
+    [string]$BundleArtifactId,
+
+    [string]$BundleSysHash,
+
+    [string]$BundleCatalogHash,
+
+    [string]$BundleInfHash,
 
     [string]$SessionId
 )
@@ -19,6 +27,7 @@ $originalInf = 'ext4win.inf'
 $providerName = 'ext4-win'
 $sessionParent = Join-Path $RepositoryRoot 'target\driver-load-sessions'
 $serviceRegistryPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\ext4win'
+$controlContractPath = Join-Path $RepositoryRoot 'crates\ext4-driver\lifecycle-control-v1.txt'
 $script:State = [ordered]@{}
 $script:SessionDirectory = $null
 $script:SessionEstablished = $false
@@ -110,12 +119,13 @@ function Assert-HostContract([bool]$RequireCleanState) {
             throw "required Windows command is unavailable: $program"
         }
     }
-    foreach ($command in @('Get-Service', 'Start-Service')) {
+    foreach ($command in @('Get-Service', 'Start-Service', 'Start-Job', 'Wait-Job', 'Stop-Job', 'Remove-Job')) {
         if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
             throw "required SCM PowerShell command is unavailable: $command"
         }
     }
     Assert-TestSigning
+    Get-ControlContract | Out-Null
     if ($RequireCleanState) {
         Assert-CleanDriverState
     }
@@ -141,45 +151,198 @@ function Read-KeyValueFile([string]$Path) {
     return $values
 }
 
-function Assert-Bundle([string]$BundlePath) {
+function Get-ControlContract {
+    if (-not (Test-Path -LiteralPath $controlContractPath -PathType Leaf)) {
+        throw 'driver lifecycle control contract is absent'
+    }
+    $contract = Read-KeyValueFile $controlContractPath
+    if ($contract.contract_version -cne '1') {
+        throw 'unsupported driver lifecycle control contract version'
+    }
+    if ([string]$contract.win32_device_path -notmatch '^\\\\\.\\[A-Za-z0-9]+$') {
+        throw 'driver lifecycle Win32 device path is malformed'
+    }
+    if ([string]$contract.prepare_unload_ioctl -notmatch '^0x[0-9A-Fa-f]{8}$') {
+        throw 'driver lifecycle prepare-unload IOCTL is malformed'
+    }
+    $ioctl = [Convert]::ToUInt32(
+        ([string]$contract.prepare_unload_ioctl).Substring(2),
+        16
+    )
+    return [ordered]@{
+        version = [string]$contract.contract_version
+        win32_device_path = [string]$contract.win32_device_path
+        prepare_unload_ioctl = $ioctl
+        prepare_unload_ioctl_text = ('0x{0:X8}' -f $ioctl)
+    }
+}
+
+function Assert-SessionControlContract {
+    $contract = Get-ControlContract
+    if ($script:State.control_contract_version -cne $contract.version -or
+        $script:State.control_device_path -cne $contract.win32_device_path -or
+        $script:State.prepare_unload_ioctl -cne $contract.prepare_unload_ioctl_text) {
+        throw 'driver-load session lifecycle contract differs from the checked-in authority'
+    }
+    return $contract
+}
+
+function Initialize-ControlNativeBoundary {
+    if ('Ext4Win.DriverLifecycleNative' -as [type]) {
+        return
+    }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace Ext4Win {
+    public static class DriverLifecycleNative {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern SafeFileHandle CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile
+        );
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool DeviceIoControl(
+            SafeFileHandle device,
+            uint ioControlCode,
+            IntPtr inputBuffer,
+            uint inputBufferSize,
+            IntPtr outputBuffer,
+            uint outputBufferSize,
+            out uint bytesReturned,
+            IntPtr overlapped
+        );
+    }
+}
+'@
+}
+
+function Invoke-DriverUnloadPreparation {
+    Assert-Administrator
+    $contract = Get-ControlContract
+    Initialize-ControlNativeBoundary
+    $genericWrite = [uint32]0x40000000
+    $shareReadWriteDelete = [uint32]0x00000007
+    $openExisting = [uint32]3
+    $normalAttributes = [uint32]0x00000080
+    $handle = [Ext4Win.DriverLifecycleNative]::CreateFile(
+        $contract.win32_device_path,
+        $genericWrite,
+        $shareReadWriteDelete,
+        [IntPtr]::Zero,
+        $openExisting,
+        $normalAttributes,
+        [IntPtr]::Zero
+    )
+    try {
+        if ($handle.IsInvalid) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw [ComponentModel.Win32Exception]::new(
+                $errorCode,
+                'opening the secured ext4win control device failed'
+            )
+        }
+        [uint32]$bytesReturned = 0
+        $completed = [Ext4Win.DriverLifecycleNative]::DeviceIoControl(
+            $handle,
+            $contract.prepare_unload_ioctl,
+            [IntPtr]::Zero,
+            0,
+            [IntPtr]::Zero,
+            0,
+            [ref]$bytesReturned,
+            [IntPtr]::Zero
+        )
+        if (-not $completed) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw [ComponentModel.Win32Exception]::new(
+                $errorCode,
+                'ext4win prepare-unload request failed'
+            )
+        }
+        if ($bytesReturned -ne 0) {
+            throw 'ext4win prepare-unload returned an unexpected payload'
+        }
+    }
+    finally {
+        $handle.Dispose()
+    }
+    Write-Output 'driver unload preparation: PASS'
+}
+
+function Request-BoundedDriverUnloadPreparation {
+    $job = Start-Job -FilePath $PSCommandPath -ArgumentList @('PrepareUnload', $RepositoryRoot)
+    try {
+        $completed = Wait-Job -Job $job -Timeout 30
+        if (-not $completed) {
+            Stop-Job -Job $job
+            Receive-Job -Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Output $_ }
+            throw 'driver prepare-unload request exceeded 30 seconds; registration outcome is uncertain'
+        }
+        Receive-Job -Job $job -ErrorAction Stop | ForEach-Object { Write-Output $_ }
+        if ($job.State -ne 'Completed') {
+            throw "driver prepare-unload helper ended in state $($job.State)"
+        }
+    }
+    finally {
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Resolve-BundleIdentity(
+    [string]$BundlePath,
+    [string]$ArtifactId,
+    [string]$SysHash,
+    [string]$CatalogHash,
+    [string]$InfHash
+) {
+    if ($ArtifactId -notmatch '^[0-9a-f]{32}$') {
+        throw 'verified production artifact identity is malformed'
+    }
+    foreach ($hash in @($SysHash, $CatalogHash, $InfHash)) {
+        if ($hash -notmatch '^[0-9A-Fa-f]{64}$') {
+            throw 'verified production package hash is malformed'
+        }
+    }
     $resolvedBundle = (Resolve-Path -LiteralPath $BundlePath).Path
     $verifiedParent = (Resolve-Path -LiteralPath (Join-Path $RepositoryRoot 'target\verified-production')).Path
     if ((Split-Path -Parent $resolvedBundle) -ne $verifiedParent) {
         throw 'bundle is outside target\verified-production'
     }
-    $manifestPath = Join-Path $resolvedBundle 'manifest-v1.txt'
-    $manifest = Read-KeyValueFile $manifestPath
-    if ($manifest.manifest_version -ne '1') {
-        throw 'unsupported production bundle manifest version'
+    if ((Split-Path -Leaf $resolvedBundle) -cne $ArtifactId) {
+        throw 'bundle directory identity differs from the verified production identity'
     }
-    if ((Split-Path -Leaf $resolvedBundle) -ne $manifest.artifact_id) {
-        throw 'bundle directory identity differs from its manifest'
+    $packageFiles = [ordered]@{
+        sys = [ordered]@{ path = (Join-Path $resolvedBundle 'ext4win.sys'); hash = $SysHash.ToUpperInvariant() }
+        cat = [ordered]@{ path = (Join-Path $resolvedBundle 'ext4win.cat'); hash = $CatalogHash.ToUpperInvariant() }
+        inf = [ordered]@{ path = (Join-Path $resolvedBundle 'ext4win.inf'); hash = $InfHash.ToUpperInvariant() }
     }
-    $artifactPaths = [ordered]@{
-        ir = 'ext4win.ll'
-        map = 'ext4win.map'
-        sys = 'ext4win.sys'
-        cat = 'ext4win.cat'
-        inf = 'ext4win.inf'
-    }
-    foreach ($artifact in $artifactPaths.Keys) {
-        $pathKey = "artifact.$artifact.path"
-        $hashKey = "artifact.$artifact.sha256"
-        if ([string]$manifest[$pathKey] -cne $artifactPaths[$artifact]) {
-            throw "bundle artifact path is not canonical: $artifact"
+    foreach ($name in $packageFiles.Keys) {
+        if (-not (Test-Path -LiteralPath $packageFiles[$name].path -PathType Leaf)) {
+            throw "verified production package file is absent: $name"
         }
-        $artifactPath = Join-Path $resolvedBundle $artifactPaths[$artifact]
-        $actualHash = Get-Sha256FileHash $artifactPath
-        if ($actualHash -ne [string]$manifest[$hashKey]) {
-            throw "bundle artifact hash mismatch: $artifact"
+        $actualHash = Get-Sha256FileHash $packageFiles[$name].path
+        if ($actualHash -cne $packageFiles[$name].hash) {
+            throw "verified production package file hash mismatch: $name"
         }
     }
     return [ordered]@{
         path = $resolvedBundle
-        artifact_id = [string]$manifest.artifact_id
-        sys_hash = [string]$manifest['artifact.sys.sha256']
-        sys_path = (Join-Path $resolvedBundle 'ext4win.sys')
-        inf_path = (Join-Path $resolvedBundle 'ext4win.inf')
+        artifact_id = $ArtifactId
+        sys_hash = $packageFiles.sys.hash
+        catalog_hash = $packageFiles.cat.hash
+        inf_hash = $packageFiles.inf.hash
+        sys_path = $packageFiles.sys.path
+        inf_path = $packageFiles.inf.path
     }
 }
 
@@ -298,16 +461,24 @@ function Load-Session([string]$RequestedSessionId) {
     if ($script:State.service_name -cne $serviceName) {
         throw 'driver-load session service identity mismatch'
     }
-    $bundleIdentity = Assert-Bundle $script:State.bundle_path
+    $bundleIdentity = Resolve-BundleIdentity `
+        $script:State.bundle_path `
+        $script:State.artifact_id `
+        $script:State.sys_hash `
+        $script:State.catalog_hash `
+        $script:State.inf_hash
     if ($bundleIdentity.path -ne $script:State.bundle_path -or
         $bundleIdentity.artifact_id -cne $script:State.artifact_id -or
-        $bundleIdentity.sys_hash -ne $script:State.sys_hash) {
+        $bundleIdentity.sys_hash -cne $script:State.sys_hash -or
+        $bundleIdentity.catalog_hash -cne $script:State.catalog_hash -or
+        $bundleIdentity.inf_hash -cne $script:State.inf_hash) {
         throw 'driver-load session artifact identity no longer matches the verified bundle'
     }
     $signerThumbprint = Get-BundleSignerThumbprint $bundleIdentity
     if ($signerThumbprint -ne $script:State.signer_thumbprint) {
         throw 'driver-load session signer identity no longer matches the verified bundle'
     }
+    Assert-SessionControlContract | Out-Null
     $script:SessionEstablished = $true
     return $bundleIdentity
 }
@@ -485,10 +656,18 @@ function Assert-InstalledDriverIdentity {
     return $package
 }
 
-function Start-DriverLoadSession([string]$BundlePath, [string]$RequestedSessionId) {
+function Start-DriverLoadSession(
+    [string]$BundlePath,
+    [string]$ArtifactId,
+    [string]$SysHash,
+    [string]$CatalogHash,
+    [string]$InfHash,
+    [string]$RequestedSessionId
+) {
     Assert-HostContract $true
     Assert-SessionId $RequestedSessionId
-    $bundleIdentity = Assert-Bundle $BundlePath
+    $bundleIdentity = Resolve-BundleIdentity $BundlePath $ArtifactId $SysHash $CatalogHash $InfHash
+    $controlContract = Get-ControlContract
     $signerThumbprint = Assert-BundleInstallationTrust $bundleIdentity
     Write-Output "certificate LocalMachine\Root thumbprint: $signerThumbprint"
     Write-Output "certificate LocalMachine\TrustedPublisher thumbprint: $signerThumbprint"
@@ -500,8 +679,13 @@ function Start-DriverLoadSession([string]$BundlePath, [string]$RequestedSessionI
     Set-StateValue 'artifact_id' $bundleIdentity.artifact_id
     Set-StateValue 'bundle_path' $bundleIdentity.path
     Set-StateValue 'sys_hash' $bundleIdentity.sys_hash
+    Set-StateValue 'catalog_hash' $bundleIdentity.catalog_hash
+    Set-StateValue 'inf_hash' $bundleIdentity.inf_hash
     Set-StateValue 'signer_thumbprint' $signerThumbprint
     Set-StateValue 'service_name' $serviceName
+    Set-StateValue 'control_contract_version' $controlContract.version
+    Set-StateValue 'control_device_path' $controlContract.win32_device_path
+    Set-StateValue 'prepare_unload_ioctl' $controlContract.prepare_unload_ioctl_text
     Set-StateValue 'service_started' 'false'
     Write-Phase 'SessionCreated'
     $script:SessionEstablished = $true
@@ -543,8 +727,11 @@ function Cleanup-DriverLoadSession {
         Assert-ServiceConfiguration $script:State.sys_hash ([bool]$package)
         $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
         if ($service -and $service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
-            Write-Phase 'CleanupServiceStopRequested'
             if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::StopPending) {
+                Write-Phase 'CleanupUnloadPreparationRequested'
+                Request-BoundedDriverUnloadPreparation
+                Write-Phase 'CleanupUnloadPrepared'
+                Write-Phase 'CleanupServiceStopRequested'
                 Request-BoundedServiceStop
             }
             $service = Get-Service -Name $serviceName -ErrorAction Stop
@@ -588,10 +775,23 @@ function Cleanup-DriverLoadSession {
     Write-Phase 'Complete'
 }
 
-function Run-HostedDriverLoad([string]$BundlePath, [string]$RequestedSessionId) {
+function Run-HostedDriverLoad(
+    [string]$BundlePath,
+    [string]$ArtifactId,
+    [string]$SysHash,
+    [string]$CatalogHash,
+    [string]$InfHash,
+    [string]$RequestedSessionId
+) {
     $operationError = $null
     try {
-        Start-DriverLoadSession $BundlePath $RequestedSessionId
+        Start-DriverLoadSession `
+            $BundlePath `
+            $ArtifactId `
+            $SysHash `
+            $CatalogHash `
+            $InfHash `
+            $RequestedSessionId
     }
     catch {
         $operationError = $_
@@ -623,16 +823,30 @@ switch ($Mode) {
         Write-Output 'hosted driver-load host contract: PASS'
     }
     'Start' {
-        if (-not $Bundle -or -not $SessionId) {
-            throw 'Start requires generated Bundle and SessionId arguments'
+        if (-not $Bundle -or -not $BundleArtifactId -or -not $BundleSysHash -or
+            -not $BundleCatalogHash -or -not $BundleInfHash -or -not $SessionId) {
+            throw 'Start requires generated production bundle identity and SessionId arguments'
         }
-        Start-DriverLoadSession $Bundle $SessionId
+        Start-DriverLoadSession `
+            $Bundle `
+            $BundleArtifactId `
+            $BundleSysHash `
+            $BundleCatalogHash `
+            $BundleInfHash `
+            $SessionId
     }
     'Run' {
-        if (-not $Bundle -or -not $SessionId) {
-            throw 'Run requires generated Bundle and SessionId arguments'
+        if (-not $Bundle -or -not $BundleArtifactId -or -not $BundleSysHash -or
+            -not $BundleCatalogHash -or -not $BundleInfHash -or -not $SessionId) {
+            throw 'Run requires generated production bundle identity and SessionId arguments'
         }
-        Run-HostedDriverLoad $Bundle $SessionId
+        Run-HostedDriverLoad `
+            $Bundle `
+            $BundleArtifactId `
+            $BundleSysHash `
+            $BundleCatalogHash `
+            $BundleInfHash `
+            $SessionId
     }
     'Cleanup' {
         Assert-Administrator
@@ -641,5 +855,8 @@ switch ($Mode) {
         }
         Load-Session $SessionId | Out-Null
         Cleanup-DriverLoadSession
+    }
+    'PrepareUnload' {
+        Invoke-DriverUnloadPreparation
     }
 }

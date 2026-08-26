@@ -930,7 +930,8 @@ impl CompletionReactor {
     /// Initializes one reactor directly in stable device-extension storage.
     /// # Safety
     ///
-    /// `reactor` must remain at this address through [`Self::release_at`].
+    /// `reactor` must remain at this address through [`Self::release_at`] or the paired
+    /// [`Self::quiesce_at`] and [`Self::release_quiesced_at`] transitions.
     /// # Errors
     ///
     /// Returns an error when native queue, event, timer, cancel, or worker-thread initialization
@@ -1610,17 +1611,17 @@ impl CompletionReactor {
         self.with_scheduler(|scheduler| scheduler.has_active())
     }
 
-    /// Releases reactor-owned resources after dispatch admission has been closed.
+    /// Closes admission, drains every operation, and joins the reactor without destroying it.
     /// # Safety
     ///
-    /// No new dispatch callback may enter this device extension. The mounted state and completion
-    /// destination must remain live until this method joins the reactor and drains rundown.
+    /// This transition may be called exactly once. The device extension and target must remain live
+    /// until [`Self::release_quiesced_at`] consumes the stopped reactor.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(crate) unsafe fn release_at(reactor: *mut Self) -> ReactorTarget {
-        let mut reactor_address = NonNull::new(reactor).unwrap_or_else(|| {
+    pub(crate) unsafe fn quiesce_at(reactor: *mut Self) {
+        let reactor_address = NonNull::new(reactor).unwrap_or_else(|| {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
         });
         let reactor = unsafe {
@@ -1689,13 +1690,35 @@ impl CompletionReactor {
         {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
-        let reactor = unsafe {
-            // SAFETY: Join, empty slots, and rundown closure grant exclusive teardown access.
-            reactor_address.as_mut()
-        };
         reactor
             .thread_handle
             .store(core::ptr::null_mut(), Ordering::Release);
+    }
+
+    /// Destroys a reactor after its quiesce transition and returns its target authority.
+    /// # Safety
+    ///
+    /// [`Self::quiesce_at`] must have completed exactly once for this reactor. No dispatch callback
+    /// may still access the containing device extension.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) unsafe fn release_quiesced_at(reactor: *mut Self) -> ReactorTarget {
+        let mut reactor_address = NonNull::new(reactor).unwrap_or_else(|| {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+        });
+        let reactor = unsafe {
+            // SAFETY: The completed quiesce transition grants exclusive teardown access.
+            reactor_address.as_mut()
+        };
+        if reactor.state() != ReactorState::Stopped
+            || !reactor.thread_handle.load(Ordering::Acquire).is_null()
+            || reactor.admitted.load(Ordering::Acquire) != 0
+            || reactor.has_active()
+        {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
         let target = core::mem::replace(
             unsafe {
                 // SAFETY: Join and rundown closure grant terminal exclusive shell access.
@@ -1708,6 +1731,26 @@ impl CompletionReactor {
             core::ptr::drop_in_place(reactor);
         }
         target
+    }
+
+    /// Quiesces and destroys one reactor when no external lifecycle boundary separates the phases.
+    /// # Safety
+    ///
+    /// No new dispatch callback may enter this device extension. The mounted state and completion
+    /// destination must remain live until this method joins the reactor and drains rundown.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) unsafe fn release_at(reactor: *mut Self) -> ReactorTarget {
+        unsafe {
+            // SAFETY: The caller grants the complete single-phase teardown contract.
+            Self::quiesce_at(reactor);
+        }
+        unsafe {
+            // SAFETY: The preceding transition completed quiescence for the same stable address.
+            Self::release_quiesced_at(reactor)
+        }
     }
 
     /// Enters the mounted binding for one non-suspending sole-actor transition.
@@ -3598,9 +3641,15 @@ mod tests {
         };
         reactor.cancel_pending_ordinary(file_object);
         unsafe {
-            // SAFETY: No pending, active, or completion-owned work remains.
-            let _target = CompletionReactor::release_at(storage.as_mut_ptr());
+            // SAFETY: No pending, active, or completion-owned work remains, and the stable test
+            // storage remains live after this quiesce boundary.
+            CompletionReactor::quiesce_at(storage.as_mut_ptr());
         }
+        let target = unsafe {
+            // SAFETY: The preceding transition quiesced the reactor at this stable address.
+            CompletionReactor::release_quiesced_at(storage.as_mut_ptr())
+        };
+        assert!(matches!(target, super::ReactorTarget::ControlDevice));
     }
 
     /// # Panics
