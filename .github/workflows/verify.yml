@@ -305,7 +305,7 @@ jobs:
       - name: Set up WSL oracle
         uses: Vampire/setup-wsl@v7.0.0
         with:
-          distribution: Ubuntu-24.04
+          distribution: Ubuntu-26.04
           set-as-default: 'true'
           additional-packages: e2fsprogs
           use-cache: 'false'
@@ -365,7 +365,7 @@ jobs:
           $linuxPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
           wsl.exe `
-            --distribution Ubuntu-24.04 `
+            --distribution Ubuntu-26.04 `
             --exec /usr/bin/env `
             "PATH=$linuxPath" `
             /usr/bin/env
@@ -378,7 +378,7 @@ jobs:
           Write-Host "=== e2fsprogs ==="
 
           wsl.exe `
-            --distribution Ubuntu-24.04 `
+            --distribution Ubuntu-26.04 `
             --exec /usr/bin/env `
             "PATH=$linuxPath" `
             mke2fs -V
@@ -388,7 +388,7 @@ jobs:
           }
 
           wsl.exe `
-            --distribution Ubuntu-24.04 `
+            --distribution Ubuntu-26.04 `
             --exec /usr/bin/env `
             "PATH=$linuxPath" `
             debugfs -V
@@ -398,7 +398,7 @@ jobs:
           }
 
           wsl.exe `
-            --distribution Ubuntu-24.04 `
+            --distribution Ubuntu-26.04 `
             --exec /usr/bin/env `
             "PATH=$linuxPath" `
             e2fsck -V
@@ -416,7 +416,7 @@ jobs:
             "e2fsck"
           )) {
             wsl.exe `
-              --distribution Ubuntu-24.04 `
+              --distribution Ubuntu-26.04 `
               --exec /usr/bin/env `
               "PATH=$linuxPath" `
               /usr/bin/which $tool
