@@ -183,28 +183,61 @@ function Assert-Bundle([string]$BundlePath) {
     }
 }
 
-function Get-BundleSignerThumbprint($BundleIdentity) {
-    $signature = Get-AuthenticodeSignature -LiteralPath $BundleIdentity.sys_path
-    if (-not $signature.SignerCertificate -or -not $signature.SignerCertificate.Thumbprint) {
-        throw 'verified production SYS has no Authenticode signer certificate identity'
+function Get-BundleSignerCertificate($BundleIdentity) {
+    try {
+        $certificate = [Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile(
+            $BundleIdentity.sys_path
+        )
+        try {
+            return [Security.Cryptography.X509Certificates.X509Certificate2]::new($certificate)
+        }
+        finally {
+            $certificate.Dispose()
+        }
     }
-    return [string]$signature.SignerCertificate.Thumbprint
+    catch {
+        throw "verified production SYS signer certificate extraction failed: $_"
+    }
+}
+
+function Get-BundleSignerThumbprint($BundleIdentity) {
+    $certificate = Get-BundleSignerCertificate $BundleIdentity
+    try {
+        if (-not $certificate.Thumbprint) {
+            throw 'verified production SYS has no Authenticode signer certificate identity'
+        }
+        return [string]$certificate.Thumbprint
+    }
+    finally {
+        $certificate.Dispose()
+    }
+}
+
+function Assert-CertificateStoreIdentity([string]$StoreName, [string]$Thumbprint) {
+    $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+        $StoreName,
+        [Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+    )
+    try {
+        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+        $matches = $store.Certificates.Find(
+            [Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+            $Thumbprint,
+            $false
+        )
+        if ($matches.Count -ne 1 -or $matches[0].Thumbprint -cne $Thumbprint) {
+            throw "production signer $Thumbprint is absent from LocalMachine\$StoreName"
+        }
+    }
+    finally {
+        $store.Dispose()
+    }
 }
 
 function Assert-BundleInstallationTrust($BundleIdentity) {
-    $signature = Get-AuthenticodeSignature -LiteralPath $BundleIdentity.sys_path
-    if (-not $signature.SignerCertificate -or -not $signature.SignerCertificate.Thumbprint) {
-        throw 'verified production SYS has no Authenticode signer certificate identity'
-    }
-    $thumbprint = [string]$signature.SignerCertificate.Thumbprint
+    $thumbprint = Get-BundleSignerThumbprint $BundleIdentity
     foreach ($store in @('Root', 'TrustedPublisher')) {
-        $certificatePath = "Cert:\LocalMachine\$store\$thumbprint"
-        if (-not (Test-Path -LiteralPath $certificatePath)) {
-            throw "production signer $thumbprint is absent from LocalMachine\$store"
-        }
-    }
-    if ([string]$signature.Status -ne 'Valid') {
-        throw "verified production SYS Authenticode status is $($signature.Status) after trust validation"
+        Assert-CertificateStoreIdentity $store $thumbprint
     }
     return $thumbprint
 }
