@@ -312,6 +312,17 @@ impl Scheduler {
         self.draining = true;
     }
 
+    /// Returns active slots whose legal cancellation has not yet been requested.
+    pub(crate) fn drain_cancel_mask(&self) -> u64 {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                !matches!(slot.phase, Phase::Vacant) && slot.cancel_enabled && !slot.cancel_pending
+            })
+            .fold(0_u64, |mask, (index, _)| mask | (1_u64 << index))
+    }
+
     /// Reserves one vacant slot with a fresh generation.
     pub(crate) fn reserve(&mut self) -> Option<SlotId> {
         if self.draining {
@@ -1091,16 +1102,17 @@ mod tests {
         assert!(scheduler.complete(resumed_commit));
     }
 
-    /// Verifies terminal admission closure while already-active work remains completable.
+    /// Verifies drain cancellation selects interruptible work and preserves terminal work.
     /// # Panics
     ///
-    /// Panics when drain admits new work or strands an existing operation.
+    /// Panics when drain admits new work, repeats cancellation, or cancels a terminal barrier.
     #[test]
-    fn drain_rejects_admission_and_preserves_active_completion() {
+    fn drain_rejects_admission_and_selects_interruptible_work() {
         let mut scheduler = Scheduler::new();
         let slot = require_some!(scheduler.reserve());
         let lower = require_some!(scheduler.reserve());
         assert!(scheduler.set_phase(lower, Phase::Lower));
+        let terminal = require_some!(scheduler.reserve());
         let handle = HandleId::from_address(17);
         assert_eq!(
             scheduler.install(
@@ -1113,14 +1125,41 @@ mod tests {
             ),
             Some(AdmissionStart::Admitted)
         );
+        assert_eq!(
+            scheduler.install(
+                terminal,
+                Admission::Handle {
+                    handle: HandleId::from_address(23),
+                    lane: HandleOperationLane::Cleanup,
+                },
+                false,
+            ),
+            Some(AdmissionStart::Admitted)
+        );
         scheduler.begin_drain();
         assert!(scheduler.reserve().is_none());
+        assert_eq!(
+            scheduler.drain_cancel_mask(),
+            (1_u64 << slot.index()) | (1_u64 << lower.index())
+        );
+        assert_eq!(
+            scheduler.request_cancel(slot.index()),
+            CancelDisposition::ResumeOperation
+        );
+        assert_eq!(
+            scheduler.request_cancel(lower.index()),
+            CancelDisposition::CancelLower
+        );
+        assert_eq!(scheduler.drain_cancel_mask(), 0);
         let actor = require_some!(scheduler.take_ready());
         assert!(scheduler.complete(actor));
         let lower_actor = require_some!(
             scheduler.enter_phase(lower.index(), |phase| matches!(phase, Phase::Lower))
         );
         assert!(scheduler.complete(lower_actor));
+        let terminal_actor = require_some!(scheduler.take_ready());
+        assert_eq!(terminal_actor, terminal);
+        assert!(scheduler.complete(terminal_actor));
         assert!(!scheduler.has_active());
     }
 

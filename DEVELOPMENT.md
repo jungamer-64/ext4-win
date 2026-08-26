@@ -72,10 +72,11 @@ command neither reuses portable artifacts nor accepts stale release output.
 
 `verify-hosted-driver-load` is the higher CI umbrella. It performs the hosted
 preflight, invokes `verify-production-driver`'s bundle construction exactly
-once, and passes the resulting verified bundle value directly to the
-DriverStore/service lifecycle owner. The lower production command remains
-available when signed artifact and reachability evidence are the intended
-boundary without a live kernel-load claim.
+once, shuts down the production gate's WSL oracle so its ext4 virtual disk is
+not an incidental mount target, and passes the resulting verified bundle value
+directly to the DriverStore/service lifecycle owner. The lower production
+command remains available when signed artifact and reachability evidence are
+the intended boundary without a live kernel-load claim.
 
 ## CI and live-driver boundaries
 

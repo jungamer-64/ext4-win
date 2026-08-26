@@ -110,7 +110,7 @@ function Assert-HostContract([bool]$RequireCleanState) {
             throw "required Windows command is unavailable: $program"
         }
     }
-    foreach ($command in @('Get-Service', 'Start-Service', 'Stop-Service')) {
+    foreach ($command in @('Get-Service', 'Start-Service')) {
         if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
             throw "required SCM PowerShell command is unavailable: $command"
         }
@@ -394,6 +394,59 @@ function Assert-ServiceConfiguration([string]$ExpectedHash, [bool]$RequireImageF
     Write-Host "service ImagePath: $resolvedImagePath"
 }
 
+function Request-BoundedServiceStop {
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = 'sc.exe'
+    $start.Arguments = "stop $serviceName"
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) {
+            throw 'SCM stop request process did not start'
+        }
+        if (-not $process.WaitForExit(30000)) {
+            $terminationError = $null
+            try {
+                $process.Kill()
+                $process.WaitForExit()
+            }
+            catch {
+                $terminationError = $_
+            }
+            $standardOutput = $process.StandardOutput.ReadToEnd()
+            $standardError = $process.StandardError.ReadToEnd()
+            if ($standardOutput) {
+                Write-Host $standardOutput.TrimEnd()
+            }
+            if ($standardError) {
+                Write-Host $standardError.TrimEnd()
+            }
+            if ($terminationError) {
+                throw "SCM stop request exceeded 30 seconds and its helper could not be terminated: $terminationError"
+            }
+            throw 'SCM stop request exceeded 30 seconds; driver unload outcome is uncertain'
+        }
+        $standardOutput = $process.StandardOutput.ReadToEnd()
+        $standardError = $process.StandardError.ReadToEnd()
+        if ($standardOutput) {
+            Write-Host $standardOutput.TrimEnd()
+        }
+        if ($standardError) {
+            Write-Host $standardError.TrimEnd()
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "SCM stop request failed with exit code $($process.ExitCode)"
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Get-InstalledSessionPackage([bool]$AllowRecovery) {
     $inventoryPath = Join-Path $script:SessionDirectory ("inventory-{0}.xml" -f [Guid]::NewGuid().ToString('N'))
     $packages = @(Get-Ext4WinPackages $inventoryPath)
@@ -491,7 +544,9 @@ function Cleanup-DriverLoadSession {
         $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
         if ($service -and $service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
             Write-Phase 'CleanupServiceStopRequested'
-            Stop-Service -Name $serviceName -ErrorAction Stop
+            if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::StopPending) {
+                Request-BoundedServiceStop
+            }
             $service = Get-Service -Name $serviceName -ErrorAction Stop
             $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(15))
             if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {

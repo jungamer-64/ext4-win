@@ -1548,6 +1548,24 @@ impl CompletionReactor {
         true
     }
 
+    /// Requests cancellation once for every interruptible operation retained during drain.
+    #[cfg(not(test))]
+    fn cancel_active_for_drain(&self) -> bool {
+        let mut targets = self.with_scheduler(|scheduler| scheduler.drain_cancel_mask());
+        if targets == 0 {
+            return false;
+        }
+        while targets != 0 {
+            let index = match usize::try_from(targets.trailing_zeros()) {
+                Ok(index) => index,
+                Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+            };
+            targets &= !slot_bit(index);
+            self.request_active_cancel(index);
+        }
+        true
+    }
+
     /// Publishes cancellation into one active slot or its exact published lower request.
     #[cfg(not(test))]
     #[expect(
@@ -1724,10 +1742,12 @@ impl CompletionReactor {
     )]
     fn run(&self) {
         loop {
+            let mut progressed = false;
             if self.state() == ReactorState::Draining {
                 self.with_scheduler(Scheduler::begin_drain);
+                progressed |= self.cancel_active_for_drain();
             }
-            let mut progressed = self.drain_storage_completions();
+            progressed |= self.drain_storage_completions();
             progressed |= self.drain_length_completions();
             progressed |= self.drain_active_cancels();
             progressed |= self.drain_retry_events();
