@@ -4,10 +4,57 @@ pub(crate) use wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM;
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::IofCompleteRequest;
 pub(crate) use wdk_sys::ntddk::{
-    IoCheckShareAccess, IoCreateDevice, IoDeleteDevice, IoRegisterFileSystem, IoRemoveShareAccess,
-    IoUnregisterFileSystem, KeQuerySystemTimePrecise, MmMapLockedPagesSpecifyCache,
-    RtlSecondsSince1970ToTime, RtlTimeToSecondsSince1970,
+    IoCheckShareAccess, IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice, IoDeleteSymbolicLink,
+    IoRegisterFileSystem, IoRemoveShareAccess, IoUnregisterFileSystem, KeQuerySystemTimePrecise,
+    MmMapLockedPagesSpecifyCache, RtlSecondsSince1970ToTime, RtlTimeToSecondsSince1970,
 };
+
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+#[cfg(not(test))]
+#[link(name = "wdmsec", kind = "static")]
+unsafe extern "system" {
+    /// Creates the named control device with the exact SDDL and setup-class identity supplied by
+    /// the generated lifecycle contract.
+    pub(crate) fn WdmlibIoCreateDeviceSecure(
+        driver: wdk_sys::PDRIVER_OBJECT,
+        extension_size: wdk_sys::ULONG,
+        device_name: wdk_sys::PUNICODE_STRING,
+        device_type: wdk_sys::ULONG,
+        device_characteristics: wdk_sys::ULONG,
+        exclusive: wdk_sys::BOOLEAN,
+        default_sddl: wdk_sys::PCUNICODE_STRING,
+        device_class_guid: wdk_sys::LPCGUID,
+        device: *mut wdk_sys::PDEVICE_OBJECT,
+    ) -> wdk_sys::NTSTATUS;
+}
+
+#[cfg(test)]
+#[expect(
+    unsafe_code,
+    non_snake_case,
+    clippy::too_many_arguments,
+    reason = "the host test build preserves the exact external symbol shape without linking a kernel-only library"
+)]
+/// Host-test stand-in for a kernel-library boundary that production links and checks separately.
+/// # Safety
+///
+/// The arguments retain the production FFI shape but are never dereferenced by this stand-in.
+pub(crate) unsafe fn WdmlibIoCreateDeviceSecure(
+    _driver: wdk_sys::PDRIVER_OBJECT,
+    _extension_size: wdk_sys::ULONG,
+    _device_name: wdk_sys::PUNICODE_STRING,
+    _device_type: wdk_sys::ULONG,
+    _device_characteristics: wdk_sys::ULONG,
+    _exclusive: wdk_sys::BOOLEAN,
+    _default_sddl: wdk_sys::PCUNICODE_STRING,
+    _device_class_guid: wdk_sys::LPCGUID,
+    _device: *mut wdk_sys::PDEVICE_OBJECT,
+) -> wdk_sys::NTSTATUS {
+    wdk_sys::STATUS_NOT_SUPPORTED
+}
 
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{

@@ -35,6 +35,8 @@ pub(crate) enum DriverError {
     DeletePending,
     /// CLEANUP closed ordinary admission for this FILE_OBJECT.
     FileClosed,
+    /// Another caller owns the non-repeatable device lifecycle transition.
+    DeviceBusy,
     /// The selected namespace link cannot be deleted.
     CannotDelete,
     /// The mounted volume has entered its terminal logical dismount state.
@@ -115,6 +117,7 @@ impl DriverError {
             Self::AccessDenied => STATUS_ACCESS_DENIED,
             Self::DeletePending => ntstatus(0xC000_0056),
             Self::FileClosed => ntstatus(0xC000_0128),
+            Self::DeviceBusy => ntstatus(0xC000_009E),
             Self::CannotDelete => STATUS_CANNOT_DELETE,
             Self::VolumeDismounted => ntstatus(0xC000_026E),
             Self::NotLocked => ntstatus(0xC000_002A),

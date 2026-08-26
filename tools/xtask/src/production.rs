@@ -141,12 +141,43 @@ struct SealedProductionArtifacts {
 
 /// Atomically published production bundle whose manifest and artifacts passed the release gate.
 #[derive(Debug)]
-pub(crate) struct VerifiedProductionBundle(PathBuf);
+pub(crate) struct VerifiedProductionBundle {
+    /// Exact atomically published bundle directory.
+    directory: PathBuf,
+    /// Build-generated identity embedded in the signed driver and directory name.
+    artifact_id: String,
+    /// Hash of the exact signed SYS admitted by the production gate.
+    driver_hash: String,
+    /// Hash of the exact signed catalog admitted by the production gate.
+    catalog_hash: String,
+    /// Hash of the exact installation metadata admitted by the production gate.
+    inf_hash: String,
+}
 
 impl VerifiedProductionBundle {
     /// Returns the exact published directory passed to downstream artifact consumers.
     pub(crate) fn as_path(&self) -> &Path {
-        &self.0
+        &self.directory
+    }
+
+    /// Returns the exact embedded artifact identity established during production verification.
+    pub(crate) fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    /// Returns the admitted signed-driver digest without reparsing the published manifest.
+    pub(crate) fn driver_hash(&self) -> &str {
+        &self.driver_hash
+    }
+
+    /// Returns the admitted signed-catalog digest without reparsing the published manifest.
+    pub(crate) fn catalog_hash(&self) -> &str {
+        &self.catalog_hash
+    }
+
+    /// Returns the admitted installation-metadata digest without reparsing the published manifest.
+    pub(crate) fn inf_hash(&self) -> &str {
+        &self.inf_hash
     }
 }
 
@@ -294,7 +325,13 @@ pub(crate) fn build_verified_production_bundle(
     println!("signed driver: ext4win.sys ({})", sealed.driver_hash,);
     println!("signed catalog: ext4win.cat ({})", sealed.catalog_hash);
     println!("installation metadata: ext4win.inf ({})", sealed.inf_hash);
-    Ok(VerifiedProductionBundle(bundle_directory))
+    Ok(VerifiedProductionBundle {
+        directory: bundle_directory,
+        artifact_id: identity.as_str().to_owned(),
+        driver_hash: sealed.driver_hash,
+        catalog_hash: sealed.catalog_hash,
+        inf_hash: sealed.inf_hash,
+    })
 }
 
 /// Invokes cargo-wdk from the sole driver package with child-local build identity and flags.

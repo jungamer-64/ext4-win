@@ -1,0 +1,7 @@
+contract_version=1
+nt_device_name=\FileSystem\Ext4Win
+dos_device_name=\DosDevices\Ext4WinControl
+win32_device_path=\\.\Ext4WinControl
+device_sddl=D:P(A;;GA;;;SY)(A;;GA;;;BA)
+device_class_guid=9386ed6e-1f04-4e9f-a254-cd0ac9ff8d10
+prepare_unload_ioctl=0x0008A000

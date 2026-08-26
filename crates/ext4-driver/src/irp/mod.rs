@@ -1657,6 +1657,32 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         })
     }
 
+    /// Decodes one buffered device-control request without retaining an IRP stack pointer.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT is absent or either buffer length is not
+    /// representable by the driver boundary.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) fn device_control(self) -> Result<DeviceControlStack, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active device-control IRP.
+            self.stack.as_ref()
+        };
+        let control = unsafe {
+            // SAFETY: The caller selects this accessor only for IRP_MJ_DEVICE_CONTROL.
+            stack.Parameters.DeviceIoControl
+        };
+        self.kernel_file_object()?;
+        Ok(DeviceControlStack {
+            input_buffer_length: IrpBufferLength::from_ulong(control.InputBufferLength)?,
+            output_buffer_length: IrpBufferLength::from_ulong(control.OutputBufferLength)?,
+            io_control_code: control.IoControlCode,
+        })
+    }
+
     /// Decodes create/open parameters from the current stack location.
     /// # Errors
     ///
@@ -3404,6 +3430,17 @@ pub(crate) struct FileSystemControlStack {
     fs_control_code: FsControlCode,
 }
 
+/// Decoded buffered device-control stack parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeviceControlStack {
+    /// Input system-buffer length.
+    input_buffer_length: IrpBufferLength,
+    /// Output system-buffer length.
+    output_buffer_length: IrpBufferLength,
+    /// Requested IOCTL code.
+    io_control_code: wdk_sys::ULONG,
+}
+
 impl MountVolumeStack {
     /// Returns the VPB supplied for the mount.
     pub(crate) const fn vpb(self) -> KernelVpb {
@@ -3435,6 +3472,18 @@ impl FileSystemControlStack {
     /// Returns the FSCTL code.
     pub(crate) const fn fs_control_code(self) -> FsControlCode {
         self.fs_control_code
+    }
+}
+
+impl DeviceControlStack {
+    /// Returns whether this request carries no input or output payload.
+    pub(crate) const fn is_payload_free(self) -> bool {
+        self.input_buffer_length.is_empty() && self.output_buffer_length.is_empty()
+    }
+
+    /// Returns the exact requested IOCTL code.
+    pub(crate) const fn io_control_code(self) -> wdk_sys::ULONG {
+        self.io_control_code
     }
 }
 
@@ -4427,6 +4476,40 @@ mod tests {
                     .map(crate::kernel::status::DriverError::ntstatus),
                 Some(STATUS_NOT_SUPPORTED)
             );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the payload-free lifecycle IOCTL loses its exact stack identity.
+    #[test]
+    fn device_control_stack_preserves_payload_shape_and_control_code() {
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        stack.Parameters.DeviceIoControl =
+            wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_17 {
+                OutputBufferLength: 0,
+                __bindgen_padding_0: 0,
+                InputBufferLength: 0,
+                __bindgen_padding_1: 0,
+                IoControlCode: crate::lifecycle_control::PREPARE_UNLOAD_IOCTL,
+                Type3InputBuffer: core::ptr::null_mut(),
+            };
+
+        let current = current_stack_fixture(&mut stack);
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let control = current.device_control();
+            assert!(control.is_ok());
+            if let Ok(control) = control {
+                assert!(control.is_payload_free());
+                assert_eq!(
+                    control.io_control_code(),
+                    crate::lifecycle_control::PREPARE_UNLOAD_IOCTL
+                );
+            }
         }
     }
 
