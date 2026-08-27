@@ -482,152 +482,6 @@ impl ReactorState {
     }
 }
 
-/// Admission rundown closes capture and CSQ insertion atomically with teardown.
-struct AdmissionRundown {
-    /// Native executive rundown state.
-    #[cfg(not(test))]
-    native: UnsafeCell<wdk_sys::EX_RUNDOWN_REF>,
-    /// Closed bit plus active admission count in deterministic tests.
-    #[cfg(test)]
-    state: AtomicUsize,
-}
-
-/// High bit marking closed test admission.
-#[cfg(test)]
-const TEST_ADMISSION_CLOSED: usize = 1_usize << (usize::BITS - 1);
-
-impl AdmissionRundown {
-    /// Creates an uninitialized native gate or open test gate.
-    fn new() -> Self {
-        Self {
-            #[cfg(not(test))]
-            native: UnsafeCell::new(wdk_sys::EX_RUNDOWN_REF::default()),
-            #[cfg(test)]
-            state: AtomicUsize::new(0),
-        }
-    }
-
-    /// Initializes native rundown after final placement.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-        )
-    )]
-    fn initialize(&self) {
-        #[cfg(not(test))]
-        unsafe {
-            // SAFETY: The containing device extension is already address-stable.
-            ffi::ExInitializeRundownProtection(self.native.get());
-        }
-    }
-
-    /// Acquires one admission lease unless teardown closed the gate.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-        )
-    )]
-    fn acquire(&self) -> Option<AdmissionLease<'_>> {
-        #[cfg(not(test))]
-        {
-            let acquired = unsafe {
-                // SAFETY: Native rundown was initialized before device publication.
-                ffi::ExAcquireRundownProtection(self.native.get())
-            };
-            if acquired == 0 {
-                return None;
-            }
-        }
-        #[cfg(test)]
-        {
-            self.state
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                    if state & TEST_ADMISSION_CLOSED != 0 {
-                        None
-                    } else {
-                        state
-                            .checked_add(1)
-                            .filter(|next| next & TEST_ADMISSION_CLOSED == 0)
-                    }
-                })
-                .ok()?;
-        }
-        Some(AdmissionLease { owner: self })
-    }
-
-    /// Closes admission and waits for every capture/insertion lease.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-        )
-    )]
-    fn close_and_wait(&self) {
-        #[cfg(not(test))]
-        unsafe {
-            // SAFETY: Teardown runs at PASSIVE_LEVEL after publishing Draining.
-            ffi::ExWaitForRundownProtectionRelease(self.native.get());
-        }
-        #[cfg(test)]
-        {
-            let previous = self.state.fetch_or(TEST_ADMISSION_CLOSED, Ordering::AcqRel);
-            if previous & TEST_ADMISSION_CLOSED != 0 {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
-            while self.state.load(Ordering::Acquire) != TEST_ADMISSION_CLOSED {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    /// Releases one admission lease.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-        )
-    )]
-    fn release(&self) {
-        #[cfg(not(test))]
-        unsafe {
-            // SAFETY: Each lease corresponds to one successful acquisition.
-            ffi::ExReleaseRundownProtection(self.native.get());
-        }
-        #[cfg(test)]
-        {
-            let previous = self.state.fetch_sub(1, Ordering::AcqRel);
-            if previous == 0 || previous == TEST_ADMISSION_CLOSED {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
-        }
-    }
-}
-
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-// SAFETY: Native rundown or the test atomic serializes every interior access.
-unsafe impl Sync for AdmissionRundown {}
-
-/// One capture-to-insertion admission lease.
-struct AdmissionLease<'owner> {
-    /// Stable gate owning the acquisition.
-    owner: &'owner AdmissionRundown,
-}
-
-impl Drop for AdmissionLease<'_> {
-    fn drop(&mut self) {
-        self.owner.release();
-    }
-}
-
 /// One operation-capacity reservation retained until top-level terminal completion.
 #[derive(Debug)]
 struct OperationReservation {
@@ -873,8 +727,6 @@ pub(crate) struct CompletionReactor {
     cancel_ready: AtomicU64,
     /// Running/draining/stopped lifecycle.
     lifecycle: AtomicU8,
-    /// Capture-to-CSQ insertion teardown gate.
-    admission: AdmissionRundown,
     /// Lifetime gate retained by every lower completion envelope.
     completion_rundown: CompletionRundown,
     /// System-thread handle joined during teardown.
@@ -930,8 +782,8 @@ impl CompletionReactor {
     /// Initializes one reactor directly in stable device-extension storage.
     /// # Safety
     ///
-    /// `reactor` must remain at this address through [`Self::release_at`] or the paired
-    /// [`Self::quiesce_at`] and [`Self::release_quiesced_at`] transitions.
+    /// `reactor` must remain at this address through [`Self::release_at`]. Its owner must close
+    /// and drain every dispatch borrow before beginning release.
     /// # Errors
     ///
     /// Returns an error when native queue, event, timer, cancel, or worker-thread initialization
@@ -961,7 +813,6 @@ impl CompletionReactor {
                     retry_ready: AtomicU64::new(0),
                     cancel_ready: AtomicU64::new(0),
                     lifecycle: AtomicU8::new(ReactorState::Running.as_raw()),
-                    admission: AdmissionRundown::new(),
                     completion_rundown,
                     thread_handle: AtomicPtr::new(core::ptr::null_mut()),
                     scheduler: UnsafeCell::new(Scheduler::new()),
@@ -988,7 +839,6 @@ impl CompletionReactor {
             // SAFETY: This is an exclusive, final-address list head before reactor publication.
             initialize_list_head(reactor.length_completion_head.get());
         }
-        reactor.admission.initialize();
         #[cfg(not(test))]
         for timer in &reactor.retry_timers {
             unsafe {
@@ -1081,27 +931,12 @@ impl CompletionReactor {
         Ok(())
     }
 
-    /// Captures a queued request and emits only its admission event.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(crate) fn receive(mut received: ReceivedIrp, major: DispatchMajor) -> NTSTATUS {
-        let reactor = match Self::from_device(received.device()) {
-            Ok(reactor) => reactor,
-            Err(error) => return received.complete_result(Err(error)),
-        };
-        let reactor = unsafe {
-            // SAFETY: Dispatch keeps the device extension stable through queue insertion.
-            reactor.as_ref()
-        };
-        let Some(_admission) = reactor.admission.acquire() else {
-            return received.complete_result(Err(DriverError::InvalidDeviceRequest));
-        };
-        if reactor.state() != ReactorState::Running {
+    /// Captures a request under the device owner's dispatch lease and emits its admission event.
+    pub(crate) fn receive(&self, mut received: ReceivedIrp, major: DispatchMajor) -> NTSTATUS {
+        if self.state() != ReactorState::Running {
             return received.complete_result(Err(DriverError::InvalidDeviceRequest));
         }
-        let reservation = match OperationReservation::acquire(&reactor.admitted) {
+        let reservation = match OperationReservation::acquire(&self.admitted) {
             Ok(reservation) => reservation,
             Err(error) => return received.complete_result(Err(error)),
         };
@@ -1111,7 +946,7 @@ impl CompletionReactor {
         };
         let pending = PendingIrp::from_received(received, context);
         let status = pending.dispatch_status();
-        reactor.enqueue(pending, reservation);
+        self.enqueue(pending, reservation);
         status
     }
 
@@ -1134,24 +969,6 @@ impl CompletionReactor {
             release_operation_reservation(&self.admitted);
             let _status = owned.complete_cancelled();
         }
-    }
-
-    /// Returns the reactor prefix of a driver-owned device extension.
-    /// # Errors
-    ///
-    /// Returns [`DriverError::InvalidParameter`] when either the device object or its extension is
-    /// null.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    fn from_device(device: KernelDevice) -> DriverResult<NonNull<Self>> {
-        let object = unsafe {
-            // SAFETY: Dispatch owns a live typed device pointer.
-            device.as_ptr().as_ref()
-        }
-        .ok_or(DriverError::InvalidParameter)?;
-        NonNull::new(object.DeviceExtension.cast::<Self>()).ok_or(DriverError::InvalidParameter)
     }
 
     /// Publishes a pending IRP to the CSQ, then wakes the reactor for its admission event.
@@ -1620,7 +1437,7 @@ impl CompletionReactor {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(crate) unsafe fn quiesce_at(reactor: *mut Self) {
+    unsafe fn quiesce_at(reactor: *mut Self) {
         let reactor_address = NonNull::new(reactor).unwrap_or_else(|| {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
         });
@@ -1629,7 +1446,6 @@ impl CompletionReactor {
             reactor_address.as_ref()
         };
         reactor.begin_drain();
-        reactor.admission.close_and_wait();
         loop {
             let irp = reactor.remove_next_irp(None);
             if irp.is_null() {
@@ -1704,7 +1520,7 @@ impl CompletionReactor {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(crate) unsafe fn release_quiesced_at(reactor: *mut Self) -> ReactorTarget {
+    unsafe fn release_quiesced_at(reactor: *mut Self) -> ReactorTarget {
         let mut reactor_address = NonNull::new(reactor).unwrap_or_else(|| {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
         });
