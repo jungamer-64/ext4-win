@@ -338,8 +338,8 @@ function Invoke-DriverUnloadPreparation {
                 # A prior prepare request can retire the endpoint before its host records success.
                 # Absence is not unload success: the identity-bound caller must still observe
                 # SCM Stopped, package removal, and final service/package absence.
-                Write-Output 'driver control endpoint absent; reconciling retirement through SCM stop'
-                return
+                Write-Host 'driver control endpoint absent; reconciling retirement through SCM stop'
+                return 'EndpointAbsent'
             }
             throw [ComponentModel.Win32Exception]::new(
                 $errorCode,
@@ -382,7 +382,8 @@ function Invoke-DriverUnloadPreparation {
     if ($errorCode -ne 2) {
         throw [ComponentModel.Win32Exception]::new($errorCode, 'checking control alias withdrawal failed')
     }
-    Write-Output 'driver unload preparation and control alias withdrawal: PASS'
+    Write-Host 'driver unload preparation and control alias withdrawal: PASS'
+    return 'Retired'
 }
 
 function Request-BoundedDriverUnloadPreparation {
@@ -394,10 +395,14 @@ function Request-BoundedDriverUnloadPreparation {
             Receive-Job -Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Output $_ }
             throw 'driver prepare-unload request exceeded 30 seconds; registration outcome is uncertain'
         }
-        Receive-Job -Job $job -ErrorAction Stop | ForEach-Object { Write-Output $_ }
+        $outcomes = @(Receive-Job -Job $job -ErrorAction Stop)
         if ($job.State -ne 'Completed') {
             throw "driver prepare-unload helper ended in state $($job.State)"
         }
+        if ($outcomes.Count -ne 1 -or $outcomes[0] -cnotin @('Retired', 'EndpointAbsent')) {
+            throw 'driver prepare-unload helper returned an invalid retirement outcome'
+        }
+        return [string]$outcomes[0]
     }
     finally {
         Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
@@ -906,8 +911,12 @@ function Cleanup-DriverLoadSession {
             try {
                 if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::StopPending) {
                     Write-Phase 'CleanupUnloadPreparationRequested'
-                    Request-BoundedDriverUnloadPreparation
-                    Write-Phase 'CleanupUnloadPrepared'
+                    $retirement = Request-BoundedDriverUnloadPreparation
+                    switch -CaseSensitive ($retirement) {
+                        'Retired' { Write-Phase 'CleanupUnloadPrepared' }
+                        'EndpointAbsent' { Write-Phase 'CleanupUnloadEndpointAbsent' }
+                        default { throw 'unknown control retirement outcome' }
+                    }
                     Write-Phase 'CleanupServiceStopRequested'
                     Request-BoundedServiceStop
                 }
