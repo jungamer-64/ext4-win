@@ -101,10 +101,17 @@ service `ImagePath` SYS match the production manifest SHA-256, the registry
 records `Type=2` and `Start=3`, and demand-start initialization returned with
 the service in `Running` state. Before SCM stop, the administrator/System-only
 named control device consumes the `IoRegisterFileSystem` reference through its
-payload-free prepare-unload request and quiesces the control reactor. SCM stop
-must then complete `DriverUnload`; OEM package removal and final service/package
-absence are mandatory. The lifecycle device path and IOCTL are generated into
-the driver and read by the cleanup owner from the same versioned contract.
+payload-free prepare-unload request, closes reactor admission, drains and destroys
+the control reactor, withdraws its alias, and requests device deletion. Existing
+control handles can still complete Cleanup/Close against the closed extension
+header. Base filesystem drivers must retire every device before `DriverUnload`
+can run; mounted volumes retire through dismount and final close, not through
+that callback. The host closes its control handle and verifies alias withdrawal
+before SCM stop. Interrupted cleanup can find an already-withdrawn endpoint;
+that absence alone is not unload success. SCM stop must complete `DriverUnload`;
+OEM package removal and final service/package absence are mandatory. The
+lifecycle device path and IOCTL are generated into the driver and read by the
+cleanup owner from the same versioned contract.
 
 The hosted gate does not claim a byte hash of kernel memory, VHDX or filesystem
 I/O behavior, or Driver Verifier coverage. Those are distinct live-validation

@@ -4,8 +4,8 @@ use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP};
 
 use crate::{
     irp::{
-        ActorRequest, CompletionReactor, DataIoKind, DispatchMajor, IrpCompletion, OwnedIrp,
-        PreparedDirectoryControl, PreparedRequest, ReceivedIrp,
+        ActorRequest, DataIoKind, DispatchMajor, IrpCompletion, OwnedIrp, PreparedDirectoryControl,
+        PreparedRequest, ReceivedIrp,
     },
     kernel::status::{DriverError, DriverResult},
 };
@@ -415,7 +415,7 @@ unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> N
     };
     match dispatch_policy(device_kind, major) {
         DispatchPolicy::Immediate(request) => execute_immediate(received, request),
-        DispatchPolicy::Queued => CompletionReactor::receive(received, major),
+        DispatchPolicy::Queued => crate::state::queue_device_request(received, major),
         DispatchPolicy::FsRtlFileLock => dispatch_file_lock(received),
     }
 }

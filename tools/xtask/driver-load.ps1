@@ -284,6 +284,9 @@ namespace Ext4Win {
         public static extern bool MoveFileEx(string existingFileName, string newFileName, uint flags);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint QueryDosDevice(string deviceName, StringBuilder targetPath, uint capacity);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern SafeFileHandle CreateFile(
             string fileName,
             uint desiredAccess,
@@ -331,6 +334,13 @@ function Invoke-DriverUnloadPreparation {
     try {
         if ($handle.IsInvalid) {
             $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            if ($errorCode -eq 2 -or $errorCode -eq 3) {
+                # A prior prepare request can retire the endpoint before its host records success.
+                # Absence is not unload success: the identity-bound caller must still observe
+                # SCM Stopped, package removal, and final service/package absence.
+                Write-Output 'driver control endpoint absent; reconciling retirement through SCM stop'
+                return
+            }
             throw [ComponentModel.Win32Exception]::new(
                 $errorCode,
                 'opening the secured ext4win control device failed'
@@ -361,7 +371,18 @@ function Invoke-DriverUnloadPreparation {
     finally {
         $handle.Dispose()
     }
-    Write-Output 'driver unload preparation: PASS'
+    $target = [Text.StringBuilder]::new(32768)
+    $length = [Ext4Win.DriverLifecycleNative]::QueryDosDevice(
+        $contract.win32_device_path.Substring(4), $target, [uint32]$target.Capacity
+    )
+    if ($length -ne 0) {
+        throw "prepare-unload left the control alias published: $target"
+    }
+    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    if ($errorCode -ne 2) {
+        throw [ComponentModel.Win32Exception]::new($errorCode, 'checking control alias withdrawal failed')
+    }
+    Write-Output 'driver unload preparation and control alias withdrawal: PASS'
 }
 
 function Request-BoundedDriverUnloadPreparation {
