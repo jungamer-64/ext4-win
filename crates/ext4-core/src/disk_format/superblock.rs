@@ -1484,26 +1484,6 @@ impl Superblock {
         }
     }
 
-    /// Recognizes the sole repairable primary-superblock checksum failure.
-    ///
-    /// The stored checksum belongs to the state before a contiguous marker write. Toggling only
-    /// `INCOMPAT_RECOVER` must therefore recreate a fully valid superblock; reparsing the candidate
-    /// keeps all feature, geometry, and journal checks at the ordinary admission boundary.
-    /// # Errors
-    ///
-    /// Returns an error when toggling only the marker does not recreate a fully valid primary
-    /// superblock or the owned repair image cannot be allocated.
-    fn restore_torn_recovery_marker(
-        mut raw: [u8; SUPERBLOCK_SIZE],
-    ) -> Result<PrimarySuperblockRead> {
-        let incompat = le_u32(&raw, disk_offset(96))?;
-        put_le_u32(&mut raw, disk_offset(96), incompat ^ INCOMPAT_RECOVER)?;
-        Self::parse_read_write(&raw)?;
-        Ok(PrimarySuperblockRead::TornRecoveryMarker {
-            repair: memory::copied_slice(&raw)?,
-        })
-    }
-
     /// Parses and validates a 1024-byte superblock payload for read-write mode.
     ///
     /// # Errors
@@ -1881,28 +1861,6 @@ impl Superblock {
     #[must_use]
     pub const fn recovery_state(self) -> RecoveryState {
         self.features.recovery_state()
-    }
-
-    /// Builds a primary-superblock image with the requested recovery marker.
-    ///
-    /// This function performs no write. The mount operation must persist the returned image and
-    /// flush it before publishing mounted state.
-    /// # Errors
-    /// Returns an error when the primary superblock cannot be read or rewritten.
-    pub(crate) fn prepare_recovery_marker(
-        device: &mut OperationDevice<'_>,
-        state: RecoveryState,
-    ) -> Result<[u8; SUPERBLOCK_SIZE]> {
-        let mut raw = [0_u8; SUPERBLOCK_SIZE];
-        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
-        let current = le_u32(&raw, disk_offset(96))?;
-        let incompat = match state {
-            RecoveryState::Clean => current & !INCOMPAT_RECOVER,
-            RecoveryState::NeedsRecovery => current | INCOMPAT_RECOVER,
-        };
-        put_le_u32(&mut raw, disk_offset(96), incompat)?;
-        Self::refresh_checksum(&mut raw)?;
-        Ok(raw)
     }
 
     /// Recomputes the primary superblock checksum when the on-disk checksum is present.
