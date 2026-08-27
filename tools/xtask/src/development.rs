@@ -1,9 +1,13 @@
+#[cfg(windows)]
+use crate::process::require_file;
 use crate::{
     TaskResult,
-    process::{cargo_command, require_file, run_checked, run_checked_output},
+    process::{cargo_command, run_checked, run_checked_output},
 };
 use alloc::collections::BTreeSet;
-use std::{env, fs, io, path::Path, process::Command};
+#[cfg(windows)]
+use std::{env, process::Command};
+use std::{fs, io, path::Path};
 
 /// Runs formatting, checking, tests, and Clippy without selecting the WDK crate.
 ///
