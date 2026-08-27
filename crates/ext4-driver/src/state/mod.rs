@@ -3579,37 +3579,6 @@ fn record_file_control_block_share(
     .record_share_access(file_object, desired_access, share_access, share_check)
 }
 
-/// Releases one open reference to an FCB in a VCB-owned table.
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-fn close_file_control_block_in_table(
-    table: &mut DriverVec<Box<FileControlBlock>>,
-    fcb: NonNull<FileControlBlock>,
-) -> Option<Box<FileControlBlock>> {
-    let Some(index) = table
-        .iter()
-        .position(|candidate| NonNull::from(candidate.as_ref()) == fcb)
-    else {
-        KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-    };
-    let mut state = ledger_file_control_block_open_state(table, fcb);
-    let release = unsafe {
-        // SAFETY: The caller holds the ledger resource exclusively and the helper validated this
-        // state pointer against the owning table.
-        state.as_mut()
-    }
-    .release_open_reference();
-    match release {
-        FileControlBlockRelease::StillOpen => None,
-        FileControlBlockRelease::LastReference => match table.swap_remove(index) {
-            Some(removed) => Some(removed),
-            None => KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck(),
-        },
-    }
-}
-
 /// Finds a VCB-owned FCB by node identity.
 fn find_file_control_block_in_table(
     table: &DriverVec<Box<FileControlBlock>>,
@@ -4208,7 +4177,7 @@ impl VpbLabel {
     }
 }
 
-/// File control block stored in `FILE_OBJECT::FsContext`.
+/// Ledger-owned file control block for one mounted inode stream.
 pub(crate) struct FileControlBlock {
     /// Mounted volume that owns this file.
     volume: NonNull<VolumeControlBlock>,
@@ -4327,7 +4296,7 @@ impl FileControlBlock {
 struct FileControlBlockOpenState {
     /// I/O manager share-access accounting for this inode identity.
     share_access: SHARE_ACCESS,
-    /// Number of open FILE_OBJECTs currently referencing this FCB.
+    /// Number of open FILE_OBJECTs currently carrying a share claim for this stream.
     file_object_references: NonZeroU32,
     /// One namespace deletion truth shared by every handle for this inode.
     deletion: FileDeletionState,
@@ -4511,19 +4480,6 @@ impl FileControlBlockOpenState {
             .ok_or(DriverError::TooManyOpenReferences)
     }
 
-    /// Releases one FILE_OBJECT reference from a non-empty FCB.
-    fn release_open_reference(&mut self) -> FileControlBlockRelease {
-        let Some(remaining) = self
-            .file_object_references
-            .get()
-            .checked_sub(1)
-            .and_then(NonZeroU32::new)
-        else {
-            return FileControlBlockRelease::LastReference;
-        };
-        self.file_object_references = remaining;
-        FileControlBlockRelease::StillOpen
-    }
 }
 
 /// Opaque FsRtl byte-range lock state owned by one FCB.
@@ -4771,15 +4727,6 @@ impl fmt::Debug for FileByteRangeLocks {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("FileByteRangeLocks(..)")
     }
-}
-
-/// FCB lifetime state after releasing one open reference.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FileControlBlockRelease {
-    /// Other FILE_OBJECTs still reference this FCB.
-    StillOpen,
-    /// The released reference was the final open reference.
-    LastReference,
 }
 
 /// Core-owned live-directory continuation stored directly in the CCB.
@@ -5843,34 +5790,6 @@ impl PreparedFilePositionPublication {
 unsafe impl Send for PreparedFilePositionPublication {}
 
 impl<'owner> OpenedObject<'owner> {
-    /// Decodes an initialized FILE_OBJECT context pair.
-    ///
-    /// # Errors
-    /// Returns an error when either filesystem context pointer is absent or
-    /// when the shared FCB node kind does not match the per-handle state kind.
-    pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
-        let object = file_object.as_ref();
-        if object.Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
-            return Err(DriverError::ObjectTypeMismatch);
-        }
-        let fcb = NonNull::new(object.FsContext.cast::<FileControlBlock>());
-        let handle = NonNull::new(object.FsContext2.cast::<OpenedHandle>());
-        let (fcb, handle) = match (fcb, handle) {
-            (Some(fcb), Some(handle)) => (fcb, handle),
-            (None, None) => return Err(DriverError::InvalidParameter),
-            (Some(_), None) | (None, Some(_)) => {
-                KernelWideInconsistency::file_object_context_corruption().bugcheck();
-            }
-        };
-        let opened = Self {
-            file_object,
-            fcb,
-            handle,
-        };
-        opened.validate_handle_kind()?;
-        Ok(opened)
-    }
-
     /// Returns the kernel FILE_OBJECT associated with this opened handle.
     pub(crate) const fn file_object(&self) -> KernelFileObject {
         self.file_object.address()
@@ -6089,34 +6008,6 @@ impl<'owner> OpenedObject<'owner> {
             .close_release_plan(close_kind, self.file_object.cleanup_complete())
     }
 
-    /// Detaches the exact FCB and CCB pair validated by this opened-object capability.
-    ///
-    /// A close IRP is the sole transition permitted to consume this pair. Any pointer change
-    /// between decode and detachment is global lifecycle corruption.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(crate) fn detach_contexts(self) -> (NonNull<FileControlBlock>, NonNull<OpenedHandle>) {
-        let object = unsafe {
-            // SAFETY: This consumed active opened-object capability represents the unique close
-            // transition for the live FILE_OBJECT.
-            &mut *self.file_object.as_ptr()
-        };
-        let fcb = NonNull::new(
-            core::mem::replace(&mut object.FsContext, core::ptr::null_mut())
-                .cast::<FileControlBlock>(),
-        );
-        let handle = NonNull::new(
-            core::mem::replace(&mut object.FsContext2, core::ptr::null_mut())
-                .cast::<OpenedHandle>(),
-        );
-        match (fcb, handle) {
-            (Some(fcb), Some(handle)) if fcb == self.fcb && handle == self.handle => (fcb, handle),
-            _ => KernelWideInconsistency::file_object_context_corruption().bugcheck(),
-        }
-    }
-
     /// Returns the decoded file control block.
     #[expect(
         unsafe_code,
@@ -6324,30 +6215,6 @@ pub(crate) struct OpenedVolume<'owner> {
 }
 
 impl<'owner> OpenedVolume<'owner> {
-    /// Decodes a direct-volume FILE_OBJECT.
-    /// # Errors
-    ///
-    /// Returns an error when the volume flag or either typed context pointer is absent.
-    pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
-        let object = file_object.as_ref();
-        if object.Flags & wdk_sys::FO_VOLUME_OPEN == 0 {
-            return Err(DriverError::ObjectTypeMismatch);
-        }
-        let volume = NonNull::new(object.FsContext.cast::<VolumeControlBlock>());
-        let handle = NonNull::new(object.FsContext2.cast::<OpenedVolumeHandle>());
-        match (volume, handle) {
-            (Some(volume), Some(handle)) => Ok(Self {
-                file_object,
-                volume,
-                handle,
-            }),
-            (None, None) => Err(DriverError::InvalidParameter),
-            (Some(_), None) | (None, Some(_)) => {
-                KernelWideInconsistency::file_object_context_corruption().bugcheck()
-            }
-        }
-    }
-
     /// Returns the mounted VCB identified by this volume handle.
     pub(crate) const fn volume(&self) -> NonNull<VolumeControlBlock> {
         self.volume
@@ -6397,33 +6264,6 @@ impl<'owner> OpenedVolume<'owner> {
         .close_release_plan(close_kind, self.file_object.cleanup_complete())
     }
 
-    /// Detaches the exact VCB and volume-handle pair at terminal close.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(crate) fn detach_contexts(
-        self,
-    ) -> (NonNull<VolumeControlBlock>, NonNull<OpenedVolumeHandle>) {
-        let object = unsafe {
-            // SAFETY: This consumed capability represents the unique close transition.
-            &mut *self.file_object.as_ptr()
-        };
-        let volume = NonNull::new(
-            core::mem::replace(&mut object.FsContext, core::ptr::null_mut())
-                .cast::<VolumeControlBlock>(),
-        );
-        let handle = NonNull::new(
-            core::mem::replace(&mut object.FsContext2, core::ptr::null_mut())
-                .cast::<OpenedVolumeHandle>(),
-        );
-        match (volume, handle) {
-            (Some(volume), Some(handle)) if volume == self.volume && handle == self.handle => {
-                (volume, handle)
-            }
-            _ => KernelWideInconsistency::file_object_context_corruption().bugcheck(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -6748,8 +6588,8 @@ mod tests {
         CleanCloseTerminal, CleanupStart, CloseReleasePlan, ControlDeviceLifecycle,
         ControlDevicePhase, DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode,
         DeviceExtensionKind, DirectoryChange, DirectoryChangeAction, DriverDeviceKind,
-        FileControlBlock, FileControlBlockLedger, FileControlBlockOpenState,
-        FileControlBlockRelease, FileObjectCloseKind, HandleAdmissionState, HandleDeletion,
+        FileControlBlock, FileControlBlockLedger, FileControlBlockOpenState, FileObjectCloseKind,
+        HandleAdmissionState, HandleDeletion,
         KernelDevice, KernelFileObject, MountedVolumeState, NativeFileByteRange,
         NoIntermediateTransfer, OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation,
         OpenedNodeMode, OpenedObject, OpenedRegularFile, OpenedVolumeHandle, RetirementAdmission,
@@ -7753,35 +7593,6 @@ mod tests {
                 UninitializedFileObject::decode(file_object).map(|_| ())
             }),
             Err(DriverError::InvalidParameter)
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn file_control_block_reference_count_cannot_represent_zero() {
-        let mut state = FileControlBlockOpenState::new();
-
-        assert_eq!(state.file_object_references.get(), 1);
-        let next = state.next_file_object_reference();
-        assert_eq!(
-            next,
-            NonZeroU32::new(2).ok_or(DriverError::TooManyOpenReferences)
-        );
-        let Ok(next) = next else {
-            return;
-        };
-        state.file_object_references = next;
-        assert_eq!(state.file_object_references.get(), 2);
-        assert_eq!(
-            state.release_open_reference(),
-            FileControlBlockRelease::StillOpen
-        );
-        assert_eq!(state.file_object_references.get(), 1);
-        assert_eq!(
-            state.release_open_reference(),
-            FileControlBlockRelease::LastReference
         );
     }
 

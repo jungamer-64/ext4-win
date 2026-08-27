@@ -1693,60 +1693,6 @@ impl Drop for PendingFileControlBlockClaim {
 // only the reactor thread consumes or drops this claim.
 unsafe impl Send for PendingFileControlBlockClaim {}
 
-/// Stores already-opened FCB and preallocated CCB context pointers in the FILE_OBJECT.
-fn attach_preallocated_file_object(
-    file_object: UninitializedFileObject<'_>,
-    fcb: NonNull<FileControlBlock>,
-    handle: Box<OpenedHandle>,
-    file_object_flags: CreateFileObjectFlags,
-) {
-    let kernel_file_object = file_object.kernel_file_object();
-    attach_preallocated_file_object_raw(kernel_file_object, fcb, handle, file_object_flags);
-}
-
-/// Stores prepared contexts through the stable FILE_OBJECT identity captured before the commit.
-#[expect(
-    unsafe_code,
-    reason = "successful create exclusively publishes the preallocated contexts to one FILE_OBJECT"
-)]
-fn attach_preallocated_file_object_raw(
-    file_object: KernelFileObject,
-    fcb: NonNull<FileControlBlock>,
-    handle: Box<OpenedHandle>,
-    file_object_flags: CreateFileObjectFlags,
-) {
-    let file_object = unsafe {
-        // SAFETY: `file_object` comes from the active create stack and is
-        // exclusively owned by this uncompleted create operation. Preparation validated both
-        // filesystem context slots before any lower write and no other path can publish them.
-        &mut *file_object.as_ptr()
-    };
-    file_object_flags.apply_to(file_object);
-    file_object.FsContext = fcb.as_ptr().cast::<c_void>();
-    file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
-}
-
-/// Stores a typed VCB/volume-handle context pair in one direct-volume FILE_OBJECT.
-#[expect(
-    unsafe_code,
-    reason = "successful volume create exclusively publishes contexts to its active FILE_OBJECT"
-)]
-fn attach_volume_file_object(
-    mut file_object: UninitializedFileObject<'_>,
-    volume: NonNull<VolumeControlBlock>,
-    handle: Box<OpenedVolumeHandle>,
-    file_object_flags: CreateFileObjectFlags,
-) {
-    let file_object = unsafe {
-        // SAFETY: This is the sole successful-create attachment transition for the FILE_OBJECT.
-        file_object.as_mut()
-    };
-    file_object_flags.apply_to(file_object);
-    file_object.Flags |= wdk_sys::FO_VOLUME_OPEN;
-    file_object.FsContext = volume.as_ptr().cast::<c_void>();
-    file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
