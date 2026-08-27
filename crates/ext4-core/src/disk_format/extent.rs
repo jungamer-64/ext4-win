@@ -11,6 +11,9 @@ use crate::disk_format::inode::{InodeExtentRoot, InodeId};
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
 
+mod tail;
+pub(crate) use tail::{ExtentAllocation, ExtentTail, visit_allocations};
+
 /// Magic value stored at the start of every ext4 extent header.
 const EXTENT_MAGIC: u16 = 0xF30A;
 /// Size of an extent or index header in bytes.
@@ -405,12 +408,6 @@ impl ExtentTree {
     #[must_use]
     pub fn extents(&self) -> &[Extent] {
         &self.extents
-    }
-
-    /// External extent metadata blocks visited while loading this tree.
-    #[must_use]
-    pub fn metadata_blocks(&self) -> &[BlockAddress] {
-        &self.metadata_blocks
     }
 }
 

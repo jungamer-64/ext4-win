@@ -147,7 +147,10 @@ impl ClusterReferenceIndex {
     ///
     /// Returns an error when static metadata or live inode block references cannot be validated
     /// against allocation bitmaps.
-    pub(super) fn load(volume: &mut EpochReadView<'_, '_>) -> Result<Self> {
+    pub(super) fn load(
+        volume: &mut EpochReadView<'_, '_>,
+        orphans: &super::orphan::ValidatedOrphanInventory,
+    ) -> Result<Self> {
         let allocation = MountedAllocationSnapshot::load(&mut volume.device, &volume.superblock)?;
         let mut index = Self {
             refs: Vec::new(),
@@ -155,7 +158,7 @@ impl ClusterReferenceIndex {
             xattr_blocks: Vec::new(),
         };
         index.add_static_metadata(&volume.superblock, &allocation)?;
-        index.add_live_inodes(volume, &allocation)?;
+        index.add_live_inodes(volume, &allocation, orphans)?;
         Ok(index)
     }
 
@@ -308,6 +311,7 @@ impl ClusterReferenceIndex {
         &mut self,
         volume: &mut EpochReadView<'_, '_>,
         allocation: &MountedAllocationSnapshot,
+        orphans: &super::orphan::ValidatedOrphanInventory,
     ) -> Result<()> {
         for group in &allocation.groups {
             let inode_count = inode_count_in_group(&volume.superblock, group.group)?;
@@ -332,30 +336,37 @@ impl ClusterReferenceIndex {
                 if let Some(block) = raw_inode.xattr_block()? {
                     self.add_xattr_reference(&volume.superblock, allocation, block)?;
                 }
-                let Ok(inode) = raw_inode.parse() else {
+                if !orphans.contains(inode_id) && raw_inode.parse().is_err() {
                     if raw_inode.has_extent_tree()? {
                         return Err(Error::UnsupportedBlockMap);
                     }
                     continue;
-                };
-                let root = match inode.storage() {
+                }
+                let data = crate::disk_format::inode::InodeData::parse(
+                    raw_inode.id,
+                    &raw_inode.bytes,
+                    raw_inode.encoding,
+                )?;
+                let root = match data.storage() {
                     InodeStorage::Extents(root) => root,
                     InodeStorage::InlineBytes(_) => continue,
                     InodeStorage::UnsupportedBlockMap => return Err(Error::UnsupportedBlockMap),
                 };
-                let context = volume.extent_tree_context(&inode);
-                let tree = ExtentTree::load_inode_tree(
+                let superblock = volume.superblock;
+                crate::disk_format::extent::visit_allocations(
                     root,
-                    volume.superblock.block_size(),
+                    superblock.block_size(),
                     &mut volume.device,
-                    context,
+                    super::orphan::extent_context(superblock, &data),
+                    |item| match item {
+                        crate::disk_format::extent::ExtentAllocation::Data(extent) => {
+                            self.add_extent_references(&superblock, allocation, extent)
+                        }
+                        crate::disk_format::extent::ExtentAllocation::Metadata(block) => {
+                            self.add_exclusive_reference(&superblock, allocation, block)
+                        }
+                    },
                 )?;
-                for extent in tree.extents().iter().copied() {
-                    self.add_extent_references(&volume.superblock, allocation, extent)?;
-                }
-                for block in tree.metadata_blocks().iter().copied() {
-                    self.add_exclusive_reference(&volume.superblock, allocation, block)?;
-                }
             }
         }
         Ok(())

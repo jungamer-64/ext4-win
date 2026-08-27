@@ -25,7 +25,8 @@ impl MutationResolvePass<'_, '_, '_> {
         name: XattrName,
         value: XattrValue,
     ) -> Result<()> {
-        self.update_xattrs(node, |set| set.insert(name, value))
+        self.mutation
+            .update_xattrs(node, self.now, |set| set.insert(name, value))
     }
 
     /// Removes one ext4 extended attribute.
@@ -38,7 +39,7 @@ impl MutationResolvePass<'_, '_, '_> {
         name: &XattrName,
     ) -> Result<Option<XattrValue>> {
         let mut removed = None;
-        self.update_xattrs(node, |set| {
+        self.mutation.update_xattrs(node, self.now, |set| {
             removed = set.remove(name)?;
             Ok(())
         })?;
@@ -95,7 +96,9 @@ impl MutationResolvePass<'_, '_, '_> {
         };
         Ok(Some(WindowsSymlinkReparsePoint::parse(&value)?))
     }
+}
 
+impl MetadataMutation<'_, '_> {
     /// Stages the latest image for a mutated external xattr block.
     /// # Errors
     ///
@@ -169,6 +172,7 @@ impl MutationResolvePass<'_, '_, '_> {
     fn update_xattrs(
         &mut self,
         node: TransactionNode,
+        now: Ext4Timestamp,
         update: impl FnOnce(&mut XattrSet) -> Result<()>,
     ) -> Result<()> {
         self.require_xattr_mutation()?;
@@ -180,7 +184,7 @@ impl MutationResolvePass<'_, '_, '_> {
         let mut set = self.xattr_set_for_raw_inode(&raw_inode)?;
         update(set.public_mut())?;
         self.store_xattr_set(&mut raw_inode, &set)?;
-        raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+        raw_inode.set_timestamps(now, self.volume.superblock.inode_timestamp_encoding())?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
@@ -277,8 +281,10 @@ impl MutationResolvePass<'_, '_, '_> {
     ///
     /// Returns an error when the block image or refcount is malformed, or the backing cluster
     /// reference cannot be released.
-    fn release_xattr_block_ref(&mut self, block: BlockAddress) -> Result<()> {
+    pub(super) fn release_xattr_block_ref(&mut self, block: BlockAddress) -> Result<()> {
         let bytes = self.xattr_block_bytes(block)?;
+        let _validated =
+            xattr_storage::parse_external_xattr_block(&bytes, block, &self.volume.superblock)?;
         let refcount = xattr_storage::external_xattr_refcount(&bytes)?;
         self.release_cluster_reference(block)?;
         if refcount > 1 {

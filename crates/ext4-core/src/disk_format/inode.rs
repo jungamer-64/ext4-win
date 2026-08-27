@@ -1257,6 +1257,15 @@ impl InodeInlineBytes {
 /// Parsed ext4 inode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Inode {
+    /// Parsed allocation and storage facts, independent of namespace reachability.
+    data: InodeData,
+    /// Nonzero link count for this live inode.
+    links_count: Ext4LinkCount,
+}
+
+/// Inode storage facts shared by live access and unlinked-inode recovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InodeData {
     /// Stable inode number used by directory entries and checksum seeds.
     id: InodeId,
     /// Supported inode kind and permission bits selected from `i_mode`.
@@ -1269,8 +1278,6 @@ pub struct Inode {
     owner: Ext4Owner,
     /// Timestamps parsed from ext4 inode time fields.
     times: Ext4Times,
-    /// Nonzero link count for this live inode.
-    links_count: Ext4LinkCount,
     /// Inode flags hidden behind typed predicates and capability constructors.
     flags: InodeFlags,
     /// Inode generation used by metadata checksums.
@@ -1279,8 +1286,8 @@ pub struct Inode {
     storage: InodeStorage,
 }
 
-impl Inode {
-    /// Parses a single inode record.
+impl InodeData {
+    /// Parses storage facts without granting live namespace access.
     ///
     /// # Errors
     /// Returns an error when the inode record is truncated or has an unsupported
@@ -1300,7 +1307,6 @@ impl Inode {
             le_u32(raw, disk_offset(108))?,
         )?;
         let times = parse_times(raw)?;
-        let links_count = Ext4LinkCount::new(le_u16(raw, disk_offset(26))?)?;
         let flags = InodeFlags::from_u32(le_u32(raw, disk_offset(32))?);
         let allocation_size = encoding.decode_allocation_size(
             le_u32(raw, disk_offset(28))?,
@@ -1325,47 +1331,88 @@ impl Inode {
             allocation_size,
             owner,
             times,
-            links_count,
             flags,
             generation,
             storage,
         })
     }
 
+    /// Stable identity used to seed extent metadata verification.
+    pub(crate) const fn id(&self) -> InodeId {
+        self.id
+    }
+    /// Parsed inode kind.
+    pub(crate) const fn kind(&self) -> InodeKind {
+        self.mode.kind()
+    }
+    /// Persisted EOF, including an interrupted truncation's committed target.
+    pub(crate) const fn size(&self) -> FileSize {
+        self.size
+    }
+    /// Allocation charge still owned by this inode.
+    pub(crate) const fn allocation_size(&self) -> FileAllocationSize {
+        self.allocation_size
+    }
+    /// Checksum generation associated with the inode identity.
+    pub(crate) const fn generation(&self) -> InodeGeneration {
+        self.generation
+    }
+    /// Allocation-bearing storage; this does not authorize payload access.
+    pub(crate) const fn storage(&self) -> &InodeStorage {
+        &self.storage
+    }
+    /// Protection metadata whose post-EOF allocation must be preserved for linked inodes.
+    pub(crate) const fn protection(&self) -> InodeProtection {
+        self.flags.protection()
+    }
+}
+
+impl Inode {
+    /// Parses a live inode, rejecting records without a namespace link.
+    /// # Errors
+    /// Returns an error for malformed storage facts or a zero link count.
+    pub(crate) fn parse(id: InodeId, raw: &[u8], encoding: InodeDataEncoding) -> Result<Self> {
+        let links_count = Ext4LinkCount::new(le_u16(raw, disk_offset(26))?)?;
+        Ok(Self {
+            data: InodeData::parse(id, raw, encoding)?,
+            links_count,
+        })
+    }
+
     /// Inode identifier.
     #[must_use]
     pub const fn id(&self) -> InodeId {
-        self.id
+        self.data.id
     }
 
     /// Node kind.
     #[must_use]
     pub const fn kind(&self) -> InodeKind {
-        self.mode.kind()
+        self.data.mode.kind()
     }
 
     /// File size in bytes.
     #[must_use]
     pub const fn size(&self) -> FileSize {
-        self.size
+        self.data.size
     }
 
     /// Bytes allocated to this inode according to ext4 `i_blocks`.
     #[must_use]
     pub const fn allocation_size(&self) -> FileAllocationSize {
-        self.allocation_size
+        self.data.allocation_size
     }
 
     /// POSIX security state parsed from owner and mode fields.
     #[must_use]
     pub const fn security(&self) -> Ext4Security {
-        Ext4Security::new(self.owner, self.mode.permissions())
+        Ext4Security::new(self.data.owner, self.data.mode.permissions())
     }
 
     /// ext4 inode timestamps.
     #[must_use]
     pub const fn times(&self) -> Ext4Times {
-        self.times
+        self.data.times
     }
 
     /// Live link count.
@@ -1377,7 +1424,7 @@ impl Inode {
     /// Inode generation used by metadata checksums.
     #[must_use]
     pub const fn generation(&self) -> InodeGeneration {
-        self.generation
+        self.data.generation
     }
 
     /// Directory storage shape selected by this directory inode.
@@ -1385,10 +1432,10 @@ impl Inode {
     /// # Errors
     /// Returns an error when the inode is not a directory.
     pub fn directory_storage_kind(&self) -> Result<DirectoryStorageKind> {
-        if self.mode.kind() != InodeKind::Directory {
+        if self.data.mode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
-        if self.flags.has_indexed_directory() {
+        if self.data.flags.has_indexed_directory() {
             Ok(DirectoryStorageKind::HTree)
         } else {
             Ok(DirectoryStorageKind::Linear)
@@ -1398,7 +1445,7 @@ impl Inode {
     /// Contents protection selected by inode flags.
     #[must_use]
     pub const fn protection(&self) -> InodeProtection {
-        self.flags.protection()
+        self.data.flags.protection()
     }
 
     /// Builds a metadata mutation capability for this inode.
@@ -1406,7 +1453,7 @@ impl Inode {
     /// # Errors
     /// Returns an error when this inode's flags reject metadata writes.
     pub fn metadata_mutation(&self) -> Result<MetadataMutationCapability> {
-        self.flags.metadata_mutation()
+        self.data.flags.metadata_mutation()
     }
 
     /// Builds a directory-entry mutation capability for this inode.
@@ -1414,7 +1461,7 @@ impl Inode {
     /// # Errors
     /// Returns an error when this inode's flags reject directory entry writes.
     pub fn directory_entry_mutation(&self) -> Result<DirectoryEntryMutationCapability> {
-        self.flags.directory_entry_mutation()
+        self.data.flags.directory_entry_mutation()
     }
 
     /// Builds a file payload mutation capability for this inode.
@@ -1422,7 +1469,7 @@ impl Inode {
     /// # Errors
     /// Returns an error when this inode's flags reject file data writes.
     pub fn file_payload_mutation(&self) -> Result<FilePayloadMutationCapability> {
-        self.flags.file_payload_mutation()
+        self.data.flags.file_payload_mutation()
     }
 
     /// Builds a file-size mutation capability for this inode.
@@ -1430,7 +1477,7 @@ impl Inode {
     /// # Errors
     /// Returns an error when this inode's flags reject file size writes.
     pub fn file_size_mutation(&self) -> Result<FileSizeMutationCapability> {
-        self.flags.file_size_mutation()
+        self.data.flags.file_size_mutation()
     }
 
     /// Builds a deletion mutation capability for this inode.
@@ -1438,13 +1485,13 @@ impl Inode {
     /// # Errors
     /// Returns an error when this inode's flags reject final deletion.
     pub fn deletion_mutation(&self) -> Result<DeletionMutationCapability> {
-        self.flags.deletion_mutation()
+        self.data.flags.deletion_mutation()
     }
 
     /// Data storage selected by inode flags and node kind.
     #[must_use]
     pub const fn storage(&self) -> &InodeStorage {
-        &self.storage
+        &self.data.storage
     }
 
     /// Returns the extent root when this inode uses extents.
@@ -1452,7 +1499,7 @@ impl Inode {
     /// # Errors
     /// Returns an error when this inode uses an unsupported block map or inline storage.
     pub fn extent_root(&self) -> Result<&InodeExtentRoot> {
-        match &self.storage {
+        match &self.data.storage {
             InodeStorage::Extents(root) => Ok(root),
             InodeStorage::InlineBytes(_) | InodeStorage::UnsupportedBlockMap => {
                 Err(Error::UnsupportedBlockMap)
@@ -1465,7 +1512,7 @@ impl Inode {
     /// # Errors
     /// Returns an error when this inode uses extents or an unsupported block map.
     pub fn inline_bytes(&self) -> Result<&InodeInlineBytes> {
-        match &self.storage {
+        match &self.data.storage {
             InodeStorage::InlineBytes(bytes) => Ok(bytes),
             InodeStorage::Extents(_) | InodeStorage::UnsupportedBlockMap => {
                 Err(Error::UnsupportedBlockMap)

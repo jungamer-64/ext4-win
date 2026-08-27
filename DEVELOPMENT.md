@@ -37,6 +37,13 @@ links, unlink, and xattr creation, replacement, and removal. The 4 KiB-block/
 16 KiB-cluster BIGALLOC profile additionally covers allocation, cluster reuse,
 and free-space accounting.
 
+Fresh 1 KiB and 4 KiB profiles also exercise authenticated orphan-file slots,
+the fallback orphan chain, zero-link reclamation, linked EOF truncation, and
+BIGALLOC accounting. A multi-batch orphan fixture is interrupted after every
+512-byte write prefix and flush. At every cut, remount publication must wait for
+tracker cleanup to checkpoint, and clean close must leave an `e2fsck`-clean
+allocation and namespace endpoint.
+
 Journal recovery is one part of this ext4-wide gate. Linux-generated JBD2
 records exercise supported block sizes, checksum layouts, 64-bit block numbers,
 and revokes. The external-journal profile groups rename, sparse-extension write,

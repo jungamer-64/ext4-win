@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl MutationResolvePass<'_, '_, '_> {
+impl MetadataMutation<'_, '_> {
     /// Serializes all staged metadata mutations into byte-range writes.
     /// # Errors
     ///
@@ -141,7 +141,7 @@ impl MutationResolvePass<'_, '_, '_> {
     ///
     /// Returns an error when a metadata write does not fit within one block or an original metadata
     /// block cannot be read before patching.
-    fn metadata_blocks(&mut self) -> Result<Vec<MetadataBlock>> {
+    pub(super) fn metadata_blocks(&mut self) -> Result<Vec<MetadataBlock>> {
         let block_size = self.volume.superblock.block_size();
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
@@ -240,7 +240,7 @@ impl MutationResolvePass<'_, '_, '_> {
     }
 }
 
-impl MutationResolvePass<'_, '_, '_> {
+impl MetadataMutation<'_, '_> {
     /// Completes a storage-resolved mutation without issuing any lower write.
     /// # Errors
     ///
@@ -586,5 +586,18 @@ pub(super) fn reject_reserved_directory_name(name: &Ext4Name) -> Result<()> {
         Err(Error::InvalidName)
     } else {
         Ok(())
+    }
+}
+
+impl MutationResolvePass<'_, '_, '_> {
+    /// Seals restart-local filesystem staging after the public mutation operations finish.
+    /// # Errors
+    /// Returns the metadata resolver's validation, allocation, or suspended-I/O failure.
+    pub fn resolve(
+        self,
+        ticket: u64,
+        coordinator: &MutationCoordinatorState,
+    ) -> Result<ResolvedMutation> {
+        self.mutation.resolve(ticket, coordinator)
     }
 }

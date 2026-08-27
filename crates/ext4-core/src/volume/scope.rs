@@ -64,8 +64,8 @@ pub(super) use super::directory::{
     DirectoryScanPosition, MAX_DIRECTORY_SCAN_ENTRIES, ScannedDirectoryEntry,
 };
 pub(super) use super::inode_record::{
-    AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord, ResizeInodeBlockMap,
-    StagedInodeIndex, StagedInodeRecord,
+    AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord,
+    RecoverableOrphanInode, ResizeInodeBlockMap, StagedInodeIndex, StagedInodeRecord,
 };
 pub(super) use super::mount::{
     CommittedEpoch, EpochReadView, JournalCoordinatorState, MountedProfile,

@@ -34,6 +34,10 @@ pub enum Error {
     InvalidClusterGeometry,
     /// The inode number is outside the mounted filesystem.
     InvalidInode,
+    /// Orphan tracking refers to malformed, duplicated, or inconsistent inode state.
+    InvalidOrphanTracking,
+    /// The orphan file exceeds the bounded recovery profile.
+    OrphanRecoveryLimitExceeded,
     /// An inode did not contain the requested node kind.
     WrongInodeKind,
     /// The inode does not use extents.
@@ -129,6 +133,8 @@ impl fmt::Display for Error {
             Self::InvalidSuperblock => "invalid ext4 superblock",
             Self::InvalidClusterGeometry => "invalid ext4 cluster geometry",
             Self::InvalidInode => "invalid ext4 inode",
+            Self::InvalidOrphanTracking => "invalid ext4 orphan tracking",
+            Self::OrphanRecoveryLimitExceeded => "ext4 orphan file exceeds recovery capacity",
             Self::WrongInodeKind => "inode has the wrong kind",
             Self::UnsupportedBlockMap => "unsupported inode block map",
             Self::UnsupportedExtentDepth => "unsupported extent tree depth",

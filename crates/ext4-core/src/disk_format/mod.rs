@@ -6,5 +6,6 @@ pub(crate) mod extent;
 pub(crate) mod group;
 pub(crate) mod inode;
 pub(crate) mod journal;
+pub(crate) mod orphan;
 pub(crate) mod superblock;
 pub(crate) mod xattr;

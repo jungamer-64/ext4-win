@@ -21,12 +21,13 @@ impl MutationResolvePass<'_, '_, '_> {
         let end_offset = offset.checked_add_len(bytes.len())?;
         let new_size = FileSize::from_bytes(end_offset.bytes());
         let encoded_size = self
+            .mutation
             .volume
             .superblock
             .inode_data_encoding()
             .encode_file_size(new_size)?;
-        let inode_index = self.ensure_inode_update(file.inode())?;
-        let mut raw_inode = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
+        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
@@ -40,7 +41,7 @@ impl MutationResolvePass<'_, '_, '_> {
             None
         };
 
-        let mut tree = self.mutable_extent_tree(&inode)?;
+        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
@@ -56,9 +57,12 @@ impl MutationResolvePass<'_, '_, '_> {
         if let Some(encoded_new_size) = encoded_new_size {
             raw_inode.set_encoded_size(encoded_new_size)?;
         }
-        raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.stage_extent_tree(&mut raw_inode, tree)?;
-        self.replace_live_inode(inode_index, raw_inode)?;
+        raw_inode.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+        self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
 
@@ -79,10 +83,11 @@ impl MutationResolvePass<'_, '_, '_> {
         if gap_start >= gap_end {
             return Ok(());
         }
-        let block_size = u64::from(self.volume.superblock.block_size().bytes());
+        let block_size = u64::from(self.mutation.volume.superblock.block_size().bytes());
         let encrypted_contents_key = if inode.protection().is_encrypted() {
             Some(
-                self.volume
+                self.mutation
+                    .volume
                     .fscrypt_contents_key_for_inode(inode, self.crypto)?,
             )
         } else {
@@ -192,6 +197,7 @@ impl MutationResolvePass<'_, '_, '_> {
             );
         }
         let write_offset = self
+            .mutation
             .volume
             .superblock
             .block_size()
@@ -199,7 +205,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .get()
             .checked_add(in_block)
             .ok_or(Error::ArithmeticOverflow)?;
-        self.data_writes.try_push(RangeWrite {
+        self.mutation.data_writes.try_push(RangeWrite {
             offset: ByteOffset::new(write_offset),
             bytes: zeroes,
         })?;
@@ -216,7 +222,13 @@ impl MutationResolvePass<'_, '_, '_> {
         tree: &MutableExtentTree,
         logical_block: LogicalBlock,
     ) -> Result<BlockAddress> {
-        let blocks_per_cluster = u64::from(self.volume.superblock.blocks_per_cluster().as_u32());
+        let blocks_per_cluster = u64::from(
+            self.mutation
+                .volume
+                .superblock
+                .blocks_per_cluster()
+                .as_u32(),
+        );
         let logical = logical_block.as_u64();
         let cluster_offset = logical
             .checked_rem(blocks_per_cluster)
@@ -236,14 +248,18 @@ impl MutationResolvePass<'_, '_, '_> {
             else {
                 continue;
             };
-            let cluster = self.volume.superblock.cluster_of_block(physical)?;
+            let cluster = self.mutation.volume.superblock.cluster_of_block(physical)?;
             let physical = self.physical_block_in_cluster(cluster, cluster_offset)?;
-            self.record_cluster_reference_delta(cluster, 1)?;
+            self.mutation.record_cluster_reference_delta(cluster, 1)?;
             return Ok(physical);
         }
 
-        let first_block = self.allocate_cluster()?;
-        let cluster = self.volume.superblock.cluster_of_block(first_block)?;
+        let first_block = self.mutation.allocate_cluster()?;
+        let cluster = self
+            .mutation
+            .volume
+            .superblock
+            .cluster_of_block(first_block)?;
         self.physical_block_in_cluster(cluster, cluster_offset)
     }
 
@@ -267,7 +283,7 @@ impl MutationResolvePass<'_, '_, '_> {
             }
             EncryptedBlockBase::ZeroedPlaintext => memory::repeated_vec(
                 0_u8,
-                usize::try_from(self.volume.superblock.block_size().bytes())
+                usize::try_from(self.mutation.volume.superblock.block_size().bytes())
                     .map_err(|_| Error::ArithmeticOverflow)?,
             )?,
         };
@@ -277,8 +293,13 @@ impl MutationResolvePass<'_, '_, '_> {
             .ok_or(Error::ArithmeticOverflow)?;
         memory::copy_exact(block.get_mut(start..end).ok_or(Error::DeviceRange)?, bytes)?;
         contents_key.encrypt_block(logical_block.as_u64(), &mut block, self.crypto)?;
-        self.data_writes.try_push(RangeWrite {
-            offset: self.volume.superblock.block_size().offset_of(physical)?,
+        self.mutation.data_writes.try_push(RangeWrite {
+            offset: self
+                .mutation
+                .volume
+                .superblock
+                .block_size()
+                .offset_of(physical)?,
             bytes: block,
         })?;
         Ok(())
@@ -295,11 +316,12 @@ impl MutationResolvePass<'_, '_, '_> {
         logical_block: LogicalBlock,
         physical: BlockAddress,
     ) -> Result<Vec<u8>> {
-        let block_size = self.volume.superblock.block_size();
+        let block_size = self.mutation.volume.superblock.block_size();
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
         let block_offset = block_size.offset_of(physical)?;
         let mut block = if let Some(staged) = self
+            .mutation
             .data_writes
             .iter()
             .rev()
@@ -308,7 +330,10 @@ impl MutationResolvePass<'_, '_, '_> {
             memory::copied_slice(&staged.bytes)?
         } else {
             let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
-            self.volume.device.read_exact_at(block_offset, &mut bytes)?;
+            self.mutation
+                .volume
+                .device
+                .read_exact_at(block_offset, &mut bytes)?;
             bytes
         };
         contents_key.decrypt_block(logical_block.as_u64(), &mut block, self.crypto)?;
@@ -325,11 +350,13 @@ impl MutationResolvePass<'_, '_, '_> {
         cluster: ClusterAddress,
         cluster_offset: u64,
     ) -> Result<BlockAddress> {
-        if cluster_offset >= u64::from(self.volume.superblock.blocks_in_cluster(cluster)?) {
+        if cluster_offset >= u64::from(self.mutation.volume.superblock.blocks_in_cluster(cluster)?)
+        {
             return Err(Error::InvalidClusterGeometry);
         }
         Ok(BlockAddress::new(
-            self.volume
+            self.mutation
+                .volume
                 .superblock
                 .first_block_of_cluster(cluster)?
                 .get()
@@ -352,7 +379,7 @@ impl MutationResolvePass<'_, '_, '_> {
         if bytes.is_empty() {
             return Ok(());
         }
-        let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
+        let block_size_u64 = u64::from(self.mutation.volume.superblock.block_size().bytes());
         let block_size = usize::try_from(block_size_u64).map_err(|_| Error::ArithmeticOverflow)?;
         let mut completed = 0_usize;
         while completed < bytes.len() {
@@ -385,6 +412,7 @@ impl MutationResolvePass<'_, '_, '_> {
             match tree.map_logical(logical_block) {
                 BlockMapping::Physical(physical) => {
                     let write_offset = self
+                        .mutation
                         .volume
                         .superblock
                         .block_size()
@@ -392,7 +420,7 @@ impl MutationResolvePass<'_, '_, '_> {
                         .get()
                         .checked_add(in_block)
                         .ok_or(Error::ArithmeticOverflow)?;
-                    self.data_writes.try_push(RangeWrite {
+                    self.mutation.data_writes.try_push(RangeWrite {
                         offset: ByteOffset::new(write_offset),
                         bytes: memory::copied_slice(
                             bytes.get(completed..end).ok_or(Error::DeviceRange)?,
@@ -410,8 +438,13 @@ impl MutationResolvePass<'_, '_, '_> {
                         block.get_mut(start..block_end).ok_or(Error::DeviceRange)?,
                         bytes.get(completed..end).ok_or(Error::DeviceRange)?,
                     )?;
-                    self.data_writes.try_push(RangeWrite {
-                        offset: self.volume.superblock.block_size().offset_of(physical)?,
+                    self.mutation.data_writes.try_push(RangeWrite {
+                        offset: self
+                            .mutation
+                            .volume
+                            .superblock
+                            .block_size()
+                            .offset_of(physical)?,
                         bytes: block,
                     })?;
                 }
@@ -437,9 +470,10 @@ impl MutationResolvePass<'_, '_, '_> {
             return Ok(());
         }
         let contents_key = self
+            .mutation
             .volume
             .fscrypt_contents_key_for_inode(inode, self.crypto)?;
-        let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
+        let block_size_u64 = u64::from(self.mutation.volume.superblock.block_size().bytes());
         let mut completed = 0_usize;
         while completed < bytes.len() {
             let position = offset
@@ -498,20 +532,24 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when `new_size` would shrink the file.
     pub fn extend_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
         let encoded_size = self
+            .mutation
             .volume
             .superblock
             .inode_data_encoding()
             .encode_file_size(new_size)?;
-        let inode_index = self.ensure_inode_update(file.inode())?;
-        let mut raw_inode = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
+        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         self.require_file_size_mutation(&inode)?;
         if new_size < inode.size() {
             return Err(Error::InvalidWriteRange);
         }
         raw_inode.set_encoded_size(encoded_size)?;
-        raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.replace_live_inode(inode_index, raw_inode)?;
+        raw_inode.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
 
@@ -522,19 +560,20 @@ impl MutationResolvePass<'_, '_, '_> {
     /// updates cannot fit in the inode.
     pub fn truncate_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
         let encoded_size = self
+            .mutation
             .volume
             .superblock
             .inode_data_encoding()
             .encode_file_size(new_size)?;
-        let inode_index = self.ensure_inode_update(file.inode())?;
-        let mut raw_inode = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
+        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         self.require_file_size_mutation(&inode)?;
         if new_size > inode.size() {
             return Err(Error::InvalidWriteRange);
         }
-        let block_size_u64 = u64::from(self.volume.superblock.block_size().bytes());
-        let mut tree = self.mutable_extent_tree(&inode)?;
+        let block_size_u64 = u64::from(self.mutation.volume.superblock.block_size().bytes());
+        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
@@ -545,7 +584,7 @@ impl MutationResolvePass<'_, '_, '_> {
             let start = extent.logical_start().as_u64();
             let end = extent.end_logical();
             if start >= keep_blocks {
-                self.free_extent(extent, 0)?;
+                self.mutation.free_extent(extent, 0)?;
             } else if end > keep_blocks {
                 let keep_len = u16::try_from(
                     keep_blocks
@@ -553,7 +592,7 @@ impl MutationResolvePass<'_, '_, '_> {
                         .ok_or(Error::ArithmeticOverflow)?,
                 )
                 .map_err(|_| Error::ArithmeticOverflow)?;
-                self.free_extent(extent, keep_len)?;
+                self.mutation.free_extent(extent, keep_len)?;
                 updated.try_push(Extent::initialized(
                     extent.logical_start(),
                     ExtentLength::new(keep_len)?,
@@ -582,9 +621,12 @@ impl MutationResolvePass<'_, '_, '_> {
         }
         tree.replace_extents(updated)?;
         raw_inode.set_encoded_size(encoded_size)?;
-        raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.stage_extent_tree(&mut raw_inode, tree)?;
-        self.replace_live_inode(inode_index, raw_inode)?;
+        raw_inode.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+        self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
 
@@ -596,25 +638,25 @@ impl MutationResolvePass<'_, '_, '_> {
     /// cannot be read into the verification domain, metadata allocation fails,
     /// or the extent tree cannot represent the post-EOF metadata.
     pub fn enable_verity(&mut self, file: TransactionFile, enable: &FsverityEnable) -> Result<()> {
-        let inode_index = self.ensure_inode_update(file.inode())?;
-        let mut raw_inode = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
+        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
         if inode.protection().is_encrypted() {
-            self.volume.require_encryption_key(&inode)?;
+            self.mutation.volume.require_encryption_key(&inode)?;
         }
         if inode.protection().is_verity() {
             return Err(Error::UnsupportedInodeMutation);
         }
-        if enable.block_size().bytes() > self.volume.superblock.block_size().bytes() {
+        if enable.block_size().bytes() > self.mutation.volume.superblock.block_size().bytes() {
             return Err(Error::InvalidVerityMetadata);
         }
         let _payload = inode.file_payload_mutation()?;
 
         let mut plaintext = memory::repeated_vec(0_u8, inode.size().to_usize()?)?;
-        let read = self.volume.read_inode_plaintext_data(
+        let read = self.mutation.volume.read_inode_plaintext_data(
             &inode,
             FileOffset::ZERO,
             &mut plaintext,
@@ -641,7 +683,7 @@ impl MutationResolvePass<'_, '_, '_> {
         let descriptor_bytes = descriptor_byte_count(enable.signature().bytes())?;
         let layout = Ext4VerityMetadataLayout::new(
             inode.size(),
-            self.volume.superblock.block_size(),
+            self.mutation.volume.superblock.block_size(),
             u64::try_from(merkle_tree.blocks().len()).map_err(|_| Error::ArithmeticOverflow)?,
             descriptor_bytes,
         )?;
@@ -652,7 +694,7 @@ impl MutationResolvePass<'_, '_, '_> {
             enable.signature().bytes(),
         )?;
 
-        let mut tree = self.mutable_extent_tree(&inode)?;
+        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
@@ -667,9 +709,12 @@ impl MutationResolvePass<'_, '_, '_> {
             self.stage_inode_stream_write(&mut tree, layout.merkle_tree_offset(), &metadata)?;
         }
         raw_inode.mark_verity()?;
-        raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.stage_extent_tree(&mut raw_inode, tree)?;
-        self.replace_live_inode(inode_index, raw_inode)?;
+        raw_inode.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+        self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
 
@@ -683,7 +728,7 @@ impl MutationResolvePass<'_, '_, '_> {
         inode: &Inode,
     ) -> Result<FilePayloadMutationCapability> {
         if inode.protection().is_encrypted() {
-            self.volume.require_encryption_key(inode)?;
+            self.mutation.volume.require_encryption_key(inode)?;
             if inode.kind() != InodeKind::File || inode.protection().is_verity() {
                 return Err(Error::UnsupportedEncryption);
             }
@@ -701,7 +746,7 @@ impl MutationResolvePass<'_, '_, '_> {
         inode: &Inode,
     ) -> Result<FileSizeMutationCapability> {
         if inode.protection().is_encrypted() {
-            self.volume.require_encryption_key(inode)?;
+            self.mutation.volume.require_encryption_key(inode)?;
             if inode.kind() != InodeKind::File || inode.protection().is_verity() {
                 return Err(Error::UnsupportedEncryption);
             }
@@ -737,6 +782,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .checked_sub(in_block)
             .ok_or(Error::ArithmeticOverflow)?;
         let offset = self
+            .mutation
             .volume
             .superblock
             .block_size()
@@ -744,7 +790,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .get()
             .checked_add(in_block)
             .ok_or(Error::ArithmeticOverflow)?;
-        self.data_writes.try_push(RangeWrite {
+        self.mutation.data_writes.try_push(RangeWrite {
             offset: ByteOffset::new(offset),
             bytes: memory::repeated_vec(
                 0_u8,
@@ -780,6 +826,7 @@ impl MutationResolvePass<'_, '_, '_> {
             return Ok(());
         };
         let contents_key = self
+            .mutation
             .volume
             .fscrypt_contents_key_for_inode(inode, self.crypto)?;
         let zero_len = usize::try_from(

@@ -3,7 +3,12 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use super::orphan::{OrphanRecoveryQueue, ValidatedOrphanInventory};
 use super::scope::*;
+use super::transaction::{
+    ORPHAN_METADATA_BUDGET, OrphanBatchCompletion, StorageRequestSequence,
+    StorageRequestSequenceStep, prepare_orphan_batch,
+};
 use crate::disk::storage::{
     OperationDevice, StorageReadOverlay, StorageRequestIdentity, StorageTarget, StorageTranscript,
 };
@@ -13,7 +18,7 @@ use crate::disk_format::journal::{
 };
 use crate::disk_format::superblock::{
     ChecksumInvalidSuperblock, FilesystemUuid, JournalMode, JournalUuid, PrimarySuperblockRead,
-    RecoveryState,
+    WriteSessionState,
 };
 
 /// Maximum distinct resources whose committed versions are tracked by one mounted volume.
@@ -749,7 +754,7 @@ pub struct ExternalJournalProbeOperation {
     candidate: StorageTranscript,
 }
 
-/// Proof that the primary recovery marker was durably cleared after every mounted device drained.
+/// Proof that both primary write-session markers were durably cleared after every mounted device drained.
 #[derive(Debug)]
 pub struct CleanCloseDurability {
     /// Prevents construction outside this module.
@@ -899,7 +904,10 @@ impl CleanCloseOperation {
                 CleanClosePhase::PrepareMarker => {
                     let raw = {
                         let mut filesystem = OperationDevice::new(&mut self.filesystem);
-                        Superblock::prepare_recovery_marker(&mut filesystem, RecoveryState::Clean)
+                        Superblock::prepare_write_session(
+                            &mut filesystem,
+                            WriteSessionState::Closed,
+                        )
                     };
                     match raw {
                         Ok(raw) => {
@@ -1090,7 +1098,7 @@ pub struct MountOperation {
 enum MountState {
     /// Resolve the primary superblock and internal journal placement.
     Resolving,
-    /// A validated previous recovery-marker image is ready to replace a torn primary superblock.
+    /// A validated previous write-session image is ready to replace a torn primary superblock.
     RepairWriteReady {
         /// Complete repaired primary-superblock image.
         marker: Vec<u8>,
@@ -1132,34 +1140,54 @@ enum MountState {
         /// Device containing the journal.
         journal_target: StorageTarget,
     },
-    /// Build the allocation ownership index from the recovered filesystem image.
-    Indexing(MountPublicationSeed),
+    /// Validate both persistent orphan trackers before granting write authority.
+    ScanningOrphans(MountPublicationSeed),
+    /// Build allocation ownership with validated admission for zero-link orphans.
+    Indexing(ValidatedMountSeed),
     /// Prepare the marker image and all publication allocations before its first write.
     PreparingMarker(IndexedMountSeed),
     /// Marker write is ready for lower submission.
     MarkerWriteReady {
         /// Fully allocated mount result, publishable only after marker flush.
-        completed: Box<CompletedMount>,
+        completed: UnpublishedMount,
         /// Owned primary-superblock marker image.
         marker: Vec<u8>,
     },
     /// Marker write is owned by the lower stack.
     MarkerWritePending {
         /// Fully allocated mount result.
-        completed: Box<CompletedMount>,
+        completed: UnpublishedMount,
         /// Expected marker write completion.
         expected: StorageRequestIdentity,
     },
     /// Marker write completed and its filesystem flush is ready.
-    MarkerFlushReady(Box<CompletedMount>),
+    MarkerFlushReady(UnpublishedMount),
     /// Marker flush is owned by the lower stack.
     MarkerFlushPending {
         /// Fully allocated mount result.
-        completed: Box<CompletedMount>,
+        completed: UnpublishedMount,
         /// Expected filesystem flush completion.
         expected: StorageRequestIdentity,
     },
-    /// Recovery marker is durable and the completed mount may be published.
+    /// Resolve one bounded batch, with no published namespace or scheduler authority.
+    RecoveringOrphans(UnpublishedMount),
+    /// Immutable requests and their post-checkpoint state, all allocated before submission.
+    OrphanWrites {
+        /// Private mount and prospective queue state.
+        mount: UnpublishedMount,
+        /// Journal commit and home-checkpoint sequence.
+        sequence: StorageRequestSequence<OrphanBatchCompletion>,
+    },
+    /// An effect-bearing batch cannot be canceled while one transfer is pending.
+    OrphanWritePending {
+        /// Private mount and prospective queue state.
+        mount: UnpublishedMount,
+        /// Remaining requests, resumed only after this exact completion succeeds.
+        sequence: StorageRequestSequence<OrphanBatchCompletion>,
+        /// Identity of the one outstanding transfer.
+        expected: StorageRequestIdentity,
+    },
+    /// Write-session markers are durable and the completed mount may be published.
     Published(Box<CompletedMount>),
 }
 
@@ -1176,18 +1204,38 @@ struct MountPublicationSeed {
 
 /// Allocation-indexed mount values awaiting durable write-session marking.
 #[derive(Debug)]
+struct ValidatedMountSeed {
+    /// Replayed primary and clean journal.
+    publication: MountPublicationSeed,
+    /// Immutable membership, consumed only after allocation indexing completes.
+    orphans: ValidatedOrphanInventory,
+}
+
+/// Allocation-indexed mount values awaiting durable write-session marking.
+#[derive(Debug)]
 struct IndexedMountSeed {
+    /// Tracker ownership retained through marker durability.
+    orphans: ValidatedOrphanInventory,
     /// Recovery and journal placement facts.
     publication: MountPublicationSeed,
     /// Fully validated committed allocation ownership.
     clusters: ClusterReferenceIndex,
 }
 
+/// A fully allocated mount that remains private until every orphan has checkpointed.
+#[derive(Debug)]
+struct UnpublishedMount {
+    /// VCB components allocated before write-session marking.
+    completed: Box<CompletedMount>,
+    /// Prospective queue state may advance only while held behind a pending durable batch.
+    orphans: OrphanRecoveryQueue,
+}
+
 /// Journal resolution result before recovery begins.
 #[derive(Debug)]
 enum JournalResolution {
-    /// A torn recovery-marker write was recognized and must be restored before journal resolution.
-    RepairRecoveryMarker {
+    /// A torn write-session transition was recognized and must be restored before journal resolution.
+    RepairWriteSession {
         /// Fully allocated previous valid primary-superblock image.
         marker: Vec<u8>,
     },
@@ -1314,6 +1362,8 @@ impl MountOperation {
                         | MountState::MarkerWritePending { .. }
                         | MountState::MarkerFlushReady(_)
                         | MountState::MarkerFlushPending { .. }
+                        | MountState::OrphanWrites { .. }
+                        | MountState::OrphanWritePending { .. }
                 ) {
                     self.cancel_requested = true;
                     Ok(())
@@ -1346,6 +1396,22 @@ impl MountOperation {
             MountState::RepairFlushPending { expected } => {
                 expected.complete(completion)?;
                 self.state = MountState::Repaired;
+            }
+            MountState::ScanningOrphans(publication) => {
+                self.filesystem.complete(completion)?;
+                self.state = MountState::ScanningOrphans(publication);
+            }
+            MountState::RecoveringOrphans(mount) => {
+                self.filesystem.complete(completion)?;
+                self.state = MountState::RecoveringOrphans(mount);
+            }
+            MountState::OrphanWritePending {
+                mount,
+                sequence,
+                expected,
+            } => {
+                expected.complete(completion)?;
+                self.state = MountState::OrphanWrites { mount, sequence };
             }
             MountState::Indexing(publication) => {
                 self.filesystem.complete(completion)?;
@@ -1389,7 +1455,9 @@ impl MountOperation {
                 expected,
             } => {
                 expected.complete(completion)?;
-                self.state = MountState::Published(completed);
+                self.filesystem =
+                    StorageTranscript::new(StorageTarget::Filesystem, self.filesystem.len());
+                self.state = MountState::RecoveringOrphans(completed);
             }
             state @ (MountState::AwaitingExternal { .. }
             | MountState::RepairWriteReady { .. }
@@ -1397,6 +1465,7 @@ impl MountOperation {
             | MountState::Repaired
             | MountState::MarkerWriteReady { .. }
             | MountState::MarkerFlushReady(_)
+            | MountState::OrphanWrites { .. }
             | MountState::Published(_)) => {
                 self.state = state;
                 return Err(Error::DeviceIo);
@@ -1410,7 +1479,7 @@ impl MountOperation {
         loop {
             match core::mem::replace(&mut self.state, MountState::Resolving) {
                 MountState::Resolving => match self.resolve_journal() {
-                    Ok(JournalResolution::RepairRecoveryMarker { marker }) => {
+                    Ok(JournalResolution::RepairWriteSession { marker }) => {
                         self.state = MountState::RepairWriteReady { marker };
                     }
                     Ok(JournalResolution::Loaded {
@@ -1526,20 +1595,9 @@ impl MountOperation {
                                 StorageTarget::Filesystem,
                                 filesystem_length,
                             );
-                            self.state = match primary {
-                                ResolvedPrimary::Valid(superblock) => {
-                                    MountState::Indexing(MountPublicationSeed {
-                                        superblock,
-                                        journal,
-                                        journal_target,
-                                    })
-                                }
-                                ResolvedPrimary::JournalRepairRequired(_) => {
-                                    MountState::VerifyingReplayedPrimary {
-                                        journal,
-                                        journal_target,
-                                    }
-                                }
+                            self.state = MountState::VerifyingReplayedPrimary {
+                                journal,
+                                journal_target,
                             };
                         }
                         Err(error) => return MountTransition::Complete(Err(error)),
@@ -1556,14 +1614,14 @@ impl MountOperation {
                     };
                     match primary {
                         Ok(PrimarySuperblockRead::Valid(superblock)) => {
-                            self.state = MountState::Indexing(MountPublicationSeed {
+                            self.state = MountState::ScanningOrphans(MountPublicationSeed {
                                 superblock,
                                 journal,
                                 journal_target,
                             });
                         }
                         Ok(
-                            PrimarySuperblockRead::TornRecoveryMarker { .. }
+                            PrimarySuperblockRead::TornWriteSession { .. }
                             | PrimarySuperblockRead::ChecksumInvalid(_),
                         ) => return MountTransition::Complete(Err(Error::ChecksumMismatch)),
                         Err(Error::OperationSuspended) => {
@@ -1576,26 +1634,58 @@ impl MountOperation {
                         Err(error) => return MountTransition::Complete(Err(error)),
                     }
                 }
-                MountState::Indexing(publication) => {
-                    let clusters = {
+                MountState::ScanningOrphans(publication) => {
+                    let result = {
                         let device = OperationDevice::new(&mut self.filesystem);
-                        let keys = match self.fscrypt_keys.as_ref() {
-                            Some(keys) => keys,
-                            None => return MountTransition::Complete(Err(Error::DeviceIo)),
+                        let Some(keys) = self.fscrypt_keys.as_ref() else {
+                            return MountTransition::Complete(Err(Error::DeviceIo));
                         };
                         let mut volume =
                             EpochReadView::mounting(device, publication.superblock, keys);
-                        ClusterReferenceIndex::load(&mut volume)
+                        ValidatedOrphanInventory::load(&mut volume)
+                    };
+                    match result {
+                        Ok(orphans) => {
+                            if !orphans.is_empty()
+                                && let Err(error) = publication.journal.require_metadata_capacity(
+                                    ORPHAN_METADATA_BUDGET,
+                                    publication.superblock.block_size(),
+                                )
+                            {
+                                return MountTransition::Complete(Err(error));
+                            }
+                            self.state = MountState::Indexing(ValidatedMountSeed {
+                                publication,
+                                orphans,
+                            });
+                        }
+                        Err(Error::OperationSuspended) => {
+                            self.state = MountState::ScanningOrphans(publication);
+                            return self.submit_pending_read();
+                        }
+                        Err(error) => return MountTransition::Complete(Err(error)),
+                    }
+                }
+                MountState::Indexing(validated) => {
+                    let clusters = {
+                        let device = OperationDevice::new(&mut self.filesystem);
+                        let Some(keys) = self.fscrypt_keys.as_ref() else {
+                            return MountTransition::Complete(Err(Error::DeviceIo));
+                        };
+                        let mut volume =
+                            EpochReadView::mounting(device, validated.publication.superblock, keys);
+                        ClusterReferenceIndex::load(&mut volume, &validated.orphans)
                     };
                     match clusters {
                         Ok(clusters) => {
                             self.state = MountState::PreparingMarker(IndexedMountSeed {
-                                publication,
+                                publication: validated.publication,
+                                orphans: validated.orphans,
                                 clusters,
-                            });
+                            })
                         }
                         Err(Error::OperationSuspended) => {
-                            self.state = MountState::Indexing(publication);
+                            self.state = MountState::Indexing(validated);
                             return self.submit_pending_read();
                         }
                         Err(error) => return MountTransition::Complete(Err(error)),
@@ -1604,9 +1694,9 @@ impl MountOperation {
                 MountState::PreparingMarker(indexed) => {
                     let raw = {
                         let mut filesystem = OperationDevice::new(&mut self.filesystem);
-                        Superblock::prepare_recovery_marker(
+                        Superblock::prepare_write_session(
                             &mut filesystem,
-                            RecoveryState::NeedsRecovery,
+                            WriteSessionState::Active,
                         )
                     };
                     match raw {
@@ -1637,6 +1727,10 @@ impl MountOperation {
                             let marker = match memory::copied_slice(&raw) {
                                 Ok(marker) => marker,
                                 Err(error) => return MountTransition::Complete(Err(error)),
+                            };
+                            let completed = UnpublishedMount {
+                                completed,
+                                orphans: indexed.orphans.into_queue(),
                             };
                             self.state = MountState::MarkerWriteReady { completed, marker };
                         }
@@ -1697,6 +1791,71 @@ impl MountOperation {
                     };
                     return MountTransition::Complete(Err(Error::DeviceIo));
                 }
+                MountState::RecoveringOrphans(mut mount) => {
+                    if self.cancel_requested {
+                        return MountTransition::Complete(Err(Error::OperationCancelled));
+                    }
+                    let Some(target) = mount.orphans.current() else {
+                        self.state = MountState::Published(mount.completed);
+                        continue;
+                    };
+                    let inode = target.tracking.inode;
+                    let result = {
+                        let device = OperationDevice::new(&mut self.filesystem);
+                        let view = EpochReadView::committed(device, &mount.completed.epoch);
+                        let JournalCoordinatorState::Ready(journal) =
+                            &mount.completed.coordinator.journal
+                        else {
+                            return MountTransition::Complete(Err(Error::JournalCorrupt));
+                        };
+                        prepare_orphan_batch(view, target, journal)
+                    };
+                    match result {
+                        Ok((sequence, progress)) => {
+                            if let Err(error) = mount.orphans.prepare_advance(inode, progress) {
+                                return MountTransition::Complete(Err(error));
+                            }
+                            self.state = MountState::OrphanWrites { mount, sequence };
+                        }
+                        Err(Error::OperationSuspended) => {
+                            self.state = MountState::RecoveringOrphans(mount);
+                            return self.submit_pending_read();
+                        }
+                        Err(error) => return MountTransition::Complete(Err(error)),
+                    }
+                }
+                MountState::OrphanWrites {
+                    mut mount,
+                    sequence,
+                } => match sequence.advance() {
+                    StorageRequestSequenceStep::Submit { request, suspended } => {
+                        let expected = StorageRequestIdentity::from_request(&request);
+                        self.state = MountState::OrphanWritePending {
+                            mount,
+                            sequence: suspended,
+                            expected,
+                        };
+                        return MountTransition::SubmitLower {
+                            request,
+                            suspended: self,
+                        };
+                    }
+                    StorageRequestSequenceStep::Finished(completion) => {
+                        mount.completed.epoch.superblock = completion.superblock;
+                        mount.completed.epoch.clusters = completion.clusters;
+                        mount.completed.profile.superblock = completion.superblock;
+                        mount.completed.coordinator.journal =
+                            JournalCoordinatorState::Ready(completion.journal);
+                        self.filesystem = StorageTranscript::new(
+                            StorageTarget::Filesystem,
+                            self.filesystem.len(),
+                        );
+                        self.state = MountState::RecoveringOrphans(mount);
+                    }
+                },
+                MountState::OrphanWritePending { .. } => {
+                    return MountTransition::Complete(Err(Error::DeviceIo));
+                }
                 MountState::Published(completed) => {
                     return if self.cancel_requested {
                         MountTransition::Complete(Err(Error::OperationCancelled))
@@ -1719,8 +1878,8 @@ impl MountOperation {
         };
         let primary = match primary_read {
             PrimarySuperblockRead::Valid(superblock) => ResolvedPrimary::Valid(superblock),
-            PrimarySuperblockRead::TornRecoveryMarker { repair } => {
-                return Ok(JournalResolution::RepairRecoveryMarker { marker: repair });
+            PrimarySuperblockRead::TornWriteSession { repair } => {
+                return Ok(JournalResolution::RepairWriteSession { marker: repair });
             }
             PrimarySuperblockRead::ChecksumInvalid(provisional) => {
                 ResolvedPrimary::JournalRepairRequired(provisional)
@@ -1780,7 +1939,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use crate::disk::endian::{DiskOffset, le_u32, put_le_u32};
+    use crate::disk::endian::{DiskOffset, le_u32, put_le_u16, put_le_u32};
     use crate::memory::FallibleVec;
     use crate::{
         ByteOffset, CompletedStorageTransfer, DeviceLength, Error, Result, StorageCompletion,
@@ -1849,7 +2008,25 @@ mod tests {
                                 return Err(Error::DeviceIo);
                             }
                             let mut primary = [0_u8; 1024];
-                            put_le_u32(&mut primary, DiskOffset::new(96), 0x0000_0004)?;
+                            for (offset, value) in [
+                                (0, 128),
+                                (4, 4096),
+                                (20, 1),
+                                (32, 8192),
+                                (36, 8192),
+                                (40, 128),
+                                (84, 11),
+                                (92, 0x1004),
+                                (96, 0x46),
+                                (100, 0x10000),
+                                (224, 8),
+                                (0x280, 12),
+                            ] {
+                                put_le_u32(&mut primary, DiskOffset::new(offset), value)?;
+                            }
+                            put_le_u16(&mut primary, DiskOffset::new(56), 0xef53)?;
+                            put_le_u16(&mut primary, DiskOffset::new(58), 1)?;
+                            put_le_u16(&mut primary, DiskOffset::new(88), 256)?;
                             crate::memory::copy_exact(buffer, &primary)?;
                             ObservedCloseRequest::ReadFilesystem
                         }
@@ -1874,7 +2051,8 @@ mod tests {
                                 .ok_or(Error::ArithmeticOverflow)?;
                             if *target != StorageTarget::Filesystem
                                 || *offset != ByteOffset::new(1024)
-                                || le_u32(buffer, DiskOffset::new(96))? != 0
+                                || le_u32(buffer, DiskOffset::new(96))? != 0x42
+                                || le_u32(buffer, DiskOffset::new(100))? != 0
                             {
                                 return Err(Error::DeviceIo);
                             }
