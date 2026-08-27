@@ -9,6 +9,12 @@ pub(crate) use wdk_sys::ntddk::{
     MmMapLockedPagesSpecifyCache, RtlSecondsSince1970ToTime, RtlTimeToSecondsSince1970,
 };
 
+#[cfg(not(test))]
+pub(crate) use wdk_sys::ntddk::{
+    IoGetFileObjectGenericMapping, SeAccessCheck, SeAppendPrivileges, SeFreePrivileges,
+    SeLockSubjectContext, SeSetAccessStateGenericMapping, SeUnlockSubjectContext,
+};
+
 #[expect(
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"

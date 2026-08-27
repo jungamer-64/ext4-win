@@ -12,7 +12,7 @@ use crate::{
         CreateAction, CreateCompletion, CreateDeletion, CreateDisposition,
         CreateNameInterpretation, CreateParameters, CreateReparsePointMode,
         CreateSymlinkReparseBuffer, CreateSynchronizationMode, CreateTargetRequirement,
-        CreateTransferBuffering, DesiredAccess, ExistingOperationAccess, PendingIrpLease,
+        CreateTransferBuffering, ExistingOperationAccess, GrantedAccess, PendingIrpLease,
         RegularFileWriteAccess, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult},
@@ -21,6 +21,7 @@ use crate::{
         ea::CreateEa,
         metadata,
         reparse::{NodeSymlinkReparsePoint, UnparsedPathLength},
+        security::CreateSecurityDescriptor,
     },
     state::{
         ChildCreationTarget, DataTransferMode, DirectoryChange, DirectoryChangeAction,
@@ -85,6 +86,15 @@ struct CreateCompletionOwner<'a> {
     device: KernelDevice,
 }
 
+/// Create completion authority paired with rights proven for the exact opened object.
+#[derive(Debug)]
+struct AuthorizedCreateCompletionOwner<'a> {
+    /// Sole FILE_OBJECT attachment and IRP completion authority.
+    owner: CreateCompletionOwner<'a>,
+    /// Concrete handle rights returned by the Security Reference Monitor boundary.
+    granted_access: GrantedAccess,
+}
+
 impl<'a> PreparedCreateRequest<'a> {
     /// Decodes the create request from the current IRP stack.
     /// # Errors
@@ -100,6 +110,7 @@ impl<'a> PreparedCreateRequest<'a> {
             let file_object = current.file_object()?;
             let stack = current.create()?;
             let parameters = stack.parameters();
+            parameters.validate_supported_flags()?;
             let file_object = UninitializedFileObject::decode(file_object)?;
             let device = active.device();
             Ok::<_, DriverError>((
@@ -126,7 +137,7 @@ impl<'a> PreparedCreateRequest<'a> {
     }
 }
 
-impl CreateCompletionOwner<'_> {
+impl<'a> CreateCompletionOwner<'a> {
     /// Returns the mounted device receiving the create.
     const fn device(&self) -> KernelDevice {
         self.device
@@ -154,6 +165,161 @@ impl CreateCompletionOwner<'_> {
             operation(UninitializedFileObject::decode(file_object)?)
         })
     }
+
+    /// Performs one bounded operation against the active create ACCESS_STATE.
+    /// # Errors
+    ///
+    /// Returns malformed security-context errors or the operation's native authorization failure.
+    fn with_access_state<R>(
+        &mut self,
+        operation: impl for<'view> FnOnce(&mut crate::irp::CreateAccessState<'view>) -> DriverResult<R>,
+    ) -> DriverResult<R> {
+        let policy = self.parameters.access_check();
+        self.request.with_active(|active| {
+            let mut state = active.create_access_state(policy)?;
+            operation(&mut state)
+        })
+    }
+
+    /// Checks traversal authority for one directory when SeChangeNotifyPrivilege is absent.
+    /// # Errors
+    ///
+    /// Returns metadata/descriptor errors or denies traversal before looking up a child name.
+    fn authorize_traverse(
+        &mut self,
+        directory: DirectoryNodeId,
+        read: &mut impl CommittedReadPass,
+    ) -> DriverResult<()> {
+        let required = self.with_access_state(|state| Ok(state.requires_traverse_checks()))?;
+        if !required {
+            return Ok(());
+        }
+        let descriptor = CreateSecurityDescriptor::for_node(read, NodeId::Directory(directory))?;
+        self.with_access_state(|state| {
+            state.authorize_operation(descriptor.as_native(), wdk_sys::FILE_TRAVERSE)
+        })
+    }
+
+    /// Authorizes one existing object and consumes unvalidated completion authority.
+    /// # Errors
+    ///
+    /// Returns metadata/descriptor errors or native denial without producing attachment authority.
+    fn authorize_existing(
+        mut self,
+        node: NodeId,
+        read: &mut impl CommittedReadPass,
+    ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
+        let descriptor = CreateSecurityDescriptor::for_node(read, node)?;
+        let required = self.parameters.existing_operation_required_access();
+        let requested = self.parameters.desired_access();
+        let granted_access = self.with_access_state(|state| {
+            state.authorize_operation(descriptor.as_native(), required)?;
+            state.authorize_requested(descriptor.as_native(), requested)
+        })?;
+        Ok(AuthorizedCreateCompletionOwner {
+            owner: self,
+            granted_access,
+        })
+    }
+
+    /// Authorizes creation under a parent directory and consumes unvalidated authority.
+    /// # Errors
+    ///
+    /// Returns parent metadata/descriptor errors or native creation/privilege denial before staging
+    /// a namespace mutation.
+    fn authorize_child_creation(
+        mut self,
+        parent: DirectoryNodeId,
+        requirement: CreateTargetRequirement,
+        read: &mut impl CommittedReadPass,
+    ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
+        let descriptor = CreateSecurityDescriptor::for_node(read, NodeId::Directory(parent))?;
+        let required = match requirement {
+            CreateTargetRequirement::Directory => wdk_sys::FILE_ADD_SUBDIRECTORY,
+            CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
+                wdk_sys::FILE_ADD_FILE
+            }
+        };
+        let requested = self.parameters.desired_access();
+        let granted_access = self.with_access_state(|state| {
+            state.authorize_child_creation(descriptor.as_native(), required, requested)
+        })?;
+        Ok(AuthorizedCreateCompletionOwner {
+            owner: self,
+            granted_access,
+        })
+    }
+
+    /// Authorizes a target-directory open and its target-dependent namespace right.
+    /// # Errors
+    ///
+    /// Returns metadata/descriptor errors or native denial for the parent or existing target.
+    fn authorize_target_directory(
+        mut self,
+        directory: DirectoryNodeId,
+        target: TargetDirectoryLeaf,
+        requirement: CreateTargetRequirement,
+        read: &mut impl CommittedReadPass,
+    ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
+        let directory_descriptor =
+            CreateSecurityDescriptor::for_node(read, NodeId::Directory(directory))?;
+        let target_descriptor = match target {
+            TargetDirectoryLeaf::Missing => None,
+            TargetDirectoryLeaf::Existing(node) => {
+                Some(CreateSecurityDescriptor::for_node(read, node)?)
+            }
+        };
+        let requested = self.parameters.desired_access();
+        let granted_access = self.with_access_state(|state| {
+            match target_descriptor.as_ref() {
+                Some(descriptor) => {
+                    state.authorize_operation(descriptor.as_native(), wdk_sys::DELETE)?;
+                }
+                None => {
+                    let required = match requirement {
+                        CreateTargetRequirement::Directory => wdk_sys::FILE_ADD_SUBDIRECTORY,
+                        CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
+                            wdk_sys::FILE_ADD_FILE
+                        }
+                    };
+                    state.authorize_operation(directory_descriptor.as_native(), required)?;
+                }
+            }
+            state.authorize_requested(directory_descriptor.as_native(), requested)
+        })?;
+        Ok(AuthorizedCreateCompletionOwner {
+            owner: self,
+            granted_access,
+        })
+    }
+}
+
+impl AuthorizedCreateCompletionOwner<'_> {
+    /// Returns the mounted device receiving the create.
+    const fn device(&self) -> KernelDevice {
+        self.owner.device()
+    }
+
+    /// Returns decoded create parameters.
+    const fn parameters(&self) -> CreateParameters {
+        self.owner.parameters()
+    }
+
+    /// Returns concrete rights established by create authorization.
+    const fn granted_access(&self) -> GrantedAccess {
+        self.granted_access
+    }
+
+    /// Executes the sole FILE_OBJECT attachment transition.
+    /// # Errors
+    ///
+    /// Returns invalid FILE_OBJECT errors or the attachment operation's failure before publication.
+    fn with_file_object<R>(
+        &mut self,
+        operation: impl for<'view> FnOnce(UninitializedFileObject<'view>) -> DriverResult<R>,
+    ) -> DriverResult<R> {
+        self.owner.with_file_object(operation)
+    }
 }
 
 /// Opens or creates an ext4 object from a volume-root or opened-directory path.
@@ -175,6 +341,15 @@ fn open_or_create(
     let disposition = owner.parameters().disposition();
     let target = match target {
         CreateTargetSpecifier::Volume => {
+            if matches!(
+                owner.parameters().target_selection(),
+                crate::irp::CreateTargetSelection::ParentDirectory
+            ) {
+                return Err(DriverError::InvalidParameter);
+            }
+            operations.authorize_create()?;
+            let owner =
+                owner.authorize_existing(NodeId::Directory(DirectoryNodeId::ROOT), mutation)?;
             return open_volume(owner, create_ea, mounted_volume, operations)
                 .map(CreateCompletion::Handle)
                 .map(CreateResolution::Complete);
@@ -184,31 +359,31 @@ fn open_or_create(
         }
     };
     operations.authorize_create()?;
-    match resolve_target(
-        target,
-        operations,
-        mutation,
-        owner.parameters().reparse_point_mode(),
-    )? {
+    match resolve_target(target, &mut owner, operations, mutation)? {
         CreateTargetLookup::Existing {
             node,
             node_mode,
             location,
-        } => open_existing_node(
-            &mut owner,
-            disposition,
-            ExistingNodeTarget {
-                volume: mounted_volume,
-                node,
-                node_mode,
-                location,
-            },
-            operations,
-            mutation,
-        )
-        .map(CreateCompletion::Handle)
-        .map(CreateResolution::Complete),
+        } => {
+            let mut owner = owner.authorize_existing(node, mutation)?;
+            open_existing_node(
+                &mut owner,
+                disposition,
+                ExistingNodeTarget {
+                    volume: mounted_volume,
+                    node,
+                    node_mode,
+                    location,
+                },
+                operations,
+                mutation,
+            )
+            .map(CreateCompletion::Handle)
+            .map(CreateResolution::Complete)
+        }
         CreateTargetLookup::Missing { parent, name } => {
+            let requirement = owner.parameters().target_requirement();
+            let owner = owner.authorize_child_creation(parent, requirement, mutation)?;
             let publication = create_missing_node(
                 owner,
                 create_ea,
@@ -219,6 +394,26 @@ fn open_or_create(
                 &name,
             )?;
             memory::boxed_try_with(move || Ok(publication)).map(CreateResolution::Mutation)
+        }
+        CreateTargetLookup::ParentDirectory {
+            directory,
+            location,
+            target,
+        } => {
+            let requirement = owner.parameters().target_requirement();
+            let mut owner =
+                owner.authorize_target_directory(directory, target, requirement, mutation)?;
+            open_target_directory(
+                &mut owner,
+                create_ea,
+                mounted_volume,
+                directory,
+                location,
+                target,
+                operations,
+            )
+            .map(CreateCompletion::Handle)
+            .map(CreateResolution::Complete)
         }
         CreateTargetLookup::ReparseSymlink {
             point,
@@ -313,6 +508,15 @@ enum CreateTargetLookup {
         /// New ext4 child name.
         name: Ext4Name,
     },
+    /// `SL_OPEN_TARGET_DIRECTORY` selected the final component's containing directory.
+    ParentDirectory {
+        /// Parent directory opened for the caller.
+        directory: DirectoryNodeId,
+        /// Stable namespace location of that directory.
+        location: OpenedLocation,
+        /// Existence and identity of the named target below the parent.
+        target: TargetDirectoryLeaf,
+    },
     /// Name resolution encountered a reparse point that Windows must process.
     ReparseSymlink {
         /// Reparse metadata captured from the encountered node.
@@ -322,11 +526,20 @@ enum CreateTargetLookup {
     },
 }
 
+/// Final-component observation retained for `SL_OPEN_TARGET_DIRECTORY` access checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetDirectoryLeaf {
+    /// The named final component does not exist.
+    Missing,
+    /// The named final component exists with this identity.
+    Existing(NodeId),
+}
+
 /// Per-handle policy decoded from one create/open request.
 #[derive(Clone, Copy, Debug)]
 struct CreateHandlePolicy {
     /// Access explicitly requested for the returned handle.
-    desired_access: DesiredAccess,
+    granted_access: GrantedAccess,
     /// Virtual access used only to preflight an existing-object operation.
     existing_operation_access: ExistingOperationAccess,
     /// Share mask used for Windows share-access accounting.
@@ -346,11 +559,16 @@ impl CreateHandlePolicy {
     /// # Errors
     ///
     /// Returns an error when requested transfer buffering cannot be satisfied by the mounted device.
-    fn from_parameters(parameters: CreateParameters, device: KernelDevice) -> DriverResult<Self> {
+    fn from_authorized(
+        parameters: CreateParameters,
+        granted_access: GrantedAccess,
+        device: KernelDevice,
+    ) -> DriverResult<Self> {
         let file_object_flags = CreateFileObjectFlags::from_parameters(parameters);
         Ok(Self {
-            desired_access: parameters.desired_access(),
-            existing_operation_access: parameters.existing_operation_access(),
+            granted_access,
+            existing_operation_access: granted_access
+                .including_for_operation(parameters.existing_operation_required_access()),
             share_access: parameters.share_access(),
             data_transfer_mode: match parameters.transfer_buffering() {
                 CreateTransferBuffering::IntermediateAllowed => {
@@ -360,19 +578,19 @@ impl CreateHandlePolicy {
                     DataTransferMode::NoIntermediate(NoIntermediateTransfer::from_device(device)?)
                 }
             },
-            regular_file_write_access: parameters.desired_access().regular_file_write_access(),
+            regular_file_write_access: granted_access.regular_file_write_access(),
             deletion: HandleDeletion::from_create(
                 parameters.deletion(),
-                parameters.desired_access().delete_access(),
-                parameters.desired_access().file_attributes_write_access(),
+                granted_access.delete_access(),
+                granted_access.file_attributes_write_access(),
             )?,
             file_object_flags,
         })
     }
 
     /// Returns access explicitly requested for the returned handle.
-    const fn desired_access(self) -> DesiredAccess {
-        self.desired_access
+    const fn granted_access(self) -> GrantedAccess {
+        self.granted_access
     }
 
     /// Returns virtual access that existing handles must share for this operation.
@@ -672,11 +890,11 @@ impl CreatePathAnchor {
         })
     }
 
-    /// Returns the directory where component lookup starts.
-    const fn directory(&self) -> DirectoryNodeId {
+    /// Consumes the anchor into its directory identity and stable namespace location.
+    fn into_directory_location(self) -> (DirectoryNodeId, OpenedLocation) {
         match self {
-            Self::VolumeRoot => DirectoryNodeId::ROOT,
-            Self::OpenedDirectory { id, .. } => *id,
+            Self::VolumeRoot => (DirectoryNodeId::ROOT, OpenedLocation::Root),
+            Self::OpenedDirectory { id, location } => (id, location),
         }
     }
 }
@@ -700,7 +918,7 @@ struct ExistingNodeTarget {
 /// Returns an error when existing-node options conflict, create-only disposition collides, share
 /// access fails, or an incomplete destructive disposition is requested.
 fn open_existing_node(
-    request: &mut CreateCompletionOwner<'_>,
+    request: &mut AuthorizedCreateCompletionOwner<'_>,
     disposition: CreateDisposition,
     target: ExistingNodeTarget,
     operations: &mut MountedVolumeAccess<'_>,
@@ -713,7 +931,11 @@ fn open_existing_node(
         location,
     } = target;
     let parameters = request.parameters();
-    let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
+    let policy = CreateHandlePolicy::from_authorized(
+        parameters,
+        request.granted_access(),
+        request.device(),
+    )?;
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
@@ -774,7 +996,7 @@ fn prepare_create_deletion(
 /// Returns an error when EAs are supplied, share-access validation fails, handle allocation fails,
 /// or the completion-owned FILE_OBJECT cannot be attached.
 fn open_volume(
-    mut request: CreateCompletionOwner<'_>,
+    mut request: AuthorizedCreateCompletionOwner<'_>,
     create_ea: CreateEa,
     volume: NonNull<VolumeControlBlock>,
     operations: &mut MountedVolumeAccess<'_>,
@@ -783,7 +1005,11 @@ fn open_volume(
         return Err(DriverError::InvalidParameter);
     }
     let parameters = request.parameters();
-    let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
+    let policy = CreateHandlePolicy::from_authorized(
+        parameters,
+        request.granted_access(),
+        request.device(),
+    )?;
     if policy.deletion() == CreateDeletion::DeleteOnClose {
         return Err(DriverError::CannotDelete);
     }
@@ -791,13 +1017,60 @@ fn open_volume(
     request.with_file_object(move |file_object| {
         operations.open_volume_handle(
             file_object.kernel_file_object(),
-            policy.desired_access(),
+            policy.granted_access(),
             policy.share_access(),
         )?;
         attach_volume_file_object(file_object, volume, handle, policy.file_object_flags());
         Ok(())
     })?;
     Ok(CreateAction::Opened)
+}
+
+/// Opens the containing directory selected by `SL_OPEN_TARGET_DIRECTORY`.
+/// # Errors
+///
+/// Returns an error when the request would mutate the namespace, carries EAs or delete-on-close,
+/// conflicts with existing share state, or cannot attach the parent directory handle.
+fn open_target_directory(
+    request: &mut AuthorizedCreateCompletionOwner<'_>,
+    create_ea: CreateEa,
+    volume: NonNull<VolumeControlBlock>,
+    directory: DirectoryNodeId,
+    location: OpenedLocation,
+    target: TargetDirectoryLeaf,
+    _operations: &mut MountedVolumeAccess<'_>,
+) -> DriverResult<CreateAction> {
+    if !create_ea.is_empty() || request.parameters().disposition() != CreateDisposition::Open {
+        return Err(DriverError::InvalidParameter);
+    }
+    let parameters = request.parameters();
+    if parameters.deletion() == CreateDeletion::DeleteOnClose {
+        return Err(DriverError::CannotDelete);
+    }
+    validate_existing_node_options(
+        NodeId::Directory(directory),
+        parameters.target_requirement(),
+    )?;
+    let policy = CreateHandlePolicy::from_authorized(
+        parameters,
+        request.granted_access(),
+        request.device(),
+    )?;
+    request.with_file_object(|file_object| {
+        initialize_file_object(
+            file_object,
+            volume,
+            NodeId::Directory(directory),
+            OpenedNodeMode::Direct,
+            location,
+            policy,
+        )?;
+        Ok(())
+    })?;
+    Ok(match target {
+        TargetDirectoryLeaf::Missing => CreateAction::TargetDoesNotExist,
+        TargetDirectoryLeaf::Existing(_) => CreateAction::TargetExists,
+    })
 }
 
 /// Validates create semantics that are meaningful for a direct volume open.
@@ -830,7 +1103,7 @@ fn destructive_directory_error(directory: DirectoryNodeId) -> DriverError {
 /// Returns an error when the disposition requires an existing name, missing-child creation cannot
 /// be staged or committed, or the new file object cannot be initialized.
 fn create_missing_node(
-    mut request: CreateCompletionOwner<'_>,
+    mut request: AuthorizedCreateCompletionOwner<'_>,
     create_ea: CreateEa,
     operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
@@ -839,7 +1112,11 @@ fn create_missing_node(
     name: &Ext4Name,
 ) -> DriverResult<PendingCreatePublication> {
     let parameters = request.parameters();
-    let policy = CreateHandlePolicy::from_parameters(parameters, request.device())?;
+    let policy = CreateHandlePolicy::from_authorized(
+        parameters,
+        request.granted_access(),
+        request.device(),
+    )?;
     match disposition {
         CreateDisposition::Create
         | CreateDisposition::OpenIf
@@ -876,7 +1153,7 @@ fn create_missing_node(
     Ok(PendingCreatePublication {
         creation,
         file_object,
-        desired_access: policy.desired_access(),
+        desired_access: policy.granted_access(),
         share_access: policy.share_access(),
         handle,
         flags: policy.file_object_flags(),
@@ -929,17 +1206,24 @@ fn validate_existing_node_options(
 /// Returns an error when path or file-reference resolution fails.
 fn resolve_target(
     target: CreateTargetSpecifier,
+    owner: &mut CreateCompletionOwner<'_>,
     operations: &mut MountedVolumeAccess<'_>,
     read: &mut impl CommittedReadPass,
-    reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
+    let parameters = owner.parameters();
     match target {
         CreateTargetSpecifier::Volume => Err(DriverError::InternalInvariantViolation),
         CreateTargetSpecifier::Path { name, anchor } => {
-            resolve_path(name, anchor, operations, read, reparse_point_mode)
+            resolve_path(name, anchor, owner, operations, read)
         }
         CreateTargetSpecifier::FileReference(reference) => {
-            let target = resolve_file_reference(reference, read, reparse_point_mode)?;
+            if matches!(
+                parameters.target_selection(),
+                crate::irp::CreateTargetSelection::ParentDirectory
+            ) {
+                return Err(DriverError::InvalidParameter);
+            }
+            let target = resolve_file_reference(reference, read, parameters.reparse_point_mode())?;
             if let CreateTargetLookup::Existing { node, .. } = &target {
                 operations.ensure_node_openable(*node)?;
             }
@@ -1002,12 +1286,24 @@ fn file_reference_lookup_error(error: ext4_core::Error) -> DriverError {
 fn resolve_path(
     name: CreatePathName,
     anchor: CreatePathAnchor,
+    owner: &mut CreateCompletionOwner<'_>,
     operations: &mut MountedVolumeAccess<'_>,
     read: &mut impl CommittedReadPass,
-    reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
-    let mut parent_id = anchor.directory();
+    let parameters = owner.parameters();
+    let reparse_point_mode = parameters.reparse_point_mode();
+    let name_match = parameters.name_match();
+    let target_selection = parameters.target_selection();
+    let (mut parent_id, mut parent_location) = anchor.into_directory_location();
     let components = name.components();
+    if components.is_empty()
+        && matches!(
+            target_selection,
+            crate::irp::CreateTargetSelection::ParentDirectory
+        )
+    {
+        return Err(DriverError::InvalidParameter);
+    }
     let mut components = components.iter().peekable();
     while let Some(component) = components.next() {
         let position = if components.peek().is_none() {
@@ -1016,12 +1312,26 @@ fn resolve_path(
             PathComponentPosition::Intermediate
         };
         operations.ensure_node_openable(NodeId::Directory(parent_id))?;
+        owner.authorize_traverse(parent_id, read)?;
         let parent = match read.load_directory(parent_id) {
             Ok(directory) => directory,
             Err(error) => return Err(DriverError::from(error)),
         };
-        let child = match read.lookup_windows_child(&parent, component.name()) {
+        let child = match read.lookup_windows_child(&parent, component.name(), name_match) {
             Ok(ChildLookup::Found(child)) => child,
+            Ok(ChildLookup::NotFound)
+                if position == PathComponentPosition::Final
+                    && matches!(
+                        target_selection,
+                        crate::irp::CreateTargetSelection::ParentDirectory
+                    ) =>
+            {
+                return Ok(CreateTargetLookup::ParentDirectory {
+                    directory: parent_id,
+                    location: parent_location,
+                    target: TargetDirectoryLeaf::Missing,
+                });
+            }
             Ok(ChildLookup::NotFound) if position == PathComponentPosition::Final => {
                 return Ok(CreateTargetLookup::Missing {
                     parent: parent_id,
@@ -1033,6 +1343,18 @@ fn resolve_path(
         };
         let child_node = *child.node();
         operations.ensure_node_openable(child_node)?;
+        if position == PathComponentPosition::Final
+            && matches!(
+                target_selection,
+                crate::irp::CreateTargetSelection::ParentDirectory
+            )
+        {
+            return Ok(CreateTargetLookup::ParentDirectory {
+                directory: parent_id,
+                location: parent_location,
+                target: TargetDirectoryLeaf::Existing(child_node),
+            });
+        }
         let reparse_point = NodeSymlinkReparsePoint::load(read, child_node)?;
         if let Some(point) = reparse_point {
             match reparse_point_encounter(position, reparse_point_mode) {
@@ -1064,20 +1386,14 @@ fn resolve_path(
         let NodeId::Directory(directory_id) = child_node else {
             return Err(DriverError::ObjectPathNotFound);
         };
+        parent_location = OpenedLocation::try_directory_entry(child.parent(), child.name())?;
         parent_id = directory_id;
     }
 
-    Ok(match anchor {
-        CreatePathAnchor::VolumeRoot => CreateTargetLookup::Existing {
-            node: NodeId::Directory(DirectoryNodeId::ROOT),
-            node_mode: OpenedNodeMode::Direct,
-            location: OpenedLocation::Root,
-        },
-        CreatePathAnchor::OpenedDirectory { id, location } => CreateTargetLookup::Existing {
-            node: NodeId::Directory(id),
-            node_mode: OpenedNodeMode::Direct,
-            location,
-        },
+    Ok(CreateTargetLookup::Existing {
+        node: NodeId::Directory(parent_id),
+        node_mode: OpenedNodeMode::Direct,
+        location: parent_location,
     })
 }
 
@@ -1211,7 +1527,7 @@ fn initialize_file_object(
         &file_object,
         vcb,
         node,
-        policy.desired_access(),
+        policy.granted_access(),
         policy.existing_operation_access(),
         policy.share_access(),
     )?;
@@ -1228,7 +1544,7 @@ fn open_shared_file_control_block(
     file_object: &UninitializedFileObject<'_>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
     node: NodeId,
-    desired_access: DesiredAccess,
+    desired_access: GrantedAccess,
     existing_operation_access: ExistingOperationAccess,
     share_access: ShareAccess,
 ) -> DriverResult<NonNull<FileControlBlock>> {
@@ -1249,7 +1565,7 @@ fn open_shared_file_control_block(
 fn open_pending_child_file_control_block(
     creation: &PendingChildCreation,
     file_object: KernelFileObject,
-    desired_access: DesiredAccess,
+    desired_access: GrantedAccess,
     share_access: ShareAccess,
 ) -> DriverResult<NonNull<FileControlBlock>> {
     creation.open_file_control_block(file_object, desired_access, share_access)
@@ -1263,7 +1579,7 @@ pub(crate) struct PendingCreatePublication {
     /// Create-owned FILE_OBJECT identity retained by the top-level IRP.
     file_object: KernelFileObject,
     /// Share-accounting access mask.
-    desired_access: DesiredAccess,
+    desired_access: GrantedAccess,
     /// Share-accounting share mask.
     share_access: ShareAccess,
     /// Fully allocated per-handle context.

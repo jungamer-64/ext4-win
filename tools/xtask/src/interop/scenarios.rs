@@ -557,8 +557,8 @@ fn delimited_oracle_section<'output>(
 ///
 /// # Errors
 ///
-/// Returns an error when formatting, batched mutation, bounded enumeration, exact lookup, rename,
-/// debugfs inspection, or e2fsck validation fails.
+/// Returns an error when formatting, batched mutation, bounded enumeration, exact/case-insensitive
+/// lookup, rename, debugfs inspection, or e2fsck validation fails.
 fn verify_htree_mutation_profile(
     linux: LinuxEnvironment,
     temporary_root: &Path,
@@ -645,6 +645,27 @@ fn verify_htree_mutation_profile(
             ext4_core::ChildLookup::Found(_)
         ) {
             return Err(ext4_core::Error::DirectoryEntryNotFound);
+        }
+        let exact_name = ext4_core::WindowsName::from_ext4(&source)?;
+        let uppercase = ext4_core::Ext4Name::new(&source.bytes().to_ascii_uppercase())?;
+        let uppercase_name = ext4_core::WindowsName::from_ext4(&uppercase)?;
+        for (requested, policy, should_exist) in [
+            (&exact_name, ext4_core::WindowsNameMatch::Exact, true),
+            (&uppercase_name, ext4_core::WindowsNameMatch::Exact, false),
+            (
+                &uppercase_name,
+                ext4_core::WindowsNameMatch::CaseInsensitive,
+                true,
+            ),
+        ] {
+            let found =
+                ext4_core::CommittedReadPass::lookup_windows_child(pass, &root, requested, policy)?;
+            match found {
+                ext4_core::ChildLookup::Found(child) if should_exist && child.name() == &source => {
+                }
+                ext4_core::ChildLookup::NotFound if !should_exist => {}
+                _ => return Err(ext4_core::Error::InvalidDirectoryEntry),
+            }
         }
         let transaction_root = pass.directory(root.id())?;
         pass.rename_child(

@@ -39,12 +39,10 @@ pub(crate) enum PreparedDirectoryPattern {
 /// Owned query-EA selection captured before queue insertion.
 #[derive(Debug)]
 pub(crate) enum PreparedEaSelection {
-    /// Return every EA associated with the opened file.
-    All,
+    /// Enumerate from the scalar cursor position captured in `QueryEaStack`.
+    Enumerate,
     /// Requestor-owned FILE_GET_EA_INFORMATION bytes.
     Names(DriverVec<u8>),
-    /// Return the entry at a caller-supplied one-based index.
-    Index(super::EaEntryIndex),
 }
 
 /// Directory-control request whose meaningful auxiliary inputs are sealed before queue insertion.
@@ -898,6 +896,20 @@ impl PreparedRequest {
                             .map_err(IrpCompletion::from_error)?;
                         Self::DirectoryControl(PreparedDirectoryControl::NotifyChangeDirectory)
                     }
+                    DirectoryControlMinorFunction::NotifyChangeDirectoryEx => {
+                        let information_class = stack
+                            .notify_directory_ex()
+                            .map_err(IrpCompletion::from_error)?;
+                        // The FsRtl registration path implements only the standard minor-function
+                        // contract. Do not submit EX requests with an incompatible output layout.
+                        return Err(IrpCompletion::from_error(match information_class {
+                            super::DirectoryNotifyInformationClass::Standard
+                            | super::DirectoryNotifyInformationClass::Extended
+                            | super::DirectoryNotifyInformationClass::Full => {
+                                DriverError::NotSupported
+                            }
+                        }));
+                    }
                     DirectoryControlMinorFunction::Unsupported => {
                         return Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest));
                     }
@@ -1041,14 +1053,7 @@ fn capture_ea_selection(
         return Ok(PreparedEaSelection::Names(bytes));
     }
 
-    let selection = stack
-        .query_ea()
-        .map_err(IrpCompletion::from_error)?
-        .selection();
-    Ok(match selection {
-        super::EaSelection::All => PreparedEaSelection::All,
-        super::EaSelection::Index(index) => PreparedEaSelection::Index(index),
-    })
+    Ok(PreparedEaSelection::Enumerate)
 }
 
 /// Stable FILE_OBJECT identity used by cleanup while the IRP is queue-owned.

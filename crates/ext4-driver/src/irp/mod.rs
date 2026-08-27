@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use ext4_core::FileOffset;
+use ext4_core::{FileOffset, WindowsNameMatch};
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_PENDING, STATUS_SUCCESS};
 
 mod cancel;
@@ -28,7 +28,7 @@ use capture::{QueueContext, QueueContextOwnership};
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory;
-use crate::security_descriptor::SecuritySelection;
+use crate::security_descriptor::{SecurityDescriptorRef, SecuritySelection};
 use crate::state::{
     DirectoryChangeNotifier, DirectoryNotificationRegistration, FileControlBlock, KernelDevice,
     KernelFileObject, KernelVpb, WriteCommitment,
@@ -259,6 +259,10 @@ pub(crate) enum CreateAction {
     Opened,
     /// A missing object was created.
     Created,
+    /// `SL_OPEN_TARGET_DIRECTORY` opened the parent and the named target exists.
+    TargetExists,
+    /// `SL_OPEN_TARGET_DIRECTORY` opened the parent and the named target is absent.
+    TargetDoesNotExist,
 }
 
 impl CreateAction {
@@ -267,6 +271,8 @@ impl CreateAction {
         match self {
             Self::Opened => wdk_sys::FILE_OPENED,
             Self::Created => wdk_sys::FILE_CREATED,
+            Self::TargetExists => wdk_sys::FILE_EXISTS,
+            Self::TargetDoesNotExist => wdk_sys::FILE_DOES_NOT_EXIST,
         }
     }
 }
@@ -434,6 +440,27 @@ impl ActiveIrp<'_> {
         }
     }
 
+    /// Borrows the live create access state under this completion owner.
+    /// # Errors
+    ///
+    /// Returns an error when the requestor mode, create security context, or access state is
+    /// malformed.
+    #[expect(
+        unsafe_code,
+        reason = "the active IRP owner retains the requestor mode and create security context for this bounded borrow"
+    )]
+    pub(crate) fn create_access_state(
+        &mut self,
+        policy: CreateAccessCheck,
+    ) -> DriverResult<CreateAccessState<'_>> {
+        let requestor_mode = unsafe {
+            // SAFETY: This active view keeps the IRP live for the returned owner-bound state view.
+            self.irp.as_ref().RequestorMode
+        };
+        self.current_stack()?
+            .create_access_state(requestor_mode, policy)
+    }
+
     /// Returns the kernel process identity used by FsRtl byte-range lock ownership.
     /// # Errors
     ///
@@ -507,6 +534,19 @@ impl ActiveIrp<'_> {
         length: IrpBufferLength,
     ) -> Result<RequestorOutput<'_>, DriverError> {
         RequestorOutput::from_active(self.requestor_buffer(length)?)
+    }
+
+    /// Borrows disjoint output and FILE_OBJECT views for one output-and-cursor publication.
+    /// # Errors
+    ///
+    /// Returns an error before publication if either the output mapping or FILE_OBJECT is invalid.
+    pub(crate) fn requestor_output_with_file_object(
+        &mut self,
+        length: IrpBufferLength,
+    ) -> DriverResult<(RequestorOutput<'_>, ActiveFileObject<'_>)> {
+        let file_object = self.current_stack()?.file_object()?;
+        let output = RequestorOutput::from_active(self.requestor_buffer(length)?)?;
+        Ok((output, file_object))
     }
 
     /// Returns read-like IRP data bytes tied to this active owner borrow.
@@ -1718,7 +1758,55 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
                 create.Options,
                 create.ShareAccess,
                 IrpBufferLength::from_ulong(create.EaLength)?,
+                stack.Flags,
             )?,
+        })
+    }
+
+    /// Borrows the live ACCESS_STATE carried by an active create stack.
+    /// # Errors
+    ///
+    /// Returns an error when the security context/access state is absent or requestor mode is not
+    /// one of the two WDK processor modes.
+    #[expect(
+        unsafe_code,
+        reason = "the active IRP stack retains its create security context and ACCESS_STATE for the owner-bound view"
+    )]
+    fn create_access_state(
+        self,
+        requestor_mode: wdk_sys::KPROCESSOR_MODE,
+        policy: CreateAccessCheck,
+    ) -> DriverResult<CreateAccessState<'owner>> {
+        let stack = unsafe {
+            // SAFETY: `stack` belongs to the active create IRP retained by the owner borrow.
+            self.stack.as_ref()
+        };
+        let create = unsafe {
+            // SAFETY: The caller selects this accessor only for IRP_MJ_CREATE.
+            stack.Parameters.Create
+        };
+        let security_context =
+            NonNull::new(create.SecurityContext).ok_or(DriverError::InvalidParameter)?;
+        let access_state = unsafe {
+            // SAFETY: The I/O Manager retains the security context for this create IRP.
+            NonNull::new(security_context.as_ref().AccessState)
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        let kernel_mode = wdk_sys::KPROCESSOR_MODE::try_from(wdk_sys::_MODE::KernelMode)
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        let user_mode = wdk_sys::KPROCESSOR_MODE::try_from(wdk_sys::_MODE::UserMode)
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        if requestor_mode != kernel_mode && requestor_mode != user_mode {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(CreateAccessState {
+            access_state,
+            access_check: policy,
+            access_mode: match policy {
+                CreateAccessCheck::HonorRequestorMode => requestor_mode,
+                CreateAccessCheck::ForceUserMode => user_mode,
+            },
+            owner: core::marker::PhantomData,
         })
     }
 
@@ -1918,6 +2006,32 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         })
     }
 
+    /// Decodes extended directory-change-notification parameters.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT is absent, the filter is invalid, or the requested
+    /// extended information class is not defined by the current WDK contract.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(crate) fn notify_directory_ex(
+        self,
+    ) -> Result<DirectoryNotifyInformationClass, DriverError> {
+        let stack = unsafe {
+            // SAFETY: `stack` is non-null and belongs to the active IRP stack for this callback.
+            self.stack.as_ref()
+        };
+        let notify = unsafe {
+            // SAFETY: The caller selects this accessor only for
+            // IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX, where NotifyDirectoryEx is active.
+            stack.Parameters.NotifyDirectoryEx
+        };
+        self.kernel_file_object()?;
+        DirectoryChangeFilter::from_raw(notify.CompletionFilter)?;
+        DirectoryNotifyInformationClass::from_raw(notify.DirectoryNotifyInformationClass)
+    }
+
     /// Decodes query-EA parameters.
     /// # Errors
     ///
@@ -1938,15 +2052,12 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
             // where QueryEa is active.
             stack.Parameters.QueryEa
         };
-        let ea_list_length = IrpBufferLength::from_ulong(query.EaListLength)?;
-        let selection = if !ea_list_length.is_empty() {
-            // The requestor-owned list is captured before queue insertion. The stack view keeps a
-            // neutral selection because the raw pointer must never escape this callback boundary.
-            EaSelection::All
-        } else if stack_flag(stack.Flags, wdk_sys::SL_INDEX_SPECIFIED) {
-            EaSelection::Index(EaEntryIndex::from_u32(query.EaIndex))
+        let cursor_position = if stack_flag(stack.Flags, wdk_sys::SL_INDEX_SPECIFIED) {
+            EaCursorPosition::Index(EaEntryIndex::from_u32(query.EaIndex))
+        } else if stack_flag(stack.Flags, wdk_sys::SL_RESTART_SCAN) {
+            EaCursorPosition::Restart
         } else {
-            EaSelection::All
+            EaCursorPosition::Current
         };
         let entry_emission = if stack_flag(stack.Flags, wdk_sys::SL_RETURN_SINGLE_ENTRY) {
             EaEntryEmission::Single
@@ -1955,7 +2066,7 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         };
         self.kernel_file_object()?;
         Ok(QueryEaStack {
-            selection,
+            cursor_position,
             entry_emission,
             length: IrpBufferLength::from_ulong(query.Length)?,
         })
@@ -2445,12 +2556,14 @@ impl EaEntryIndex {
     }
 }
 
-/// Query-EA selection supplied by the caller.
+/// Starting position selected by a query-EA request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EaSelection {
-    /// Return every EA associated with the opened file.
-    All,
-    /// Return the entry at a caller-supplied one-based index, then continue scanning.
+pub(crate) enum EaCursorPosition {
+    /// Continue from the FILE_OBJECT-owned cursor.
+    Current,
+    /// Restart at the first EA.
+    Restart,
+    /// Start at a caller-supplied one-based index.
     Index(EaEntryIndex),
 }
 
@@ -2830,6 +2943,14 @@ pub(crate) struct CreateParameters {
     deletion: CreateDeletion,
     /// Extended-attribute input length supplied with create.
     ea_length: IrpBufferLength,
+    /// I/O-stack access-check policy selected for this create.
+    access_check: CreateAccessCheck,
+    /// Windows-visible path-name comparison policy.
+    name_match: WindowsNameMatch,
+    /// Whether the caller requests the named object or its containing directory.
+    target_selection: CreateTargetSelection,
+    /// Create flags whose semantics this filesystem does not implement.
+    unsupported_flags: UnsupportedCreateFlags,
 }
 
 impl CreateParameters {
@@ -2843,6 +2964,7 @@ impl CreateParameters {
         options: wdk_sys::ULONG,
         share_access: wdk_sys::USHORT,
         ea_length: IrpBufferLength,
+        stack_flags: wdk_sys::UCHAR,
     ) -> Result<Self, DriverError> {
         let desired_access = DesiredAccess::from_raw(desired_access);
         let disposition = CreateDisposition::from_options(options)?;
@@ -2861,6 +2983,14 @@ impl CreateParameters {
             name_interpretation: create_options.name_interpretation(),
             deletion: create_options.deletion(),
             ea_length,
+            access_check: CreateAccessCheck::from_stack_flags(stack_flags),
+            name_match: if stack_flag(stack_flags, wdk_sys::SL_CASE_SENSITIVE) {
+                WindowsNameMatch::Exact
+            } else {
+                WindowsNameMatch::CaseInsensitive
+            },
+            target_selection: CreateTargetSelection::from_stack_flags(stack_flags),
+            unsupported_flags: UnsupportedCreateFlags::from_stack_flags(stack_flags),
         })
     }
 
@@ -2870,8 +3000,8 @@ impl CreateParameters {
     }
 
     /// Returns virtual access whose sharing must permit this existing-object operation.
-    pub(crate) const fn existing_operation_access(self) -> ExistingOperationAccess {
-        let required = match self.disposition {
+    pub(crate) const fn existing_operation_required_access(self) -> wdk_sys::ACCESS_MASK {
+        match self.disposition {
             CreateDisposition::Overwrite | CreateDisposition::OverwriteIf => {
                 wdk_sys::FILE_WRITE_DATA | wdk_sys::FILE_WRITE_EA | wdk_sys::FILE_WRITE_ATTRIBUTES
             }
@@ -2879,8 +3009,7 @@ impl CreateParameters {
                 wdk_sys::DELETE | wdk_sys::FILE_WRITE_EA | wdk_sys::FILE_WRITE_ATTRIBUTES
             }
             CreateDisposition::Open | CreateDisposition::Create | CreateDisposition::OpenIf => 0,
-        };
-        self.desired_access.including_for_operation(required)
+        }
     }
 
     /// Returns the share access.
@@ -2932,6 +3061,104 @@ impl CreateParameters {
     pub(crate) const fn ea_length(self) -> IrpBufferLength {
         self.ea_length
     }
+
+    /// Returns whether kernel requestors may bypass target security evaluation.
+    pub(crate) const fn access_check(self) -> CreateAccessCheck {
+        self.access_check
+    }
+
+    /// Returns Windows-visible path-name comparison policy.
+    pub(crate) const fn name_match(self) -> WindowsNameMatch {
+        self.name_match
+    }
+
+    /// Returns the namespace object selected by this create.
+    pub(crate) const fn target_selection(self) -> CreateTargetSelection {
+        self.target_selection
+    }
+
+    /// Rejects valid create flags whose required filesystem protocol is not implemented.
+    /// # Errors
+    ///
+    /// Returns not-supported instead of silently treating a special create as an ordinary open.
+    pub(crate) const fn validate_supported_flags(self) -> DriverResult<()> {
+        self.unsupported_flags.validate()
+    }
+}
+
+/// Access-check policy carried by `IO_STACK_LOCATION::Flags`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateAccessCheck {
+    /// Kernel-mode requestors may use their trusted access bypass.
+    HonorRequestorMode,
+    /// Evaluate access as user mode even for a kernel-mode requestor.
+    ForceUserMode,
+}
+
+impl CreateAccessCheck {
+    /// Decodes `SL_FORCE_ACCESS_CHECK`.
+    fn from_stack_flags(flags: wdk_sys::UCHAR) -> Self {
+        if stack_flag(flags, wdk_sys::SL_FORCE_ACCESS_CHECK) {
+            Self::ForceUserMode
+        } else {
+            Self::HonorRequestorMode
+        }
+    }
+}
+
+/// Namespace object selected by a create request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateTargetSelection {
+    /// Open or create the named object.
+    NamedObject,
+    /// Open the containing directory for the named final component.
+    ParentDirectory,
+}
+
+impl CreateTargetSelection {
+    /// Decodes `SL_OPEN_TARGET_DIRECTORY`.
+    fn from_stack_flags(flags: wdk_sys::UCHAR) -> Self {
+        if stack_flag(flags, wdk_sys::SL_OPEN_TARGET_DIRECTORY) {
+            Self::ParentDirectory
+        } else {
+            Self::NamedObject
+        }
+    }
+}
+
+/// Special create modes that require protocols this filesystem does not expose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnsupportedCreateFlags {
+    /// The Memory Manager requested paging-file semantics.
+    paging_file: bool,
+    /// Name resolution requested the stop-on-symlink contract.
+    stop_on_symlink: bool,
+    /// Replacement requested read-only-attribute bypass semantics.
+    ignore_readonly_attribute: bool,
+}
+
+impl UnsupportedCreateFlags {
+    /// Captures every currently unsupported create stack flag.
+    fn from_stack_flags(flags: wdk_sys::UCHAR) -> Self {
+        Self {
+            paging_file: stack_flag(flags, wdk_sys::SL_OPEN_PAGING_FILE),
+            stop_on_symlink: stack_flag(flags, wdk_sys::SL_STOP_ON_SYMLINK),
+            ignore_readonly_attribute: stack_flag(flags, wdk_sys::SL_IGNORE_READONLY_ATTRIBUTE),
+        }
+    }
+
+    /// Requires an ordinary create request.
+    /// # Errors
+    ///
+    /// Returns not-supported when the caller requires a special create protocol not implemented
+    /// by this filesystem.
+    const fn validate(self) -> DriverResult<()> {
+        if self.paging_file || self.stop_on_symlink || self.ignore_readonly_attribute {
+            Err(DriverError::NotSupported)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Desired access requested by a create/open.
@@ -2939,6 +3166,26 @@ impl CreateParameters {
 pub(crate) struct DesiredAccess {
     /// Raw WDK access mask, retained for I/O Manager share-access accounting.
     raw: wdk_sys::ACCESS_MASK,
+}
+
+/// Access rights retained by a handle only after create authorization succeeds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GrantedAccess {
+    /// Concrete, generic-mapped WDK access mask.
+    raw: wdk_sys::ACCESS_MASK,
+}
+
+/// Owner-bound view of the Security Reference Monitor state for one active create.
+#[derive(Debug)]
+pub(crate) struct CreateAccessState<'owner> {
+    /// I/O Manager-owned state retained by the active create IRP.
+    access_state: NonNull<wdk_sys::ACCESS_STATE>,
+    /// Effective processor mode after `SL_FORCE_ACCESS_CHECK` is applied.
+    access_mode: wdk_sys::KPROCESSOR_MODE,
+    /// Forced checks must not reuse rights cached during a trusted kernel-mode open.
+    access_check: CreateAccessCheck,
+    /// Prevents the state view from escaping its active completion-owner borrow.
+    owner: core::marker::PhantomData<&'owner mut wdk_sys::ACCESS_STATE>,
 }
 
 /// Virtual access used to preflight an existing-object create operation.
@@ -2996,13 +3243,30 @@ impl DesiredAccess {
         Self { raw }
     }
 
-    /// Returns the WDK access mask for `IoCheckShareAccess`.
+    /// Returns the requested WDK access mask for create authorization.
     pub(crate) const fn as_raw(self) -> wdk_sys::ACCESS_MASK {
         self.raw
     }
 
-    /// Adds rights implied only for the duration of an existing-object operation.
-    const fn including_for_operation(
+    /// Returns whether the request includes every selected access bit.
+    pub(crate) const fn requests(self, mask: wdk_sys::ACCESS_MASK) -> bool {
+        self.raw & mask == mask
+    }
+}
+
+impl GrantedAccess {
+    /// Constructs concrete rights after the access-check boundary authorizes them.
+    const fn from_authorized(raw: wdk_sys::ACCESS_MASK) -> Self {
+        Self { raw }
+    }
+
+    /// Returns the WDK mask used for share-access accounting.
+    pub(crate) const fn as_raw(self) -> wdk_sys::ACCESS_MASK {
+        self.raw
+    }
+
+    /// Adds rights needed only while preflighting an existing-object operation.
+    pub(crate) const fn including_for_operation(
         self,
         required: wdk_sys::ACCESS_MASK,
     ) -> ExistingOperationAccess {
@@ -3011,7 +3275,7 @@ impl DesiredAccess {
         }
     }
 
-    /// Projects Windows desired-access bits into regular-file write authority.
+    /// Projects authorized Windows rights into regular-file write authority.
     pub(crate) const fn regular_file_write_access(self) -> RegularFileWriteAccess {
         if self.contains(wdk_sys::FILE_WRITE_DATA) {
             RegularFileWriteAccess::Positional
@@ -3022,7 +3286,7 @@ impl DesiredAccess {
         }
     }
 
-    /// Projects Windows `DELETE` into retained per-handle authority.
+    /// Projects authorized `DELETE` into retained per-handle authority.
     pub(crate) const fn delete_access(self) -> DeleteAccess {
         if self.contains(wdk_sys::DELETE) {
             DeleteAccess::Granted
@@ -3031,7 +3295,7 @@ impl DesiredAccess {
         }
     }
 
-    /// Projects Windows `FILE_WRITE_ATTRIBUTES` into retained per-handle authority.
+    /// Projects authorized `FILE_WRITE_ATTRIBUTES` into retained authority.
     pub(crate) const fn file_attributes_write_access(self) -> FileAttributesWriteAccess {
         if self.contains(wdk_sys::FILE_WRITE_ATTRIBUTES) {
             FileAttributesWriteAccess::Granted
@@ -3043,6 +3307,263 @@ impl DesiredAccess {
     /// Returns whether all selected access bits are present.
     const fn contains(self, mask: wdk_sys::ACCESS_MASK) -> bool {
         self.raw & mask == mask
+    }
+}
+
+impl CreateAccessState<'_> {
+    /// Returns whether path traversal must be checked directory by directory.
+    #[expect(
+        unsafe_code,
+        reason = "the active create owner uniquely retains ACCESS_STATE observation for this bounded call"
+    )]
+    pub(crate) fn requires_traverse_checks(&self) -> bool {
+        let state = unsafe {
+            // SAFETY: The active create IRP retains the non-null ACCESS_STATE for this view.
+            self.access_state.as_ref()
+        };
+        state.Flags & wdk_sys::TOKEN_HAS_TRAVERSE_PRIVILEGE == 0
+    }
+
+    /// Authorizes and records the rights that become persistent handle authority.
+    /// # Errors
+    ///
+    /// Returns the exact Security Reference Monitor or privilege-recording failure.
+    #[expect(
+        unsafe_code,
+        reason = "the access-state mutation and Security Reference Monitor call are confined to the active create owner"
+    )]
+    pub(crate) fn authorize_requested(
+        &mut self,
+        descriptor: SecurityDescriptorRef<'_>,
+        requested: DesiredAccess,
+    ) -> DriverResult<GrantedAccess> {
+        let kernel_mode = wdk_sys::KPROCESSOR_MODE::try_from(wdk_sys::_MODE::KernelMode)
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        if self.access_mode == kernel_mode {
+            let granted = unrestricted_file_access(requested.as_raw());
+            let state = unsafe {
+                // SAFETY: The active create is the sole ACCESS_STATE executor; no native call
+                // overlaps this field update.
+                self.access_state.as_mut()
+            };
+            state.PreviouslyGrantedAccess |= granted;
+            state.RemainingDesiredAccess = 0;
+            return Ok(GrantedAccess::from_authorized(
+                state.PreviouslyGrantedAccess,
+            ));
+        }
+
+        let (desired, previously_granted) = unsafe {
+            // SAFETY: Snapshot fields before the native check; no reference is retained across
+            // the call that may update the ACCESS_STATE privilege set.
+            let state = self.access_state.as_ref();
+            match self.access_check {
+                CreateAccessCheck::HonorRequestorMode => (
+                    map_file_generic_access(state.RemainingDesiredAccess),
+                    map_file_generic_access(state.PreviouslyGrantedAccess),
+                ),
+                CreateAccessCheck::ForceUserMode => (
+                    map_file_generic_access(requested.as_raw() | state.RemainingDesiredAccess),
+                    0,
+                ),
+            }
+        };
+        let granted = if desired == 0 {
+            previously_granted
+        } else {
+            self.check(descriptor, desired, previously_granted)?
+        };
+        let state = unsafe {
+            // SAFETY: The native check has completed and released all state borrows.
+            self.access_state.as_mut()
+        };
+        state.PreviouslyGrantedAccess = previously_granted | granted;
+        state.RemainingDesiredAccess = desired & !(granted | wdk_sys::MAXIMUM_ALLOWED);
+        Ok(GrantedAccess::from_authorized(
+            state.PreviouslyGrantedAccess,
+        ))
+    }
+
+    /// Checks operation-only rights without turning them into returned handle authority.
+    /// # Errors
+    ///
+    /// Returns the exact Security Reference Monitor or privilege-recording failure.
+    pub(crate) fn authorize_operation(
+        &mut self,
+        descriptor: SecurityDescriptorRef<'_>,
+        required: wdk_sys::ACCESS_MASK,
+    ) -> DriverResult<()> {
+        if required == 0 {
+            return Ok(());
+        }
+        let kernel_mode = wdk_sys::KPROCESSOR_MODE::try_from(wdk_sys::_MODE::KernelMode)
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        if self.access_mode == kernel_mode {
+            return Ok(());
+        }
+        self.check(descriptor, required, 0).map(|_| ())
+    }
+
+    /// Authorizes creation in the containing directory, including privilege-only rights, before
+    /// recording the initial handle's rights. Parent creation permission cannot grant SACL access.
+    /// # Errors
+    ///
+    /// Returns the parent access-check or explicit privilege-check failure without granting a
+    /// handle. No ACCESS_STATE rights are published until both checks succeed.
+    #[expect(
+        unsafe_code,
+        reason = "the active create owner exclusively records newly-created handle authority"
+    )]
+    pub(crate) fn authorize_child_creation(
+        &mut self,
+        parent: SecurityDescriptorRef<'_>,
+        required: wdk_sys::ACCESS_MASK,
+        requested: DesiredAccess,
+    ) -> DriverResult<GrantedAccess> {
+        self.authorize_operation(parent, required)?;
+        self.authorize_operation(parent, requested.as_raw() & wdk_sys::ACCESS_SYSTEM_SECURITY)?;
+        let granted = unrestricted_file_access(requested.as_raw());
+        let state = unsafe {
+            // SAFETY: This owner-bound mutable view is the sole create executor touching ACCESS_STATE.
+            self.access_state.as_mut()
+        };
+        state.PreviouslyGrantedAccess = granted;
+        state.RemainingDesiredAccess = 0;
+        Ok(GrantedAccess::from_authorized(
+            state.PreviouslyGrantedAccess,
+        ))
+    }
+
+    /// Performs one descriptor check while retaining all privilege cleanup responsibility.
+    /// # Errors
+    ///
+    /// Returns the native access denial or privilege-recording failure. Returned privilege
+    /// storage is released on every outcome before control returns to the create executor.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "this is the audited Security Reference Monitor FFI boundary for a live create ACCESS_STATE"
+    )]
+    fn check(
+        &mut self,
+        descriptor: SecurityDescriptorRef<'_>,
+        desired: wdk_sys::ACCESS_MASK,
+        previously_granted: wdk_sys::ACCESS_MASK,
+    ) -> DriverResult<wdk_sys::ACCESS_MASK> {
+        let mapping = unsafe {
+            // SAFETY: The I/O Manager owns the immutable file-object generic mapping for the
+            // running kernel; this actor calls the security monitor at PASSIVE_LEVEL.
+            ffi::IoGetFileObjectGenericMapping()
+        };
+        unsafe {
+            // SAFETY: This owner exclusively retains ACCESS_STATE and the WDK mapping remains
+            // valid through both this preparation and the access check below.
+            ffi::SeSetAccessStateGenericMapping(self.access_state.as_ptr(), mapping);
+        }
+        let state = unsafe {
+            // SAFETY: The active create owner retains exclusive mutation authority for ACCESS_STATE.
+            self.access_state.as_mut()
+        };
+        let mut privileges: wdk_sys::PPRIVILEGE_SET = core::ptr::null_mut();
+        let mut granted = 0;
+        let mut access_status = wdk_sys::STATUS_ACCESS_DENIED;
+        unsafe {
+            // SAFETY: The subject context is embedded in the live ACCESS_STATE and remains locked
+            // only across this non-panicking SeAccessCheck call.
+            ffi::SeLockSubjectContext(core::ptr::addr_of_mut!(state.SubjectSecurityContext));
+        }
+        let allowed = unsafe {
+            // SAFETY: Every pointer names live storage for the duration of the call; the complete
+            // self-relative descriptor is owned by the create resolve pass.
+            ffi::SeAccessCheck(
+                descriptor.as_ptr(),
+                core::ptr::addr_of_mut!(state.SubjectSecurityContext),
+                1,
+                desired,
+                previously_granted,
+                core::ptr::addr_of_mut!(privileges),
+                mapping,
+                self.access_mode,
+                core::ptr::addr_of_mut!(granted),
+                core::ptr::addr_of_mut!(access_status),
+            )
+        };
+        unsafe {
+            // SAFETY: This exactly balances the immediately preceding subject-context lock.
+            ffi::SeUnlockSubjectContext(core::ptr::addr_of_mut!(state.SubjectSecurityContext));
+        }
+
+        let append_status = if allowed != 0 && !privileges.is_null() {
+            Some(unsafe {
+                // SAFETY: SeAccessCheck returned this privilege set and the active ACCESS_STATE is
+                // the required destination for audit/close semantics.
+                ffi::SeAppendPrivileges(self.access_state.as_ptr(), privileges)
+            })
+        } else {
+            None
+        };
+        if !privileges.is_null() {
+            unsafe {
+                // SAFETY: SeAccessCheck transferred this allocation to the caller exactly once.
+                ffi::SeFreePrivileges(privileges);
+            }
+        }
+        if let Some(status) = append_status
+            && status < 0
+        {
+            return Err(DriverError::PrivilegeRecordingFailed(status));
+        }
+        if allowed == 0 {
+            return Err(DriverError::SecurityCheckFailed(if access_status < 0 {
+                access_status
+            } else {
+                wdk_sys::STATUS_ACCESS_DENIED
+            }));
+        }
+        Ok(granted)
+    }
+
+    /// Kernel token checks cannot run in the user-mode unit-test process.
+    /// # Errors
+    ///
+    /// Always returns not-supported; a unit-test process cannot grant kernel token authority.
+    #[cfg(test)]
+    fn check(
+        &mut self,
+        _descriptor: SecurityDescriptorRef<'_>,
+        _desired: wdk_sys::ACCESS_MASK,
+        _previously_granted: wdk_sys::ACCESS_MASK,
+    ) -> DriverResult<wdk_sys::ACCESS_MASK> {
+        Err(DriverError::NotSupported)
+    }
+}
+
+/// Maps generic file rights while leaving MAXIMUM_ALLOWED for the descriptor-based access check.
+const fn map_file_generic_access(raw: wdk_sys::ACCESS_MASK) -> wdk_sys::ACCESS_MASK {
+    let mut mapped = raw;
+    if mapped & wdk_sys::GENERIC_READ != 0 {
+        mapped = (mapped & !wdk_sys::GENERIC_READ) | wdk_sys::FILE_GENERIC_READ;
+    }
+    if mapped & wdk_sys::GENERIC_WRITE != 0 {
+        mapped = (mapped & !wdk_sys::GENERIC_WRITE) | wdk_sys::FILE_GENERIC_WRITE;
+    }
+    if mapped & wdk_sys::GENERIC_EXECUTE != 0 {
+        mapped = (mapped & !wdk_sys::GENERIC_EXECUTE) | wdk_sys::FILE_GENERIC_EXECUTE;
+    }
+    if mapped & wdk_sys::GENERIC_ALL != 0 {
+        mapped = (mapped & !wdk_sys::GENERIC_ALL) | wdk_sys::FILE_ALL_ACCESS;
+    }
+    mapped
+}
+
+/// Expands the full file access request only for trusted kernel opens or newly created objects
+/// whose parent and privilege-only access have already been checked.
+const fn unrestricted_file_access(raw: wdk_sys::ACCESS_MASK) -> wdk_sys::ACCESS_MASK {
+    let mapped = map_file_generic_access(raw);
+    if mapped & wdk_sys::MAXIMUM_ALLOWED != 0 {
+        (mapped & !wdk_sys::MAXIMUM_ALLOWED) | wdk_sys::FILE_ALL_ACCESS
+    } else {
+        mapped
     }
 }
 
@@ -3182,7 +3703,7 @@ impl CreateSynchronizationMode {
     ///
     /// Returns an error when the caller omitted `SYNCHRONIZE`.
     fn synchronized(desired_access: DesiredAccess, mode: Self) -> DriverResult<Self> {
-        if !desired_access.contains(wdk_sys::SYNCHRONIZE) {
+        if !desired_access.requests(wdk_sys::SYNCHRONIZE) {
             return Err(DriverError::InvalidParameter);
         }
         Ok(mode)
@@ -3234,7 +3755,9 @@ impl CreateDeletion {
     /// Returns access denied when delete-on-close is requested without `DELETE`.
     fn from_options(options: wdk_sys::ULONG, desired_access: DesiredAccess) -> DriverResult<Self> {
         if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
-            desired_access.delete_access().require()?;
+            if !desired_access.requests(wdk_sys::DELETE) {
+                return Err(DriverError::AccessDenied);
+            }
             Ok(Self::DeleteOnClose)
         } else {
             Ok(Self::Retain)
@@ -3561,11 +4084,43 @@ pub(crate) struct NotifyDirectoryStack {
     watch_scope: DirectoryWatchScope,
 }
 
+/// Output record format selected by `IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryNotifyInformationClass {
+    /// `FILE_NOTIFY_INFORMATION` records.
+    Standard,
+    /// `FILE_NOTIFY_EXTENDED_INFORMATION` records.
+    Extended,
+    /// `FILE_NOTIFY_FULL_INFORMATION` records.
+    Full,
+}
+
+impl DirectoryNotifyInformationClass {
+    /// Decodes the WDK information-class enum.
+    /// # Errors
+    ///
+    /// Returns invalid-info-class when the value does not identify a defined notification layout.
+    fn from_raw(value: wdk_sys::DIRECTORY_NOTIFY_INFORMATION_CLASS) -> DriverResult<Self> {
+        match value {
+            wdk_sys::_DIRECTORY_NOTIFY_INFORMATION_CLASS::DirectoryNotifyInformation => {
+                Ok(Self::Standard)
+            }
+            wdk_sys::_DIRECTORY_NOTIFY_INFORMATION_CLASS::DirectoryNotifyExtendedInformation => {
+                Ok(Self::Extended)
+            }
+            wdk_sys::_DIRECTORY_NOTIFY_INFORMATION_CLASS::DirectoryNotifyFullInformation => {
+                Ok(Self::Full)
+            }
+            _ => Err(DriverError::InvalidInfoClass),
+        }
+    }
+}
+
 /// Decoded query-EA stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryEaStack {
-    /// EA selection requested by the caller.
-    selection: EaSelection,
+    /// FILE_OBJECT cursor transition selected by the caller.
+    cursor_position: EaCursorPosition,
     /// EA entry emission cardinality.
     entry_emission: EaEntryEmission,
     /// Output buffer length.
@@ -3809,9 +4364,9 @@ impl NotifyDirectoryStack {
 }
 
 impl QueryEaStack {
-    /// Returns the EA selection.
-    pub(crate) const fn selection(self) -> EaSelection {
-        self.selection
+    /// Returns the FILE_OBJECT cursor transition selected by the caller.
+    pub(crate) const fn cursor_position(self) -> EaCursorPosition {
+        self.cursor_position
     }
 
     /// Returns EA entry emission cardinality.
@@ -3861,22 +4416,23 @@ mod tests {
     use alloc::boxed::Box;
     use core::ffi::c_void;
 
-    use ext4_core::FileOffset;
+    use ext4_core::{FileOffset, WindowsNameMatch};
     use wdk_sys::{STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
 
     use super::{
-        ActiveFileObject, CREATE_DISPOSITION_SHIFT, CreateAction, CreateCompletion,
-        CreateDisposition, CreateNameInterpretation, CreateReparsePointMode,
+        ActiveFileObject, CREATE_DISPOSITION_SHIFT, CreateAccessCheck, CreateAction,
+        CreateCompletion, CreateDisposition, CreateNameInterpretation, CreateReparsePointMode,
         CreateSymlinkReparseBuffer, CreateSynchronizationMode, CreateTargetRequirement,
-        CreateTransferBuffering, CurrentIrpStackLocation, DataIoKind, DirectoryChangeFilter,
-        DirectoryControlMinorFunction, DirectoryCursorPosition, DirectoryEntryEmission,
-        DirectoryInformationClass, DirectoryWatchScope, DispatchTarget, EaEntryEmission,
-        EaEntryIndex, EaSelection, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
-        FILE_OVERWRITE_DISPOSITION, FILE_OVERWRITE_IF_DISPOSITION, FILE_SUPERSEDE_DISPOSITION,
-        FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
-        IrpCompletion, KernelIrp, OwnedIrp, QueryFileInformationClass, QueryVolumeInformationClass,
-        ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess, SetFileInformationClass,
-        SetVolumeInformationClass, WriteStartingPoint,
+        CreateTargetSelection, CreateTransferBuffering, CurrentIrpStackLocation, DataIoKind,
+        DirectoryChangeFilter, DirectoryControlMinorFunction, DirectoryCursorPosition,
+        DirectoryEntryEmission, DirectoryInformationClass, DirectoryNotifyInformationClass,
+        DirectoryWatchScope, DispatchTarget, EaCursorPosition, EaEntryEmission, EaEntryIndex,
+        FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION, FILE_OVERWRITE_DISPOSITION,
+        FILE_OVERWRITE_IF_DISPOSITION, FILE_SUPERSEDE_DISPOSITION, FileSystemControlMinorFunction,
+        FsControlCode, InformationLength, IrpBufferLength, IrpCompletion, KernelIrp, OwnedIrp,
+        QueryFileInformationClass, QueryVolumeInformationClass, ReadStartingPoint, ReceivedIrp,
+        RegularFileWriteAccess, SetFileInformationClass, SetVolumeInformationClass,
+        WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
     use crate::security_descriptor::SecurityComponentSelection;
@@ -4236,6 +4792,11 @@ mod tests {
         for (action, expected) in [
             (CreateAction::Opened, wdk_sys::FILE_OPENED),
             (CreateAction::Created, wdk_sys::FILE_CREATED),
+            (CreateAction::TargetExists, wdk_sys::FILE_EXISTS),
+            (
+                CreateAction::TargetDoesNotExist,
+                wdk_sys::FILE_DOES_NOT_EXIST,
+            ),
         ] {
             let mut device_object = wdk_sys::DEVICE_OBJECT::default();
             let device = kernel_device_fixture(&mut device_object);
@@ -4579,6 +5140,12 @@ mod tests {
             ..wdk_sys::IO_SECURITY_CONTEXT::default()
         };
         let mut stack = wdk_sys::IO_STACK_LOCATION {
+            Flags: u8::try_from(
+                wdk_sys::SL_CASE_SENSITIVE
+                    | wdk_sys::SL_FORCE_ACCESS_CHECK
+                    | wdk_sys::SL_OPEN_TARGET_DIRECTORY,
+            )
+            .unwrap_or(u8::MAX),
             FileObject: file_object.as_ptr(),
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
@@ -4639,6 +5206,54 @@ mod tests {
                     wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE
                 );
                 assert_eq!(parameters.ea_length().as_usize(), 48);
+                assert_eq!(parameters.name_match(), WindowsNameMatch::Exact);
+                assert_eq!(parameters.access_check(), CreateAccessCheck::ForceUserMode);
+                assert_eq!(
+                    parameters.target_selection(),
+                    CreateTargetSelection::ParentDirectory
+                );
+                assert_eq!(parameters.validate_supported_flags(), Ok(()));
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a special create stack flag is silently treated as an ordinary open.
+    #[test]
+    fn create_stack_rejects_unimplemented_special_flag_protocols() {
+        for flag in [
+            wdk_sys::SL_OPEN_PAGING_FILE,
+            wdk_sys::SL_STOP_ON_SYMLINK,
+            wdk_sys::SL_IGNORE_READONLY_ATTRIBUTE,
+        ] {
+            let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                Flags: u8::try_from(flag).unwrap_or(u8::MAX),
+                FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+                SecurityContext: core::ptr::addr_of_mut!(security_context),
+                Options: FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT,
+                __bindgen_padding_0: [0; 2],
+                FileAttributes: 0,
+                ShareAccess: 0,
+                __bindgen_padding_1: 0,
+                EaLength: 0,
+            };
+
+            let current = current_stack_fixture(&mut stack);
+            assert!(current.is_ok());
+            if let Ok(current) = current {
+                let create = current.create();
+                assert!(create.is_ok());
+                if let Ok(create) = create {
+                    assert_eq!(
+                        create.parameters().validate_supported_flags(),
+                        Err(DriverError::NotSupported)
+                    );
+                }
             }
         }
     }
@@ -4724,8 +5339,8 @@ mod tests {
                     requested_access
                 );
                 assert_eq!(
-                    create.parameters().existing_operation_access().as_raw(),
-                    requested_access | required_access
+                    create.parameters().existing_operation_required_access(),
+                    required_access
                 );
             }
         }
@@ -4839,6 +5454,15 @@ mod tests {
                 assert_eq!(
                     parameters.name_interpretation(),
                     CreateNameInterpretation::Path
+                );
+                assert_eq!(parameters.name_match(), WindowsNameMatch::CaseInsensitive);
+                assert_eq!(
+                    parameters.access_check(),
+                    CreateAccessCheck::HonorRequestorMode
+                );
+                assert_eq!(
+                    parameters.target_selection(),
+                    CreateTargetSelection::NamedObject
                 );
             }
         }
@@ -5088,7 +5712,10 @@ mod tests {
                 );
                 assert_eq!(query.entry_emission(), EaEntryEmission::Single);
                 assert_eq!(query.length().as_usize(), 128);
-                assert_eq!(query.selection(), EaSelection::All);
+                assert_eq!(
+                    query.cursor_position(),
+                    EaCursorPosition::Index(EaEntryIndex(3))
+                );
                 assert_eq!(
                     current.query_ea_name_list().ok().flatten(),
                     Some((ea_list.cast(), super::IrpBufferLength(24)))
@@ -5121,7 +5748,46 @@ mod tests {
             let query = current.query_ea();
             assert!(query.is_ok());
             if let Ok(query) = query {
-                assert_eq!(query.selection(), EaSelection::Index(EaEntryIndex(3)));
+                assert_eq!(
+                    query.cursor_position(),
+                    EaCursorPosition::Index(EaEntryIndex(3))
+                );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when restart and continuation requests collapse into one EA cursor transition.
+    #[test]
+    fn query_ea_stack_distinguishes_restart_from_current_cursor() {
+        for (flags, expected) in [
+            (0, EaCursorPosition::Current),
+            (
+                u8::try_from(wdk_sys::SL_RESTART_SCAN).unwrap_or(u8::MAX),
+                EaCursorPosition::Restart,
+            ),
+        ] {
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                Flags: flags,
+                FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.QueryEa = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_11 {
+                Length: 128,
+                EaList: core::ptr::null_mut(),
+                EaListLength: 0,
+                __bindgen_padding_0: 0,
+                EaIndex: 0,
+            };
+
+            let current = current_stack_fixture(&mut stack);
+            assert!(current.is_ok());
+            if let Ok(current) = current {
+                assert_eq!(
+                    current.query_ea().map(|query| query.cursor_position()),
+                    Ok(expected)
+                );
             }
         }
     }
@@ -5581,7 +6247,7 @@ mod tests {
     ///
     /// Panics when desired access does not produce one exclusive write authority.
     #[test]
-    fn desired_access_projects_regular_file_write_authority() {
+    fn granted_access_projects_regular_file_write_authority() {
         for (raw, expected) in [
             (0, RegularFileWriteAccess::Denied),
             (
@@ -5595,23 +6261,93 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                super::DesiredAccess::from_raw(raw).regular_file_write_access(),
+                super::GrantedAccess::from_authorized(raw).regular_file_write_access(),
                 expected
             );
         }
+    }
+
+    /// Forced user-mode checks must reach the native security check even when a kernel request
+    /// carries previously granted access. The user-mode harness reports native checks unsupported.
+    /// # Panics
+    ///
+    /// Panics if cached kernel rights bypass a forced user-mode check.
+    /// # Errors
+    ///
+    /// Returns fixture construction failures or an unexpected trusted-kernel authorization error.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "test assertions report contract failures while Result propagates fixture setup errors"
+    )]
+    fn forced_user_access_does_not_reuse_kernel_grants() -> Result<(), DriverError> {
+        let security = ext4_core::Ext4Security::new(
+            ext4_core::Ext4Owner::new(
+                ext4_core::Ext4Uid::from_u32(0),
+                ext4_core::Ext4Gid::from_u32(0),
+            ),
+            ext4_core::Ext4Permissions::new(0)?,
+        );
+        let descriptor =
+            crate::request::security::CreateSecurityDescriptor::from_security(security)?;
+        let requested = super::DesiredAccess::from_raw(wdk_sys::GENERIC_WRITE);
+        for policy in [
+            CreateAccessCheck::HonorRequestorMode,
+            CreateAccessCheck::ForceUserMode,
+        ] {
+            let mut access_state = wdk_sys::ACCESS_STATE {
+                PreviouslyGrantedAccess: wdk_sys::FILE_ALL_ACCESS,
+                ..wdk_sys::ACCESS_STATE::default()
+            };
+            let mut context = wdk_sys::IO_SECURITY_CONTEXT {
+                AccessState: core::ptr::from_mut(&mut access_state),
+                DesiredAccess: requested.as_raw(),
+                ..wdk_sys::IO_SECURITY_CONTEXT::default()
+            };
+            let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+            stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
+                SecurityContext: core::ptr::from_mut(&mut context),
+                ..Default::default()
+            };
+            let kernel_mode = wdk_sys::KPROCESSOR_MODE::try_from(wdk_sys::_MODE::KernelMode)
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            let current = current_stack_fixture(&mut stack)?;
+            let mut state = current.create_access_state(kernel_mode, policy)?;
+            let result = state.authorize_requested(descriptor.as_native(), requested);
+            match policy {
+                CreateAccessCheck::HonorRequestorMode => {
+                    assert_eq!(result?.as_raw(), wdk_sys::FILE_ALL_ACCESS);
+                }
+                CreateAccessCheck::ForceUserMode => {
+                    assert_eq!(result, Err(DriverError::NotSupported));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// # Panics
+    ///
+    /// Panics if generic mapping expands descriptor-dependent maximum access prematurely.
+    #[test]
+    fn generic_mapping_preserves_maximum_for_security_evaluation() {
+        assert_eq!(
+            super::map_file_generic_access(wdk_sys::GENERIC_READ | wdk_sys::MAXIMUM_ALLOWED),
+            wdk_sys::FILE_GENERIC_READ | wdk_sys::MAXIMUM_ALLOWED
+        );
     }
 
     /// # Panics
     ///
     /// Panics when `DELETE` is not retained as an explicit handle authority.
     #[test]
-    fn desired_access_projects_delete_authority() {
+    fn granted_access_projects_delete_authority() {
         assert_eq!(
-            super::DesiredAccess::from_raw(0).delete_access(),
+            super::GrantedAccess::from_authorized(0).delete_access(),
             super::DeleteAccess::Denied
         );
         assert_eq!(
-            super::DesiredAccess::from_raw(wdk_sys::DELETE).delete_access(),
+            super::GrantedAccess::from_authorized(wdk_sys::DELETE).delete_access(),
             super::DeleteAccess::Granted
         );
         assert_eq!(
@@ -5625,13 +6361,13 @@ mod tests {
     ///
     /// Panics when `FILE_WRITE_ATTRIBUTES` is not retained as an explicit handle authority.
     #[test]
-    fn desired_access_projects_file_attributes_write_authority() {
+    fn granted_access_projects_file_attributes_write_authority() {
         assert_eq!(
-            super::DesiredAccess::from_raw(0).file_attributes_write_access(),
+            super::GrantedAccess::from_authorized(0).file_attributes_write_access(),
             super::FileAttributesWriteAccess::Denied
         );
         assert_eq!(
-            super::DesiredAccess::from_raw(wdk_sys::FILE_WRITE_ATTRIBUTES)
+            super::GrantedAccess::from_authorized(wdk_sys::FILE_WRITE_ATTRIBUTES)
                 .file_attributes_write_access(),
             super::FileAttributesWriteAccess::Granted
         );
@@ -5670,11 +6406,8 @@ mod tests {
                     CreateTransferBuffering::NoIntermediate
                 );
                 assert_eq!(
-                    create
-                        .parameters()
-                        .desired_access()
-                        .regular_file_write_access(),
-                    RegularFileWriteAccess::AppendOnly
+                    create.parameters().desired_access().as_raw(),
+                    wdk_sys::FILE_APPEND_DATA
                 );
             }
         }
@@ -6124,6 +6857,53 @@ mod tests {
                     notification.watch_scope(),
                     DirectoryWatchScope::DirectChildren
                 );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the extended notify minor function or its output format is decoded through the
+    /// standard notification contract.
+    #[test]
+    fn notify_directory_ex_stack_preserves_minor_and_information_class() {
+        for (raw, expected) in [
+            (
+                wdk_sys::_DIRECTORY_NOTIFY_INFORMATION_CLASS::DirectoryNotifyInformation,
+                DirectoryNotifyInformationClass::Standard,
+            ),
+            (
+                wdk_sys::_DIRECTORY_NOTIFY_INFORMATION_CLASS::DirectoryNotifyExtendedInformation,
+                DirectoryNotifyInformationClass::Extended,
+            ),
+            (
+                wdk_sys::_DIRECTORY_NOTIFY_INFORMATION_CLASS::DirectoryNotifyFullInformation,
+                DirectoryNotifyInformationClass::Full,
+            ),
+        ] {
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                MinorFunction: u8::try_from(wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX)
+                    .unwrap_or(u8::MAX),
+                FileObject: NonNull::<wdk_sys::FILE_OBJECT>::dangling().as_ptr(),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.NotifyDirectoryEx =
+                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_8 {
+                    Length: 512,
+                    __bindgen_padding_0: 0,
+                    CompletionFilter: wdk_sys::FILE_NOTIFY_CHANGE_FILE_NAME,
+                    __bindgen_padding_1: 0,
+                    DirectoryNotifyInformationClass: raw,
+                };
+
+            let current = current_stack_fixture(&mut stack);
+            assert!(current.is_ok());
+            if let Ok(current) = current {
+                assert_eq!(
+                    current.directory_control_minor(),
+                    DirectoryControlMinorFunction::NotifyChangeDirectoryEx
+                );
+                assert_eq!(current.notify_directory_ex(), Ok(expected));
             }
         }
     }

@@ -1501,7 +1501,11 @@ fn prepare_hard_link_destination(
     HardLinkDirectoryChanges,
 )> {
     let parent = read.load_directory(target_parent)?;
-    let target = read.lookup_windows_child(&parent, target_windows_name)?;
+    let target = read.lookup_windows_child(
+        &parent,
+        target_windows_name,
+        ext4_core::WindowsNameMatch::CaseInsensitive,
+    )?;
     let ChildLookup::Found(target) = target else {
         return Ok((
             PreparedHardLinkDestination::Vacant,
@@ -1759,7 +1763,11 @@ impl RenameDirectoryNameChanges {
             RenameTargetCollision::Reject => None,
             RenameTargetCollision::Replace => {
                 let parent = read.load_directory(target_parent)?;
-                match read.lookup_windows_child(&parent, &WindowsName::from_ext4(target_name)?)? {
+                match read.lookup_windows_child(
+                    &parent,
+                    &WindowsName::from_ext4(target_name)?,
+                    ext4_core::WindowsNameMatch::CaseInsensitive,
+                )? {
                     ChildLookup::Found(child) if *child.node() == source_node => return Ok(None),
                     ChildLookup::Found(child) => {
                         operations.ensure_node_replaceable(*child.node())?;
@@ -3330,7 +3338,11 @@ fn resolve_namespace_target(
         let parent = read
             .load_directory(parent_id)
             .map_err(|_| DriverError::ObjectPathNotFound)?;
-        let child = read.lookup_windows_child(&parent, component)?;
+        let child = read.lookup_windows_child(
+            &parent,
+            component,
+            ext4_core::WindowsNameMatch::CaseInsensitive,
+        )?;
         match child {
             ChildLookup::Found(child) => {
                 let NodeId::Directory(directory_id) = *child.node() else {

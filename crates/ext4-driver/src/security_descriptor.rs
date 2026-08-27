@@ -2,6 +2,35 @@
 
 use crate::kernel::status::{DriverError, DriverResult};
 
+/// Immutable, owner-bound descriptor accepted by the native security reference monitor.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SecurityDescriptorRef<'a> {
+    /// Complete self-relative image retained by its descriptor owner.
+    bytes: &'a [u8],
+}
+
+impl<'a> SecurityDescriptorRef<'a> {
+    /// Borrows an already validated native descriptor image.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` must be suitably aligned and encode a complete, valid self-relative security
+    /// descriptor whose owner, group, ACLs, and referenced SIDs are contained in the slice. Native
+    /// access checks may read the image but must not mutate it.
+    #[expect(
+        unsafe_code,
+        reason = "descriptor encoders establish the native layout invariant once before creating this immutable view"
+    )]
+    pub(crate) unsafe fn from_validated_bytes(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    /// Returns the borrowed address only for native input parameters.
+    pub(crate) fn as_ptr(self) -> wdk_sys::PSECURITY_DESCRIPTOR {
+        self.bytes.as_ptr().cast_mut().cast()
+    }
+}
+
 /// Serialized `SECURITY_DESCRIPTOR_RELATIVE` header length.
 pub(crate) const SECURITY_DESCRIPTOR_RELATIVE_BYTES: usize = 20;
 /// Serialized SID bytes before the first sub-authority.
@@ -60,6 +89,15 @@ pub(crate) struct SecuritySelection {
 }
 
 impl SecuritySelection {
+    /// Selects every component represented by the ext4 owner/mode security model.
+    pub(crate) const fn complete() -> Self {
+        Self::from_components(
+            SecurityComponentSelection::Selected,
+            SecurityComponentSelection::Selected,
+            SecurityComponentSelection::Selected,
+        )
+    }
+
     /// Builds a security selection from already-decoded component states.
     pub(crate) const fn from_components(
         owner: SecurityComponentSelection,

@@ -577,6 +577,10 @@ impl<O> PreparedStorageCommand<O> {
     /// Returns the suspended command when IRP, MDL, envelope, or completion-rundown preparation
     /// fails before registration.
     #[cfg(not(test))]
+    #[expect(
+        clippy::result_large_err,
+        reason = "pre-submission failure must return the command and its suspended owner without allocating another fallible error container"
+    )]
     pub fn build_lower<R>(
         self,
         destination: R,
