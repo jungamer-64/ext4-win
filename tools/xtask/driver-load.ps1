@@ -53,6 +53,65 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments, [string]$Descrip
     }
 }
 
+function Write-ServiceStartFailureDiagnostics([datetime]$AttemptStartedAt, [System.Management.Automation.ErrorRecord]$Failure) {
+    $exception = $Failure.Exception
+    $depth = 0
+    while ($exception -and $depth -lt 8) {
+        Write-Output ("service start exception[{0}]: type={1} hresult=0x{2:X8} message={3}" -f `
+            $depth,
+            $exception.GetType().FullName,
+            ([BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$exception.HResult), 0)),
+            $exception.Message)
+        $exception = $exception.InnerException
+        $depth++
+    }
+
+    Write-Output 'service start SCM state:'
+    & sc.exe query $serviceName 2>&1 | ForEach-Object { Write-Output $_ }
+    Write-Output "service start SCM query exit code: $LASTEXITCODE"
+
+    try {
+        $driver = Get-CimInstance -ClassName Win32_SystemDriver -Filter "Name='$serviceName'" -ErrorAction Stop
+        Write-Output ("service start CIM state: State={0} Status={1} Started={2} ExitCode={3} ServiceSpecificExitCode={4}" -f `
+            $driver.State,
+            $driver.Status,
+            $driver.Started,
+            $driver.ExitCode,
+            $driver.ServiceSpecificExitCode)
+    }
+    catch {
+        Write-Output "service start CIM diagnostic unavailable: $($_.Exception.Message)"
+    }
+
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = 'System'
+            StartTime = $AttemptStartedAt.AddSeconds(-2)
+        } -ErrorAction Stop | Where-Object {
+            $_.ProviderName -in @(
+                'Service Control Manager',
+                'Microsoft-Windows-CodeIntegrity',
+                'Microsoft-Windows-Kernel-PnP'
+            ) -and ($_.Message -match '(?i)ext4win' -or $_.Id -in @(219, 7000, 7001, 7009, 7026))
+        } | Select-Object -First 20)
+        if ($events.Count -eq 0) {
+            Write-Output 'service start relevant System events: none'
+        }
+        foreach ($event in $events) {
+            $message = ([string]$event.Message).Replace("`r", ' ').Replace("`n", ' ')
+            Write-Output ("service start System event: Time={0:o} Provider={1} Id={2} Level={3} Message={4}" -f `
+                $event.TimeCreated,
+                $event.ProviderName,
+                $event.Id,
+                $event.LevelDisplayName,
+                $message)
+        }
+    }
+    catch {
+        Write-Output "service start System-event diagnostic unavailable: $($_.Exception.Message)"
+    }
+}
+
 function Get-Sha256FileHash([string]$Path) {
     $stream = [IO.File]::Open(
         $Path,
@@ -702,7 +761,14 @@ function Start-DriverLoadSession(
     Write-Phase 'PackageInstalled'
 
     Write-Phase 'ServiceStartRequested'
-    Start-Service -Name $serviceName -ErrorAction Stop
+    $serviceStartAttempt = Get-Date
+    try {
+        Start-Service -Name $serviceName -ErrorAction Stop
+    }
+    catch {
+        Write-ServiceStartFailureDiagnostics $serviceStartAttempt $_
+        throw
+    }
     $service = Get-Service -Name $serviceName -ErrorAction Stop
     $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(15))
     if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Running) {
