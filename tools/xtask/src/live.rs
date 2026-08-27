@@ -1,6 +1,8 @@
 use crate::{
     TaskResult,
-    driver_load::{DriverLoadSessionId, check_hosted_driver_host},
+    driver_load::{
+        DriverLoadSessionId, append_verified_bundle_arguments, check_hosted_driver_host,
+    },
     process::{require_file, run_checked},
     production::{VerifiedProductionBundle, build_verified_production_bundle},
 };
@@ -28,12 +30,7 @@ pub(crate) fn verify_live_vhdx(repository_root: &Path) -> TaskResult<()> {
     check_live_driver_host(repository_root)?;
     let bundle = build_verified_production_bundle(repository_root)?;
     let session_id = DriverLoadSessionId::create(repository_root)?;
-    run_live_vhdx_script(
-        repository_root,
-        "Run",
-        Some(bundle.as_path()),
-        Some(&session_id),
-    )?;
+    run_live_vhdx_script(repository_root, "Run", Some(&bundle), Some(&session_id))?;
     println!("live VHDX driver assurance: PASS");
     println!("session: {}", session_id.as_str());
     Ok(())
@@ -104,7 +101,7 @@ fn run_live_vhdx_script(
         .arg("-RepositoryRoot")
         .arg(repository_root);
     if let Some(bundle) = bundle {
-        command.arg("-Bundle").arg(bundle);
+        append_verified_bundle_arguments(&mut command, bundle);
     }
     if let Some(session_id) = session_id {
         command.arg("-SessionId").arg(session_id.as_str());
