@@ -1,12 +1,12 @@
 //! Windows extended-attribute IRP handling.
 
 use crate::irp::{
-    ActiveIrp, EaEntryEmission, EaEntryIndex, IrpBufferLength, IrpCompletion, PendingIrpLease,
+    ActiveIrp, EaCursorPosition, EaEntryEmission, IrpBufferLength, IrpCompletion, PendingIrpLease,
     PreparedEaSelection, SetEaStack,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
-use crate::state::{OpenedObject, PendingChildCreation};
+use crate::state::{EaCursor, OpenedObject, PendingChildCreation};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{CommittedReadPass, XattrName, XattrNamespace, XattrValue};
 
@@ -44,13 +44,14 @@ pub(crate) fn query(
     mut request_irp: PendingIrpLease<'_>,
     read: &mut impl CommittedReadPass,
 ) -> DriverResult<IrpCompletion> {
+    let (node, current_cursor) = request_irp.with_active(|active| {
+        let opened = OpenedObject::decode(active.current_stack()?.file_object()?)?;
+        Ok::<_, DriverError>((opened.node(), opened.ea_cursor()))
+    })?;
     let prepared = request_irp.prepared_query_ea()?;
     let stack = prepared.stack();
-    let selection = requested_eas(prepared.selection())?;
-    let node = request_irp.with_active(|active| {
-        let opened_file = OpenedObject::decode(active.current_stack()?.file_object()?)?;
-        Ok::<_, DriverError>(opened_file.node())
-    })?;
+    let prepared_selection = prepared.selection();
+    let selection = requested_eas(prepared_selection, stack.cursor_position(), current_cursor)?;
     let request = QueryEaRequest {
         request: request_irp,
         length: stack.length(),
@@ -292,12 +293,26 @@ impl WindowsEaRecord {
 /// Query-EA name selection.
 #[derive(Debug, Eq, PartialEq)]
 enum WindowsEaSelection {
-    /// Return every persisted EA.
-    All,
+    /// Enumerate persisted EAs from one FILE_OBJECT cursor transition.
+    Enumerate {
+        /// Zero-based first entry.
+        cursor: EaCursor,
+        /// Reason this starting point was selected.
+        origin: EaEnumerationOrigin,
+    },
     /// Return only the requested names.
     Names(DriverVec<WindowsEaName>),
-    /// Return persisted EAs starting at a one-based EA index.
-    Index(EaEntryIndex),
+}
+
+/// Semantic origin of an EA enumeration starting point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EaEnumerationOrigin {
+    /// Existing FILE_OBJECT continuation.
+    Current,
+    /// Explicit restart at the beginning.
+    Restart,
+    /// Caller supplied a one-based index.
+    Index,
 }
 
 /// Performs an EA query against mounted ext4 xattrs.
@@ -310,32 +325,63 @@ fn query_ea(
     read: &mut impl CommittedReadPass,
 ) -> DriverResult<IrpCompletion> {
     let entries = load_windows_eas(read, request.node)?;
-    let entries = collect_query_entries(entries, request.selection)?;
-    let entries = if matches!(request.entry_emission, EaEntryEmission::Single) {
-        entries.as_slice().get(..entries.len().min(1))
-    } else {
-        Some(entries.as_slice())
-    }
-    .ok_or(DriverError::InvalidParameter)?;
-    if entries.is_empty() {
+    let (entries, start, cursor) = match request.selection {
+        WindowsEaSelection::Names(names) => (collect_named_query_entries(entries, names)?, 0, None),
+        WindowsEaSelection::Enumerate { cursor, origin } => {
+            let start = validate_enumeration_start(entries.len(), cursor, origin)?;
+            (entries, start, Some(cursor))
+        }
+    };
+    let remaining = entries
+        .as_slice()
+        .get(start..)
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    if remaining.is_empty() {
         return Err(DriverError::NoEasOnFile);
     }
-
-    let length = request.length;
-    let required = packed_full_ea_length(entries)?;
-    if length.as_usize() < required {
+    let maximum_entries = if matches!(request.entry_emission, EaEntryEmission::Single) {
+        1
+    } else {
+        remaining.len()
+    };
+    let emitted = fitting_full_ea_prefix(
+        remaining
+            .get(..maximum_entries)
+            .ok_or(DriverError::InternalInvariantViolation)?,
+        request.length.as_usize(),
+    )?;
+    if emitted == 0 {
         return Err(DriverError::BufferTooSmall);
     }
+    let output_entries = remaining
+        .get(..emitted)
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    let length = request.length;
+    let required = packed_full_ea_length(output_entries)?;
     let mut packed = DriverVec::try_repeated_copy(0_u8, required)?;
-    let written = pack_full_ea_entries(entries, packed.as_mut_slice())?;
+    let written = pack_full_ea_entries(output_entries, packed.as_mut_slice())?;
+    let completion = if matches!(request.entry_emission, EaEntryEmission::Multiple)
+        && emitted < remaining.len()
+    {
+        IrpCompletion::buffer_overflow(written)?
+    } else {
+        IrpCompletion::from_usize(written)?
+    };
     let source = packed
         .as_slice()
         .get(..written)
         .ok_or(DriverError::InternalInvariantViolation)?;
-    request
-        .request
-        .with_active(|active| active.requestor_output(length)?.copy_from(0, source))?;
-    IrpCompletion::from_usize(written)
+    let next_cursor = cursor.map(|cursor| cursor.advanced(emitted)).transpose()?;
+    request.request.with_active(|active| {
+        let (mut output, file_object) = active.requestor_output_with_file_object(length)?;
+        let mut opened = OpenedObject::decode(file_object)?;
+        output.copy_from(0, source)?;
+        if let Some(next) = next_cursor {
+            opened.publish_ea_cursor(next);
+        }
+        Ok::<_, DriverError>(())
+    })?;
+    Ok(completion)
 }
 
 /// Applies set-EA records to `user.ext4win.ea.*` xattrs.
@@ -354,25 +400,51 @@ fn set_ea(
 /// # Errors
 ///
 /// Returns an error when persisted EAs or the caller's requested EA-name list cannot be parsed.
-fn collect_query_entries(
+fn collect_named_query_entries(
     entries: DriverVec<WindowsEaRecord>,
-    selection: WindowsEaSelection,
+    names: DriverVec<WindowsEaName>,
 ) -> DriverResult<DriverVec<WindowsEaRecord>> {
-    match selection {
-        WindowsEaSelection::All => Ok(entries),
-        WindowsEaSelection::Names(names) => {
-            let mut selected = DriverVec::new();
-            for requested in names.iter() {
-                if let Some(entry) = entries.iter().find(|entry| entry.name == *requested) {
-                    selected
-                        .try_push_owned(entry.try_clone()?)
-                        .map_err(|error| error.into_parts().0)?;
-                }
-            }
-            Ok(selected)
+    let mut selected = DriverVec::new();
+    for requested in names.iter() {
+        if let Some(entry) = entries.iter().find(|entry| entry.name == *requested) {
+            selected
+                .try_push_owned(entry.try_clone()?)
+                .map_err(|error| error.into_parts().0)?;
         }
-        WindowsEaSelection::Index(index) => indexed_ea_entries(entries, index),
     }
+    Ok(selected)
+}
+
+/// Validates an EA enumeration starting point against the current persisted list.
+/// # Errors
+///
+/// Distinguishes an empty EA set, an exhausted continuation, and an explicit nonexistent index.
+fn validate_enumeration_start(
+    entry_count: usize,
+    cursor: EaCursor,
+    origin: EaEnumerationOrigin,
+) -> DriverResult<usize> {
+    let start = cursor.next_entry();
+    if entry_count == 0 {
+        return match origin {
+            EaEnumerationOrigin::Index => Err(DriverError::NonexistentEaEntry),
+            EaEnumerationOrigin::Current | EaEnumerationOrigin::Restart => {
+                Err(DriverError::NoEasOnFile)
+            }
+        };
+    }
+    if start == entry_count {
+        return Err(DriverError::NoMoreEas);
+    }
+    if start > entry_count {
+        return match origin {
+            EaEnumerationOrigin::Index => Err(DriverError::NonexistentEaEntry),
+            EaEnumerationOrigin::Current | EaEnumerationOrigin::Restart => {
+                Err(DriverError::NoMoreEas)
+            }
+        };
+    }
+    Ok(start)
 }
 
 /// Reads all ext4win Windows EA xattrs for the opened node.
@@ -470,50 +542,37 @@ fn parse_set_ea_entries(
 /// # Errors
 ///
 /// Returns an error when the caller's EA-name selection buffer is malformed.
-fn requested_eas(selection: &PreparedEaSelection) -> DriverResult<WindowsEaSelection> {
+fn requested_eas(
+    selection: &PreparedEaSelection,
+    position: EaCursorPosition,
+    current: EaCursor,
+) -> DriverResult<WindowsEaSelection> {
     match selection {
-        PreparedEaSelection::All => Ok(WindowsEaSelection::All),
+        PreparedEaSelection::Enumerate => match position {
+            EaCursorPosition::Current => Ok(WindowsEaSelection::Enumerate {
+                cursor: current,
+                origin: EaEnumerationOrigin::Current,
+            }),
+            EaCursorPosition::Restart => Ok(WindowsEaSelection::Enumerate {
+                cursor: EaCursor::START,
+                origin: EaEnumerationOrigin::Restart,
+            }),
+            EaCursorPosition::Index(index) => {
+                let one_based =
+                    usize::try_from(index.as_u32()).map_err(|_| DriverError::InvalidParameter)?;
+                let zero_based = one_based
+                    .checked_sub(1)
+                    .ok_or(DriverError::NonexistentEaEntry)?;
+                Ok(WindowsEaSelection::Enumerate {
+                    cursor: EaCursor::at(zero_based),
+                    origin: EaEnumerationOrigin::Index,
+                })
+            }
+        },
         PreparedEaSelection::Names(bytes) => {
             parse_get_ea_list(bytes.as_slice()).map(WindowsEaSelection::Names)
         }
-        PreparedEaSelection::Index(index) => Ok(WindowsEaSelection::Index(*index)),
     }
-}
-
-/// Selects EA entries starting at a caller-supplied one-based index.
-/// # Errors
-///
-/// Returns an error when the requested index is zero, beyond the enumerating end, or does not
-/// identify an existing EA entry.
-fn indexed_ea_entries(
-    entries: DriverVec<WindowsEaRecord>,
-    index: EaEntryIndex,
-) -> DriverResult<DriverVec<WindowsEaRecord>> {
-    let requested = usize::try_from(index.as_u32()).map_err(|_| DriverError::InvalidParameter)?;
-    if requested == 0 || entries.is_empty() {
-        return Err(DriverError::NonexistentEaEntry);
-    }
-    let start = requested
-        .checked_sub(1)
-        .ok_or(DriverError::InvalidParameter)?;
-    if start == entries.len() {
-        return Err(DriverError::NoMoreEas);
-    }
-    if start > entries.len() {
-        return Err(DriverError::NonexistentEaEntry);
-    }
-
-    let mut selected = DriverVec::new();
-    for entry in entries
-        .as_slice()
-        .get(start..)
-        .ok_or(DriverError::InvalidParameter)?
-    {
-        selected
-            .try_push_owned(entry.try_clone()?)
-            .map_err(|error| error.into_parts().0)?;
-    }
-    Ok(selected)
 }
 
 /// Parses a FILE_FULL_EA_INFORMATION list.
@@ -728,6 +787,40 @@ fn packed_full_ea_length(entries: &[WindowsEaRecord]) -> DriverResult<usize> {
     Ok(total)
 }
 
+/// Returns the largest complete EA-record prefix that fits the caller's output capacity.
+/// # Errors
+///
+/// Returns an error when record-size arithmetic exceeds the Windows EA domain.
+fn fitting_full_ea_prefix(entries: &[WindowsEaRecord], capacity: usize) -> DriverResult<usize> {
+    let mut fitted = 0usize;
+    let mut packed = 0usize;
+    let mut previous_raw = 0usize;
+    for entry in entries {
+        let raw = full_ea_record_length(entry.name.len(), entry.value.len())?;
+        let candidate = if fitted == 0 {
+            raw
+        } else {
+            packed
+                .checked_add(
+                    align_to_four(previous_raw)?
+                        .checked_sub(previous_raw)
+                        .ok_or(DriverError::InternalInvariantViolation)?,
+                )
+                .and_then(|length| length.checked_add(raw))
+                .ok_or(DriverError::EaTooLarge)?
+        };
+        if candidate > capacity {
+            break;
+        }
+        fitted = fitted
+            .checked_add(1)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        packed = candidate;
+        previous_raw = raw;
+    }
+    Ok(fitted)
+}
+
 /// Returns the unaligned FILE_FULL_EA_INFORMATION record length.
 /// # Errors
 ///
@@ -791,16 +884,17 @@ mod tests {
     use core::ffi::c_void;
 
     use crate::{
-        irp::{EaEntryIndex, ReceivedIrp},
+        irp::ReceivedIrp,
         kernel::status::DriverError,
         memory::DriverVec,
+        state::EaCursor,
         wire::{LittleEndianInput, LittleEndianOutput},
     };
 
     use super::{
-        CreateEa, EA_RECORD_ALIGNMENT, WindowsEaName, WindowsEaRecord, WindowsEaValue,
-        indexed_ea_entries, pack_full_ea_entries, parse_full_ea_list, parse_get_ea_list,
-        wire_offset, xattr_name_from_ea_name,
+        CreateEa, EA_RECORD_ALIGNMENT, EaEnumerationOrigin, WindowsEaName, WindowsEaRecord,
+        WindowsEaValue, fitting_full_ea_prefix, pack_full_ea_entries, parse_full_ea_list,
+        parse_get_ea_list, validate_enumeration_start, wire_offset, xattr_name_from_ea_name,
     };
 
     /// Builds a create dispatch target carrying one EA system buffer.
@@ -927,36 +1021,72 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn indexed_ea_entries_selects_one_based_suffix() {
-        let entries = sample_ea_records();
-        let selected = indexed_ea_entries(entries, EaEntryIndex::from_u32(2));
-        assert!(selected.is_ok());
-        if let Ok(selected) = selected {
-            let expected = sample_ea_records();
-            assert_eq!(
-                selected.as_slice(),
-                expected.as_slice().get(1..).unwrap_or(&[])
-            );
-        }
+    fn enumeration_cursor_selects_zero_based_continuation() {
+        assert_eq!(
+            validate_enumeration_start(3, EaCursor::at(1), EaEnumerationOrigin::Index),
+            Ok(1)
+        );
+        assert_eq!(
+            super::requested_eas(
+                &crate::irp::PreparedEaSelection::Enumerate,
+                crate::irp::EaCursorPosition::Current,
+                EaCursor::at(2),
+            ),
+            Ok(super::WindowsEaSelection::Enumerate {
+                cursor: EaCursor::at(2),
+                origin: EaEnumerationOrigin::Current,
+            })
+        );
+        assert_eq!(
+            super::requested_eas(
+                &crate::irp::PreparedEaSelection::Enumerate,
+                crate::irp::EaCursorPosition::Restart,
+                EaCursor::at(2),
+            ),
+            Ok(super::WindowsEaSelection::Enumerate {
+                cursor: EaCursor::START,
+                origin: EaEnumerationOrigin::Restart,
+            })
+        );
     }
 
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn indexed_ea_entries_rejects_non_entry_indexes() {
+    fn enumeration_cursor_rejects_non_entry_indexes() {
         assert_eq!(
-            indexed_ea_entries(sample_ea_records(), EaEntryIndex::from_u32(0)),
+            super::requested_eas(
+                &crate::irp::PreparedEaSelection::Enumerate,
+                crate::irp::EaCursorPosition::Index(crate::irp::EaEntryIndex::from_u32(0)),
+                EaCursor::START,
+            ),
             Err(DriverError::NonexistentEaEntry)
         );
         assert_eq!(
-            indexed_ea_entries(sample_ea_records(), EaEntryIndex::from_u32(4)),
+            validate_enumeration_start(3, EaCursor::at(3), EaEnumerationOrigin::Index),
             Err(DriverError::NoMoreEas)
         );
         assert_eq!(
-            indexed_ea_entries(sample_ea_records(), EaEntryIndex::from_u32(5)),
+            validate_enumeration_start(3, EaCursor::at(4), EaEnumerationOrigin::Index),
             Err(DriverError::NonexistentEaEntry)
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a variable EA buffer does not emit the largest complete prefix.
+    #[test]
+    fn fitting_prefix_stops_before_the_first_incomplete_record() {
+        let entries = sample_ea_records();
+        // WDK wire sizes: 8-byte header + name + NUL + value. Only nonfinal records are
+        // four-byte aligned, yielding prefix lengths 17, 20 + 16, and 20 + 16 + 19.
+        for (capacity, emitted) in [(16, 0), (17, 1), (35, 1), (36, 2), (54, 2), (55, 3)] {
+            assert_eq!(
+                fitting_full_ea_prefix(entries.as_slice(), capacity),
+                Ok(emitted)
+            );
+        }
     }
 
     /// # Panics

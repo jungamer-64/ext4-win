@@ -38,8 +38,8 @@ use wdk_sys::{LIST_ENTRY, PNOTIFY_SYNC, STATUS_PENDING};
 use crate::irp::reactor::ReactorTarget;
 use crate::irp::{
     ActiveFileObject, ByteRangeLockKey, CompletionReactor, CreateDeletion, DataIoKind,
-    DeleteAccess, DesiredAccess, DispatchTarget, ExistingOperationAccess,
-    FileAttributesWriteAccess, RegularFileWriteAccess, RequestorProcess, ShareAccess,
+    DeleteAccess, DispatchTarget, ExistingOperationAccess, FileAttributesWriteAccess,
+    GrantedAccess, RegularFileWriteAccess, RequestorProcess, ShareAccess,
 };
 use crate::kernel::cng::CngOperation;
 use crate::kernel::fatal::KernelWideInconsistency;
@@ -1301,7 +1301,7 @@ impl VolumeHandleLedger {
     fn open(
         &mut self,
         file_object: KernelFileObject,
-        desired_access: DesiredAccess,
+        desired_access: GrantedAccess,
         share_access: ShareAccess,
     ) -> DriverResult<()> {
         let status = unsafe {
@@ -1502,7 +1502,7 @@ impl MountedVolumeAccess<'_> {
     pub(crate) fn open_volume_handle(
         &mut self,
         file_object: KernelFileObject,
-        desired_access: DesiredAccess,
+        desired_access: GrantedAccess,
         share_access: ShareAccess,
     ) -> DriverResult<()> {
         let control = &mut self.volume.volume_control;
@@ -2160,7 +2160,7 @@ impl FileControlBlockLedger {
         volume: NonNull<VolumeControlBlock>,
         node: NodeId,
         file_object: KernelFileObject,
-        desired_access: DesiredAccess,
+        desired_access: GrantedAccess,
         existing_operation_access: ExistingOperationAccess,
         share_access: ShareAccess,
     ) -> DriverResult<NonNull<FileControlBlock>> {
@@ -2183,7 +2183,7 @@ impl FileControlBlockLedger {
         volume: NonNull<VolumeControlBlock>,
         node: NodeId,
         file_object: KernelFileObject,
-        desired_access: DesiredAccess,
+        desired_access: GrantedAccess,
         share_access: ShareAccess,
     ) -> DriverResult<NonNull<FileControlBlock>> {
         self.open(
@@ -2209,7 +2209,7 @@ impl FileControlBlockLedger {
         volume: NonNull<VolumeControlBlock>,
         node: NodeId,
         file_object: KernelFileObject,
-        desired_access: DesiredAccess,
+        desired_access: GrantedAccess,
         share_access: ShareAccess,
         share_check: FileControlBlockShareCheck,
     ) -> DriverResult<NonNull<FileControlBlock>> {
@@ -2287,7 +2287,7 @@ impl FileControlBlockLedger {
         &self,
         node: NodeId,
         file_object: KernelFileObject,
-        desired_access: DesiredAccess,
+        desired_access: GrantedAccess,
         share_access: ShareAccess,
         share_check: FileControlBlockShareCheck,
     ) -> Option<DriverResult<NonNull<FileControlBlock>>> {
@@ -2610,7 +2610,7 @@ impl VolumeControlBlock {
         volume: NonNull<Self>,
         node: NodeId,
         file_object: KernelFileObject,
-        desired_access: DesiredAccess,
+        desired_access: GrantedAccess,
         existing_operation_access: ExistingOperationAccess,
         share_access: ShareAccess,
     ) -> DriverResult<NonNull<FileControlBlock>> {
@@ -3237,7 +3237,7 @@ impl PendingChildCreation {
     pub(crate) fn open_file_control_block(
         &self,
         file_object: KernelFileObject,
-        desired_access: DesiredAccess,
+        desired_access: GrantedAccess,
         share_access: ShareAccess,
     ) -> DriverResult<NonNull<FileControlBlock>> {
         unsafe {
@@ -3295,7 +3295,7 @@ fn record_reused_file_control_block_open(
     table: &DriverVec<Box<FileControlBlock>>,
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
-    desired_access: DesiredAccess,
+    desired_access: GrantedAccess,
     share_access: ShareAccess,
     share_check: FileControlBlockShareCheck,
 ) -> DriverResult<()> {
@@ -3323,7 +3323,7 @@ fn record_file_control_block_share(
     table: &DriverVec<Box<FileControlBlock>>,
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
-    desired_access: DesiredAccess,
+    desired_access: GrantedAccess,
     share_access: ShareAccess,
     share_check: FileControlBlockShareCheck,
 ) -> DriverResult<()> {
@@ -4141,7 +4141,7 @@ impl FileControlBlockOpenState {
     fn record_share_access(
         &mut self,
         file_object: KernelFileObject,
-        desired_access: DesiredAccess,
+        desired_access: GrantedAccess,
         share_access: ShareAccess,
         share_check: FileControlBlockShareCheck,
     ) -> DriverResult<()> {
@@ -4562,6 +4562,40 @@ enum FileControlBlockRelease {
 
 /// Core-owned live-directory continuation stored directly in the CCB.
 pub(crate) type DirectoryCursor = DirectoryScanCursor;
+
+/// Zero-based index of the next EA returned through one FILE_OBJECT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EaCursor {
+    /// Next persisted EA index.
+    next_entry: usize,
+}
+
+impl EaCursor {
+    /// Cursor before the first EA.
+    pub(crate) const START: Self = Self { next_entry: 0 };
+
+    /// Builds a cursor at an already validated zero-based entry index.
+    pub(crate) const fn at(next_entry: usize) -> Self {
+        Self { next_entry }
+    }
+
+    /// Returns the zero-based entry index selected for the next query.
+    pub(crate) const fn next_entry(self) -> usize {
+        self.next_entry
+    }
+
+    /// Advances by the number of entries actually published to the caller.
+    /// # Errors
+    ///
+    /// Returns an invariant error when cursor arithmetic overflows.
+    pub(crate) fn advanced(self, emitted: usize) -> DriverResult<Self> {
+        Ok(Self::at(
+            self.next_entry
+                .checked_add(emitted)
+                .ok_or(DriverError::InternalInvariantViolation)?,
+        ))
+    }
+}
 
 /// Stable namespace identity selected for a deferred Windows deletion.
 #[derive(Debug, Eq, PartialEq)]
@@ -5161,6 +5195,8 @@ struct OpenedHandleState {
     data_transfer_mode: DataTransferMode,
     /// Stable FsRtl directory-name descriptor, retained even if the opened node changes kind.
     directory_notification_name: UnsafeCell<DirectoryNotificationName>,
+    /// FILE_OBJECT-local continuation for ordinary EA enumeration.
+    ea_cursor: UnsafeCell<EaCursor>,
 }
 
 impl OpenedHandleState {
@@ -5178,6 +5214,31 @@ impl OpenedHandleState {
             deletion,
             data_transfer_mode,
             directory_notification_name: UnsafeCell::new(DirectoryNotificationName::Unregistered),
+            ea_cursor: UnsafeCell::new(EaCursor::START),
+        }
+    }
+
+    /// Reads the current EA continuation under the per-FILE_OBJECT operation lane.
+    #[expect(
+        unsafe_code,
+        reason = "the device operation lane serializes every EA cursor observation and publication"
+    )]
+    fn ea_cursor(&self) -> EaCursor {
+        unsafe {
+            // SAFETY: Ordinary operations on this FILE_OBJECT are serialized by its device lane.
+            *self.ea_cursor.get()
+        }
+    }
+
+    /// Publishes the next EA continuation after output bytes become caller-visible.
+    #[expect(
+        unsafe_code,
+        reason = "the device operation lane serializes every EA cursor observation and publication"
+    )]
+    fn publish_ea_cursor(&self, cursor: EaCursor) {
+        unsafe {
+            // SAFETY: Ordinary operations on this FILE_OBJECT are serialized by its device lane.
+            *self.ea_cursor.get() = cursor;
         }
     }
 
@@ -5601,6 +5662,16 @@ impl<'owner> OpenedObject<'owner> {
     /// Returns the ext4 node identity owned by the shared FCB.
     pub(crate) fn node(&self) -> NodeId {
         self.file_control_block().node()
+    }
+
+    /// Returns this FILE_OBJECT's next ordinary EA enumeration position.
+    pub(crate) fn ea_cursor(&self) -> EaCursor {
+        self.handle().state.ea_cursor()
+    }
+
+    /// Publishes the next ordinary EA enumeration position.
+    pub(crate) fn publish_ea_cursor(&mut self, cursor: EaCursor) {
+        self.handle().state.publish_ea_cursor(cursor);
     }
 
     /// Returns the opened location identity.

@@ -5,7 +5,7 @@ use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::security_descriptor::{
     ACCESS_ALLOWED_ACE_PREFIX_BYTES, ACL_HEADER_BYTES, SECURITY_DESCRIPTOR_RELATIVE_BYTES,
-    SID_PREFIX_BYTES, SecurityComponentSelection, SecuritySelection,
+    SID_PREFIX_BYTES, SecurityComponentSelection, SecurityDescriptorRef, SecuritySelection,
 };
 use crate::state::OpenedObject;
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
@@ -35,6 +35,47 @@ const SECURITY_NT_NON_UNIQUE_AUTHORITY: u64 = 22;
 const SECURITY_WORLD_AUTHORITY: u64 = 1;
 /// POSIX permission bits stored in ext4 mode.
 const POSIX_RWX_BITS: u16 = 0o777;
+
+/// Complete self-relative descriptor used only while authorizing one create operation.
+#[derive(Debug)]
+pub(crate) struct CreateSecurityDescriptor {
+    /// Owned descriptor bytes retained across restartable metadata reads.
+    bytes: DriverVec<u8>,
+}
+
+impl CreateSecurityDescriptor {
+    /// Builds a complete descriptor for one existing ext4 node.
+    /// # Errors
+    ///
+    /// Returns an error when node security cannot be loaded or the descriptor cannot be allocated.
+    pub(crate) fn for_node(read: &mut impl CommittedReadPass, node: NodeId) -> DriverResult<Self> {
+        Self::from_security(security_from_node(read, node)?)
+    }
+
+    /// Builds a complete descriptor from already validated ext4 security metadata.
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor image cannot be allocated or encoded.
+    pub(crate) fn from_security(security: Ext4Security) -> DriverResult<Self> {
+        Ok(Self {
+            bytes: security_descriptor(security, SecuritySelection::complete())?,
+        })
+    }
+
+    /// Borrows the complete descriptor for one native access check.
+    #[expect(
+        unsafe_code,
+        reason = "the complete descriptor encoder owns the native layout and all referenced components"
+    )]
+    pub(crate) fn as_native(&self) -> SecurityDescriptorRef<'_> {
+        unsafe {
+            // SAFETY: The constructor encodes a complete self-relative header, owner/group SIDs,
+            // and DACL into one pool-aligned allocation. Every component offset is four-byte
+            // aligned and within the immutable image retained for this borrow.
+            SecurityDescriptorRef::from_validated_bytes(self.bytes.as_slice())
+        }
+    }
+}
 
 /// Executes IRP_MJ_QUERY_SECURITY.
 /// # Errors
@@ -981,6 +1022,51 @@ mod tests {
         parse_dacl_permissions, permission_bits_from_mask, permission_class_mask,
         security_descriptor, security_from_descriptor, sid_identity, uid_sid, wire_offset,
     };
+
+    #[link(name = "advapi32")]
+    #[expect(
+        unsafe_code,
+        reason = "this test-only import validates encoded descriptors with the independent Windows security parser"
+    )]
+    unsafe extern "system" {
+        /// Checks the descriptor through the Win32 security API.
+        #[link_name = "IsValidSecurityDescriptor"]
+        fn native_security_descriptor_is_valid(descriptor: *const core::ffi::c_void) -> i32;
+    }
+
+    /// Complete create descriptors are accepted by the native parser for boundary owner/mode
+    /// values, independently of the repository's encoder and decoder round-trip.
+    /// # Panics
+    ///
+    /// Panics if an encoded descriptor is malformed according to Windows.
+    /// # Errors
+    ///
+    /// Returns fixture allocation or encoding failures.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "native validation assertions report test failures while Result propagates fixture setup errors"
+    )]
+    #[expect(
+        unsafe_code,
+        reason = "the checked encoder retains one complete descriptor throughout the native validation call"
+    )]
+    fn create_descriptors_pass_native_validation() -> Result<(), DriverError> {
+        for (uid, gid, mode) in [(0, 0, 0), (1000, 1000, 0o644), (u32::MAX, u32::MAX, 0o777)] {
+            let security = Ext4Security::new(
+                Ext4Owner::new(Ext4Uid::from_u32(uid), Ext4Gid::from_u32(gid)),
+                Ext4Permissions::new(mode)?,
+            );
+            let descriptor = super::CreateSecurityDescriptor::from_security(security)?;
+            let valid = unsafe {
+                // SAFETY: The descriptor constructor encodes a complete self-relative image in
+                // live immutable storage, including every referenced SID and ACL.
+                native_security_descriptor_is_valid(descriptor.as_native().as_ptr())
+            };
+            assert_ne!(valid, 0);
+        }
+        Ok(())
+    }
 
     fn all_security_components() -> SecuritySelection {
         SecuritySelection::from_components(

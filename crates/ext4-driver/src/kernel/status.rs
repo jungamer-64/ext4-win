@@ -31,6 +31,10 @@ pub(crate) enum DriverError {
     InsufficientResources,
     /// Access is denied by the current FSD policy.
     AccessDenied,
+    /// The Security Reference Monitor supplied the exact failed access status.
+    SecurityCheckFailed(NTSTATUS),
+    /// Privileges used by a successful check could not be recorded in the create access state.
+    PrivilegeRecordingFailed(NTSTATUS),
     /// The target inode has entered the terminal delete-pending namespace state.
     DeletePending,
     /// CLEANUP closed ordinary admission for this FILE_OBJECT.
@@ -115,6 +119,7 @@ impl DriverError {
             Self::InternalInvariantViolation => STATUS_INTERNAL_ERROR,
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,
+            Self::SecurityCheckFailed(status) | Self::PrivilegeRecordingFailed(status) => status,
             Self::DeletePending => ntstatus(0xC000_0056),
             Self::FileClosed => ntstatus(0xC000_0128),
             Self::DeviceBusy => ntstatus(0xC000_009E),
@@ -299,6 +304,20 @@ mod tests {
         assert_eq!(
             DriverError::from(Error::OperationCancelled).ntstatus(),
             STATUS_CANCELLED
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when native create-security failures lose their exact NTSTATUS identity.
+    #[test]
+    fn create_security_failures_preserve_native_status() {
+        let denied = wdk_sys::STATUS_ACCESS_DENIED;
+        let resources = wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
+        assert_eq!(DriverError::SecurityCheckFailed(denied).ntstatus(), denied);
+        assert_eq!(
+            DriverError::PrivilegeRecordingFailed(resources).ntstatus(),
+            resources
         );
     }
 

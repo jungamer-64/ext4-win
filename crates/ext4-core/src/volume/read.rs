@@ -1560,8 +1560,8 @@ impl EpochReadView<'_, '_> {
         name_match: super::operation::WindowsNameMatch,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<Option<DirectoryEntry>> {
-        if parent.protection().is_encrypted() {
-            let visible_name = requested.to_ext4()?;
+        let visible_name = requested.to_ext4()?;
+        let exact_entry = if parent.protection().is_encrypted() {
             let ciphertext =
                 match self.encrypt_directory_child_name(parent.inode(), &visible_name, crypto) {
                     Ok(ciphertext) => ciphertext,
@@ -1575,18 +1575,15 @@ impl EpochReadView<'_, '_> {
                     }
                     Err(error) => return Err(error),
                 };
-            let entry = self.find_raw_directory_entry(parent.inode(), &ciphertext)?;
-            return match entry {
-                Some(entry) => Ok(Some(self.validate_directory_entry(entry, &visible_name)?)),
-                None => Ok(None),
-            };
-        }
-        if parent.protection().is_verity() {
-            return Err(Error::UnsupportedVerity);
-        }
-        let exact = requested.to_ext4()?;
-        if let Some(raw) = self.find_raw_directory_entry(parent.inode(), &exact)? {
-            return Ok(Some(self.validate_directory_entry(raw, &exact)?));
+            self.find_raw_directory_entry(parent.inode(), &ciphertext)?
+        } else {
+            if parent.protection().is_verity() {
+                return Err(Error::UnsupportedVerity);
+            }
+            self.find_raw_directory_entry(parent.inode(), &visible_name)?
+        };
+        if let Some(raw) = exact_entry {
+            return Ok(Some(self.validate_directory_entry(raw, &visible_name)?));
         }
         if matches!(name_match, super::operation::WindowsNameMatch::Exact) {
             return Ok(None);
