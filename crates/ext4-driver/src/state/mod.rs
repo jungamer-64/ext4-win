@@ -524,9 +524,7 @@ impl DriverDeviceKind {
 /// Common prefix shared by all driver-owned device extensions.
 #[repr(C)]
 struct DeviceExtensionHeader {
-    /// Device-owned completion-driven operation reactor.
-    reactor: CompletionReactor,
-    /// Concrete extension kind following the reactor prefix.
+    /// Concrete extension kind retained until the I/O Manager frees the device.
     kind: DeviceExtensionKind,
 }
 
@@ -768,35 +766,6 @@ impl ControlDeviceExtension {
         }
     }
 
-    /// Releases a control extension after the external prepare-unload transition.
-    /// # Safety
-    ///
-    /// The I/O Manager must have invoked `DriverUnload`, excluding every dispatch callback.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    unsafe fn release_prepared(device: KernelDevice) {
-        let extension = unsafe {
-            // SAFETY: DriverUnload retains exclusive access to this control device.
-            Self::from_device(device)
-        }
-        .unwrap_or_else(|_| {
-            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck()
-        });
-        if extension.registration.state() != FileSystemRegistrationState::PreparedForUnload {
-            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
-        }
-        let target = unsafe {
-            // SAFETY: Prepare-unload stopped this exact reactor before releasing registration.
-            CompletionReactor::release_quiesced_at(
-                core::ptr::addr_of!(extension.header.reactor).cast_mut(),
-            )
-        };
-        if !matches!(target, ReactorTarget::ControlDevice) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-    }
 }
 
 /// Registered file system control device owned by the driver.
