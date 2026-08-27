@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  RUST_TOOLCHAIN: nightly-2026-08-23
+  RUST_TOOLCHAIN: nightly-2026-08-27
   E2FSPROGS_RELEASE: 1.47.2
 
   # Keep cargo-wdk aligned with the exact windows-drivers-rs revision
