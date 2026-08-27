@@ -1425,6 +1425,21 @@ impl<State> Journal<State> {
         }))
     }
 
+    /// Admits a bounded metadata operation before any of its persistent effects begin.
+    /// # Errors
+    /// Returns an unsupported-journal error if the complete reserved payload cannot fit the ring.
+    pub(crate) fn require_metadata_capacity(
+        &self,
+        payloads: usize,
+        block_size: BlockSize,
+    ) -> Result<()> {
+        match self.journal_credits(payloads, block_size) {
+            Ok(_) => Ok(()),
+            Err(Error::TransactionTooLarge) => Err(Error::UnsupportedJournal),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Serializes every commit, publish-overlay, and checkpoint allocation before the first write.
     /// # Errors
     ///

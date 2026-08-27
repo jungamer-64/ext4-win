@@ -6,8 +6,11 @@ mod allocation;
 mod commit;
 mod file_data;
 mod namespace;
+mod orphan;
 mod staging;
 mod xattr;
+
+pub(super) use orphan::{ORPHAN_METADATA_BUDGET, OrphanBatchCompletion, prepare_orphan_batch};
 
 use commit::{
     descriptor_byte_count, directory_entry_kind, map_extents, reject_reserved_directory_name,
@@ -300,12 +303,18 @@ impl TransactionNode {
 
 /// Restart-local mutation resolver that owns no committed or coordinator state.
 pub struct MutationResolvePass<'storage, 'epoch, 'crypto> {
-    /// Ephemeral view of the selected committed epoch and operation transcript.
-    volume: EpochReadView<'storage, 'epoch>,
+    /// Timestamp supplied by the ordinary mutation caller, not by mount recovery.
+    now: Ext4Timestamp,
+    /// Filesystem staging authority, independent of cryptographic execution.
+    mutation: MetadataMutation<'storage, 'epoch>,
     /// Mutable provider objects owned by the enclosing top-level operation.
     crypto: &'crypto mut dyn CryptographicOperation,
-    /// Timestamp applied consistently to staged inode updates.
-    now: Ext4Timestamp,
+}
+
+/// Private metadata, allocation, and serialization authority shared by ordinary mutation and recovery.
+struct MetadataMutation<'storage, 'epoch> {
+    /// Ephemeral view of the selected committed epoch and operation transcript.
+    volume: EpochReadView<'storage, 'epoch>,
     /// Inode records staged for rewrite at commit.
     inode_updates: Vec<StagedInodeRecord>,
     /// Block bitmap images staged for allocation changes.
@@ -696,49 +705,14 @@ impl CleanJournalDurability {
     }
 }
 
-impl<'storage, 'epoch, 'crypto> MutationResolvePass<'storage, 'epoch, 'crypto> {
-    /// Starts an empty mutation resolve pass against one committed epoch.
-    pub(super) fn begin(
-        volume: EpochReadView<'storage, 'epoch>,
-        now: Ext4Timestamp,
-        crypto: &'crypto mut dyn CryptographicOperation,
-    ) -> Self {
-        Self {
-            volume,
-            crypto,
-            now,
-            inode_updates: Vec::new(),
-            block_bitmap_updates: Vec::new(),
-            inode_bitmap_updates: Vec::new(),
-            directory_updates: Vec::new(),
-            extent_updates: Vec::new(),
-            xattr_updates: Vec::new(),
-            group_deltas: Vec::new(),
-            data_writes: Vec::new(),
-            cluster_deltas: Vec::new(),
-            free_clusters_delta: FreeClusterDelta::ZERO,
-            free_inodes_delta: 0,
-            volume_label_update: None,
-            fscrypt_keys_update: None,
-        }
-    }
-}
 impl MutationResolvePass<'_, '_, '_> {
-    /// Verifies that the mounted profile admits xattr storage mutation.
-    /// # Errors
-    ///
-    /// Returns an error when mounted xattr feature flags do not permit xattr storage mutation.
-    fn require_xattr_mutation(&self) -> Result<()> {
-        self.volume.superblock.xattr_mutation().require_supported()
-    }
-
     /// Selects any supported inode for POSIX metadata mutation.
     ///
     /// # Errors
     /// Returns an error when the inode cannot be read or carries mutation
     /// semantics outside the write domain.
     pub fn node(&mut self, id: NodeId) -> Result<TransactionNode> {
-        let inode = self.volume.read_inode_record(id.inode())?;
+        let inode = self.mutation.volume.read_inode_record(id.inode())?;
         let _metadata = inode.metadata_mutation()?;
         match (id, inode.kind()) {
             (NodeId::File(_), InodeKind::File)
@@ -753,7 +727,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// # Errors
     /// Returns an error when the inode is not a regular file or cannot be read.
     pub fn file(&mut self, id: FileNodeId) -> Result<TransactionFile> {
-        let inode = self.volume.read_inode_record(id.inode())?;
+        let inode = self.mutation.volume.read_inode_record(id.inode())?;
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
@@ -765,7 +739,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// # Errors
     /// Returns an error when the inode is not a directory or cannot be read.
     pub fn directory(&mut self, id: DirectoryNodeId) -> Result<TransactionDirectory> {
-        let inode = self.volume.read_inode_record(id.inode())?;
+        let inode = self.mutation.volume.read_inode_record(id.inode())?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
@@ -778,7 +752,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when the inode is not a symbolic link or carries
     /// mutation semantics outside the write domain.
     pub fn symlink(&mut self, id: SymlinkNodeId) -> Result<TransactionSymlink> {
-        let inode = self.volume.read_inode_record(id.inode())?;
+        let inode = self.mutation.volume.read_inode_record(id.inode())?;
         if inode.kind() != InodeKind::Symlink {
             return Err(Error::WrongInodeKind);
         }
@@ -791,7 +765,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// # Errors
     /// Returns an error when the typed identity does not match the inode or names a directory.
     pub fn hard_link_source(&mut self, id: HardLinkNodeId) -> Result<TransactionHardLinkSource> {
-        let inode = self.volume.read_inode_record(id.inode())?;
+        let inode = self.mutation.volume.read_inode_record(id.inode())?;
         let _metadata = inode.metadata_mutation()?;
         match (id, inode.kind()) {
             (HardLinkNodeId::File(_), InodeKind::File)
@@ -814,14 +788,17 @@ impl MutationResolvePass<'_, '_, '_> {
         node: TransactionNode,
         security: Ext4Security,
     ) -> Result<()> {
-        let inode_index = self.ensure_inode_update(node.inode())?;
-        let mut raw_inode = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(node.inode())?;
+        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         let _metadata = inode.metadata_mutation()?;
         raw_inode.set_owner(security.owner())?;
         raw_inode.set_permissions(security.permissions())?;
-        raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.replace_live_inode(inode_index, raw_inode)?;
+        raw_inode.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
 
@@ -831,18 +808,21 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when the inode leaves the mutable write domain or the
     /// inode record cannot be rewritten.
     pub fn set_times(&mut self, node: TransactionNode, times: Ext4Times) -> Result<()> {
-        let inode_index = self.ensure_inode_update(node.inode())?;
-        let mut raw_inode = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(node.inode())?;
+        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         let _metadata = inode.metadata_mutation()?;
-        raw_inode.set_ext4_times(times, self.volume.superblock.inode_timestamp_encoding())?;
-        self.replace_live_inode(inode_index, raw_inode)?;
+        raw_inode.set_ext4_times(
+            times,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
 
     /// Replaces the ext4 volume label stored in the primary superblock.
     pub fn set_volume_label(&mut self, label: Ext4VolumeLabel) {
-        self.volume_label_update = Some(label);
+        self.mutation.volume_label_update = Some(label);
     }
 
     /// Adds one key to an operation-owned snapshot for allocation-free durable publication.
@@ -858,12 +838,12 @@ impl MutationResolvePass<'_, '_, '_> {
         if key.identifier() != expected_identifier {
             return Err(Error::InvalidEncryptionContext);
         }
-        let mut keys = match self.fscrypt_keys_update.take() {
+        let mut keys = match self.mutation.fscrypt_keys_update.take() {
             Some(keys) => keys,
-            None => self.volume.fscrypt_keys.try_clone()?,
+            None => self.mutation.volume.fscrypt_keys.try_clone()?,
         };
         keys.insert(key)?;
-        self.fscrypt_keys_update = Some(keys);
+        self.mutation.fscrypt_keys_update = Some(keys);
         Ok(())
     }
 
@@ -872,30 +852,13 @@ impl MutationResolvePass<'_, '_, '_> {
     ///
     /// Returns an error when cloning or rebuilding the key set fails.
     pub fn remove_fscrypt_key(&mut self, identifier: FscryptKeyIdentifier) -> Result<bool> {
-        let mut keys = match self.fscrypt_keys_update.take() {
+        let mut keys = match self.mutation.fscrypt_keys_update.take() {
             Some(keys) => keys,
-            None => self.volume.fscrypt_keys.try_clone()?,
+            None => self.mutation.volume.fscrypt_keys.try_clone()?,
         };
         let removed = keys.remove(identifier)?.is_some();
-        self.fscrypt_keys_update = Some(keys);
+        self.mutation.fscrypt_keys_update = Some(keys);
         Ok(removed)
-    }
-
-    /// Computes mounted cluster state after a successful commit.
-    /// # Errors
-    ///
-    /// Returns an error when staged cluster deltas conflict or the superblock free-cluster delta
-    /// cannot be applied.
-    fn committed_cluster_state(&self) -> Result<(ClusterReferenceIndex, Superblock)> {
-        let mut clusters = self.volume.committed_clusters()?.try_clone()?;
-        clusters.apply_deltas(self.cluster_deltas.as_slice())?;
-        let mut superblock = self.volume.superblock;
-        superblock.apply_free_cluster_delta(self.free_clusters_delta)?;
-        superblock.apply_free_inode_delta(self.free_inodes_delta)?;
-        if let Some(label) = self.volume_label_update {
-            superblock.apply_volume_label(label);
-        }
-        Ok((clusters, superblock))
     }
 
     /// Verifies directory-entry creation policy using the latest staged inode.
@@ -907,7 +870,7 @@ impl MutationResolvePass<'_, '_, '_> {
         &mut self,
         inode_id: InodeId,
     ) -> Result<DirectoryEntryMutationCapability> {
-        let raw_inode = self.raw_inode_for_policy(inode_id)?;
+        let raw_inode = self.mutation.raw_inode_for_policy(inode_id)?;
         let inode = raw_inode.parse()?;
         self.require_directory_entry_create_mutation_for_inode(&inode)
     }
@@ -925,7 +888,7 @@ impl MutationResolvePass<'_, '_, '_> {
             return Err(Error::WrongInodeKind);
         }
         if inode.protection().is_encrypted() {
-            self.volume.require_encryption_key(inode)?;
+            self.mutation.volume.require_encryption_key(inode)?;
         }
         inode.directory_entry_mutation()
     }
@@ -978,7 +941,8 @@ impl MutationResolvePass<'_, '_, '_> {
         if !parent.protection().is_encrypted() {
             return Ok(None);
         }
-        let (parent_context, _master_key) = self.volume.fscrypt_master_key_for_inode(parent)?;
+        let (parent_context, _master_key) =
+            self.mutation.volume.fscrypt_master_key_for_inode(parent)?;
         let mut nonce = [0_u8; 16];
         self.crypto.fill_random(&mut nonce)?;
         let nonce = FscryptFileNonce::new(nonce);
@@ -998,11 +962,159 @@ impl MutationResolvePass<'_, '_, '_> {
         let Some(context) = context else {
             return Ok(());
         };
-        self.require_xattr_mutation()?;
+        self.mutation.require_xattr_mutation()?;
         raw_inode.mark_encrypted()?;
-        let mut set = self.xattr_set_for_raw_inode(raw_inode)?;
+        let mut set = self.mutation.xattr_set_for_raw_inode(raw_inode)?;
         set.set_encryption_context(XattrValue::new(&context.to_bytes()?)?);
-        self.store_xattr_set(raw_inode, &set)
+        self.mutation.store_xattr_set(raw_inode, &set)
+    }
+}
+
+impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
+    fn load_file(&mut self, id: FileNodeId) -> Result<FileNode> {
+        self.mutation.volume.load_file(id)
+    }
+
+    fn load_directory(&mut self, id: DirectoryNodeId) -> Result<DirectoryNode> {
+        self.mutation.volume.load_directory(id)
+    }
+
+    fn load_symlink(&mut self, id: SymlinkNodeId) -> Result<SymlinkNode> {
+        self.mutation.volume.load_symlink(id)
+    }
+
+    fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId> {
+        self.mutation.volume.load_node_by_file_index(file_index)
+    }
+
+    fn read_xattrs(&mut self, node: NodeId) -> Result<XattrSet> {
+        self.mutation.volume.read_inode_xattrs(node.inode())
+    }
+
+    fn read_xattr(&mut self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>> {
+        self.mutation.volume.read_inode_xattr(node.inode(), name)
+    }
+
+    fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>> {
+        self.mutation
+            .volume
+            .read_inode_windows_overlay(node.inode())
+    }
+
+    fn read_windows_symlink_reparse_point(
+        &mut self,
+        node: NodeId,
+    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
+        self.mutation
+            .volume
+            .read_inode_windows_symlink_reparse_point(node.inode())
+    }
+
+    fn read_file(
+        &mut self,
+        file: &FileNode,
+        offset: FileOffset,
+        out: &mut [u8],
+    ) -> Result<ReadBytes> {
+        self.mutation
+            .volume
+            .read_file(file, offset, out, self.crypto)
+    }
+
+    fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
+        self.mutation.volume.read_symlink(symlink)
+    }
+
+    fn scan_directory(
+        &mut self,
+        directory: &DirectoryNode,
+        cursor: &DirectoryScanCursor,
+        limit: DirectoryScanLimit,
+    ) -> Result<DirectoryScanBatch> {
+        self.mutation
+            .volume
+            .scan_directory(directory, cursor, limit, self.crypto)
+    }
+
+    fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
+        self.mutation.volume.read_hard_links(target, self.crypto)
+    }
+
+    fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup> {
+        self.mutation.volume.lookup_child(parent, name)
+    }
+
+    fn lookup_windows_child(
+        &mut self,
+        parent: &DirectoryNode,
+        requested: &WindowsName,
+    ) -> Result<ChildLookup> {
+        self.mutation
+            .volume
+            .lookup_windows_child(parent, requested, self.crypto)
+    }
+}
+
+impl<'storage, 'epoch, 'crypto> MutationResolvePass<'storage, 'epoch, 'crypto> {
+    /// Starts an empty mutation resolve pass against one committed epoch.
+    pub(super) fn begin(
+        volume: EpochReadView<'storage, 'epoch>,
+        now: Ext4Timestamp,
+        crypto: &'crypto mut dyn CryptographicOperation,
+    ) -> Self {
+        Self {
+            mutation: MetadataMutation::begin(volume),
+            now,
+            crypto,
+        }
+    }
+}
+
+impl<'storage, 'epoch> MetadataMutation<'storage, 'epoch> {
+    /// Starts restart-local staging with no payload cryptographic authority.
+    fn begin(volume: EpochReadView<'storage, 'epoch>) -> Self {
+        Self {
+            volume,
+            inode_updates: Vec::new(),
+            block_bitmap_updates: Vec::new(),
+            inode_bitmap_updates: Vec::new(),
+            directory_updates: Vec::new(),
+            extent_updates: Vec::new(),
+            xattr_updates: Vec::new(),
+            group_deltas: Vec::new(),
+            data_writes: Vec::new(),
+            cluster_deltas: Vec::new(),
+            free_clusters_delta: FreeClusterDelta::ZERO,
+            free_inodes_delta: 0,
+            volume_label_update: None,
+            fscrypt_keys_update: None,
+        }
+    }
+}
+impl MetadataMutation<'_, '_> {
+    /// Verifies that the mounted profile admits xattr storage mutation.
+    /// # Errors
+    ///
+    /// Returns an error when mounted xattr feature flags do not permit xattr storage mutation.
+    fn require_xattr_mutation(&self) -> Result<()> {
+        self.volume.superblock.xattr_mutation().require_supported()
+    }
+
+    /// Computes mounted cluster state after a successful commit.
+    /// # Errors
+    ///
+    /// Returns an error when staged cluster deltas conflict or the superblock free-cluster delta
+    /// cannot be applied.
+    fn committed_cluster_state(&self) -> Result<(ClusterReferenceIndex, Superblock)> {
+        let mut clusters = self.volume.committed_clusters()?.try_clone()?;
+        clusters.apply_deltas(self.cluster_deltas.as_slice())?;
+        let mut superblock = self.volume.superblock;
+        superblock.apply_free_cluster_delta(self.free_clusters_delta)?;
+        superblock.apply_free_inode_delta(self.free_inodes_delta)?;
+        if let Some(label) = self.volume_label_update {
+            superblock.apply_volume_label(label);
+        }
+        Ok((clusters, superblock))
     }
 
     /// Returns the staged inode record when present, otherwise the device image.
@@ -1156,11 +1268,11 @@ impl MutationResolvePass<'_, '_, '_> {
     ///
     /// Returns an error when the directory inode cannot be staged, its link count is saturated, or
     /// timestamps cannot be written.
-    fn increment_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
+    fn increment_directory_links(&mut self, inode_id: InodeId, now: Ext4Timestamp) -> Result<()> {
         let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         raw_inode.increment_links_count()?;
-        raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+        raw_inode.set_timestamps(now, self.volume.superblock.inode_timestamp_encoding())?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
@@ -1170,11 +1282,11 @@ impl MutationResolvePass<'_, '_, '_> {
     ///
     /// Returns an error when the directory inode cannot be staged or the decremented link count and
     /// timestamps cannot be written.
-    fn decrement_directory_links(&mut self, inode_id: InodeId) -> Result<()> {
+    fn decrement_directory_links(&mut self, inode_id: InodeId, now: Ext4Timestamp) -> Result<()> {
         let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         let _links = raw_inode.decrement_links_count()?;
-        raw_inode.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
+        raw_inode.set_timestamps(now, self.volume.superblock.inode_timestamp_encoding())?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
@@ -1243,83 +1355,5 @@ impl MutationResolvePass<'_, '_, '_> {
             .get_mut(index.get())
             .ok_or(Error::InvalidInode)? = record.into();
         Ok(())
-    }
-}
-
-impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
-    fn load_file(&mut self, id: FileNodeId) -> Result<FileNode> {
-        self.volume.load_file(id)
-    }
-
-    fn load_directory(&mut self, id: DirectoryNodeId) -> Result<DirectoryNode> {
-        self.volume.load_directory(id)
-    }
-
-    fn load_symlink(&mut self, id: SymlinkNodeId) -> Result<SymlinkNode> {
-        self.volume.load_symlink(id)
-    }
-
-    fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId> {
-        self.volume.load_node_by_file_index(file_index)
-    }
-
-    fn read_xattrs(&mut self, node: NodeId) -> Result<XattrSet> {
-        self.volume.read_inode_xattrs(node.inode())
-    }
-
-    fn read_xattr(&mut self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>> {
-        self.volume.read_inode_xattr(node.inode(), name)
-    }
-
-    fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>> {
-        self.volume.read_inode_windows_overlay(node.inode())
-    }
-
-    fn read_windows_symlink_reparse_point(
-        &mut self,
-        node: NodeId,
-    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
-        self.volume
-            .read_inode_windows_symlink_reparse_point(node.inode())
-    }
-
-    fn read_file(
-        &mut self,
-        file: &FileNode,
-        offset: FileOffset,
-        out: &mut [u8],
-    ) -> Result<ReadBytes> {
-        self.volume.read_file(file, offset, out, self.crypto)
-    }
-
-    fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
-        self.volume.read_symlink(symlink)
-    }
-
-    fn scan_directory(
-        &mut self,
-        directory: &DirectoryNode,
-        cursor: &DirectoryScanCursor,
-        limit: DirectoryScanLimit,
-    ) -> Result<DirectoryScanBatch> {
-        self.volume
-            .scan_directory(directory, cursor, limit, self.crypto)
-    }
-
-    fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
-        self.volume.read_hard_links(target, self.crypto)
-    }
-
-    fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup> {
-        self.volume.lookup_child(parent, name)
-    }
-
-    fn lookup_windows_child(
-        &mut self,
-        parent: &DirectoryNode,
-        requested: &WindowsName,
-    ) -> Result<ChildLookup> {
-        self.volume
-            .lookup_windows_child(parent, requested, self.crypto)
     }
 }

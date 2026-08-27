@@ -7,6 +7,9 @@ use alloc::collections::BTreeSet;
 use core::{error::Error, fmt::Write as _, mem::size_of};
 use std::{ffi::OsStr, path::PathBuf, process::Stdio};
 
+/// Independent orphan-file/chain encoders and recovery oracles.
+mod orphan;
+
 /// One generated internal-journal interoperability profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct JournalInteropCase {
@@ -264,6 +267,7 @@ pub(crate) fn verify_journal_interop(repository_root: &Path) -> TaskResult<()> {
         },
     ];
     let verification = (|| -> TaskResult<()> {
+        orphan::verify_orphan_recovery(linux, &temporary_root)?;
         verify_internal_mutation_profiles(linux, &temporary_root)?;
         for case in cases {
             verify_linux_generated_journal_case(linux, &temporary_root, case)?;
@@ -698,7 +702,7 @@ fn format_htree_image(
     } else {
         "^large_dir"
     };
-    let features = format!("64bit,dir_index,{checksum},{large},^metadata_csum_seed,^orphan_file");
+    let features = format!("64bit,dir_index,{checksum},{large},^metadata_csum_seed");
     let journal_size = format!("size={journal_megabytes}");
     let mut mke2fs = linux.command("mke2fs");
     mke2fs.args([
@@ -998,9 +1002,9 @@ fn format_mutation_image(
     File::create(image)?.set_len(IMAGE_BYTES)?;
     let image_path = linux.tool_path(image)?;
     let features = if cluster_bytes.is_some() {
-        "metadata_csum,64bit,bigalloc,^metadata_csum_seed,^orphan_file"
+        "metadata_csum,64bit,bigalloc,^metadata_csum_seed"
     } else {
-        "metadata_csum,64bit,^metadata_csum_seed,^orphan_file"
+        "metadata_csum,64bit,^metadata_csum_seed"
     };
     let mut mke2fs = linux.command("mke2fs");
     mke2fs.args([
@@ -1602,9 +1606,9 @@ fn verify_linux_generated_journal_case(
     File::create(&image)?.set_len(IMAGE_BYTES)?;
     let image_tool_path = linux.tool_path(&image)?;
     let features = if case.block_numbers_64bit {
-        "metadata_csum,64bit,^metadata_csum_seed,^orphan_file"
+        "metadata_csum,64bit,^metadata_csum_seed"
     } else {
-        "metadata_csum,^64bit,^metadata_csum_seed,^orphan_file"
+        "metadata_csum,^64bit,^metadata_csum_seed"
     };
     let mut mke2fs = linux.command("mke2fs");
     mke2fs.args([

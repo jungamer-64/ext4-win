@@ -120,19 +120,22 @@ impl MutationResolvePass<'_, '_, '_> {
     ) -> Result<TransactionFile> {
         self.ensure_child_absent(parent.inode(), name)?;
         self.require_directory_entry_create_mutation(parent.inode())?;
-        let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
+        let parent_inode = self
+            .mutation
+            .raw_inode_for_policy(parent.inode())?
+            .parse()?;
         let inherited_context = self.inherited_fscrypt_context(&parent_inode)?;
-        let allocated_inode = self.allocate_inode()?;
+        let allocated_inode = self.mutation.allocate_inode()?;
         let mut raw_inode = allocated_inode.initialize_file(
             metadata,
             self.now,
-            self.volume.superblock.block_size(),
-            self.volume.superblock.inode_timestamp_encoding(),
+            self.mutation.volume.superblock.block_size(),
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
         )?;
         self.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
         let inode_id = raw_inode.id();
         self.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::File)?;
-        self.inode_updates.try_push(raw_inode.into())?;
+        self.mutation.inode_updates.try_push(raw_inode.into())?;
         Ok(TransactionFile {
             id: FileNodeId::new(inode_id),
         })
@@ -146,8 +149,8 @@ impl MutationResolvePass<'_, '_, '_> {
     /// regular file, or metadata cannot be updated.
     pub fn unlink_file(&mut self, parent: TransactionDirectory, name: &Ext4Name) -> Result<()> {
         let removed = self.remove_directory_entry(parent.inode(), name)?;
-        let inode_index = self.ensure_inode_update(removed.inode())?;
-        let mut raw_inode = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(removed.inode())?;
+        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
@@ -155,25 +158,27 @@ impl MutationResolvePass<'_, '_, '_> {
         let _deletion = inode.deletion_mutation()?;
         match raw_inode.decrement_links_count()? {
             LinkCountAfterDecrement::StillLinked(_) => {
-                raw_inode
-                    .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-                self.replace_live_inode(inode_index, raw_inode)?;
+                raw_inode.set_timestamps(
+                    self.now,
+                    self.mutation.volume.superblock.inode_timestamp_encoding(),
+                )?;
+                self.mutation.replace_live_inode(inode_index, raw_inode)?;
             }
             LinkCountAfterDecrement::Unlinked => {
-                let tree = self.mutable_extent_tree(&inode)?;
+                let tree = self.mutation.mutable_extent_tree(&inode)?;
                 for extent in tree.extents().iter().copied() {
-                    self.free_extent(extent, 0)?;
+                    self.mutation.free_extent(extent, 0)?;
                 }
                 for block in tree.metadata_blocks().iter().copied() {
-                    self.release_cluster_reference(block)?;
+                    self.mutation.release_cluster_reference(block)?;
                 }
-                self.free_inode(raw_inode.id())?;
+                self.mutation.reclaim_inode(raw_inode.raw())?;
                 let deleted = raw_inode.delete_and_touch(
                     self.now,
-                    self.volume.superblock.block_size(),
-                    self.volume.superblock.inode_timestamp_encoding(),
+                    self.mutation.volume.superblock.block_size(),
+                    self.mutation.volume.superblock.inode_timestamp_encoding(),
                 )?;
-                self.replace_deleted_inode(inode_index, deleted)?;
+                self.mutation.replace_deleted_inode(inode_index, deleted)?;
             }
         }
         Ok(())
@@ -194,11 +199,14 @@ impl MutationResolvePass<'_, '_, '_> {
     ) -> Result<()> {
         reject_reserved_directory_name(target_name)?;
         let source_inode_id = source.inode();
-        let source_index = self.ensure_inode_update(source_inode_id)?;
-        let mut raw_source = self.staged_live_inode(source_index)?;
+        let source_index = self.mutation.ensure_inode_update(source_inode_id)?;
+        let mut raw_source = self.mutation.staged_live_inode(source_index)?;
         let source_inode = raw_source.parse()?;
         let _metadata = source_inode.metadata_mutation()?;
-        let target_parent_inode = self.raw_inode_for_policy(target_parent.inode())?.parse()?;
+        let target_parent_inode = self
+            .mutation
+            .raw_inode_for_policy(target_parent.inode())?
+            .parse()?;
         self.require_hard_link_encryption_policy(&source_inode, &target_parent_inode)?;
 
         let mut add_link = true;
@@ -223,8 +231,11 @@ impl MutationResolvePass<'_, '_, '_> {
                         }
                     }
                 } else {
-                    let existing_kind =
-                        self.raw_inode_for_policy(existing.inode())?.parse()?.kind();
+                    let existing_kind = self
+                        .mutation
+                        .raw_inode_for_policy(existing.inode())?
+                        .parse()?
+                        .kind();
                     match existing_kind {
                         InodeKind::File => {
                             self.unlink_file(target_parent, existing_name)?;
@@ -247,8 +258,11 @@ impl MutationResolvePass<'_, '_, '_> {
             )?;
             raw_source.increment_links_count()?;
         }
-        raw_source.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.replace_live_inode(source_index, raw_source)?;
+        raw_source.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.replace_live_inode(source_index, raw_source)?;
         Ok(())
     }
 
@@ -268,10 +282,12 @@ impl MutationResolvePass<'_, '_, '_> {
             (false, false) => Ok(()),
             (true, true) => {
                 let source_context = self
+                    .mutation
                     .volume
                     .read_inode_fscrypt_context(source.id())?
                     .ok_or(Error::InvalidEncryptionContext)?;
                 let target_context = self
+                    .mutation
                     .volume
                     .read_inode_fscrypt_context(target_parent.id())?
                     .ok_or(Error::InvalidEncryptionContext)?;
@@ -298,15 +314,19 @@ impl MutationResolvePass<'_, '_, '_> {
     ) -> Result<TransactionDirectory> {
         self.ensure_child_absent(parent.inode(), name)?;
         self.require_directory_entry_create_mutation(parent.inode())?;
-        let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
+        let parent_inode = self
+            .mutation
+            .raw_inode_for_policy(parent.inode())?
+            .parse()?;
         let inherited_context = self.inherited_fscrypt_context(&parent_inode)?;
-        let block = self.allocate_cluster()?;
-        let allocated_inode = self.allocate_inode()?;
-        let block_size = self.volume.superblock.block_size();
+        let block = self.mutation.allocate_cluster()?;
+        let allocated_inode = self.mutation.allocate_inode()?;
+        let block_size = self.mutation.volume.superblock.block_size();
         let allocated_blocks = u64::from(
-            self.volume
+            self.mutation
+                .volume
                 .superblock
-                .blocks_in_cluster(self.volume.superblock.cluster_of_block(block)?)?,
+                .blocks_in_cluster(self.mutation.volume.superblock.cluster_of_block(block)?)?,
         );
         let allocation_size = FileAllocationSize::from_bytes(
             allocated_blocks
@@ -319,11 +339,11 @@ impl MutationResolvePass<'_, '_, '_> {
             block_size,
             block,
             allocation_size,
-            self.volume.superblock.inode_timestamp_encoding(),
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
         )?;
         self.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
         let inode_id = raw_inode.id();
-        let directory_checksum = self.volume.directory_checksum(&raw_inode.parse()?);
+        let directory_checksum = self.mutation.volume.directory_checksum(&raw_inode.parse()?);
 
         let mut directory = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
@@ -338,10 +358,12 @@ impl MutationResolvePass<'_, '_, '_> {
             inode_id,
             DirectoryEntryKind::Directory,
         )?;
-        self.increment_directory_links(parent.inode())?;
-        let group = InodeBitmapPosition::from_inode(&self.volume.superblock, inode_id)?.group();
-        self.record_group_used_dirs_delta(group, 1)?;
-        self.inode_updates.try_push(raw_inode.into())?;
+        self.mutation
+            .increment_directory_links(parent.inode(), self.now)?;
+        let group =
+            InodeBitmapPosition::from_inode(&self.mutation.volume.superblock, inode_id)?.group();
+        self.mutation.record_group_used_dirs_delta(group, 1)?;
+        self.mutation.inode_updates.try_push(raw_inode.into())?;
         Ok(TransactionDirectory {
             id: DirectoryNodeId::new(inode_id),
         })
@@ -361,26 +383,29 @@ impl MutationResolvePass<'_, '_, '_> {
     ) -> Result<TransactionSymlink> {
         self.ensure_child_absent(parent.inode(), name)?;
         self.require_directory_entry_create_mutation(parent.inode())?;
-        let parent_inode = self.raw_inode_for_policy(parent.inode())?.parse()?;
+        let parent_inode = self
+            .mutation
+            .raw_inode_for_policy(parent.inode())?
+            .parse()?;
         if parent_inode.protection().is_encrypted() {
             return Err(Error::UnsupportedEncryption);
         }
-        let allocated_inode = self.allocate_inode()?;
+        let allocated_inode = self.mutation.allocate_inode()?;
         let raw_inode = if target.is_inline() {
             allocated_inode.initialize_inline_symlink(
                 metadata,
                 self.now,
                 target,
-                self.volume.superblock.inode_timestamp_encoding(),
+                self.mutation.volume.superblock.inode_timestamp_encoding(),
             )?
         } else {
-            let block_size = self.volume.superblock.block_size();
+            let block_size = self.mutation.volume.superblock.block_size();
             let mut raw_inode = allocated_inode.initialize_extent_symlink(
                 metadata,
                 self.now,
                 block_size,
                 target,
-                self.volume.superblock.inode_timestamp_encoding(),
+                self.mutation.volume.superblock.inode_timestamp_encoding(),
             )?;
             let block_bytes =
                 usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
@@ -395,13 +420,13 @@ impl MutationResolvePass<'_, '_, '_> {
                 let (chunk, remainder) = remaining
                     .split_at_checked(chunk_len)
                     .ok_or(Error::InvalidWriteRange)?;
-                let block = self.allocate_cluster()?;
+                let block = self.mutation.allocate_cluster()?;
                 let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
                 memory::copy_exact(
                     bytes.get_mut(..chunk.len()).ok_or(Error::DeviceRange)?,
                     chunk,
                 )?;
-                self.data_writes.try_push(RangeWrite {
+                self.mutation.data_writes.try_push(RangeWrite {
                     offset: block_size.offset_of(block)?,
                     bytes,
                 })?;
@@ -411,12 +436,12 @@ impl MutationResolvePass<'_, '_, '_> {
                     logical = logical.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
                 }
             }
-            self.stage_extent_tree(&mut raw_inode, tree)?;
+            self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
             raw_inode
         };
         let inode_id = raw_inode.id();
         self.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::Symlink)?;
-        self.inode_updates.try_push(raw_inode.into())?;
+        self.mutation.inode_updates.try_push(raw_inode.into())?;
         Ok(TransactionSymlink {
             id: SymlinkNodeId::new(inode_id),
         })
@@ -436,8 +461,8 @@ impl MutationResolvePass<'_, '_, '_> {
         if removed.inode() == InodeId::ROOT {
             return Err(Error::CannotRemoveRoot);
         }
-        let inode_index = self.ensure_inode_update(removed.inode())?;
-        let raw_inode = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(removed.inode())?;
+        let raw_inode = self.mutation.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
@@ -447,20 +472,19 @@ impl MutationResolvePass<'_, '_, '_> {
             return Err(Error::DirectoryNotEmpty);
         }
         let _removed = self.remove_directory_entry(parent.inode(), name)?;
-        let tree = self.mutable_extent_tree(&inode)?;
+        let tree = self.mutation.mutable_extent_tree(&inode)?;
         for extent in tree.extents().iter().copied() {
-            self.free_extent(extent, 0)?;
+            self.mutation.free_extent(extent, 0)?;
         }
         for block in tree.metadata_blocks().iter().copied() {
-            self.release_cluster_reference(block)?;
+            self.mutation.release_cluster_reference(block)?;
         }
-        self.free_inode(raw_inode.id())?;
-        let deleted = raw_inode.delete(self.now, self.volume.superblock.block_size())?;
-        self.replace_deleted_inode(inode_index, deleted)?;
-        self.decrement_directory_links(parent.inode())?;
-        let group =
-            InodeBitmapPosition::from_inode(&self.volume.superblock, removed.inode())?.group();
-        self.record_group_used_dirs_delta(group, -1)
+        self.mutation.reclaim_inode(raw_inode.raw())?;
+        let deleted = raw_inode.delete(self.now, self.mutation.volume.superblock.block_size())?;
+        self.mutation.replace_deleted_inode(inode_index, deleted)?;
+        self.mutation
+            .decrement_directory_links(parent.inode(), self.now)?;
+        Ok(())
     }
 
     /// Renames or moves a child entry.
@@ -490,8 +514,8 @@ impl MutationResolvePass<'_, '_, '_> {
             self.ensure_child_absent(target_parent, target_name)?;
         }
 
-        let child_index = self.ensure_inode_update(source.inode())?;
-        let mut child_raw = self.staged_live_inode(child_index)?;
+        let child_index = self.mutation.ensure_inode_update(source.inode())?;
+        let mut child_raw = self.mutation.staged_live_inode(child_index)?;
         let child_inode = child_raw.parse()?;
         let _metadata = child_inode.metadata_mutation()?;
         if child_inode.kind() == InodeKind::Directory && source.inode() == InodeId::ROOT {
@@ -538,13 +562,18 @@ impl MutationResolvePass<'_, '_, '_> {
                 if replaced.inode() != source_parent {
                     return Err(Error::InvalidDirectoryEntry);
                 }
-                self.decrement_directory_links(source_parent)?;
-                self.increment_directory_links(target_parent)?;
+                self.mutation
+                    .decrement_directory_links(source_parent, self.now)?;
+                self.mutation
+                    .increment_directory_links(target_parent, self.now)?;
             }
         }
 
-        child_raw.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.replace_live_inode(child_index, child_raw)?;
+        child_raw.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.replace_live_inode(child_index, child_raw)?;
         Ok(())
     }
 
@@ -569,7 +598,11 @@ impl MutationResolvePass<'_, '_, '_> {
             return Ok(ExistingRenameTarget::SameInode);
         }
 
-        let target_kind = self.raw_inode_for_policy(target.inode())?.parse()?.kind();
+        let target_kind = self
+            .mutation
+            .raw_inode_for_policy(target.inode())?
+            .parse()?
+            .kind();
         let target_parent = TransactionDirectory {
             id: DirectoryNodeId::new(target_parent),
         };
@@ -598,24 +631,24 @@ impl MutationResolvePass<'_, '_, '_> {
     /// metadata cannot be updated.
     pub fn remove_symlink(&mut self, parent: TransactionDirectory, name: &Ext4Name) -> Result<()> {
         let removed = self.remove_directory_entry(parent.inode(), name)?;
-        let inode_index = self.ensure_inode_update(removed.inode())?;
-        let raw_inode = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(removed.inode())?;
+        let raw_inode = self.mutation.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
         if inode.kind() != InodeKind::Symlink {
             return Err(Error::WrongInodeKind);
         }
         let _deletion = inode.deletion_mutation()?;
-        if let Ok(tree) = self.mutable_extent_tree(&inode) {
+        if let Ok(tree) = self.mutation.mutable_extent_tree(&inode) {
             for extent in tree.extents().iter().copied() {
-                self.free_extent(extent, 0)?;
+                self.mutation.free_extent(extent, 0)?;
             }
             for block in tree.metadata_blocks().iter().copied() {
-                self.release_cluster_reference(block)?;
+                self.mutation.release_cluster_reference(block)?;
             }
         }
-        self.free_inode(raw_inode.id())?;
-        let deleted = raw_inode.delete(self.now, self.volume.superblock.block_size())?;
-        self.replace_deleted_inode(inode_index, deleted)?;
+        self.mutation.reclaim_inode(raw_inode.raw())?;
+        let deleted = raw_inode.delete(self.now, self.mutation.volume.superblock.block_size())?;
+        self.mutation.replace_deleted_inode(inode_index, deleted)?;
         Ok(())
     }
 
@@ -638,7 +671,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when `parent` is not a directory, its lookup name cannot be derived, or the
     /// requested entry is absent.
     fn find_child_entry(&mut self, parent: InodeId, name: &Ext4Name) -> Result<RawDirectoryEntry> {
-        let inode = self.raw_inode_for_policy(parent)?.parse()?;
+        let inode = self.mutation.raw_inode_for_policy(parent)?.parse()?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
@@ -659,6 +692,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// ciphertext fallback can represent `name`.
     fn directory_lookup_name(&mut self, directory: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
         match self
+            .mutation
             .volume
             .encrypt_directory_child_name(directory, name, self.crypto)
         {
@@ -685,15 +719,16 @@ impl MutationResolvePass<'_, '_, '_> {
         child: InodeId,
         kind: DirectoryEntryKind,
     ) -> Result<()> {
-        let inode_index = self.ensure_inode_update(parent)?;
-        let mut raw_parent = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(parent)?;
+        let mut raw_parent = self.mutation.staged_live_inode(inode_index)?;
         let parent_inode = raw_parent.parse()?;
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
         self.require_directory_entry_create_mutation_for_inode(&parent_inode)?;
         let disk_name =
-            self.volume
+            self.mutation
+                .volume
                 .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
         if self
             .directory_entry_location(&parent_inode, &disk_name)?
@@ -713,11 +748,11 @@ impl MutationResolvePass<'_, '_, '_> {
             );
         }
 
-        let mut tree = self.mutable_extent_tree(&parent_inode)?;
+        let mut tree = self.mutation.mutable_extent_tree(&parent_inode)?;
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
-        let block_size = self.volume.superblock.block_size();
+        let block_size = self.mutation.volume.superblock.block_size();
         let block_size_u64 = u64::from(block_size.bytes());
         let block_count = round_up_div(parent_inode.size().bytes(), block_size_u64)?;
         for logical in 0..block_count {
@@ -728,16 +763,18 @@ impl MutationResolvePass<'_, '_, '_> {
             )?;
             if block.insert(child, &disk_name, kind)? {
                 self.stage_directory_block(physical, block.into_bytes())?;
-                raw_parent
-                    .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-                self.replace_live_inode(inode_index, raw_parent)?;
+                raw_parent.set_timestamps(
+                    self.now,
+                    self.mutation.volume.superblock.inode_timestamp_encoding(),
+                )?;
+                self.mutation.replace_live_inode(inode_index, raw_parent)?;
                 return Ok(());
             }
         }
 
         if block_count == 1
             && !matches!(
-                self.volume.superblock.directory_indexing(),
+                self.mutation.volume.superblock.directory_indexing(),
                 DirectoryIndexing::Disabled
             )
         {
@@ -750,13 +787,13 @@ impl MutationResolvePass<'_, '_, '_> {
             );
         }
 
-        let new_physical = self.allocate_cluster()?;
+        let new_physical = self.mutation.allocate_cluster()?;
         let logical_block = LogicalBlock::try_from(block_count)?;
         tree.insert_or_extend_initialized(logical_block, new_physical)?;
 
         let mut block = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
-            self.volume.directory_checksum(&parent_inode),
+            self.mutation.volume.directory_checksum(&parent_inode),
         )?;
         block.initialize_free_space()?;
         let inserted = block.insert(child, &disk_name, kind)?;
@@ -772,14 +809,18 @@ impl MutationResolvePass<'_, '_, '_> {
                 .ok_or(Error::ArithmeticOverflow)?,
         );
         let encoded_size = self
+            .mutation
             .volume
             .superblock
             .inode_data_encoding()
             .encode_directory_size(DirectorySize::from_bytes(new_parent_size.bytes()))?;
         raw_parent.set_encoded_size(encoded_size)?;
-        raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.stage_extent_tree(&mut raw_parent, tree)?;
-        self.replace_live_inode(inode_index, raw_parent)?;
+        raw_parent.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.stage_extent_tree(&mut raw_parent, tree)?;
+        self.mutation.replace_live_inode(inode_index, raw_parent)?;
         Ok(())
     }
 
@@ -793,8 +834,8 @@ impl MutationResolvePass<'_, '_, '_> {
         parent: InodeId,
         name: &Ext4Name,
     ) -> Result<RawDirectoryEntry> {
-        let inode_index = self.ensure_inode_update(parent)?;
-        let mut raw_parent = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(parent)?;
+        let mut raw_parent = self.mutation.staged_live_inode(inode_index)?;
         let parent_inode = raw_parent.parse()?;
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
@@ -809,8 +850,11 @@ impl MutationResolvePass<'_, '_, '_> {
             .remove(&disk_name)?
             .ok_or(Error::DirectoryEntryNotFound)?;
         self.stage_directory_block(location.physical, location.block.into_bytes())?;
-        raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.replace_live_inode(inode_index, raw_parent)?;
+        raw_parent.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.replace_live_inode(inode_index, raw_parent)?;
         Ok(removed)
     }
 
@@ -827,19 +871,23 @@ impl MutationResolvePass<'_, '_, '_> {
         child: InodeId,
         kind: DirectoryEntryKind,
     ) -> Result<RawDirectoryEntry> {
-        let inode_index = self.ensure_inode_update(parent)?;
-        let mut raw_parent = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(parent)?;
+        let mut raw_parent = self.mutation.staged_live_inode(inode_index)?;
         let parent_inode = raw_parent.parse()?;
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
         self.require_directory_entry_rename_mutation_for_inode(&parent_inode)?;
-        let old_disk_name =
-            self.volume
-                .encrypt_directory_child_name(&parent_inode, old_name, self.crypto)?;
-        let new_disk_name =
-            self.volume
-                .encrypt_directory_child_name(&parent_inode, new_name, self.crypto)?;
+        let old_disk_name = self.mutation.volume.encrypt_directory_child_name(
+            &parent_inode,
+            old_name,
+            self.crypto,
+        )?;
+        let new_disk_name = self.mutation.volume.encrypt_directory_child_name(
+            &parent_inode,
+            new_name,
+            self.crypto,
+        )?;
         if self
             .directory_entry_location(&parent_inode, &new_disk_name)?
             .is_some()
@@ -853,7 +901,7 @@ impl MutationResolvePass<'_, '_, '_> {
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let tree = self.mutable_extent_tree(&parent_inode)?;
+            let tree = self.mutation.mutable_extent_tree(&parent_inode)?;
             let target_context = self.mutation_htree_context(
                 &parent_inode,
                 &tree,
@@ -877,9 +925,11 @@ impl MutationResolvePass<'_, '_, '_> {
                     return Err(Error::InvalidDirectoryEntry);
                 }
                 self.stage_directory_block(source.physical, source.block.into_bytes())?;
-                raw_parent
-                    .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-                self.replace_live_inode(inode_index, raw_parent)?;
+                raw_parent.set_timestamps(
+                    self.now,
+                    self.mutation.volume.superblock.inode_timestamp_encoding(),
+                )?;
+                self.mutation.replace_live_inode(inode_index, raw_parent)?;
                 return Ok(renamed);
             }
             let renamed = source
@@ -908,9 +958,11 @@ impl MutationResolvePass<'_, '_, '_> {
                     return Err(Error::InvalidDirectoryEntry);
                 }
                 self.stage_directory_block(source.physical, source.block.into_bytes())?;
-                raw_parent
-                    .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-                self.replace_live_inode(inode_index, raw_parent)?;
+                raw_parent.set_timestamps(
+                    self.now,
+                    self.mutation.volume.superblock.inode_timestamp_encoding(),
+                )?;
+                self.mutation.replace_live_inode(inode_index, raw_parent)?;
                 Ok(renamed)
             }
             Ok(None) => Err(Error::DirectoryEntryNotFound),
@@ -942,15 +994,16 @@ impl MutationResolvePass<'_, '_, '_> {
         child: InodeId,
         kind: DirectoryEntryKind,
     ) -> Result<RawDirectoryEntry> {
-        let inode_index = self.ensure_inode_update(parent)?;
-        let mut raw_parent = self.staged_live_inode(inode_index)?;
+        let inode_index = self.mutation.ensure_inode_update(parent)?;
+        let mut raw_parent = self.mutation.staged_live_inode(inode_index)?;
         let parent_inode = raw_parent.parse()?;
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
         self.require_directory_entry_replace_mutation_for_inode(&parent_inode)?;
         let disk_name =
-            self.volume
+            self.mutation
+                .volume
                 .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
         let Some(mut location) = self.directory_entry_location(&parent_inode, &disk_name)? else {
             return Err(Error::DirectoryEntryNotFound);
@@ -960,8 +1013,11 @@ impl MutationResolvePass<'_, '_, '_> {
             .replace(&disk_name, child, kind)?
             .ok_or(Error::DirectoryEntryNotFound)?;
         self.stage_directory_block(location.physical, location.block.into_bytes())?;
-        raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.replace_live_inode(inode_index, raw_parent)?;
+        raw_parent.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.replace_live_inode(inode_index, raw_parent)?;
         Ok(replaced)
     }
 
@@ -971,13 +1027,15 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when recording a new staged block image cannot allocate.
     fn stage_directory_block(&mut self, block: BlockAddress, bytes: Vec<u8>) -> Result<()> {
         if let Some(image) = self
+            .mutation
             .directory_updates
             .iter_mut()
             .find(|image| image.block == block)
         {
             image.bytes = bytes;
         } else {
-            self.directory_updates
+            self.mutation
+                .directory_updates
                 .try_push(BlockImage { block, bytes })?;
         }
         Ok(())
@@ -996,7 +1054,7 @@ impl MutationResolvePass<'_, '_, '_> {
     ) -> Result<(BlockAddress, DirectoryBlock)> {
         let block_count = round_up_div(
             inode.size().bytes(),
-            u64::from(self.volume.superblock.block_size().bytes()),
+            u64::from(self.mutation.volume.superblock.block_size().bytes()),
         )?;
         if logical.as_u64() >= block_count {
             return Err(Error::InvalidDirectoryEntry);
@@ -1007,10 +1065,11 @@ impl MutationResolvePass<'_, '_, '_> {
                 return Err(Error::InvalidDirectoryEntry);
             }
         };
-        let block_size = self.volume.superblock.block_size();
+        let block_size = self.mutation.volume.superblock.block_size();
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
         let bytes = if let Some(staged) = self
+            .mutation
             .directory_updates
             .iter()
             .find(|image| image.block == physical)
@@ -1021,14 +1080,15 @@ impl MutationResolvePass<'_, '_, '_> {
             memory::copied_slice(&staged.bytes)?
         } else {
             let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
-            self.volume
+            self.mutation
+                .volume
                 .device
                 .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
             bytes
         };
         Ok((
             physical,
-            DirectoryBlock::new(bytes, self.volume.directory_checksum(inode)),
+            DirectoryBlock::new(bytes, self.mutation.volume.directory_checksum(inode)),
         ))
     }
 
@@ -1043,14 +1103,15 @@ impl MutationResolvePass<'_, '_, '_> {
         tree: &MutableExtentTree,
         target: HtreePathTarget<'_>,
     ) -> Result<HtreeMutationContext> {
-        let checksum = self.volume.directory_checksum(inode);
+        let checksum = self.mutation.volume.directory_checksum(inode);
         let (root_physical, root_block) =
             self.read_mutation_directory_block(inode, tree, LogicalBlock::try_from(0_u64)?)?;
         let root = HtreeRoot::parse(
             root_block.bytes(),
             inode.id(),
-            self.volume.superblock.directory_hash_seed(),
-            self.volume
+            self.mutation.volume.superblock.directory_hash_seed(),
+            self.mutation
+                .volume
                 .superblock
                 .directory_indexing()
                 .require_supported()?,
@@ -1132,7 +1193,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .checked_add(1)
                 .ok_or(Error::ArithmeticOverflow)?,
         );
-        let checksum = self.volume.directory_checksum(inode);
+        let checksum = self.mutation.volume.directory_checksum(inode);
         while path.levels.len() < expected_levels {
             let logical = path
                 .levels
@@ -1168,12 +1229,12 @@ impl MutationResolvePass<'_, '_, '_> {
         inode: &Inode,
         name: &Ext4Name,
     ) -> Result<Option<DirectoryEntryLocation>> {
-        let tree = self.mutable_extent_tree(inode)?;
+        let tree = self.mutation.mutable_extent_tree(inode)?;
         match inode.directory_storage_kind()? {
             DirectoryStorageKind::Linear => {
                 let block_count = round_up_div(
                     inode.size().bytes(),
-                    u64::from(self.volume.superblock.block_size().bytes()),
+                    u64::from(self.mutation.volume.superblock.block_size().bytes()),
                 )?;
                 for logical in 0..block_count {
                     let (physical, block) = self.read_mutation_directory_block(
@@ -1234,11 +1295,11 @@ impl MutationResolvePass<'_, '_, '_> {
         parent_inode: &Inode,
         entry: RawDirectoryEntry,
     ) -> Result<()> {
-        let mut tree = self.mutable_extent_tree(parent_inode)?;
+        let mut tree = self.mutation.mutable_extent_tree(parent_inode)?;
         if tree.contains_uninitialized() {
             return Err(Error::UnsupportedInodeMutation);
         }
-        let checksum = self.volume.directory_checksum(parent_inode);
+        let checksum = self.mutation.volume.directory_checksum(parent_inode);
         let mut context =
             self.mutation_htree_context(parent_inode, &tree, HtreePathTarget::Name(entry.name()))?;
         let leaf_logical = context.path.leaf()?;
@@ -1253,9 +1314,11 @@ impl MutationResolvePass<'_, '_, '_> {
             .validate_leaf(&leaf.entries()?, context.root.hash_scheme())?;
         if leaf.insert(entry.inode(), entry.name(), entry.kind())? {
             self.stage_directory_block(leaf_physical, leaf.into_bytes())?;
-            raw_parent
-                .set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-            return self.replace_live_inode(inode_index, raw_parent);
+            raw_parent.set_timestamps(
+                self.now,
+                self.mutation.volume.superblock.inode_timestamp_encoding(),
+            )?;
+            return self.mutation.replace_live_inode(inode_index, raw_parent);
         }
 
         if context
@@ -1265,6 +1328,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .all(|level| level.index.is_full())
             && context.root.indirect_levels()
                 >= self
+                    .mutation
                     .volume
                     .superblock
                     .directory_indexing()
@@ -1295,13 +1359,13 @@ impl MutationResolvePass<'_, '_, '_> {
             .map(|entry| hash.hash(entry.name()).major)
             .ok_or(Error::InvalidDirectoryEntry)?;
         let boundary = right_first_hash | u32::from(left_last_hash == right_first_hash);
-        let block_bytes = usize::try_from(self.volume.superblock.block_size().bytes())
+        let block_bytes = usize::try_from(self.mutation.volume.superblock.block_size().bytes())
             .map_err(|_| Error::ArithmeticOverflow)?;
         let left = DirectoryBlock::from_entries(block_bytes, checksum, left_entries)?;
         let right = DirectoryBlock::from_entries(block_bytes, checksum, right_entries)?;
         let mut next_logical = round_up_div(
             parent_inode.size().bytes(),
-            u64::from(self.volume.superblock.block_size().bytes()),
+            u64::from(self.mutation.volume.superblock.block_size().bytes()),
         )?;
         let (right_logical, right_physical) =
             self.allocate_directory_block(&mut tree, &mut next_logical)?;
@@ -1326,7 +1390,7 @@ impl MutationResolvePass<'_, '_, '_> {
         entries: &[RawDirectoryEntry],
         checksum: DirectoryChecksum,
     ) -> Result<usize> {
-        let usable = usize::try_from(self.volume.superblock.block_size().bytes())
+        let usable = usize::try_from(self.mutation.volume.superblock.block_size().bytes())
             .map_err(|_| Error::ArithmeticOverflow)?
             .checked_sub(checksum.dirent_tail_bytes())
             .ok_or(Error::InvalidDirectoryEntry)?;
@@ -1378,8 +1442,8 @@ impl MutationResolvePass<'_, '_, '_> {
         context: &mut HtreeMutationContext,
         mut route: DxEntry,
     ) -> Result<()> {
-        let checksum = self.volume.directory_checksum(inode);
-        let block_bytes = usize::try_from(self.volume.superblock.block_size().bytes())
+        let checksum = self.mutation.volume.directory_checksum(inode);
+        let block_bytes = usize::try_from(self.mutation.volume.superblock.block_size().bytes())
             .map_err(|_| Error::ArithmeticOverflow)?;
         for level_index in (0..context.path.levels.len()).rev() {
             let split = {
@@ -1416,6 +1480,7 @@ impl MutationResolvePass<'_, '_, '_> {
             };
             if level_index == 0 {
                 let maximum = self
+                    .mutation
                     .volume
                     .superblock
                     .directory_indexing()
@@ -1479,7 +1544,7 @@ impl MutationResolvePass<'_, '_, '_> {
         mut tree: MutableExtentTree,
         entry: RawDirectoryEntry,
     ) -> Result<()> {
-        let checksum = self.volume.directory_checksum(parent_inode);
+        let checksum = self.mutation.volume.directory_checksum(parent_inode);
         let (root_physical, block) = self.read_mutation_directory_block(
             parent_inode,
             &tree,
@@ -1500,8 +1565,11 @@ impl MutationResolvePass<'_, '_, '_> {
             return Err(Error::InvalidDirectoryEntry);
         }
         let hash = DirectoryHashScheme::from_metadata(
-            self.volume.superblock.directory_hash_seed(),
-            self.volume.superblock.default_directory_hash_version(),
+            self.mutation.volume.superblock.directory_hash_seed(),
+            self.mutation
+                .volume
+                .superblock
+                .default_directory_hash_version(),
         );
         let mut children = Vec::new();
         for child in entries {
@@ -1515,7 +1583,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .cmp(&hash.hash(right.name()))
                 .then(left.name().bytes().cmp(right.name().bytes()))
         })?;
-        let block_bytes = usize::try_from(self.volume.superblock.block_size().bytes())
+        let block_bytes = usize::try_from(self.mutation.volume.superblock.block_size().bytes())
             .map_err(|_| Error::ArithmeticOverflow)?;
         let mut next_logical = 1_u64;
         let mut routes = Vec::new();
@@ -1558,7 +1626,10 @@ impl MutationResolvePass<'_, '_, '_> {
             block_bytes,
             parent_inode.id(),
             parent_inode_id,
-            self.volume.superblock.default_directory_hash_version(),
+            self.mutation
+                .volume
+                .superblock
+                .default_directory_hash_version(),
             &root_index,
             checksum,
         )?;
@@ -1578,7 +1649,7 @@ impl MutationResolvePass<'_, '_, '_> {
     ) -> Result<(u32, BlockAddress)> {
         let logical = u32::try_from(*next_logical).map_err(|_| Error::DirectoryIndexFull)?;
         DxEntry::new(0, logical)?;
-        let physical = self.allocate_cluster()?;
+        let physical = self.mutation.allocate_cluster()?;
         tree.insert_or_extend_initialized(LogicalBlock::try_from(*next_logical)?, physical)?;
         *next_logical = next_logical
             .checked_add(1)
@@ -1604,18 +1675,24 @@ impl MutationResolvePass<'_, '_, '_> {
         }
         let size = FileSize::from_bytes(
             block_count
-                .checked_mul(u64::from(self.volume.superblock.block_size().bytes()))
+                .checked_mul(u64::from(
+                    self.mutation.volume.superblock.block_size().bytes(),
+                ))
                 .ok_or(Error::ArithmeticOverflow)?,
         );
         let encoded = self
+            .mutation
             .volume
             .superblock
             .inode_data_encoding()
             .encode_directory_size(DirectorySize::from_bytes(size.bytes()))?;
         raw_parent.set_encoded_size(encoded)?;
-        raw_parent.set_timestamps(self.now, self.volume.superblock.inode_timestamp_encoding())?;
-        self.stage_extent_tree(&mut raw_parent, tree)?;
-        self.replace_live_inode(inode_index, raw_parent)
+        raw_parent.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
+        self.mutation.stage_extent_tree(&mut raw_parent, tree)?;
+        self.mutation.replace_live_inode(inode_index, raw_parent)
     }
 
     /// Returns whether a directory contains only `.` and `..`.
@@ -1623,12 +1700,12 @@ impl MutationResolvePass<'_, '_, '_> {
     ///
     /// Returns an error when the directory layout cannot be loaded or parsed.
     fn directory_is_empty(&mut self, inode: &Inode) -> Result<bool> {
-        let tree = self.mutable_extent_tree(inode)?;
+        let tree = self.mutation.mutable_extent_tree(inode)?;
         match inode.directory_storage_kind()? {
             DirectoryStorageKind::Linear => {
                 let block_count = round_up_div(
                     inode.size().bytes(),
-                    u64::from(self.volume.superblock.block_size().bytes()),
+                    u64::from(self.mutation.volume.superblock.block_size().bytes()),
                 )?;
                 for logical in 0..block_count {
                     let (_physical, block) = self.read_mutation_directory_block(

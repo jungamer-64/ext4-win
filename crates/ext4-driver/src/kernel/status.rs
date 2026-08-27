@@ -197,6 +197,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::UnsupportedInodeMutation
         | Error::UnsupportedEncryption
         | Error::UnsupportedVerity => STATUS_NOT_SUPPORTED,
+        Error::OrphanRecoveryLimitExceeded => STATUS_NOT_SUPPORTED,
         Error::DeviceRange
         | Error::ArithmeticOverflow
         | Error::InvalidName
@@ -212,6 +213,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::InvalidSuperblock
         | Error::InvalidClusterGeometry
         | Error::InvalidInode
+        | Error::InvalidOrphanTracking
         | Error::InvalidExtentTree
         | Error::InvalidDirectoryEntry
         | Error::ClusterReferenceConflict

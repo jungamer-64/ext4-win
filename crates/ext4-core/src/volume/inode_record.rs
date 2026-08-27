@@ -1,6 +1,7 @@
 //! Inode record typestates staged by mounted volume transactions.
 
 use super::scope::*;
+use crate::disk_format::inode::InodeData;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Raw inode record paired with its inode number and device offset.
@@ -57,6 +58,8 @@ pub(super) enum StagedInodeRecord {
     Live(LiveInodeRecord),
     /// Deleted inode cleanup rewrite.
     Deleted(DeletedInodeRecord),
+    /// Allocated orphan whose remaining storage still requires recovery.
+    Recovering(RecoverableOrphanInode),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,6 +219,11 @@ impl AllocatedInodeRecord {
 }
 
 impl LiveInodeRecord {
+    /// Storage facts passed to the final allocation release boundary without copying the record.
+    pub(super) const fn raw(&self) -> &RawInodeRecord {
+        &self.raw
+    }
+
     /// Returns this inode record's id.
     pub(super) const fn id(&self) -> InodeId {
         self.raw.id()
@@ -482,6 +490,7 @@ impl StagedInodeRecord {
             Self::Deleted(record) => Self::Deleted(DeletedInodeRecord {
                 raw: record.raw.try_clone_record()?,
             }),
+            Self::Recovering(record) => Self::Recovering(record.try_clone()?),
         })
     }
 
@@ -490,6 +499,7 @@ impl StagedInodeRecord {
         match self {
             Self::Live(record) => record.raw.id(),
             Self::Deleted(record) => record.raw.id(),
+            Self::Recovering(record) => record.raw().id(),
         }
     }
 
@@ -502,7 +512,7 @@ impl StagedInodeRecord {
             Self::Live(record) => Ok(LiveInodeRecord {
                 raw: record.raw.try_clone_record()?,
             }),
-            Self::Deleted(_) => Err(Error::InvalidInode),
+            Self::Deleted(_) | Self::Recovering(_) => Err(Error::InvalidInode),
         }
     }
 
@@ -514,6 +524,7 @@ impl StagedInodeRecord {
         match self {
             Self::Live(record) => record.raw.refresh_checksum(superblock),
             Self::Deleted(record) => record.raw.refresh_checksum(superblock),
+            Self::Recovering(record) => record.raw_mut().refresh_checksum(superblock),
         }
     }
 
@@ -522,6 +533,7 @@ impl StagedInodeRecord {
         match self {
             Self::Live(record) => record.raw.offset(),
             Self::Deleted(record) => record.raw.offset(),
+            Self::Recovering(record) => record.raw().offset(),
         }
     }
 
@@ -530,6 +542,7 @@ impl StagedInodeRecord {
         match self {
             Self::Live(record) => record.raw.bytes(),
             Self::Deleted(record) => record.raw.bytes(),
+            Self::Recovering(record) => record.raw().bytes(),
         }
     }
 }
@@ -1139,14 +1152,60 @@ impl RawInodeRecord {
         if superblock.metadata_checksum() != MetadataChecksum::Crc32c {
             return Ok(());
         }
-        if self.bytes.len() <= INODE_CHECKSUM_LO_OFFSET {
+        let (checksum, high) = self.checksum(superblock)?;
+        put_le_u16(
+            &mut self.bytes,
+            disk_offset(INODE_CHECKSUM_LO_OFFSET),
+            u16::try_from(checksum & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        if high {
+            put_le_u16(
+                &mut self.bytes,
+                disk_offset(INODE_CHECKSUM_HI_OFFSET),
+                u16::try_from(checksum >> 16).map_err(|_| Error::ArithmeticOverflow)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Authenticates inode storage before a tracker can confer recovery authority.
+    /// # Errors
+    /// Returns a checksum mismatch or a malformed record error; no bytes are modified.
+    pub(super) fn verify_checksum(&self, superblock: &Superblock) -> Result<()> {
+        if superblock.metadata_checksum() != MetadataChecksum::Crc32c {
             return Ok(());
         }
-        self.ensure_extra_isize()?;
-        put_le_u16(&mut self.bytes, disk_offset(INODE_CHECKSUM_LO_OFFSET), 0)?;
-        if self.bytes.len() > INODE_CHECKSUM_HI_OFFSET {
-            put_le_u16(&mut self.bytes, disk_offset(INODE_CHECKSUM_HI_OFFSET), 0)?;
+        let (mut expected, high) = self.checksum(superblock)?;
+        let mut stored = u32::from(le_u16(&self.bytes, disk_offset(INODE_CHECKSUM_LO_OFFSET))?);
+        if high {
+            stored |= u32::from(le_u16(&self.bytes, disk_offset(INODE_CHECKSUM_HI_OFFSET))?) << 16;
+        } else {
+            expected &= u32::from(u16::MAX);
         }
+        if stored == expected {
+            Ok(())
+        } else {
+            Err(Error::ChecksumMismatch)
+        }
+    }
+
+    /// Calculates the inode CRC with only checksum fields excluded, preserving extra-isize.
+    /// # Errors
+    /// Returns an error for a truncated or out-of-range extra-inode layout.
+    fn checksum(&self, superblock: &Superblock) -> Result<(u32, bool)> {
+        let extra = if self.bytes.len() > 128 {
+            usize::from(le_u16(&self.bytes, disk_offset(128))?)
+        } else {
+            0
+        };
+        if 128_usize
+            .checked_add(extra)
+            .ok_or(Error::ArithmeticOverflow)?
+            > self.bytes.len()
+        {
+            return Err(Error::InvalidInode);
+        }
+        let high = extra >= 4;
         let seed = ext4_crc32c(
             superblock.checksum_seed().as_u32(),
             &self.id.as_u32().to_le_bytes(),
@@ -1155,20 +1214,28 @@ impl RawInodeRecord {
             seed,
             &le_u32(&self.bytes, disk_offset(INODE_GENERATION_OFFSET))?.to_le_bytes(),
         );
-        let checksum = ext4_crc32c(seed, &self.bytes);
-        put_le_u16(
-            &mut self.bytes,
-            disk_offset(INODE_CHECKSUM_LO_OFFSET),
-            u16::try_from(checksum & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-        if self.bytes.len() > INODE_CHECKSUM_HI_OFFSET {
-            put_le_u16(
-                &mut self.bytes,
-                disk_offset(INODE_CHECKSUM_HI_OFFSET),
-                u16::try_from(checksum >> 16).map_err(|_| Error::ArithmeticOverflow)?,
-            )?;
+        let mut checksum = ext4_crc32c(
+            seed,
+            self.bytes.get(..124).ok_or(Error::TruncatedStructure)?,
+        );
+        checksum = ext4_crc32c(checksum, &[0, 0]);
+        if high {
+            checksum = ext4_crc32c(
+                checksum,
+                self.bytes.get(126..130).ok_or(Error::TruncatedStructure)?,
+            );
+            checksum = ext4_crc32c(checksum, &[0, 0]);
+            checksum = ext4_crc32c(
+                checksum,
+                self.bytes.get(132..).ok_or(Error::TruncatedStructure)?,
+            );
+        } else {
+            checksum = ext4_crc32c(
+                checksum,
+                self.bytes.get(126..).ok_or(Error::TruncatedStructure)?,
+            );
         }
-        Ok(())
+        Ok((checksum, high))
     }
 
     /// Ensures the inode advertises enough extra space for extended fields.
@@ -1456,5 +1523,97 @@ mod tests {
             record.resize_inode_block_map(),
             Err(Error::UnsupportedBlockMap)
         );
+    }
+}
+
+/// Allocated recovery state; the unlinked variant never grants ordinary live-inode access.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RecoverableOrphanInode {
+    /// All storage must be released before the inode bitmap can be cleared.
+    Unlinked(RawInodeRecord),
+    /// Namespace links remain; only allocation beyond persisted EOF may be removed.
+    Truncating(LiveInodeRecord),
+}
+
+impl RecoverableOrphanInode {
+    /// Validates the inode storage and chooses the recovery operation from its persistent links.
+    /// # Errors
+    /// Returns an error for unsupported mappings, invalid linked kinds, or malformed records.
+    pub(super) fn parse(raw: RawInodeRecord) -> Result<Self> {
+        let data = InodeData::parse(raw.id, &raw.bytes, raw.encoding)?;
+        if matches!(data.storage(), InodeStorage::UnsupportedBlockMap) {
+            return Err(Error::UnsupportedBlockMap);
+        }
+        if le_u16(&raw.bytes, disk_offset(INODE_LINKS_COUNT_OFFSET))? == 0 {
+            Ok(Self::Unlinked(raw))
+        } else {
+            if data.kind() != InodeKind::File || data.protection().is_verity() {
+                return Err(Error::InvalidOrphanTracking);
+            }
+            Ok(Self::Truncating(raw.into_live()?))
+        }
+    }
+
+    /// Copies restart-local bytes without copying recovery authority outside the owning pass.
+    /// # Errors
+    /// Returns an allocation error.
+    fn try_clone(&self) -> Result<Self> {
+        Self::parse(self.raw().try_clone_record()?)
+    }
+
+    /// Current raw image, including the legacy next pointer while cleanup is incomplete.
+    pub(super) const fn raw(&self) -> &RawInodeRecord {
+        match self {
+            Self::Unlinked(raw) => raw,
+            Self::Truncating(live) => &live.raw,
+        }
+    }
+
+    /// Mutation is confined to the owning recovery pass.
+    pub(super) fn raw_mut(&mut self) -> &mut RawInodeRecord {
+        match self {
+            Self::Unlinked(raw) => raw,
+            Self::Truncating(live) => &mut live.raw,
+        }
+    }
+
+    /// Reads current storage facts without creating live access for an unlinked inode.
+    /// # Errors
+    /// Returns an error if a staged field is malformed.
+    pub(super) fn data(&self) -> Result<InodeData> {
+        InodeData::parse(self.raw().id, &self.raw().bytes, self.raw().encoding)
+    }
+
+    /// Ends tracking only after the caller has removed the matching persistent entry atomically.
+    /// # Errors
+    /// Returns an error for malformed terminal storage or inode serialization.
+    pub(super) fn finish(self) -> Result<StagedInodeRecord> {
+        match self {
+            Self::Truncating(mut live) => {
+                live.raw.set_deletion_time(0)?;
+                Ok(StagedInodeRecord::Live(live))
+            }
+            Self::Unlinked(mut raw) => {
+                // Recovery has no wall-clock authority. Preserve the unlink event's recorded
+                // change time as the nonzero freed-inode marker, never a chain successor.
+                let deletion_time = le_u32(&raw.bytes, disk_offset(INODE_CTIME_OFFSET))?.max(1);
+                raw.set_deletion_time(deletion_time)?;
+                let size = match InodeData::parse(raw.id, &raw.bytes, raw.encoding)?.kind() {
+                    InodeKind::Directory => raw
+                        .encoding
+                        .encode_directory_size(DirectorySize::from_bytes(0))?,
+                    InodeKind::File | InodeKind::Symlink => {
+                        raw.encoding.encode_file_size(FileSize::from_bytes(0))?
+                    }
+                };
+                raw.set_encoded_size(size)?;
+                raw.set_encoded_allocation_size(
+                    raw.encoding
+                        .encode_allocation_size(FileAllocationSize::from_bytes(0))?,
+                )?;
+                raw.set_xattr_block(None)?;
+                Ok(StagedInodeRecord::Deleted(DeletedInodeRecord { raw }))
+            }
+        }
     }
 }

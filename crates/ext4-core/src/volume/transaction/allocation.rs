@@ -2,7 +2,22 @@
 
 use super::*;
 
-impl MutationResolvePass<'_, '_, '_> {
+impl MetadataMutation<'_, '_> {
+    /// Releases terminal inode ownership after all data and extent-node references are staged away.
+    /// # Errors
+    /// Returns an error for invalid xattr ownership, allocation bitmaps, or directory accounting.
+    pub(super) fn reclaim_inode(&mut self, raw: &RawInodeRecord) -> Result<()> {
+        if let Some(block) = raw.xattr_block()? {
+            self.release_xattr_block_ref(block)?;
+        }
+        self.free_inode(raw.id())?;
+        if InodeMode::from_disk(raw.mode()?)?.kind() == InodeKind::Directory {
+            let group = InodeBitmapPosition::from_inode(&self.volume.superblock, raw.id())?.group();
+            self.record_group_used_dirs_delta(group, -1)?;
+        }
+        Ok(())
+    }
+
     /// Allocates the first free allocation cluster visible in group bitmaps.
     /// # Errors
     ///

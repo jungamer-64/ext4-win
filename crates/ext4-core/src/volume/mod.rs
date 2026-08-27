@@ -7,6 +7,7 @@ mod inode_record;
 mod mount;
 mod node;
 mod operation;
+mod orphan;
 mod read;
 mod scope;
 mod transaction;

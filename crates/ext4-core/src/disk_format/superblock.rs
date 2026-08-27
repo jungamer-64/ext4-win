@@ -825,9 +825,27 @@ pub enum RecoveryState {
     NeedsRecovery,
 }
 
+/// Durable write-session boundary, including orphan tracking when the feature is enabled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriteSessionState {
+    /// The journal and every orphan cleanup have completed before the final filesystem flush.
+    Closed,
+    /// Recovery may be required until an explicit clean close completes.
+    Active,
+}
+
+/// Special inode and validity marker of the on-disk orphan file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OrphanFile {
+    /// Allocated inode containing orphan-entry blocks.
+    pub(crate) inode: InodeId,
+    /// Whether the last write session may have left entries to recover.
+    pub(crate) present: bool,
+}
+
 /// Validated result of reading the primary superblock at the mount boundary.
 ///
-/// A recovery-marker update changes `s_feature_incompat` in the first sector and `s_checksum` in
+/// A write-session update changes RECOVER and ORPHAN_PRESENT in the first sector and `s_checksum` in
 /// the second. If power is lost after only the first sector reaches stable storage, the retained
 /// checksum identifies the previous valid marker image exactly. Only that constrained tear is
 /// repairable; every other checksum mismatch remains corruption.
@@ -835,9 +853,9 @@ pub enum RecoveryState {
 pub(crate) enum PrimarySuperblockRead {
     /// The on-disk image is already fully valid.
     Valid(Superblock),
-    /// The first sector contains the next recovery marker while the checksum still authenticates
-    /// the previous marker. Mount must durably restore this image before interpreting metadata.
-    TornRecoveryMarker {
+    /// The first sector contains the next write-session state while the checksum still authenticates
+    /// the previous state. Mount must durably restore this image before interpreting metadata.
+    TornWriteSession {
         /// Complete primary-superblock image already validated as the previous marker state.
         repair: Vec<u8>,
     },
@@ -1171,10 +1189,15 @@ impl FeatureSet {
         if compat & COMPAT_HAS_JOURNAL == 0 {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if compat & (COMPAT_FAST_COMMIT | COMPAT_ORPHAN_FILE) != 0 {
+        if compat & COMPAT_FAST_COMMIT != 0 {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if compat & !(COMPAT_HAS_JOURNAL | COMPAT_EXT_ATTR | COMPAT_RESIZE_INODE | COMPAT_DIR_INDEX)
+        if compat
+            & !(COMPAT_HAS_JOURNAL
+                | COMPAT_EXT_ATTR
+                | COMPAT_RESIZE_INODE
+                | COMPAT_DIR_INDEX
+                | COMPAT_ORPHAN_FILE)
             != 0
         {
             return Err(Error::UnsupportedWriteFeature);
@@ -1236,11 +1259,11 @@ impl FeatureSet {
         {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if read_only_compat
-            & (RO_COMPAT_READONLY | RO_COMPAT_QUOTA | RO_COMPAT_PROJECT | RO_COMPAT_ORPHAN_PRESENT)
-            != 0
-        {
+        if read_only_compat & (RO_COMPAT_READONLY | RO_COMPAT_QUOTA | RO_COMPAT_PROJECT) != 0 {
             return Err(Error::UnsupportedWriteFeature);
+        }
+        if read_only_compat & RO_COMPAT_ORPHAN_PRESENT != 0 && compat & COMPAT_ORPHAN_FILE == 0 {
+            return Err(Error::InvalidOrphanTracking);
         }
         Ok(Self::from_raw(compat, incompat, read_only_compat))
     }
@@ -1443,6 +1466,10 @@ pub struct Superblock {
     descriptor_size: BlockGroupDescriptorSize,
     /// Journal placement selected from superblock feature fields.
     journal_mode: JournalMode,
+    /// Validated special orphan-file identity and entry-validity marker.
+    orphan_file: Option<OrphanFile>,
+    /// Head of the fallback orphan chain; each member stores its successor in i_dtime.
+    last_orphan: Option<InodeId>,
     /// Filesystem UUID used for checksums and journal matching.
     uuid: FilesystemUuid,
     /// Filesystem volume label stored in the superblock.
@@ -1469,7 +1496,7 @@ impl Superblock {
         device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
         match Self::parse_read_write(&raw) {
             Ok(superblock) => Ok(PrimarySuperblockRead::Valid(superblock)),
-            Err(Error::ChecksumMismatch) => match Self::restore_torn_recovery_marker(raw) {
+            Err(Error::ChecksumMismatch) => match Self::restore_torn_write_session(raw) {
                 Ok(restored) => Ok(restored),
                 Err(Error::ChecksumMismatch) => Self::parse_with_policy(
                     &raw,
@@ -1482,6 +1509,62 @@ impl Superblock {
             },
             Err(error) => Err(error),
         }
+    }
+
+    /// Recovers only a sector-prefix tear of a write-session transition.
+    ///
+    /// Both feature words reside in the first sector, while the checksum resides in the second.
+    /// An active image may have replaced any admitted prior marker pair; a closed image can only
+    /// have replaced an active session. Every candidate must authenticate the entire old image.
+    /// # Errors
+    /// Returns a checksum error unless one permitted previous image validates, or an allocation error.
+    fn restore_torn_write_session(raw: [u8; SUPERBLOCK_SIZE]) -> Result<PrimarySuperblockRead> {
+        let has_file = le_u32(&raw, disk_offset(92))? & COMPAT_ORPHAN_FILE != 0;
+        let recovery = le_u32(&raw, disk_offset(96))? & INCOMPAT_RECOVER != 0;
+        let present = le_u32(&raw, disk_offset(100))? & RO_COMPAT_ORPHAN_PRESENT != 0;
+        for (old_recovery, old_present) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            if !has_file && (present || old_present) {
+                continue;
+            }
+            let active = recovery && (!has_file || present);
+            let closed = !recovery && !present;
+            let prior_active = old_recovery && (!has_file || old_present);
+            if (!active && !(closed && prior_active))
+                || (recovery, present) == (old_recovery, old_present)
+            {
+                continue;
+            }
+            let mut candidate = raw;
+            let incompat = le_u32(&raw, disk_offset(96))? & !INCOMPAT_RECOVER;
+            let ro_compat = le_u32(&raw, disk_offset(100))? & !RO_COMPAT_ORPHAN_PRESENT;
+            put_le_u32(
+                &mut candidate,
+                disk_offset(96),
+                incompat | if old_recovery { INCOMPAT_RECOVER } else { 0 },
+            )?;
+            put_le_u32(
+                &mut candidate,
+                disk_offset(100),
+                ro_compat
+                    | if old_present {
+                        RO_COMPAT_ORPHAN_PRESENT
+                    } else {
+                        0
+                    },
+            )?;
+            match Self::parse_read_write(&candidate) {
+                Ok(_) => {
+                    return Ok(PrimarySuperblockRead::TornWriteSession {
+                        repair: memory::copied_slice(&candidate)?,
+                    });
+                }
+                Err(Error::ChecksumMismatch) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::ChecksumMismatch)
     }
 
     /// Parses and validates a 1024-byte superblock payload for read-write mode.
@@ -1572,13 +1655,11 @@ impl Superblock {
             (MetadataChecksum::Crc32c, SuperblockChecksumValidation::DeferredToJournalReplay) => {}
             (MetadataChecksum::Crc32c, SuperblockChecksumValidation::Required) => {
                 let expected = le_u32(raw, disk_offset(SUPERBLOCK_CHECKSUM_OFFSET))?;
-                if expected != 0 {
-                    let checksum_input = raw
-                        .get(..SUPERBLOCK_CHECKSUM_OFFSET)
-                        .ok_or(Error::TruncatedStructure)?;
-                    if ext4_crc32c(u32::MAX, checksum_input) != expected {
-                        return Err(Error::ChecksumMismatch);
-                    }
+                let checksum_input = raw
+                    .get(..SUPERBLOCK_CHECKSUM_OFFSET)
+                    .ok_or(Error::TruncatedStructure)?;
+                if ext4_crc32c(u32::MAX, checksum_input) != expected {
+                    return Err(Error::ChecksumMismatch);
                 }
             }
         }
@@ -1611,6 +1692,25 @@ impl Superblock {
             JournalMode::None
         };
         let checksum_seed = features.checksum_seed_source().seed(raw, &uuid)?;
+        let orphan_id = |value| -> Result<Option<InodeId>> {
+            if value == 0 {
+                return Ok(None);
+            }
+            if value > inode_count.as_u32() {
+                return Err(Error::InvalidOrphanTracking);
+            }
+            Ok(Some(InodeId::try_from(value)?))
+        };
+        let orphan_file = if le_u32(raw, disk_offset(92))? & COMPAT_ORPHAN_FILE != 0 {
+            Some(OrphanFile {
+                inode: orphan_id(le_u32(raw, disk_offset(0x280))?)?
+                    .ok_or(Error::InvalidOrphanTracking)?,
+                present: le_u32(raw, disk_offset(100))? & RO_COMPAT_ORPHAN_PRESENT != 0,
+            })
+        } else {
+            None
+        };
+        let last_orphan = orphan_id(le_u32(raw, disk_offset(0xe8))?)?;
         let directory_hash_seed = DirectoryHashSeed::from_words([
             le_u32(raw, disk_offset(DIRECTORY_HASH_SEED_OFFSET))?,
             le_u32(raw, disk_offset(DIRECTORY_HASH_SEED_OFFSET + 4))?,
@@ -1641,6 +1741,8 @@ impl Superblock {
             first_inode,
             descriptor_size,
             journal_mode,
+            orphan_file,
+            last_orphan,
             uuid,
             volume_label,
             checksum_seed,
@@ -1863,12 +1965,49 @@ impl Superblock {
         self.features.recovery_state()
     }
 
+    /// Orphan-file identity, when that on-disk feature is enabled.
+    pub(crate) const fn orphan_file(self) -> Option<OrphanFile> {
+        self.orphan_file
+    }
+
+    /// First fallback-chain member still requiring recovery.
+    pub(crate) const fn last_orphan(self) -> Option<InodeId> {
+        self.last_orphan
+    }
+
+    /// Prepares both write-session markers without issuing I/O.
+    /// # Errors
+    /// Returns an error when reading, validating, or checksumming the primary image fails.
+    pub(crate) fn prepare_write_session(
+        device: &mut OperationDevice<'_>,
+        state: WriteSessionState,
+    ) -> Result<[u8; SUPERBLOCK_SIZE]> {
+        let mut raw = [0_u8; SUPERBLOCK_SIZE];
+        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
+        let superblock = Self::parse_read_write(&raw)?;
+        if state == WriteSessionState::Closed && superblock.last_orphan.is_some() {
+            return Err(Error::InvalidOrphanTracking);
+        }
+        let mut incompat = le_u32(&raw, disk_offset(96))? & !INCOMPAT_RECOVER;
+        let mut ro_compat = le_u32(&raw, disk_offset(100))? & !RO_COMPAT_ORPHAN_PRESENT;
+        if state == WriteSessionState::Active {
+            incompat |= INCOMPAT_RECOVER;
+            if superblock.orphan_file.is_some() {
+                ro_compat |= RO_COMPAT_ORPHAN_PRESENT;
+            }
+        }
+        put_le_u32(&mut raw, disk_offset(96), incompat)?;
+        put_le_u32(&mut raw, disk_offset(100), ro_compat)?;
+        Self::refresh_checksum(&mut raw)?;
+        Ok(raw)
+    }
+
     /// Recomputes the primary superblock checksum when the on-disk checksum is present.
     /// # Errors
     ///
     /// Returns an error when the checksum field cannot be read, zeroed, or rewritten.
     pub(crate) fn refresh_checksum(raw: &mut [u8]) -> Result<()> {
-        if le_u32(raw, disk_offset(SUPERBLOCK_CHECKSUM_OFFSET))? == 0 {
+        if le_u32(raw, disk_offset(100))? & RO_COMPAT_METADATA_CSUM == 0 {
             return Ok(());
         }
         let checksum_input = raw
@@ -2108,6 +2247,95 @@ fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::endian::put_le_u16;
+
+    /// Independently assembled minimal primary geometry with a required CRC32C checksum.
+    /// # Errors
+    /// Returns an error for wire-field serialization.
+    fn primary(orphan_file: bool, recovery: bool, present: bool) -> Result<[u8; 1024]> {
+        let mut bytes = [0; 1024];
+        for (offset, value) in [
+            (0, 128),
+            (4, 4096),
+            (20, 1),
+            (32, 8192),
+            (36, 8192),
+            (40, 128),
+            (84, 11),
+            (224, 8),
+            (0x280, 12),
+            (
+                92,
+                COMPAT_HAS_JOURNAL | if orphan_file { COMPAT_ORPHAN_FILE } else { 0 },
+            ),
+            (
+                96,
+                INCOMPAT_EXTENTS | INCOMPAT_FILETYPE | if recovery { INCOMPAT_RECOVER } else { 0 },
+            ),
+            (
+                100,
+                RO_COMPAT_METADATA_CSUM | if present { RO_COMPAT_ORPHAN_PRESENT } else { 0 },
+            ),
+        ] {
+            put_le_u32(&mut bytes, disk_offset(offset), value)?;
+        }
+        put_le_u16(&mut bytes, disk_offset(56), EXT4_SUPER_MAGIC)?;
+        put_le_u16(&mut bytes, disk_offset(58), EXT4_VALID_FS)?;
+        put_le_u16(&mut bytes, disk_offset(88), 256)?;
+        Superblock::refresh_checksum(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// # Panics
+    /// Panics when sector-prefix recovery accepts unrelated corruption or loses either marker.
+    #[test]
+    fn write_session_tear_requires_one_authenticated_previous_marker_pair() {
+        let result = (|| -> Result<()> {
+            for (has_file, old_recovery, old_present, next_active) in [
+                (false, false, false, true),
+                (false, true, false, false),
+                (true, false, false, true),
+                (true, false, true, true),
+                (true, true, false, true),
+                (true, true, true, false),
+            ] {
+                let old = primary(has_file, old_recovery, old_present)?;
+                let next = primary(has_file, next_active, has_file && next_active)?;
+                let mut torn = old;
+                memory::copy_exact(
+                    torn.get_mut(..512).ok_or(Error::TruncatedStructure)?,
+                    next.get(..512).ok_or(Error::TruncatedStructure)?,
+                )?;
+                assert!(matches!(
+                    Superblock::parse_read_write(&torn),
+                    Err(Error::ChecksumMismatch)
+                ));
+                let PrimarySuperblockRead::TornWriteSession { repair } =
+                    Superblock::restore_torn_write_session(torn)?
+                else {
+                    return Err(Error::InvalidSuperblock);
+                };
+                assert_eq!(repair, old);
+                put_le_u32(&mut torn, disk_offset(264), 1)?;
+                assert!(matches!(
+                    Superblock::restore_torn_write_session(torn),
+                    Err(Error::ChecksumMismatch)
+                ));
+            }
+            let mut raw = primary(true, false, false)?;
+            put_le_u32(&mut raw, disk_offset(1020), 0)?;
+            assert!(matches!(
+                Superblock::parse_read_write(&raw),
+                Err(Error::ChecksumMismatch)
+            ));
+            assert!(matches!(
+                Superblock::parse_read_write(&primary(false, true, true)?),
+                Err(Error::InvalidOrphanTracking)
+            ));
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
 
     /// # Panics
     ///

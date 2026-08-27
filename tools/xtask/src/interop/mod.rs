@@ -814,6 +814,46 @@ fn mount_external_core<S: HostStorage>(
     }
 }
 
+/// Runs an internal-journal mount until normal completion or one selected storage effect.
+/// # Errors
+/// Returns an error for invalid boundary selection, host I/O, external discovery, or core rejection.
+fn run_internal_mount_until_boundary(
+    filesystem: &Path,
+    cut: Option<EffectCut>,
+) -> TaskResult<EffectBoundaryRun> {
+    let mut storage = CrashStorageAdapter::open_internal(filesystem)?;
+    let filesystem_length =
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
+    let mut controller = EffectBoundaryController::new(cut)?;
+    let mut transition = Box::try_new(ext4_core::MountOperation::new(
+        filesystem_length,
+        ext4_core::FscryptKeySet::empty(),
+    ))?
+    .advance(ext4_core::OperationEvent::Admitted);
+    loop {
+        match transition {
+            ext4_core::MountTransition::SubmitLower { request, suspended } => {
+                let Some(completion) = controller.complete(&mut storage, request)? else {
+                    return Ok(controller.stopped());
+                };
+                transition =
+                    suspended.advance(ext4_core::OperationEvent::StorageCompleted(completion));
+            }
+            ext4_core::MountTransition::DiscoverExternalJournal { .. } => {
+                return Err(io::Error::other(
+                    "internal-journal fault image requested external discovery",
+                )
+                .into());
+            }
+            ext4_core::MountTransition::Complete(result) => {
+                result.map_err(core_task_error)?;
+                storage.materialize_durable()?;
+                return Ok(controller.completed());
+            }
+        }
+    }
+}
+
 /// Runs a clean close for one mounted profile through the same storage boundary.
 ///
 /// # Errors
