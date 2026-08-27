@@ -10,6 +10,7 @@ permissions:
 
 env:
   RUST_TOOLCHAIN: nightly-2026-08-23
+  E2FSPROGS_RELEASE: 1.47.2
 
   # Keep cargo-wdk aligned with the exact windows-drivers-rs revision
   # used by this repository.
@@ -69,6 +70,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes e2fsprogs
+
+          actual_release="$(mke2fs -V 2>&1 | sed -n 's/^mke2fs \([0-9.]*\).*/\1/p')"
+          if [ "$actual_release" != "${{ env.E2FSPROGS_RELEASE }}" ]; then
+            echo "e2fsprogs release must be ${{ env.E2FSPROGS_RELEASE }}, found $actual_release" >&2
+            exit 1
+          fi
 
       - name: Verify journal interoperability
         run: cargo xtask verify-journal-interop
@@ -302,14 +309,180 @@ jobs:
 
           cargo wdk --version
 
-      - name: Set up WSL oracle
-        uses: Vampire/setup-wsl@v7.0.0
-        with:
-          distribution: Ubuntu-26.04
-          set-as-default: 'true'
-          additional-packages: e2fsprogs
-          use-cache: 'false'
-          wsl-version: 2
+      - name: Set up Ubuntu 26.04 WSL oracle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $distro = "Ubuntu-26.04"
+          $image = Join-Path `
+            $env:RUNNER_TEMP `
+            "ubuntu-26.04-wsl-amd64.wsl"
+          $imageUri = `
+            "https://releases.ubuntu.com/26.04/ubuntu-26.04-wsl-amd64.wsl"
+          $checksums = Join-Path `
+            $env:RUNNER_TEMP `
+            "ubuntu-26.04-SHA256SUMS"
+          $checksumsUri = `
+            "https://releases.ubuntu.com/26.04/SHA256SUMS"
+
+          Write-Host "=== WSL version ==="
+          wsl.exe --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to query WSL version"
+          }
+
+          Write-Host ""
+          Write-Host "=== WSL status ==="
+          wsl.exe --status
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to query WSL status"
+          }
+
+          Write-Host ""
+          Write-Host "=== Configure WSL2 as the default ==="
+          wsl.exe --set-default-version 2
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to configure WSL2 as the default version"
+          }
+
+          Write-Host ""
+          Write-Host "=== Download Ubuntu 26.04 WSL image ==="
+          curl.exe `
+            --fail `
+            --location `
+            --retry 5 `
+            --retry-all-errors `
+            --output $image `
+            $imageUri
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ubuntu 26.04 WSL image download failed with exit code $LASTEXITCODE"
+          }
+
+          if (-not (Test-Path -LiteralPath $image)) {
+            throw "Ubuntu 26.04 WSL image was not downloaded: $image"
+          }
+
+          curl.exe `
+            --fail `
+            --location `
+            --retry 5 `
+            --retry-all-errors `
+            --output $checksums `
+            $checksumsUri
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ubuntu 26.04 checksum download failed with exit code $LASTEXITCODE"
+          }
+
+          $checksumLine = Get-Content -LiteralPath $checksums |
+            Where-Object {
+              $_ -match '\*ubuntu-26\.04-wsl-amd64\.wsl$'
+            } |
+            Select-Object -First 1
+
+          if (-not $checksumLine) {
+            throw "Ubuntu 26.04 WSL checksum was not found in SHA256SUMS"
+          }
+
+          $expectedHash = ($checksumLine -split '\s+')[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash `
+            -LiteralPath $image `
+            -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          Write-Host "Downloaded image: $image"
+          Get-Item -LiteralPath $image |
+            Select-Object FullName, Length
+          Write-Host "Expected SHA256: $expectedHash"
+          Write-Host "Actual SHA256:   $actualHash"
+
+          if ($actualHash -ne $expectedHash) {
+            throw "Ubuntu 26.04 WSL image SHA256 mismatch"
+          }
+
+          Write-Host ""
+          Write-Host "=== Install Ubuntu 26.04 ==="
+          wsl.exe --install `
+            --from-file $image `
+            --name $distro `
+            --version 2 `
+            --no-launch
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ubuntu 26.04 WSL installation failed with exit code $LASTEXITCODE"
+          }
+
+          wsl.exe --set-default $distro
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to set $distro as the default WSL distribution"
+          }
+
+          #
+          # setup-wsl normally leaves these CI distributions using root.
+          # Keep that contract so later direct wsl.exe calls and the xtask
+          # oracle do not trigger Ubuntu's interactive first-run user setup.
+          #
+          wsl.exe --manage $distro --set-default-user root
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to configure root as the default $distro user"
+          }
+
+          Write-Host ""
+          Write-Host "=== Installed WSL distributions ==="
+          wsl.exe --list --verbose
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to list WSL distributions"
+          }
+
+          Write-Host ""
+          Write-Host "=== Ubuntu release ==="
+          wsl.exe `
+            --distribution $distro `
+            --user root `
+            --exec cat /etc/os-release
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to start $distro"
+          }
+
+          #
+          # wsl.exe --exec does not guarantee the normal login-shell PATH.
+          # e2fsprogs tools live below /usr/sbin on Ubuntu.
+          #
+          $linuxPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+          Write-Host ""
+          Write-Host "=== Install e2fsprogs ==="
+          wsl.exe `
+            --distribution $distro `
+            --user root `
+            --exec /usr/bin/env `
+            "PATH=$linuxPath" `
+            "DEBIAN_FRONTEND=noninteractive" `
+            /usr/bin/apt-get update
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "apt-get update failed in $distro"
+          }
+
+          wsl.exe `
+            --distribution $distro `
+            --user root `
+            --exec /usr/bin/env `
+            "PATH=$linuxPath" `
+            "DEBIAN_FRONTEND=noninteractive" `
+            /usr/bin/apt-get install --yes e2fsprogs
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "e2fsprogs installation failed in $distro"
+          }
 
       - name: Verify runner contract
         shell: pwsh
@@ -363,6 +536,7 @@ jobs:
           # live below /usr/sbin on Ubuntu.
           #
           $linuxPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          $e2fsprogsRelease = "${{ env.E2FSPROGS_RELEASE }}"
 
           wsl.exe `
             --distribution Ubuntu-26.04 `
@@ -385,6 +559,20 @@ jobs:
 
           if ($LASTEXITCODE -ne 0) {
             throw "mke2fs is unavailable in WSL"
+          }
+
+          $mke2fsVersion = wsl.exe `
+            --distribution Ubuntu-26.04 `
+            --exec /usr/bin/env `
+            "PATH=$linuxPath" `
+            mke2fs -V 2>&1 | Out-String
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to query the WSL e2fsprogs release"
+          }
+
+          if ($mke2fsVersion -notmatch "(?m)^mke2fs $([regex]::Escape($e2fsprogsRelease))(?:\s|\()") {
+            throw "e2fsprogs release must be $e2fsprogsRelease; mke2fs reported: $mke2fsVersion"
           }
 
           wsl.exe `
