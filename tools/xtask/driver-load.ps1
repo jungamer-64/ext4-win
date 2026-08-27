@@ -28,6 +28,7 @@ $providerName = 'ext4-win'
 $sessionParent = Join-Path $RepositoryRoot 'target\driver-load-sessions'
 $serviceRegistryPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\ext4win'
 $controlContractPath = Join-Path $RepositoryRoot 'crates\ext4-driver\lifecycle-control-v1.txt'
+$serviceStopCompletionTimeout = [TimeSpan]::FromSeconds(60)
 $script:State = [ordered]@{}
 $script:SessionDirectory = $null
 $script:SessionEstablished = $false
@@ -53,26 +54,34 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments, [string]$Descrip
     }
 }
 
-function Write-ServiceStartFailureDiagnostics([datetime]$AttemptStartedAt, [System.Management.Automation.ErrorRecord]$Failure) {
-    $exception = $Failure.Exception
-    $depth = 0
-    while ($exception -and $depth -lt 8) {
-        Write-Output ("service start exception[{0}]: type={1} hresult=0x{2:X8} message={3}" -f `
-            $depth,
-            $exception.GetType().FullName,
-            ([BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$exception.HResult), 0)),
-            $exception.Message)
-        $exception = $exception.InnerException
-        $depth++
+function Write-ServiceFailureDiagnostics(
+    [string]$Operation,
+    [datetime]$AttemptStartedAt,
+    [System.Management.Automation.ErrorRecord]$Failure
+) {
+    if ($Failure) {
+        $exception = $Failure.Exception
+        $depth = 0
+        while ($exception -and $depth -lt 8) {
+            Write-Output ("{0} exception[{1}]: type={2} hresult=0x{3:X8} message={4}" -f `
+                $Operation,
+                $depth,
+                $exception.GetType().FullName,
+                ([BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$exception.HResult), 0)),
+                $exception.Message)
+            $exception = $exception.InnerException
+            $depth++
+        }
     }
 
-    Write-Output 'service start SCM state:'
+    Write-Output "$Operation SCM state:"
     & sc.exe query $serviceName 2>&1 | ForEach-Object { Write-Output $_ }
-    Write-Output "service start SCM query exit code: $LASTEXITCODE"
+    Write-Output "$Operation SCM query exit code: $LASTEXITCODE"
 
     try {
         $driver = Get-CimInstance -ClassName Win32_SystemDriver -Filter "Name='$serviceName'" -ErrorAction Stop
-        Write-Output ("service start CIM state: State={0} Status={1} Started={2} ExitCode={3} ServiceSpecificExitCode={4}" -f `
+        Write-Output ("{0} CIM state: State={1} Status={2} Started={3} ExitCode={4} ServiceSpecificExitCode={5}" -f `
+            $Operation,
             $driver.State,
             $driver.Status,
             $driver.Started,
@@ -80,7 +89,7 @@ function Write-ServiceStartFailureDiagnostics([datetime]$AttemptStartedAt, [Syst
             $driver.ServiceSpecificExitCode)
     }
     catch {
-        Write-Output "service start CIM diagnostic unavailable: $($_.Exception.Message)"
+        Write-Output "$Operation CIM diagnostic unavailable: $($_.Exception.Message)"
     }
 
     try {
@@ -95,11 +104,12 @@ function Write-ServiceStartFailureDiagnostics([datetime]$AttemptStartedAt, [Syst
             ) -and ($_.Message -match '(?i)ext4win' -or $_.Id -in @(219, 7000, 7001, 7009, 7026))
         } | Select-Object -First 20)
         if ($events.Count -eq 0) {
-            Write-Output 'service start relevant System events: none'
+            Write-Output "$Operation relevant System events: none"
         }
         foreach ($event in $events) {
             $message = ([string]$event.Message).Replace("`r", ' ').Replace("`n", ' ')
-            Write-Output ("service start System event: Time={0:o} Provider={1} Id={2} Level={3} Message={4}" -f `
+            Write-Output ("{0} System event: Time={1:o} Provider={2} Id={3} Level={4} Message={5}" -f `
+                $Operation,
                 $event.TimeCreated,
                 $event.ProviderName,
                 $event.Id,
@@ -108,7 +118,7 @@ function Write-ServiceStartFailureDiagnostics([datetime]$AttemptStartedAt, [Syst
         }
     }
     catch {
-        Write-Output "service start System-event diagnostic unavailable: $($_.Exception.Message)"
+        Write-Output "$Operation System-event diagnostic unavailable: $($_.Exception.Message)"
     }
 }
 
@@ -829,7 +839,7 @@ function Start-DriverLoadSession(
     catch {
         $startFailure = $_
         try {
-            Write-ServiceStartFailureDiagnostics $serviceStartAttempt $startFailure
+            Write-ServiceFailureDiagnostics 'service start' $serviceStartAttempt $startFailure
         }
         catch {
             Write-Output "service start diagnostics failed: $_"
@@ -871,17 +881,35 @@ function Cleanup-DriverLoadSession {
         Assert-ServiceConfiguration $script:State.sys_hash $expectedDriverStorePath ([bool]$package)
         $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
         if ($service -and $service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
-            if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::StopPending) {
-                Write-Phase 'CleanupUnloadPreparationRequested'
-                Request-BoundedDriverUnloadPreparation
-                Write-Phase 'CleanupUnloadPrepared'
-                Write-Phase 'CleanupServiceStopRequested'
-                Request-BoundedServiceStop
+            $serviceStopAttempt = Get-Date
+            try {
+                if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::StopPending) {
+                    Write-Phase 'CleanupUnloadPreparationRequested'
+                    Request-BoundedDriverUnloadPreparation
+                    Write-Phase 'CleanupUnloadPrepared'
+                    Write-Phase 'CleanupServiceStopRequested'
+                    Request-BoundedServiceStop
+                }
+                $service = Get-Service -Name $serviceName -ErrorAction Stop
+                # SCM can remain StopPending while filesystem-registration notifications and
+                # attached-device references drain. This session owns the bounded terminal wait.
+                $service.WaitForStatus(
+                    [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+                    $serviceStopCompletionTimeout
+                )
+                if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
+                    throw "ext4win service state is $($service.Status), expected Stopped"
+                }
             }
-            $service = Get-Service -Name $serviceName -ErrorAction Stop
-            $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(15))
-            if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
-                throw "ext4win service state is $($service.Status), expected Stopped"
+            catch {
+                $stopFailure = $_
+                try {
+                    Write-ServiceFailureDiagnostics 'service stop' $serviceStopAttempt $stopFailure
+                }
+                catch {
+                    Write-Output "service stop diagnostics failed: $_"
+                }
+                throw $stopFailure
             }
             Set-StateValue 'service_started' 'false'
             Invoke-Checked 'sc.exe' @('query', $serviceName) 'ext4win stopped-state diagnostic query'
