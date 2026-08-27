@@ -88,10 +88,18 @@ fn write_lifecycle_control_contract() -> Result<(), io::Error> {
             "unsupported lifecycle control contract version",
         ));
     }
-    let nt_device_name = unicode_constant(
-        "CONTROL_DEVICE_NT_NAME",
-        required_record(&records, "nt_device_name")?,
-    )?;
+    let native_name = required_record(&records, "nt_device_name")?;
+    // Keep the control device in the device-object directory, separate from the filesystem
+    // driver object that the I/O manager names from the service before entering DriverEntry.
+    if !native_name
+        .strip_prefix(r"\Device\")
+        .is_some_and(|name| !name.is_empty() && !name.contains('\\'))
+    {
+        return Err(invalid_contract(
+            "lifecycle control device must be a direct child of the Device object directory",
+        ));
+    }
+    let nt_device_name = unicode_constant("CONTROL_DEVICE_NT_NAME", native_name)?;
     let dos_device_name = unicode_constant(
         "CONTROL_DEVICE_DOS_NAME",
         required_record(&records, "dos_device_name")?,

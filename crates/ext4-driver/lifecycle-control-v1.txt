@@ -1,5 +1,5 @@
 contract_version=1
-nt_device_name=\FileSystem\Ext4Win
+nt_device_name=\Device\Ext4WinControl
 dos_device_name=\DosDevices\Ext4WinControl
 win32_device_path=\\.\Ext4WinControl
 device_sddl=D:P(A;;GA;;;SY)(A;;GA;;;BA)
