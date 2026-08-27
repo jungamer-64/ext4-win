@@ -8,6 +8,14 @@ param(
 
     [string]$Bundle,
 
+    [string]$BundleArtifactId,
+
+    [string]$BundleSysHash,
+
+    [string]$BundleCatalogHash,
+
+    [string]$BundleInfHash,
+
     [string]$SessionId
 )
 
@@ -48,7 +56,7 @@ function Invoke-Wsl([string[]]$Arguments, [string]$Description) {
     return $output
 }
 
-function Invoke-DriverLoadSession([string]$RequestedMode, [string]$BundlePath, [string]$RequestedSessionId) {
+function Invoke-DriverLoadSession([string]$RequestedMode, [string]$RequestedSessionId, [string[]]$BundleArguments) {
     if (-not (Test-Path -LiteralPath $driverLoadScript -PathType Leaf)) {
         throw 'repository driver-load workflow script is absent'
     }
@@ -67,8 +75,8 @@ function Invoke-DriverLoadSession([string]$RequestedMode, [string]$BundlePath, [
         '-SessionId',
         $RequestedSessionId
     )
-    if ($BundlePath) {
-        $arguments += @('-Bundle', $BundlePath)
+    if ($BundleArguments) {
+        $arguments += $BundleArguments
     }
     Invoke-Checked 'powershell.exe' $arguments "delegated driver-load $RequestedMode session"
 }
@@ -128,6 +136,18 @@ function Set-StateValue([string]$Name, [string]$Value) {
 }
 
 function Write-Phase([string]$Phase) {
+    if (-not ('Ext4Win.LivePhasePublication' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+namespace Ext4Win {
+    public static class LivePhasePublication {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool MoveFileEx(string source, string destination, uint flags);
+    }
+}
+'@
+    }
     $sequence = 0
     if ($script:State.Contains('phase_sequence')) {
         $sequence = [int]$script:State.phase_sequence + 1
@@ -135,7 +155,8 @@ function Write-Phase([string]$Phase) {
     Set-StateValue 'phase_sequence' ([string]$sequence)
     Set-StateValue 'phase' $Phase
     $path = Join-Path $script:SessionDirectory ('session-v1-{0:D4}.manifest' -f $sequence)
-    $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $pendingPath = "$path-$([Guid]::NewGuid().ToString('N')).pending"
+    $stream = [IO.File]::Open($pendingPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     try {
         $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false), 4096, $true)
         try {
@@ -151,6 +172,12 @@ function Write-Phase([string]$Phase) {
     }
     finally {
         $stream.Dispose()
+    }
+    # Recovery reads only published records. Flush both contents and filename publication before
+    # the next VHDX effect, without replacing a previously acknowledged sequence number.
+    if (-not [Ext4Win.LivePhasePublication]::MoveFileEx($pendingPath, $path, 8)) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw [ComponentModel.Win32Exception]::new($errorCode, 'durable live phase publication failed')
     }
 }
 
@@ -228,7 +255,7 @@ function Format-SessionVhdx {
     Write-Phase 'WslUnmounted'
 }
 
-function Exercise-SessionVolume {
+function Exercise-SessionVolume([string[]]$BundleArguments) {
     Write-Phase 'WindowsAttachRequested'
     $vhd = Mount-VHD -Path $script:State.vhdx_path -Passthru
     $disk = @($vhd | Get-Disk)
@@ -237,7 +264,7 @@ function Exercise-SessionVolume {
     }
     Write-Phase 'WindowsAttached'
     Write-Phase 'DriverLoadSessionStartRequested'
-    Invoke-DriverLoadSession 'Start' $script:State.bundle_path $script:State.driver_session_id
+    Invoke-DriverLoadSession 'Start' $script:State.driver_session_id $BundleArguments
     Set-StateValue 'driver_session_started' 'true'
     Write-Phase 'DriverLoadSessionStarted'
     $partition = @(Get-Partition -DiskNumber $disk[0].Number | Where-Object { $_.Type -ne 'Reserved' })
@@ -319,7 +346,7 @@ function Cleanup-DriverLoadResources {
     $driverSessionDirectory = Join-Path $driverSessionParent $script:State.driver_session_id
     if (Test-Path -LiteralPath $driverSessionDirectory -PathType Container) {
         Write-Phase 'CleanupDriverLoadSessionRequested'
-        Invoke-DriverLoadSession 'Cleanup' $null $script:State.driver_session_id
+        Invoke-DriverLoadSession 'Cleanup' $script:State.driver_session_id @()
         Set-StateValue 'driver_session_started' 'false'
         Write-Phase 'CleanupDriverLoadSessionCompleted'
     }
@@ -357,7 +384,7 @@ function Cleanup-SessionInternal {
     Write-Phase 'Complete'
 }
 
-function Start-LiveSession([string]$BundlePath, [string]$RequestedSessionId) {
+function Start-LiveSession([string[]]$BundleArguments, [string]$RequestedSessionId) {
     Assert-HostContract
     Assert-SessionId $RequestedSessionId
     New-Item -ItemType Directory -Path $sessionParent -Force | Out-Null
@@ -366,7 +393,6 @@ function Start-LiveSession([string]$BundlePath, [string]$RequestedSessionId) {
     $vhdxPath = Join-Path $script:SessionDirectory 'disk.vhdx'
     Set-StateValue 'manifest_version' '1'
     Set-StateValue 'session_id' $RequestedSessionId
-    Set-StateValue 'bundle_path' $BundlePath
     Set-StateValue 'driver_session_id' $RequestedSessionId
     Set-StateValue 'vhdx_path' $vhdxPath
     Set-StateValue 'wsl_attached' 'false'
@@ -396,7 +422,7 @@ function Start-LiveSession([string]$BundlePath, [string]$RequestedSessionId) {
         Dismount-VHD -Path $vhdxPath
         Write-Phase 'PartitioningDismounted'
         Format-SessionVhdx
-        Exercise-SessionVolume
+        Exercise-SessionVolume $BundleArguments
     }
     catch {
         $operationError = $_
@@ -426,10 +452,20 @@ switch ($Mode) {
         Write-Output 'live VHDX host contract: PASS'
     }
     'Run' {
-        if (-not $Bundle -or -not $SessionId) {
-            throw 'Run requires generated Bundle and SessionId arguments'
+        if (-not $Bundle -or -not $BundleArtifactId -or -not $BundleSysHash -or
+            -not $BundleCatalogHash -or -not $BundleInfHash -or -not $SessionId) {
+            throw 'Run requires generated production bundle identity and SessionId arguments'
         }
-        Start-LiveSession $Bundle $SessionId
+        # Forward the Rust-verified identity without parsing or independently interpreting it.
+        # Only the driver-load owner validates this boundary and persists package identity.
+        $bundleArguments = @(
+            '-Bundle', $Bundle,
+            '-BundleArtifactId', $BundleArtifactId,
+            '-BundleSysHash', $BundleSysHash,
+            '-BundleCatalogHash', $BundleCatalogHash,
+            '-BundleInfHash', $BundleInfHash
+        )
+        Start-LiveSession $bundleArguments $SessionId
     }
     'Cleanup' {
         Assert-Administrator

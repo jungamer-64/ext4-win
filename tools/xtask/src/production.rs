@@ -902,6 +902,39 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// The process boundary keeps the path, artifact ID, and all three hashes paired.
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization drops, swaps, or splits an identity field.
+    #[test]
+    fn verified_bundle_process_arguments_preserve_identity() {
+        let bundle = VerifiedProductionBundle {
+            directory: PathBuf::from("bundle with spaces/0123456789abcdef0123456789abcdef"),
+            artifact_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            driver_hash: "A".repeat(64),
+            catalog_hash: "B".repeat(64),
+            inf_hash: "C".repeat(64),
+        };
+        let mut command = Command::new("powershell.exe");
+        crate::driver_load::append_verified_bundle_arguments(&mut command, &bundle);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("-Bundle"),
+                bundle.directory.as_os_str(),
+                OsStr::new("-BundleArtifactId"),
+                OsStr::new(&bundle.artifact_id),
+                OsStr::new("-BundleSysHash"),
+                OsStr::new(&bundle.driver_hash),
+                OsStr::new("-BundleCatalogHash"),
+                OsStr::new(&bundle.catalog_hash),
+                OsStr::new("-BundleInfHash"),
+                OsStr::new(&bundle.inf_hash),
+            ]
+        );
+    }
+
     /// Artifact identities satisfy the build-script boundary without using the sentinel.
     ///
     /// # Panics
