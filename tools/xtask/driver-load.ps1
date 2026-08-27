@@ -246,17 +246,33 @@ function Assert-SessionControlContract {
     return $contract
 }
 
-function Initialize-ControlNativeBoundary {
+function Initialize-DriverLoadNativeBoundary {
     if ('Ext4Win.DriverLifecycleNative' -as [type]) {
         return
     }
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace Ext4Win {
     public static class DriverLifecycleNative {
+        [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetupGetInfDriverStoreLocation(
+            string fileName,
+            IntPtr alternatePlatformInfo,
+            IntPtr localeName,
+            StringBuilder returnBuffer,
+            uint returnBufferSize,
+            out uint requiredSize
+        );
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool MoveFileEx(string existingFileName, string newFileName, uint flags);
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern SafeFileHandle CreateFile(
             string fileName,
@@ -288,7 +304,7 @@ namespace Ext4Win {
 function Invoke-DriverUnloadPreparation {
     Assert-Administrator
     $contract = Get-ControlContract
-    Initialize-ControlNativeBoundary
+    Initialize-DriverLoadNativeBoundary
     $genericWrite = [uint32]0x40000000
     $shareReadWriteDelete = [uint32]0x00000007
     $openExisting = [uint32]3
@@ -472,6 +488,7 @@ function Set-StateValue([string]$Name, [string]$Value) {
 }
 
 function Write-Phase([string]$Phase) {
+    Initialize-DriverLoadNativeBoundary
     $sequence = 0
     if ($script:State.Contains('phase_sequence')) {
         $sequence = [int]$script:State.phase_sequence + 1
@@ -497,7 +514,12 @@ function Write-Phase([string]$Phase) {
     finally {
         $stream.Dispose()
     }
-    [IO.File]::Move($pendingPath, $finalPath)
+    # Flushing the contents is separate from publishing the filename. Do not acknowledge a
+    # phase until the same-directory, non-replacing move has also completed with write-through.
+    if (-not [Ext4Win.DriverLifecycleNative]::MoveFileEx($pendingPath, $finalPath, 8)) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw [ComponentModel.Win32Exception]::new($errorCode, 'durable phase publication failed')
+    }
 }
 
 function Load-Session([string]$RequestedSessionId) {
@@ -549,6 +571,36 @@ function Assert-PackageShape($Package) {
     }
 }
 
+function Resolve-PackageDriverStoreSysPath($Package) {
+    Assert-PackageShape $Package
+    $oemInf = [string]$Package.DriverName
+    if ($oemInf -notmatch '^oem[0-9]+\.inf$') {
+        throw 'structured DriverStore inventory has an invalid published INF name'
+    }
+    Initialize-DriverLoadNativeBoundary
+    # SetupAPI owns the OEM-INF -> DriverStore mapping. The XML inventory owns package/file
+    # selection; neither an export-directory spelling nor the service ImagePath proves this map.
+    $pathBuffer = [Text.StringBuilder]::new(260)
+    [uint32]$requiredSize = 0
+    $resolved = [Ext4Win.DriverLifecycleNative]::SetupGetInfDriverStoreLocation(
+        (Join-Path $env:SystemRoot "INF\$oemInf"),
+        [IntPtr]::Zero,
+        [IntPtr]::Zero,
+        $pathBuffer,
+        [uint32]$pathBuffer.Capacity,
+        [ref]$requiredSize
+    )
+    if (-not $resolved) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw [ComponentModel.Win32Exception]::new($errorCode, 'OEM INF DriverStore location query failed')
+    }
+    $infPath = [IO.Path]::GetFullPath($pathBuffer.ToString())
+    if ((Split-Path -Leaf $infPath) -ine $originalInf) {
+        throw 'selected OEM INF resolves to a different original INF identity'
+    }
+    return Join-Path (Split-Path -Parent $infPath) 'ext4win.sys'
+}
+
 function Export-And-VerifyPackage($Package, [string]$ExpectedHash) {
     Assert-PackageShape $Package
     $exportPath = Join-Path $script:SessionDirectory ("driverstore-export-{0}" -f [Guid]::NewGuid().ToString('N'))
@@ -582,7 +634,7 @@ function Resolve-ServiceImagePath([string]$ImagePath) {
     return [IO.Path]::GetFullPath($expanded)
 }
 
-function Assert-ServiceConfiguration([string]$ExpectedHash, [bool]$RequireImageFile) {
+function Assert-ServiceConfiguration([string]$ExpectedHash, [string]$ExpectedDriverStorePath, [bool]$RequireImageFile) {
     if (-not (Test-Path -LiteralPath $serviceRegistryPath)) {
         throw 'ext4win service registry entry is absent'
     }
@@ -595,6 +647,10 @@ function Assert-ServiceConfiguration([string]$ExpectedHash, [bool]$RequireImageF
     }
     $rawImagePath = [string]$configuration.ImagePath
     $resolvedImagePath = Resolve-ServiceImagePath $rawImagePath
+    if (-not $ExpectedDriverStorePath -or
+        -not $resolvedImagePath.Equals($ExpectedDriverStorePath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'ext4win service ImagePath does not select the SYS of the session OEM package'
+    }
     $driverStoreRoot = (Resolve-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\DriverStore\FileRepository')).Path.TrimEnd('\') + '\'
     $packageDirectoryName = Split-Path -Leaf (Split-Path -Parent $resolvedImagePath)
     if (-not $resolvedImagePath.StartsWith($driverStoreRoot, [StringComparison]::OrdinalIgnoreCase) -or
@@ -622,6 +678,7 @@ function Assert-ServiceConfiguration([string]$ExpectedHash, [bool]$RequireImageF
     Set-StateValue 'service_image_path_raw' $rawImagePath
     Write-Host 'service registry: Type=2 Start=3'
     Write-Host "service ImagePath: $resolvedImagePath"
+    Write-Host "service ImagePath matches selected OEM package SYS: $ExpectedDriverStorePath"
 }
 
 function Request-BoundedServiceStop {
@@ -693,6 +750,9 @@ function Get-InstalledSessionPackage([bool]$AllowRecovery) {
         }
     }
     elseif ($AllowRecovery) {
+        if ($script:State.phase -cne 'PackageInstallRequested') {
+            throw 'session has no durable install intent authorizing package recovery'
+        }
         Export-And-VerifyPackage $package $script:State.sys_hash | Out-Null
         Set-StateValue 'oem_inf' ([string]$package.DriverName)
         Write-Phase 'PackageIdentityRecovered'
@@ -711,7 +771,8 @@ function Assert-InstalledDriverIdentity {
     }
     $exportedSys = Export-And-VerifyPackage $package $script:State.sys_hash
     Set-StateValue 'exported_sys_path' $exportedSys
-    Assert-ServiceConfiguration $script:State.sys_hash $true
+    $driverStoreSysPath = Resolve-PackageDriverStoreSysPath $package
+    Assert-ServiceConfiguration $script:State.sys_hash $driverStoreSysPath $true
     return $package
 }
 
@@ -766,8 +827,14 @@ function Start-DriverLoadSession(
         Start-Service -Name $serviceName -ErrorAction Stop
     }
     catch {
-        Write-ServiceStartFailureDiagnostics $serviceStartAttempt $_
-        throw
+        $startFailure = $_
+        try {
+            Write-ServiceStartFailureDiagnostics $serviceStartAttempt $startFailure
+        }
+        catch {
+            Write-Output "service start diagnostics failed: $_"
+        }
+        throw $startFailure
     }
     $service = Get-Service -Name $serviceName -ErrorAction Stop
     $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(15))
@@ -790,7 +857,18 @@ function Cleanup-DriverLoadSession {
     $package = Get-InstalledSessionPackage $true
     $serviceExists = (Test-Path -LiteralPath $serviceRegistryPath) -or [bool](Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
     if ($serviceExists) {
-        Assert-ServiceConfiguration $script:State.sys_hash ([bool]$package)
+        # A package removed by an interrupted cleanup can no longer be mapped by SetupAPI.
+        # Only the service image already bound to that package in a durable phase may remain.
+        $expectedDriverStorePath = if ($package) {
+            Resolve-PackageDriverStoreSysPath $package
+        }
+        elseif ($script:State.Contains('service_image_path')) {
+            $script:State.service_image_path
+        }
+        else {
+            throw 'remaining service has no durable package-bound image identity'
+        }
+        Assert-ServiceConfiguration $script:State.sys_hash $expectedDriverStorePath ([bool]$package)
         $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
         if ($service -and $service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
             if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::StopPending) {
