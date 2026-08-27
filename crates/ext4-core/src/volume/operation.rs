@@ -18,6 +18,15 @@ pub enum ReadTransition<T> {
     Complete(Result<T>),
 }
 
+/// Name-comparison contract for one Windows-visible directory lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsNameMatch {
+    /// Match only the exact Windows-visible spelling supplied by the caller.
+    Exact,
+    /// Permit one unique ASCII-case-insensitive match after exact lookup fails.
+    CaseInsensitive,
+}
+
 /// Read surface shared by immutable read passes and mutation resolve passes.
 ///
 /// These are the two concrete restart-local contexts that may inspect committed state. Neither
@@ -112,6 +121,7 @@ pub trait CommittedReadPass {
         &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
+        name_match: WindowsNameMatch,
     ) -> Result<ChildLookup>;
 }
 
@@ -265,9 +275,10 @@ impl EpochReadPass<'_, '_, '_> {
         &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
+        name_match: WindowsNameMatch,
     ) -> Result<ChildLookup> {
         self.view
-            .lookup_windows_child(parent, requested, self.crypto)
+            .lookup_windows_child(parent, requested, name_match, self.crypto)
     }
 }
 
@@ -341,8 +352,9 @@ impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
         &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
+        name_match: WindowsNameMatch,
     ) -> Result<ChildLookup> {
-        self.lookup_windows_child(parent, requested)
+        self.lookup_windows_child(parent, requested, name_match)
     }
 }
 

@@ -1048,10 +1048,11 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
         &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
+        name_match: crate::volume::operation::WindowsNameMatch,
     ) -> Result<ChildLookup> {
         self.mutation
             .volume
-            .lookup_windows_child(parent, requested, self.crypto)
+            .lookup_windows_child(parent, requested, name_match, self.crypto)
     }
 }
 
