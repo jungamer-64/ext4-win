@@ -2,7 +2,7 @@ use crate::{
     TaskResult,
     driver_load::{DriverLoadSessionId, check_hosted_driver_host},
     process::{require_file, run_checked},
-    production::build_verified_production_bundle,
+    production::{VerifiedProductionBundle, build_verified_production_bundle},
 };
 use std::{ffi::OsStr, io, path::Path, process::Command};
 
@@ -80,7 +80,7 @@ fn require_windows_live_host() -> TaskResult<()> {
 fn run_live_vhdx_script(
     repository_root: &Path,
     mode: &str,
-    bundle: Option<&Path>,
+    bundle: Option<&VerifiedProductionBundle>,
     session_id: Option<&DriverLoadSessionId>,
 ) -> TaskResult<()> {
     let script = repository_root
