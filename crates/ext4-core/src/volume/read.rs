@@ -1539,9 +1539,10 @@ impl EpochReadView<'_, '_> {
         &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
+        name_match: super::operation::WindowsNameMatch,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<ChildLookup> {
-        match self.lookup_windows_child_entry(parent, requested, crypto)? {
+        match self.lookup_windows_child_entry(parent, requested, name_match, crypto)? {
             Some(entry) => Ok(ChildLookup::Found(entry.into_child(parent.id()))),
             None => Ok(ChildLookup::NotFound),
         }
@@ -1556,6 +1557,7 @@ impl EpochReadView<'_, '_> {
         &mut self,
         parent: &DirectoryNode,
         requested: &WindowsName,
+        name_match: super::operation::WindowsNameMatch,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<Option<DirectoryEntry>> {
         if parent.protection().is_encrypted() {
@@ -1585,6 +1587,9 @@ impl EpochReadView<'_, '_> {
         let exact = requested.to_ext4()?;
         if let Some(raw) = self.find_raw_directory_entry(parent.inode(), &exact)? {
             return Ok(Some(self.validate_directory_entry(raw, &exact)?));
+        }
+        if matches!(name_match, super::operation::WindowsNameMatch::Exact) {
+            return Ok(None);
         }
         let mut folded = None;
         let mut cursor = DirectoryScanCursor::start();

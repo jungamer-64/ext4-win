@@ -1532,11 +1532,11 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
             value if value == wdk_sys::IRP_MN_QUERY_DIRECTORY => {
                 DirectoryControlMinorFunction::QueryDirectory
             }
-            value
-                if value == wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY
-                    || value == wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX =>
-            {
+            value if value == wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY => {
                 DirectoryControlMinorFunction::NotifyChangeDirectory
+            }
+            value if value == wdk_sys::IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX => {
+                DirectoryControlMinorFunction::NotifyChangeDirectoryEx
             }
             _ => DirectoryControlMinorFunction::Unsupported,
         }
@@ -2486,6 +2486,8 @@ pub(crate) enum DirectoryControlMinorFunction {
     QueryDirectory,
     /// Directory change notification request.
     NotifyChangeDirectory,
+    /// Extended directory change notification request.
+    NotifyChangeDirectoryEx,
     /// Unsupported directory-control minor function.
     Unsupported,
 }

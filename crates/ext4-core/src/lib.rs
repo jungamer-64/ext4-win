@@ -64,4 +64,5 @@ pub use volume::{
     StorageRequestSequence, StorageRequestSequenceStep, SymlinkNode, SymlinkNodeId,
     TransactionDirectory, TransactionFile, TransactionHardLinkSource, TransactionNode,
     TransactionSymlink, ValidatedExternalJournal, VisibilityLease, VolumeGeometry, VolumeIdentity,
+    WindowsNameMatch,
 };
