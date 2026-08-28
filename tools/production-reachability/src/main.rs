@@ -20,7 +20,7 @@ const FATAL_BUGCHECK_ALLOWLIST: &[&str] =
     &["<ext4win::kernel::fatal::KernelWideInconsistency>::bugcheck"];
 
 /// Release boundary whose complete reachable graph must remain allocation-free after durability.
-const DURABLE_PUBLISH_ROOT: &str = "<ext4win::state::MountedVolumeAccess>::publish_durable";
+const DURABLE_PUBLISH_ROOT: &str = "<ext4win::state::volume::MountedVolumeAccess>::publish_durable";
 
 /// Required active top-level IRP cancellation callback.
 const ACTIVE_CANCEL_CALLBACK: &str = "ext4win::irp::cancel::active_irp_cancelled";
@@ -2224,7 +2224,7 @@ mod tests {
              define internal void @active_cancel(ptr %device, ptr %irp) {{\n  ret void\n}}\n\
              ; ext4win::irp::reactor::storage_retry_timer_dpc\n\
              define internal void @retry_timer(ptr %dpc, ptr %context, ptr %arg1, ptr %arg2) {{\n  ret void\n}}\n\
-             ; <ext4win::state::MountedVolumeAccess>::publish_durable\n\
+             ; <ext4win::state::volume::MountedVolumeAccess>::publish_durable\n\
              define internal void @publish() {{\n{publish_body}\n  ret void\n}}\n\
              declare i32 @IoSetCompletionRoutineEx(ptr, ptr, ptr, ptr, i8, i8, i8)\n\
              declare i32 @IofCallDriver(ptr, ptr)\n\
