@@ -660,7 +660,7 @@ ext4win_stream_cache_flush(_In_ PVOID stream_header)
     return status;
 }
 
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NTAPI
@@ -672,6 +672,9 @@ ext4win_stream_cache_coherency_flush_and_purge(_In_ PVOID stream_header)
 
     if (stream == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
     }
     if ((stream->SectionObjects.DataSectionObject == NULL) &&
         (stream->SectionObjects.SharedCacheMap == NULL)) {
@@ -690,6 +693,10 @@ ext4win_stream_cache_coherency_flush_and_purge(_In_ PVOID stream_header)
             &io_status,
             0);
         status = io_status.Status;
+        /* This informational Cc status means invalidation failed, not coherent success. */
+        if (status == STATUS_CACHE_PAGE_LOCKED) {
+            status = STATUS_USER_MAPPED_FILE;
+        }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
@@ -712,11 +719,6 @@ ext4win_stream_cache_uninitialize(
     if (!ext4win_stream_matches_file_object(stream, file_object)) {
         return STATUS_INVALID_PARAMETER;
     }
-    if (file_object->PrivateCacheMap == NULL) {
-        file_object->Flags &= ~FO_CACHE_SUPPORTED;
-        return STATUS_SUCCESS;
-    }
-
     status = STATUS_SUCCESS;
     __try {
         (VOID)CcUninitializeCacheMap(file_object, NULL, NULL);

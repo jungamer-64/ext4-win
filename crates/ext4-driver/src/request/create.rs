@@ -28,7 +28,8 @@ use crate::{
         FileControlBlock, HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeAccess,
         NoIntermediateTransfer, NodeStreamSizes, OpenedHandle, OpenedLocation, OpenedNodeMode,
         OpenedObject, OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion,
-        UninitializedFileObject, VolumeControlBlock, WriteCommitment, abandon_file_control_block,
+        RawVolumeAccess, UninitializedFileObject, VolumeControlBlock, WriteCommitment,
+        abandon_file_control_block,
     },
 };
 
@@ -1034,7 +1035,11 @@ fn open_volume(
     if policy.deletion() == CreateDeletion::DeleteOnClose {
         return Err(DriverError::CannotDelete);
     }
-    let handle = memory::boxed_try_with(|| Ok(OpenedVolumeHandle::new()))?;
+    let handle = memory::boxed_try_with(|| {
+        Ok(OpenedVolumeHandle::new(RawVolumeAccess::from_granted(
+            policy.granted_access(),
+        )))
+    })?;
     request.with_file_object(move |file_object| {
         operations.open_volume_handle(
             file_object.kernel_file_object(),

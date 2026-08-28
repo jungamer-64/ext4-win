@@ -152,3 +152,27 @@ pub(crate) fn direct_volume_target(
         })
     })
 }
+
+/// Applies `FSCTL_ALLOW_EXTENDED_DASD_IO` to one payload-free direct-volume handle.
+/// # Errors
+///
+/// Returns an error for payload-bearing requests, a foreign VCB, invalid handle state, or a
+/// lifecycle state that no longer admits this handle.
+pub(crate) fn allow_extended_dasd_io(
+    request: &mut PendingIrpLease<'_>,
+    operations: &MountedVolumeAccess<'_>,
+) -> DriverResult<()> {
+    request.with_active(|active| {
+        let stack = active.current_stack()?.file_system_control()?;
+        if !stack.input_buffer_length().is_empty() || !stack.output_buffer_length().is_empty() {
+            return Err(DriverError::InvalidParameter);
+        }
+        let mut opened = OpenedVolume::decode(active.current_stack()?.file_object()?)?;
+        if !operations.owns_volume(opened.volume()) {
+            return Err(DriverError::InvalidDeviceRequest);
+        }
+        operations.authorize_raw_extent_change(opened.file_object())?;
+        opened.allow_partition_extent();
+        Ok(())
+    })
+}
