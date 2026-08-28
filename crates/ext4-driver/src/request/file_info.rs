@@ -236,7 +236,7 @@ pub(crate) fn read(
     request: PendingIrpLease<'_>,
     read: &mut impl CommittedReadPass,
 ) -> DriverResult<IrpCompletion> {
-    read_regular_file_direct(request, read)
+    read_regular_file_by_transfer_mode(request, read)
 }
 
 /// Executes regular file data writes.
@@ -247,7 +247,7 @@ pub(crate) fn write(
     request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<WriteResolution> {
-    write_regular_file_windowed(request, mutation)
+    write_regular_file_by_transfer_mode(request, mutation)
 }
 
 /// Executes file information queries.
