@@ -608,8 +608,7 @@ pub(crate) fn admit_owned(
     enum HandleRequestClass {
         Device,
         Ordinary,
-        PagingRead,
-        PagingWrite,
+        Paging,
         FlushBuffers,
         Cleanup,
         Close,
@@ -776,14 +775,14 @@ pub(crate) fn admit_owned(
     let handle_class = match &admission {
         Admission::Mount(_) => HandleRequestClass::Device,
         Admission::Read(ReadRequestKind::Read) if data_io_kind == Some(DataIoKind::Paging) => {
-            HandleRequestClass::PagingRead
+            HandleRequestClass::Paging
         }
         Admission::Read(_) | Admission::Raw(_) => HandleRequestClass::Ordinary,
         Admission::Mutation(MutationRequestKind::Create) => HandleRequestClass::Device,
         Admission::Mutation(MutationRequestKind::Write)
             if data_io_kind == Some(DataIoKind::Paging) =>
         {
-            HandleRequestClass::PagingWrite
+            HandleRequestClass::Paging
         }
         Admission::Mutation(MutationRequestKind::Cleanup) => HandleRequestClass::Cleanup,
         Admission::Mutation(_) => HandleRequestClass::Ordinary,
@@ -796,8 +795,10 @@ pub(crate) fn admit_owned(
         Admission::FsControl(_) | Admission::Unsupported => HandleRequestClass::Device,
     };
 
-    let (operation_admission, lifecycle_publication) = if handle_class == HandleRequestClass::Device
-    {
+    let (operation_admission, lifecycle_publication) = if matches!(
+        handle_class,
+        HandleRequestClass::Device | HandleRequestClass::Paging
+    ) {
         (OperationAdmission::Device, LifecyclePublication::None)
     } else {
         let prepared = match super::file_info::prepare_handle_admission(owned.request()) {
@@ -827,21 +828,6 @@ pub(crate) fn admit_owned(
                                 file_object,
                                 lane: HandleOperationLane::Ordinary,
                             },
-                            LifecyclePublication::None,
-                        )
-                    }
-                    HandleRequestClass::PagingRead | HandleRequestClass::PagingWrite => {
-                        let request = if handle_class == HandleRequestClass::PagingRead {
-                            PostCleanupRequest::PagingRead
-                        } else {
-                            PostCleanupRequest::PagingWrite
-                        };
-                        let lane = match post_cleanup_lane(state, request) {
-                            Ok(lane) => lane,
-                            Err(error) => return Err(AdmitOperationError::new(error, owned)),
-                        };
-                        (
-                            OperationAdmission::Handle { file_object, lane },
                             LifecyclePublication::None,
                         )
                     }
@@ -879,7 +865,7 @@ pub(crate) fn admit_owned(
                         },
                         LifecyclePublication::Close(prepared),
                     ),
-                    HandleRequestClass::Device => {
+                    HandleRequestClass::Device | HandleRequestClass::Paging => {
                         (OperationAdmission::Device, LifecyclePublication::None)
                     }
                 }
@@ -1033,15 +1019,11 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when paging I/O or flush loses its post-cleanup lane while the handle is open, or
-    /// remains admissible after close begins.
+    /// Panics when flush loses its post-cleanup lane while the handle is open, or remains
+    /// admissible after close begins.
     #[test]
     fn post_cleanup_requests_keep_one_lane_for_the_whole_live_handle() {
-        for request in [
-            PostCleanupRequest::PagingRead,
-            PostCleanupRequest::PagingWrite,
-            PostCleanupRequest::FlushBuffers,
-        ] {
+        for request in [PostCleanupRequest::FlushBuffers] {
             for state in [
                 HandleAdmissionState::OpenHandle,
                 HandleAdmissionState::CleanupDraining,

@@ -126,8 +126,9 @@ impl DataTransferWindows {
 pub(crate) fn read(
     request: PendingIrpLease<'_>,
     read: &mut impl CommittedReadPass,
+    paging: Option<&crate::state::PagingStreamLease>,
 ) -> DriverResult<IrpCompletion> {
-    read_regular_file_by_transfer_mode(request, read)
+    read_regular_file_by_transfer_mode(request, read, paging)
 }
 
 /// Executes regular file data writes.
@@ -137,8 +138,9 @@ pub(crate) fn read(
 pub(crate) fn write(
     request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
+    paging: Option<&crate::state::PagingStreamLease>,
 ) -> DriverResult<WriteResolution> {
-    write_regular_file_by_transfer_mode(request, mutation)
+    write_regular_file_by_transfer_mode(request, mutation, paging)
 }
 
 /// One authorized raw-volume request ready for lower-device submission.
@@ -687,8 +689,9 @@ fn regular_file_end(
 fn read_regular_file_by_transfer_mode(
     request: PendingIrpLease<'_>,
     read: &mut impl CommittedReadPass,
+    paging: Option<&crate::state::PagingStreamLease>,
 ) -> DriverResult<IrpCompletion> {
-    read_regular_file_direct(request, read)
+    read_regular_file_direct(request, read, paging)
 }
 
 /// Executes the actor-owned journal mutation after top-level cache dispatch declined the write.
@@ -701,8 +704,9 @@ fn read_regular_file_by_transfer_mode(
 fn write_regular_file_by_transfer_mode(
     request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
+    paging: Option<&crate::state::PagingStreamLease>,
 ) -> DriverResult<WriteResolution> {
-    write_regular_file_windowed(request, mutation)
+    write_regular_file_windowed(request, mutation, paging)
 }
 
 /// Reads a regular file through bounded driver-owned windows into the pending read IRP.
@@ -713,6 +717,7 @@ fn write_regular_file_by_transfer_mode(
 fn read_regular_file_direct(
     mut request: PendingIrpLease<'_>,
     read: &mut impl CommittedReadPass,
+    _paging: Option<&crate::state::PagingStreamLease>,
 ) -> DriverResult<IrpCompletion> {
     let stack = request.prepared_read()?.stack();
     let output_address = request.prepared_read()?.output_address();
@@ -790,6 +795,7 @@ fn read_regular_file_direct(
 fn write_regular_file_windowed(
     mut request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
+    _paging: Option<&crate::state::PagingStreamLease>,
 ) -> DriverResult<WriteResolution> {
     let stack = request.prepared_write()?.stack();
     let input_address = request.prepared_write()?.input_address();
