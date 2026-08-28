@@ -263,10 +263,10 @@ impl NoIntermediateTransfer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Per-handle data transfer buffering policy.
 pub(crate) enum DataTransferMode {
-    /// The filesystem may use ordinary intermediate buffering behavior.
-    IntermediateAllowed,
+    /// The stream participates in Cache Manager coherency and paging writeback.
+    Cached,
     /// Every non-empty transfer must satisfy no-intermediate-buffering constraints.
-    NoIntermediate(NoIntermediateTransfer),
+    Direct(NoIntermediateTransfer),
 }
 
 impl DataTransferMode {
@@ -276,8 +276,8 @@ impl DataTransferMode {
     /// Returns an error when no-intermediate buffering requires stricter alignment.
     pub(crate) fn validate_range(self, byte_offset: u64, byte_count: usize) -> DriverResult<()> {
         match self {
-            Self::IntermediateAllowed => Ok(()),
-            Self::NoIntermediate(transfer) => transfer.validate_range(byte_offset, byte_count),
+            Self::Cached => Ok(()),
+            Self::Direct(transfer) => transfer.validate_range(byte_offset, byte_count),
         }
     }
 
@@ -287,8 +287,8 @@ impl DataTransferMode {
     /// Returns an error when no-intermediate buffering requires sector alignment.
     pub(crate) fn validate_position(self, byte_offset: u64) -> DriverResult<()> {
         match self {
-            Self::IntermediateAllowed => Ok(()),
-            Self::NoIntermediate(transfer) => transfer.validate_position(byte_offset),
+            Self::Cached => Ok(()),
+            Self::Direct(transfer) => transfer.validate_position(byte_offset),
         }
     }
 
@@ -298,8 +298,8 @@ impl DataTransferMode {
     /// Returns an error when no-intermediate buffering requires stricter alignment.
     pub(crate) fn validate_buffer(self, address: NonNull<u8>) -> DriverResult<()> {
         match self {
-            Self::IntermediateAllowed => Ok(()),
-            Self::NoIntermediate(transfer) => transfer.validate_buffer(address),
+            Self::Cached => Ok(()),
+            Self::Direct(transfer) => transfer.validate_buffer(address),
         }
     }
 }
@@ -4699,11 +4699,9 @@ impl FileControlBlockOpenState {
         self.lifetime.with_additional_handle()
     }
 
-    /// Releases one FILE_OBJECT lease and reports whether the stream became reclaimable.
-    fn release_file_object_reference(&mut self) -> bool {
-        self.lifetime = self.lifetime.without_handle();
-        self.lifetime == StreamLifetimeState::Reclaimable
-    }
+    // FILE_OBJECT close may no longer decide reclamation from the handle count alone. Cache-map,
+    // section, paging, oplock-continuation, and worker leases are migrated to explicit residency
+    // transitions before this release boundary is rebuilt.
 }
 
 /// Lifetime of one inode stream independent of any particular handle.
@@ -4753,33 +4751,6 @@ impl StreamLifetimeState {
         }
     }
 
-    /// Computes the state after consuming exactly one FILE_OBJECT close obligation.
-    fn without_handle(self) -> Self {
-        match self {
-            Self::OpenHandles {
-                handles,
-                resident_leases,
-            } if handles.get() > 1 => Self::OpenHandles {
-                handles: NonZeroU32::new(handles.get() - 1).unwrap_or_else(|| {
-                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
-                }),
-                resident_leases,
-            },
-            Self::OpenHandles {
-                resident_leases: 0, ..
-            } => Self::Reclaimable,
-            Self::OpenHandles {
-                resident_leases, ..
-            } => Self::CachedOrMappedResident {
-                resident_leases: NonZeroU32::new(resident_leases).unwrap_or_else(|| {
-                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
-                }),
-            },
-            Self::CachedOrMappedResident { .. } | Self::Reclaimable => {
-                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
-            }
-        }
-    }
 }
 
 /// Opaque FsRtl byte-range lock state owned by one FCB.
