@@ -378,6 +378,8 @@ enum QueryFilePlan {
         node: NodeId,
         /// Shared FCB deletion state captured before metadata I/O.
         delete_pending: bool,
+        /// Coherent Windows size authority, not a projection from ext4 query metadata.
+        stream_sizes: crate::kernel::stream::StreamSizes,
     },
     /// Traverse the ext4 namespace for every name of one hard-linkable inode.
     HardLinks {
@@ -440,15 +442,23 @@ fn query_file_information(
             information_class,
             node: opened_file.node(),
             delete_pending: opened_file.delete_pending(),
+            stream_sizes: opened_file.file_control_block().stream_sizes()?,
         })
     })?;
-    let (length, information_class, node, delete_pending) = match plan {
+    let (length, information_class, node, delete_pending, stream_sizes) = match plan {
         QueryFilePlan::Metadata {
             length,
             information_class,
             node,
             delete_pending,
-        } => (length, information_class, node, delete_pending),
+            stream_sizes,
+        } => (
+            length,
+            information_class,
+            node,
+            delete_pending,
+            stream_sizes,
+        ),
         QueryFilePlan::Complete {
             length,
             output,
@@ -474,9 +484,12 @@ fn query_file_information(
             QueryFileInformationClass::Basic => {
                 pack_basic_information(buffer.as_mut_slice(), metadata)
             }
-            QueryFileInformationClass::Standard => {
-                pack_standard_information(buffer.as_mut_slice(), metadata, delete_pending)
-            }
+            QueryFileInformationClass::Standard => pack_standard_information(
+                buffer.as_mut_slice(),
+                metadata,
+                delete_pending,
+                stream_sizes,
+            ),
             QueryFileInformationClass::StandardLink => {
                 pack_standard_link_information(buffer.as_mut_slice(), metadata, delete_pending)
             }
@@ -484,7 +497,7 @@ fn query_file_information(
                 pack_internal_information(buffer.as_mut_slice(), metadata)
             }
             QueryFileInformationClass::NetworkOpen => {
-                pack_network_open_information(buffer.as_mut_slice(), metadata)
+                pack_network_open_information(buffer.as_mut_slice(), metadata, stream_sizes)
             }
             QueryFileInformationClass::AttributeTag => {
                 pack_attribute_tag_information(buffer.as_mut_slice(), metadata)
@@ -3797,12 +3810,12 @@ fn pack_basic_information(
 /// Packs FILE_STANDARD_INFORMATION.
 /// # Errors
 ///
-/// Returns an error when allocation or EOF sizes cannot be represented, or the output buffer is too
-/// small for `FILE_STANDARD_INFORMATION`.
+/// Returns an error when link accounting is inconsistent or the output buffer is too small.
 fn pack_standard_information(
     output: &mut [u8],
     metadata: FileMetadata,
     delete_pending: bool,
+    stream_sizes: crate::kernel::stream::StreamSizes,
 ) -> DriverResult<IrpCompletion> {
     let links = WindowsLinkInformation::from_metadata(metadata, delete_pending)?;
     let size = core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>();
@@ -3812,14 +3825,14 @@ fn pack_standard_information(
             wdk_sys::FILE_STANDARD_INFORMATION,
             AllocationSize
         )),
-        signed_i64(metadata.allocation_size.bytes())?,
+        stream_sizes.allocation_charge(),
     )?;
     writer.write_i64(
         WireOffset::new(core::mem::offset_of!(
             wdk_sys::FILE_STANDARD_INFORMATION,
             EndOfFile
         )),
-        signed_i64(metadata.size.bytes())?,
+        stream_sizes.file_size(),
     )?;
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
@@ -3934,11 +3947,11 @@ fn pack_position_information(
 /// Packs FILE_NETWORK_OPEN_INFORMATION.
 /// # Errors
 ///
-/// Returns an error when sizes cannot be represented as signed Windows values or the output buffer
-/// is too small for `FILE_NETWORK_OPEN_INFORMATION`.
+/// Returns an error when the output buffer is too small for `FILE_NETWORK_OPEN_INFORMATION`.
 fn pack_network_open_information(
     output: &mut [u8],
     metadata: FileMetadata,
+    stream_sizes: crate::kernel::stream::StreamSizes,
 ) -> DriverResult<IrpCompletion> {
     let size = core::mem::size_of::<wdk_sys::FILE_NETWORK_OPEN_INFORMATION>();
     let mut writer = fixed_record_writer(output, size)?;
@@ -3975,14 +3988,14 @@ fn pack_network_open_information(
             wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
             AllocationSize
         )),
-        signed_i64(metadata.allocation_size.bytes())?,
+        stream_sizes.allocation_charge(),
     )?;
     writer.write_i64(
         WireOffset::new(core::mem::offset_of!(
             wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
             EndOfFile
         )),
-        signed_i64(metadata.size.bytes())?,
+        stream_sizes.file_size(),
     )?;
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
@@ -4836,6 +4849,7 @@ mod tests {
     /// padding.
     #[test]
     fn fixed_query_information_packers_clear_every_padding_byte() {
+        let stream_sizes = crate::kernel::stream::StreamSizes::EMPTY;
         let metadata = test_metadata(super::FileMetadataKind::File);
         assert!(metadata.is_some());
         let Some(metadata) = metadata else {
@@ -4872,7 +4886,9 @@ mod tests {
 
         let mut standard =
             vec![0xA5_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>()];
-        assert!(super::pack_standard_information(&mut standard, metadata, false).is_ok());
+        assert!(
+            super::pack_standard_information(&mut standard, metadata, false, stream_sizes).is_ok()
+        );
         assert_padding_zero(
             &standard,
             &[
@@ -4932,7 +4948,7 @@ mod tests {
 
         let mut network =
             vec![0xA5_u8; core::mem::size_of::<wdk_sys::FILE_NETWORK_OPEN_INFORMATION>()];
-        assert!(super::pack_network_open_information(&mut network, metadata).is_ok());
+        assert!(super::pack_network_open_information(&mut network, metadata, stream_sizes).is_ok());
         assert_padding_zero(
             &network,
             &[
@@ -5738,14 +5754,31 @@ mod tests {
         let allocation_size = 4096_u64;
         metadata.size = FileSize::from_bytes(eof);
         metadata.allocation_size = FileAllocationSize::from_bytes(allocation_size);
+        let stream_sizes = ext4_core::ClusterSize::new(4_096)
+            .map_err(DriverError::from)
+            .and_then(|cluster| {
+                crate::kernel::stream::StreamSizes::try_from_ext4(
+                    metadata.size,
+                    metadata.allocation_size,
+                    cluster,
+                )
+            });
+        assert!(stream_sizes.is_ok());
+        let Ok(stream_sizes) = stream_sizes else {
+            return;
+        };
 
         let mut standard = [0_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>()];
-        assert!(super::pack_standard_information(&mut standard, metadata, false).is_ok());
+        assert!(
+            super::pack_standard_information(&mut standard, metadata, false, stream_sizes).is_ok()
+        );
         assert_eq!(
             standard[core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, DeletePending)],
             0
         );
-        assert!(super::pack_standard_information(&mut standard, metadata, true).is_ok());
+        assert!(
+            super::pack_standard_information(&mut standard, metadata, true, stream_sizes).is_ok()
+        );
         assert_eq!(
             standard[core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, DeletePending)],
             1
@@ -5754,7 +5787,7 @@ mod tests {
         assert_eq!(le_i64(&standard, 8), i64::try_from(eof).ok());
 
         let mut network = [0_u8; core::mem::size_of::<wdk_sys::FILE_NETWORK_OPEN_INFORMATION>()];
-        assert!(super::pack_network_open_information(&mut network, metadata).is_ok());
+        assert!(super::pack_network_open_information(&mut network, metadata, stream_sizes).is_ok());
         assert_eq!(le_i64(&network, 32), i64::try_from(allocation_size).ok());
         assert_eq!(le_i64(&network, 40), i64::try_from(eof).ok());
 
@@ -5796,6 +5829,57 @@ mod tests {
             }),
             Ok(FileSize::from_bytes(eof))
         );
+    }
+
+    /// # Errors
+    ///
+    /// Returns a fixture construction or information-packing error.
+    /// # Panics
+    ///
+    /// Panics if handle queries recompute sizes from ext4 metadata or accept a short fixed buffer.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture failures use Result; assertions verify the Windows wire contract"
+    )]
+    fn file_information_uses_stream_sizes_and_rejects_short_buffers() -> Result<(), DriverError> {
+        let mut metadata = test_metadata(super::FileMetadataKind::File)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        metadata.size = FileSize::from_bytes(1);
+        metadata.allocation_size = FileAllocationSize::from_bytes(512);
+        let stream_sizes = crate::kernel::stream::StreamSizes::try_from_ext4(
+            FileSize::from_bytes(8_193),
+            FileAllocationSize::from_bytes(4_096),
+            ext4_core::ClusterSize::new(4_096)?,
+        )?;
+        let mut standard = [0xA5; core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>()];
+        for length in 0..standard.len() {
+            let short = standard
+                .get_mut(..length)
+                .ok_or(DriverError::InternalInvariantViolation)?;
+            assert_eq!(
+                super::pack_standard_information(short, metadata, false, stream_sizes),
+                Err(DriverError::BufferTooSmall)
+            );
+        }
+        super::pack_standard_information(&mut standard, metadata, false, stream_sizes)?;
+        assert_eq!(le_i64(&standard, 0), Some(4_096));
+        assert_eq!(le_i64(&standard, 8), Some(8_193));
+
+        let mut network = [0xA5; core::mem::size_of::<wdk_sys::FILE_NETWORK_OPEN_INFORMATION>()];
+        for length in 0..network.len() {
+            let short = network
+                .get_mut(..length)
+                .ok_or(DriverError::InternalInvariantViolation)?;
+            assert_eq!(
+                super::pack_network_open_information(short, metadata, stream_sizes),
+                Err(DriverError::BufferTooSmall)
+            );
+        }
+        super::pack_network_open_information(&mut network, metadata, stream_sizes)?;
+        assert_eq!(le_i64(&network, 32), Some(4_096));
+        assert_eq!(le_i64(&network, 40), Some(8_193));
+        Ok(())
     }
 
     /// # Panics
@@ -5947,7 +6031,12 @@ mod tests {
 
         let mut standard = vec![0_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>()];
         assert_eq!(
-            super::pack_standard_information(&mut standard, metadata, false),
+            super::pack_standard_information(
+                &mut standard,
+                metadata,
+                false,
+                crate::kernel::stream::StreamSizes::EMPTY
+            ),
             IrpCompletion::from_usize(standard.len())
         );
         assert_eq!(

@@ -1489,6 +1489,30 @@ mod tests {
         );
     }
 
+    /// # Errors
+    ///
+    /// Returns an inode construction or encoding error.
+    /// # Panics
+    ///
+    /// Panics if a storage snapshot conflates logical EOF with the physical allocation charge.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture failures use Result; assertions verify inode observations"
+    )]
+    fn storage_snapshot_preserves_sparse_size_and_allocation_independently() -> Result<()> {
+        let mut record = initialized_file(16)?;
+        let eof = FileSize::from_bytes((1_u64 << 32) + 17);
+        let charge = FileAllocationSize::from_bytes(4_096);
+        record.set_encoded_size(record.raw.encoding.encode_file_size(eof)?)?;
+        record.set_encoded_allocation_size(record.raw.encoding.encode_allocation_size(charge)?)?;
+        let snapshot = NodeStorageSnapshot::from_inode(&record.parse()?);
+        assert_eq!(snapshot.node().file_index(), 16);
+        assert_eq!(snapshot.size(), eof);
+        assert_eq!(snapshot.allocation_size(), charge);
+        Ok(())
+    }
+
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.

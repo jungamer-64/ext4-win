@@ -1761,7 +1761,16 @@ enum PendingDriverPublication {
 
 /// Post-commit driver publication whose durable path cannot allocate or fail.
 #[derive(Debug)]
-enum PreparedDriverPublication {
+struct PreparedDriverPublication {
+    /// Every changed live inode's sizes, derived from the reserved core mutation.
+    stream_sizes: crate::state::PreparedStreamSizePublications,
+    /// Handle, cursor, notification, or volume state published after the sizes.
+    effect: PreparedDriverEffect,
+}
+
+/// Operation-specific state prepared before any irreversible lower write.
+#[derive(Debug)]
+enum PreparedDriverEffect {
     /// Fully claimed create handle state.
     Create(Box<crate::request::create::PreparedCreatePublication>),
     /// Checked write cursor and completion.
@@ -1780,23 +1789,36 @@ impl PendingDriverPublication {
     /// Completes every fallible driver-side acquisition before commit I/O can start.
     /// # Errors
     ///
-    /// Returns an error when create publication cannot pre-acquire its FCB/share/handle state.
-    fn prepare(self) -> DriverResult<PreparedDriverPublication> {
-        Ok(match self {
+    /// Returns an error when sizes cannot be represented or create cannot acquire its FCB/share
+    /// state. No partially prepared value has publication authority on failure.
+    fn prepare(
+        self,
+        reserved: &ReservedMutation,
+        geometry: ext4_core::VolumeGeometry,
+    ) -> DriverResult<PreparedDriverPublication> {
+        let stream_sizes = crate::state::PreparedStreamSizePublications::try_new(
+            reserved.node_storage_updates(),
+            geometry.cluster_size(),
+        )?;
+        let effect = match self {
             Self::Create(publication) => {
                 let publication = (*publication).prepare()?;
-                PreparedDriverPublication::Create(memory::boxed_try_with(move || Ok(publication))?)
+                PreparedDriverEffect::Create(memory::boxed_try_with(move || Ok(publication))?)
             }
-            Self::Write(publication) => PreparedDriverPublication::Write(publication),
-            Self::SetFile(publication) => PreparedDriverPublication::SetFile(publication),
-            Self::Cleanup(publication) => PreparedDriverPublication::Cleanup(publication),
-            Self::VolumeLabel(publication) => PreparedDriverPublication::VolumeLabel(publication),
-            Self::Normal(completion) => PreparedDriverPublication::Normal(completion),
+            Self::Write(publication) => PreparedDriverEffect::Write(publication),
+            Self::SetFile(publication) => PreparedDriverEffect::SetFile(publication),
+            Self::Cleanup(publication) => PreparedDriverEffect::Cleanup(publication),
+            Self::VolumeLabel(publication) => PreparedDriverEffect::VolumeLabel(publication),
+            Self::Normal(completion) => PreparedDriverEffect::Normal(completion),
+        };
+        Ok(PreparedDriverPublication {
+            stream_sizes,
+            effect,
         })
     }
 }
 
-impl PreparedDriverPublication {
+impl PreparedDriverEffect {
     /// Applies only moves and prevalidated pointer/state updates after commit durability.
     fn publish(self, operations: &mut crate::state::MountedVolumeAccess<'_>) -> TopLevelCompletion {
         match self {
@@ -2291,6 +2313,12 @@ impl MutationRequestOperation {
             Ok(ready) => ready,
             Err(error) => return self.complete_error(owned, DriverError::from(error)),
         };
+        // The version set sealed below must describe the same inode/allocation snapshot as this
+        // pass. A completed lower read from an older epoch cannot be relabeled with new versions.
+        if !operations.is_current_epoch(&epoch) {
+            drop(ready);
+            return self.restart_resolution(owned, operations);
+        }
         let mut publication = None;
         let resolved = {
             let kind = self.kind;
@@ -2769,7 +2797,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                         return self.complete_error(owned, DriverError::from(error));
                     }
                 };
-                let publication = match publication.prepare() {
+                let publication = match publication.prepare(&reserved, access.volume_geometry()) {
                     Ok(publication) => publication,
                     Err(error) => return self.complete_error(owned, error),
                 };
@@ -2959,9 +2987,18 @@ impl InfalliblePublication for MutationRequestOperation {
                     durable_slot,
                     checkpoint_slot,
                 } = context;
-                let pending =
-                    access.publish_durable(durable, visibility, durable_slot, checkpoint_slot);
-                let completion = publication.publish(access);
+                let PreparedDriverPublication {
+                    stream_sizes,
+                    effect,
+                } = publication;
+                let pending = access.publish_durable(
+                    durable,
+                    visibility,
+                    durable_slot,
+                    checkpoint_slot,
+                    stream_sizes,
+                );
+                let completion = effect.publish(access);
                 let _complete = Self::complete_success(owned, completion);
                 self.state = MutationOperationState::AwaitingCheckpoint(pending);
             }

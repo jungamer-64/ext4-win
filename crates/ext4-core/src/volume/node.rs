@@ -104,6 +104,54 @@ impl NodeId {
     }
 }
 
+/// Logical payload size and physical allocation charge of one live inode snapshot.
+///
+/// Holes can make the allocation charge smaller than EOF, while inode-owned metadata and
+/// preallocation can make it larger. This observation grants no mutation or publication authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeStorageSnapshot {
+    /// Identity and kind validated from the same inode as the size fields.
+    node: NodeId,
+    /// Logical payload length, including holes and unwritten ranges.
+    size: FileSize,
+    /// Allocation charge including inode-owned metadata blocks.
+    allocation_size: FileAllocationSize,
+}
+
+impl NodeStorageSnapshot {
+    /// Projects an already validated inode without reinterpreting on-disk arithmetic.
+    pub(super) fn from_inode(inode: &Inode) -> Self {
+        let node = match inode.kind() {
+            InodeKind::File => NodeId::File(FileNodeId::new(inode.id())),
+            InodeKind::Directory => NodeId::Directory(DirectoryNodeId::new(inode.id())),
+            InodeKind::Symlink => NodeId::Symlink(SymlinkNodeId::new(inode.id())),
+        };
+        Self {
+            node,
+            size: inode.size(),
+            allocation_size: inode.allocation_size(),
+        }
+    }
+
+    /// Identity of the inode represented by this snapshot.
+    #[must_use]
+    pub const fn node(self) -> NodeId {
+        self.node
+    }
+
+    /// Logical payload length in the observed inode.
+    #[must_use]
+    pub const fn size(self) -> FileSize {
+        self.size
+    }
+
+    /// Physical allocation charged to the observed inode.
+    #[must_use]
+    pub const fn allocation_size(self) -> FileAllocationSize {
+        self.allocation_size
+    }
+}
+
 /// Typed identity of an inode that can own hard-link names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HardLinkNodeId {

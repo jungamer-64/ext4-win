@@ -23,11 +23,12 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ext4_core::{
-    CleanJournalDurability, CommitLease, CommitReadyMutation, CompletedMount, DirectoryNodeId,
-    DirectoryScanCursor, DurableMutation, Ext4Name, FileNodeId, FileOffset, FscryptKeyIdentifier,
-    FscryptKeyPresence, MountedProfile, MutationLease, MutationResolvePass, NewDirectoryMetadata,
-    NewFileMetadata, NodeId, ReservedMutation, ResolvedMutation, VisibilityLease, VolumeGeometry,
-    VolumeIdentity, WindowsName, XattrName, XattrValue,
+    CleanJournalDurability, ClusterSize, CommitLease, CommitReadyMutation, CompletedMount,
+    DirectoryNodeId, DirectoryScanCursor, DurableMutation, Ext4Name, FileNodeId, FileOffset,
+    FscryptKeyIdentifier, FscryptKeyPresence, MountedProfile, MutationLease, MutationResolvePass,
+    NewDirectoryMetadata, NewFileMetadata, NodeId, NodeStorageSnapshot, ReservedMutation,
+    ResolvedMutation, VisibilityLease, VolumeGeometry, VolumeIdentity, WindowsName, XattrName,
+    XattrValue,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, LARGE_INTEGER, PDEVICE_OBJECT,
@@ -2101,17 +2102,29 @@ impl MountedVolumeAccess<'_> {
         self.volume.runtime.journal_is_clean()
     }
 
-    /// Publishes one durable mutation into its pre-reserved immutable epoch slot.
+    /// Publishes the durable epoch and its prevalidated stream sizes in one reactor turn.
+    ///
+    /// The core durability/visibility capabilities are required here, so a caller cannot install
+    /// prepared stream sizes through the mounted-volume boundary before the commit is durable.
+    #[inline(never)]
     pub(crate) fn publish_durable(
         &mut self,
         mutation: DurableMutation,
         visibility: VisibilityLease,
         durable_slot: EpochPublicationSlot,
         checkpoint_slot: EpochPublicationSlot,
+        stream_sizes: PreparedStreamSizePublications,
     ) -> PendingCheckpoint {
+        let checkpoint = self.volume.runtime.publish_durable(
+            mutation,
+            visibility,
+            durable_slot,
+            checkpoint_slot,
+        );
         self.volume
-            .runtime
-            .publish_durable(mutation, visibility, durable_slot, checkpoint_slot)
+            .file_control_blocks
+            .publish_stream_sizes(stream_sizes);
+        checkpoint
     }
 
     /// Publishes an overlay-free checkpoint and releases journal space.
@@ -2149,6 +2162,15 @@ impl MountedVolumeAccess<'_> {
     /// Current committed allocation geometry.
     pub(crate) fn volume_geometry(&self) -> VolumeGeometry {
         self.volume.runtime.current_epoch().geometry()
+    }
+
+    /// Checks whether resolve still observes the epoch paired with the current coordinator.
+    ///
+    /// Unlike pure snapshot reads, mutations must not pair old inode/allocation observations with
+    /// newer resource versions. Creates can also attach a FILE_OBJECT without mutation intents.
+    /// Both therefore restart after an epoch change before the next non-suspending resolve pass.
+    pub(crate) fn is_current_epoch(&self, epoch: &EpochLease) -> bool {
+        epoch.epoch().sequence() == self.volume.runtime.current_epoch().sequence()
     }
 
     /// Current committed fscrypt key presence.
@@ -2404,7 +2426,7 @@ impl FileControlBlockLedger {
     fn open_existing(
         &self,
         volume: NonNull<VolumeControlBlock>,
-        node: NodeId,
+        stream: NodeStreamSizes,
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
         existing_operation_access: ExistingOperationAccess,
@@ -2412,7 +2434,7 @@ impl FileControlBlockLedger {
     ) -> DriverResult<NonNull<FileControlBlock>> {
         self.open(
             volume,
-            node,
+            stream,
             file_object,
             desired_access,
             share_access,
@@ -2427,14 +2449,14 @@ impl FileControlBlockLedger {
     fn open_new(
         &self,
         volume: NonNull<VolumeControlBlock>,
-        node: NodeId,
+        stream: NodeStreamSizes,
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
         share_access: ShareAccess,
     ) -> DriverResult<NonNull<FileControlBlock>> {
         self.open(
             volume,
-            node,
+            stream,
             file_object,
             desired_access,
             share_access,
@@ -2453,19 +2475,20 @@ impl FileControlBlockLedger {
     fn open(
         &self,
         volume: NonNull<VolumeControlBlock>,
-        node: NodeId,
+        stream: NodeStreamSizes,
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
         share_access: ShareAccess,
         share_check: FileControlBlockShareCheck,
     ) -> DriverResult<NonNull<FileControlBlock>> {
+        let node = stream.node();
         if let Some(result) =
             self.try_open_present(node, file_object, desired_access, share_access, share_check)
         {
             return result;
         }
 
-        let candidate = self.file_control_block(volume, node)?;
+        let candidate = self.file_control_block(volume, stream)?;
         let mut discarded = None;
         let mut removed = None;
         let result = {
@@ -2516,13 +2539,16 @@ impl FileControlBlockLedger {
     }
 
     /// Creates an uninserted FCB candidate owned by this ledger.
+    /// # Errors
+    ///
+    /// Returns an allocation or native-header initialization/binding error.
     fn file_control_block(
         &self,
         volume: NonNull<VolumeControlBlock>,
-        node: NodeId,
+        stream: NodeStreamSizes,
     ) -> DriverResult<Box<FileControlBlock>> {
         let candidate = memory::boxed_try_with(|| {
-            FileControlBlock::try_new(volume, NonNull::from(self), node)
+            FileControlBlock::try_new(volume, NonNull::from(self), stream)
         })?;
         candidate.bind_stream_owner()?;
         Ok(candidate)
@@ -2715,6 +2741,34 @@ impl FileControlBlockLedger {
         drop(removed);
     }
 
+    /// Looks up current streams only at durable publication, including opens admitted while the
+    /// commit was in flight. The ledger guard pins each header for the non-suspending update;
+    /// no borrowed FCB pointer survives the guard or enters deferred work.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource retains every selected FCB throughout native size publication"
+    )]
+    fn publish_stream_sizes(&self, updates: PreparedStreamSizePublications) {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The ledger resource excludes removal until every header write completes.
+            &*self.table.get()
+        };
+        for update in updates.nodes.iter() {
+            if let Some(fcb) = find_file_control_block_in_table(table, update.node()) {
+                let fcb = unsafe {
+                    // SAFETY: This pointer was found in the still-locked owning ledger.
+                    fcb.as_ref()
+                };
+                if fcb.stream_context.set_sizes(update.sizes).is_err() {
+                    // Invalid native ownership after durability cannot be reported as an ordinary
+                    // failed mutation: the commit is already visible and cannot be rolled back.
+                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+                }
+            }
+        }
+    }
+
     /// Counts namespace handles whose cleanup share claims remain active.
     #[expect(
         unsafe_code,
@@ -2846,6 +2900,9 @@ impl VolumeControlBlock {
     }
 
     /// Returns the direct-volume stream's shared section-object set.
+    /// # Errors
+    ///
+    /// Returns an invariant error if the volume's native header is malformed.
     pub(crate) fn stream_section_objects(
         &self,
     ) -> DriverResult<NonNull<wdk_sys::SECTION_OBJECT_POINTERS>> {
@@ -2880,7 +2937,7 @@ impl VolumeControlBlock {
     )]
     pub(crate) fn open_existing_file_control_block(
         volume: NonNull<Self>,
-        node: NodeId,
+        stream: NodeStreamSizes,
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
         existing_operation_access: ExistingOperationAccess,
@@ -2900,7 +2957,7 @@ impl VolumeControlBlock {
         };
         file_control_blocks.open_existing(
             volume,
-            node,
+            stream,
             file_object,
             desired_access,
             existing_operation_access,
@@ -3511,14 +3568,18 @@ impl PendingChildCreation {
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
         share_access: ShareAccess,
+        stream_sizes: NodeStreamSizes,
     ) -> DriverResult<NonNull<FileControlBlock>> {
+        if stream_sizes.node() != self.node {
+            return Err(DriverError::InternalInvariantViolation);
+        }
         unsafe {
             // SAFETY: The mounted VCB outlives all admitted operations and FILE_OBJECT contexts.
             self.file_control_blocks.as_ref()
         }
         .open_new(
             self.volume.as_non_null(),
-            self.node,
+            stream_sizes,
             file_object,
             desired_access,
             share_access,
@@ -4276,22 +4337,28 @@ impl fmt::Debug for FileControlBlock {
 
 impl FileControlBlock {
     /// Creates an FCB boundary value for a mounted node with one open reference.
+    /// # Errors
+    ///
+    /// Returns an error if the native header or its synchronization resources cannot be allocated.
     fn try_new(
         volume: NonNull<VolumeControlBlock>,
         owner: NonNull<FileControlBlockLedger>,
-        node: NodeId,
+        stream: NodeStreamSizes,
     ) -> DriverResult<Self> {
         Ok(Self {
             volume,
             owner,
-            node,
+            node: stream.node(),
             byte_range_locks: FileByteRangeLocks::new(),
             open_state: UnsafeCell::new(FileControlBlockOpenState::new()),
-            stream_context: StreamContext::try_new(StreamOwnerKind::Node, StreamSizes::EMPTY)?,
+            stream_context: StreamContext::try_new(StreamOwnerKind::Node, stream.sizes)?,
         })
     }
 
     /// Binds the native header after the ledger candidate reaches its final heap address.
+    /// # Errors
+    ///
+    /// Returns an invariant error on repeated binding or malformed native ownership.
     fn bind_stream_owner(&self) -> DriverResult<()> {
         self.stream_context
             .bind_owner(NonNull::from(self).cast::<c_void>())
@@ -4303,10 +4370,21 @@ impl FileControlBlock {
     }
 
     /// Returns the inode stream's shared cache and mapped-section authority.
+    /// # Errors
+    ///
+    /// Returns an invariant error if the inode's native header is malformed.
     pub(crate) fn stream_section_objects(
         &self,
     ) -> DriverResult<NonNull<wdk_sys::SECTION_OBJECT_POINTERS>> {
         self.stream_context.section_objects()
+    }
+
+    /// Reads the sole Windows-visible size authority from the advanced header.
+    /// # Errors
+    ///
+    /// Returns an invariant error if the native header cannot provide a coherent snapshot.
+    pub(crate) fn stream_sizes(&self) -> DriverResult<StreamSizes> {
+        self.stream_context.sizes()
     }
 
     /// Returns the mounted VCB pointer that owns this open node.
@@ -4369,6 +4447,68 @@ impl FileControlBlock {
     ) {
         self.byte_range_locks
             .release_for_cleanup(requestor, file_object);
+    }
+}
+
+/// Identity-bound Windows sizes derived together from one validated core inode snapshot.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NodeStreamSizes {
+    /// Inode whose stream receives these sizes.
+    node: NodeId,
+    /// Complete native size tuple, validated before publication can become irreversible.
+    sizes: StreamSizes,
+}
+
+impl NodeStreamSizes {
+    /// Converts the core observation to Windows units without granting publication authority.
+    /// # Errors
+    ///
+    /// Returns an error when the observed sizes exceed Windows' signed size domain.
+    pub(crate) fn try_from_storage(
+        snapshot: NodeStorageSnapshot,
+        cluster_size: ClusterSize,
+    ) -> DriverResult<Self> {
+        Ok(Self {
+            node: snapshot.node(),
+            sizes: StreamSizes::try_from_ext4(
+                snapshot.size(),
+                snapshot.allocation_size(),
+                cluster_size,
+            )?,
+        })
+    }
+
+    /// Identity bound to the size observation.
+    pub(crate) const fn node(self) -> NodeId {
+        self.node
+    }
+}
+
+/// Prevalidated sizes retained with the exact mutation's commit continuation.
+///
+/// Preparation does not snapshot FCB addresses: a stream may close or first open during commit
+/// I/O. Publication resolves inode identities under the ledger guard after epoch visibility and
+/// before IRP completion/notifications. Future opens initialize from that now-current epoch.
+#[derive(Debug)]
+pub(crate) struct PreparedStreamSizePublications {
+    /// One final size tuple per live inode changed by the reserved mutation.
+    nodes: DriverVec<NodeStreamSizes>,
+}
+
+impl PreparedStreamSizePublications {
+    /// Prepares all conversions and storage before the first lower write.
+    /// # Errors
+    ///
+    /// Returns an error on allocation failure or a size outside the Windows domain.
+    pub(crate) fn try_new(
+        snapshots: &[NodeStorageSnapshot],
+        cluster_size: ClusterSize,
+    ) -> DriverResult<Self> {
+        let mut nodes = DriverVec::try_with_capacity(snapshots.len())?;
+        for snapshot in snapshots {
+            nodes.try_push(NodeStreamSizes::try_from_storage(*snapshot, cluster_size)?)?;
+        }
+        Ok(Self { nodes })
     }
 }
 
@@ -4587,6 +4727,9 @@ enum StreamLifetimeState {
 
 impl StreamLifetimeState {
     /// Computes the state after admitting one additional FILE_OBJECT.
+    /// # Errors
+    ///
+    /// Returns too-many-open-references without consuming the existing state on counter overflow.
     fn with_additional_handle(self) -> DriverResult<Self> {
         match self {
             Self::OpenHandles {
@@ -5867,12 +6010,12 @@ impl OpenedHandle {
     }
 }
 
-/// FILE_OBJECT whose FCB and CCB contexts have both been initialized by create.
+/// FILE_OBJECT whose native stream header and handle-local CCB were attached by create.
 #[derive(Debug)]
 pub(crate) struct OpenedObject<'owner> {
     /// Kernel FILE_OBJECT carrying the contexts.
     file_object: ActiveFileObject<'owner>,
-    /// Shared file control block stored in FsContext.
+    /// Shared file control block decoded from the native header's bound owner identity.
     fcb: NonNull<FileControlBlock>,
     /// Per-handle context stored in FsContext2.
     handle: NonNull<OpenedHandle>,
@@ -5951,6 +6094,10 @@ impl<'owner> OpenedObject<'owner> {
     /// # Errors
     ///
     /// Returns an error when the FILE_OBJECT is a volume open or either context is absent.
+    #[expect(
+        unsafe_code,
+        reason = "the active FILE_OBJECT retains the driver-published native header and CCB"
+    )]
     pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
         let object = file_object.as_ref();
         if object.Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
@@ -5965,9 +6112,16 @@ impl<'owner> OpenedObject<'owner> {
                 KernelWideInconsistency::file_object_context_corruption().bugcheck();
             }
         };
-        let fcb =
-            StreamContext::decode_owner(header, StreamOwnerKind::Node)?.cast::<FileControlBlock>();
-        if object.SectionObjectPointer != StreamContext::decode_section_objects(header)?.as_ptr() {
+        let fcb = unsafe {
+            // SAFETY: The active FILE_OBJECT retains the native header and its bound inode owner.
+            StreamContext::decode_owner(header, StreamOwnerKind::Node)?
+        }
+        .cast::<FileControlBlock>();
+        let sections = unsafe {
+            // SAFETY: The same FILE_OBJECT lease retains the header's embedded section storage.
+            StreamContext::decode_section_objects(header)?
+        };
+        if object.SectionObjectPointer != sections.as_ptr() {
             KernelWideInconsistency::file_object_context_corruption().bugcheck();
         }
         let opened = Self {
@@ -6245,9 +6399,8 @@ impl<'owner> OpenedObject<'owner> {
     )]
     pub(crate) fn file_control_block(&self) -> &FileControlBlock {
         unsafe {
-            // SAFETY: `decode` only constructs this type from a non-null
-            // FsContext written by successful create and used during the
-            // active FILE_OBJECT lifetime.
+            // SAFETY: `decode` validates the native header and its bound inode owner.
+            // The active FILE_OBJECT retains both allocations throughout this borrow.
             self.fcb.as_ref()
         }
     }
@@ -6438,7 +6591,7 @@ impl PreparedHandleAdmission {
 pub(crate) struct OpenedVolume<'owner> {
     /// Live direct-volume FILE_OBJECT.
     file_object: ActiveFileObject<'owner>,
-    /// Mounted VCB stored in `FsContext`.
+    /// Mounted VCB decoded from the advanced header's bound owner identity.
     volume: NonNull<VolumeControlBlock>,
     /// Per-handle lifecycle stored in `FsContext2`.
     handle: NonNull<OpenedVolumeHandle>,
@@ -6449,6 +6602,10 @@ impl<'owner> OpenedVolume<'owner> {
     /// # Errors
     ///
     /// Returns an error when the FILE_OBJECT is not marked as a volume open or lacks contexts.
+    #[expect(
+        unsafe_code,
+        reason = "the active volume FILE_OBJECT retains its driver-published native header and owner"
+    )]
     pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
         let object = file_object.as_ref();
         if object.Flags & wdk_sys::FO_VOLUME_OPEN == 0 {
@@ -6463,9 +6620,16 @@ impl<'owner> OpenedVolume<'owner> {
                 KernelWideInconsistency::file_object_context_corruption().bugcheck();
             }
         };
-        let volume = StreamContext::decode_owner(header, StreamOwnerKind::Volume)?
-            .cast::<VolumeControlBlock>();
-        if object.SectionObjectPointer != StreamContext::decode_section_objects(header)?.as_ptr() {
+        let volume = unsafe {
+            // SAFETY: The active volume FILE_OBJECT retains the native header and its VCB owner.
+            StreamContext::decode_owner(header, StreamOwnerKind::Volume)?
+        }
+        .cast::<VolumeControlBlock>();
+        let sections = unsafe {
+            // SAFETY: The same FILE_OBJECT lease retains the header's embedded section storage.
+            StreamContext::decode_section_objects(header)?
+        };
+        if object.SectionObjectPointer != sections.as_ptr() {
             KernelWideInconsistency::file_object_context_corruption().bugcheck();
         }
         Ok(Self {
@@ -7016,6 +7180,10 @@ mod tests {
         handle.ok()
     }
 
+    #[expect(
+        unsafe_code,
+        reason = "the fixture callers supply live native header storage whenever both contexts are nonnull"
+    )]
     fn file_object_with_contexts(
         fs_context: *mut core::ffi::c_void,
         fs_context2: *mut core::ffi::c_void,
@@ -7026,9 +7194,11 @@ mod tests {
             ..wdk_sys::FILE_OBJECT::default()
         };
         if let (Some(header), false) = (NonNull::new(fs_context), fs_context2.is_null()) {
-            file_object.SectionObjectPointer =
+            file_object.SectionObjectPointer = unsafe {
+                // SAFETY: Nonempty fixture pairs below retain a StreamContext owner until return.
                 crate::kernel::stream::StreamContext::decode_section_objects(header)
-                    .map_or(core::ptr::null_mut(), NonNull::as_ptr);
+            }
+            .map_or(core::ptr::null_mut(), NonNull::as_ptr);
         }
         file_object
     }
@@ -7240,12 +7410,19 @@ mod tests {
         volume: NonNull<VolumeControlBlock>,
         node: NodeId,
     ) -> Box<FileControlBlock> {
-        let fcb = Box::new(
-            FileControlBlock::try_new(volume, NonNull::<FileControlBlockLedger>::dangling(), node)
-                .unwrap_or_else(|_| {
-                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
-                }),
-        );
+        let fcb = crate::memory::boxed_try_with(|| {
+            FileControlBlock::try_new(
+                volume,
+                NonNull::<FileControlBlockLedger>::dangling(),
+                super::NodeStreamSizes {
+                    node,
+                    sizes: crate::kernel::stream::StreamSizes::EMPTY,
+                },
+            )
+        })
+        .unwrap_or_else(|_| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
         fcb.bind_stream_owner().unwrap_or_else(|_| {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
         });
@@ -7946,6 +8123,69 @@ mod tests {
                 resident_leases: 0,
             }
         );
+    }
+
+    /// # Errors
+    ///
+    /// Returns a fixture allocation or size conversion error.
+    /// # Panics
+    ///
+    /// Panics if publication misses a stream opened after preparation or exposes uncommitted sizes.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture failures use Result; assertions check commit visibility"
+    )]
+    fn size_publication_targets_streams_opened_after_preparation() -> Result<(), DriverError> {
+        let mut ledger = FileControlBlockLedger::try_new()?;
+        let node = NodeId::Directory(DirectoryNodeId::ROOT);
+        let initial = super::NodeStreamSizes {
+            node,
+            sizes: crate::kernel::stream::StreamSizes::EMPTY,
+        };
+        let changed = super::NodeStreamSizes {
+            node,
+            sizes: crate::kernel::stream::StreamSizes::try_from_ext4(
+                ext4_core::FileSize::from_bytes(9_000),
+                ext4_core::FileAllocationSize::from_bytes(4_096),
+                ext4_core::ClusterSize::new(4_096)?,
+            )?,
+        };
+        let mut nodes = crate::memory::DriverVec::new();
+        nodes.try_push(changed)?;
+        let publication = super::PreparedStreamSizePublications { nodes };
+
+        // Only immutable stream fields are exercised, so the volume identity is never dereferenced.
+        let original = ledger.file_control_block(NonNull::dangling(), initial)?;
+        let original_pointer = NonNull::from(original.as_ref());
+        ledger
+            .table
+            .get_mut()
+            .try_push_owned(original)
+            .map_err(|failure| failure.into_parts().0)?;
+        ledger.close(original_pointer);
+
+        let reopened = ledger.file_control_block(NonNull::dangling(), initial)?;
+        let before = reopened.stream_sizes();
+        let reopened_pointer = NonNull::from(reopened.as_ref());
+        ledger
+            .table
+            .get_mut()
+            .try_push_owned(reopened)
+            .map_err(|failure| failure.into_parts().0)?;
+        ledger.publish_stream_sizes(publication);
+        let after = ledger
+            .table
+            .get_mut()
+            .as_slice()
+            .first()
+            .ok_or(DriverError::InternalInvariantViolation)
+            .and_then(|stream| stream.stream_sizes());
+        ledger.close(reopened_pointer);
+        assert_eq!(before, Ok(initial.sizes));
+        assert_eq!(after, Ok(changed.sizes));
+        assert!(ledger.is_empty());
+        Ok(())
     }
 
     /// # Panics
