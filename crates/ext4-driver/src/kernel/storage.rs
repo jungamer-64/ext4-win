@@ -196,6 +196,16 @@ impl MountedStorageRoute {
             }
         }
     }
+
+    /// Returns the complete lower partition length for direct-volume bounds validation.
+    pub(crate) const fn filesystem_device_length(self) -> DeviceLength {
+        self.filesystem.length
+    }
+
+    /// Returns the physical sector unit required for direct-volume offsets and lengths.
+    pub(crate) const fn filesystem_sector_size(self) -> usize {
+        self.filesystem.sector_size
+    }
 }
 
 /// Exclusive external-journal kernel ownership retained until mounted runtime teardown.
@@ -730,7 +740,17 @@ pub enum StorageFailureClass {
     /// A lower read reported a medium/device failure that invalidates future committed reads.
     ReadUnreliable,
     /// A write or flush may have taken effect and journal abort/recovery is required.
-    DurabilityUnknown,
+    DurabilityUnknown {
+        /// Lower-reported byte progress retained for operation-specific recovery policy.
+        completed: usize,
+    },
+}
+
+impl StorageFailureClass {
+    /// Returns whether a write or flush crossed a boundary with an uncertain effect.
+    pub(crate) const fn is_durability_unknown(self) -> bool {
+        matches!(self, Self::DurabilityUnknown { .. })
+    }
 }
 
 /// Failed completed command retaining ownership for retry or abort handling.
@@ -766,7 +786,9 @@ impl<O> FailedStorageCommand<O> {
         } else if self.command.read_retry_policy() || effect_free_write_failure {
             StorageFailureClass::Terminal
         } else {
-            StorageFailureClass::DurabilityUnknown
+            StorageFailureClass::DurabilityUnknown {
+                completed: self.information,
+            }
         };
         let (suspended, request) = self.command.into_parts();
         (suspended, request, class)
@@ -1330,7 +1352,10 @@ mod tests {
             return;
         };
         let (_, _, class) = timeout.into_failure();
-        assert_eq!(class, StorageFailureClass::DurabilityUnknown);
+        assert_eq!(
+            class,
+            StorageFailureClass::DurabilityUnknown { completed: 0 }
+        );
 
         let short = StorageRequest::Write {
             target: StorageTarget::Filesystem,
@@ -1344,7 +1369,10 @@ mod tests {
             return;
         };
         let (_, _, class) = short.into_failure();
-        assert_eq!(class, StorageFailureClass::DurabilityUnknown);
+        assert_eq!(
+            class,
+            StorageFailureClass::DurabilityUnknown { completed: 511 }
+        );
 
         let flush = StorageRequest::Flush {
             target: StorageTarget::Filesystem,
@@ -1362,7 +1390,10 @@ mod tests {
             return;
         };
         let (_, _, class) = timeout.into_failure();
-        assert_eq!(class, StorageFailureClass::DurabilityUnknown);
+        assert_eq!(
+            class,
+            StorageFailureClass::DurabilityUnknown { completed: 0 }
+        );
     }
 
     /// # Panics

@@ -23,12 +23,12 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ext4_core::{
-    CleanJournalDurability, ClusterSize, CommitLease, CommitReadyMutation, CompletedMount,
-    DirectoryNodeId, DirectoryScanCursor, DurableMutation, Ext4Name, FileNodeId, FileOffset,
-    FscryptKeyIdentifier, FscryptKeyPresence, MountedProfile, MutationLease, MutationResolvePass,
-    NewDirectoryMetadata, NewFileMetadata, NodeId, NodeStorageSnapshot, ReservedMutation,
-    ResolvedMutation, VisibilityLease, VolumeGeometry, VolumeIdentity, WindowsName, XattrName,
-    XattrValue,
+    ByteOffset, CleanJournalDurability, ClusterSize, CommitLease, CommitReadyMutation,
+    CompletedMount, DeviceLength, DirectoryNodeId, DirectoryScanCursor, DurableMutation, Ext4Name,
+    FileNodeId, FileOffset, FscryptKeyIdentifier, FscryptKeyPresence, MountedProfile,
+    MutationLease, MutationResolvePass, NewDirectoryMetadata, NewFileMetadata, NodeId,
+    NodeStorageSnapshot, ReservedMutation, ResolvedMutation, VisibilityLease, VolumeGeometry,
+    VolumeIdentity, WindowsName, XattrName, XattrValue,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, LARGE_INTEGER, PDEVICE_OBJECT,
@@ -1272,6 +1272,11 @@ impl VolumeControlPlane {
 enum MountedVolumeState {
     /// Namespace and direct-volume opens are admitted.
     Mounted,
+    /// Namespace admission is closed while one lock request drains durable work.
+    Locking {
+        /// Direct-volume FILE_OBJECT that owns this reversible lock attempt.
+        owner: KernelFileObject,
+    },
     /// Only the FILE_OBJECT that locked the volume may issue ordinary operations.
     Locked {
         /// Direct-volume FILE_OBJECT that owns the lock.
@@ -1308,18 +1313,34 @@ pub(crate) enum CleanCloseTerminal {
 }
 
 impl MountedVolumeState {
-    /// Selects the locked state reached by one direct-volume FILE_OBJECT.
+    /// Closes namespace admission before the lock's durability barrier can suspend.
     /// # Errors
     ///
     /// Returns access denied when already locked or volume dismounted after terminal dismount.
-    fn lock(self, owner: KernelFileObject) -> DriverResult<Self> {
+    fn begin_lock(self, owner: KernelFileObject) -> DriverResult<Self> {
         match self {
-            Self::Mounted => Ok(Self::Locked { owner }),
-            Self::Locked { .. } => Err(DriverError::AccessDenied),
+            Self::Mounted => Ok(Self::Locking { owner }),
+            Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
             Self::Closing { .. }
             | Self::Dismounted { .. }
             | Self::ShutdownComplete { .. }
             | Self::Retiring => Err(DriverError::VolumeDismounted),
+        }
+    }
+
+    /// Publishes a clean lock only for the FILE_OBJECT that began its barrier.
+    fn finish_lock(self, owner: KernelFileObject) -> Option<Self> {
+        match self {
+            Self::Locking { owner: current } if current == owner => Some(Self::Locked { owner }),
+            _ => None,
+        }
+    }
+
+    /// Reopens namespace admission after an uncommitted lock attempt fails or is cancelled.
+    fn abort_lock(self, owner: KernelFileObject) -> Option<Self> {
+        match self {
+            Self::Locking { owner: current } if current == owner => Some(Self::Mounted),
+            _ => None,
         }
     }
 
@@ -1346,6 +1367,7 @@ impl MountedVolumeState {
                 lock_owner: Some(current_owner),
             } if current_owner == owner => Ok(Self::ShutdownComplete { lock_owner: None }),
             Self::Mounted
+            | Self::Locking { .. }
             | Self::Locked { .. }
             | Self::Closing { .. }
             | Self::Dismounted { .. }
@@ -1370,7 +1392,7 @@ impl MountedVolumeState {
                 terminal: CleanCloseTerminal::Dismount,
                 lock_owner: Some(owner),
             }),
-            Self::Locked { .. } => Err(DriverError::AccessDenied),
+            Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
             Self::Closing { .. }
             | Self::Dismounted { .. }
             | Self::ShutdownComplete { .. }
@@ -1392,6 +1414,7 @@ impl MountedVolumeState {
                 terminal: CleanCloseTerminal::Shutdown,
                 lock_owner: Some(owner),
             }),
+            Self::Locking { .. } => Err(DriverError::AccessDenied),
             Self::Closing { .. }
             | Self::Dismounted { .. }
             | Self::ShutdownComplete { .. }
@@ -1420,6 +1443,9 @@ impl MountedVolumeState {
     /// Applies implicit lock release when the owning FILE_OBJECT is cleaned up.
     fn cleanup(self, owner: KernelFileObject) -> (Self, VolumeHandleCleanup) {
         match self {
+            Self::Locking { owner: current } if current == owner => {
+                (Self::Mounted, VolumeHandleCleanup::Released)
+            }
             Self::Locked {
                 owner: current_owner,
             } if current_owner == owner => (Self::Mounted, VolumeHandleCleanup::Unlocked),
@@ -1446,6 +1472,7 @@ impl MountedVolumeState {
                 VolumeHandleCleanup::Unlocked,
             ),
             Self::Mounted
+            | Self::Locking { .. }
             | Self::Locked { .. }
             | Self::Closing { .. }
             | Self::Dismounted { .. }
@@ -1468,6 +1495,7 @@ impl MountedVolumeState {
             }
             Self::Retiring => KernelWideInconsistency::mounted_volume_state_corruption().bugcheck(),
             Self::Mounted
+            | Self::Locking { .. }
             | Self::Locked { .. }
             | Self::Closing { .. }
             | Self::Dismounted { .. }
@@ -1481,7 +1509,9 @@ impl MountedVolumeState {
     /// Returns volume dismounted after the terminal transition.
     fn ensure_mounted(self) -> DriverResult<()> {
         match self {
-            Self::Mounted | Self::Locked { .. } | Self::Closing { .. } => Ok(()),
+            Self::Mounted | Self::Locking { .. } | Self::Locked { .. } | Self::Closing { .. } => {
+                Ok(())
+            }
             Self::Dismounted { .. } | Self::ShutdownComplete { .. } | Self::Retiring => {
                 Err(DriverError::VolumeDismounted)
             }
@@ -1495,7 +1525,7 @@ impl MountedVolumeState {
     fn authorize_create(self) -> DriverResult<()> {
         match self {
             Self::Mounted => Ok(()),
-            Self::Locked { .. } => Err(DriverError::AccessDenied),
+            Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
             Self::Closing { .. } => Err(DriverError::AccessDenied),
             Self::Dismounted { .. } | Self::ShutdownComplete { .. } | Self::Retiring => {
                 Err(DriverError::VolumeDismounted)
@@ -1511,8 +1541,62 @@ impl MountedVolumeState {
         match self {
             Self::Mounted => Ok(()),
             Self::Locked { owner } if owner == file_object => Ok(()),
-            Self::Locked { .. } => Err(DriverError::AccessDenied),
+            Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
             Self::Closing { .. } => Err(DriverError::AccessDenied),
+            Self::Dismounted { .. } | Self::ShutdownComplete { .. } | Self::Retiring => {
+                Err(DriverError::VolumeDismounted)
+            }
+        }
+    }
+
+    /// Requires the lock/dismount lifecycle authority for one raw data operation.
+    /// # Errors
+    ///
+    /// Returns access denied unless this FILE_OBJECT owns the clean lock, and requires terminal
+    /// logical dismount for writes.
+    fn authorize_raw(
+        self,
+        owner: KernelFileObject,
+        kind: RawVolumeOperationKind,
+    ) -> DriverResult<()> {
+        match (self, kind) {
+            (Self::Locked { owner: current }, RawVolumeOperationKind::Read) if current == owner => {
+                Ok(())
+            }
+            (
+                Self::Dismounted {
+                    lock_owner: Some(current),
+                },
+                RawVolumeOperationKind::Read | RawVolumeOperationKind::Write,
+            ) if current == owner => Ok(()),
+            (
+                Self::Mounted
+                | Self::Locking { .. }
+                | Self::Locked { .. }
+                | Self::Closing { .. }
+                | Self::Dismounted { .. }
+                | Self::ShutdownComplete { .. },
+                _,
+            ) => Err(DriverError::AccessDenied),
+            (Self::Retiring, _) => Err(DriverError::VolumeDismounted),
+        }
+    }
+
+    /// Admits a handle-local raw extent change without granting data authority.
+    /// # Errors
+    ///
+    /// Returns access denied for a competing owner, or volume dismounted once the raw owner is
+    /// no longer retained. The lock owner may expand its bound after logical dismount.
+    fn authorize_raw_extent_change(self, owner: KernelFileObject) -> DriverResult<()> {
+        match self {
+            Self::Mounted => Ok(()),
+            Self::Locked { owner: current }
+            | Self::Dismounted {
+                lock_owner: Some(current),
+            } if current == owner => Ok(()),
+            Self::Locking { .. } | Self::Locked { .. } | Self::Closing { .. } => {
+                Err(DriverError::AccessDenied)
+            }
             Self::Dismounted { .. } | Self::ShutdownComplete { .. } | Self::Retiring => {
                 Err(DriverError::VolumeDismounted)
             }
@@ -1702,10 +1786,8 @@ pub(crate) struct PreparedVolumeStateTransition {
 enum PreparedVolumeStateTransitionKind {
     /// Ordinary volume-lock publication after one filesystem flush.
     Lock {
-        /// State that must still be visible when the barrier releases.
-        expected: MountedVolumeState,
-        /// Locked state published after durability succeeds.
-        next: MountedVolumeState,
+        /// FILE_OBJECT whose lock attempt has already closed namespace admission.
+        owner: KernelFileObject,
     },
     /// Terminal publication authorized only by a completed clean-close protocol.
     CleanClose {
@@ -1835,20 +1917,21 @@ impl MountedVolumeAccess<'_> {
     /// Returns access denied while any other handle is active, volume dismounted after terminal
     /// dismount.
     pub(crate) fn prepare_lock_volume(
-        &self,
+        &mut self,
         owner: KernelFileObject,
     ) -> DriverResult<PreparedVolumeStateTransition> {
+        self.authorize_durability()?;
         let control = &self.volume.volume_control;
-        let next_state = control.state.lock(owner)?;
-        let namespace_handles = self.volume.file_control_blocks.active_handle_count();
-        if namespace_handles != 0 || control.handles.active_handle_count() != 1 {
+        let next_state = control.state.begin_lock(owner)?;
+        // A clean lock excludes native section residents and deferred stream work, not only
+        // user handles. Cache draining must retire their ledger entries before this boundary.
+        if !self.volume.file_control_blocks.is_empty() || control.handles.active_handle_count() != 1
+        {
             return Err(DriverError::AccessDenied);
         }
+        self.volume.volume_control.state = next_state;
         Ok(PreparedVolumeStateTransition {
-            kind: PreparedVolumeStateTransitionKind::Lock {
-                expected: control.state,
-                next: next_state,
-            },
+            kind: PreparedVolumeStateTransitionKind::Lock { owner },
         })
     }
 
@@ -1901,17 +1984,29 @@ impl MountedVolumeAccess<'_> {
     ) {
         let control = &mut self.volume.volume_control;
         match transition.kind {
-            PreparedVolumeStateTransitionKind::Lock { expected, next } => {
-                if control.state != expected {
-                    KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
-                }
-                control.state = next;
+            PreparedVolumeStateTransitionKind::Lock { owner } => {
+                control.state = control.state.finish_lock(owner).unwrap_or_else(|| {
+                    KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+                });
             }
             PreparedVolumeStateTransitionKind::CleanClose { terminal } => {
                 control.state = control.state.finish_close(terminal).unwrap_or_else(|| {
                     KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
                 });
             }
+        }
+    }
+
+    /// Consumes a failed lifecycle publication while preserving one-way clean-close semantics.
+    pub(crate) fn fail_volume_state_transition(
+        &mut self,
+        transition: PreparedVolumeStateTransition,
+    ) {
+        if let PreparedVolumeStateTransitionKind::Lock { owner } = transition.kind {
+            let control = &mut self.volume.volume_control;
+            control.state = control.state.abort_lock(owner).unwrap_or_else(|| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            });
         }
     }
 
@@ -1941,6 +2036,85 @@ impl MountedVolumeAccess<'_> {
             .volume_control
             .state
             .authorize_handle(file_object)
+    }
+
+    /// Produces one bounded raw transfer authority from lifecycle, access, and extent state.
+    /// # Errors
+    ///
+    /// Returns access denied unless the handle owns the clean lock and retained the matching data
+    /// right; writes additionally require completed logical dismount.
+    pub(crate) fn authorize_raw_volume_io(
+        &self,
+        target: RawVolumeTarget,
+        kind: RawVolumeOperationKind,
+    ) -> DriverResult<RawVolumeIoPermit> {
+        if !self.owns_volume(target.volume()) {
+            return Err(DriverError::InvalidDeviceRequest);
+        }
+        self.volume
+            .volume_control
+            .state
+            .authorize_raw(target.owner(), kind)?;
+        let (access, extent) = target.authority();
+        access.require(kind)?;
+        if kind == RawVolumeOperationKind::Write {
+            target.ensure_write_retryable()?;
+        }
+        let route = self.storage_route();
+        let bound = match extent {
+            RawExtentPolicy::FilesystemExtent => self.mounted_profile().filesystem_length(),
+            RawExtentPolicy::PartitionExtent => route.filesystem_device_length(),
+        };
+        Ok(RawVolumeIoPermit {
+            bound,
+            sector_size: route.filesystem_sector_size(),
+        })
+    }
+
+    /// Authorizes changing only this direct-volume handle's selected raw bound.
+    /// # Errors
+    ///
+    /// Returns an ownership or lifecycle error when the handle cannot control its raw extent.
+    pub(crate) fn authorize_raw_extent_change(&self, owner: KernelFileObject) -> DriverResult<()> {
+        self.volume
+            .volume_control
+            .state
+            .authorize_raw_extent_change(owner)
+    }
+
+    /// Selects a direct-volume flush without reusing a logically dismounted ext4 epoch.
+    /// # Errors
+    ///
+    /// Returns an ownership, access, lifecycle, or consumed raw-write authority error.
+    pub(crate) fn volume_flush_scope(
+        &self,
+        target: RawVolumeTarget,
+    ) -> DriverResult<VolumeFlushScope> {
+        if !self.owns_volume(target.volume()) {
+            return Err(DriverError::InvalidDeviceRequest);
+        }
+        let state = self.volume.volume_control.state;
+        if matches!(state, MountedVolumeState::Dismounted { .. }) {
+            state.authorize_raw(target.owner(), RawVolumeOperationKind::Read)?;
+            target
+                .authority()
+                .0
+                .require(RawVolumeOperationKind::Write)?;
+            target.ensure_write_retryable()?;
+            Ok(VolumeFlushScope::RawDevice(target))
+        } else {
+            state.authorize_handle(target.owner())?;
+            self.authorize_durability()?;
+            Ok(VolumeFlushScope::Filesystem)
+        }
+    }
+
+    /// Requires the mounted journal's authoritative health before promising a durable flush.
+    /// # Errors
+    ///
+    /// Returns the same terminal failure status as future mutation attempts.
+    pub(crate) fn authorize_durability(&self) -> DriverResult<()> {
+        self.volume.runtime.authorize_durability()
     }
 
     /// Rejects namespace traversal through an inode that is delete-pending.
@@ -2919,28 +3093,6 @@ impl FileControlBlockLedger {
             }
         };
         drop(removed);
-    }
-
-    /// Counts namespace handles whose cleanup share claims remain active.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    fn active_handle_count(&self) -> u32 {
-        let _guard = self.lock.acquire();
-        let table = unsafe {
-            // SAFETY: The executive resource serializes table and open-state observation.
-            &*self.table.get()
-        };
-        table.iter().fold(0_u32, |total, fcb| {
-            let open_count = unsafe {
-                // SAFETY: The ledger resource is held and this FCB remains table-owned.
-                (*fcb.open_state.get()).share_access.OpenCount
-            };
-            total.checked_add(open_count).unwrap_or_else(|| {
-                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
-            })
-        })
     }
 
     /// Returns the current user-handle count for one table-owned FCB.
@@ -5870,13 +6022,231 @@ impl Eq for HandleLifecycle {}
 pub(crate) struct OpenedVolumeHandle {
     /// One-way cleanup lifecycle shared with the volume FILE_OBJECT.
     lifecycle: HandleLifecycle,
+    /// Raw data operations authorized by the create access check.
+    raw_access: RawVolumeAccess,
+    /// Current per-handle extent bound for raw requests.
+    raw_extent: RawExtentPolicy,
+    /// One-way raw-write retry authority after an uncertain lower outcome.
+    raw_write_outcome: RawWriteOutcome,
+}
+
+/// Direct-volume data authority retained from one successful create access check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RawVolumeAccess {
+    /// The handle has no raw data authority.
+    MetadataOnly,
+    /// The handle may read raw sectors.
+    Read,
+    /// The handle may write raw sectors after the lifecycle prerequisites are met.
+    Write,
+    /// The handle may read and conditionally write raw sectors.
+    ReadWrite,
+}
+
+impl RawVolumeAccess {
+    /// Projects granted Windows volume-data rights into retained raw authority.
+    pub(crate) const fn from_granted(access: GrantedAccess) -> Self {
+        let read = access.as_raw() & wdk_sys::FILE_READ_DATA != 0;
+        let write = access.as_raw() & wdk_sys::FILE_WRITE_DATA != 0;
+        match (read, write) {
+            (false, false) => Self::MetadataOnly,
+            (true, false) => Self::Read,
+            (false, true) => Self::Write,
+            (true, true) => Self::ReadWrite,
+        }
+    }
+
+    /// Requires the independently retained data right for one raw operation.
+    /// # Errors
+    ///
+    /// Returns access denied when the create access check did not grant this operation.
+    const fn require(self, kind: RawVolumeOperationKind) -> DriverResult<()> {
+        match (self, kind) {
+            (Self::Read | Self::ReadWrite, RawVolumeOperationKind::Read)
+            | (Self::Write | Self::ReadWrite, RawVolumeOperationKind::Write) => Ok(()),
+            _ => Err(DriverError::AccessDenied),
+        }
+    }
+}
+
+/// Per-handle raw byte extent selected independently from access authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RawExtentPolicy {
+    /// Bound requests to the mounted filesystem extent.
+    FilesystemExtent,
+    /// Bound requests to the complete partition exposed by the lower device.
+    PartitionExtent,
+}
+
+/// Per-handle raw-write outcome retained across requests after terminal dismount.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RawWriteOutcome {
+    /// No ambiguous raw write has consumed this handle's retry authority.
+    Retryable,
+    /// A lower write or required flush may have changed data.
+    Uncertain {
+        /// Byte progress reported by the lower write, or the full write before an ambiguous flush.
+        completed: usize,
+    },
+}
+
+/// Data operation selected for a direct-volume handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RawVolumeOperationKind {
+    /// Read whole sectors from the selected extent.
+    Read,
+    /// Write whole sectors after terminal logical dismount.
+    Write,
+}
+
+/// Durability scope validated before a file or volume flush is suspended.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum VolumeFlushScope {
+    /// The mounted ext4 journal must reach its durability barrier before lower flush.
+    Filesystem,
+    /// Logical dismount is terminal; only this retained raw owner's lower device is flushed.
+    RawDevice(RawVolumeTarget),
+}
+
+/// Validated lifecycle and extent authority for one raw transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RawVolumeIoPermit {
+    /// Maximum exclusive byte offset selected by the handle's extent policy.
+    bound: DeviceLength,
+    /// Physical sector unit required for offset and length.
+    sector_size: usize,
+}
+
+impl RawVolumeIoPermit {
+    /// Converts a file-position range into a whole-sector lower-device offset.
+    /// # Errors
+    ///
+    /// Returns invalid-parameter for alignment, overflow, signed-position, or selected extent
+    /// violations. Buffer alignment is checked on the captured system mapping before submission.
+    pub(crate) fn validate_transfer(
+        self,
+        start: FileOffset,
+        length: usize,
+        buffer_address: usize,
+    ) -> DriverResult<ByteOffset> {
+        let sector = u64::try_from(self.sector_size).map_err(|_| DriverError::InvalidParameter)?;
+        let length_u64 = u64::try_from(length).map_err(|_| DriverError::InvalidBufferSize)?;
+        let end = start
+            .bytes()
+            .checked_add(length_u64)
+            .ok_or(DriverError::InvalidParameter)?;
+        if sector == 0
+            || !start.bytes().is_multiple_of(sector)
+            || !length.is_multiple_of(self.sector_size)
+            || !buffer_address.is_multiple_of(self.sector_size)
+            || end > self.bound.bytes()
+            || i64::try_from(end).is_err()
+        {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(ByteOffset::new(start.bytes()))
+    }
+}
+
+/// Stable direct-volume handle identity retained by its pending raw IRP.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RawVolumeTarget {
+    /// Mounted volume named by the FILE_OBJECT stream header.
+    volume: NonNull<VolumeControlBlock>,
+    /// Direct-volume FILE_OBJECT that must own lifecycle authority.
+    owner: KernelFileObject,
+    /// Per-handle access, bounds, and outcome state retained by the pending IRP.
+    handle: NonNull<OpenedVolumeHandle>,
+}
+
+impl RawVolumeTarget {
+    /// Returns the mounted VCB identity.
+    pub(crate) const fn volume(self) -> NonNull<VolumeControlBlock> {
+        self.volume
+    }
+
+    /// Returns the direct-volume FILE_OBJECT identity.
+    pub(crate) const fn owner(self) -> KernelFileObject {
+        self.owner
+    }
+
+    /// Reads the handle-local access and extent policy while its IRP retains the CCB.
+    #[expect(
+        unsafe_code,
+        reason = "the pending IRP retains this CCB and actor serialization protects its policy"
+    )]
+    fn authority(self) -> (RawVolumeAccess, RawExtentPolicy) {
+        unsafe {
+            // SAFETY: Construction requires a decoded live direct-volume FILE_OBJECT.
+            self.handle.as_ref()
+        }
+        .raw_authority()
+    }
+
+    /// Rejects raw-write retry after a previous uncertain effect.
+    /// # Errors
+    ///
+    /// Returns the stable raw-outcome status after the capability has been consumed.
+    #[expect(
+        unsafe_code,
+        reason = "the pending IRP retains this CCB and actor serialization protects its outcome"
+    )]
+    fn ensure_write_retryable(self) -> DriverResult<()> {
+        match unsafe {
+            // SAFETY: Construction requires a decoded live direct-volume FILE_OBJECT.
+            self.handle.as_ref()
+        }
+        .raw_write_outcome()
+        {
+            RawWriteOutcome::Retryable => Ok(()),
+            RawWriteOutcome::Uncertain { .. } => Err(DriverError::RawOutcomeUncertain),
+        }
+    }
+
+    /// Consumes this handle's raw-write retry authority after an uncertain lower outcome.
+    #[expect(
+        unsafe_code,
+        reason = "the mounted actor exclusively publishes the live CCB outcome transition"
+    )]
+    pub(crate) fn mark_write_uncertain(mut self, completed: usize) {
+        unsafe {
+            // SAFETY: The suspended operation retains the CCB and actor serialization is exclusive.
+            self.handle.as_mut()
+        }
+        .mark_raw_write_uncertain(completed);
+    }
 }
 
 impl OpenedVolumeHandle {
     /// Creates one active direct-volume handle.
-    pub(crate) const fn new() -> Self {
+    pub(crate) const fn new(raw_access: RawVolumeAccess) -> Self {
         Self {
             lifecycle: HandleLifecycle::active(),
+            raw_access,
+            raw_extent: RawExtentPolicy::FilesystemExtent,
+            raw_write_outcome: RawWriteOutcome::Retryable,
+        }
+    }
+
+    /// Expands this handle's bounds without changing its read or write authority.
+    fn allow_partition_extent(&mut self) {
+        self.raw_extent = RawExtentPolicy::PartitionExtent;
+    }
+
+    /// Returns the independently retained raw access and extent capabilities.
+    const fn raw_authority(&self) -> (RawVolumeAccess, RawExtentPolicy) {
+        (self.raw_access, self.raw_extent)
+    }
+
+    /// Returns the one-way raw-write retry outcome.
+    const fn raw_write_outcome(&self) -> RawWriteOutcome {
+        self.raw_write_outcome
+    }
+
+    /// Records the first uncertain raw-write outcome and retains its byte progress.
+    fn mark_raw_write_uncertain(&mut self, completed: usize) {
+        if self.raw_write_outcome == RawWriteOutcome::Retryable {
+            self.raw_write_outcome = RawWriteOutcome::Uncertain { completed };
         }
     }
 
@@ -7021,6 +7391,68 @@ impl<'owner> OpenedVolume<'owner> {
         self.file_object.address()
     }
 
+    /// Expands this handle's raw bound to the lower partition without granting data access.
+    #[expect(
+        unsafe_code,
+        reason = "the mounted actor exclusively mutates the live CCB retained by this FILE_OBJECT"
+    )]
+    pub(crate) fn allow_partition_extent(&mut self) {
+        unsafe {
+            // SAFETY: Actor serialization excludes another operation mutating this live CCB.
+            self.handle.as_mut()
+        }
+        .allow_partition_extent();
+    }
+
+    /// Captures the stable identities retained by this pending raw data IRP.
+    pub(crate) const fn raw_target(&self) -> RawVolumeTarget {
+        RawVolumeTarget {
+            volume: self.volume,
+            owner: self.file_object.address(),
+            handle: self.handle,
+        }
+    }
+
+    /// Reads the synchronous FILE_OBJECT byte position for raw current-position requests.
+    /// # Errors
+    ///
+    /// Returns invalid-parameter if external state supplied a negative position.
+    #[expect(
+        unsafe_code,
+        reason = "the active FILE_OBJECT retains its initialized LARGE_INTEGER position arm"
+    )]
+    pub(crate) fn current_file_position(&self) -> DriverResult<FileOffset> {
+        if self.file_object.as_ref().Flags & wdk_sys::FO_SYNCHRONOUS_IO == 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+        let position = unsafe {
+            // SAFETY: Windows initializes CurrentByteOffset and the driver uses its QuadPart arm.
+            self.file_object.as_ref().CurrentByteOffset.QuadPart
+        };
+        let bytes = u64::try_from(position).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(FileOffset::from_bytes(bytes))
+    }
+
+    /// Prevalidates the synchronous raw handle position before lower I/O can change storage.
+    /// # Errors
+    ///
+    /// Returns invalid-parameter if the resulting position exceeds Windows' signed offset domain.
+    pub(crate) fn prepare_current_file_position_update(
+        &self,
+        start: FileOffset,
+        transferred: usize,
+    ) -> DriverResult<PreparedFilePositionPublication> {
+        if self.file_object.as_ref().Flags & wdk_sys::FO_SYNCHRONOUS_IO == 0 {
+            return Ok(PreparedFilePositionPublication::Unchanged);
+        }
+        let position = start.checked_add_len(transferred)?;
+        let signed = i64::try_from(position.bytes()).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(PreparedFilePositionPublication::Set {
+            file_object: self.file_object(),
+            position: signed,
+        })
+    }
+
     /// Begins this handle's idempotent cleanup transition.
     #[expect(
         unsafe_code,
@@ -7415,7 +7847,7 @@ mod tests {
     use core::num::NonZeroU32;
     use core::ptr::NonNull;
 
-    use ext4_core::{DirectoryNodeId, Ext4Name, FileOffset, NodeId};
+    use ext4_core::{ByteOffset, DeviceLength, DirectoryNodeId, Ext4Name, FileOffset, NodeId};
 
     use crate::irp::{
         ActiveFileObject, CreateDeletion, DataIoKind, DeleteAccess, FileAttributesWriteAccess,
@@ -7432,9 +7864,11 @@ mod tests {
         HandleAdmissionState, HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeState,
         NativeFileByteRange, NoIntermediateTransfer, OpenedDirectory, OpenedFileObject,
         OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
-        OpenedVolumeHandle, RetirementAdmission, StreamLifetimeState, TransferBufferAlignment,
-        TransferSectorSize, UninitializedFileObject, VolumeControlBlock, VolumeHandleCleanup,
-        VolumeRetirement, select_close_release_plan, shutdown_registration_status,
+        OpenedVolumeHandle, RawExtentPolicy, RawVolumeAccess, RawVolumeIoPermit,
+        RawVolumeOperationKind, RawWriteOutcome, RetirementAdmission, StreamLifetimeState,
+        TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
+        VolumeHandleCleanup, VolumeRetirement, select_close_release_plan,
+        shutdown_registration_status,
     };
 
     /// # Errors
@@ -7591,12 +8025,12 @@ mod tests {
         stream.bind_owner(volume.cast()).unwrap_or_else(|_| {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
         });
-        let mut handle = OpenedVolumeHandle::new();
+        let mut handle = OpenedVolumeHandle::new(RawVolumeAccess::MetadataOnly);
         let mut file = file_object_with_contexts(
             stream.header().as_ptr(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
-        file.Flags |= wdk_sys::FO_VOLUME_OPEN;
+        file.Flags |= wdk_sys::FO_VOLUME_OPEN | wdk_sys::FO_SYNCHRONOUS_IO;
 
         let result = with_active_file_object(&mut file, |file_object| {
             assert!(matches!(
@@ -7608,6 +8042,28 @@ mod tests {
                 return Err(DriverError::InternalInvariantViolation);
             };
             assert_eq!(opened.volume(), volume);
+            let position =
+                opened.prepare_current_file_position_update(FileOffset::from_bytes(512), 512)?;
+            assert_eq!(
+                opened.current_file_position(),
+                Ok(FileOffset::from_bytes(0))
+            );
+            position.publish();
+            assert_eq!(
+                opened.current_file_position(),
+                Ok(FileOffset::from_bytes(1024))
+            );
+            assert!(matches!(
+                opened.prepare_current_file_position_update(FileOffset::from_bytes(u64::MAX), 1),
+                Err(DriverError::Core(ext4_core::Error::ArithmeticOverflow))
+            ));
+            let target = opened.raw_target();
+            assert_eq!(target.ensure_write_retryable(), Ok(()));
+            target.mark_write_uncertain(512);
+            assert_eq!(
+                target.ensure_write_retryable(),
+                Err(DriverError::RawOutcomeUncertain)
+            );
             Ok(())
         });
         assert_eq!(result, Ok(()));
@@ -7640,9 +8096,26 @@ mod tests {
         let mounted = MountedVolumeState::Mounted;
         assert_eq!(mounted.authorize_create(), Ok(()));
         assert_eq!(mounted.authorize_handle(competing), Ok(()));
-        let locked = mounted.lock(owner);
-        assert_eq!(locked, Ok(MountedVolumeState::Locked { owner }));
-        let Ok(locked) = locked else {
+        let locking = mounted.begin_lock(owner);
+        assert_eq!(locking, Ok(MountedVolumeState::Locking { owner }));
+        let Ok(locking) = locking else {
+            return;
+        };
+        assert_eq!(locking.authorize_create(), Err(DriverError::AccessDenied));
+        assert_eq!(
+            locking.authorize_handle(owner),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            locking.authorize_raw(owner, RawVolumeOperationKind::Read),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(locking.abort_lock(owner), Some(MountedVolumeState::Mounted));
+        assert_eq!(locking.abort_lock(competing), None);
+        assert_eq!(locking.finish_lock(competing), None);
+        let locked = locking.finish_lock(owner);
+        assert_eq!(locked, Some(MountedVolumeState::Locked { owner }));
+        let Some(locked) = locked else {
             return;
         };
         assert_eq!(locked.authorize_create(), Err(DriverError::AccessDenied));
@@ -7652,6 +8125,22 @@ mod tests {
             Err(DriverError::AccessDenied)
         );
         assert_eq!(locked.unlock(competing), Err(DriverError::NotLocked));
+        assert_eq!(
+            mounted.authorize_raw(owner, RawVolumeOperationKind::Read),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            locked.authorize_raw(owner, RawVolumeOperationKind::Read),
+            Ok(())
+        );
+        assert_eq!(
+            locked.authorize_raw(owner, RawVolumeOperationKind::Write),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            locked.authorize_raw(competing, RawVolumeOperationKind::Read),
+            Err(DriverError::AccessDenied)
+        );
         assert_eq!(locked.unlock(owner), Ok(MountedVolumeState::Mounted));
     }
 
@@ -7699,6 +8188,19 @@ mod tests {
             return;
         };
         assert_eq!(
+            closing.authorize_raw(owner, RawVolumeOperationKind::Write),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            dismounted.authorize_raw(owner, RawVolumeOperationKind::Write),
+            Ok(())
+        );
+        assert_eq!(dismounted.authorize_raw_extent_change(owner), Ok(()));
+        assert_eq!(
+            dismounted.authorize_raw(competing, RawVolumeOperationKind::Write),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
             dismounted.authorize_handle(owner),
             Err(DriverError::VolumeDismounted)
         );
@@ -7741,6 +8243,116 @@ mod tests {
         assert_eq!(
             MountedVolumeState::Mounted.retire_if_unreferenced(true, 0),
             (MountedVolumeState::Mounted, VolumeRetirement::Retained)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics if an extended extent changes access rights or uncertain write progress is lost.
+    #[test]
+    fn raw_handle_bounds_do_not_grant_access_or_restore_consumed_write_authority() {
+        let mut handle = OpenedVolumeHandle::new(RawVolumeAccess::Read);
+        assert_eq!(
+            handle.raw_authority(),
+            (RawVolumeAccess::Read, RawExtentPolicy::FilesystemExtent)
+        );
+        handle.allow_partition_extent();
+        assert_eq!(
+            handle.raw_authority(),
+            (RawVolumeAccess::Read, RawExtentPolicy::PartitionExtent)
+        );
+        assert_eq!(
+            handle.raw_access.require(RawVolumeOperationKind::Read),
+            Ok(())
+        );
+        assert_eq!(
+            handle.raw_access.require(RawVolumeOperationKind::Write),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            RawVolumeAccess::MetadataOnly.require(RawVolumeOperationKind::Read),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            RawVolumeAccess::Write.require(RawVolumeOperationKind::Write),
+            Ok(())
+        );
+        assert_eq!(
+            RawVolumeAccess::ReadWrite.require(RawVolumeOperationKind::Read),
+            Ok(())
+        );
+        assert_eq!(
+            RawVolumeAccess::ReadWrite.require(RawVolumeOperationKind::Write),
+            Ok(())
+        );
+        handle.mark_raw_write_uncertain(512);
+        handle.allow_partition_extent();
+        handle.mark_raw_write_uncertain(0);
+        assert_eq!(
+            handle.raw_write_outcome(),
+            RawWriteOutcome::Uncertain { completed: 512 }
+        );
+        assert_eq!(
+            DriverError::RawOutcomeUncertain.ntstatus(),
+            wdk_sys::STATUS_DEVICE_DATA_ERROR
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics if raw I/O can cross its selected extent, ignore sector alignment, or overflow.
+    #[test]
+    fn raw_transfer_checks_sector_geometry_selected_extent_and_checked_offsets() {
+        let filesystem = RawVolumeIoPermit {
+            bound: DeviceLength::from_bytes(4096),
+            sector_size: 512,
+        };
+        let partition = RawVolumeIoPermit {
+            bound: DeviceLength::from_bytes(8192),
+            sector_size: 512,
+        };
+        assert_eq!(
+            filesystem.validate_transfer(FileOffset::from_bytes(4096), 0, 0),
+            Ok(ByteOffset::new(4096))
+        );
+        assert_eq!(
+            filesystem.validate_transfer(FileOffset::from_bytes(4608), 0, 0),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            filesystem.validate_transfer(FileOffset::from_bytes(3584), 512, 4096),
+            Ok(ByteOffset::new(3584))
+        );
+        assert_eq!(
+            filesystem.validate_transfer(FileOffset::from_bytes(4096), 512, 4096),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            partition.validate_transfer(FileOffset::from_bytes(4096), 512, 4096),
+            Ok(ByteOffset::new(4096))
+        );
+        assert_eq!(
+            partition.validate_transfer(FileOffset::from_bytes(8192), 512, 4096),
+            Err(DriverError::InvalidParameter)
+        );
+        for (offset, length, address) in [
+            (1, 512, 4096),
+            (0, 511, 4096),
+            (0, 512, 4097),
+            (u64::MAX - 511, 512, 4096),
+        ] {
+            assert_eq!(
+                partition.validate_transfer(FileOffset::from_bytes(offset), length, address),
+                Err(DriverError::InvalidParameter)
+            );
+        }
+        let invalid_geometry = RawVolumeIoPermit {
+            bound: DeviceLength::from_bytes(8192),
+            sector_size: 0,
+        };
+        assert_eq!(
+            invalid_geometry.validate_transfer(FileOffset::from_bytes(0), 512, 4096),
+            Err(DriverError::InvalidParameter)
         );
     }
 

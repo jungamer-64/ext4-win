@@ -3,8 +3,8 @@
 use ext4_core::Error;
 use wdk_sys::{
     NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
-    STATUS_CANCELLED, STATUS_CANNOT_DELETE, STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL,
-    STATUS_EA_LIST_INCONSISTENT, STATUS_EA_TOO_LARGE, STATUS_FILE_CORRUPT_ERROR,
+    STATUS_CANCELLED, STATUS_CANNOT_DELETE, STATUS_DEVICE_DATA_ERROR, STATUS_DIRECTORY_NOT_EMPTY,
+    STATUS_DISK_FULL, STATUS_EA_LIST_INCONSISTENT, STATUS_EA_TOO_LARGE, STATUS_FILE_CORRUPT_ERROR,
     STATUS_INSUFFICIENT_RESOURCES, STATUS_INTERNAL_ERROR, STATUS_INVALID_BUFFER_SIZE,
     STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_EA_NAME, STATUS_INVALID_INFO_CLASS,
     STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_NO_EAS_ON_FILE, STATUS_NO_MORE_FILES,
@@ -43,6 +43,8 @@ pub(crate) enum DriverError {
     FileClosed,
     /// Another caller owns the non-repeatable device lifecycle transition.
     DeviceBusy,
+    /// A raw write or its required flush reached an outcome that cannot be retried safely.
+    RawOutcomeUncertain,
     /// The selected namespace link cannot be deleted.
     CannotDelete,
     /// The mounted volume has entered its terminal logical dismount state.
@@ -129,6 +131,7 @@ impl DriverError {
             Self::DeletePending => ntstatus(0xC000_0056),
             Self::FileClosed => ntstatus(0xC000_0128),
             Self::DeviceBusy => ntstatus(0xC000_009E),
+            Self::RawOutcomeUncertain => STATUS_DEVICE_DATA_ERROR,
             Self::CannotDelete => STATUS_CANNOT_DELETE,
             Self::VolumeDismounted => ntstatus(0xC000_026E),
             Self::NotLocked => ntstatus(0xC000_002A),

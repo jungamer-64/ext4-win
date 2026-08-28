@@ -517,6 +517,25 @@ impl<T> KernelVec<T, Global> {
     }
 }
 
+/// Builds one fully initialized standard vector for an external ownership boundary.
+///
+/// Most driver code uses [`KernelVec`] so later growth cannot allocate accidentally. Core storage
+/// requests own `alloc::vec::Vec`, so this boundary performs the only fallible construction before
+/// transferring the completed allocation.
+/// # Errors
+///
+/// Returns an error when the requested length overflows vector limits or allocation fails.
+pub(crate) fn try_repeated_vec<T: Copy>(value: T, len: usize) -> DriverResult<Vec<T>> {
+    let mut output = Vec::new();
+    output.try_reserve_exact(len).map_err(reserve_failed)?;
+    while output.len() < len {
+        output
+            .push_within_capacity(value)
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+    }
+    Ok(output)
+}
+
 impl<T> Default for KernelVec<T, Global> {
     fn default() -> Self {
         Self::new()

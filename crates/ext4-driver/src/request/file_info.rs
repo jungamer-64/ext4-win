@@ -7,8 +7,8 @@ use ext4_core::{
     ChildLookup, CommittedReadPass, DirectoryNode, DirectoryNodeId, DirectoryScanLimit,
     Ext4LinkCount, Ext4Name, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
     Ext4WindowsAttributes, FileAllocationSize, FileNodeId, FileOffset, FileSize,
-    HardLinkDestination, HardLinkNodeId, HardLinks, NodeId, RenameTargetCollision, WindowsName,
-    WindowsOverlay,
+    HardLinkDestination, HardLinkNodeId, HardLinks, NodeId, RenameTargetCollision, StorageRequest,
+    StorageTarget, WindowsName, WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
@@ -27,8 +27,8 @@ use crate::state::{
     FileDeleteTarget, MountedVolumeAccess, MountedVolumeDevice, OpenedDirectory, OpenedFileObject,
     OpenedLocation, OpenedObject, OpenedRegularFile, PendingFileDeletion,
     PreparedFilePositionPublication, PreparedHandleAdmission, PreparedOpenedLocationPublication,
-    VolumeHandleCleanup, VolumeRetirement, release_cancelled_file_control_block,
-    release_file_control_block,
+    RawVolumeOperationKind, RawVolumeTarget, VolumeHandleCleanup, VolumeRetirement,
+    release_cancelled_file_control_block, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 
@@ -251,6 +251,184 @@ pub(crate) fn write(
     write_regular_file_by_transfer_mode(request, mutation)
 }
 
+/// One authorized raw-volume request ready for lower-device submission.
+#[derive(Debug)]
+pub(crate) struct PreparedRawVolumeTransfer {
+    /// Direct-volume handle retained by the pending IRP.
+    target: RawVolumeTarget,
+    /// Whole-sector lower request bounded by the selected extent.
+    request: StorageRequest,
+    /// Position and completion payload validated before a write can take effect.
+    publication: RawVolumeTransferPublication,
+    /// Whether a successful write requires a following lower flush.
+    write_through: bool,
+}
+
+impl PreparedRawVolumeTransfer {
+    /// Consumes the prepared transfer into its operation-owned values.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        RawVolumeTarget,
+        StorageRequest,
+        RawVolumeTransferPublication,
+        bool,
+    ) {
+        (
+            self.target,
+            self.request,
+            self.publication,
+            self.write_through,
+        )
+    }
+}
+
+/// Infallible successful raw-transfer publication prepared before lower I/O.
+#[derive(Debug)]
+pub(crate) struct RawVolumeTransferPublication {
+    /// Synchronous cursor update, absent for asynchronous handles.
+    position: PreparedFilePositionPublication,
+    /// Exact successful status and byte count.
+    completion: IrpCompletion,
+}
+
+impl RawVolumeTransferPublication {
+    /// Publishes a successful transfer without allocation or offset conversion.
+    pub(crate) fn publish(self) -> IrpCompletion {
+        self.position.publish();
+        self.completion
+    }
+
+    /// Retains the completed write count when its required flush fails.
+    pub(crate) const fn committed_failure(&self, error: DriverError) -> IrpCompletion {
+        self.completion.committed_failure(error)
+    }
+}
+
+/// Normalized raw-volume position; append has no meaning for a device extent.
+#[derive(Clone, Copy, Debug)]
+enum RawVolumeStartingPoint {
+    /// Partition-relative byte position supplied by the request.
+    Absolute(FileOffset),
+    /// Synchronous FILE_OBJECT position.
+    CurrentPosition,
+}
+
+/// Returns whether a captured read/write targets the mounted volume rather than an ext4 node.
+/// # Errors
+///
+/// Returns an error when the active FILE_OBJECT context pair is malformed.
+pub(crate) fn is_direct_volume_data(mut request: PendingIrpLease<'_>) -> DriverResult<bool> {
+    request.with_active(|active| {
+        let opened = OpenedFileObject::decode(active.current_stack()?.file_object()?)?;
+        Ok(matches!(opened, OpenedFileObject::Volume(_)))
+    })
+}
+
+/// Validates and snapshots one direct-volume request before lower I/O.
+/// # Errors
+///
+/// Returns an access, lifecycle, offset, sector-alignment, extent-bound, or allocation error.
+pub(crate) fn prepare_raw_volume_transfer(
+    mut request: PendingIrpLease<'_>,
+    kind: RawVolumeOperationKind,
+    access: &MountedVolumeAccess<'_>,
+) -> DriverResult<Option<PreparedRawVolumeTransfer>> {
+    let (length, starting_point, buffer_address) = match kind {
+        RawVolumeOperationKind::Read => {
+            let prepared = request.prepared_read()?;
+            let starting_point = match prepared.stack().starting_point() {
+                ReadStartingPoint::Absolute(start) => RawVolumeStartingPoint::Absolute(start),
+                ReadStartingPoint::CurrentFilePosition => RawVolumeStartingPoint::CurrentPosition,
+            };
+            (
+                prepared.stack().length().as_usize(),
+                starting_point,
+                prepared.output_address(),
+            )
+        }
+        RawVolumeOperationKind::Write => {
+            let prepared = request.prepared_write()?;
+            let starting_point = match prepared.stack().starting_point() {
+                WriteStartingPoint::Absolute(start) => RawVolumeStartingPoint::Absolute(start),
+                WriteStartingPoint::CurrentFilePosition => RawVolumeStartingPoint::CurrentPosition,
+                WriteStartingPoint::EndOfFile => return Err(DriverError::InvalidParameter),
+            };
+            (
+                prepared.stack().length().as_usize(),
+                starting_point,
+                prepared.input_address(),
+            )
+        }
+    };
+    let (target, start, publication, write_through) = request.with_active(|active| {
+        if active.data_io_kind() != DataIoKind::Handle {
+            return Err(DriverError::InvalidParameter);
+        }
+        let file_object = active.current_stack()?.file_object()?;
+        let opened = crate::state::OpenedVolume::decode(file_object)?;
+        let start = match starting_point {
+            RawVolumeStartingPoint::Absolute(start) => start,
+            RawVolumeStartingPoint::CurrentPosition => opened.current_file_position()?,
+        };
+        let publication = RawVolumeTransferPublication {
+            position: opened.prepare_current_file_position_update(start, length)?,
+            completion: IrpCompletion::from_usize(length)?,
+        };
+        Ok::<_, DriverError>((
+            opened.raw_target(),
+            start,
+            publication,
+            file_object.as_ref().Flags & wdk_sys::FO_WRITE_THROUGH != 0,
+        ))
+    })?;
+    let permit = access.authorize_raw_volume_io(target, kind)?;
+    let address = match (length, buffer_address) {
+        (0, None) => 0,
+        (_, Some(address)) => address.as_ptr().addr(),
+        (_, None) => return Err(DriverError::InternalInvariantViolation),
+    };
+    let offset = permit.validate_transfer(start, length, address)?;
+    if length == 0 {
+        return Ok(None);
+    }
+    let mut buffer = memory::try_repeated_vec(0_u8, length)?;
+    if kind == RawVolumeOperationKind::Write {
+        request.prepared_write()?.copy_window(0, &mut buffer)?;
+    }
+    let request = match kind {
+        RawVolumeOperationKind::Read => StorageRequest::Read {
+            target: StorageTarget::Filesystem,
+            offset,
+            buffer,
+        },
+        RawVolumeOperationKind::Write => StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset,
+            buffer,
+        },
+    };
+    Ok(Some(PreparedRawVolumeTransfer {
+        target,
+        request,
+        publication,
+        write_through,
+    }))
+}
+
+/// Copies one successful raw read to the retained IRP mapping before cursor publication.
+/// # Errors
+///
+/// Returns an error if the retained requestor mapping cannot receive the returned bytes.
+pub(crate) fn finish_raw_volume_read(
+    mut request: PendingIrpLease<'_>,
+    publication: RawVolumeTransferPublication,
+    buffer: &[u8],
+) -> DriverResult<IrpCompletion> {
+    request.prepared_read_mut()?.copy_window(0, buffer)?;
+    Ok(publication.publish())
+}
+
 /// Attempts a normal cached read during the top-level dispatch callback.
 ///
 /// `None` transfers the unchanged IRP to the actor-owned direct/paging path. `Some` is a terminal
@@ -262,6 +440,9 @@ pub(crate) fn dispatch_cached_read(
     target: &mut ActiveIrp<'_>,
 ) -> DriverResult<Option<IrpCompletion>> {
     if target.data_io_kind() == DataIoKind::Paging {
+        return Ok(None);
+    }
+    if target.current_stack()?.file_object()?.as_ref().Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
         return Ok(None);
     }
     let stack = target.current_stack()?.read()?;
@@ -330,6 +511,9 @@ pub(crate) fn dispatch_cached_write(
     target: &mut ActiveIrp<'_>,
 ) -> DriverResult<Option<IrpCompletion>> {
     if target.data_io_kind() == DataIoKind::Paging {
+        return Ok(None);
+    }
+    if target.current_stack()?.file_object()?.as_ref().Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
         return Ok(None);
     }
     let stack = target.current_stack()?.write()?;

@@ -441,6 +441,14 @@ impl VolumeRuntime {
         self.commit_gate = CommitGateState::Ready;
     }
 
+    /// Requires a healthy runtime before a flush can claim journal durability.
+    /// # Errors
+    ///
+    /// Returns the same terminal status observed by mutation admission.
+    pub(crate) fn authorize_durability(&self) -> DriverResult<()> {
+        self.failure.authorize_mutation()
+    }
+
     /// Moves a confirmed durable abort into read-only state.
     pub(crate) fn record_durable_abort(&mut self) {
         self.failure = self.failure.durable_abort();

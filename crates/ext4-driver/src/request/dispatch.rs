@@ -624,6 +624,7 @@ pub(crate) fn admit_owned(
     enum Admission {
         Mount(super::file_system_control::MountAdmission),
         Read(ReadRequestKind),
+        Raw(crate::state::RawVolumeOperationKind),
         Mutation(MutationRequestKind),
         Flush(FlushRequestKind),
         Immediate(ImmediateRequestKind),
@@ -740,6 +741,9 @@ pub(crate) fn admit_owned(
                     crate::irp::FsControlCode::IsVolumeMounted => Admission::VolumeControl(
                         super::operation::VolumeControlRequestKind::IsMounted,
                     ),
+                    crate::irp::FsControlCode::AllowExtendedDasdIo => Admission::VolumeControl(
+                        super::operation::VolumeControlRequestKind::AllowExtendedDasdIo,
+                    ),
                 },
             }
         }
@@ -751,12 +755,30 @@ pub(crate) fn admit_owned(
         ActorRequest::Captured(PreparedRequest::Write(write)) => Some(write.kind()),
         _ => None,
     };
+    let raw_kind = match (&admission, data_io_kind) {
+        (Admission::Read(ReadRequestKind::Read), Some(DataIoKind::Handle)) => {
+            Some(crate::state::RawVolumeOperationKind::Read)
+        }
+        (Admission::Mutation(MutationRequestKind::Write), Some(DataIoKind::Handle)) => {
+            Some(crate::state::RawVolumeOperationKind::Write)
+        }
+        _ => None,
+    };
+    let admission = if let Some(kind) = raw_kind {
+        match super::file_info::is_direct_volume_data(owned.request()) {
+            Ok(true) => Admission::Raw(kind),
+            Ok(false) => admission,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
+        }
+    } else {
+        admission
+    };
     let handle_class = match &admission {
         Admission::Mount(_) => HandleRequestClass::Device,
         Admission::Read(ReadRequestKind::Read) if data_io_kind == Some(DataIoKind::Paging) => {
             HandleRequestClass::PagingRead
         }
-        Admission::Read(_) => HandleRequestClass::Ordinary,
+        Admission::Read(_) | Admission::Raw(_) => HandleRequestClass::Ordinary,
         Admission::Mutation(MutationRequestKind::Create) => HandleRequestClass::Device,
         Admission::Mutation(MutationRequestKind::Write)
             if data_io_kind == Some(DataIoKind::Paging) =>
@@ -872,6 +894,9 @@ pub(crate) fn admit_owned(
         }
         Admission::Read(kind) => {
             target.with_mounted_access(|access| super::operation::read(owned, kind, access))
+        }
+        Admission::Raw(kind) => {
+            target.with_mounted_access(|access| super::operation::raw_volume(owned, kind, access))
         }
         Admission::Mutation(kind) => {
             target.with_mounted_access(|access| super::operation::mutation(owned, kind, access))

@@ -2669,6 +2669,8 @@ pub(crate) enum FsControlCode {
     DismountVolume,
     /// Windows `FSCTL_IS_VOLUME_MOUNTED`.
     IsVolumeMounted,
+    /// Windows `FSCTL_ALLOW_EXTENDED_DASD_IO`.
+    AllowExtendedDasdIo,
     /// Windows `FSCTL_GET_REPARSE_POINT`.
     GetReparsePoint,
     /// Windows `FSCTL_SET_REPARSE_POINT`.
@@ -2705,6 +2707,7 @@ impl FsControlCode {
             FSCTL_UNLOCK_VOLUME => Ok(Self::UnlockVolume),
             FSCTL_DISMOUNT_VOLUME => Ok(Self::DismountVolume),
             FSCTL_IS_VOLUME_MOUNTED => Ok(Self::IsVolumeMounted),
+            FSCTL_ALLOW_EXTENDED_DASD_IO => Ok(Self::AllowExtendedDasdIo),
             FSCTL_GET_REPARSE_POINT => Ok(Self::GetReparsePoint),
             FSCTL_SET_REPARSE_POINT => Ok(Self::SetReparsePoint),
             FSCTL_DELETE_REPARSE_POINT => Ok(Self::DeleteReparsePoint),
@@ -2760,6 +2763,9 @@ const FSCTL_UNLOCK_VOLUME: wdk_sys::ULONG = buffered_file_system_control(7);
 const FSCTL_DISMOUNT_VOLUME: wdk_sys::ULONG = buffered_file_system_control(8);
 /// `FSCTL_IS_VOLUME_MOUNTED`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 10, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_IS_VOLUME_MOUNTED: wdk_sys::ULONG = buffered_file_system_control(10);
+/// `FSCTL_ALLOW_EXTENDED_DASD_IO`, from
+/// `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 32, METHOD_NEITHER, FILE_ANY_ACCESS)`.
+const FSCTL_ALLOW_EXTENDED_DASD_IO: wdk_sys::ULONG = neither_file_system_control(32);
 /// `FSCTL_GET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_GET_REPARSE_POINT: wdk_sys::ULONG = 589_992;
 /// `FSCTL_SET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
@@ -2771,6 +2777,8 @@ const FSCTL_DELETE_REPARSE_POINT: wdk_sys::ULONG = 589_996;
 const FILE_DEVICE_FILE_SYSTEM: wdk_sys::ULONG = 0x0000_0009;
 /// Windows `METHOD_BUFFERED`.
 const METHOD_BUFFERED: wdk_sys::ULONG = 0;
+/// Windows `METHOD_NEITHER`.
+const METHOD_NEITHER: wdk_sys::ULONG = 3;
 /// Windows `FILE_ANY_ACCESS`.
 const FILE_ANY_ACCESS: wdk_sys::ULONG = 0;
 /// ext4win private function code for adding an fscrypt key.
@@ -2785,6 +2793,11 @@ const EXT4WIN_ENABLE_VERITY_FUNCTION: wdk_sys::ULONG = 0x903;
 /// Builds a buffered, unrestricted Windows filesystem control code.
 const fn buffered_file_system_control(function: wdk_sys::ULONG) -> wdk_sys::ULONG {
     (FILE_DEVICE_FILE_SYSTEM << 16) | (FILE_ANY_ACCESS << 14) | (function << 2) | METHOD_BUFFERED
+}
+
+/// Builds an unrestricted Windows filesystem control code with no transfer buffer.
+const fn neither_file_system_control(function: wdk_sys::ULONG) -> wdk_sys::ULONG {
+    (FILE_DEVICE_FILE_SYSTEM << 16) | (FILE_ANY_ACCESS << 14) | (function << 2) | METHOD_NEITHER
 }
 
 /// ext4win FSCTL carrying Linux `struct fscrypt_add_key_arg`.
@@ -5295,6 +5308,10 @@ mod tests {
         assert_eq!(
             FsControlCode::from_raw(0x0009_0028),
             Ok(FsControlCode::IsVolumeMounted)
+        );
+        assert_eq!(
+            FsControlCode::from_raw(0x0009_0083),
+            Ok(FsControlCode::AllowExtendedDasdIo)
         );
     }
 

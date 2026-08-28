@@ -60,6 +60,27 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("native stream size observation", "ext4win_stream_get_sizes"),
     ("native stream size publication", "ext4win_stream_set_sizes"),
     ("native stream destruction", "ext4win_stream_destroy"),
+    (
+        "cache-map initialization",
+        "ext4win_stream_cache_initialize",
+    ),
+    ("cached read boundary", "ext4win_stream_cache_read"),
+    ("cached write boundary", "ext4win_stream_cache_write"),
+    ("cache flush boundary", "ext4win_stream_cache_flush"),
+    (
+        "cache coherency boundary",
+        "ext4win_stream_cache_coherency_flush_and_purge",
+    ),
+    (
+        "cache-map finalization",
+        "ext4win_stream_cache_uninitialize",
+    ),
+    ("oplock FSCTL boundary", "ext4win_stream_oplock_fsctrl"),
+    ("oplock package delegation", "FsRtlOplockFsctrlEx"),
+    ("Fast I/O registration", "ext4win_fast_io_dispatch"),
+    ("Fast I/O read callback", "ext4win_fast_io_read"),
+    ("Fast I/O write callback", "ext4win_fast_io_write"),
+    ("raw-volume operation admission", "raw_volume"),
 ];
 
 /// AMD64 COFF machine identifier.
@@ -2286,6 +2307,18 @@ mod tests {
              ext4win_stream_get_sizes\n\
              ext4win_stream_set_sizes\n\
              ext4win_stream_destroy\n\
+             ext4win_stream_cache_initialize\n\
+             ext4win_stream_cache_read\n\
+             ext4win_stream_cache_write\n\
+             ext4win_stream_cache_flush\n\
+             ext4win_stream_cache_coherency_flush_and_purge\n\
+             ext4win_stream_cache_uninitialize\n\
+             ext4win_stream_oplock_fsctrl\n\
+             FsRtlOplockFsctrlEx\n\
+             ext4win_fast_io_dispatch\n\
+             ext4win_fast_io_read\n\
+             ext4win_fast_io_write\n\
+             raw_volume\n\
              EXT4WIN_PRODUCTION_ARTIFACT_ID\n"
         )
     }
