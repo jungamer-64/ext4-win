@@ -352,22 +352,6 @@ impl VolumeRuntime {
         self.epochs.reserve_publication()
     }
 
-    /// Grants the commit slot if this ticket is currently eligible.
-    pub(crate) fn try_grant_commit(&mut self, ticket: u64) -> Option<ext4_core::CommitLease> {
-        if self.failure.authorize_mutation().is_err() {
-            return None;
-        }
-        match self.commit_gate {
-            CommitGateState::Ready => {
-                self.commit_gate = CommitGateState::CommitGranted { ticket };
-                Some(ext4_core::CommitLease::granted(ticket))
-            }
-            CommitGateState::CommitGranted { .. }
-            | CommitGateState::CheckpointPending { .. }
-            | CommitGateState::CheckpointGranted { .. } => None,
-        }
-    }
-
     /// Releases a commit grant before the first lower write was issued.
     pub(crate) fn abandon_commit(&mut self, ticket: u64) {
         if self.commit_gate == (CommitGateState::CommitGranted { ticket }) {

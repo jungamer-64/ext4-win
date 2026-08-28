@@ -315,7 +315,7 @@ pub(crate) trait CompletionOperation: fmt::Debug + Send + 'static {
     /// Consumes this operation and its one concrete event into exactly one scheduler action.
     fn advance(
         self: Box<Self>,
-        event: OperationEvent,
+        event: CompletionEvent,
         target: &mut ReactorTarget,
     ) -> OperationTransition;
 
@@ -337,7 +337,7 @@ pub(crate) trait MountedVolumeOperation: fmt::Debug + Send + 'static {
     /// Consumes one event inside the sole lifetime-bound mounted access scope.
     fn advance_mounted(
         self: Box<Self>,
-        event: OperationEvent,
+        event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition;
 
@@ -542,7 +542,7 @@ enum SlotPayload {
         /// Owned operation state machine.
         operation: Box<dyn CompletionOperation>,
         /// Concrete event selected by the scheduler shell.
-        event: Option<OperationEvent>,
+        event: Option<CompletionEvent>,
     },
     /// One retry command retaining its original operation.
     #[cfg(not(test))]
