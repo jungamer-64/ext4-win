@@ -276,11 +276,12 @@ function Mount-SessionNamespace {
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     $volume = $null
     do {
-        $volume = [Ext4Win.LiveVolume]::Find([uint32]$partition.DiskNumber, [long]$partition.Offset, [long]$partition.Size)
+        $volume = [Ext4Win.LiveVolume]::Find([uint32]$partition.DiskNumber, [long]$partition.Offset, [long]$partition.Size, [Guid]$script:State.partition_id)
         if ($volume) { break }
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
     if (-not $volume) { throw 'Linux data GUID volume was not registered with Mount Manager' }
+    Get-SessionPartition | Out-Null
     Set-StateValue 'volume_name' $volume
     Write-Phase 'VolumeRecognized'
     $mountPath = Join-Path $script:SessionDirectory 'mount'
