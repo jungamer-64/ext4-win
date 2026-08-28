@@ -96,7 +96,6 @@ impl VolumeDiscovery {
         }
         .ok_or(wdk_sys::STATUS_INVALID_PARAMETER)?;
         let address = core::ptr::from_ref(context).cast_mut().cast::<c_void>();
-        let mut guid = VolumeInterfaceClass::Hidden.guid();
         let mut registration = core::ptr::null_mut();
         let status = unsafe {
             // SAFETY: Callback storage is initialized and pinned. The callback only signals;
@@ -104,7 +103,9 @@ impl VolumeDiscovery {
             wdk_sys::ntddk::IoRegisterPlugPlayNotification(
                 wdk_sys::_IO_NOTIFICATION_EVENT_CATEGORY::EventCategoryDeviceInterfaceChange,
                 wdk_sys::PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
-                (&raw mut guid).cast(),
+                core::ptr::from_ref(VolumeInterfaceClass::Hidden.guid())
+                    .cast_mut()
+                    .cast(),
                 device.DriverObject,
                 Some(interface_change),
                 address,
