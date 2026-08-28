@@ -13,9 +13,9 @@ use ext4_core::{
 use wdk_sys::STATUS_SUCCESS;
 
 use crate::irp::reactor::{
-    CLEANUP_HANDLE_BARRIER, CLOSE_HANDLE_BARRIER, CompletionOperation, ControlDeviceOperation,
-    InfalliblePublication, IntentRequest, MountedVolumeOperation, OperationTransition,
-    PublicationAuthority, ReactorTarget, WaitCondition,
+    CLEANUP_HANDLE_BARRIER, CLOSE_HANDLE_BARRIER, CompletionEvent, CompletionOperation,
+    ControlDeviceOperation, InfalliblePublication, IntentRequest, MountedVolumeOperation,
+    OperationTransition, PublicationAuthority, ReactorTarget, WaitCondition,
 };
 use crate::irp::{CreateCompletion, IrpCompletion, OwnedIrp};
 use crate::kernel::cng::CngOperation;
@@ -40,7 +40,7 @@ macro_rules! impl_mounted_operation_adapter {
         impl CompletionOperation for $operation {
             fn advance(
                 self: Box<Self>,
-                event: OperationEvent,
+                event: CompletionEvent,
                 target: &mut ReactorTarget,
             ) -> OperationTransition {
                 target.with_mounted_access(|access| self.advance_mounted(event, access))
@@ -626,11 +626,11 @@ impl ControlDeviceOperation for MountRequestOperation {
 impl CompletionOperation for MountRequestOperation {
     fn advance(
         self: Box<Self>,
-        event: OperationEvent,
+        event: CompletionEvent,
         target: &mut ReactorTarget,
     ) -> OperationTransition {
         target.require_control_device();
-        self.advance_control(event)
+        self.advance_control(event.into_core())
     }
 
     fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget) {
@@ -770,9 +770,10 @@ impl ReadRequestOperation {
 impl MountedVolumeOperation for ReadRequestOperation {
     fn advance_mounted(
         mut self: Box<Self>,
-        event: OperationEvent,
+        event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        let event = event.into_core();
         let state = core::mem::replace(&mut self.state, ReadOperationState::Terminal);
         let ReadOperationState::Running { mut owned, read } = state else {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -938,9 +939,10 @@ impl RawVolumeOperation {
 impl MountedVolumeOperation for RawVolumeOperation {
     fn advance_mounted(
         mut self: Box<Self>,
-        event: OperationEvent,
+        event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        let event = event.into_core();
         let state = core::mem::replace(&mut self.state, RawVolumeOperationState::Terminal);
         match state {
             RawVolumeOperationState::Ready(mut owned) => match event {
@@ -1171,9 +1173,10 @@ impl ImmediateRequestOperation {
 impl MountedVolumeOperation for ImmediateRequestOperation {
     fn advance_mounted(
         mut self: Box<Self>,
-        event: OperationEvent,
+        event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        let event = event.into_core();
         let state = core::mem::replace(&mut self.state, ImmediateOperationState::Terminal);
         let ImmediateOperationState::Ready(mut owned) = state else {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -1293,9 +1296,10 @@ impl NotificationOperation {
 impl MountedVolumeOperation for NotificationOperation {
     fn advance_mounted(
         mut self: Box<Self>,
-        event: OperationEvent,
+        event: CompletionEvent,
         _access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        let event = event.into_core();
         let state = core::mem::replace(&mut self.state, NotificationOperationState::Terminal);
         let NotificationOperationState::Ready(owned) = state else {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -1525,9 +1529,23 @@ impl VolumeControlOperation {
 impl MountedVolumeOperation for VolumeControlOperation {
     fn advance_mounted(
         mut self: Box<Self>,
-        event: OperationEvent,
+        event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        let event = match event {
+            CompletionEvent::Core(event) => event,
+            CompletionEvent::VolumeFailed(error) => {
+                let state =
+                    core::mem::replace(&mut self.state, VolumeControlOperationState::Terminal);
+                let VolumeControlOperationState::Waiting {
+                    owned, transition, ..
+                } = state
+                else {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                return Self::fail_transition(owned, transition, error, access);
+            }
+        };
         let state = core::mem::replace(&mut self.state, VolumeControlOperationState::Terminal);
         match state {
             VolumeControlOperationState::Ready(mut owned) => match event {
@@ -1896,9 +1914,22 @@ impl FlushRequestOperation {
 impl MountedVolumeOperation for FlushRequestOperation {
     fn advance_mounted(
         mut self: Box<Self>,
-        event: OperationEvent,
+        event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        let event = match event {
+            CompletionEvent::Core(event) => event,
+            CompletionEvent::VolumeFailed(error) => {
+                let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
+                let FlushOperationState::Waiting { owned, transition } = state else {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                if let Some(transition) = transition {
+                    access.fail_volume_state_transition(transition);
+                }
+                return Self::complete(owned, Err(error));
+            }
+        };
         let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
         match state {
             FlushOperationState::Ready(mut owned) => match event {
@@ -3110,9 +3141,19 @@ impl MutationRequestOperation {
 impl MountedVolumeOperation for MutationRequestOperation {
     fn advance_mounted(
         mut self: Box<Self>,
-        event: OperationEvent,
+        event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        let event = match event {
+            CompletionEvent::Core(event) => event,
+            CompletionEvent::VolumeFailed(error) => {
+                let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
+                let MutationOperationState::AwaitingCommit { owned, .. } = state else {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                return self.complete_error(owned, error);
+            }
+        };
         let event = if self.kind == MutationRequestKind::Cleanup && !self.cleanup_barrier_released {
             match event {
                 OperationEvent::Admitted => {

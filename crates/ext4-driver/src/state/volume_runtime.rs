@@ -225,6 +225,30 @@ enum CommitGateState {
     },
 }
 
+impl CommitGateState {
+    /// Acquires clean journal space only while the volume still permits mutation.
+    /// # Errors
+    ///
+    /// Returns the authoritative volume failure without changing the current grant. `Ok(None)`
+    /// means only that a healthy volume must wait for existing commit/checkpoint work.
+    fn acquire(
+        &mut self,
+        ticket: u64,
+        failure: VolumeFailureState,
+    ) -> DriverResult<Option<ext4_core::CommitLease>> {
+        failure.authorize_mutation()?;
+        match self {
+            Self::Ready => {
+                *self = Self::CommitGranted { ticket };
+                Ok(Some(ext4_core::CommitLease::granted(ticket)))
+            }
+            Self::CommitGranted { .. }
+            | Self::CheckpointPending { .. }
+            | Self::CheckpointGranted { .. } => Ok(None),
+        }
+    }
+}
+
 /// Short allocation-free visibility gate, separate from checkpoint ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VisibilityGateState {
@@ -350,6 +374,17 @@ impl VolumeRuntime {
     pub(crate) fn reserve_epoch_publication(&mut self) -> DriverResult<EpochPublicationSlots> {
         self.failure.authorize_mutation()?;
         self.epochs.reserve_publication()
+    }
+
+    /// Attempts a commit grant while retaining volume failure separately from contention.
+    /// # Errors
+    ///
+    /// Returns the volume's mutation failure without acquiring or replacing a grant.
+    pub(crate) fn acquire_commit(
+        &mut self,
+        ticket: u64,
+    ) -> DriverResult<Option<ext4_core::CommitLease>> {
+        self.commit_gate.acquire(ticket, self.failure)
     }
 
     /// Releases a commit grant before the first lower write was issued.
@@ -525,7 +560,7 @@ impl PendingCheckpoint {
 
 #[cfg(test)]
 mod tests {
-    use super::{VolumeFailureState, VolumeRuntime};
+    use super::{CommitGateState, VolumeFailureState, VolumeRuntime};
 
     /// # Panics
     ///
@@ -557,6 +592,39 @@ mod tests {
             ))
         );
         assert_eq!(publication.durable_abort(), publication);
+        assert_eq!(publication.durability_unknown(), publication);
+        assert_eq!(
+            publication.publication_failed(wdk_sys::STATUS_INSUFFICIENT_RESOURCES),
+            publication
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when contention swallows terminal failure or failure acquires/replaces a grant.
+    #[test]
+    fn commit_grants_preserve_failure_separately_from_contention() {
+        let mut gate = CommitGateState::Ready;
+        assert_eq!(
+            gate.acquire(7, VolumeFailureState::Operational)
+                .map(|grant| grant.map(ext4_core::CommitLease::into_ticket)),
+            Ok(Some(7))
+        );
+        assert!(matches!(
+            gate.acquire(8, VolumeFailureState::Operational),
+            Ok(None)
+        ));
+        let failed = VolumeFailureState::CommittedButUnpublished {
+            status: wdk_sys::STATUS_IO_DEVICE_ERROR,
+        };
+        let error = crate::kernel::status::DriverError::CacheManagerFailure(
+            wdk_sys::STATUS_IO_DEVICE_ERROR,
+        );
+        assert!(matches!(gate.acquire(8, failed), Err(failure) if failure == error));
+        assert_eq!(gate, CommitGateState::CommitGranted { ticket: 7 });
+        let mut vacant = CommitGateState::Ready;
+        assert!(matches!(vacant.acquire(9, failed), Err(failure) if failure == error));
+        assert_eq!(vacant, CommitGateState::Ready);
     }
 
     /// Keeps serialized commit, visibility, and checkpoint grants in the unit-test production
@@ -569,8 +637,12 @@ mod tests {
     #[test]
     fn durability_gate_boundaries_remain_linked() {
         let _clean: fn(&VolumeRuntime) -> bool = VolumeRuntime::journal_is_clean;
-        let _commit: fn(&mut VolumeRuntime, u64) -> Option<ext4_core::CommitLease> =
-            VolumeRuntime::try_grant_commit;
+        let _commit: fn(
+            &mut VolumeRuntime,
+            u64,
+        )
+            -> crate::kernel::status::DriverResult<Option<ext4_core::CommitLease>> =
+            VolumeRuntime::acquire_commit;
         let _abandon: fn(&mut VolumeRuntime, u64) = VolumeRuntime::abandon_commit;
         let _visibility: fn(&mut VolumeRuntime, u64) -> Option<ext4_core::VisibilityLease> =
             VolumeRuntime::try_grant_visibility;

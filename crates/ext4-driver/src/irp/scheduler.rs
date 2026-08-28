@@ -676,6 +676,21 @@ impl Scheduler {
         true
     }
 
+    /// Returns an ungranted commit to actor ownership for its terminal volume-failure event.
+    /// No commit capability is fabricated, and existing resource intents remain until completion.
+    pub(crate) fn reject_commit(&mut self, identity: SlotId, ticket: u64) -> bool {
+        let Some(slot) = self.slot_mut(identity) else {
+            return false;
+        };
+        if !matches!(slot.phase, Phase::Commit { ticket: queued } if queued == ticket)
+            || slot.commit.is_some()
+        {
+            return false;
+        }
+        slot.phase = Phase::Actor;
+        true
+    }
+
     /// Removes a pre-write commit grant for return to the runtime.
     pub(crate) fn abandon_commit(&mut self, identity: SlotId) -> Option<u64> {
         self.slot_mut(identity)?
@@ -694,6 +709,28 @@ impl Scheduler {
     /// Installs one wait condition from actor ownership.
     pub(crate) fn request_wait(&mut self, identity: SlotId, condition: WaitCondition) -> bool {
         self.set_phase(identity, Phase::Waiting(condition))
+    }
+
+    /// Enters a one-way closing wait and revokes top-level cancellation permanently.
+    ///
+    /// The lifecycle transition to `Closing` is already published before this call. A callback
+    /// racing with actor execution therefore cannot restore the pre-closing state or abandon the
+    /// durability outcome.
+    pub(crate) fn request_closing_wait(
+        &mut self,
+        identity: SlotId,
+        condition: WaitCondition,
+    ) -> bool {
+        let Some(slot) = self.slot_mut(identity) else {
+            return false;
+        };
+        if !matches!(slot.phase, Phase::Actor) {
+            return false;
+        }
+        slot.cancel_pending = false;
+        slot.cancel_enabled = false;
+        slot.phase = Phase::Waiting(condition);
+        true
     }
 
     /// Returns one fixed slot's current wait condition.
@@ -975,6 +1012,13 @@ mod tests {
         );
         assert!(scheduler.grant_commit(earlier, 10));
         assert!(scheduler.has_commit_work());
+        assert!(!scheduler.reject_commit(later, 10));
+        assert!(scheduler.reject_commit(later, 20));
+        assert_eq!(scheduler.abandon_commit(later), None);
+        assert!(scheduler.has_commit_work());
+        assert!(!scheduler.reject_commit(earlier, 10));
+        assert_eq!(scheduler.abandon_commit(earlier), Some(10));
+        assert!(!scheduler.has_commit_work());
     }
 
     /// Verifies cancellation behavior at every suspending scheduler phase.
@@ -1055,6 +1099,32 @@ mod tests {
             let waiting = require_some!(scheduler.take_ready());
             assert!(scheduler.complete(waiting));
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if one-way closing retains or later recovers top-level cancellation authority.
+    #[test]
+    fn closing_wait_revokes_cancellation_before_durability_drain() {
+        let mut scheduler = Scheduler::new();
+        let slot = require_some!(scheduler.reserve());
+        assert_eq!(
+            scheduler.install(slot, Admission::Device, false),
+            Some(AdmissionStart::Admitted)
+        );
+        assert_eq!(scheduler.take_ready(), Some(slot));
+        assert_eq!(
+            scheduler.request_cancel(slot.index()),
+            CancelDisposition::AwaitRegistration
+        );
+        let condition = WaitCondition::JournalClean;
+        assert!(scheduler.request_closing_wait(slot, condition));
+        assert_eq!(scheduler.wait_condition(slot.index()), Some(condition));
+        assert!(!scheduler.cancellation_is_pending(slot.index(), true));
+        assert_eq!(
+            scheduler.request_cancel(slot.index()),
+            CancelDisposition::Ignored
+        );
     }
 
     /// Verifies pre-commit cancellation resumes without entering lower I/O and leaves no grant.
