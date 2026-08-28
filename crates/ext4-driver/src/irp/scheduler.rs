@@ -55,10 +55,6 @@ impl HandleId {
 /// Requests whose FILE_OBJECT lifetime legally continues after CLEANUP.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PostCleanupRequest {
-    /// Paging read captured from `IRP_PAGING_IO`.
-    PagingRead,
-    /// Paging write captured from `IRP_PAGING_IO`.
-    PagingWrite,
     /// Explicit device flush that accesses no user-visible handle authority.
     FlushBuffers,
     /// Terminal context release after every earlier post-cleanup request drains.
@@ -1272,7 +1268,7 @@ mod tests {
                 independent,
                 Admission::Handle {
                     handle: other,
-                    lane: HandleOperationLane::PostCleanup(PostCleanupRequest::PagingRead),
+                    lane: HandleOperationLane::PostCleanup(PostCleanupRequest::FlushBuffers),
                 },
                 false,
             ),
