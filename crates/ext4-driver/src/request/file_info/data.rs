@@ -5,6 +5,34 @@ use super::*;
 /// Maximum requestor data bytes copied through driver-owned memory at one time.
 const MAX_DATA_TRANSFER_WINDOW_BYTES: usize = 65_536;
 
+/// Data-stream authority selected before an operation can outlive current FILE_OBJECT decoding.
+#[derive(Debug)]
+pub(crate) enum RegularFileDataAuthority {
+    /// Ordinary I/O remains authorized and serialized by its live handle lane.
+    Handle,
+    /// Paging I/O owns an FCB ledger lease independent of handle-local cleanup state.
+    Paging(PagingStreamLease),
+}
+
+/// Captures the exact stream authority required by one regular-file data IRP.
+/// # Errors
+///
+/// Returns an error when paging stream identity cannot be retained independently from the CCB.
+pub(crate) fn prepare_regular_file_data_authority(
+    mut request: PendingIrpLease<'_>,
+    operations: &MountedVolumeAccess<'_>,
+) -> DriverResult<RegularFileDataAuthority> {
+    request.with_active(|active| match active.data_io_kind() {
+        DataIoKind::Handle => Ok(RegularFileDataAuthority::Handle),
+        DataIoKind::Paging => {
+            let file_object = active.current_stack()?.file_object()?;
+            operations
+                .acquire_paging_stream_lease(file_object)
+                .map(RegularFileDataAuthority::Paging)
+        }
+    })
+}
+
 /// One non-empty, bounded interval selected from a pending data-transfer IRP.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DataTransferWindow {
@@ -126,9 +154,9 @@ impl DataTransferWindows {
 pub(crate) fn read(
     request: PendingIrpLease<'_>,
     read: &mut impl CommittedReadPass,
-    paging: Option<&crate::state::PagingStreamLease>,
+    authority: &RegularFileDataAuthority,
 ) -> DriverResult<IrpCompletion> {
-    read_regular_file_by_transfer_mode(request, read, paging)
+    read_regular_file_by_transfer_mode(request, read, authority)
 }
 
 /// Executes regular file data writes.
@@ -138,9 +166,9 @@ pub(crate) fn read(
 pub(crate) fn write(
     request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
-    paging: Option<&crate::state::PagingStreamLease>,
+    authority: &RegularFileDataAuthority,
 ) -> DriverResult<WriteResolution> {
-    write_regular_file_by_transfer_mode(request, mutation, paging)
+    write_regular_file_by_transfer_mode(request, mutation, authority)
 }
 
 /// One authorized raw-volume request ready for lower-device submission.
@@ -689,9 +717,9 @@ fn regular_file_end(
 fn read_regular_file_by_transfer_mode(
     request: PendingIrpLease<'_>,
     read: &mut impl CommittedReadPass,
-    paging: Option<&crate::state::PagingStreamLease>,
+    authority: &RegularFileDataAuthority,
 ) -> DriverResult<IrpCompletion> {
-    read_regular_file_direct(request, read, paging)
+    read_regular_file_direct(request, read, authority)
 }
 
 /// Executes the actor-owned journal mutation after top-level cache dispatch declined the write.
@@ -704,9 +732,9 @@ fn read_regular_file_by_transfer_mode(
 fn write_regular_file_by_transfer_mode(
     request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
-    paging: Option<&crate::state::PagingStreamLease>,
+    authority: &RegularFileDataAuthority,
 ) -> DriverResult<WriteResolution> {
-    write_regular_file_windowed(request, mutation, paging)
+    write_regular_file_windowed(request, mutation, authority)
 }
 
 /// Reads a regular file through bounded driver-owned windows into the pending read IRP.
@@ -717,38 +745,61 @@ fn write_regular_file_by_transfer_mode(
 fn read_regular_file_direct(
     mut request: PendingIrpLease<'_>,
     read: &mut impl CommittedReadPass,
-    _paging: Option<&crate::state::PagingStreamLease>,
+    authority: &RegularFileDataAuthority,
 ) -> DriverResult<IrpCompletion> {
     let stack = request.prepared_read()?.stack();
     let output_address = request.prepared_read()?.output_address();
-    let Some((file_id, kind, range)) = request.with_active(|active| {
+    let Some((file_id, range)) = request.with_active(|active| {
         let kind = active.data_io_kind();
         let file_object = active.current_stack()?.file_object()?;
-        let mut opened_file = OpenedRegularFile::decode(file_object)?;
-        let range = ResolvedFileRange::new(
-            resolve_read_start(&opened_file, kind, stack.starting_point())?,
-            stack.length().as_usize(),
-        )?;
-        let data_transfer_mode = opened_file.data_transfer_mode();
-        data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
-        if stack.length().is_empty() {
-            opened_file.update_current_file_position(kind, range.start(), 0)?;
-            return Ok(None);
+        match authority {
+            RegularFileDataAuthority::Handle => {
+                if kind != DataIoKind::Handle {
+                    return Err(DriverError::InternalInvariantViolation);
+                }
+                let mut opened_file = OpenedRegularFile::decode(file_object)?;
+                let range = ResolvedFileRange::new(
+                    resolve_read_start(&opened_file, kind, stack.starting_point())?,
+                    stack.length().as_usize(),
+                )?;
+                let data_transfer_mode = opened_file.data_transfer_mode();
+                data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
+                if stack.length().is_empty() {
+                    opened_file.update_current_file_position(kind, range.start(), 0)?;
+                    return Ok(None);
+                }
+                data_transfer_mode.validate_buffer(
+                    output_address.ok_or(DriverError::InternalInvariantViolation)?,
+                )?;
+                if !opened_file.file_control_block().permits_byte_range_read(
+                    active.requestor_process()?,
+                    opened_file.file_object(),
+                    range.start(),
+                    range.length(),
+                    stack.key(),
+                )? {
+                    return Err(DriverError::FileLockConflict);
+                }
+                Ok(Some((opened_file.id(), range)))
+            }
+            RegularFileDataAuthority::Paging(paging) => {
+                if kind != DataIoKind::Paging {
+                    return Err(DriverError::InternalInvariantViolation);
+                }
+                paging.validate_file_object(file_object)?;
+                let SelectedReadStart::Absolute(start) =
+                    select_read_start(kind, stack.starting_point())?
+                else {
+                    return Err(DriverError::InternalInvariantViolation);
+                };
+                let range = ResolvedFileRange::new(start, stack.length().as_usize())?;
+                if stack.length().is_empty() {
+                    return Ok(None);
+                }
+                let _output = output_address.ok_or(DriverError::InternalInvariantViolation)?;
+                Ok(Some((paging.file(), range)))
+            }
         }
-        data_transfer_mode
-            .validate_buffer(output_address.ok_or(DriverError::InternalInvariantViolation)?)?;
-        if kind == DataIoKind::Handle
-            && !opened_file.file_control_block().permits_byte_range_read(
-                active.requestor_process()?,
-                opened_file.file_object(),
-                range.start(),
-                range.length(),
-                stack.key(),
-            )?
-        {
-            return Err(DriverError::FileLockConflict);
-        }
-        Ok(Some((opened_file.id(), kind, range)))
     })?
     else {
         return Ok(IrpCompletion::EMPTY);
@@ -779,11 +830,16 @@ fn read_regular_file_direct(
             break;
         }
     }
-    request.with_active(|active| {
-        let file_object = active.current_stack()?.file_object()?;
-        let mut opened_file = OpenedRegularFile::decode(file_object)?;
-        opened_file.update_current_file_position(kind, range.start(), bytes_read)
-    })?;
+    if let RegularFileDataAuthority::Handle = authority {
+        request.with_active(|active| {
+            if active.data_io_kind() != DataIoKind::Handle {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+            let file_object = active.current_stack()?.file_object()?;
+            let mut opened_file = OpenedRegularFile::decode(file_object)?;
+            opened_file.update_current_file_position(DataIoKind::Handle, range.start(), bytes_read)
+        })?;
+    }
     IrpCompletion::from_usize(bytes_read)
 }
 
@@ -795,20 +851,44 @@ fn read_regular_file_direct(
 fn write_regular_file_windowed(
     mut request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
-    _paging: Option<&crate::state::PagingStreamLease>,
+    authority: &RegularFileDataAuthority,
 ) -> DriverResult<WriteResolution> {
     let stack = request.prepared_write()?.stack();
     let input_address = request.prepared_write()?.input_address();
-    let (file_id, kind, anchor, data_transfer_mode) = request.with_active(|active| {
+    let (file_id, anchor, data_transfer_mode) = request.with_active(|active| {
         let file_object = active.current_stack()?.file_object()?;
-        let opened_file = OpenedRegularFile::decode(file_object)?;
         let kind = active.data_io_kind();
-        let selected_start =
-            select_write_start(opened_file.write_access(), kind, stack.starting_point())?;
-        let anchor =
-            selected_start.bind_current_position(|| opened_file.current_file_position())?;
-        let data_transfer_mode = opened_file.data_transfer_mode();
-        Ok::<_, DriverError>((opened_file.id(), kind, anchor, data_transfer_mode))
+        match authority {
+            RegularFileDataAuthority::Handle => {
+                if kind != DataIoKind::Handle {
+                    return Err(DriverError::InternalInvariantViolation);
+                }
+                let opened_file = OpenedRegularFile::decode(file_object)?;
+                let selected_start =
+                    select_write_start(opened_file.write_access(), kind, stack.starting_point())?;
+                let anchor =
+                    selected_start.bind_current_position(|| opened_file.current_file_position())?;
+                Ok::<_, DriverError>((
+                    opened_file.id(),
+                    anchor,
+                    Some(opened_file.data_transfer_mode()),
+                ))
+            }
+            RegularFileDataAuthority::Paging(paging) => {
+                if kind != DataIoKind::Paging {
+                    return Err(DriverError::InternalInvariantViolation);
+                }
+                paging.validate_file_object(file_object)?;
+                let selected_start = select_write_start(
+                    RegularFileWriteAccess::Denied,
+                    kind,
+                    stack.starting_point(),
+                )?;
+                let anchor = selected_start
+                    .bind_current_position(|| Err(DriverError::InternalInvariantViolation))?;
+                Ok((paging.file(), anchor, None))
+            }
+        }
     })?;
 
     let range = ResolvedFileRange::new(
@@ -817,32 +897,51 @@ fn write_regular_file_windowed(
     )?;
     request.with_active(|active| {
         let file_object = active.current_stack()?.file_object()?;
-        let opened_file = OpenedRegularFile::decode(file_object)?;
-        data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
-        if stack.length().is_empty() {
-            return Ok(());
-        }
-        data_transfer_mode
-            .validate_buffer(input_address.ok_or(DriverError::InternalInvariantViolation)?)?;
-        if kind == DataIoKind::Handle
-            && !opened_file.file_control_block().permits_byte_range_write(
-                active.requestor_process()?,
-                opened_file.file_object(),
-                range.start(),
-                range.length(),
-                stack.key(),
-            )?
-        {
-            return Err(DriverError::FileLockConflict);
+        match authority {
+            RegularFileDataAuthority::Handle => {
+                if active.data_io_kind() != DataIoKind::Handle {
+                    return Err(DriverError::InternalInvariantViolation);
+                }
+                let opened_file = OpenedRegularFile::decode(file_object)?;
+                let data_transfer_mode =
+                    data_transfer_mode.ok_or(DriverError::InternalInvariantViolation)?;
+                data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
+                if stack.length().is_empty() {
+                    return Ok(());
+                }
+                data_transfer_mode.validate_buffer(
+                    input_address.ok_or(DriverError::InternalInvariantViolation)?,
+                )?;
+                if !opened_file.file_control_block().permits_byte_range_write(
+                    active.requestor_process()?,
+                    opened_file.file_object(),
+                    range.start(),
+                    range.length(),
+                    stack.key(),
+                )? {
+                    return Err(DriverError::FileLockConflict);
+                }
+            }
+            RegularFileDataAuthority::Paging(paging) => {
+                if active.data_io_kind() != DataIoKind::Paging || data_transfer_mode.is_some() {
+                    return Err(DriverError::InternalInvariantViolation);
+                }
+                paging.validate_file_object(file_object)?;
+                if !stack.length().is_empty() {
+                    let _input = input_address.ok_or(DriverError::InternalInvariantViolation)?;
+                }
+            }
         }
         Ok(())
     })?;
     if stack.length().is_empty() {
-        request.with_active(|active| {
-            let file_object = active.current_stack()?.file_object()?;
-            let mut opened_file = OpenedRegularFile::decode(file_object)?;
-            opened_file.update_current_file_position(kind, range.start(), 0)
-        })?;
+        if let RegularFileDataAuthority::Handle = authority {
+            request.with_active(|active| {
+                let file_object = active.current_stack()?.file_object()?;
+                let mut opened_file = OpenedRegularFile::decode(file_object)?;
+                opened_file.update_current_file_position(DataIoKind::Handle, range.start(), 0)
+            })?;
+        }
         return Ok(WriteResolution::Complete(IrpCompletion::EMPTY));
     }
 
@@ -865,11 +964,18 @@ fn write_regular_file_windowed(
         }
         windows.completed()
     };
-    let position = request.with_active(|active| {
-        let file_object = active.current_stack()?.file_object()?;
-        let opened_file = OpenedRegularFile::decode(file_object)?;
-        opened_file.prepare_current_file_position_update(kind, range.start(), bytes_written)
-    })?;
+    let position = match authority {
+        RegularFileDataAuthority::Handle => request.with_active(|active| {
+            let file_object = active.current_stack()?.file_object()?;
+            let opened_file = OpenedRegularFile::decode(file_object)?;
+            opened_file.prepare_current_file_position_update(
+                DataIoKind::Handle,
+                range.start(),
+                bytes_written,
+            )
+        })?,
+        RegularFileDataAuthority::Paging(_) => PreparedFilePositionPublication::Unchanged,
+    };
     Ok(WriteResolution::Mutation(PreparedWritePublication {
         completion: IrpCompletion::from_usize(bytes_written)?,
         position,

@@ -25,7 +25,7 @@ use crate::state::{
     CleanupStart, CloseReleasePlan, DataTransferMode, DirectoryChange, DirectoryChangeAction,
     DirectoryCursor, DirectoryNotificationRegistration, FileCleanupDisposition, FileControlBlock,
     FileDeleteTarget, MountedVolumeAccess, MountedVolumeDevice, OpenedDirectory, OpenedFileObject,
-    OpenedLocation, OpenedObject, OpenedRegularFile, PendingFileDeletion,
+    OpenedLocation, OpenedObject, OpenedRegularFile, PagingStreamLease, PendingFileDeletion,
     PreparedFilePositionPublication, PreparedHandleAdmission, PreparedOpenedLocationPublication,
     RawVolumeOperationKind, RawVolumeTarget, VolumeHandleCleanup, VolumeRetirement,
     release_cancelled_file_control_block, release_file_control_block,
