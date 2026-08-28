@@ -33,7 +33,8 @@ pub use disk_format::inode::{
     NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 pub use disk_format::superblock::{
-    ClusterCount, ClusterSize, Ext4VolumeLabel, FilesystemUuid, FreeClusterCount, JournalUuid,
+    ClusterCount, ClusterSize, Ext4VolumeLabel, ExtVolumeSignature, FilesystemUuid,
+    FreeClusterCount, JournalUuid,
 };
 pub use disk_format::xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 pub use error::{Error, Result};

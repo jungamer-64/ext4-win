@@ -98,7 +98,7 @@ function Assert-HostContract {
             throw "Hyper-V PowerShell command is unavailable: $command"
         }
     }
-    foreach ($program in @('wsl.exe', 'fsutil.exe')) {
+    foreach ($program in @('wsl.exe', 'fsutil.exe', 'mountvol.exe')) {
         if (-not (Get-Command $program -ErrorAction SilentlyContinue)) {
             throw "required Windows command is unavailable: $program"
         }
@@ -255,6 +255,73 @@ function Format-SessionVhdx {
     Write-Phase 'WslUnmounted'
 }
 
+function Get-SessionPartition {
+    $disk = Get-SessionDisk
+    if (-not $disk) { throw 'session VHDX is not attached' }
+    $partition = Get-Partition -DiskNumber $disk.Number -PartitionNumber ([int]$script:State.partition_number)
+    if ([Guid]$partition.GptType -ne [Guid]$script:State.partition_type -or
+        [Guid]$partition.Guid -ne [Guid]$script:State.partition_id -or
+        [string]$partition.Offset -ne $script:State.partition_offset -or
+        [string]$partition.Size -ne $script:State.partition_size) {
+        throw 'session GPT type, identity, or range changed'
+    }
+    return $partition
+}
+
+function Mount-SessionNamespace {
+    if (-not ('Ext4Win.LiveVolume' -as [type])) {
+        Add-Type -Path (Join-Path $RepositoryRoot 'tools\xtask\live-volume.cs')
+    }
+    $partition = Get-SessionPartition
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    $volume = $null
+    do {
+        $volume = [Ext4Win.LiveVolume]::Find([uint32]$partition.DiskNumber, [long]$partition.Offset, [long]$partition.Size)
+        if ($volume) { break }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (-not $volume) { throw 'Linux data GUID volume was not registered with Mount Manager' }
+    Set-StateValue 'volume_name' $volume
+    Write-Phase 'VolumeRecognized'
+    $mountPath = Join-Path $script:SessionDirectory 'mount'
+    New-Item -ItemType Directory -Path $mountPath -Force | Out-Null
+    Write-Phase 'NamespaceMountRequested'
+    Invoke-Checked 'mountvol.exe' @($mountPath, $volume) 'session volume namespace mount' | Out-Null
+    Write-Phase 'NamespaceMounted'
+    return "$mountPath\"
+}
+
+function Remove-SessionNamespace {
+    $mountPath = Join-Path $script:SessionDirectory 'mount'
+    $item = Get-Item -LiteralPath $mountPath -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (-not ('Ext4Win.LiveVolume' -as [type])) {
+            Add-Type -Path (Join-Path $RepositoryRoot 'tools\xtask\live-volume.cs')
+        }
+        $volume = [Ext4Win.LiveVolume]::AtMountPoint("$mountPath\")
+        if ($volume -ne $script:State.volume_name) {
+            throw 'session mount point targets a different volume; cleanup refused'
+        }
+        Write-Phase 'NamespaceRemovalRequested'
+        Invoke-Checked 'mountvol.exe' @($mountPath, '/D') 'session namespace removal'
+    }
+    # Only the empty, generated directory is removed, never its filesystem contents.
+    [IO.Directory]::Delete($mountPath, $false)
+    Write-Phase 'NamespaceRemoved'
+}
+
+function Wait-SessionVolumeRemoval {
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        $names = @(Invoke-Checked 'mountvol.exe' @() 'registered volume inventory')
+        $present = @($names | Where-Object { $_.Trim() -eq $script:State.volume_name })
+        if ($present.Count -eq 0) { return }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Mount Manager retained the removed session volume'
+}
+
 function Exercise-SessionVolume([string[]]$BundleArguments) {
     Write-Phase 'WindowsAttachRequested'
     $vhd = Mount-VHD -Path $script:State.vhdx_path -Passthru
@@ -267,19 +334,7 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
     Invoke-DriverLoadSession 'Start' $script:State.driver_session_id $BundleArguments
     Set-StateValue 'driver_session_started' 'true'
     Write-Phase 'DriverLoadSessionStarted'
-    $partition = @(Get-Partition -DiskNumber $disk[0].Number | Where-Object { $_.Type -ne 'Reserved' })
-    if ($partition.Count -ne 1 -or [string]$partition[0].PartitionNumber -ne $script:State.partition_number) {
-        throw 'session partition identity changed after WSL formatting'
-    }
-    Write-Phase 'AccessPathRequested'
-    $partition[0] | Add-PartitionAccessPath -AssignDriveLetter
-    $mounted = Get-Partition -DiskNumber $disk[0].Number -PartitionNumber $partition[0].PartitionNumber
-    if (-not $mounted.DriveLetter) {
-        throw 'Windows did not assign an access path to the ext4 session volume'
-    }
-    Set-StateValue 'drive_letter' ([string]$mounted.DriveLetter)
-    Write-Phase 'AccessPathAssigned'
-    $root = '{0}:\' -f $mounted.DriveLetter
+    $root = Mount-SessionNamespace
     $alpha = Join-Path $root 'alpha.bin'
     $beta = Join-Path $root 'beta.bin'
     $hardlink = Join-Path $root 'beta-link.bin'
@@ -308,14 +363,33 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
     }
     Write-Phase 'FilesystemOperationsCompleted'
     Write-Phase 'VolumeDismountRequested'
-    Invoke-Checked 'fsutil.exe' @('volume', 'dismount', ('{0}:' -f $mounted.DriveLetter)) 'ext4 session volume dismount'
-    Remove-PartitionAccessPath -DiskNumber $disk[0].Number -PartitionNumber $partition[0].PartitionNumber -AccessPath $root
-    Set-StateValue 'drive_letter' ''
+    Get-SessionPartition | Out-Null
+    Invoke-Checked 'fsutil.exe' @('volume', 'dismount', $script:State.volume_name) 'ext4 session volume dismount'
+    Remove-SessionNamespace
     Dismount-VHD -Path $script:State.vhdx_path
+    Wait-SessionVolumeRemoval
     Write-Phase 'VolumeDismounted'
+
+    # A second attachment with the same loaded driver exercises the PnP callback,
+    # not INCLUDE_EXISTING alone, and requires the persisted content to survive.
+    Write-Phase 'HotAttachRequested'
+    Mount-VHD -Path $script:State.vhdx_path | Out-Null
+    $root = Mount-SessionNamespace
+    $readback = [IO.File]::ReadAllBytes((Join-Path $root 'beta-link.bin'))
+    if ([Convert]::ToBase64String($payload) -ne [Convert]::ToBase64String($readback)) {
+        throw 'hot-attached Linux data GUID volume lost the durable content'
+    }
+    Get-SessionPartition | Out-Null
+    Write-Phase 'HotAttachVerified'
+    Invoke-Checked 'fsutil.exe' @('volume', 'dismount', $script:State.volume_name) 'hot-attached session volume dismount'
+    Remove-SessionNamespace
+    Dismount-VHD -Path $script:State.vhdx_path
+    Wait-SessionVolumeRemoval
+    Write-Phase 'HotAttachDismounted'
 }
 
 function Cleanup-VhdxResources {
+    Remove-SessionNamespace
     if ($script:State.wsl_attached -eq 'true') {
         Write-Phase 'CleanupWslUnmountRequested'
         Invoke-Wsl @('--unmount', $script:State.vhdx_path) 'cleanup WSL VHDX unmount' | Out-Null
@@ -412,11 +486,18 @@ function Start-LiveSession([string[]]$BundleArguments, [string]$RequestedSession
         }
         Set-StateValue 'disk_unique_id' ([string]$disk[0].UniqueId)
         Write-Phase 'PartitioningAttached'
+        Set-StateValue 'partition_type' '{0FC63DAF-8483-4772-8E79-3D69D8477DE4}'
         Write-Phase 'PartitionCreateRequested'
         Set-Disk -Number $disk[0].Number -IsOffline $false -IsReadOnly $false
         Initialize-Disk -Number $disk[0].Number -PartitionStyle GPT
-        $partition = New-Partition -DiskNumber $disk[0].Number -UseMaximumSize
+        $partition = New-Partition -DiskNumber $disk[0].Number -UseMaximumSize -GptType $script:State.partition_type
+        if ([Guid]$partition.GptType -ne [Guid]$script:State.partition_type) {
+            throw 'new disposable partition did not retain the Linux data GUID'
+        }
         Set-StateValue 'partition_number' ([string]$partition.PartitionNumber)
+        Set-StateValue 'partition_id' ([string]$partition.Guid)
+        Set-StateValue 'partition_offset' ([string]$partition.Offset)
+        Set-StateValue 'partition_size' ([string]$partition.Size)
         Write-Phase 'PartitionCreated'
         Write-Phase 'PartitioningDismountRequested'
         Dismount-VHD -Path $vhdxPath

@@ -27,6 +27,14 @@ Mutations are journaled and recovered before a mounted volume is published.
 Both internal and external journals are represented by the core mount and
 durability protocols.
 
+GPT Linux filesystem data partitions (`0FC63DAF-8483-4772-8E79-3D69D8477DE4`)
+are discovered through Windows' hidden-volume interface without changing their
+partition type or identity. An ext superblock signature is required before
+Mount Manager notification; the GUID alone does not identify ext4. External
+journal devices are discovered separately and are not published as filesystems.
+Explicit no-automount, hidden, shadow-copy, read-only and no-block-I/O attributes
+are not overridden. Full feature validation and recovery still occur at mount.
+
 This is not an exhaustive feature-flag matrix. `ext4-core` mount validation is
 the authority for whether a particular volume's feature set, geometry, and
 journal configuration are accepted. The project does not claim compatibility
