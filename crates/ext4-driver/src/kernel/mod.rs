@@ -6,4 +6,5 @@ pub(crate) mod fatal;
 pub(crate) mod ffi;
 pub(crate) mod status;
 pub(crate) mod storage;
+pub(crate) mod stream;
 pub(crate) mod time;

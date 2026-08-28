@@ -426,6 +426,7 @@ impl MountRequestOperation {
         let mut vcb = memory::boxed_try_with(move || {
             VolumeControlBlock::from_completed_mount(*completed, devices)
         })?;
+        vcb.bind_stream_owner()?;
         vcb.initialize_directory_change_notifier()?;
 
         let extension_size =

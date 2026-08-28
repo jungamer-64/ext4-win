@@ -4492,7 +4492,7 @@ fn release_file_contexts(
             let volume = opened.volume();
             let release_plan = opened.close_release_plan(close_kind);
             let file_object_address = file_object.address();
-            let (fcb, handle) = opened.detach_contexts();
+            let (fcb, handle) = opened.take_node_contexts();
             match release_plan {
                 CloseReleasePlan::CleanedHandle => release_file_control_block(fcb),
                 CloseReleasePlan::CancelledOpen => {
@@ -4513,7 +4513,7 @@ fn release_file_contexts(
         OpenedFileObject::Volume(opened) => {
             let release_plan = opened.close_release_plan(close_kind);
             let file_object_address = opened.file_object();
-            let (volume, handle) = opened.detach_contexts();
+            let (volume, handle) = opened.take_volume_contexts();
             if !operations.owns_volume(volume) {
                 crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
                     .bugcheck();
