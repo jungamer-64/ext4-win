@@ -1276,6 +1276,46 @@ fn stream_lifetime_separates_handles_native_residency_and_deferred_leases() {
 
 /// # Errors
 ///
+/// Returns a fixture allocation or native stream-header error.
+/// # Panics
+///
+/// Panics if paging admission consults a CCB or accepts a non-file stream.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fixture failures use Result; assertions verify the paging stream boundary"
+)]
+fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<(), DriverError> {
+    let mut ledger = FileControlBlockLedger::try_new()?;
+    let volume = NonNull::<VolumeControlBlock>::dangling();
+    let stream = super::NodeStreamSizes {
+        node: NodeId::Directory(DirectoryNodeId::ROOT),
+        sizes: crate::kernel::stream::StreamSizes::EMPTY,
+    };
+    let fcb = ledger.file_control_block(volume, stream)?;
+    let fcb_pointer = NonNull::from(fcb.as_ref());
+    let header = fcb.stream_header().as_ptr();
+    ledger
+        .table
+        .get_mut()
+        .try_push_owned(fcb)
+        .map_err(|failure| failure.into_parts().0)?;
+    let mut file_object = file_object_with_contexts(header, core::ptr::null_mut());
+
+    let result = with_active_file_object(&mut file_object, |active| {
+        ledger.acquire_paging_stream_lease(active, volume)
+    });
+    assert!(matches!(
+        result,
+        Err(DriverError::Core(ext4_core::Error::WrongInodeKind))
+    ));
+    ledger.close(fcb_pointer);
+    assert!(ledger.is_empty());
+    Ok(())
+}
+
+/// # Errors
+///
 /// Returns a fixture allocation or size conversion error.
 /// # Panics
 ///

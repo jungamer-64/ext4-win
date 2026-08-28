@@ -812,6 +812,20 @@ impl MountedVolumeAccess<'_> {
             .authorize_handle(file_object)
     }
 
+    /// Retains one regular-file stream for paging I/O without consulting handle-local CCB state.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT stream identity is malformed, belongs to another
+    /// mounted volume, is not a regular file, or the finite deferred-lease count is exhausted.
+    pub(crate) fn acquire_paging_stream_lease(
+        &self,
+        file_object: ActiveFileObject<'_>,
+    ) -> DriverResult<PagingStreamLease> {
+        self.volume
+            .file_control_blocks
+            .acquire_paging_stream_lease(file_object, NonNull::from(&*self.volume))
+    }
+
     /// Produces one bounded raw transfer authority from lifecycle, access, and extent state.
     /// # Errors
     ///
@@ -1028,10 +1042,7 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns the volume failure without confusing terminal rejection with a pending grant.
     #[cfg(not(test))]
-    pub(crate) fn acquire_commit(
-        &mut self,
-        ticket: u64,
-    ) -> DriverResult<Option<CommitLease>> {
+    pub(crate) fn acquire_commit(&mut self, ticket: u64) -> DriverResult<Option<CommitLease>> {
         self.volume.runtime.acquire_commit(ticket)
     }
 
