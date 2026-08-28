@@ -73,6 +73,12 @@ impl<'driver> DispatchTable<'driver> {
 /// Returns an error when the WDK dispatch table cannot hold one of ext4win's required IRP major
 /// function slots.
 pub(crate) fn install(driver: &mut DRIVER_OBJECT) -> Result<(), DispatchInstallError> {
+    #[cfg(not(test))]
+    {
+        driver.FastIoDispatch = crate::kernel::stream::fast_io_dispatch()
+            .map_err(|_| DispatchInstallError)?
+            .as_ptr();
+    }
     let mut table = DispatchTable::new(driver);
     table.unload(crate::state::driver_unload);
     table.set(DispatchMajor::Create, create)?;
@@ -443,6 +449,15 @@ unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> N
             Ok(None) => {}
             Err(error) => return received.complete_result(Err(error)),
         }
+        if major == DispatchMajor::FileSystemControl {
+            match received.with_active(super::file_info::oplock_control) {
+                Ok(Some(file_control_block)) => {
+                    return received.delegate_oplock(file_control_block);
+                }
+                Ok(None) => {}
+                Err(error) => return received.complete_result(Err(error)),
+            }
+        }
     }
     match dispatch_policy(device_kind, major) {
         DispatchPolicy::Immediate(request) => execute_immediate(received, request),
@@ -683,6 +698,15 @@ pub(crate) fn admit_owned(
                     Admission::Unsupported
                 }
                 super::file_system_control::FsControlAdmission::User(code) => match code {
+                    crate::irp::FsControlCode::RequestOplockLevel1
+                    | crate::irp::FsControlCode::RequestOplockLevel2
+                    | crate::irp::FsControlCode::RequestBatchOplock
+                    | crate::irp::FsControlCode::OplockBreakAcknowledge
+                    | crate::irp::FsControlCode::OplockBatchAckClosePending
+                    | crate::irp::FsControlCode::OplockBreakNotify
+                    | crate::irp::FsControlCode::OplockBreakAckNoLevel2
+                    | crate::irp::FsControlCode::RequestFilterOplock
+                    | crate::irp::FsControlCode::RequestOplock => Admission::Unsupported,
                     crate::irp::FsControlCode::GetReparsePoint => {
                         Admission::Read(ReadRequestKind::GetReparsePoint)
                     }

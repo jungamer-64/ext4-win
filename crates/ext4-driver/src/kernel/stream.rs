@@ -230,6 +230,94 @@ impl StreamContext {
         }
     }
 
+    /// Binds this node stream to the FCB-owned FsRtl byte-range lock state exactly once.
+    /// # Errors
+    ///
+    /// Returns an invariant error if a volume stream is supplied or construction binds twice.
+    pub(crate) fn bind_byte_range_locks(
+        &self,
+        _locks: NonNull<wdk_sys::FILE_LOCK>,
+    ) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The enclosing boxed FCB gives both objects one stable shared lifetime.
+                ext4win_stream_bind_byte_range_locks(self.header.as_ptr(), _locks.as_ptr())
+            };
+            native_status(status)
+        }
+        #[cfg(test)]
+        {
+            if self.kind != StreamOwnerKind::Node {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+            Ok(())
+        }
+    }
+
+    /// Transfers one live filesystem-control IRP to the stream-owned FsRtl oplock package.
+    ///
+    /// # Safety
+    ///
+    /// `irp` must identify the active `IRP_MJ_FILE_SYSTEM_CONTROL` request whose FILE_OBJECT owns
+    /// this stream. The caller transfers terminal completion authority to FsRtl exactly once.
+    #[cfg(not(test))]
+    pub(crate) unsafe fn process_oplock_fsctrl(
+        &self,
+        irp: NonNull<wdk_sys::IRP>,
+        open_count: u32,
+        flags: u32,
+    ) -> NTSTATUS {
+        unsafe {
+            // SAFETY: The caller supplies the live consuming IRP capability documented above.
+            ext4win_stream_oplock_fsctrl(self.header.as_ptr(), irp.as_ptr(), open_count, flags)
+        }
+    }
+
+    /// Transfers one live lock-control IRP to the bound FsRtl FILE_LOCK package.
+    ///
+    /// # Safety
+    ///
+    /// `irp` must identify the active `IRP_MJ_LOCK_CONTROL` request for this stream, and the caller
+    /// must transfer terminal completion authority exactly once.
+    #[cfg(not(test))]
+    pub(crate) unsafe fn process_file_lock(&self, irp: NonNull<wdk_sys::IRP>) -> NTSTATUS {
+        unsafe {
+            // SAFETY: The caller supplies the consuming IRP capability documented above.
+            ext4win_stream_process_file_lock(self.header.as_ptr(), irp.as_ptr())
+        }
+    }
+
+    /// Releases cleanup-owned byte locks and refreshes the derived Fast I/O projection.
+    /// # Errors
+    ///
+    /// Returns an invariant error if the native stream, FILE_OBJECT, or requestor identity does
+    /// not belong to one live regular-file stream.
+    pub(crate) fn unlock_all(
+        &self,
+        file_object: NonNull<wdk_sys::FILE_OBJECT>,
+        process: NonNull<c_void>,
+    ) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: Cleanup retains the FCB, FILE_OBJECT, and captured requestor process.
+                ext4win_stream_unlock_all(
+                    self.header.as_ptr(),
+                    file_object.as_ptr(),
+                    process.as_ptr().cast(),
+                )
+            };
+            native_status(status)
+        }
+        #[cfg(test)]
+        {
+            let _file_object = file_object;
+            let _process = process;
+            Ok(())
+        }
+    }
+
     /// Returns the `FSRTL_ADVANCED_FCB_HEADER` address stored in `FILE_OBJECT::FsContext`.
     pub(crate) fn header(&self) -> NonNull<c_void> {
         #[cfg(not(test))]
@@ -570,6 +658,23 @@ impl StreamContext {
     }
 }
 
+/// Returns the single nonpaged Fast I/O dispatch table owned by the native driver image.
+/// # Errors
+///
+/// Returns an invariant error if the native image does not expose its static dispatch table.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the native image-lifetime dispatch table crosses one audited pointer ABI boundary"
+)]
+pub(crate) fn fast_io_dispatch() -> DriverResult<NonNull<wdk_sys::FAST_IO_DISPATCH>> {
+    let pointer = unsafe {
+        // SAFETY: Native code returns the address of one image-lifetime static dispatch table.
+        ext4win_fast_io_dispatch()
+    };
+    NonNull::new(pointer).ok_or(DriverError::InternalInvariantViolation)
+}
+
 #[expect(
     unsafe_code,
     reason = "the opaque native header uses internally synchronized resources and immutable owner identity after publication"
@@ -651,6 +756,25 @@ unsafe extern "system" {
         expected_kind: wdk_sys::ULONG,
         owner: wdk_sys::PVOID,
     ) -> NTSTATUS;
+    fn ext4win_stream_bind_byte_range_locks(
+        stream_header: wdk_sys::PVOID,
+        byte_range_locks: *mut wdk_sys::FILE_LOCK,
+    ) -> NTSTATUS;
+    fn ext4win_stream_oplock_fsctrl(
+        stream_header: wdk_sys::PVOID,
+        irp: *mut wdk_sys::IRP,
+        open_count: wdk_sys::ULONG,
+        flags: wdk_sys::ULONG,
+    ) -> NTSTATUS;
+    fn ext4win_stream_process_file_lock(
+        stream_header: wdk_sys::PVOID,
+        irp: *mut wdk_sys::IRP,
+    ) -> NTSTATUS;
+    fn ext4win_stream_unlock_all(
+        stream_header: wdk_sys::PVOID,
+        file_object: *mut wdk_sys::FILE_OBJECT,
+        process: *mut c_void,
+    ) -> NTSTATUS;
 
     fn ext4win_stream_decode_owner(
         stream_header: wdk_sys::PVOID,
@@ -716,6 +840,7 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     fn ext4win_stream_destroy(stream_header: wdk_sys::PVOID) -> NTSTATUS;
+    fn ext4win_fast_io_dispatch() -> *mut wdk_sys::FAST_IO_DISPATCH;
 }
 
 #[cfg(test)]

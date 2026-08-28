@@ -538,6 +538,28 @@ pub(crate) fn lock_control(target: &mut ActiveIrp<'_>) -> DriverResult<NonNull<F
     Ok(NonNull::from(opened.file_control_block()))
 }
 
+/// Selects a regular-file FCB only for a standard FsRtl-owned oplock FSCTL.
+/// # Errors
+///
+/// Returns an error when a user FSCTL stack or its opened regular-file context is malformed.
+pub(crate) fn oplock_control(
+    target: &mut ActiveIrp<'_>,
+) -> DriverResult<Option<NonNull<FileControlBlock>>> {
+    let current = target.current_stack()?;
+    if current.file_system_control_minor()
+        != crate::irp::FileSystemControlMinorFunction::UserFsRequest
+    {
+        return Ok(None);
+    }
+    let control = current.file_system_control()?;
+    if !control.fs_control_code().is_oplock() {
+        return Ok(None);
+    }
+    let file_object = current.file_object()?;
+    let opened = OpenedRegularFile::decode(file_object)?;
+    Ok(Some(NonNull::from(opened.file_control_block())))
+}
+
 /// Owned query-file work selected before the first suspension point.
 enum QueryFilePlan {
     /// The synchronous FILE_OBJECT state was packed into driver-owned storage.
