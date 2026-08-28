@@ -14,15 +14,16 @@ pub(crate) enum VolumeInterfaceClass {
 
 impl VolumeInterfaceClass {
     /// WDK `ntddstor.h` interface identity; not a GPT partition type or filesystem UUID.
-    pub(crate) const fn guid(self) -> GUID {
+    /// Static storage also covers subscriptions that retain their category data.
+    pub(crate) const fn guid(self) -> &'static GUID {
         match self {
-            Self::Visible => GUID {
+            Self::Visible => &GUID {
                 Data1: 0x53f5_630d,
                 Data2: 0xb6bf,
                 Data3: 0x11d0,
                 Data4: [0x94, 0xf2, 0x00, 0xa0, 0xc9, 0x1e, 0xfb, 0x8b],
             },
-            Self::Hidden => GUID {
+            Self::Hidden => &GUID {
                 Data1: 0x7f10_8a28,
                 Data2: 0x9833,
                 Data3: 0x4b3b,
@@ -51,7 +52,7 @@ impl VolumeInterfaces {
         let status = unsafe {
             // SAFETY: The GUID and output slot live through this synchronous PnP query.
             crate::kernel::ffi::IoGetDeviceInterfaces(
-                &class.guid(),
+                class.guid(),
                 core::ptr::null_mut(),
                 0,
                 &raw mut list,
