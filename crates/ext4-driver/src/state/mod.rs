@@ -41,8 +41,8 @@ use crate::irp::reactor::ReactorTarget;
 use crate::irp::{
     ActiveFileObject, ByteRangeLockKey, CompletionReactor, CreateDeletion, DataIoKind,
     DeleteAccess, DispatchMajor, DispatchTarget, ExistingOperationAccess,
-    FileAttributesWriteAccess, GrantedAccess, ReceivedIrp, RegularFileWriteAccess,
-    RequestorProcess, ShareAccess,
+    FileAttributesWriteAccess, GrantedAccess, OplockCreatePolicy, ReceivedIrp,
+    RegularFileWriteAccess, RequestorProcess, ShareAccess,
 };
 use crate::kernel::cng::CngOperation;
 use crate::kernel::fatal::KernelWideInconsistency;
@@ -2457,9 +2457,33 @@ impl Drop for FileControlBlockLedgerLock {
 #[derive(Clone, Copy, Debug)]
 enum FileControlBlockShareCheck {
     /// Existing-node operations must first respect the access shared by prior handles.
-    ExistingNode(ExistingOperationAccess),
+    ExistingNode {
+        /// Virtual access required by the existing-node disposition.
+        operation_access: ExistingOperationAccess,
+        /// Oplock behavior that must be admitted atomically with the new share claim.
+        oplock_policy: OplockCreatePolicy,
+    },
     /// A transaction-local new node has no pre-existing operation access to validate.
     NewNode,
+}
+
+/// One normalized existing-stream claim admitted atomically by the FCB ledger.
+#[derive(Clone, Copy, Debug)]
+struct ExistingFileControlBlockOpen {
+    /// Mounted-volume identity that owns the stream.
+    volume: NonNull<VolumeControlBlock>,
+    /// Durable size snapshot used if construction creates the FCB.
+    stream: NodeStreamSizes,
+    /// FILE_OBJECT whose share claim is being published.
+    file_object: KernelFileObject,
+    /// Access already granted by the create security boundary.
+    desired_access: GrantedAccess,
+    /// Existing-node operation access that participates in share validation.
+    operation_access: ExistingOperationAccess,
+    /// Requested Windows sharing.
+    share_access: ShareAccess,
+    /// Requested create-time oplock behavior.
+    oplock_policy: OplockCreatePolicy,
 }
 
 impl FileControlBlockLedger {
@@ -2480,20 +2504,18 @@ impl FileControlBlockLedger {
     /// Returns an error when FCB allocation/reference growth or Windows share validation fails.
     fn open_existing(
         &self,
-        volume: NonNull<VolumeControlBlock>,
-        stream: NodeStreamSizes,
-        file_object: KernelFileObject,
-        desired_access: GrantedAccess,
-        existing_operation_access: ExistingOperationAccess,
-        share_access: ShareAccess,
+        request: ExistingFileControlBlockOpen,
     ) -> DriverResult<NonNull<FileControlBlock>> {
         self.open(
-            volume,
-            stream,
-            file_object,
-            desired_access,
-            share_access,
-            FileControlBlockShareCheck::ExistingNode(existing_operation_access),
+            request.volume,
+            request.stream,
+            request.file_object,
+            request.desired_access,
+            request.share_access,
+            FileControlBlockShareCheck::ExistingNode {
+                operation_access: request.operation_access,
+                oplock_policy: request.oplock_policy,
+            },
         )
     }
 
@@ -2921,6 +2943,25 @@ impl FileControlBlockLedger {
         })
     }
 
+    /// Returns the current user-handle count for one table-owned FCB.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes the exact FCB open-count observation"
+    )]
+    fn stream_open_count(&self, fcb: NonNull<FileControlBlock>) -> u32 {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table membership and open state.
+            &*self.table.get()
+        };
+        let state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: The FCB is table-owned for this retained FILE_OBJECT and the guard is held.
+            state.as_ref().share_access.OpenCount
+        }
+    }
+
     /// Returns whether every namespace FILE_OBJECT has released its FCB reference.
     #[expect(
         unsafe_code,
@@ -3072,6 +3113,7 @@ impl VolumeControlBlock {
         desired_access: GrantedAccess,
         existing_operation_access: ExistingOperationAccess,
         share_access: ShareAccess,
+        oplock_policy: OplockCreatePolicy,
     ) -> DriverResult<NonNull<FileControlBlock>> {
         let volume_ptr = volume.as_ptr();
         let file_control_blocks = unsafe {
@@ -3085,14 +3127,15 @@ impl VolumeControlBlock {
             // shared reference spanning the transaction-owned `volume` field.
             &*file_control_blocks
         };
-        file_control_blocks.open_existing(
+        file_control_blocks.open_existing(ExistingFileControlBlockOpen {
             volume,
             stream,
             file_object,
             desired_access,
-            existing_operation_access,
+            operation_access: existing_operation_access,
             share_access,
-        )
+            oplock_policy,
+        })
     }
 
     /// Returns whether logical dismount already consumed shutdown registration.
@@ -4436,12 +4479,15 @@ pub(crate) struct FileControlBlock {
     owner: NonNull<FileControlBlockLedger>,
     /// Ext4 node opened by this FCB.
     node: NodeId,
+    /// Windows advanced-header stream identity shared by every FILE_OBJECT for this inode.
+    ///
+    /// This field precedes the lock package so native callbacks are withdrawn before their bound
+    /// FILE_LOCK storage is uninitialized during terminal FCB destruction.
+    stream_context: StreamContext,
     /// FsRtl-owned byte-range lock state for this opened inode identity.
     byte_range_locks: FileByteRangeLocks,
     /// Ledger-owned mutable state; accessed only under `owner`'s exclusive resource.
     open_state: UnsafeCell<FileControlBlockOpenState>,
-    /// Windows advanced-header stream identity shared by every FILE_OBJECT for this inode.
-    stream_context: StreamContext,
 }
 
 #[expect(
@@ -4480,9 +4526,9 @@ impl FileControlBlock {
             volume,
             owner,
             node: stream.node(),
+            stream_context: StreamContext::try_new(StreamOwnerKind::Node, stream.sizes)?,
             byte_range_locks: FileByteRangeLocks::new(),
             open_state: UnsafeCell::new(FileControlBlockOpenState::new()),
-            stream_context: StreamContext::try_new(StreamOwnerKind::Node, stream.sizes)?,
         })
     }
 
@@ -4492,7 +4538,9 @@ impl FileControlBlock {
     /// Returns an invariant error on repeated binding or malformed native ownership.
     fn bind_stream_owner(&self) -> DriverResult<()> {
         self.stream_context
-            .bind_owner(NonNull::from(self).cast::<c_void>())
+            .bind_owner(NonNull::from(self).cast::<c_void>())?;
+        self.stream_context
+            .bind_byte_range_locks(self.byte_range_locks.native_pointer())
     }
 
     /// Returns the advanced-header pointer installed in every FILE_OBJECT for this inode.
@@ -4612,8 +4660,63 @@ impl FileControlBlock {
     }
 
     /// Transfers one validated lock-control IRP to the FsRtl lock package.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the consuming dispatch target transfers its one live IRP to FsRtl"
+        )
+    )]
     pub(crate) fn process_byte_range_lock(&self, target: DispatchTarget) -> wdk_sys::NTSTATUS {
-        self.byte_range_locks.process(target)
+        #[cfg(not(test))]
+        {
+            let raw_irp = target.into_raw_irp();
+            let Some(irp) = NonNull::new(raw_irp) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            };
+            unsafe {
+                // SAFETY: `target` was consumed and no driver completion owner remains.
+                self.stream_context.process_file_lock(irp)
+            }
+        }
+        #[cfg(test)]
+        {
+            let _target = target;
+            wdk_sys::STATUS_SUCCESS
+        }
+    }
+
+    /// Transfers one validated oplock FSCTL to the stream-owned FsRtl oplock package.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the consuming dispatch target transfers its one live IRP to FsRtl"
+        )
+    )]
+    pub(crate) fn process_oplock_fsctrl(&self, target: DispatchTarget) -> wdk_sys::NTSTATUS {
+        #[cfg(not(test))]
+        {
+            let open_count = unsafe {
+                // SAFETY: This FILE_OBJECT retains the FCB and therefore its ledger owner.
+                self.owner.as_ref()
+            }
+            .stream_open_count(NonNull::from(self));
+            let raw_irp = target.into_raw_irp();
+            let Some(irp) = NonNull::new(raw_irp) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            };
+            unsafe {
+                // SAFETY: `target` was consumed and no driver completion owner remains.
+                self.stream_context
+                    .process_oplock_fsctrl(irp, open_count, 0)
+            }
+        }
+        #[cfg(test)]
+        {
+            let _target = target;
+            wdk_sys::STATUS_SUCCESS
+        }
     }
 
     /// Returns whether the requestor may read one fully resolved file byte range.
@@ -4654,8 +4757,13 @@ impl FileControlBlock {
         requestor: RequestorProcess,
         file_object: KernelFileObject,
     ) {
-        self.byte_range_locks
-            .release_for_cleanup(requestor, file_object);
+        if self
+            .stream_context
+            .unlock_all(file_object.as_non_null(), requestor.as_non_null())
+            .is_err()
+        {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
     }
 }
 
@@ -4785,7 +4893,16 @@ impl FileControlBlockOpenState {
         share_check: FileControlBlockShareCheck,
     ) -> DriverResult<()> {
         self.deletion.ensure_openable()?;
-        if let FileControlBlockShareCheck::ExistingNode(existing_operation_access) = share_check {
+        if let FileControlBlockShareCheck::ExistingNode {
+            operation_access: existing_operation_access,
+            oplock_policy,
+        } = share_check
+        {
+            if matches!(oplock_policy, OplockCreatePolicy::ReserveFilter)
+                && self.share_access.OpenCount != 0
+            {
+                return Err(DriverError::OplockNotGranted);
+            }
             let operation_status = unsafe {
                 // SAFETY: The ledger exclusively owns this SHARE_ACCESS record. Update is false,
                 // so operation-implied access is checked without recording it as returned-handle
@@ -5152,31 +5269,18 @@ impl FileByteRangeLocks {
         }
     }
 
-    /// Lets FsRtl process and complete one byte-range lock IRP.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-        )
-    )]
-    fn process(&self, target: DispatchTarget) -> wdk_sys::NTSTATUS {
+    /// Returns the stable FCB-owned FILE_LOCK address bound into the native stream header.
+    fn native_pointer(&self) -> NonNull<wdk_sys::FILE_LOCK> {
         #[cfg(not(test))]
         {
-            unsafe {
-                // SAFETY: FsRtl owns this FCB's initialized FILE_LOCK state
-                // and takes over completion of the live lock-control IRP.
-                ffi::FsRtlProcessFileLock(
-                    self.native.get(),
-                    target.into_raw_irp(),
-                    core::ptr::null_mut(),
-                )
-            }
+            // `UnsafeCell::get` is non-null and the enclosing FCB is already in stable storage.
+            NonNull::new(self.native.get()).unwrap_or_else(|| {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+            })
         }
         #[cfg(test)]
         {
-            let _target = target;
-            wdk_sys::STATUS_SUCCESS
+            NonNull::dangling()
         }
     }
 
@@ -5269,34 +5373,6 @@ impl FileByteRangeLocks {
             let _key = key;
             let _range = range;
             Ok(true)
-        }
-    }
-
-    /// Releases all locks associated with this cleanup IRP's FILE_OBJECT and requestor.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-        )
-    )]
-    fn release_for_cleanup(&self, requestor: RequestorProcess, file_object: KernelFileObject) {
-        #[cfg(not(test))]
-        unsafe {
-            // SAFETY: Cleanup runs for this live FILE_OBJECT. Passing the
-            // requestor captured in its IRP matches FsRtl's lock ownership
-            // identity and releases only that process's locks.
-            let _status = ffi::FsRtlFastUnlockAll(
-                self.native.get(),
-                file_object.as_ptr(),
-                requestor.as_ptr().cast(),
-                core::ptr::null_mut(),
-            );
-        }
-        #[cfg(test)]
-        {
-            let _requestor = requestor;
-            let _file_object = file_object;
         }
     }
 }

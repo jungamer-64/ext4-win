@@ -847,6 +847,11 @@ fn copy_requestor_output_window(
 pub(crate) struct RequestorProcess(NonNull<c_void>);
 
 impl RequestorProcess {
+    /// Returns the stable non-null process identity without granting process access.
+    pub(crate) const fn as_non_null(self) -> NonNull<c_void> {
+        self.0
+    }
+
     /// Returns the opaque process pointer for FsRtl.
     #[cfg(not(test))]
     pub(crate) const fn as_ptr(self) -> *mut c_void {
@@ -977,6 +982,19 @@ impl ReceivedIrp {
             file_control_block.as_ref()
         };
         file_control_block.process_byte_range_lock(self.target)
+    }
+
+    /// Transfers this oplock FSCTL's terminal completion authority to FsRtl.
+    #[expect(
+        unsafe_code,
+        reason = "the validated FILE_OBJECT retains its FCB while FsRtl owns the consumed IRP"
+    )]
+    pub(crate) fn delegate_oplock(self, file_control_block: NonNull<FileControlBlock>) -> NTSTATUS {
+        let file_control_block = unsafe {
+            // SAFETY: FSCTL decode validated this FILE_OBJECT's bound inode stream owner.
+            file_control_block.as_ref()
+        };
+        file_control_block.process_oplock_fsctrl(self.target)
     }
 
     /// Completes a raw IRP when dispatch-target decoding failed.
@@ -2625,6 +2643,24 @@ const MOUNT_VOLUME_MINOR_FUNCTION: u32 = 1;
 /// Decoded user FSCTL code selected by the caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FsControlCode {
+    /// Windows `FSCTL_REQUEST_OPLOCK_LEVEL_1`.
+    RequestOplockLevel1,
+    /// Windows `FSCTL_REQUEST_OPLOCK_LEVEL_2`.
+    RequestOplockLevel2,
+    /// Windows `FSCTL_REQUEST_BATCH_OPLOCK`.
+    RequestBatchOplock,
+    /// Windows `FSCTL_OPLOCK_BREAK_ACKNOWLEDGE`.
+    OplockBreakAcknowledge,
+    /// Windows `FSCTL_OPBATCH_ACK_CLOSE_PENDING`.
+    OplockBatchAckClosePending,
+    /// Windows `FSCTL_OPLOCK_BREAK_NOTIFY`.
+    OplockBreakNotify,
+    /// Windows `FSCTL_OPLOCK_BREAK_ACK_NO_2`.
+    OplockBreakAckNoLevel2,
+    /// Windows `FSCTL_REQUEST_FILTER_OPLOCK`.
+    RequestFilterOplock,
+    /// Windows `FSCTL_REQUEST_OPLOCK` structured request.
+    RequestOplock,
     /// Windows `FSCTL_LOCK_VOLUME`.
     LockVolume,
     /// Windows `FSCTL_UNLOCK_VOLUME`.
@@ -2656,6 +2692,15 @@ impl FsControlCode {
     /// Returns an error when `value` is not one of the supported Windows or ext4win FSCTL codes.
     fn from_raw(value: wdk_sys::ULONG) -> Result<Self, DriverError> {
         match value {
+            FSCTL_REQUEST_OPLOCK_LEVEL_1 => Ok(Self::RequestOplockLevel1),
+            FSCTL_REQUEST_OPLOCK_LEVEL_2 => Ok(Self::RequestOplockLevel2),
+            FSCTL_REQUEST_BATCH_OPLOCK => Ok(Self::RequestBatchOplock),
+            FSCTL_OPLOCK_BREAK_ACKNOWLEDGE => Ok(Self::OplockBreakAcknowledge),
+            FSCTL_OPBATCH_ACK_CLOSE_PENDING => Ok(Self::OplockBatchAckClosePending),
+            FSCTL_OPLOCK_BREAK_NOTIFY => Ok(Self::OplockBreakNotify),
+            FSCTL_OPLOCK_BREAK_ACK_NO_2 => Ok(Self::OplockBreakAckNoLevel2),
+            FSCTL_REQUEST_FILTER_OPLOCK => Ok(Self::RequestFilterOplock),
+            FSCTL_REQUEST_OPLOCK => Ok(Self::RequestOplock),
             FSCTL_LOCK_VOLUME => Ok(Self::LockVolume),
             FSCTL_UNLOCK_VOLUME => Ok(Self::UnlockVolume),
             FSCTL_DISMOUNT_VOLUME => Ok(Self::DismountVolume),
@@ -2670,7 +2715,42 @@ impl FsControlCode {
             _ => Err(DriverError::NotSupported),
         }
     }
+
+    /// Returns whether FsRtl owns this standard oplock control operation.
+    pub(crate) const fn is_oplock(self) -> bool {
+        matches!(
+            self,
+            Self::RequestOplockLevel1
+                | Self::RequestOplockLevel2
+                | Self::RequestBatchOplock
+                | Self::OplockBreakAcknowledge
+                | Self::OplockBatchAckClosePending
+                | Self::OplockBreakNotify
+                | Self::OplockBreakAckNoLevel2
+                | Self::RequestFilterOplock
+                | Self::RequestOplock
+        )
+    }
 }
+
+/// `FSCTL_REQUEST_OPLOCK_LEVEL_1`.
+const FSCTL_REQUEST_OPLOCK_LEVEL_1: wdk_sys::ULONG = buffered_file_system_control(0);
+/// `FSCTL_REQUEST_OPLOCK_LEVEL_2`.
+const FSCTL_REQUEST_OPLOCK_LEVEL_2: wdk_sys::ULONG = buffered_file_system_control(1);
+/// `FSCTL_REQUEST_BATCH_OPLOCK`.
+const FSCTL_REQUEST_BATCH_OPLOCK: wdk_sys::ULONG = buffered_file_system_control(2);
+/// `FSCTL_OPLOCK_BREAK_ACKNOWLEDGE`.
+const FSCTL_OPLOCK_BREAK_ACKNOWLEDGE: wdk_sys::ULONG = buffered_file_system_control(3);
+/// `FSCTL_OPBATCH_ACK_CLOSE_PENDING`.
+const FSCTL_OPBATCH_ACK_CLOSE_PENDING: wdk_sys::ULONG = buffered_file_system_control(4);
+/// `FSCTL_OPLOCK_BREAK_NOTIFY`.
+const FSCTL_OPLOCK_BREAK_NOTIFY: wdk_sys::ULONG = buffered_file_system_control(5);
+/// `FSCTL_OPLOCK_BREAK_ACK_NO_2`.
+const FSCTL_OPLOCK_BREAK_ACK_NO_2: wdk_sys::ULONG = buffered_file_system_control(20);
+/// `FSCTL_REQUEST_FILTER_OPLOCK`.
+const FSCTL_REQUEST_FILTER_OPLOCK: wdk_sys::ULONG = buffered_file_system_control(23);
+/// `FSCTL_REQUEST_OPLOCK`.
+const FSCTL_REQUEST_OPLOCK: wdk_sys::ULONG = buffered_file_system_control(144);
 
 /// `FSCTL_LOCK_VOLUME`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 6, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_LOCK_VOLUME: wdk_sys::ULONG = buffered_file_system_control(6);
@@ -2947,6 +3027,8 @@ pub(crate) struct CreateParameters {
     write_commitment: WriteCommitment,
     /// Data transfer buffering requested by create options.
     transfer_buffering: CreateTransferBuffering,
+    /// Oplock break or reservation behavior requested by create options.
+    oplock_policy: OplockCreatePolicy,
     /// Per-handle synchronous I/O mode requested by create options.
     synchronization_mode: CreateSynchronizationMode,
     /// Reparse-point opening mode requested by create options.
@@ -2981,17 +3063,19 @@ impl CreateParameters {
         stack_flags: wdk_sys::UCHAR,
     ) -> Result<Self, DriverError> {
         let desired_access = DesiredAccess::from_raw(desired_access);
+        let share_access = ShareAccess::from_raw(share_access)?;
         let disposition = CreateDisposition::from_options(options)?;
         let create_options = CreateOptions::decode(options, desired_access)?;
         let target_requirement = create_options.target_requirement();
         disposition.validate_target_requirement(target_requirement)?;
         Ok(Self {
             desired_access,
-            share_access: ShareAccess::from_raw(share_access)?,
+            share_access,
             disposition,
             target_requirement,
             write_commitment: create_options.write_commitment(),
             transfer_buffering: create_options.transfer_buffering(),
+            oplock_policy: OplockCreatePolicy::decode(options, desired_access, share_access)?,
             synchronization_mode: create_options.synchronization_mode(),
             reparse_point_mode: create_options.reparse_point_mode(),
             name_interpretation: create_options.name_interpretation(),
@@ -3049,6 +3133,11 @@ impl CreateParameters {
     /// Returns data transfer buffering requested at create/open.
     pub(crate) const fn transfer_buffering(self) -> CreateTransferBuffering {
         self.transfer_buffering
+    }
+
+    /// Returns create-time oplock break or reservation behavior.
+    pub(crate) const fn oplock_policy(self) -> OplockCreatePolicy {
+        self.oplock_policy
     }
 
     /// Returns synchronous I/O mode requested at create/open.
@@ -3685,6 +3774,58 @@ pub(crate) enum CreateTransferBuffering {
     NoIntermediate,
 }
 
+/// Create-time behavior when the named stream has, or will reserve, an oplock relationship.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OplockCreatePolicy {
+    /// Use the ordinary oplock break-and-wait protocol.
+    Ordinary,
+    /// Complete with the Windows alternate success status instead of waiting for a break.
+    CompleteIfOplocked,
+    /// Refuse the create rather than breaking an existing oplock.
+    RequireUnbrokenOplock,
+    /// Reserve the atomic filter-oplock acquisition protocol for this exact metadata-only open.
+    ReserveFilter,
+}
+
+impl OplockCreatePolicy {
+    /// Normalizes the mutually exclusive create flags and validates filter-reservation access.
+    /// # Errors
+    ///
+    /// Returns invalid-parameter for ambiguous flags or a reserve-filter request whose exact
+    /// desired/share contract cannot be honored.
+    fn decode(
+        options: wdk_sys::ULONG,
+        desired_access: DesiredAccess,
+        share_access: ShareAccess,
+    ) -> DriverResult<Self> {
+        let complete = create_option_selected(options, wdk_sys::FILE_COMPLETE_IF_OPLOCKED);
+        let require = create_option_selected(options, wdk_sys::FILE_OPEN_REQUIRING_OPLOCK);
+        let reserve = create_option_selected(options, wdk_sys::FILE_RESERVE_OPFILTER);
+        if [complete, require, reserve]
+            .into_iter()
+            .filter(|selected| *selected)
+            .nth(1)
+            .is_some()
+        {
+            return Err(DriverError::InvalidParameter);
+        }
+        if reserve {
+            if desired_access.as_raw() != wdk_sys::FILE_READ_ATTRIBUTES
+                || share_access.as_ulong() != wdk_sys::ULONG::from(FILE_SHARE_ACCESS_MASK)
+            {
+                return Err(DriverError::InvalidParameter);
+            }
+            Ok(Self::ReserveFilter)
+        } else if require {
+            Ok(Self::RequireUnbrokenOplock)
+        } else if complete {
+            Ok(Self::CompleteIfOplocked)
+        } else {
+            Ok(Self::Ordinary)
+        }
+    }
+}
+
 /// Requested per-handle synchronous I/O mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CreateSynchronizationMode {
@@ -3931,10 +4072,12 @@ const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_DIRECTORY_FILE
     | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT
     | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT
     | wdk_sys::FILE_OPEN_REPARSE_POINT
-    | wdk_sys::FILE_OPEN_BY_FILE_ID;
+    | wdk_sys::FILE_OPEN_BY_FILE_ID
+    | wdk_sys::FILE_COMPLETE_IF_OPLOCKED
+    | wdk_sys::FILE_OPEN_REQUIRING_OPLOCK
+    | wdk_sys::FILE_RESERVE_OPFILTER;
 /// Create options consumed as Windows boundary hints.
 const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONLY
-    | wdk_sys::FILE_COMPLETE_IF_OPLOCKED
     | wdk_sys::FILE_NO_EA_KNOWLEDGE
     | wdk_sys::FILE_RANDOM_ACCESS
     | wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT
@@ -4438,14 +4581,15 @@ mod tests {
         CreateCompletion, CreateDisposition, CreateNameInterpretation, CreateReparsePointMode,
         CreateSymlinkReparseBuffer, CreateSynchronizationMode, CreateTargetRequirement,
         CreateTargetSelection, CreateTransferBuffering, CurrentIrpStackLocation, DataIoKind,
-        DirectoryChangeFilter, DirectoryControlMinorFunction, DirectoryCursorPosition,
-        DirectoryEntryEmission, DirectoryInformationClass, DirectoryNotifyInformationClass,
-        DirectoryWatchScope, DispatchTarget, EaCursorPosition, EaEntryEmission, EaEntryIndex,
-        FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION, FILE_OVERWRITE_DISPOSITION,
-        FILE_OVERWRITE_IF_DISPOSITION, FILE_SUPERSEDE_DISPOSITION, FileSystemControlMinorFunction,
-        FsControlCode, InformationLength, IrpBufferLength, IrpCompletion, KernelIrp, OwnedIrp,
+        DesiredAccess, DirectoryChangeFilter, DirectoryControlMinorFunction,
+        DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
+        DirectoryNotifyInformationClass, DirectoryWatchScope, DispatchTarget, EaCursorPosition,
+        EaEntryEmission, EaEntryIndex, FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION,
+        FILE_OVERWRITE_DISPOSITION, FILE_OVERWRITE_IF_DISPOSITION, FILE_SHARE_ACCESS_MASK,
+        FILE_SUPERSEDE_DISPOSITION, FileSystemControlMinorFunction, FsControlCode,
+        InformationLength, IrpBufferLength, IrpCompletion, KernelIrp, OplockCreatePolicy, OwnedIrp,
         QueryFileInformationClass, QueryVolumeInformationClass, ReadStartingPoint, ReceivedIrp,
-        RegularFileWriteAccess, SetFileInformationClass, SetVolumeInformationClass,
+        RegularFileWriteAccess, SetFileInformationClass, SetVolumeInformationClass, ShareAccess,
         WriteStartingPoint,
     };
     use crate::kernel::status::DriverError;
@@ -5684,7 +5828,7 @@ mod tests {
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::addr_of_mut!(security_context),
             Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
-                | wdk_sys::FILE_OPEN_REQUIRING_OPLOCK,
+                | wdk_sys::FILE_CREATE_TREE_CONNECTION,
             __bindgen_padding_0: [0; 2],
             FileAttributes: 0,
             ShareAccess: 0,
@@ -6971,5 +7115,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when create oplock flags stop normalizing to one unambiguous domain policy.
+    #[test]
+    fn create_oplock_policy_rejects_ambiguous_flags() {
+        let desired = DesiredAccess::from_raw(wdk_sys::FILE_READ_ATTRIBUTES);
+        let shared = ShareAccess::from_raw(FILE_SHARE_ACCESS_MASK);
+        assert!(shared.is_ok());
+        let Ok(shared) = shared else { return };
+        assert_eq!(
+            OplockCreatePolicy::decode(0, desired, shared),
+            Ok(OplockCreatePolicy::Ordinary)
+        );
+        assert_eq!(
+            OplockCreatePolicy::decode(wdk_sys::FILE_COMPLETE_IF_OPLOCKED, desired, shared),
+            Ok(OplockCreatePolicy::CompleteIfOplocked)
+        );
+        assert_eq!(
+            OplockCreatePolicy::decode(wdk_sys::FILE_OPEN_REQUIRING_OPLOCK, desired, shared),
+            Ok(OplockCreatePolicy::RequireUnbrokenOplock)
+        );
+        assert_eq!(
+            OplockCreatePolicy::decode(
+                wdk_sys::FILE_COMPLETE_IF_OPLOCKED | wdk_sys::FILE_OPEN_REQUIRING_OPLOCK,
+                desired,
+                shared,
+            ),
+            Err(DriverError::InvalidParameter)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when filter-oplock reservation accepts anything except the documented exact open.
+    #[test]
+    fn reserve_filter_oplock_requires_exact_access_and_sharing() {
+        let shared = ShareAccess::from_raw(FILE_SHARE_ACCESS_MASK);
+        assert!(shared.is_ok());
+        let Ok(shared) = shared else { return };
+        assert_eq!(
+            OplockCreatePolicy::decode(
+                wdk_sys::FILE_RESERVE_OPFILTER,
+                DesiredAccess::from_raw(wdk_sys::FILE_READ_ATTRIBUTES),
+                shared,
+            ),
+            Ok(OplockCreatePolicy::ReserveFilter)
+        );
+        assert_eq!(
+            OplockCreatePolicy::decode(
+                wdk_sys::FILE_RESERVE_OPFILTER,
+                DesiredAccess::from_raw(wdk_sys::FILE_READ_ATTRIBUTES | wdk_sys::SYNCHRONIZE),
+                shared,
+            ),
+            Err(DriverError::InvalidParameter)
+        );
+        let read_only_share = u16::try_from(wdk_sys::FILE_SHARE_READ)
+            .map_err(|_| DriverError::InvalidParameter)
+            .and_then(ShareAccess::from_raw);
+        assert!(read_only_share.is_ok());
+        let Ok(read_only_share) = read_only_share else {
+            return;
+        };
+        assert_eq!(
+            OplockCreatePolicy::decode(
+                wdk_sys::FILE_RESERVE_OPFILTER,
+                DesiredAccess::from_raw(wdk_sys::FILE_READ_ATTRIBUTES),
+                read_only_share,
+            ),
+            Err(DriverError::InvalidParameter)
+        );
     }
 }

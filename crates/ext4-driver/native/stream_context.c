@@ -13,6 +13,7 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     LONGLONG AllocationCharge;
     PVOID FileContextSupport;
     PVOID Owner;
+    PFILE_LOCK ByteRangeLocks;
     PVOID AePushLock;
     ULONG Signature;
     ULONG Kind;
@@ -107,6 +108,55 @@ ext4win_stream_matches_file_object(
     return (stream != NULL) && (file_object != NULL) &&
         (file_object->FsContext == (PVOID)&stream->Header) &&
         (file_object->SectionObjectPointer == &stream->SectionObjects);
+}
+
+static BOOLEAN
+ext4win_stream_fast_io_stream(
+    _In_ PFILE_OBJECT file_object,
+    _Outptr_ PEXT4WIN_STREAM_CONTEXT *stream_out)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    if ((file_object == NULL) || (stream_out == NULL) ||
+        (file_object->FsContext == NULL)) {
+        return FALSE;
+    }
+    stream = ext4win_stream_from_header(file_object->FsContext);
+    if (!ext4win_stream_matches_file_object(stream, file_object) ||
+        (stream->Kind != 1) || (stream->ByteRangeLocks == NULL)) {
+        return FALSE;
+    }
+    *stream_out = stream;
+    return TRUE;
+}
+
+static BOOLEAN
+ext4win_stream_fast_io_candidate(
+    _In_ PFILE_OBJECT file_object,
+    _Outptr_ PEXT4WIN_STREAM_CONTEXT *stream_out)
+{
+    if (!ext4win_stream_fast_io_stream(file_object, stream_out) ||
+        ((file_object->Flags & FO_NO_INTERMEDIATE_BUFFERING) != 0) ||
+        (file_object->PrivateCacheMap == NULL) ||
+        ((file_object->Flags & FO_CACHE_SUPPORTED) == 0)) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static VOID
+ext4win_stream_refresh_fast_io_projection(_In_ PEXT4WIN_STREAM_CONTEXT stream)
+{
+    if ((stream == NULL) || (stream->ByteRangeLocks == NULL) ||
+        !FsRtlOplockIsFastIoPossible(&stream->Header.Oplock)) {
+        if (stream != NULL) {
+            stream->Header.IsFastIoPossible = FastIoIsNotPossible;
+        }
+    } else if (FsRtlAreThereCurrentFileLocks(stream->ByteRangeLocks)) {
+        stream->Header.IsFastIoPossible = FastIoIsQuestionable;
+    } else {
+        stream->Header.IsFastIoPossible = FastIoIsPossible;
+    }
 }
 
 static VOID
@@ -218,6 +268,111 @@ ext4win_stream_bind_owner(
     }
     stream->Owner = owner;
     return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_bind_byte_range_locks(
+    _In_ PVOID stream_header,
+    _Inout_ PFILE_LOCK byte_range_locks)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+
+    if ((stream == NULL) || (stream->Kind != 1) ||
+        (byte_range_locks == NULL) || (stream->ByteRangeLocks != NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    stream->ByteRangeLocks = byte_range_locks;
+    ext4win_stream_refresh_fast_io_projection(stream);
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_oplock_fsctrl(
+    _In_ PVOID stream_header,
+    _Inout_ PIRP irp,
+    _In_ ULONG open_count,
+    _In_ ULONG flags)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    NTSTATUS status;
+
+    if ((stream == NULL) || (stream->Kind != 1) ||
+        (stream->ByteRangeLocks == NULL) || (irp == NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    FsRtlIncrementLockRequestsInProgress(stream->ByteRangeLocks);
+    __try {
+        status = FsRtlOplockFsctrlEx(
+            &stream->Header.Oplock,
+            irp,
+            open_count,
+            flags);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    FsRtlDecrementLockRequestsInProgress(stream->ByteRangeLocks);
+    ext4win_stream_refresh_fast_io_projection(stream);
+    ExReleaseResourceLite(&stream->MainResource);
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_process_file_lock(
+    _In_ PVOID stream_header,
+    _Inout_ PIRP irp)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    NTSTATUS status;
+
+    if ((stream == NULL) || (stream->Kind != 1) ||
+        (stream->ByteRangeLocks == NULL) || (irp == NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    status = FsRtlProcessFileLock(stream->ByteRangeLocks, irp, NULL);
+    ext4win_stream_refresh_fast_io_projection(stream);
+    ExReleaseResourceLite(&stream->MainResource);
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_unlock_all(
+    _In_ PVOID stream_header,
+    _In_ PFILE_OBJECT file_object,
+    _In_ PEPROCESS process)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    NTSTATUS status;
+
+    if ((stream == NULL) || (stream->Kind != 1) ||
+        (stream->ByteRangeLocks == NULL) ||
+        !ext4win_stream_matches_file_object(stream, file_object) ||
+        (process == NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    status = FsRtlFastUnlockAll(
+        stream->ByteRangeLocks,
+        file_object,
+        process,
+        NULL);
+    ext4win_stream_refresh_fast_io_projection(stream);
+    ExReleaseResourceLite(&stream->MainResource);
+    return status;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -592,6 +747,580 @@ ext4win_stream_has_native_residency(
         (stream->SectionObjects.ImageSectionObject != NULL);
     ExReleaseResourceLite(&stream->MainResource);
     return STATUS_SUCCESS;
+}
+
+static BOOLEAN
+ext4win_fast_io_range(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream,
+    _In_ PLARGE_INTEGER file_offset,
+    _In_ ULONG length,
+    _Out_ PLARGE_INTEGER length_out)
+{
+    LONGLONG file_size;
+
+    if ((stream == NULL) || (file_offset == NULL) || (length_out == NULL) ||
+        (file_offset->QuadPart < 0) ||
+        (file_offset->QuadPart > (MAXLONGLONG - (LONGLONG)length))) {
+        return FALSE;
+    }
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    file_size = stream->Header.FileSize.QuadPart;
+    ExReleaseFastMutex(&stream->HeaderMutex);
+    if ((file_offset->QuadPart + (LONGLONG)length) > file_size) {
+        return FALSE;
+    }
+    length_out->QuadPart = (LONGLONG)length;
+    return TRUE;
+}
+
+static BOOLEAN
+ext4win_fast_io_lock_allows(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream,
+    _In_ PFILE_OBJECT file_object,
+    _In_ PLARGE_INTEGER file_offset,
+    _In_ PLARGE_INTEGER length,
+    _In_ ULONG lock_key,
+    _In_ BOOLEAN read_operation)
+{
+    PEPROCESS process = PsGetCurrentProcess();
+
+    if (!FsRtlOplockIsFastIoPossible(&stream->Header.Oplock)) {
+        return FALSE;
+    }
+    if (read_operation) {
+        return FsRtlFastCheckLockForRead(
+            stream->ByteRangeLocks,
+            file_offset,
+            length,
+            lock_key,
+            file_object,
+            process);
+    }
+    return FsRtlFastCheckLockForWrite(
+        stream->ByteRangeLocks,
+        file_offset,
+        length,
+        lock_key,
+        file_object,
+        process);
+}
+
+static BOOLEAN
+NTAPI
+ext4win_fast_io_check_if_possible(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PLARGE_INTEGER file_offset,
+    _In_ ULONG length,
+    _In_ BOOLEAN wait,
+    _In_ ULONG lock_key,
+    _In_ BOOLEAN read_operation,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    LARGE_INTEGER native_length;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if (io_status == NULL) {
+        return FALSE;
+    }
+    io_status->Status = STATUS_NOT_SUPPORTED;
+    io_status->Information = 0;
+    if (!wait || !ext4win_stream_fast_io_candidate(file_object, &stream) ||
+        !ext4win_fast_io_range(stream, file_offset, length, &native_length) ||
+        (read_operation ? !file_object->ReadAccess : !file_object->WriteAccess) ||
+        !ext4win_fast_io_lock_allows(
+            stream,
+            file_object,
+            file_offset,
+            &native_length,
+            lock_key,
+            read_operation)) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_fast_io_read(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PLARGE_INTEGER file_offset,
+    _In_ ULONG length,
+    _In_ BOOLEAN wait,
+    _In_ ULONG lock_key,
+    _Out_writes_bytes_(length) PVOID buffer,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    BOOLEAN handled;
+
+    if ((buffer == NULL) || !ext4win_fast_io_check_if_possible(
+            file_object,
+            file_offset,
+            length,
+            wait,
+            lock_key,
+            TRUE,
+            io_status,
+            device_object) ||
+        !ext4win_stream_fast_io_candidate(file_object, &stream)) {
+        return FALSE;
+    }
+    handled = FALSE;
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    __try {
+        handled = CcCopyRead(file_object, file_offset, length, wait, buffer, io_status);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        io_status->Status = GetExceptionCode();
+        io_status->Information = 0;
+        handled = TRUE;
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return handled;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_fast_io_write(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PLARGE_INTEGER file_offset,
+    _In_ ULONG length,
+    _In_ BOOLEAN wait,
+    _In_ ULONG lock_key,
+    _In_reads_bytes_(length) PVOID buffer,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    BOOLEAN handled;
+
+    if ((buffer == NULL) || ((file_object->Flags & FO_WRITE_THROUGH) != 0) ||
+        !ext4win_fast_io_check_if_possible(
+            file_object,
+            file_offset,
+            length,
+            wait,
+            lock_key,
+            FALSE,
+            io_status,
+            device_object) ||
+        !ext4win_stream_fast_io_candidate(file_object, &stream)) {
+        return FALSE;
+    }
+    handled = FALSE;
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    __try {
+        handled = CcCopyWrite(file_object, file_offset, length, wait, buffer);
+        if (handled) {
+            io_status->Status = STATUS_SUCCESS;
+            io_status->Information = length;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        io_status->Status = GetExceptionCode();
+        io_status->Information = 0;
+        handled = TRUE;
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return handled;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_fast_io_lock(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PLARGE_INTEGER file_offset,
+    _In_ PLARGE_INTEGER length,
+    _In_ PEPROCESS process,
+    _In_ ULONG key,
+    _In_ BOOLEAN fail_immediately,
+    _In_ BOOLEAN exclusive_lock,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    BOOLEAN handled;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if ((io_status == NULL) || (file_offset == NULL) || (length == NULL) ||
+        (process == NULL) || !ext4win_stream_fast_io_stream(file_object, &stream)) {
+        return FALSE;
+    }
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    FsRtlIncrementLockRequestsInProgress(stream->ByteRangeLocks);
+    handled = FsRtlFastLock(
+        stream->ByteRangeLocks,
+        file_object,
+        file_offset,
+        length,
+        process,
+        key,
+        fail_immediately,
+        exclusive_lock,
+        io_status,
+        NULL,
+        TRUE);
+    FsRtlDecrementLockRequestsInProgress(stream->ByteRangeLocks);
+    ext4win_stream_refresh_fast_io_projection(stream);
+    ExReleaseResourceLite(&stream->MainResource);
+    return handled;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_fast_io_unlock_single(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PLARGE_INTEGER file_offset,
+    _In_ PLARGE_INTEGER length,
+    _In_ PEPROCESS process,
+    _In_ ULONG key,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if ((io_status == NULL) || (file_offset == NULL) || (length == NULL) ||
+        (process == NULL) || !ext4win_stream_fast_io_stream(file_object, &stream)) {
+        return FALSE;
+    }
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    io_status->Status = FsRtlFastUnlockSingle(
+        stream->ByteRangeLocks,
+        file_object,
+        file_offset,
+        length,
+        process,
+        key,
+        NULL,
+        TRUE);
+    io_status->Information = 0;
+    ext4win_stream_refresh_fast_io_projection(stream);
+    ExReleaseResourceLite(&stream->MainResource);
+    return TRUE;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_fast_io_unlock_all(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PEPROCESS process,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if ((io_status == NULL) || (process == NULL) ||
+        !ext4win_stream_fast_io_stream(file_object, &stream)) {
+        return FALSE;
+    }
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    io_status->Status = FsRtlFastUnlockAll(
+        stream->ByteRangeLocks,
+        file_object,
+        process,
+        NULL);
+    io_status->Information = 0;
+    ext4win_stream_refresh_fast_io_projection(stream);
+    ExReleaseResourceLite(&stream->MainResource);
+    return TRUE;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_fast_io_unlock_all_by_key(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PVOID process,
+    _In_ ULONG key,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if ((io_status == NULL) || (process == NULL) ||
+        !ext4win_stream_fast_io_stream(file_object, &stream)) {
+        return FALSE;
+    }
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    io_status->Status = FsRtlFastUnlockAllByKey(
+        stream->ByteRangeLocks,
+        file_object,
+        (PEPROCESS)process,
+        key,
+        NULL);
+    io_status->Information = 0;
+    ext4win_stream_refresh_fast_io_projection(stream);
+    ExReleaseResourceLite(&stream->MainResource);
+    return TRUE;
+}
+
+static VOID
+NTAPI
+ext4win_acquire_file_for_section(_In_ PFILE_OBJECT file_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    if (ext4win_stream_fast_io_stream(file_object, &stream)) {
+        ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    }
+}
+
+static VOID
+NTAPI
+ext4win_release_file_for_section(_In_ PFILE_OBJECT file_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    if ((file_object != NULL) &&
+        ((stream = ext4win_stream_from_header(file_object->FsContext)) != NULL)) {
+        ExReleaseResourceLite(&stream->MainResource);
+    }
+}
+
+static BOOLEAN
+NTAPI
+ext4win_mdl_read(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PLARGE_INTEGER file_offset,
+    _In_ ULONG length,
+    _In_ ULONG lock_key,
+    _Outptr_ PMDL *mdl_chain,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    BOOLEAN handled;
+
+    if ((mdl_chain == NULL) || !ext4win_fast_io_check_if_possible(
+            file_object,
+            file_offset,
+            length,
+            TRUE,
+            lock_key,
+            TRUE,
+            io_status,
+            device_object) ||
+        !ext4win_stream_fast_io_candidate(file_object, &stream)) {
+        return FALSE;
+    }
+    *mdl_chain = NULL;
+    handled = TRUE;
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    __try {
+        CcMdlRead(file_object, file_offset, length, mdl_chain, io_status);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        io_status->Status = GetExceptionCode();
+        io_status->Information = 0;
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return handled;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_mdl_read_complete(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PMDL mdl_chain,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    BOOLEAN handled;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if ((mdl_chain == NULL) || !ext4win_stream_fast_io_candidate(file_object, &stream)) {
+        return FALSE;
+    }
+    handled = TRUE;
+    __try {
+        CcMdlReadComplete(file_object, mdl_chain);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        handled = FALSE;
+    }
+    return handled;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_prepare_mdl_write(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PLARGE_INTEGER file_offset,
+    _In_ ULONG length,
+    _In_ ULONG lock_key,
+    _Outptr_ PMDL *mdl_chain,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    if ((mdl_chain == NULL) || ((file_object->Flags & FO_WRITE_THROUGH) != 0) ||
+        !ext4win_fast_io_check_if_possible(
+            file_object,
+            file_offset,
+            length,
+            TRUE,
+            lock_key,
+            FALSE,
+            io_status,
+            device_object) ||
+        !ext4win_stream_fast_io_candidate(file_object, &stream)) {
+        return FALSE;
+    }
+    *mdl_chain = NULL;
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    __try {
+        CcPrepareMdlWrite(file_object, file_offset, length, mdl_chain, io_status);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        io_status->Status = GetExceptionCode();
+        io_status->Information = 0;
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return TRUE;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_mdl_write_complete(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PLARGE_INTEGER file_offset,
+    _In_ PMDL mdl_chain,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    BOOLEAN handled;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if ((file_offset == NULL) || (mdl_chain == NULL) ||
+        !ext4win_stream_fast_io_candidate(file_object, &stream)) {
+        return FALSE;
+    }
+    handled = TRUE;
+    __try {
+        CcMdlWriteComplete(file_object, file_offset, mdl_chain);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        handled = FALSE;
+    }
+    return handled;
+}
+
+static NTSTATUS
+NTAPI
+ext4win_acquire_for_mod_write(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PLARGE_INTEGER ending_offset,
+    _Outptr_ PERESOURCE *resource_to_release,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    UNREFERENCED_PARAMETER(ending_offset);
+    UNREFERENCED_PARAMETER(device_object);
+    if ((resource_to_release == NULL) ||
+        !ext4win_stream_fast_io_stream(file_object, &stream)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ExAcquireResourceSharedLite(&stream->PagingIoResource, TRUE);
+    *resource_to_release = &stream->PagingIoResource;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+NTAPI
+ext4win_release_for_mod_write(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PERESOURCE resource_to_release,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if ((resource_to_release == NULL) || (file_object == NULL) ||
+        ((stream = ext4win_stream_from_header(file_object->FsContext)) == NULL) ||
+        (resource_to_release != &stream->PagingIoResource)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ExReleaseResourceLite(resource_to_release);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+NTAPI
+ext4win_acquire_for_cc_flush(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if (!ext4win_stream_fast_io_stream(file_object, &stream)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+NTAPI
+ext4win_release_for_cc_flush(
+    _In_ PFILE_OBJECT file_object,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if ((file_object == NULL) ||
+        ((stream = ext4win_stream_from_header(file_object->FsContext)) == NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return STATUS_SUCCESS;
+}
+
+static FAST_IO_DISPATCH ext4win_fast_io_dispatch_table = {
+    sizeof(FAST_IO_DISPATCH),
+    ext4win_fast_io_check_if_possible,
+    ext4win_fast_io_read,
+    ext4win_fast_io_write,
+    NULL,
+    NULL,
+    ext4win_fast_io_lock,
+    ext4win_fast_io_unlock_single,
+    ext4win_fast_io_unlock_all,
+    ext4win_fast_io_unlock_all_by_key,
+    NULL,
+    ext4win_acquire_file_for_section,
+    ext4win_release_file_for_section,
+    NULL,
+    NULL,
+    ext4win_acquire_for_mod_write,
+    ext4win_mdl_read,
+    ext4win_mdl_read_complete,
+    ext4win_prepare_mdl_write,
+    ext4win_mdl_write_complete,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    ext4win_release_for_mod_write,
+    ext4win_acquire_for_cc_flush,
+    ext4win_release_for_cc_flush
+};
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PFAST_IO_DISPATCH
+NTAPI
+ext4win_fast_io_dispatch(VOID)
+{
+    return &ext4win_fast_io_dispatch_table;
 }
 
 _IRQL_requires_max_(APC_LEVEL)

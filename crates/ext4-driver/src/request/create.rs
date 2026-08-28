@@ -550,6 +550,8 @@ struct CreateHandlePolicy {
     share_access: ShareAccess,
     /// Data transfer buffering policy stored on the opened handle.
     data_transfer_mode: DataTransferMode,
+    /// Create-time oplock behavior retained until FCB admission completes.
+    oplock_policy: crate::irp::OplockCreatePolicy,
     /// Regular-file write authority retained by the per-handle state.
     regular_file_write_access: RegularFileWriteAccess,
     /// Delete authority and create-time namespace lifecycle retained by the handle.
@@ -580,6 +582,7 @@ impl CreateHandlePolicy {
                     DataTransferMode::Direct(NoIntermediateTransfer::from_device(device)?)
                 }
             },
+            oplock_policy: parameters.oplock_policy(),
             regular_file_write_access: granted_access.regular_file_write_access(),
             deletion: HandleDeletion::from_create(
                 parameters.deletion(),
@@ -608,6 +611,11 @@ impl CreateHandlePolicy {
     /// Returns data transfer buffering policy.
     const fn data_transfer_mode(self) -> DataTransferMode {
         self.data_transfer_mode
+    }
+
+    /// Returns the oplock admission policy selected by create flags.
+    const fn oplock_policy(self) -> crate::irp::OplockCreatePolicy {
+        self.oplock_policy
     }
 
     /// Returns create-time namespace deletion requested for this handle.
@@ -1549,6 +1557,7 @@ fn initialize_file_object(
         policy.granted_access(),
         policy.existing_operation_access(),
         policy.share_access(),
+        policy.oplock_policy(),
     )?;
     publish_node_stream(file_object, fcb, handle, policy.file_object_flags());
     Ok(fcb)
@@ -1566,6 +1575,7 @@ fn open_shared_file_control_block(
     desired_access: GrantedAccess,
     existing_operation_access: ExistingOperationAccess,
     share_access: ShareAccess,
+    oplock_policy: crate::irp::OplockCreatePolicy,
 ) -> DriverResult<NonNull<FileControlBlock>> {
     VolumeControlBlock::open_existing_file_control_block(
         vcb,
@@ -1574,6 +1584,7 @@ fn open_shared_file_control_block(
         desired_access,
         existing_operation_access,
         share_access,
+        oplock_policy,
     )
 }
 

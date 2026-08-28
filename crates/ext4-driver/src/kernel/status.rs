@@ -89,6 +89,8 @@ pub(crate) enum DriverError {
     ShareAccessConflict,
     /// A byte-range lock held by another requestor blocks this I/O range.
     FileLockConflict,
+    /// The requested create-time oplock reservation cannot be granted.
+    OplockNotGranted,
     /// FCB open reference count reached the representable boundary.
     TooManyOpenReferences,
     /// Directory enumeration has no more entries for this cursor.
@@ -150,6 +152,7 @@ impl DriverError {
             Self::NotADirectory => ntstatus(0xC000_0103),
             Self::ShareAccessConflict => ntstatus(0xC000_0043),
             Self::FileLockConflict => ntstatus(0xC000_0054),
+            Self::OplockNotGranted => ntstatus(0xC000_00E2),
             Self::TooManyOpenReferences => STATUS_INSUFFICIENT_RESOURCES,
             Self::NoMoreFiles => STATUS_NO_MORE_FILES,
             Self::NoSuchFile => STATUS_NO_SUCH_FILE,
