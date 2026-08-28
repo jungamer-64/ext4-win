@@ -110,7 +110,9 @@ service `ImagePath` SYS match the production manifest SHA-256, the registry
 records `Type=2` and `Start=3`, and demand-start initialization returned with
 the service in `Running` state. Before SCM stop, the administrator/System-only
 named control device consumes the `IoRegisterFileSystem` reference through its
-payload-free prepare-unload request, closes reactor admission, drains and destroys
+payload-free prepare-unload request. It first unregisters hidden-volume PnP
+notifications and joins discovery I/O while mount requests can still complete,
+then closes reactor admission, drains and destroys
 the control reactor, withdraws its alias, and requests device deletion. Existing
 control handles can still complete Cleanup/Close against the closed extension
 header. Base filesystem drivers must retire every device before `DriverUnload`
@@ -133,6 +135,18 @@ device discovery to the device introduced by that VHDX, and unmounts the device
 from WSL before Windows-driver access. Driver installation, start, stop, package
 selection, hash verification, and cleanup are delegated to the same durable
 driver-load session used by the hosted gate.
+
+Load preflight rejects existing Linux data GUID volumes. Immediately before
+driver startup, any such partition must match the live session's generated VHDX,
+disk identity and exact partition identity/range. The dedicated host must remain
+free of unrelated storage arrivals throughout the run.
+
+The disposable partition retains the Linux filesystem data GUID. The live gate
+requires Mount Manager to enumerate a volume with that exact disk extent before
+creating a session-owned directory mount point. It checks both discovery at
+driver startup and reattachment while the driver is running, and rechecks GPT
+type, identity and range after filesystem I/O. Neither the harness nor the
+driver substitutes a Basic Data partition type to obtain a mount point.
 
 The live scenario requires file create, read, write, rename, hard link,
 patterned enumeration, durable flush, clean dismount, driver unload, package

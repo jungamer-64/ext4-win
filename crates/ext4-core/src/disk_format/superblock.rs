@@ -28,6 +28,107 @@ const SUPERBLOCK_CHECKSUM_OFFSET: usize = 1020;
 const RESERVED_GDT_BLOCKS_OFFSET: usize = 206;
 /// Magic value stored in `s_magic`.
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
+
+/// Recognition only: an ext-family filesystem or a standalone journal device.
+///
+/// A signature does not grant mount or write authority. Geometry, feature support,
+/// checksums and recovery remain the responsibility of the core mount protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtVolumeSignature {
+    /// An ext2/3/4 filesystem candidate, subject to mount-policy validation.
+    Filesystem,
+    /// A journal device, never a user-visible filesystem namespace.
+    ExternalJournal,
+}
+
+impl ExtVolumeSignature {
+    /// Device-relative offset of the recognition input.
+    pub const BYTE_OFFSET: u64 = SUPERBLOCK_OFFSET;
+    /// Complete primary-superblock length required by recognition.
+    pub const BYTE_LEN: usize = SUPERBLOCK_SIZE;
+
+    /// Classifies a primary superblock without rejecting recoverable checksum damage.
+    ///
+    /// Returns `None` for other signatures. The caller must supply bytes beginning
+    /// at [`Self::BYTE_OFFSET`], not an entire disk prefix or a partition-table GUID.
+    /// # Errors
+    /// Returns [`Error::TruncatedStructure`] if the superblock is incomplete.
+    pub fn recognize(superblock: &[u8]) -> Result<Option<Self>> {
+        let raw = superblock
+            .get(..SUPERBLOCK_SIZE)
+            .ok_or(Error::TruncatedStructure)?;
+        if le_u16(raw, disk_offset(0x38))? != EXT4_SUPER_MAGIC {
+            return Ok(None);
+        }
+        let kind = if le_u32(raw, disk_offset(0x60))? & INCOMPAT_JOURNAL_DEV == 0 {
+            Self::Filesystem
+        } else {
+            Self::ExternalJournal
+        };
+        Ok(Some(kind))
+    }
+}
+
+#[cfg(test)]
+mod recognition_tests {
+    use super::ExtVolumeSignature;
+    use crate::Error;
+
+    /// # Panics
+    /// Panics if the ext magic is confused with a different signature or byte order.
+    #[test]
+    fn recognition_uses_the_superblock_magic_and_complete_input() {
+        let raw: [u8; 1024] = core::array::from_fn(|offset| match offset {
+            0x38 => 0x53,
+            0x39 => 0xef,
+            _ => 0,
+        });
+        assert_eq!(
+            ExtVolumeSignature::recognize(&raw),
+            Ok(Some(ExtVolumeSignature::Filesystem))
+        );
+        assert_eq!(ExtVolumeSignature::recognize(&[0; 1024]), Ok(None));
+        assert_eq!(
+            ExtVolumeSignature::recognize(&[0; 1023]),
+            Err(Error::TruncatedStructure)
+        );
+        let swapped: [u8; 1024] = core::array::from_fn(|offset| match offset {
+            0x38 => 0xef,
+            0x39 => 0x53,
+            _ => 0,
+        });
+        assert_eq!(ExtVolumeSignature::recognize(&swapped), Ok(None));
+    }
+
+    /// # Panics
+    /// Panics if a journal device is offered as a filesystem or recognition becomes mount policy.
+    #[test]
+    fn journal_identity_and_mount_admission_are_separate_facts() {
+        let journal: [u8; 1024] = core::array::from_fn(|offset| match offset {
+            0x38 => 0x53,
+            0x39 => 0xef,
+            0x60 => 8,
+            _ => 0,
+        });
+        assert_eq!(
+            ExtVolumeSignature::recognize(&journal),
+            Ok(Some(ExtVolumeSignature::ExternalJournal))
+        );
+        // Unknown features, invalid geometry and checksum damage must reach the
+        // mount/recovery protocol, not turn a recognizable filesystem into another format.
+        let candidate: [u8; 1024] = core::array::from_fn(|offset| match offset {
+            0x38 => 0x53,
+            0x39 => 0xef,
+            0x60 => 0xf7,
+            0x61..=0x67 => 0xff,
+            _ => 0,
+        });
+        assert_eq!(
+            ExtVolumeSignature::recognize(&candidate),
+            Ok(Some(ExtVolumeSignature::Filesystem))
+        );
+    }
+}
 /// Clean filesystem bit stored in `s_state`.
 const EXT4_VALID_FS: u16 = 0x0001;
 /// Fixed inode number assigned to online-resize metadata by ext4.

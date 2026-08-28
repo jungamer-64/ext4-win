@@ -80,6 +80,18 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("Fast I/O registration", "ext4win_fast_io_dispatch"),
     ("Fast I/O read callback", "ext4win_fast_io_read"),
     ("Fast I/O write callback", "ext4win_fast_io_write"),
+    (
+        "GPT volume identity query",
+        "ext4win_query_volume_partition",
+    ),
+    (
+        "hidden volume recognition read",
+        "ext4win_read_volume_prefix",
+    ),
+    (
+        "Mount Manager volume publication",
+        "ext4win_announce_volume",
+    ),
     ("raw-volume operation admission", "raw_volume"),
 ];
 
@@ -2318,6 +2330,9 @@ mod tests {
              ext4win_fast_io_dispatch\n\
              ext4win_fast_io_read\n\
              ext4win_fast_io_write\n\
+             ext4win_query_volume_partition\n\
+             ext4win_read_volume_prefix\n\
+             ext4win_announce_volume\n\
              raw_volume\n\
              EXT4WIN_PRODUCTION_ARTIFACT_ID\n"
         )

@@ -607,6 +607,45 @@ function Assert-PackageShape($Package) {
     }
 }
 
+function Assert-DiscoveryVolumeScope([string]$LiveSessionId) {
+    # Driver startup can now publish hidden Linux data volumes. A load test may
+    # encounter only its durable live-session VHDX, never an existing data disk.
+    $candidates = @(Get-Partition | Where-Object {
+        $_.GptType -and [Guid]$_.GptType -eq [Guid]'{0FC63DAF-8483-4772-8E79-3D69D8477DE4}'
+    })
+    if ($candidates.Count -eq 0) { return }
+    if (-not $LiveSessionId) {
+        throw 'driver-load preflight requires all existing Linux data GUID volumes to be detached'
+    }
+    Assert-SessionId $LiveSessionId
+    $liveRoot = Join-Path $RepositoryRoot 'target\live-vhdx-sessions'
+    $liveDirectory = Join-Path $liveRoot $LiveSessionId
+    $manifest = Get-ChildItem -LiteralPath $liveDirectory -Filter 'session-v1-*.manifest' -File -ErrorAction SilentlyContinue |
+        Sort-Object Name | Select-Object -Last 1
+    if (-not $manifest) { throw 'Linux data GUID volume is not owned by a live VHDX session' }
+    $live = Read-KeyValueFile $manifest.FullName
+    $expectedVhdx = Join-Path $liveDirectory 'disk.vhdx'
+    if ($live.manifest_version -ne '1' -or $live.session_id -ne $LiveSessionId -or
+        $live.driver_session_id -ne $LiveSessionId -or $live.vhdx_path -ne $expectedVhdx) {
+        throw 'live VHDX discovery scope has no matching durable identity'
+    }
+    $vhd = Get-VHD -Path $expectedVhdx
+    if (-not $vhd.Attached) { throw 'live VHDX discovery target is not attached' }
+    $disk = Get-Disk -Number $vhd.DiskNumber
+    if ([string]$disk.UniqueId -ne $live.disk_unique_id) {
+        throw 'live VHDX discovery scope disk identity changed'
+    }
+    foreach ($partition in $candidates) {
+        if ($partition.DiskNumber -ne $disk.Number -or
+            [string]$partition.PartitionNumber -ne $live.partition_number -or
+            [Guid]$partition.Guid -ne [Guid]$live.partition_id -or
+            [string]$partition.Offset -ne $live.partition_offset -or
+            [string]$partition.Size -ne $live.partition_size) {
+            throw 'driver startup would discover a Linux data GUID volume outside the disposable session'
+        }
+    }
+}
+
 function Resolve-PackageDriverStoreSysPath($Package) {
     Assert-PackageShape $Package
     $oemInf = [string]$Package.DriverName
@@ -822,6 +861,7 @@ function Start-DriverLoadSession(
 ) {
     Assert-HostContract $true
     Assert-SessionId $RequestedSessionId
+    Assert-DiscoveryVolumeScope $RequestedSessionId
     $bundleIdentity = Resolve-BundleIdentity $BundlePath $ArtifactId $SysHash $CatalogHash $InfHash
     $controlContract = Get-ControlContract
     $signerThumbprint = Assert-BundleInstallationTrust $bundleIdentity
@@ -858,6 +898,7 @@ function Start-DriverLoadSession(
     Write-Phase 'PackageInstalled'
 
     Write-Phase 'ServiceStartRequested'
+    Assert-DiscoveryVolumeScope $RequestedSessionId
     $serviceStartAttempt = Get-Date
     try {
         Start-Service -Name $serviceName -ErrorAction Stop
@@ -1022,6 +1063,7 @@ function Run-HostedDriverLoad(
 switch ($Mode) {
     'Preflight' {
         Assert-HostContract $true
+        Assert-DiscoveryVolumeScope ''
         Write-Output 'hosted driver-load host contract: PASS'
     }
     'Start' {

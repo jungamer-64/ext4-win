@@ -449,42 +449,85 @@ pub(crate) struct ControlDeviceExtension {
     header: DeviceExtensionHeader,
     /// One authoritative state for registration and terminal control-device retirement.
     lifecycle: ControlDeviceLifecycle,
+    /// Native discovery is destroyed before filesystem unregister or reactor retirement.
+    #[cfg(not(test))]
+    discovery: UnsafeCell<MaybeUninit<crate::kernel::volume_discovery::VolumeDiscovery>>,
 }
 
 impl ControlDeviceExtension {
     /// Initializes the extension attached to the control device.
     /// # Errors
     ///
-    /// Returns an error when the device has no extension or its reactor cannot be initialized.
+    /// Returns the native failure when extension, reactor or dormant discovery initialization fails.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn initialize(device: KernelDevice) -> DriverResult<()> {
+    fn initialize(device: KernelDevice) -> Result<(), wdk_sys::NTSTATUS> {
         let device_object = unsafe {
             // SAFETY: `device` is the newly created control device object.
-            device.as_ptr().as_mut()
+            device.as_ptr().as_ref()
         }
-        .ok_or(DriverError::InvalidParameter)?;
-        let extension = unsafe {
-            // SAFETY: DriverEntry creates the control device with a
-            // ControlDeviceExtension-sized extension.
+        .ok_or(DriverError::InvalidParameter.ntstatus())?;
+        let extension = NonNull::new(
             device_object
                 .DeviceExtension
-                .cast::<ControlDeviceExtension>()
-                .as_mut()
+                .cast::<ControlDeviceExtension>(),
+        )
+        .ok_or(DriverError::InvalidParameter.ntstatus())?;
+        let lifecycle = unsafe {
+            // SAFETY: This raw field projection does not borrow the uninitialized extension.
+            core::ptr::addr_of_mut!((*extension.as_ptr()).lifecycle)
+        };
+        unsafe {
+            // SAFETY: The newly allocated device owns this uninitialized lifecycle field.
+            lifecycle.write(ControlDeviceLifecycle::unpublished());
         }
-        .ok_or(DriverError::InvalidParameter)?;
-        extension.lifecycle = ControlDeviceLifecycle::unpublished();
+        let header = unsafe {
+            // SAFETY: This extension was allocated with ControlDeviceExtension size and alignment.
+            core::ptr::addr_of_mut!((*extension.as_ptr()).header)
+        };
         unsafe {
             // SAFETY: The extension is stable device-owned storage.
             DeviceExtensionHeader::initialize_at(
-                core::ptr::addr_of_mut!(extension.header),
+                header,
                 DeviceExtensionKind::CONTROL,
                 device,
                 ReactorTarget::ControlDevice,
             )
         }
+        .map_err(|error| error.ntstatus())?;
+        #[cfg(not(test))]
+        {
+            let discovery = match crate::kernel::volume_discovery::VolumeDiscovery::start(device) {
+                Ok(discovery) => discovery,
+                Err(status) => {
+                    let header = unsafe {
+                        // SAFETY: Successful header initialization established this live value.
+                        &*header
+                    };
+                    unsafe {
+                        // SAFETY: No publication occurred; discovery rollback joined its observers.
+                        let target = header.retire();
+                        if !matches!(target, ReactorTarget::ControlDevice) {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck();
+                        }
+                    }
+                    return Err(status);
+                }
+            };
+            let destination = unsafe {
+                // SAFETY: Project only the uninitialized discovery field; the running reactor is
+                // a different field and is never aliased by a whole-extension mutable reference.
+                core::ptr::addr_of_mut!((*extension.as_ptr()).discovery)
+            };
+            unsafe {
+                // SAFETY: This field is uniquely owned and uninitialized until this write.
+                destination.write(UnsafeCell::new(MaybeUninit::new(discovery)));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the exact extension of a checked control device.
@@ -535,6 +578,15 @@ impl ControlDeviceExtension {
         });
         if extension.lifecycle.state() != ControlDevicePhase::Unpublished {
             KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Rollback owns initialized discovery exactly once before publication.
+            extension
+                .discovery
+                .get()
+                .cast::<crate::kernel::volume_discovery::VolumeDiscovery>()
+                .drop_in_place();
         }
         let target = unsafe {
             // SAFETY: The unpublished device cannot receive dispatch and owns this live reactor.
@@ -599,12 +651,12 @@ impl ControlDevice {
         }) else {
             return Err(DriverError::InternalInvariantViolation.ntstatus());
         };
-        if let Err(error) = ControlDeviceExtension::initialize(device) {
+        if let Err(status) = ControlDeviceExtension::initialize(device) {
             unsafe {
                 // SAFETY: Extension initialization failed before any device publication.
                 ffi::IoDeleteDevice(device.as_ptr());
             }
-            return Err(error.ntstatus());
+            return Err(status);
         }
 
         let mut dos_name = lifecycle_unicode_string(
@@ -645,6 +697,15 @@ impl ControlDevice {
             KernelWideInconsistency::driver_device_teardown_corruption().bugcheck()
         });
         extension.lifecycle.mark_registered();
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Discovery cannot be retired until device publication below.
+            (&*extension
+                .discovery
+                .get()
+                .cast::<crate::kernel::volume_discovery::VolumeDiscovery>())
+                .activate();
+        }
         let device_object = unsafe {
             // SAFETY: Registration state now represents every lifecycle fact that dispatch can
             // observe once this final publication flag is cleared.
@@ -676,6 +737,16 @@ impl ControlDevice {
         };
         if extension.lifecycle.begin_retirement()? == RetirementAdmission::AlreadyRetired {
             return Ok(());
+        }
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Retirement has one owner. Drop unregisters PnP and joins discovery I/O while
+            // the filesystem and reactor can still service any in-flight mount.
+            extension
+                .discovery
+                .get()
+                .cast::<crate::kernel::volume_discovery::VolumeDiscovery>()
+                .drop_in_place();
         }
         unsafe {
             // SAFETY: This request exclusively consumed the Registered state, so it owns the sole

@@ -32,11 +32,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     const DATA_TRANSFER_SOURCE: &str = "native/data_transfer.c";
     const CANCEL_SOURCE: &str = "native/cancel.c";
     const STREAM_CONTEXT_SOURCE: &str = "native/stream_context.c";
+    const VOLUME_DISCOVERY_SOURCE: &str = "native/volume_discovery.c";
 
     println!("cargo:rerun-if-changed={SECURITY_CAPTURE_SOURCE}");
     println!("cargo:rerun-if-changed={DATA_TRANSFER_SOURCE}");
     println!("cargo:rerun-if-changed={CANCEL_SOURCE}");
     println!("cargo:rerun-if-changed={STREAM_CONTEXT_SOURCE}");
+    println!("cargo:rerun-if-changed={VOLUME_DISCOVERY_SOURCE}");
     println!("cargo:rerun-if-changed={LIFECYCLE_CONTROL_CONTRACT}");
     println!("cargo:rerun-if-env-changed={ARTIFACT_ID_ENVIRONMENT}");
 
@@ -61,7 +63,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .file(SECURITY_CAPTURE_SOURCE)
         .file(DATA_TRANSFER_SOURCE)
         .file(CANCEL_SOURCE)
-        .file(STREAM_CONTEXT_SOURCE);
+        .file(STREAM_CONTEXT_SOURCE)
+        .file(VOLUME_DISCOVERY_SOURCE);
 
     if is_msvc {
         native.flag("/kernel").flag("/W4").flag("/WX");

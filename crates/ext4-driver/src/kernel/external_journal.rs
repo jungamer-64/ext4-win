@@ -3,6 +3,8 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
+#[cfg(not(test))]
+use crate::kernel::device_interface::{VolumeInterfaceClass, VolumeInterfaces, unicode_string};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::storage::ExternalJournalLease;
 use crate::memory::DriverVec;
@@ -63,65 +65,32 @@ impl ExternalJournalCandidates {
     ///
     /// Returns an error for kernel enumeration failure or fallible ownership capture failure.
     #[cfg(not(test))]
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
     pub(crate) fn enumerate(filesystem: KernelDevice) -> DriverResult<Self> {
-        let mut list = core::ptr::null_mut();
-        let status = unsafe {
-            // SAFETY: The GUID is static and `list` is writable output storage. A null PDO asks the
-            // PnP manager for every present enabled volume interface.
-            crate::kernel::ffi::IoGetDeviceInterfaces(
-                &GUID_DEVINTERFACE_VOLUME,
-                core::ptr::null_mut(),
-                0,
-                &raw mut list,
-            )
-        };
-        if status < wdk_sys::STATUS_SUCCESS {
-            return Err(DriverError::ExternalJournalDiscoveryFailed);
-        }
-        let list = InterfaceList::from_raw(list)?;
         let filesystem_base = base_device_identity(filesystem)?;
         let mut candidates: DriverVec<SharedExternalJournalCandidate> = DriverVec::new();
-        let mut cursor = list.as_ptr();
-        loop {
-            let path_len = unsafe {
-                // SAFETY: `IoGetDeviceInterfaces` returns a double-NUL-terminated MULTI_SZ whose
-                // allocation stays owned by `list` for this traversal.
-                terminated_length(cursor)?
-            };
-            if path_len == 0 {
-                break;
-            }
-            let component_units = path_len
-                .checked_add(1)
-                .ok_or(DriverError::ExternalJournalDiscoveryFailed)?;
-            let path = unsafe {
-                // SAFETY: The preceding bounded scan established `path_len` readable units plus
-                // the terminating NUL in the live MULTI_SZ allocation.
-                core::slice::from_raw_parts(cursor, component_units)
-            };
-            if let Some(candidate) = open_shared_candidate(path)? {
-                let duplicate = candidate.base_identity == filesystem_base
-                    || candidates
-                        .iter()
-                        .any(|existing| existing.base_identity == candidate.base_identity);
-                let push_result = if duplicate {
-                    Ok(())
-                } else {
-                    candidates.try_push_owned(candidate)
-                };
-                if let Err(error) = push_result {
-                    let (driver_error, _candidate) = error.into_parts();
-                    return Err(driver_error);
+        for class in [VolumeInterfaceClass::Visible, VolumeInterfaceClass::Hidden] {
+            let mut list = VolumeInterfaces::enumerate(class)
+                .map_err(|_| DriverError::ExternalJournalDiscoveryFailed)?;
+            while let Some(path) = list
+                .next_path()
+                .map_err(|_| DriverError::ExternalJournalDiscoveryFailed)?
+            {
+                if let Some(candidate) = open_shared_candidate(path)? {
+                    let duplicate = candidate.base_identity == filesystem_base
+                        || candidates
+                            .iter()
+                            .any(|existing| existing.base_identity == candidate.base_identity);
+                    let push_result = if duplicate {
+                        Ok(())
+                    } else {
+                        candidates.try_push_owned(candidate)
+                    };
+                    if let Err(error) = push_result {
+                        let (driver_error, _candidate) = error.into_parts();
+                        return Err(driver_error);
+                    }
                 }
             }
-            cursor = unsafe {
-                // SAFETY: `component_units` advances exactly to the next MULTI_SZ component.
-                cursor.add(component_units)
-            };
         }
         Ok(Self {
             candidates,
@@ -220,7 +189,8 @@ impl ExclusiveExternalJournal {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     pub(crate) fn open(selected: SelectedExternalJournal) -> DriverResult<Self> {
-        let mut name = unicode_string(selected.path.as_slice())?;
+        let mut name = unicode_string(selected.path.as_slice())
+            .map_err(|_| DriverError::ExternalJournalDiscoveryFailed)?;
         let mut attributes = wdk_sys::OBJECT_ATTRIBUTES {
             Length: u32::try_from(size_of::<wdk_sys::OBJECT_ATTRIBUTES>())
                 .map_err(|_| DriverError::InternalInvariantViolation)?,
@@ -352,7 +322,7 @@ impl ExclusiveExternalJournal {
 )]
 fn open_shared_candidate(path: &[u16]) -> DriverResult<Option<SharedExternalJournalCandidate>> {
     let owned_path = DriverVec::try_copied_from_slice(path)?;
-    let mut name = unicode_string(path)?;
+    let mut name = unicode_string(path).map_err(|_| DriverError::ExternalJournalDiscoveryFailed)?;
     let mut file_object = core::ptr::null_mut();
     let mut device = core::ptr::null_mut();
     let status = unsafe {

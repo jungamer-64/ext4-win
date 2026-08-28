@@ -1,0 +1,84 @@
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace Ext4Win {
+    // Read-only identity lookup. Discovery must already have registered a volume
+    // with Mount Manager; this helper cannot register or retag a partition.
+    public static class LiveVolume {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr FindFirstVolume(StringBuilder name, uint length);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool FindNextVolume(IntPtr search, StringBuilder name, uint length);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool FindVolumeClose(IntPtr search);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(string name, uint access, uint share,
+            IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeviceIoControl(SafeFileHandle handle, uint code,
+            IntPtr input, uint inputLength, byte[] output, uint outputLength,
+            out uint returned, IntPtr overlapped);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetVolumeNameForVolumeMountPoint(string path,
+            StringBuilder name, uint length);
+
+        public static string AtMountPoint(string path) {
+            var name = new StringBuilder(1024);
+            if (!GetVolumeNameForVolumeMountPoint(path, name, (uint)name.Capacity)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            return name.ToString();
+        }
+
+        // Match the independently queried VHDX disk number and exact partition
+        // range, not a drive letter or enumeration order. No access requests a
+        // filesystem mount; inaccessible unrelated volumes are not candidates.
+        public static string Find(uint disk, long offset, long length) {
+            var name = new StringBuilder(1024);
+            IntPtr search = FindFirstVolume(name, (uint)name.Capacity);
+            if (search == new IntPtr(-1)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            string match = null;
+            try {
+                do {
+                    string volume = name.ToString();
+                    using (SafeFileHandle handle = CreateFile(volume.TrimEnd('\\'),
+                        0, 7, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+                        if (handle.IsInvalid) { continue; }
+                        var extents = new byte[32];
+                        uint returned;
+                        // IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, one native DISK_EXTENT.
+                        if (!DeviceIoControl(handle, 0x00560000, IntPtr.Zero, 0,
+                            extents, (uint)extents.Length, out returned, IntPtr.Zero)) {
+                            continue;
+                        }
+                        if (returned != 32 || BitConverter.ToUInt32(extents, 0) != 1 ||
+                            BitConverter.ToUInt32(extents, 8) != disk ||
+                            BitConverter.ToInt64(extents, 16) != offset ||
+                            BitConverter.ToInt64(extents, 24) != length) { continue; }
+                        if (match != null && match != volume) {
+                            throw new InvalidOperationException("multiple volume names match the session partition");
+                        }
+                        match = volume;
+                    }
+                } while (FindNextVolume(search, name, (uint)name.Capacity));
+                int error = Marshal.GetLastWin32Error();
+                if (error != 18) { throw new Win32Exception(error); } // ERROR_NO_MORE_FILES
+            }
+            finally {
+                if (!FindVolumeClose(search)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+            }
+            return match;
+        }
+    }
+}
