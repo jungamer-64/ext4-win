@@ -1020,7 +1020,7 @@ fn open_volume(
             policy.granted_access(),
             policy.share_access(),
         )?;
-        attach_volume_file_object(file_object, volume, handle, policy.file_object_flags());
+        publish_volume_stream(file_object, volume, handle, policy.file_object_flags());
         Ok(())
     })?;
     Ok(CreateAction::Opened)
@@ -1531,7 +1531,7 @@ fn initialize_file_object(
         policy.existing_operation_access(),
         policy.share_access(),
     )?;
-    attach_preallocated_file_object(file_object, fcb, handle, policy.file_object_flags());
+    publish_node_stream(file_object, fcb, handle, policy.file_object_flags());
     Ok(fcb)
 }
 
@@ -1653,7 +1653,7 @@ impl PreparedCreatePublication {
             notification,
         } = self;
         let (fcb, file_object) = claim.consume();
-        attach_preallocated_file_object_raw(file_object, fcb, handle, flags);
+        publish_node_stream_raw(file_object, fcb, handle, flags);
         if let Some(pending) = pending_deletion {
             operations.set_file_delete_pending(fcb, pending);
         }
@@ -1692,6 +1692,78 @@ impl Drop for PendingFileControlBlockClaim {
 // SAFETY: The top-level create IRP pins the FILE_OBJECT, and the mounted VCB pins the FCB ledger;
 // only the reactor thread consumes or drops this claim.
 unsafe impl Send for PendingFileControlBlockClaim {}
+
+/// Publishes an inode-wide advanced header, shared section pointers, and one per-handle CCB.
+fn publish_node_stream(
+    file_object: UninitializedFileObject<'_>,
+    fcb: NonNull<FileControlBlock>,
+    handle: Box<OpenedHandle>,
+    file_object_flags: CreateFileObjectFlags,
+) {
+    publish_node_stream_raw(
+        file_object.kernel_file_object(),
+        fcb,
+        handle,
+        file_object_flags,
+    );
+}
+
+/// Publishes prepared node contexts through the stable FILE_OBJECT captured before commit.
+#[expect(
+    unsafe_code,
+    reason = "successful create exclusively publishes one advanced header and prepared CCB"
+)]
+fn publish_node_stream_raw(
+    file_object: KernelFileObject,
+    fcb: NonNull<FileControlBlock>,
+    handle: Box<OpenedHandle>,
+    file_object_flags: CreateFileObjectFlags,
+) {
+    let fcb = unsafe {
+        // SAFETY: The ledger-owned FCB is retained by the open claim being published.
+        fcb.as_ref()
+    };
+    let sections = fcb.stream_section_objects().unwrap_or_else(|_| {
+        crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption().bugcheck()
+    });
+    let file_object = unsafe {
+        // SAFETY: Successful create owns the sole publication transition for this FILE_OBJECT.
+        &mut *file_object.as_ptr()
+    };
+    file_object_flags.apply_to(file_object);
+    file_object.FsContext = fcb.stream_header().as_ptr();
+    file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
+    file_object.SectionObjectPointer = sections.as_ptr();
+}
+
+/// Publishes the mounted volume's header-based stream and one per-handle CCB.
+#[expect(
+    unsafe_code,
+    reason = "successful volume create exclusively publishes one advanced header and prepared CCB"
+)]
+fn publish_volume_stream(
+    mut file_object: UninitializedFileObject<'_>,
+    volume: NonNull<VolumeControlBlock>,
+    handle: Box<OpenedVolumeHandle>,
+    file_object_flags: CreateFileObjectFlags,
+) {
+    let volume = unsafe {
+        // SAFETY: The mounted VCB retains this stable pointer through the direct volume open.
+        volume.as_ref()
+    };
+    let sections = volume.stream_section_objects().unwrap_or_else(|_| {
+        crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption().bugcheck()
+    });
+    let file_object = unsafe {
+        // SAFETY: This is the sole successful-create publication for the FILE_OBJECT.
+        file_object.as_mut()
+    };
+    file_object_flags.apply_to(file_object);
+    file_object.Flags |= wdk_sys::FO_VOLUME_OPEN;
+    file_object.FsContext = volume.stream_header().as_ptr();
+    file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
+    file_object.SectionObjectPointer = sections.as_ptr();
+}
 
 #[cfg(test)]
 mod tests {

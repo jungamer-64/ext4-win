@@ -48,6 +48,7 @@ use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::storage::{MountedStorage, MountedStorageRoute};
+use crate::kernel::stream::{StreamContext, StreamOwnerKind, StreamSizes};
 use crate::memory::{self, DriverVec, InPlaceInitialization};
 
 /// Non-null kernel device object pointer at the WDK boundary.
@@ -1234,6 +1235,8 @@ pub(crate) struct VolumeControlBlock {
     volume_control: VolumeControlPlane,
     /// Mounted profile, committed epochs, and mutation coordination.
     runtime: VolumeRuntime,
+    /// Header-based stream identity used by every direct volume FILE_OBJECT.
+    stream_context: StreamContext,
 }
 
 /// Actor-owned mounted-volume lifecycle and direct-open ledger.
@@ -2462,7 +2465,7 @@ impl FileControlBlockLedger {
             return result;
         }
 
-        let candidate = memory::boxed_try_with(|| Ok(self.file_control_block(volume, node)))?;
+        let candidate = self.file_control_block(volume, node)?;
         let mut discarded = None;
         let mut removed = None;
         let result = {
@@ -2495,7 +2498,7 @@ impl FileControlBlockLedger {
                     ) {
                         Ok(()) => Ok(fcb),
                         Err(error) => {
-                            removed = close_file_control_block_in_table(table, fcb);
+                            removed = release_file_object_lease_in_table(table, fcb);
                             Err(error)
                         }
                     },
@@ -2517,8 +2520,12 @@ impl FileControlBlockLedger {
         &self,
         volume: NonNull<VolumeControlBlock>,
         node: NodeId,
-    ) -> FileControlBlock {
-        FileControlBlock::new(volume, NonNull::from(self), node)
+    ) -> DriverResult<Box<FileControlBlock>> {
+        let candidate = memory::boxed_try_with(|| {
+            FileControlBlock::try_new(volume, NonNull::from(self), node)
+        })?;
+        candidate.bind_stream_owner()?;
+        Ok(candidate)
     }
 
     /// Attempts to reuse an existing entry without allocating a candidate FCB.
@@ -2686,7 +2693,7 @@ impl FileControlBlockLedger {
                 state.as_mut()
             }
             .remove_share_access(file_object);
-            close_file_control_block_in_table(table, fcb)
+            release_file_object_lease_in_table(table, fcb)
         };
         drop(removed);
     }
@@ -2703,7 +2710,7 @@ impl FileControlBlockLedger {
                 // SAFETY: The executive resource uniquely owns table and open-state mutation.
                 &mut *self.table.get()
             };
-            close_file_control_block_in_table(table, fcb)
+            release_file_object_lease_in_table(table, fcb)
         };
         drop(removed);
     }
@@ -2820,7 +2827,29 @@ impl VolumeControlBlock {
             file_control_blocks: FileControlBlockLedger::try_new()?,
             volume_control: VolumeControlPlane::mounted(),
             runtime: VolumeRuntime::try_new(mount, storage)?,
+            stream_context: StreamContext::try_new(StreamOwnerKind::Volume, StreamSizes::EMPTY)?,
         })
+    }
+
+    /// Binds the volume stream header after the VCB reaches its final heap address.
+    /// # Errors
+    ///
+    /// Returns an invariant error if mount publication attempts to bind this VCB more than once.
+    pub(crate) fn bind_stream_owner(&self) -> DriverResult<()> {
+        self.stream_context
+            .bind_owner(NonNull::from(self).cast::<c_void>())
+    }
+
+    /// Returns the advanced-header address published through direct volume FILE_OBJECTs.
+    pub(crate) fn stream_header(&self) -> NonNull<c_void> {
+        self.stream_context.header()
+    }
+
+    /// Returns the direct-volume stream's shared section-object set.
+    pub(crate) fn stream_section_objects(
+        &self,
+    ) -> DriverResult<NonNull<wdk_sys::SECTION_OBJECT_POINTERS>> {
+        self.stream_context.section_objects()
     }
 
     /// Initializes the volume-wide FsRtl notification state after this VCB reaches stable storage.
@@ -3550,7 +3579,7 @@ fn record_reused_file_control_block_open(
     };
     let references = state.next_file_object_reference()?;
     state.record_share_access(file_object, desired_access, share_access, share_check)?;
-    state.file_object_references = references;
+    state.lifetime = references;
     Ok(())
 }
 
@@ -3577,6 +3606,36 @@ fn record_file_control_block_share(
         state.as_mut()
     }
     .record_share_access(file_object, desired_access, share_access, share_check)
+}
+
+/// Consumes one handle lease and removes the FCB only after the stream becomes reclaimable.
+#[expect(
+    unsafe_code,
+    reason = "the ledger resource uniquely owns stream-lifetime mutation and table removal"
+)]
+fn release_file_object_lease_in_table(
+    table: &mut DriverVec<Box<FileControlBlock>>,
+    fcb: NonNull<FileControlBlock>,
+) -> Option<Box<FileControlBlock>> {
+    let Some(index) = table
+        .iter()
+        .position(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+    else {
+        KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+    };
+    let mut state = ledger_file_control_block_open_state(table, fcb);
+    let reclaimable = unsafe {
+        // SAFETY: The caller holds the ledger resource and table ownership was validated above.
+        state.as_mut()
+    }
+    .release_file_object_reference();
+    if !reclaimable {
+        return None;
+    }
+    match table.swap_remove(index) {
+        Some(removed) => Some(removed),
+        None => KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck(),
+    }
 }
 
 /// Finds a VCB-owned FCB by node identity.
@@ -4189,6 +4248,8 @@ pub(crate) struct FileControlBlock {
     byte_range_locks: FileByteRangeLocks,
     /// Ledger-owned mutable state; accessed only under `owner`'s exclusive resource.
     open_state: UnsafeCell<FileControlBlockOpenState>,
+    /// Windows advanced-header stream identity shared by every FILE_OBJECT for this inode.
+    stream_context: StreamContext,
 }
 
 #[expect(
@@ -4215,18 +4276,37 @@ impl fmt::Debug for FileControlBlock {
 
 impl FileControlBlock {
     /// Creates an FCB boundary value for a mounted node with one open reference.
-    fn new(
+    fn try_new(
         volume: NonNull<VolumeControlBlock>,
         owner: NonNull<FileControlBlockLedger>,
         node: NodeId,
-    ) -> Self {
-        Self {
+    ) -> DriverResult<Self> {
+        Ok(Self {
             volume,
             owner,
             node,
             byte_range_locks: FileByteRangeLocks::new(),
             open_state: UnsafeCell::new(FileControlBlockOpenState::new()),
-        }
+            stream_context: StreamContext::try_new(StreamOwnerKind::Node, StreamSizes::EMPTY)?,
+        })
+    }
+
+    /// Binds the native header after the ledger candidate reaches its final heap address.
+    fn bind_stream_owner(&self) -> DriverResult<()> {
+        self.stream_context
+            .bind_owner(NonNull::from(self).cast::<c_void>())
+    }
+
+    /// Returns the advanced-header pointer installed in every FILE_OBJECT for this inode.
+    pub(crate) fn stream_header(&self) -> NonNull<c_void> {
+        self.stream_context.header()
+    }
+
+    /// Returns the inode stream's shared cache and mapped-section authority.
+    pub(crate) fn stream_section_objects(
+        &self,
+    ) -> DriverResult<NonNull<wdk_sys::SECTION_OBJECT_POINTERS>> {
+        self.stream_context.section_objects()
     }
 
     /// Returns the mounted VCB pointer that owns this open node.
@@ -4296,8 +4376,8 @@ impl FileControlBlock {
 struct FileControlBlockOpenState {
     /// I/O manager share-access accounting for this inode identity.
     share_access: SHARE_ACCESS,
-    /// Number of open FILE_OBJECTs currently carrying a share claim for this stream.
-    file_object_references: NonZeroU32,
+    /// Explicit stream lifetime across handle and cache/mapping residency domains.
+    lifetime: StreamLifetimeState,
     /// One namespace deletion truth shared by every handle for this inode.
     deletion: FileDeletionState,
 }
@@ -4315,7 +4395,10 @@ impl FileControlBlockOpenState {
                 SharedWrite: 0,
                 SharedDelete: 0,
             },
-            file_object_references: NonZeroU32::MIN,
+            lifetime: StreamLifetimeState::OpenHandles {
+                handles: NonZeroU32::MIN,
+                resident_leases: 0,
+            },
             deletion: FileDeletionState::Live,
         }
     }
@@ -4472,14 +4555,88 @@ impl FileControlBlockOpenState {
     /// # Errors
     ///
     /// Returns an error when the FCB open-reference counter cannot be incremented.
-    fn next_file_object_reference(&self) -> DriverResult<NonZeroU32> {
-        self.file_object_references
-            .get()
-            .checked_add(1)
-            .and_then(NonZeroU32::new)
-            .ok_or(DriverError::TooManyOpenReferences)
+    fn next_file_object_reference(&self) -> DriverResult<StreamLifetimeState> {
+        self.lifetime.with_additional_handle()
     }
 
+    /// Releases one FILE_OBJECT lease and reports whether the stream became reclaimable.
+    fn release_file_object_reference(&mut self) -> bool {
+        self.lifetime = self.lifetime.without_handle();
+        self.lifetime == StreamLifetimeState::Reclaimable
+    }
+}
+
+/// Lifetime of one inode stream independent of any particular handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamLifetimeState {
+    /// At least one FILE_OBJECT owns the stream; native residents may coexist.
+    OpenHandles {
+        /// Exact number of FILE_OBJECT close obligations.
+        handles: NonZeroU32,
+        /// Cache maps, sections, oplock continuations, or worker operations retaining the stream.
+        resident_leases: u32,
+    },
+    /// No FILE_OBJECT remains, but native or deferred work still retains the stream.
+    CachedOrMappedResident {
+        /// Exact number of non-handle retention obligations.
+        resident_leases: NonZeroU32,
+    },
+    /// No handle or resident lease remains and the ledger may destroy the stream.
+    Reclaimable,
+}
+
+impl StreamLifetimeState {
+    /// Computes the state after admitting one additional FILE_OBJECT.
+    fn with_additional_handle(self) -> DriverResult<Self> {
+        match self {
+            Self::OpenHandles {
+                handles,
+                resident_leases,
+            } => Ok(Self::OpenHandles {
+                handles: handles
+                    .get()
+                    .checked_add(1)
+                    .and_then(NonZeroU32::new)
+                    .ok_or(DriverError::TooManyOpenReferences)?,
+                resident_leases,
+            }),
+            Self::CachedOrMappedResident { resident_leases } => Ok(Self::OpenHandles {
+                handles: NonZeroU32::MIN,
+                resident_leases: resident_leases.get(),
+            }),
+            Self::Reclaimable => {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+            }
+        }
+    }
+
+    /// Computes the state after consuming exactly one FILE_OBJECT close obligation.
+    fn without_handle(self) -> Self {
+        match self {
+            Self::OpenHandles {
+                handles,
+                resident_leases,
+            } if handles.get() > 1 => Self::OpenHandles {
+                handles: NonZeroU32::new(handles.get() - 1).unwrap_or_else(|| {
+                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+                }),
+                resident_leases,
+            },
+            Self::OpenHandles {
+                resident_leases: 0, ..
+            } => Self::Reclaimable,
+            Self::OpenHandles {
+                resident_leases, ..
+            } => Self::CachedOrMappedResident {
+                resident_leases: NonZeroU32::new(resident_leases).unwrap_or_else(|| {
+                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+                }),
+            },
+            Self::CachedOrMappedResident { .. } | Self::Reclaimable => {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+            }
+        }
+    }
 }
 
 /// Opaque FsRtl byte-range lock state owned by one FCB.
@@ -5790,6 +5947,38 @@ impl PreparedFilePositionPublication {
 unsafe impl Send for PreparedFilePositionPublication {}
 
 impl<'owner> OpenedObject<'owner> {
+    /// Decodes a node FILE_OBJECT through its advanced-header owner identity and per-handle CCB.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT is a volume open or either context is absent.
+    pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
+        let object = file_object.as_ref();
+        if object.Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
+            return Err(DriverError::ObjectTypeMismatch);
+        }
+        let header = NonNull::new(object.FsContext.cast::<c_void>());
+        let handle = NonNull::new(object.FsContext2.cast::<OpenedHandle>());
+        let (header, handle) = match (header, handle) {
+            (Some(header), Some(handle)) => (header, handle),
+            (None, None) => return Err(DriverError::InvalidParameter),
+            (Some(_), None) | (None, Some(_)) => {
+                KernelWideInconsistency::file_object_context_corruption().bugcheck();
+            }
+        };
+        let fcb =
+            StreamContext::decode_owner(header, StreamOwnerKind::Node)?.cast::<FileControlBlock>();
+        if object.SectionObjectPointer != StreamContext::decode_section_objects(header)?.as_ptr() {
+            KernelWideInconsistency::file_object_context_corruption().bugcheck();
+        }
+        let opened = Self {
+            file_object,
+            fcb,
+            handle,
+        };
+        opened.validate_handle_kind()?;
+        Ok(opened)
+    }
+
     /// Returns the kernel FILE_OBJECT associated with this opened handle.
     pub(crate) const fn file_object(&self) -> KernelFileObject {
         self.file_object.address()
@@ -6008,6 +6197,47 @@ impl<'owner> OpenedObject<'owner> {
             .close_release_plan(close_kind, self.file_object.cleanup_complete())
     }
 
+    /// Consumes the unique close authority and clears the header, section, and CCB projections.
+    #[expect(
+        unsafe_code,
+        reason = "the consumed opened capability owns the unique CLOSE context-detachment transition"
+    )]
+    pub(crate) fn take_node_contexts(self) -> (NonNull<FileControlBlock>, NonNull<OpenedHandle>) {
+        let object = unsafe {
+            // SAFETY: This consumed opened capability represents the unique CLOSE transition.
+            &mut *self.file_object.as_ptr()
+        };
+        let header = NonNull::new(core::mem::replace(
+            &mut object.FsContext,
+            core::ptr::null_mut(),
+        ));
+        let sections = core::mem::replace(&mut object.SectionObjectPointer, core::ptr::null_mut());
+        let handle = NonNull::new(
+            core::mem::replace(&mut object.FsContext2, core::ptr::null_mut())
+                .cast::<OpenedHandle>(),
+        );
+        let fcb = unsafe {
+            // SAFETY: Decode validated the ledger-owned FCB for this consumed FILE_OBJECT.
+            self.fcb.as_ref()
+        };
+        match (header, handle) {
+            (Some(header), Some(handle))
+                if header == fcb.stream_header()
+                    && sections
+                        == fcb
+                            .stream_section_objects()
+                            .unwrap_or_else(|_| {
+                                KernelWideInconsistency::file_object_context_corruption().bugcheck()
+                            })
+                            .as_ptr()
+                    && handle == self.handle =>
+            {
+                (self.fcb, handle)
+            }
+            _ => KernelWideInconsistency::file_object_context_corruption().bugcheck(),
+        }
+    }
+
     /// Returns the decoded file control block.
     #[expect(
         unsafe_code,
@@ -6215,6 +6445,36 @@ pub(crate) struct OpenedVolume<'owner> {
 }
 
 impl<'owner> OpenedVolume<'owner> {
+    /// Decodes a direct-volume FILE_OBJECT through its advanced-header owner identity.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT is not marked as a volume open or lacks contexts.
+    pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
+        let object = file_object.as_ref();
+        if object.Flags & wdk_sys::FO_VOLUME_OPEN == 0 {
+            return Err(DriverError::ObjectTypeMismatch);
+        }
+        let header = NonNull::new(object.FsContext.cast::<c_void>());
+        let handle = NonNull::new(object.FsContext2.cast::<OpenedVolumeHandle>());
+        let (header, handle) = match (header, handle) {
+            (Some(header), Some(handle)) => (header, handle),
+            (None, None) => return Err(DriverError::InvalidParameter),
+            (Some(_), None) | (None, Some(_)) => {
+                KernelWideInconsistency::file_object_context_corruption().bugcheck();
+            }
+        };
+        let volume = StreamContext::decode_owner(header, StreamOwnerKind::Volume)?
+            .cast::<VolumeControlBlock>();
+        if object.SectionObjectPointer != StreamContext::decode_section_objects(header)?.as_ptr() {
+            KernelWideInconsistency::file_object_context_corruption().bugcheck();
+        }
+        Ok(Self {
+            file_object,
+            volume,
+            handle,
+        })
+    }
+
     /// Returns the mounted VCB identified by this volume handle.
     pub(crate) const fn volume(&self) -> NonNull<VolumeControlBlock> {
         self.volume
@@ -6264,6 +6524,48 @@ impl<'owner> OpenedVolume<'owner> {
         .close_release_plan(close_kind, self.file_object.cleanup_complete())
     }
 
+    /// Consumes the unique close authority and clears the volume stream and CCB projections.
+    #[expect(
+        unsafe_code,
+        reason = "the consumed volume capability owns the unique CLOSE context-detachment transition"
+    )]
+    pub(crate) fn take_volume_contexts(
+        self,
+    ) -> (NonNull<VolumeControlBlock>, NonNull<OpenedVolumeHandle>) {
+        let object = unsafe {
+            // SAFETY: This consumed opened capability represents the unique CLOSE transition.
+            &mut *self.file_object.as_ptr()
+        };
+        let header = NonNull::new(core::mem::replace(
+            &mut object.FsContext,
+            core::ptr::null_mut(),
+        ));
+        let sections = core::mem::replace(&mut object.SectionObjectPointer, core::ptr::null_mut());
+        let handle = NonNull::new(
+            core::mem::replace(&mut object.FsContext2, core::ptr::null_mut())
+                .cast::<OpenedVolumeHandle>(),
+        );
+        let volume = unsafe {
+            // SAFETY: Decode validated the mounted VCB for this consumed FILE_OBJECT.
+            self.volume.as_ref()
+        };
+        match (header, handle) {
+            (Some(header), Some(handle))
+                if header == volume.stream_header()
+                    && sections
+                        == volume
+                            .stream_section_objects()
+                            .unwrap_or_else(|_| {
+                                KernelWideInconsistency::file_object_context_corruption().bugcheck()
+                            })
+                            .as_ptr()
+                    && handle == self.handle =>
+            {
+                (self.volume, handle)
+            }
+            _ => KernelWideInconsistency::file_object_context_corruption().bugcheck(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -6571,6 +6873,7 @@ pub(crate) fn queue_device_request(
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
     use core::cell::Cell;
     use core::mem::MaybeUninit;
     use core::num::NonZeroU32;
@@ -6582,6 +6885,7 @@ mod tests {
         ActiveFileObject, CreateDeletion, DataIoKind, DeleteAccess, FileAttributesWriteAccess,
         ReceivedIrp, RegularFileWriteAccess,
     };
+    use crate::kernel::fatal::KernelWideInconsistency;
     use crate::kernel::status::DriverError;
 
     use super::{
@@ -6589,13 +6893,12 @@ mod tests {
         ControlDevicePhase, DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode,
         DeviceExtensionKind, DirectoryChange, DirectoryChangeAction, DriverDeviceKind,
         FileControlBlock, FileControlBlockLedger, FileControlBlockOpenState, FileObjectCloseKind,
-        HandleAdmissionState, HandleDeletion,
-        KernelDevice, KernelFileObject, MountedVolumeState, NativeFileByteRange,
-        NoIntermediateTransfer, OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation,
-        OpenedNodeMode, OpenedObject, OpenedRegularFile, OpenedVolumeHandle, RetirementAdmission,
-        TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
-        VolumeHandleCleanup, VolumeRetirement, select_close_release_plan,
-        shutdown_registration_status,
+        HandleAdmissionState, HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeState,
+        NativeFileByteRange, NoIntermediateTransfer, OpenedDirectory, OpenedFileObject,
+        OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
+        OpenedVolumeHandle, RetirementAdmission, StreamLifetimeState, TransferBufferAlignment,
+        TransferSectorSize, UninitializedFileObject, VolumeControlBlock, VolumeHandleCleanup,
+        VolumeRetirement, select_close_release_plan, shutdown_registration_status,
     };
 
     /// # Errors
@@ -6717,11 +7020,17 @@ mod tests {
         fs_context: *mut core::ffi::c_void,
         fs_context2: *mut core::ffi::c_void,
     ) -> wdk_sys::FILE_OBJECT {
-        wdk_sys::FILE_OBJECT {
+        let mut file_object = wdk_sys::FILE_OBJECT {
             FsContext: fs_context,
             FsContext2: fs_context2,
             ..wdk_sys::FILE_OBJECT::default()
+        };
+        if let (Some(header), false) = (NonNull::new(fs_context), fs_context2.is_null()) {
+            file_object.SectionObjectPointer =
+                crate::kernel::stream::StreamContext::decode_section_objects(header)
+                    .map_or(core::ptr::null_mut(), NonNull::as_ptr);
         }
+        file_object
     }
 
     /// # Panics
@@ -6730,9 +7039,19 @@ mod tests {
     #[test]
     fn volume_open_flag_selects_typed_volume_contexts() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
+        let stream = crate::kernel::stream::StreamContext::try_new(
+            crate::kernel::stream::StreamOwnerKind::Volume,
+            crate::kernel::stream::StreamSizes::EMPTY,
+        )
+        .unwrap_or_else(|_| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
+        stream.bind_owner(volume.cast()).unwrap_or_else(|_| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
         let mut handle = OpenedVolumeHandle::new();
         let mut file = file_object_with_contexts(
-            volume.as_ptr().cast(),
+            stream.header().as_ptr(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
         file.Flags |= wdk_sys::FO_VOLUME_OPEN;
@@ -6920,8 +7239,17 @@ mod tests {
     fn test_file_control_block(
         volume: NonNull<VolumeControlBlock>,
         node: NodeId,
-    ) -> FileControlBlock {
-        FileControlBlock::new(volume, NonNull::<FileControlBlockLedger>::dangling(), node)
+    ) -> Box<FileControlBlock> {
+        let fcb = Box::new(
+            FileControlBlock::try_new(volume, NonNull::<FileControlBlockLedger>::dangling(), node)
+                .unwrap_or_else(|_| {
+                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+                }),
+        );
+        fcb.bind_stream_owner().unwrap_or_else(|_| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
+        fcb
     }
 
     /// # Panics
@@ -7091,7 +7419,7 @@ mod tests {
     #[test]
     fn typed_opened_directory_exposes_cursor_without_option() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
             DataTransferMode::IntermediateAllowed,
@@ -7099,7 +7427,7 @@ mod tests {
             return;
         };
         let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
+            fcb.stream_header().as_ptr(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
         let result = with_active_file_object(&mut file, |file_object| {
@@ -7123,7 +7451,7 @@ mod tests {
     )]
     fn opened_directory_reuses_a_stable_notification_name_descriptor() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
             DataTransferMode::IntermediateAllowed,
@@ -7131,7 +7459,7 @@ mod tests {
             return;
         };
         let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
+            fcb.stream_header().as_ptr(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
         let result = with_active_file_object(&mut file, |file_object| {
@@ -7225,7 +7553,7 @@ mod tests {
     #[test]
     fn typed_opened_decoders_reject_wrong_node_kind() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
             DataTransferMode::IntermediateAllowed,
@@ -7233,7 +7561,7 @@ mod tests {
             return;
         };
         let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
+            fcb.stream_header().as_ptr(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
         assert_eq!(
@@ -7251,7 +7579,7 @@ mod tests {
     #[test]
     fn reparse_point_directory_handle_rejects_directory_operations() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let Some(mut handle) = directory_handle(
             OpenedNodeMode::ReparsePoint,
             DataTransferMode::IntermediateAllowed,
@@ -7259,7 +7587,7 @@ mod tests {
             return;
         };
         let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
+            fcb.stream_header().as_ptr(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
         assert_eq!(
@@ -7354,7 +7682,7 @@ mod tests {
             buffer_alignment,
         };
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
             DataTransferMode::NoIntermediate(transfer),
@@ -7362,7 +7690,7 @@ mod tests {
             return;
         };
         let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
+            fcb.stream_header().as_ptr(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
         let result = with_active_file_object(&mut file, |file_object| {
@@ -7382,7 +7710,7 @@ mod tests {
     #[test]
     fn synchronous_opened_object_reads_sets_and_advances_position() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
             DataTransferMode::IntermediateAllowed,
@@ -7390,7 +7718,7 @@ mod tests {
             return;
         };
         let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
+            fcb.stream_header().as_ptr(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
         file.Flags = wdk_sys::FO_SYNCHRONOUS_IO;
@@ -7467,7 +7795,7 @@ mod tests {
     )]
     fn asynchronous_and_paging_io_do_not_advance_position() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
             DataTransferMode::IntermediateAllowed,
@@ -7475,7 +7803,7 @@ mod tests {
             return;
         };
         let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
+            fcb.stream_header().as_ptr(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
         file.CurrentByteOffset = wdk_sys::LARGE_INTEGER { QuadPart: 7 };
@@ -7527,7 +7855,7 @@ mod tests {
     #[test]
     fn file_position_and_native_lock_range_reject_signed_overflow() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
-        let mut fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+        let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
         let Some(mut handle) = directory_handle(
             OpenedNodeMode::Direct,
             DataTransferMode::IntermediateAllowed,
@@ -7535,7 +7863,7 @@ mod tests {
             return;
         };
         let mut file = file_object_with_contexts(
-            core::ptr::addr_of_mut!(fcb).cast(),
+            fcb.stream_header().as_ptr(),
             core::ptr::addr_of_mut!(handle).cast(),
         );
         file.Flags = wdk_sys::FO_SYNCHRONOUS_IO;
@@ -7602,13 +7930,22 @@ mod tests {
     #[test]
     fn file_control_block_reference_count_overflow_is_typed() {
         let mut state = FileControlBlockOpenState::new();
-        state.file_object_references = NonZeroU32::MAX;
+        state.lifetime = StreamLifetimeState::OpenHandles {
+            handles: NonZeroU32::MAX,
+            resident_leases: 0,
+        };
 
         assert_eq!(
             state.next_file_object_reference(),
             Err(DriverError::TooManyOpenReferences)
         );
-        assert_eq!(state.file_object_references, NonZeroU32::MAX);
+        assert_eq!(
+            state.lifetime,
+            StreamLifetimeState::OpenHandles {
+                handles: NonZeroU32::MAX,
+                resident_leases: 0,
+            }
+        );
     }
 
     /// # Panics
