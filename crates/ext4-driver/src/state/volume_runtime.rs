@@ -373,7 +373,6 @@ impl VolumeRuntime {
     }
 
     /// Allocation-free durable epoch publication after a matching visibility grant.
-    #[inline(never)]
     pub(crate) fn publish_durable(
         &mut self,
         mutation: DurableMutation,

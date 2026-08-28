@@ -71,6 +71,12 @@ the production reachability gate, and rejects concurrent source changes. It
 fails explicitly on macOS and Linux instead of compiling a non-Windows driver
 shim.
 
+The allocation-free Rust audit starts at mounted-volume durable publication,
+including both epoch replacement and stream-size publication. The link-map
+contract also requires the native advanced-header allocation, owner/section
+decoding, size access, and destruction boundaries. Linked native entry points
+are not evidence that Cache Manager or mapped-I/O callbacks have been exercised.
+
 Successful bundles are atomically published below
 `target/verified-production/<artifact-id>/`. The versioned manifest binds the
 IR, MAP, SYS, CAT, and INF hashes to the exact source snapshot, target, profile,

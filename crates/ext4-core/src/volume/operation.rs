@@ -33,6 +33,23 @@ pub enum WindowsNameMatch {
 /// implementation can survive suspension: all storage and continuation ownership remains in its
 /// enclosing operation.
 pub trait CommittedReadPass {
+    /// Reads logical size and physical allocation from one committed inode.
+    /// # Errors
+    ///
+    /// Returns an error when the inode cannot be read or its kind differs from `node`.
+    fn load_node_storage(&mut self, node: NodeId) -> Result<super::NodeStorageSnapshot> {
+        let snapshot = match node {
+            NodeId::File(id) => super::NodeStorageSnapshot::from_inode(self.load_file(id)?.inode()),
+            NodeId::Directory(id) => {
+                super::NodeStorageSnapshot::from_inode(self.load_directory(id)?.inode())
+            }
+            NodeId::Symlink(id) => {
+                super::NodeStorageSnapshot::from_inode(self.load_symlink(id)?.inode())
+            }
+        };
+        Ok(snapshot)
+    }
+
     /// Loads a regular file by validated identity.
     /// # Errors
     ///

@@ -20,8 +20,7 @@ const FATAL_BUGCHECK_ALLOWLIST: &[&str] =
     &["<ext4win::kernel::fatal::KernelWideInconsistency>::bugcheck"];
 
 /// Release boundary whose complete reachable graph must remain allocation-free after durability.
-const DURABLE_PUBLISH_ROOT: &str =
-    "<ext4win::state::volume_runtime::VolumeRuntime>::publish_durable";
+const DURABLE_PUBLISH_ROOT: &str = "<ext4win::state::MountedVolumeAccess>::publish_durable";
 
 /// Required active top-level IRP cancellation callback.
 const ACTIVE_CANCEL_CALLBACK: &str = "ext4win::irp::cancel::active_irp_cancelled";
@@ -49,6 +48,18 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("durable publication boundary", "publish_durable"),
     ("completion registration import", "IoSetCompletionRoutineEx"),
     ("lower submission import", "IofCallDriver"),
+    ("native advanced-header allocation", "ext4win_stream_create"),
+    (
+        "native stream owner decoding",
+        "ext4win_stream_decode_owner",
+    ),
+    (
+        "native section-object identity",
+        "ext4win_stream_section_objects",
+    ),
+    ("native stream size observation", "ext4win_stream_get_sizes"),
+    ("native stream size publication", "ext4win_stream_set_sizes"),
+    ("native stream destruction", "ext4win_stream_destroy"),
 ];
 
 /// AMD64 COFF machine identifier.
@@ -2180,7 +2191,7 @@ mod tests {
              define internal void @active_cancel(ptr %device, ptr %irp) {{\n  ret void\n}}\n\
              ; ext4win::irp::reactor::storage_retry_timer_dpc\n\
              define internal void @retry_timer(ptr %dpc, ptr %context, ptr %arg1, ptr %arg2) {{\n  ret void\n}}\n\
-             ; <ext4win::state::volume_runtime::VolumeRuntime>::publish_durable\n\
+             ; <ext4win::state::MountedVolumeAccess>::publish_durable\n\
              define internal void @publish() {{\n{publish_body}\n  ret void\n}}\n\
              declare i32 @IoSetCompletionRoutineEx(ptr, ptr, ptr, ptr, i8, i8, i8)\n\
              declare i32 @IofCallDriver(ptr, ptr)\n\
@@ -2269,6 +2280,12 @@ mod tests {
              publish_durable\n\
              IoSetCompletionRoutineEx\n\
              IofCallDriver\n\
+             ext4win_stream_create\n\
+             ext4win_stream_decode_owner\n\
+             ext4win_stream_section_objects\n\
+             ext4win_stream_get_sizes\n\
+             ext4win_stream_set_sizes\n\
+             ext4win_stream_destroy\n\
              EXT4WIN_PRODUCTION_ARTIFACT_ID\n"
         )
     }

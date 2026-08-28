@@ -958,8 +958,8 @@ impl ReceivedIrp {
         file_control_block: NonNull<FileControlBlock>,
     ) -> NTSTATUS {
         let file_control_block = unsafe {
-            // SAFETY: Lock-control decode obtained this pointer from the active FILE_OBJECT's
-            // FsContext, and the consumed IRP keeps that context alive through delegation.
+            // SAFETY: Lock-control decode validated the active FILE_OBJECT's native header and
+            // bound inode owner. The consumed IRP retains both through delegation.
             file_control_block.as_ref()
         };
         file_control_block.process_byte_range_lock(self.target)

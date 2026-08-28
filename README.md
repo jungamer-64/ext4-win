@@ -43,6 +43,16 @@ with every ext4 volume.
 The dependency direction keeps ext4 semantics in the portable core while the
 driver contains Windows-specific representation and lifecycle concerns.
 
+Node and volume opens use native advanced FCB headers; node opens share one
+stream per inode and retain handle-local state separately. Windows EOF and
+valid-data length are published together after the corresponding ext4 commit.
+Sparse holes count toward the logical section bound, not the physical
+allocation charge returned by file-information queries.
+
+These stream contracts do not establish Cache Manager, mapped-writeback,
+oplock, Fast I/O, or raw-volume-write completion. Those paths and their elevated
+live-driver gates remain required before claiming a complete Windows FSD.
+
 ## Build and evaluate
 
 The portable ext4 implementation and repository tooling can be checked on

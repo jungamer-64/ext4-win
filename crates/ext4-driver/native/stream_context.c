@@ -9,6 +9,8 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     ERESOURCE MainResource;
     ERESOURCE PagingIoResource;
     SECTION_OBJECT_POINTERS SectionObjects;
+    /* Physical storage charge is not the header's logical section bound. */
+    LONGLONG AllocationCharge;
     PVOID FileContextSupport;
     PVOID Owner;
     PVOID AePushLock;
@@ -49,6 +51,7 @@ ext4win_stream_create(
     _In_ LONGLONG allocation_size,
     _In_ LONGLONG file_size,
     _In_ LONGLONG valid_data_length,
+    _In_ LONGLONG allocation_charge,
     _Outptr_ PVOID *stream_header_out)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
@@ -59,7 +62,8 @@ ext4win_stream_create(
     }
     *stream_header_out = NULL;
     if ((kind == 0) || (allocation_size < 0) || (file_size < 0) ||
-        (valid_data_length < 0) || (valid_data_length > file_size) ||
+        (allocation_charge < 0) || (allocation_charge > allocation_size) ||
+        (valid_data_length != file_size) ||
         (file_size > allocation_size)) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -102,6 +106,7 @@ ext4win_stream_create(
     stream->Header.AllocationSize.QuadPart = allocation_size;
     stream->Header.FileSize.QuadPart = file_size;
     stream->Header.ValidDataLength.QuadPart = valid_data_length;
+    stream->AllocationCharge = allocation_charge;
     stream->Header.IsFastIoPossible = FastIoIsQuestionable;
     FsRtlSetupAdvancedHeaderEx2(
         &stream->Header,
@@ -178,6 +183,61 @@ ext4win_stream_section_objects(
         return STATUS_INVALID_PARAMETER;
     }
     *section_objects_out = &stream->SectionObjects;
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_get_sizes(
+    _In_ PVOID stream_header,
+    _Out_ LONGLONG *allocation_size_out,
+    _Out_ LONGLONG *file_size_out,
+    _Out_ LONGLONG *valid_data_length_out,
+    _Out_ LONGLONG *allocation_charge_out)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+
+    if ((stream == NULL) || (allocation_size_out == NULL) ||
+        (file_size_out == NULL) || (valid_data_length_out == NULL) ||
+        (allocation_charge_out == NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    *allocation_size_out = stream->Header.AllocationSize.QuadPart;
+    *file_size_out = stream->Header.FileSize.QuadPart;
+    *valid_data_length_out = stream->Header.ValidDataLength.QuadPart;
+    *allocation_charge_out = stream->AllocationCharge;
+    ExReleaseFastMutex(&stream->HeaderMutex);
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_set_sizes(
+    _In_ PVOID stream_header,
+    _In_ LONGLONG allocation_size,
+    _In_ LONGLONG file_size,
+    _In_ LONGLONG valid_data_length,
+    _In_ LONGLONG allocation_charge)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+
+    if ((stream == NULL) || (allocation_size < 0) || (file_size < 0) ||
+        (allocation_charge < 0) || (allocation_charge > allocation_size) ||
+        (valid_data_length != file_size) ||
+        (file_size > allocation_size)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    stream->Header.AllocationSize.QuadPart = allocation_size;
+    stream->Header.FileSize.QuadPart = file_size;
+    stream->Header.ValidDataLength.QuadPart = valid_data_length;
+    stream->AllocationCharge = allocation_charge;
+    ExReleaseFastMutex(&stream->HeaderMutex);
     return STATUS_SUCCESS;
 }
 

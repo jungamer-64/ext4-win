@@ -26,9 +26,9 @@ use crate::{
     state::{
         ChildCreationTarget, DataTransferMode, DirectoryChange, DirectoryChangeAction,
         FileControlBlock, HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeAccess,
-        NoIntermediateTransfer, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
-        OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion, UninitializedFileObject,
-        VolumeControlBlock, WriteCommitment, abandon_file_control_block,
+        NoIntermediateTransfer, NodeStreamSizes, OpenedHandle, OpenedLocation, OpenedNodeMode,
+        OpenedObject, OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion,
+        UninitializedFileObject, VolumeControlBlock, WriteCommitment, abandon_file_control_block,
     },
 };
 
@@ -403,6 +403,10 @@ fn open_or_create(
             let requirement = owner.parameters().target_requirement();
             let mut owner =
                 owner.authorize_target_directory(directory, target, requirement, mutation)?;
+            let stream_sizes = NodeStreamSizes::try_from_storage(
+                mutation.load_node_storage(NodeId::Directory(directory))?,
+                operations.volume_geometry().cluster_size(),
+            )?;
             open_target_directory(
                 &mut owner,
                 create_ea,
@@ -410,7 +414,7 @@ fn open_or_create(
                 directory,
                 location,
                 target,
-                operations,
+                stream_sizes,
             )
             .map(CreateCompletion::Handle)
             .map(CreateResolution::Complete)
@@ -940,8 +944,19 @@ fn open_existing_node(
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
             let pending = prepare_create_deletion(policy, node, &location, read)?;
+            let stream_sizes = NodeStreamSizes::try_from_storage(
+                read.load_node_storage(node)?,
+                operations.volume_geometry().cluster_size(),
+            )?;
             let fcb = request.with_file_object(|file_object| {
-                initialize_file_object(file_object, volume, node, node_mode, location, policy)
+                initialize_file_object(
+                    file_object,
+                    volume,
+                    stream_sizes,
+                    node_mode,
+                    location,
+                    policy,
+                )
             })?;
             if let Some(pending) = pending {
                 operations.set_file_delete_pending(fcb, pending);
@@ -1038,7 +1053,7 @@ fn open_target_directory(
     directory: DirectoryNodeId,
     location: OpenedLocation,
     target: TargetDirectoryLeaf,
-    _operations: &mut MountedVolumeAccess<'_>,
+    stream_sizes: NodeStreamSizes,
 ) -> DriverResult<CreateAction> {
     if !create_ea.is_empty() || request.parameters().disposition() != CreateDisposition::Open {
         return Err(DriverError::InvalidParameter);
@@ -1060,7 +1075,7 @@ fn open_target_directory(
         initialize_file_object(
             file_object,
             volume,
-            NodeId::Directory(directory),
+            stream_sizes,
             OpenedNodeMode::Direct,
             location,
             policy,
@@ -1148,10 +1163,15 @@ fn create_missing_node(
         )
     })?;
     create_ea.apply_to_pending_child(&mut creation, mutation)?;
+    let stream_sizes = NodeStreamSizes::try_from_storage(
+        mutation.staged_node_storage(node)?,
+        operations.volume_geometry().cluster_size(),
+    )?;
     let file_object =
         request.with_file_object(|file_object| Ok(file_object.kernel_file_object()))?;
     Ok(PendingCreatePublication {
         creation,
+        stream_sizes,
         file_object,
         desired_access: policy.granted_access(),
         share_access: policy.share_access(),
@@ -1501,18 +1521,19 @@ fn path_components(units: &[u16]) -> DriverResult<DriverVec<CreatePathComponent>
     Ok(components)
 }
 
-/// Stores FCB/CCB context pointers in the FILE_OBJECT.
+/// Attaches the inode's advanced header and this handle's CCB to the FILE_OBJECT.
 /// # Errors
 ///
 /// Returns an error when the shared FCB cannot be opened or the handle context cannot be attached.
 fn initialize_file_object(
     file_object: UninitializedFileObject<'_>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
-    node: NodeId,
+    stream_sizes: NodeStreamSizes,
     node_mode: OpenedNodeMode,
     location: OpenedLocation,
     policy: CreateHandlePolicy,
 ) -> DriverResult<NonNull<FileControlBlock>> {
+    let node = stream_sizes.node();
     let handle = memory::boxed_try_with(|| {
         OpenedHandle::new(
             node,
@@ -1526,7 +1547,7 @@ fn initialize_file_object(
     let fcb = open_shared_file_control_block(
         &file_object,
         vcb,
-        node,
+        stream_sizes,
         policy.granted_access(),
         policy.existing_operation_access(),
         policy.share_access(),
@@ -1543,14 +1564,14 @@ fn initialize_file_object(
 fn open_shared_file_control_block(
     file_object: &UninitializedFileObject<'_>,
     vcb: NonNull<crate::state::VolumeControlBlock>,
-    node: NodeId,
+    stream_sizes: NodeStreamSizes,
     desired_access: GrantedAccess,
     existing_operation_access: ExistingOperationAccess,
     share_access: ShareAccess,
 ) -> DriverResult<NonNull<FileControlBlock>> {
     VolumeControlBlock::open_existing_file_control_block(
         vcb,
-        node,
+        stream_sizes,
         file_object.kernel_file_object(),
         desired_access,
         existing_operation_access,
@@ -1558,24 +1579,13 @@ fn open_shared_file_control_block(
     )
 }
 
-/// Opens the staged child FCB and records the create share-access claim before commit.
-/// # Errors
-///
-/// Returns an error when FCB creation fails or Windows share-access checking rejects the new handle.
-fn open_pending_child_file_control_block(
-    creation: &PendingChildCreation,
-    file_object: KernelFileObject,
-    desired_access: GrantedAccess,
-    share_access: ShareAccess,
-) -> DriverResult<NonNull<FileControlBlock>> {
-    creation.open_file_control_block(file_object, desired_access, share_access)
-}
-
 /// Driver publication seed built during a restartable mutation resolve pass.
 #[derive(Debug)]
 pub(crate) struct PendingCreatePublication {
     /// Staged child identity and stable VCB/FCB-ledger capability.
     creation: PendingChildCreation,
+    /// Exact staged inode sizes after all create-time metadata and EA changes.
+    stream_sizes: NodeStreamSizes,
     /// Create-owned FILE_OBJECT identity retained by the top-level IRP.
     file_object: KernelFileObject,
     /// Share-accounting access mask.
@@ -1603,6 +1613,7 @@ impl PendingCreatePublication {
     pub(crate) fn prepare(self) -> DriverResult<PreparedCreatePublication> {
         let Self {
             creation,
+            stream_sizes,
             file_object,
             desired_access,
             share_access,
@@ -1611,11 +1622,11 @@ impl PendingCreatePublication {
             pending_deletion,
             notification,
         } = self;
-        let fcb = open_pending_child_file_control_block(
-            &creation,
+        let fcb = creation.open_file_control_block(
             file_object,
             desired_access,
             share_access,
+            stream_sizes,
         )?;
         Ok(PreparedCreatePublication {
             claim: PendingFileControlBlockClaim { fcb, file_object },
