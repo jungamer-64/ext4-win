@@ -130,6 +130,14 @@ impl IrpCompletion {
         }
     }
 
+    /// Replaces only the status after an irreversible operation has already committed bytes.
+    pub(crate) const fn committed_failure(self, error: DriverError) -> Self {
+        Self {
+            status: error.ntstatus(),
+            information: self.information,
+        }
+    }
+
     /// Preserves one failed status raised by the native requestor-memory capture boundary.
     const fn from_native_failure(status: NTSTATUS) -> Self {
         Self {
@@ -557,7 +565,10 @@ impl ActiveIrp<'_> {
     /// # Errors
     ///
     /// Returns an error when neither a system buffer nor a mapped MDL covers `length`.
-    fn data_input_address(&self, length: IrpBufferLength) -> Result<NonNull<u8>, DriverError> {
+    pub(crate) fn data_input_address(
+        &self,
+        length: IrpBufferLength,
+    ) -> Result<NonNull<u8>, DriverError> {
         self.data_buffer_address(length)
     }
 
@@ -569,7 +580,10 @@ impl ActiveIrp<'_> {
     /// # Errors
     ///
     /// Returns an error when neither a system buffer nor a mapped MDL covers `length`.
-    fn data_output_address(&self, length: IrpBufferLength) -> Result<NonNull<u8>, DriverError> {
+    pub(crate) fn data_output_address(
+        &self,
+        length: IrpBufferLength,
+    ) -> Result<NonNull<u8>, DriverError> {
         self.data_buffer_address(length)
     }
 
@@ -4657,6 +4671,24 @@ mod tests {
             STATUS_INVALID_PARAMETER
         );
         assert_eq!(irp.IoStatus.Information, 0);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when post-commit failure loses the committed byte count or exact status.
+    #[test]
+    fn committed_failure_preserves_information() {
+        let completion = IrpCompletion::from_usize(4096);
+        assert!(completion.is_ok());
+        if let Ok(completion) = completion {
+            let failed = completion.committed_failure(
+                crate::kernel::status::DriverError::CacheManagerFailure(
+                    wdk_sys::STATUS_IO_DEVICE_ERROR,
+                ),
+            );
+            assert_eq!(failed.status(), wdk_sys::STATUS_IO_DEVICE_ERROR);
+            assert_eq!(failed.information().as_ulong_ptr(), 4096);
+        }
     }
 
     /// # Panics

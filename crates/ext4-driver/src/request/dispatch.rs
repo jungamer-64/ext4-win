@@ -396,7 +396,7 @@ unsafe extern "C" fn shutdown(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS {
-    let received = match unsafe {
+    let mut received = match unsafe {
         // SAFETY: The callback caller retains the WDK-provided device and IRP for this transition.
         ReceivedIrp::decode(device, irp)
     } {
@@ -413,6 +413,37 @@ unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> N
         Ok(device_kind) => device_kind,
         Err(error) => return received.complete_result(Err(error)),
     };
+    if device_kind == DriverDeviceKind::MountedVolume {
+        let cache_boundary = match major {
+            DispatchMajor::Read => received.with_active(super::file_info::dispatch_cached_read),
+            DispatchMajor::Write => received.with_active(super::file_info::dispatch_cached_write),
+            DispatchMajor::FlushBuffers => received
+                .with_active(super::file_info::flush_cache_before_queued_flush)
+                .map(|()| None),
+            DispatchMajor::Cleanup | DispatchMajor::Close => received
+                .with_active(super::file_info::uninitialize_cache_before_cleanup)
+                .map(|()| None),
+            DispatchMajor::Create
+            | DispatchMajor::QueryInformation
+            | DispatchMajor::SetInformation
+            | DispatchMajor::QueryVolumeInformation
+            | DispatchMajor::SetVolumeInformation
+            | DispatchMajor::DirectoryControl
+            | DispatchMajor::FileSystemControl
+            | DispatchMajor::DeviceControl
+            | DispatchMajor::QueryEa
+            | DispatchMajor::SetEa
+            | DispatchMajor::LockControl
+            | DispatchMajor::Shutdown
+            | DispatchMajor::QuerySecurity
+            | DispatchMajor::SetSecurity => Ok(None),
+        };
+        match cache_boundary {
+            Ok(Some(completion)) => return received.complete(completion),
+            Ok(None) => {}
+            Err(error) => return received.complete_result(Err(error)),
+        }
+    }
     match dispatch_policy(device_kind, major) {
         DispatchPolicy::Immediate(request) => execute_immediate(received, request),
         DispatchPolicy::Queued => crate::state::queue_device_request(received, major),
