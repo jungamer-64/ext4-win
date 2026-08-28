@@ -339,6 +339,11 @@ impl KernelFileObject {
         self.file_object.as_ptr()
     }
 
+    /// Returns the non-null typed pointer for lifetime-bounded native wrappers.
+    pub(crate) const fn as_non_null(self) -> NonNull<FILE_OBJECT> {
+        self.file_object
+    }
+
     /// Publishes one already range-checked current-byte offset.
     #[expect(
         unsafe_code,
@@ -2114,17 +2119,21 @@ impl MountedVolumeAccess<'_> {
         durable_slot: EpochPublicationSlot,
         checkpoint_slot: EpochPublicationSlot,
         stream_sizes: PreparedStreamSizePublications,
-    ) -> PendingCheckpoint {
+    ) -> DurablePublicationOutcome {
         let checkpoint = self.volume.runtime.publish_durable(
             mutation,
             visibility,
             durable_slot,
             checkpoint_slot,
         );
-        self.volume
+        let stream_projection = self
+            .volume
             .file_control_blocks
             .publish_stream_sizes(stream_sizes);
-        checkpoint
+        DurablePublicationOutcome {
+            checkpoint,
+            stream_projection,
+        }
     }
 
     /// Publishes an overlay-free checkpoint and releases journal space.
@@ -2152,6 +2161,11 @@ impl MountedVolumeAccess<'_> {
     /// Records that committed reads can no longer be trusted.
     pub(crate) fn record_read_unreliable(&mut self) {
         self.volume.runtime.record_read_unreliable();
+    }
+
+    /// Records an exact post-commit Cc/MM publication failure.
+    pub(crate) fn record_publication_failure(&mut self, status: wdk_sys::NTSTATUS) {
+        self.volume.runtime.record_publication_failure(status);
     }
 
     /// Current committed volume identity.
@@ -2229,6 +2243,47 @@ struct FileControlBlockLedger {
     table: UnsafeCell<DriverVec<Box<FileControlBlock>>>,
     /// Stable-address executive resource for every table/share/reference transition.
     lock: FileControlBlockLedgerLock,
+}
+
+/// One explicit FCB retention authority used while durable metadata is published outside the
+/// ledger resource.
+struct StreamPublicationLease {
+    /// Ledger that granted and must release this lease.
+    owner: NonNull<FileControlBlockLedger>,
+    /// Exact FCB retained by the ledger-owned deferred lease count.
+    fcb: NonNull<FileControlBlock>,
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the explicit lease retains the exact FCB pointer while publishing outside the ledger"
+)]
+impl StreamPublicationLease {
+    /// Publishes one complete stream-size tuple through the native Cc/MM boundary.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager publication failure.
+    fn publish(&self, sizes: StreamSizes) -> DriverResult<()> {
+        let fcb = unsafe {
+            // SAFETY: This lease keeps the FCB table entry alive until its own Drop completes.
+            self.fcb.as_ref()
+        };
+        fcb.stream_context.set_sizes(sizes)
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the lease releases the exact ledger/Fcb identity retained at acquisition"
+)]
+impl Drop for StreamPublicationLease {
+    fn drop(&mut self) {
+        let owner = unsafe {
+            // SAFETY: An FCB cannot outlive its VCB-owned ledger; this lease retains an FCB entry.
+            self.owner.as_ref()
+        };
+        owner.release_stream_publication_lease(self.fcb);
+    }
 }
 
 #[expect(
@@ -2521,7 +2576,7 @@ impl FileControlBlockLedger {
                     ) {
                         Ok(()) => Ok(fcb),
                         Err(error) => {
-                            removed = release_file_object_lease_in_table(table, fcb);
+                            removed = release_file_object_lease_in_table(table, fcb, false);
                             Err(error)
                         }
                     },
@@ -2706,6 +2761,14 @@ impl FileControlBlockLedger {
         fcb: NonNull<FileControlBlock>,
         file_object: KernelFileObject,
     ) {
+        let native_resident = unsafe {
+            // SAFETY: The closing FILE_OBJECT retains its FCB until this release completes.
+            fcb.as_ref()
+        }
+        .has_native_stream_residency()
+        .unwrap_or_else(|_| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
         let removed = {
             let _guard = self.lock.acquire();
             let table = unsafe {
@@ -2719,7 +2782,7 @@ impl FileControlBlockLedger {
                 state.as_mut()
             }
             .remove_share_access(file_object);
-            release_file_object_lease_in_table(table, fcb)
+            release_file_object_lease_in_table(table, fcb, native_resident)
         };
         drop(removed);
     }
@@ -2730,43 +2793,110 @@ impl FileControlBlockLedger {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn close(&self, fcb: NonNull<FileControlBlock>) {
+        let native_resident = unsafe {
+            // SAFETY: The closing FILE_OBJECT retains its FCB until this release completes.
+            fcb.as_ref()
+        }
+        .has_native_stream_residency()
+        .unwrap_or_else(|_| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
         let removed = {
             let _guard = self.lock.acquire();
             let table = unsafe {
                 // SAFETY: The executive resource uniquely owns table and open-state mutation.
                 &mut *self.table.get()
             };
-            release_file_object_lease_in_table(table, fcb)
+            release_file_object_lease_in_table(table, fcb, native_resident)
         };
         drop(removed);
     }
 
-    /// Looks up current streams only at durable publication, including opens admitted while the
-    /// commit was in flight. The ledger guard pins each header for the non-suspending update;
-    /// no borrowed FCB pointer survives the guard or enters deferred work.
-    #[expect(
-        unsafe_code,
-        reason = "the ledger resource retains every selected FCB throughout native size publication"
-    )]
-    fn publish_stream_sizes(&self, updates: PreparedStreamSizePublications) {
-        let _guard = self.lock.acquire();
-        let table = unsafe {
-            // SAFETY: The ledger resource excludes removal until every header write completes.
-            &*self.table.get()
-        };
+    /// Looks up current streams at durable publication and retains each through a short explicit
+    /// lease while the ledger resource is released for the native Cc/MM call.
+    /// # Errors
+    ///
+    /// Returns the exact stream-lease or Cc/MM publication failure.
+    fn publish_stream_sizes(&self, updates: PreparedStreamSizePublications) -> DriverResult<()> {
         for update in updates.nodes.iter() {
-            if let Some(fcb) = find_file_control_block_in_table(table, update.node()) {
-                let fcb = unsafe {
-                    // SAFETY: This pointer was found in the still-locked owning ledger.
-                    fcb.as_ref()
-                };
-                if fcb.stream_context.set_sizes(update.sizes).is_err() {
-                    // Invalid native ownership after durability cannot be reported as an ordinary
-                    // failed mutation: the commit is already visible and cannot be rolled back.
-                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-                }
+            if let Some(lease) = self.acquire_stream_publication_lease(update.node())? {
+                lease.publish(update.sizes)?;
             }
         }
+        Ok(())
+    }
+
+    /// Acquires an explicit stream lease before releasing the ledger resource for a Cc/MM call.
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the finite deferred-lease count is exhausted.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes the table and deferred-lease transition"
+    )]
+    fn acquire_stream_publication_lease(
+        &self,
+        node: NodeId,
+    ) -> DriverResult<Option<StreamPublicationLease>> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table lookup and lifetime mutation.
+            &*self.table.get()
+        };
+        let Some(fcb) = find_file_control_block_in_table(table, node) else {
+            return Ok(None);
+        };
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: The resource remains held and the FCB was found in this owning table.
+            state.as_mut()
+        }
+        .acquire_deferred_lease()?;
+        Ok(Some(StreamPublicationLease {
+            owner: NonNull::from(self),
+            fcb,
+        }))
+    }
+
+    /// Releases one publication lease and destroys the FCB only after native residency drains.
+    #[expect(
+        unsafe_code,
+        reason = "the live lease retains its FCB while the ledger serializes terminal release"
+    )]
+    fn release_stream_publication_lease(&self, fcb: NonNull<FileControlBlock>) {
+        let native_resident = unsafe {
+            // SAFETY: The outstanding publication lease retains this FCB for the observation.
+            fcb.as_ref()
+        }
+        .has_native_stream_residency()
+        .unwrap_or_else(|_| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
+        let removed = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource uniquely owns table and lifetime mutation.
+                &mut *self.table.get()
+            };
+            let Some(index) = table
+                .iter()
+                .position(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+            else {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+            };
+            let mut state = ledger_file_control_block_open_state(table, fcb);
+            let reclaimable = unsafe {
+                // SAFETY: The ledger resource and exact lease grant this lifetime transition.
+                state.as_mut()
+            }
+            .release_deferred_lease(native_resident);
+            if reclaimable {
+                table.swap_remove(index)
+            } else {
+                None
+            }
+        };
+        drop(removed);
     }
 
     /// Counts namespace handles whose cleanup share claims remain active.
@@ -3677,6 +3807,7 @@ fn record_file_control_block_share(
 fn release_file_object_lease_in_table(
     table: &mut DriverVec<Box<FileControlBlock>>,
     fcb: NonNull<FileControlBlock>,
+    native_resident: bool,
 ) -> Option<Box<FileControlBlock>> {
     let Some(index) = table
         .iter()
@@ -3689,7 +3820,7 @@ fn release_file_object_lease_in_table(
         // SAFETY: The caller holds the ledger resource and table ownership was validated above.
         state.as_mut()
     }
-    .release_file_object_reference();
+    .release_file_object_reference(native_resident);
     if !reclaimable {
         return None;
     }
@@ -4387,6 +4518,84 @@ impl FileControlBlock {
         self.stream_context.sizes()
     }
 
+    /// Ensures that one cached FILE_OBJECT is attached to this stream's shared cache identity.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager failure status.
+    pub(crate) fn initialize_cache_map(
+        &self,
+        file_object: ActiveFileObject<'_>,
+    ) -> DriverResult<()> {
+        self.stream_context
+            .initialize_cache_map(file_object.address().as_non_null())
+    }
+
+    /// Reads one range through Cache Manager into a system-addressable IRP mapping.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager failure status or an invalid buffer/range error.
+    pub(crate) fn cached_read(
+        &self,
+        file_object: ActiveFileObject<'_>,
+        offset: i64,
+        length: usize,
+        output: Option<NonNull<u8>>,
+    ) -> DriverResult<usize> {
+        self.stream_context
+            .cached_read(file_object.address().as_non_null(), offset, length, output)
+    }
+
+    /// Accepts one within-EOF range into Cache Manager.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager failure status or an invalid buffer/range error.
+    pub(crate) fn cached_write(
+        &self,
+        file_object: ActiveFileObject<'_>,
+        offset: i64,
+        input: Option<NonNull<u8>>,
+        length: usize,
+    ) -> DriverResult<()> {
+        self.stream_context
+            .cached_write(file_object.address().as_non_null(), offset, input, length)
+    }
+
+    /// Flushes this stream's dirty cache pages.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager flush status.
+    pub(crate) fn flush_cache(&self) -> DriverResult<()> {
+        self.stream_context.flush_cache()
+    }
+
+    /// Establishes coherency before a direct I/O or size-changing mutation.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager flush/purge status.
+    pub(crate) fn coherency_flush_and_purge(&self) -> DriverResult<()> {
+        self.stream_context.coherency_flush_and_purge()
+    }
+
+    /// Releases this FILE_OBJECT's private cache map while preserving shared section residency.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager exception status.
+    pub(crate) fn uninitialize_cache_map(
+        &self,
+        file_object: ActiveFileObject<'_>,
+    ) -> DriverResult<()> {
+        self.stream_context
+            .uninitialize_cache_map(file_object.address().as_non_null())
+    }
+
+    /// Reports whether a cache map or mapped section still retains this stream.
+    /// # Errors
+    ///
+    /// Returns an invariant error if native stream metadata is malformed.
+    fn has_native_stream_residency(&self) -> DriverResult<bool> {
+        self.stream_context.has_native_residency()
+    }
+
     /// Returns the mounted VCB pointer that owns this open node.
     pub(crate) const fn volume(&self) -> NonNull<VolumeControlBlock> {
         self.volume
@@ -4495,6 +4704,22 @@ pub(crate) struct PreparedStreamSizePublications {
     nodes: DriverVec<NodeStreamSizes>,
 }
 
+/// Result of durable ext4 visibility publication plus the independently fallible Windows stream
+/// projection.
+pub(crate) struct DurablePublicationOutcome {
+    /// Checkpoint work remains mandatory because the ext4 commit is already visible.
+    checkpoint: PendingCheckpoint,
+    /// Exact Cc/MM projection result; failure cannot roll back the durable mutation.
+    stream_projection: DriverResult<()>,
+}
+
+impl DurablePublicationOutcome {
+    /// Separates mandatory checkpoint ownership from the post-commit projection result.
+    pub(crate) fn into_parts(self) -> (PendingCheckpoint, DriverResult<()>) {
+        (self.checkpoint, self.stream_projection)
+    }
+}
+
 impl PreparedStreamSizePublications {
     /// Prepares all conversions and storage before the first lower write.
     /// # Errors
@@ -4537,7 +4762,7 @@ impl FileControlBlockOpenState {
             },
             lifetime: StreamLifetimeState::OpenHandles {
                 handles: NonZeroU32::MIN,
-                resident_leases: 0,
+                deferred_leases: 0,
             },
             deletion: FileDeletionState::Live,
         }
@@ -4699,9 +4924,26 @@ impl FileControlBlockOpenState {
         self.lifetime.with_additional_handle()
     }
 
-    // FILE_OBJECT close may no longer decide reclamation from the handle count alone. Cache-map,
-    // section, paging, oplock-continuation, and worker leases are migrated to explicit residency
-    // transitions before this release boundary is rebuilt.
+    /// Consumes one FILE_OBJECT lease while preserving a native or deferred stream resident.
+    fn release_file_object_reference(&mut self, native_resident: bool) -> bool {
+        self.lifetime = self.lifetime.without_handle(native_resident);
+        matches!(self.lifetime, StreamLifetimeState::Reclaimable)
+    }
+
+    /// Acquires one explicit lease for work that must outlive the ledger guard.
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the finite lease count is exhausted.
+    fn acquire_deferred_lease(&mut self) -> DriverResult<()> {
+        self.lifetime = self.lifetime.with_additional_deferred_lease()?;
+        Ok(())
+    }
+
+    /// Releases one explicit lease using a fresh observation of native cache/section residency.
+    fn release_deferred_lease(&mut self, native_resident: bool) -> bool {
+        self.lifetime = self.lifetime.without_deferred_lease(native_resident);
+        matches!(self.lifetime, StreamLifetimeState::Reclaimable)
+    }
 }
 
 /// Lifetime of one inode stream independent of any particular handle.
@@ -4711,13 +4953,13 @@ enum StreamLifetimeState {
     OpenHandles {
         /// Exact number of FILE_OBJECT close obligations.
         handles: NonZeroU32,
-        /// Cache maps, sections, oplock continuations, or worker operations retaining the stream.
-        resident_leases: u32,
+        /// Oplock continuations, paging operations, or workers retaining the stream.
+        deferred_leases: u32,
     },
     /// No FILE_OBJECT remains, but native or deferred work still retains the stream.
     CachedOrMappedResident {
-        /// Exact number of non-handle retention obligations.
-        resident_leases: NonZeroU32,
+        /// Explicit worker/oplock/paging leases independent of native section residency.
+        deferred_leases: u32,
     },
     /// No handle or resident lease remains and the ledger may destroy the stream.
     Reclaimable,
@@ -4732,18 +4974,18 @@ impl StreamLifetimeState {
         match self {
             Self::OpenHandles {
                 handles,
-                resident_leases,
+                deferred_leases,
             } => Ok(Self::OpenHandles {
                 handles: handles
                     .get()
                     .checked_add(1)
                     .and_then(NonZeroU32::new)
                     .ok_or(DriverError::TooManyOpenReferences)?,
-                resident_leases,
+                deferred_leases,
             }),
-            Self::CachedOrMappedResident { resident_leases } => Ok(Self::OpenHandles {
+            Self::CachedOrMappedResident { deferred_leases } => Ok(Self::OpenHandles {
                 handles: NonZeroU32::MIN,
-                resident_leases: resident_leases.get(),
+                deferred_leases,
             }),
             Self::Reclaimable => {
                 KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
@@ -4751,6 +4993,89 @@ impl StreamLifetimeState {
         }
     }
 
+    /// Computes the state after one FILE_OBJECT close from a fresh native residency observation.
+    fn without_handle(self, native_resident: bool) -> Self {
+        match self {
+            Self::OpenHandles {
+                handles,
+                deferred_leases,
+            } if handles.get() > 1 => Self::OpenHandles {
+                handles: NonZeroU32::new(handles.get() - 1).unwrap_or_else(|| {
+                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+                }),
+                deferred_leases,
+            },
+            Self::OpenHandles {
+                handles,
+                deferred_leases,
+            } if handles == NonZeroU32::MIN => {
+                if native_resident || deferred_leases != 0 {
+                    Self::CachedOrMappedResident { deferred_leases }
+                } else {
+                    Self::Reclaimable
+                }
+            }
+            Self::OpenHandles { .. } | Self::CachedOrMappedResident { .. } | Self::Reclaimable => {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+            }
+        }
+    }
+
+    /// Adds one non-handle lease without changing handle or native residency authority.
+    /// # Errors
+    ///
+    /// Returns insufficient resources when the finite lease count is exhausted.
+    fn with_additional_deferred_lease(self) -> DriverResult<Self> {
+        match self {
+            Self::OpenHandles {
+                handles,
+                deferred_leases,
+            } => Ok(Self::OpenHandles {
+                handles,
+                deferred_leases: deferred_leases
+                    .checked_add(1)
+                    .ok_or(DriverError::InsufficientResources)?,
+            }),
+            Self::CachedOrMappedResident { deferred_leases } => Ok(Self::CachedOrMappedResident {
+                deferred_leases: deferred_leases
+                    .checked_add(1)
+                    .ok_or(DriverError::InsufficientResources)?,
+            }),
+            Self::Reclaimable => {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+            }
+        }
+    }
+
+    /// Removes one non-handle lease and selects reclamation only after native residency drains.
+    fn without_deferred_lease(self, native_resident: bool) -> Self {
+        match self {
+            Self::OpenHandles {
+                handles,
+                deferred_leases,
+            } if deferred_leases != 0 => Self::OpenHandles {
+                handles,
+                deferred_leases: deferred_leases.checked_sub(1).unwrap_or_else(|| {
+                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+                }),
+            },
+            Self::CachedOrMappedResident { deferred_leases } if deferred_leases > 1 => {
+                Self::CachedOrMappedResident {
+                    deferred_leases: deferred_leases.checked_sub(1).unwrap_or_else(|| {
+                        KernelWideInconsistency::file_control_block_ownership_corruption()
+                            .bugcheck()
+                    }),
+                }
+            }
+            Self::CachedOrMappedResident { deferred_leases: 1 } if native_resident => {
+                Self::CachedOrMappedResident { deferred_leases: 0 }
+            }
+            Self::CachedOrMappedResident { deferred_leases: 1 } => Self::Reclaimable,
+            Self::OpenHandles { .. } | Self::CachedOrMappedResident { .. } | Self::Reclaimable => {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+            }
+        }
+    }
 }
 
 /// Opaque FsRtl byte-range lock state owned by one FCB.
@@ -7478,7 +7803,7 @@ mod tests {
         let Ok(buffer_alignment) = buffer_alignment else {
             return;
         };
-        let mode = DataTransferMode::NoIntermediate(NoIntermediateTransfer {
+        let mode = DataTransferMode::Direct(NoIntermediateTransfer {
             sector_size: TransferSectorSize::WINDOWS_REPORTED,
             buffer_alignment,
         });
@@ -7568,10 +7893,8 @@ mod tests {
     fn typed_opened_directory_exposes_cursor_without_option() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let Some(mut handle) = directory_handle(
-            OpenedNodeMode::Direct,
-            DataTransferMode::IntermediateAllowed,
-        ) else {
+        let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+        else {
             return;
         };
         let mut file = file_object_with_contexts(
@@ -7600,10 +7923,8 @@ mod tests {
     fn opened_directory_reuses_a_stable_notification_name_descriptor() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let Some(mut handle) = directory_handle(
-            OpenedNodeMode::Direct,
-            DataTransferMode::IntermediateAllowed,
-        ) else {
+        let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+        else {
             return;
         };
         let mut file = file_object_with_contexts(
@@ -7702,10 +8023,8 @@ mod tests {
     fn typed_opened_decoders_reject_wrong_node_kind() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let Some(mut handle) = directory_handle(
-            OpenedNodeMode::Direct,
-            DataTransferMode::IntermediateAllowed,
-        ) else {
+        let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+        else {
             return;
         };
         let mut file = file_object_with_contexts(
@@ -7728,10 +8047,9 @@ mod tests {
     fn reparse_point_directory_handle_rejects_directory_operations() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let Some(mut handle) = directory_handle(
-            OpenedNodeMode::ReparsePoint,
-            DataTransferMode::IntermediateAllowed,
-        ) else {
+        let Some(mut handle) =
+            directory_handle(OpenedNodeMode::ReparsePoint, DataTransferMode::Cached)
+        else {
             return;
         };
         let mut file = file_object_with_contexts(
@@ -7752,10 +8070,8 @@ mod tests {
     /// Panics when cleanup retries repeat cleanup-owned side effects.
     #[test]
     fn handle_lifecycle_makes_completed_cleanup_idempotent() {
-        let Some(handle) = directory_handle(
-            OpenedNodeMode::Direct,
-            DataTransferMode::IntermediateAllowed,
-        ) else {
+        let Some(handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+        else {
             return;
         };
         assert_eq!(
@@ -7786,10 +8102,8 @@ mod tests {
     /// Panics when a filter-cancelled open cannot select its one atomic release path.
     #[test]
     fn active_cancelled_open_selects_combined_share_and_reference_release() {
-        let Some(handle) = directory_handle(
-            OpenedNodeMode::Direct,
-            DataTransferMode::IntermediateAllowed,
-        ) else {
+        let Some(handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+        else {
             return;
         };
         handle.begin_close_admission(FileObjectCloseKind::CancelledOpen, false);
@@ -7831,10 +8145,9 @@ mod tests {
         };
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let Some(mut handle) = directory_handle(
-            OpenedNodeMode::Direct,
-            DataTransferMode::NoIntermediate(transfer),
-        ) else {
+        let Some(mut handle) =
+            directory_handle(OpenedNodeMode::Direct, DataTransferMode::Direct(transfer))
+        else {
             return;
         };
         let mut file = file_object_with_contexts(
@@ -7845,7 +8158,7 @@ mod tests {
             let opened = OpenedObject::decode(file_object)?;
             assert_eq!(
                 opened.data_transfer_mode(),
-                DataTransferMode::NoIntermediate(transfer)
+                DataTransferMode::Direct(transfer)
             );
             Ok(())
         });
@@ -7859,10 +8172,8 @@ mod tests {
     fn synchronous_opened_object_reads_sets_and_advances_position() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let Some(mut handle) = directory_handle(
-            OpenedNodeMode::Direct,
-            DataTransferMode::IntermediateAllowed,
-        ) else {
+        let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+        else {
             return;
         };
         let mut file = file_object_with_contexts(
@@ -7925,7 +8236,7 @@ mod tests {
                     OpenedNodeMode::Direct,
                     OpenedLocation::Root,
                     retained_handle_deletion(),
-                    DataTransferMode::IntermediateAllowed,
+                    DataTransferMode::Cached,
                 ),
                 kind: super::OpenedHandleKind::File { write_access },
             };
@@ -7944,10 +8255,8 @@ mod tests {
     fn asynchronous_and_paging_io_do_not_advance_position() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let Some(mut handle) = directory_handle(
-            OpenedNodeMode::Direct,
-            DataTransferMode::IntermediateAllowed,
-        ) else {
+        let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+        else {
             return;
         };
         let mut file = file_object_with_contexts(
@@ -8004,10 +8313,8 @@ mod tests {
     fn file_position_and_native_lock_range_reject_signed_overflow() {
         let volume = NonNull::<VolumeControlBlock>::dangling();
         let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-        let Some(mut handle) = directory_handle(
-            OpenedNodeMode::Direct,
-            DataTransferMode::IntermediateAllowed,
-        ) else {
+        let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+        else {
             return;
         };
         let mut file = file_object_with_contexts(
@@ -8080,7 +8387,7 @@ mod tests {
         let mut state = FileControlBlockOpenState::new();
         state.lifetime = StreamLifetimeState::OpenHandles {
             handles: NonZeroU32::MAX,
-            resident_leases: 0,
+            deferred_leases: 0,
         };
 
         assert_eq!(
@@ -8091,9 +8398,42 @@ mod tests {
             state.lifetime,
             StreamLifetimeState::OpenHandles {
                 handles: NonZeroU32::MAX,
-                resident_leases: 0,
+                deferred_leases: 0,
             }
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when the last handle can reclaim a still-cached stream or a drained stream leaks.
+    #[test]
+    fn stream_lifetime_separates_handles_native_residency_and_deferred_leases() {
+        let open = StreamLifetimeState::OpenHandles {
+            handles: NonZeroU32::MIN,
+            deferred_leases: 0,
+        };
+        let resident = open.without_handle(true);
+        assert_eq!(
+            resident,
+            StreamLifetimeState::CachedOrMappedResident { deferred_leases: 0 }
+        );
+        let reopened = resident.with_additional_handle();
+        assert_eq!(reopened, Ok(open));
+        assert_eq!(open.without_handle(false), StreamLifetimeState::Reclaimable);
+
+        let leased = open.with_additional_deferred_lease();
+        assert!(leased.is_ok());
+        if let Ok(leased) = leased {
+            let without_handle = leased.without_handle(false);
+            assert_eq!(
+                without_handle,
+                StreamLifetimeState::CachedOrMappedResident { deferred_leases: 1 }
+            );
+            assert_eq!(
+                without_handle.without_deferred_lease(false),
+                StreamLifetimeState::Reclaimable
+            );
+        }
     }
 
     /// # Errors
@@ -8144,7 +8484,7 @@ mod tests {
             .get_mut()
             .try_push_owned(reopened)
             .map_err(|failure| failure.into_parts().0)?;
-        ledger.publish_stream_sizes(publication);
+        ledger.publish_stream_sizes(publication)?;
         let after = ledger
             .table
             .get_mut()

@@ -2991,15 +2991,31 @@ impl InfalliblePublication for MutationRequestOperation {
                     stream_sizes,
                     effect,
                 } = publication;
-                let pending = access.publish_durable(
+                let publication = access.publish_durable(
                     durable,
                     visibility,
                     durable_slot,
                     checkpoint_slot,
                     stream_sizes,
                 );
+                let (pending, stream_projection) = publication.into_parts();
                 let completion = effect.publish(access);
-                let _complete = Self::complete_success(owned, completion);
+                match stream_projection {
+                    Ok(()) => {
+                        let _complete = Self::complete_success(owned, completion);
+                    }
+                    Err(error) => {
+                        access.record_publication_failure(error.ntstatus());
+                        match completion {
+                            TopLevelCompletion::Normal(completion) => {
+                                let _status = owned.complete(completion.committed_failure(error));
+                            }
+                            TopLevelCompletion::Create(_completion) => {
+                                let _status = owned.complete_create_result(Err(error));
+                            }
+                        }
+                    }
+                }
                 self.state = MutationOperationState::AwaitingCheckpoint(pending);
             }
             MutationOperationState::PublishingCheckpoint {

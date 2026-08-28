@@ -8,6 +8,7 @@ use ext4_core::{
     EpochSequence, FscryptKeyIdentifier, FscryptKeyPresence, MountedProfile,
     MutationCoordinatorState, PublishedMutation, VisibilityLease,
 };
+use wdk_sys::NTSTATUS;
 
 use crate::kernel::cng::CngProvider;
 use crate::kernel::fatal::KernelWideInconsistency;
@@ -24,6 +25,11 @@ pub(crate) enum VolumeFailureState {
     DegradedReadOnly,
     /// Journal replay or durability is unknown and this runtime must be torn down.
     RecoveryRequired,
+    /// Ext4 commit is durable but its Windows stream projection could not be published.
+    CommittedButUnpublished {
+        /// Exact Cc/MM status returned to the committing IRP and later operations.
+        status: NTSTATUS,
+    },
     /// Lower reads are no longer trustworthy.
     Failed,
 }
@@ -39,6 +45,9 @@ impl VolumeFailureState {
             Self::DegradedReadOnly | Self::RecoveryRequired | Self::Failed => {
                 Err(DriverError::VolumeDismounted)
             }
+            Self::CommittedButUnpublished { status } => {
+                Err(DriverError::CacheManagerFailure(status))
+            }
         }
     }
 
@@ -50,6 +59,9 @@ impl VolumeFailureState {
         match self {
             Self::Operational | Self::DegradedReadOnly => Ok(()),
             Self::RecoveryRequired | Self::Failed => Err(DriverError::VolumeDismounted),
+            Self::CommittedButUnpublished { status } => {
+                Err(DriverError::CacheManagerFailure(status))
+            }
         }
     }
 
@@ -57,7 +69,10 @@ impl VolumeFailureState {
     const fn durable_abort(self) -> Self {
         match self {
             Self::Operational => Self::DegradedReadOnly,
-            Self::DegradedReadOnly | Self::RecoveryRequired | Self::Failed => self,
+            Self::DegradedReadOnly
+            | Self::RecoveryRequired
+            | Self::CommittedButUnpublished { .. }
+            | Self::Failed => self,
         }
     }
 
@@ -65,13 +80,24 @@ impl VolumeFailureState {
     const fn durability_unknown(self) -> Self {
         match self {
             Self::Operational | Self::DegradedReadOnly => Self::RecoveryRequired,
-            Self::RecoveryRequired | Self::Failed => self,
+            Self::RecoveryRequired | Self::CommittedButUnpublished { .. } | Self::Failed => self,
         }
     }
 
     /// Moves to terminal failure once reads cannot be trusted.
     const fn read_unreliable(self) -> Self {
         Self::Failed
+    }
+
+    /// Records the exact post-commit publication failure as a non-retryable terminal state.
+    const fn publication_failed(self, status: NTSTATUS) -> Self {
+        match self {
+            Self::Failed => Self::Failed,
+            Self::CommittedButUnpublished { status } => Self::CommittedButUnpublished { status },
+            Self::Operational | Self::DegradedReadOnly | Self::RecoveryRequired => {
+                Self::CommittedButUnpublished { status }
+            }
+        }
     }
 }
 
@@ -430,6 +456,11 @@ impl VolumeRuntime {
         self.failure = self.failure.read_unreliable();
     }
 
+    /// Records an exact post-commit Cc/MM publication failure.
+    pub(crate) fn record_publication_failure(&mut self, status: NTSTATUS) {
+        self.failure = self.failure.publication_failed(status);
+    }
+
     /// Current volume identity from the selected immutable epoch.
     pub(crate) fn identity(&self) -> ext4_core::VolumeIdentity {
         self.current_epoch().identity()
@@ -509,6 +540,7 @@ mod tests {
     /// Panics when failure-state transitions weaken an already stronger failure.
     #[test]
     fn volume_failure_transitions_are_monotonic() {
+        let publication_status = wdk_sys::STATUS_IO_DEVICE_ERROR;
         assert_eq!(
             VolumeFailureState::Operational.durable_abort(),
             VolumeFailureState::DegradedReadOnly
@@ -525,6 +557,14 @@ mod tests {
             VolumeFailureState::Operational.read_unreliable(),
             VolumeFailureState::Failed
         );
+        let publication = VolumeFailureState::Operational.publication_failed(publication_status);
+        assert_eq!(
+            publication.authorize_mutation(),
+            Err(crate::kernel::status::DriverError::CacheManagerFailure(
+                publication_status
+            ))
+        );
+        assert_eq!(publication.durable_abort(), publication);
     }
 
     /// Keeps serialized commit, visibility, and checkpoint grants in the unit-test production

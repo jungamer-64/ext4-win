@@ -35,6 +35,8 @@ pub(crate) enum DriverError {
     SecurityCheckFailed(NTSTATUS),
     /// Privileges used by a successful check could not be recorded in the create access state.
     PrivilegeRecordingFailed(NTSTATUS),
+    /// Cache Manager or Memory Manager rejected an operation with this exact status.
+    CacheManagerFailure(NTSTATUS),
     /// The target inode has entered the terminal delete-pending namespace state.
     DeletePending,
     /// CLEANUP closed ordinary admission for this FILE_OBJECT.
@@ -119,7 +121,9 @@ impl DriverError {
             Self::InternalInvariantViolation => STATUS_INTERNAL_ERROR,
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,
-            Self::SecurityCheckFailed(status) | Self::PrivilegeRecordingFailed(status) => status,
+            Self::SecurityCheckFailed(status)
+            | Self::PrivilegeRecordingFailed(status)
+            | Self::CacheManagerFailure(status) => status,
             Self::DeletePending => ntstatus(0xC000_0056),
             Self::FileClosed => ntstatus(0xC000_0128),
             Self::DeviceBusy => ntstatus(0xC000_009E),
@@ -319,6 +323,15 @@ mod tests {
             DriverError::PrivilegeRecordingFailed(resources).ntstatus(),
             resources
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a Cache Manager exception loses its machine-readable NTSTATUS identity.
+    #[test]
+    fn cache_manager_failures_preserve_native_status() {
+        let fault = wdk_sys::STATUS_IO_DEVICE_ERROR;
+        assert_eq!(DriverError::CacheManagerFailure(fault).ntstatus(), fault);
     }
 
     /// # Panics

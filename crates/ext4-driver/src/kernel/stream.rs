@@ -315,6 +315,186 @@ impl StreamContext {
         }
     }
 
+    /// Ensures that this FILE_OBJECT has a private cache map bound to the shared stream sections.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager exception status when initialization fails.
+    pub(crate) fn initialize_cache_map(
+        &self,
+        _file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    ) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The active FILE_OBJECT retains this stream and its shared sections.
+                ext4win_stream_cache_initialize(self.header.as_ptr(), _file_object.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        Ok(())
+    }
+
+    /// Copies cached bytes into one system-addressable IRP buffer.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager status or an input representation failure.
+    pub(crate) fn cached_read(
+        &self,
+        _file_object: NonNull<wdk_sys::FILE_OBJECT>,
+        _offset: i64,
+        length: usize,
+        _output: Option<NonNull<u8>>,
+    ) -> DriverResult<usize> {
+        if length == 0 {
+            return Ok(0);
+        }
+        let _length = u32::try_from(length).map_err(|_| DriverError::InvalidBufferSize)?;
+        let _output = _output.ok_or(DriverError::InternalInvariantViolation)?;
+        #[cfg(not(test))]
+        {
+            let mut information = 0_usize;
+            let status = unsafe {
+                // SAFETY: The active IRP owns a writable system mapping of at least `length` bytes.
+                ext4win_stream_cache_read(
+                    self.header.as_ptr(),
+                    _file_object.as_ptr(),
+                    _offset,
+                    _length,
+                    _output.as_ptr().cast(),
+                    core::ptr::addr_of_mut!(information),
+                )
+            };
+            cache_status(status)?;
+            Ok(information)
+        }
+        #[cfg(test)]
+        Err(DriverError::NotSupported)
+    }
+
+    /// Accepts one within-EOF write into the FILE_OBJECT cache map.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager status or an input representation failure.
+    pub(crate) fn cached_write(
+        &self,
+        _file_object: NonNull<wdk_sys::FILE_OBJECT>,
+        _offset: i64,
+        _input: Option<NonNull<u8>>,
+        length: usize,
+    ) -> DriverResult<()> {
+        if length == 0 {
+            return Ok(());
+        }
+        let _length = u32::try_from(length).map_err(|_| DriverError::InvalidBufferSize)?;
+        let _input = _input.ok_or(DriverError::InternalInvariantViolation)?;
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The active IRP owns a readable system mapping of at least `length` bytes.
+                ext4win_stream_cache_write(
+                    self.header.as_ptr(),
+                    _file_object.as_ptr(),
+                    _offset,
+                    _length,
+                    _input.as_ptr().cast(),
+                )
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        Err(DriverError::NotSupported)
+    }
+
+    /// Flushes all dirty cached pages for this stream and observes the Cache Manager result.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager flush status.
+    pub(crate) fn flush_cache(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: `self` owns the live shared section-object set for this call.
+                ext4win_stream_cache_flush(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
+    /// Flushes and purges cached data before a coherent direct mutation or size change.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager coherency status.
+    pub(crate) fn coherency_flush_and_purge(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: `self` owns the live shared section-object set for this call.
+                ext4win_stream_cache_coherency_flush_and_purge(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
+    /// Releases this FILE_OBJECT's private cache map without destroying shared stream sections.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager exception status.
+    pub(crate) fn uninitialize_cache_map(
+        &self,
+        _file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    ) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: Cleanup/close retains the FILE_OBJECT and stream for the complete call.
+                ext4win_stream_cache_uninitialize(self.header.as_ptr(), _file_object.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        Ok(())
+    }
+
+    /// Reports whether Cache Manager or Memory Manager still retains the shared stream sections.
+    /// # Errors
+    ///
+    /// Returns an invariant error if the native stream header is malformed.
+    pub(crate) fn has_native_residency(&self) -> DriverResult<bool> {
+        #[cfg(not(test))]
+        {
+            let mut resident = 0_u8;
+            let status = unsafe {
+                // SAFETY: `self` owns the live native header and the output is one BOOLEAN.
+                ext4win_stream_has_native_residency(
+                    self.header.as_ptr(),
+                    core::ptr::addr_of_mut!(resident),
+                )
+            };
+            native_status(status)?;
+            Ok(resident != 0)
+        }
+        #[cfg(test)]
+        {
+            let sections = self.section_objects()?;
+            let sections = unsafe {
+                // SAFETY: The test stream owns this stable SECTION_OBJECT_POINTERS allocation.
+                sections.as_ref()
+            };
+            Ok(!sections.DataSectionObject.is_null()
+                || !sections.SharedCacheMap.is_null()
+                || !sections.ImageSectionObject.is_null())
+        }
+    }
+
     /// Decodes the section-object set embedded beside one validated advanced header.
     /// # Errors
     ///
@@ -439,6 +619,19 @@ fn native_status(status: NTSTATUS) -> DriverResult<()> {
 }
 
 #[cfg(not(test))]
+/// Preserves one Cache Manager or Memory Manager status for the IRP completion boundary.
+/// # Errors
+///
+/// Returns the exact non-success native status without reclassifying it.
+fn cache_status(status: NTSTATUS) -> DriverResult<()> {
+    if status == STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(DriverError::CacheManagerFailure(status))
+    }
+}
+
+#[cfg(not(test))]
 #[expect(
     unsafe_code,
     reason = "these declarations expose the audited native advanced-FCB-header ownership boundary"
@@ -484,6 +677,42 @@ unsafe extern "system" {
         file_size: i64,
         valid_data_length: i64,
         allocation_charge: i64,
+    ) -> NTSTATUS;
+
+    fn ext4win_stream_cache_initialize(
+        stream_header: wdk_sys::PVOID,
+        file_object: *mut wdk_sys::FILE_OBJECT,
+    ) -> NTSTATUS;
+
+    fn ext4win_stream_cache_read(
+        stream_header: wdk_sys::PVOID,
+        file_object: *mut wdk_sys::FILE_OBJECT,
+        offset: i64,
+        length: wdk_sys::ULONG,
+        buffer: wdk_sys::PVOID,
+        information_out: *mut usize,
+    ) -> NTSTATUS;
+
+    fn ext4win_stream_cache_write(
+        stream_header: wdk_sys::PVOID,
+        file_object: *mut wdk_sys::FILE_OBJECT,
+        offset: i64,
+        length: wdk_sys::ULONG,
+        buffer: wdk_sys::PVOID,
+    ) -> NTSTATUS;
+
+    fn ext4win_stream_cache_flush(stream_header: wdk_sys::PVOID) -> NTSTATUS;
+
+    fn ext4win_stream_cache_coherency_flush_and_purge(stream_header: wdk_sys::PVOID) -> NTSTATUS;
+
+    fn ext4win_stream_cache_uninitialize(
+        stream_header: wdk_sys::PVOID,
+        file_object: *mut wdk_sys::FILE_OBJECT,
+    ) -> NTSTATUS;
+
+    fn ext4win_stream_has_native_residency(
+        stream_header: wdk_sys::PVOID,
+        resident_out: *mut wdk_sys::BOOLEAN,
     ) -> NTSTATUS;
 
     fn ext4win_stream_destroy(stream_header: wdk_sys::PVOID) -> NTSTATUS;

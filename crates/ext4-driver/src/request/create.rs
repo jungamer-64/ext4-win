@@ -575,11 +575,9 @@ impl CreateHandlePolicy {
                 .including_for_operation(parameters.existing_operation_required_access()),
             share_access: parameters.share_access(),
             data_transfer_mode: match parameters.transfer_buffering() {
-                CreateTransferBuffering::IntermediateAllowed => {
-                    DataTransferMode::IntermediateAllowed
-                }
+                CreateTransferBuffering::IntermediateAllowed => DataTransferMode::Cached,
                 CreateTransferBuffering::NoIntermediate => {
-                    DataTransferMode::NoIntermediate(NoIntermediateTransfer::from_device(device)?)
+                    DataTransferMode::Direct(NoIntermediateTransfer::from_device(device)?)
                 }
             },
             regular_file_write_access: granted_access.regular_file_write_access(),

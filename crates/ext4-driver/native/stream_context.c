@@ -42,6 +42,85 @@ ext4win_stream_from_header(_In_ PVOID stream_header)
     return stream;
 }
 
+static BOOLEAN
+NTAPI
+ext4win_acquire_for_lazy_write(
+    _In_ PVOID context,
+    _In_ BOOLEAN wait)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(context);
+
+    if (stream == NULL) {
+        return FALSE;
+    }
+    return ExAcquireResourceExclusiveLite(&stream->PagingIoResource, wait);
+}
+
+static VOID
+NTAPI
+ext4win_release_from_lazy_write(_In_ PVOID context)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(context);
+
+    if (stream != NULL) {
+        ExReleaseResourceLite(&stream->PagingIoResource);
+    }
+}
+
+static BOOLEAN
+NTAPI
+ext4win_acquire_for_read_ahead(
+    _In_ PVOID context,
+    _In_ BOOLEAN wait)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(context);
+
+    if (stream == NULL) {
+        return FALSE;
+    }
+    return ExAcquireResourceSharedLite(&stream->MainResource, wait);
+}
+
+static VOID
+NTAPI
+ext4win_release_from_read_ahead(_In_ PVOID context)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(context);
+
+    if (stream != NULL) {
+        ExReleaseResourceLite(&stream->MainResource);
+    }
+}
+
+static CACHE_MANAGER_CALLBACKS ext4win_cache_callbacks = {
+    ext4win_acquire_for_lazy_write,
+    ext4win_release_from_lazy_write,
+    ext4win_acquire_for_read_ahead,
+    ext4win_release_from_read_ahead
+};
+
+static BOOLEAN
+ext4win_stream_matches_file_object(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream,
+    _In_ PFILE_OBJECT file_object)
+{
+    return (stream != NULL) && (file_object != NULL) &&
+        (file_object->FsContext == (PVOID)&stream->Header) &&
+        (file_object->SectionObjectPointer == &stream->SectionObjects);
+}
+
+static VOID
+ext4win_capture_cache_sizes(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream,
+    _Out_ PCC_FILE_SIZES sizes)
+{
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    sizes->AllocationSize = stream->Header.AllocationSize;
+    sizes->FileSize = stream->Header.FileSize;
+    sizes->ValidDataLength = stream->Header.ValidDataLength;
+    ExReleaseFastMutex(&stream->HeaderMutex);
+}
+
 _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
@@ -225,6 +304,9 @@ ext4win_stream_set_sizes(
     _In_ LONGLONG allocation_charge)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    CC_FILE_SIZES sizes;
+    PFILE_OBJECT file_object;
+    NTSTATUS status;
 
     if ((stream == NULL) || (allocation_size < 0) || (file_size < 0) ||
         (allocation_charge < 0) || (allocation_charge > allocation_size) ||
@@ -232,12 +314,283 @@ ext4win_stream_set_sizes(
         (file_size > allocation_size)) {
         return STATUS_INVALID_PARAMETER;
     }
-    ExAcquireFastMutex(&stream->HeaderMutex);
-    stream->Header.AllocationSize.QuadPart = allocation_size;
-    stream->Header.FileSize.QuadPart = file_size;
-    stream->Header.ValidDataLength.QuadPart = valid_data_length;
-    stream->AllocationCharge = allocation_charge;
-    ExReleaseFastMutex(&stream->HeaderMutex);
+    status = STATUS_SUCCESS;
+    file_object = NULL;
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    __try {
+        ExAcquireFastMutex(&stream->HeaderMutex);
+        stream->Header.AllocationSize.QuadPart = allocation_size;
+        stream->Header.FileSize.QuadPart = file_size;
+        stream->Header.ValidDataLength.QuadPart = valid_data_length;
+        stream->AllocationCharge = allocation_charge;
+        sizes.AllocationSize = stream->Header.AllocationSize;
+        sizes.FileSize = stream->Header.FileSize;
+        sizes.ValidDataLength = stream->Header.ValidDataLength;
+        ExReleaseFastMutex(&stream->HeaderMutex);
+
+        if (stream->SectionObjects.SharedCacheMap != NULL) {
+            file_object = CcGetFileObjectFromSectionPtrsRef(&stream->SectionObjects);
+            if (file_object == NULL) {
+                status = STATUS_INTERNAL_ERROR;
+            } else {
+                status = CcSetFileSizesEx(file_object, &sizes);
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    if (file_object != NULL) {
+        ObDereferenceObject(file_object);
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_cache_initialize(
+    _In_ PVOID stream_header,
+    _Inout_ PFILE_OBJECT file_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    CC_FILE_SIZES sizes;
+    NTSTATUS status;
+
+    if (!ext4win_stream_matches_file_object(stream, file_object)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = STATUS_SUCCESS;
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    __try {
+        if (file_object->PrivateCacheMap == NULL) {
+            ext4win_capture_cache_sizes(stream, &sizes);
+            __try {
+                CcInitializeCacheMap(
+                    file_object,
+                    &sizes,
+                    FALSE,
+                    &ext4win_cache_callbacks,
+                    &stream->Header);
+                file_object->Flags |= FO_CACHE_SUPPORTED;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                status = GetExceptionCode();
+            }
+        }
+    }
+    __finally {
+        ExReleaseResourceLite(&stream->MainResource);
+    }
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_cache_read(
+    _In_ PVOID stream_header,
+    _Inout_ PFILE_OBJECT file_object,
+    _In_ LONGLONG offset,
+    _In_ ULONG length,
+    _Out_writes_bytes_(length) PVOID buffer,
+    _Out_ ULONG_PTR *information_out)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    IO_STATUS_BLOCK io_status;
+    LARGE_INTEGER file_offset;
+    NTSTATUS status;
+
+    if (!ext4win_stream_matches_file_object(stream, file_object) ||
+        (offset < 0) || ((length != 0) && (buffer == NULL)) ||
+        (information_out == NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    *information_out = 0;
+    status = ext4win_stream_cache_initialize(stream_header, file_object);
+    if (!NT_SUCCESS(status) || (length == 0)) {
+        return status;
+    }
+
+    file_offset.QuadPart = offset;
+    io_status.Status = STATUS_SUCCESS;
+    io_status.Information = 0;
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    __try {
+        if (!CcCopyRead(file_object, &file_offset, length, TRUE, buffer, &io_status)) {
+            status = STATUS_CANT_WAIT;
+        } else {
+            status = io_status.Status;
+            *information_out = io_status.Information;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_cache_write(
+    _In_ PVOID stream_header,
+    _Inout_ PFILE_OBJECT file_object,
+    _In_ LONGLONG offset,
+    _In_ ULONG length,
+    _In_reads_bytes_(length) PVOID buffer)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    LARGE_INTEGER file_offset;
+    NTSTATUS status;
+
+    if (!ext4win_stream_matches_file_object(stream, file_object) ||
+        (offset < 0) || ((length != 0) && (buffer == NULL))) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    status = ext4win_stream_cache_initialize(stream_header, file_object);
+    if (!NT_SUCCESS(status) || (length == 0)) {
+        return status;
+    }
+
+    file_offset.QuadPart = offset;
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    __try {
+        status = CcCopyWrite(file_object, &file_offset, length, TRUE, buffer)
+            ? STATUS_SUCCESS
+            : STATUS_CANT_WAIT;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_cache_flush(_In_ PVOID stream_header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    IO_STATUS_BLOCK io_status;
+    NTSTATUS status;
+
+    if (stream == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (stream->SectionObjects.SharedCacheMap == NULL) {
+        return STATUS_SUCCESS;
+    }
+
+    io_status.Status = STATUS_SUCCESS;
+    io_status.Information = 0;
+    status = STATUS_SUCCESS;
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    __try {
+        CcFlushCache(&stream->SectionObjects, NULL, 0, &io_status);
+        status = io_status.Status;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_cache_coherency_flush_and_purge(_In_ PVOID stream_header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    IO_STATUS_BLOCK io_status;
+    NTSTATUS status;
+
+    if (stream == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if ((stream->SectionObjects.DataSectionObject == NULL) &&
+        (stream->SectionObjects.SharedCacheMap == NULL)) {
+        return STATUS_SUCCESS;
+    }
+
+    io_status.Status = STATUS_SUCCESS;
+    io_status.Information = 0;
+    status = STATUS_SUCCESS;
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    __try {
+        CcCoherencyFlushAndPurgeCache(
+            &stream->SectionObjects,
+            NULL,
+            0,
+            &io_status,
+            0);
+        status = io_status.Status;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_cache_uninitialize(
+    _In_ PVOID stream_header,
+    _Inout_ PFILE_OBJECT file_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    NTSTATUS status;
+
+    if (!ext4win_stream_matches_file_object(stream, file_object)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (file_object->PrivateCacheMap == NULL) {
+        file_object->Flags &= ~FO_CACHE_SUPPORTED;
+        return STATUS_SUCCESS;
+    }
+
+    status = STATUS_SUCCESS;
+    __try {
+        (VOID)CcUninitializeCacheMap(file_object, NULL, NULL);
+        file_object->Flags &= ~FO_CACHE_SUPPORTED;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_has_native_residency(
+    _In_ PVOID stream_header,
+    _Out_ PBOOLEAN resident_out)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+
+    if ((stream == NULL) || (resident_out == NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    *resident_out = (stream->SectionObjects.DataSectionObject != NULL) ||
+        (stream->SectionObjects.SharedCacheMap != NULL) ||
+        (stream->SectionObjects.ImageSectionObject != NULL);
+    ExReleaseResourceLite(&stream->MainResource);
     return STATUS_SUCCESS;
 }
 
