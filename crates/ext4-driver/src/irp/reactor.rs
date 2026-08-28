@@ -323,6 +323,43 @@ pub(crate) trait CompletionOperation: fmt::Debug + Send + 'static {
     fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget);
 }
 
+/// Events owned by the Windows executor, including failures with native status semantics.
+///
+/// A volume failure only rejects an ungranted commit or a durability wait. It never revokes
+/// an issued commit/visibility/checkpoint lease or drops an in-flight lower operation.
+#[derive(Debug)]
+pub(crate) enum CompletionEvent {
+    /// A filesystem event with its original consuming grant or lower completion.
+    Core(OperationEvent),
+    /// The volume can no longer satisfy a pre-effect commit or durability wait.
+    VolumeFailed(DriverError),
+}
+
+impl CompletionEvent {
+    /// Extracts an event for an operation that never waits on volume durability.
+    /// A native wait failure routed to such an operation is reactor state corruption.
+    pub(crate) fn into_core(self) -> OperationEvent {
+        match self {
+            Self::Core(event) => event,
+            Self::VolumeFailed(_) => {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            }
+        }
+    }
+
+    /// Turns one authoritative readiness observation into a grant, rejection, or continued wait.
+    /// Failure is checked even while earlier commit/checkpoint work still occupies its lane.
+    fn durability_wait(identity: u64, readiness: DriverResult<bool>) -> Option<Self> {
+        match readiness {
+            Ok(false) => None,
+            Ok(true) => Some(Self::Core(OperationEvent::BarrierReleased(
+                ext4_core::BarrierPermit::released(identity),
+            ))),
+            Err(error) => Some(Self::VolumeFailed(error)),
+        }
+    }
+}
+
 /// Operation payload valid only for the file-system control device.
 pub(crate) trait ControlDeviceOperation: fmt::Debug + Send + 'static {
     /// Consumes one control-device event without any mounted-volume authority.
@@ -1227,9 +1264,13 @@ impl CompletionReactor {
             slot.payload = SlotPayload::Operation {
                 operation,
                 event: match start {
-                    AdmissionStart::Cancelled => Some(OperationEvent::CancelRequested),
+                    AdmissionStart::Cancelled => {
+                        Some(CompletionEvent::Core(OperationEvent::CancelRequested))
+                    }
                     AdmissionStart::HandleTurn => None,
-                    AdmissionStart::Admitted => Some(OperationEvent::Admitted),
+                    AdmissionStart::Admitted => {
+                        Some(CompletionEvent::Core(OperationEvent::Admitted))
+                    }
                 },
             };
         });
@@ -1291,7 +1332,7 @@ impl CompletionReactor {
             index,
             SlotPayload::Operation {
                 operation: suspended,
-                event: Some(OperationEvent::CancelRequested),
+                event: Some(CompletionEvent::Core(OperationEvent::CancelRequested)),
             },
         );
         None
@@ -1319,10 +1360,10 @@ impl CompletionReactor {
         &self,
         index: usize,
         operation: SuspendedOperation,
-        event: OperationEvent,
+        event: CompletionEvent,
     ) {
         let event = if self.cancellation_is_pending(index) {
-            OperationEvent::CancelRequested
+            CompletionEvent::Core(OperationEvent::CancelRequested)
         } else {
             event
         };
@@ -1403,7 +1444,7 @@ impl CompletionReactor {
                     let SlotPayload::Operation { event, .. } = &mut slot.payload else {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     };
-                    *event = Some(OperationEvent::CancelRequested);
+                    *event = Some(CompletionEvent::Core(OperationEvent::CancelRequested));
                 });
             }
             CancelDisposition::CancelLower => {
@@ -1794,9 +1835,9 @@ impl CompletionReactor {
                         index,
                         SlotPayload::Operation {
                             operation: suspended,
-                            event: Some(OperationEvent::IntentGranted(
+                            event: Some(CompletionEvent::Core(OperationEvent::IntentGranted(
                                 ext4_core::MutationLease::granted(ticket),
-                            )),
+                            ))),
                         },
                     ),
                     IntentDisposition::Queued => self.install_payload(
@@ -1863,7 +1904,9 @@ impl CompletionReactor {
                 else {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 };
-                if !self.with_scheduler(|scheduler| scheduler.request_wait(identity, condition)) {
+                if !self
+                    .with_scheduler(|scheduler| scheduler.request_closing_wait(identity, condition))
+                {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }
                 self.install_payload(
@@ -1883,7 +1926,11 @@ impl CompletionReactor {
                     self.retire_cancel_slot(index);
                     self.release_handle_lane(index);
                 }
-                self.set_ready_operation_event(index, operation, OperationEvent::Admitted);
+                self.set_ready_operation_event(
+                    index,
+                    operation,
+                    CompletionEvent::Core(OperationEvent::Admitted),
+                );
                 self.grant_available_intents();
                 self.grant_available_commit();
                 self.grant_all_available_waits();
@@ -1978,7 +2025,11 @@ impl CompletionReactor {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             }
             let operation = self.take_operation_payload(index);
-            self.set_ready_operation_event(index, operation, OperationEvent::Admitted);
+            self.set_ready_operation_event(
+                index,
+                operation,
+                CompletionEvent::Core(OperationEvent::Admitted),
+            );
         }
     }
 
@@ -2127,7 +2178,7 @@ impl CompletionReactor {
             self.set_ready_operation_event(
                 index,
                 scheduled.into_operation(),
-                OperationEvent::CancelRequested,
+                CompletionEvent::Core(OperationEvent::CancelRequested),
             );
             return;
         }
@@ -2197,7 +2248,9 @@ impl CompletionReactor {
         self.set_ready_operation_event(
             index,
             suspended,
-            OperationEvent::StorageCompleted(failed_unsubmitted_request(request, error)),
+            CompletionEvent::Core(OperationEvent::StorageCompleted(
+                failed_unsubmitted_request(request, error),
+            )),
         );
     }
 
@@ -2212,7 +2265,9 @@ impl CompletionReactor {
         self.set_ready_operation_event(
             index,
             suspended,
-            OperationEvent::DeviceLengthCompleted(Err(driver_error_to_core(error))),
+            CompletionEvent::Core(OperationEvent::DeviceLengthCompleted(Err(
+                driver_error_to_core(error),
+            ))),
         );
     }
 
@@ -2301,7 +2356,7 @@ impl CompletionReactor {
                     self.set_ready_operation_event(
                         index,
                         scheduled.into_operation(),
-                        OperationEvent::StorageCompleted(completion),
+                        CompletionEvent::Core(OperationEvent::StorageCompleted(completion)),
                     );
                 }
                 Ok(StorageCommandStep::Failed(failed)) => match failed.into_retry() {
@@ -2315,9 +2370,8 @@ impl CompletionReactor {
                         self.set_ready_operation_event(
                             index,
                             suspended,
-                            OperationEvent::StorageCompleted(failed_unsubmitted_request(
-                                request,
-                                ext4_core::Error::DeviceIo,
+                            CompletionEvent::Core(OperationEvent::StorageCompleted(
+                                failed_unsubmitted_request(request, ext4_core::Error::DeviceIo),
                             )),
                         );
                     }
@@ -2408,7 +2462,7 @@ impl CompletionReactor {
                 Ok((suspended, length)) => self.set_ready_operation_event(
                     index,
                     suspended,
-                    OperationEvent::DeviceLengthCompleted(Ok(length)),
+                    CompletionEvent::Core(OperationEvent::DeviceLengthCompleted(Ok(length))),
                 ),
                 Err((suspended, error)) => {
                     self.set_ready_length_failure(index, suspended, error);
@@ -2488,7 +2542,7 @@ impl CompletionReactor {
             self.set_ready_operation_event(
                 index,
                 scheduled.into_operation(),
-                OperationEvent::CancelRequested,
+                CompletionEvent::Core(OperationEvent::CancelRequested),
             );
             return;
         }
@@ -2551,7 +2605,7 @@ impl CompletionReactor {
                 self.set_ready_operation_event(
                     index,
                     scheduled.into_operation(),
-                    OperationEvent::CancelRequested,
+                    CompletionEvent::Core(OperationEvent::CancelRequested),
                 );
                 continue;
             }
@@ -2602,7 +2656,9 @@ impl CompletionReactor {
             self.set_ready_operation_event(
                 identity.index(),
                 operation,
-                OperationEvent::IntentGranted(ext4_core::MutationLease::granted(ticket)),
+                CompletionEvent::Core(OperationEvent::IntentGranted(
+                    ext4_core::MutationLease::granted(ticket),
+                )),
             );
         }
     }
@@ -2622,15 +2678,24 @@ impl CompletionReactor {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             };
             *was_attempted = true;
-            let grant = self.with_mounted_access(|access| access.try_grant_commit(ticket));
-            let Some(grant) = grant else {
-                continue;
+            let grant = self.with_mounted_access(|access| access.acquire_commit(ticket));
+            let event = match grant {
+                Ok(Some(grant)) => {
+                    if !self.with_scheduler(|scheduler| scheduler.grant_commit(identity, ticket)) {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    CompletionEvent::Core(OperationEvent::CommitGranted(grant))
+                }
+                Ok(None) => continue,
+                Err(error) => {
+                    if !self.with_scheduler(|scheduler| scheduler.reject_commit(identity, ticket)) {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    CompletionEvent::VolumeFailed(error)
+                }
             };
-            if !self.with_scheduler(|scheduler| scheduler.grant_commit(identity, ticket)) {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
             let operation = self.take_operation_payload(index);
-            self.set_ready_operation_event(index, operation, OperationEvent::CommitGranted(grant));
+            self.set_ready_operation_event(index, operation, event);
         }
     }
 
@@ -2645,25 +2710,28 @@ impl CompletionReactor {
             WaitCondition::Visibility { ticket } => self.with_mounted_access(|access| {
                 access
                     .try_grant_visibility(ticket)
-                    .map(OperationEvent::VisibilityGranted)
+                    .map(|grant| CompletionEvent::Core(OperationEvent::VisibilityGranted(grant)))
             }),
             WaitCondition::Checkpoint { epoch } => self.with_mounted_access(|access| {
                 access
                     .try_grant_checkpoint(epoch)
-                    .map(OperationEvent::CheckpointGranted)
+                    .map(|grant| CompletionEvent::Core(OperationEvent::CheckpointGranted(grant)))
             }),
-            WaitCondition::VolumeDurability => (!self
-                .with_scheduler(|scheduler| scheduler.has_commit_work()))
-            .then(|| OperationEvent::BarrierReleased(ext4_core::BarrierPermit::released(0))),
+            WaitCondition::VolumeDurability => {
+                let has_commit_work = self.with_scheduler(|scheduler| scheduler.has_commit_work());
+                let readiness = self.with_mounted_access(|access| {
+                    access.authorize_durability()?;
+                    Ok(!has_commit_work)
+                });
+                CompletionEvent::durability_wait(0, readiness)
+            }
             WaitCondition::JournalClean => {
-                if self.with_scheduler(|scheduler| scheduler.has_commit_work()) {
-                    None
-                } else {
-                    self.with_mounted_access(|access| access.journal_is_clean())
-                        .then(|| {
-                            OperationEvent::BarrierReleased(ext4_core::BarrierPermit::released(1))
-                        })
-                }
+                let has_commit_work = self.with_scheduler(|scheduler| scheduler.has_commit_work());
+                let readiness = self.with_mounted_access(|access| {
+                    access.authorize_durability()?;
+                    Ok(!has_commit_work && access.journal_is_clean())
+                });
+                CompletionEvent::durability_wait(1, readiness)
             }
             WaitCondition::Barrier { identity } => {
                 if !self.with_scheduler(|scheduler| {
@@ -2671,9 +2739,9 @@ impl CompletionReactor {
                 }) {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }
-                Some(OperationEvent::BarrierReleased(
+                Some(CompletionEvent::Core(OperationEvent::BarrierReleased(
                     ext4_core::BarrierPermit::released(identity),
-                ))
+                )))
             }
         };
         let Some(event) = event else {
@@ -3202,20 +3270,42 @@ mod tests {
     use crate::state::{KernelDevice, KernelFileObject};
 
     use super::{
-        AdmittedOperation, CompletionOperation, CompletionReactor, HandleOperationLane,
-        InfalliblePublication, MAX_OPERATIONS, OperationAdmission, OperationTransition,
-        PendingIrpSelection, PublicationAuthority, SlotPayload, SuspendedOperation,
-        driver_error_to_core, initialize_list_head, insert_tail_list, list_is_empty,
-        remove_head_list, slot_bit,
+        AdmittedOperation, CompletionEvent, CompletionOperation, CompletionReactor,
+        HandleOperationLane, InfalliblePublication, MAX_OPERATIONS, OperationAdmission,
+        OperationTransition, PendingIrpSelection, PublicationAuthority, SlotPayload,
+        SuspendedOperation, driver_error_to_core, initialize_list_head, insert_tail_list,
+        list_is_empty, remove_head_list, slot_bit,
     };
 
     #[derive(Debug)]
     struct TestOperation;
 
+    /// # Panics
+    ///
+    /// Panics when a failed volume wait produces a success permit or loses the native status.
+    #[test]
+    fn durability_wait_distinguishes_pending_grant_and_volume_failure() {
+        assert!(CompletionEvent::durability_wait(1, Ok(false)).is_none());
+        let released = CompletionEvent::durability_wait(1, Ok(true));
+        assert!(matches!(
+            &released,
+            Some(CompletionEvent::Core(OperationEvent::BarrierReleased(_)))
+        ));
+        let Some(CompletionEvent::Core(OperationEvent::BarrierReleased(permit))) = released else {
+            return;
+        };
+        assert_eq!(permit.into_identity(), 1);
+        let error = DriverError::CacheManagerFailure(wdk_sys::STATUS_IO_DEVICE_ERROR);
+        assert!(matches!(
+            CompletionEvent::durability_wait(1, Err(error)),
+            Some(CompletionEvent::VolumeFailed(failure)) if failure == error
+        ));
+    }
+
     impl CompletionOperation for TestOperation {
         fn advance(
             self: Box<Self>,
-            _event: OperationEvent,
+            _event: CompletionEvent,
             _target: &mut super::ReactorTarget,
         ) -> OperationTransition {
             OperationTransition::Complete
@@ -3244,7 +3334,7 @@ mod tests {
     fn advance_concrete_event(
         mut operation: SuspendedOperation,
         failure: StorageFailureClass,
-        event: OperationEvent,
+        event: CompletionEvent,
     ) -> OperationTransition {
         let mut target = super::ReactorTarget::ControlDevice;
         operation.record_storage_failure(failure, &mut target);
@@ -3324,7 +3414,7 @@ mod tests {
         let _advance: fn(
             SuspendedOperation,
             StorageFailureClass,
-            OperationEvent,
+            CompletionEvent,
         ) -> OperationTransition = advance_concrete_event;
         let _publish: fn(
             alloc::boxed::Box<dyn InfalliblePublication>,
@@ -3369,7 +3459,7 @@ mod tests {
         assert_eq!(admission, cleanup);
         let mut target = super::ReactorTarget::ControlDevice;
         assert!(matches!(
-            operation.advance(OperationEvent::Admitted, &mut target),
+            operation.advance(CompletionEvent::Core(OperationEvent::Admitted), &mut target),
             OperationTransition::Complete
         ));
     }
@@ -3436,7 +3526,10 @@ mod tests {
         else {
             return;
         };
-        assert!(matches!(event, OperationEvent::CancelRequested));
+        assert!(matches!(
+            event,
+            CompletionEvent::Core(OperationEvent::CancelRequested)
+        ));
         drop(operation);
         reactor.retire_cancel_slot(index);
         assert!(reactor.with_scheduler(|scheduler| scheduler.release_intent(identity)));

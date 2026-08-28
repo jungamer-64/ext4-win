@@ -1023,9 +1023,16 @@ impl MountedVolumeAccess<'_> {
     }
 
     /// Grants the serialized commit lane when its runtime preconditions are satisfied.
+    ///
+    /// # Errors
+    ///
+    /// Returns the volume failure without confusing terminal rejection with a pending grant.
     #[cfg(not(test))]
-    pub(crate) fn try_grant_commit(&mut self, ticket: u64) -> Option<CommitLease> {
-        self.volume.runtime.try_grant_commit(ticket)
+    pub(crate) fn acquire_commit(
+        &mut self,
+        ticket: u64,
+    ) -> DriverResult<Option<CommitLease>> {
+        self.volume.runtime.acquire_commit(ticket)
     }
 
     /// Returns an unused pre-write commit grant to the runtime.
