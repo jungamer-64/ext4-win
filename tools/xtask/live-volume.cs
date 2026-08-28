@@ -37,10 +37,10 @@ namespace Ext4Win {
             return name.ToString();
         }
 
-        // Match the independently queried VHDX disk number and exact partition
-        // range, not a drive letter or enumeration order. No access requests a
+        // Match the independently recorded GPT partition ID as well as the disk
+        // extent: a removed disk's number may be reused during discovery. No access requests a
         // filesystem mount; inaccessible unrelated volumes are not candidates.
-        public static string Find(uint disk, long offset, long length) {
+        public static string Find(uint disk, long offset, long length, Guid partitionId) {
             var name = new StringBuilder(1024);
             IntPtr search = FindFirstVolume(name, (uint)name.Capacity);
             if (search == new IntPtr(-1)) {
@@ -64,6 +64,15 @@ namespace Ext4Win {
                             BitConverter.ToUInt32(extents, 8) != disk ||
                             BitConverter.ToInt64(extents, 16) != offset ||
                             BitConverter.ToInt64(extents, 24) != length) { continue; }
+                        // IOCTL_DISK_GET_PARTITION_INFO_EX. The GPT arm starts at
+                        // byte 32; its partition ID follows the 16-byte type GUID.
+                        var partition = new byte[144];
+                        if (!DeviceIoControl(handle, 0x00070048, IntPtr.Zero, 0,
+                            partition, (uint)partition.Length, out returned, IntPtr.Zero) ||
+                            returned != 144 || BitConverter.ToUInt32(partition, 0) != 1) { continue; }
+                        var identity = new byte[16];
+                        Buffer.BlockCopy(partition, 48, identity, 0, identity.Length);
+                        if (new Guid(identity) != partitionId) { continue; }
                         if (match != null && match != volume) {
                             throw new InvalidOperationException("multiple volume names match the session partition");
                         }
