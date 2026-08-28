@@ -8,19 +8,6 @@ use crate::kernel::storage::ExternalJournalLease;
 use crate::memory::DriverVec;
 use crate::state::KernelDevice;
 
-/// `GUID_DEVINTERFACE_VOLUME` from `ntddvol.h`.
-#[cfg(not(test))]
-const GUID_DEVINTERFACE_VOLUME: wdk_sys::GUID = wdk_sys::GUID {
-    Data1: 0x53f5_630d,
-    Data2: 0xb6bf,
-    Data3: 0x11d0,
-    Data4: [0x94, 0xf2, 0x00, 0xa0, 0xc9, 0x1e, 0xfb, 0x8b],
-};
-
-/// Maximum UTF-16 code units representable by one `UNICODE_STRING` byte length.
-#[cfg(not(test))]
-const MAX_UNICODE_UNITS: usize = 32_767;
-
 /// One shared-open volume candidate retained while core probes are scheduled.
 #[derive(Debug)]
 struct SharedExternalJournalCandidate {
@@ -351,104 +338,6 @@ impl ExclusiveExternalJournal {
     pub(crate) fn into_parts(self) -> (KernelDevice, ExternalJournalLease) {
         (self.device, self.lease)
     }
-}
-
-#[cfg(not(test))]
-#[derive(Debug)]
-/// System-pool MULTI_SZ returned by `IoGetDeviceInterfaces`.
-struct InterfaceList(NonNull<u16>);
-
-#[cfg(not(test))]
-impl InterfaceList {
-    /// Takes ownership of one WDK-allocated interface list.
-    /// # Errors
-    ///
-    /// Returns discovery failure when WDK reports success with a null allocation.
-    fn from_raw(list: *mut u16) -> DriverResult<Self> {
-        NonNull::new(list)
-            .map(Self)
-            .ok_or(DriverError::ExternalJournalDiscoveryFailed)
-    }
-
-    /// Returns the first UTF-16 unit of the owned MULTI_SZ allocation.
-    const fn as_ptr(&self) -> *const u16 {
-        self.0.as_ptr()
-    }
-}
-
-#[cfg(not(test))]
-impl Drop for InterfaceList {
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    fn drop(&mut self) {
-        unsafe {
-            // SAFETY: `IoGetDeviceInterfaces` allocated this buffer from system pool and transferred
-            // its sole release responsibility to the caller.
-            crate::kernel::ffi::ExFreePool(self.0.as_ptr().cast());
-        }
-    }
-}
-
-#[cfg(not(test))]
-/// Finds the terminating NUL of one MULTI_SZ component.
-///
-/// # Safety
-///
-/// `start` must point to a readable component in the live buffer returned by
-/// `IoGetDeviceInterfaces`, terminated within `MAX_UNICODE_UNITS` code units.
-///
-/// # Errors
-///
-/// Returns discovery failure when no representable terminator is found.
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-unsafe fn terminated_length(start: *const u16) -> DriverResult<usize> {
-    for length in 0..=MAX_UNICODE_UNITS {
-        let unit_ptr = unsafe {
-            // SAFETY: The caller guarantees a live MULTI_SZ component and the scan remains within
-            // the documented representable bound.
-            start.add(length)
-        };
-        let unit = unsafe {
-            // SAFETY: `unit_ptr` is the current readable unit guaranteed by the caller.
-            unit_ptr.read()
-        };
-        if unit == 0 {
-            return Ok(length);
-        }
-    }
-    Err(DriverError::ExternalJournalDiscoveryFailed)
-}
-
-#[cfg(not(test))]
-/// Borrows one NUL-terminated owned path as a WDK `UNICODE_STRING`.
-/// # Errors
-///
-/// Returns discovery failure for a missing terminator and invalid-buffer-size for an
-/// unrepresentable UTF-16 byte length.
-fn unicode_string(path: &[u16]) -> DriverResult<wdk_sys::UNICODE_STRING> {
-    let content = path
-        .strip_suffix(&[0])
-        .ok_or(DriverError::ExternalJournalDiscoveryFailed)?;
-    let length = u16::try_from(
-        content
-            .len()
-            .checked_mul(size_of::<u16>())
-            .ok_or(DriverError::InvalidBufferSize)?,
-    )
-    .map_err(|_| DriverError::InvalidBufferSize)?;
-    let maximum_length = length
-        .checked_add(u16::try_from(size_of::<u16>()).map_err(|_| DriverError::InvalidBufferSize)?)
-        .ok_or(DriverError::InvalidBufferSize)?;
-    Ok(wdk_sys::UNICODE_STRING {
-        Length: length,
-        MaximumLength: maximum_length,
-        Buffer: path.as_ptr().cast_mut(),
-    })
 }
 
 #[cfg(not(test))]
