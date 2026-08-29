@@ -512,6 +512,25 @@ impl StreamContext {
         }
     }
 
+    /// Flushes cached data and rejects any live data or image section before volume lock.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager exception or mapped-section conflict status.
+    pub(crate) fn drain_cache_for_volume_lock(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: `self` owns the live shared section-object set for this call.
+                ext4win_stream_cache_drain_for_volume_lock(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
     /// Releases this FILE_OBJECT's private cache map without destroying shared stream sections.
     /// # Errors
     ///
@@ -803,6 +822,8 @@ unsafe extern "system" {
     fn ext4win_stream_cache_flush(stream_header: wdk_sys::PVOID) -> NTSTATUS;
 
     fn ext4win_stream_cache_coherency_flush_and_purge(stream_header: wdk_sys::PVOID) -> NTSTATUS;
+
+    fn ext4win_stream_cache_drain_for_volume_lock(stream_header: wdk_sys::PVOID) -> NTSTATUS;
 
     fn ext4win_stream_cache_uninitialize(
         stream_header: wdk_sys::PVOID,

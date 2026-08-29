@@ -436,6 +436,22 @@ impl FileControlBlockOpenState {
         }
     }
 
+    /// Returns whether one active handle still owns share-access authority for this stream.
+    pub(super) const fn has_active_handle(&self) -> bool {
+        self.share_access.OpenCount != 0
+    }
+
+    /// Returns whether lock-time cache draining has removed every non-handle resident.
+    pub(super) const fn volume_lock_ready(&self) -> bool {
+        matches!(
+            self.lifetime,
+            StreamLifetimeState::OpenHandles {
+                deferred_leases: 0,
+                ..
+            }
+        )
+    }
+
     /// Publishes a shared delete-pending target and returns displaced storage.
     ///
     /// A create-time delete-on-close target is mandatory and therefore cannot be replaced by a
@@ -549,7 +565,6 @@ impl FileControlBlockOpenState {
     }
 
     /// Returns whether the stream requires delayed native-residency maintenance.
-    #[cfg(not(test))]
     pub(super) const fn native_residency_recheck_pending(&self) -> bool {
         self.lifetime.native_residency_recheck_pending()
     }

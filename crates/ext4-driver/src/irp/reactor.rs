@@ -3874,6 +3874,9 @@ mod tests {
                     | crate::irp::CacheWorkCompletion::Uninitialize(result) => {
                         let _result = result;
                     }
+                    crate::irp::CacheWorkCompletion::DrainForVolumeLock(result) => {
+                        let _result = result;
+                    }
                 }
                 drop(suspended);
             }

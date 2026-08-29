@@ -705,6 +705,63 @@ ext4win_stream_cache_coherency_flush_and_purge(_In_ PVOID stream_header)
     return status;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_cache_drain_for_volume_lock(_In_ PVOID stream_header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    IO_STATUS_BLOCK io_status;
+    NTSTATUS status;
+
+    if (stream == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    if ((stream->SectionObjects.DataSectionObject == NULL) &&
+        (stream->SectionObjects.SharedCacheMap == NULL) &&
+        (stream->SectionObjects.ImageSectionObject == NULL)) {
+        return STATUS_SUCCESS;
+    }
+
+    io_status.Status = STATUS_SUCCESS;
+    io_status.Information = 0;
+    status = STATUS_SUCCESS;
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    __try {
+        if (!MmFlushImageSection(&stream->SectionObjects, MmFlushForWrite)) {
+            status = STATUS_USER_MAPPED_FILE;
+        }
+        else if ((stream->SectionObjects.DataSectionObject != NULL) ||
+                 (stream->SectionObjects.SharedCacheMap != NULL)) {
+            CcCoherencyFlushAndPurgeCache(
+                &stream->SectionObjects,
+                NULL,
+                0,
+                &io_status,
+                0);
+            status = io_status.Status;
+            if (status == STATUS_CACHE_PAGE_LOCKED) {
+                status = STATUS_USER_MAPPED_FILE;
+            }
+        }
+        if (NT_SUCCESS(status) &&
+            ((stream->SectionObjects.DataSectionObject != NULL) ||
+             (stream->SectionObjects.SharedCacheMap != NULL) ||
+             (stream->SectionObjects.ImageSectionObject != NULL))) {
+            status = STATUS_USER_MAPPED_FILE;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return status;
+}
+
 _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
